@@ -21,11 +21,16 @@ pathname = os.path.abspath(os.path.dirname(sys.argv[0]))
 
 print(bcolors.HEADER + "\nUpdate Releases Threaded Started at {}".format(datetime.datetime.now().strftime("%H:%M:%S")) + bcolors.ENDC)
 
-cur[0].execute("SELECT value FROM tmux WHERE setting = 'releasethreads'")
-dbgrab = cur[0].fetchone()
-threads = int(dbgrab[0][0])
+cur[0].execute("SELECT (SELECT value FROM site WHERE setting = 'tablepergroup') AS a, (SELECT value FROM site WHERE setting = 'releasethreads') AS b")
+dbgrab = cur[0].fetchall()
+allowed = int(dbgrab[0][0])
+threads = int(dbgrab[0][1])
+if allowed == 0:
+	print(bcolors.ERROR + "Table per group not enabled" + bcolors.ENDC)
+	info.disconnect(cur[0], cur[1])
+	sys.exit()
 
-cur[0].execute("SELECT table_name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '"+conf['DB_NAME']+"' AND table_rows > 0 AND table_name LIKE 'binaries'")
+cur[0].execute("SELECT table_name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '"+conf['DB_NAME']+"' AND table_rows > 0 AND table_name LIKE 'binaries_%'")
 datas = cur[0].fetchall()
 
 #close connection to mysql
@@ -55,7 +60,7 @@ class queue_runner(threading.Thread):
 			else:
 				if my_id:
 					time_of_last_run = time.time()
-					subprocess.call(["php", pathname+"/../bin/update_releases_new.php", ""+my_id])
+					subprocess.call(["php", pathname+"/../../multiprocessing/.do_not_run/switch.php", "releases  "+my_id])
 					self.my_queue.task_done()
 
 def main():
@@ -83,10 +88,12 @@ def main():
 		if count >= threads:
 			count = 0
 		count += 1
-		my_queue.put("%s  %s" % (release[0].replace('binaries', ''), count))
+		my_queue.put("%s  %s" % (release[0].replace('binaries_', ''), count))
 
 	my_queue.join()
 
+	#stage7b
+	subprocess.call(["php", pathname+"/../../multiprocessing/.do_not_run/switch.php", "python  releases  "+str(count)+"_"])
 
 	print(bcolors.HEADER + "\nUpdate Releases Threaded Completed at {}".format(datetime.datetime.now().strftime("%H:%M:%S")) + bcolors.ENDC)
 	print(bcolors.HEADER + "Running time: {}\n\n".format(str(datetime.timedelta(seconds=time.time() - start_time))) + bcolors.ENDC)
