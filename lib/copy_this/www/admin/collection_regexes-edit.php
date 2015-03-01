@@ -1,11 +1,8 @@
 <?php
-require_once("config.php");
-require_once(WWW_DIR."/lib/adminpage.php");
-require_once(WWW_DIR."/lib/CollectionsCleaning.php");
-require_once(WWW_DIR."/lib/category.php");
+require_once './config.php';
 
 $page = new AdminPage();
-$cc = new CollectionsCleaning(['Settings' => $page->settings]);
+$regexes = new Regexes(['Settings' => $page->settings, 'Table_Name' => 'collection_regexes']);
 
 // Set the current action.
 $action = isset($_REQUEST['action']) ? $_REQUEST['action'] : 'view';
@@ -32,9 +29,9 @@ switch($action) {
 		}
 
 		if ($_POST["id"] == "") {
-			$cc->addRegex($_POST);
+			$regexes->addRegex($_POST);
 		} else {
-			$cc->updateRegex($_POST);
+			$regexes->updateRegex($_POST);
 		}
 
 		header("Location:".WWW_TOP."/collection_regexes-list.php");
@@ -45,7 +42,7 @@ switch($action) {
 		if (isset($_GET["id"])) {
 			$page->title = "Collections Regex Edit";
 			$id = $_GET["id"];
-			$r = $cc->getRegexByID($id);
+			$r = $regexes->getRegexByID($id);
 		} else {
 			$page->title = "Collections Regex Add";
 			$r = ['status' => 1];
