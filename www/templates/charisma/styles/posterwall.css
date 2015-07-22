@@ -14,8 +14,8 @@ body,h1,h2,h3,h4,h5,h6,img,input,form,fieldset{
 body{
     font-family:"Droid Sans",Arial,serif;
     font-size:13px;
-    color:#000;
-    background-color:#d5d3be;
+    color: #1c94c4;
+    background-color: dimgrey;
 }
 
 
@@ -28,7 +28,7 @@ div.poster a img{
 
 div.poster a{
     text-decoration:none;
-    color:#008fbb;
+    color: #E6FF99;
 }
 
 
@@ -106,7 +106,7 @@ h3 a.see-more{
     float:right;
     font-size:12px;
     font-weight:normal;
-    background-color:#d5d3be;
+    background-color:dimgrey;
 }
 
 
@@ -127,15 +127,15 @@ input.placeholder{
 
 
 ::-moz-selection{
-    background:#4DBCE9;
-    color:#fff;
+    background:cornflowerblue;
+    color:black;
     text-shadow:none;
 }
 
 
 ::selection{
-    background:#4DBCE9;
-    color:#fff;
+    background:cornflowerblue;
+    color:black;
     text-shadow:none;
 }
 
@@ -460,7 +460,7 @@ br.clear{
 .library-wrapper .library-show .title{
     display:block;
     font-weight:bold;
-    color:#000;
+    color:#000000;
 }
 
 
@@ -702,7 +702,7 @@ br.clear{
     width:13px;
     height:30px;
     margin:0!important;
-    background-color:#333!important;
+    background-color:steelblue!important;
     background-image:url(https://trakt.us/images/quick-icons/heart-love.png);
     background-size:12px 12px;
     float:left;
@@ -727,7 +727,7 @@ br.clear{
 
 
 .rating-pod{
-    background-color:#333;
+    background-color:steelblue;
     padding:5px 10px 5px 7px;
     border-radius:0 0 6px 6px;
     overflow:hidden;
@@ -778,20 +778,20 @@ br.clear{
 }
 
 .main-title {
-    color: rgb(255, 255, 255);
+    color: lightgrey;
     text-shadow: 0px -1px 1px rgb(17, 17, 17);
     padding: 10px 10px 11px;
     font-size: 16px;
     border-radius: 4px 4px 0px 0px;
     border-top: 1px solid rgb(119, 119, 119);
     border-bottom: 1px solid rgb(51, 51, 51);
-    background-color: rgb(95, 95, 95);
+    background-color: steelblue;
     background-image: -moz-linear-gradient(center top , rgb(102, 102, 102), rgb(85, 85, 85));
 }
 
 .main-wrapper {
-    background: none repeat scroll 0% 0% rgb(208, 208, 208);
-    color: rgb(153, 153, 153);
+    background: none repeat scroll 0% 0% rgb(70,130,180);
+    color: steelblue;
     padding: 9px;
 }
 

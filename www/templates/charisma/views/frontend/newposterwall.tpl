@@ -67,12 +67,16 @@
 							</div>
 							<div class="rating-pod" id="guid{$result.guid}">
 								<div class="icons">
-									<div class="icon icon_nzb"><a class="divlink" title="Download Nzb"
-																  href="{$smarty.const.WWW_TOP}/getnzb/{$result.guid}/{$result.searchname|escape:"htmlall"}"></a>
+									<div class="icon_nzb text-muted"><a class="divlink" title="Download Nzb"
+																		href="{$smarty.const.WWW_TOP}/getnzb/{$result.guid}/{$result.searchname|escape:"htmlall"}"><i class="fa fa-download"></i></a>
 									</div>
-									<div class="icon icon_cart" title="Add to Cart"></div>
+									<div class="icon_cart text-muted" title="Add to Cart">
+										<i class="fa fa-shopping-cart"></i>
+									</div>
 									{if isset($sabintegrated)}
-										<div class="icon icon_sab" title="Send to my Queue"></div>
+										<div class="icon_sab text-muted" title="Send to my Queue">
+											<i class="fa fa-send-o"></i>
+										</div>
 									{/if}
 								</div>
 								<br>
@@ -99,7 +103,7 @@
 											<a class="divlink" target="_blank" title="View on IMDB"
 											   href="{$site->dereferrer_link}http://www.imdb.com/title/tt{$result.imdbid}/"></a>
 										</div>
-										<div class="icon icon_trakt">
+										<div class="icon_trakt">
 											<a class="divlink" target="_blank" title="View on Trakt"
 											   href="{$site->dereferrer_link}http://trakt.tv/search/imdb/tt{$result.imdbid}/"></a>
 										</div>
@@ -125,7 +129,7 @@
 											   href="{$site->dereferrer_link}http://www.iafd.com/results.asp?searchtype=title&searchstring={$result.title|escape:"url"}/"></a>
 										</div>
 									{elseif $type == 'PC'}
-										<div class="icon icon_ign">
+										<div class="icon_ign">
 											<a class="divlink" title="Find on IGN"
 											   href="{$site->dereferrer_link}http://ign.com/search?q={$result.searchname|escape:"url"}&page=0&count=10&type=object&objectType=game&filter=games&"
 											   target="_blank"></a>
