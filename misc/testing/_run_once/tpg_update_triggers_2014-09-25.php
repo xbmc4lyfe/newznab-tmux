@@ -51,3 +51,5 @@ if ($tables instanceof \Traversable) {
 	}
 	echo 'All done!' . PHP_EOL;
 }
+
+?>
