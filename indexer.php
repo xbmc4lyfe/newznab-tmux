@@ -28,6 +28,8 @@ use nntmux\utility\Utility;
 
 $config = new Configure('indexer');
 
-define('HAS_WHICH', Utility::hasWhich() ? true : false);
+if (!defined('HAS_WHICH')) {
+	define('HAS_WHICH', Utility::hasWhich() ? true : false);
+}
 
 ?>
