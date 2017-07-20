@@ -19,11 +19,10 @@
 
 namespace App\Extensions\util\yenc\adapter;
 
-use Illuminate\Support\ServiceProvider;
 use yenc\yenc;
 
 
-class NzedbYenc extends ServiceProvider
+class NzedbYenc extends \App\Extensions\util\Yenc
 {
 	public static function decode(&$text, $ignore = false, array $options = [])
 	{
