@@ -14,8 +14,9 @@ class CreateReleaseNfosTable extends Migration
     public function up()
     {
         Schema::create('release_nfos', function (Blueprint $table) {
-            $table->increments('id');
-            $table->timestamps();
+            $table->unsignedInteger('releases_id');
+            $table->binary('nfo');
+            $table->primary('releases_id');
         });
     }
 
