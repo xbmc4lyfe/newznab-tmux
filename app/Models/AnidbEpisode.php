@@ -12,6 +12,11 @@ class AnidbEpisode extends Model
     protected $dateFormat = false;
 
     /**
+     * @var string
+     */
+    protected $primaryKey = 'anidbid';
+
+    /**
      * @var bool
      */
     public $incrementing = false;
@@ -24,11 +29,15 @@ class AnidbEpisode extends Model
     /**
      * @var array
      */
-    protected $fillable = [
-        'anidbid',
-        'episodeid',
-        'episode_no',
-        'episode_title',
-        'airdate',
-    ];
+    protected $guarded = [];
+
+    public function title()
+    {
+        return $this->belongsTo('App\Models\AnidbTitle', 'anidbid');
+    }
+
+    public function info()
+    {
+        return $this->hasMany('App\Modles\AnidbInfo', 'anidbid');
+    }
 }
