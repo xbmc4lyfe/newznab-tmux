@@ -32,12 +32,10 @@ class ConsoleController extends BasePageController
         $this->smarty->assign('catlist', $ctmp);
         $this->smarty->assign('category', $category->title);
 
-        $offset = ($request->has('offset') && ctype_digit($request->input('offset'))) ? $request->input('offset') : 0;
-        $ordering = $console->getConsoleOrdering();
-        $orderby = $request->has('ob') && \in_array($request->input('ob'), $ordering, false) ? $request->input('ob') : '';
+        $page = \request()->has('page') ? \request()->input('page') : 1;
 
         $consoles = [];
-        $results = $console->getConsoleRange($catarray, $orderby, $this->userdata['categoryexclusions']);
+        $results = $console->getConsoleRange($page, $catarray, $this->userdata['categoryexclusions']);
 
         $maxwords = 50;
         foreach ($results as $result) {
@@ -66,30 +64,15 @@ class ConsoleController extends BasePageController
         $this->smarty->assign('genres', $genres);
         $this->smarty->assign('genre', $genre);
 
-        $browseby_link = '&amp;title='.$title.'&amp;platform='.$platform;
-
-        $this->smarty->assign('pagertotalitems', $results[0]['_totalcount'] ?? 0);
-        $this->smarty->assign('pageroffset', $offset);
-        $this->smarty->assign('pageritemsperpage', config('nntmux.items_per_cover_page'));
-        $this->smarty->assign('pagerquerybase', WWW_TOP.'/console?t='.$category.$browseby_link.'&amp;ob='.$orderby.'&amp;offset=');
-        $this->smarty->assign('pagerquerysuffix', '#results');
-
-        $thisr = $this->smarty->fetch('pager.tpl');
-        $this->smarty->assign('pager', $thisr);
-
-        if ((int) $category === -1) {
+        if ($category === -1) {
             $this->smarty->assign('catname', 'All');
         } else {
             $cdata = Category::find($category);
             if ($cdata) {
-                $this->smarty->assign('catname', $cdata->parent !== null ? $cdata->parent->title.' > '.$cdata->title : $cdata->title);
+                $this->smarty->assign('catname', array_first($cdata)->parent !== null ? array_first($cdata)->parent->title.' > '.array_first($cdata)->title : array_first($cdata)->title);
             } else {
                 $this->show404();
             }
-        }
-
-        foreach ($ordering as $ordertype) {
-            $this->smarty->assign('orderby'.$ordertype, WWW_TOP.'/console?t='.$category.$browseby_link.'&amp;ob='.$ordertype.'&amp;offset=0');
         }
 
         $this->smarty->assign('results', $consoles);
