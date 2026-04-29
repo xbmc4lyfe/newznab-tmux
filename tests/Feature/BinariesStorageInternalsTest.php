@@ -128,7 +128,7 @@ class BinariesStorageInternalsTest extends TestCase
     {
         $this->createHeaderStorageTables('CHECK(size < 500)');
 
-        $service = new HeaderStorageService($this->deterministicCollectionHandler(), config: new BinariesConfig(partsChunkSize: 2));
+        $service = new HeaderStorageService($this->deterministicCollectionHandler(), config: new BinariesConfig(partsChunkSize: 2, headerChunkSize: 2));
         $failed = $service->store([
             $this->parsedHeader(301, 1, 'Chunk.One', 100),
             $this->parsedHeader(302, 2, 'Chunk.One', 100),

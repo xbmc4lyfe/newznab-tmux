@@ -13,6 +13,14 @@ use Illuminate\Support\Facades\Log;
  */
 final class BinaryHandler
 {
+    /**
+     * Hard upper bound on the number of rows packed into a single SQL
+     * statement (multi-row INSERT, OR-clause SELECT, etc.). Keeps the
+     * generated SQL string and PDO parameter list bounded regardless of
+     * how many headers the caller passes in.
+     */
+    private const MAX_SQL_ROWS_PER_STATEMENT = 500;
+
     /** @var array<int, array{Size: int, Parts: int}> Pending binary updates */
     private array $binariesUpdate = [];
 
@@ -220,46 +228,50 @@ final class BinaryHandler
     /** @param  list<array<string, mixed>>  $rows */
     private function bulkInsertBinariesSqlite(array $rows): void
     {
-        $insertRows = [];
-        foreach ($rows as $row) {
-            $insertRows[] = [
-                'binaryhash' => $row['hash'],
-                'name' => $row['name'],
-                'collections_id' => $row['collections_id'],
-                'totalparts' => $row['totalparts'],
-                'currentparts' => 1,
-                'filenumber' => $row['filenumber'],
-                'partsize' => $row['partsize'],
-            ];
-        }
+        foreach (array_chunk($rows, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            $insertRows = [];
+            foreach ($chunk as $row) {
+                $insertRows[] = [
+                    'binaryhash' => $row['hash'],
+                    'name' => $row['name'],
+                    'collections_id' => $row['collections_id'],
+                    'totalparts' => $row['totalparts'],
+                    'currentparts' => 1,
+                    'filenumber' => $row['filenumber'],
+                    'partsize' => $row['partsize'],
+                ];
+            }
 
-        DB::table('binaries')->insertOrIgnore($insertRows);
+            DB::table('binaries')->insertOrIgnore($insertRows);
+        }
     }
 
     /** @param  list<array<string, mixed>>  $rows */
     private function bulkInsertBinariesMysql(array $rows): void
     {
-        $placeholders = [];
-        $bindings = [];
-        foreach ($rows as $row) {
-            $placeholders[] = '(UNHEX(?), ?, ?, ?, 1, ?, ?)';
-            array_push(
-                $bindings,
-                $row['hash'],
-                $row['name'],
-                $row['collections_id'],
-                $row['totalparts'],
-                $row['filenumber'],
-                $row['partsize']
+        foreach (array_chunk($rows, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            $placeholders = [];
+            $bindings = [];
+            foreach ($chunk as $row) {
+                $placeholders[] = '(UNHEX(?), ?, ?, ?, 1, ?, ?)';
+                array_push(
+                    $bindings,
+                    $row['hash'],
+                    $row['name'],
+                    $row['collections_id'],
+                    $row['totalparts'],
+                    $row['filenumber'],
+                    $row['partsize']
+                );
+            }
+
+            DB::statement(
+                'INSERT INTO binaries (binaryhash, name, collections_id, totalparts, currentparts, filenumber, partsize) VALUES '
+                .implode(',', $placeholders)
+                .' ON DUPLICATE KEY UPDATE currentparts = currentparts + 1, partsize = partsize + VALUES(partsize)',
+                $bindings
             );
         }
-
-        DB::statement(
-            'INSERT INTO binaries (binaryhash, name, collections_id, totalparts, currentparts, filenumber, partsize) VALUES '
-            .implode(',', $placeholders)
-            .' ON DUPLICATE KEY UPDATE currentparts = currentparts + 1, partsize = partsize + VALUES(partsize)',
-            $bindings
-        );
     }
 
     /**
@@ -287,22 +299,39 @@ final class BinaryHandler
         }
 
         $driver = DB::getDriverName();
-        $clauses = [];
-        $bindings = [];
-        foreach ($rows as $row) {
-            $clauses[] = $driver === 'sqlite'
-                ? '(binaryhash = ? AND collections_id = ?)'
-                : '(binaryhash = UNHEX(?) AND collections_id = ?)';
-            $bindings[] = $row['hash'];
-            $bindings[] = $row['collections_id'];
-        }
-
         $hashExpression = $driver === 'sqlite' ? 'binaryhash' : 'LOWER(HEX(binaryhash))';
 
-        return DB::select(
-            "SELECT id, {$hashExpression} AS hashvalue, collections_id FROM binaries WHERE ".implode(' OR ', $clauses),
-            $bindings
-        );
+        // Group lookups by collections_id and run small `binaryhash IN (...)`
+        // queries per collection. This avoids producing a single
+        // `WHERE (... AND ...) OR (... AND ...) OR ...` expression with
+        // thousands of clauses and bindings, which both bloats the SQL
+        // string in PHP and can force MySQL into pathological plans.
+        $rowsByCollection = [];
+        foreach ($rows as $row) {
+            $rowsByCollection[(int) $row['collections_id']][] = (string) $row['hash'];
+        }
+
+        $results = [];
+        foreach ($rowsByCollection as $collectionId => $hashes) {
+            $hashes = array_values(array_unique($hashes));
+            foreach (array_chunk($hashes, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+                $placeholders = implode(',', array_fill(0, \count($chunk), $driver === 'sqlite' ? '?' : 'UNHEX(?)'));
+                $bindings = $chunk;
+                $bindings[] = $collectionId;
+
+                $rowsResult = DB::select(
+                    "SELECT id, {$hashExpression} AS hashvalue, collections_id FROM binaries "
+                    ."WHERE binaryhash IN ({$placeholders}) AND collections_id = ?",
+                    $bindings
+                );
+
+                foreach ($rowsResult as $r) {
+                    $results[] = $r;
+                }
+            }
+        }
+
+        return $results;
     }
 
     private function binaryLookupKey(string $hash, int $collectionId): string
@@ -441,6 +470,11 @@ final class BinaryHandler
      */
     private function flushUpdatesMysql(array $updates, int $chunkSize): bool
     {
+        // Clamp the caller-provided chunk size to our hard upper bound so an
+        // unusually large config value cannot produce a 100 KB+ UNION ALL
+        // query that exhausts memory on either side of the connection.
+        $chunkSize = max(1, min($chunkSize, self::MAX_SQL_ROWS_PER_STATEMENT));
+
         foreach (array_chunk($updates, $chunkSize) as $chunk) {
             $selects = [];
             $bindings = [];

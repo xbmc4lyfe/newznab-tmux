@@ -24,6 +24,17 @@ final readonly class BinariesConfig
         public int $partsChunkSize = 5000,
         public int $binariesUpdateChunkSize = 1000,
         public bool $echoCli = false,
+        // Number of headers processed (and bulk-inserted) at a time inside
+        // HeaderStorageService. This MUST stay small because each chunk
+        // produces multi-row INSERTs/SELECTs whose binding count and SQL size
+        // grow linearly with the value. Defaulting it to partsChunkSize
+        // (which used to only control single-row part flushes) caused MySQL
+        // and PHP to allocate hundreds of MB per scan and run out of RAM.
+        public int $headerChunkSize = 500,
+        // Hard upper bound applied internally to bulk SELECT/INSERT/UPDATE
+        // operations regardless of caller-provided chunk size, so a
+        // misconfiguration cannot blow up server memory.
+        public int $bulkSqlChunkSize = 500,
     ) {}
 
     /**
@@ -41,8 +52,10 @@ final readonly class BinariesConfig
             partRepairLimit: self::getSettingInt('maxpartrepair', 15000),
             partRepairMaxTries: self::getSettingInt('partrepairmaxtries', 3),
             partsChunkSize: max(100, (int) config('nntmux.parts_chunk_size', 5000)),
-            binariesUpdateChunkSize: max(100, (int) config('nntmux.binaries_update_chunk_size', 1000)),
+            binariesUpdateChunkSize: max(100, min(1000, (int) config('nntmux.binaries_update_chunk_size', 1000))),
             echoCli: (bool) config('nntmux.echocli'),
+            headerChunkSize: max(50, min(2000, (int) config('nntmux.header_chunk_size', 500))),
+            bulkSqlChunkSize: max(50, min(1000, (int) config('nntmux.bulk_sql_chunk_size', 500))),
         );
     }
 

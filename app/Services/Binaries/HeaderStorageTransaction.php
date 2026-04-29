@@ -12,6 +12,8 @@ use Illuminate\Support\Facades\Log;
  */
 final class HeaderStorageTransaction
 {
+    private const MAX_SQL_ROWS_PER_STATEMENT = 500;
+
     private CollectionHandler $collectionHandler;
 
     private BinaryHandler $binaryHandler;
@@ -126,18 +128,18 @@ final class HeaderStorageTransaction
     private function cleanupParts(): void
     {
         $ids = $this->binaryHandler->getInsertedIds();
-        if (! empty($ids)) {
-            $placeholders = implode(',', array_fill(0, \count($ids), '?'));
-            DB::statement("DELETE FROM parts WHERE binaries_id IN ({$placeholders})", $ids);
+        foreach (array_chunk($ids, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            $placeholders = implode(',', array_fill(0, \count($chunk), '?'));
+            DB::statement("DELETE FROM parts WHERE binaries_id IN ({$placeholders})", $chunk);
         }
     }
 
     private function cleanupBinaries(): void
     {
         $ids = $this->binaryHandler->getInsertedIds();
-        if (! empty($ids)) {
-            $placeholders = implode(',', array_fill(0, \count($ids), '?'));
-            DB::statement("DELETE FROM binaries WHERE id IN ({$placeholders})", $ids);
+        foreach (array_chunk($ids, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            $placeholders = implode(',', array_fill(0, \count($chunk), '?'));
+            DB::statement("DELETE FROM binaries WHERE id IN ({$placeholders})", $chunk);
         }
     }
 
@@ -150,27 +152,30 @@ final class HeaderStorageTransaction
         $ids = ! empty($insertedIds) ? $insertedIds : $allIds;
 
         if (! empty($ids)) {
-            $placeholders = implode(',', array_fill(0, \count($ids), '?'));
+            foreach (array_chunk($ids, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+                $placeholders = implode(',', array_fill(0, \count($chunk), '?'));
 
-            // Remove parts and binaries referencing these collections, then collections
-            DB::statement(
-                "DELETE FROM parts WHERE binaries_id IN (SELECT id FROM binaries WHERE collections_id IN ({$placeholders}))",
-                $ids
-            );
-            DB::statement("DELETE FROM binaries WHERE collections_id IN ({$placeholders})", $ids);
-            DB::statement("DELETE FROM collections WHERE id IN ({$placeholders})", $ids);
+                DB::statement(
+                    "DELETE FROM parts WHERE binaries_id IN (SELECT id FROM binaries WHERE collections_id IN ({$placeholders}))",
+                    $chunk
+                );
+                DB::statement("DELETE FROM binaries WHERE collections_id IN ({$placeholders})", $chunk);
+                DB::statement("DELETE FROM collections WHERE id IN ({$placeholders})", $chunk);
+            }
         } elseif (! empty($hashes)) {
-            $placeholders = implode(',', array_fill(0, \count($hashes), '?'));
+            foreach (array_chunk($hashes, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+                $placeholders = implode(',', array_fill(0, \count($chunk), '?'));
 
-            DB::statement(
-                "DELETE FROM parts WHERE binaries_id IN (SELECT id FROM binaries WHERE collections_id IN (SELECT id FROM collections WHERE collectionhash IN ({$placeholders})))",
-                $hashes
-            );
-            DB::statement(
-                "DELETE FROM binaries WHERE collections_id IN (SELECT id FROM collections WHERE collectionhash IN ({$placeholders}))",
-                $hashes
-            );
-            DB::statement("DELETE FROM collections WHERE collectionhash IN ({$placeholders})", $hashes);
+                DB::statement(
+                    "DELETE FROM parts WHERE binaries_id IN (SELECT id FROM binaries WHERE collections_id IN (SELECT id FROM collections WHERE collectionhash IN ({$placeholders})))",
+                    $chunk
+                );
+                DB::statement(
+                    "DELETE FROM binaries WHERE collections_id IN (SELECT id FROM collections WHERE collectionhash IN ({$placeholders}))",
+                    $chunk
+                );
+                DB::statement("DELETE FROM collections WHERE collectionhash IN ({$placeholders})", $chunk);
+            }
         } else {
             // Fallback by noise marker
             DB::statement(

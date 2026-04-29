@@ -54,9 +54,21 @@ final class HeaderStorageService
 
         $this->failedInserts = [];
 
-        $chunkSize = max(1, $this->config->partsChunkSize);
-        foreach (array_chunk($headers, $chunkSize) as $chunk) {
+        // Use the dedicated header chunk size, NOT partsChunkSize. The latter
+        // controls single-row part flushes and is normally much larger; using
+        // it here forces every collection/binary bulk INSERT and OR-clause
+        // SELECT to scale to thousands of rows per chunk, which exhausts PHP
+        // and MySQL memory.
+        $chunkSize = max(1, $this->config->headerChunkSize);
+
+        // Walk the array with offset slicing instead of array_chunk() so we
+        // don't materialize every chunk simultaneously in memory.
+        $total = \count($headers);
+        $headers = array_values($headers);
+        for ($offset = 0; $offset < $total; $offset += $chunkSize) {
+            $chunk = \array_slice($headers, $offset, $chunkSize);
             $this->storeChunk($chunk, $groupMySQL, $addToPartRepair);
+            unset($chunk);
         }
 
         return array_values(array_unique($this->failedInserts));

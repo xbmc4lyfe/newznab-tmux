@@ -12,6 +12,14 @@ use Illuminate\Support\Facades\Log;
  */
 final class PartHandler
 {
+    /**
+     * Hard upper bound on rows packed into a single SQL statement
+     * (multi-row INSERT, OR-clause SELECT). The public chunkSize controls
+     * when we flush; this constant guarantees the actual SQL we emit is
+     * never large enough to blow up PHP/MySQL memory.
+     */
+    private const MAX_SQL_ROWS_PER_STATEMENT = 500;
+
     /** @var array<string, mixed> Pending parts to insert */
     private array $parts = [];
 
@@ -123,25 +131,31 @@ final class PartHandler
      */
     private function insertChunk(array $parts): ?int
     {
-        $placeholders = [];
-        $bindings = [];
         $driver = DB::getDriverName();
-
-        foreach ($parts as $row) {
-            $placeholders[] = '(?,?,?,?,?)';
-            $bindings[] = $row['binaries_id'];
-            $bindings[] = $row['number'];
-            $bindings[] = $row['messageid'];
-            $bindings[] = $row['partnumber'];
-            $bindings[] = $row['size'];
-        }
-
-        $sql = $driver === 'sqlite'
-            ? 'INSERT OR IGNORE INTO parts (binaries_id, number, messageid, partnumber, size) VALUES '.implode(',', $placeholders)
-            : 'INSERT IGNORE INTO parts (binaries_id, number, messageid, partnumber, size) VALUES '.implode(',', $placeholders);
+        $totalInserted = 0;
 
         try {
-            return DB::affectingStatement($sql, $bindings);
+            foreach (array_chunk($parts, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+                $placeholders = [];
+                $bindings = [];
+
+                foreach ($chunk as $row) {
+                    $placeholders[] = '(?,?,?,?,?)';
+                    $bindings[] = $row['binaries_id'];
+                    $bindings[] = $row['number'];
+                    $bindings[] = $row['messageid'];
+                    $bindings[] = $row['partnumber'];
+                    $bindings[] = $row['size'];
+                }
+
+                $sql = $driver === 'sqlite'
+                    ? 'INSERT OR IGNORE INTO parts (binaries_id, number, messageid, partnumber, size) VALUES '.implode(',', $placeholders)
+                    : 'INSERT IGNORE INTO parts (binaries_id, number, messageid, partnumber, size) VALUES '.implode(',', $placeholders);
+
+                $totalInserted += (int) DB::affectingStatement($sql, $bindings);
+            }
+
+            return $totalInserted;
         } catch (\Throwable $e) {
             if (config('app.debug') === true) {
                 Log::error('Parts chunk insert failed: '.$e->getMessage());
@@ -161,22 +175,30 @@ final class PartHandler
             return [];
         }
 
-        $clauses = [];
-        $bindings = [];
+        $keys = [];
+        // Group by binaries_id and use IN(...) per binary so the SELECT does
+        // not turn into thousands of OR clauses with two bindings each.
+        $numbersByBinary = [];
         foreach ($parts as $part) {
-            $clauses[] = '(binaries_id = ? AND number = ?)';
-            $bindings[] = $part['binaries_id'];
-            $bindings[] = $part['number'];
+            $numbersByBinary[(int) $part['binaries_id']][] = $part['number'];
         }
 
-        $rows = DB::select(
-            'SELECT binaries_id, number FROM parts WHERE '.implode(' OR ', $clauses),
-            $bindings
-        );
+        foreach ($numbersByBinary as $binaryId => $numbers) {
+            $numbers = array_values(array_unique($numbers));
+            foreach (array_chunk($numbers, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+                $placeholders = implode(',', array_fill(0, \count($chunk), '?'));
+                $bindings = $chunk;
+                $bindings[] = $binaryId;
 
-        $keys = [];
-        foreach ($rows as $row) {
-            $keys[$this->partKey((int) $row->binaries_id, (int) $row->number)] = true;
+                $rows = DB::select(
+                    "SELECT binaries_id, number FROM parts WHERE number IN ({$placeholders}) AND binaries_id = ?",
+                    $bindings
+                );
+
+                foreach ($rows as $row) {
+                    $keys[$this->partKey((int) $row->binaries_id, (int) $row->number)] = true;
+                }
+            }
         }
 
         return $keys;

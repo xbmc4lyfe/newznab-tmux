@@ -16,6 +16,13 @@ use Illuminate\Support\Facades\Log;
  */
 final class CollectionHandler
 {
+    /**
+     * Hard upper bound on rows packed into a single SQL statement
+     * (multi-row INSERT, IN(...) lookup, etc.). Keeps the generated SQL
+     * and PDO parameter count bounded regardless of caller batch size.
+     */
+    private const MAX_SQL_ROWS_PER_STATEMENT = 500;
+
     private CollectionsCleaningService $collectionsCleaning;
 
     private XrefService $xrefService;
@@ -237,10 +244,13 @@ final class CollectionHandler
             return;
         }
 
-        $rows = Collection::query()
-            ->whereIn('collectionhash', array_values($missing))
-            ->pluck('xref', 'collectionhash')
-            ->all();
+        $rows = [];
+        foreach (array_chunk(array_values($missing), self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            $rows += Collection::query()
+                ->whereIn('collectionhash', $chunk)
+                ->pluck('xref', 'collectionhash')
+                ->all();
+        }
 
         foreach ($missing as $collectionKey => $hash) {
             $this->existingXrefs[$collectionKey] = isset($rows[$hash]) ? (string) $rows[$hash] : null;
@@ -282,11 +292,16 @@ final class CollectionHandler
             return [];
         }
 
-        return Collection::query()
-            ->whereIn('collectionhash', $hashes)
-            ->pluck('collectionhash')
-            ->mapWithKeys(static fn (string $hash): array => [$hash => true])
-            ->all();
+        $existing = [];
+        foreach (array_chunk($hashes, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            $existing += Collection::query()
+                ->whereIn('collectionhash', $chunk)
+                ->pluck('collectionhash')
+                ->mapWithKeys(static fn (string $hash): array => [$hash => true])
+                ->all();
+        }
+
+        return $existing;
     }
 
     /**
@@ -310,7 +325,9 @@ final class CollectionHandler
             ];
         }
 
-        DB::table('collections')->insertOrIgnore($rows);
+        foreach (array_chunk($rows, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            DB::table('collections')->insertOrIgnore($chunk);
+        }
     }
 
     /**
@@ -319,30 +336,32 @@ final class CollectionHandler
      */
     private function bulkInsertCollectionsMysql(array $rowsByCollectionKey, array $existingHashes): void
     {
-        $placeholders = [];
-        $bindings = [];
-        foreach ($rowsByCollectionKey as $row) {
-            $placeholders[] = '(?, ?, FROM_UNIXTIME(?), ?, ?, ?, ?, ?, NOW(), ?)';
-            array_push(
-                $bindings,
-                $row['subject'],
-                $row['fromname'],
-                $row['unixtime'],
-                $row['xref'],
-                $row['groups_id'],
-                $row['totalfiles'],
-                $row['collectionhash'],
-                $row['collection_regexes_id'],
-                $row['noise']
+        foreach (array_chunk(array_values($rowsByCollectionKey), self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            $placeholders = [];
+            $bindings = [];
+            foreach ($chunk as $row) {
+                $placeholders[] = '(?, ?, FROM_UNIXTIME(?), ?, ?, ?, ?, ?, NOW(), ?)';
+                array_push(
+                    $bindings,
+                    $row['subject'],
+                    $row['fromname'],
+                    $row['unixtime'],
+                    $row['xref'],
+                    $row['groups_id'],
+                    $row['totalfiles'],
+                    $row['collectionhash'],
+                    $row['collection_regexes_id'],
+                    $row['noise']
+                );
+            }
+
+            DB::statement(
+                'INSERT INTO collections (subject, fromname, date, xref, groups_id, totalfiles, collectionhash, collection_regexes_id, dateadded, noise) VALUES '
+                .implode(',', $placeholders)
+                .' ON DUPLICATE KEY UPDATE dateadded = NOW()',
+                $bindings
             );
         }
-
-        DB::statement(
-            'INSERT INTO collections (subject, fromname, date, xref, groups_id, totalfiles, collectionhash, collection_regexes_id, dateadded, noise) VALUES '
-            .implode(',', $placeholders)
-            .' ON DUPLICATE KEY UPDATE dateadded = NOW()',
-            $bindings
-        );
 
         foreach ($rowsByCollectionKey as $row) {
             if ($row['xref_append'] !== '' && isset($existingHashes[$row['collectionhash']])) {
@@ -365,11 +384,16 @@ final class CollectionHandler
             return [];
         }
 
-        return Collection::query()
-            ->whereIn('collectionhash', $hashes)
-            ->pluck('id', 'collectionhash')
-            ->mapWithKeys(static fn (int|string $id, string $hash): array => [$hash => (int) $id])
-            ->all();
+        $resolved = [];
+        foreach (array_chunk($hashes, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            $resolved += Collection::query()
+                ->whereIn('collectionhash', $chunk)
+                ->pluck('id', 'collectionhash')
+                ->mapWithKeys(static fn (int|string $id, string $hash): array => [$hash => (int) $id])
+                ->all();
+        }
+
+        return $resolved;
     }
 
     /**
