@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Services;
 
-use App\Models\Collection;
 use App\Models\Settings;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -162,6 +161,7 @@ class CollectionCleanupService
                         if ($echoCLI) {
                             cli()->error('Orphan cleanup delete failed after retries: '.$e->getMessage());
                         }
+
                         return $deleted;
                     }
                     usleep(20000 * $attempt);
@@ -212,6 +212,7 @@ class CollectionCleanupService
                         if ($echoCLI) {
                             cli()->error('Missed-NZB cleanup delete failed after retries: '.$e->getMessage());
                         }
+
                         return $deleted;
                     }
                     usleep(20000 * $attempt);
