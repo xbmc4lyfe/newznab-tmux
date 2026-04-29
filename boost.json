@@ -2,6 +2,7 @@
     "agents": [
         "phpstorm-copilot"
     ],
+    "cloud": false,
     "editors": [
         "phpstorm-copilot"
     ],
