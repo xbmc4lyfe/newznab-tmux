@@ -501,7 +501,7 @@ final class ReleaseProcessingService
             $this->echoCLI
         );
 
-        return ReleaseCreationResult::fromArray($result);
+        return ReleaseCreationResult::from($result);
     }
 
     /**

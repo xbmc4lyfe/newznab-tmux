@@ -83,61 +83,148 @@ class CollectionCleanupService
             );
         }
 
-        // Occasionally prune CBP orphans (low frequency to avoid heavy load).
-        if (random_int(0, 200) <= 1) {
-            if ($echoCLI) {
-                echo cli()->header('Process Releases -> Remove CBP orphans.'.PHP_EOL).
-                    cli()->primary('Deleting orphaned collections.');
-            }
-
-            $deleted = 0;
-            // NOTE: This JOIN DELETE can be heavy; consider batching if it becomes an issue in practice.
-            $deleteQuery = Collection::query()
-                ->whereNull('binaries.id')
-                ->orWhereNull('parts.binaries_id')
-                ->leftJoin('binaries', 'collections.id', '=', 'binaries.collections_id')
-                ->leftJoin('parts', 'binaries.id', '=', 'parts.binaries_id')
-                ->delete();
-
-            if ($deleteQuery > 0) {
-                $deleted = $deleteQuery;
-                $deletedCount += $deleted;
-            }
-
-            $totalTime = now()->diffInSeconds($startTime);
-
-            if ($echoCLI) {
-                cli()->primary('Finished deleting '.$deleted.' orphaned collections in '.$totalTime.Str::plural(' second', (int) $totalTime), true);
-            }
+        // Prune orphaned collections (no binaries) every run, but bounded so a large
+        // backlog cannot stall the cycle or exhaust memory. Subsequent runs will keep
+        // chipping away until the backlog is gone.
+        if ($echoCLI) {
+            echo cli()->header('Process Releases -> Remove CBP orphans.'.PHP_EOL).
+                cli()->primary('Deleting orphaned collections.', true);
         }
 
+        $orphanDeleted = $this->deleteOrphanCollections($echoCLI);
+        $deletedCount += $orphanDeleted;
+
+        if ($echoCLI) {
+            $totalTime = now()->diffInSeconds($startTime, true);
+            cli()->primary(
+                'Finished deleting '.$orphanDeleted.' orphaned collections in '.
+                $totalTime.Str::plural(' second', (int) $totalTime),
+                true
+            );
+        }
+
+        // Collections whose release has already been NZB'd are dead weight; drop them
+        // in batches via an id-subselect so we never materialise the full id set in PHP
+        // and never issue per-row DELETEs.
         if ($echoCLI) {
             cli()->primary('Deleting collections that were missed after NZB creation.', true);
         }
 
-        $deleted = 0;
-        $collections = Collection::query()
-            ->where('releases.nzbstatus', '=', 1)
-            ->leftJoin('releases', 'releases.id', '=', 'collections.releases_id')
-            ->select('collections.id')
-            ->get();
-
-        foreach ($collections as $collection) {
-            $deleted++;
-            Collection::query()->where('id', $collection->id)->delete();
-        }
-        $deletedCount += $deleted;
+        $missedDeleted = $this->deleteCollectionsMissedAfterNzb($echoCLI);
+        $deletedCount += $missedDeleted;
 
         $totalTime = now()->diffInSeconds($startTime, true);
 
         if ($echoCLI) {
             cli()->primary(
-                'Finished deleting '.$deleted.' collections missed after NZB creation in '.($totalTime).Str::plural(' second', (int) $totalTime).
+                'Finished deleting '.$missedDeleted.' collections missed after NZB creation in '.($totalTime).Str::plural(' second', (int) $totalTime).
                 PHP_EOL.'Removed '.number_format($deletedCount).' parts/binaries/collection rows in '.$totalTime.Str::plural(' second', (int) $totalTime),
                 true
             );
         }
 
         return $deletedCount;
+    }
+
+    /**
+     * Delete collections that have no binaries (CBP orphans), in bounded batches.
+     * Uses a NOT EXISTS subquery (cheap with the binaries.collections_id index) and
+     * an id-subselect to avoid the multi-table JOIN DELETE that previously could
+     * scan the full parts table.
+     */
+    private function deleteOrphanCollections(bool $echoCLI): int
+    {
+        $deleted = 0;
+        $maxBatches = 20; // hard cap per cycle; bounded backlog drain
+        $batchSize = 500;
+
+        for ($i = 0; $i < $maxBatches; $i++) {
+            $affected = 0;
+            $attempt = 0;
+
+            do {
+                try {
+                    $affected = DB::affectingStatement(
+                        'DELETE FROM collections WHERE id IN (
+                            SELECT id FROM (
+                                SELECT c.id FROM collections c
+                                WHERE NOT EXISTS (
+                                    SELECT 1 FROM binaries b WHERE b.collections_id = c.id
+                                )
+                                ORDER BY c.id LIMIT '.(int) $batchSize.'
+                            ) AS x
+                        )'
+                    );
+                    break;
+                } catch (\Throwable $e) {
+                    $attempt++;
+                    if ($attempt >= 5) {
+                        if ($echoCLI) {
+                            cli()->error('Orphan cleanup delete failed after retries: '.$e->getMessage());
+                        }
+                        return $deleted;
+                    }
+                    usleep(20000 * $attempt);
+                }
+            } while (true);
+
+            $deleted += $affected;
+            if ($affected < $batchSize) {
+                break;
+            }
+            usleep(10000);
+        }
+
+        return $deleted;
+    }
+
+    /**
+     * Delete collections whose release was already turned into an NZB
+     * (releases.nzbstatus = 1). Batched via id-subselect so a large backlog
+     * cannot stall the cycle or load every id into PHP memory.
+     */
+    private function deleteCollectionsMissedAfterNzb(bool $echoCLI): int
+    {
+        $deleted = 0;
+        $maxBatches = 20;
+        $batchSize = 500;
+
+        for ($i = 0; $i < $maxBatches; $i++) {
+            $affected = 0;
+            $attempt = 0;
+
+            do {
+                try {
+                    $affected = DB::affectingStatement(
+                        'DELETE FROM collections WHERE id IN (
+                            SELECT id FROM (
+                                SELECT c.id FROM collections c
+                                INNER JOIN releases r ON r.id = c.releases_id
+                                WHERE r.nzbstatus = 1
+                                ORDER BY c.id LIMIT '.(int) $batchSize.'
+                            ) AS x
+                        )'
+                    );
+                    break;
+                } catch (\Throwable $e) {
+                    $attempt++;
+                    if ($attempt >= 5) {
+                        if ($echoCLI) {
+                            cli()->error('Missed-NZB cleanup delete failed after retries: '.$e->getMessage());
+                        }
+                        return $deleted;
+                    }
+                    usleep(20000 * $attempt);
+                }
+            } while (true);
+
+            $deleted += $affected;
+            if ($affected < $batchSize) {
+                break;
+            }
+            usleep(10000);
+        }
+
+        return $deleted;
     }
 }
