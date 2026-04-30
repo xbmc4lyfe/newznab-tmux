@@ -6543,16 +6543,16 @@
         },
         {
             "name": "spatie/laravel-passkeys",
-            "version": "1.7.1",
+            "version": "1.7.2",
             "source": {
                 "type": "git",
                 "url": "https://github.com/spatie/laravel-passkeys.git",
-                "reference": "20eb4df5e85ad3c1e9a155a5e70c6bf83ff32b7e"
+                "reference": "e04bb0bb3b1b7237f0ef6baedd27110128d7dfac"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/spatie/laravel-passkeys/zipball/20eb4df5e85ad3c1e9a155a5e70c6bf83ff32b7e",
-                "reference": "20eb4df5e85ad3c1e9a155a5e70c6bf83ff32b7e",
+                "url": "https://api.github.com/repos/spatie/laravel-passkeys/zipball/e04bb0bb3b1b7237f0ef6baedd27110128d7dfac",
+                "reference": "e04bb0bb3b1b7237f0ef6baedd27110128d7dfac",
                 "shasum": ""
             },
             "require": {
@@ -6609,7 +6609,7 @@
             ],
             "support": {
                 "issues": "https://github.com/spatie/laravel-passkeys/issues",
-                "source": "https://github.com/spatie/laravel-passkeys/tree/1.7.1"
+                "source": "https://github.com/spatie/laravel-passkeys/tree/1.7.2"
             },
             "funding": [
                 {
@@ -6617,7 +6617,7 @@
                     "type": "github"
                 }
             ],
-            "time": "2026-04-29T07:21:31+00:00"
+            "time": "2026-04-30T13:13:30+00:00"
         },
         {
             "name": "spatie/laravel-permission",
