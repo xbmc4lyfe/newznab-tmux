@@ -50,7 +50,7 @@ class AdminDashboardAutoRefreshTest extends TestCase
         // Auto-refresh interval is preserved.
         $this->assertStringContainsString('15 * 60 * 1000', $content);
         // The fetch hits the cached JSON endpoint.
-        $this->assertStringContainsString("this.\$el.dataset.dataUrl", $content);
+        $this->assertStringContainsString('this.$el.dataset.dataUrl', $content);
         // Each tick re-renders headline tiles + registration status + the
         // visible "Last refresh" label, not just the deferred widgets.
         $this->assertStringContainsString('_renderHeadlineStats(payload.stats)', $content);

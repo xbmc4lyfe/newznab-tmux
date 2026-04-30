@@ -31,13 +31,13 @@ class AdminDashboardSummaryWindowTest extends TestCase
 
         // 7-day window inclusive of today (today-6 .. today).
         $this->assertStringContainsString(
-            "\$weekStart = Carbon::now()->subDays(6)->startOfDay();",
+            '$weekStart = Carbon::now()->subDays(6)->startOfDay();',
             $content,
             'Summary window must be the last 7 calendar days inclusive of today.'
         );
 
         // Closed days from the daily aggregate, strictly before today.
-        $this->assertStringContainsString("UserActivityStat::query()", $content);
+        $this->assertStringContainsString('UserActivityStat::query()', $content);
         $this->assertStringContainsString(
             "->where('stat_date', '>=', \$weekStart->format('Y-m-d'))",
             $content
@@ -88,7 +88,7 @@ class AdminDashboardSummaryWindowTest extends TestCase
         // The previous "two-days-ago" boundary that produced the under-reporting
         // bug must be gone from getSummaryStats.
         $this->assertStringNotContainsString(
-            "\$twoDaysAgo = Carbon::now()->subDays(2)->startOfDay();",
+            '$twoDaysAgo = Carbon::now()->subDays(2)->startOfDay();',
             $content
         );
     }
@@ -165,4 +165,3 @@ class AdminDashboardSummaryWindowTest extends TestCase
         );
     }
 }
-

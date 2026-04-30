@@ -11,6 +11,7 @@ use App\Services\SiteStatusService;
 use App\Services\SystemMetricsService;
 use App\Services\UserStatsService;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Carbon;
 
 class AdminPageController extends BasePageController
 {
@@ -120,7 +121,7 @@ class AdminPageController extends BasePageController
         ];
 
         $generatedAt = $payload['generated_at'] ?? now()->toIso8601String();
-        $generatedAtCarbon = \Illuminate\Support\Carbon::parse($generatedAt);
+        $generatedAtCarbon = Carbon::parse($generatedAt);
 
         return response()->json([
             'success' => true,

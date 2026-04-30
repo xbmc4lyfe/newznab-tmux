@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Models;
 
+use App\Services\UserStatsService;
 use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
@@ -113,7 +114,7 @@ class UserActivityStat extends Model
      * Sums closed days from `user_activity_stats` and today's closed hours
      * from `user_activity_stats_hourly`. The current in-progress hour is not
      * included here — callers needing live "today" totals should use
-     * {@see \App\Services\UserStatsService::getSummaryStats()} which layers
+     * {@see UserStatsService::getSummaryStats()} which layers
      * the live tables on top.
      */
     public static function getTotalDownloads(int $days = 7): int
