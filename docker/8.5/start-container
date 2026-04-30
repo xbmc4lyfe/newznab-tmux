@@ -12,6 +12,21 @@ chmod -R ugo+rw /.composer
 addgroup supervisor > /dev/null 2>&1
 usermod -a -G supervisor sail > /dev/null 2>&1
 
+# Run PHP-FPM as `sail` so its uid/gid match files written via the bind mount
+# (host user = sail's primary group). Avoids "chmod(): Operation not permitted"
+# on storage/logs when files were created by the host user or other processes.
+# The FPM unix socket stays owned by www-data so nginx (running as www-data)
+# can connect to it.
+SAIL_GROUP="$(id -gn sail)"
+cat > /etc/php/8.5/fpm/pool.d/zz-sail.conf <<EOF
+[www]
+user = sail
+group = ${SAIL_GROUP}
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+EOF
+
 # Set timezone
 ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
