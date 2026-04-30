@@ -82,7 +82,7 @@ update: check-env pull ## Infra-only: pull base images, rebuild with --pull, res
 	@$(SAIL) up -d --remove-orphans
 	@echo "$(GREEN)✔ Infra updated.$(RESET)"
 .PHONY: upgrade
-upgrade: update composer-install npm-build ## Full app upgrade: update + composer + npm + migrate + caches
+upgrade: update fix-permissions composer-install npm-build ## Full app upgrade: update + perms + composer + npm + migrate + caches
 	@if [ "$(MAINTENANCE)" = "1" ]; then $(SAIL) artisan down; fi
 	@$(SAIL) artisan migrate --force
 	@if [ "$(MAINTENANCE)" = "1" ]; then $(SAIL) artisan up; fi
@@ -122,19 +122,26 @@ migrate-fresh: ## Drop all tables and re-run migrations (DATA LOSS!)
 seed: ## Run database seeders
 	@$(SAIL) artisan db:seed --force
 .PHONY: cache-clear
-cache-clear: ## Clear config / route / view / application caches
+cache-clear: ## Clear config / route / view / application caches (and stale bootstrap/cache files)
 	@$(SAIL) artisan config:clear
 	@$(SAIL) artisan route:clear
 	@$(SAIL) artisan view:clear
 	@$(SAIL) artisan cache:clear
+	@rm -f bootstrap/cache/config.php bootstrap/cache/routes-v7.php bootstrap/cache/services.php bootstrap/cache/packages.php
 	@echo "$(GREEN)✔ Caches cleared.$(RESET)"
 .PHONY: optimize
-optimize: ## Cache config / routes / views and warm spatie/laravel-data
+optimize: ## Dev-safe optimize: warm data structures + view cache only (no config/route cache)
+	@$(SAIL) artisan view:cache
+	@$(SAIL) artisan data:cache-structures
+	@echo "$(GREEN)✔ Optimized (dev-safe).$(RESET)"
+.PHONY: optimize-deploy
+optimize-deploy: ## Production optimize: cache config / routes / views + data structures (bakes absolute paths!)
+	@echo "$(YELLOW)⚠  This caches absolute paths from inside the container — only run on the deploy host.$(RESET)"
 	@$(SAIL) artisan config:cache
 	@$(SAIL) artisan route:cache
 	@$(SAIL) artisan view:cache
 	@$(SAIL) artisan data:cache-structures
-	@echo "$(GREEN)✔ Optimized.$(RESET)"
+	@echo "$(GREEN)✔ Optimized for deploy.$(RESET)"
 .PHONY: queue-work
 queue-work: ## Run a foreground queue worker (Ctrl-C to stop)
 	@$(SAIL) artisan queue:work
@@ -205,6 +212,26 @@ db: ## Open a MariaDB CLI session
 .PHONY: redis-cli
 redis-cli: ## Open a Redis CLI session
 	@$(SAIL) redis
+# Host UID/GID — used by fix-permissions so files stay writable from BOTH
+# the host and the in-container sail user (whose UID should match WWWUSER).
+HOST_UID ?= $(shell id -u)
+HOST_GID ?= $(shell id -g)
+.PHONY: fix-permissions
+fix-permissions: ## Align UIDs: remap sail to host UID, chown project, register git safe.directory
+	@echo "$(YELLOW)→ Remapping container 'sail' user to UID $(HOST_UID) and chowning /var/www/html…$(RESET)"
+	@$(DOCKER_COMPOSE) exec -u root laravel.test usermod -u $(HOST_UID) -o sail >/dev/null 2>&1 || true
+	@$(DOCKER_COMPOSE) exec -u root laravel.test groupmod -g $(HOST_GID) -o sail >/dev/null 2>&1 || true
+	@$(DOCKER_COMPOSE) exec -u root laravel.test chown -R $(HOST_UID):$(HOST_GID) /var/www/html
+	@$(DOCKER_COMPOSE) exec -u root laravel.test git config --system --add safe.directory /var/www/html
+	@echo "$(GREEN)✔ Permissions fixed.$(RESET)"
+	@if [ "$(WWWUSER)" != "$(HOST_UID)" ] || [ -z "$(WWWUSER)" ]; then 		echo "$(YELLOW)⚠  WWWUSER ($(WWWUSER)) ≠ host UID ($(HOST_UID)). Set WWWUSER=$(HOST_UID) and WWWGROUP=$(HOST_GID) in .env, then run 'make rebuild' to align the container's sail user.$(RESET)"; 	fi
+.PHONY: fix-perms
+fix-perms: fix-permissions ## Alias for 'fix-permissions'
+
+.PHONY: git-safe-directory
+git-safe-directory: ## Register /var/www/html as a git safe.directory inside the container
+	@$(DOCKER_COMPOSE) exec -u root laravel.test git config --system --add safe.directory /var/www/html >/dev/null 2>&1 || true
+	@$(DOCKER_COMPOSE) exec laravel.test git config --global --add safe.directory /var/www/html >/dev/null 2>&1 || true
 # ── Logs & Status ────────────────────────────────────────────
 .PHONY: logs
 logs: ## Tail logs (usage: make logs [SERVICE=mariadb])

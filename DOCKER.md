@@ -83,14 +83,17 @@ Run `make` or `make help` to see all targets, grouped by section.
 | `make migrate`      | Run pending migrations                                |
 | `make migrate-fresh`| Drop all tables and re-migrate (DATA LOSS)            |
 | `make seed`         | Run database seeders                                  |
-| `make cache-clear`  | Clear config / route / view / app caches              |
-| `make optimize`     | Cache config / routes / views + spatie/laravel-data   |
+| `make cache-clear`  | Clear config / route / view / app caches (and stale `bootstrap/cache` files) |
+| `make optimize`     | Dev-safe: warm view cache + spatie/laravel-data           |
+| `make optimize-deploy` | Production: also caches config/routes (bakes absolute paths) |
 | `make queue-work`   | Foreground queue worker                               |
 | `make queue-restart`| Signal queue workers to restart                       |
 | `make tmux-start`   | Start the NNTmux tmux processing engine               |
 | `make tmux-stop`    | Stop the tmux processing engine                       |
 | `make tmux-attach`  | Attach to the running tmux session                    |
 | `make horizon`      | Show Horizon queue status                             |
+| `make fix-permissions` | Chown project to host UID + register git `safe.directory` |
+| `make fix-permissions` | Chown project to `sail` + register git safe.directory |
 
 ### Testing & Quality
 
@@ -235,7 +238,12 @@ docker compose up -d
 
 | Problem                         | Solution                                                              |
 |---------------------------------|-----------------------------------------------------------------------|
-| Permission errors on storage/   | `make root-shell` then `chown -R sail:sail storage bootstrap/cache`   |
+| Permission errors on storage/   | `make fix-permissions` (chowns project to your host UID)              |
+| `composer install` permission denied | `make fix-permissions`, then re-run `make composer-install`      |
+| `npm`/`ncu` EACCES on host (`package.json`) | `make fix-permissions` chowns to host UID, not container `sail` |
+| `fatal: detected dubious ownership` (git) | `make fix-permissions` registers `safe.directory` in the container |
+| Container `sail` UID ≠ host UID  | Set `WWWUSER=$(id -u)` / `WWWGROUP=$(id -g)` in `.env`, then `make rebuild` |
+| Host artisan/npm fails with `/var/www/html/...` paths | Stale `bootstrap/cache/config.php` from a container `config:cache`. Run `make cache-clear` and prefer `make optimize` (dev-safe) over `optimize-deploy` in development |
 | Port already in use             | Change `APP_PORT`, `FORWARD_DB_PORT`, etc. in `.env`                  |
 | Containers won't start          | `make logs` to inspect, or `make rebuild` to start fresh              |
 | Stale images after upgrade      | `make update` (pulls base images + rebuild + restart)                 |
