@@ -11,11 +11,13 @@ use App\Models\Invitation;
 use App\Models\User;
 use App\Models\UserDownload;
 use App\Models\UserRequest;
+use App\Services\AdminDashboardSnapshotService;
 use Illuminate\Contracts\View\View;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Spatie\LaravelPasskeys\Models\Passkey;
 use Spatie\Permission\Models\Role;
@@ -319,6 +321,7 @@ class AdminUserController extends BasePageController
             $username = $user->username;
 
             $user->delete();
+            Cache::forget(AdminDashboardSnapshotService::CACHE_KEY);
 
             // Redirect with username to display in notification
             return redirect()->to('admin/user-list?deleted=1&username='.urlencode($username));

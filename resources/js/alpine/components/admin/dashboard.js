@@ -23,6 +23,13 @@ const IMPACT_BADGE_CLASSES = {
     minor: 'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200',
 };
 const SYSTEM_SERVICE_SLUGS = ['database', 'redis', 'queue', 'disk'];
+// Mirror of \App\Models\Settings::REGISTER_STATUS_*.
+const REGISTRATION_BADGE_BASE = 'inline-flex items-center justify-center rounded-full px-3 py-1.5 text-sm font-semibold ';
+const REGISTRATION_BADGE_CLASSES = {
+    0: 'border border-emerald-500/30 bg-emerald-600 text-white shadow-sm dark:border-emerald-300/20 dark:bg-emerald-500 dark:text-slate-950',
+    1: 'border border-amber-500/30 bg-amber-500 text-slate-950 shadow-sm dark:border-amber-200/20 dark:bg-amber-400 dark:text-slate-950',
+    2: 'border border-rose-500/30 bg-rose-600 text-white shadow-sm dark:border-rose-200/20 dark:bg-rose-500 dark:text-white',
+};
 const formatNumber = (value) => Number(value || 0).toLocaleString();
 const escapeHtml = (str) => String(str ?? '')
     .replace(/&/g, '&amp;')
@@ -32,6 +39,8 @@ const escapeHtml = (str) => String(str ?? '')
     .replace(/'/g, '&#39;');
 const badgeClass = (status) => 'px-2 py-0.5 inline-flex text-xs leading-5 font-semibold rounded-full '
     + (STATUS_BADGE_CLASSES[status] ?? 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200');
+const registrationBadgeClass = (status) => REGISTRATION_BADGE_BASE
+    + (REGISTRATION_BADGE_CLASSES[status] ?? REGISTRATION_BADGE_CLASSES[2]);
 Alpine.data('adminDashboard', () => ({
     _charts: [],
     _refreshInterval: null,
@@ -68,6 +77,9 @@ Alpine.data('adminDashboard', () => ({
                 return response.json();
             })
             .then(payload => {
+                this._renderHeadlineStats(payload.stats);
+                this._renderRegistrationStatus(payload.registrationStatus);
+                this._renderLastRefresh(payload.generated_at_time);
                 this._renderUserStats(payload.userStats);
                 this._renderSystemMetrics(payload.systemMetrics);
                 this._renderRecentActivity(payload.recent_activity);
@@ -88,6 +100,55 @@ Alpine.data('adminDashboard', () => ({
         content?.classList.remove('hidden');
         return widget;
     },
+    _setStatText(key, value) {
+        const el = this.$el.querySelector(`[data-stat="${key}"]`);
+        if (el) el.textContent = value;
+    },
+    _renderHeadlineStats(stats) {
+        if (!stats) return;
+        const soft = Number(stats.soft_deleted_users ?? 0);
+        const perm = Number(stats.permanently_deleted_users ?? 0);
+        this._setStatText('releases', formatNumber(stats.releases));
+        this._setStatText('releases-today', formatNumber(stats.releases_today));
+        this._setStatText('users', formatNumber(stats.users));
+        this._setStatText('users-today', formatNumber(stats.users_today));
+        this._setStatText('active-groups', formatNumber(stats.active_groups));
+        this._setStatText('groups', formatNumber(stats.groups));
+        this._setStatText('failed', formatNumber(stats.failed));
+        this._setStatText('reported', formatNumber(stats.reported));
+        this._setStatText('soft-deleted-users', formatNumber(soft));
+        this._setStatText('permanently-deleted-users', formatNumber(perm));
+        this._setStatText('deleted-users-total', formatNumber(soft + perm));
+    },
+    _renderRegistrationStatus(reg) {
+        if (!reg) return;
+        const effective = this.$el.querySelector('[data-registration="effective-badge"]');
+        if (effective) {
+            effective.className = registrationBadgeClass(Number(reg.effective_status));
+            effective.textContent = String(reg.effective_status_label ?? '');
+        }
+        const manual = this.$el.querySelector('[data-registration="manual-badge"]');
+        if (manual) {
+            manual.className = registrationBadgeClass(Number(reg.manual_status));
+            manual.textContent = String(reg.manual_status_label ?? '');
+        }
+        const override = this.$el.querySelector('[data-registration="scheduled-override"]');
+        if (override) {
+            override.classList.toggle('hidden', !reg.scheduled_override_active);
+        }
+        const message = this.$el.querySelector('[data-registration="message"]');
+        if (message) message.textContent = String(reg.message ?? '');
+    },
+    _renderLastRefresh(timeText) {
+        // "Last dashboard refresh" reflects when the JS last successfully
+        // fetched data — drive it from the browser clock so the indicator
+        // always advances on a successful tick, even if the server snapshot
+        // happened to be served from cache (Cache::flexible) with an older
+        // `generated_at`. The server timestamp (when supplied) is used as a
+        // fallback only — see AdminPageController::getDashboardData().
+        const clientNow = new Date().toLocaleTimeString();
+        this._setStatText('last-refresh', clientNow || timeText || '');
+    },
     _renderUserStats(stats) {
         if (!stats) return;
         const widget = this._swapWidget('user-stats');
@@ -96,9 +157,9 @@ Alpine.data('adminDashboard', () => ({
         const cards = [
             { label: 'Total Users', value: summary.total_users, theme: 'blue' },
             { label: 'Downloads Today', value: summary.downloads_today, theme: 'green' },
-            { label: 'Downloads (7d)', value: summary.downloads_week, theme: 'purple' },
+            { label: 'Downloads (last 7d incl. today)', value: summary.downloads_week, theme: 'purple' },
             { label: 'API Hits Today', value: summary.api_hits_today, theme: 'orange' },
-            { label: 'API Hits (7d)', value: summary.api_hits_week, theme: 'pink' },
+            { label: 'API Hits (last 7d incl. today)', value: summary.api_hits_week, theme: 'pink' },
         ];
         const summaryGrid = widget.querySelector('[data-summary-grid]');
         if (summaryGrid) {

@@ -108,23 +108,45 @@ class UserActivityStat extends Model
     }
 
     /**
-     * Get total downloads for the last N days
+     * Get total downloads across the last N days inclusive of today.
+     *
+     * Sums closed days from `user_activity_stats` and today's closed hours
+     * from `user_activity_stats_hourly`. The current in-progress hour is not
+     * included here — callers needing live "today" totals should use
+     * {@see \App\Services\UserStatsService::getSummaryStats()} which layers
+     * the live tables on top.
      */
     public static function getTotalDownloads(int $days = 7): int
     {
-        return self::query()
-            ->where('stat_date', '>=', Carbon::now()->subDays($days)->format('Y-m-d'))
-            ->sum('downloads_count');
+        return self::sumLastNDays($days, 'downloads_count');
     }
 
     /**
-     * Get total API hits for the last N days
+     * Get total API hits across the last N days inclusive of today.
+     *
+     * @see self::getTotalDownloads() for source-layering notes.
      */
     public static function getTotalApiHits(int $days = 7): int
     {
-        return self::query()
-            ->where('stat_date', '>=', Carbon::now()->subDays($days)->format('Y-m-d'))
-            ->sum('api_hits_count');
+        return self::sumLastNDays($days, 'api_hits_count');
+    }
+
+    private static function sumLastNDays(int $days, string $column): int
+    {
+        $today = Carbon::now()->startOfDay();
+        $weekStart = Carbon::now()->subDays($days - 1)->startOfDay();
+
+        $closedDays = (int) self::query()
+            ->where('stat_date', '>=', $weekStart->format('Y-m-d'))
+            ->where('stat_date', '<', $today->format('Y-m-d'))
+            ->sum($column);
+
+        $todayClosedHours = (int) DB::table('user_activity_stats_hourly')
+            ->where('stat_hour', '>=', $today->format('Y-m-d H:00:00'))
+            ->where('stat_hour', '<', Carbon::now()->startOfHour()->format('Y-m-d H:00:00'))
+            ->sum($column);
+
+        return $closedDays + $todayClosedHours;
     }
 
     /**

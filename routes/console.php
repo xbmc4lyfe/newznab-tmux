@@ -34,7 +34,7 @@ Schedule::command('nntmux:disable-expired-registration-periods')->everyFiveMinut
 Schedule::command('nntmux:remove-bad')->hourly()->withoutOverlapping();
 Schedule::command('cloudflare:reload')->daily()->withoutOverlapping();
 Schedule::command('cache:prune-stale-tags')->hourly();
-Schedule::command('nntmux:collect-stats')->hourly();
+Schedule::command('nntmux:collect-stats')->everyFifteenMinutes()->withoutOverlapping();
 Schedule::command('nntmux:populate-steam-apps')->monthly();
 // Collect system metrics every 5 minutes
 Schedule::command('metrics:collect')->everyFiveMinutes()->withoutOverlapping();

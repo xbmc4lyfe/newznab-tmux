@@ -14,7 +14,6 @@
 
 <div x-data="adminDashboard"
      id="adminDashboard"
-     data-refresh-url="{{ route('admin.index') }}"
      data-data-url="{{ route('admin.api.dashboard-data') }}"
      data-refresh-interval="{{ 15 * 60 * 1000 }}">
     <div class="space-y-6" data-dashboard-content>
@@ -27,7 +26,7 @@
             </div>
             <div class="rounded-lg bg-gray-50 dark:bg-gray-900 px-4 py-3 text-sm text-gray-600 dark:text-gray-300 lg:text-right">
                 <p class="font-medium text-gray-700 dark:text-gray-200">
-                    <i class="fas fa-sync-alt mr-1"></i> Last dashboard refresh: {{ $dashboardLastRefreshedAt }}
+                    <i class="fas fa-sync-alt mr-1"></i> Last dashboard refresh: <span data-stat="last-refresh">{{ $dashboardLastRefreshedAt }}</span>
                 </p>
                 <p class="mt-1 text-xs text-green-600 dark:text-green-400">Auto-refreshes every 15 minutes</p>
             </div>
@@ -41,7 +40,7 @@
             <div class="flex items-center justify-between">
                 <div>
                     <p class="text-sm text-gray-500 dark:text-gray-400 mb-1">Total Releases</p>
-                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200">{{ number_format($stats['releases'] ?? 0) }}</p>
+                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200" data-stat="releases">{{ number_format($stats['releases'] ?? 0) }}</p>
                 </div>
                 <div class="w-12 h-12 bg-blue-100 dark:bg-blue-900 rounded-lg flex items-center justify-center">
                     <i class="fas fa-download text-2xl text-blue-600 dark:text-blue-400"></i>
@@ -49,7 +48,7 @@
             </div>
             <div class="mt-4">
                 <span class="text-sm text-green-600 dark:text-green-400">
-                    <i class="fas fa-arrow-up"></i> {{ number_format($stats['releases_today'] ?? 0) }} today
+                    <i class="fas fa-arrow-up"></i> <span data-stat="releases-today">{{ number_format($stats['releases_today'] ?? 0) }}</span> today
                 </span>
             </div>
         </div>
@@ -59,7 +58,7 @@
             <div class="flex items-center justify-between">
                 <div>
                     <p class="text-sm text-gray-500 dark:text-gray-400 mb-1">Active Users</p>
-                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200">{{ number_format($stats['users'] ?? 0) }}</p>
+                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200" data-stat="users">{{ number_format($stats['users'] ?? 0) }}</p>
                 </div>
                 <div class="w-12 h-12 bg-green-100 dark:bg-green-900 rounded-lg flex items-center justify-center">
                     <i class="fas fa-users text-2xl text-green-600 dark:text-green-400"></i>
@@ -67,7 +66,7 @@
             </div>
             <div class="mt-4">
                 <span class="text-sm text-blue-600 dark:text-blue-400">
-                    <i class="fas fa-user-plus"></i> {{ $stats['users_today'] ?? 0 }} registered today
+                    <i class="fas fa-user-plus"></i> <span data-stat="users-today">{{ $stats['users_today'] ?? 0 }}</span> registered today
                 </span>
             </div>
         </div>
@@ -77,7 +76,7 @@
             <div class="flex items-center justify-between">
                 <div>
                     <p class="text-sm text-gray-500 dark:text-gray-400 mb-1">Active Groups</p>
-                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200">{{ number_format($stats['active_groups'] ?? 0) }}</p>
+                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200" data-stat="active-groups">{{ number_format($stats['active_groups'] ?? 0) }}</p>
                 </div>
                 <div class="w-12 h-12 bg-purple-100 dark:bg-purple-900 rounded-lg flex items-center justify-center">
                     <i class="fas fa-layer-group text-2xl text-purple-600 dark:text-purple-400"></i>
@@ -85,7 +84,7 @@
             </div>
             <div class="mt-4">
                 <span class="text-sm text-gray-600 dark:text-gray-400">
-                    {{ number_format($stats['groups'] ?? 0) }} total groups
+                    <span data-stat="groups">{{ number_format($stats['groups'] ?? 0) }}</span> total groups
                 </span>
             </div>
         </div>
@@ -95,7 +94,7 @@
             <div class="flex items-center justify-between">
                 <div>
                     <p class="text-sm text-gray-500 dark:text-gray-400 mb-1">Failed Releases</p>
-                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200">{{ number_format($stats['failed'] ?? 0) }}</p>
+                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200" data-stat="failed">{{ number_format($stats['failed'] ?? 0) }}</p>
                 </div>
                 <div class="w-12 h-12 bg-red-100 dark:bg-red-900 rounded-lg flex items-center justify-center">
                     <i class="fas fa-exclamation-triangle text-2xl text-red-600 dark:text-red-400"></i>
@@ -113,7 +112,7 @@
             <div class="flex items-center justify-between">
                 <div>
                     <p class="text-sm text-gray-500 dark:text-gray-400 mb-1">Reported Releases</p>
-                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200">{{ number_format($stats['reported'] ?? 0) }}</p>
+                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200" data-stat="reported">{{ number_format($stats['reported'] ?? 0) }}</p>
                 </div>
                 <div class="w-12 h-12 bg-orange-100 dark:bg-orange-900 rounded-lg flex items-center justify-center">
                     <i class="fas fa-flag text-2xl text-orange-600 dark:text-orange-400"></i>
@@ -131,7 +130,7 @@
             <div class="flex items-center justify-between">
                 <div>
                     <p class="text-sm text-gray-500 dark:text-gray-400 mb-1">Deleted Users</p>
-                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200">{{ number_format(($stats['soft_deleted_users'] ?? 0) + ($stats['permanently_deleted_users'] ?? 0)) }}</p>
+                    <p class="text-3xl font-bold text-gray-800 dark:text-gray-200" data-stat="deleted-users-total">{{ number_format(($stats['soft_deleted_users'] ?? 0) + ($stats['permanently_deleted_users'] ?? 0)) }}</p>
                 </div>
                 <div class="w-12 h-12 bg-red-100 dark:bg-red-900 rounded-lg flex items-center justify-center">
                     <i class="fas fa-user-slash text-2xl text-red-600 dark:text-red-400"></i>
@@ -139,10 +138,10 @@
             </div>
             <div class="mt-4 space-y-1">
                 <span class="text-sm text-yellow-600 dark:text-yellow-400 block">
-                    <i class="fas fa-trash"></i> {{ number_format($stats['soft_deleted_users'] ?? 0) }} soft deleted
+                    <i class="fas fa-trash"></i> <span data-stat="soft-deleted-users">{{ number_format($stats['soft_deleted_users'] ?? 0) }}</span> soft deleted
                 </span>
                 <span class="text-sm text-red-600 dark:text-red-400 block">
-                    <i class="fas fa-trash-alt"></i> {{ number_format($stats['permanently_deleted_users'] ?? 0) }} permanently deleted
+                    <i class="fas fa-trash-alt"></i> <span data-stat="permanently-deleted-users">{{ number_format($stats['permanently_deleted_users'] ?? 0) }}</span> permanently deleted
                 </span>
             </div>
             <div class="mt-2">
@@ -175,7 +174,8 @@
     </div>
 
     <!-- Registration Status Widget -->
-    <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-6 border border-gray-200 dark:border-gray-700">
+    <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-6 border border-gray-200 dark:border-gray-700"
+         data-widget="registration-status">
         <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
             <div>
                 <h3 class="text-xl font-semibold text-gray-800 dark:text-gray-200 flex items-center">
@@ -196,22 +196,26 @@
             <div class="rounded-xl border border-gray-200 bg-gray-50 p-5 dark:border-gray-700 dark:bg-gray-900">
                 <p class="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Effective Status</p>
                 <div class="mt-3 flex flex-wrap items-center gap-2">
-                    <span class="inline-flex items-center justify-center rounded-full px-3 py-1.5 text-sm font-semibold {{ $dashboardStatusBadgeClasses($registrationStatus['effective_status']) }}">
+                    <span data-registration="effective-badge"
+                          class="inline-flex items-center justify-center rounded-full px-3 py-1.5 text-sm font-semibold {{ $dashboardStatusBadgeClasses($registrationStatus['effective_status']) }}">
                         {{ $registrationStatus['effective_status_label'] }}
                     </span>
-                    @if($registrationStatus['scheduled_override_active'])
-                        <span class="inline-flex items-center justify-center rounded-full border border-blue-500/30 bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm dark:border-blue-300/20 dark:bg-blue-500 dark:text-white">
-                            Scheduled Override
-                        </span>
-                    @endif
+                    <span data-registration="scheduled-override"
+                          @class([
+                              'inline-flex items-center justify-center rounded-full border border-blue-500/30 bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm dark:border-blue-300/20 dark:bg-blue-500 dark:text-white',
+                              'hidden' => ! $registrationStatus['scheduled_override_active'],
+                          ])>
+                        Scheduled Override
+                    </span>
                 </div>
-                <p class="mt-3 text-sm text-gray-600 dark:text-gray-400">{{ $registrationStatus['message'] }}</p>
+                <p class="mt-3 text-sm text-gray-600 dark:text-gray-400" data-registration="message">{{ $registrationStatus['message'] }}</p>
             </div>
 
             <div class="rounded-xl border border-gray-200 bg-gray-50 p-5 dark:border-gray-700 dark:bg-gray-900">
                 <p class="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Manual Baseline</p>
                 <div class="mt-3">
-                    <span class="inline-flex items-center justify-center rounded-full px-3 py-1.5 text-sm font-semibold {{ $dashboardStatusBadgeClasses($registrationStatus['manual_status']) }}">
+                    <span data-registration="manual-badge"
+                          class="inline-flex items-center justify-center rounded-full px-3 py-1.5 text-sm font-semibold {{ $dashboardStatusBadgeClasses($registrationStatus['manual_status']) }}">
                         {{ $registrationStatus['manual_status_label'] }}
                     </span>
                 </div>

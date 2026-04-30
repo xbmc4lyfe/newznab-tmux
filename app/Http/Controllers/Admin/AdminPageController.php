@@ -60,7 +60,9 @@ class AdminPageController extends BasePageController
 
     /**
      * JSON payload consumed by the dashboard's deferred widgets (User Statistics,
-     * System Resources history, Recent Activity, Site Status). Reads from the
+     * System Resources history, Recent Activity, Site Status) and by the
+     * client-side auto-refresh which also re-renders the headline stat tiles
+     * and the registration status panel from this payload. Reads from the
      * same snapshot cache the index uses, so the warmer keeps it hot.
      */
     public function getDashboardData(): JsonResponse
@@ -99,9 +101,34 @@ class AdminPageController extends BasePageController
             'metadata' => $activity->metadata,
         ], $payload['recent_activity']);
 
+        $registrationStatus = $payload['registrationStatus'];
+        $serializePeriod = static fn ($period): ?array => $period === null ? null : [
+            'id' => $period->id,
+            'name' => $period->name,
+            'starts_at' => $period->starts_at?->format('Y-m-d H:i'),
+            'ends_at' => $period->ends_at?->format('Y-m-d H:i'),
+        ];
+
+        $registrationPayload = [
+            'manual_status' => $registrationStatus['manual_status'],
+            'manual_status_label' => $registrationStatus['manual_status_label'],
+            'effective_status' => $registrationStatus['effective_status'],
+            'effective_status_label' => $registrationStatus['effective_status_label'],
+            'scheduled_override_active' => (bool) $registrationStatus['scheduled_override_active'],
+            'message' => $registrationStatus['message'],
+            'active_period' => $serializePeriod($registrationStatus['active_period']),
+        ];
+
+        $generatedAt = $payload['generated_at'] ?? now()->toIso8601String();
+        $generatedAtCarbon = \Illuminate\Support\Carbon::parse($generatedAt);
+
         return response()->json([
             'success' => true,
-            'generated_at' => $payload['generated_at'],
+            'generated_at' => $generatedAt,
+            'generated_at_time' => $generatedAtCarbon->format('H:i:s'),
+            'stats' => $payload['stats'],
+            'registrationStatus' => $registrationPayload,
+            'nextRegistrationPeriod' => $serializePeriod($payload['nextRegistrationPeriod']),
             'userStats' => $payload['userStats'],
             'systemMetrics' => $payload['systemMetrics'],
             'recent_activity' => $recentActivity,

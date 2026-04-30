@@ -25,19 +25,28 @@ class AdminDashboardReportedReleasesTest extends TestCase
     }
 
     /**
-     * Test that the AdminPageController contains the reported count in stats.
+     * Test that the dashboard snapshot exposes the reported-releases count.
+     *
+     * The "stats" payload is built by AdminDashboardSnapshotService and
+     * surfaced to the Blade view (and to the auto-refresh JSON endpoint)
+     * through AdminPageController, so the assertions live on the service.
      */
     public function test_controller_stats_method_has_reported_key(): void
     {
-        $controllerPath = app_path('Http/Controllers/Admin/AdminPageController.php');
+        $servicePath = app_path('Services/AdminDashboardSnapshotService.php');
 
-        $this->assertFileExists($controllerPath);
+        $this->assertFileExists($servicePath);
 
-        $content = file_get_contents($controllerPath);
+        $content = (string) file_get_contents($servicePath);
 
-        // Check that the controller contains the reported releases count
         $this->assertStringContainsString("'reported'", $content);
-        $this->assertStringContainsString('admin_stats_reported_count', $content);
-        $this->assertStringContainsString('ReleaseReport::where', $content);
+        $this->assertStringContainsString('ReleaseReport::', $content);
+
+        $controllerPath = app_path('Http/Controllers/Admin/AdminPageController.php');
+        $controllerContent = (string) file_get_contents($controllerPath);
+
+        // Controller still surfaces the snapshot stats payload to the view
+        // and the JSON endpoint used by the auto-refresh JS.
+        $this->assertStringContainsString("'stats' => \$payload['stats']", $controllerContent);
     }
 }

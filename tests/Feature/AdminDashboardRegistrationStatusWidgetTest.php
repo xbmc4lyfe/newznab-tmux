@@ -24,15 +24,28 @@ class AdminDashboardRegistrationStatusWidgetTest extends TestCase
 
     public function test_dashboard_controller_provides_registration_widget_data(): void
     {
+        // The dashboard view receives `registrationStatus` / `nextRegistrationPeriod`
+        // built by AdminDashboardSnapshotService, and the auto-refresh JSON
+        // endpoint serialises the same payload for the client.
+        $snapshotPath = app_path('Services/AdminDashboardSnapshotService.php');
         $controllerPath = app_path('Http/Controllers/Admin/AdminPageController.php');
 
+        $this->assertFileExists($snapshotPath);
         $this->assertFileExists($controllerPath);
 
-        $content = file_get_contents($controllerPath);
+        $snapshotContent = (string) file_get_contents($snapshotPath);
+        $controllerContent = (string) file_get_contents($controllerPath);
 
-        $this->assertStringContainsString('RegistrationStatusService', $content);
-        $this->assertStringContainsString("'registrationStatus' => \$registrationStatus", $content);
-        $this->assertStringContainsString("'nextRegistrationPeriod' => \$nextRegistrationPeriod", $content);
-        $this->assertStringContainsString('getNextUpcomingPeriod', $content);
+        // Snapshot builds the registration data used by the widget.
+        $this->assertStringContainsString('RegistrationStatusService', $snapshotContent);
+        $this->assertStringContainsString("'registrationStatus' => \$registrationStatus", $snapshotContent);
+        $this->assertStringContainsString("'nextRegistrationPeriod' => \$nextRegistrationPeriod", $snapshotContent);
+        $this->assertStringContainsString('getNextUpcomingPeriod', $snapshotContent);
+
+        // Controller passes the snapshot fields through to the Blade view
+        // and the JSON endpoint consumed by the auto-refresh JS.
+        $this->assertStringContainsString("'registrationStatus' => \$payload['registrationStatus']", $controllerContent);
+        $this->assertStringContainsString("'nextRegistrationPeriod' => \$payload['nextRegistrationPeriod']", $controllerContent);
+        $this->assertStringContainsString("'registrationStatus' => \$registrationPayload", $controllerContent);
     }
 }

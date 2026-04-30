@@ -10,6 +10,7 @@ use App\Models\Settings;
 use App\Models\User;
 use Carbon\CarbonInterface;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 
 class RegistrationStatusService
 {
@@ -117,6 +118,8 @@ class RegistrationStatusService
             'registerstatus' => $newStatus,
         ]);
 
+        $this->forgetDashboardSnapshot();
+
         if ($oldStatus === $newStatus && blank($note)) {
             return;
         }
@@ -169,6 +172,8 @@ class RegistrationStatusService
             ]
         );
 
+        $this->forgetDashboardSnapshot();
+
         return $period;
     }
 
@@ -202,6 +207,8 @@ class RegistrationStatusService
             ]
         );
 
+        $this->forgetDashboardSnapshot();
+
         return $period;
     }
 
@@ -228,6 +235,8 @@ class RegistrationStatusService
                 'period' => $this->serializePeriod($period),
             ]
         );
+
+        $this->forgetDashboardSnapshot();
 
         return $period;
     }
@@ -264,6 +273,10 @@ class RegistrationStatusService
             );
         }
 
+        if ($expiredPeriods->isNotEmpty()) {
+            $this->forgetDashboardSnapshot();
+        }
+
         return $expiredPeriods;
     }
 
@@ -286,6 +299,8 @@ class RegistrationStatusService
                 'period' => $snapshot,
             ]
         );
+
+        $this->forgetDashboardSnapshot();
     }
 
     private function buildMessage(
@@ -323,5 +338,15 @@ class RegistrationStatusService
             'created_by' => $period->created_by,
             'updated_by' => $period->updated_by,
         ];
+    }
+
+    /**
+     * Drop the cached admin dashboard snapshot so the per-minute warmer (or
+     * the next admin request) rebuilds with fresh registration data. Avoids
+     * an inline rebuild here to keep write-path latency low.
+     */
+    private function forgetDashboardSnapshot(): void
+    {
+        Cache::forget(AdminDashboardSnapshotService::CACHE_KEY);
     }
 }

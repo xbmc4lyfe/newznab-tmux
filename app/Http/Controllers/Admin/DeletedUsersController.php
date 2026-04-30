@@ -6,8 +6,10 @@ namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\BasePageController;
 use App\Models\User;
+use App\Services\AdminDashboardSnapshotService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 
 class DeletedUsersController extends BasePageController
 {
@@ -126,11 +128,13 @@ class DeletedUsersController extends BasePageController
 
         if ($action === 'restore') {
             $count = User::onlyTrashed()->whereIn('id', $userIds)->restore();
+            Cache::forget(AdminDashboardSnapshotService::CACHE_KEY);
 
             return redirect()->route('admin.deleted.users.index')->with('success', $count.' user(s) restored successfully.');
         }
 
         $count = User::onlyTrashed()->whereIn('id', $userIds)->forceDelete();
+        Cache::forget(AdminDashboardSnapshotService::CACHE_KEY);
 
         return redirect()->route('admin.deleted.users.index')->with('success', $count.' user(s) permanently deleted.');
     }
@@ -143,6 +147,7 @@ class DeletedUsersController extends BasePageController
         $user = User::onlyTrashed()->find($id);
         if ($user) {
             $user->restore();
+            Cache::forget(AdminDashboardSnapshotService::CACHE_KEY);
 
             return redirect()->route('admin.deleted.users.index')->with('success', "User '{$user->username}' has been restored successfully.");
         }
@@ -159,6 +164,7 @@ class DeletedUsersController extends BasePageController
         if ($user) {
             $username = $user->username;
             $user->forceDelete();
+            Cache::forget(AdminDashboardSnapshotService::CACHE_KEY);
 
             return redirect()->route('admin.deleted.users.index')->with('success', "User '{$username}' has been permanently deleted.");
         }

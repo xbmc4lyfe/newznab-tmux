@@ -36,68 +36,25 @@ class UserStatsService
     }
 
     /**
-     * Get downloads per day for the last N days
-     * Uses aggregated stats from user_activity_stats table for dates older than 2 days
-     * Uses live data from user_downloads table for recent days
+     * Get downloads per day for the last N days (inclusive of today).
      *
-     * @return array<string, mixed>
+     * Source layering — designed to avoid the 1-day rolling purge of
+     * `user_downloads` (see routes/console.php cleanup-api-request-logs):
+     *  - Closed days (today-(N-1) … yesterday) come from `user_activity_stats`.
+     *  - Today is composed of closed hours from `user_activity_stats_hourly`
+     *    + the in-progress hour from the live `user_downloads` table.
+     *
+     * @return list<array<string, int|string>>
      */
     public function getDownloadsPerDay(int $days = 7): array
     {
-        $startDate = Carbon::now()->subDays($days - 1)->startOfDay();
-        $twoDaysAgo = Carbon::now()->subDays(2)->startOfDay();
-
-        $result = [];
-
-        // For historical data (older than 2 days), use aggregated stats
-        if ($days > 2) {
-            $historicalStartDate = $startDate->format('Y-m-d');
-            $historicalEndDate = $twoDaysAgo->copy()->subDay()->format('Y-m-d');
-
-            $historicalStats = UserActivityStat::query()
-                ->select('stat_date', 'downloads_count')
-                ->where('stat_date', '>=', $historicalStartDate)
-                ->where('stat_date', '<=', $historicalEndDate)
-                ->orderBy('stat_date', 'asc')
-                ->get()
-                ->keyBy('stat_date');
-
-            // Add historical data
-            $currentDate = $startDate->copy();
-            while ($currentDate->lt($twoDaysAgo)) {
-                $dateStr = $currentDate->format('Y-m-d');
-                $stat = $historicalStats->get($dateStr);
-                $result[] = [
-                    'date' => $currentDate->format('M d'),
-                    'count' => $stat ? $stat->downloads_count : 0,
-                ];
-                $currentDate->addDay();
-            }
-        }
-
-        // For recent data (last 2 days), use live data from user_downloads
-        $downloads = UserDownload::query()
-            ->select(DB::raw('DATE(timestamp) as date'), DB::raw('COUNT(*) as count'))
-            ->where('timestamp', '>=', $twoDaysAgo)
-            ->groupBy(DB::raw('DATE(timestamp)'))
-            ->orderBy('date', 'asc')
-            ->get()
-            ->keyBy('date');
-
-        // Add recent data
-        $currentDate = $twoDaysAgo->copy();
-        $now = Carbon::now();
-        while ($currentDate->lte($now)) {
-            $dateStr = $currentDate->format('Y-m-d');
-            $found = $downloads->get($dateStr);
-            $result[] = [
-                'date' => $currentDate->format('M d'),
-                'count' => $found ? $found->count : 0,
-            ];
-            $currentDate->addDay();
-        }
-
-        return $result;
+        return $this->buildPerDaySeries(
+            $days,
+            'downloads_count',
+            static fn (Carbon $from): int => UserDownload::query()
+                ->where('timestamp', '>=', $from)
+                ->count()
+        );
     }
 
     /**
@@ -148,68 +105,23 @@ class UserStatsService
     }
 
     /**
-     * Get API hits per day for the last N days
-     * Uses aggregated stats from user_activity_stats table for dates older than 2 days
-     * Uses live data from user_requests table for recent days
+     * Get API hits per day for the last N days (inclusive of today).
      *
-     * @return list<array<string, int|string|null>>
+     * Mirrors {@see self::getDownloadsPerDay()} — closed days from
+     * `user_activity_stats`, today composed of `user_activity_stats_hourly`
+     * + the in-progress hour from `user_requests`.
+     *
+     * @return list<array<string, int|string>>
      */
     public function getApiHitsPerDay(int $days = 7): array
     {
-        $startDate = Carbon::now()->subDays($days - 1)->startOfDay();
-        $twoDaysAgo = Carbon::now()->subDays(2)->startOfDay();
-
-        $result = [];
-
-        // For historical data (older than 2 days), use aggregated stats
-        if ($days > 2) {
-            $historicalStartDate = $startDate->format('Y-m-d');
-            $historicalEndDate = $twoDaysAgo->copy()->subDay()->format('Y-m-d');
-
-            $historicalStats = UserActivityStat::query()
-                ->select('stat_date', 'api_hits_count')
-                ->where('stat_date', '>=', $historicalStartDate)
-                ->where('stat_date', '<=', $historicalEndDate)
-                ->orderBy('stat_date', 'asc')
-                ->get()
-                ->keyBy('stat_date');
-
-            // Add historical data
-            $currentDate = $startDate->copy();
-            while ($currentDate->lt($twoDaysAgo)) {
-                $dateStr = $currentDate->format('Y-m-d');
-                $stat = $historicalStats->get($dateStr);
-                $result[] = [
-                    'date' => $currentDate->format('M d'),
-                    'count' => $stat ? $stat->api_hits_count : 0,
-                ];
-                $currentDate->addDay();
-            }
-        }
-
-        // For recent data (last 2 days), use live data from user_requests
-        $apiHits = UserRequest::query()
-            ->select(DB::raw('DATE(timestamp) as date'), DB::raw('COUNT(*) as count'))
-            ->where('timestamp', '>=', $twoDaysAgo)
-            ->groupBy(DB::raw('DATE(timestamp)'))
-            ->orderBy('date', 'asc')
-            ->get()
-            ->keyBy('date');
-
-        // Add recent data
-        $currentDate = $twoDaysAgo->copy();
-        $now = Carbon::now();
-        while ($currentDate->lte($now)) {
-            $dateStr = $currentDate->format('Y-m-d');
-            $found = $apiHits->get($dateStr);
-            $result[] = [
-                'date' => $currentDate->format('M d'),
-                'count' => $found ? $found->count : 0,
-            ];
-            $currentDate->addDay();
-        }
-
-        return $result;
+        return $this->buildPerDaySeries(
+            $days,
+            'api_hits_count',
+            static fn (Carbon $from): int => UserRequest::query()
+                ->where('timestamp', '>=', $from)
+                ->count()
+        );
     }
 
     /**
@@ -261,47 +173,56 @@ class UserStatsService
     }
 
     /**
-     * Get summary statistics
-     * Uses aggregated stats for weekly totals where possible
+     * Get summary statistics for the headline tiles.
      *
-     * @return list<array<string, int|string|null>>
+     * Window: "today" and "(7d) = last 7 calendar days inclusive of today".
+     *
+     * The live `user_downloads` / `user_requests` tables are pruned hourly to
+     * the last ~24h (see routes/console.php), so we layer sources to keep the
+     * totals consistent regardless of when the purge ran:
+     *  - Closed days (today-6 … yesterday) → `user_activity_stats`.
+     *  - Today's closed hours → `user_activity_stats_hourly`.
+     *  - Current in-progress hour → live `user_downloads` / `user_requests`.
+     *
+     * @return array{total_users: int, downloads_today: int, downloads_week: int, api_hits_today: int, api_hits_week: int}
      */
     public function getSummaryStats(): array
     {
         $today = Carbon::now()->startOfDay();
-        $twoDaysAgo = Carbon::now()->subDays(2)->startOfDay();
-        $sevenDaysAgo = Carbon::now()->subDays(7)->startOfDay();
+        $weekStart = Carbon::now()->subDays(6)->startOfDay();
+        $currentHourStart = Carbon::now()->startOfHour();
 
-        // Combine weekly historical totals + today/2-day live counts in a single
-        // query per source table using conditional aggregation.
+        // Closed days: [today-6 .. yesterday]
         $historical = UserActivityStat::query()
-            ->where('stat_date', '>=', $sevenDaysAgo->format('Y-m-d'))
-            ->where('stat_date', '<', $twoDaysAgo->format('Y-m-d'))
+            ->where('stat_date', '>=', $weekStart->format('Y-m-d'))
+            ->where('stat_date', '<', $today->format('Y-m-d'))
             ->selectRaw('COALESCE(SUM(downloads_count), 0) as downloads, COALESCE(SUM(api_hits_count), 0) as api_hits')
             ->first();
 
-        $downloadAgg = UserDownload::query()
-            ->where('timestamp', '>=', $twoDaysAgo)
-            ->selectRaw(
-                'SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) as today_count, COUNT(*) as recent_count',
-                [$today]
-            )
+        // Today: closed hours from hourly aggregate.
+        $todayClosed = DB::table('user_activity_stats_hourly')
+            ->where('stat_hour', '>=', $today->format('Y-m-d H:00:00'))
+            ->where('stat_hour', '<', $currentHourStart->format('Y-m-d H:00:00'))
+            ->selectRaw('COALESCE(SUM(downloads_count), 0) as downloads, COALESCE(SUM(api_hits_count), 0) as api_hits')
             ->first();
 
-        $apiAgg = UserRequest::query()
-            ->where('timestamp', '>=', $twoDaysAgo)
-            ->selectRaw(
-                'SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) as today_count, COUNT(*) as recent_count',
-                [$today]
-            )
-            ->first();
+        // Current in-progress hour from live tables.
+        $downloadsCurrentHour = UserDownload::query()
+            ->where('timestamp', '>=', $currentHourStart)
+            ->count();
+        $apiHitsCurrentHour = UserRequest::query()
+            ->where('timestamp', '>=', $currentHourStart)
+            ->count();
+
+        $downloadsToday = (int) ($todayClosed->downloads ?? 0) + $downloadsCurrentHour;
+        $apiHitsToday = (int) ($todayClosed->api_hits ?? 0) + $apiHitsCurrentHour;
 
         return [
             'total_users' => User::whereNull('deleted_at')->count(),
-            'downloads_today' => (int) ($downloadAgg->today_count ?? 0),
-            'downloads_week' => (int) ($historical->downloads ?? 0) + (int) ($downloadAgg->recent_count ?? 0),
-            'api_hits_today' => (int) ($apiAgg->today_count ?? 0),
-            'api_hits_week' => (int) ($historical->api_hits ?? 0) + (int) ($apiAgg->recent_count ?? 0),
+            'downloads_today' => $downloadsToday,
+            'downloads_week' => (int) ($historical->downloads ?? 0) + $downloadsToday,
+            'api_hits_today' => $apiHitsToday,
+            'api_hits_week' => (int) ($historical->api_hits ?? 0) + $apiHitsToday,
         ];
     }
 
@@ -323,5 +244,58 @@ class UserStatsService
             ->limit($limit)
             ->get()
             ->toArray();
+    }
+
+    /**
+     * Build a "last N days inclusive of today" series, layering closed days
+     * (from `user_activity_stats`), today's closed hours (from
+     * `user_activity_stats_hourly`) and the current in-progress hour from a
+     * caller-supplied live counter.
+     *
+     * @param  callable(Carbon): int  $liveCurrentHourCounter
+     * @return list<array{date: string, count: int}>
+     */
+    private function buildPerDaySeries(int $days, string $statColumn, callable $liveCurrentHourCounter): array
+    {
+        $today = Carbon::now()->startOfDay();
+        $startDate = $today->copy()->subDays($days - 1);
+
+        $historical = UserActivityStat::query()
+            ->select('stat_date', $statColumn)
+            ->where('stat_date', '>=', $startDate->format('Y-m-d'))
+            ->where('stat_date', '<', $today->format('Y-m-d'))
+            ->orderBy('stat_date', 'asc')
+            ->get()
+            ->keyBy(static fn (UserActivityStat $s): string => $s->stat_date instanceof Carbon
+                ? $s->stat_date->format('Y-m-d')
+                : (string) $s->stat_date);
+
+        $result = [];
+        $cursor = $startDate->copy();
+        while ($cursor->lt($today)) {
+            $stat = $historical->get($cursor->format('Y-m-d'));
+            $result[] = [
+                'date' => $cursor->format('M d'),
+                'count' => $stat ? (int) $stat->{$statColumn} : 0,
+            ];
+            $cursor->addDay();
+        }
+
+        // Today: closed hours from hourly aggregate + the current hour from live.
+        $currentHourStart = Carbon::now()->startOfHour();
+        $hourlyColumn = $statColumn === 'api_hits_count' ? 'api_hits_count' : 'downloads_count';
+        $todayClosed = (int) DB::table('user_activity_stats_hourly')
+            ->where('stat_hour', '>=', $today->format('Y-m-d H:00:00'))
+            ->where('stat_hour', '<', $currentHourStart->format('Y-m-d H:00:00'))
+            ->sum($hourlyColumn);
+
+        $todayLive = (int) $liveCurrentHourCounter($currentHourStart);
+
+        $result[] = [
+            'date' => $today->format('M d'),
+            'count' => $todayClosed + $todayLive,
+        ];
+
+        return $result;
     }
 }
