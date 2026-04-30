@@ -4,7 +4,7 @@
 
 ## Prerequisites
 
-- Docker & Docker Compose v2+
+- Docker & **Docker Compose v2.22+** (the Makefile uses `pull --ignore-buildable`)
 - A GitHub (scopeless) token for Composer private packages
 - [Laravel Sail](https://laravel.com/docs/12.x/sail) (included as a dev dependency)
 
@@ -55,35 +55,106 @@ dormant and consumes no resources.
 
 ## Make Targets
 
-Run `make` or `make help` to see all targets:
+Run `make` or `make help` to see all targets, grouped by section.
+
+### Lifecycle
+
+| Target            | Description                                                     |
+|-------------------|-----------------------------------------------------------------|
+| `make up`         | Start all services (detached)                                   |
+| `make down`       | Stop all services                                               |
+| `make restart`    | Restart all services                                            |
+| `make recreate`   | Force-recreate containers without rebuilding                    |
+| `make build`      | Build the app image (cached)                                    |
+| `make rebuild`    | Pull fresh base images + `--no-cache` build + force-recreate    |
+| `make pull`       | Pull latest enabled-profile base images (skips buildable ones)  |
+| `make update`     | Infra-only: pull + `--pull` build + restart                     |
+| `make upgrade`    | App upgrade: `update` + composer + npm + migrate + caches       |
+| `make fresh`      | **Destroy volumes**, pull, rebuild, recreate (DATA LOSS)        |
+
+### Development
 
 | Target              | Description                                           |
 |---------------------|-------------------------------------------------------|
-| `make up`           | Start all services (detached)                         |
-| `make down`         | Stop all services                                     |
-| `make restart`      | Restart all services                                  |
-| `make build`        | Build the app image                                   |
-| `make rebuild`      | Build from scratch (no cache)                         |
-| `make pull`         | Pull latest base images                               |
-| `make update`       | Pull + rebuild + restart                              |
-| `make fresh`        | **Destroy volumes**, rebuild, start clean (DATA LOSS) |
 | `make shell`        | Bash shell in the app container                       |
 | `make root-shell`   | Root bash shell in the app container                  |
+| `make tinker`       | Laravel Tinker REPL                                   |
 | `make artisan cmd=` | Run any artisan command                               |
+| `make migrate`      | Run pending migrations                                |
+| `make migrate-fresh`| Drop all tables and re-migrate (DATA LOSS)            |
+| `make seed`         | Run database seeders                                  |
+| `make cache-clear`  | Clear config / route / view / app caches              |
+| `make optimize`     | Cache config / routes / views + spatie/laravel-data   |
+| `make queue-work`   | Foreground queue worker                               |
+| `make queue-restart`| Signal queue workers to restart                       |
 | `make tmux-start`   | Start the NNTmux tmux processing engine               |
 | `make tmux-stop`    | Stop the tmux processing engine                       |
 | `make tmux-attach`  | Attach to the running tmux session                    |
 | `make horizon`      | Show Horizon queue status                             |
-| `make test`         | Run PHPUnit tests (`filter=Name` optional)            |
-| `make pint`         | Pint formatter on dirty files                         |
-| `make npm-build`    | `npm install` + `npm run build`                       |
-| `make npm-dev`      | Start Vite dev server                                 |
-| `make db`           | MariaDB CLI session                                   |
-| `make redis-cli`    | Redis CLI session                                     |
-| `make logs`         | Tail all container logs                               |
-| `make status`       | Show container status                                 |
-| `make clean`        | Prune stopped containers / dangling images            |
-| `make nuke`         | **Remove ALL** project containers, images, volumes    |
+
+### Testing & Quality
+
+| Target           | Description                                          |
+|------------------|------------------------------------------------------|
+| `make test`      | PHPUnit tests (`filter=Name` optional)               |
+| `make pint`      | Pint formatter on dirty files                        |
+| `make pint-all`  | Pint formatter on all files                          |
+| `make phpstan`   | PHPStan static analysis (2G memory limit)            |
+| `make rector`    | Rector dry-run (no changes)                          |
+| `make rector-fix`| Apply Rector refactorings                            |
+
+### Frontend & Types
+
+| Target                | Description                          |
+|-----------------------|--------------------------------------|
+| `make npm-build`      | `npm install` + `npm run build`      |
+| `make npm-dev`        | Start Vite dev server                |
+| `make ts-types`       | Regenerate TypeScript types          |
+| `make ts-types-check` | CI: fail if generated types drift    |
+| `make data-cache`     | Cache spatie/laravel-data structures |
+
+### Logs & Status
+
+| Target              | Description                                                      |
+|---------------------|------------------------------------------------------------------|
+| `make logs`         | Tail all container logs (or `SERVICE=name` for one)              |
+| `make tail-laravel` | Tail `storage/logs/laravel.log` inside the app container         |
+| `make status` / `ps`| Show running containers                                          |
+| `make top`          | Show processes inside each container                             |
+| `make images`       | Show images used by each service                                 |
+| `make health`       | Healthcheck status per service                                   |
+
+### Cleanup
+
+| Target        | Description                                                   |
+|---------------|---------------------------------------------------------------|
+| `make clean`  | Prune stopped containers / dangling images                    |
+| `make nuke`   | **Remove ALL** project containers, images, volumes (DATA LOSS)|
+
+### Flags
+
+These can be combined with the targets above:
+
+| Flag           | Effect                                                                |
+|----------------|-----------------------------------------------------------------------|
+| `FORCE=1`      | Skip confirmation prompts on `fresh`, `nuke`, `migrate-fresh` (CI use)|
+| `MAINTENANCE=1`| Wrap `upgrade` migrations in `artisan down` / `artisan up`            |
+| `SERVICE=name` | Restrict `logs` to a specific compose service                         |
+| `CMD="…"`      | Free-form command for `artisan` (alternative to `cmd=`)               |
+| `filter=Name`  | Pass `--filter=Name` to `make test`                                   |
+
+Examples:
+
+```bash
+make fresh FORCE=1                      # non-interactive teardown + rebuild
+make upgrade MAINTENANCE=1              # zero-downtime-ish upgrade with maint mode
+make logs SERVICE=mariadb               # tail only mariadb
+make test filter=ReleaseSearchTest      # run a single test
+```
+
+> **Note:** `make pull` / `update` / `rebuild` use `docker compose pull --ignore-buildable`,
+> which only pulls images for services in the active `COMPOSE_PROFILES` and skips images
+> that are built locally (e.g. `sail-8.5/app`). Requires Docker Compose v2.22+.
 
 You can also use `./sail` directly for anything not covered above —
 unknown commands are passed through to `docker compose`.
@@ -167,7 +238,8 @@ docker compose up -d
 | Permission errors on storage/   | `make root-shell` then `chown -R sail:sail storage bootstrap/cache`   |
 | Port already in use             | Change `APP_PORT`, `FORWARD_DB_PORT`, etc. in `.env`                  |
 | Containers won't start          | `make logs` to inspect, or `make rebuild` to start fresh              |
-| Stale images after upgrade      | `make update` (pulls + rebuilds + restarts)                           |
-| Need a completely clean slate   | `make fresh` (destroys all volumes!)                                  |
+| Stale images after upgrade      | `make update` (pulls base images + rebuild + restart)                 |
+| Need a completely clean slate   | `make fresh` (destroys all volumes; add `FORCE=1` for non-interactive)|
+| CI / scripted teardown          | `make fresh FORCE=1` or `make nuke FORCE=1` to skip prompts           |
 | supervisorctl not connecting    | `make root-shell` then `supervisorctl status` to verify socket path   |
 
