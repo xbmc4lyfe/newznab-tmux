@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Http\Controllers\Api\ApiController;
+use App\Http\Controllers\Api\ApiV2Controller;
 use App\Models\Category;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
@@ -344,6 +345,111 @@ class ApiRequestMatrixTest extends TestCase
             $controller->api($request);
             $this->assertNotNull($controller->capturedOutput);
             $this->assertSame('api', $controller->capturedOutput['type']);
+        }
+    }
+
+    public function test_v2_audio_without_id_browses_requested_categories(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+        $request = Request::create('/api/v2/audio', 'GET', [
+            'cat' => '3000,3010,3020,3030,3040,3050,3060,3999',
+            'api_token' => $token,
+        ]);
+
+        $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearchService->shouldNotReceive('apiMusicSearch');
+        $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
+        $releaseBrowseService->shouldReceive('getBrowseRangeForApi')
+            ->once()
+            ->with(
+                1,
+                ['3000', '3010', '3020', '3030', '3040', '3050', '3060', '3999'],
+                0,
+                100,
+                'posted_desc',
+                -1,
+                [5030],
+                -1,
+                0
+            )
+            ->andReturn(collect());
+
+        $controller = new ApiV2Controller(app(ApiController::class), $releaseSearchService, $releaseBrowseService);
+
+        $response = $controller->audio($request);
+
+        $this->assertSame(200, $response->getStatusCode());
+        $this->assertSame([], $response->getData(true)['results']);
+    }
+
+    public function test_v2_books_without_id_browses_requested_categories(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+        $request = Request::create('/api/v2/books', 'GET', [
+            'cat' => '3030,7020,8010',
+            'api_token' => $token,
+        ]);
+
+        $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearchService->shouldNotReceive('apiBookSearch');
+        $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
+        $releaseBrowseService->shouldReceive('getBrowseRangeForApi')
+            ->once()
+            ->with(
+                1,
+                ['3030', '7020', '8010'],
+                0,
+                100,
+                'posted_desc',
+                -1,
+                [5030],
+                -1,
+                0
+            )
+            ->andReturn(collect());
+
+        $controller = new ApiV2Controller(app(ApiController::class), $releaseSearchService, $releaseBrowseService);
+
+        $response = $controller->books($request);
+
+        $this->assertSame(200, $response->getStatusCode());
+        $this->assertSame([], $response->getData(true)['results']);
+    }
+
+    public function test_v2_audio_and_books_without_id_default_to_their_root_categories(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+
+        foreach ([
+            'audio' => ['method' => 'audio', 'category' => [Category::MUSIC_ROOT]],
+            'books' => ['method' => 'books', 'category' => [Category::BOOKS_ROOT]],
+        ] as $endpoint => $expectation) {
+            $request = Request::create('/api/v2/'.$endpoint, 'GET', [
+                'api_token' => $token,
+            ]);
+
+            $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
+            $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
+            $releaseBrowseService->shouldReceive('getBrowseRangeForApi')
+                ->once()
+                ->with(
+                    1,
+                    $expectation['category'],
+                    0,
+                    100,
+                    'posted_desc',
+                    -1,
+                    [5030],
+                    -1,
+                    0
+                )
+                ->andReturn(collect());
+
+            $controller = new ApiV2Controller(app(ApiController::class), $releaseSearchService, $releaseBrowseService);
+            $response = $controller->{$expectation['method']}($request);
+
+            $this->assertSame(200, $response->getStatusCode());
+            $this->assertSame([], $response->getData(true)['results']);
         }
     }
 

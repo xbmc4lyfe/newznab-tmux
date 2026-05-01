@@ -297,9 +297,8 @@ class ApiV2Controller extends BasePageController
         UserRequest::addApiRequest($user->id, $request->getRequestUri());
         event(new UserAccessedApi($user, $request->ip()));
 
-        $q = (string) $request->input('id', '');
-        if ($q === '') {
-            return response()->json(['error' => 'Missing id (search query)'], 400);
+        if ($request->has('id') && $request->isNotFilled('id')) {
+            return response()->json(['error' => 'Incorrect parameter (id must not be empty)'], 400);
         }
 
         $offset = $this->api->offset($request);
@@ -318,17 +317,35 @@ class ApiV2Controller extends BasePageController
         $catExclusions = User::getCategoryExclusionById($user->id);
         $groupName = $this->api->group($request);
 
-        $relData = $this->releaseSearchService->apiMusicSearch(
-            $q,
-            $groupName,
-            $offset,
-            $limit,
-            $maxAge,
-            $catExclusions,
-            $categoryID,
-            $minSize,
-            $sort
-        );
+        if (! $request->filled('id')) {
+            if ($categoryID === [-1]) {
+                $categoryID = [Category::MUSIC_ROOT];
+            }
+
+            $relData = $this->releaseBrowseService->getBrowseRangeForApi(
+                1,
+                $categoryID,
+                $offset,
+                $limit,
+                $sort,
+                $maxAge,
+                $catExclusions,
+                $groupName,
+                $minSize
+            );
+        } else {
+            $relData = $this->releaseSearchService->apiMusicSearch(
+                (string) $request->input('id'),
+                $groupName,
+                $offset,
+                $limit,
+                $maxAge,
+                $catExclusions,
+                $categoryID,
+                $minSize,
+                $sort
+            );
+        }
 
         return $this->buildSearchResponse($relData, $user);
     }
@@ -343,9 +360,8 @@ class ApiV2Controller extends BasePageController
         UserRequest::addApiRequest($user->id, $request->getRequestUri());
         event(new UserAccessedApi($user, $request->ip()));
 
-        $q = (string) $request->input('id', '');
-        if ($q === '') {
-            return response()->json(['error' => 'Missing id (search query)'], 400);
+        if ($request->has('id') && $request->isNotFilled('id')) {
+            return response()->json(['error' => 'Incorrect parameter (id must not be empty)'], 400);
         }
 
         $offset = $this->api->offset($request);
@@ -364,17 +380,35 @@ class ApiV2Controller extends BasePageController
         $catExclusions = User::getCategoryExclusionById($user->id);
         $groupName = $this->api->group($request);
 
-        $relData = $this->releaseSearchService->apiBookSearch(
-            $q,
-            $groupName,
-            $offset,
-            $limit,
-            $maxAge,
-            $catExclusions,
-            $categoryID,
-            $minSize,
-            $sort
-        );
+        if (! $request->filled('id')) {
+            if ($categoryID === [-1]) {
+                $categoryID = [Category::BOOKS_ROOT];
+            }
+
+            $relData = $this->releaseBrowseService->getBrowseRangeForApi(
+                1,
+                $categoryID,
+                $offset,
+                $limit,
+                $sort,
+                $maxAge,
+                $catExclusions,
+                $groupName,
+                $minSize
+            );
+        } else {
+            $relData = $this->releaseSearchService->apiBookSearch(
+                (string) $request->input('id'),
+                $groupName,
+                $offset,
+                $limit,
+                $maxAge,
+                $catExclusions,
+                $categoryID,
+                $minSize,
+                $sort
+            );
+        }
 
         return $this->buildSearchResponse($relData, $user);
     }
