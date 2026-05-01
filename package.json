@@ -6,7 +6,7 @@
         "build": "php artisan typescript:transform --quiet && vite build",
         "types": "php artisan typescript:transform",
         "format": "prettier --write 'resources/**/*.{css,js,vue}'",
-        "package-update": "ncu -u -x pnotify,tinymce"
+        "package-update": "ncu -u -x prettier-plugin-tailwindcss"
     },
     "devDependencies": {
         "@tailwindcss/forms": "^0.5.11",
@@ -16,7 +16,7 @@
         "npm-check-updates": "^22.0.1",
         "prettier": "3.8.3",
         "prettier-plugin-blade": "3.1.6",
-        "prettier-plugin-tailwindcss": "^0.8.0",
+        "prettier-plugin-tailwindcss": "^0.7.4",
         "tailwindcss": "^4.2.4",
         "vite": "^8.0",
         "vue": "^3.5.33"
