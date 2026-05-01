@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Http\Controllers\Api\ApiController;
+use App\Models\Category;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
 use Illuminate\Database\Schema\Blueprint;
@@ -192,6 +193,158 @@ class ApiRequestMatrixTest extends TestCase
         $this->assertNotNull($controller->capturedOutput);
         $this->assertSame('api', $controller->capturedOutput['type']);
         $this->assertInstanceOf(Collection::class, $controller->capturedOutput['data']);
+    }
+
+    public function test_v1_music_without_query_browses_requested_categories(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+        $request = Request::create('/api/v1/api', 'GET', [
+            't' => 'music',
+            'cat' => '3000,3010,3020,3030,3040,3050,3060,3999',
+            'extended' => '1',
+            'apikey' => $token,
+        ]);
+
+        $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearchService->shouldNotReceive('apiMusicSearch');
+        $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
+        $releaseBrowseService->shouldReceive('getBrowseRangeForApi')
+            ->once()
+            ->with(
+                1,
+                ['3000', '3010', '3020', '3030', '3040', '3050', '3060', '3999'],
+                0,
+                100,
+                'posted_desc',
+                -1,
+                [5030],
+                -1,
+                0
+            )
+            ->andReturn(collect());
+
+        $controller = new class($releaseSearchService, $releaseBrowseService) extends ApiController
+        {
+            /**
+             * @var array{data:mixed,params:array<string,mixed>,xml:bool,offset:int,type:string}|null
+             */
+            public ?array $capturedOutput = null;
+
+            public function output(mixed $data, array $params, bool $xml, int $offset, string $type = '')
+            {
+                $this->capturedOutput = [
+                    'data' => $data,
+                    'params' => $params,
+                    'xml' => $xml,
+                    'offset' => $offset,
+                    'type' => $type,
+                ];
+            }
+        };
+
+        $controller->api($request);
+        $this->assertNotNull($controller->capturedOutput);
+        $this->assertSame('api', $controller->capturedOutput['type']);
+        $this->assertInstanceOf(Collection::class, $controller->capturedOutput['data']);
+    }
+
+    public function test_v1_book_without_query_browses_requested_categories(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+        $request = Request::create('/api/v1/api', 'GET', [
+            't' => 'book',
+            'cat' => '3030,7020,8010',
+            'extended' => '1',
+            'apikey' => $token,
+        ]);
+
+        $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearchService->shouldNotReceive('apiBookSearch');
+        $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
+        $releaseBrowseService->shouldReceive('getBrowseRangeForApi')
+            ->once()
+            ->with(
+                1,
+                ['3030', '7020', '8010'],
+                0,
+                100,
+                'posted_desc',
+                -1,
+                [5030],
+                -1,
+                0
+            )
+            ->andReturn(collect());
+
+        $controller = new class($releaseSearchService, $releaseBrowseService) extends ApiController
+        {
+            /**
+             * @var array{data:mixed,params:array<string,mixed>,xml:bool,offset:int,type:string}|null
+             */
+            public ?array $capturedOutput = null;
+
+            public function output(mixed $data, array $params, bool $xml, int $offset, string $type = '')
+            {
+                $this->capturedOutput = [
+                    'data' => $data,
+                    'params' => $params,
+                    'xml' => $xml,
+                    'offset' => $offset,
+                    'type' => $type,
+                ];
+            }
+        };
+
+        $controller->api($request);
+        $this->assertNotNull($controller->capturedOutput);
+        $this->assertSame('api', $controller->capturedOutput['type']);
+        $this->assertInstanceOf(Collection::class, $controller->capturedOutput['data']);
+    }
+
+    public function test_v1_music_and_book_without_query_default_to_their_root_categories(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+
+        foreach ([
+            'music' => [Category::MUSIC_ROOT],
+            'book' => [Category::BOOKS_ROOT],
+        ] as $type => $expectedCategory) {
+            $request = Request::create('/api/v1/api', 'GET', [
+                't' => $type,
+                'apikey' => $token,
+            ]);
+
+            $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
+            $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
+            $releaseBrowseService->shouldReceive('getBrowseRangeForApi')
+                ->once()
+                ->with(
+                    1,
+                    $expectedCategory,
+                    0,
+                    100,
+                    'posted_desc',
+                    -1,
+                    [5030],
+                    -1,
+                    0
+                )
+                ->andReturn(collect());
+
+            $controller = new class($releaseSearchService, $releaseBrowseService) extends ApiController
+            {
+                public ?array $capturedOutput = null;
+
+                public function output(mixed $data, array $params, bool $xml, int $offset, string $type = '')
+                {
+                    $this->capturedOutput = compact('data', 'params', 'xml', 'offset', 'type');
+                }
+            };
+
+            $controller->api($request);
+            $this->assertNotNull($controller->capturedOutput);
+            $this->assertSame('api', $controller->capturedOutput['type']);
+        }
     }
 
     public function test_v2_movie_requires_query_or_external_id(): void

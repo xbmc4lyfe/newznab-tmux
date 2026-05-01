@@ -376,8 +376,8 @@ class ApiController extends BasePageController
                 break;
 
             case 'music':
-                if (! $request->filled('q')) {
-                    return showApiError(200, 'Missing parameter (q)');
+                if ($request->has('q') && ! $request->filled('q')) {
+                    return showApiError(201, 'Incorrect parameter (q must not be empty)');
                 }
                 $maxAge = $this->maxAge($request);
                 if (! is_int($maxAge)) {
@@ -389,23 +389,44 @@ class ApiController extends BasePageController
                 }
                 $groupName = $this->group($request);
                 UserRequest::addApiRequest($uid, $request->getRequestUri());
-                $relData = $this->releaseSearchService->apiMusicSearch(
-                    (string) $request->input('q'),
-                    $groupName,
-                    $offset,
-                    $this->limit($request),
-                    $maxAge,
-                    $catExclusions,
-                    $this->categoryID($request),
-                    $minSize,
-                    $sort
-                );
+                $categoryID = $this->categoryID($request);
+                $limit = $this->limit($request);
+
+                if (! $request->filled('q')) {
+                    if ($categoryID === [-1]) {
+                        $categoryID = [Category::MUSIC_ROOT];
+                    }
+
+                    $relData = $this->releaseBrowseService->getBrowseRangeForApi(
+                        1,
+                        $categoryID,
+                        $offset,
+                        $limit,
+                        $sort,
+                        $maxAge,
+                        $catExclusions,
+                        $groupName,
+                        $minSize
+                    );
+                } else {
+                    $relData = $this->releaseSearchService->apiMusicSearch(
+                        (string) $request->input('q'),
+                        $groupName,
+                        $offset,
+                        $limit,
+                        $maxAge,
+                        $catExclusions,
+                        $categoryID,
+                        $minSize,
+                        $sort
+                    );
+                }
                 $this->output($relData, $params, $outputXML, $offset, 'api');
                 break;
 
             case 'book':
-                if (! $request->filled('q')) {
-                    return showApiError(200, 'Missing parameter (q)');
+                if ($request->has('q') && ! $request->filled('q')) {
+                    return showApiError(201, 'Incorrect parameter (q must not be empty)');
                 }
                 $maxAge = $this->maxAge($request);
                 if (! is_int($maxAge)) {
@@ -417,17 +438,38 @@ class ApiController extends BasePageController
                 }
                 $groupName = $this->group($request);
                 UserRequest::addApiRequest($uid, $request->getRequestUri());
-                $relData = $this->releaseSearchService->apiBookSearch(
-                    (string) $request->input('q'),
-                    $groupName,
-                    $offset,
-                    $this->limit($request),
-                    $maxAge,
-                    $catExclusions,
-                    $this->categoryID($request),
-                    $minSize,
-                    $sort
-                );
+                $categoryID = $this->categoryID($request);
+                $limit = $this->limit($request);
+
+                if (! $request->filled('q')) {
+                    if ($categoryID === [-1]) {
+                        $categoryID = [Category::BOOKS_ROOT];
+                    }
+
+                    $relData = $this->releaseBrowseService->getBrowseRangeForApi(
+                        1,
+                        $categoryID,
+                        $offset,
+                        $limit,
+                        $sort,
+                        $maxAge,
+                        $catExclusions,
+                        $groupName,
+                        $minSize
+                    );
+                } else {
+                    $relData = $this->releaseSearchService->apiBookSearch(
+                        (string) $request->input('q'),
+                        $groupName,
+                        $offset,
+                        $limit,
+                        $maxAge,
+                        $catExclusions,
+                        $categoryID,
+                        $minSize,
+                        $sort
+                    );
+                }
                 $this->output($relData, $params, $outputXML, $offset, 'api');
                 break;
 
