@@ -175,29 +175,34 @@ final class PartHandler
             return [];
         }
 
-        $keys = [];
-        // Group by binaries_id and use IN(...) per binary so the SELECT does
-        // not turn into thousands of OR clauses with two bindings each.
-        $numbersByBinary = [];
+        // Deduplicate (binaries_id, number) pairs so we don't bind the same
+        // tuple twice when a chunk contains repeats.
+        $uniquePairs = [];
         foreach ($parts as $part) {
-            $numbersByBinary[(int) $part['binaries_id']][] = $part['number'];
+            $bid = (int) $part['binaries_id'];
+            $num = (int) $part['number'];
+            $uniquePairs[$bid.':'.$num] = [$bid, $num];
         }
 
-        foreach ($numbersByBinary as $binaryId => $numbers) {
-            $numbers = array_values(array_unique($numbers));
-            foreach (array_chunk($numbers, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
-                $placeholders = implode(',', array_fill(0, \count($chunk), '?'));
-                $bindings = $chunk;
-                $bindings[] = $binaryId;
+        $keys = [];
+        // Single tuple-IN per sub-chunk: (binaries_id, number) IN ((?,?),...).
+        // Both MySQL and SQLite (3.15+) support this row-constructor form,
+        // which lets one SELECT replace the previous "one SELECT per binary".
+        foreach (array_chunk(array_values($uniquePairs), self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            $tuples = implode(',', array_fill(0, \count($chunk), '(?,?)'));
+            $bindings = [];
+            foreach ($chunk as [$bid, $num]) {
+                $bindings[] = $bid;
+                $bindings[] = $num;
+            }
 
-                $rows = DB::select(
-                    "SELECT binaries_id, number FROM parts WHERE number IN ({$placeholders}) AND binaries_id = ?",
-                    $bindings
-                );
+            $rows = DB::select(
+                "SELECT binaries_id, number FROM parts WHERE (binaries_id, number) IN ({$tuples})",
+                $bindings
+            );
 
-                foreach ($rows as $row) {
-                    $keys[$this->partKey((int) $row->binaries_id, (int) $row->number)] = true;
-                }
+            foreach ($rows as $row) {
+                $keys[$this->partKey((int) $row->binaries_id, (int) $row->number)] = true;
             }
         }
 

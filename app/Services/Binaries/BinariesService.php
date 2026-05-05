@@ -79,7 +79,8 @@ class BinariesService
         $this->headerStorage = $headerStorage ?? new HeaderStorageService(config: $this->config);
         $this->missedPartHandler = $missedPartHandler ?? new MissedPartHandler(
             $this->config->partRepairLimit,
-            $this->config->partRepairMaxTries
+            $this->config->partRepairMaxTries,
+            $this->config->bulkSqlChunkSize
         );
         $this->nntp = $nntp;
         $this->startUpdate = Carbon::now();
@@ -414,12 +415,23 @@ class BinariesService
         $date = 0;
 
         do {
-            // Try to get the article date locally first
+            // Try to get the article date locally first.
+            //
+            // This query joins parts -> binaries -> collections starting from
+            // `parts.number = ?`. The parts table has PRIMARY KEY
+            // (binaries_id, number), so without a separate index on `number`
+            // the planner can only full-scan parts. The
+            // `ix_parts_number` index added in the
+            // 2026_05_05 add_cbp_query_indexes migration makes this an index
+            // lookup; do not drop it without revisiting this call site.
+            // LIMIT 1 is fine because we just need any matching collection
+            // date for the article.
             $local = DB::select(
                 'SELECT c.date AS date FROM collections c
                     INNER JOIN binaries b ON(c.id=b.collections_id)
                     INNER JOIN parts p ON(b.id=p.binaries_id)
-                    WHERE p.number = ?',
+                    WHERE p.number = ?
+                    LIMIT 1',
                 [$currentPost]
             );
 

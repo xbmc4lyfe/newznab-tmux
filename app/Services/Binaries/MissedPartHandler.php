@@ -17,10 +17,13 @@ final class MissedPartHandler
 
     private int $partRepairMaxTries;
 
-    public function __construct(int $partRepairLimit = 15000, int $partRepairMaxTries = 3)
+    private int $chunkSize;
+
+    public function __construct(int $partRepairLimit = 15000, int $partRepairMaxTries = 3, int $chunkSize = 500)
     {
         $this->partRepairLimit = $partRepairLimit;
         $this->partRepairMaxTries = $partRepairMaxTries;
+        $this->chunkSize = max(50, min(1000, $chunkSize));
     }
 
     /**
@@ -50,7 +53,7 @@ final class MissedPartHandler
      */
     private function addMissingPartsSqlite(array $numbers, int $groupId): void
     {
-        foreach (array_chunk(array_unique($numbers), 1000) as $chunk) {
+        foreach (array_chunk(array_unique($numbers), $this->chunkSize) as $chunk) {
             $placeholders = [];
             $bindings = [];
 
@@ -72,7 +75,7 @@ final class MissedPartHandler
      */
     private function addMissingPartsMysql(array $numbers, int $groupId): void
     {
-        foreach (array_chunk(array_unique($numbers), 1000) as $chunk) {
+        foreach (array_chunk(array_unique($numbers), $this->chunkSize) as $chunk) {
             $placeholders = [];
             $bindings = [];
 
@@ -101,12 +104,12 @@ final class MissedPartHandler
         }
 
         try {
-            DB::transaction(static function () use ($groupId, $numbers): void {
-                DB::table('missed_parts')
-                    ->where('groups_id', $groupId)
-                    ->whereIn('numberid', $numbers)
-                    ->delete();
-            }, 10);
+            // Single DELETE — InnoDB autocommits one statement atomically, so
+            // an explicit transaction here would just add round-trips.
+            DB::table('missed_parts')
+                ->where('groups_id', $groupId)
+                ->whereIn('numberid', $numbers)
+                ->delete();
         } catch (\Throwable $e) {
             if (config('app.debug') === true) {
                 Log::warning('removeRepairedParts failed: '.$e->getMessage());
@@ -183,11 +186,11 @@ final class MissedPartHandler
      */
     public function cleanupExhaustedParts(int $groupId): void
     {
-        DB::transaction(function () use ($groupId): void {
-            DB::table('missed_parts')
-                ->where('groups_id', $groupId)
-                ->where('attempts', '>=', $this->partRepairMaxTries)
-                ->delete();
-        }, 10);
+        // Single DELETE — InnoDB autocommits atomically; the explicit
+        // transaction wrapper would just add round-trips.
+        DB::table('missed_parts')
+            ->where('groups_id', $groupId)
+            ->where('attempts', '>=', $this->partRepairMaxTries)
+            ->delete();
     }
 }

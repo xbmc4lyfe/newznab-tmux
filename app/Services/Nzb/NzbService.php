@@ -90,9 +90,32 @@ class NzbService
             ->select(['collections.*', DB::raw('UNIX_TIMESTAMP(collections.date) AS udate'), 'usenet_groups.name as groupname'])
             ->get();
 
-        if (empty($collections)) {
+        if ($collections->isEmpty()) {
             return false;
         }
+
+        // Pre-load every binary and part for the release in two flat queries
+        // and group them in PHP, instead of issuing one binaries SELECT per
+        // collection and one parts SELECT per binary (1 + N + N*M queries).
+        $collectionIds = $collections->pluck('id')->all();
+        $binariesByCollection = Binary::query()
+            ->whereIn('collections_id', $collectionIds)
+            ->orderBy('name')
+            ->get(['id', 'collections_id', 'name', 'totalparts'])
+            ->groupBy('collections_id');
+
+        $allBinaryIds = $binariesByCollection->flatten(1)->pluck('id')->all();
+        $partsByBinary = $allBinaryIds === []
+            ? collect()
+            : Part::query()
+                ->whereIn('binaries_id', $allBinaryIds)
+                // distinct() preserves the dedup the previous per-binary
+                // query had, in case two rows share (messageid, size,
+                // partnumber) for the same binary (defensive).
+                ->distinct()
+                ->orderBy('partnumber')
+                ->get(['binaries_id', 'messageid', 'size', 'partnumber'])
+                ->groupBy('binaries_id');
 
         $XMLWriter = new \XMLWriter;
         $XMLWriter->openMemory();
@@ -120,16 +143,16 @@ class NzbService
         $XMLWriter->endElement(); // head
 
         foreach ($collections as $collection) {
-            $binaries = Binary::whereCollectionsId($collection->id)->select(['id', 'name', 'totalparts'])->orderBy('name')->get();
-            if (empty($binaries)) {
+            $binaries = $binariesByCollection->get($collection->id);
+            if ($binaries === null || $binaries->isEmpty()) {
                 return false;
             }
 
             $poster = $collection->fromname;
 
             foreach ($binaries as $binary) {
-                $parts = Part::whereBinariesId($binary->id)->distinct()->select(['messageid', 'size', 'partnumber'])->orderBy('partnumber')->get();
-                if (empty($parts)) {
+                $parts = $partsByBinary->get($binary->id);
+                if ($parts === null || $parts->isEmpty()) {
                     return false;
                 }
 

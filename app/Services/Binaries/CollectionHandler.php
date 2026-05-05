@@ -39,6 +39,9 @@ final class CollectionHandler
     /** @var array<string, string|null> Cached collection xrefs by collection key */
     private array $existingXrefs = [];
 
+    /** @var array<string, int> Cached collection IDs by collectionhash (populated by bulk prefetch) */
+    private array $existingIdsByHash = [];
+
     public function __construct(
         ?CollectionsCleaningService $collectionsCleaning = null,
         ?XrefService $xrefService = null
@@ -56,6 +59,7 @@ final class CollectionHandler
         $this->insertedCollectionIds = [];
         $this->batchCollectionHashes = [];
         $this->existingXrefs = [];
+        $this->existingIdsByHash = [];
     }
 
     /**
@@ -197,7 +201,7 @@ final class CollectionHandler
             return $resolved;
         }
 
-        $this->prefetchExistingXrefs($xrefsToPrefetch);
+        $this->prefetchExistingCollections($xrefsToPrefetch);
         foreach ($pending as $collectionKey => &$row) {
             $row['xref_append'] = implode(' ', $this->xrefService->diffNewTokens(
                 $this->existingXrefs[$collectionKey],
@@ -230,9 +234,14 @@ final class CollectionHandler
     }
 
     /**
+     * Prefetch existing collections in one round-trip. Populates both
+     * $existingXrefs (keyed by collectionKey) and $existingIdsByHash so the
+     * subsequent bulkInsertAndResolve() can skip its existence-check SELECT
+     * and only re-query for the freshly inserted rows.
+     *
      * @param  array<string, string>  $collectionHashByKey
      */
-    private function prefetchExistingXrefs(array $collectionHashByKey): void
+    private function prefetchExistingCollections(array $collectionHashByKey): void
     {
         $missing = array_filter(
             $collectionHashByKey,
@@ -246,14 +255,24 @@ final class CollectionHandler
 
         $rows = [];
         foreach (array_chunk(array_values($missing), self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
-            $rows += Collection::query()
+            foreach (Collection::query()
                 ->whereIn('collectionhash', $chunk)
-                ->pluck('xref', 'collectionhash')
-                ->all();
+                ->select(['id', 'collectionhash', 'xref'])
+                ->get() as $row) {
+                $rows[(string) $row->collectionhash] = [
+                    'id' => (int) $row->id,
+                    'xref' => (string) $row->xref,
+                ];
+            }
         }
 
         foreach ($missing as $collectionKey => $hash) {
-            $this->existingXrefs[$collectionKey] = isset($rows[$hash]) ? (string) $rows[$hash] : null;
+            if (isset($rows[$hash])) {
+                $this->existingXrefs[$collectionKey] = $rows[$hash]['xref'];
+                $this->existingIdsByHash[$hash] = $rows[$hash]['id'];
+            } else {
+                $this->existingXrefs[$collectionKey] = null;
+            }
         }
     }
 
@@ -264,7 +283,18 @@ final class CollectionHandler
     private function bulkInsertAndResolve(array $rowsByCollectionKey): array
     {
         $hashes = array_values(array_column($rowsByCollectionKey, 'collectionhash'));
-        $existingHashes = $this->existingHashes($hashes);
+
+        // The prefetch step has already populated $existingIdsByHash, so we
+        // know which hashes existed before the INSERT without issuing a
+        // separate "existingHashes" SELECT.
+        $existingHashes = [];
+        $idsByHash = [];
+        foreach ($hashes as $hash) {
+            if (isset($this->existingIdsByHash[$hash])) {
+                $existingHashes[$hash] = true;
+                $idsByHash[$hash] = $this->existingIdsByHash[$hash];
+            }
+        }
 
         if (DB::getDriverName() === 'sqlite') {
             $this->bulkInsertCollectionsSqlite($rowsByCollectionKey);
@@ -272,7 +302,17 @@ final class CollectionHandler
             $this->bulkInsertCollectionsMysql($rowsByCollectionKey, $existingHashes);
         }
 
-        $idsByHash = $this->resolveIdsByHash($hashes);
+        // Only resolve ids for the hashes we couldn't satisfy from the
+        // prefetch cache (i.e. the freshly inserted rows). For chunks where
+        // every collection already existed this issues zero extra SELECTs.
+        $newHashes = array_values(array_diff(array_unique($hashes), array_keys($idsByHash)));
+        if ($newHashes !== []) {
+            foreach ($this->resolveIdsByHash($newHashes) as $hash => $id) {
+                $idsByHash[$hash] = $id;
+                $this->existingIdsByHash[$hash] = $id;
+            }
+        }
+
         foreach ($idsByHash as $hash => $id) {
             if (! isset($existingHashes[$hash])) {
                 $this->insertedCollectionIds[$id] = true;
@@ -280,28 +320,6 @@ final class CollectionHandler
         }
 
         return $idsByHash;
-    }
-
-    /**
-     * @param  list<string>  $hashes
-     * @return array<string, true>
-     */
-    private function existingHashes(array $hashes): array
-    {
-        if ($hashes === []) {
-            return [];
-        }
-
-        $existing = [];
-        foreach (array_chunk($hashes, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
-            $existing += Collection::query()
-                ->whereIn('collectionhash', $chunk)
-                ->pluck('collectionhash')
-                ->mapWithKeys(static fn (string $hash): array => [$hash => true])
-                ->all();
-        }
-
-        return $existing;
     }
 
     /**
@@ -355,22 +373,61 @@ final class CollectionHandler
                 );
             }
 
+            // ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id) is the standard
+            // "insert or do nothing" idiom that avoids re-writing existing
+            // rows (and the redo/binlog churn that comes with it) while still
+            // letting LAST_INSERT_ID() return the existing row's id.
             DB::statement(
                 'INSERT INTO collections (subject, fromname, date, xref, groups_id, totalfiles, collectionhash, collection_regexes_id, dateadded, noise) VALUES '
                 .implode(',', $placeholders)
-                .' ON DUPLICATE KEY UPDATE dateadded = NOW()',
+                .' ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)',
                 $bindings
             );
         }
 
+        $this->batchAppendXrefs($rowsByCollectionKey, $existingHashes);
+    }
+
+    /**
+     * Append xref tokens for every existing collection in a chunk in a single
+     * UPDATE...JOIN per sub-chunk instead of N standalone UPDATEs (one per row).
+     * Same UNION ALL shape as BinaryHandler::flushUpdatesMysql().
+     *
+     * @param  array<string, array<string, mixed>>  $rowsByCollectionKey
+     * @param  array<string, true>  $existingHashes
+     */
+    private function batchAppendXrefs(array $rowsByCollectionKey, array $existingHashes): void
+    {
+        $updates = [];
         foreach ($rowsByCollectionKey as $row) {
-            if ($row['xref_append'] !== '' && isset($existingHashes[$row['collectionhash']])) {
-                DB::update('UPDATE collections SET xref = CONCAT(xref, ?, ?) WHERE collectionhash = ?', [
-                    "\n",
-                    $row['xref_append'],
-                    $row['collectionhash'],
-                ]);
+            if (($row['xref_append'] ?? '') !== '' && isset($existingHashes[$row['collectionhash']])) {
+                $updates[] = [
+                    'collectionhash' => $row['collectionhash'],
+                    'xref_append' => $row['xref_append'],
+                ];
             }
+        }
+
+        if ($updates === []) {
+            return;
+        }
+
+        foreach (array_chunk($updates, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            $selects = [];
+            $bindings = [];
+            foreach ($chunk as $u) {
+                $selects[] = 'SELECT ? AS collectionhash, ? AS xref_append';
+                $bindings[] = $u['collectionhash'];
+                $bindings[] = $u['xref_append'];
+            }
+
+            $sql = 'UPDATE collections c INNER JOIN ('
+                .implode(' UNION ALL ', $selects)
+                .') u ON u.collectionhash = c.collectionhash '
+                .'SET c.xref = CONCAT(c.xref, ?, u.xref_append)';
+            $bindings[] = "\n";
+
+            DB::statement($sql, $bindings);
         }
     }
 
@@ -491,10 +548,13 @@ final class CollectionHandler
         int $regexId,
         string $batchNoise
     ): int {
+        // ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id) lets LAST_INSERT_ID()
+        // return the existing row's id without rewriting the row (avoids the
+        // redo/binlog churn of `dateadded = NOW()`).
         $insertSql = 'INSERT INTO collections '
             .'(subject, fromname, date, xref, groups_id, totalfiles, collectionhash, collection_regexes_id, dateadded, noise) '
             .'VALUES (?, ?, FROM_UNIXTIME(?), ?, ?, ?, ?, ?, NOW(), ?) '
-            .'ON DUPLICATE KEY UPDATE dateadded = NOW()';
+            .'ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)';
 
         $bindings = [
             $subject,
@@ -513,11 +573,18 @@ final class CollectionHandler
             $bindings[] = $finalXrefAppend;
         }
 
-        DB::statement($insertSql, $bindings);
-
+        // affectingStatement so we can distinguish a brand-new insert
+        // (rowCount = 1) from a duplicate-key hit (rowCount = 0 with no xref
+        // append, or 2 when xref was actually appended). LAST_INSERT_ID(id) in
+        // the ODKU clause makes lastInsertId() return the existing row id
+        // even on a duplicate, so we can't rely on lastInsertId() alone.
+        $affected = (int) DB::affectingStatement($insertSql, $bindings);
         $lastId = (int) DB::connection()->getPdo()->lastInsertId();
+
         if ($lastId > 0) {
-            $this->insertedCollectionIds[$lastId] = true;
+            if ($affected === 1) {
+                $this->insertedCollectionIds[$lastId] = true;
+            }
 
             return $lastId;
         }

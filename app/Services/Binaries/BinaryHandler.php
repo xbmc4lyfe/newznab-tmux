@@ -193,7 +193,15 @@ final class BinaryHandler
     private function bulkInsertAndResolve(array $rowsByArticleKey): array
     {
         $lookupRows = array_values($rowsByArticleKey);
-        $existingKeys = $this->existingBinaryKeys($lookupRows);
+
+        // One SELECT establishes both "did this row exist?" and "what is its
+        // id?", instead of two identical SELECTs (existingBinaryKeys +
+        // resolveBinaryIds) that the previous implementation issued.
+        $idsByKey = $this->selectBinaryIdsByKey($lookupRows);
+        $existingKeys = [];
+        foreach ($idsByKey as $key => $_id) {
+            $existingKeys[$key] = true;
+        }
 
         if (DB::getDriverName() === 'sqlite') {
             $this->bulkInsertBinariesSqlite($lookupRows);
@@ -201,7 +209,22 @@ final class BinaryHandler
             $this->bulkInsertBinariesMysql($lookupRows);
         }
 
-        $idsByKey = $this->resolveBinaryIds($lookupRows);
+        // Only re-query for rows we couldn't satisfy from the prefetch
+        // (i.e. those that didn't exist before the bulk INSERT).
+        $missingRows = [];
+        foreach ($lookupRows as $row) {
+            $key = $this->binaryLookupKey((string) $row['hash'], (int) $row['collections_id']);
+            if (! isset($idsByKey[$key])) {
+                $missingRows[] = $row;
+            }
+        }
+
+        if ($missingRows !== []) {
+            foreach ($this->selectBinaryIdsByKey($missingRows) as $key => $id) {
+                $idsByKey[$key] = $id;
+            }
+        }
+
         foreach ($idsByKey as $key => $id) {
             if (! isset($existingKeys[$key])) {
                 $this->insertedBinaryIds[$id] = true;
@@ -213,16 +236,16 @@ final class BinaryHandler
 
     /**
      * @param  list<array<string, mixed>>  $rows
-     * @return array<string, true>
+     * @return array<string, int> id keyed by binaryLookupKey(hash, collectionId)
      */
-    private function existingBinaryKeys(array $rows): array
+    private function selectBinaryIdsByKey(array $rows): array
     {
-        $keys = [];
+        $resolved = [];
         foreach ($this->selectBinaryRows($rows) as $row) {
-            $keys[$this->binaryLookupKey((string) $row->hashvalue, (int) $row->collections_id)] = true;
+            $resolved[$this->binaryLookupKey((string) $row->hashvalue, (int) $row->collections_id)] = (int) $row->id;
         }
 
-        return $keys;
+        return $resolved;
     }
 
     /** @param  list<array<string, mixed>>  $rows */
@@ -272,20 +295,6 @@ final class BinaryHandler
                 $bindings
             );
         }
-    }
-
-    /**
-     * @param  list<array<string, mixed>>  $rows
-     * @return array<string, int>
-     */
-    private function resolveBinaryIds(array $rows): array
-    {
-        $resolved = [];
-        foreach ($this->selectBinaryRows($rows) as $row) {
-            $resolved[$this->binaryLookupKey((string) $row->hashvalue, (int) $row->collections_id)] = (int) $row->id;
-        }
-
-        return $resolved;
     }
 
     /**
