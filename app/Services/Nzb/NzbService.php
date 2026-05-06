@@ -9,6 +9,7 @@ use App\Models\Collection;
 use App\Models\Part;
 use App\Models\Release;
 use App\Models\Settings;
+use App\Services\CollectionCleanupService;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -57,8 +58,9 @@ class NzbService
 
     protected string $siteCommentString;
 
-    public function __construct()
-    {
+    public function __construct(
+        private readonly CollectionCleanupService $collectionCleanupService,
+    ) {
         try {
             $nzbSplitLevel = (int) Settings::settingValue('nzbsplitlevel');
         } catch (QueryException $e) {
@@ -217,9 +219,11 @@ class NzbService
         // Delete CBP (Collections, Binaries, Parts) for release that has its NZB created.
         // Use a transaction to ensure cascading deletes complete properly.
         try {
-            DB::transaction(function () use ($release) {
-                Collection::query()->where('releases_id', $release->id)->delete();
-            });
+            $this->collectionCleanupService->deleteCollectionsAndDescendants(
+                $collectionIds,
+                'NZB cleanup',
+                false
+            );
         } catch (\Throwable $e) {
             // Log the error but don't fail the NZB creation since the file was written successfully
             Log::warning('Failed to delete collections for release '.$release->id.': '.$e->getMessage());

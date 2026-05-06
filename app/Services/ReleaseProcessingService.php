@@ -85,11 +85,11 @@ final class ReleaseProcessingService
         $this->releaseCleaning = $releaseCleaning ?? new ReleaseCleaningService;
         $this->releaseManagement = $releaseManagement ?? app(ReleaseManagementService::class);
         $this->releaseImage = $releaseImage ?? new ReleaseImageService;
-
-        $this->releaseCreationService = $releaseCreationService
-            ?? new ReleaseCreationService($this->releaseCleaning);
         $this->collectionCleanupService = $collectionCleanupService
             ?? new CollectionCleanupService;
+
+        $this->releaseCreationService = $releaseCreationService
+            ?? new ReleaseCreationService($this->releaseCleaning, $this->collectionCleanupService);
         $this->postProcessService = $postProcessService;
 
         $this->settings = $this->loadSettings();
@@ -432,21 +432,22 @@ final class ReleaseProcessingService
         $stats = ['minSize' => 0, 'maxSize' => 0, 'minFiles' => 0, 'par2Only' => 0];
 
         // Delete collections where ALL binaries are par2 files (no actual content)
-        DB::transaction(static function () use (&$stats): void {
-            $par2OnlyCollectionIds = DB::table('collections as c')
-                ->join('binaries as b', 'c.id', '=', 'b.collections_id')
-                ->where('c.filecheck', CollectionFileCheckStatus::Sized->value)
-                ->where('c.filesize', '>', 0)
-                ->groupBy('c.id')
-                ->havingRaw("COUNT(b.id) = SUM(CASE WHEN b.name REGEXP '\\\\.(vol[0-9]+\\\\+[0-9]+\\\\.par2|par2)' THEN 1 ELSE 0 END)")
-                ->pluck('c.id');
+        $par2OnlyCollectionIds = DB::table('collections as c')
+            ->join('binaries as b', 'c.id', '=', 'b.collections_id')
+            ->where('c.filecheck', CollectionFileCheckStatus::Sized->value)
+            ->where('c.filesize', '>', 0)
+            ->groupBy('c.id')
+            ->havingRaw("COUNT(b.id) = SUM(CASE WHEN b.name REGEXP '\\\\.(vol[0-9]+\\\\+[0-9]+\\\\.par2|par2)' THEN 1 ELSE 0 END)")
+            ->pluck('c.id')
+            ->all();
 
-            if ($par2OnlyCollectionIds->isNotEmpty()) {
-                $stats['par2Only'] += Collection::query()
-                    ->whereIn('id', $par2OnlyCollectionIds)
-                    ->delete();
-            }
-        }, 10);
+        if ($par2OnlyCollectionIds !== []) {
+            $stats['par2Only'] += $this->collectionCleanupService->deleteCollectionsAndDescendants(
+                $par2OnlyCollectionIds,
+                'Par2-only cleanup',
+                $this->echoCLI
+            );
+        }
 
         foreach ($groupIDs as $grpID) {
             $groupSettings = UsenetGroup::getGroupByID($grpID['id']);
@@ -457,32 +458,48 @@ final class ReleaseProcessingService
                 continue;
             }
 
-            DB::transaction(function () use ($groupMinSize, $groupMinFiles, &$stats): void {
-                $effectiveMinSize = max($groupMinSize, $this->settings->minSizeToFormRelease);
-                if ($effectiveMinSize > 0) {
-                    $stats['minSize'] += Collection::query()
-                        ->where('filecheck', CollectionFileCheckStatus::Sized->value)
-                        ->where('filesize', '>', 0)
-                        ->where('filesize', '<', $effectiveMinSize)
-                        ->delete();
-                }
+            $effectiveMinSize = max($groupMinSize, $this->settings->minSizeToFormRelease);
+            if ($effectiveMinSize > 0) {
+                $ids = Collection::query()
+                    ->where('filecheck', CollectionFileCheckStatus::Sized->value)
+                    ->where('filesize', '>', 0)
+                    ->where('filesize', '<', $effectiveMinSize)
+                    ->pluck('id')
+                    ->all();
+                $stats['minSize'] += $this->collectionCleanupService->deleteCollectionsAndDescendants(
+                    $ids,
+                    'Min-size cleanup',
+                    $this->echoCLI
+                );
+            }
 
-                if ($this->settings->maxSizeToFormRelease > 0) {
-                    $stats['maxSize'] += Collection::query()
-                        ->where('filecheck', CollectionFileCheckStatus::Sized->value)
-                        ->where('filesize', '>', $this->settings->maxSizeToFormRelease)
-                        ->delete();
-                }
+            if ($this->settings->maxSizeToFormRelease > 0) {
+                $ids = Collection::query()
+                    ->where('filecheck', CollectionFileCheckStatus::Sized->value)
+                    ->where('filesize', '>', $this->settings->maxSizeToFormRelease)
+                    ->pluck('id')
+                    ->all();
+                $stats['maxSize'] += $this->collectionCleanupService->deleteCollectionsAndDescendants(
+                    $ids,
+                    'Max-size cleanup',
+                    $this->echoCLI
+                );
+            }
 
-                $effectiveMinFiles = max($groupMinFiles, $this->settings->minFilesToFormRelease);
-                if ($effectiveMinFiles > 0) {
-                    $stats['minFiles'] += Collection::query()
-                        ->where('filecheck', CollectionFileCheckStatus::Sized->value)
-                        ->where('filesize', '>', 0)
-                        ->where('totalfiles', '<', $effectiveMinFiles)
-                        ->delete();
-                }
-            }, 10);
+            $effectiveMinFiles = max($groupMinFiles, $this->settings->minFilesToFormRelease);
+            if ($effectiveMinFiles > 0) {
+                $ids = Collection::query()
+                    ->where('filecheck', CollectionFileCheckStatus::Sized->value)
+                    ->where('filesize', '>', 0)
+                    ->where('totalfiles', '<', $effectiveMinFiles)
+                    ->pluck('id')
+                    ->all();
+                $stats['minFiles'] += $this->collectionCleanupService->deleteCollectionsAndDescendants(
+                    $ids,
+                    'Min-files cleanup',
+                    $this->echoCLI
+                );
+            }
         }
 
         $this->outputCollectionDeleteStats($stats, $startTime);
@@ -993,20 +1010,24 @@ final class ReleaseProcessingService
 
         do {
             try {
-                $groupCondition = $groupID !== 0 ? 'AND groups_id = ? ' : '';
-                $batchLimit = self::BATCH_SIZE;
+                $query = DB::table('collections')
+                    ->where('added', '<', $cutoff)
+                    ->orderBy('id')
+                    ->limit(self::BATCH_SIZE);
+                if ($groupID !== 0) {
+                    $query->where('groups_id', '=', $groupID);
+                }
 
-                $sql = <<<SQL
-                    DELETE FROM collections WHERE id IN (
-                        SELECT id FROM (
-                            SELECT id FROM collections WHERE added < ? {$groupCondition}
-                            ORDER BY id LIMIT {$batchLimit}
-                        ) AS x
-                    )
-                SQL;
+                $ids = $query->pluck('id')->all();
+                if ($ids === []) {
+                    break;
+                }
 
-                $params = $groupID !== 0 ? [$cutoff, $groupID] : [$cutoff];
-                $affected = DB::affectingStatement($sql, $params);
+                $affected = $this->collectionCleanupService->deleteCollectionsAndDescendants(
+                    $ids,
+                    'Stuck collections cleanup',
+                    $this->echoCLI
+                );
                 break;
             } catch (Throwable $e) {
                 $attempt++;

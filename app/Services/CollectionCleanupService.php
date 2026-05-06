@@ -11,6 +11,8 @@ use Illuminate\Support\Str;
 
 class CollectionCleanupService
 {
+    private const MAX_SQL_ROWS_PER_STATEMENT = 500;
+
     /**
      * Maximum number of retries for a lock-related DB error before giving up.
      */
@@ -50,28 +52,27 @@ class CollectionCleanupService
                 ), true);
         }
 
-        // Batch-delete old collections using a safe id-subselect to avoid read-then-delete races.
-        // The DELETE here is single-table (no JOIN), so cross-table deadlocks
-        // are not a concern; the helper still gives us bounded retries with
-        // jittered backoff and re-throws non-lock errors instead of swallowing them.
+        // Batch-delete old collections using select-then-delete so we can
+        // explicitly remove parts/binaries/collections even when FK cascades
+        // are not present in the runtime schema.
         $cutoff = now()->subHours(Settings::settingValue('partretentionhours'));
         $batchDeleted = 0;
         do {
-            $affected = $this->retryOnLockError(
-                fn (): int => DB::affectingStatement(
-                    'DELETE FROM collections WHERE id IN (
-                        SELECT id FROM (
-                            SELECT id FROM collections WHERE dateadded < ? ORDER BY id LIMIT 500
-                        ) AS x
-                    )',
-                    [$cutoff]
-                ),
-                'Cleanup',
-                $echoCLI,
-            );
+            $ids = DB::table('collections')
+                ->where('dateadded', '<', $cutoff)
+                ->orderBy('id')
+                ->limit(self::MAX_SQL_ROWS_PER_STATEMENT)
+                ->pluck('id')
+                ->all();
+
+            if ($ids === []) {
+                break;
+            }
+
+            $affected = $this->deleteCollectionsAndDescendants($ids, 'Cleanup', $echoCLI);
 
             $batchDeleted += $affected;
-            if ($affected < 500) {
+            if ($affected < self::MAX_SQL_ROWS_PER_STATEMENT) {
                 break;
             }
             // Brief pause to reduce pressure on the lock manager in busy systems.
@@ -125,7 +126,7 @@ class CollectionCleanupService
         if ($echoCLI) {
             cli()->primary(
                 'Finished deleting '.$missedDeleted.' collections missed after NZB creation in '.($totalTime).Str::plural(' second', (int) $totalTime).
-                PHP_EOL.'Removed '.number_format($deletedCount).' parts/binaries/collection rows in '.$totalTime.Str::plural(' second', (int) $totalTime),
+                PHP_EOL.'Removed '.number_format($deletedCount).' collections (with related binaries/parts) in '.$totalTime.Str::plural(' second', (int) $totalTime),
                 true
             );
         }
@@ -146,7 +147,7 @@ class CollectionCleanupService
     {
         $deleted = 0;
         $maxBatches = 20; // hard cap per cycle; bounded backlog drain
-        $batchSize = 500;
+        $batchSize = self::MAX_SQL_ROWS_PER_STATEMENT;
 
         for ($i = 0; $i < $maxBatches; $i++) {
             $ids = DB::table('collections as c')
@@ -162,11 +163,7 @@ class CollectionCleanupService
                 break;
             }
 
-            $affected = $this->retryOnLockError(
-                fn (): int => DB::table('collections')->whereIn('id', $ids)->delete(),
-                'Orphan cleanup',
-                $echoCLI,
-            );
+            $affected = $this->deleteCollectionsAndDescendants($ids, 'Orphan cleanup', $echoCLI);
 
             $deleted += $affected;
             if ($affected < $batchSize) {
@@ -199,7 +196,7 @@ class CollectionCleanupService
     {
         $deleted = 0;
         $maxBatches = 20;
-        $batchSize = 500;
+        $batchSize = self::MAX_SQL_ROWS_PER_STATEMENT;
 
         for ($i = 0; $i < $maxBatches; $i++) {
             $ids = DB::table('collections as c')
@@ -214,11 +211,7 @@ class CollectionCleanupService
                 break;
             }
 
-            $affected = $this->retryOnLockError(
-                fn (): int => DB::table('collections')->whereIn('id', $ids)->delete(),
-                'Missed-NZB cleanup',
-                $echoCLI,
-            );
+            $affected = $this->deleteCollectionsAndDescendants($ids, 'Missed-NZB cleanup', $echoCLI);
 
             $deleted += $affected;
             if ($affected < $batchSize) {
@@ -228,6 +221,51 @@ class CollectionCleanupService
         }
 
         return $deleted;
+    }
+
+    /**
+     * Explicitly delete parts, binaries, then collections for the given IDs.
+     * This path does not rely on DB-level cascade constraints.
+     *
+     * @param  list<int>  $collectionIds
+     */
+    public function deleteCollectionsAndDescendants(
+        array $collectionIds,
+        string $label = 'CBP cleanup',
+        bool $echoCLI = false,
+    ): int {
+        if ($collectionIds === []) {
+            return 0;
+        }
+
+        $deletedCollections = 0;
+
+        foreach (array_chunk($collectionIds, self::MAX_SQL_ROWS_PER_STATEMENT) as $chunk) {
+            $placeholders = implode(',', array_fill(0, count($chunk), '?'));
+            $deletedCollections += $this->retryOnLockError(
+                fn (): int => DB::transaction(
+                    function () use ($chunk, $placeholders): int {
+                        DB::statement(
+                            "DELETE FROM parts WHERE binaries_id IN (SELECT id FROM binaries WHERE collections_id IN ({$placeholders}))",
+                            $chunk
+                        );
+                        DB::statement(
+                            "DELETE FROM binaries WHERE collections_id IN ({$placeholders})",
+                            $chunk
+                        );
+
+                        return (int) DB::affectingStatement(
+                            "DELETE FROM collections WHERE id IN ({$placeholders})",
+                            $chunk
+                        );
+                    }
+                ),
+                $label,
+                $echoCLI,
+            );
+        }
+
+        return $deletedCollections;
     }
 
     /**

@@ -21,7 +21,8 @@ use Illuminate\Support\Str;
 class ReleaseCreationService
 {
     public function __construct(
-        private readonly ReleaseCleaningService $releaseCleaning
+        private readonly ReleaseCleaningService $releaseCleaning,
+        private readonly CollectionCleanupService $collectionCleanupService,
     ) {}
 
     /**
@@ -171,9 +172,11 @@ class ReleaseCreationService
                     }
                 }
             } else {
-                DB::transaction(static function () use ($collection) {
-                    Collection::query()->where('collectionhash', $collection->collectionhash)->delete();
-                }, 10);
+                $this->collectionCleanupService->deleteCollectionsAndDescendants(
+                    [$collection->id],
+                    'Duplicate cleanup',
+                    $echoCLI
+                );
 
                 $duplicate++;
             }
