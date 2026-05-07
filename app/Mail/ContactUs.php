@@ -4,13 +4,14 @@ declare(strict_types=1);
 
 namespace App\Mail;
 
+use App\Mail\Concerns\HasBrandedSubject;
 use Illuminate\Bus\Queueable;
 use Illuminate\Mail\Mailable;
 use Illuminate\Queue\SerializesModels;
 
 class ContactUs extends Mailable
 {
-    use Queueable, SerializesModels;
+    use HasBrandedSubject, Queueable, SerializesModels;
 
     public string $mailFrom;
 
@@ -18,24 +19,32 @@ class ContactUs extends Mailable
 
     public string $mailTo;
 
-    /**
-     * Create a new message instance.
-     */
+    public string $site;
+
+    public ?string $preheader;
+
     public function __construct(mixed $mailTo, mixed $mailFrom, mixed $mailBody)
     {
-        $this->mailTo = $mailTo;
-        $this->mailFrom = $mailFrom;
-        $this->mailBody = $mailBody;
+        $this->mailTo = (string) $mailTo;
+        $this->mailFrom = (string) $mailFrom;
+        $this->mailBody = (string) $mailBody;
+        $this->site = (string) config('app.name');
+        $this->preheader = "New contact form submission from {$this->mailFrom}.";
     }
 
     /**
-     * Build the message.
-     *
-     *
      * @throws \Exception
      */
     public function build(): static
     {
-        return $this->from($this->mailTo)->subject('Contact form submitted')->replyTo($this->mailFrom)->view('emails.contactUs')->with(['mailBody' => $this->mailBody]);
+        return $this->from($this->mailTo)
+            ->replyTo($this->mailFrom)
+            ->brandedSubject('Contact form submitted')
+            ->markdown('emails.markdown.contactUs', [
+                'mailBody' => $this->mailBody,
+                'mailFrom' => $this->mailFrom,
+                'site' => $this->site,
+                'preheader' => $this->preheader,
+            ]);
     }
 }

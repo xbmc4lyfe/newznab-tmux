@@ -1,34 +1,35 @@
-@extends('emails.email_layout')
-
-@section('title')
-    {{ $resolved ? 'Incident Resolved' : 'Incident Detected' }} — {{ $services }}
-@endsection
-
-@section('site_name', $site)
-
-@section('content')
-    @if($resolved)
-        <div class="alert-box alert-success">
-            <strong>✅ Resolved</strong> — The following incident has been automatically resolved.
-        </div>
+@php
+    $title = $resolved
+        ? "Incident Resolved — {$services}"
+        : "Incident Detected — {$services}";
+    $impactValue = $incident->impact->value;
+    $alertType = $resolved
+        ? 'success'
+        : ($impactValue === 'critical' ? 'danger' : ($impactValue === 'major' ? 'warning' : 'info'));
+@endphp
+<x-mail.layout :title="$title" :preheader="$preheader" :site-name="$site">
+    @if ($resolved)
+        <x-mail.alert type="success">
+            <strong>Resolved</strong> — The following incident has been automatically resolved.
+        </x-mail.alert>
     @else
-        <div class="alert-box alert-{{ $incident->impact->value === 'critical' ? 'danger' : ($incident->impact->value === 'major' ? 'warning' : 'info') }}">
-            <strong>⚠️ {{ ucfirst($incident->impact->value) }} Impact</strong> — An automated health check has detected a service issue.
-        </div>
+        <x-mail.alert :type="$alertType">
+            <strong>{{ ucfirst($impactValue) }} impact</strong> — An automated health check has detected a service issue.
+        </x-mail.alert>
     @endif
 
-    <table class="status-table">
+    <x-mail.status-table>
         <tr>
             <td class="status-label">Incident</td>
             <td>{{ $incident->title }}</td>
         </tr>
         <tr>
-            <td class="status-label">Affected Services</td>
+            <td class="status-label">Affected services</td>
             <td>{{ $services }}</td>
         </tr>
         <tr>
             <td class="status-label">Impact</td>
-            <td>{{ ucfirst($incident->impact->value) }}</td>
+            <td>{{ ucfirst($impactValue) }}</td>
         </tr>
         <tr>
             <td class="status-label">Status</td>
@@ -38,30 +39,30 @@
             <td class="status-label">Started</td>
             <td>{{ $incident->started_at->format('M j, Y g:i A T') }}</td>
         </tr>
-        @if($resolved && $incident->resolved_at)
-        <tr>
-            <td class="status-label">Resolved</td>
-            <td>{{ $incident->resolved_at->format('M j, Y g:i A T') }}</td>
-        </tr>
-        <tr>
-            <td class="status-label">Duration</td>
-            <td>{{ $incident->started_at->diffForHumans($incident->resolved_at, true) }}</td>
-        </tr>
+        @if ($resolved && $incident->resolved_at)
+            <tr>
+                <td class="status-label">Resolved</td>
+                <td>{{ $incident->resolved_at->format('M j, Y g:i A T') }}</td>
+            </tr>
+            <tr>
+                <td class="status-label">Duration</td>
+                <td>{{ $incident->started_at->diffForHumans($incident->resolved_at, true) }}</td>
+            </tr>
         @endif
-    </table>
+    </x-mail.status-table>
 
-    @if($incident->description)
-        <div class="info-box">
+    @if ($incident->description)
+        <x-mail.info-box>
             <strong>Details:</strong><br>
             {!! nl2br(e($incident->description)) !!}
-        </div>
+        </x-mail.info-box>
     @endif
 
-    <p style="text-align: center; margin-top: 24px;">
-        <a href="{{ $statusUrl }}" class="button">View Status Dashboard</a>
-    </p>
+    <x-mail.button :url="$statusUrl" :color="$resolved ? 'success' : 'primary'">
+        View status dashboard
+    </x-mail.button>
 
     <div class="signature">
         <p>— {{ $site }} Monitoring</p>
     </div>
-@endsection
+</x-mail.layout>

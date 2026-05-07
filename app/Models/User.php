@@ -8,11 +8,11 @@ use App\Enums\SignupError;
 use App\Enums\UserRole;
 use App\Jobs\SendAccountExpiredEmail;
 use App\Jobs\SendAccountWillExpireEmail;
+use App\Notifications\VerifyEmailBranded;
 use App\Rules\ValidEmailDomain;
 use App\Services\InvitationService;
 use Carbon\CarbonImmutable;
 use Illuminate\Auth\MustVerifyEmail as MustVerifyEmailTrait;
-use Illuminate\Auth\Notifications\VerifyEmail;
 use Illuminate\Contracts\Auth\MustVerifyEmail as MustVerifyEmailContract;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
@@ -402,11 +402,15 @@ final class User extends Authenticatable implements HasPasskeys, MustVerifyEmail
     }
 
     /**
-     * Send the standard Laravel email verification notification.
+     * Send the branded email verification notification.
+     *
+     * Uses {@see VerifyEmailBranded} so the verification email renders with
+     * the same themed Markdown components as the rest of the site's
+     * transactional emails (instead of Laravel's default notification look).
      */
     public function sendEmailVerificationNotification(): void
     {
-        $this->notify(new VerifyEmail);
+        $this->notify(new VerifyEmailBranded);
     }
 
     /**

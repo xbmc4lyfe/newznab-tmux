@@ -4,47 +4,39 @@ declare(strict_types=1);
 
 namespace App\Mail;
 
-use App\Models\User;
+use App\Mail\Concerns\HasBrandedSubject;
 use Illuminate\Bus\Queueable;
 use Illuminate\Mail\Mailable;
 use Illuminate\Queue\SerializesModels;
 
 class NewAccountCreatedEmail extends Mailable
 {
-    use Queueable, SerializesModels;
+    use HasBrandedSubject, Queueable, SerializesModels;
 
-    /**
-     * @var User
-     */
-    private $user;
+    public string $username;
 
-    /**
-     * @var mixed
-     */
-    private $siteEmail;
+    public string $site;
 
-    /**
-     * @var mixed
-     */
-    private $siteTitle;
+    public ?string $preheader;
 
-    /**
-     * Create a new message instance.
-     *
-     * @return void
-     */
+    private string $siteEmail;
+
     public function __construct(mixed $user)
     {
-        $this->user = $user;
-        $this->siteEmail = config('mail.from.address');
-        $this->siteTitle = config('app.name');
+        $this->username = (string) $user->username;
+        $this->siteEmail = (string) config('mail.from.address');
+        $this->site = (string) config('app.name');
+        $this->preheader = "New user registered on {$this->site}.";
     }
 
-    /**
-     * Build the message.
-     */
     public function build(): static
     {
-        return $this->from($this->siteEmail)->subject('New account registered')->view('emails.newAccountCreated')->with(['username' => $this->user->username, 'site' => $this->siteTitle]);
+        return $this->from($this->siteEmail)
+            ->brandedSubject('New account registered')
+            ->markdown('emails.markdown.newAccountCreated', [
+                'username' => $this->username,
+                'site' => $this->site,
+                'preheader' => $this->preheader,
+            ]);
     }
 }

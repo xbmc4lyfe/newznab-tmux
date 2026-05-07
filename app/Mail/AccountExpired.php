@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Mail;
 
+use App\Mail\Concerns\HasBrandedSubject;
 use App\Models\User;
 use Illuminate\Bus\Queueable;
 use Illuminate\Mail\Mailable;
@@ -11,32 +12,39 @@ use Illuminate\Queue\SerializesModels;
 
 class AccountExpired extends Mailable
 {
-    use Queueable, SerializesModels;
+    use HasBrandedSubject, Queueable, SerializesModels;
 
-    public User $user;
+    public string $username;
 
-    private mixed $siteEmail;
+    public string $account;
 
-    private mixed $siteTitle;
+    public string $site;
 
-    /**
-     * Create a new message instance.
-     */
+    public ?string $preheader;
+
+    private string $siteEmail;
+
     public function __construct(User $user)
     {
-        $this->user = $user;
-        $this->siteEmail = config('mail.from.address');
-        $this->siteTitle = config('app.name');
+        $this->username = (string) $user->username;
+        $this->account = (string) ($user->role->name ?? 'User');
+        $this->siteEmail = (string) config('mail.from.address');
+        $this->site = (string) config('app.name');
+        $this->preheader = "Your {$this->site} subscription has expired — account downgraded to {$this->account}.";
     }
 
     /**
-     * Build the message.
-     *
-     *
      * @throws \Exception
      */
     public function build(): static
     {
-        return $this->from($this->siteEmail)->subject('Account expired')->view('emails.accountExpired')->with(['account' => $this->user->role->name, 'username' => $this->user->username, 'site' => $this->siteTitle]);
+        return $this->from($this->siteEmail)
+            ->brandedSubject('Your account has expired')
+            ->markdown('emails.markdown.accountExpired', [
+                'username' => $this->username,
+                'account' => $this->account,
+                'site' => $this->site,
+                'preheader' => $this->preheader,
+            ]);
     }
 }

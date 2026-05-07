@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Mail;
 
+use App\Mail\Concerns\HasBrandedSubject;
 use App\Models\User;
 use Illuminate\Bus\Queueable;
 use Illuminate\Mail\Mailable;
@@ -11,32 +12,40 @@ use Illuminate\Queue\SerializesModels;
 
 class AccountWillExpire extends Mailable
 {
-    use Queueable, SerializesModels;
+    use HasBrandedSubject, Queueable, SerializesModels;
 
-    private int $days;
+    public int $days;
 
-    private User $user;
+    public string $username;
 
-    private mixed $siteEmail;
+    public string $account;
 
-    private mixed $siteTitle;
+    public string $site;
 
-    /**
-     * Create a new message instance.
-     */
+    public ?string $preheader;
+
+    private string $siteEmail;
+
     public function __construct(User $user, int $days)
     {
-        $this->user = $user;
         $this->days = $days;
-        $this->siteEmail = config('mail.from.address');
-        $this->siteTitle = config('app.name');
+        $this->username = (string) $user->username;
+        $this->account = (string) ($user->role->name ?? 'User');
+        $this->siteEmail = (string) config('mail.from.address');
+        $this->site = (string) config('app.name');
+        $this->preheader = "Your {$this->account} role expires in {$this->days} day(s).";
     }
 
-    /**
-     * Build the message.
-     */
     public function build(): static
     {
-        return $this->from($this->siteEmail)->subject('Account about to expire')->view('emails.accountAboutToExpire')->with(['account' => $this->user->role->name, 'username' => $this->user->username, 'site' => $this->siteTitle, 'days' => $this->days]);
+        return $this->from($this->siteEmail)
+            ->brandedSubject('Your account is about to expire')
+            ->markdown('emails.markdown.accountWillExpire', [
+                'username' => $this->username,
+                'account' => $this->account,
+                'days' => $this->days,
+                'site' => $this->site,
+                'preheader' => $this->preheader,
+            ]);
     }
 }

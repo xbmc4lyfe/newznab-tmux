@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Mail;
 
+use App\Mail\Concerns\HasBrandedSubject;
 use App\Models\User;
 use Illuminate\Bus\Queueable;
 use Illuminate\Mail\Mailable;
@@ -11,38 +12,32 @@ use Illuminate\Queue\SerializesModels;
 
 class WelcomeEmail extends Mailable
 {
-    use Queueable, SerializesModels;
+    use HasBrandedSubject, Queueable, SerializesModels;
 
-    /**
-     * @var User
-     */
-    private $user;
+    public string $username;
 
-    /**
-     * @var mixed
-     */
-    private $siteEmail;
+    public string $site;
 
-    /**
-     * @var mixed
-     */
-    private $siteTitle;
+    public ?string $preheader;
 
-    /**
-     * Create a new message instance.
-     */
+    private string $siteEmail;
+
     public function __construct(User $user)
     {
-        $this->user = $user;
-        $this->siteEmail = config('mail.from.address');
-        $this->siteTitle = config('app.name');
+        $this->username = (string) $user->username;
+        $this->site = (string) config('app.name');
+        $this->siteEmail = (string) config('mail.from.address');
+        $this->preheader = "Welcome to {$this->site} — your account is ready.";
     }
 
-    /**
-     * Build the message.
-     */
     public function build(): static
     {
-        return $this->from($this->siteEmail)->subject('Welcome to '.$this->siteTitle)->view('emails.welcome')->with(['username' => $this->user->username, 'site' => $this->siteTitle]);
+        return $this->from($this->siteEmail)
+            ->brandedSubject('Welcome to '.$this->site)
+            ->markdown('emails.markdown.welcome', [
+                'username' => $this->username,
+                'site' => $this->site,
+                'preheader' => $this->preheader,
+            ]);
     }
 }

@@ -1,7 +1,7 @@
 <?php
 
 return [
-    'default' => env('MAIL_MAILER', env('MAIL_DRIVER', 'smtp')),
+    'default' => env('MAIL_MAILER', 'smtp'),
 
     'mailers' => [
         'smtp' => [
@@ -46,6 +46,28 @@ return [
         'paths' => [
             resource_path('views/vendor/mail'),
         ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Mail Branding
+    |--------------------------------------------------------------------------
+    |
+    | Shared branding values consumed by both Markdown mailables (themed via
+    | resources/views/vendor/mail/*) and Blade mailables (rendered through the
+    | <x-mail.layout> component). The `subject_prefix` is automatically applied
+    | by the `App\Mail\Concerns\HasBrandedSubject` trait so every email subject
+    | reads "[<App Name>] <subject>" unless an explicit override is supplied.
+    | Set `MAIL_BRAND_LOGO_URL` to a publicly-reachable absolute URL to swap
+    | the text branding for an inline logo.
+    |
+    */
+
+    'brand' => [
+        'logo_url' => env('MAIL_BRAND_LOGO_URL'),
+        'subject_prefix' => env('MAIL_SUBJECT_PREFIX', '['.env('APP_NAME', 'NNTmux').'] '),
+        'queue' => env('MAIL_QUEUE', 'emails'),
+        'incident_queue' => env('MAIL_INCIDENT_QUEUE', 'incidents'),
     ],
 
 ];

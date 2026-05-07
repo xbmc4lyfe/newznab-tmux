@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Mail;
 
+use App\Mail\Concerns\HasBrandedSubject;
 use App\Models\User;
 use Illuminate\Bus\Queueable;
 use Illuminate\Mail\Mailable;
@@ -11,47 +12,39 @@ use Illuminate\Queue\SerializesModels;
 
 class PasswordReset extends Mailable
 {
-    use Queueable, SerializesModels;
+    use HasBrandedSubject, Queueable, SerializesModels;
 
-    /**
-     * @var User
-     */
-    public $user;
+    public string $username;
 
-    /**
-     * @var string
-     */
-    public $newPass;
+    public string $newPass;
 
-    /**
-     * @var mixed
-     */
-    private $siteEmail;
+    public string $site;
 
-    /**
-     * @var mixed
-     */
-    private $siteTitle;
+    public ?string $preheader;
 
-    /**
-     * PasswordReset constructor.
-     */
-    public function __construct(User $user, mixed $newPass)
+    private string $siteEmail;
+
+    public function __construct(User $user, string $newPass)
     {
-        $this->user = $user;
+        $this->username = (string) $user->username;
         $this->newPass = $newPass;
-        $this->siteEmail = config('mail.from.address');
-        $this->siteTitle = config('app.name');
+        $this->siteEmail = (string) config('mail.from.address');
+        $this->site = (string) config('app.name');
+        $this->preheader = 'Your password has been reset — temporary credentials inside.';
     }
 
     /**
-     * Build the message.
-     *
-     *
      * @throws \Exception
      */
     public function build(): static
     {
-        return $this->from($this->siteEmail)->subject('Password reset')->view('emails.passwordReset')->with(['newPass' => $this->newPass, 'userName' => $this->user->username, 'site' => $this->siteTitle]);
+        return $this->from($this->siteEmail)
+            ->brandedSubject('Your password has been reset')
+            ->markdown('emails.markdown.passwordReset', [
+                'username' => $this->username,
+                'newPass' => $this->newPass,
+                'site' => $this->site,
+                'preheader' => $this->preheader,
+            ]);
     }
 }

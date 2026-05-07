@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Mail;
 
+use App\Mail\Concerns\HasBrandedSubject;
 use App\Models\User;
 use Illuminate\Bus\Queueable;
 use Illuminate\Mail\Mailable;
@@ -11,41 +12,39 @@ use Illuminate\Queue\SerializesModels;
 
 class AccountChange extends Mailable
 {
-    use Queueable, SerializesModels;
+    use HasBrandedSubject, Queueable, SerializesModels;
 
-    /**
-     * @var User
-     */
-    public $user;
+    public string $username;
 
-    /**
-     * @var mixed
-     */
-    private $siteEmail;
+    public string $account;
 
-    /**
-     * @var mixed
-     */
-    private $siteTitle;
+    public string $site;
 
-    /**
-     * AccountChange constructor.
-     */
+    public ?string $preheader;
+
+    private string $siteEmail;
+
     public function __construct(User $user)
     {
-        $this->user = $user;
-        $this->siteEmail = config('mail.from.address');
-        $this->siteTitle = config('app.name');
+        $this->username = (string) $user->username;
+        $this->account = (string) ($user->role->name ?? 'User');
+        $this->siteEmail = (string) config('mail.from.address');
+        $this->site = (string) config('app.name');
+        $this->preheader = "Your {$this->site} account level was updated to {$this->account}.";
     }
 
     /**
-     * Build the message.
-     *
-     *
      * @throws \Exception
      */
     public function build(): static
     {
-        return $this->from($this->siteEmail)->subject('Account Changed')->view('emails.accountChange')->with(['account' => $this->user->role->name, 'username' => $this->user->username, 'site' => $this->siteTitle]);
+        return $this->from($this->siteEmail)
+            ->brandedSubject('Account level changed')
+            ->markdown('emails.markdown.accountChange', [
+                'username' => $this->username,
+                'account' => $this->account,
+                'site' => $this->site,
+                'preheader' => $this->preheader,
+            ]);
     }
 }
