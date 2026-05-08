@@ -44,7 +44,7 @@ final class PasskeyLoginController extends Controller
             }
         }
 
-        $passkeyOptionsJson = Session::get('passkey-authentication-options');
+        $passkeyOptionsJson = Session::pull('passkey-authentication-options');
 
         if (! is_string($passkeyOptionsJson) || $passkeyOptionsJson === '') {
             Log::channel('failed_login')->warning(

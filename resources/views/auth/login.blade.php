@@ -43,7 +43,9 @@
                 @endif
 
                 <div x-show="!showPassword" x-cloak>
-                    @include('partials.passkey-authenticate', ['autoPromptPasskey' => ! $errors->any()])
+                    @include('partials.passkey-authenticate', [
+                        'autoPromptPasskey' => ! $errors->any() && ! session()->has('authenticatePasskey::message'),
+                    ])
 
                     <button
                         type="button"
