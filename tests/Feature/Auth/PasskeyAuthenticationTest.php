@@ -128,7 +128,7 @@ class PasskeyAuthenticationTest extends TestCase
         $this->assertSame('You have not verified your email address!', session('authenticatePasskey::message'));
     }
 
-    private function createSchema(): void
+    protected function createSchema(): void
     {
         Schema::create('settings', function (Blueprint $table): void {
             $table->string('name')->primary();
@@ -165,6 +165,7 @@ class PasskeyAuthenticationTest extends TestCase
             $table->timestamp('email_verified_at')->nullable();
             $table->timestamp('lastlogin')->nullable();
             $table->rememberToken();
+            $table->string('session_token', 60)->nullable();
             $table->timestamps();
             $table->softDeletes();
         });
@@ -210,7 +211,7 @@ class PasskeyAuthenticationTest extends TestCase
         });
     }
 
-    private function seedSettings(): void
+    protected function seedSettings(): void
     {
         DB::table('settings')->insert([
             ['name' => 'title', 'value' => 'NNTmux Test'],
@@ -220,7 +221,7 @@ class PasskeyAuthenticationTest extends TestCase
         ]);
     }
 
-    private function createUser(string $email, bool $verified = true): User
+    protected function createUser(string $email, bool $verified = true): User
     {
         $role = Role::query()->firstOrCreate(
             ['name' => 'User', 'guard_name' => 'web'],

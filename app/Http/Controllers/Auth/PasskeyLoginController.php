@@ -8,11 +8,13 @@ use App\Events\UserLoggedIn;
 use App\Http\Controllers\Controller;
 use App\Models\User;
 use App\Support\CaptchaHelper;
+use Illuminate\Auth\Events\OtherDeviceLogout;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Session;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Str;
 use Spatie\LaravelPasskeys\Actions\FindPasskeyToAuthenticateAction;
 use Spatie\LaravelPasskeys\Events\PasskeyUsedToAuthenticateEvent;
 use Spatie\LaravelPasskeys\Http\Requests\AuthenticateUsingPasskeysRequest;
@@ -88,8 +90,18 @@ final class PasskeyLoginController extends Controller
             return back();
         }
 
+        $newSessionToken = Str::random(60);
+
+        $user->setRememberToken(Str::random(60));
+        $user->forceFill([
+            'session_token' => $newSessionToken,
+        ])->save();
+
         Auth::login($user, $request->boolean('remember'));
         $request->session()->regenerate();
+        $request->session()->put('session_token_web', $newSessionToken);
+
+        event(new OtherDeviceLogout(Auth::getDefaultDriver(), $user));
 
         // Passkey auth is treated as sufficient MFA, so skip additional OTP gate.
         session([config('google2fa.session_var') => true]);

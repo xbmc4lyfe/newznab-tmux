@@ -82,6 +82,7 @@ use Spatie\Permission\Traits\HasRoles;
  * @property Carbon|null $pending_role_start_date
  * @property int|null $pending_roles_id
  * @property string|null $remember_token
+ * @property string|null $session_token
  * @property int $rate_limit
  * @property Carbon|null $email_verified_at
  * @property bool $verified
@@ -135,6 +136,7 @@ final class User extends Authenticatable implements HasPasskeys, MustVerifyEmail
      */
     protected $hidden = [
         'remember_token',
+        'session_token',
         'password',
     ];
 

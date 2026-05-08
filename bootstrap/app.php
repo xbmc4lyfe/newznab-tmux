@@ -4,6 +4,7 @@ use App\Http\Middleware\BlockAbusiveServices;
 use App\Http\Middleware\ClearanceMiddleware;
 use App\Http\Middleware\ContentSecurityPolicy;
 use App\Http\Middleware\DegradeWhenRedisUnreachable;
+use App\Http\Middleware\EnforceSessionToken;
 use App\Http\Middleware\EnsureAuthenticatedUsersAreVerified;
 use App\Http\Middleware\ForceJsonOnAPI;
 use App\Http\Middleware\Google2FAMiddleware;
@@ -76,6 +77,7 @@ return Application::configure(basePath: dirname(__DIR__))
 
         $middleware->web([
             AuthenticateSession::class,
+            EnforceSessionToken::class,
             TrustedDevice2FAMiddleware::class, // Add our new trusted device middleware
             ContentSecurityPolicy::class, // Add CSP middleware for security
             SetUserTimezone::class, // Set user timezone
