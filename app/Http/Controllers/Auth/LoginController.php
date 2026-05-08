@@ -11,6 +11,7 @@ use App\Models\User;
 use App\Services\PasswordBreachService;
 use App\Support\Auth\AuthenticatesUsers;
 use Illuminate\Auth\AuthenticationException;
+use Illuminate\Auth\Events\OtherDeviceLogout;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -19,6 +20,7 @@ use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Str;
 
 class LoginController extends Controller
 {
@@ -137,6 +139,7 @@ class LoginController extends Controller
 
                                     // Skip 2FA - proceed with login
                                     Auth::logoutOtherDevices($request->input('password'));
+                                    $this->rotateSessionTokenForCurrentSession($request, $user);
                                     $this->clearLoginAttempts($request);
 
                                     // Check for password breach
@@ -170,6 +173,7 @@ class LoginController extends Controller
                     }
 
                     Auth::logoutOtherDevices($request->input('password'));
+                    $this->rotateSessionTokenForCurrentSession($request, $user);
                     $this->clearLoginAttempts($request);
 
                     // Check for password breach
@@ -282,5 +286,17 @@ class LoginController extends Controller
         }
 
         return $redirect;
+    }
+
+    private function rotateSessionTokenForCurrentSession(Request $request, User $user): void
+    {
+        $newSessionToken = Str::random(60);
+
+        $user->forceFill([
+            'session_token' => $newSessionToken,
+        ])->save();
+
+        $request->session()->put('session_token_web', $newSessionToken);
+        event(new OtherDeviceLogout(Auth::getDefaultDriver(), $user));
     }
 }

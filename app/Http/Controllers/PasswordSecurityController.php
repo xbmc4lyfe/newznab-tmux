@@ -8,6 +8,7 @@ use App\Http\Requests\Disable2faPasswordSecurityRequest;
 use App\Models\PasswordSecurity;
 use App\Models\User;
 use App\Services\PasswordBreachService;
+use Illuminate\Auth\Events\OtherDeviceLogout;
 use Illuminate\Contracts\View\Factory;
 use Illuminate\Contracts\View\View;
 use Illuminate\Foundation\Application;
@@ -17,6 +18,7 @@ use Illuminate\Routing\Redirector;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 use PragmaRX\Google2FA\Exceptions\IncompatibleWithGoogleAuthenticatorException;
 use PragmaRX\Google2FA\Exceptions\InvalidCharactersException;
 use PragmaRX\Google2FA\Exceptions\SecretKeyTooShortException;
@@ -196,6 +198,18 @@ class PasswordSecurityController extends Controller
 
         // Clean up the temporary session variables
         $passwordToCheck = $request->session()->get('2fa:password_check');
+
+        if (is_string($passwordToCheck) && $passwordToCheck !== '') {
+            Auth::logoutOtherDevices($passwordToCheck);
+        }
+
+        $newSessionToken = Str::random(60);
+        $user->forceFill([
+            'session_token' => $newSessionToken,
+        ])->save();
+        $request->session()->put('session_token_web', $newSessionToken);
+        event(new OtherDeviceLogout(Auth::getDefaultDriver(), $user));
+
         $request->session()->forget(['2fa:user:id', '2fa:remember', '2fa:password_check']);
 
         // Determine where to redirect after successful verification
