@@ -128,6 +128,20 @@ class PasskeyAuthenticationTest extends TestCase
         $this->assertSame('You have not verified your email address!', session('authenticatePasskey::message'));
     }
 
+    public function test_passkey_authentication_without_session_options_redirects_with_message(): void
+    {
+        $response = $this
+            ->from(route('login'))
+            ->post(route('passkeys.login'), [
+                'start_authentication_response' => json_encode(['id' => 'credential-x'], JSON_THROW_ON_ERROR),
+            ]);
+
+        $response->assertRedirect(route('login'));
+        $this->assertGuest();
+        $this->assertSame('missing_auth_options', session('authenticatePasskey::reason'));
+        $this->assertStringContainsString('expired', (string) session('authenticatePasskey::message'));
+    }
+
     protected function createSchema(): void
     {
         Schema::create('settings', function (Blueprint $table): void {

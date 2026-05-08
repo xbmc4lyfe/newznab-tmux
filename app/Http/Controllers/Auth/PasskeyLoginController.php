@@ -44,6 +44,22 @@ final class PasskeyLoginController extends Controller
             }
         }
 
+        $passkeyOptionsJson = Session::get('passkey-authentication-options');
+
+        if (! is_string($passkeyOptionsJson) || $passkeyOptionsJson === '') {
+            Log::channel('failed_login')->warning(
+                'Passkey login submitted without passkey-authentication-options in session from IP address: '.$request->ip()
+            );
+
+            session()->flash(
+                'authenticatePasskey::message',
+                'Your passkey sign-in session expired or was interrupted. Please try signing in with a passkey again.'
+            );
+            session()->flash('authenticatePasskey::reason', 'missing_auth_options');
+
+            return back();
+        }
+
         $findAuthenticatableUsingPasskey = Config::getAction(
             'find_passkey',
             FindPasskeyToAuthenticateAction::class
@@ -51,7 +67,7 @@ final class PasskeyLoginController extends Controller
 
         $passkey = $findAuthenticatableUsingPasskey->execute(
             $request->input('start_authentication_response'),
-            Session::get('passkey-authentication-options'),
+            $passkeyOptionsJson,
         );
 
         if (! $passkey || ! $passkey->authenticatable instanceof User) {
