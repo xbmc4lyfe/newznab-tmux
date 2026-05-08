@@ -106,7 +106,6 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
             'isrenamed' => 0,
             'guid' => str_repeat('a', 40),
             'leftguid' => 'a',
-            'nzb_guid' => 'test',
             'size' => 1,
             'postdate' => now(),
             'adddate' => now(),
@@ -154,7 +153,6 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
             'isrenamed' => 0,
             'guid' => str_repeat('b', 40),
             'leftguid' => 'b',
-            'nzb_guid' => 'test-olympics',
             'size' => 1,
             'postdate' => now(),
             'adddate' => now(),
@@ -200,7 +198,6 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
             'isrenamed' => 1,
             'guid' => str_repeat('c', 40),
             'leftguid' => 'c',
-            'nzb_guid' => 'test-southern-charm',
             'size' => 1,
             'postdate' => now(),
             'adddate' => now(),
@@ -298,7 +295,6 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
                 $table->tinyInteger('proc_crc32')->default(0);
                 $table->tinyInteger('passwordstatus')->default(0);
                 $table->tinyInteger('nzbstatus')->default(0);
-                $table->binary('nzb_guid')->nullable();
             });
         }
     }

@@ -29,7 +29,6 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * @property string $shareid
  * @property string $siteid
  * @property int|null $sourceid
- * @property mixed $nzb_guid
  * @property-read Release $release
  * @property-read User $user
  *
@@ -40,7 +39,6 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * @method static \Illuminate\Database\Eloquent\Builder|\App\Models\ReleaseComment whereId($value)
  * @method static \Illuminate\Database\Eloquent\Builder|\App\Models\ReleaseComment whereIssynced($value)
  * @method static \Illuminate\Database\Eloquent\Builder|\App\Models\ReleaseComment whereIsvisible($value)
- * @method static \Illuminate\Database\Eloquent\Builder|\App\Models\ReleaseComment whereNzbGuid($value)
  * @method static \Illuminate\Database\Eloquent\Builder|\App\Models\ReleaseComment whereReleasesId($value)
  * @method static \Illuminate\Database\Eloquent\Builder|\App\Models\ReleaseComment whereShared($value)
  * @method static \Illuminate\Database\Eloquent\Builder|\App\Models\ReleaseComment whereShareid($value)

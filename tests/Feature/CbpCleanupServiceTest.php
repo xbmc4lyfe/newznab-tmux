@@ -89,7 +89,6 @@ class CbpCleanupServiceTest extends TestCase
             'iscategorized' => 1,
             'predb_id' => 0,
             'source' => null,
-            'nzb_guid' => null,
         ]);
 
         DB::table('collections')->insert([
@@ -158,7 +157,6 @@ class CbpCleanupServiceTest extends TestCase
             'iscategorized' => 1,
             'predb_id' => 0,
             'source' => null,
-            'nzb_guid' => null,
         ]);
 
         DB::table('collections')->insert([
@@ -244,8 +242,7 @@ class CbpCleanupServiceTest extends TestCase
             isrenamed INTEGER,
             iscategorized INTEGER,
             predb_id INTEGER,
-            source VARCHAR(255) NULL,
-            nzb_guid BLOB NULL
+            source VARCHAR(255) NULL
         )');
         DB::statement('CREATE TABLE collections (
             id INTEGER PRIMARY KEY,

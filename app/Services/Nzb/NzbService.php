@@ -124,8 +124,6 @@ class NzbService
         $XMLWriter->setIndent(true);
         $XMLWriter->setIndentString('  ');
 
-        $nzb_guid = '';
-
         $XMLWriter->startDocument('1.0', 'UTF-8');
         $XMLWriter->startDtd(self::NZB_DTD_NAME, self::NZB_DTD_PUBLIC, self::NZB_DTD_EXTERNAL);
         $XMLWriter->endDtd();
@@ -181,9 +179,6 @@ class NzbService
                 $XMLWriter->startElement('segments');
                 foreach ($parts as $part) {
                     $messageId = $this->normalizeSegmentMessageId($part->messageid);
-                    if ($nzb_guid === '') {
-                        $nzb_guid = $messageId;
-                    }
                     $XMLWriter->startElement('segment');
                     $XMLWriter->writeAttribute('bytes', (string) $part->size);
                     $XMLWriter->writeAttribute('number', (string) $part->partnumber);
@@ -212,9 +207,6 @@ class NzbService
         }
         // Mark release as having NZB.
         $release->update(['nzbstatus' => self::NZB_ADDED]);
-        if (! empty($nzb_guid)) {
-            $release->update(['nzb_guid' => DB::raw('UNHEX( '.escapeString(md5((string) $nzb_guid)).' )')]);
-        }
 
         // Delete CBP (Collections, Binaries, Parts) for release that has its NZB created.
         // Use a transaction to ensure cascading deletes complete properly.

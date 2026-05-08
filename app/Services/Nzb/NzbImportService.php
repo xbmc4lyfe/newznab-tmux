@@ -58,11 +58,6 @@ class NzbImportService
     public NzbService $nzb;
 
     /**
-     * The MD5 hash of the first segment Message-ID of the NZB
-     */
-    protected string $nzbGuid;
-
-    /**
      * @param  array<string, mixed>  $options
      */
     public function __construct(array $options = [])
@@ -123,8 +118,6 @@ class NzbImportService
 
         // Loop over the NZB file names only.
         foreach ($nzbFiles as $nzbFilePath) {
-            $this->nzbGuid = '';
-
             // Check if the file is really there.
             if (File::isFile($nzbFilePath)) {
                 // Get the contents of the NZB file as a string.
@@ -187,7 +180,6 @@ class NzbImportService
                         }
                         $nzbsSkipped++;
                     } else {
-                        $this->updateNzbGuid();
                         if ($delete) {
                             // Remove the nzb file.
                             File::delete($nzbFilePath);
@@ -339,17 +331,6 @@ class NzbImportService
         // After scanning all files, persist any matched whitelist/blacklist usage
         $this->blacklistService->updateBlacklistUsage($this->blacklistService->getAndClearIdsToUpdate()); // @phpstan-ignore argument.type
 
-        // Sort values alphabetically but keep the keys intact
-        if (\count($binary_names) > 0) {
-            asort($binary_names);
-            foreach ($nzbXML->file as $file) {
-                if ($file['subject'] === $binary_names[0]) {
-                    $this->nzbGuid = md5((string) $file->segments->segment);
-                    break;
-                }
-            }
-        }
-
         // Try to insert the NZB details into the DB.
         return $this->insertNZB(
             [
@@ -467,18 +448,6 @@ class NzbImportService
             $this->retVal .= $message.'<br />';
         } elseif ($this->echoCLI) {
             cli()->notice($message);
-        }
-    }
-
-    /**
-     * The function updates the NZB guid after there is no chance of deletion.
-     */
-    protected function updateNzbGuid(): void
-    {
-        try {
-            Release::query()->where('guid', $this->relGuid)->update(['nzb_guid' => sodium_hex2bin($this->nzbGuid)]);
-        } catch (\SodiumException $e) {
-            $this->echoOut('ERROR: Problem updating nzb_guid for: '.$this->relGuid);
         }
     }
 }
