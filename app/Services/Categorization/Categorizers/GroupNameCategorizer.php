@@ -23,6 +23,9 @@ class GroupNameCategorizer extends AbstractCategorizer
         if (empty($groupName)) {
             return $this->noMatch();
         }
+        if (preg_match('/alt\.binaries\..*anime/i', $groupName)) {
+            return $this->matched(Category::TV_ANIME, 0.8, 'group_name_anime');
+        }
         if (preg_match('/alt\.binaries\..*?(tv|hdtv|tvseries)/i', $groupName)) {
             return $this->matched(Category::TV_OTHER, 0.6, 'group_name_tv');
         }

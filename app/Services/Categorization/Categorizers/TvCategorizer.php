@@ -17,6 +17,12 @@ class TvCategorizer extends AbstractCategorizer
 
     private const string SPORTS_EVENT_CONTEXT_REGEX = '/\d{4}|\b(Season|Week|Round|Match|Game|vs|Playoffs?|Finals?|Qualifying|Opening|Closing|Ceremony|Championship)\b/i';
 
+    /**
+     * Known anime release/fansub group tags. Matches when the tag appears
+     * as a standalone token in the release name (bracketed, dotted, etc.).
+     */
+    private const string ANIME_GROUPS_REGEX = '/(?:^|[.\-_ \[])(URANiME|ANiHLS|HaiKU|ANiURL|SkyAnime|Erai-raws|LostYears|Vodes|SubsPlease|Judas|Ember|EMBER|YuiSubs|ASW|Tsundere-Raws|Anime-Raws|Kekkan|SSA|MoyaiSubs|QCE|Nyanpasu|UCCUSS|NS|DKB|MTBB|NanDesuKa|smol|Cleo|ToshY|Kawaiika-Raws|Beatrice-Raws|Reaktor|FLE|Commie|HorribleSubs|Doki|FFF|UTW|Coalgirls|CoalGuys|Mezashite|Vivid|Kaylith|Underwater|gg|Chihiro|Hatsuyuki|Mazui|WhyNot|Migoto|Doutei|GJM|Asenshi|Inka-Subs|Akatsuki)(?:[.\-_ \]]|$)/i';
+
     protected int $priority = 20;
 
     public function getName(): string
@@ -32,6 +38,13 @@ class TvCategorizer extends AbstractCategorizer
     public function categorize(ReleaseContext $context): CategorizationResult
     {
         $name = $context->releaseName;
+
+        // High-signal anime checks first. These can match release names that
+        // don't follow standard TV S01E01 naming conventions (e.g. anime
+        // fansub releases like "[Group] Show - 08 [1080p]").
+        if ($result = $this->checkAnimeStrongSignals($name, $context)) {
+            return $result;
+        }
 
         if (! $this->looksLikeTV($name)) {
             return $this->noMatch();
@@ -106,24 +119,51 @@ class TvCategorizer extends AbstractCategorizer
             return true;
         }
         // Known anime release groups (should be treated as TV)
-        if (preg_match('/(?:^|[.\-_ \[])(URANiME|ANiHLS|HaiKU|ANiURL|SkyAnime|Erai-raws|LostYears|Vodes|SubsPlease|Judas|Ember|EMBER|YuiSubs|ASW|Tsundere-Raws|Anime-Raws|Kekkan)(?:[.\-_ \]]|$)/i', $name)) {
+        if (preg_match(self::ANIME_GROUPS_REGEX, $name)) {
             return true;
         }
 
         return false;
     }
 
+    /**
+     * Strong, gate-bypassing anime signals: Anime Tosho poster, anime usenet
+     * groups, and anime hash patterns. These can match even when the release
+     * name doesn't look like a typical TV release.
+     */
+    protected function checkAnimeStrongSignals(string $name, ReleaseContext $context): ?CategorizationResult
+    {
+        // Anime Tosho poster (very strong signal)
+        if ($context->poster !== '' && preg_match('/animetosho\.org/i', $context->poster)) {
+            return $this->matched(Category::TV_ANIME, 0.98, 'anime_tosho_poster');
+        }
+        // Usenet group dedicated to anime (e.g. alt.binaries.*anime*)
+        if ($context->groupName !== '' && preg_match('/alt\.binaries\..*anime/i', $context->groupName)) {
+            return $this->matched(Category::TV_ANIME, 0.9, 'anime_group_name');
+        }
+        // Known anime fansub/release group tag
+        if (preg_match(self::ANIME_GROUPS_REGEX, $name)) {
+            return $this->matched(Category::TV_ANIME, 0.92, 'anime_group');
+        }
+        // Anime hash pattern: [GroupName] Title - 01 [ABCD1234]
+        if (preg_match('/^\[.+\].*\d{2,3}.*\[[a-fA-F0-9]{8}\]/i', $name)) {
+            return $this->matched(Category::TV_ANIME, 0.9, 'anime_hash');
+        }
+
+        return null;
+    }
+
     protected function checkAnime(string $name, ReleaseContext $context): ?CategorizationResult
     {
         // Check for Anime Tosho poster
-        if (preg_match('/animetosho\.org|usenet\.bot@animetosho\.org/i', $context->poster)) {
+        if ($context->poster !== '' && preg_match('/animetosho\.org/i', $context->poster)) {
             return $this->matched(Category::TV_ANIME, 0.98, 'anime_tosho_poster');
         }
         if (preg_match('/[._ -]Anime[._ -]/i', $name)) {
             return $this->matched(Category::TV_ANIME, 0.95, 'anime_pattern');
         }
         // Known anime release groups - matches with brackets, dots, dashes, underscores, spaces, or at the start
-        if (preg_match('/(?:^|[.\-_ \[])(URANiME|ANiHLS|HaiKU|ANiURL|SkyAnime|Erai-raws|LostYears|Vodes|SubsPlease|Judas|Ember|EMBER|YuiSubs|ASW|Tsundere-Raws|Anime-Raws|Kekkan)(?:[.\-_ \]]|$)/i', $name)) {
+        if (preg_match(self::ANIME_GROUPS_REGEX, $name)) {
             return $this->matched(Category::TV_ANIME, 0.95, 'anime_group');
         }
         // Anime hash pattern: [GroupName] Title - 01 [ABCD1234]
