@@ -98,4 +98,3 @@ final class CategorizeAnimeTest extends TestCase
         $this->assertSame('group_name_anime', $result->matchedBy);
     }
 }
-
