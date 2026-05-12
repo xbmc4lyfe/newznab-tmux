@@ -152,7 +152,7 @@ class NzbImportService
                 }
 
                 // Try to insert the NZB details into the DB.
-                $nzbFileName = $useNzbName === true ? str_ireplace('.nzb', '', basename($nzbFilePath)) : '';
+                $nzbFileName = $useNzbName === true ? $this->deriveReleaseNameFromNzbPath($nzbFilePath) : '';
                 try {
                     $importStatus = $this->scanNZBFile($nzbXML, $nzbFileName, $source);
                 } catch (\Exception $e) {
@@ -230,6 +230,30 @@ class NzbImportService
         }
 
         return true;
+    }
+
+    /**
+     * Derive a clean release name from an NZB file path by stripping the
+     * trailing ".nzb"/".nzb.gz" wrapper and a known trailing media/container
+     * extension (e.g. ".mkv", ".mp4"). Example:
+     *   "Show - S01E07 [1080p].mkv.nzb.gz" => "Show - S01E07 [1080p]".
+     */
+    protected function deriveReleaseNameFromNzbPath(string $path): string
+    {
+        $name = basename($path);
+
+        // Strip trailing .nzb or .nzb.gz (case-insensitive).
+        $name = preg_replace('/\.nzb(\.gz)?$/i', '', $name) ?? $name;
+
+        // Strip one trailing known media/container extension from the allow-list.
+        $name = preg_replace(
+            '/\.(mkv|mp4|avi|mov|wmv|flv|m4v|ts|webm|mpg|mpeg|iso|m2ts|ogm|divx|vob)$/i',
+            '',
+            $name
+        ) ?? $name;
+
+        // Tidy up any trailing dots/whitespace left behind.
+        return rtrim($name, ". \t\n\r\0\x0B");
     }
 
     /**

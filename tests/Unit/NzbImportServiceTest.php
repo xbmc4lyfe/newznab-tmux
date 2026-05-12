@@ -10,6 +10,7 @@ use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use PDO;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
 
 final class NzbImportServiceTest extends TestCase
@@ -188,6 +189,43 @@ final class NzbImportServiceTest extends TestCase
         $this->assertFileDoesNotExist($duplicateFile);
         $this->assertFileDoesNotExist($blacklistedFile);
         $this->assertFileDoesNotExist($noGroupFile);
+    }
+
+    /**
+     * @return array<string, array{0: string, 1: string}>
+     */
+    public static function nzbFilenameProvider(): array
+    {
+        return [
+            'plain .nzb' => ['foo.nzb', 'foo'],
+            'plain .nzb.gz' => ['foo.nzb.gz', 'foo'],
+            'mkv wrapper' => ['foo.mkv.nzb.gz', 'foo'],
+            'uppercase wrapper' => ['bar.MP4.NZB.GZ', 'bar'],
+            'release with brackets' => [
+                '[DKB] Kami-tachi ni Hirowareta Otoko - S01E07 [1080p][H.265 10bit].mkv.nzb.gz',
+                '[DKB] Kami-tachi ni Hirowareta Otoko - S01E07 [1080p][H.265 10bit]',
+            ],
+            'non-media inner ext stays' => ['release.name.nzb.gz', 'release.name'],
+            'no trailing media ext' => ['something.nzb', 'something'],
+            'full path input' => ['/tmp/nested/path/Show - 01.mp4.nzb.gz', 'Show - 01'],
+        ];
+    }
+
+    /**
+     * @dataProvider nzbFilenameProvider
+     */
+    #[DataProvider('nzbFilenameProvider')]
+    public function test_derive_release_name_strips_wrapper_and_media_extension(string $input, string $expected): void
+    {
+        $service = new class(['Browser' => true]) extends NzbImportService
+        {
+            public function deriveForTest(string $path): string
+            {
+                return $this->deriveReleaseNameFromNzbPath($path);
+            }
+        };
+
+        $this->assertSame($expected, $service->deriveForTest($input));
     }
 
     private function makeNzbFile(string $suffix): string
