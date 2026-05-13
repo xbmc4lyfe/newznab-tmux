@@ -9,6 +9,7 @@ use App\Models\Release;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use Carbon\Carbon;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
 use Throwable;
 
 class NntmuxSearchReconcile extends Command
@@ -80,6 +81,14 @@ class NntmuxSearchReconcile extends Command
             $this->line('Sample ids: '.implode(', ', $sample));
         }
 
+        // Hardening: if a dry-run with a non-trivial scan reports 100% missing, that almost
+        // always indicates a response-shape regression in fetchIndexedIds() (see
+        // Manticoresearch\Response\SqlToArray::getResponse()). Emit a single warning with a
+        // small probe sample so the regression is obvious without flooding logs.
+        if ($dryRun && $scanned >= 50 && $missingTotal === $scanned) {
+            $this->probeAndWarnAllMissing($manticore, $index, \array_slice($missingAll, 0, 5));
+        }
+
         if ($missingTotal === 0) {
             return self::SUCCESS;
         }
@@ -145,17 +154,96 @@ class NntmuxSearchReconcile extends Command
             return [];
         }
 
-        if (! \is_array($response) || ! isset($response['data']) || ! \is_array($response['data'])) {
+        if (! \is_array($response)) {
             return [];
         }
 
+        $requested = array_flip($ids);
         $out = [];
-        foreach ($response['data'] as $row) {
-            if (isset($row['id'])) {
-                $out[] = (int) $row['id'];
+
+        // In raw mode (sql($q, true)) the response goes through
+        // Manticoresearch\Response\SqlToArray::getResponse() which FLATTENS a SELECT result
+        // into [id => id] for single-column projections (or [id => rowArray] for multi-column).
+        // The old `$response['data']` shape only exists for non-raw mode or pre-4.x clients.
+        foreach ($response as $key => $value) {
+            // Top-level numeric keys mirror row ids (single-column id projection).
+            if (\is_int($key) || (\is_string($key) && ctype_digit($key))) {
+                $id = (int) $key;
+                if (isset($requested[$id])) {
+                    $out[$id] = $id;
+                }
+            }
+            // Multi-column rows: value is an array possibly containing 'id'.
+            if (\is_array($value) && isset($value['id'])) {
+                $id = (int) $value['id'];
+                if (isset($requested[$id])) {
+                    $out[$id] = $id;
+                }
+            }
+            // Scalar value that itself is the id (defensive).
+            if (\is_int($value) || (\is_string($value) && ctype_digit($value))) {
+                $id = (int) $value;
+                if (isset($requested[$id])) {
+                    $out[$id] = $id;
+                }
             }
         }
 
-        return $out;
+        // Legacy fallback: ['data' => [['id' => N], ...]] (non-raw / older client).
+        if ($out === [] && isset($response['data']) && \is_array($response['data'])) {
+            foreach ($response['data'] as $row) {
+                if (\is_array($row) && isset($row['id'])) {
+                    $id = (int) $row['id'];
+                    if (isset($requested[$id])) {
+                        $out[$id] = $id;
+                    }
+                }
+            }
+        }
+
+        return array_values($out);
+    }
+
+    /**
+     * Emit a single warning when a dry-run scan reports 100% missing. Logs a small sample
+     * of the raw Manticore response so a future SqlToArray shape change is easy to spot.
+     *
+     * @param  list<int>  $sampleIds
+     */
+    private function probeAndWarnAllMissing(ManticoreSearchDriver $driver, string $index, array $sampleIds): void
+    {
+        if ($sampleIds === []) {
+            return;
+        }
+
+        $list = implode(',', array_map(static fn (int $id): string => (string) $id, $sampleIds));
+        $safeIndex = str_replace('`', '``', $index);
+        $sql = "SELECT id FROM `{$safeIndex}` WHERE id IN ({$list})";
+
+        $rawShape = 'unavailable';
+        try {
+            $response = $driver->manticoreSearch->sql($sql, true);
+            if (\is_array($response)) {
+                $rawShape = json_encode([
+                    'top_keys' => \array_slice(array_keys($response), 0, 10),
+                    'has_data_key' => isset($response['data']),
+                    'size' => \count($response),
+                ], JSON_UNESCAPED_SLASHES) ?: 'encode_failed';
+            } else {
+                $rawShape = 'non_array:'.\gettype($response);
+            }
+        } catch (Throwable $e) {
+            $rawShape = 'exception:'.$e->getMessage();
+        }
+
+        $message = sprintf(
+            'nntmux:search-reconcile reported 100%% missing for index "%s" — possible Manticore client response-shape regression. Probe sample ids=%s shape=%s',
+            $index,
+            implode(',', $sampleIds),
+            $rawShape,
+        );
+
+        $this->warn($message);
+        Log::warning($message);
     }
 }

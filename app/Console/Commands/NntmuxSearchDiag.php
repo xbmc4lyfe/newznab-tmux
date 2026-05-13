@@ -118,6 +118,31 @@ class NntmuxSearchDiag extends Command
             return [];
         }
 
+        // In raw mode (sql($q, true)) the response goes through
+        // Manticoresearch\Response\SqlToArray::getResponse(), which flattens a SELECT
+        // result so each row is keyed by its `id` (and the `id` column is removed from
+        // multi-column rows). Reconstruct row arrays here. The legacy
+        // ['data' => [...]] shape is retained as a fallback.
+        $rows = [];
+        foreach ($response as $key => $value) {
+            if (\is_int($key) || (\is_string($key) && ctype_digit($key))) {
+                if (\is_array($value)) {
+                    $row = $value;
+                    if (! isset($row['id'])) {
+                        $row['id'] = (int) $key;
+                    }
+                    $rows[] = $row;
+                } else {
+                    // Single-column id projection: value mirrors the key.
+                    $rows[] = ['id' => (int) $key];
+                }
+            }
+        }
+
+        if ($rows !== []) {
+            return $rows;
+        }
+
         if (isset($response['data']) && \is_array($response['data'])) {
             return array_values($response['data']);
         }
