@@ -8,6 +8,7 @@ use App\Services\CollectionCleanupService;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
+use App\Services\Releases\ReleaseDuplicateFinder;
 use Illuminate\Support\Facades\DB;
 use Tests\TestCase;
 
@@ -21,6 +22,20 @@ class CbpCleanupServiceTest extends TestCase
         DB::purge();
         DB::reconnect();
         DB::connection()->getPdo()->sqliteCreateFunction('UNIX_TIMESTAMP', static fn (?string $value): int => strtotime((string) $value));
+        DB::connection()->getPdo()->sqliteCreateFunction(
+            'REGEXP',
+            static function (?string $subject, ?string $pattern): int {
+                if ($subject === null || $pattern === null || $pattern === '') {
+                    return 0;
+                }
+                set_error_handler(static fn (): true => true);
+                $ok = @preg_match($pattern, $subject);
+                restore_error_handler();
+
+                return $ok ? 1 : 0;
+            },
+            2
+        );
 
         $this->createTables();
         $this->seedSettings();
@@ -192,7 +207,8 @@ class CbpCleanupServiceTest extends TestCase
 
         $service = new ReleaseCreationService(
             app(ReleaseCleaningService::class),
-            app(CollectionCleanupService::class)
+            app(CollectionCleanupService::class),
+            app(ReleaseDuplicateFinder::class)
         );
         $result = $service->createReleases(null, 10, false);
 
@@ -200,6 +216,145 @@ class CbpCleanupServiceTest extends TestCase
         $this->assertSame(0, DB::table('parts')->count());
         $this->assertSame(0, DB::table('binaries')->count());
         $this->assertSame(0, DB::table('collections')->count());
+    }
+
+    public function test_release_duplicate_finder_matches_searchname_within_size_band(): void
+    {
+        DB::table('releases')->insert([
+            'id' => 20,
+            'name' => 'raw-obfuscated-a',
+            'searchname' => 'Unified.Scene.S01E01.1080p',
+            'totalpart' => 1,
+            'groups_id' => 1,
+            'adddate' => now()->format('Y-m-d H:i:s'),
+            'guid' => str_repeat('c', 36),
+            'leftguid' => 'c',
+            'postdate' => now()->format('Y-m-d H:i:s'),
+            'fromname' => 'poster-a@example.com',
+            'size' => 1_000_000,
+            'passwordstatus' => 0,
+            'haspreview' => -1,
+            'categories_id' => 1,
+            'nfostatus' => -1,
+            'nzbstatus' => NzbService::NZB_NONE,
+            'isrenamed' => 1,
+            'iscategorized' => 1,
+            'predb_id' => 0,
+            'source' => null,
+        ]);
+
+        $finder = app(ReleaseDuplicateFinder::class);
+        [$dup, $reason] = $finder->findDuplicate(
+            'raw-obfuscated-b',
+            'Unified.Scene.S01E01.1080p',
+            0,
+            1_020_000
+        );
+
+        $this->assertNotNull($dup);
+        $this->assertSame('searchname_match', $reason);
+    }
+
+    public function test_release_duplicate_finder_matches_predb_id_when_searchname_differs(): void
+    {
+        DB::table('releases')->insert([
+            'id' => 21,
+            'name' => 'old',
+            'searchname' => 'Old Style Name',
+            'totalpart' => 1,
+            'groups_id' => 1,
+            'adddate' => now()->format('Y-m-d H:i:s'),
+            'guid' => str_repeat('d', 36),
+            'leftguid' => 'd',
+            'postdate' => now()->format('Y-m-d H:i:s'),
+            'fromname' => 'p@example.com',
+            'size' => 2_000_000,
+            'passwordstatus' => 0,
+            'haspreview' => -1,
+            'categories_id' => 1,
+            'nfostatus' => -1,
+            'nzbstatus' => NzbService::NZB_NONE,
+            'isrenamed' => 1,
+            'iscategorized' => 1,
+            'predb_id' => 9001,
+            'source' => null,
+        ]);
+
+        $finder = app(ReleaseDuplicateFinder::class);
+        [$dup, $reason] = $finder->findDuplicate(
+            'new',
+            'New Style Name',
+            9001,
+            2_050_000
+        );
+
+        $this->assertNotNull($dup);
+        $this->assertSame('predb_id_match', $reason);
+    }
+
+    public function test_release_duplicate_finder_does_not_match_outside_size_tolerance(): void
+    {
+        config(['nntmux.release_dedupe_size_tolerance' => 0.05]);
+
+        DB::table('releases')->insert([
+            'id' => 22,
+            'name' => 'x',
+            'searchname' => 'Same.Search',
+            'totalpart' => 1,
+            'groups_id' => 1,
+            'adddate' => now()->format('Y-m-d H:i:s'),
+            'guid' => str_repeat('e', 36),
+            'leftguid' => 'e',
+            'postdate' => now()->format('Y-m-d H:i:s'),
+            'fromname' => 'p@example.com',
+            'size' => 1_000_000,
+            'passwordstatus' => 0,
+            'haspreview' => -1,
+            'categories_id' => 1,
+            'nfostatus' => -1,
+            'nzbstatus' => NzbService::NZB_NONE,
+            'isrenamed' => 1,
+            'iscategorized' => 1,
+            'predb_id' => 0,
+            'source' => null,
+        ]);
+
+        $finder = app(ReleaseDuplicateFinder::class);
+        [$dup] = $finder->findDuplicate('x', 'Same.Search', 0, 1_200_000);
+
+        $this->assertNull($dup);
+    }
+
+    public function test_release_duplicate_finder_falls_back_to_name_when_searchname_empty(): void
+    {
+        DB::table('releases')->insert([
+            'id' => 23,
+            'name' => 'fallback.unique',
+            'searchname' => '',
+            'totalpart' => 1,
+            'groups_id' => 1,
+            'adddate' => now()->format('Y-m-d H:i:s'),
+            'guid' => str_repeat('f', 36),
+            'leftguid' => 'f',
+            'postdate' => now()->format('Y-m-d H:i:s'),
+            'fromname' => 'p@example.com',
+            'size' => 500,
+            'passwordstatus' => 0,
+            'haspreview' => -1,
+            'categories_id' => 1,
+            'nfostatus' => -1,
+            'nzbstatus' => NzbService::NZB_NONE,
+            'isrenamed' => 1,
+            'iscategorized' => 1,
+            'predb_id' => 0,
+            'source' => null,
+        ]);
+
+        $finder = app(ReleaseDuplicateFinder::class);
+        [$dup, $reason] = $finder->findDuplicate('fallback.unique', '', 0, 500);
+
+        $this->assertNotNull($dup);
+        $this->assertSame('name_match_fallback', $reason);
     }
 
     private function seedSettings(): void
@@ -273,6 +428,25 @@ class CbpCleanupServiceTest extends TestCase
             messageid VARCHAR(255),
             partnumber INTEGER,
             size INTEGER
+        )');
+        DB::statement('CREATE TABLE release_naming_regexes (
+            id INTEGER PRIMARY KEY,
+            group_regex VARCHAR(255),
+            regex VARCHAR(255),
+            status INTEGER DEFAULT 1,
+            ordinal INTEGER DEFAULT 0
+        )');
+        DB::statement('CREATE TABLE collection_regexes (
+            id INTEGER PRIMARY KEY,
+            group_regex VARCHAR(255),
+            regex VARCHAR(255),
+            status INTEGER DEFAULT 1,
+            ordinal INTEGER DEFAULT 0
+        )');
+        DB::statement('CREATE TABLE predb (
+            id INTEGER PRIMARY KEY,
+            title VARCHAR(255),
+            filename VARCHAR(255)
         )');
         DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.test']);
         DB::table('categories')->insert(['id' => 1, 'title' => 'Misc', 'parent_categories_id' => null]);

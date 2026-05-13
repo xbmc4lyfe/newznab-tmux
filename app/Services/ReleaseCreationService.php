@@ -14,8 +14,10 @@ use App\Models\ReleasesGroups;
 use App\Models\UsenetGroup;
 use App\Services\Categorization\CategorizationService;
 use App\Services\Nzb\NzbService;
+use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Support\Utf8;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 class ReleaseCreationService
@@ -23,6 +25,7 @@ class ReleaseCreationService
     public function __construct(
         private readonly ReleaseCleaningService $releaseCleaning,
         private readonly CollectionCleanupService $collectionCleanupService,
+        private readonly ReleaseDuplicateFinder $releaseDuplicateFinder,
     ) {}
 
     /**
@@ -62,46 +65,48 @@ class ReleaseCreationService
             $cleanRelName = Utf8::clean(str_replace(['#', '@', '$', '%', '^', '§', '¨', '©', 'Ö'], '', $collection->subject));
             $fromName = Utf8::clean(trim($collection->fromname, "'"));
 
-            // Deduplicate by name, from, and ~size
-            $dupeCheck = Release::query()
-                ->where(['name' => $cleanRelName, 'fromname' => $fromName])
-                ->whereBetween('size', [$collection->filesize * .99, $collection->filesize * 1.01])
-                ->first(['id']);
+            $cleanedMeta = $this->releaseCleaning->releaseCleaner(
+                $collection->subject,
+                $collection->fromname,
+                $collection->gname
+            );
+
+            $namingRegexId = 0;
+            if (\is_array($cleanedMeta)) {
+                $namingRegexId = isset($cleanedMeta['id']) ? (int) $cleanedMeta['id'] : 0;
+            }
+
+            if (\is_array($cleanedMeta)) {
+                $properName = $cleanedMeta['properlynamed'] ?? false;
+                $preID = $cleanedMeta['predb'] ?? false;
+                $cleanedName = $cleanedMeta['cleansubject'] ?? $cleanRelName;
+            } else {
+                $properName = true;
+                $preID = false;
+                $cleanedName = $cleanRelName;
+            }
+
+            if ($preID === false && $cleanedName !== '') {
+                $preMatch = Predb::matchPre($cleanedName);
+                if ($preMatch !== false) {
+                    $cleanedName = $preMatch['title'];
+                    $preID = $preMatch['predb_id'];
+                    $properName = true;
+                }
+            }
+
+            $searchName = ! empty($cleanedName) ? Utf8::clean($cleanedName) : $cleanRelName;
+            $predbIdInt = $preID === false ? 0 : (int) $preID;
+
+            [$dupeCheck, $dupeReason] = $this->releaseDuplicateFinder->findDuplicate(
+                $cleanRelName,
+                $searchName,
+                $predbIdInt,
+                (int) $collection->filesize
+            );
 
             if ($dupeCheck === null) {
-                $cleanedMeta = $this->releaseCleaning->releaseCleaner(
-                    $collection->subject,
-                    $collection->fromname,
-                    $collection->gname
-                );
-
-                $namingRegexId = 0;
-                if (\is_array($cleanedMeta)) {
-                    $namingRegexId = isset($cleanedMeta['id']) ? (int) $cleanedMeta['id'] : 0;
-                }
-
-                if (\is_array($cleanedMeta)) {
-                    $properName = $cleanedMeta['properlynamed'] ?? false;
-                    $preID = $cleanedMeta['predb'] ?? false;
-                    $cleanedName = $cleanedMeta['cleansubject'] ?? $cleanRelName;
-                } else {
-                    $properName = true;
-                    $preID = false;
-                    $cleanedName = $cleanRelName;
-                }
-
-                if ($preID === false && $cleanedName !== '') {
-                    $preMatch = Predb::matchPre($cleanedName);
-                    if ($preMatch !== false) {
-                        $cleanedName = $preMatch['title'];
-                        $preID = $preMatch['predb_id'];
-                        $properName = true;
-                    }
-                }
-
                 $determinedCategory = $categorize->determineCategory($collection->groups_id, $cleanedName, $fromName);
-
-                $searchName = ! empty($cleanedName) ? Utf8::clean($cleanedName) : $cleanRelName;
 
                 $releaseID = Release::insertRelease([
                     'name' => $cleanRelName,
@@ -114,7 +119,7 @@ class ReleaseCreationService
                     'size' => $collection->filesize,
                     'categories_id' => $determinedCategory['categories_id'] ?? Category::OTHER_MISC,
                     'isrenamed' => $properName === true ? 1 : 0,
-                    'predb_id' => $preID === false ? 0 : $preID,
+                    'predb_id' => $predbIdInt,
                     'nzbstatus' => NzbService::NZB_NONE,
                 ]);
 
@@ -172,6 +177,19 @@ class ReleaseCreationService
                     }
                 }
             } else {
+                Log::info('Release import skipped as duplicate', [
+                    'reason' => $dupeReason,
+                    'matched_release_id' => $dupeCheck->id,
+                    'new_searchname' => $searchName,
+                    'existing_searchname' => $dupeCheck->searchname,
+                    'new_size' => (int) $collection->filesize,
+                    'existing_size' => (int) $dupeCheck->size,
+                    'new_fromname' => $fromName,
+                    'existing_fromname' => $dupeCheck->fromname,
+                    'new_name' => $cleanRelName,
+                    'existing_name' => $dupeCheck->name,
+                ]);
+
                 $this->collectionCleanupService->deleteCollectionsAndDescendants(
                     [$collection->id],
                     'Duplicate cleanup',

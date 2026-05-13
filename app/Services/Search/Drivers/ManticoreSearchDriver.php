@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Search\Drivers;
 
 use App\Enums\SecondarySearchIndex;
+use App\Jobs\ReindexReleaseJob;
 use App\Models\BookInfo;
 use App\Models\ConsoleInfo;
 use App\Models\GamesInfo;
@@ -168,26 +169,95 @@ class ManticoreSearchDriver implements SearchDriverInterface
             return;
         }
 
-        try {
-            $document = ReleaseSearchIndexDocument::normalize($parameters);
-            unset($document['id']);
+        $releaseId = (int) $parameters['id'];
+        if (! $this->replaceReleaseDocumentWithRetry($parameters)) {
+            $this->recordReleaseIndexFailure($releaseId, 'insertRelease');
+            try {
+                ReindexReleaseJob::dispatch($releaseId)->delay(now()->addSeconds(2));
+            } catch (\Throwable $e) {
+                Log::error('ManticoreSearch: failed to queue ReindexReleaseJob', [
+                    'release_id' => $releaseId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+    }
 
-            $this->manticoreSearch->table($this->config['indexes']['releases'])
-                ->replaceDocument($document, $parameters['id']);
+    /**
+     * @param  array<string, mixed>  $parameters
+     */
+    private function replaceReleaseDocumentWithRetry(array $parameters): bool
+    {
+        $document = ReleaseSearchIndexDocument::normalize($parameters);
+        unset($document['id']);
 
-        } catch (ResponseException $e) {
-            Log::error('ManticoreSearch insertRelease ResponseException: '.$e->getMessage(), [
-                'release_id' => $parameters['id'],
-                'index' => $this->config['indexes']['releases'],
+        $indexName = $this->config['indexes']['releases'];
+        $releaseId = (int) $parameters['id'];
+
+        for ($attempt = 0; $attempt < 2; $attempt++) {
+            try {
+                $this->manticoreSearch->table($indexName)
+                    ->replaceDocument($document, $releaseId);
+
+                return true;
+            } catch (\Throwable $e) {
+                $isResponse = $e instanceof ResponseException;
+                $isManticoreRuntime = $e instanceof RuntimeException;
+
+                if (($isResponse || $isManticoreRuntime) && $attempt === 0) {
+                    usleep(100_000);
+
+                    continue;
+                }
+
+                if ($isResponse) {
+                    Log::error('ManticoreSearch insertRelease ResponseException: '.$e->getMessage(), [
+                        'release_id' => $releaseId,
+                        'index' => $indexName,
+                    ]);
+
+                    return false;
+                }
+
+                if ($isManticoreRuntime) {
+                    Log::error('ManticoreSearch insertRelease RuntimeException: '.$e->getMessage(), [
+                        'release_id' => $releaseId,
+                    ]);
+
+                    return false;
+                }
+
+                Log::error('ManticoreSearch insertRelease unexpected error: '.$e->getMessage(), [
+                    'release_id' => $releaseId,
+                    'trace' => $e->getTraceAsString(),
+                ]);
+
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    private function recordReleaseIndexFailure(int $releaseId, string $phase): void
+    {
+        Cache::increment('search:index:failures:releases');
+        if (Cache::add('search:index:release_index_warn_lock', true, 60)) {
+            Log::warning('ManticoreSearch: release indexing failure', [
+                'release_id_sample' => $releaseId,
+                'phase' => $phase,
+                'failures_total' => (int) Cache::get('search:index:failures:releases', 0),
             ]);
-        } catch (RuntimeException $e) {
-            Log::error('ManticoreSearch insertRelease RuntimeException: '.$e->getMessage(), [
-                'release_id' => $parameters['id'],
-            ]);
-        } catch (\Throwable $e) {
-            Log::error('ManticoreSearch insertRelease unexpected error: '.$e->getMessage(), [
-                'release_id' => $parameters['id'],
-                'trace' => $e->getTraceAsString(),
+        }
+    }
+
+    private function recordReleaseNotFoundForIndex(int|string $releaseID): void
+    {
+        Cache::increment('search:index:failures:release_not_found');
+        if (Cache::add('search:index:release_not_found_warn_lock', true, 60)) {
+            Log::warning('ManticoreSearch: release not found when updating index', [
+                'release_id' => $releaseID,
+                'not_found_total' => (int) Cache::get('search:index:failures:release_not_found', 0),
             ]);
         }
     }
@@ -648,11 +718,13 @@ class ManticoreSearchDriver implements SearchDriverInterface
                 $this->insertRelease($release->toArray());
             } else {
                 Log::warning('ManticoreSearch: Release not found for update', ['id' => $releaseID]);
+                $this->recordReleaseNotFoundForIndex($releaseID);
             }
         } catch (\Throwable $e) {
             Log::error('ManticoreSearch updateRelease error: '.$e->getMessage(), [
                 'release_id' => $releaseID,
             ]);
+            $this->recordReleaseIndexFailure((int) $releaseID, 'updateRelease_query');
         }
     }
 

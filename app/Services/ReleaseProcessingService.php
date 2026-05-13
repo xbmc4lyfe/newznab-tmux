@@ -16,6 +16,7 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseBrowseService;
+use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseManagementService;
 use App\Support\Data\ProcessReleasesSettings;
 use App\Support\Data\ReleaseCreationResult;
@@ -89,7 +90,11 @@ final class ReleaseProcessingService
             ?? new CollectionCleanupService;
 
         $this->releaseCreationService = $releaseCreationService
-            ?? new ReleaseCreationService($this->releaseCleaning, $this->collectionCleanupService);
+            ?? new ReleaseCreationService(
+                $this->releaseCleaning,
+                $this->collectionCleanupService,
+                app(ReleaseDuplicateFinder::class)
+            );
         $this->postProcessService = $postProcessService;
 
         $this->settings = $this->loadSettings();

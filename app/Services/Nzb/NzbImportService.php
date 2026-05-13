@@ -5,15 +5,19 @@ declare(strict_types=1);
 namespace App\Services\Nzb;
 
 use App\Enums\NzbImportStatus;
+use App\Models\Predb;
 use App\Models\Release;
 use App\Models\Settings;
 use App\Models\UsenetGroup;
 use App\Services\BlacklistService;
 use App\Services\Categorization\CategorizationService;
 use App\Services\ReleaseCleaningService;
+use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Support\Utf8;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 /**
@@ -30,6 +34,8 @@ class NzbImportService
     protected mixed $crossPostt;
 
     protected CategorizationService $category;
+
+    protected ReleaseDuplicateFinder $releaseDuplicateFinder;
 
     /**
      * List of all the group names/ids in the DB.
@@ -67,6 +73,7 @@ class NzbImportService
         $this->category = new CategorizationService;
         $this->nzb = app(NzbService::class);
         $this->releaseCleaner = new ReleaseCleaningService;
+        $this->releaseDuplicateFinder = app(ReleaseDuplicateFinder::class);
         $this->crossPostt = Settings::settingValue('crossposttime') !== '' ? Settings::settingValue('crossposttime') : 2;
 
         // Set properties from options
@@ -386,50 +393,88 @@ class NzbImportService
         $subject = mb_convert_encoding(trim(preg_replace('/yEnc.*$/i', 'yEnc', $partLess)), 'UTF-8', mb_list_encodings());
 
         $renamed = 0;
+        $cleanedMeta = null;
         if ($nzbDetails['useFName'] !== '') {
-            // If we are using the filename as the subject. We don't need to clean it.
             $cleanName = $nzbDetails['useFName'];
             $renamed = 1;
         } else {
-            // Pass the subject through release cleaner to get a nicer name.
-            $cleanName = $this->releaseCleaner->releaseCleaner($subject, $nzbDetails['from'], $nzbDetails['groupName']);
-            if (isset($cleanName['properlynamed'])) {
-                $cleanName = $cleanName['cleansubject'];
-                $renamed = (isset($cleanName['properlynamed']) && $cleanName['properlynamed'] === true ? 1 : 0);
+            $cleanedMeta = $this->releaseCleaner->releaseCleaner($subject, $nzbDetails['from'], $nzbDetails['groupName']);
+            if (\is_array($cleanedMeta)) {
+                $cleanName = $cleanedMeta['cleansubject'] ?? $subject;
+                $renamed = (isset($cleanedMeta['properlynamed']) && $cleanedMeta['properlynamed'] === true) ? 1 : 0;
+            } else {
+                $cleanName = \is_string($cleanedMeta) ? $cleanedMeta : $subject;
+            }
+        }
+
+        if (! \is_string($cleanName)) {
+            $cleanName = $subject;
+        }
+
+        $preIdFromCleaner = 0;
+        if (\is_array($cleanedMeta) && isset($cleanedMeta['predb']) && (int) $cleanedMeta['predb'] > 0) {
+            $preIdFromCleaner = (int) $cleanedMeta['predb'];
+        }
+
+        $predbIdInt = $preIdFromCleaner;
+        if ($predbIdInt === 0 && $cleanName !== '') {
+            $preMatch = Predb::matchPre($cleanName);
+            if ($preMatch !== false) {
+                $cleanName = $preMatch['title'];
+                $predbIdInt = (int) $preMatch['predb_id'];
+                $renamed = 1;
             }
         }
 
         $escapedSubject = $subject;
         $escapedFromName = $nzbDetails['from'];
+        $escapedSearchName = Utf8::clean($cleanName);
+        if ($escapedSearchName === '') {
+            $escapedSearchName = $escapedSubject;
+        }
 
-        // Look for a duplicate on name, poster and size.
-        $dupeCheck = Release::query()->where(['name' => $escapedSubject, 'fromname' => $escapedFromName])->whereBetween('size', [$nzbDetails['totalSize'] * 0.99, $nzbDetails['totalSize'] * 1.01])->first(['id']);
+        [$dupeCheck, $dupeReason] = $this->releaseDuplicateFinder->findDuplicate(
+            $escapedSubject,
+            $escapedSearchName,
+            $predbIdInt,
+            (int) $nzbDetails['totalSize']
+        );
 
-        if ($dupeCheck === null) {
-            $escapedSearchName = $cleanName;
-            $determinedCategory = $this->category->determineCategory($nzbDetails['groups_id'], $cleanName, $escapedFromName);
-            // Insert the release into the DB.
-            $relID = Release::insertRelease(
-                [
-                    'name' => $escapedSubject,
-                    'searchname' => $escapedSearchName ?? $escapedSubject,
-                    'totalpart' => $nzbDetails['totalFiles'],
-                    'groups_id' => $nzbDetails['groups_id'],
-                    'guid' => $this->relGuid,
-                    'postdate' => $nzbDetails['postDate'],
-                    'fromname' => $escapedFromName,
-                    'size' => $nzbDetails['totalSize'],
-                    'categories_id' => $determinedCategory['categories_id'],
-                    'isrenamed' => $renamed,
-                    'predb_id' => 0,
-                    'nzbstatus' => NzbService::NZB_ADDED,
-                ]
-            );
-        } else {
+        if ($dupeCheck !== null) {
+            Log::info('NZB import skipped as duplicate', [
+                'reason' => $dupeReason,
+                'matched_release_id' => $dupeCheck->id,
+                'new_searchname' => $escapedSearchName,
+                'existing_searchname' => $dupeCheck->searchname,
+                'new_size' => (int) $nzbDetails['totalSize'],
+                'existing_size' => (int) $dupeCheck->size,
+                'new_fromname' => $escapedFromName,
+                'existing_fromname' => $dupeCheck->fromname,
+                'new_name' => $escapedSubject,
+                'existing_name' => $dupeCheck->name,
+            ]);
             $this->echoOut('This release is already in our DB so skipping: '.$subject);
 
             return NzbImportStatus::Duplicate;
         }
+
+        $determinedCategory = $this->category->determineCategory($nzbDetails['groups_id'], $cleanName, $escapedFromName);
+        $relID = Release::insertRelease(
+            [
+                'name' => $escapedSubject,
+                'searchname' => $escapedSearchName,
+                'totalpart' => $nzbDetails['totalFiles'],
+                'groups_id' => $nzbDetails['groups_id'],
+                'guid' => $this->relGuid,
+                'postdate' => $nzbDetails['postDate'],
+                'fromname' => $escapedFromName,
+                'size' => $nzbDetails['totalSize'],
+                'categories_id' => $determinedCategory['categories_id'],
+                'isrenamed' => $renamed,
+                'predb_id' => $predbIdInt,
+                'nzbstatus' => NzbService::NZB_ADDED,
+            ]
+        );
 
         if ($relID === null) {
             $this->echoOut('ERROR: Problem inserting: '.$subject);
