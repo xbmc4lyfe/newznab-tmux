@@ -146,7 +146,12 @@ class NntmuxSearchReconcile extends Command
 
         $list = implode(',', array_map(static fn (int $id): string => (string) $id, $ids));
         $safeIndex = str_replace('`', '``', $index);
-        $sql = "SELECT id FROM `{$safeIndex}` WHERE id IN ({$list})";
+        // Manticore SQL applies an implicit LIMIT 20 when no LIMIT clause is given, AND
+        // max_matches defaults to 1000. Without explicitly raising both, our IN() probe
+        // would only return the first 20 (or 1000) matches per batch, falsely flagging
+        // the rest as missing. Use the actual batch size with a small ceiling cushion.
+        $limit = max(\count($ids), 1);
+        $sql = "SELECT id FROM `{$safeIndex}` WHERE id IN ({$list}) LIMIT {$limit} OPTION max_matches={$limit}";
 
         try {
             $response = $driver->manticoreSearch->sql($sql, true);
@@ -218,7 +223,8 @@ class NntmuxSearchReconcile extends Command
 
         $list = implode(',', array_map(static fn (int $id): string => (string) $id, $sampleIds));
         $safeIndex = str_replace('`', '``', $index);
-        $sql = "SELECT id FROM `{$safeIndex}` WHERE id IN ({$list})";
+        $limit = max(\count($sampleIds), 1);
+        $sql = "SELECT id FROM `{$safeIndex}` WHERE id IN ({$list}) LIMIT {$limit} OPTION max_matches={$limit}";
 
         $rawShape = 'unavailable';
         try {
