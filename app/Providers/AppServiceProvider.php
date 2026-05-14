@@ -49,12 +49,14 @@ class AppServiceProvider extends ServiceProvider
         // Share global data with layouts and all admin views
         // Admin child views need direct registration because @section blocks
         // are evaluated before the layout composer runs
+        // Same for search.* so category menu data (e.g. parentcatlist) exists in @section('content')
         view()->composer([
             'layouts.main',
             'layouts.admin',
             'layouts.guest',
             'layouts.app',
             'admin.*',
+            'search.*',
         ], GlobalDataComposer::class);
 
         Gate::define('viewPulse', function (User $user) {

@@ -59,20 +59,22 @@
                     @if(isset($parentcatlist))
                         @foreach($parentcatlist as $parentcat)
                             @php
+                                $parentId = is_object($parentcat) ? $parentcat->id : ($parentcat['id'] ?? '');
                                 $parentTitle = is_object($parentcat) ? $parentcat->title : ($parentcat['title'] ?? 'Category');
                                 $subcategories = is_object($parentcat) ? $parentcat->categories : ($parentcat['categories'] ?? []);
                             @endphp
-                            <optgroup label="{{ $parentTitle }}">
-                                @foreach($subcategories as $subcat)
-                                    @php
-                                        $subcatId = is_object($subcat) ? $subcat->id : ($subcat['id'] ?? '');
-                                        $subcatTitle = is_object($subcat) ? $subcat->title : ($subcat['title'] ?? '');
-                                    @endphp
-                                    <option value="{{ $subcatId }}" {{ request('t') == $subcatId ? 'selected' : '' }}>
-                                        {{ $subcatTitle }}
-                                    </option>
-                                @endforeach
-                            </optgroup>
+                            <option value="{{ $parentId }}" class="font-semibold" {{ request('t') == $parentId ? 'selected' : '' }}>
+                                {{ $parentTitle }}
+                            </option>
+                            @foreach($subcategories as $subcat)
+                                @php
+                                    $subcatId = is_object($subcat) ? $subcat->id : ($subcat['id'] ?? '');
+                                    $subcatTitle = is_object($subcat) ? $subcat->title : ($subcat['title'] ?? '');
+                                @endphp
+                                <option value="{{ $subcatId }}" {{ request('t') == $subcatId ? 'selected' : '' }}>
+                                    &nbsp;&nbsp;{{ $subcatTitle }}
+                                </option>
+                            @endforeach
                         @endforeach
                     @elseif(isset($catlist))
                         @foreach($catlist as $catId => $catTitle)

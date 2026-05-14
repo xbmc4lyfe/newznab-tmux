@@ -66,6 +66,7 @@ class ReleaseSearchService
             Log::debug('ReleaseSearchService::search called', [
                 'searchArr' => $searchArr,
                 'limit' => $limit,
+                'type' => $type,
             ]);
         }
 
@@ -89,9 +90,7 @@ class ReleaseSearchService
                 }
             }
 
-            $categoryIdsRaw = $type === 'basic'
-                ? Category::getCategorySearch($cat, null, true)
-                : (((int) ($cat[0] ?? -1) !== -1) ? [(int) $cat[0]] : null);
+            $categoryIdsRaw = Category::getCategorySearch($cat, null, true);
 
             $categoryIds = null;
             if (is_array($categoryIdsRaw)) {
@@ -176,7 +175,6 @@ class ReleaseSearchService
             $daysOld,
             $maxAge,
             $excludedCats,
-            $type,
             $cat,
             $minSize
         );
@@ -1723,7 +1721,6 @@ class ReleaseSearchService
         mixed $daysOld,
         int $maxAge,
         array $excludedCats,
-        string $type,
         array $cat,
         int $minSize
     ): string {
@@ -1755,7 +1752,7 @@ class ReleaseSearchService
         }
 
         // Category conditions - only add if not empty
-        $catQuery = $this->buildCategoryCondition($type, $cat);
+        $catQuery = $this->buildCategoryCondition($cat);
         if (! empty($catQuery) && $catQuery !== '1=1') {
             $conditions[] = $catQuery;
         }
@@ -1851,26 +1848,18 @@ class ReleaseSearchService
     }
 
     /**
-     * Build category condition based on search type
+     * Build category condition for web search (basic and advanced).
      *
      * @param  array<int|string, mixed>  $cat  Category IDs (list or associative)
      */
-    private function buildCategoryCondition(string $type, array $cat): string
+    private function buildCategoryCondition(array $cat): string
     {
-        if ($type === 'basic') {
-            $catSearch = Category::getCategorySearch($cat);
-            // Remove WHERE and AND from the beginning as we're building it into a larger WHERE clause
-            $catSearch = preg_replace('/^(WHERE|AND)\s+/i', '', trim($catSearch));
+        $catSearch = Category::getCategorySearch($cat);
+        // Remove WHERE and AND from the beginning as we're building it into a larger WHERE clause
+        $catSearch = preg_replace('/^(WHERE|AND)\s+/i', '', trim((string) $catSearch));
 
-            // Don't return '1=1' as it's not needed
-            return ($catSearch === '1=1') ? '' : $catSearch;
-        }
-
-        if ($type === 'advanced' && (int) $cat[0] !== -1) {
-            return sprintf('r.categories_id = %d', (int) $cat[0]);
-        }
-
-        return '';
+        // Don't return '1=1' as it's not needed
+        return ($catSearch === '1=1') ? '' : $catSearch;
     }
 
     /**
