@@ -567,8 +567,9 @@ class ApiController extends BasePageController
                 }
                 break;
                 //
-                // nzb add request
+                // nzb / nfo add request
                 // curl -X POST -F "file=@./The.File.nzb" "site_url/api/V1/api?t=nzbadd&apikey=xxx"
+                // curl -X POST -F "file=@./The.File.nfo" "site_url/api/V1/api?t=nzbadd&apikey=xxx"
                 //
             case 'nzbAdd':
                 if (! User::canPost($uid)) {
@@ -576,14 +577,14 @@ class ApiController extends BasePageController
                 }
 
                 if ($request->missing('file')) {
-                    return showApiError(200, 'Missing parameter (file is required for adding an NZB)');
+                    return showApiError(200, 'Missing parameter (file is required for adding an NZB or NFO)');
                 }
                 if ($request->missing('apikey')) {
-                    return showApiError(200, 'Missing parameter (apikey is required for adding an NZB)');
+                    return showApiError(200, 'Missing parameter (apikey is required for adding an NZB or NFO)');
                 }
 
                 if (! $request->hasFile('file')) {
-                    return showApiError(600, 'Failed to load NZB');
+                    return showApiError(600, 'Failed to load upload (no file)');
                 }
 
                 UserRequest::addApiRequest($uid, $request->getRequestUri());
@@ -592,20 +593,32 @@ class ApiController extends BasePageController
 
                 // Save the file to the server, get the name without the extension.
                 if ($nzbFile !== null) {
-                    // We need to check if file is an actual nzb file.
-                    if ($nzbFile->getClientOriginalExtension() !== 'nzb') {
-                        return showApiError(600, 'Failed to load NZB (file is not an NZB file)');
+                    $ext = strtolower((string) $nzbFile->getClientOriginalExtension());
+                    if (! in_array($ext, ['nzb', 'nfo'], true)) {
+                        return showApiError(600, 'Failed to load NZB (file is not an NZB or NFO file)');
                     }
-                    // Check if the file is proper xml nzb file.
-                    if (! isValidNewznabNzb($nzbFile->getContent())) {
+
+                    $content = $nzbFile->getContent();
+                    if (! is_string($content)) {
+                        return showApiError(600, 'Failed to load upload');
+                    }
+
+                    if ($ext === 'nzb' && ! isValidNewznabNzb($content)) {
                         return showApiError(600, 'Failed to load NZB (invalid NZB payload)');
                     }
+
+                    // Same max raw size as NfoService::MAX_NFO_SIZE (64KB).
+                    $maxNfoUploadBytes = 65535;
+                    if ($ext === 'nfo' && ($content === '' || strlen($content) > $maxNfoUploadBytes)) {
+                        return showApiError(600, 'Failed to load NFO (empty or too large)');
+                    }
+
                     if (! File::isDirectory(config('nntmux.nzb_upload_folder'))) {
                         @File::makeDirectory(config('nntmux.nzb_upload_folder'), 0775, true);
                     }
 
-                    if (File::put(config('nntmux.nzb_upload_folder').$nzbFile->getClientOriginalName(), $nzbFile->getContent())) {
-                        Log::channel('nzb_upload')->info('NZB file uploaded by API: '.$nzbFile->getClientOriginalName());
+                    if (File::put(config('nntmux.nzb_upload_folder').$nzbFile->getClientOriginalName(), $content)) {
+                        Log::channel('nzb_upload')->info('File uploaded by API: '.$nzbFile->getClientOriginalName().' (type: '.$ext.')');
 
                         $successXml = sprintf(
                             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<success id=\"0\" guid=\"\" categoryid=\"%s\" name=\"%s\" />\n",
@@ -616,14 +629,14 @@ class ApiController extends BasePageController
                         return response($successXml, 200)->header('Content-type', 'text/xml');
                     }
 
-                    Log::channel('nzb_upload')->warning('NZB file uploaded by API failed: '.$nzbFile->getClientOriginalName());
+                    Log::channel('nzb_upload')->warning('File upload by API failed to write: '.$nzbFile->getClientOriginalName().' (type: '.$ext.')');
                 } else {
-                    Log::channel('nzb_upload')->warning('NZB file uploaded by API failed: no file provided');
+                    Log::channel('nzb_upload')->warning('File upload by API failed: no file provided');
 
-                    return showApiError(603, 'NZB failed to write to disk');
+                    return showApiError(603, 'Failed to write file to disk');
                 }
 
-                return showApiError(603, 'NZB failed to write to disk');
+                return showApiError(603, 'Failed to write file to disk');
 
                 break;
 

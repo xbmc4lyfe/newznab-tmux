@@ -225,10 +225,15 @@ newznab-tmux https://github.com/NNTmux/newznab-tmux
    Parameters:
    t=nzbadd
    apikey=xxxx
-   file=<multipart nzb file>
+   file=<multipart nzb or nfo file>
 
    Optional:
    cat, includemeta, dupecheck, nfo, medianfo
+
+   Behavior:
+   Valid .nzb and .nfo uploads are written to the same NZB upload folder
+   (NZB_UPLOAD_FOLDER). NFO files are not linked to releases at upload time;
+   a separate import command is expected to process them later.
 
    Error handling:
    Uses XML error codes from section 6.
