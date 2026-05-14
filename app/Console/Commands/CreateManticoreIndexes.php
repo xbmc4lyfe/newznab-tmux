@@ -90,10 +90,10 @@ class CreateManticoreIndexes extends Command
                     'adddate_ts' => ['type' => 'bigint'],
                     'totalpart' => ['type' => 'integer'],
                     'grabs' => ['type' => 'integer'],
-                    'passwordstatus' => ['type' => 'integer'],
+                    'passwordstatus' => ['type' => 'bigint'],
                     'groups_id' => ['type' => 'integer'],
                     'nzbstatus' => ['type' => 'integer'],
-                    'haspreview' => ['type' => 'integer'],
+                    'haspreview' => ['type' => 'bigint'],
                 ],
             ],
             'predb_rt' => [
