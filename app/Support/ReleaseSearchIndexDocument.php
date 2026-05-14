@@ -10,6 +10,26 @@ namespace App\Support;
 final class ReleaseSearchIndexDocument
 {
     /**
+     * Normalize a release row for bulk indexing. Rows already produced by {@see normalize()}
+     * (e.g. from release search populate) lack `postdate` / `adddate` keys;
+     * calling {@see normalize()} again would zero `postdate_ts` / `adddate_ts` unless those sources are restored.
+     *
+     * @param  array<string, mixed>  $row
+     * @return array<string, mixed>
+     */
+    public static function normalizeForBulk(array $row): array
+    {
+        if (array_key_exists('postdate_ts', $row) && ! array_key_exists('postdate', $row)) {
+            $row = array_merge($row, [
+                'postdate' => $row['postdate_ts'] ?? null,
+                'adddate' => $row['adddate_ts'] ?? null,
+            ]);
+        }
+
+        return self::normalize($row);
+    }
+
+    /**
      * @param  array<string, mixed>  $row  Keys from DB or insert parameters
      * @return array<string, mixed>
      */

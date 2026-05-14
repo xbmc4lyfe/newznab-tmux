@@ -366,7 +366,7 @@ class ManticoreSearchDriver implements SearchDriverInterface
 
             $documents[] = array_merge(
                 ['id' => $release['id']],
-                ReleaseSearchIndexDocument::normalize($release)
+                ReleaseSearchIndexDocument::normalizeForBulk($release)
             );
         }
 
