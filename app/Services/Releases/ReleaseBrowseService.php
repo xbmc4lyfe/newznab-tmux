@@ -117,7 +117,7 @@ class ReleaseBrowseService
                     'min_size' => $minSize,
                     'max_age_days' => $maxAge,
                     'groups_id' => $groupId,
-                    'password_allow_rar' => str_contains($this->showPasswords(), '<='),
+                    'password_allow_rar' => $this->passwordAllowRar(),
                     'sort_field' => $indexSort,
                     'sort_dir' => $orderBy[1] ?? 'desc', // @phpstan-ignore offsetAccess.notFound
                     'try_fuzzy' => true,
@@ -365,7 +365,7 @@ class ReleaseBrowseService
             'min_size' => $minSize,
             'max_age_days' => $maxAge,
             'groups_id' => $groupId,
-            'password_allow_rar' => str_contains($this->showPasswords(), '<='),
+            'password_allow_rar' => $this->passwordAllowRar(),
             'sort_field' => $indexSortField,
             'sort_dir' => $orderBy[1] ?? 'desc',
             'try_fuzzy' => false,
@@ -432,8 +432,27 @@ class ReleaseBrowseService
 
         return match ($setting) {
             1 => '<= '.self::PASSWD_RAR,
-            default => '= '.self::PASSWD_NONE,
+            default => '<= '.self::PASSWD_NONE,
         };
+    }
+
+    /**
+     * When true, search/browse includes RAR-passworded releases (passwordstatus <= 1).
+     */
+    public function passwordAllowRar(): bool
+    {
+        return (int) Settings::settingValue('showpasswordedrelease') === 1;
+    }
+
+    /**
+     * Password clause for RSS/feed SQL: excludes untested backlog (passwordstatus = -1).
+     * Site search and browse use {@see showPasswords()} which includes -1 until post-processing.
+     */
+    public function showPasswordsForRss(): string
+    {
+        return $this->passwordAllowRar()
+            ? 'BETWEEN '.self::PASSWD_NONE.' AND '.self::PASSWD_RAR
+            : '= '.self::PASSWD_NONE;
     }
 
     /**

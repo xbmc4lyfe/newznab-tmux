@@ -346,8 +346,8 @@ interface SearchServiceInterface
      *
      * @param  array<string, mixed>  $criteria  Keys: phrases (string|array|null), category_ids (list<int>|null),
      *                                          excluded_category_ids (list<int>), min_size (int), max_age_days (int),
-     *                                          groups_id (int|null), password_allow_rar (bool), sort_field (string),
-     *                                          sort_dir (string), try_fuzzy (bool), release_ids (list<int>|null)
+     *                                          groups_id (int|null), password_allow_rar (bool), password_status_min (int|null),
+     *                                          sort_field (string), sort_dir (string), try_fuzzy (bool), release_ids (list<int>|null)
      * @return array{ids: list<int>, total: int, fuzzy: bool}
      */
     public function searchReleasesFiltered(array $criteria, int $limit, int $offset = 0): array;

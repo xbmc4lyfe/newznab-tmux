@@ -174,14 +174,14 @@ class ReleaseSearchServiceOrderingTest extends TestCase
 
         $sql = $method->invoke(
             $this->service,
-            'WHERE r.passwordstatus = 0 AND r.id IN (1,2,3)',
+            'WHERE r.passwordstatus <= 0 AND r.id IN (1,2,3)',
             ['postdate', 'desc'],
             50,
             0
         );
 
         $this->assertSame(
-            'SELECT r.id FROM releases r WHERE r.passwordstatus = 0 AND r.id IN (1,2,3) ORDER BY r.postdate desc LIMIT 50 OFFSET 0',
+            'SELECT r.id FROM releases r WHERE r.passwordstatus <= 0 AND r.id IN (1,2,3) ORDER BY r.postdate desc LIMIT 50 OFFSET 0',
             $sql
         );
         $this->assertStringNotContainsString('JOIN', $sql);
@@ -201,9 +201,9 @@ class ReleaseSearchServiceOrderingTest extends TestCase
 
         $service->expects($this->once())
             ->method('getPagerCount')
-            ->with('SELECT COUNT(*) as count FROM releases r WHERE r.passwordstatus = 0 AND r.id IN (1,2,3)')
+            ->with('SELECT COUNT(*) as count FROM releases r WHERE r.passwordstatus <= 0 AND r.id IN (1,2,3)')
             ->willReturn(3);
 
-        $this->assertSame(3, $method->invoke($service, 'WHERE r.passwordstatus = 0 AND r.id IN (1,2,3)'));
+        $this->assertSame(3, $method->invoke($service, 'WHERE r.passwordstatus <= 0 AND r.id IN (1,2,3)'));
     }
 }

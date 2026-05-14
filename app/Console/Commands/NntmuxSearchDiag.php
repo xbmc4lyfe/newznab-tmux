@@ -197,10 +197,8 @@ class NntmuxSearchDiag extends Command
             return 'MISSING_IN_INDEX';
         }
 
-        $hidden = false;
-        if (! $showPasswords && (int) $release->passwordstatus !== 0) {
-            $hidden = true;
-        }
+        $maxVisiblePasswordStatus = $showPasswords ? 1 : 0;
+        $hidden = (int) $release->passwordstatus > $maxVisiblePasswordStatus;
 
         $expected = ReleaseSearchIndexDocument::normalize($release->toArray());
         unset($expected['id']);

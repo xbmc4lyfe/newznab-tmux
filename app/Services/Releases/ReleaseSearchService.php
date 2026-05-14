@@ -118,7 +118,7 @@ class ReleaseSearchService
                 'min_date' => $minDateCriteria,
                 'max_date' => $maxDateCriteria,
                 'groups_id' => $groupId,
-                'password_allow_rar' => str_contains($this->showPasswords(), '<='),
+                'password_allow_rar' => $this->passwordAllowRar(),
                 'sort_field' => $this->browseOrderToIndexSortField((string) $orderBy[0]),
                 'sort_dir' => $orderBy[1] ?? 'desc',
                 'try_fuzzy' => true,
@@ -261,7 +261,7 @@ class ReleaseSearchService
                 'min_size' => $minSize,
                 'max_age_days' => $maxAge,
                 'groups_id' => $groupId,
-                'password_allow_rar' => str_contains($this->showPasswords(), '<='),
+                'password_allow_rar' => $this->passwordAllowRar(),
                 'sort_field' => $this->browseOrderToIndexSortField($orderField),
                 'sort_dir' => $orderDir,
                 'try_fuzzy' => true,
@@ -1606,7 +1606,7 @@ class ReleaseSearchService
             'excluded_category_ids' => array_map(static fn ($id): int => (int) $id, $excludedCategories),
             'min_size' => $minSize,
             'max_age_days' => $maxAge,
-            'password_allow_rar' => str_contains($this->showPasswords(), '<='),
+            'password_allow_rar' => $this->passwordAllowRar(),
             'sort_field' => 'postdate_ts',
             'sort_dir' => 'desc',
             'try_fuzzy' => false,
@@ -1940,8 +1940,16 @@ class ReleaseSearchService
 
         return match ($setting) {
             1 => '<= '.self::PASSWD_RAR,
-            default => '= '.self::PASSWD_NONE,
+            default => '<= '.self::PASSWD_NONE,
         };
+    }
+
+    /**
+     * When true, search/browse includes RAR-passworded releases (passwordstatus <= 1).
+     */
+    private function passwordAllowRar(): bool
+    {
+        return (int) Settings::settingValue('showpasswordedrelease') === 1;
     }
 
     /**

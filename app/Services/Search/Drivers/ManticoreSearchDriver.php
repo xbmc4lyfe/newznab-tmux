@@ -2670,7 +2670,11 @@ class ManticoreSearchDriver implements SearchDriverInterface
         if ($allowRar) {
             $query->filter('passwordstatus', 'lte', 1);
         } else {
-            $query->filter('passwordstatus', '=', 0);
+            $query->filter('passwordstatus', 'lte', 0);
+        }
+
+        if (array_key_exists('password_status_min', $criteria) && $criteria['password_status_min'] !== null) {
+            $query->filter('passwordstatus', 'gte', (int) $criteria['password_status_min']);
         }
     }
 

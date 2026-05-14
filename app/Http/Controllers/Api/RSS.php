@@ -76,7 +76,7 @@ class RSS extends ApiController
 				%s %s %s %s
 				ORDER BY postdate DESC %s",
                 $cartSearch,
-                $this->releaseBrowseService->showPasswords(),
+                $this->releaseBrowseService->showPasswordsForRss(),
                 $catSearch,
                 ($videosId > 0 ? sprintf('AND r.videos_id = %d %s', $videosId, ($catSearch === '' ? $catLimit : '')) : ''),
                 ($aniDbID > 0 ? sprintf('AND r.anidbid = %d %s', $aniDbID, ($catSearch === '' ? $catLimit : '')) : ''),
@@ -141,7 +141,8 @@ class RSS extends ApiController
             'min_size' => 0,
             'max_age_days' => 0,
             'groups_id' => null,
-            'password_allow_rar' => str_contains($this->releaseBrowseService->showPasswords(), '<='),
+            'password_allow_rar' => $this->releaseBrowseService->passwordAllowRar(),
+            'password_status_min' => 0,
             'sort_field' => 'postdate_ts',
             'sort_dir' => 'desc',
             'try_fuzzy' => false,
@@ -205,7 +206,7 @@ class RSS extends ApiController
             ($airDate > -1 ? sprintf(' AND tve.firstaired >= DATE_SUB(CURDATE(), INTERVAL %d DAY)', $airDate) : ''),
             Category::TV_ROOT,
             Category::TV_OTHER,
-            $this->releaseBrowseService->showPasswords(),
+            $this->releaseBrowseService->showPasswordsForRss(),
             ! empty($limit) ? sprintf(' LIMIT %d OFFSET 0', min($limit, 100)) : ''
         );
 
@@ -235,7 +236,7 @@ class RSS extends ApiController
             (\count($excludedCats) > 0 ? ' AND r.categories_id NOT IN ('.implode(',', $excludedCats).')' : ''),
             Category::MOVIE_ROOT,
             Category::MOVIE_OTHER,
-            $this->releaseBrowseService->showPasswords(),
+            $this->releaseBrowseService->showPasswordsForRss(),
             ! empty($limit) ? sprintf(' LIMIT %d OFFSET 0', min($limit, 100)) : ''
         );
 
@@ -309,7 +310,7 @@ class RSS extends ApiController
                 WHERE rn <= 5
                 ORDER BY FIELD(imdbid, '%s'), postdate DESC",
                 implode("','", $topMovies->toArray()),
-                $this->releaseBrowseService->showPasswords(),
+                $this->releaseBrowseService->showPasswordsForRss(),
                 implode("','", $topMovies->toArray())
             );
 
@@ -376,7 +377,7 @@ class RSS extends ApiController
                 WHERE rn <= 5
                 ORDER BY FIELD(videos_id, %s), postdate DESC",
                 implode(',', $topShows->toArray()),
-                $this->releaseBrowseService->showPasswords(),
+                $this->releaseBrowseService->showPasswordsForRss(),
                 implode(',', $topShows->toArray())
             );
 

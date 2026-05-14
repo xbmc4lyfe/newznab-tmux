@@ -3107,7 +3107,11 @@ class ElasticSearchDriver implements SearchDriverInterface
         if ($allowRar) {
             $filter[] = ['range' => ['passwordstatus' => ['lte' => 1]]];
         } else {
-            $filter[] = ['term' => ['passwordstatus' => 0]];
+            $filter[] = ['range' => ['passwordstatus' => ['lte' => 0]]];
+        }
+
+        if (array_key_exists('password_status_min', $criteria) && $criteria['password_status_min'] !== null) {
+            $filter[] = ['range' => ['passwordstatus' => ['gte' => (int) $criteria['password_status_min']]]];
         }
 
         return $filter;
