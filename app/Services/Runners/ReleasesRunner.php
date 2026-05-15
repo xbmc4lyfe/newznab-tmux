@@ -62,7 +62,7 @@ class ReleasesRunner extends BaseRunner
             }
 
             try {
-                $results = Concurrency::run($tasks);
+                $results = Concurrency::run($tasks, $this->concurrencyTimeout());
 
                 foreach ($results as $groupId => $output) {
                     echo $output;
@@ -111,7 +111,7 @@ class ReleasesRunner extends BaseRunner
             }
 
             try {
-                $results = Concurrency::run($tasks);
+                $results = Concurrency::run($tasks, $this->concurrencyTimeout());
 
                 foreach ($results as $groupId => $output) {
                     echo $output;
@@ -184,7 +184,7 @@ class ReleasesRunner extends BaseRunner
             }
 
             try {
-                $results = Concurrency::run($tasks);
+                $results = Concurrency::run($tasks, $this->concurrencyTimeout());
 
                 foreach ($results as $taskIdx => $output) {
                     echo $output;

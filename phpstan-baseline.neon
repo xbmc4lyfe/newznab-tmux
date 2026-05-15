@@ -786,17 +786,6 @@ parameters:
 			count: 1
 			path: app/Services/Categorization/CategorizationService.php
 
-		-
-			message: '#^Method App\\Services\\Concurrency\\TimeoutAwareProcessDriver\:\:run\(\) has parameter \$tasks with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Services/Concurrency/TimeoutAwareProcessDriver.php
-
-		-
-			message: '#^Method App\\Services\\Concurrency\\TimeoutAwareProcessDriver\:\:run\(\) return type has no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Services/Concurrency/TimeoutAwareProcessDriver.php
 
 		-
 			message: '#^Strict comparison using \!\=\= between non\-empty\-array\<mixed, mixed\> and array\{\} will always evaluate to true\.$#'

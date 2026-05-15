@@ -11,6 +11,16 @@ abstract class BaseRunner
 {
     public function __construct() {}
 
+    /**
+     * Resolve the configured timeout (seconds) for Laravel's Concurrency::run() calls.
+     */
+    protected function concurrencyTimeout(): int
+    {
+        $configured = config('nntmux.concurrency_timeout');
+
+        return (int) ($configured ?? config('nntmux.multiprocessing_max_child_time', 1800));
+    }
+
     protected function buildDnrCommand(string $args): string
     {
         // Convert legacy command arguments to new artisan commands
