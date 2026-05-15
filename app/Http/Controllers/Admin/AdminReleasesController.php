@@ -33,14 +33,38 @@ class AdminReleasesController extends BasePageController
 
         $meta_title = $title = 'Release List';
 
-        $page = $request->input('page', 1);
-        $releaseList = Release::getReleasesRange($page);
+        $page = (int) $request->input('page', 1);
+        $search = trim((string) $request->input('search', ''));
+        $categoryId = $request->filled('category_id') ? (int) $request->input('category_id') : null;
+        if ($categoryId === -1) {
+            $categoryId = null;
+        }
+
+        $releaseList = Release::getReleasesRange($page, $search !== '' ? $search : null, $categoryId);
+        $releaseList->appends($request->only(['search', 'category_id']));
 
         return view('admin.releases.index', [
             'releaselist' => $releaseList,
+            'catlist' => Category::getForSelect(true),
             'title' => $title,
             'meta_title' => $meta_title,
         ]);
+    }
+
+    public function bulkCategory(Request $request): RedirectResponse
+    {
+        $validated = $request->validate([
+            'guids' => 'required|array|min:1',
+            'guids.*' => 'string',
+            'categories_id' => 'required|integer|min:1|exists:categories,id',
+        ]);
+
+        $count = $this->releaseManagement->bulkUpdateCategory(
+            $validated['guids'],
+            (int) $validated['categories_id'],
+        );
+
+        return back()->with('success', $count.' release(s) re-categorised.');
     }
 
     /**

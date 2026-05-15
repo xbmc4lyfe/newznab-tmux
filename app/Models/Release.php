@@ -12,6 +12,8 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
+use Illuminate\Pagination\LengthAwarePaginator as PaginatorLengthAware;
+use Illuminate\Pagination\Paginator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -381,16 +383,99 @@ class Release extends Model
      * @param  int  $page  The page number to retrieve
      * @return LengthAwarePaginator|mixed
      */
-    public static function getReleasesRange(int $page = 1): mixed
+    public static function getReleasesRange(int $page = 1, ?string $search = null, ?int $categoryId = null): mixed
     {
-        $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_long'));
-        $cacheKey = md5('releasesRange_'.$page);
-        $releases = Cache::get($cacheKey);
-        if ($releases !== null) {
-            return $releases;
+        $search = $search !== null && $search !== '' ? $search : null;
+        $hasFilters = $search !== null || $categoryId !== null;
+
+        if ($search !== null && Search::isAvailable()) {
+            return self::getReleasesRangeFromSearchIndex($page, $search, $categoryId);
         }
 
-        $releases = self::query()
+        if (! $hasFilters) {
+            $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_long'));
+            $cacheKey = md5('releasesRange_'.$page);
+            $releases = Cache::get($cacheKey);
+            if ($releases !== null) {
+                return $releases;
+            }
+        }
+
+        $query = self::adminReleaseListQuery();
+
+        if ($search !== null) {
+            $query->where('releases.searchname', 'like', '%'.$search.'%');
+        }
+
+        if ($categoryId !== null) {
+            $query->where('releases.categories_id', $categoryId);
+        }
+
+        $releases = $query->paginate(config('nntmux.items_per_page'), ['*'], 'page', $page);
+
+        if (! $hasFilters) {
+            $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_long'));
+            Cache::put(md5('releasesRange_'.$page), $releases, $expiresAt);
+        }
+
+        return $releases;
+    }
+
+    /**
+     * @return PaginatorLengthAware<int, mixed>
+     */
+    private static function getReleasesRangeFromSearchIndex(int $page, string $search, ?int $categoryId): PaginatorLengthAware
+    {
+        $perPage = (int) config('nntmux.items_per_page');
+        $offset = ($page - 1) * $perPage;
+
+        $criteria = [
+            'phrases' => ['searchname' => $search],
+            'category_ids' => $categoryId !== null ? [$categoryId] : null,
+            'sort_field' => 'postdate_ts',
+            'sort_dir' => 'desc',
+            'try_fuzzy' => true,
+        ];
+
+        $filtered = Search::searchReleasesFiltered($criteria, $perPage, $offset);
+        $ids = array_map(static fn (int|string $id): int => (int) $id, $filtered['ids'] ?? []);
+        $total = (int) ($filtered['total'] ?? 0);
+
+        if ($ids === []) {
+            return new PaginatorLengthAware([], 0, $perPage, $page, [
+                'path' => Paginator::resolveCurrentPath(),
+                'pageName' => 'page',
+            ]);
+        }
+
+        $idList = implode(',', $ids);
+        $rows = self::adminReleaseListQuery()
+            ->whereIn('releases.id', $ids)
+            ->orderByRaw('FIELD(releases.id, '.$idList.')')
+            ->get();
+
+        return new PaginatorLengthAware($rows, $total, $perPage, $page, [
+            'path' => Paginator::resolveCurrentPath(),
+            'pageName' => 'page',
+        ]);
+    }
+
+    /**
+     * Clear cached admin release-list pages after bulk updates.
+     */
+    public static function clearAdminReleasesRangeCache(int $maxPages = 25): void
+    {
+        for ($page = 1; $page <= $maxPages; $page++) {
+            Cache::forget(md5('releasesRange_'.$page));
+        }
+    }
+
+    /**
+     * @return Builder<Release>
+     */
+    private static function adminReleaseListQuery(): Builder
+    {
+        return self::query()
             ->select(
                 [
                     'releases.id',
@@ -409,12 +494,7 @@ class Release extends Model
             )
             ->leftJoin('categories as c', 'c.id', '=', 'releases.categories_id')
             ->leftJoin('root_categories as cp', 'cp.id', '=', 'c.root_categories_id')
-            ->orderByDesc('releases.postdate')
-            ->paginate(config('nntmux.items_per_page'), ['*'], 'page', $page);
-
-        Cache::put($cacheKey, $releases, $expiresAt);
-
-        return $releases;
+            ->orderByDesc('releases.postdate');
     }
 
     public static function getByGuid(mixed $guid): mixed

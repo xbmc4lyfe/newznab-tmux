@@ -296,6 +296,7 @@ Route::middleware(['role:Admin', '2fa'])->prefix('admin')->group(function () {
     Route::post('ajax', [AdminAjaxController::class, 'ajaxAction'])->name('admin.ajax');
     Route::match(['GET', 'POST'], 'tmux-edit', [AdminTmuxController::class, 'edit'])->name('admin.tmux-edit');
     Route::get('release-list', [AdminReleasesController::class, 'index'])->name('admin.release-list');
+    Route::post('release-bulk-category', [AdminReleasesController::class, 'bulkCategory'])->name('admin.release-bulk-category');
     Route::post('release-delete/{id}', [AdminReleasesController::class, 'destroy'])->name('admin.release-delete');
 
     // Release Reports Management

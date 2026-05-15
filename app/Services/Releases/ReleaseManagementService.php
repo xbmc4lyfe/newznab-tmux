@@ -13,6 +13,7 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Service for managing releases (delete, update, export).
@@ -109,6 +110,60 @@ class ReleaseManagementService
         ReleaseSearchIndexSync::forIds($releaseIds);
 
         return $updated;
+    }
+
+    /**
+     * @param  list<string>  $guids
+     */
+    public function bulkUpdateCategory(array $guids, int $categoryId): int
+    {
+        $guids = array_values(array_filter($guids));
+        if ($guids === [] || $categoryId <= 0) {
+            return 0;
+        }
+
+        $updated = 0;
+
+        DB::transaction(function () use ($guids, $categoryId, &$updated): void {
+            $releaseIds = Release::query()
+                ->whereIn('guid', $guids)
+                ->pluck('id');
+
+            $updated = Release::query()
+                ->whereIn('guid', $guids)
+                ->update(['categories_id' => $categoryId, 'iscategorized' => 1]);
+
+            if ($updated > 0) {
+                $this->syncReleasesToSearchIndex($releaseIds);
+                Release::clearAdminReleasesRangeCache();
+            }
+        });
+
+        return $updated;
+    }
+
+    /**
+     * Re-index releases after query-builder updates that bypass {@see ReleaseObserver}.
+     *
+     * @param  Collection<int, int|string>|iterable<int|string>  $releaseIds
+     */
+    private function syncReleasesToSearchIndex(iterable $releaseIds): void
+    {
+        foreach ($releaseIds as $releaseId) {
+            $intId = (int) $releaseId;
+            if ($intId <= 0) {
+                continue;
+            }
+
+            try {
+                Search::updateRelease($intId);
+            } catch (\Throwable $e) {
+                Log::error('ReleaseManagementService: Failed to sync release to search index after category change', [
+                    'release_id' => $intId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
     }
 
     /**

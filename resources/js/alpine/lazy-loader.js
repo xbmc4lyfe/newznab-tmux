@@ -32,6 +32,7 @@ const lazyComponentMap = {
     'contentDelete':   () => import('./components/content-toggle.js'),  // same file
     'releaseReport':   () => import('./components/release-report.js'),
     'adminReleaseReports': () => import('./components/release-report.js'),  // same file
+    'adminReleaseList': () => import('./components/admin/release-list.js'),
     'profileEdit':     () => import('./components/profile-edit.js'),
     'profilePage':     () => import('./components/profile-edit.js'),    // same file
     'copyToClipboard': () => import('./components/profile-edit.js'),    // same file
