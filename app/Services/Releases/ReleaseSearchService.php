@@ -75,7 +75,12 @@ class ReleaseSearchService
             return $value !== -1 && $value !== '' && $value !== null;
         });
 
-        if (empty($searchFields)) {
+        if ($searchFields === []) {
+            return collect();
+        }
+
+        $categoryIds = $this->resolveSearchCategoryIds($cat, $excludedCats);
+        if ($categoryIds === []) {
             return collect();
         }
 
@@ -88,18 +93,6 @@ class ReleaseSearchService
                 if ($resolved) {
                     $groupId = (int) $resolved;
                 }
-            }
-
-            $categoryIdsRaw = Category::getCategorySearch($cat, null, true);
-
-            $categoryIds = null;
-            if (is_array($categoryIdsRaw)) {
-                $categoryIds = array_values(array_filter(
-                    array_map(static fn ($id): int => (int) $id, $categoryIdsRaw),
-                    static fn (int $id): bool => $id > 0
-                ));
-            } elseif (is_int($categoryIdsRaw) || (is_string($categoryIdsRaw) && ctype_digit((string) $categoryIdsRaw))) {
-                $categoryIds = [(int) $categoryIdsRaw];
             }
 
             [$sizeMinFromRange, $sizeMaxFromRange] = $this->resolveSizeRangeBounds($sizeFrom, $sizeTo);
@@ -1845,6 +1838,40 @@ class ReleaseSearchService
         }
 
         return [$minDate, $maxDate];
+    }
+
+    /**
+     * Resolve leaf category IDs for search/browse filters (expands root categories).
+     *
+     * @param  array<int|string, mixed>  $cat
+     * @param  array<int|string, mixed>  $excludedCats
+     * @return array<int>|null null = no category filter; [] = filter matches nothing
+     */
+    private function resolveSearchCategoryIds(array $cat, array $excludedCats): ?array
+    {
+        $categoryIdsRaw = Category::getCategorySearch($cat, null, true);
+
+        $categoryIds = null;
+        if (is_array($categoryIdsRaw)) {
+            $categoryIds = array_values(array_filter(
+                array_map(static fn ($id): int => (int) $id, $categoryIdsRaw),
+                static fn (int $id): bool => $id > 0
+            ));
+        } elseif (is_int($categoryIdsRaw) || (is_string($categoryIdsRaw) && ctype_digit((string) $categoryIdsRaw))) {
+            $categoryIds = [(int) $categoryIdsRaw];
+        }
+
+        if (! is_array($categoryIds) || $categoryIds === []) {
+            return $categoryIds;
+        }
+
+        if ($excludedCats === []) {
+            return $categoryIds;
+        }
+
+        $excluded = array_map(static fn ($id): int => (int) $id, $excludedCats);
+
+        return array_values(array_diff($categoryIds, $excluded));
     }
 
     /**

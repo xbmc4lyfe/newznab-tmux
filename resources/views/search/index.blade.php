@@ -50,6 +50,9 @@
             </div>
 
             <!-- Category -->
+            @php
+                $selectedCategory = request('t', request('searchadvcat', ''));
+            @endphp
             <div>
                 <label for="category" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Category</label>
                 <select id="category"
@@ -63,7 +66,7 @@
                                 $parentTitle = is_object($parentcat) ? $parentcat->title : ($parentcat['title'] ?? 'Category');
                                 $subcategories = is_object($parentcat) ? $parentcat->categories : ($parentcat['categories'] ?? []);
                             @endphp
-                            <option value="{{ $parentId }}" class="font-semibold" {{ request('t') == $parentId ? 'selected' : '' }}>
+                            <option value="{{ $parentId }}" class="font-semibold" {{ (string) $selectedCategory === (string) $parentId ? 'selected' : '' }}>
                                 {{ $parentTitle }}
                             </option>
                             @foreach($subcategories as $subcat)
@@ -71,14 +74,14 @@
                                     $subcatId = is_object($subcat) ? $subcat->id : ($subcat['id'] ?? '');
                                     $subcatTitle = is_object($subcat) ? $subcat->title : ($subcat['title'] ?? '');
                                 @endphp
-                                <option value="{{ $subcatId }}" {{ request('t') == $subcatId ? 'selected' : '' }}>
+                                <option value="{{ $subcatId }}" {{ (string) $selectedCategory === (string) $subcatId ? 'selected' : '' }}>
                                     &nbsp;&nbsp;{{ $subcatTitle }}
                                 </option>
                             @endforeach
                         @endforeach
                     @elseif(isset($catlist))
                         @foreach($catlist as $catId => $catTitle)
-                            <option value="{{ $catId }}" {{ request('t') == $catId ? 'selected' : '' }}>
+                            <option value="{{ $catId }}" {{ (string) $selectedCategory === (string) $catId ? 'selected' : '' }}>
                                 {{ $catTitle }}
                             </option>
                         @endforeach

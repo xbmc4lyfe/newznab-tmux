@@ -54,7 +54,7 @@ class SearchController extends BasePageController
         $category = [0];
         $lastvisit = $this->userdata->lastlogin;
 
-        if ($searchType === 'basic' && $request->missing('searchadvr') && ($request->has('id') || $request->has('subject') || $request->has('search'))) {
+        if ($searchType === 'basic' && ($request->filled('id') || $request->filled('subject') || $request->filled('search'))) {
             $searchString = [];
             switch (true) {
                 case $request->filled('subject'):
@@ -73,13 +73,7 @@ class SearchController extends BasePageController
                     $searchString['searchname'] = '';
             }
 
-            $categoryID = [-1];
-            if ($request->has('t')) {
-                $t = $request->input('t');
-                if ($t !== null && $t !== '') {
-                    $categoryID = array_map('intval', explode(',', (string) $t));
-                }
-            }
+            $categoryID = $this->resolveCategoryIdsFromRequest($request);
 
             $orderByUrls = [];
             foreach ($this->releaseBrowseService->getBrowseOrdering() as $orderType) {
@@ -172,12 +166,15 @@ class SearchController extends BasePageController
             }
         }
 
-        if ($searchType !== 'basic' && $request->missing('id') && $request->missing('subject') && $request->anyFilled(['searchadvr', 'searchadvsubject', 'searchadvfilename', 'searchadvposter', 'minage', 'maxage', 'group', 'minsize', 'maxsize', 'search'])) {
+        if ($searchType !== 'basic' && $request->missing('id') && $request->missing('subject') && $request->anyFilled(['searchadvr', 'searchadvsubject', 'searchadvfilename', 'searchadvposter', 'search'])) {
             $orderByString = '';
             foreach ($searchVars as $searchVarKey => $searchVar) {
                 $orderByString .= "&$searchVarKey=".htmlentities($searchVar, ENT_QUOTES | ENT_HTML5);
             }
             $orderByString = ltrim($orderByString, '&');
+            if ($request->filled('t')) {
+                $orderByString .= '&t='.urlencode((string) $request->input('t'));
+            }
 
             $orderByUrls = [];
             foreach ($ordering as $orderType) {
@@ -204,7 +201,7 @@ class SearchController extends BasePageController
                 -1,
                 $this->userdata->categoryexclusions ?? [],
                 'advanced',
-                [$searchVars['searchadvcat'] === '' ? -1 : $searchVars['searchadvcat']]
+                $this->resolveCategoryIdsFromRequest($request)
             );
 
             $results = $this->paginate($rslt ?? [], $rslt[0]->_totalrows ?? 0, config('nntmux.items_per_page'), $page, $request->url(), $request->query());
@@ -235,5 +232,19 @@ class SearchController extends BasePageController
         ]);
 
         return view('search.index', $this->viewData);
+    }
+
+    /**
+     * @return array<int>
+     */
+    private function resolveCategoryIdsFromRequest(Request $request): array
+    {
+        $raw = $request->input('t', $request->input('searchadvcat', ''));
+
+        if ($raw === null || $raw === '' || $raw === '-1') {
+            return [-1];
+        }
+
+        return array_map('intval', explode(',', (string) $raw));
     }
 }
