@@ -15,7 +15,7 @@ class ProcessPostProcess extends Command
      * @var string
      */
     protected $signature = 'multiprocessing:postprocess
-                            {type : Type: ama, add, ani, mov, nfo or tv}
+                            {type : Type: ama, add, ani, mov, nfo, tv, boo, mus, con, gam}
                             {renamed=false : For mov/tv: only post-process renamed releases (true/false)}';
 
     /**
@@ -30,16 +30,17 @@ class ProcessPostProcess extends Command
      */
     public function handle(): int
     {
-        $this->warn('⚠️  WARNING: This command is to be used from cli.');
-        $this->line('');
-
         $type = $this->argument('type');
         $renamed = $this->argument('renamed');
 
-        if (! \in_array($type, ['ama', 'add', 'ani', 'mov', 'nfo', 'tv'], true)) {
-            $this->error('Type must be one of: ama, add, ani, mov, nfo, sha, tv');
+        if (! \in_array($type, ['ama', 'add', 'ani', 'mov', 'nfo', 'tv', 'boo', 'mus', 'con', 'gam'], true)) {
+            $this->error('Type must be one of: ama, add, ani, mov, nfo, tv, boo, mus, con, gam');
             $this->line('');
-            $this->line('ama => Do amazon/books processing');
+            $this->line('ama => Do amazon (books+music+console+games) processing in parallel');
+            $this->line('boo => Do books processing');
+            $this->line('mus => Do music processing');
+            $this->line('con => Do console processing');
+            $this->line('gam => Do games processing');
             $this->line('add => Do additional (rar|zip) processing');
             $this->line('ani => Do anime processing');
             $this->line('mov => Do movie processing');
@@ -54,12 +55,16 @@ class ProcessPostProcess extends Command
             $service = new ForkingService;
 
             match ($type) {
-                'ama' => $service->processBooks(),
+                'ama' => $service->processAmazon(),
+                'boo' => $service->processBooks(),
                 'add' => $service->processAdditional(),
                 'ani' => $service->processAnime(),
                 'mov' => $service->processMovies($renamedOnly),
                 'nfo' => $service->processNfo(),
                 'tv' => $service->processTv($renamedOnly),
+                'mus' => $service->processMusic(),
+                'con' => $service->processConsoles(),
+                'gam' => $service->processGames(),
             };
 
             return self::SUCCESS;

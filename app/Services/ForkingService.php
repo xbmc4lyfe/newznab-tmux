@@ -172,7 +172,39 @@ class ForkingService
      */
     public function processBooks(): void
     {
-        $this->runWithTiming('postProcess_ama', fn () => $this->postProcessRunner->processBooks());
+        $this->runWithTiming('postProcess_boo', fn () => $this->postProcessRunner->processBooks());
+    }
+
+    /**
+     * Process music metadata.
+     */
+    public function processMusic(): void
+    {
+        $this->runWithTiming('postProcess_mus', fn () => $this->postProcessRunner->processMusic());
+    }
+
+    /**
+     * Process console game metadata.
+     */
+    public function processConsoles(): void
+    {
+        $this->runWithTiming('postProcess_con', fn () => $this->postProcessRunner->processConsoles());
+    }
+
+    /**
+     * Process PC game metadata.
+     */
+    public function processGames(): void
+    {
+        $this->runWithTiming('postProcess_gam', fn () => $this->postProcessRunner->processGames());
+    }
+
+    /**
+     * Process books, music, console, and games metadata in parallel.
+     */
+    public function processAmazon(): void
+    {
+        $this->runWithTiming('postProcess_ama', fn () => $this->postProcessRunner->processAmazon());
     }
 
     /**
@@ -192,8 +224,12 @@ class ForkingService
             'releases' => $this->releases(),
             'postProcess_add' => $this->processAdditional(),
             'postProcess_ani' => $this->processAnime(),
-            'postProcess_ama' => $this->processBooks(),
+            'postProcess_ama' => $this->processAmazon(),
+            'postProcess_boo' => $this->processBooks(),
+            'postProcess_con' => $this->processConsoles(),
+            'postProcess_gam' => $this->processGames(),
             'postProcess_mov' => $this->processMovies($options[0] ?? false),
+            'postProcess_mus' => $this->processMusic(),
             'postProcess_nfo' => $this->processNfo(),
             'postProcess_tv' => $this->processTv($options[0] ?? false),
             'safe_backfill' => $this->safeBackfill(),

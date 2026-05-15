@@ -16,10 +16,10 @@ class MusicProcessor
         $this->echooutput = $echooutput;
     }
 
-    public function process(): void
+    public function process(string $groupID = '', string $guidChar = ''): void
     {
         if ((int) Settings::settingValue('lookupmusic') !== 0) {
-            (new MusicService)->processMusicReleases();
+            (new MusicService)->processMusicReleases(false, $groupID, $guidChar);
         }
     }
 }

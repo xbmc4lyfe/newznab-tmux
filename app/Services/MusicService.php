@@ -460,8 +460,11 @@ class MusicService
      *
      * @throws \Exception
      */
-    public function processMusicReleases(bool $local = false): void
+    public function processMusicReleases(bool $local = false, string $groupID = '', string $guidChar = ''): void
     {
+        $guidFilter = $guidChar !== '' ? 'AND leftguid LIKE '.DB::getPdo()->quote($guidChar.'%') : '';
+        $groupFilter = $groupID !== '' ? 'AND groups_id = '.(int) $groupID : '';
+
         $res = DB::select(
             sprintf(
                 '
@@ -469,10 +472,14 @@ class MusicService
                 FROM releases
                 WHERE musicinfo_id IS NULL
                 %s
+                %s
+                %s
                 AND categories_id IN (%s, %s, %s)
                 ORDER BY postdate DESC
                 LIMIT %d',
                 $this->renamed,
+                $guidFilter,
+                $groupFilter,
                 Category::MUSIC_MP3,
                 Category::MUSIC_LOSSLESS,
                 Category::MUSIC_OTHER,

@@ -565,20 +565,20 @@ class TmuxTaskRunner
         if ($postSetting === 1) {
             // Post = 1: Additional processing only
             if ($hasWork) {
-                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan update:postprocess additional true 2>&1 | tee -a {$log}";
+                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan multiprocessing:postprocess add 2>&1 | tee -a {$log}";
             }
         } elseif ($postSetting === 2) {
             // Post = 2: NFO processing only
             if ($hasNfo) {
-                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan update:postprocess nfo true 2>&1 | tee -a {$log}";
+                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan multiprocessing:postprocess nfo 2>&1 | tee -a {$log}";
             }
         } elseif ($postSetting === 3) {
             // Post = 3: Both additional and NFO
             if ($hasWork) {
-                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan update:postprocess additional true 2>&1 | tee -a {$log}";
+                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan multiprocessing:postprocess add 2>&1 | tee -a {$log}";
             }
             if ($hasNfo) {
-                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan update:postprocess nfo true 2>&1 | tee -a {$log}";
+                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan multiprocessing:postprocess nfo 2>&1 | tee -a {$log}";
             }
         }
 
@@ -625,14 +625,14 @@ class TmuxTaskRunner
         $processTv = (int) ($runVar['settings']['processtvrage'] ?? 0);
         $hasTvWork = (int) ($runVar['counts']['now']['processtv'] ?? 0) > 0;
         if ($processTv > 0 && $hasTvWork) {
-            $commands[] = "nice -n{$niceness} {$artisan} update:postprocess tv 2>&1 | tee -a {$log}";
+            $commands[] = "nice -n{$niceness} {$artisan} multiprocessing:postprocess tv 2>&1 | tee -a {$log}";
         }
 
         // Anime processing
         $processAnime = (int) ($runVar['settings']['processanime'] ?? 0);
         $hasAnimeWork = (int) ($runVar['counts']['now']['processanime'] ?? 0) > 0;
         if ($processAnime > 0 && $hasAnimeWork) {
-            $commands[] = "nice -n{$niceness} {$artisan} update:postprocess anime true 2>&1 | tee -a {$log}";
+            $commands[] = "nice -n{$niceness} {$artisan} multiprocessing:postprocess ani 2>&1 | tee -a {$log}";
         }
 
         // If no work available for any enabled type, disable the pane
@@ -693,7 +693,7 @@ class TmuxTaskRunner
         }
 
         $sleep = (int) ($runVar['settings']['post_timer_non'] ?? 300);
-        $command = "nice -n{$niceness} {$artisan} update:postprocess movies true 2>&1 | tee -a {$log}";
+        $command = "nice -n{$niceness} {$artisan} multiprocessing:postprocess mov false 2>&1 | tee -a {$log}";
         $sleepCommand = $this->buildSleepCommand($sleep);
         $fullCommand = "{$command}; date +'%Y-%m-%d %T'; {$sleepCommand}";
 
@@ -738,45 +738,11 @@ class TmuxTaskRunner
         $niceness = Settings::settingValue('niceness') ?? 2;
         $log = $this->getLogFile('post_amazon');
         $artisan = PHP_BINARY.' artisan';
-        $commands = [];
-
-        // Books processing
-        $processBooks = (int) ($runVar['settings']['processbooks'] ?? 0);
-        $hasBooksWork = (int) ($runVar['counts']['now']['processbooks'] ?? 0) > 0;
-        if ($processBooks > 0 && $hasBooksWork) {
-            $commands[] = "nice -n{$niceness} {$artisan} update:postprocess book 2>&1 | tee -a {$log}";
-        }
-
-        // Music processing
-        $processMusic = (int) ($runVar['settings']['processmusic'] ?? 0);
-        $hasMusicWork = (int) ($runVar['counts']['now']['processmusic'] ?? 0) > 0;
-        if ($processMusic > 0 && $hasMusicWork) {
-            $commands[] = "nice -n{$niceness} {$artisan} update:postprocess music 2>&1 | tee -a {$log}";
-        }
-
-        // Console processing (uses same lookupgames setting as games)
-        $processConsole = (int) ($runVar['settings']['processgames'] ?? 0);
-        $hasConsoleWork = (int) ($runVar['counts']['now']['processconsole'] ?? 0) > 0;
-        if ($processConsole > 0 && $hasConsoleWork) {
-            $commands[] = "nice -n{$niceness} {$artisan} update:postprocess console 2>&1 | tee -a {$log}";
-        }
-
-        // Games processing
-        $processGames = (int) ($runVar['settings']['processgames'] ?? 0);
-        $hasGamesWork = (int) ($runVar['counts']['now']['processgames'] ?? 0) > 0;
-        if ($processGames > 0 && $hasGamesWork) {
-            $commands[] = "nice -n{$niceness} {$artisan} update:postprocess games 2>&1 | tee -a {$log}";
-        }
-
-        // If no commands were added (no work available), disable the pane
-        if (empty($commands)) {
-            return $this->disablePane($pane, 'Post-process Metadata', 'no work available for any enabled type');
-        }
-
         $sleep = (int) ($runVar['settings']['post_timer_amazon'] ?? 300);
-        $allCommands = implode('; ', $commands);
+
+        $command = "nice -n{$niceness} {$artisan} multiprocessing:postprocess ama 2>&1 | tee -a {$log}";
         $sleepCommand = $this->buildSleepCommand($sleep);
-        $fullCommand = "{$allCommands}; date +'%Y-%m-%d %T'; {$sleepCommand}";
+        $fullCommand = "{$command}; date +'%Y-%m-%d %T'; {$sleepCommand}";
 
         return $this->paneManager->respawnPane($pane, $fullCommand);
     }

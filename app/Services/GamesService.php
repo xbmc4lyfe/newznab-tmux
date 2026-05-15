@@ -730,7 +730,7 @@ class GamesService
      *
      * @throws \Exception
      */
-    public function processGamesReleases(): void
+    public function processGamesReleases(string $groupID = '', string $guidChar = ''): void
     {
         // Reset stats
         $this->processedCount = 0;
@@ -743,6 +743,14 @@ class GamesService
         $query = Release::query()
             ->where('gamesinfo_id', '=', 0)
             ->where('categories_id', '=', Category::PC_GAMES);
+
+        if ($guidChar !== '') {
+            $query->where('leftguid', 'like', $guidChar.'%');
+        }
+
+        if ($groupID !== '') {
+            $query->where('groups_id', $groupID);
+        }
 
         if ((int) Settings::settingValue('lookupgames') === 2) {
             $query->where('isrenamed', '=', 1);

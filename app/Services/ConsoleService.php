@@ -491,12 +491,20 @@ class ConsoleService
      *
      * @throws \Exception
      */
-    public function processConsoleReleases(): void
+    public function processConsoleReleases(string $groupID = '', string $guidChar = ''): void
     {
         $query = Release::query()
             ->select(['searchname', 'id'])
             ->whereBetween('categories_id', [Category::GAME_ROOT, Category::GAME_OTHER])
             ->whereNull('consoleinfo_id');
+
+        if ($guidChar !== '') {
+            $query->where('leftguid', 'like', $guidChar.'%');
+        }
+
+        if ($groupID !== '') {
+            $query->where('groups_id', $groupID);
+        }
 
         if ($this->renamed === true) {
             $query->where('isrenamed', '=', 1);

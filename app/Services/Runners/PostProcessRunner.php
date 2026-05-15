@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Runners;
 
+use App\Models\Category;
 use App\Models\Settings;
 use App\Services\NfoService;
 use Illuminate\Support\Facades\Concurrency;
@@ -20,7 +21,7 @@ class PostProcessRunner extends BaseRunner
     }
 
     /**
-     * @param  array<string, mixed>  $releases
+     * @param  array<int, object{id?: mixed}>  $releases
      */
     private function runPostProcess(array $releases, int $maxProcesses, string $type, string $desc): void
     {
@@ -82,6 +83,139 @@ class PostProcessRunner extends BaseRunner
                 cli()->error('Batch '.($batchIndex + 1).' failed: '.$e->getMessage());
             }
         }
+    }
+
+    /**
+     * @param  array<int, object{type: string, id: string}>  $tasks
+     */
+    private function runPostProcessMixed(array $tasks, int $maxProcesses, string $desc): void
+    {
+        if ($tasks === []) {
+            $this->headerNone();
+
+            return;
+        }
+
+        if ((bool) config('nntmux.stream_fork_output', false) === true) {
+            $commands = [];
+            foreach ($tasks as $task) {
+                $char = substr((string) $task->id, 0, 1);
+                $commands[] = PHP_BINARY.' artisan postprocess:guid '.$task->type.' '.$char;
+            }
+            $this->runStreamingCommands($commands, $maxProcesses, $desc); // @phpstan-ignore argument.type
+
+            return;
+        }
+
+        $count = count($tasks);
+        $this->headerStart('postprocess: '.$desc, $count, $maxProcesses);
+
+        if ($count <= 1 || $maxProcesses <= 1) {
+            foreach ($tasks as $task) {
+                $char = substr((string) $task->id, 0, 1);
+                $command = PHP_BINARY.' artisan postprocess:guid '.$task->type.' '.$char;
+                echo $this->executeCommand($command);
+                cli()->primary('Finished task for '.$desc);
+            }
+
+            return;
+        }
+
+        $batches = array_chunk($tasks, max(1, $maxProcesses));
+
+        foreach ($batches as $batchIndex => $batch) {
+            $runTasks = [];
+            foreach ($batch as $idx => $task) {
+                $char = substr((string) $task->id, 0, 1);
+                $command = PHP_BINARY.' artisan postprocess:guid '.$task->type.' '.$char;
+                $runTasks[$idx] = fn () => $this->executeCommand($command);
+            }
+
+            try {
+                $results = Concurrency::run($runTasks, $this->concurrencyTimeout());
+
+                foreach ($results as $output) {
+                    echo $output;
+                    cli()->primary('Finished task for '.$desc);
+                }
+            } catch (\Throwable $e) {
+                Log::error('Postprocess mixed batch failed: '.$e->getMessage());
+                cli()->error('Batch '.($batchIndex + 1).' failed: '.$e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * @return array<int, object{id: string}>
+     */
+    private function getBooksBuckets(): array
+    {
+        $bucketExpr = $this->guidBucketExpression();
+
+        return DB::select('
+            SELECT DISTINCT '.$bucketExpr.' AS id
+            FROM releases
+            WHERE (
+                categories_id BETWEEN '.Category::BOOKS_ROOT.' AND '.Category::BOOKS_UNKNOWN.'
+                OR categories_id = '.Category::MUSIC_AUDIOBOOK.'
+            )
+            AND (
+                bookinfo_id IS NULL
+                OR searchname LIKE "N:/NZB%"
+                OR searchname LIKE "N_NZB_%"
+                OR name LIKE "N:/NZB%"
+                OR name LIKE "N_NZB_%"
+            )
+            LIMIT 16');
+    }
+
+    /**
+     * @return array<int, object{id: string}>
+     */
+    private function getMusicBuckets(): array
+    {
+        $bucketExpr = $this->guidBucketExpression();
+
+        return DB::select('
+            SELECT DISTINCT '.$bucketExpr.' AS id
+            FROM releases
+            WHERE categories_id IN ('.Category::MUSIC_MP3.', '.Category::MUSIC_LOSSLESS.', '.Category::MUSIC_OTHER.')
+            AND musicinfo_id IS NULL
+            LIMIT 16');
+    }
+
+    /**
+     * @return array<int, object{id: string}>
+     */
+    private function getConsoleBuckets(): array
+    {
+        $bucketExpr = $this->guidBucketExpression();
+        $renamedFilter = (int) Settings::settingValue('lookupgames') === 2 ? 'AND isrenamed = 1' : '';
+
+        return DB::select('
+            SELECT DISTINCT '.$bucketExpr.' AS id
+            FROM releases
+            WHERE categories_id BETWEEN '.Category::GAME_ROOT.' AND '.Category::GAME_OTHER.'
+            AND consoleinfo_id IS NULL
+            '.$renamedFilter.'
+            LIMIT 16');
+    }
+
+    /**
+     * @return array<int, object{id: string}>
+     */
+    private function getGamesBuckets(): array
+    {
+        $bucketExpr = $this->guidBucketExpression();
+        $renamedFilter = (int) Settings::settingValue('lookupgames') === 2 ? 'AND isrenamed = 1' : '';
+
+        return DB::select('
+            SELECT DISTINCT '.$bucketExpr.' AS id
+            FROM releases
+            WHERE categories_id = '.Category::PC_GAMES.'
+            AND gamesinfo_id = 0
+            '.$renamedFilter.'
+            LIMIT 16');
     }
 
     public function processAdditional(): void
@@ -386,7 +520,116 @@ class PostProcessRunner extends BaseRunner
             LIMIT 16';
         $queue = DB::select($sql);
 
-        $maxProcesses = (int) Settings::settingValue('postthreadsnon');
+        $maxProcesses = (int) Settings::settingValue('postthreadsamazon');
         $this->runPostProcess($queue, $maxProcesses, 'books', 'books postprocessing');
+    }
+
+    public function processMusic(): void
+    {
+        if ((int) Settings::settingValue('lookupmusic') <= 0) {
+            $this->headerNone();
+
+            return;
+        }
+
+        $checkSql = '
+            SELECT id
+            FROM releases
+            WHERE categories_id IN ('.Category::MUSIC_MP3.', '.Category::MUSIC_LOSSLESS.', '.Category::MUSIC_OTHER.')
+            AND musicinfo_id IS NULL
+            LIMIT 1';
+        if (count(DB::select($checkSql)) === 0) {
+            $this->headerNone();
+
+            return;
+        }
+
+        $queue = $this->getMusicBuckets();
+        $maxProcesses = (int) Settings::settingValue('postthreadsamazon');
+        $this->runPostProcess($queue, $maxProcesses, 'music', 'music postprocessing');
+    }
+
+    public function processConsoles(): void
+    {
+        if ((int) Settings::settingValue('lookupgames') <= 0) {
+            $this->headerNone();
+
+            return;
+        }
+
+        $renamedFilter = (int) Settings::settingValue('lookupgames') === 2 ? 'AND isrenamed = 1' : '';
+        $checkSql = '
+            SELECT id
+            FROM releases
+            WHERE categories_id BETWEEN '.Category::GAME_ROOT.' AND '.Category::GAME_OTHER.'
+            AND consoleinfo_id IS NULL
+            '.$renamedFilter.'
+            LIMIT 1';
+        if (count(DB::select($checkSql)) === 0) {
+            $this->headerNone();
+
+            return;
+        }
+
+        $queue = $this->getConsoleBuckets();
+        $maxProcesses = (int) Settings::settingValue('postthreadsamazon');
+        $this->runPostProcess($queue, $maxProcesses, 'console', 'console postprocessing');
+    }
+
+    public function processGames(): void
+    {
+        if ((int) Settings::settingValue('lookupgames') <= 0) {
+            $this->headerNone();
+
+            return;
+        }
+
+        $renamedFilter = (int) Settings::settingValue('lookupgames') === 2 ? 'AND isrenamed = 1' : '';
+        $checkSql = '
+            SELECT id
+            FROM releases
+            WHERE categories_id = '.Category::PC_GAMES.'
+            AND gamesinfo_id = 0
+            '.$renamedFilter.'
+            LIMIT 1';
+        if (count(DB::select($checkSql)) === 0) {
+            $this->headerNone();
+
+            return;
+        }
+
+        $queue = $this->getGamesBuckets();
+        $maxProcesses = (int) Settings::settingValue('postthreadsamazon');
+        $this->runPostProcess($queue, $maxProcesses, 'games', 'games postprocessing');
+    }
+
+    public function processAmazon(): void
+    {
+        $maxProcesses = (int) Settings::settingValue('postthreadsamazon');
+        $tasks = [];
+
+        if ((int) Settings::settingValue('lookupbooks') > 0) {
+            foreach ($this->getBooksBuckets() as $row) {
+                $tasks[] = (object) ['type' => 'books', 'id' => (string) $row->id];
+            }
+        }
+
+        if ((int) Settings::settingValue('lookupmusic') > 0) {
+            foreach ($this->getMusicBuckets() as $row) {
+                $tasks[] = (object) ['type' => 'music', 'id' => (string) $row->id];
+            }
+        }
+
+        if ((int) Settings::settingValue('lookupgames') > 0) {
+            foreach ($this->getConsoleBuckets() as $row) {
+                $tasks[] = (object) ['type' => 'console', 'id' => (string) $row->id];
+            }
+
+            foreach ($this->getGamesBuckets() as $row) {
+                $tasks[] = (object) ['type' => 'games', 'id' => (string) $row->id];
+            }
+        }
+
+        $this->runPostProcessMixed($tasks, $maxProcesses, 'amazon (books+music+console+games)');
     }
 }

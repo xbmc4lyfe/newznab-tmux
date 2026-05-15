@@ -140,9 +140,9 @@ final class PostProcessService
      *
      * @throws \Exception
      */
-    public function processConsoles(): void
+    public function processConsoles(string $groupID = '', string $guidChar = ''): void
     {
-        $this->consolesProcessor->process();
+        $this->consolesProcessor->process($groupID, $guidChar);
     }
 
     /**
@@ -150,9 +150,9 @@ final class PostProcessService
      *
      * @throws \Exception
      */
-    public function processGames(): void
+    public function processGames(string $groupID = '', string $guidChar = ''): void
     {
-        $this->gamesProcessor->process();
+        $this->gamesProcessor->process($groupID, $guidChar);
     }
 
     /**
@@ -177,9 +177,9 @@ final class PostProcessService
      *
      * @throws \Exception
      */
-    public function processMusic(): void
+    public function processMusic(string $groupID = '', string $guidChar = ''): void
     {
-        $this->musicProcessor->process();
+        $this->musicProcessor->process($groupID, $guidChar);
     }
 
     /**

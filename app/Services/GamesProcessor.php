@@ -19,10 +19,10 @@ class GamesProcessor
         $this->gamesService = $gamesService ?? new GamesService;
     }
 
-    public function process(): void
+    public function process(string $groupID = '', string $guidChar = ''): void
     {
         if ((int) Settings::settingValue('lookupgames') !== 0) {
-            $this->gamesService->processGamesReleases();
+            $this->gamesService->processGamesReleases($groupID, $guidChar);
         }
     }
 }
