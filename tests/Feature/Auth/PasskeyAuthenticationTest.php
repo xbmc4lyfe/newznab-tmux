@@ -8,6 +8,7 @@ use App\Events\UserLoggedIn;
 use App\Http\Middleware\Google2FAMiddleware;
 use App\Models\User;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Schema;
@@ -65,6 +66,7 @@ class PasskeyAuthenticationTest extends TestCase
             ]);
 
         $response->assertRedirect('/');
+        $response->assertCookieMissing(Auth::guard()->getRecallerName());
         $this->assertAuthenticatedAs($user);
         $this->assertTrue((bool) session(config('google2fa.session_var')));
         Event::assertDispatched(UserLoggedIn::class);
@@ -88,14 +90,15 @@ class PasskeyAuthenticationTest extends TestCase
         FakeFindPasskeyAction::$passkey = $passkey;
         config()->set('passkeys.actions.find_passkey', FakeFindPasskeyAction::class);
 
-        $this
+        $response = $this
             ->withSession(['passkey-authentication-options' => '{}'])
             ->post(route('passkeys.login'), [
                 'start_authentication_response' => json_encode(['id' => 'credential-3'], JSON_THROW_ON_ERROR),
                 'remember' => true,
-            ])
-            ->assertRedirect('/');
+            ]);
 
+        $response->assertRedirect('/');
+        $response->assertCookie(Auth::guard()->getRecallerName());
         $this->assertAuthenticatedAs($user);
         $this->assertNotNull($user->fresh()?->remember_token);
     }
