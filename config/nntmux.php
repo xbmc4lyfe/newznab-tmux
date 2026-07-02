@@ -32,7 +32,11 @@ return [
     'proxy_detection_window_seconds' => (int) env('PROXY_DETECTION_WINDOW_SECONDS', 3600),
     'proxy_detection_ratio_min' => (float) env('PROXY_DETECTION_RATIO_MIN', 0.8),
     'proxy_detection_min_searches' => (int) env('PROXY_DETECTION_MIN_SEARCHES', 20),
-    'proxy_detection_indexer_referer_patterns' => env('PROXY_DETECTION_INDEXER_REFERER_PATTERNS', 'hydra,prowlarr,jackett,lidarr,radarr,sonarr,readarr,bazarr'),
+    // Only apps that fetch NZBs directly from the indexer belong here. NZBHydra2/Prowlarr (and Jackett,
+    // which proxies torrent/NZB downloads) issue their own download requests. The *arr suite (Sonarr,
+    // Radarr, Lidarr, Readarr, Bazarr) only search — directly or via Prowlarr/NZBHydra2 — and never
+    // download from the indexer, so listing them here would only risk false positives.
+    'proxy_detection_indexer_referer_patterns' => env('PROXY_DETECTION_INDEXER_REFERER_PATTERNS', 'hydra,prowlarr,jackett'),
 
     /*
     |--------------------------------------------------------------------------

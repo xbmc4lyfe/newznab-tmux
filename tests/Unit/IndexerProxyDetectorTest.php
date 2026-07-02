@@ -303,7 +303,7 @@ class IndexerProxyDetectorTest extends TestCase
         config()->set('nntmux.proxy_detection_min_searches', $overrides['min_searches'] ?? 20);
         config()->set(
             'nntmux.proxy_detection_indexer_referer_patterns',
-            $overrides['referer_patterns'] ?? 'hydra,prowlarr,jackett,lidarr,radarr,sonarr,readarr,bazarr',
+            $overrides['referer_patterns'] ?? 'hydra,prowlarr,jackett',
         );
     }
 
