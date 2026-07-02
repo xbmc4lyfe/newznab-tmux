@@ -307,7 +307,7 @@ class BlockAbusiveServicesTest extends TestCase
         config()->set('nntmux.proxy_detection_window_seconds', 3600);
         config()->set('nntmux.proxy_detection_ratio_min', 0.8);
         config()->set('nntmux.proxy_detection_min_searches', 20);
-        config()->set('nntmux.proxy_detection_indexer_referer_patterns', 'hydra,prowlarr,jackett');
+        config()->set('nntmux.proxy_detection_indexer_referer_patterns', 'hydra,prowlarr');
 
         $this->app->instance(
             CacheRepositoryContract::class,
