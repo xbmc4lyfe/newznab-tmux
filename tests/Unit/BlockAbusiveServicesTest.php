@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace Tests\Unit;
 
 use App\Http\Middleware\BlockAbusiveServices;
+use Illuminate\Cache\ArrayStore;
+use Illuminate\Cache\Repository as CacheRepository;
+use Illuminate\Contracts\Cache\Repository as CacheRepositoryContract;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -136,6 +139,65 @@ class BlockAbusiveServicesTest extends TestCase
         $this->assertSame(Response::HTTP_OK, $response->getStatusCode());
     }
 
+    public function test_behavioral_detection_blocks_spoofed_ua_direct_proxy_fetch(): void
+    {
+        $this->enableBehavioralDetection();
+
+        // A direct proxy fetch masquerading as a downloader: the strict UA fast path
+        // (block_proxy_indexer_apps) is off and SABnzbd is not a blocked UA, so only
+        // the behavioural signals can catch this.
+        $spoofedUa = 'SABnzbd/4.3.3';
+        $ip = '203.0.113.10';
+
+        // The proxy searches first with the spoofed UA — this seeds the UA-pair
+        // window for the api_token and the IP->UA correlation window.
+        $searchResponse = $this->handleRequest(
+            '/api/v1/api?t=search&q=linux&apikey=user-key',
+            $spoofedUa,
+            ip: $ip,
+        );
+        $this->assertSame(Response::HTTP_OK, $searchResponse->getStatusCode());
+
+        // Then it downloads with the same UA, same token, same IP, and leaks the
+        // indexer host in the Referer. Signals: referer (30) + ua_pair (25) +
+        // ip_correlation (20) = 75 >= 50 threshold.
+        $downloadResponse = $this->handleRequest(
+            '/api/v1/api?t=get&id=release-guid&apikey=user-key',
+            $spoofedUa,
+            ['Referer' => 'http://hydra.local:5076/nzb/details'],
+            $ip,
+        );
+
+        $this->assertSame(Response::HTTP_FORBIDDEN, $downloadResponse->getStatusCode());
+        $this->assertStringContainsString(
+            'Proxying NZB downloads through indexer apps is not allowed',
+            (string) $downloadResponse->getContent(),
+        );
+    }
+
+    public function test_search_routes_record_signals_for_later_correlation(): void
+    {
+        $this->enableBehavioralDetection();
+
+        $spoofedUa = 'SABnzbd/4.3.3';
+        $ip = '203.0.113.20';
+        $downloadUri = '/api/v1/api?t=get&id=release-guid&apikey=user-key';
+        $referer = ['Referer' => 'http://prowlarr.local:9696/download'];
+
+        // Without a prior search, only the Referer signal fires (30 < 50 threshold),
+        // so the download is allowed — the correlation windows are empty.
+        $coldResponse = $this->handleRequest($downloadUri, $spoofedUa, $referer, $ip);
+        $this->assertSame(Response::HTTP_OK, $coldResponse->getStatusCode());
+
+        // A search from the same token + IP + UA seeds the UA-pair and IP windows.
+        $this->handleRequest('/api/v1/api?t=search&q=ubuntu&apikey=user-key', $spoofedUa, ip: $ip);
+
+        // Now the same download correlates: referer (30) + ua_pair (25) +
+        // ip_correlation (20) = 75, and it is blocked.
+        $warmResponse = $this->handleRequest($downloadUri, $spoofedUa, $referer, $ip);
+        $this->assertSame(Response::HTTP_FORBIDDEN, $warmResponse->getStatusCode());
+    }
+
     public function test_enabled_proxy_indexer_app_block_allows_configured_user_agent_on_unrelated_routes(): void
     {
         config()->set('nntmux.block_proxy_indexer_apps', true);
@@ -207,16 +269,49 @@ class BlockAbusiveServicesTest extends TestCase
         $_SERVER[$key] = $value;
     }
 
-    private function handleRequest(string $uri, string $userAgent): Response
+    /**
+     * @param  array<string, string>  $headers
+     */
+    private function handleRequest(string $uri, string $userAgent, array $headers = [], string $ip = '127.0.0.1'): Response
     {
-        $request = Request::create($uri, 'GET', server: [
+        $server = [
             'HTTP_USER_AGENT' => $userAgent,
-            'REMOTE_ADDR' => '127.0.0.1',
-        ]);
+            'REMOTE_ADDR' => $ip,
+        ];
+
+        foreach ($headers as $name => $value) {
+            $server['HTTP_'.strtoupper(str_replace('-', '_', $name))] = $value;
+        }
+
+        $request = Request::create($uri, 'GET', server: $server);
 
         return app(BlockAbusiveServices::class)->handle(
             $request,
             static fn (): Response => response()->json(['ok' => true])
+        );
+    }
+
+    /**
+     * Turn on behavioural proxy detection with a deterministic in-memory cache.
+     *
+     * The detector resolves its CacheRepository from the container; binding an
+     * ArrayStore-backed repository keeps per-token / per-IP windows isolated to the
+     * test and lets a recorded search feed a later download in the same test run.
+     * The ASN cache uses the Cache facade (a different store) and is untouched.
+     */
+    private function enableBehavioralDetection(): void
+    {
+        config()->set('nntmux.block_proxy_indexer_apps', false);
+        config()->set('nntmux.proxy_detection_enabled', true);
+        config()->set('nntmux.proxy_detection_threshold', 50);
+        config()->set('nntmux.proxy_detection_window_seconds', 3600);
+        config()->set('nntmux.proxy_detection_ratio_min', 0.8);
+        config()->set('nntmux.proxy_detection_min_searches', 20);
+        config()->set('nntmux.proxy_detection_indexer_referer_patterns', 'hydra,prowlarr,jackett');
+
+        $this->app->instance(
+            CacheRepositoryContract::class,
+            new CacheRepository(new ArrayStore)
         );
     }
 }

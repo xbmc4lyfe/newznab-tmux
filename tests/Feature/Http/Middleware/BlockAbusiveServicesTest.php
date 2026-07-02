@@ -16,7 +16,7 @@ final class BlockAbusiveServicesTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
-        $this->middleware = new BlockAbusiveServices;
+        $this->middleware = app(BlockAbusiveServices::class);
         Cache::flush();
     }
 

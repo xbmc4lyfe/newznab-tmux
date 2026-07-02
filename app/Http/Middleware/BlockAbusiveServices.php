@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Http\Middleware;
 
+use App\Services\Security\IndexerProxyDetector;
+use App\Services\Security\ProxyRequestContext;
 use Closure;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -65,6 +67,8 @@ class BlockAbusiveServices
      */
     protected int $cacheTtl = 86400;
 
+    public function __construct(private readonly IndexerProxyDetector $detector) {}
+
     /**
      * Handle an incoming request.
      *
@@ -84,6 +88,35 @@ class BlockAbusiveServices
             ]);
 
             return $this->blockedResponse('Access denied: Streaming services are not allowed.');
+        }
+
+        // Behavioural proxy-fetch detection. Downloads are scored against the
+        // sliding-window signals; searches/RSS feed those windows so a later
+        // download from the same token/IP can be correlated. Redirected grabs
+        // score zero and pass through.
+        $isDownload = $this->isNzbDownloadRequest($request);
+        $isSearch = $this->isSearchRequest($request);
+
+        if ($isDownload || $isSearch) {
+            $ctx = ProxyRequestContext::fromRequest($request, $isDownload, $isSearch);
+
+            if ($isDownload) {
+                $verdict = $this->detector->analyze($ctx);
+
+                if ($verdict->shouldBlock) {
+                    Log::warning('Blocked proxied NZB download (behavioural)', [
+                        'ip' => $ip,
+                        'user_agent' => $userAgent,
+                        'score' => $verdict->score,
+                        'reasons' => $verdict->reasons,
+                        'uri' => $this->safeRequestUri($request),
+                    ]);
+
+                    return $this->blockedResponse('Access denied: Proxying NZB downloads through indexer apps is not allowed.');
+                }
+            } else {
+                $this->detector->recordSearch($ctx);
+            }
         }
 
         if ($this->shouldBlockProxyIndexerApp($request, $userAgent)) {
@@ -171,6 +204,41 @@ class BlockAbusiveServices
         $type = strtolower(trim((string) $request->input('t', '')));
 
         return in_array($type, ['get', 'g'], true);
+    }
+
+    /**
+     * Detect search / caps / RSS requests that should feed the correlation
+     * windows. These populate the per-token and per-IP signals so a later
+     * download from the same client can be scored.
+     */
+    protected function isSearchRequest(Request $request): bool
+    {
+        // RSS feeds are search-like: a client discovering releases to grab.
+        if ($request->is('rss/*')) {
+            return true;
+        }
+
+        // v2 REST search/caps endpoints.
+        if ($request->is(
+            'api/v2/search',
+            'api/v2/movies',
+            'api/v2/audio',
+            'api/v2/books',
+            'api/v2/anime',
+            'api/v2/tv',
+            'api/v2/capabilities',
+        )) {
+            return true;
+        }
+
+        // v1 newznab: t= identifies the operation.
+        if (! $request->is('api/v1/api')) {
+            return false;
+        }
+
+        $type = strtolower(trim((string) $request->input('t', '')));
+
+        return in_array($type, ['search', 'tvsearch', 'movie', 'music', 'book', 'caps'], true);
     }
 
     /**

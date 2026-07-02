@@ -24,6 +24,16 @@ return [
     'block_proxy_indexer_apps' => (bool) env('BLOCK_PROXY_INDEXER_APPS', false),
     'block_proxy_indexer_app_user_agents' => env('BLOCK_PROXY_INDEXER_APP_USER_AGENTS', 'Prowlarr/,NZBHydra2'),
 
+    // Behavioural detection of direct proxy fetches (NZBHydra2/Prowlarr) that spoof a downloader UA.
+    // Combines Referer, UA-pair, download/search ratio, and IP-correlation signals into a score; blocks
+    // only when the score meets the threshold, so legitimate redirected grabs are left untouched.
+    'proxy_detection_enabled' => (bool) env('PROXY_DETECTION_ENABLED', false),
+    'proxy_detection_threshold' => (int) env('PROXY_DETECTION_THRESHOLD', 50),
+    'proxy_detection_window_seconds' => (int) env('PROXY_DETECTION_WINDOW_SECONDS', 3600),
+    'proxy_detection_ratio_min' => (float) env('PROXY_DETECTION_RATIO_MIN', 0.8),
+    'proxy_detection_min_searches' => (int) env('PROXY_DETECTION_MIN_SEARCHES', 20),
+    'proxy_detection_indexer_referer_patterns' => env('PROXY_DETECTION_INDEXER_REFERER_PATTERNS', 'hydra,prowlarr,jackett,lidarr,radarr,sonarr,readarr,bazarr'),
+
     /*
     |--------------------------------------------------------------------------
     | Release dedupe (import-time)
