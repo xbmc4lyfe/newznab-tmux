@@ -1647,9 +1647,15 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
     {
         $user = static::findOrFail($userId);
 
-        $userAllowed = $user->getDirectPermissions()->pluck('name')->toArray();
-        $roleAllowed = $user->getAllPermissions()->pluck('name')->toArray();
-        $allowed = array_intersect($roleAllowed, $userAllowed);
+        // getAllPermissions() already merges permissions granted directly to the
+        // user with permissions granted via their role(s). Intersecting it with
+        // getDirectPermissions() (as this used to do) meant that any user whose
+        // permissions come only from their role -- which is how every seeded
+        // role in RolesAndPermissionsSeeder grants them, including Admin -- ended
+        // up with an empty $allowed array, and therefore every category root
+        // excluded. That silently zeroed out browse/API results for all users
+        // on a fresh install.
+        $allowed = $user->getAllPermissions()->pluck('name')->toArray();
 
         $categoryPermissions = [
             'view console' => 1000,

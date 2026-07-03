@@ -266,6 +266,29 @@ final class UserExcludedCategoryTest extends TestCase
         $this->assertContains(2070, $exclusions);
     }
 
+    public function test_role_only_permissions_are_not_excluded(): void
+    {
+        // Regression test: RolesAndPermissionsSeeder grants every view permission
+        // via the role only (Role::givePermissionTo), never directly to the user
+        // (User::givePermissionTo). getCategoryExclusionById() must honor
+        // role-granted permissions, not just permissions assigned directly to
+        // the user, or every category ends up excluded on a fresh install.
+        $roleOnlyUser = $this->createTestUser($this->userRole->id);
+        $roleOnlyUser->assignRole($this->userRole);
+        // Deliberately do NOT call $roleOnlyUser->givePermissionTo(...) here.
+
+        $exclusions = User::getCategoryExclusionById($roleOnlyUser->id);
+
+        // The role has every 'view *' permission except 'view other', so only
+        // the 'Other' root category (id 1) should be excluded -- nothing from
+        // the seeded Movies (2000) or TV (5000) root categories.
+        $this->assertNotContains(2030, $exclusions);
+        $this->assertNotContains(2040, $exclusions);
+        $this->assertNotContains(2070, $exclusions);
+        $this->assertNotContains(5030, $exclusions);
+        $this->assertNotContains(5040, $exclusions);
+    }
+
     public function test_clearing_exclusions_works(): void
     {
         // First add exclusions
