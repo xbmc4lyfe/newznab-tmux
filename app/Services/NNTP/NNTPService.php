@@ -470,7 +470,7 @@ class NNTPService extends NntpClient
      *
      * @throws \Exception
      */
-    public function getXOVER(string $range): array|string|NNTPService
+    public function getXOVER(string $range): mixed
     {
         // Check if we are still connected.
         $connected = $this->_checkConnection();
