@@ -15,6 +15,7 @@ use Carbon\CarbonImmutable;
 use Illuminate\Auth\MustVerifyEmail as MustVerifyEmailTrait;
 use Illuminate\Contracts\Auth\CanResetPassword as CanResetPasswordContract;
 use Illuminate\Contracts\Auth\MustVerifyEmail as MustVerifyEmailContract;
+use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Collection;
@@ -755,20 +756,15 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
         ?string $createdTo = '',
         ?string $verified = '',
     ): int {
-        return self::query()
-            ->withTrashed()
-            ->excludeSharing()
-            ->when($role, fn (Builder $q) => $q->where('roles_id', $role))
-            ->when($username, fn (Builder $q) => $q->where('username', 'like', "%{$username}%"))
-            ->when($host, fn (Builder $q) => $q->where('host', 'like', "%{$host}%"))
-            ->when($email, fn (Builder $q) => $q->where('email', 'like', "%{$email}%"))
-            ->when($createdFrom, fn (Builder $q) => $q->where('created_at', '>=', "{$createdFrom} 00:00:00"))
-            ->when($createdTo, fn (Builder $q) => $q->where('created_at', '<=', "{$createdTo} 23:59:59"))
-            ->when($verified === '1', fn (Builder $q) => $q->where(function (Builder $verifiedQuery): void {
-                $verifiedQuery->where('verified', true)
-                    ->orWhereNotNull('email_verified_at');
-            }))
-            ->when($verified === '0', fn (Builder $q) => $q->where('verified', false)->whereNull('email_verified_at'))
+        return self::adminListBaseQuery([
+            'role' => (string) $role,
+            'username' => (string) $username,
+            'host' => (string) $host,
+            'email' => (string) $email,
+            'created_from' => (string) $createdFrom,
+            'created_to' => (string) $createdTo,
+            'verified' => (string) $verified,
+        ])
             ->count();
     }
 
@@ -1355,6 +1351,57 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
     ): Collection {
         $order = self::getBrowseOrder($orderBy);
 
+        return self::adminListBaseQuery([
+            'username' => (string) $userName,
+            'email' => (string) $email,
+            'host' => (string) $host,
+            'role' => (string) $role,
+            'created_from' => (string) $createdFrom,
+            'created_to' => (string) $createdTo,
+            'verified' => (string) $verified,
+        ])
+            ->withCount([
+                'requests as daily_api_count' => fn (Builder $q) => $q->where('timestamp', '>', now()->subDay()),
+                'downloads as daily_download_count' => fn (Builder $q) => $q->where('timestamp', '>', now()->subDay()),
+            ])
+            ->with('roles:id,name')
+            ->orderBy($order[0], $order[1])
+            ->when($start !== false, fn (Builder $q) => $q->offset($start)->limit($offset))
+            ->get();
+    }
+
+    /**
+     * @param  array{username?: string, email?: string, host?: string, role?: string, verified?: string, created_from?: string, created_to?: string}  $filters
+     * @return LengthAwarePaginator<int, User>
+     */
+    public static function adminListPaginator(array $filters, string $orderBy, int $perPage): LengthAwarePaginator
+    {
+        $order = self::getBrowseOrder($orderBy);
+
+        return self::adminListBaseQuery($filters)
+            ->withCount([
+                'requests as daily_api_count' => fn (Builder $q) => $q->where('timestamp', '>', now()->subDay()),
+                'downloads as daily_download_count' => fn (Builder $q) => $q->where('timestamp', '>', now()->subDay()),
+            ])
+            ->with('roles:id,name')
+            ->orderBy($order[0], $order[1])
+            ->paginate($perPage);
+    }
+
+    /**
+     * @param  array{username?: string, email?: string, host?: string, role?: string, verified?: string, created_from?: string, created_to?: string}  $filters
+     * @return Builder<User>
+     */
+    private static function adminListBaseQuery(array $filters): Builder
+    {
+        $username = $filters['username'] ?? '';
+        $email = $filters['email'] ?? '';
+        $host = $filters['host'] ?? '';
+        $role = $filters['role'] ?? '';
+        $verified = $filters['verified'] ?? '';
+        $createdFrom = $filters['created_from'] ?? '';
+        $createdTo = $filters['created_to'] ?? '';
+
         return self::query()
             ->withTrashed()
             ->select('users.*')
@@ -1363,7 +1410,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
                 'rolename'
             )
             ->excludeSharing()
-            ->when($userName, fn (Builder $q) => $q->where('username', 'like', "%{$userName}%"))
+            ->when($username, fn (Builder $q) => $q->where('username', 'like', "%{$username}%"))
             ->when($email, fn (Builder $q) => $q->where('email', 'like', "%{$email}%"))
             ->when($host, fn (Builder $q) => $q->where('host', 'like', "%{$host}%"))
             ->when($role, fn (Builder $q) => $q->where('roles_id', $role))
@@ -1373,15 +1420,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
                 $verifiedQuery->where('verified', true)
                     ->orWhereNotNull('email_verified_at');
             }))
-            ->when($verified === '0', fn (Builder $q) => $q->where('verified', false)->whereNull('email_verified_at'))
-            ->withCount([
-                'requests as daily_api_count' => fn (Builder $q) => $q->where('timestamp', '>', now()->subDay()),
-                'downloads as daily_download_count' => fn (Builder $q) => $q->where('timestamp', '>', now()->subDay()),
-            ])
-            ->with('roles:id,name')
-            ->orderBy($order[0], $order[1])
-            ->when($start !== false, fn (Builder $q) => $q->offset($start)->limit($offset))
-            ->get();
+            ->when($verified === '0', fn (Builder $q) => $q->where('verified', false)->whereNull('email_verified_at'));
     }
 
     /**
@@ -1400,6 +1439,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
             'createdat' => 'created_at',
             'lastlogin' => 'lastlogin',
             'apiaccess' => 'apiaccess',
+            'apirequests' => 'daily_api_count',
             'grabs' => 'grabs',
             'role' => 'rolename',
             'rolechangedate' => 'rolechangedate',

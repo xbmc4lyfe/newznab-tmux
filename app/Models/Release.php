@@ -506,6 +506,8 @@ class Release extends Model
             'video:id,title,tvdb,trakt,tvrage,tvmaze,source',
             'video.tvInfo:videos_id,summary,image',
             'episode:id,title,firstaired,se_complete',
+            'releaseGroup:releases_id,groups_id',
+            'releaseGroup.group:id,name',
         ]);
 
         if (is_array($guid)) {

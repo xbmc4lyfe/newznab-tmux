@@ -3,20 +3,16 @@
 @section('content')
 <div class="space-y-6" x-data="adminUserList">
     <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                    <i class="fas fa-users mr-2"></i>{{ $title }}
-                </h1>
+        <x-admin.page-header :title="$title" icon="fas fa-users">
+            <x-slot:actions>
                 <a href="{{ url('admin/user-edit?action=add') }}" class="px-4 py-2 bg-blue-600 dark:bg-blue-700 text-white rounded-lg hover:bg-blue-700 dark:hover:bg-blue-800">
                     <i class="fas fa-plus mr-2"></i>Add New User
                 </a>
-            </div>
-        </div>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Search Filters -->
-        <div class="px-6 py-4 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700">
+        <x-admin.search-bar>
             <form method="get" action="{{ url('admin/user-list') }}">
                 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                     <div>
@@ -95,34 +91,9 @@
                     </a>
                 </div>
             </form>
-        </div>
+        </x-admin.search-bar>
 
-        <!-- Success/Error Messages -->
-        @if(request()->has('deleted') && request()->input('deleted') == 1)
-            <div class="mx-6 mt-4 p-4 bg-green-50 dark:bg-green-900 border border-green-200 dark:border-green-700 rounded-lg">
-                <p class="text-green-800 dark:text-green-200">
-                    <i class="fas fa-check-circle mr-2"></i>
-                    User "{{ request()->input('username') }}" has been deleted successfully.
-                </p>
-            </div>
-        @endif
-
-        @if(session('success'))
-            <div class="mx-6 mt-4 p-4 bg-green-50 dark:bg-green-900 border border-green-200 dark:border-green-700 rounded-lg">
-                <p class="text-green-800 dark:text-green-200">
-                    <i class="fas fa-check-circle mr-2"></i>{{ session('success') }}
-                </p>
-            </div>
-        @endif
-
-        @if(session('error'))
-            <div class="mx-6 mt-4 p-4 bg-red-50 dark:bg-red-900 border border-red-200 dark:border-red-700 rounded-lg">
-                <p class="text-red-800 dark:text-red-200">
-                    <i class="fas fa-exclamation-circle mr-2"></i>{{ session('error') }}
-                </p>
-            </div>
-        @endif
-
+        <!-- Validation Messages -->
         @if($errors->any())
             <div class="mx-6 mt-4 p-4 bg-red-50 dark:bg-red-900 border border-red-200 dark:border-red-700 rounded-lg">
                 <p class="text-red-800 dark:text-red-200">
@@ -489,4 +460,3 @@
 @endsection
 
 {{-- Scripts moved to resources/js/csp-safe.js --}}
-

@@ -7,6 +7,7 @@ namespace App\Http\Controllers\Admin;
 use App\Enums\SignupError;
 use App\Enums\UserRole;
 use App\Http\Controllers\BasePageController;
+use App\Http\Requests\Admin\AdminUserListRequest;
 use App\Models\Invitation;
 use App\Models\User;
 use App\Models\UserDownload;
@@ -28,43 +29,23 @@ class AdminUserController extends BasePageController
     /**
      * @throws \Throwable
      */
-    public function index(Request $request): View
+    public function index(AdminUserListRequest $request): View
     {
         $this->setAdminPrefs();
 
         $meta_title = $title = 'User List';
 
-        $roles = Role::pluck('name', 'id')->toArray();
+        $roles = Role::query()->orderBy('name')->pluck('name', 'id')->toArray();
 
         $ordering = getUserBrowseOrdering();
-        $orderBy = $request->has('ob') && \in_array($request->input('ob'), $ordering, false) ? $request->input('ob') : '';
-        $page = $request->has('page') && is_numeric($request->input('page')) ? $request->input('page') : 1;
-        $offset = ($page - 1) * config('nntmux.items_per_page');
+        $orderBy = $request->orderBy();
+        $variables = $request->filters();
 
-        $variables = [
-            'username' => $request->has('username') ? $request->input('username') : '',
-            'email' => $request->has('email') ? $request->input('email') : '',
-            'host' => $request->has('host') ? $request->input('host') : '',
-            'role' => $request->has('role') ? $request->input('role') : '',
-            'verified' => in_array($request->input('verified'), ['0', '1'], true) ? $request->input('verified') : '',
-            'created_from' => $request->has('created_from') ? $request->input('created_from') : '',
-            'created_to' => $request->has('created_to') ? $request->input('created_to') : '',
-        ];
-
-        $result = User::getRange(
-            $offset,
-            (int) config('nntmux.items_per_page'),
+        $results = User::adminListPaginator(
+            $variables,
             $orderBy,
-            $variables['username'],
-            $variables['email'],
-            $variables['host'],
-            $variables['role'],
-            $variables['created_from'],
-            $variables['created_to'],
-            $variables['verified']
-        );
-
-        $results = $this->paginate($result, User::getCount($variables['role'], $variables['username'], $variables['host'], $variables['email'], $variables['created_from'], $variables['created_to'], $variables['verified']), config('nntmux.items_per_page'), $page, $request->url(), $request->query());
+            (int) config('nntmux.items_per_page'),
+        )->withQueryString();
 
         // Build order by URLs
         $orderByUrls = [];
@@ -392,8 +373,9 @@ class AdminUserController extends BasePageController
             $user->delete();
             Cache::forget(AdminDashboardSnapshotService::CACHE_KEY);
 
-            // Redirect with username to display in notification
-            return redirect()->to('admin/user-list?deleted=1&username='.urlencode($username));
+            return redirect()
+                ->route('admin.user-list')
+                ->with('success', 'User "'.$username.'" has been deleted successfully.');
         }
 
         if ($request->has('redir')) {

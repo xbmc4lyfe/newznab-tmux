@@ -29,6 +29,7 @@ use App\Observers\ReleaseObserver;
 use App\Observers\RolePromotionObserver;
 use App\Observers\SteamAppObserver;
 use App\Observers\VideoObserver;
+use App\View\Composers\AdminDataComposer;
 use App\View\Composers\GlobalDataComposer;
 use Illuminate\Auth\Events\Login;
 use Illuminate\Pagination\Paginator;
@@ -46,18 +47,21 @@ class AppServiceProvider extends ServiceProvider
     {
         Paginator::useTailwind();
 
-        // Share global data with layouts and all admin views
-        // Admin child views need direct registration because @section blocks
-        // are evaluated before the layout composer runs
-        // Same for search.* so category menu data (e.g. parentcatlist) exists in @section('content')
+        // Share public-site global data with layouts that need menu/category data.
+        // search.* needs direct registration because @section blocks are evaluated
+        // before the layout composer runs.
         view()->composer([
             'layouts.main',
-            'layouts.admin',
             'layouts.guest',
             'layouts.app',
-            'admin.*',
             'search.*',
         ], GlobalDataComposer::class);
+
+        // Admin pages use a leaner composer and do not need public-site menu data.
+        view()->composer([
+            'layouts.admin',
+            'admin.*',
+        ], AdminDataComposer::class);
 
         Gate::define('viewPulse', function (User $user) {
             return $user->hasRole('Admin');
