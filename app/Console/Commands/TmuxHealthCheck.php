@@ -7,6 +7,7 @@ namespace App\Console\Commands;
 use App\Models\Settings;
 use App\Services\Tmux\TmuxSessionManager;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Process;
 
 class TmuxHealthCheck extends Command
@@ -37,21 +38,33 @@ class TmuxHealthCheck extends Command
     public function handle(): int
     {
         try {
-            // Get session name from option, database setting, or config
             $this->sessionName = $this->option('session')
                 ?? Settings::settingValue('tmux_session')
                 ?? config('tmux.session.default_name', 'nntmux');
 
             $this->sessionManager = new TmuxSessionManager($this->sessionName);
-
-            // Use Laravel's built-in quiet mode check
             $quiet = $this->output->isQuiet();
+            $shouldBeRunning = $this->shouldBeRunning();
+            $autoRestart = (bool) $this->option('auto-restart');
 
-            // Step 1: Check if tmux session exists
             if (! $this->sessionManager->sessionExists()) {
                 if (! $quiet) {
                     $this->warn("⚠️  Tmux session '{$this->sessionName}' does not exist.");
                 }
+
+                if (! $shouldBeRunning) {
+                    $this->logHealthCheck('notice', 'stopped_intentionally');
+
+                    return Command::SUCCESS;
+                }
+
+                if ($autoRestart) {
+                    $this->logHealthCheck('warning', 'session_missing_restart_attempted');
+
+                    return $this->restartTmux();
+                }
+
+                $this->logHealthCheck('warning', 'session_missing_unrecovered');
 
                 return Command::FAILURE;
             }
@@ -60,7 +73,6 @@ class TmuxHealthCheck extends Command
                 $this->info("✅ Tmux session '{$this->sessionName}' exists.");
             }
 
-            // Step 2: Check if monitor pane (0.0) is dead
             $monitorPaneDead = $this->isMonitorPaneDead();
 
             if ($monitorPaneDead) {
@@ -68,9 +80,13 @@ class TmuxHealthCheck extends Command
                     $this->warn('⚠️  Monitor pane (0.0) is dead.');
                 }
 
-                if ($this->option('auto-restart')) {
+                if ($autoRestart) {
+                    $this->logHealthCheck('warning', 'monitor_dead_restart_attempted');
+
                     return $this->restartTmux();
                 }
+
+                $this->logHealthCheck('warning', 'monitor_dead_unrecovered');
 
                 return Command::FAILURE;
             }
@@ -79,9 +95,11 @@ class TmuxHealthCheck extends Command
                 $this->info('✅ Monitor pane (0.0) is alive and running.');
             }
 
+            $this->logHealthCheck('info', 'healthy');
+
             return Command::SUCCESS;
 
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             $this->error('❌ Health check failed: '.$e->getMessage());
             logger()->error('Tmux health check error', [
                 'message' => $e->getMessage(),
@@ -97,24 +115,20 @@ class TmuxHealthCheck extends Command
      */
     private function isMonitorPaneDead(): bool
     {
-        // Use tmux display-message to check pane_dead flag
         $result = Process::timeout(10)->run(
             "tmux display-message -p -t {$this->sessionName}:0.0 '#{pane_dead}'"
         );
 
         if (! $result->successful()) {
-            // If we can't even query the pane, consider it dead
             return true;
         }
 
         $paneDeadFlag = trim($result->output());
 
-        // tmux returns '1' if pane is dead, '0' if alive
         if ($paneDeadFlag === '1') {
             return true;
         }
 
-        // Additional check: verify the pane is actually running a process
         $commandResult = Process::timeout(10)->run(
             "tmux display-message -p -t {$this->sessionName}:0.0 '#{pane_current_command}'"
         );
@@ -123,11 +137,12 @@ class TmuxHealthCheck extends Command
             return true;
         }
 
-        $currentCommand = trim($commandResult->output());
-
-        // If the pane is just showing a shell with no process, it might be considered "idle"
-        // but not necessarily dead. The pane_dead flag is the authoritative check.
         return false;
+    }
+
+    private function shouldBeRunning(): bool
+    {
+        return filter_var(Settings::settingValue('running'), FILTER_VALIDATE_BOOL);
     }
 
     /**
@@ -137,7 +152,6 @@ class TmuxHealthCheck extends Command
     {
         $this->info('🔄 Restarting tmux session...');
 
-        // First, stop the existing session if it exists
         if ($this->sessionManager->sessionExists()) {
             $this->info('⏹️  Stopping existing session...');
             $this->call('tmux:stop', [
@@ -145,11 +159,9 @@ class TmuxHealthCheck extends Command
                 '--force' => true,
             ]);
 
-            // Give it a moment to clean up
             sleep(2);
         }
 
-        // Start a new session
         $this->info('▶️  Starting new tmux session...');
         $exitCode = $this->call('tmux:start', [
             '--session' => $this->sessionName,
@@ -157,10 +169,23 @@ class TmuxHealthCheck extends Command
 
         if ($exitCode === Command::SUCCESS) {
             $this->info("✅ Tmux session '{$this->sessionName}' restarted successfully.");
+            $this->logHealthCheck('notice', 'restart_succeeded', $exitCode);
         } else {
             $this->error("❌ Failed to restart tmux session '{$this->sessionName}'.");
+            $this->logHealthCheck('error', 'restart_failed', $exitCode);
         }
 
         return $exitCode;
+    }
+
+    private function logHealthCheck(string $level, string $outcome, ?int $exitCode = null): void
+    {
+        Log::log($level, 'Tmux health check result', [
+            'session' => $this->sessionName,
+            'auto_restart' => (bool) $this->option('auto-restart'),
+            'should_be_running' => $this->shouldBeRunning(),
+            'outcome' => $outcome,
+            'exit_code' => $exitCode,
+        ]);
     }
 }
