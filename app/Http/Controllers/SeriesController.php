@@ -37,17 +37,17 @@ class SeriesController extends BasePageController
 
         if ($id && ctype_digit($id)) {
             $category = -1;
-            if ($request->has('t') && ctype_digit($request->input('t'))) {
-                $category = $request->input('t');
+            $categoryInput = $this->scalarInput($request, 't');
+            if ($categoryInput !== '' && ctype_digit($categoryInput)) {
+                $category = (int) $categoryInput;
             }
 
             $catarray = [];
             $catarray[] = $category;
 
             $seriesLimit = (int) config('nntmux.series_view_limit', 200);
-            $page = $request->has('page') && is_numeric($request->input('page')) ? (int) $request->input('page') : 1;
-            $page = max($page, 1);
-            $offset = $seriesLimit > 0 ? ($page - 1) * $seriesLimit : 0;
+            $page = $this->resolvePage($request);
+            $offset = $seriesLimit > 0 ? $this->paginationOffset($page, $seriesLimit) : 0;
 
             $rel = $this->releaseSearchService->tvSearch(['id' => $id], '', '', '', $offset, $seriesLimit, '', $catarray, -1);
 
@@ -175,7 +175,7 @@ class SeriesController extends BasePageController
         } else {
             $letter = ($id && preg_match('/^(0-9|[A-Z])$/i', $id)) ? $id : '0-9';
 
-            $showname = ($request->has('title') && ! empty($request->input('title'))) ? $request->input('title') : '';
+            $showname = $this->scalarInput($request, 'title');
 
             if ($showname !== '' && ! $id) {
                 $letter = '';

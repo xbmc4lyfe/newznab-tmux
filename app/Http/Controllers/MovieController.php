@@ -36,26 +36,23 @@ class MovieController extends BasePageController
             return ['id' => $mcat->id, 'title' => $mcat->title];
         });
 
-        $category = $request->has('imdb') ? -1 : ($request->input('t', Category::MOVIE_ROOT));
+        $category = $request->has('imdb') ? -1 : $this->integerInput($request, 't', Category::MOVIE_ROOT);
         if ($id && $moviecats->pluck('title')->contains($id)) {
             $cat = Category::where(['title' => $id, 'root_categories_id' => Category::MOVIE_ROOT])->first(['id']);
-            $category = $cat->id ?? Category::MOVIE_ROOT;
+            $category = $cat !== null ? (int) $cat->id : Category::MOVIE_ROOT;
         }
 
         $catarray = $category !== -1 ? [$category] : [];
 
-        $page = (int) $request->input('page', 1);
-        $offset = ($page - 1) * (int) config('nntmux.items_per_cover_page');
-
-        $orderby = $request->input('ob', '');
+        $page = $this->resolvePage($request);
+        $perPage = (int) config('nntmux.items_per_cover_page');
+        $offset = $this->paginationOffset($page, $perPage);
         $ordering = $this->movieBrowseService->getMovieOrdering();
-        if (! in_array($orderby, $ordering, true)) {
-            $orderby = '';
-        }
+        $orderby = $this->resolveOrderBy($request, $ordering);
 
-        $rslt = $this->movieBrowseService->getMovieRange($page, $catarray, $offset, (int) config('nntmux.items_per_cover_page'), $orderby, -1, (array) $this->userdata->categoryexclusions);
+        $rslt = $this->movieBrowseService->getMovieRange($page, $catarray, $offset, $perPage, $orderby, -1, (array) $this->userdata->categoryexclusions);
         $totalCount = $rslt->isNotEmpty() ? ($rslt[0]->_totalcount ?? 0) : 0;
-        $results = $this->paginate($rslt ?? [], $totalCount, (int) config('nntmux.items_per_cover_page'), $page, $request->url(), $request->query());
+        $results = $this->paginate($rslt ?? [], $totalCount, $perPage, $page, $request->url(), $request->query());
 
         $movies = $results->map(function ($result) {
             $result->genre = makeFieldLinks($result, 'genre', 'movies');
@@ -71,6 +68,11 @@ class MovieController extends BasePageController
         $years = range(1903, now()->addYear()->year);
         rsort($years);
 
+        $genres = $this->movieBrowseService->getGenres();
+        $ratingInput = $this->integerInput($request, 'rating', 0);
+        $genreInput = $this->scalarInput($request, 'genre');
+        $yearInput = $this->integerInput($request, 'year', 0);
+
         $catname = $category === -1 ? 'All' : Category::find($category) ?? 'All';
 
         $this->viewData = array_merge($this->viewData, [
@@ -79,15 +81,15 @@ class MovieController extends BasePageController
             'catlist' => $moviecats,
             'category' => $category,
             'categorytitle' => $id,
-            'title' => stripslashes((string) ($request->input('title') ?? '')),
-            'actors' => stripslashes((string) ($request->input('actors') ?? '')),
-            'director' => stripslashes((string) ($request->input('director') ?? '')),
+            'title' => stripslashes($this->scalarInput($request, 'title')),
+            'actors' => stripslashes($this->scalarInput($request, 'actors')),
+            'director' => stripslashes($this->scalarInput($request, 'director')),
             'ratings' => range(1, 9),
-            'rating' => $request->input('rating', ''),
-            'genres' => $this->movieBrowseService->getGenres(),
-            'genre' => $request->input('genre', ''),
+            'rating' => \in_array($ratingInput, range(1, 9), true) ? $ratingInput : '',
+            'genres' => $genres,
+            'genre' => \in_array($genreInput, $genres, true) ? $genreInput : '',
             'years' => $years,
-            'year' => $request->input('year', ''),
+            'year' => \in_array($yearInput, $years, true) ? $yearInput : '',
             'catname' => $catname,
             'resultsadd' => $movies,
             'results' => $results,
@@ -162,8 +164,9 @@ class MovieController extends BasePageController
      */
     public function showTrailer(Request $request)
     {
-        if ($request->has('id') && ctype_digit($request->input('id'))) {
-            $mov = $this->movieService->getMovieInfo($request->input('id'));
+        $movieId = $this->scalarInput($request, 'id');
+        if ($movieId !== '' && ctype_digit($movieId)) {
+            $mov = $this->movieService->getMovieInfo($movieId);
 
             if (! $mov) {
                 return response()->json(['message' => 'There is no trailer for this movie.'], 404);

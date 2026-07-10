@@ -148,4 +148,17 @@ class ReleaseBrowseServiceTest extends TestCase
 
         $this->assertEquals(['searchname', 'desc'], $result);
     }
+
+    /**
+     * Test that browse result report badges use joined page rows, not a full-table report aggregate.
+     */
+    public function test_browse_query_uses_page_scoped_report_join(): void
+    {
+        $servicePath = __DIR__.'/../../app/Services/Releases/ReleaseBrowseService.php';
+        $content = (string) file_get_contents($servicePath);
+
+        $this->assertStringContainsString('LEFT OUTER JOIN release_reports rr ON rr.releases_id = r.id', $content);
+        $this->assertStringContainsString('COUNT(DISTINCT rr.id) AS total_report_count', $content);
+        $this->assertStringNotContainsString('FROM release_reports GROUP BY releases_id', $content);
+    }
 }

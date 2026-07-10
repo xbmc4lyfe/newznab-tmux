@@ -124,6 +124,89 @@ class BasePageController extends Controller
         return new LengthAwarePaginator($query, $totalCount, $items, $page, ['path' => $path, 'query' => $reqQuery]);
     }
 
+    protected function resolvePage(Request $request, string $key = 'page'): int
+    {
+        $page = $request->input($key, 1);
+        if (! is_scalar($page)) {
+            return 1;
+        }
+
+        $page = (string) $page;
+        if ($page === '' || preg_match('/^\d+$/', $page) !== 1) {
+            return 1;
+        }
+
+        return max(1, (int) $page);
+    }
+
+    /**
+     * @param  array<int, string>  $ordering
+     */
+    protected function resolveOrderBy(Request $request, array $ordering, string $key = 'ob'): string
+    {
+        $orderByInput = $request->input($key, '');
+        $orderBy = is_scalar($orderByInput) ? (string) $orderByInput : '';
+
+        return \in_array($orderBy, $ordering, true) ? $orderBy : '';
+    }
+
+    protected function paginationOffset(int $page, int $perPage): int
+    {
+        return ($page - 1) * $perPage;
+    }
+
+    /**
+     * @param  array<int, string>  $ordering
+     * @return array<string, string>
+     */
+    protected function buildOrderByUrls(array $ordering, string $basePath, string $prefix = 'orderby'): array
+    {
+        $orderByUrls = [];
+        foreach ($ordering as $orderType) {
+            $orderByUrls[$prefix.$orderType] = url($basePath.'?ob='.$orderType);
+        }
+
+        return $orderByUrls;
+    }
+
+    protected function scalarInput(Request $request, string $key, string $default = ''): string
+    {
+        $value = $request->input($key, $default);
+
+        return is_scalar($value) ? (string) $value : $default;
+    }
+
+    protected function integerInput(Request $request, string $key, int $default = 0): int
+    {
+        $value = $this->scalarInput($request, $key, (string) $default);
+
+        return preg_match('/^-?\d+$/', $value) === 1 ? (int) $value : $default;
+    }
+
+    /**
+     * @return array<int|string, mixed>
+     */
+    protected function arrayInput(Request $request, string $key): array
+    {
+        $value = $request->input($key, []);
+
+        return \is_array($value) ? $value : [];
+    }
+
+    protected function localReturnUrl(Request $request, string $fallback, string $key = 'from'): string
+    {
+        $from = $this->scalarInput($request, $key);
+        if ($from === '') {
+            return url($fallback);
+        }
+
+        if (filter_var($from, FILTER_VALIDATE_URL) !== false) {
+            return parse_url($from, PHP_URL_HOST) === $request->getHost() ? $from : url($fallback);
+        }
+
+        return url($from);
+    }
+
     /**
      * Check if request is POST.
      */

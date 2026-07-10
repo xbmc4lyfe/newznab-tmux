@@ -93,27 +93,16 @@
 
         <!-- Results -->
         @if(count($results) > 0)
-            <div class="mb-4 flex flex-wrap justify-between items-center gap-4">
-                <div class="flex items-center gap-4">
-                    <h2 class="text-xl font-semibold text-gray-800 dark:text-gray-200">
-                        <i class="fa fa-music mr-2 text-blue-600 dark:text-blue-400"></i>
-                        {{ $catname ?? 'All' }} Albums
-                    </h2>
-                    <x-view-toggle
-                        current-view="covers"
-                        covgroup="music"
-                        :category="$categorytitle ?? 'All'"
-                        parentcat="Audio"
-                        :shows="false"
-                    />
-                </div>
-                <div class="flex items-center gap-4">
-                    <x-inline-search placeholder="Search in Audio..." :category="$category ?? null" />
-                    <span class="text-sm text-gray-600 dark:text-gray-400">
-                        {{ $results->total() }} results found
-                    </span>
-                </div>
-            </div>
+            <x-cover-results-toolbar
+                :results="$results"
+                icon="fa fa-music"
+                :title="($catname ?? 'All') . ' Albums'"
+                covgroup="music"
+                :category="$categorytitle ?? 'All'"
+                parentcat="Audio"
+                search-placeholder="Search in Audio..."
+                :search-category="$category ?? null"
+            />
 
             <!-- Album Grid - Card Layout with Multiple Releases -->
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
@@ -121,9 +110,7 @@
                     @php
                         $releases = $result->releases ?? [];
                         $totalReleases = $result->total_releases ?? count($releases);
-                        $maxReleases = 2;
-                        $displayReleases = array_slice($releases, 0, $maxReleases);
-                        $guid = !empty($displayReleases) ? $displayReleases[0]->guid : null;
+                        $guid = !empty($releases) ? $releases[0]->guid : null;
                         $totalFailed = collect($releases)->sum(fn($r) => (int)($r->failed_count ?? 0));
                     @endphp
 
@@ -182,66 +169,7 @@
                                     </div>
                                 </div>
 
-                                <!-- Release Information -->
-                                @if(!empty($displayReleases))
-                                    <div class="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
-                                        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">
-                                            Available Releases
-                                            @if($totalReleases > $maxReleases)
-                                                <span class="text-xs font-normal text-gray-500">(Showing {{ $maxReleases }} of {{ $totalReleases }})</span>
-                                            @endif
-                                        </h4>
-                                        <div class="space-y-2">
-                                            @foreach($displayReleases as $release)
-                                                @if($release->searchname)
-                                                    <div class="bg-gray-50 dark:bg-gray-900 rounded-lg p-2 border border-gray-200 dark:border-gray-700">
-                                                        <div class="space-y-2">
-                                                            <!-- Release Name -->
-                                                            <a href="{{ url('/details/' . $release->guid) }}" class="text-sm text-gray-800 dark:text-gray-200 hover:text-blue-600 dark:hover:text-blue-400 font-medium block break-all" title="{{ $release->searchname }}">
-                                                                {{ $release->searchname }}
-                                                            </a>
-
-                                                            <!-- Info Badges -->
-                                                            <div class="flex flex-wrap items-center gap-1.5">
-                                                                @if(isset($release->size))
-                                                                    <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300">
-                                                                        <i class="fas fa-hdd mr-1"></i>{{ number_format($release->size / 1073741824, 2) }} GB
-                                                                    </span>
-                                                                @endif
-                                                                @if(isset($release->postdate))
-                                                                    <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300">
-                                                                        <i class="fas fa-calendar-alt mr-1"></i>{{ date('M d, Y H:i', strtotime($release->postdate)) }}
-                                                                    </span>
-                                                                @endif
-                                                                @if(isset($release->nfoid) && !empty($release->nfoid))
-                                                                    <button type="button"
-                                                                            class="nfo-badge inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200 hover:bg-yellow-200 dark:hover:bg-yellow-800 transition cursor-pointer"
-                                                                            data-guid="{{ $release->guid }}"
-                                                                            title="View NFO file">
-                                                                        <i class="fas fa-file-alt mr-1"></i> NFO
-                                                                    </button>
-                                                                @endif
-                                                            </div>
-
-                                                            <!-- Action Buttons -->
-                                                            <div class="flex flex-wrap items-center gap-1.5">
-                                                                <a href="{{ url('/getnzb/' . $release->guid) }}" class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-600 dark:bg-green-700 text-white hover:bg-green-700 dark:hover:bg-green-800 transition">
-                                                                    <i class="fas fa-download mr-1"></i> Download
-                                                                </a>
-                                                                <button class="add-to-cart inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-800 transition" data-guid="{{ $release->guid }}">
-                                                                    <i class="fas fa-shopping-cart mr-1"></i> Cart
-                                                                </button>
-                                                                <a href="{{ url('/details/' . $release->guid) }}" class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-600 dark:bg-gray-700 text-white hover:bg-gray-700 dark:hover:bg-gray-800 transition">
-                                                                    <i class="fas fa-info-circle mr-1"></i> Details
-                                                                </a>
-                                                            </div>
-                                                        </div>
-                                                    </div>
-                                                @endif
-                                            @endforeach
-                                        </div>
-                                    </div>
-                                @endif
+                                <x-cover-release-list :releases="$releases" :total-releases="$totalReleases" />
                             </div>
                         </div>
                     </div>
@@ -268,4 +196,3 @@
 
 {{-- NFO modal is included globally via layouts.main --}}
 @endsection
-

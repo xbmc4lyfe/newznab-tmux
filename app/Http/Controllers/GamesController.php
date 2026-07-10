@@ -26,21 +26,24 @@ class GamesController extends BasePageController
             $ctmp[$ccat['id']] = $ccat;
         }
         $category = Category::PC_GAMES;
-        if ($request->has('t') && isset($ctmp[$request->input('t')])) {
-            $category = $request->input('t') + 0;
+        $categoryInput = $this->scalarInput($request, 't');
+        if ($categoryInput !== '' && isset($ctmp[$categoryInput])) {
+            $category = (int) $categoryInput;
         }
 
         $catarray = [];
         $catarray[] = $category;
 
-        $page = $request->has('page') && is_numeric($request->input('page')) ? $request->input('page') : 1;
+        $page = $this->resolvePage($request);
         $ordering = $games->getGamesOrdering();
-        $orderby = $request->has('ob') && \in_array($request->input('ob'), $ordering, true) ? $request->input('ob') : '';
-        $offset = ($page - 1) * (int) config('nntmux.items_per_cover_page');
-        $rslt = $games->getGamesRange($page, $catarray, $offset, (int) config('nntmux.items_per_cover_page'), $orderby, '', (array) $this->userdata->categoryexclusions);
-        $results = $this->paginate($rslt, $rslt[0]->_totalcount ?? 0, (int) config('nntmux.items_per_cover_page'), $page, $request->url(), $request->query());
+        $orderby = $this->resolveOrderBy($request, $ordering);
+        $perPage = (int) config('nntmux.items_per_cover_page');
+        $offset = $this->paginationOffset($page, $perPage);
+        $rslt = $games->getGamesRange($page, $catarray, $offset, $perPage, $orderby, '', (array) $this->userdata->categoryexclusions);
+        $results = $this->paginate($rslt, $rslt[0]->_totalcount ?? 0, $perPage, $page, $request->url(), $request->query());
 
-        $title = ($request->has('title') && ! empty($request->input('title'))) ? stripslashes($request->input('title')) : '';
+        $titleInput = $this->scalarInput($request, 'title');
+        $title = $titleInput !== '' ? stripslashes($titleInput) : '';
 
         $genres = $gen->getGenres((string) GenreService::GAME_TYPE, true);
         $tmpgnr = [];
@@ -51,9 +54,12 @@ class GamesController extends BasePageController
 
         $years = range(1903, date('Y') + 1);
         rsort($years);
-        $year = ($request->has('year') && \in_array($request->input('year'), $years, true)) ? $request->input('year') : '';
+        $yearInput = $this->scalarInput($request, 'year');
+        $yearValue = is_numeric($yearInput) ? (int) $yearInput : null;
+        $year = $yearValue !== null && \in_array($yearValue, $years, true) ? $yearValue : '';
 
-        $genre = ($request->has('genre') && isset($tmpgnr[$request->input('genre')])) ? $request->input('genre') : '';
+        $genreInput = $this->scalarInput($request, 'genre');
+        $genre = isset($tmpgnr[$genreInput]) ? $genreInput : '';
 
         if ((int) $category === -1) {
             $catname = 'All';

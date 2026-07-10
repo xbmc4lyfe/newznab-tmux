@@ -141,6 +141,29 @@ class AdminContentControllerTest extends TestCase
         $this->assertSame('/about/', $content->url);
     }
 
+    public function test_content_page_accepts_string_content_id_from_query(): void
+    {
+        $user = $this->createUserWithRole('User');
+        /** @var Authenticatable $authenticatedUser */
+        $authenticatedUser = $user;
+
+        $content = $this->createContent([
+            'title' => 'Useful Content',
+            'body' => '<p>Visible body.</p>',
+            'contenttype' => Content::TYPE_USEFUL,
+            'status' => Content::STATUS_ENABLED,
+            'role' => Content::ROLE_LOGGED_IN,
+        ]);
+
+        $response = $this->actingAs($authenticatedUser)->get(route('content', [
+            'id' => (string) $content->id,
+            'page' => 'content',
+        ]));
+
+        $response->assertOk();
+        $response->assertSee('Useful Content');
+    }
+
     public function test_create_form_marks_title_as_optional(): void
     {
         $admin = $this->createUserWithRole('Admin');

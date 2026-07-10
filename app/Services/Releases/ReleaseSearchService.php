@@ -1900,15 +1900,15 @@ class ReleaseSearchService
                     r.totalpart, r.fromname, r.grabs, r.comments, r.adddate,
                     r.videos_id, r.haspreview, r.jpgstatus, r.nfostatus,
                     CONCAT(cp.title, ' > ', c.title) AS category_name,
-                    df.failed AS failed_count,
-                    rr.total_report_count AS total_report_count,
-                    rr.report_count AS report_count,
-                    rr.report_reasons AS report_reasons,
-                    rr.all_report_reasons AS all_report_reasons,
-                    rr.latest_report_reason AS latest_report_reason,
-                    rr.latest_report_description AS latest_report_description,
-                    rr.response_count AS report_response_count,
-                    rr.latest_response_at AS latest_report_response_at,
+                    MAX(df.failed) AS failed_count,
+                    COUNT(DISTINCT rr.id) AS total_report_count,
+                    COUNT(DISTINCT CASE WHEN rr.status IN ('pending', 'reviewed', 'resolved') THEN rr.id ELSE NULL END) AS report_count,
+                    GROUP_CONCAT(DISTINCT CASE WHEN rr.status IN ('pending', 'reviewed', 'resolved') THEN rr.reason ELSE NULL END SEPARATOR ', ') AS report_reasons,
+                    GROUP_CONCAT(DISTINCT rr.reason SEPARATOR ', ') AS all_report_reasons,
+                    SUBSTRING_INDEX(GROUP_CONCAT(rr.reason ORDER BY rr.created_at DESC SEPARATOR ','), ',', 1) AS latest_report_reason,
+                    SUBSTRING_INDEX(GROUP_CONCAT(COALESCE(NULLIF(rr.description, ''), 'No additional report details were provided.') ORDER BY rr.created_at DESC SEPARATOR ' || '), ' || ', 1) AS latest_report_description,
+                    COUNT(DISTINCT CASE WHEN rr.response IS NOT NULL AND rr.response != '' AND rr.response_is_public = 1 THEN rr.id ELSE NULL END) AS report_response_count,
+                    MAX(CASE WHEN rr.response IS NOT NULL AND rr.response != '' AND rr.response_is_public = 1 THEN rr.responded_at ELSE NULL END) AS latest_report_response_at,
                     g.name AS group_name,
                     rn.releases_id AS nfoid,
                     re.releases_id AS reid,
@@ -1921,8 +1921,9 @@ class ReleaseSearchService
             LEFT JOIN categories c ON c.id = r.categories_id
             LEFT JOIN root_categories cp ON cp.id = c.root_categories_id
             LEFT OUTER JOIN dnzb_failures df ON df.release_id = r.id
-            LEFT OUTER JOIN (SELECT releases_id, COUNT(*) AS total_report_count, SUM(CASE WHEN status IN ('pending', 'reviewed', 'resolved') THEN 1 ELSE 0 END) AS report_count, GROUP_CONCAT(DISTINCT CASE WHEN status IN ('pending', 'reviewed', 'resolved') THEN reason ELSE NULL END SEPARATOR ', ') AS report_reasons, GROUP_CONCAT(DISTINCT reason SEPARATOR ', ') AS all_report_reasons, SUBSTRING_INDEX(GROUP_CONCAT(reason ORDER BY created_at DESC SEPARATOR ','), ',', 1) AS latest_report_reason, SUBSTRING_INDEX(GROUP_CONCAT(COALESCE(NULLIF(description, ''), 'No additional report details were provided.') ORDER BY created_at DESC SEPARATOR ' || '), ' || ', 1) AS latest_report_description, SUM(CASE WHEN response IS NOT NULL AND response != '' AND response_is_public = 1 THEN 1 ELSE 0 END) AS response_count, MAX(CASE WHEN response IS NOT NULL AND response != '' AND response_is_public = 1 THEN responded_at ELSE NULL END) AS latest_response_at FROM release_reports GROUP BY releases_id) rr ON rr.releases_id = r.id
-            %s",
+            LEFT OUTER JOIN release_reports rr ON rr.releases_id = r.id
+            %s
+            GROUP BY r.id",
             $whereSql
         );
     }
@@ -2073,6 +2074,8 @@ class ReleaseSearchService
         // Remove ORDER BY clause (not needed for COUNT)
         $countQuery = preg_replace('/ORDER\s+BY\s+[^)]+$/is', '', $countQuery);
 
+        $hadGroupBy = preg_match('/GROUP\s+BY/is', $countQuery);
+
         // Remove GROUP BY if it's only grouping by r.id
         $countQuery = preg_replace('/GROUP\s+BY\s+r\.id\s*$/is', '', $countQuery);
 
@@ -2080,7 +2083,7 @@ class ReleaseSearchService
         $hasDistinct = preg_match('/SELECT\s+DISTINCT/is', $countQuery);
 
         // Replace SELECT clause with COUNT
-        if ($hasDistinct || preg_match('/GROUP\s+BY/is', $countQuery)) {
+        if ($hasDistinct || $hadGroupBy || preg_match('/GROUP\s+BY/is', $countQuery)) {
             // For queries with DISTINCT or GROUP BY, count distinct r.id
             $countQuery = preg_replace(
                 '/SELECT\s+.+?\s+FROM/is',

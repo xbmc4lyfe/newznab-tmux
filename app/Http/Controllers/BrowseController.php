@@ -8,6 +8,7 @@ use App\Models\Category;
 use App\Models\RootCategory;
 use App\Services\Releases\ReleaseBrowseService;
 use Illuminate\Http\Request;
+use Illuminate\Pagination\LengthAwarePaginator;
 
 class BrowseController extends BasePageController
 {
@@ -25,18 +26,12 @@ class BrowseController extends BasePageController
     public function index(Request $request): mixed
     {
         $ordering = $this->releaseBrowseService->getBrowseOrdering();
-        $orderBy = $request->has('ob') && ! empty($request->input('ob')) ? $request->input('ob') : '';
-        $page = $request->has('page') && is_numeric($request->input('page')) ? $request->input('page') : 1;
-        $offset = ($page - 1) * config('nntmux.items_per_page');
-
-        $rslt = $this->releaseBrowseService->getBrowseRange($page, [-1], $offset, config('nntmux.items_per_page'), $orderBy, -1, (array) $this->userdata->categoryexclusions, -1);
-        $results = $this->paginate($rslt ?? [], $rslt[0]->_totalcount ?? 0, config('nntmux.items_per_page'), $page, $request->url(), $request->query());
+        $orderBy = $this->resolveOrderBy($request, $ordering);
+        $page = $this->resolvePage($request);
+        $results = $this->getBrowsePaginator($request, $page, [-1], $orderBy);
 
         // Build order by URLs
-        $orderByUrls = [];
-        foreach ($ordering as $orderType) {
-            $orderByUrls['orderby'.$orderType] = url('browse/All?ob='.$orderType);
-        }
+        $orderByUrls = $this->buildOrderByUrls($ordering, 'browse/All');
 
         $this->viewData = array_merge($this->viewData, [
             'category' => -1,
@@ -57,12 +52,13 @@ class BrowseController extends BasePageController
     public function show(Request $request, string $parentCategory, string $id = 'All'): mixed
     {
 
-        $parentId = RootCategory::query()->where('title', $parentCategory)->value('id');
+        $parentIdValue = RootCategory::query()->where('title', $parentCategory)->value('id');
+        $parentId = $parentIdValue === null ? null : (int) $parentIdValue;
 
         $query = Category::query()->where('title', $id)->where('root_categories_id', $parentId);
         if ($id !== 'All') {
             $cat = $query->first();
-            $category = $cat !== null ? $cat->id : -1;
+            $category = $cat !== null ? (int) $cat->id : -1;
         } else {
             $category = $parentId ?? -1;
         }
@@ -73,12 +69,9 @@ class BrowseController extends BasePageController
         $catarray[] = $category;
 
         $ordering = $this->releaseBrowseService->getBrowseOrdering();
-        $orderBy = $request->has('ob') && ! empty($request->input('ob')) ? $request->input('ob') : '';
-        $page = $request->has('page') && is_numeric($request->input('page')) ? $request->input('page') : 1;
-        $offset = ($page - 1) * config('nntmux.items_per_page');
-
-        $rslt = $this->releaseBrowseService->getBrowseRange($page, $catarray, $offset, config('nntmux.items_per_page'), $orderBy, -1, (array) $this->userdata->categoryexclusions, $grp);
-        $results = $this->paginate($rslt ?? [], $rslt[0]->_totalcount ?? 0, config('nntmux.items_per_page'), $page, $request->url(), $request->query());
+        $orderBy = $this->resolveOrderBy($request, $ordering);
+        $page = $this->resolvePage($request);
+        $results = $this->getBrowsePaginator($request, $page, $catarray, $orderBy, $grp);
 
         $covgroup = '';
         $shows = false;
@@ -126,14 +119,10 @@ class BrowseController extends BasePageController
         $orderByUrls = [];
         if ($id === 'All' && $parentCategory === 'All') {
             $meta_title = 'Browse '.$parentCategory.' releases';
-            foreach ($ordering as $orderType) {
-                $orderByUrls['orderby'.$orderType] = url('browse/'.$parentCategory.'?ob='.$orderType);
-            }
+            $orderByUrls = $this->buildOrderByUrls($ordering, 'browse/'.$parentCategory);
         } else {
             $meta_title = 'Browse '.$parentCategory.' / '.$id.' releases';
-            foreach ($ordering as $orderType) {
-                $orderByUrls['orderby'.$orderType] = url('browse/'.$parentCategory.'/'.$id.'?ob='.$orderType);
-            }
+            $orderByUrls = $this->buildOrderByUrls($ordering, 'browse/'.$parentCategory.'/'.$id);
         }
 
         $viewData = [
@@ -163,11 +152,14 @@ class BrowseController extends BasePageController
     public function group(Request $request): mixed
     {
         if ($request->has('g')) {
-            $group = $request->input('g');
-            $page = $request->has('page') && is_numeric($request->input('page')) ? $request->input('page') : 1;
-            $offset = ($page - 1) * config('nntmux.items_per_page');
-            $rslt = $this->releaseBrowseService->getBrowseRange($page, [-1], $offset, config('nntmux.items_per_page'), '', -1, (array) $this->userdata->categoryexclusions, $group);
-            $results = $this->paginate($rslt ?? [], $rslt[0]->_totalcount ?? 0, config('nntmux.items_per_page'), $page, $request->url(), $request->query());
+            $groupInput = $request->input('g');
+            if (! is_scalar($groupInput)) {
+                return redirect()->back()->with('error', 'Group parameter is invalid');
+            }
+
+            $group = (string) $groupInput;
+            $page = $this->resolvePage($request);
+            $results = $this->getBrowsePaginator($request, $page, [-1], '', $group);
 
             $this->viewData = array_merge($this->viewData, [
                 'results' => $results,
@@ -183,5 +175,18 @@ class BrowseController extends BasePageController
         }
 
         return redirect()->back()->with('error', 'Group parameter is required');
+    }
+
+    /**
+     * @param  array<int>  $categories
+     * @return LengthAwarePaginator<int, mixed>
+     */
+    private function getBrowsePaginator(Request $request, int $page, array $categories, string $orderBy, int|string $group = -1): LengthAwarePaginator
+    {
+        $perPage = (int) config('nntmux.items_per_page');
+        $offset = $this->paginationOffset($page, $perPage);
+        $rslt = $this->releaseBrowseService->getBrowseRange($page, $categories, $offset, $perPage, $orderBy, -1, (array) $this->userdata->categoryexclusions, $group);
+
+        return $this->paginate($rslt ?? [], $rslt[0]->_totalcount ?? 0, $perPage, $page, $request->url(), $request->query());
     }
 }

@@ -40,26 +40,27 @@ class ConsoleController extends BasePageController
                     'title' => $ccat->title,
                 ];
         }
-        $category = $request->has('t') ? $request->input('t') : Category::GAME_ROOT;
+        $category = $request->has('t') ? $this->scalarInput($request, 't', (string) Category::GAME_ROOT) : Category::GAME_ROOT;
         if ($id && \in_array($id, Arr::pluck($ctmp, 'title'), false)) {
             $cat = Category::query()
                 ->where('title', $id)
                 ->where('root_categories_id', '=', Category::GAME_ROOT)
                 ->first(['id']);
-            $category = $cat !== null ? $cat['id'] : Category::GAME_ROOT;
+            $category = $cat !== null ? (int) $cat['id'] : Category::GAME_ROOT;
         }
 
         $catarray = [];
-        $catarray[] = $category;
+        $catarray[] = (int) $category;
 
         $ordering = $this->consoleService->getConsoleOrdering();
-        $orderby = $request->has('ob') && \in_array($request->input('ob'), $ordering, false) ? $request->input('ob') : '';
-        $page = $request->has('page') && is_numeric($request->input('page')) ? $request->input('page') : 1;
-        $offset = ($page - 1) * (int) config('nntmux.items_per_cover_page');
+        $orderby = $this->resolveOrderBy($request, $ordering);
+        $page = $this->resolvePage($request);
+        $perPage = (int) config('nntmux.items_per_cover_page');
+        $offset = $this->paginationOffset($page, $perPage);
 
         $consoles = [];
-        $rslt = $this->consoleService->getConsoleRange($page, $catarray, $offset, (int) config('nntmux.items_per_cover_page'), $orderby, (array) $this->userdata->categoryexclusions);
-        $results = $this->paginate($rslt, $rslt[0]->_totalcount ?? 0, (int) config('nntmux.items_per_cover_page'), $page, $request->url(), $request->query());
+        $rslt = $this->consoleService->getConsoleRange($page, $catarray, $offset, $perPage, $orderby, (array) $this->userdata->categoryexclusions);
+        $results = $this->paginate($rslt, $rslt[0]->_totalcount ?? 0, $perPage, $page, $request->url(), $request->query());
 
         $maxwords = 50;
         foreach ($results as $result) {
@@ -73,8 +74,10 @@ class ConsoleController extends BasePageController
             $consoles[] = $result;
         }
 
-        $platform = ($request->has('platform') && ! empty($request->input('platform'))) ? stripslashes($request->input('platform')) : '';
-        $title = ($request->has('title') && ! empty($request->input('title'))) ? stripslashes($request->input('title')) : '';
+        $platformInput = $this->scalarInput($request, 'platform');
+        $platform = $platformInput !== '' ? stripslashes($platformInput) : '';
+        $titleInput = $this->scalarInput($request, 'title');
+        $title = $titleInput !== '' ? stripslashes($titleInput) : '';
 
         $genres = $gen->getGenres((string) GenreService::CONSOLE_TYPE, true);
         $tmpgnr = [];
@@ -82,7 +85,8 @@ class ConsoleController extends BasePageController
             /** @var Genre $gn */
             $tmpgnr[$gn->id] = $gn->title;
         }
-        $genre = ($request->has('genre') && isset($tmpgnr[$request->input('genre')])) ? $request->input('genre') : '';
+        $genreInput = $this->scalarInput($request, 'genre');
+        $genre = isset($tmpgnr[$genreInput]) ? $genreInput : '';
 
         if ((int) $category === -1) {
             $catname = 'All';

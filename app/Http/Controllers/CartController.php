@@ -36,7 +36,7 @@ class CartController extends BasePageController
      */
     public function store(Request $request): RedirectResponse|JsonResponse
     {
-        $guids = collect(explode(',', (string) $request->input('id')))
+        $guids = collect(explode(',', $this->scalarInput($request, 'id')))
             ->map(static fn (string $guid): string => trim($guid))
             ->filter()
             ->unique()

@@ -188,6 +188,22 @@ class ReleaseSearchServiceOrderingTest extends TestCase
     }
 
     /**
+     * Test that web search report badge data is aggregated on joined result rows.
+     */
+    public function test_build_search_base_sql_uses_page_scoped_report_join(): void
+    {
+        $reflection = new ReflectionClass(ReleaseSearchService::class);
+        $method = $reflection->getMethod('buildSearchBaseSql');
+
+        $sql = $method->invoke($this->service, 'WHERE r.id IN (1,2,3)');
+
+        $this->assertStringContainsString('LEFT OUTER JOIN release_reports rr ON rr.releases_id = r.id', $sql);
+        $this->assertStringContainsString('COUNT(DISTINCT rr.id) AS total_report_count', $sql);
+        $this->assertStringContainsString('GROUP BY r.id', $sql);
+        $this->assertStringNotContainsString('FROM release_reports GROUP BY releases_id', $sql);
+    }
+
+    /**
      * Test that the lightweight count query is built directly against releases.
      */
     public function test_get_releases_count_for_where_builds_releases_only_count_query(): void

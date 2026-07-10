@@ -54,7 +54,7 @@ class UserSerie extends Model
      * When a user wants to add a show to "my shows" insert it into the user series table.
      *
      *
-     * @param  array<string, mixed>  $catID
+     * @param  array<int|string, mixed>  $catID
      * @return int|Builder
      */
     public static function addShow(mixed $userId, mixed $videoId, array $catID = []) // @phpstan-ignore missingType.generics
@@ -125,7 +125,7 @@ class UserSerie extends Model
     /**
      * Update a TV show category ID for a user's "my show" TV show.
      *
-     * @param  array<string, mixed>  $catID  List of category ID's.
+     * @param  array<int|string, mixed>  $catID  List of category ID's.
      */
     public static function updateShow(mixed $users_id, mixed $videos_id, array $catID = []): void
     {

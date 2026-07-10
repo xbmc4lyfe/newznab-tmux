@@ -195,9 +195,9 @@ class GetNzbController extends BasePageController
      */
     private function validateAndSanitizeId(Request $request): string|Response
     {
-        $id = $request->input('id');
+        $id = $this->scalarInput($request, 'id');
 
-        if (empty($id)) {
+        if ($id === '') {
             return showApiError(200, 'Parameter id is required');
         }
 

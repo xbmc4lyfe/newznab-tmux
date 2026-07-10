@@ -156,7 +156,8 @@ class RssController extends BasePageController
      */
     public function categoryFeedRss(Request $request)
     {
-        if ($request->missing('id')) {
+        $categoryInput = $this->scalarInput($request, 'id');
+        if ($categoryInput === '') {
             return response()->json(['error' => 'Category ID is missing'], 403);
         }
 
@@ -165,7 +166,14 @@ class RssController extends BasePageController
             return $user;
         }
 
-        $categoryId = explode(',', $request->input('id'));
+        $categoryId = array_values(array_filter(
+            array_map('trim', explode(',', $categoryInput)),
+            static fn (string $categoryId): bool => preg_match('/^-?\d+$/', $categoryId) === 1
+        ));
+        if ($categoryId === []) {
+            return response()->json(['error' => 'Category ID is missing'], 403);
+        }
+
         [$userShow, $userAnidb, $userAirDate, $userNum, $userLimit, $outputXML] = $this->parseCommonRssParams($request);
 
         $relData = $this->rss->getRss($categoryId, $userShow, $userAnidb, $user['user_id'], $userAirDate, $userLimit, $userNum);

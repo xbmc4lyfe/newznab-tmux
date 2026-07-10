@@ -34,27 +34,27 @@ class BooksController extends BasePageController
                     'title' => $bcat->title,
                 ];
         }
-        $category = $request->has('t') ? $request->input('t') : Category::BOOKS_ROOT;
+        $category = $request->has('t') ? $this->scalarInput($request, 't', (string) Category::BOOKS_ROOT) : Category::BOOKS_ROOT;
         if ($id && \in_array($id, Arr::pluck($btmp, 'title'), false)) {
             $cat = Category::query()
                 ->where('title', $id)
                 ->where('root_categories_id', '=', Category::BOOKS_ROOT)
                 ->first(['id']);
-            $category = $cat !== null ? $cat['id'] : Category::BOOKS_ROOT;
+            $category = $cat !== null ? (int) $cat['id'] : Category::BOOKS_ROOT;
         }
 
         $catarray = [];
-        $catarray[] = $category;
+        $catarray[] = (int) $category;
 
         $ordering = $this->bookService->getBookOrdering();
-        $orderby = $request->has('ob') && \in_array($request->input('ob'), $ordering, false) ? $request->input('ob') : '';
+        $orderby = $this->resolveOrderBy($request, $ordering);
 
         $books = [];
-        $pageInput = $request->input('page');
-        $page = is_scalar($pageInput) && preg_match('/^\d+$/', (string) $pageInput) === 1 ? max(1, (int) $pageInput) : 1;
-        $offset = ($page - 1) * (int) config('nntmux.items_per_cover_page');
-        $rslt = $this->bookService->getBookRange($page, $catarray, $offset, (int) config('nntmux.items_per_cover_page'), $orderby, (array) $this->userdata->categoryexclusions);
-        $results = $this->paginate($rslt, $rslt[0]->_totalcount ?? 0, (int) config('nntmux.items_per_cover_page'), $page, $request->url(), $request->query());
+        $page = $this->resolvePage($request);
+        $perPage = (int) config('nntmux.items_per_cover_page');
+        $offset = $this->paginationOffset($page, $perPage);
+        $rslt = $this->bookService->getBookRange($page, $catarray, $offset, $perPage, $orderby, (array) $this->userdata->categoryexclusions);
+        $results = $this->paginate($rslt, $rslt[0]->_totalcount ?? 0, $perPage, $page, $request->url(), $request->query());
         $maxwords = 50;
         foreach ($results as $result) {
             if (! empty($result->overview)) {
@@ -67,9 +67,11 @@ class BooksController extends BasePageController
             $books[] = $result;
         }
 
-        $author = ($request->has('author') && ! empty($request->input('author'))) ? stripslashes($request->input('author')) : '';
+        $authorInput = $this->scalarInput($request, 'author');
+        $author = $authorInput !== '' ? stripslashes($authorInput) : '';
 
-        $title = ($request->has('title') && ! empty($request->input('title'))) ? stripslashes($request->input('title')) : '';
+        $titleInput = $this->scalarInput($request, 'title');
+        $title = $titleInput !== '' ? stripslashes($titleInput) : '';
 
         $browseby_link = '&title='.$title.'&author='.$author;
 

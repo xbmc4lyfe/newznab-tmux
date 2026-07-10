@@ -39,31 +39,33 @@ class MusicController extends BasePageController
                 ];
         }
 
-        $category = $request->has('t') ? $request->input('t') : Category::MUSIC_ROOT;
+        $category = $request->has('t') ? $this->scalarInput($request, 't', (string) Category::MUSIC_ROOT) : Category::MUSIC_ROOT;
         if ($id && \in_array($id, Arr::pluck($mtmp, 'title'), true)) {
             $cat = Category::query()
                 ->where('title', $id)
                 ->where('root_categories_id', '=', Category::MUSIC_ROOT)
                 ->first(['id']);
-            $category = $cat !== null ? $cat['id'] : Category::MUSIC_ROOT;
+            $category = $cat !== null ? (int) $cat['id'] : Category::MUSIC_ROOT;
         }
 
         $catarray = [];
-        $catarray[] = $category;
+        $catarray[] = (int) $category;
 
-        $pageInput = $request->input('page');
-        $page = is_scalar($pageInput) && preg_match('/^\d+$/', (string) $pageInput) === 1 ? max(1, (int) $pageInput) : 1;
-        $offset = ($page - 1) * (int) config('nntmux.items_per_cover_page');
+        $page = $this->resolvePage($request);
+        $perPage = (int) config('nntmux.items_per_cover_page');
+        $offset = $this->paginationOffset($page, $perPage);
         $ordering = $this->musicService->getMusicOrdering();
-        $orderby = $request->has('ob') && \in_array($request->input('ob'), $ordering, true) ? $request->input('ob') : '';
+        $orderby = $this->resolveOrderBy($request, $ordering);
 
         $musics = [];
-        $rslt = $this->musicService->getMusicRange($page, $catarray, $offset, (int) config('nntmux.items_per_cover_page'), $orderby, (array) $this->userdata->categoryexclusions);
-        $results = $this->paginate($rslt ?? [], $rslt[0]->_totalcount ?? 0, (int) config('nntmux.items_per_cover_page'), $page, $request->url(), $request->query());
+        $rslt = $this->musicService->getMusicRange($page, $catarray, $offset, $perPage, $orderby, (array) $this->userdata->categoryexclusions);
+        $results = $this->paginate($rslt ?? [], $rslt[0]->_totalcount ?? 0, $perPage, $page, $request->url(), $request->query());
 
-        $artist = ($request->has('artist') && ! empty($request->input('artist'))) ? stripslashes($request->input('artist')) : '';
+        $artistInput = $this->scalarInput($request, 'artist');
+        $artist = $artistInput !== '' ? stripslashes($artistInput) : '';
 
-        $title = ($request->has('title') && ! empty($request->input('title'))) ? stripslashes($request->input('title')) : '';
+        $titleInput = $this->scalarInput($request, 'title');
+        $title = $titleInput !== '' ? stripslashes($titleInput) : '';
 
         $genres = $this->genreService->getGenres((string) GenreService::MUSIC_TYPE, true);
         $tmpgnr = [];
@@ -74,15 +76,18 @@ class MusicController extends BasePageController
 
         foreach ($results as $result) {
             $res = $result;
-            $result->genre = $tmpgnr[$res->genres_id];
+            $result->genre = $tmpgnr[$res->genres_id] ?? '';
             $musics[] = $result;
         }
 
-        $genre = ($request->has('genre') && isset($tmpgnr[$request->input('genre')])) ? $request->input('genre') : '';
+        $genreInput = $this->scalarInput($request, 'genre');
+        $genre = isset($tmpgnr[$genreInput]) ? $genreInput : '';
 
         $years = range(1950, date('Y') + 1);
         rsort($years);
-        $year = ($request->has('year') && \in_array($request->input('year'), $years, true)) ? $request->input('year') : '';
+        $yearInput = $this->scalarInput($request, 'year');
+        $yearValue = is_numeric($yearInput) ? (int) $yearInput : null;
+        $year = $yearValue !== null && \in_array($yearValue, $years, true) ? $yearValue : '';
 
         if ((int) $category === -1) {
             $catname = 'All';

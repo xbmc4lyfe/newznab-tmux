@@ -22,7 +22,7 @@ class ContentController extends BasePageController
      */
     public function show(Request $request)
     {
-        $role = $this->userdata->role ?? 0;
+        $role = $this->contentRole();
 
         /* The role column in the content table values are:
          * 1 = logged in users
@@ -38,8 +38,8 @@ class ContentController extends BasePageController
          */
         $isAdmin = \in_array($role, [UserRole::ADMIN->value, UserRole::MODERATOR->value], true);
 
-        $contentId = $request->input('id', 0);
-        $contentPage = $request->input('page', false);
+        $contentId = $this->integerInput($request, 'id');
+        $contentPage = $this->scalarInput($request, 'page');
 
         if ($contentId === 0 && $contentPage === 'content') {
             // Show all content except front page
@@ -48,7 +48,7 @@ class ContentController extends BasePageController
             $meta_title = 'Contents page';
             $meta_keywords = 'contents';
             $meta_description = 'This is the contents page.';
-        } elseif ($contentId !== 0 && $contentPage !== false) {
+        } elseif ($contentId !== 0 && $contentPage !== '') {
             // Show specific content by ID
             $contentItem = $this->getContentById($contentId, $role);
             $content = $contentItem ? [$contentItem] : [];
@@ -80,6 +80,23 @@ class ContentController extends BasePageController
         ]);
 
         return view('content.index', $this->viewData);
+    }
+
+    private function contentRole(): int
+    {
+        if (! isset($this->userdata)) {
+            return Content::ROLE_EVERYONE;
+        }
+
+        if ($this->userdata->hasRole('Admin')) {
+            return UserRole::ADMIN->value;
+        }
+
+        if ($this->userdata->hasRole('Moderator')) {
+            return UserRole::MODERATOR->value;
+        }
+
+        return Content::ROLE_LOGGED_IN;
     }
 
     /**

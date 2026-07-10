@@ -41,7 +41,7 @@ class UserMovie extends Model
     protected $dateFormat = false;
 
     /**
-     * @param  array<string, mixed>  $catID
+     * @param  array<int|string, mixed>  $catID
      * @return int|Builder
      */
     public static function addMovie(mixed $uid, mixed $imdbid, array $catID = []) // @phpstan-ignore missingType.generics
@@ -97,7 +97,7 @@ class UserMovie extends Model
     }
 
     /**
-     * @param  array<string, mixed>  $catID
+     * @param  array<int|string, mixed>  $catID
      */
     public static function updateMovie(mixed $uid, mixed $imdbid, array $catID = []): void
     {

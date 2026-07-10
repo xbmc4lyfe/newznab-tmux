@@ -61,6 +61,11 @@
                                     <i class="fas fa-file-alt mr-2"></i> View NFO
                                 </button>
                             @endif
+                            @if(($release->totalpart ?? 0) > 0)
+                                <button type="button" class="filelist-badge px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-100 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 transition inline-flex items-center" data-guid="{{ $release->guid }}" title="View file list">
+                                    <i class="fas fa-list mr-2"></i> View Files
+                                </button>
+                            @endif
                             @auth
                                 @if(auth()->user()->hasRole('Admin') || auth()->user()->hasRole('Moderator'))
                                     <a href="{{ route('admin.release-edit', ['id' => $release->guid]) }}" class="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition inline-flex items-center" title="Edit Release">
@@ -947,41 +952,6 @@
                 </div>
             @endif
 
-            <!-- NFO -->
-            @if($nfo ?? false)
-                <div>
-                    <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-3">NFO</h3>
-                    <div class="bg-black dark:bg-gray-950 text-green-400 dark:text-green-300 p-4 rounded-lg overflow-x-auto font-mono text-sm border border-gray-700 dark:border-gray-600">
-                        <pre>{{ $nfo }}</pre>
-                    </div>
-                </div>
-            @endif
-
-            <!-- File List -->
-            @if(isset($files) && count($files) > 0)
-                <div>
-                    <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-3">Files ({{ count($files) }})</h3>
-                    <div class="detail-file-list surface-panel-alt rounded-lg overflow-hidden border">
-                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                            <thead class="surface-panel-alt">
-                                <tr>
-                                    <th class="px-4 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">Filename</th>
-                                    <th class="px-4 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">Size</th>
-                                </tr>
-                            </thead>
-                            <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
-                                @foreach($files as $file)
-                                    <tr class="hover:bg-gray-100 dark:hover:bg-gray-700 transition">
-                                        <td class="px-4 py-2 text-sm text-gray-800 dark:text-gray-200">{{ $file->name }}</td>
-                                        <td class="px-4 py-2 text-sm text-gray-600 dark:text-gray-400">{{ number_format($file->size / 1048576, 2) }} MB</td>
-                                    </tr>
-                                @endforeach
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            @endif
-
             <!-- Comments Section -->
             <div>
                 <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-4 flex items-center">
@@ -1156,4 +1126,3 @@
 @push('scripts')
 @include('partials.cart-script')
 @endpush
-

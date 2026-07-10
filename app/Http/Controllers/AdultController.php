@@ -32,24 +32,25 @@ class AdultController extends BasePageController
                 'title' => $mcat->title,
             ];
         }
-        $category = $request->has('t') ? $request->input('t') : Category::XXX_ROOT;
+        $category = $this->integerInput($request, 't', Category::XXX_ROOT);
         if ($id && \in_array($id, Arr::pluck($mtmp, 'title'), true)) {
             $cat = Category::query()
                 ->where('title', $id)
                 ->where('root_categories_id', '=', Category::XXX_ROOT)
                 ->first(['id']);
-            $category = $cat !== null ? $cat['id'] : Category::XXX_ROOT;
+            $category = $cat !== null ? (int) $cat['id'] : Category::XXX_ROOT;
         }
         $catarray = [];
         $catarray[] = $category;
 
         $ordering = $this->releaseBrowseService->getBrowseOrdering();
-        $orderby = $request->has('ob') && \in_array($request->input('ob'), $ordering, true) ? $request->input('ob') : '';
+        $orderby = $this->resolveOrderBy($request, $ordering);
 
-        $page = $request->has('page') && is_numeric($request->input('page')) ? $request->input('page') : 1;
-        $offset = ($page - 1) * config('nntmux.items_per_page');
-        $rslt = $this->releaseBrowseService->getBrowseRange($page, $catarray, $offset, config('nntmux.items_per_page'), $orderby, -1, (array) ($this->userdata->categoryexclusions ?? []), -1);
-        $results = $this->paginate($rslt ?? [], isset($rslt[0]->_totalcount) ? $rslt[0]->_totalcount : 0, config('nntmux.items_per_page'), $page, $request->url(), $request->query());
+        $page = $this->resolvePage($request);
+        $perPage = (int) config('nntmux.items_per_page');
+        $offset = $this->paginationOffset($page, $perPage);
+        $rslt = $this->releaseBrowseService->getBrowseRange($page, $catarray, $offset, $perPage, $orderby, -1, (array) ($this->userdata->categoryexclusions ?? []), -1);
+        $results = $this->paginate($rslt ?? [], isset($rslt[0]->_totalcount) ? $rslt[0]->_totalcount : 0, $perPage, $page, $request->url(), $request->query());
 
         if ((int) $category === -1) {
             $catname = 'All';
@@ -60,7 +61,7 @@ class AdultController extends BasePageController
 
         $orderByUrls = [];
         foreach ($ordering as $ordertype) {
-            $orderByUrls['orderby'.$ordertype] = url('/XXX/'.($id ?: 'All').'?t='.$category.'&ob='.$ordertype.'&offset=0');
+            $orderByUrls['orderby'.$ordertype] = url('/XXX/'.($id ?: 'All').'?t='.$category.'&ob='.$ordertype);
         }
 
         $this->viewData = array_merge($this->viewData, [
@@ -69,6 +70,7 @@ class AdultController extends BasePageController
             'categorytitle' => $id,
             'catname' => $catname,
             'ordering' => $ordering,
+            'orderByUrls' => $orderByUrls,
             'results' => $results,
             'lastvisit' => $this->userdata['lastlogin'] ?? null,
             'meta_title' => 'Browse XXX',

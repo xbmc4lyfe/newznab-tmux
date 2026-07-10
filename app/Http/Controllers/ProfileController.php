@@ -41,8 +41,10 @@ class ProfileController extends BasePageController
         $publicView = false;
 
         if ($privileged || ! $privateProfiles) {
-            $altID = ($request->has('id') && (int) $request->input('id') >= 0) ? (int) $request->input('id') : false;
-            $altUsername = ($request->has('name') && $request->input('name') !== '') ? $request->input('name') : false;
+            $altIdInput = $this->scalarInput($request, 'id');
+            $altID = $altIdInput !== '' && preg_match('/^\d+$/', $altIdInput) === 1 ? (int) $altIdInput : false;
+            $altUsername = $this->scalarInput($request, 'name');
+            $altUsername = $altUsername !== '' ? $altUsername : false;
 
             // If both 'id' and 'name' are specified, 'id' should take precedence.
             if ($altID === false && $altUsername !== false) {
@@ -252,9 +254,9 @@ class ProfileController extends BasePageController
      */
     public function destroy(Request $request, GdprErasureService $erasureService): Application|View|Factory|RedirectResponse|\Illuminate\Contracts\Foundation\Application
     {
-        $userId = $request->input('id');
+        $userId = $this->integerInput($request, 'id');
 
-        if ($userId !== null && (int) $userId === $this->userdata->id && ! $this->userdata->hasRole('Admin')) {
+        if ($userId > 0 && $userId === $this->userdata->id && ! $this->userdata->hasRole('Admin')) {
             $user = User::find($userId);
             if ($user === null) {
                 return redirect()->to('profile');

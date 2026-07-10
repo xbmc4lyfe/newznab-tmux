@@ -73,27 +73,16 @@
 
         <!-- Results -->
         @if(count($results) > 0)
-            <div class="mb-4 flex flex-wrap justify-between items-center gap-4">
-                <div class="flex items-center gap-4">
-                    <h2 class="text-xl font-semibold text-gray-800 dark:text-gray-200">
-                        <i class="fa fa-book mr-2 text-blue-600"></i>
-                        {{ $catname ?? 'All' }} Books
-                    </h2>
-                    <x-view-toggle
-                        current-view="covers"
-                        covgroup="books"
-                        :category="$categorytitle ?? 'All'"
-                        parentcat="Books"
-                        :shows="false"
-                    />
-                </div>
-                <div class="flex items-center gap-4">
-                    <x-inline-search placeholder="Search in Books..." :category="$category ?? null" />
-                    <span class="text-sm text-gray-600 dark:text-gray-400">
-                        {{ $results->total() }} results found
-                    </span>
-                </div>
-            </div>
+            <x-cover-results-toolbar
+                :results="$results"
+                icon="fa fa-book"
+                :title="($catname ?? 'All') . ' Books'"
+                covgroup="books"
+                :category="$categorytitle ?? 'All'"
+                parentcat="Books"
+                search-placeholder="Search in Books..."
+                :search-category="$category ?? null"
+            />
 
             <!-- Books Grid -->
             <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 mb-6">
@@ -173,4 +162,3 @@
     </div>
 </div>
 @endsection
-

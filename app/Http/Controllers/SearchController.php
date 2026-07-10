@@ -5,11 +5,12 @@ declare(strict_types=1);
 namespace App\Http\Controllers;
 
 use App\Models\Category;
-use App\Models\UsenetGroup;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
 use App\Services\Search\Contracts\SearchServiceInterface;
 use Illuminate\Http\Request;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\Cache;
 
 class SearchController extends BasePageController
 {
@@ -44,9 +45,10 @@ class SearchController extends BasePageController
         }
 
         $ordering = $this->releaseBrowseService->getBrowseOrdering();
-        $orderBy = ($request->has('ob') && \in_array($request->input('ob'), $ordering, true) ? $request->input('ob') : '');
-        $page = $request->has('page') && is_numeric($request->input('page')) ? $request->input('page') : 1;
-        $offset = ($page - 1) * config('nntmux.items_per_page');
+        $orderBy = $this->resolveOrderBy($request, $ordering);
+        $page = $this->resolvePage($request);
+        $perPage = (int) config('nntmux.items_per_page');
+        $offset = $this->paginationOffset($page, $perPage);
 
         $subject = '';
         $search = '';
@@ -58,15 +60,15 @@ class SearchController extends BasePageController
             $searchString = [];
             switch (true) {
                 case $request->filled('subject'):
-                    $searchString['searchname'] = (string) $request->input('subject');
+                    $searchString['searchname'] = $this->scalarInput($request, 'subject');
                     $subject = $searchString['searchname'];
                     break;
                 case $request->filled('id'):
-                    $searchString['searchname'] = (string) $request->input('id');
+                    $searchString['searchname'] = $this->scalarInput($request, 'id');
                     $id = $searchString['searchname'];
                     break;
                 case $request->filled('search'):
-                    $searchString['searchname'] = (string) $request->input('search');
+                    $searchString['searchname'] = $this->scalarInput($request, 'search');
                     $search = $searchString['searchname'];
                     break;
                 default:
@@ -88,14 +90,14 @@ class SearchController extends BasePageController
                 -1,
                 -1,
                 $offset,
-                (int) config('nntmux.items_per_page'),
+                $perPage,
                 $orderBy,
                 -1,
                 $this->userdata->categoryexclusions ?? [],
                 'basic',
                 $categoryID);
 
-            $results = $this->paginate($rslt ?? [], $rslt[0]->_totalrows ?? 0, config('nntmux.items_per_page'), $page, $request->url(), $request->query());
+            $results = $this->paginate($rslt ?? [], $rslt[0]->_totalrows ?? 0, $perPage, $page, $request->url(), $request->query());
             $category = $categoryID;
         } else {
             $orderByUrls = [];
@@ -117,54 +119,38 @@ class SearchController extends BasePageController
         ];
 
         foreach ($searchVars as $searchVarKey => $searchVar) {
-            $searchVars[$searchVarKey] = ($request->has($searchVarKey) ? (string) $request->input($searchVarKey) : '');
+            $searchVars[$searchVarKey] = $this->scalarInput($request, $searchVarKey);
         }
 
         // Map new form field names to old internal names
         if ($request->has('minage')) {
-            $searchVars['searchadvdaysnew'] = (string) $request->input('minage');
+            $searchVars['searchadvdaysnew'] = $this->scalarInput($request, 'minage');
         }
         if ($request->has('maxage')) {
-            $searchVars['searchadvdaysold'] = (string) $request->input('maxage');
+            $searchVars['searchadvdaysold'] = $this->scalarInput($request, 'maxage');
         }
         if ($request->has('group')) {
-            $searchVars['searchadvgroups'] = (string) $request->input('group');
+            $searchVars['searchadvgroups'] = $this->scalarInput($request, 'group');
         }
         if ($request->has('minsize')) {
-            $searchVars['searchadvsizefrom'] = (string) $request->input('minsize');
+            $searchVars['searchadvsizefrom'] = $this->scalarInput($request, 'minsize');
         }
         if ($request->has('maxsize')) {
-            $searchVars['searchadvsizeto'] = (string) $request->input('maxsize');
+            $searchVars['searchadvsizeto'] = $this->scalarInput($request, 'maxsize');
         }
         // Map basic search field to advanced search when in advanced mode
         if ($request->has('search') && $searchType === 'advanced') {
-            $searchVars['searchadvr'] = (string) $request->input('search');
+            $searchVars['searchadvr'] = $this->scalarInput($request, 'search');
         }
         // Map basic category field to advanced category when in advanced mode
         if ($request->has('t') && $searchType === 'advanced') {
-            $searchVars['searchadvcat'] = (string) $request->input('t');
+            $searchVars['searchadvcat'] = implode(',', $this->resolveCategoryIdsFromRequest($request));
         }
 
         $searchVars['selectedgroup'] = $searchVars['searchadvgroups'];
         $searchVars['selectedcat'] = $searchVars['searchadvcat'];
         $searchVars['selectedsizefrom'] = $searchVars['searchadvsizefrom'];
         $searchVars['selectedsizeto'] = $searchVars['searchadvsizeto'];
-
-        // Get spell correction suggestions if we have a search query but few/no results
-        $spellSuggestion = null;
-        $searchQuery = $search ?: $searchVars['searchadvr'];
-        if (! empty($searchQuery) && $this->searchService->isSuggestEnabled()) {
-            // Get suggestions from search service
-            $suggestions = $this->searchService->suggest($searchQuery);
-            if (! empty($suggestions)) {
-                // Sort by doc count descending to get best suggestion
-                usort($suggestions, fn ($a, $b) => $b['docs'] - $a['docs']);
-                // Only show suggestion if it's different from the query
-                if ($suggestions[0]['suggest'] !== $searchQuery) {
-                    $spellSuggestion = $suggestions[0]['suggest'];
-                }
-            }
-        }
 
         if ($searchType !== 'basic' && $request->missing('id') && $request->missing('subject') && $request->anyFilled(['searchadvr', 'searchadvsubject', 'searchadvfilename', 'searchadvposter', 'search'])) {
             $orderByString = '';
@@ -173,7 +159,7 @@ class SearchController extends BasePageController
             }
             $orderByString = ltrim($orderByString, '&');
             if ($request->filled('t')) {
-                $orderByString .= '&t='.urlencode((string) $request->input('t'));
+                $orderByString .= '&t='.urlencode(implode(',', $this->resolveCategoryIdsFromRequest($request)));
             }
 
             $orderByUrls = [];
@@ -196,7 +182,7 @@ class SearchController extends BasePageController
                 ($searchVars['searchadvdaysnew'] === '' ? -1 : $searchVars['searchadvdaysnew']),
                 ($searchVars['searchadvdaysold'] === '' ? -1 : $searchVars['searchadvdaysold']),
                 $offset,
-                (int) config('nntmux.items_per_page'),
+                $perPage,
                 $orderBy,
                 -1,
                 $this->userdata->categoryexclusions ?? [],
@@ -204,8 +190,11 @@ class SearchController extends BasePageController
                 $this->resolveCategoryIdsFromRequest($request)
             );
 
-            $results = $this->paginate($rslt ?? [], $rslt[0]->_totalrows ?? 0, config('nntmux.items_per_page'), $page, $request->url(), $request->query());
+            $results = $this->paginate($rslt ?? [], $rslt[0]->_totalrows ?? 0, $perPage, $page, $request->url(), $request->query());
         }
+
+        $suggestEnabled = $this->searchService->isSuggestEnabled();
+        $spellSuggestion = $this->resolveSpellSuggestion($search ?: $searchVars['searchadvr'], $results, $suggestEnabled);
 
         $this->viewData = array_merge($this->viewData, $searchVars, $orderByUrls, [
             'subject' => $subject,
@@ -214,21 +203,16 @@ class SearchController extends BasePageController
             'category' => $category,
             'covgroup' => '',
             'lastvisit' => $lastvisit,
-            'sizelist' => [
-                -1 => '--Select--', 1 => '100MB', 2 => '250MB', 3 => '500MB', 4 => '1GB', 5 => '2GB',
-                6 => '3GB', 7 => '4GB', 8 => '8GB', 9 => '16GB', 10 => '32GB', 11 => '64GB',
-            ],
             'results' => $results,
             'sadvanced' => $searchType !== 'basic',
-            'grouplist' => UsenetGroup::getGroupsForSelect(),
-            'catlist' => Category::getForSelect(),
+            'catlist' => $this->getCategorySelectOptions(),
             'meta_title' => 'Search Nzbs',
             'meta_keywords' => 'search,nzb,description,details',
             'meta_description' => 'Search for Nzbs',
             // Search enhanced features
             'spellSuggestion' => $spellSuggestion,
             'autocompleteEnabled' => $this->searchService->isAutocompleteEnabled(),
-            'suggestEnabled' => $this->searchService->isSuggestEnabled(),
+            'suggestEnabled' => $suggestEnabled,
         ]);
 
         return view('search.index', $this->viewData);
@@ -239,12 +223,63 @@ class SearchController extends BasePageController
      */
     private function resolveCategoryIdsFromRequest(Request $request): array
     {
-        $raw = $request->input('t', $request->input('searchadvcat', ''));
+        $raw = $this->scalarInput($request, 't', $this->scalarInput($request, 'searchadvcat'));
 
-        if ($raw === null || $raw === '' || $raw === '-1') {
+        if ($raw === '' || $raw === '-1') {
             return [-1];
         }
 
-        return array_map('intval', explode(',', (string) $raw));
+        $categoryIds = [];
+        foreach (explode(',', $raw) as $categoryId) {
+            $categoryId = trim($categoryId);
+            if (preg_match('/^-?\d+$/', $categoryId) === 1) {
+                $categoryIds[] = (int) $categoryId;
+            }
+        }
+
+        return $categoryIds === [] ? [-1] : array_values(array_unique($categoryIds));
+    }
+
+    /**
+     * @param  array<int, mixed>|LengthAwarePaginator<int, mixed>  $results
+     */
+    private function resolveSpellSuggestion(string $searchQuery, array|LengthAwarePaginator $results, bool $suggestEnabled): ?string
+    {
+        if ($searchQuery === '' || ! $suggestEnabled || $this->resultCount($results) > 3) {
+            return null;
+        }
+
+        $suggestions = $this->searchService->suggest($searchQuery);
+        if ($suggestions === []) {
+            return null;
+        }
+
+        usort($suggestions, static fn (array $a, array $b): int => (int) $b['docs'] <=> (int) $a['docs']);
+
+        return $suggestions[0]['suggest'] !== $searchQuery ? $suggestions[0]['suggest'] : null;
+    }
+
+    /**
+     * @param  array<int, mixed>|LengthAwarePaginator<int, mixed>  $results
+     */
+    private function resultCount(array|LengthAwarePaginator $results): int
+    {
+        if ($results instanceof LengthAwarePaginator) {
+            return $results->total();
+        }
+
+        return count($results);
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function getCategorySelectOptions(): array
+    {
+        try {
+            return Cache::remember('search:category-select-options', now()->addMinutes(10), fn (): array => Category::getForSelect());
+        } catch (\Throwable) {
+            return Category::getForSelect();
+        }
     }
 }

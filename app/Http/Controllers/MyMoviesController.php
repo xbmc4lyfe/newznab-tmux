@@ -28,14 +28,11 @@ class MyMoviesController extends BasePageController
 
     public function show(Request $request): mixed
     {
-        $action = $request->input('id') ?? '';
-        $imdbid = $request->input('imdb') ?? '';
+        $action = $this->scalarInput($request, 'id');
+        $imdbid = $this->scalarInput($request, 'imdb');
+        $from = $this->localReturnUrl($request, '/mymovies');
 
-        if ($request->has('from')) {
-            $this->viewData['from'] = url($request->input('from'));
-        } else {
-            $this->viewData['from'] = url('/mymovies');
-        }
+        $this->viewData['from'] = $from;
 
         switch ($action) {
             case 'delete':
@@ -44,13 +41,8 @@ class MyMoviesController extends BasePageController
                     return redirect()->to('/mymovies');
                 }
                 UserMovie::delMovie($this->userdata->id, $imdbid);
-                if ($request->has('from')) {
-                    header('Location:'.url($request->input('from')));
-                } else {
-                    return redirect()->to('/mymovies');
-                }
 
-                break;
+                return redirect()->to($from);
             case 'add':
             case 'doadd':
                 $movie = UserMovie::getMovie($this->userdata->id, $imdbid);
@@ -64,24 +56,13 @@ class MyMoviesController extends BasePageController
                 }
 
                 if ($action === 'doadd') {
-                    $category = ($request->has('category') && \is_array($request->input('category')) && ! empty($request->input('category'))) ? $request->input('category') : [];
+                    $category = $this->selectedCategoryIds($request, $this->movieCategories(true));
                     UserMovie::addMovie($this->userdata->id, $imdbid, $category);
-                    if ($request->has('from')) {
-                        return redirect()->to($request->input('from'));
-                    }
 
-                    return redirect()->to('/mymovies');
+                    return redirect()->to($from);
                 }
 
-                $tmpcats = Category::getChildren(Category::MOVIE_ROOT);
-                $categories = [];
-                foreach ($tmpcats as $c) {
-                    // If MOVIE WEB-DL categorization is disabled, don't include it as an option
-                    if ((int) $c['id'] === Category::MOVIE_WEBDL && (int) Settings::settingValue('catwebdl') === 0) {
-                        continue;
-                    }
-                    $categories[$c['id']] = $c['title'];
-                }
+                $categories = $this->movieCategories(true);
                 $this->viewData['type'] = 'add';
                 $this->viewData['cat_ids'] = array_keys($categories);
                 $this->viewData['cat_names'] = $categories;
@@ -102,20 +83,13 @@ class MyMoviesController extends BasePageController
                 }
 
                 if ($action === 'doedit') {
-                    $category = ($request->has('category') && \is_array($request->input('category')) && ! empty($request->input('category'))) ? $request->input('category') : [];
+                    $category = $this->selectedCategoryIds($request, $this->movieCategories(false));
                     UserMovie::updateMovie($this->userdata->id, $imdbid, $category);
-                    if ($request->has('from')) {
-                        return redirect()->to($request->input('from'));
-                    }
 
-                    return redirect()->to('mymovies');
+                    return redirect()->to($from);
                 }
 
-                $tmpcats = Category::getChildren(Category::MOVIE_ROOT);
-                $categories = [];
-                foreach ($tmpcats as $c) {
-                    $categories[$c['id']] = $c['title'];
-                }
+                $categories = $this->movieCategories(false);
 
                 $this->viewData['type'] = 'edit';
                 $this->viewData['cat_ids'] = array_keys($categories);
@@ -135,19 +109,19 @@ class MyMoviesController extends BasePageController
                 $meta_keywords = 'search,add,to,cart,nzb,description,details';
                 $meta_description = 'Browse Your Movies';
 
-                $page = $request->has('page') && is_numeric($request->input('page')) ? $request->input('page') : 1;
-
-                $offset = ($page - 1) * (int) config('nntmux.items_per_cover_page');
+                $page = $this->resolvePage($request);
+                $perPage = (int) config('nntmux.items_per_cover_page');
+                $offset = $this->paginationOffset($page, $perPage);
 
                 $movies = UserMovie::getMovies($this->userdata->id);
                 /** @var array<string, string> $categories */
-                $categories = $movie = [];
+                $categories = $this->movieCategories(false);
                 foreach ($movies as $moviek => $movie) {
                     $showcats = explode('|', $movie['categories']);
                     if (\count($showcats) > 0) {
                         $catarr = [];
                         foreach ($showcats as $scat) {
-                            if (! empty($scat)) {
+                            if (! empty($scat) && isset($categories[$scat])) {
                                 $catarr[] = $categories[$scat];
                             }
                         }
@@ -155,13 +129,14 @@ class MyMoviesController extends BasePageController
                     } else {
                         $movie['categoryNames'] = '';
                     }
+
+                    $movies[$moviek] = $movie;
                 }
 
-                $ordering = $request->input('ob', '');
+                $ordering = $this->movieBrowseService->getMovieOrdering();
+                $orderby = $this->resolveOrderBy($request, $ordering);
 
-                $page = $request->has('page') && is_numeric($request->input('page')) ? $request->input('page') : 1;
-
-                $results = $this->movieBrowseService->getMovieRange($page, [], $offset, (int) config('nntmux.items_per_cover_page'), $ordering, -1, (array) $this->userdata->categoryexclusions);
+                $results = $this->movieBrowseService->getMovieRange($page, [], $offset, $perPage, $orderby, -1, (array) $this->userdata->categoryexclusions);
 
                 $this->viewData['covgroup'] = '';
 
@@ -171,9 +146,10 @@ class MyMoviesController extends BasePageController
 
                 $this->viewData['lastvisit'] = $this->userdata->lastlogin;
                 $this->viewData['results'] = $results;
+                $this->viewData['resultsadd'] = $results;
                 $this->viewData['movies'] = true;
                 /** @var view-string $browseView */
-                $browseView = 'browse';
+                $browseView = 'browse.index';
                 $this->viewData['content'] = view($browseView, $this->viewData)->render();
                 $this->viewData = array_merge($this->viewData, compact('title', 'meta_title', 'meta_keywords', 'meta_description'));
 
@@ -186,11 +162,7 @@ class MyMoviesController extends BasePageController
                 $meta_keywords = 'search,add,to,cart,nzb,description,details';
                 $meta_description = 'Manage Your Movies';
 
-                $tmpcats = Category::getChildren(Category::MOVIE_ROOT);
-                $categories = [];
-                foreach ($tmpcats as $c) {
-                    $categories[$c['id']] = $c['title'];
-                }
+                $categories = $this->movieCategories(false);
 
                 $movies = UserMovie::getMovies($this->userdata->id);
                 $results = [];
@@ -218,7 +190,38 @@ class MyMoviesController extends BasePageController
                 return $this->pagerender();
         }
 
-        // Fallback return in case no case matches
-        return redirect()->to('/mymovies');
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function movieCategories(bool $excludeDisabledWebdl): array
+    {
+        $categories = [];
+        foreach (Category::getChildren(Category::MOVIE_ROOT) as $category) {
+            if ($excludeDisabledWebdl && (int) $category['id'] === Category::MOVIE_WEBDL && (int) Settings::settingValue('catwebdl') === 0) {
+                continue;
+            }
+
+            $categories[(int) $category['id']] = (string) $category['title'];
+        }
+
+        return $categories;
+    }
+
+    /**
+     * @param  array<int, string>  $allowedCategories
+     * @return array<int, int>
+     */
+    private function selectedCategoryIds(Request $request, array $allowedCategories): array
+    {
+        $selected = [];
+        foreach ($this->arrayInput($request, 'category') as $categoryId) {
+            if (is_scalar($categoryId) && preg_match('/^\d+$/', (string) $categoryId) === 1 && isset($allowedCategories[(int) $categoryId])) {
+                $selected[] = (int) $categoryId;
+            }
+        }
+
+        return array_values(array_unique($selected));
     }
 }

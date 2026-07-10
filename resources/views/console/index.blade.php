@@ -62,9 +62,7 @@
                         @php
                             $releases = $result->releases ?? [];
                             $totalReleases = $result->total_releases ?? count($releases);
-                            $maxReleases = 2;
-                            $displayReleases = array_slice($releases, 0, $maxReleases);
-                            $guid = !empty($displayReleases) ? $displayReleases[0]->guid : null;
+                            $guid = !empty($releases) ? $releases[0]->guid : null;
                             $totalFailed = collect($releases)->sum(fn($r) => (int)($r->failed_count ?? 0));
                         @endphp
 
@@ -137,87 +135,14 @@
                                         </div>
                                     </div>
 
-                                    <!-- Release Information -->
-                                    @if(!empty($displayReleases))
-                                        <div class="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
-                                            <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">
-                                                Available Releases
-                                                @if($totalReleases > $maxReleases)
-                                                    <span class="text-xs font-normal text-gray-500">(Showing {{ $maxReleases }} of {{ $totalReleases }})</span>
-                                                @endif
-                                            </h4>
-                                            <div class="space-y-2">
-                                                @foreach($displayReleases as $release)
-                                                    @if($release->searchname)
-                                                        <div class="bg-gray-50 dark:bg-gray-900 rounded-lg p-2 border border-gray-200 dark:border-gray-700">
-                                                            <div class="space-y-2">
-                                                                <div class="flex items-start justify-between gap-2">
-                                                                    <!-- Release Name -->
-                                                                    <a href="{{ url('/details/' . $release->guid) }}" class="text-sm text-gray-800 dark:text-gray-200 hover:text-blue-600 dark:hover:text-blue-400 font-medium block break-all flex-1" title="{{ $release->searchname }}">
-                                                                        {{ $release->searchname }}
-                                                                    </a>
-                                                                    <label class="inline-flex items-center shrink-0">
-                                                                        <input type="checkbox" class="chkRelease form-checkbox h-4 w-4 text-blue-600" value="{{ $release->guid }}" name="release[]" @change="onCheckboxChange()"/>
-                                                                    </label>
-                                                                </div>
-
-                                                                <!-- Info Badges -->
-                                                                <div class="flex flex-wrap items-center gap-1.5">
-                                                                    @if(isset($release->size))
-                                                                        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300">
-                                                                            <i class="fas fa-hdd mr-1"></i>{{ number_format($release->size / 1073741824, 2) }} GB
-                                                                        </span>
-                                                                    @endif
-                                                                    @if(isset($release->postdate))
-                                                                        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300">
-                                                                            <i class="fas fa-calendar-alt mr-1"></i>{{ date('M d, Y H:i', strtotime($release->postdate)) }}
-                                                                        </span>
-                                                                    @endif
-                                                                    @if(isset($release->adddate))
-                                                                        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300">
-                                                                            <i class="fas fa-plus-circle mr-1"></i>{{ userDateDiffForHumans($release->adddate) }}
-                                                                        </span>
-                                                                    @endif
-                                                                    @if(isset($release->nfoid) && !empty($release->nfoid))
-                                                                        <button type="button"
-                                                                                class="nfo-badge inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200 hover:bg-yellow-200 dark:hover:bg-yellow-800 transition cursor-pointer"
-                                                                                data-guid="{{ $release->guid }}"
-                                                                                title="View NFO file">
-                                                                            <i class="fas fa-file-alt mr-1"></i> NFO
-                                                                        </button>
-                                                                    @endif
-                                                                    @if(isset($release->group_name) && !empty($release->group_name))
-                                                                        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-indigo-100 dark:bg-indigo-900 text-indigo-800 dark:text-indigo-200" title="Poster/Uploader">
-                                                                            <i class="fas fa-user mr-1"></i> {{ $release->group_name }}
-                                                                        </span>
-                                                                    @endif
-                                                                </div>
-
-                                                                <!-- Action Buttons -->
-                                                                <div class="flex flex-wrap items-center gap-1.5">
-                                                                    <a href="{{ url('/getnzb/' . $release->guid) }}" class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-600 dark:bg-green-700 text-white hover:bg-green-700 dark:hover:bg-green-800 transition">
-                                                                        <i class="fas fa-download mr-1"></i> Download
-                                                                        @if(isset($release->grabs) && $release->grabs > 0)
-                                                                            <span class="ml-1 px-1 bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 text-xs rounded">{{ $release->grabs }}</span>
-                                                                        @endif
-                                                                    </a>
-                                                                    <button class="add-to-cart inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-800 transition" data-guid="{{ $release->guid }}">
-                                                                        <i class="fas fa-shopping-cart mr-1"></i> Cart
-                                                                    </button>
-                                                                    <a href="{{ url('/details/' . $release->guid) }}" class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-600 dark:bg-gray-700 text-white hover:bg-gray-700 dark:hover:bg-gray-800 transition">
-                                                                        <i class="fas fa-info-circle mr-1"></i> Details
-                                                                        @if(isset($release->comments) && $release->comments > 0)
-                                                                            <span class="ml-1 px-1 bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 text-xs rounded">{{ $release->comments }}</span>
-                                                                        @endif
-                                                                    </a>
-                                                                </div>
-                                                            </div>
-                                                        </div>
-                                                    @endif
-                                                @endforeach
-                                            </div>
-                                        </div>
-                                    @endif
+                                    <x-cover-release-list
+                                        :releases="$releases"
+                                        :total-releases="$totalReleases"
+                                        :show-checkbox="true"
+                                        :show-add-date="true"
+                                        :show-group="true"
+                                        :show-stats="true"
+                                    />
                                 </div>
                             </div>
                         </div>

@@ -8,12 +8,9 @@ use App\Models\DnzbFailure;
 use App\Models\Predb;
 use App\Models\Release;
 use App\Models\ReleaseComment;
-use App\Models\ReleaseFile;
-use App\Models\ReleaseNfo;
 use App\Models\ReleaseRegex;
 use App\Models\ReleaseReport;
 use App\Models\Settings;
-use App\Models\UserDownload;
 use App\Models\Video;
 use App\Services\AnidbService;
 use App\Services\BookService;
@@ -63,9 +60,6 @@ class DetailsController extends BasePageController
             return redirect()->route('details', ['guid' => $guid])->with('success', 'Comment posted successfully!');
         }
 
-        $nfoData = ReleaseNfo::getReleaseNfo($data['id']);
-        /** @var ReleaseNfo|null $nfoData */
-        $nfo = $nfoData ? $nfoData->nfo : null;
         $reVideo = $this->releaseExtraService->getVideo($data['id']);
         $reAudio = $this->releaseExtraService->getAudio($data['id']);
         $reSubs = $this->releaseExtraService->getSubs($data['id']);
@@ -93,8 +87,6 @@ class DetailsController extends BasePageController
             ->where('response', '!=', '')
             ->orderByDesc('responded_at')
             ->get();
-        $downloadedBy = UserDownload::query()->with('user')->where('releases_id', $data['id'])->get(['users_id']);
-
         $showInfo = '';
         if ($data['videos_id'] > 0) {
             $showInfo = Video::getByVideoID($data['videos_id']);
@@ -166,15 +158,11 @@ class DetailsController extends BasePageController
 
         $pre = Predb::getForRelease($data['predb_id']);
 
-        $releasefiles = ReleaseFile::getReleaseFiles($data['id']);
-
         $this->viewData = array_merge($this->viewData, [
-            'releasefiles' => $releasefiles,
             'release' => $data,
             'reVideo' => $reVideo,
             'reAudio' => $reAudio,
             'reSubs' => $reSubs,
-            'nfo' => $nfo,
             'show' => $showInfo,
             'movie' => $mov,
             'anidb' => $AniDBAPIArray,
@@ -184,7 +172,6 @@ class DetailsController extends BasePageController
             'book' => $book,
             'predb' => $pre,
             'comments' => $comments,
-            'files' => $releasefiles,
             'searchname' => getSimilarName($data['searchname']),
             'similars' => $similars !== false ? $similars : [],
             'privateprofiles' => config('nntmux_settings.private_profiles'),
@@ -196,7 +183,6 @@ class DetailsController extends BasePageController
             'allReportReasons' => $allReportReasons,
             'publicReportResponses' => $publicReportResponses,
             'regex' => $releaseRegex,
-            'downloadedby' => $downloadedBy,
             'meta_title' => 'View NZB',
             'meta_keywords' => 'view,nzb,description,details',
             'meta_description' => 'View NZB for '.$data['searchname'],

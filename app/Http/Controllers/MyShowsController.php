@@ -23,14 +23,11 @@ class MyShowsController extends BasePageController
 
     public function show(Request $request): mixed
     {
-        $action = $request->input('action') ?? '';
-        $videoId = $request->input('id') ?? '';
+        $action = $this->scalarInput($request, 'action');
+        $videoId = $this->scalarInput($request, 'id');
+        $from = $this->localReturnUrl($request, '/myshows');
 
-        if ($request->has('from')) {
-            $this->viewData['from'] = url($request->input('from'));
-        } else {
-            $this->viewData['from'] = url('/myshows');
-        }
+        $this->viewData['from'] = $from;
 
         switch ($action) {
             case 'delete':
@@ -40,13 +37,8 @@ class MyShowsController extends BasePageController
                 }
 
                 UserSerie::delShow($this->userdata->id, $videoId);
-                if ($request->has('from')) {
-                    header('Location:'.url($request->input('from')));
-                } else {
-                    return redirect()->to('myshows');
-                }
 
-                break;
+                return redirect()->to($from);
             case 'add':
             case 'doadd':
                 $show = UserSerie::getShow($this->userdata->id, $videoId);
@@ -60,24 +52,13 @@ class MyShowsController extends BasePageController
                 }
 
                 if ($action === 'doadd') {
-                    $category = ($request->has('category') && \is_array($request->input('category')) && ! empty($request->input('category'))) ? $request->input('category') : [];
+                    $category = $this->selectedCategoryIds($request, $this->showCategories(true));
                     UserSerie::addShow($this->userdata->id, $videoId, $category);
-                    if ($request->has('from')) {
-                        return redirect()->to($request->input('from'));
-                    }
 
-                    return redirect()->to('myshows');
+                    return redirect()->to($from);
                 }
 
-                $tmpcats = Category::getChildren(Category::TV_ROOT);
-                $categories = [];
-                foreach ($tmpcats as $c) {
-                    // If TV WEB-DL categorization is disabled, don't include it as an option
-                    if ((int) $c['id'] === Category::TV_WEBDL && (int) Settings::settingValue('catwebdl') === 0) {
-                        continue;
-                    }
-                    $categories[$c['id']] = $c['title'];
-                }
+                $categories = $this->showCategories(true);
                 $this->viewData['type'] = 'add';
                 $this->viewData['cat_ids'] = array_keys($categories);
                 $this->viewData['cat_names'] = $categories;
@@ -98,20 +79,13 @@ class MyShowsController extends BasePageController
                 }
 
                 if ($action === 'doedit') {
-                    $category = ($request->has('category') && \is_array($request->input('category')) && ! empty($request->input('category'))) ? $request->input('category') : [];
+                    $category = $this->selectedCategoryIds($request, $this->showCategories(false));
                     UserSerie::updateShow($this->userdata->id, $videoId, $category);
-                    if ($request->has('from')) {
-                        return redirect()->to($request->input('from'));
-                    }
 
-                    return redirect()->to('myshows');
+                    return redirect()->to($from);
                 }
 
-                $tmpcats = Category::getChildren(Category::TV_ROOT);
-                $categories = [];
-                foreach ($tmpcats as $c) {
-                    $categories[$c['id']] = $c['title'];
-                }
+                $categories = $this->showCategories(false);
 
                 $this->viewData['type'] = 'edit';
                 $this->viewData['cat_ids'] = array_keys($categories);
@@ -131,11 +105,7 @@ class MyShowsController extends BasePageController
                 $meta_keywords = 'search,add,to,cart,nzb,description,details';
                 $meta_description = 'Manage Your Shows';
 
-                $tmpcats = Category::getChildren(Category::TV_ROOT);
-                $categories = [];
-                foreach ($tmpcats as $c) {
-                    $categories[$c['id']] = $c['title'];
-                }
+                $categories = $this->showCategories(false);
 
                 $shows = UserSerie::getShows($this->userdata->id);
                 $results = [];
@@ -165,8 +135,6 @@ class MyShowsController extends BasePageController
                 return $this->pagerender();
         }
 
-        // Fallback return in case no case matches
-        return redirect()->to('/myshows');
     }
 
     /**
@@ -181,14 +149,15 @@ class MyShowsController extends BasePageController
 
         $shows = UserSerie::getShows($this->userdata->id);
 
-        $page = $request->has('page') && is_numeric($request->input('page')) ? $request->input('page') : 1;
-        $offset = ($page - 1) * config('nntmux.items_per_page');
+        $page = $this->resolvePage($request);
+        $perPage = (int) config('nntmux.items_per_page');
+        $offset = $this->paginationOffset($page, $perPage);
         $ordering = $this->releaseBrowseService->getBrowseOrdering();
-        $orderby = $request->has('ob') && \in_array($request->input('ob'), $ordering, true) ? $request->input('ob') : '';
+        $orderby = $this->resolveOrderBy($request, $ordering);
         $browseCount = $shows ? $shows->count() : 0;
 
-        $rslt = $this->releaseBrowseService->getShowsRange($shows ?? [], $offset, config('nntmux.items_per_page'), $orderby, -1, (array) $this->userdata->categoryexclusions);
-        $results = $this->paginate($rslt ?? [], $browseCount, config('nntmux.items_per_page'), $page, $request->url(), $request->query());
+        $rslt = $this->releaseBrowseService->getShowsRange($shows ?? [], $offset, $perPage, $orderby, -1, (array) $this->userdata->categoryexclusions);
+        $results = $this->paginate($rslt ?? [], $browseCount, $perPage, $page, $request->url(), $request->query());
 
         $this->viewData['covgroup'] = '';
 
@@ -204,5 +173,38 @@ class MyShowsController extends BasePageController
         $this->viewData = array_merge($this->viewData, compact('title', 'meta_title', 'meta_keywords', 'meta_description'));
 
         return $this->pagerender();
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function showCategories(bool $excludeDisabledWebdl): array
+    {
+        $categories = [];
+        foreach (Category::getChildren(Category::TV_ROOT) as $category) {
+            if ($excludeDisabledWebdl && (int) $category['id'] === Category::TV_WEBDL && (int) Settings::settingValue('catwebdl') === 0) {
+                continue;
+            }
+
+            $categories[(int) $category['id']] = (string) $category['title'];
+        }
+
+        return $categories;
+    }
+
+    /**
+     * @param  array<int, string>  $allowedCategories
+     * @return array<int, int>
+     */
+    private function selectedCategoryIds(Request $request, array $allowedCategories): array
+    {
+        $selected = [];
+        foreach ($this->arrayInput($request, 'category') as $categoryId) {
+            if (is_scalar($categoryId) && preg_match('/^\d+$/', (string) $categoryId) === 1 && isset($allowedCategories[(int) $categoryId])) {
+                $selected[] = (int) $categoryId;
+            }
+        }
+
+        return array_values(array_unique($selected));
     }
 }
