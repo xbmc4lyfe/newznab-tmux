@@ -11,10 +11,7 @@
         ['label' => 'Search'],
     ]" />
 
-    <div class="px-6 py-6">
-        <h1 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-2">Search Releases</h1>
-        <p class="text-gray-600 dark:text-gray-400">Find exactly what you're looking for</p>
-    </div>
+    <x-page-header title="Search Releases" description="Find exactly what you're looking for" icon="fas fa-search" />
 
     <!-- Search Form -->
     <form method="GET" action="{{ route('search') }}" class="px-6 pb-6" id="searchForm">
@@ -144,13 +141,9 @@
 
         <!-- Action Buttons -->
         <div class="flex flex-col sm:flex-row flex-wrap gap-2">
-            <button type="submit" class="px-6 py-2 bg-primary-600 dark:bg-primary-700 text-white rounded-lg hover:bg-primary-700 dark:hover:bg-primary-800 transition inline-flex items-center justify-center font-semibold">
-                <i class="fas fa-search mr-2"></i> Search
-            </button>
-            <a href="{{ url('/search?search_type=adv') }}" class="px-6 py-2 bg-primary-600 dark:bg-primary-700 text-white rounded-lg hover:bg-primary-700 dark:hover:bg-primary-800 transition inline-flex items-center justify-center">
-                <i class="fas fa-sliders-h mr-2"></i> Advanced Search
-            </a>
-            <a href="{{ route('search') }}" class="px-6 py-2 bg-gray-300 dark:bg-gray-600 text-gray-700 dark:text-gray-100 rounded-lg hover:bg-gray-400 dark:hover:bg-gray-700 transition justify-center inline-flex">
+            <x-button type="submit" size="lg" icon="fas fa-search">Search</x-button>
+            <x-button-link href="{{ url('/search?search_type=adv') }}" size="lg" icon="fas fa-sliders-h">Advanced Search</x-button-link>
+            <a href="{{ route('search') }}" class="inline-flex justify-center rounded-lg bg-gray-300 px-6 py-3 text-base font-semibold text-gray-700 transition hover:bg-gray-400 dark:bg-gray-600 dark:text-gray-100 dark:hover:bg-gray-700">
                 Clear
             </a>
         </div>

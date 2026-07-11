@@ -298,6 +298,83 @@ footer {
     border-color: var(--border-default-dark);
 }
 
+.auth-page {
+    background-color: var(--surface-body) !important;
+}
+.dark .auth-page {
+    background-color: var(--surface-body-dark) !important;
+}
+.auth-card {
+    background-color: var(--surface-card) !important;
+    border: 1px solid var(--border-default);
+}
+.dark .auth-card {
+    background-color: var(--surface-card-dark) !important;
+    border-color: var(--border-default-dark);
+}
+.release-chip {
+    @apply inline-flex items-center rounded px-2 py-0.5 text-xs font-medium;
+    background-color: var(--surface-panel-alt);
+    color: rgb(55 65 81);
+}
+.dark .release-chip {
+    background-color: var(--surface-panel-alt-dark);
+    color: rgb(209 213 219);
+}
+.release-action {
+    @apply inline-flex items-center justify-center rounded-lg px-2 py-1 text-sm transition;
+}
+.release-action-sm {
+    @apply inline-flex items-center justify-center rounded px-3 py-1 text-xs font-medium transition;
+}
+.release-action-download {
+    @apply bg-green-600 text-white hover:bg-green-700 dark:bg-green-700 dark:hover:bg-green-800;
+}
+.release-action-primary {
+    @apply bg-primary-600 text-white hover:bg-primary-700 dark:bg-primary-700 dark:hover:bg-primary-800;
+}
+.release-action-muted {
+    @apply bg-gray-200 text-gray-700 hover:bg-gray-300 dark:bg-gray-700 dark:text-gray-200 dark:hover:bg-gray-600;
+}
+.surface-prose {
+    @apply max-w-none text-gray-700 dark:text-gray-300;
+}
+.surface-prose h1,
+.surface-prose h2,
+.surface-prose h3,
+.surface-prose h4,
+.surface-prose h5,
+.surface-prose h6 {
+    @apply mt-6 mb-3 font-semibold text-gray-900 dark:text-gray-100;
+}
+.surface-prose p,
+.surface-prose ul,
+.surface-prose ol {
+    @apply mb-4;
+}
+.surface-prose ul,
+.surface-prose ol {
+    @apply pl-6;
+}
+.surface-prose a {
+    @apply text-primary-600 underline hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300;
+}
+.surface-prose img {
+    @apply my-6 h-auto max-w-full rounded-lg;
+}
+.surface-prose blockquote {
+    @apply my-6 border-l-4 border-gray-200 pl-4 italic text-gray-600 dark:border-gray-700 dark:text-gray-400;
+}
+.surface-prose code {
+    @apply rounded bg-gray-100 px-1.5 py-1 text-sm dark:bg-gray-900;
+}
+.surface-prose pre {
+    @apply my-6 overflow-x-auto rounded-lg bg-gray-900 p-4 text-gray-50;
+}
+.surface-prose pre code {
+    @apply bg-transparent p-0 text-inherit;
+}
+
 /* Tables in main content - use scheme surfaces so they match sidebar/header/cards */
 main table {
     background-color: var(--surface-card) !important;

@@ -1,12 +1,12 @@
 @extends('layouts.guest')
 
 @section('content')
-<div class="min-h-screen flex items-center justify-center bg-gray-100 dark:bg-gray-900 py-12 px-4 sm:px-6 lg:px-8">
+<div class="min-h-screen auth-page flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
     <div class="max-w-md w-full space-y-8">
         <!-- Logo and Title -->
         <div class="text-center">
             <a href="{{ url('/') }}" class="inline-flex items-center justify-center mb-4">
-                <div class="w-16 h-16 bg-blue-600 dark:bg-gray-700 rounded-full flex items-center justify-center shadow-lg">
+                <div class="w-16 h-16 bg-primary-600 dark:bg-primary-700 rounded-full flex items-center justify-center shadow-lg">
                     <i class="fas fa-shield-alt text-3xl text-white"></i>
                 </div>
             </a>
@@ -19,7 +19,7 @@
         </div>
 
         <!-- 2FA Verification Card -->
-        <div class="bg-white dark:bg-gray-800 rounded-2xl shadow-xl overflow-hidden">
+        <div class="auth-card rounded-xl shadow-xl overflow-hidden">
             <div class="px-8 py-6">
                 @if($errors->any())
                     <div class="mb-4 p-4 rounded-lg bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-700">
@@ -40,7 +40,7 @@
                 <div class="mb-6">
                     <div class="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-lg p-4">
                         <div class="flex items-start">
-                            <i class="fas fa-info-circle text-blue-600 dark:text-blue-400 mr-3 mt-0.5"></i>
+                            <i class="fas fa-info-circle text-primary-600 dark:text-primary-400 mr-3 mt-0.5"></i>
                             <div class="text-sm text-blue-800 dark:text-blue-200">
                                 <p class="font-medium mb-1">Security Verification Required</p>
                                 <p>Open your authenticator app and enter the 6-digit verification code to complete your login.</p>
@@ -72,7 +72,7 @@
                             required
                             autofocus
                             placeholder="000000"
-                            class="w-full px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-center text-2xl tracking-widest font-mono bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500"
+                            class="w-full px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-center text-2xl tracking-widest font-mono bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500"
                         >
                         <p class="mt-2 text-xs text-gray-500 dark:text-gray-400 text-center">
                             Enter the 6-digit code from your authenticator app
@@ -86,7 +86,7 @@
                             name="trust_device"
                             id="trust_device"
                             value="1"
-                            class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 checked:bg-blue-600 dark:checked:bg-blue-600"
+                            class="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 checked:bg-primary-600 dark:checked:bg-primary-600"
                         >
                         <label for="trust_device" class="ml-2 block text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
                             Trust this device for 30 days
@@ -97,7 +97,7 @@
                     <div>
                         <button
                             type="submit"
-                            class="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 dark:bg-blue-700 dark:hover:bg-blue-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors duration-200"
+                            class="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-primary-600 hover:bg-primary-700 dark:bg-primary-700 dark:hover:bg-primary-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 transition-colors duration-200"
                         >
                             <i class="fas fa-sign-in-alt mr-2"></i>
                             Verify and Continue
@@ -107,7 +107,7 @@
 
                 <!-- Back to Login Link -->
                 <div class="mt-6 text-center">
-                    <a href="{{ route('login') }}" class="text-sm text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 transition-colors">
+                    <a href="{{ route('login') }}" class="text-sm text-primary-600 dark:text-primary-400 hover:text-primary-800 dark:hover:text-primary-300 transition-colors">
                         <i class="fas fa-arrow-left mr-1"></i>
                         Back to login
                     </a>
@@ -115,7 +115,7 @@
             </div>
 
             <!-- Help Section -->
-            <div class="bg-gray-50 dark:bg-gray-900 px-8 py-4 border-t border-gray-200 dark:border-gray-700">
+            <div class="surface-panel-alt px-8 py-4 border-t border-gray-200 dark:border-gray-700">
                 <div class="text-xs text-gray-600 dark:text-gray-400">
                     <p class="mb-2">
                         <i class="fas fa-question-circle mr-1"></i>

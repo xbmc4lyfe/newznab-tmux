@@ -2,7 +2,7 @@
     <button
         type="button"
         @click="toggle"
-        class="inline-flex items-center gap-2 px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400 transition shadow-sm"
+        class="inline-flex items-center gap-2 px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500 dark:focus:ring-primary-400 transition shadow-sm"
     >
         <i class="fas {{ $currentIcon }} text-gray-500 dark:text-gray-300"></i>
         <span>Sort: {{ $currentLabel }}</span>
@@ -22,12 +22,12 @@
             @foreach($sortOptions as $sortKey => $sortData)
                 <a
                     href="{{ $sortUrls[$sortKey] }}"
-                    class="flex items-center gap-3 px-4 py-2 text-sm transition {{ $currentSort === $sortKey ? 'bg-blue-100 dark:bg-blue-600 text-blue-800 dark:text-white font-medium' : 'text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-600' }}"
+                    class="flex items-center gap-3 px-4 py-2 text-sm transition {{ $currentSort === $sortKey ? 'bg-primary-100 dark:bg-primary-600 text-primary-800 dark:text-white font-medium' : 'text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-600' }}"
                 >
-                    <i class="fas {{ $sortData['icon'] }} w-4 text-center {{ $currentSort === $sortKey ? 'text-blue-600 dark:text-blue-200' : 'text-gray-400 dark:text-gray-400' }}"></i>
+                    <i class="fas {{ $sortData['icon'] }} w-4 text-center {{ $currentSort === $sortKey ? 'text-primary-600 dark:text-primary-200' : 'text-gray-400 dark:text-gray-400' }}"></i>
                     <span class="flex-1">{{ $sortData['label'] }}</span>
                     @if($currentSort === $sortKey)
-                        <i class="fas fa-check text-blue-600 dark:text-blue-200"></i>
+                        <i class="fas fa-check text-primary-600 dark:text-primary-200"></i>
                     @endif
                 </a>
             @endforeach

@@ -92,11 +92,11 @@
         {{-- Currently in cover view --}}
         <span class="font-semibold text-gray-800 dark:text-gray-200">Covers</span>
         <span class="text-gray-400 dark:text-gray-500">|</span>
-        <a href="{{ $listUrl }}" class="text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300">List</a>
+        <a href="{{ $listUrl }}" class="text-primary-600 dark:text-primary-400 hover:text-primary-800 dark:hover:text-primary-300">List</a>
     @else
         {{-- Currently in list view --}}
         @if($covgroup || $shows)
-            <a href="{{ $coverUrl }}" class="text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300">Covers</a>
+            <a href="{{ $coverUrl }}" class="text-primary-600 dark:text-primary-400 hover:text-primary-800 dark:hover:text-primary-300">Covers</a>
             <span class="text-gray-400 dark:text-gray-500">|</span>
         @endif
         <span class="font-semibold text-gray-800 dark:text-gray-200">List</span>
@@ -106,8 +106,8 @@
             <span class="text-gray-400 dark:text-gray-500 ml-2">|</span>
             <button type="button"
                @click="toggleThumbs()"
-               class="inline-flex items-center gap-1 hover:text-blue-800 dark:hover:text-blue-300 cursor-pointer"
-               x-bind:class="showThumbs ? 'text-green-600 dark:text-green-400' : 'text-blue-600 dark:text-blue-400'"
+               class="inline-flex items-center gap-1 hover:text-primary-800 dark:hover:text-primary-300 cursor-pointer"
+               x-bind:class="showThumbs ? 'text-green-600 dark:text-green-400' : 'text-primary-600 dark:text-primary-400'"
                x-bind:title="showThumbs ? 'Hide thumbnails' : 'Show thumbnails'">
                 <i class="fas fa-image text-xs"></i>
                 <span x-text="showThumbs ? 'Hide Thumbs' : 'Show Thumbs'"></span>

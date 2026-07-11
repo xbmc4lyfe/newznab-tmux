@@ -8,14 +8,14 @@
             @if(!empty($content) && count($content) > 0)
                 <div class="space-y-6">
                     @foreach($content as $item)
-                        <article class="surface-panel rounded-lg shadow-md p-6 border hover:shadow-lg transition-shadow duration-200">
-                            <div class="prose max-w-none">
+                        <article class="surface-panel rounded-lg shadow-sm p-6 border transition-shadow duration-200 hover:shadow-md">
+                            <div class="surface-prose">
                                 @if(filled($item->title))
-                                    <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100 mb-4">{{ $item->title }}</h1>
+                                    <h1 class="mb-4 text-3xl font-bold">{{ $item->title }}</h1>
                                 @endif
 
                                 @if(isset($item->body))
-                                    <div class="text-gray-700 dark:text-gray-300 leading-relaxed">
+                                    <div class="leading-relaxed">
                                         {!! html_entity_decode(trim($item->body, '\'"')) !!}
                                     </div>
                                 @endif
@@ -28,26 +28,23 @@
                     @endforeach
                 </div>
             @else
-                <div class="text-center py-12">
-                    <i class="fas fa-file-alt text-6xl text-gray-300 mb-4"></i>
-                    <h3 class="text-xl font-medium text-gray-700 dark:text-gray-300 mb-2">No Content Available</h3>
-                    <p class="text-gray-500">There is no content to display at this time.</p>
-                </div>
+                <x-empty-state
+                    icon="fas fa-file-alt"
+                    title="No Content Available"
+                    message="There is no content to display at this time."
+                />
             @endif
         </div>
     @else
         <!-- Content List Page -->
-        <div class="px-6 py-6">
-            <div class="mb-6">
-                <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100 mb-2">Content</h1>
-                <p class="text-gray-600">Browse our content pages</p>
-            </div>
+        <x-page-header title="Content" description="Browse our content pages" icon="fas fa-file-alt" />
 
+        <div class="px-6 pb-6">
             @if(!empty($content) && count($content) > 0)
                 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                     @foreach($content as $item)
                         @if($item)
-                            <div class="surface-panel-alt rounded-lg p-6 hover:shadow-md transition">
+                            <div class="surface-panel-alt rounded-lg border p-6 transition hover:shadow-md">
                                 <h3 class="text-xl font-semibold text-gray-900 dark:text-gray-100 mb-3">
                                     <a href="{{ url('/content?page=content&id=' . $item->id) }}" class="hover:text-primary-600 dark:hover:text-primary-400 transition">
                                         {{ filled($item->title) ? $item->title : 'Untitled' }}
@@ -66,79 +63,13 @@
                     @endforeach
                 </div>
             @else
-                <div class="text-center py-12">
-                    <i class="fas fa-file-alt text-6xl text-gray-300 mb-4"></i>
-                    <h3 class="text-xl font-medium text-gray-700 dark:text-gray-300 mb-2">No Content Available</h3>
-                    <p class="text-gray-500">There is no content to display at this time.</p>
-                </div>
+                <x-empty-state
+                    icon="fas fa-file-alt"
+                    title="No Content Available"
+                    message="There is no content to display at this time."
+                />
             @endif
         </div>
     @endif
 </div>
-
-@push('styles')
-<style>
-    .prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 {
-        margin-top: 1.5em;
-        margin-bottom: 0.75em;
-        font-weight: 600;
-    }
-
-    .prose p {
-        margin-bottom: 1em;
-    }
-
-    .prose ul, .prose ol {
-        margin-bottom: 1em;
-        padding-left: 1.5em;
-    }
-
-    .prose a {
-        color: #2563eb;
-        text-decoration: underline;
-    }
-
-    .prose a:hover {
-        color: #1d4ed8;
-    }
-
-    .prose img {
-        max-width: 100%;
-        height: auto;
-        border-radius: 0.5rem;
-        margin: 1.5em 0;
-    }
-
-    .prose blockquote {
-        border-left: 4px solid #e5e7eb;
-        padding-left: 1em;
-        color: #6b7280;
-        font-style: italic;
-        margin: 1.5em 0;
-    }
-
-    .prose code {
-        background-color: #f3f4f6;
-        padding: 0.25em 0.5em;
-        border-radius: 0.25rem;
-        font-size: 0.875em;
-    }
-
-    .prose pre {
-        background-color: #1f2937;
-        color: #f9fafb;
-        padding: 1em;
-        border-radius: 0.5rem;
-        overflow-x: auto;
-        margin: 1.5em 0;
-    }
-
-    .prose pre code {
-        background-color: transparent;
-        padding: 0;
-        color: inherit;
-    }
-</style>
-@endpush
 @endsection
-

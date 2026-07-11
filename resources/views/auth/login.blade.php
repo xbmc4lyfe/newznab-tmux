@@ -1,12 +1,12 @@
 @extends('layouts.guest')
 
 @section('content')
-<div class="min-h-dvh flex items-start justify-center bg-gray-100 dark:bg-gray-900 px-4 py-6 sm:px-6 sm:py-10 lg:px-8">
+<div class="min-h-dvh auth-page flex items-start justify-center px-4 py-6 sm:px-6 sm:py-10 lg:px-8">
     <div class="w-full max-w-md space-y-6 sm:space-y-8">
         <!-- Logo and Title -->
         <div class="text-center">
             <a href="{{ url('/') }}" class="mb-3 inline-flex items-center justify-center sm:mb-4">
-                <div class="flex h-14 w-14 items-center justify-center rounded-full bg-blue-600 shadow-lg dark:bg-gray-700 sm:h-16 sm:w-16">
+                <div class="flex h-14 w-14 items-center justify-center rounded-full bg-primary-600 shadow-lg dark:bg-primary-700 sm:h-16 sm:w-16">
                     <i class="fas fa-file-download text-2xl text-white sm:text-3xl"></i>
                 </div>
             </a>
@@ -19,7 +19,7 @@
         </div>
 
         <!-- Login Card -->
-        <div class="bg-white dark:bg-gray-800 rounded-2xl shadow-xl overflow-hidden">
+        <div class="auth-card rounded-xl shadow-xl overflow-hidden">
             <div
                 x-data="loginMode"
                 x-on:use-password-login.stop="usePassword()"
@@ -51,7 +51,7 @@
                         type="button"
                         x-show="supported"
                         @click="usePassword()"
-                        class="mt-4 inline-flex items-center text-sm font-medium text-blue-600 transition hover:text-blue-500 dark:text-blue-400"
+                        class="mt-4 inline-flex items-center text-sm font-medium text-primary-600 transition hover:text-primary-500 dark:text-primary-400"
                     >
                         Sign in with password instead
                         <i class="fas fa-arrow-right ml-2"></i>
@@ -63,7 +63,7 @@
                         type="button"
                         x-show="supported"
                         @click="usePasskey()"
-                        class="mb-4 inline-flex items-center text-sm font-medium text-blue-600 transition hover:text-blue-500 dark:text-blue-400"
+                        class="mb-4 inline-flex items-center text-sm font-medium text-primary-600 transition hover:text-primary-500 dark:text-primary-400"
                     >
                         <i class="fas fa-arrow-left mr-2"></i>
                         Sign in with passkey
@@ -89,7 +89,7 @@
                                     value="{{ old('username') }}"
                                     required
                                     autofocus
-                                    class="block w-full pl-10 pr-3 py-3 border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white dark:placeholder-gray-400 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition @error('username') border-red-500 @enderror"
+                                    class="block w-full pl-10 pr-3 py-3 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder-gray-400 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition @error('username') border-red-500 @enderror"
                                     placeholder="Enter your username or email"
                                 >
                             </div>
@@ -112,7 +112,7 @@
                                     type="password"
                                     name="password"
                                     required
-                                    class="block w-full pl-10 pr-10 py-3 border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white dark:placeholder-gray-400 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition @error('password') border-red-500 @enderror"
+                                    class="block w-full pl-10 pr-10 py-3 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder-gray-400 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition @error('password') border-red-500 @enderror"
                                     placeholder="Enter your password"
                                 >
                                 <button type="button" class="password-toggle-btn absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200" data-field-id="password">
@@ -132,7 +132,7 @@
                                     name="rememberme"
                                     type="checkbox"
                                     {{ old('rememberme') ? 'checked' : '' }}
-                                    class="h-4 w-4 text-blue-600 dark:text-blue-400 focus:ring-blue-500 border-gray-300 dark:border-gray-600 rounded"
+                                    class="h-4 w-4 text-primary-600 dark:text-primary-400 focus:ring-primary-500 border-gray-300 dark:border-gray-600 rounded"
                                 >
                                 <label for="rememberme" class="ml-2 block text-sm text-gray-700 dark:text-gray-300">
                                     Remember me
@@ -140,7 +140,7 @@
                             </div>
 
                             @if(Route::has('forgottenpassword'))
-                                <a href="{{ route('forgottenpassword') }}" class="text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-500 transition">
+                                <a href="{{ route('forgottenpassword') }}" class="text-sm font-medium text-primary-600 dark:text-primary-400 hover:text-primary-500 transition">
                                     Forgot password?
                                 </a>
                             @endif
@@ -160,7 +160,7 @@
                         <div>
                             <button
                                 type="submit"
-                                class="w-full flex justify-center items-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-blue-600 dark:bg-blue-700 hover:bg-blue-700 dark:hover:bg-blue-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition duration-150 ease-in-out"
+                                class="w-full flex justify-center items-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-primary-600 dark:bg-primary-700 hover:bg-primary-700 dark:hover:bg-primary-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 transition duration-150 ease-in-out"
                             >
                                 <i class="fas fa-sign-in-alt mr-2"></i>
                                 Sign In
@@ -171,7 +171,7 @@
             </div>
 
             <!-- Card Footer -->
-            <div class="border-t border-gray-200 bg-gray-50 px-5 py-4 dark:border-gray-700 dark:bg-gray-900 sm:px-8">
+            <div class="border-t border-gray-200 surface-panel-alt px-5 py-4 dark:border-gray-700 sm:px-8">
                 <div class="flex flex-col sm:flex-row justify-between items-center gap-3 text-sm">
                     <div class="flex flex-col sm:flex-row gap-3 items-center">
                         @if(Route::has('register'))

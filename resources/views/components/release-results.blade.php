@@ -163,13 +163,13 @@
                     </td>
                     <td class="px-3 py-4 whitespace-nowrap">
                         <div class="flex items-center gap-1 flex-wrap">
-                            <a href="{{ url('/getnzb/' . $result->guid) }}" class="download-nzb px-2 py-1 bg-green-600 dark:bg-green-700 text-white rounded-lg hover:bg-green-700 dark:hover:bg-green-800 transition text-sm" title="Download NZB">
+                            <a href="{{ url('/getnzb/' . $result->guid) }}" class="download-nzb release-action release-action-download" title="Download NZB">
                                 <i class="fa fa-download"></i>
                             </a>
-                            <a href="{{ url('/details/' . $result->guid) }}" class="px-2 py-1 bg-primary-600 dark:bg-primary-700 text-white rounded-lg hover:bg-primary-700 dark:hover:bg-primary-800 transition text-sm" title="View Details">
+                            <a href="{{ url('/details/' . $result->guid) }}" class="release-action release-action-primary" title="View Details">
                                 <i class="fa fa-info"></i>
                             </a>
-                            <a href="#" class="add-to-cart px-2 py-1 bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-500 transition text-sm" data-guid="{{ $result->guid }}" title="Add to Cart">
+                            <a href="#" class="add-to-cart release-action release-action-muted" data-guid="{{ $result->guid }}" title="Add to Cart">
                                 <i class="icon_cart fa fa-shopping-basket"></i>
                             </a>
                             @if(!empty($result->imdbid) && imdb_id_is_valid($result->imdbid))
@@ -246,13 +246,13 @@
                         <span title="Comments"><i class="fas fa-comment text-primary-600 dark:text-primary-400 mr-1"></i>{{ $result->comments ?? 0 }}</span>
                     </div>
                     <div class="mt-3 flex gap-1 flex-wrap">
-                        <a href="{{ url('/getnzb/' . $result->guid) }}" class="download-nzb px-3 py-1.5 bg-green-600 dark:bg-green-700 text-white rounded-lg hover:bg-green-700 dark:hover:bg-green-800 transition text-sm" title="Download NZB">
+                        <a href="{{ url('/getnzb/' . $result->guid) }}" class="download-nzb release-action release-action-download px-3 py-1.5" title="Download NZB">
                             <i class="fa fa-download"></i>
                         </a>
-                        <a href="{{ url('/details/' . $result->guid) }}" class="px-3 py-1.5 bg-primary-600 dark:bg-primary-700 text-white rounded-lg hover:bg-primary-700 dark:hover:bg-primary-800 transition text-sm" title="View Details">
+                        <a href="{{ url('/details/' . $result->guid) }}" class="release-action release-action-primary px-3 py-1.5" title="View Details">
                             <i class="fa fa-info"></i>
                         </a>
-                        <a href="#" class="add-to-cart px-3 py-1.5 bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 transition text-sm" data-guid="{{ $result->guid }}" title="Add to Cart">
+                        <a href="#" class="add-to-cart release-action release-action-muted px-3 py-1.5" data-guid="{{ $result->guid }}" title="Add to Cart">
                             <i class="icon_cart fa fa-shopping-basket"></i>
                         </a>
                         @if(!empty($result->imdbid) && imdb_id_is_valid($result->imdbid))

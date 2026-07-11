@@ -50,25 +50,25 @@
                             </div>
                         </div>
                         <div class="flex flex-wrap gap-2">
-                            <a href="{{ url('/getnzb/' . $release->guid) }}" class="download-nzb px-4 py-2 bg-primary-600 dark:bg-primary-700 text-white rounded-lg hover:bg-primary-700 dark:hover:bg-primary-800 transition inline-flex items-center">
+                            <a href="{{ url('/getnzb/' . $release->guid) }}" class="download-nzb release-action release-action-download px-4 py-2">
                                 <i class="fas fa-download mr-2"></i> Download NZB
                             </a>
-                            <a href="#" class="add-to-cart px-4 py-2 bg-primary-600 dark:bg-primary-700 text-white rounded-lg hover:bg-primary-700 dark:hover:bg-primary-800 transition inline-flex items-center" data-guid="{{ $release->guid }}">
+                            <a href="#" class="add-to-cart release-action release-action-primary px-4 py-2" data-guid="{{ $release->guid }}">
                                 <i class="icon_cart fas fa-shopping-basket mr-2"></i> Add to Cart
                             </a>
                             @if(isset($release->nfostatus) && $release->nfostatus == 1)
-                                <button type="button" class="nfo-badge px-4 py-2 bg-primary-500 dark:bg-primary-600 text-white rounded-lg hover:bg-primary-600 dark:hover:bg-primary-700 transition inline-flex items-center" data-guid="{{ $release->guid }}" title="View NFO file">
+                                <button type="button" class="nfo-badge release-action release-action-primary px-4 py-2" data-guid="{{ $release->guid }}" title="View NFO file">
                                     <i class="fas fa-file-alt mr-2"></i> View NFO
                                 </button>
                             @endif
                             @if(($release->totalpart ?? 0) > 0)
-                                <button type="button" class="filelist-badge px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-100 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 transition inline-flex items-center" data-guid="{{ $release->guid }}" title="View file list">
+                                <button type="button" class="filelist-badge release-action release-action-muted px-4 py-2" data-guid="{{ $release->guid }}" title="View file list">
                                     <i class="fas fa-list mr-2"></i> View Files
                                 </button>
                             @endif
                             @auth
                                 @if(auth()->user()->hasRole('Admin') || auth()->user()->hasRole('Moderator'))
-                                    <a href="{{ route('admin.release-edit', ['id' => $release->guid]) }}" class="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition inline-flex items-center" title="Edit Release">
+                                    <a href="{{ route('admin.release-edit', ['id' => $release->guid]) }}" class="release-action release-action-primary px-4 py-2" title="Edit Release">
                                         <i class="fas fa-edit mr-2"></i> Edit Release
                                     </a>
                                 @endif
@@ -750,7 +750,7 @@
                             <dt class="text-sm font-medium text-gray-600 dark:text-gray-400 mb-2">Password</dt>
                             <dd class="mt-1">
                                 @if(!empty($release->password))
-                                    <div class="bg-white dark:bg-gray-800 rounded-lg p-3 border border-gray-300 dark:border-gray-700">
+                                    <div class="surface-panel rounded-lg p-3 border">
                                         <code class="text-sm text-gray-900 dark:text-gray-100 font-mono break-all">{{ $release->password }}</code>
                                     </div>
                                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
@@ -758,7 +758,7 @@
                                         This password is embedded in the NZB file and will be automatically recognized by NZBGet or SABnzbd.
                                     </p>
                                 @else
-                                    <div class="bg-white dark:bg-gray-800 rounded-lg p-3 border border-gray-300 dark:border-gray-700">
+                                    <div class="surface-panel rounded-lg p-3 border">
                                         <code class="text-sm text-gray-500 dark:text-gray-400 font-mono">None</code>
                                     </div>
                                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
@@ -784,7 +784,7 @@
                             <h4 class="text-md font-semibold text-gray-700 dark:text-gray-300 mb-3 flex items-center">
                                 <i class="fas fa-video mr-2 text-primary-500 dark:text-primary-400"></i> Video Details
                             </h4>
-                            <div class="bg-white dark:bg-gray-800 rounded-lg p-4 shadow-sm border border-gray-200 dark:border-gray-700">
+                            <div class="surface-panel rounded-lg p-4 shadow-sm border">
                                 <dl class="grid grid-cols-2 md:grid-cols-3 gap-4">
                                     @if(!empty($reVideo['containerformat']))
                                         <div>
@@ -857,7 +857,7 @@
                                 <i class="fas fa-volume-up mr-2 text-primary-500 dark:text-primary-400"></i> Audio Details
                             </h4>
                             @foreach($reAudio as $index => $audio)
-                                <div class="bg-white dark:bg-gray-800 rounded-lg p-4 shadow-sm border border-gray-200 dark:border-gray-700 {{ $index > 0 ? 'mt-3' : '' }}">
+                                <div class="surface-panel rounded-lg p-4 shadow-sm border {{ $index > 0 ? 'mt-3' : '' }}">
                                     @if(count($reAudio) > 1)
                                         <p class="text-xs font-semibold text-gray-500 dark:text-gray-400 mb-2">Track {{ $index + 1 }}</p>
                                     @endif
@@ -909,7 +909,7 @@
                             <h4 class="text-md font-semibold text-gray-700 dark:text-gray-300 mb-3 flex items-center">
                                 <i class="fas fa-closed-captioning mr-2 text-primary-500"></i> Subtitles
                             </h4>
-                            <div class="bg-white dark:bg-gray-800 rounded-lg p-4 shadow-sm">
+                            <div class="surface-panel rounded-lg p-4 shadow-sm">
                                 <p class="text-sm text-gray-900 dark:text-gray-100 font-semibold">{{ $reSubs->subs }}</p>
                             </div>
                         </div>
@@ -1020,7 +1020,7 @@
                 @if(isset($comments) && count($comments) > 0)
                     <div class="space-y-4">
                         @foreach($comments as $comment)
-                            <div class="detail-comment-card bg-gray-50 dark:bg-gray-900 rounded-lg p-4 border border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600 transition">
+                            <div class="detail-comment-card surface-panel-alt rounded-lg p-4 border transition hover:border-gray-300 dark:hover:border-gray-600">
                                 <div class="flex items-start justify-between mb-3">
                                     <div class="flex items-center">
                                         <div class="w-10 h-10 bg-primary-600 dark:bg-primary-700 rounded-full flex items-center justify-center text-white font-bold mr-3 shadow-sm">
@@ -1040,7 +1040,7 @@
                         @endforeach
                     </div>
                 @else
-                    <div class="detail-empty-comments bg-gray-50 dark:bg-gray-900 rounded-lg p-8 border border-gray-200 dark:border-gray-700 text-center">
+                    <div class="detail-empty-comments surface-panel-alt rounded-lg p-8 border text-center">
                         <i class="fas fa-comments text-4xl text-gray-400 dark:text-gray-600 mb-3"></i>
                         <p class="text-gray-500 dark:text-gray-400">No comments yet. Be the first to comment!</p>
                     </div>

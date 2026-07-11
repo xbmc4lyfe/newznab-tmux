@@ -26,7 +26,7 @@
     <div class="flex items-center">
         @if($categorySelect && !empty($categories))
             <select name="t"
-                    class="bg-gray-700 text-white {{ $sizeClasses }} rounded-l border-r border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    class="bg-gray-700 text-white {{ $sizeClasses }} rounded-l border-r border-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500">
                 <option value="-1">All</option>
                 @foreach($categories as $category)
                     @php
@@ -62,7 +62,7 @@
                    class="w-full bg-white dark:bg-gray-700 text-gray-900 dark:text-white {{ $sizeClasses }}
                           {{ $categorySelect ? '' : 'rounded-l' }}
                           {{ $submitButton ? '' : 'rounded-r' }}
-                          border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500">
+                          border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500">
 
             <!-- Autocomplete Dropdown -->
             <div id="{{ $inputId }}-dropdown"
@@ -72,7 +72,7 @@
 
         @if($submitButton)
             <button type="submit"
-                    class="bg-blue-600 dark:bg-blue-700 hover:bg-blue-700 dark:hover:bg-blue-800 text-white {{ $sizeClasses }} rounded-r transition font-medium">
+                    class="bg-primary-600 dark:bg-primary-700 hover:bg-primary-700 dark:hover:bg-primary-800 text-white {{ $sizeClasses }} rounded-r transition font-medium">
                 <i class="fas fa-search"></i>
                 <span class="sr-only">Search</span>
             </button>
@@ -83,7 +83,7 @@
         <div class="mt-2 text-sm">
             <span class="text-gray-600 dark:text-gray-400">Did you mean: </span>
             <a href="{{ route('search', ['search' => $suggestion]) }}"
-               class="text-blue-600 dark:text-blue-400 hover:underline font-medium">
+               class="text-primary-600 dark:text-primary-400 hover:underline font-medium">
                 {{ $suggestion }}
             </a>
             <span class="text-gray-500 dark:text-gray-500">?</span>
