@@ -26,8 +26,8 @@ declare(strict_types=1);
 namespace App\Http\Controllers\Api;
 
 use App\Models\Category;
-use App\Models\Release;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
 
 /**
  * Class XMLReturn.
@@ -203,7 +203,7 @@ class XML_Response
     {
         $response = [
             'offset' => $this->offset,
-            'total' => $this->releases[0]->_totalrows ?? 0,
+            'total' => $this->totalRows(),
         ];
 
         $response['apilimits'] = [
@@ -220,16 +220,60 @@ class XML_Response
         }
 
         $response['item'] = [];
-        if (! empty($this->releases)) {
-            $releases = $this->releases instanceof Release ? [$this->releases] : $this->releases;
-            foreach ($releases as $release) {
-                $this->release = $release;
-                $item = $this->buildReleaseArray();
-                $response['item'][] = $item;
-            }
+        foreach ($this->releaseRows() as $release) {
+            $this->release = $release;
+            $item = $this->buildReleaseArray();
+            $response['item'][] = $item;
         }
 
         return $response;
+    }
+
+    /**
+     * @return list<mixed>
+     */
+    protected function releaseRows(): array
+    {
+        if ($this->releases === null || $this->releases === false || $this->releases === []) {
+            return [];
+        }
+
+        if ($this->releases instanceof Collection) {
+            return $this->releases->values()->all();
+        }
+
+        if (\is_array($this->releases)) {
+            return array_values($this->releases);
+        }
+
+        if ($this->releases instanceof \Traversable) {
+            return array_values(iterator_to_array($this->releases));
+        }
+
+        if (\is_object($this->releases)) {
+            return [$this->releases];
+        }
+
+        return [];
+    }
+
+    protected function totalRows(): int
+    {
+        $releases = $this->releaseRows();
+        if ($releases === []) {
+            return 0;
+        }
+
+        $firstRelease = $releases[0];
+        if (\is_object($firstRelease) && isset($firstRelease->_totalrows)) {
+            return (int) $firstRelease->_totalrows;
+        }
+
+        if (\is_array($firstRelease) && isset($firstRelease['_totalrows'])) {
+            return (int) $firstRelease['_totalrows'];
+        }
+
+        return \count($releases);
     }
 
     /**
@@ -612,7 +656,7 @@ class XML_Response
     {
         $this->xml->startElement($this->namespace.':response');
         $this->writeXmlAttribute('offset', $this->offset);
-        $this->writeXmlAttribute('total', $this->releases[0]->_totalrows ?? 0);
+        $this->writeXmlAttribute('total', $this->totalRows());
         $this->xml->endElement();
     }
 
@@ -637,21 +681,11 @@ class XML_Response
      */
     public function includeReleases(): void
     {
-        if (! empty($this->releases)) {
-            if (! $this->releases instanceof Release) {
-                foreach ($this->releases as $this->release) {
-                    $this->xml->startElement('item');
-                    $this->includeReleaseMain();
-                    $this->setZedAttributes();
-                    $this->xml->endElement();
-                }
-            } else {
-                $this->release = $this->releases;
-                $this->xml->startElement('item');
-                $this->includeReleaseMain();
-                $this->setZedAttributes();
-                $this->xml->endElement();
-            }
+        foreach ($this->releaseRows() as $this->release) {
+            $this->xml->startElement('item');
+            $this->includeReleaseMain();
+            $this->setZedAttributes();
+            $this->xml->endElement();
         }
     }
 
