@@ -7,26 +7,20 @@ namespace App\Http\Controllers;
 use App\Models\TvEpisode;
 use App\Models\UserSerie;
 use App\Models\Video;
-use App\Services\EpisodeHydrationService;
-use App\Services\Releases\ReleaseSearchService;
+use App\Services\SeriesReleaseService;
 use Carbon\Carbon;
-use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Http\Request;
-use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
 class SeriesController extends BasePageController
 {
-    private ReleaseSearchService $releaseSearchService;
+    private SeriesReleaseService $seriesReleaseService;
 
-    private EpisodeHydrationService $episodeHydrationService;
-
-    public function __construct(ReleaseSearchService $releaseSearchService, EpisodeHydrationService $episodeHydrationService)
+    public function __construct(SeriesReleaseService $seriesReleaseService)
     {
         parent::__construct();
-        $this->releaseSearchService = $releaseSearchService;
-        $this->episodeHydrationService = $episodeHydrationService;
+        $this->seriesReleaseService = $seriesReleaseService;
     }
 
     /**
@@ -45,48 +39,57 @@ class SeriesController extends BasePageController
             $catarray = [];
             $catarray[] = $category;
 
-            $seriesLimit = (int) config('nntmux.series_view_limit', 200);
+            $seriesLimit = (int) config('nntmux.series_view_limit', config('nntmux.items_per_page', 50));
             $page = $this->resolvePage($request);
             $offset = $seriesLimit > 0 ? $this->paginationOffset($page, $seriesLimit) : 0;
-
-            $rel = $this->releaseSearchService->tvSearch(['id' => $id], '', '', '', $offset, $seriesLimit, '', $catarray, -1);
 
             $show = Video::getByVideoID($id);
 
             $nodata = '';
             $seasons = [];
+            $seasonTabs = [];
+            $selectedSeason = null;
             $myshows = null;
             $seriestitles = '';
             $seriessummary = '';
             $seriescountry = '';
+            $totalRows = 0;
 
             if (! $show) {
                 $nodata = 'No video information for this series.';
-            } elseif (! $rel) {
-                $nodata = 'No releases for this series.';
             } else {
                 $myshows = UserSerie::getShow($this->userdata->id, $show['id']);
+                $categoryIds = $this->seriesReleaseService->categoryIds($catarray);
+                $seasonCounts = $this->seriesReleaseService->seasonCounts((int) $show['id'], $categoryIds);
 
-                $this->episodeHydrationService->hydrateEpisodeMetadata($rel);
-                if ($rel instanceof EloquentCollection && $rel->isNotEmpty()) {
-                    $rel->loadCount('failed');
+                if ($seasonCounts === []) {
+                    $nodata = 'No releases for this series.';
+                } else {
+                    $requestedSeason = $this->resolveSeason($request);
+                    $selectedSeason = $requestedSeason !== null && array_key_exists($requestedSeason, $seasonCounts)
+                        ? $requestedSeason
+                        : array_key_first($seasonCounts);
+
+                    $seasonReleaseResult = $this->seriesReleaseService->releasesForSeason(
+                        (int) $show['id'],
+                        (int) $selectedSeason,
+                        $offset,
+                        $seriesLimit,
+                        $categoryIds
+                    );
+
+                    $series = [];
+                    foreach ($seasonReleaseResult['releases'] as $release) {
+                        $series[(int) $selectedSeason][(int) $release->getAttribute('episode')][] = $release;
+                    }
+                    if (isset($series[(int) $selectedSeason])) {
+                        ksort($series[(int) $selectedSeason], SORT_NUMERIC);
+                    }
+
+                    $seasons = $series;
+                    $totalRows = $seasonReleaseResult['total'];
+                    $seasonTabs = $this->buildSeasonTabs($request, $seasonCounts, (int) $selectedSeason);
                 }
-
-                // Sort releases by season, episode, date posted.
-                $series = $episode = $posted = [];
-                foreach ($rel as $rlk => $rlv) {
-                    $series[$rlk] = $rlv->series;
-                    $episode[$rlk] = $rlv->episode;
-                    $posted[$rlk] = $rlv->postdate;
-                }
-                Arr::sort($series, [[$episode, false], [$posted, false], $rel]);
-
-                $series = [];
-                foreach ($rel as $r) {
-                    $series[$r->series][$r->episode][] = $r;
-                }
-
-                $seasons = Arr::sortRecursive($series);
 
                 // get series name(s), description, country and genre
                 $seriestitlesArray = $seriessummaryArray = $seriescountryArray = [];
@@ -107,7 +110,7 @@ class SeriesController extends BasePageController
 
             // Calculate statistics
             $episodeCount = 0;
-            $seasonCount = count($seasons);
+            $seasonCount = count($seasonTabs);
             $totalSeasonsAvailable = $seasonCount;
 
             // Get first and last aired dates from TV episodes
@@ -141,11 +144,12 @@ class SeriesController extends BasePageController
             }
 
             $catid = $category !== -1 ? $category : '';
-            $totalRows = ($rel && $rel->count() > 0) ? ($rel[0]->_totalrows ?? $rel->count()) : 0;
             $totalPages = $seriesLimit > 0 ? (int) ceil(max($totalRows, 1) / $seriesLimit) : 1;
 
             $this->viewData = array_merge($this->viewData, [
                 'seasons' => $seasons,
+                'seasonTabs' => $seasonTabs,
+                'selectedSeason' => $selectedSeason,
                 'show' => $show,
                 'myshows' => $myshows,
                 'seriestitles' => $seriestitles,
@@ -170,6 +174,17 @@ class SeriesController extends BasePageController
                 'meta_keywords' => 'view,series,tv,show,description,details',
                 'meta_description' => 'View TV Series',
             ]);
+
+            if ($this->scalarInput($request, '_fragment') === 'season') {
+                return response()->json([
+                    'selectedSeason' => $selectedSeason,
+                    'contentHtml' => view('series.partials.season-content', $this->viewData)->render(),
+                    'paginationHtml' => view('series.partials.season-pagination', $this->viewData)->render(),
+                    'url' => $selectedSeason !== null
+                        ? $this->seriesUrlWithQuery($request, ['season' => (int) $selectedSeason, 'page' => $page])
+                        : $this->seriesUrlWithQuery($request),
+                ]);
+            }
 
             return view('series.viewseries', $this->viewData);
         } else {
@@ -209,6 +224,52 @@ class SeriesController extends BasePageController
 
             return view('series.viewserieslist', $this->viewData);
         }
+    }
+
+    private function resolveSeason(Request $request): ?int
+    {
+        $seasonInput = $this->scalarInput($request, 'season');
+        if ($seasonInput === '' || preg_match('/^\d+$/', $seasonInput) !== 1) {
+            return null;
+        }
+
+        return (int) $seasonInput;
+    }
+
+    /**
+     * @param  array<int, int>  $seasonCounts
+     * @return array<int, array{season:int,count:int,url:string,active:bool}>
+     */
+    private function buildSeasonTabs(Request $request, array $seasonCounts, int $selectedSeason): array
+    {
+        $tabs = [];
+        foreach ($seasonCounts as $season => $count) {
+            $tabs[] = [
+                'season' => (int) $season,
+                'count' => (int) $count,
+                'url' => $this->seriesUrlWithQuery($request, [
+                    'season' => (int) $season,
+                    'page' => 1,
+                ]).'#series-episodes',
+                'active' => (int) $season === $selectedSeason,
+            ];
+        }
+
+        return $tabs;
+    }
+
+    /**
+     * @param  array<string, mixed>  $query
+     */
+    private function seriesUrlWithQuery(Request $request, array $query = []): string
+    {
+        $currentQuery = $request->query();
+        unset($currentQuery['_fragment']);
+
+        $merged = array_merge($currentQuery, $query);
+        $queryString = http_build_query($merged);
+
+        return url()->current().($queryString !== '' ? '?'.$queryString : '');
     }
 
     /**
