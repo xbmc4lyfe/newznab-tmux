@@ -40,7 +40,7 @@ class RssController extends BasePageController
         $outputXML = ! ($request->has('o') && $request->input('o') === 'json');
         $userNum = $request->has('num') && is_numeric($request->input('num')) ? abs((int) $request->input('num')) : 0;
 
-        $relData = $this->rss->getMyMoviesRss($userNum, $user['user_id'], User::getCategoryExclusionById($user['user_id']));
+        $relData = $this->rss->getMyMoviesRss($userNum, $user['user_id'], User::getCachedCategoryExclusionById($user['user_id']));
 
         return $this->rss->output($relData, $user['params'], $outputXML, 0, 'rss');
     }
@@ -61,7 +61,7 @@ class RssController extends BasePageController
         $userNum = $request->has('num') && is_numeric($request->input('num')) ? abs((int) $request->input('num')) : 0;
         $outputXML = ! ($request->has('o') && $request->input('o') === 'json');
 
-        $relData = $this->rss->getShowsRss($userNum, $user['user_id'], User::getCategoryExclusionById($user['user_id']), $userAirDate);
+        $relData = $this->rss->getShowsRss($userNum, $user['user_id'], User::getCachedCategoryExclusionById($user['user_id']), $userAirDate);
 
         return $this->rss->output($relData, $user['params'], $outputXML, 0, 'rss');
     }

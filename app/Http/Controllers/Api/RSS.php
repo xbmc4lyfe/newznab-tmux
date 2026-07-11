@@ -200,7 +200,7 @@ class RSS extends ApiController
     }
 
     /**
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      */
     public function getShowsRss(int $limit, int $userID = 0, array $excludedCats = [], int $airDate = -1): mixed
     {
@@ -230,7 +230,7 @@ class RSS extends ApiController
     }
 
     /**
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      * @return Release[]|Collection|mixed
      */
     public function getMyMoviesRss(int $limit, int $userID = 0, array $excludedCats = [])

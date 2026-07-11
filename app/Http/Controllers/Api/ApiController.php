@@ -15,6 +15,7 @@ use App\Models\Settings;
 use App\Models\UsenetGroup;
 use App\Models\User;
 use App\Models\UserRequest;
+use App\Services\Api\ApiReleaseRowCache;
 use App\Services\RegistrationStatusService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
@@ -43,13 +44,17 @@ class ApiController extends BasePageController
 
     protected ReleaseBrowseService $releaseBrowseService;
 
+    protected ApiReleaseRowCache $releaseRowCache;
+
     public function __construct(
         ReleaseSearchService $releaseSearchService,
-        ReleaseBrowseService $releaseBrowseService
+        ReleaseBrowseService $releaseBrowseService,
+        ?ApiReleaseRowCache $releaseRowCache = null
     ) {
         parent::__construct();
         $this->releaseSearchService = $releaseSearchService;
         $this->releaseBrowseService = $releaseBrowseService;
+        $this->releaseRowCache = $releaseRowCache ?? app(ApiReleaseRowCache::class);
     }
 
     /**
@@ -144,7 +149,7 @@ class ApiController extends BasePageController
 
             $uid = $res->id;
             // Use user ID directly instead of re-looking up by token
-            $catExclusions = User::getCategoryExclusionById($uid);
+            $catExclusions = User::getCachedCategoryExclusionById($uid);
             $maxRequests = $res->role->apirequests;
             $maxDownloads = $res->role->downloadrequests;
 
@@ -201,20 +206,33 @@ class ApiController extends BasePageController
                 $categoryID = $this->categoryID($request);
                 $limit = $this->limit($request);
 
-                if ($request->has('q')) {
-                    $relData = $this->releaseSearchService->apiSearch(
-                        $request->input('q'),
-                        $groupName,
-                        $offset,
-                        $limit,
-                        $maxAge,
-                        $catExclusions,
-                        $categoryID,
-                        $minSize,
-                        $sort
-                    );
-                } else {
-                    $relData = $this->releaseBrowseService->getBrowseRangeForApi(
+                $searchName = $request->input('q');
+                $relData = $this->releaseRowCache->remember('v1', 'search', [
+                    'q' => $searchName,
+                    'group' => $groupName,
+                    'offset' => $offset,
+                    'limit' => $limit,
+                    'sort' => $sort,
+                    'category' => $categoryID,
+                    'max_age' => $maxAge,
+                    'min_size' => $minSize,
+                    'excluded' => $catExclusions,
+                ], function () use ($request, $searchName, $groupName, $offset, $limit, $maxAge, $catExclusions, $categoryID, $minSize, $sort) {
+                    if ($request->has('q')) {
+                        return $this->releaseSearchService->apiSearch(
+                            $searchName,
+                            $groupName,
+                            $offset,
+                            $limit,
+                            $maxAge,
+                            $catExclusions,
+                            $categoryID,
+                            $minSize,
+                            $sort
+                        );
+                    }
+
+                    return $this->releaseBrowseService->getBrowseRangeForApi(
                         1,
                         $categoryID,
                         $offset,
@@ -225,7 +243,7 @@ class ApiController extends BasePageController
                         $groupName,
                         $minSize
                     );
-                }
+                });
 
                 return $this->output($relData, $params, $outputXML, $offset, 'api');
                 // Search tv releases.
@@ -253,7 +271,16 @@ class ApiController extends BasePageController
                         $categoryID = Category::TV_GROUP;
                     }
 
-                    $relData = $this->releaseBrowseService->getBrowseRangeForApi(
+                    $relData = $this->releaseRowCache->remember('v1', 'tv', [
+                        'has_search' => false,
+                        'offset' => $offset,
+                        'limit' => $limit,
+                        'sort' => $sort,
+                        'category' => $categoryID,
+                        'max_age' => $maxAge,
+                        'min_size' => $minSize,
+                        'excluded' => $catExclusions,
+                    ], fn () => $this->releaseBrowseService->getBrowseRangeForApi(
                         1,
                         $categoryID,
                         $offset,
@@ -263,7 +290,7 @@ class ApiController extends BasePageController
                         $catExclusions,
                         -1,
                         $minSize
-                    );
+                    ));
 
                     return $this->output($relData, $params, $outputXML, $offset, 'api');
                 }
@@ -288,20 +315,36 @@ class ApiController extends BasePageController
                     $airDate = str_replace('/', '-', $year[0].'-'.$episode);
                 }
 
-                $relData = $this->releaseSearchService->tvSearch(
+                $airDate = $airDate ?? '';
+                $searchName = $request->input('q') ?? '';
+                $relData = $this->releaseRowCache->remember('v1', 'tv', [
+                    'has_search' => true,
+                    'site_ids' => $siteIdArr,
+                    'season' => $series,
+                    'episode' => $episode,
+                    'air_date' => $airDate,
+                    'offset' => $offset,
+                    'limit' => $limit,
+                    'q' => $searchName,
+                    'category' => $categoryID,
+                    'max_age' => $maxAge,
+                    'min_size' => $minSize,
+                    'excluded' => $catExclusions,
+                    'sort' => $sort,
+                ], fn () => $this->releaseSearchService->tvSearch(
                     $siteIdArr,
                     $series,
                     $episode,
-                    $airDate ?? '',
-                    $this->offset($request),
+                    $airDate,
+                    $offset,
                     $limit,
-                    $request->input('q') ?? '',
+                    $searchName,
                     $categoryID,
                     $maxAge,
                     $minSize,
                     $catExclusions,
                     $sort
-                );
+                ));
 
                 return $this->output($relData, $params, $outputXML, $offset, 'api');
 
@@ -330,7 +373,16 @@ class ApiController extends BasePageController
                         $categoryID = Category::MOVIES_GROUP;
                     }
 
-                    $relData = $this->releaseBrowseService->getBrowseRangeForApi(
+                    $relData = $this->releaseRowCache->remember('v1', 'movie', [
+                        'has_search' => false,
+                        'offset' => $offset,
+                        'limit' => $limit,
+                        'sort' => $sort,
+                        'category' => $categoryID,
+                        'max_age' => $maxAge,
+                        'min_size' => $minSize,
+                        'excluded' => $catExclusions,
+                    ], fn () => $this->releaseBrowseService->getBrowseRangeForApi(
                         1,
                         $categoryID,
                         $offset,
@@ -340,7 +392,7 @@ class ApiController extends BasePageController
                         $catExclusions,
                         -1,
                         $minSize
-                    );
+                    ));
 
                     return $this->output($relData, $params, $outputXML, $offset, 'api');
                 }
@@ -351,19 +403,33 @@ class ApiController extends BasePageController
                 $tmdbId = $request->has('tmdbid') && $request->filled('tmdbid') ? (int) $request->input('tmdbid') : -1;
                 $traktId = $request->has('traktid') && $request->filled('traktid') ? (int) $request->input('traktid') : -1;
 
-                $relData = $this->releaseSearchService->moviesSearch(
+                $searchName = $request->input('q') ?? '';
+                $relData = $this->releaseRowCache->remember('v1', 'movie', [
+                    'has_search' => true,
+                    'imdbid' => $imdbId,
+                    'tmdbid' => $tmdbId,
+                    'traktid' => $traktId,
+                    'offset' => $offset,
+                    'limit' => $limit,
+                    'q' => $searchName,
+                    'sort' => $sort,
+                    'category' => $categoryID,
+                    'max_age' => $maxAge,
+                    'min_size' => $minSize,
+                    'excluded' => $catExclusions,
+                ], fn () => $this->releaseSearchService->moviesSearch(
                     $imdbId,
                     $tmdbId,
                     $traktId,
-                    $this->offset($request),
+                    $offset,
                     $limit,
-                    $request->input('q') ?? '',
+                    $searchName,
                     $categoryID,
                     $maxAge,
                     $minSize,
                     $catExclusions,
                     $sort
-                );
+                ));
 
                 $this->addCoverURL(
                     $relData,
@@ -391,25 +457,40 @@ class ApiController extends BasePageController
                 $categoryID = $this->categoryID($request);
                 $limit = $this->limit($request);
 
-                if (! $request->filled('q')) {
+                $searchName = (string) $request->input('q', '');
+                if ($searchName === '') {
                     if ($categoryID === [-1]) {
                         $categoryID = [Category::MUSIC_ROOT];
                     }
+                }
 
-                    $relData = $this->releaseBrowseService->getBrowseRangeForApi(
-                        1,
-                        $categoryID,
-                        $offset,
-                        $limit,
-                        $sort,
-                        $maxAge,
-                        $catExclusions,
-                        $groupName,
-                        $minSize
-                    );
-                } else {
-                    $relData = $this->releaseSearchService->apiMusicSearch(
-                        (string) $request->input('q'),
+                $relData = $this->releaseRowCache->remember('v1', 'music', [
+                    'q' => $searchName,
+                    'group' => $groupName,
+                    'offset' => $offset,
+                    'limit' => $limit,
+                    'sort' => $sort,
+                    'category' => $categoryID,
+                    'max_age' => $maxAge,
+                    'min_size' => $minSize,
+                    'excluded' => $catExclusions,
+                ], function () use ($searchName, $groupName, $offset, $limit, $sort, $maxAge, $catExclusions, $categoryID, $minSize) {
+                    if ($searchName === '') {
+                        return $this->releaseBrowseService->getBrowseRangeForApi(
+                            1,
+                            $categoryID,
+                            $offset,
+                            $limit,
+                            $sort,
+                            $maxAge,
+                            $catExclusions,
+                            $groupName,
+                            $minSize
+                        );
+                    }
+
+                    return $this->releaseSearchService->apiMusicSearch(
+                        $searchName,
                         $groupName,
                         $offset,
                         $limit,
@@ -419,7 +500,7 @@ class ApiController extends BasePageController
                         $minSize,
                         $sort
                     );
-                }
+                });
 
                 return $this->output($relData, $params, $outputXML, $offset, 'api');
 
@@ -440,25 +521,40 @@ class ApiController extends BasePageController
                 $categoryID = $this->categoryID($request);
                 $limit = $this->limit($request);
 
-                if (! $request->filled('q')) {
+                $searchName = (string) $request->input('q', '');
+                if ($searchName === '') {
                     if ($categoryID === [-1]) {
                         $categoryID = [Category::BOOKS_ROOT];
                     }
+                }
 
-                    $relData = $this->releaseBrowseService->getBrowseRangeForApi(
-                        1,
-                        $categoryID,
-                        $offset,
-                        $limit,
-                        $sort,
-                        $maxAge,
-                        $catExclusions,
-                        $groupName,
-                        $minSize
-                    );
-                } else {
-                    $relData = $this->releaseSearchService->apiBookSearch(
-                        (string) $request->input('q'),
+                $relData = $this->releaseRowCache->remember('v1', 'book', [
+                    'q' => $searchName,
+                    'group' => $groupName,
+                    'offset' => $offset,
+                    'limit' => $limit,
+                    'sort' => $sort,
+                    'category' => $categoryID,
+                    'max_age' => $maxAge,
+                    'min_size' => $minSize,
+                    'excluded' => $catExclusions,
+                ], function () use ($searchName, $groupName, $offset, $limit, $sort, $maxAge, $catExclusions, $categoryID, $minSize) {
+                    if ($searchName === '') {
+                        return $this->releaseBrowseService->getBrowseRangeForApi(
+                            1,
+                            $categoryID,
+                            $offset,
+                            $limit,
+                            $sort,
+                            $maxAge,
+                            $catExclusions,
+                            $groupName,
+                            $minSize
+                        );
+                    }
+
+                    return $this->releaseSearchService->apiBookSearch(
+                        $searchName,
                         $groupName,
                         $offset,
                         $limit,
@@ -468,7 +564,7 @@ class ApiController extends BasePageController
                         $minSize,
                         $sort
                     );
-                }
+                });
 
                 return $this->output($relData, $params, $outputXML, $offset, 'api');
 
@@ -488,17 +584,29 @@ class ApiController extends BasePageController
                     return $sort;
                 }
                 UserRequest::addApiRequest($uid, $request->getRequestUri());
-                $relData = $this->releaseSearchService->animeSearch(
+                $limit = $this->limit($request);
+                $categoryID = $this->categoryID($request);
+                $relData = $this->releaseRowCache->remember('v1', 'anime', [
+                    'q' => $q,
+                    'anidbid' => $anidb,
+                    'anilistid' => $anilist,
+                    'offset' => $offset,
+                    'limit' => $limit,
+                    'sort' => $sort,
+                    'category' => $categoryID,
+                    'max_age' => $maxAge,
+                    'excluded' => $catExclusions,
+                ], fn () => $this->releaseSearchService->animeSearch(
                     $anidb,
                     $offset,
-                    $this->limit($request),
+                    $limit,
                     $q,
-                    $this->categoryID($request),
+                    $categoryID,
                     $maxAge,
                     $catExclusions,
                     $anilist,
                     $sort
-                );
+                ));
 
                 return $this->output($relData, $params, $outputXML, $offset, 'api');
 
@@ -525,7 +633,10 @@ class ApiController extends BasePageController
                 }
 
                 UserRequest::addApiRequest($uid, $request->getRequestUri());
-                $data = Release::getByGuidForApi($request->input('id'));
+                $guid = $request->input('id');
+                $data = $this->releaseRowCache->remember('v1', 'details', [
+                    'guid' => $guid,
+                ], fn () => Release::getByGuidForApi($guid));
 
                 return $this->output($data, $params, $outputXML, $offset, 'api');
 

@@ -5,6 +5,7 @@ namespace Tests\Feature;
 use App\Models\Category;
 use App\Models\User;
 use App\Models\UserExcludedCategory;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Spatie\Permission\Models\Permission;
@@ -264,6 +265,32 @@ final class UserExcludedCategoryTest extends TestCase
         $exclusions = User::getCategoryExclusionById($this->user->id);
 
         $this->assertContains(2070, $exclusions);
+    }
+
+    public function test_cached_category_exclusions_are_invalidated_when_syncing(): void
+    {
+        $this->user->syncExcludedCategories([2070]);
+
+        $this->assertContains(2070, User::getCachedCategoryExclusionById($this->user->id));
+
+        $this->user->syncExcludedCategories([2040]);
+
+        $exclusions = User::getCachedCategoryExclusionById($this->user->id);
+
+        $this->assertNotContains(2070, $exclusions);
+        $this->assertContains(2040, $exclusions);
+    }
+
+    public function test_cached_category_exclusions_are_invalidated_when_rows_change_directly(): void
+    {
+        Cache::put(User::categoryExclusionCacheKey($this->user->id), [2070], 300);
+
+        UserExcludedCategory::create([
+            'users_id' => $this->user->id,
+            'categories_id' => 2040,
+        ]);
+
+        $this->assertNull(Cache::get(User::categoryExclusionCacheKey($this->user->id)));
     }
 
     public function test_clearing_exclusions_works(): void

@@ -7,6 +7,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
 
 /**
  * App\Models\UserExcludedCategory.
@@ -39,6 +40,17 @@ class UserExcludedCategory extends Model
             'users_id' => 'integer',
             'categories_id' => 'integer',
         ];
+    }
+
+    protected static function booted(): void
+    {
+        static::saved(static function (self $excludedCategory): void {
+            Cache::forget(User::categoryExclusionCacheKey($excludedCategory->users_id));
+        });
+
+        static::deleted(static function (self $excludedCategory): void {
+            Cache::forget(User::categoryExclusionCacheKey($excludedCategory->users_id));
+        });
     }
 
     /**

@@ -88,7 +88,7 @@ class BasePageController extends Controller
 
                 // Cache category exclusions per user (5 minutes)
                 $this->userdata->categoryexclusions = $this->rememberWithCacheFallback(
-                    'user_category_exclusions_'.$userId,
+                    User::categoryExclusionCacheKey($userId),
                     300,
                     fn () => User::getCategoryExclusionById($userId)
                 );

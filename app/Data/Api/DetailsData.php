@@ -42,41 +42,44 @@ final class DetailsData extends Data
         public Optional|int|string|null $tvmazeid = new Optional,
     ) {}
 
-    public static function fromRelease(Release $release, User $user): self
+    public static function fromRelease(Release|\stdClass $release, User $user): self
     {
-        $categoriesId = (int) $release->categories_id;
+        $get = static fn (string $key, mixed $default = null): mixed => $release->{$key} ?? $default;
+
+        $categoriesId = (int) $get('categories_id', 0);
+        $guid = (string) $get('guid', '');
         $base = [
-            'title' => (string) $release->searchname,
-            'details' => url('/').'/details/'.$release->guid,
-            'link' => url('/').'/getnzb?id='.$release->guid.'.nzb&r='.$user->api_token,
+            'title' => (string) $get('searchname', ''),
+            'details' => url('/').'/details/'.$guid,
+            'link' => url('/').'/getnzb?id='.$guid.'.nzb&r='.$user->api_token,
             'category' => $categoriesId,
-            'category_name' => $release->category_name ?? null,
-            'added' => Carbon::parse($release->adddate)->toRssString(),
-            'size' => $release->size,
-            'files' => $release->totalpart,
-            'grabs' => $release->grabs,
-            'comments' => $release->comments,
-            'password' => $release->passwordstatus,
-            'usenetdate' => Carbon::parse($release->postdate)->toRssString(),
+            'category_name' => $get('category_name'),
+            'added' => Carbon::parse($get('adddate'))->toRssString(),
+            'size' => $get('size'),
+            'files' => $get('totalpart'),
+            'grabs' => $get('grabs'),
+            'comments' => $get('comments'),
+            'password' => $get('passwordstatus'),
+            'usenetdate' => Carbon::parse($get('postdate'))->toRssString(),
         ];
 
         if (in_array($categoriesId, Category::MOVIES_GROUP, true)) {
             return new self(
                 ...$base,
-                imdbid: $release->imdbid,
+                imdbid: $get('imdbid'),
             );
         }
 
         if (in_array($categoriesId, Category::TV_GROUP, true)) {
             return new self(
                 ...$base,
-                imdbid: $release->imdb, // @phpstan-ignore property.notFound
-                tmdbid: $release->tmdb,
-                traktid: $release->trakt,
-                tvairdate: $release->firstaired,
-                tvdbid: $release->tvdb,
-                tvrageid: $release->tvrage,
-                tvmazeid: $release->tvmaze,
+                imdbid: $get('imdb'),
+                tmdbid: $get('tmdb'),
+                traktid: $get('trakt'),
+                tvairdate: $get('firstaired'),
+                tvdbid: $get('tvdb'),
+                tvrageid: $get('tvrage'),
+                tvmazeid: $get('tvmaze'),
             );
         }
 

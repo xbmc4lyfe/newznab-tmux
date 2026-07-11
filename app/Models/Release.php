@@ -550,34 +550,73 @@ class Release extends Model
      */
     public static function getByGuidForApi(mixed $guid): mixed
     {
-        $query = self::with([
-            'group:id,name',
-            'category:id,title,root_categories_id',
-            'category.parent:id,title',
-            'video:id,title,tvdb,trakt,tvrage,tvmaze',
-            'episode:id,title,firstaired',
-        ]);
+        $categoryNameExpression = DB::connection()->getDriverName() === 'sqlite'
+            ? "cp.title || ' > ' || c.title AS category_name"
+            : "CONCAT(cp.title, ' > ', c.title) AS category_name";
+
+        $query = DB::table('releases')
+            ->select([
+                'releases.id',
+                'releases.searchname',
+                'releases.guid',
+                'releases.postdate',
+                'releases.categories_id',
+                'releases.size',
+                'releases.totalpart',
+                'releases.fromname',
+                'releases.passwordstatus',
+                'releases.grabs',
+                'releases.comments',
+                'releases.adddate',
+                'releases.videos_id',
+                'releases.tv_episodes_id',
+                'releases.haspreview',
+                'releases.nfostatus',
+                'releases.movieinfo_id',
+                'releases.musicinfo_id',
+                'releases.consoleinfo_id',
+                'c.root_categories_id as parentid',
+                'cp.title as parent_category',
+                'c.title as sub_category',
+                DB::raw($categoryNameExpression),
+                'g.name as group_name',
+                'v.tvdb',
+                'v.trakt',
+                'v.tvrage',
+                'v.tvmaze',
+                'v.imdb',
+                'v.tmdb',
+                'm.imdbid',
+                'm.tmdbid',
+                'm.traktid',
+                'tve.title',
+                'tve.series',
+                'tve.episode',
+                'tve.firstaired',
+            ])
+            ->leftJoin('categories as c', 'c.id', '=', 'releases.categories_id')
+            ->leftJoin('root_categories as cp', 'cp.id', '=', 'c.root_categories_id')
+            ->leftJoin('usenet_groups as g', 'g.id', '=', 'releases.groups_id')
+            ->leftJoin('videos as v', function ($join): void {
+                $join->on('releases.videos_id', '=', 'v.id')
+                    ->where('releases.videos_id', '>', 0);
+            })
+            ->leftJoin('tv_episodes as tve', function ($join): void {
+                $join->on('releases.tv_episodes_id', '=', 'tve.id')
+                    ->where('releases.tv_episodes_id', '>', 0);
+            })
+            ->leftJoin('movieinfo as m', function ($join): void {
+                $join->on('m.id', '=', 'releases.movieinfo_id')
+                    ->where('releases.movieinfo_id', '>', 0);
+            });
 
         if (is_array($guid)) {
-            $query->whereIn('guid', $guid);
+            $query->whereIn('releases.guid', $guid);
         } else {
-            $query->where('guid', $guid);
+            $query->where('releases.guid', $guid);
         }
 
         $releases = $query->get();
-
-        $releases->each(function ($release) {
-            $release->group_name = $release->group->name ?? null;
-            $release->tvdb = $release->video->tvdb ?? null;
-            $release->trakt = $release->video->trakt ?? null;
-            $release->tvrage = $release->video->tvrage ?? null;
-            $release->tvmaze = $release->video->tvmaze ?? null;
-            $release->title = $release->episode->title ?? null;
-            $release->firstaired = $release->episode->firstaired ?? null;
-            $release->parent_category = $release->category->parent->title ?? null;
-            $release->sub_category = $release->category->title ?? null;
-            $release->category_name = $release->parent_category.' > '.$release->sub_category;
-        });
 
         return is_array($guid) ? $releases : $releases->first();
     }
@@ -633,8 +672,6 @@ class Release extends Model
 
     public static function checkGuidForApi(mixed $guid): bool
     {
-        $check = self::whereGuid($guid)->first();
-
-        return $check !== null;
+        return self::whereGuid($guid)->exists();
     }
 }

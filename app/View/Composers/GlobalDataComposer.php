@@ -75,7 +75,7 @@ class GlobalDataComposer
             // User data with category exclusions (short cache per user)
             $userdata = $this->rememberWithCacheFallback('composer_user_'.$userId, self::CACHE_TTL, function () use ($userId) {
                 $user = User::find($userId);
-                $user->categoryexclusions = User::getCategoryExclusionById($userId);
+                $user->categoryexclusions = User::getCachedCategoryExclusionById($userId);
 
                 return $user;
             });

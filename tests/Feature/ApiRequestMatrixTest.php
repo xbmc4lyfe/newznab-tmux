@@ -118,6 +118,81 @@ class ApiRequestMatrixTest extends TestCase
             ->assertJsonPath('error', 'Incorrect parameter (maxage must be numeric)');
     }
 
+    public function test_v2_search_reuses_cached_release_rows(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+        $request = Request::create('/api/v2/search', 'GET', [
+            'api_token' => $token,
+            'id' => 'ubuntu',
+        ]);
+
+        $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearchService->shouldReceive('apiSearch')
+            ->once()
+            ->with('ubuntu', -1, 0, 100, -1, [5030], [-1], 0, 'posted_desc')
+            ->andReturn(collect());
+
+        $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
+        $releaseBrowseService->shouldNotReceive('getBrowseRangeForApi');
+
+        $controller = new ApiV2Controller(app(ApiController::class), $releaseSearchService, $releaseBrowseService);
+
+        $firstResponse = $controller->apiSearch($request);
+        $secondResponse = $controller->apiSearch($request);
+
+        $this->assertSame(200, $firstResponse->getStatusCode());
+        $this->assertSame(200, $secondResponse->getStatusCode());
+        $this->assertSame([], $firstResponse->getData(true)['results']);
+        $this->assertSame([], $secondResponse->getData(true)['results']);
+    }
+
+    public function test_v1_search_reuses_cached_release_rows(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+        $request = Request::create('/api/v1/api', 'GET', [
+            't' => 'search',
+            'apikey' => $token,
+            'q' => 'ubuntu',
+        ]);
+
+        $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearchService->shouldReceive('apiSearch')
+            ->once()
+            ->with('ubuntu', -1, 0, 100, -1, [5030], [-1], 0, 'posted_desc')
+            ->andReturn(collect());
+
+        $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
+        $releaseBrowseService->shouldNotReceive('getBrowseRangeForApi');
+
+        $controller = new class($releaseSearchService, $releaseBrowseService) extends ApiController
+        {
+            /**
+             * @var array{data:mixed,params:array<string,mixed>,xml:bool,offset:int,type:string}|null
+             */
+            public ?array $capturedOutput = null;
+
+            public function output(mixed $data, array $params, bool $xml, int $offset, string $type = '', array $headers = [])
+            {
+                $this->capturedOutput = [
+                    'data' => $data,
+                    'params' => $params,
+                    'xml' => $xml,
+                    'offset' => $offset,
+                    'type' => $type,
+                ];
+            }
+        };
+
+        $controller->api($request);
+        $this->assertNotNull($controller->capturedOutput);
+        $this->assertSame('api', $controller->capturedOutput['type']);
+        $this->assertSame(1, DB::table('user_requests')->count());
+
+        $controller->api($request);
+        $this->assertSame('api', $controller->capturedOutput['type']);
+        $this->assertSame(2, DB::table('user_requests')->count());
+    }
+
     public function test_v1_movie_without_search_params_returns_recent_movie_feed(): void
     {
         $token = (string) DB::table('users')->value('api_token');

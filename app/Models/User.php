@@ -1679,9 +1679,26 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      * This includes both permission-based exclusions (entire root categories)
      * and user-selected subcategory exclusions from user_excluded_categories table.
      *
-     * @return array<int>
+     * @return list<int>
      *
      * @throws \Exception
+     */
+    public static function getCachedCategoryExclusionById(int $userId): array
+    {
+        return Cache::remember(
+            static::categoryExclusionCacheKey($userId),
+            300,
+            static fn (): array => static::getCategoryExclusionById($userId)
+        );
+    }
+
+    public static function categoryExclusionCacheKey(int $userId): string
+    {
+        return 'user_category_exclusions_'.$userId;
+    }
+
+    /**
+     * @return list<int>
      */
     public static function getCategoryExclusionById(int $userId): array
     {
@@ -1719,16 +1736,19 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
             ->pluck('categories_id')
             ->toArray();
 
-        // Filter out user exclusions that belong to already excluded root categories
-        // to avoid duplicates
-        $filteredUserExclusions = array_filter($userExclusions, function ($categoryId) use ($excludedRoots) {
-            $category = Category::find($categoryId);
-
-            return $category && ! in_array($category->root_categories_id, $excludedRoots);
-        });
+        $filteredUserExclusions = $userExclusions === []
+            ? []
+            : Category::query()
+                ->whereIn('id', $userExclusions)
+                ->when($excludedRoots !== [], fn (Builder $query): Builder => $query->whereNotIn('root_categories_id', $excludedRoots))
+                ->pluck('id')
+                ->toArray();
 
         // Merge permission-based exclusions with user-selected subcategory exclusions
-        return array_unique(array_merge($permissionExclusions, $filteredUserExclusions));
+        return array_values(array_unique(array_map(
+            static fn (mixed $categoryId): int => (int) $categoryId,
+            array_merge($permissionExclusions, $filteredUserExclusions)
+        )));
     }
 
     /**
@@ -1748,12 +1768,14 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
                 'categories_id' => (int) $categoryId,
             ]);
         }
+
+        Cache::forget(static::categoryExclusionCacheKey($this->id));
     }
 
     /**
      * Get excluded categories for API request.
      *
-     * @return array<string, mixed>
+     * @return list<int>
      *
      * @throws \Exception
      */

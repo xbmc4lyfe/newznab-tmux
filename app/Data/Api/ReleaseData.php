@@ -56,6 +56,16 @@ final class ReleaseData extends Data
      */
     public static function fromRelease(Release|\stdClass $release, User $user): self
     {
+        return new self(...self::toArrayFromRelease($release, $user));
+    }
+
+    /**
+     * Build the API array directly for hot search response paths.
+     *
+     * @return array<string, mixed>
+     */
+    public static function toArrayFromRelease(Release|\stdClass $release, User $user): array
+    {
         $get = static fn (string $key, mixed $default = null): mixed => $release->{$key} ?? $default;
 
         $categoriesId = (int) $get('categories_id', 0);
@@ -77,31 +87,29 @@ final class ReleaseData extends Data
         ];
 
         if (in_array($categoriesId, Category::MOVIES_GROUP, true)) {
-            return new self(
-                ...$base,
-                imdbid: self::nullIfZero($get('imdbid')),
-                tmdbid: self::nullIfZero($get('tmdbid')),
-                traktid: self::nullIfZero($get('traktid')),
-            );
+            return $base + [
+                'imdbid' => self::nullIfZero($get('imdbid')),
+                'tmdbid' => self::nullIfZero($get('tmdbid')),
+                'traktid' => self::nullIfZero($get('traktid')),
+            ];
         }
 
         if (in_array($categoriesId, Category::TV_GROUP, true)) {
-            return new self(
-                ...$base,
-                imdbid: self::nullIfZero($get('imdb')),
-                tmdbid: self::nullIfZero($get('tmdb')),
-                traktid: self::nullIfZero($get('trakt')),
-                episode_title: $get('title'),
-                season: $get('series'),
-                episode: $get('episode'),
-                tvairdate: $get('firstaired'),
-                tvdbid: self::nullIfZero($get('tvdb')),
-                tvrageid: self::nullIfZero($get('tvrage')),
-                tvmazeid: self::nullIfZero($get('tvmaze')),
-            );
+            return $base + [
+                'imdbid' => self::nullIfZero($get('imdb')),
+                'tmdbid' => self::nullIfZero($get('tmdb')),
+                'traktid' => self::nullIfZero($get('trakt')),
+                'episode_title' => $get('title'),
+                'season' => $get('series'),
+                'episode' => $get('episode'),
+                'tvairdate' => $get('firstaired'),
+                'tvdbid' => self::nullIfZero($get('tvdb')),
+                'tvrageid' => self::nullIfZero($get('tvrage')),
+                'tvmazeid' => self::nullIfZero($get('tvmaze')),
+            ];
         }
 
-        return new self(...$base);
+        return $base;
     }
 
     private static function nullIfZero(mixed $value): mixed

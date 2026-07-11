@@ -18,6 +18,7 @@ use App\Models\Settings;
 use App\Models\UsenetGroup;
 use App\Models\User;
 use App\Models\UserRequest;
+use App\Services\Api\ApiReleaseRowCache;
 use App\Services\RegistrationStatusService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
@@ -41,14 +42,23 @@ class ApiV2Controller extends BasePageController
 
     private ReleaseBrowseService $releaseBrowseService;
 
+    private ApiReleaseRowCache $releaseRowCache;
+
+    /**
+     * @var array<int, object>
+     */
+    private array $resolvedUserStats = [];
+
     public function __construct(
         ApiController $api,
         ReleaseSearchService $releaseSearchService,
-        ReleaseBrowseService $releaseBrowseService
+        ReleaseBrowseService $releaseBrowseService,
+        ?ApiReleaseRowCache $releaseRowCache = null
     ) {
         $this->api = $api;
         $this->releaseSearchService = $releaseSearchService;
         $this->releaseBrowseService = $releaseBrowseService;
+        $this->releaseRowCache = $releaseRowCache ?? app(ApiReleaseRowCache::class);
     }
 
     /**
@@ -81,7 +91,7 @@ class ApiV2Controller extends BasePageController
 
         $user->loadMissing('role');
 
-        $userStats = $this->api->getCachedUserStats($user->id);
+        $userStats = $this->userStatsFor($user);
         $thisRequests = (int) ($userStats->api_count ?? 0);
         $maxRequests = (int) $user->role->apirequests;
         if ($thisRequests > $maxRequests) {
@@ -99,7 +109,7 @@ class ApiV2Controller extends BasePageController
      */
     private function buildUserStatsResponse(User $user): array
     {
-        $userStats = $this->api->getCachedUserStats($user->id);
+        $userStats = $this->userStatsFor($user);
 
         return [
             'apiCurrent' => (int) ($userStats->api_count ?? 0),
@@ -109,6 +119,11 @@ class ApiV2Controller extends BasePageController
             'apiOldestTime' => $userStats->api_time ? Carbon::parse($userStats->api_time)->toRfc2822String() : '',
             'grabOldestTime' => $userStats->grab_time ? Carbon::parse($userStats->grab_time)->toRfc2822String() : '',
         ];
+    }
+
+    private function userStatsFor(User $user): object
+    {
+        return $this->resolvedUserStats[$user->id] ??= $this->api->getCachedUserStats($user->id);
     }
 
     /**
@@ -128,7 +143,7 @@ class ApiV2Controller extends BasePageController
         $total = (int) ($rowsArray[0]->_totalrows ?? 0);
 
         $results = array_map(
-            static fn ($row): array => ReleaseData::fromRelease($row, $user)->toArray(),
+            static fn ($row): array => ReleaseData::toArrayFromRelease($row, $user),
             $rowsArray,
         );
 
@@ -266,16 +281,21 @@ class ApiV2Controller extends BasePageController
         if (! is_string($sort)) {
             return $sort;
         }
-        $catExclusions = User::getCategoryExclusionById($user->id);
+        $catExclusions = User::getCachedCategoryExclusionById($user->id);
 
-        // Create cache key for movie search results
-        $searchCacheKey = 'api_movie_search:'.md5(serialize([
-            $imdbId, $tmdbId, $traktId, $offset, $limit, $searchName, $sort,
-            $categoryID, $maxAge, $minSize, $catExclusions,
-        ]));
-
-        // Cache search results for 10 minutes
-        $relData = Cache::remember($searchCacheKey, 600, function () use (
+        $relData = $this->releaseRowCache->remember('v2', 'movie', [
+            'imdbid' => $imdbId,
+            'tmdbid' => $tmdbId,
+            'traktid' => $traktId,
+            'offset' => $offset,
+            'limit' => $limit,
+            'id' => $searchName,
+            'sort' => $sort,
+            'category' => $categoryID,
+            'max_age' => $maxAge,
+            'min_size' => $minSize,
+            'excluded' => $catExclusions,
+        ], function () use (
             $imdbId, $tmdbId, $traktId, $offset, $limit, $searchName, $sort,
             $categoryID, $maxAge, $minSize, $catExclusions
         ) {
@@ -324,28 +344,43 @@ class ApiV2Controller extends BasePageController
         }
 
         $minSize = max(0, (int) $request->input('minsize', 0));
-        $catExclusions = User::getCategoryExclusionById($user->id);
+        $catExclusions = User::getCachedCategoryExclusionById($user->id);
         $groupName = $this->api->group($request);
+        $searchName = (string) $request->input('id', '');
 
-        if (! $request->filled('id')) {
+        if ($searchName === '') {
             if ($categoryID === [-1]) {
                 $categoryID = [Category::MUSIC_ROOT];
             }
+        }
 
-            $relData = $this->releaseBrowseService->getBrowseRangeForApi(
-                1,
-                $categoryID,
-                $offset,
-                $limit,
-                $sort,
-                $maxAge,
-                $catExclusions,
-                $groupName,
-                $minSize
-            );
-        } else {
-            $relData = $this->releaseSearchService->apiMusicSearch(
-                (string) $request->input('id'),
+        $relData = $this->releaseRowCache->remember('v2', 'audio', [
+            'id' => $searchName,
+            'group' => $groupName,
+            'offset' => $offset,
+            'limit' => $limit,
+            'sort' => $sort,
+            'category' => $categoryID,
+            'max_age' => $maxAge,
+            'min_size' => $minSize,
+            'excluded' => $catExclusions,
+        ], function () use ($searchName, $groupName, $offset, $limit, $sort, $maxAge, $catExclusions, $categoryID, $minSize) {
+            if ($searchName === '') {
+                return $this->releaseBrowseService->getBrowseRangeForApi(
+                    1,
+                    $categoryID,
+                    $offset,
+                    $limit,
+                    $sort,
+                    $maxAge,
+                    $catExclusions,
+                    $groupName,
+                    $minSize
+                );
+            }
+
+            return $this->releaseSearchService->apiMusicSearch(
+                $searchName,
                 $groupName,
                 $offset,
                 $limit,
@@ -355,7 +390,7 @@ class ApiV2Controller extends BasePageController
                 $minSize,
                 $sort
             );
-        }
+        });
 
         return $this->buildSearchResponse($relData, $user);
     }
@@ -387,28 +422,43 @@ class ApiV2Controller extends BasePageController
         }
 
         $minSize = max(0, (int) $request->input('minsize', 0));
-        $catExclusions = User::getCategoryExclusionById($user->id);
+        $catExclusions = User::getCachedCategoryExclusionById($user->id);
         $groupName = $this->api->group($request);
+        $searchName = (string) $request->input('id', '');
 
-        if (! $request->filled('id')) {
+        if ($searchName === '') {
             if ($categoryID === [-1]) {
                 $categoryID = [Category::BOOKS_ROOT];
             }
+        }
 
-            $relData = $this->releaseBrowseService->getBrowseRangeForApi(
-                1,
-                $categoryID,
-                $offset,
-                $limit,
-                $sort,
-                $maxAge,
-                $catExclusions,
-                $groupName,
-                $minSize
-            );
-        } else {
-            $relData = $this->releaseSearchService->apiBookSearch(
-                (string) $request->input('id'),
+        $relData = $this->releaseRowCache->remember('v2', 'books', [
+            'id' => $searchName,
+            'group' => $groupName,
+            'offset' => $offset,
+            'limit' => $limit,
+            'sort' => $sort,
+            'category' => $categoryID,
+            'max_age' => $maxAge,
+            'min_size' => $minSize,
+            'excluded' => $catExclusions,
+        ], function () use ($searchName, $groupName, $offset, $limit, $sort, $maxAge, $catExclusions, $categoryID, $minSize) {
+            if ($searchName === '') {
+                return $this->releaseBrowseService->getBrowseRangeForApi(
+                    1,
+                    $categoryID,
+                    $offset,
+                    $limit,
+                    $sort,
+                    $maxAge,
+                    $catExclusions,
+                    $groupName,
+                    $minSize
+                );
+            }
+
+            return $this->releaseSearchService->apiBookSearch(
+                $searchName,
                 $groupName,
                 $offset,
                 $limit,
@@ -418,7 +468,7 @@ class ApiV2Controller extends BasePageController
                 $minSize,
                 $sort
             );
-        }
+        });
 
         return $this->buildSearchResponse($relData, $user);
     }
@@ -452,9 +502,19 @@ class ApiV2Controller extends BasePageController
             return $sort;
         }
 
-        $catExclusions = User::getCategoryExclusionById($user->id);
+        $catExclusions = User::getCachedCategoryExclusionById($user->id);
 
-        $relData = $this->releaseSearchService->animeSearch(
+        $relData = $this->releaseRowCache->remember('v2', 'anime', [
+            'id' => $q,
+            'anidbid' => $anidb,
+            'anilistid' => $anilist,
+            'offset' => $offset,
+            'limit' => $limit,
+            'sort' => $sort,
+            'category' => $categoryID,
+            'max_age' => $maxAge,
+            'excluded' => $catExclusions,
+        ], fn () => $this->releaseSearchService->animeSearch(
             $anidb,
             $offset,
             $limit,
@@ -464,7 +524,7 @@ class ApiV2Controller extends BasePageController
             $catExclusions,
             $anilist,
             $sort
-        );
+        ));
 
         return $this->buildSearchResponse($relData, $user);
     }
@@ -484,7 +544,7 @@ class ApiV2Controller extends BasePageController
         event(new UserAccessedApi($user, $request->ip()));
 
         $offset = $this->api->offset($request);
-        $catExclusions = User::getCategoryExclusionById($user->id);
+        $catExclusions = User::getCachedCategoryExclusionById($user->id);
         $minSize = $request->has('minsize') && $request->input('minsize') > 0 ? $request->input('minsize') : 0;
         $maxAge = $this->parseMaxAge($request);
         if (! is_int($maxAge)) {
@@ -501,20 +561,33 @@ class ApiV2Controller extends BasePageController
         $categoryID = $this->api->categoryID($request);
         $limit = $this->api->limit($request);
 
-        if ($request->has('id')) {
-            $relData = $this->releaseSearchService->apiSearch(
-                $request->input('id'),
-                $groupName,
-                $offset,
-                $limit,
-                $maxAge,
-                $catExclusions,
-                $categoryID,
-                $minSize,
-                $sort
-            );
-        } else {
-            $relData = $this->releaseBrowseService->getBrowseRangeForApi(
+        $searchName = $request->input('id');
+        $relData = $this->releaseRowCache->remember('v2', 'search', [
+            'id' => $searchName,
+            'group' => $groupName,
+            'offset' => $offset,
+            'limit' => $limit,
+            'sort' => $sort,
+            'category' => $categoryID,
+            'max_age' => $maxAge,
+            'min_size' => $minSize,
+            'excluded' => $catExclusions,
+        ], function () use ($request, $searchName, $groupName, $offset, $limit, $maxAge, $catExclusions, $categoryID, $minSize, $sort) {
+            if ($request->has('id')) {
+                return $this->releaseSearchService->apiSearch(
+                    $searchName,
+                    $groupName,
+                    $offset,
+                    $limit,
+                    $maxAge,
+                    $catExclusions,
+                    $categoryID,
+                    $minSize,
+                    $sort
+                );
+            }
+
+            return $this->releaseBrowseService->getBrowseRangeForApi(
                 1,
                 $categoryID,
                 $offset,
@@ -525,7 +598,7 @@ class ApiV2Controller extends BasePageController
                 $groupName,
                 $minSize
             );
-        }
+        });
 
         return $this->buildSearchResponse($relData, $user);
     }
@@ -541,7 +614,7 @@ class ApiV2Controller extends BasePageController
             return $user;
         }
 
-        $catExclusions = User::getCategoryExclusionById($user->id);
+        $catExclusions = User::getCachedCategoryExclusionById($user->id);
         $minSize = $request->has('minsize') && $request->input('minsize') > 0 ? $request->input('minsize') : 0;
         $this->api->verifyEmptyParameter($request, 'id');
         $this->api->verifyEmptyParameter($request, 'vid');
@@ -586,20 +659,39 @@ class ApiV2Controller extends BasePageController
             $airDate = str_replace('/', '-', $year[0].'-'.$episode);
         }
 
-        $relData = $this->releaseSearchService->apiTvSearch(
+        $offset = $this->api->offset($request);
+        $limit = $this->api->limit($request);
+        $categoryID = $this->api->categoryID($request);
+        $airDate = $airDate ?? '';
+        $searchName = $request->input('id') ?? '';
+
+        $relData = $this->releaseRowCache->remember('v2', 'tv', [
+            'site_ids' => $siteIdArr,
+            'season' => $series,
+            'episode' => $episode,
+            'air_date' => $airDate,
+            'offset' => $offset,
+            'limit' => $limit,
+            'id' => $searchName,
+            'category' => $categoryID,
+            'max_age' => $maxAge,
+            'min_size' => $minSize,
+            'excluded' => $catExclusions,
+            'sort' => $sort,
+        ], fn () => $this->releaseSearchService->apiTvSearch(
             $siteIdArr,
             $series,
             $episode,
-            $airDate ?? '',
-            $this->api->offset($request),
-            $this->api->limit($request),
-            $request->input('id') ?? '',
-            $this->api->categoryID($request),
+            $airDate,
+            $offset,
+            $limit,
+            $searchName,
+            $categoryID,
             $maxAge,
             $minSize,
             $catExclusions,
             $sort
-        );
+        ));
 
         return $this->buildSearchResponse($relData, $user);
     }
@@ -635,7 +727,10 @@ class ApiV2Controller extends BasePageController
 
         UserRequest::addApiRequest($user->id, $request->getRequestUri());
         event(new UserAccessedApi($user, $request->ip()));
-        $relData = Release::getByGuidForApi($request->input('id'));
+        $guid = $request->input('id');
+        $relData = $this->releaseRowCache->remember('v2', 'details', [
+            'guid' => $guid,
+        ], fn () => Release::getByGuidForApi($guid));
 
         if ($relData === null) {
             return response()->json(['error' => 'No such item'], 404);

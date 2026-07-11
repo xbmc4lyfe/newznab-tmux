@@ -228,7 +228,7 @@ class ProfileController extends BasePageController
         $this->viewData = array_merge($this->viewData, [
             'error' => $errorStr,
             'user' => $this->userdata,
-            'userexccat' => User::getCategoryExclusionById($userid),
+            'userexccat' => User::getCachedCategoryExclusionById($userid),
             'userExcludedCategories' => $this->userdata->excludedCategories()->pluck('categories_id')->toArray(),
             'success_2fa' => $success_2fa,
             'error_2fa' => $error_2fa,

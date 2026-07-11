@@ -41,7 +41,7 @@ class ReleaseSearchService
      * Function for searching on the site (by subject, searchname or advanced).
      *
      * @param  array<int|string, mixed>  $cat  Category IDs (list or associative)
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      * @param  array<string, mixed>  $orderBy
      * @param  array<string, mixed>  $searchArr
      * @return array|Collection|mixed
@@ -211,7 +211,7 @@ class ReleaseSearchService
      * Search function for API.
      *
      * @param  array<int|string, mixed>  $cat  Category IDs (list or associative)
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      * @return Collection|mixed
      */
     public function apiSearch(mixed $searchName, mixed $groupName, int $offset = 0, int $limit = 1000, int $maxAge = -1, array $excludedCats = [], array $cat = [-1], int $minSize = 0, string $orderBy = 'posted_desc'): mixed
@@ -592,7 +592,7 @@ class ReleaseSearchService
      * Search for TV shows via API.
      *
      * @param  array<int|string, mixed>  $cat  Category IDs (list or associative)
-     * @param  array<string, mixed>  $excludedCategories
+     * @param  array<int, int>  $excludedCategories
      * @param  array<string, mixed>  $siteIdArr
      * @return array|Collection|\Illuminate\Support\Collection|mixed
      */
@@ -910,7 +910,7 @@ class ReleaseSearchService
      * Search TV Shows via APIv2.
      *
      * @param  array<int|string, mixed>  $cat  Category IDs (list or associative)
-     * @param  array<string, mixed>  $excludedCategories
+     * @param  array<int, int>  $excludedCategories
      * @param  array<string, mixed>  $siteIdArr
      * @return Collection|mixed
      */
@@ -1082,7 +1082,7 @@ class ReleaseSearchService
      * Search anime releases.
      *
      * @param  array<int|string, mixed>  $cat  Category IDs (list or associative)
-     * @param  array<string, mixed>  $excludedCategories
+     * @param  array<int, int>  $excludedCategories
      * @return Collection|mixed
      */
     public function animeSearch(mixed $aniDbID, int $offset = 0, int $limit = 100, string $name = '', array $cat = [-1], int $maxAge = -1, array $excludedCategories = [], int $anilistId = -1, string $orderBy = 'posted_desc'): mixed
@@ -1175,7 +1175,7 @@ class ReleaseSearchService
      * Movies search through API and site.
      *
      * @param  array<int|string, mixed>  $cat  Category IDs (list or associative)
-     * @param  array<string, mixed>  $excludedCategories
+     * @param  array<int, int>  $excludedCategories
      * @return Collection|mixed
      */
     public function moviesSearch(string $imDbId = '', int $tmDbId = -1, int $traktId = -1, int $offset = 0, int $limit = 100, string $name = '', array $cat = [-1], int $maxAge = -1, int $minSize = 0, array $excludedCategories = [], string $orderBy = 'posted_desc'): mixed
@@ -1343,7 +1343,7 @@ class ReleaseSearchService
     }
 
     /**
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      * @return array<string, mixed>
      */
     public function searchSimilar(mixed $currentID, mixed $name, array $excludedCats = []): bool|array
@@ -1702,7 +1702,7 @@ class ReleaseSearchService
      * Build WHERE clause for search query
      *
      * @param  array<int|string, mixed>  $cat  Category IDs (list or associative)
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      * @param  array<string, mixed>  $searchResult
      */
     private function buildSearchWhereClause(

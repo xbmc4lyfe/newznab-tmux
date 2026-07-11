@@ -33,7 +33,7 @@ class ReleaseBrowseService
      * Selects only columns needed by the browse/search Blade views.
      *
      * @param  string|null  $searchTerm  Optional search term to filter by (uses search index)
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      * @return Collection|mixed
      */
     public function getBrowseRange(mixed $page, mixed $cat, mixed $start, mixed $num, mixed $orderBy, int $maxAge = -1, array $excludedCats = [], int|string $groupName = -1, int $minSize = 0, ?string $searchTerm = null): mixed
@@ -46,7 +46,7 @@ class ReleaseBrowseService
      * (movie IDs, TV episode info, external IDs).
      *
      * @param  string|null  $searchTerm  Optional search term to filter by (uses search index)
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      * @return Collection|mixed
      */
     public function getBrowseRangeForApi(mixed $page, mixed $cat, mixed $start, mixed $num, mixed $orderBy, int $maxAge = -1, array $excludedCats = [], int|string $groupName = -1, int $minSize = 0, ?string $searchTerm = null): mixed
@@ -60,7 +60,7 @@ class ReleaseBrowseService
      *
      * @param  string  $purpose  'browse' for web views, 'api' for API responses
      * @param  string|null  $searchTerm  Optional search term to filter by (uses search index)
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      * @return Collection|mixed
      */
     private function executeBrowseQuery(string $purpose, mixed $page, mixed $cat, mixed $start, mixed $num, mixed $orderBy, int $maxAge = -1, array $excludedCats = [], int|string $groupName = -1, int $minSize = 0, ?string $searchTerm = null): mixed
@@ -239,7 +239,7 @@ class ReleaseBrowseService
      * Uses sample-based counting and avoids JOINs whenever possible.
      *
      * @param  array<string, mixed>  $cat
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      */
     public function getBrowseCount(array $cat, int $maxAge = -1, array $excludedCats = [], int|string $groupName = ''): int
     {
@@ -331,7 +331,7 @@ class ReleaseBrowseService
      * API browse without text: filter and sort via search engine, hydrate rows from SQL.
      *
      * @param  array<string, mixed>  $cat
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      * @param  array{0: string, 1: string}  $orderBy
      */
     private function executeApiBrowseViaSearchIndex(
@@ -509,7 +509,7 @@ class ReleaseBrowseService
     }
 
     /**
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      * @return Collection|mixed
      */
     public function getShowsRange(mixed $userShows, mixed $offset, mixed $limit, mixed $orderBy, int $maxAge = -1, array $excludedCats = [])
@@ -549,7 +549,7 @@ class ReleaseBrowseService
     }
 
     /**
-     * @param  array<string, mixed>  $excludedCats
+     * @param  array<int, int>  $excludedCats
      */
     public function getShowsCount(mixed $userShows, int $maxAge = -1, array $excludedCats = []): int
     {
