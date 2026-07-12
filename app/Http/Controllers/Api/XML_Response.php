@@ -47,6 +47,10 @@ class XML_Response
 
     protected ReleaseRows $releaseRows;
 
+    protected ?ReleaseItemPayloadBuilder $releasePayloadBuilder = null;
+
+    protected ?string $releasePayloadBuilderNamespace = null;
+
     /**
      * The trailing URL parameters on the request.
      *
@@ -265,7 +269,17 @@ class XML_Response
      */
     protected function releasePayload(mixed $release): array
     {
-        return (new ReleaseItemPayloadBuilder($this->parameters, $this->server, $this->namespace))->build($release);
+        return $this->releasePayloadBuilder()->build($release);
+    }
+
+    protected function releasePayloadBuilder(): ReleaseItemPayloadBuilder
+    {
+        if ($this->releasePayloadBuilder === null || $this->releasePayloadBuilderNamespace !== $this->namespace) {
+            $this->releasePayloadBuilder = new ReleaseItemPayloadBuilder($this->parameters, $this->server, $this->namespace);
+            $this->releasePayloadBuilderNamespace = $this->namespace;
+        }
+
+        return $this->releasePayloadBuilder;
     }
 
     /**

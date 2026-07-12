@@ -4,19 +4,36 @@ declare(strict_types=1);
 
 namespace App\Services\Api\V1;
 
-use Illuminate\Support\Carbon;
-
 final readonly class ReleaseItemPayloadBuilder
 {
+    private string $serverUrl;
+
+    private mixed $token;
+
+    private string $delParam;
+
+    private bool $includeEnclosure;
+
+    private bool $extended;
+
+    private bool $isNewznab;
+
     /**
      * @param  array<string, mixed>  $parameters
      * @param  array<string, mixed>  $server
      */
     public function __construct(
-        private array $parameters,
-        private array $server,
-        private string $namespace = 'newznab',
-    ) {}
+        array $parameters,
+        array $server,
+        string $namespace = 'newznab',
+    ) {
+        $this->serverUrl = (string) ($server['server']['url'] ?? '');
+        $this->token = $parameters['token'] ?? '';
+        $this->delParam = (int) ($parameters['del'] ?? '') === 1 ? '&del=1' : '';
+        $this->includeEnclosure = ! isset($parameters['dl']) || (int) $parameters['dl'] === 1;
+        $this->extended = (int) ($parameters['extended'] ?? '') === 1;
+        $this->isNewznab = $namespace === 'newznab';
+    }
 
     /**
      * @return array{
@@ -33,22 +50,21 @@ final readonly class ReleaseItemPayloadBuilder
      */
     public function build(mixed $release): array
     {
-        $serverUrl = $this->serverUrl();
         $guid = (string) $this->value($release, 'guid');
         $searchName = $this->value($release, 'searchname');
-        $downloadUrl = $serverUrl.'/getnzb?id='.$guid.'.nzb&r='.$this->parameter('token').$this->delParam();
+        $downloadUrl = $this->serverUrl.'/getnzb?id='.$guid.'.nzb&r='.$this->token.$this->delParam;
 
         $payload = [
             'title' => $searchName,
-            'guid' => $serverUrl.'/details/'.$guid,
+            'guid' => $this->serverUrl.'/details/'.$guid,
             'link' => $downloadUrl,
-            'comments' => $serverUrl.'/details/'.$guid.'#comments',
+            'comments' => $this->serverUrl.'/details/'.$guid.'#comments',
             'pubDate' => date(DATE_RSS, strtotime((string) $this->value($release, 'adddate'))),
             'category' => $this->value($release, 'category_name'),
             'description' => $searchName,
         ];
 
-        if (! isset($this->parameters['dl']) || (int) $this->parameters['dl'] === 1) {
+        if ($this->includeEnclosure) {
             $payload['enclosure'] = [
                 'url' => $downloadUrl,
                 'length' => $this->value($release, 'size'),
@@ -56,7 +72,7 @@ final readonly class ReleaseItemPayloadBuilder
             ];
         }
 
-        $payload['attr'] = $this->attributes($release, $serverUrl);
+        $payload['attr'] = $this->attributes($release);
 
         return $payload;
     }
@@ -64,7 +80,7 @@ final readonly class ReleaseItemPayloadBuilder
     /**
      * @return array<string, mixed>
      */
-    private function attributes(mixed $release, string $serverUrl): array
+    private function attributes(mixed $release): array
     {
         $attributes = [
             'category' => $this->value($release, 'categories_id'),
@@ -73,16 +89,16 @@ final readonly class ReleaseItemPayloadBuilder
 
         $coverUrl = $this->value($release, 'coverurl');
         if (! empty($coverUrl)) {
-            $attributes['coverurl'] = $serverUrl.'/covers/'.$coverUrl;
+            $attributes['coverurl'] = $this->serverUrl.'/covers/'.$coverUrl;
         }
 
-        if ((int) $this->parameter('extended') !== 1) {
+        if (! $this->extended) {
             return $attributes;
         }
 
         $attributes['files'] = $this->value($release, 'totalpart');
 
-        if ($this->namespace === 'newznab' && $this->hasVideoInfo($release)) {
+        if ($this->isNewznab && $this->hasVideoInfo($release)) {
             $attributes = array_merge($attributes, $this->tvAttributes($release));
         }
 
@@ -102,13 +118,13 @@ final readonly class ReleaseItemPayloadBuilder
         }
 
         if ((int) ($this->value($release, 'nfostatus') ?? 0) === 1) {
-            $attributes['info'] = $serverUrl.'api?t=info&id='.$this->value($release, 'guid').'&r='.$this->parameter('token');
+            $attributes['info'] = $this->serverUrl.'api?t=info&id='.$this->value($release, 'guid').'&r='.$this->token;
         }
 
         $attributes['grabs'] = $this->value($release, 'grabs');
         $attributes['comments'] = $this->value($release, 'comments');
         $attributes['password'] = $this->value($release, 'passwordstatus');
-        $attributes['usenetdate'] = Carbon::parse($this->value($release, 'postdate'))->toRssString();
+        $attributes['usenetdate'] = date(DATE_RSS, strtotime((string) $this->value($release, 'postdate')));
 
         $groupName = $this->value($release, 'group_name');
         if (! empty($groupName)) {
@@ -173,8 +189,11 @@ final readonly class ReleaseItemPayloadBuilder
 
     private function hasVideoInfo(mixed $release): bool
     {
-        return ($this->value($release, 'videos_id') !== null && $this->value($release, 'videos_id') > 0)
-            || ($this->value($release, 'tv_episodes_id') !== null && $this->value($release, 'tv_episodes_id') > 0);
+        $videosId = $this->value($release, 'videos_id');
+        $tvEpisodesId = $this->value($release, 'tv_episodes_id');
+
+        return ($videosId !== null && $videosId > 0)
+            || ($tvEpisodesId !== null && $tvEpisodesId > 0);
     }
 
     private function scalarOrRelationValue(mixed $release, string $property, string $subProperty): mixed
@@ -203,20 +222,5 @@ final readonly class ReleaseItemPayloadBuilder
         }
 
         return null;
-    }
-
-    private function parameter(string $key): mixed
-    {
-        return $this->parameters[$key] ?? '';
-    }
-
-    private function serverUrl(): string
-    {
-        return (string) ($this->server['server']['url'] ?? '');
-    }
-
-    private function delParam(): string
-    {
-        return (int) $this->parameter('del') === 1 ? '&del=1' : '';
     }
 }
