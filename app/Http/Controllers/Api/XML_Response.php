@@ -26,8 +26,9 @@ declare(strict_types=1);
 namespace App\Http\Controllers\Api;
 
 use App\Models\Category;
-use Illuminate\Support\Carbon;
-use Illuminate\Support\Collection;
+use App\Services\Api\V1\ReleaseItemPayloadBuilder;
+use App\Services\Api\V1\ReleaseRows;
+use App\Services\Api\V1\XmlResponseContext;
 
 /**
  * Class XMLReturn.
@@ -42,12 +43,16 @@ class XML_Response
     /**
      * The RSS namespace used for the output.
      */
-    protected string $namespace;
+    protected string $namespace = 'newznab';
+
+    protected ReleaseRows $releaseRows;
 
     /**
      * The trailing URL parameters on the request.
+     *
+     * @var array<string, mixed>
      */
-    protected mixed $parameters;
+    protected array $parameters;
 
     /**
      * The release we are adding to the stream.
@@ -61,8 +66,10 @@ class XML_Response
 
     /**
      * The various server variables and active categories.
+     *
+     * @var array<string, mixed>
      */
-    protected mixed $server;
+    protected array $server;
 
     /**
      * The XML formatting operation we are returning.
@@ -83,20 +90,13 @@ class XML_Response
      */
     public function __construct(array $options = [])
     {
-        $defaults = [
-            'Parameters' => null,
-            'Data' => null,
-            'Server' => null,
-            'Offset' => null,
-            'Type' => null,
-        ];
-        $options += $defaults;
-
-        $this->parameters = $options['Parameters'];
-        $this->releases = $options['Data'];
-        $this->server = $options['Server'];
-        $this->offset = $options['Offset'];
-        $this->type = $options['Type'];
+        $context = XmlResponseContext::fromLegacyOptions($options);
+        $this->parameters = $context->parameters;
+        $this->releases = $context->data;
+        $this->server = $context->server;
+        $this->offset = $context->offset;
+        $this->type = $context->type;
+        $this->releaseRows = new ReleaseRows($this->releases);
 
         $this->xml = new \XMLWriter;
         $this->xml->openMemory();
@@ -221,9 +221,7 @@ class XML_Response
 
         $response['item'] = [];
         foreach ($this->releaseRows() as $release) {
-            $this->release = $release;
-            $item = $this->buildReleaseArray();
-            $response['item'][] = $item;
+            $response['item'][] = $this->releasePayload($release);
         }
 
         return $response;
@@ -234,46 +232,12 @@ class XML_Response
      */
     protected function releaseRows(): array
     {
-        if ($this->releases === null || $this->releases === false || $this->releases === []) {
-            return [];
-        }
-
-        if ($this->releases instanceof Collection) {
-            return $this->releases->values()->all();
-        }
-
-        if (\is_array($this->releases)) {
-            return array_values($this->releases);
-        }
-
-        if ($this->releases instanceof \Traversable) {
-            return array_values(iterator_to_array($this->releases));
-        }
-
-        if (\is_object($this->releases)) {
-            return [$this->releases];
-        }
-
-        return [];
+        return $this->releaseRows->rows();
     }
 
     protected function totalRows(): int
     {
-        $releases = $this->releaseRows();
-        if ($releases === []) {
-            return 0;
-        }
-
-        $firstRelease = $releases[0];
-        if (\is_object($firstRelease) && isset($firstRelease->_totalrows)) {
-            return (int) $firstRelease->_totalrows;
-        }
-
-        if (\is_array($firstRelease) && isset($firstRelease['_totalrows'])) {
-            return (int) $firstRelease['_totalrows'];
-        }
-
-        return \count($releases);
+        return $this->releaseRows->totalRows();
     }
 
     /**
@@ -283,114 +247,25 @@ class XML_Response
      */
     protected function buildReleaseArray(): array
     {
-        $serverUrl = $this->server['server']['url'];
-        $delParam = ((int) $this->parameters['del'] === 1 ? '&del=1' : '');
-
-        $item = [
-            'title' => $this->release->searchname,
-            'guid' => $serverUrl.'/details/'.$this->release->guid,
-            'link' => $serverUrl.'/getnzb?id='.$this->release->guid.'.nzb&r='.$this->parameters['token'].$delParam,
-            'comments' => $serverUrl.'/details/'.$this->release->guid.'#comments',
-            'pubDate' => date(DATE_RSS, strtotime((string) $this->release->adddate)),
-            'category' => $this->release->category_name,
-            'description' => $this->release->searchname,
-        ];
-
-        if (! isset($this->parameters['dl']) || (int) $this->parameters['dl'] === 1) {
-            $item['enclosure'] = [
-                'url' => $serverUrl.'/getnzb?id='.$this->release->guid.'.nzb&r='.$this->parameters['token'].$delParam,
-                'length' => $this->release->size,
-                'type' => 'application/x-nzb',
-            ];
-        }
-
-        // Attributes
-        $attrs = [
-            'category' => $this->release->categories_id,
-            'size' => $this->release->size,
-        ];
-
-        if (! empty($this->release->coverurl)) {
-            $attrs['coverurl'] = $serverUrl.'/covers/'.$this->release->coverurl;
-        }
-
-        if ((int) $this->parameters['extended'] === 1) {
-            $attrs['files'] = $this->release->totalpart;
-
-            if ((isset($this->release->videos_id) && $this->release->videos_id > 0) || (isset($this->release->tv_episodes_id) && $this->release->tv_episodes_id > 0)) {
-                $attrs = array_merge($attrs, $this->buildTvAttrArray());
-            }
-
-            if (isset($this->release->imdbid) && imdb_id_is_valid($this->release->imdbid)) {
-                $attrs['imdb'] = $this->release->imdbid;
-            }
-            if (isset($this->release->anidbid) && $this->release->anidbid > 0) {
-                $attrs['anidbid'] = $this->release->anidbid;
-            }
-            if (isset($this->release->predb_id) && $this->release->predb_id > 0) {
-                $attrs['prematch'] = '1';
-            }
-            if (isset($this->release->nfostatus) && (int) $this->release->nfostatus === 1) {
-                $attrs['info'] = $serverUrl.'api?t=info&id='.$this->release->guid.'&r='.$this->parameters['token'];
-            }
-
-            $attrs['grabs'] = $this->release->grabs;
-            $attrs['comments'] = $this->release->comments;
-            $attrs['password'] = $this->release->passwordstatus;
-            $attrs['usenetdate'] = Carbon::parse($this->release->postdate)->toRssString();
-            if (! empty($this->release->group_name)) {
-                $attrs['group'] = $this->release->group_name;
-            }
-        }
-
-        $item['attr'] = $attrs;
-
-        return $item;
+        return $this->releasePayload($this->release);
     }
 
     /**
-     * Build TV attributes as array (scalar-safe).
-     *
-     * @return array<string, mixed>
+     * @return array{
+     *     title: mixed,
+     *     guid: string,
+     *     link: string,
+     *     comments: string,
+     *     pubDate: string,
+     *     category: mixed,
+     *     description: mixed,
+     *     enclosure?: array{url: string, length: mixed, type: string},
+     *     attr: array<string, mixed>
+     * }
      */
-    protected function buildTvAttrArray(): array
+    protected function releasePayload(mixed $release): array
     {
-        $attrs = [];
-
-        if (! empty($this->release->title)) {
-            $attrs['title'] = $this->release->title;
-        }
-        if (isset($this->release->series) && $this->release->series > 0) {
-            $attrs['season'] = $this->release->series;
-        }
-        $episodeNum = $this->getScalarOrRelationValue('episode', 'episode');
-        if (! empty($episodeNum) && $episodeNum > 0) {
-            $attrs['episode'] = $episodeNum;
-        }
-        if (! empty($this->release->firstaired)) {
-            $attrs['tvairdate'] = $this->release->firstaired;
-        }
-        if (isset($this->release->tvdb) && $this->release->tvdb > 0) {
-            $attrs['tvdbid'] = $this->release->tvdb;
-        }
-        if (isset($this->release->trakt) && $this->release->trakt > 0) {
-            $attrs['traktid'] = $this->release->trakt;
-        }
-        if (isset($this->release->tvrage) && $this->release->tvrage > 0) {
-            $attrs['tvrageid'] = $this->release->tvrage;
-            $attrs['rageid'] = $this->release->tvrage;
-        }
-        if (isset($this->release->tvmaze) && $this->release->tvmaze > 0) {
-            $attrs['tvmazeid'] = $this->release->tvmaze;
-        }
-        if (isset($this->release->imdb) && imdb_id_is_valid($this->release->imdb)) {
-            $attrs['imdbid'] = $this->release->imdb;
-        }
-        if (isset($this->release->tmdb) && $this->release->tmdb > 0) {
-            $attrs['tmdbid'] = $this->release->tmdb;
-        }
-
-        return $attrs;
+        return (new ReleaseItemPayloadBuilder($this->parameters, $this->server, $this->namespace))->build($release);
     }
 
     /**
@@ -526,14 +401,14 @@ class XML_Response
     protected function writeCategoryListing(): void
     {
         $this->xml->startElement('categories');
-        foreach ($this->server['categories'] as $this->parameters) {
+        foreach (($this->server['categories'] ?? []) as $category) {
             $this->xml->startElement('category');
-            $this->writeXmlAttribute('id', $this->parameters['id']);
-            $this->writeXmlAttribute('name', html_entity_decode((string) $this->parameters['title']));
-            if (! empty($this->parameters['description'])) {
-                $this->writeXmlAttribute('description', html_entity_decode((string) $this->parameters['description']));
+            $this->writeXmlAttribute('id', $category['id']);
+            $this->writeXmlAttribute('name', html_entity_decode((string) $category['title']));
+            if (! empty($category['description'])) {
+                $this->writeXmlAttribute('description', html_entity_decode((string) $category['description']));
             }
-            foreach ($this->parameters['categories'] as $c) {
+            foreach (($category['categories'] ?? []) as $c) {
                 $this->xml->startElement('subcat');
                 $this->writeXmlAttribute('id', $c['id']);
                 $this->writeXmlAttribute('name', html_entity_decode((string) $c['title']));
@@ -652,7 +527,7 @@ class XML_Response
         $this->xml->endElement();
     }
 
-    public function includeTotalRows(): void
+    protected function includeTotalRows(): void
     {
         $this->xml->startElement($this->namespace.':response');
         $this->writeXmlAttribute('offset', $this->offset);
@@ -660,7 +535,7 @@ class XML_Response
         $this->xml->endElement();
     }
 
-    public function includeLimits(): void
+    protected function includeLimits(): void
     {
         $this->xml->startElement($this->namespace.':apilimits');
         $this->writeXmlAttribute('apicurrent', $this->parameters['requests']);
@@ -679,170 +554,65 @@ class XML_Response
     /**
      * Loop through the releases and add their info to the XML stream.
      */
-    public function includeReleases(): void
+    protected function includeReleases(): void
     {
         foreach ($this->releaseRows() as $this->release) {
+            $payload = $this->releasePayload($this->release);
             $this->xml->startElement('item');
-            $this->includeReleaseMain();
-            $this->setZedAttributes();
+            $this->includeReleaseMain($payload);
+            $this->setZedAttributes($payload['attr']);
             $this->xml->endElement();
         }
     }
 
     /**
-     * Writes the primary release information.
+     * @param  array{
+     *     title: mixed,
+     *     guid: string,
+     *     link: string,
+     *     comments: string,
+     *     pubDate: string,
+     *     category: mixed,
+     *     description: mixed,
+     *     enclosure?: array{url: string, length: mixed, type: string},
+     *     attr: array<string, mixed>
+     * }  $payload
      */
-    public function includeReleaseMain(): void
+    protected function includeReleaseMain(array $payload): void
     {
-        $this->writeXmlElement('title', $this->release->searchname);
+        $this->writeXmlElement('title', $payload['title']);
         $this->xml->startElement('guid');
         $this->writeXmlAttribute('isPermaLink', 'true');
-        $this->writeXmlText("{$this->server['server']['url']}/details/{$this->release->guid}");
+        $this->writeXmlText($payload['guid']);
         $this->xml->endElement();
-        $this->writeXmlElement(
-            'link',
-            "{$this->server['server']['url']}/getnzb?id={$this->release->guid}.nzb".
-            "&r={$this->parameters['token']}".
-            ((int) $this->parameters['del'] === 1 ? '&del=1' : '')
-        );
-        $this->writeXmlElement('comments', "{$this->server['server']['url']}/details/{$this->release->guid}#comments");
-        $this->writeXmlElement('pubDate', date(DATE_RSS, strtotime((string) $this->release->adddate)));
-        $this->writeXmlElement('category', $this->release->category_name);
+        $this->writeXmlElement('link', $payload['link']);
+        $this->writeXmlElement('comments', $payload['comments']);
+        $this->writeXmlElement('pubDate', $payload['pubDate']);
+        $this->writeXmlElement('category', $payload['category']);
         if ($this->namespace === 'newznab') {
-            $this->writeXmlElement('description', $this->release->searchname);
+            $this->writeXmlElement('description', $payload['description']);
         } else {
             $this->writeRssCdata();
         }
-        if (! isset($this->parameters['dl']) || (isset($this->parameters['dl']) && (int) $this->parameters['dl'] === 1)) {
+        if (isset($payload['enclosure'])) {
             $this->xml->startElement('enclosure');
-            $this->writeXmlAttribute(
-                'url',
-                "{$this->server['server']['url']}/getnzb?id={$this->release->guid}.nzb".
-                "&r={$this->parameters['token']}".
-                ((int) $this->parameters['del'] === 1 ? '&del=1' : '')
-            );
-            $this->writeXmlAttribute('length', $this->release->size);
-            $this->writeXmlAttribute('type', 'application/x-nzb');
+            $this->writeXmlAttribute('url', $payload['enclosure']['url']);
+            $this->writeXmlAttribute('length', $payload['enclosure']['length']);
+            $this->writeXmlAttribute('type', $payload['enclosure']['type']);
             $this->xml->endElement();
         }
     }
 
     /**
      * Writes the Zed (newznab) specific attributes.
-     */
-    protected function setZedAttributes(): void
-    {
-        $this->writeZedAttr('category', $this->release->categories_id);
-        $this->writeZedAttr('size', $this->release->size);
-        if (! empty($this->release->coverurl)) {
-            $this->writeZedAttr(
-                'coverurl',
-                $this->server['server']['url']."/covers/{$this->release->coverurl}"
-            );
-        }
-
-        if ((int) $this->parameters['extended'] === 1) {
-            $this->writeZedAttr('files', $this->release->totalpart);
-            if (((isset($this->release->videos_id) && $this->release->videos_id > 0) || (isset($this->release->tv_episodes_id) && $this->release->tv_episodes_id > 0)) && $this->namespace === 'newznab') {
-                $this->setTvAttr();
-            }
-
-            if (isset($this->release->imdbid) && imdb_id_is_valid($this->release->imdbid)) {
-                $this->writeZedAttr('imdb', $this->release->imdbid);
-            }
-            if (isset($this->release->anidbid) && $this->release->anidbid > 0) {
-                $this->writeZedAttr('anidbid', $this->release->anidbid);
-            }
-            if (isset($this->release->predb_id) && $this->release->predb_id > 0) {
-                $this->writeZedAttr('prematch', '1');
-            }
-            if (isset($this->release->nfostatus) && (int) $this->release->nfostatus === 1) {
-                $this->writeZedAttr(
-                    'info',
-                    $this->server['server']['url'].
-                    "api?t=info&id={$this->release->guid}&r={$this->parameters['token']}"
-                );
-            }
-
-            $this->writeZedAttr('grabs', $this->release->grabs);
-            $this->writeZedAttr('comments', $this->release->comments);
-            $this->writeZedAttr('password', $this->release->passwordstatus);
-            $this->writeZedAttr('usenetdate', Carbon::parse($this->release->postdate)->toRssString());
-            if (! empty($this->release->group_name)) {
-                $this->writeZedAttr('group', $this->release->group_name);
-            }
-        }
-    }
-
-    /**
-     * Writes the TV Specific attributes.
-     * Uses scalar-safe access to avoid N+1 lazy loading when release data
-     * comes from raw SQL queries (stdClass with flat columns) vs Eloquent models.
-     */
-    protected function setTvAttr(): void
-    {
-        if (! empty($this->release->title)) {
-            $this->writeZedAttr('title', $this->release->title);
-        }
-        if (isset($this->release->series) && $this->release->series > 0) {
-            $this->writeZedAttr('season', $this->release->series);
-        }
-        // episode can be a scalar (from raw SQL JOIN) or an Eloquent relation object
-        $episodeNum = $this->getScalarOrRelationValue('episode', 'episode');
-        if (! empty($episodeNum) && $episodeNum > 0) {
-            $this->writeZedAttr('episode', $episodeNum);
-        }
-        if (! empty($this->release->firstaired)) {
-            $this->writeZedAttr('tvairdate', $this->release->firstaired);
-        }
-        if (isset($this->release->tvdb) && $this->release->tvdb > 0) {
-            $this->writeZedAttr('tvdbid', $this->release->tvdb);
-        }
-        if (isset($this->release->trakt) && $this->release->trakt > 0) {
-            $this->writeZedAttr('traktid', $this->release->trakt);
-        }
-        if (isset($this->release->tvrage) && $this->release->tvrage > 0) {
-            $this->writeZedAttr('tvrageid', $this->release->tvrage);
-            $this->writeZedAttr('rageid', $this->release->tvrage);
-        }
-        if (isset($this->release->tvmaze) && $this->release->tvmaze > 0) {
-            $this->writeZedAttr('tvmazeid', $this->release->tvmaze);
-        }
-        if (isset($this->release->imdb) && imdb_id_is_valid($this->release->imdb)) {
-            $this->writeZedAttr('imdbid', $this->release->imdb);
-        }
-        if (isset($this->release->tmdb) && $this->release->tmdb > 0) {
-            $this->writeZedAttr('tmdbid', $this->release->tmdb);
-        }
-    }
-
-    /**
-     * Safely get a value that may be a scalar (from raw SQL) or a property on a related object.
-     * Prevents N+1 lazy loading when accessing Eloquent relation properties in a loop.
      *
-     * @param  string  $property  The property name on the release (may be scalar or object)
-     * @param  string  $subProperty  The sub-property to access if $property is an object
-     * @return mixed The scalar value, or null if not available
+     * @param  array<string, mixed>  $attributes
      */
-    protected function getScalarOrRelationValue(string $property, string $subProperty): mixed
+    protected function setZedAttributes(array $attributes): void
     {
-        $value = $this->release->$property ?? null;
-
-        if ($value === null) {
-            return null;
+        foreach ($attributes as $name => $value) {
+            $this->writeZedAttr((string) $name, $value);
         }
-
-        // If it's a scalar (from raw SQL JOIN), return directly
-        if (is_scalar($value)) {
-            return $value;
-        }
-
-        // If it's an object (Eloquent relation), access the sub-property
-        if (is_object($value)) {
-            return $value->$subProperty ?? null;
-        }
-
-        return null;
     }
 
     /**
