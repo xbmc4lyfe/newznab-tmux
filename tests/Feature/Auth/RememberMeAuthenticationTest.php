@@ -12,6 +12,7 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Schema;
 use PragmaRX\Google2FALaravel\Facade as Google2FA;
 use Spatie\Permission\Models\Role;
@@ -45,6 +46,8 @@ class RememberMeAuthenticationTest extends TestCase
                 return false;
             }
         });
+
+        Route::middleware(['web', 'auth'])->get('__remember_me_probe', fn () => response('ok', 200));
     }
 
     public function test_password_login_with_remember_me_queues_recaller_cookie(): void
@@ -60,6 +63,52 @@ class RememberMeAuthenticationTest extends TestCase
 
         $response->assertRedirect('/');
         $response->assertCookie($this->recallerCookieName());
+        $this->assertAuthenticatedAs($user);
+    }
+
+    public function test_password_login_with_boolean_remember_me_value_queues_recaller_cookie(): void
+    {
+        Event::fake([UserLoggedIn::class]);
+        $user = $this->createUser('remember-password-boolean@example.test');
+
+        $response = $this->post(route('login'), [
+            'username' => $user->email,
+            'password' => 'password',
+            'rememberme' => '1',
+        ]);
+
+        $response->assertRedirect('/');
+        $response->assertCookie($this->recallerCookieName());
+        $this->assertAuthenticatedAs($user);
+    }
+
+    public function test_password_login_with_remember_me_restores_authentication_after_session_expires(): void
+    {
+        Event::fake([UserLoggedIn::class]);
+        $user = $this->createUser('remember-restore@example.test');
+
+        $response = $this->post(route('login'), [
+            'username' => $user->email,
+            'password' => 'password',
+            'rememberme' => 'on',
+        ]);
+
+        $recallerCookie = $response->getCookie($this->recallerCookieName(), decrypt: false);
+        $this->assertNotNull($recallerCookie);
+        $decryptedRecallerCookie = $response->getCookie($this->recallerCookieName());
+        $this->assertNotNull($decryptedRecallerCookie);
+
+        [, $rememberToken] = explode('|', (string) $decryptedRecallerCookie->getValue(), 3);
+        $this->assertSame($user->fresh()?->remember_token, $rememberToken);
+
+        $this->flushSession();
+        Auth::forgetGuards();
+
+        $this
+            ->withUnencryptedCookie($this->recallerCookieName(), $recallerCookie->getValue())
+            ->get('/__remember_me_probe')
+            ->assertOk();
+
         $this->assertAuthenticatedAs($user);
     }
 

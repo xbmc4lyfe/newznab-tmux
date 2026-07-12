@@ -91,7 +91,7 @@ class LoginController extends Controller
         }
 
         if ($validator->passes()) {
-            $rememberMe = $request->has('rememberme') && $request->input('rememberme') === 'on';
+            $rememberMe = $request->boolean('rememberme') || $request->boolean('remember');
 
             if (! Auth::attempt($request->only($login_type, 'password'), $rememberMe)) {
                 $this->incrementLoginAttempts($request);
