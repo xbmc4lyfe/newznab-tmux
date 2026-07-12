@@ -36,6 +36,8 @@ use Illuminate\Support\Str;
 
 class ApiV2Controller extends BasePageController
 {
+    private const JSON_ENCODING_OPTIONS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
+
     private ApiController $api;
 
     private ReleaseSearchService $releaseSearchService;
@@ -133,6 +135,14 @@ class ApiV2Controller extends BasePageController
     }
 
     /**
+     * @param  array<string, mixed>  $data
+     */
+    private function jsonResponse(array $data, int $status = 200): JsonResponse
+    {
+        return response()->json($data, $status, [], self::JSON_ENCODING_OPTIONS);
+    }
+
+    /**
      * Build the standard search-results JSON response.
      *
      * Replaces the legacy Fractal `['Results' => fractal(...)]` envelope with a
@@ -155,7 +165,7 @@ class ApiV2Controller extends BasePageController
             $results[] = ReleaseData::toArrayFromRelease($row, $user, $detailsBaseUrl, $getNzbBaseUrl);
         }
 
-        return response()->json(array_merge(
+        return $this->jsonResponse(array_merge(
             ['Total' => $total],
             $this->buildUserStatsResponse($user),
             ['results' => $results],
@@ -168,10 +178,10 @@ class ApiV2Controller extends BasePageController
             return -1;
         }
         if ($request->isNotFilled('maxage')) {
-            return response()->json(['error' => 'Incorrect parameter (maxage must not be empty)'], 400);
+            return $this->jsonResponse(['error' => 'Incorrect parameter (maxage must not be empty)'], 400);
         }
         if (! is_numeric($request->input('maxage'))) {
-            return response()->json(['error' => 'Incorrect parameter (maxage must be numeric)'], 400);
+            return $this->jsonResponse(['error' => 'Incorrect parameter (maxage must be numeric)'], 400);
         }
 
         return (int) $request->input('maxage');
@@ -185,10 +195,10 @@ class ApiV2Controller extends BasePageController
 
         $sort = strtolower(trim((string) $request->input('sort')));
         if ($sort === '') {
-            return response()->json(['error' => 'Incorrect parameter (sort must not be empty)'], 400);
+            return $this->jsonResponse(['error' => 'Incorrect parameter (sort must not be empty)'], 400);
         }
         if (! preg_match('/^(cat|name|size|files|stats|posted)_(asc|desc)$/', $sort)) {
-            return response()->json(['error' => 'Incorrect parameter (sort must be one of: cat_asc/desc, name_asc/desc, size_asc/desc, files_asc/desc, stats_asc/desc, posted_asc/desc)'], 400);
+            return $this->jsonResponse(['error' => 'Incorrect parameter (sort must be one of: cat_asc/desc, name_asc/desc, size_asc/desc, files_asc/desc, stats_asc/desc, posted_asc/desc)'], 400);
         }
 
         return $sort;
@@ -258,7 +268,7 @@ class ApiV2Controller extends BasePageController
             'open' => $registrationStatus['is_open'] ? 'yes' : 'no',
         ];
 
-        return response()->json($capabilities);
+        return $this->jsonResponse($capabilities);
     }
 
     /**
@@ -280,7 +290,7 @@ class ApiV2Controller extends BasePageController
         $minSize = max(0, (int) $request->input('minsize', 0));
         $searchName = $request->input('id', '');
         if ($searchName === '' && ! imdb_id_is_valid($imdbId) && $tmdbId <= 0 && $traktId <= 0) {
-            return response()->json(['error' => 'Specify id (query), imdbid, tmdbid, or traktid'], 400);
+            return $this->jsonResponse(['error' => 'Specify id (query), imdbid, tmdbid, or traktid'], 400);
         }
         $offset = $this->api->offset($request);
         $limit = $this->api->limit($request);
@@ -339,7 +349,7 @@ class ApiV2Controller extends BasePageController
         $this->recordApiRequest($user, $request);
 
         if ($request->has('id') && $request->isNotFilled('id')) {
-            return response()->json(['error' => 'Incorrect parameter (id must not be empty)'], 400);
+            return $this->jsonResponse(['error' => 'Incorrect parameter (id must not be empty)'], 400);
         }
 
         $offset = $this->api->offset($request);
@@ -416,7 +426,7 @@ class ApiV2Controller extends BasePageController
         $this->recordApiRequest($user, $request);
 
         if ($request->has('id') && $request->isNotFilled('id')) {
-            return response()->json(['error' => 'Incorrect parameter (id must not be empty)'], 400);
+            return $this->jsonResponse(['error' => 'Incorrect parameter (id must not be empty)'], 400);
         }
 
         $offset = $this->api->offset($request);
@@ -496,7 +506,7 @@ class ApiV2Controller extends BasePageController
         $anidb = (int) $request->input('anidbid', -1);
         $anilist = (int) $request->input('anilistid', -1);
         if ($q === '' && $anidb <= 0 && $anilist <= 0) {
-            return response()->json(['error' => 'Specify id (query), anidbid, or anilistid'], 400);
+            return $this->jsonResponse(['error' => 'Specify id (query), anidbid, or anilistid'], 400);
         }
 
         $offset = $this->api->offset($request);
@@ -635,7 +645,7 @@ class ApiV2Controller extends BasePageController
         $this->api->verifyEmptyParameter($request, 'season');
         $this->api->verifyEmptyParameter($request, 'ep');
         if (! $this->hasTvSearchParameters($request)) {
-            return response()->json(['error' => 'Specify id (query), vid, tvdbid, traktid, rid, tvmazeid, imdbid, or tmdbid'], 400);
+            return $this->jsonResponse(['error' => 'Specify id (query), vid, tvdbid, traktid, rid, tvmazeid, imdbid, or tmdbid'], 400);
         }
         $maxAge = $this->parseMaxAge($request);
         if (! is_int($maxAge)) {
@@ -718,7 +728,7 @@ class ApiV2Controller extends BasePageController
             return app(GetNzbController::class)->getNzb($request);
         }
 
-        return response()->json(['data' => 'No such item (the guid you provided has no release in our database)'], 404);
+        return $this->jsonResponse(['data' => 'No such item (the guid you provided has no release in our database)'], 404);
     }
 
     public function details(Request $request): JsonResponse
@@ -728,7 +738,7 @@ class ApiV2Controller extends BasePageController
             return $user;
         }
         if ($request->missing('id')) {
-            return response()->json(['error' => 'Missing parameter (guid is required for single release details)'], 400);
+            return $this->jsonResponse(['error' => 'Missing parameter (guid is required for single release details)'], 400);
         }
 
         $this->recordApiRequest($user, $request);
@@ -738,10 +748,10 @@ class ApiV2Controller extends BasePageController
         ], fn () => Release::getByGuidForApi($guid));
 
         if ($relData === null) {
-            return response()->json(['error' => 'No such item'], 404);
+            return $this->jsonResponse(['error' => 'No such item'], 404);
         }
 
-        return response()->json(DetailsData::toArrayFromRelease(
+        return $this->jsonResponse(DetailsData::toArrayFromRelease(
             $relData,
             $user,
             url('/details').'/',
