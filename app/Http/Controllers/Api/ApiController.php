@@ -619,7 +619,7 @@ class ApiController extends BasePageController
                 UserRequest::addApiRequest($uid, $request->getRequestUri());
                 $relData = Release::checkGuidForApi($request->input('id'));
                 if ($relData) {
-                    $request->attributes->set(GetNzbController::REQUEST_USER_ATTRIBUTE, User::findOrFail($uid));
+                    $request->attributes->set(GetNzbController::REQUEST_USER_ATTRIBUTE, $res);
 
                     return app(GetNzbController::class)->getNzb($request);
                 }
