@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use App\Data\Api\DetailsData;
 use App\Data\Api\ReleaseData;
 use App\Facades\Search;
 use App\Models\Release;
@@ -133,7 +134,38 @@ class ApiPerformanceHelpersTest extends TestCase
 
         $this->assertSame(
             ReleaseData::fromRelease($release, $user)->toArray(),
-            ReleaseData::toArrayFromRelease($release, $user)
+            ReleaseData::toArrayFromRelease($release, $user, url('/details').'/', url('/getnzb'))
+        );
+    }
+
+    public function test_details_data_fast_array_matches_existing_data_output(): void
+    {
+        $release = (object) [
+            'searchname' => 'Ubuntu.Release',
+            'guid' => 'release-guid',
+            'categories_id' => 5030,
+            'category_name' => 'TV > SD',
+            'adddate' => '2026-01-03 00:00:00',
+            'size' => 123456,
+            'totalpart' => 10,
+            'grabs' => 2,
+            'comments' => 1,
+            'passwordstatus' => 0,
+            'postdate' => '2026-01-02 00:00:00',
+            'imdb' => '1234567',
+            'tmdb' => 234,
+            'trakt' => 345,
+            'firstaired' => '2026-01-01',
+            'tvdb' => 456,
+            'tvrage' => 567,
+            'tvmaze' => 678,
+        ];
+        $user = new User;
+        $user->api_token = 'api-token';
+
+        $this->assertSame(
+            DetailsData::fromRelease($release, $user)->toArray(),
+            DetailsData::toArrayFromRelease($release, $user, url('/details').'/', url('/getnzb'))
         );
     }
 

@@ -64,17 +64,23 @@ final class ReleaseData extends Data
      *
      * @return array<string, mixed>
      */
-    public static function toArrayFromRelease(Release|\stdClass $release, User $user): array
-    {
+    public static function toArrayFromRelease(
+        Release|\stdClass $release,
+        User $user,
+        ?string $detailsBaseUrl = null,
+        ?string $getNzbBaseUrl = null
+    ): array {
         $get = static fn (string $key, mixed $default = null): mixed => $release->{$key} ?? $default;
 
         $categoriesId = (int) $get('categories_id', 0);
         $guid = (string) $get('guid', '');
+        $detailsBaseUrl ??= url('/details').'/';
+        $getNzbBaseUrl ??= url('/getnzb');
 
         $base = [
             'title' => (string) $get('searchname', ''),
-            'details' => url('/details/'.$guid),
-            'url' => url('/getnzb').'?id='.$guid.'.nzb&r='.$user->api_token,
+            'details' => $detailsBaseUrl.$guid,
+            'url' => $getNzbBaseUrl.'?id='.$guid.'.nzb&r='.$user->api_token,
             'category' => $categoriesId,
             'category_name' => $get('category_name'),
             'added' => Carbon::parse($get('adddate'))->toRssString(),

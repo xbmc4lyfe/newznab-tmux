@@ -568,6 +568,24 @@ class ApiRequestMatrixTest extends TestCase
             ->assertJsonPath('genres.0.name', 'Test Genre');
     }
 
+    public function test_v2_details_response_shape_is_unchanged(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+
+        $this->getJson('/api/v2/details?api_token='.$token.'&id=release-guid')
+            ->assertOk()
+            ->assertJsonPath('title', 'Ubuntu.Release')
+            ->assertJsonPath('details', 'http://localhost/details/release-guid')
+            ->assertJsonPath('link', 'http://localhost/getnzb?id=release-guid.nzb&r='.$token)
+            ->assertJsonPath('category', 5030)
+            ->assertJsonPath('category_name', 'TV > SD')
+            ->assertJsonPath('size', 123456)
+            ->assertJsonPath('files', 10)
+            ->assertJsonPath('grabs', 2)
+            ->assertJsonPath('comments', 1)
+            ->assertJsonPath('password', 0);
+    }
+
     private function createSchema(): void
     {
         Schema::create('roles', function (Blueprint $table): void {
@@ -662,6 +680,54 @@ class ApiRequestMatrixTest extends TestCase
             $table->timestamp('timestamp')->nullable();
         });
 
+        Schema::create('videos', function (Blueprint $table): void {
+            $table->unsignedInteger('id')->primary();
+            $table->unsignedInteger('tvdb')->nullable();
+            $table->unsignedInteger('trakt')->nullable();
+            $table->unsignedInteger('tvrage')->nullable();
+            $table->unsignedInteger('tvmaze')->nullable();
+            $table->string('imdb')->nullable();
+            $table->unsignedInteger('tmdb')->nullable();
+        });
+
+        Schema::create('tv_episodes', function (Blueprint $table): void {
+            $table->unsignedInteger('id')->primary();
+            $table->string('title')->nullable();
+            $table->string('series')->nullable();
+            $table->string('episode')->nullable();
+            $table->date('firstaired')->nullable();
+        });
+
+        Schema::create('movieinfo', function (Blueprint $table): void {
+            $table->unsignedInteger('id')->primary();
+            $table->string('imdbid')->nullable();
+            $table->unsignedInteger('tmdbid')->nullable();
+            $table->unsignedInteger('traktid')->nullable();
+        });
+
+        Schema::create('releases', function (Blueprint $table): void {
+            $table->unsignedInteger('id')->primary();
+            $table->string('searchname');
+            $table->string('guid')->index();
+            $table->dateTime('postdate');
+            $table->unsignedInteger('categories_id');
+            $table->unsignedBigInteger('size');
+            $table->unsignedInteger('totalpart');
+            $table->string('fromname')->nullable();
+            $table->integer('passwordstatus')->default(0);
+            $table->unsignedInteger('grabs')->default(0);
+            $table->unsignedInteger('comments')->default(0);
+            $table->dateTime('adddate');
+            $table->unsignedInteger('videos_id')->default(0);
+            $table->unsignedInteger('tv_episodes_id')->default(0);
+            $table->integer('haspreview')->default(0);
+            $table->integer('nfostatus')->default(0);
+            $table->unsignedInteger('movieinfo_id')->default(0);
+            $table->unsignedInteger('musicinfo_id')->default(0);
+            $table->unsignedInteger('consoleinfo_id')->default(0);
+            $table->unsignedInteger('groups_id')->nullable();
+        });
+
         Schema::create('usenet_groups', function (Blueprint $table): void {
             $table->increments('id');
             $table->string('name');
@@ -754,10 +820,34 @@ class ApiRequestMatrixTest extends TestCase
         ]);
 
         DB::table('usenet_groups')->insert([
+            'id' => 1,
             'name' => 'alt.binaries.test',
             'active' => 1,
             'description' => 'Test usenet group',
             'last_updated' => now(),
+        ]);
+
+        DB::table('releases')->insert([
+            'id' => 1,
+            'searchname' => 'Ubuntu.Release',
+            'guid' => 'release-guid',
+            'postdate' => '2026-01-02 00:00:00',
+            'categories_id' => 5030,
+            'size' => 123456,
+            'totalpart' => 10,
+            'fromname' => 'poster',
+            'passwordstatus' => 0,
+            'grabs' => 2,
+            'comments' => 1,
+            'adddate' => '2026-01-03 00:00:00',
+            'videos_id' => 0,
+            'tv_episodes_id' => 0,
+            'haspreview' => 0,
+            'nfostatus' => 0,
+            'movieinfo_id' => 0,
+            'musicinfo_id' => 0,
+            'consoleinfo_id' => 0,
+            'groups_id' => 1,
         ]);
 
         DB::table('genres')->insert([

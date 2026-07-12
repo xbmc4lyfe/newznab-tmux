@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace App\Listeners;
 
 use App\Events\UserAccessedApi;
-use App\Models\User;
+use Illuminate\Support\Facades\DB;
 
 class UpdateUserAccessedApi
 {
@@ -30,6 +30,8 @@ class UpdateUserAccessedApi
             $updateData['host'] = $event->ip;
         }
 
-        User::find($event->user->id)->update($updateData);
+        DB::table('users')
+            ->where('id', $event->user->id)
+            ->update($updateData);
     }
 }

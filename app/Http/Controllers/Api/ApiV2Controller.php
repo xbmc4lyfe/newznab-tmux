@@ -126,6 +126,12 @@ class ApiV2Controller extends BasePageController
         return $this->resolvedUserStats[$user->id] ??= $this->api->getCachedUserStats($user->id);
     }
 
+    private function recordApiRequest(User $user, Request $request): void
+    {
+        UserRequest::addApiRequest($user->id, $request->getRequestUri());
+        event(new UserAccessedApi($user, $request->ip()));
+    }
+
     /**
      * Build the standard search-results JSON response.
      *
@@ -141,11 +147,13 @@ class ApiV2Controller extends BasePageController
     {
         $rowsArray = is_array($rows) ? $rows : iterator_to_array($rows, false);
         $total = (int) ($rowsArray[0]->_totalrows ?? 0);
+        $detailsBaseUrl = url('/details').'/';
+        $getNzbBaseUrl = url('/getnzb');
 
-        $results = array_map(
-            static fn ($row): array => ReleaseData::toArrayFromRelease($row, $user),
-            $rowsArray,
-        );
+        $results = [];
+        foreach ($rowsArray as $row) {
+            $results[] = ReleaseData::toArrayFromRelease($row, $user, $detailsBaseUrl, $getNzbBaseUrl);
+        }
 
         return response()->json(array_merge(
             ['Total' => $total],
@@ -211,7 +219,10 @@ class ApiV2Controller extends BasePageController
                     'book-search' => ['available' => 'yes', 'supportedParams' => 'id,cat,minsize,maxsize,maxage,group,limit,offset,sort'],
                     'anime-search' => ['available' => 'yes', 'supportedParams' => 'id,anidbid,anilistid,cat,minsize,maxsize,maxage,limit,offset,sort'],
                 ],
-                'categories' => $category->map(static fn (RootCategory $rootCategory): CategoryData => CategoryData::fromCategory($rootCategory))->values(),
+                'categories' => $category
+                    ->map(static fn (RootCategory $rootCategory): array => CategoryData::fromCategory($rootCategory)->toArray())
+                    ->values()
+                    ->all(),
                 'groups' => Schema::hasTable('usenet_groups')
                     ? UsenetGroup::query()
                         ->where('active', 1)
@@ -223,7 +234,8 @@ class ApiV2Controller extends BasePageController
                             'lastupdate' => $group->last_updated ? Carbon::parse($group->last_updated)->toRfc2822String() : '',
                         ])
                         ->values()
-                    : collect(),
+                        ->all()
+                    : [],
                 'genres' => Schema::hasTable('genres')
                     ? Genre::query()
                         ->enabled()
@@ -235,7 +247,8 @@ class ApiV2Controller extends BasePageController
                             'categoryid' => (int) ($genre->type ?? 0),
                         ])
                         ->values()
-                    : collect(),
+                        ->all()
+                    : [],
             ];
         });
 
@@ -258,8 +271,7 @@ class ApiV2Controller extends BasePageController
             return $user;
         }
 
-        UserRequest::addApiRequest($user->id, $request->getRequestUri());
-        event(new UserAccessedApi($user, $request->ip()));
+        $this->recordApiRequest($user, $request);
 
         // Get request parameters efficiently
         $imdbId = (string) Str::replace('tt', '', (string) $request->input('imdbid', ''));
@@ -324,8 +336,7 @@ class ApiV2Controller extends BasePageController
             return $user;
         }
 
-        UserRequest::addApiRequest($user->id, $request->getRequestUri());
-        event(new UserAccessedApi($user, $request->ip()));
+        $this->recordApiRequest($user, $request);
 
         if ($request->has('id') && $request->isNotFilled('id')) {
             return response()->json(['error' => 'Incorrect parameter (id must not be empty)'], 400);
@@ -402,8 +413,7 @@ class ApiV2Controller extends BasePageController
             return $user;
         }
 
-        UserRequest::addApiRequest($user->id, $request->getRequestUri());
-        event(new UserAccessedApi($user, $request->ip()));
+        $this->recordApiRequest($user, $request);
 
         if ($request->has('id') && $request->isNotFilled('id')) {
             return response()->json(['error' => 'Incorrect parameter (id must not be empty)'], 400);
@@ -480,8 +490,7 @@ class ApiV2Controller extends BasePageController
             return $user;
         }
 
-        UserRequest::addApiRequest($user->id, $request->getRequestUri());
-        event(new UserAccessedApi($user, $request->ip()));
+        $this->recordApiRequest($user, $request);
 
         $q = (string) $request->input('id', '');
         $anidb = (int) $request->input('anidbid', -1);
@@ -540,8 +549,7 @@ class ApiV2Controller extends BasePageController
             return $user;
         }
 
-        UserRequest::addApiRequest($user->id, $request->getRequestUri());
-        event(new UserAccessedApi($user, $request->ip()));
+        $this->recordApiRequest($user, $request);
 
         $offset = $this->api->offset($request);
         $catExclusions = User::getCachedCategoryExclusionById($user->id);
@@ -637,8 +645,7 @@ class ApiV2Controller extends BasePageController
         if (! is_string($sort)) {
             return $sort;
         }
-        UserRequest::addApiRequest($user->id, $request->getRequestUri());
-        event(new UserAccessedApi($user, $request->ip()));
+        $this->recordApiRequest($user, $request);
 
         $siteIdArr = [
             'id' => $request->input('vid') ?? null,
@@ -703,8 +710,7 @@ class ApiV2Controller extends BasePageController
             return $user;
         }
 
-        event(new UserAccessedApi($user, $request->ip()));
-        UserRequest::addApiRequest($user->id, $request->getRequestUri());
+        $this->recordApiRequest($user, $request);
         $relData = Release::checkGuidForApi($request->input('id'));
         if ($relData) {
             $request->attributes->set(GetNzbController::REQUEST_USER_ATTRIBUTE, $user);
@@ -725,8 +731,7 @@ class ApiV2Controller extends BasePageController
             return response()->json(['error' => 'Missing parameter (guid is required for single release details)'], 400);
         }
 
-        UserRequest::addApiRequest($user->id, $request->getRequestUri());
-        event(new UserAccessedApi($user, $request->ip()));
+        $this->recordApiRequest($user, $request);
         $guid = $request->input('id');
         $relData = $this->releaseRowCache->remember('v2', 'details', [
             'guid' => $guid,
@@ -736,7 +741,12 @@ class ApiV2Controller extends BasePageController
             return response()->json(['error' => 'No such item'], 404);
         }
 
-        return response()->json(DetailsData::fromRelease($relData, $user)->toArray());
+        return response()->json(DetailsData::toArrayFromRelease(
+            $relData,
+            $user,
+            url('/details').'/',
+            url('/getnzb')
+        ));
     }
 
     private function hasTvSearchParameters(Request $request): bool

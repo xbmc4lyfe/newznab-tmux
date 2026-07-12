@@ -44,14 +44,31 @@ final class DetailsData extends Data
 
     public static function fromRelease(Release|\stdClass $release, User $user): self
     {
+        return new self(...self::toArrayFromRelease($release, $user));
+    }
+
+    /**
+     * Build the API array directly for hot details response paths.
+     *
+     * @return array<string, mixed>
+     */
+    public static function toArrayFromRelease(
+        Release|\stdClass $release,
+        User $user,
+        ?string $detailsBaseUrl = null,
+        ?string $getNzbBaseUrl = null
+    ): array {
         $get = static fn (string $key, mixed $default = null): mixed => $release->{$key} ?? $default;
 
         $categoriesId = (int) $get('categories_id', 0);
         $guid = (string) $get('guid', '');
+        $detailsBaseUrl ??= url('/details').'/';
+        $getNzbBaseUrl ??= url('/getnzb');
+
         $base = [
             'title' => (string) $get('searchname', ''),
-            'details' => url('/').'/details/'.$guid,
-            'link' => url('/').'/getnzb?id='.$guid.'.nzb&r='.$user->api_token,
+            'details' => $detailsBaseUrl.$guid,
+            'link' => $getNzbBaseUrl.'?id='.$guid.'.nzb&r='.$user->api_token,
             'category' => $categoriesId,
             'category_name' => $get('category_name'),
             'added' => Carbon::parse($get('adddate'))->toRssString(),
@@ -64,25 +81,23 @@ final class DetailsData extends Data
         ];
 
         if (in_array($categoriesId, Category::MOVIES_GROUP, true)) {
-            return new self(
-                ...$base,
-                imdbid: $get('imdbid'),
-            );
+            return $base + [
+                'imdbid' => $get('imdbid'),
+            ];
         }
 
         if (in_array($categoriesId, Category::TV_GROUP, true)) {
-            return new self(
-                ...$base,
-                imdbid: $get('imdb'),
-                tmdbid: $get('tmdb'),
-                traktid: $get('trakt'),
-                tvairdate: $get('firstaired'),
-                tvdbid: $get('tvdb'),
-                tvrageid: $get('tvrage'),
-                tvmazeid: $get('tvmaze'),
-            );
+            return $base + [
+                'imdbid' => $get('imdb'),
+                'tmdbid' => $get('tmdb'),
+                'traktid' => $get('trakt'),
+                'tvairdate' => $get('firstaired'),
+                'tvdbid' => $get('tvdb'),
+                'tvrageid' => $get('tvrage'),
+                'tvmazeid' => $get('tvmaze'),
+            ];
         }
 
-        return new self(...$base);
+        return $base;
     }
 }
