@@ -91,6 +91,23 @@ class ReleaseProcessingContext
 
     public int $compressedFilesChecked = 0;
 
+    /**
+     * @var array<string, array<string, mixed>>
+     */
+    public array $pendingReleaseFiles = [];
+
+    /**
+     * @var array<string, array<string, mixed>>
+     */
+    public array $pendingParHashes = [];
+
+    /**
+     * @var array<string, true>|null
+     */
+    public ?array $existingReleaseFileNames = null;
+
+    public bool $releaseFilesChanged = false;
+
     // Temp path for this release
     public string $tmpPath = '';
 
@@ -145,6 +162,10 @@ class ReleaseProcessingContext
         $this->addedFileInfo = 0;
         $this->totalFileInfo = 0;
         $this->compressedFilesChecked = 0;
+        $this->pendingReleaseFiles = [];
+        $this->pendingParHashes = [];
+        $this->existingReleaseFileNames = null;
+        $this->releaseFilesChanged = false;
     }
 
     /**

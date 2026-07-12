@@ -99,19 +99,86 @@ class AdditionalCandidateQueryTest extends TestCase
         $this->assertSame(['0', '9', 'a', 'f'], $chars);
     }
 
+    public function test_bucket_chars_skip_active_claims_but_include_stale_claims(): void
+    {
+        DB::table('categories')->insert([
+            ['id' => 1, 'disablepreview' => 0],
+        ]);
+
+        DB::table('releases')->insert([
+            $this->releaseRow(1, 'a', claimedAt: now()),
+            $this->releaseRow(2, 'b', claimedAt: now()->subSeconds(301)),
+            $this->releaseRow(3, 'c'),
+        ]);
+
+        $chars = AdditionalCandidateQuery::bucketChars();
+        sort($chars);
+
+        $this->assertSame(['b', 'c'], $chars);
+    }
+
+    public function test_monitor_builder_can_include_claimed_releases_while_available_builder_excludes_them(): void
+    {
+        DB::table('categories')->insert([
+            ['id' => 1, 'disablepreview' => 0],
+        ]);
+
+        DB::table('releases')->insert([
+            $this->releaseRow(1, 'a', claimedAt: now()),
+            $this->releaseRow(2, 'b'),
+        ]);
+
+        $this->assertSame(1, AdditionalCandidateQuery::baseBuilder()->count());
+        $this->assertSame(2, AdditionalCandidateQuery::baseBuilder(includeClaimed: true)->count());
+    }
+
+    public function test_claim_batch_excludes_active_claims_and_recovers_stale_claims(): void
+    {
+        DB::table('categories')->insert([
+            ['id' => 1, 'disablepreview' => 0],
+        ]);
+
+        DB::table('releases')->insert([
+            $this->releaseRow(1, 'a', postdate: '2026-07-12 10:00:00'),
+            $this->releaseRow(2, 'a', postdate: '2026-07-12 09:00:00'),
+        ]);
+
+        $first = AdditionalCandidateQuery::claimBatch('a', 1, 'token-one', columns: ['id']);
+        $this->assertSame([1], $first->pluck('id')->all());
+
+        $second = AdditionalCandidateQuery::claimBatch('a', 10, 'token-two', columns: ['id']);
+        $this->assertSame([2], $second->pluck('id')->all());
+
+        DB::table('releases')
+            ->where('id', 1)
+            ->update(['additional_pp_claimed_at' => now()->subSeconds(301)]);
+
+        $third = AdditionalCandidateQuery::claimBatch('a', 10, 'token-three', columns: ['id']);
+        $this->assertSame([1], $third->pluck('id')->all());
+    }
+
     /**
      * @return array<string, mixed>
      */
-    private function releaseRow(int $id, string $leftguid, int $categoriesId = 1): array
-    {
+    private function releaseRow(
+        int $id,
+        string $leftguid,
+        int $categoriesId = 1,
+        ?\DateTimeInterface $claimedAt = null,
+        string $postdate = '2026-07-12 00:00:00'
+    ): array {
         return [
             'id' => $id,
+            'guid' => $leftguid.'-guid-'.$id,
             'leftguid' => $leftguid,
             'passwordstatus' => -1,
             'haspreview' => -1,
             'nzbstatus' => 1,
             'categories_id' => $categoriesId,
             'size' => 2 * 1048576,
+            'postdate' => $postdate,
+            'additional_pp_claimed_at' => $claimedAt?->format('Y-m-d H:i:s'),
+            'additional_pp_claim_token' => $claimedAt === null ? null : 'claimed',
         ];
     }
 
@@ -141,6 +208,7 @@ class AdditionalCandidateQueryTest extends TestCase
         DB::table('settings')->upsert([
             ['name' => 'categorizeforeign', 'value' => '0'],
             ['name' => 'catwebdl', 'value' => '0'],
+            ['name' => 'releaseprocessingtimeout', 'value' => '120'],
         ], ['name'], ['value']);
 
         Schema::dropIfExists('releases');
@@ -153,12 +221,16 @@ class AdditionalCandidateQueryTest extends TestCase
 
         Schema::create('releases', function (Blueprint $table): void {
             $table->unsignedInteger('id')->primary();
+            $table->string('guid');
             $table->char('leftguid', 1);
             $table->integer('passwordstatus');
             $table->integer('haspreview');
             $table->integer('nzbstatus');
             $table->unsignedInteger('categories_id');
             $table->unsignedBigInteger('size');
+            $table->dateTime('postdate')->nullable();
+            $table->timestamp('additional_pp_claimed_at')->nullable();
+            $table->string('additional_pp_claim_token', 64)->nullable();
         });
     }
 }

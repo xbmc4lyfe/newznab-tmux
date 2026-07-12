@@ -7,7 +7,9 @@ namespace App\Services\Runners;
 use App\Models\Category;
 use App\Models\Settings;
 use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
+use App\Services\AdditionalProcessing\AdditionalProcessingOrchestrator;
 use App\Services\NfoService;
+use App\Services\TempWorkspaceService;
 use Illuminate\Support\Facades\Concurrency;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -32,8 +34,10 @@ class PostProcessRunner extends BaseRunner
             return;
         }
 
-        // If streaming is enabled, run commands with real-time output
-        if ((bool) config('nntmux.stream_fork_output', false) === true) {
+        // Additional post-processing can run for a long time per bucket. Always
+        // stream it so tmux shows active parallel children instead of buffering
+        // all output until the entire pool finishes.
+        if ((bool) config('nntmux.stream_fork_output', false) === true || $type === 'additional') {
             $commands = [];
             foreach ($releases as $release) {
                 // id may already be a single GUID bucket char; if not, take first char defensively
@@ -60,29 +64,22 @@ class PostProcessRunner extends BaseRunner
             return;
         }
 
-        // Process in batches using Laravel's native Concurrency facade
-        $batches = array_chunk($releases, max(1, $maxProcesses));
+        $commands = [];
+        foreach ($releases as $idx => $release) {
+            $char = isset($release->id) ? substr((string) $release->id, 0, 1) : '';
+            $commands[$idx] = PHP_BINARY.' artisan postprocess:guid '.$type.' '.$char;
+        }
 
-        foreach ($batches as $batchIndex => $batch) {
-            $tasks = [];
-            foreach ($batch as $idx => $release) {
-                $char = isset($release->id) ? substr((string) $release->id, 0, 1) : '';
-                // Use postprocess:guid command which accepts the GUID character
-                $command = PHP_BINARY.' artisan postprocess:guid '.$type.' '.$char;
-                $tasks[$idx] = fn () => $this->executeCommand($command);
+        try {
+            $results = $this->runParallelCommands($commands, $maxProcesses, $this->concurrencyTimeout());
+
+            foreach ($results as $output) {
+                echo $output;
+                cli()->primary('Finished task for '.$desc);
             }
-
-            try {
-                $results = Concurrency::run($tasks, $this->concurrencyTimeout());
-
-                foreach ($results as $taskIdx => $output) {
-                    echo $output;
-                    cli()->primary('Finished task for '.$desc);
-                }
-            } catch (\Throwable $e) {
-                Log::error('Postprocess batch failed: '.$e->getMessage());
-                cli()->error('Batch '.($batchIndex + 1).' failed: '.$e->getMessage());
-            }
+        } catch (\Throwable $e) {
+            Log::error('Postprocess batch failed: '.$e->getMessage());
+            cli()->error('Postprocess batch failed: '.$e->getMessage());
         }
     }
 
@@ -226,12 +223,89 @@ class PostProcessRunner extends BaseRunner
         // per-worker fetch in AdditionalProcessingOrchestrator::fetchReleases().
         $chars = AdditionalCandidateQuery::bucketChars();
 
-        // Normalize to the shape the rest of runPostProcess() expects:
-        // an array of objects with an `id` (first GUID char) property.
-        $queue = array_map(static fn (string $c): object => (object) ['id' => $c], $chars);
-
         $maxProcesses = (int) Settings::settingValue('postthreads');
+
+        // Normalize to the shape the rest of runPostProcess() expects:
+        // an array of objects with an `id` (first GUID char) property. If the
+        // backlog is concentrated in fewer buckets than configured threads,
+        // repeat buckets so claimBatch() can split one hot bucket across
+        // multiple workers.
+        $queue = $this->additionalQueue($chars, $maxProcesses);
+        if (! $this->prepareAdditionalTempBuckets($chars)) {
+            return;
+        }
+
+        if ($maxProcesses <= 1) {
+            if ($queue === []) {
+                $this->headerNone();
+
+                return;
+            }
+
+            $this->headerStart('postprocess: additional postprocessing', count($queue), 1);
+            $orchestrator = app(AdditionalProcessingOrchestrator::class);
+            foreach ($chars as $char) {
+                try {
+                    $orchestrator->start('', $char);
+                } finally {
+                    $orchestrator->finish();
+                }
+                cli()->primary('Finished task for additional postprocessing');
+            }
+
+            return;
+        }
+
         $this->runPostProcess($queue, $maxProcesses, 'additional', 'additional postprocessing');
+    }
+
+    /**
+     * @param  list<string>  $chars
+     * @return list<object{id: string}>
+     */
+    private function additionalQueue(array $chars, int $maxProcesses): array
+    {
+        if ($chars === []) {
+            return [];
+        }
+
+        $queue = array_map(static fn (string $c): object => (object) ['id' => $c], $chars);
+        $target = max(count($queue), $maxProcesses);
+
+        for ($index = 0; count($queue) < $target; $index++) {
+            $queue[] = (object) ['id' => $chars[$index % count($chars)]];
+        }
+
+        return $queue;
+    }
+
+    /**
+     * @param  list<string>  $chars
+     */
+    private function prepareAdditionalTempBuckets(array $chars): bool
+    {
+        if ($chars === []) {
+            return true;
+        }
+
+        $tempWorkspace = app(TempWorkspaceService::class);
+        $basePath = (string) config('nntmux.tmp_unrar_path');
+
+        try {
+            foreach ($chars as $char) {
+                $tempWorkspace->ensureMainTempPath($basePath, $char);
+            }
+        } catch (\Throwable $e) {
+            cli()->warning('Additional post-processing skipped: '.$e->getMessage());
+            Log::error('Additional post-processing temp bucket preflight failed', [
+                'tmp_unrar_path' => $basePath,
+                'exception' => $e,
+            ]);
+
+            return false;
+        }
+
+        return true;
     }
 
     public function processNfo(): void

@@ -3,12 +3,13 @@
 namespace Tests\Unit;
 
 use App\Services\TempWorkspaceService;
-use Illuminate\Container\Container;
 use Illuminate\Filesystem\Filesystem;
+use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Facade;
 use Illuminate\Support\Facades\File;
 use PHPUnit\Framework\Attributes\WithoutErrorHandler;
 use PHPUnit\Framework\TestCase;
+use RuntimeException;
 
 class TempWorkspaceServiceTest extends TestCase
 {
@@ -20,9 +21,9 @@ class TempWorkspaceServiceTest extends TestCase
     {
         parent::setUp();
         // Minimal Facade container for File facade
-        $container = new Container;
-        $container->instance('files', new Filesystem);
-        Facade::setFacadeApplication($container);
+        $app = new Application(dirname(__DIR__, 2));
+        $app->instance('files', new Filesystem);
+        Facade::setFacadeApplication($app);
 
         $this->svc = new TempWorkspaceService;
         // Unique base path under system temp
@@ -54,6 +55,32 @@ class TempWorkspaceServiceTest extends TestCase
         $tmp = $this->svc->createReleaseTempFolder($main, 'guid-123');
         $this->assertTrue(File::isDirectory($tmp));
         $this->assertStringEndsWith('/group42/guid-123/', str_replace('\\', '/', $tmp));
+    }
+
+    #[WithoutErrorHandler]
+    public function test_ensure_main_temp_path_repairs_existing_unwritable_bucket_directory(): void
+    {
+        $bucket = $this->base.DIRECTORY_SEPARATOR.'a';
+        File::makeDirectory($bucket, 0555, true, true);
+        chmod($bucket, 0555);
+
+        $resolved = $this->svc->ensureMainTempPath($this->base, 'a', '');
+
+        $this->assertTrue(File::isDirectory($resolved));
+        $this->assertTrue(is_writable($resolved));
+    }
+
+    #[WithoutErrorHandler]
+    public function test_ensure_main_temp_path_reports_path_when_base_cannot_be_created(): void
+    {
+        $fileBase = $this->base.DIRECTORY_SEPARATOR.'not-a-directory';
+        File::put($fileBase, 'x');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Additional post-processing temp path');
+        $this->expectExceptionMessage('not-a-directory');
+
+        $this->svc->ensureMainTempPath($fileBase, 'a', '');
     }
 
     #[WithoutErrorHandler]

@@ -7,6 +7,7 @@ namespace App\Services\AdditionalProcessing;
 use App\Facades\Search;
 use App\Models\Category;
 use App\Models\MediaInfo as MediaInfoModel;
+use App\Models\ParHash;
 use App\Models\Predb;
 use App\Models\Release;
 use App\Models\ReleaseFile;
@@ -107,21 +108,8 @@ class ReleaseFileManager
             return false;
         }
 
-        // Check if a file already exists
-        $exists = ReleaseFile::query()
-            ->where([
-                'releases_id' => $context->release->id,
-                'name' => $file['name'],
-                'size' => $file['size'] ?? 0,
-            ])
-            ->first();
-
-        if ($exists !== null) {
-            return false;
-        }
-
-        // Add the file
-        $added = ReleaseFile::addReleaseFiles(
+        $queued = $this->queueReleaseFile(
+            $context,
             $context->release->id,
             $file['name'],
             $file['size'] ?? 0,
@@ -131,9 +119,7 @@ class ReleaseFileManager
             $file['crc32'] ?? ''
         );
 
-        if (! empty($added)) {
-            $context->addedFileInfo++;
-
+        if ($queued) {
             // Check for codec spam
             if (preg_match('#(?:^|[/\\\\])Codec[/\\\\]Setup\.exe$#i', $file['name'])) {
                 if ($this->config->debugMode) {
@@ -216,6 +202,8 @@ class ReleaseFileManager
      */
     public function finalizeRelease(ReleaseProcessingContext $context, bool $processPasswords): void
     {
+        $this->flushQueuedReleaseFiles($context);
+
         $updateRows = ['haspreview' => 0];
 
         // Check for existing samples
@@ -240,6 +228,8 @@ class ReleaseFileManager
         if (! $processPasswords) {
             $context->releaseHasPassword = false;
         }
+
+        $updateRows = array_merge($updateRows, AdditionalCandidateQuery::claimResetValues());
 
         // Update based on conditions
         if (! $context->releaseHasPassword && $context->nzbHasCompressedFile && $releaseFilesCount === 0) {
@@ -276,11 +266,11 @@ class ReleaseFileManager
         }
 
         // Increment the timeout counter and mark as processed to skip re-selection
-        Release::query()->where('id', $release->id)->update([
+        Release::query()->where('id', $release->id)->update(array_merge([
             'pp_timeout_count' => $newCount,
             'haspreview' => 0,
             'passwordstatus' => ReleaseBrowseService::PASSWD_NONE,
-        ]);
+        ], AdditionalCandidateQuery::claimResetValues()));
 
         Search::updateRelease((int) $release->id);
 
@@ -402,12 +392,9 @@ class ReleaseFileManager
 
             // Add to release files
             if ($this->config->addPAR2Files) {
-                if ($filesAdded < 11
-                    && ReleaseFile::query()
-                        ->where(['releases_id' => $context->release->id, 'name' => $file['name']])
-                        ->first() === null
-                ) {
-                    if (ReleaseFile::addReleaseFiles(
+                if ($filesAdded < 11) {
+                    if ($this->queueReleaseFile(
+                        $context,
                         $context->release->id,
                         $file['name'],
                         $file['size'] ?? 0,
@@ -432,8 +419,6 @@ class ReleaseFileManager
             }
         }
 
-        // Update file count
-        Release::query()->where('id', $context->release->id)->increment('rarinnerfilecount', $filesAdded);
         $context->foundPAR2Info = true;
 
         return true;
@@ -654,6 +639,91 @@ class ReleaseFileManager
     private function normalizeCandidateTitle(string $title): string
     {
         return $this->fileNameCleaner->normalizeCandidateTitle($title);
+    }
+
+    private function queueReleaseFile(
+        ReleaseProcessingContext $context,
+        int|string $releaseId,
+        string $name,
+        int|string $size,
+        mixed $createdTime,
+        mixed $hasPassword,
+        string $hash = '',
+        string $crc = ''
+    ): bool {
+        if ($name === '') {
+            return false;
+        }
+
+        $this->loadExistingReleaseFileNames($context);
+        if (isset($context->existingReleaseFileNames[$name]) || isset($context->pendingReleaseFiles[$name])) {
+            return false;
+        }
+
+        $context->pendingReleaseFiles[$name] = [
+            'releases_id' => (int) $releaseId,
+            'name' => $name,
+            'size' => (int) $size,
+            'created_at' => $this->normalizeCreatedTime($createdTime),
+            'updated_at' => now()->timestamp,
+            'passworded' => (int) $hasPassword,
+            'crc32' => $crc,
+        ];
+        $context->existingReleaseFileNames[$name] = true;
+        $context->addedFileInfo++;
+
+        if (\strlen($hash) === 32) {
+            $context->pendingParHashes[$hash] = [
+                'releases_id' => (int) $releaseId,
+                'hash' => $hash,
+            ];
+        }
+
+        return true;
+    }
+
+    private function flushQueuedReleaseFiles(ReleaseProcessingContext $context): void
+    {
+        if ($context->pendingReleaseFiles !== []) {
+            $inserted = ReleaseFile::query()->insertOrIgnore(array_values($context->pendingReleaseFiles));
+            $context->releaseFilesChanged = $context->releaseFilesChanged || $inserted > 0;
+            $context->pendingReleaseFiles = [];
+        }
+
+        if ($context->pendingParHashes !== []) {
+            ParHash::query()->insertOrIgnore(array_values($context->pendingParHashes));
+            $context->pendingParHashes = [];
+        }
+    }
+
+    private function loadExistingReleaseFileNames(ReleaseProcessingContext $context): void
+    {
+        if ($context->existingReleaseFileNames !== null) {
+            return;
+        }
+
+        $existingNames = ReleaseFile::query()
+            ->where('releases_id', $context->release->id)
+            ->pluck('name')
+            ->all();
+
+        $context->existingReleaseFileNames = [];
+        foreach ($existingNames as $name) {
+            $context->existingReleaseFileNames[(string) $name] = true;
+        }
+    }
+
+    private function normalizeCreatedTime(mixed $createdTime): mixed
+    {
+        if (! is_int($createdTime)) {
+            return $createdTime;
+        }
+
+        if ($createdTime === 0) {
+            return now()->format('Y-m-d H:i:s');
+        }
+
+        return Carbon::createFromTimestamp($createdTime, date_default_timezone_get())->format('Y-m-d H:i:s');
     }
 
     private function releaseHasNzbSplitWrapper(Release $release): bool

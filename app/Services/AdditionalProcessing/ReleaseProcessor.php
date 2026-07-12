@@ -17,6 +17,11 @@ use Illuminate\Support\Facades\File;
  */
 class ReleaseProcessor
 {
+    /**
+     * @var array<int, string>
+     */
+    private array $groupNameCache = [];
+
     public function __construct(
         private readonly ProcessingConfiguration $config,
         private readonly NzbContentParser $nzbParser,
@@ -39,7 +44,7 @@ class ReleaseProcessor
         try {
             $context->tmpPath = $this->tempWorkspace->createReleaseTempFolder($mainTmpPath, $release->guid);
         } catch (\Throwable $e) {
-            $this->output->warning('Unable to create directory: '.$e->getMessage());
+            $this->output->warning('Unable to prepare release temp directory: '.$e->getMessage());
 
             return;
         }
@@ -141,7 +146,11 @@ class ReleaseProcessor
         $context->passwordStatus = ReleaseBrowseService::PASSWD_NONE;
         $context->releaseHasPassword = false;
         try {
-            $context->releaseGroupName = UsenetGroup::getNameByID($context->release->groups_id);
+            $groupId = (int) $context->release->groups_id;
+            if (! array_key_exists($groupId, $this->groupNameCache)) {
+                $this->groupNameCache[$groupId] = UsenetGroup::getNameByID($groupId);
+            }
+            $context->releaseGroupName = $this->groupNameCache[$groupId];
         } catch (\Throwable) {
             $context->releaseGroupName = '';
         }
@@ -446,10 +455,6 @@ class ReleaseProcessor
             if ($this->releaseManager->addFileInfo($file, $context, $this->config->supportFileRegex)) {
                 $this->output->echoFileInfoAdded();
             }
-        }
-
-        if ($context->addedFileInfo > 0) {
-            $this->releaseManager->updateSearchIndex($context->release->id);
         }
 
         if (! $context->foundJPGSample && $this->config->processJPGSample) {

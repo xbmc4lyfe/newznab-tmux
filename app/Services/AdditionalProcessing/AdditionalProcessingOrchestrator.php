@@ -29,6 +29,8 @@ class AdditionalProcessingOrchestrator
 
     private string $mainTmpPath = '';
 
+    private string $claimToken = '';
+
     public function __construct(
         private readonly ProcessingConfiguration $config,
         private readonly ReleaseProcessor $processor,
@@ -44,7 +46,10 @@ class AdditionalProcessingOrchestrator
     public function start(string $groupID = '', string $guidChar = ''): void
     {
         $this->finish();
-        $this->setupTempPath($guidChar, $groupID);
+        if (! $this->setupTempPath($guidChar, $groupID)) {
+            return;
+        }
+
         $this->fetchReleases($groupID, $guidChar);
 
         if ($this->totalReleases > 0) {
@@ -71,7 +76,10 @@ class AdditionalProcessingOrchestrator
             $this->totalReleases = 1;
             $guidChar = $release->leftguid ?? substr($release->guid, 0, 1);
             $groupID = '';
-            $this->setupTempPath($guidChar, $groupID);
+            if (! $this->setupTempPath($guidChar, $groupID)) {
+                return false;
+            }
+
             $this->processReleases($guidChar);
 
             return true;
@@ -87,14 +95,29 @@ class AdditionalProcessingOrchestrator
     /**
      * Set up the main temp path.
      */
-    private function setupTempPath(string $guidChar, string $groupID): void
+    private function setupTempPath(string $guidChar, string $groupID): bool
     {
-        $this->mainTmpPath = $this->tempWorkspace->ensureMainTempPath(
-            $this->config->tmpUnrarPath,
-            $guidChar,
-            $groupID
-        );
-        $this->tempWorkspace->clearDirectory($this->mainTmpPath, true);
+        try {
+            $this->mainTmpPath = $this->tempWorkspace->ensureMainTempPath(
+                $this->config->tmpUnrarPath,
+                $guidChar,
+                $groupID
+            );
+            $this->tempWorkspace->clearDirectory($this->mainTmpPath, true);
+        } catch (\Throwable $e) {
+            $this->output->warning('Additional post-processing skipped: '.$e->getMessage());
+            Log::error('Additional post-processing temp path is unavailable', [
+                'tmp_unrar_path' => $this->config->tmpUnrarPath,
+                'guid_char' => $guidChar,
+                'group_id' => $groupID,
+                'exception' => $e,
+            ]);
+            $this->mainTmpPath = '';
+
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -108,33 +131,30 @@ class AdditionalProcessingOrchestrator
      */
     private function fetchReleases(int|string $groupID, string $guidChar): void
     {
-        $query = AdditionalCandidateQuery::baseBuilder(
-            $groupID,
+        $this->claimToken = bin2hex(random_bytes(16));
+        $this->releases = AdditionalCandidateQuery::claimBatch(
             $guidChar,
+            $this->config->queryLimit > 0 ? $this->config->queryLimit : 25,
+            $this->claimToken,
+            $groupID,
             $this->config->minSizeMB,
             $this->config->maxSizeGB,
-        )
-            ->select([
-                'r.id',
-                'r.guid',
-                'r.name',
-                'r.size',
-                'r.groups_id',
-                'r.nfostatus',
-                'r.fromname',
-                'r.completion',
-                'r.categories_id',
-                'r.searchname',
-                'r.predb_id',
-                'r.pp_timeout_count',
-            ])
-            ->selectRaw('r.id as releases_id');
-
-        $this->releases = $query
-            ->orderBy('r.passwordstatus')
-            ->orderByDesc('r.postdate')
-            ->limit($this->config->queryLimit > 0 ? $this->config->queryLimit : 25)
-            ->get();
+            [
+                'id',
+                'guid',
+                'name',
+                'size',
+                'groups_id',
+                'nfostatus',
+                'fromname',
+                'completion',
+                'categories_id',
+                'searchname',
+                'predb_id',
+                'pp_timeout_count',
+                AdditionalCandidateQuery::CLAIM_TOKEN_COLUMN,
+            ],
+        );
         $this->totalReleases = $this->releases->count();
     }
 
@@ -170,6 +190,10 @@ class AdditionalProcessingOrchestrator
                 // Don't rethrow: keep draining the bucket. The release will be
                 // re-selected on the next cycle, and the pp_timeout_count /
                 // maxpptimeoutcount machinery will eventually drop it.
+            } finally {
+                if ($this->claimToken !== '' && ! empty($release->id)) {
+                    AdditionalCandidateQuery::clearClaim((int) $release->id, $this->claimToken);
+                }
             }
         }
 
@@ -192,5 +216,6 @@ class AdditionalProcessingOrchestrator
 
         $this->releases = collect();
         $this->totalReleases = 0;
+        $this->claimToken = '';
     }
 }

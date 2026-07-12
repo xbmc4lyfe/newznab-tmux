@@ -552,7 +552,7 @@ class TmuxTaskRunner
             return $this->disablePane($pane, 'Post-process Additional', 'disabled in settings');
         }
 
-        $hasWork = (int) ($runVar['counts']['now']['work'] ?? 0) > 0;
+        $hasWork = (int) ($runVar['counts']['now']['work_available'] ?? $runVar['counts']['now']['work'] ?? 0) > 0;
         $hasNfo = (int) ($runVar['counts']['now']['processnfo'] ?? 0) > 0;
 
         $niceness = Settings::settingValue('niceness') ?? 2;

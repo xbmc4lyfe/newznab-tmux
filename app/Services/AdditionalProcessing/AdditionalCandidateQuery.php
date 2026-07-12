@@ -8,7 +8,9 @@ use App\Models\Release;
 use App\Models\Settings;
 use App\Services\Runners\PostProcessRunner;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * Single source of truth for "needs additional postprocessing" release selection.
@@ -41,6 +43,12 @@ final class AdditionalCandidateQuery
      * so a separate setting is unnecessary.
      */
     public const int BUCKET_LIMIT = 16;
+
+    public const string CLAIMED_AT_COLUMN = 'additional_pp_claimed_at';
+
+    public const string CLAIM_TOKEN_COLUMN = 'additional_pp_claim_token';
+
+    private static ?bool $supportsClaims = null;
 
     /**
      * Resolve the minimum-size filter (megabytes). Returns 0 when disabled.
@@ -90,6 +98,7 @@ final class AdditionalCandidateQuery
         string $guidChar = '',
         ?int $minSizeMB = null,
         ?int $maxSizeGB = null,
+        bool $includeClaimed = false,
     ): Builder {
         $min = $minSizeMB ?? self::minSizeMB();
         $max = $maxSizeGB ?? self::maxSizeGB();
@@ -110,6 +119,9 @@ final class AdditionalCandidateQuery
         if ($guidChar !== '') {
             $query->where('r.leftguid', $guidChar);
         }
+        if (! $includeClaimed) {
+            self::applyClaimWindow($query);
+        }
 
         return $query;
     }
@@ -125,12 +137,13 @@ final class AdditionalCandidateQuery
         string $guidChar = '',
         ?int $minSizeMB = null,
         ?int $maxSizeGB = null,
+        bool $includeClaimed = false,
     ): Builder {
         $query = Release::query()
             ->from('releases as r')
             ->leftJoin('categories as c', 'c.id', '=', 'r.categories_id');
 
-        return self::applyPredicates($query, $groupID, $guidChar, $minSizeMB, $maxSizeGB);
+        return self::applyPredicates($query, $groupID, $guidChar, $minSizeMB, $maxSizeGB, $includeClaimed);
     }
 
     /**
@@ -148,11 +161,8 @@ final class AdditionalCandidateQuery
         $effectiveLimit = $limit !== null && $limit > 0
             ? min($limit, self::BUCKET_LIMIT)
             : self::BUCKET_LIMIT;
-        $bucketExpr = DB::getDriverName() === 'sqlite'
-            ? 'substr(r.leftguid, 1, 1)'
-            : 'LEFT(r.leftguid, 1)';
         $rows = self::baseBuilder()
-            ->select(DB::raw('DISTINCT '.$bucketExpr.' AS guid_bucket'))
+            ->select(DB::raw('DISTINCT r.leftguid AS guid_bucket'))
             ->limit($effectiveLimit)
             ->get();
         $chars = [];
@@ -173,5 +183,164 @@ final class AdditionalCandidateQuery
     public static function hasAnyCandidate(): bool
     {
         return self::baseBuilder()->limit(1)->exists();
+    }
+
+    /**
+     * Claim a bounded batch of release rows for one worker.
+     *
+     * @param  list<string>  $columns
+     * @return EloquentCollection<int, Release>
+     */
+    public static function claimBatch(
+        string $guidChar,
+        int $limit,
+        string $token,
+        int|string $groupID = '',
+        ?int $minSizeMB = null,
+        ?int $maxSizeGB = null,
+        array $columns = ['*'],
+    ): EloquentCollection {
+        $effectiveLimit = max(1, $limit);
+
+        return DB::transaction(function () use ($guidChar, $effectiveLimit, $token, $groupID, $minSizeMB, $maxSizeGB, $columns): EloquentCollection {
+            $supportsClaims = self::supportsClaims();
+            $query = self::baseBuilder($groupID, $guidChar, $minSizeMB, $maxSizeGB)
+                ->select('r.id')
+                ->orderByDesc('r.postdate')
+                ->orderBy('r.id')
+                ->limit($effectiveLimit);
+
+            if (DB::getDriverName() !== 'sqlite') {
+                $query->lockForUpdate();
+            }
+
+            $ids = $query
+                ->pluck('r.id')
+                ->map(static fn (mixed $id): int => (int) $id)
+                ->all();
+
+            if ($ids === []) {
+                return (new Release)->newCollection();
+            }
+
+            if ($supportsClaims) {
+                Release::query()
+                    ->whereIn('id', $ids)
+                    ->update([
+                        self::CLAIMED_AT_COLUMN => now(),
+                        self::CLAIM_TOKEN_COLUMN => $token,
+                    ]);
+            }
+
+            return Release::query()
+                ->whereIn('id', $ids)
+                ->select(self::selectableColumns($columns, $supportsClaims))
+                ->orderByRaw(self::idOrderExpression($ids))
+                ->get();
+        }, 3);
+    }
+
+    public static function clearClaim(int $releaseId, ?string $token = null): void
+    {
+        if (! self::supportsClaims()) {
+            return;
+        }
+
+        $query = Release::query()->where('id', $releaseId);
+        if ($token !== null && $token !== '') {
+            $query->where(self::CLAIM_TOKEN_COLUMN, $token);
+        }
+
+        $query->update([
+            self::CLAIMED_AT_COLUMN => null,
+            self::CLAIM_TOKEN_COLUMN => null,
+        ]);
+    }
+
+    /**
+     * @return array<string, null>
+     */
+    public static function claimResetValues(): array
+    {
+        if (! self::supportsClaims()) {
+            return [];
+        }
+
+        return [
+            self::CLAIMED_AT_COLUMN => null,
+            self::CLAIM_TOKEN_COLUMN => null,
+        ];
+    }
+
+    public static function supportsClaims(): bool
+    {
+        if (self::$supportsClaims !== null) {
+            return self::$supportsClaims;
+        }
+
+        if (! Schema::hasTable('releases')) {
+            return self::$supportsClaims = false;
+        }
+
+        return self::$supportsClaims = Schema::hasColumn('releases', self::CLAIMED_AT_COLUMN)
+            && Schema::hasColumn('releases', self::CLAIM_TOKEN_COLUMN);
+    }
+
+    /**
+     * @param  Builder<Release>  $query
+     */
+    private static function applyClaimWindow(Builder $query): void
+    {
+        if (! self::supportsClaims()) {
+            return;
+        }
+
+        $staleBefore = now()->subSeconds(self::claimTtlSeconds());
+
+        $query->where(function (Builder $claimQuery) use ($staleBefore): void {
+            $claimQuery
+                ->whereNull('r.'.self::CLAIMED_AT_COLUMN)
+                ->orWhere('r.'.self::CLAIMED_AT_COLUMN, '<', $staleBefore);
+        });
+    }
+
+    private static function claimTtlSeconds(): int
+    {
+        $timeout = (int) (Settings::settingValue('releaseprocessingtimeout') ?: 120);
+
+        return max(300, $timeout * 2);
+    }
+
+    /**
+     * @param  list<string>  $columns
+     * @return list<string>
+     */
+    private static function selectableColumns(array $columns, bool $supportsClaims): array
+    {
+        if ($supportsClaims || $columns === ['*']) {
+            return $columns;
+        }
+
+        return array_values(array_filter(
+            $columns,
+            static fn (string $column): bool => ! in_array($column, [self::CLAIMED_AT_COLUMN, self::CLAIM_TOKEN_COLUMN], true),
+        ));
+    }
+
+    /**
+     * @param  list<int>  $ids
+     */
+    private static function idOrderExpression(array $ids): string
+    {
+        if (DB::getDriverName() !== 'sqlite') {
+            return 'FIELD(id, '.implode(',', $ids).')';
+        }
+
+        $cases = [];
+        foreach ($ids as $position => $id) {
+            $cases[] = 'WHEN '.(int) $id.' THEN '.(int) $position;
+        }
+
+        return 'CASE id '.implode(' ', $cases).' ELSE '.count($ids).' END';
     }
 }

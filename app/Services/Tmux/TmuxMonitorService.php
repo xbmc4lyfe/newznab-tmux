@@ -52,10 +52,10 @@ class TmuxMonitorService
         // Initialize counts
         $this->runVar['counts'] = [
             'iterations' => 1,
-            'now' => [],
-            'start' => [],
-            'diff' => [],
-            'percent' => [],
+            'now' => $this->defaultCountValues(),
+            'start' => $this->defaultCountValues(),
+            'diff' => $this->defaultDiffValues(),
+            'percent' => $this->defaultPercentValues(),
         ];
 
         // Parse fix_crap setting into an array
@@ -214,6 +214,8 @@ class TmuxMonitorService
     protected function getProcessCounts(): void
     {
         $timer = time();
+        $this->runVar['counts']['now']['work'] = $this->runVar['counts']['now']['work'] ?? 0;
+        $this->runVar['counts']['now']['work_available'] = $this->runVar['counts']['now']['work_available'] ?? 0;
 
         try {
             $dbName = config('nntmux.db_name');
@@ -243,13 +245,12 @@ class TmuxMonitorService
                 }
             }
 
-            // "Misc In Process" / `work` is computed via AdditionalCandidateQuery so
-            // the dashboard counter is guaranteed to match exactly what the
-            // additional post-processor will pick up. Previously this was an
-            // inline SQL fragment inside Tmux::proc_query(2) which kept drifting
-            // (e.g. missing `nzbstatus = 1`) and left releases stuck in the queue
-            // forever. Do NOT re-introduce a separate predicate here.
-            $this->runVar['counts']['now']['work'] = AdditionalCandidateQuery::baseBuilder()->count();
+            // `work` remains the visible additional-processing backlog, including
+            // rows claimed by active workers. `work_available` is the scheduler
+            // gate, excluding fresh claims so tmux does not respawn duplicate
+            // additional workers while a claimed batch is still running.
+            $this->runVar['counts']['now']['work'] = AdditionalCandidateQuery::baseBuilder(includeClaimed: true)->count();
+            $this->runVar['counts']['now']['work_available'] = AdditionalCandidateQuery::baseBuilder()->count();
 
             $this->runVar['timers']['query']['proc2_time'] = time() - $timer2;
 
@@ -341,6 +342,11 @@ class TmuxMonitorService
      */
     protected function calculateStatistics(): void
     {
+        $this->runVar['counts']['now'] = array_replace($this->defaultCountValues(), $this->runVar['counts']['now'] ?? []);
+        $this->runVar['counts']['start'] = array_replace($this->defaultCountValues(), $this->runVar['counts']['start'] ?? []);
+        $this->runVar['counts']['diff'] = array_replace($this->defaultDiffValues(), $this->runVar['counts']['diff'] ?? []);
+        $this->runVar['counts']['percent'] = array_replace($this->defaultPercentValues(), $this->runVar['counts']['percent'] ?? []);
+
         // Calculate total work
         $this->runVar['counts']['now']['total_work'] = 0;
 
@@ -400,6 +406,77 @@ class TmuxMonitorService
         $this->runVar['counts']['percent']['renamed'] = $renameTotal > 0
             ? sprintf('%02d', floor(($renamed / $renameTotal) * 100))
             : 0;
+    }
+
+    /**
+     * @return array<string, int>
+     */
+    protected function defaultCountValues(): array
+    {
+        return [
+            'active_groups' => 0,
+            'all_groups' => 0,
+            'audio' => 0,
+            'backfill_groups_date' => 0,
+            'backfill_groups_days' => 0,
+            'binaries_table' => 0,
+            'books' => 0,
+            'collections_table' => 0,
+            'console' => 0,
+            'distinct_predb_matched' => 0,
+            'misc' => 0,
+            'missed_parts_table' => 0,
+            'movies' => 0,
+            'nfo' => 0,
+            'parts_table' => 0,
+            'pc' => 0,
+            'predb' => 0,
+            'predb_matched' => 0,
+            'processanime' => 0,
+            'processbooks' => 0,
+            'processconsole' => 0,
+            'processgames' => 0,
+            'processmovies' => 0,
+            'processmusic' => 0,
+            'processnfo' => 0,
+            'processrenames' => 0,
+            'processtv' => 0,
+            'releases' => 0,
+            'renamed' => 0,
+            'total_work' => 0,
+            'tv' => 0,
+            'work' => 0,
+            'work_available' => 0,
+            'xxx' => 0,
+        ];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    protected function defaultDiffValues(): array
+    {
+        return array_fill_keys(array_keys($this->defaultCountValues()), '0');
+    }
+
+    /**
+     * @return array<string, int|string>
+     */
+    protected function defaultPercentValues(): array
+    {
+        return [
+            'audio' => 0,
+            'books' => 0,
+            'console' => 0,
+            'misc' => 0,
+            'movies' => 0,
+            'nfo' => 0,
+            'pc' => 0,
+            'predb_matched' => 0,
+            'renamed' => 0,
+            'tv' => 0,
+            'xxx' => 0,
+        ];
     }
 
     /**

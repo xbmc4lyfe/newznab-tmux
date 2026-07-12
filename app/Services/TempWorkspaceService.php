@@ -6,6 +6,8 @@ namespace App\Services;
 
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Str;
+use RuntimeException;
+use Throwable;
 
 class TempWorkspaceService
 {
@@ -26,11 +28,7 @@ class TempWorkspaceService
             $basePath .= $guidChar.'/';
         }
 
-        if (! File::isDirectory($basePath)) {
-            if (! File::makeDirectory($basePath, 0777, true, true) && ! File::isDirectory($basePath)) { // @phpstan-ignore booleanNot.alwaysTrue
-                throw new \RuntimeException(sprintf('Directory "%s" was not created', $basePath));
-            }
-        }
+        $this->ensureWritableDirectory($basePath, 'Additional post-processing temp path');
 
         return $basePath;
     }
@@ -40,15 +38,10 @@ class TempWorkspaceService
      */
     public function createReleaseTempFolder(string $mainTmpPath, string $guid): string
     {
+        $this->assertWritableDirectory(rtrim($mainTmpPath, '/\\'), 'Additional post-processing temp path');
+
         $tmpPath = rtrim($mainTmpPath, '/\\').'/'.$guid.'/';
-        if (! File::isDirectory($tmpPath)) {
-            if (! File::makeDirectory($tmpPath, 0777, true, false) && ! File::isDirectory($tmpPath)) { // @phpstan-ignore booleanNot.alwaysTrue
-                // Try again once in case of transient FS issues
-                if (! File::makeDirectory($tmpPath, 0777, true, false) && ! File::isDirectory($tmpPath)) { // @phpstan-ignore booleanNot.alwaysTrue, booleanNot.alwaysTrue, booleanAnd.alwaysTrue
-                    throw new \RuntimeException('Unable to create directory: '.$tmpPath);
-                }
-            }
-        }
+        $this->ensureWritableDirectory($tmpPath, 'Release temp path');
 
         return $tmpPath;
     }
@@ -91,8 +84,8 @@ class TempWorkspaceService
     {
         try {
             $files = File::allFiles($path);
-        } catch (\Throwable $e) {
-            throw new \RuntimeException('ERROR: Could not open temp dir: '.$e->getMessage());
+        } catch (Throwable $e) {
+            throw new RuntimeException('ERROR: Could not open temp dir: '.$e->getMessage());
         }
 
         if ($pattern !== '') {
@@ -111,5 +104,66 @@ class TempWorkspaceService
         }
 
         return $files;
+    }
+
+    private function ensureWritableDirectory(string $path, string $label): void
+    {
+        if (File::isDirectory($path)) {
+            $this->repairDirectoryIfPossible($path);
+        } else {
+            try {
+                if (! File::makeDirectory($path, 0777, true, true) && ! File::isDirectory($path)) { // @phpstan-ignore booleanNot.alwaysTrue
+                    throw new RuntimeException('mkdir returned false');
+                }
+            } catch (Throwable $e) {
+                throw new RuntimeException(sprintf(
+                    '%s "%s" could not be created: %s',
+                    $label,
+                    $path,
+                    $e->getMessage()
+                ), 0, $e);
+            }
+        }
+
+        $this->assertWritableDirectory($path, $label);
+    }
+
+    private function repairDirectoryIfPossible(string $path): void
+    {
+        if (is_writable($path)) {
+            return;
+        }
+
+        @chmod($path, 0777);
+        clearstatcache(true, $path);
+        if (is_writable($path)) {
+            return;
+        }
+
+        $normalizedPath = rtrim($path, '/\\');
+        $parent = dirname($normalizedPath);
+        if (! File::isDirectory($parent) || ! is_writable($parent)) {
+            return;
+        }
+
+        File::deleteDirectory($normalizedPath);
+        if (! File::isDirectory($normalizedPath)) {
+            File::makeDirectory($normalizedPath, 0777, true, true);
+        }
+    }
+
+    private function assertWritableDirectory(string $path, string $label): void
+    {
+        if (! File::isDirectory($path)) {
+            throw new RuntimeException(sprintf('%s "%s" is not a directory', $label, $path));
+        }
+
+        if (! is_writable($path)) {
+            throw new RuntimeException(sprintf(
+                '%s "%s" is not writable by the PHP/tmux user. Check TEMP_UNRAR_PATH ownership and permissions.',
+                $label,
+                $path
+            ));
+        }
     }
 }
