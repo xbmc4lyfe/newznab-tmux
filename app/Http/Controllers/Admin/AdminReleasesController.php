@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\BasePageController;
+use App\Http\Requests\Admin\AdminReleaseListRequest;
 use App\Models\Category;
 use App\Models\Release;
 use App\Services\Releases\ReleaseManagementService;
@@ -27,20 +28,17 @@ class AdminReleasesController extends BasePageController
     /**
      * @throws \Exception
      */
-    public function index(Request $request): mixed
+    public function index(AdminReleaseListRequest $request): mixed
     {
         $this->setAdminPrefs();
 
         $meta_title = $title = 'Release List';
 
         $page = (int) $request->input('page', 1);
-        $search = trim((string) $request->input('search', ''));
-        $categoryId = $request->filled('category_id') ? (int) $request->input('category_id') : null;
-        if ($categoryId === -1) {
-            $categoryId = null;
-        }
+        $search = $request->searchTerm();
+        $categoryId = $request->categoryId();
 
-        $releaseList = Release::getReleasesRange($page, $search !== '' ? $search : null, $categoryId);
+        $releaseList = Release::getReleasesRange($page, $search, $categoryId);
         $releaseList->appends($request->only(['search', 'category_id']));
 
         return view('admin.releases.index', [
@@ -126,6 +124,7 @@ class AdminReleasesController extends BasePageController
         try {
             if ($id) {
                 $this->releaseManagement->deleteMultiple($id);
+                Release::clearAdminReleasesRangeCache();
 
                 // Handle AJAX requests
                 if (request()->wantsJson() || request()->ajax()) {

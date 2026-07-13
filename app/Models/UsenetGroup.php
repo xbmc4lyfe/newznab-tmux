@@ -215,7 +215,21 @@ class UsenetGroup extends Model
 
     public static function getGroupsRange(string $groupname = '', mixed $active = null): LengthAwarePaginator // @phpstan-ignore missingType.generics
     {
-        $groups = self::query()->groupBy('id')->orderBy('name');
+        $groups = self::query()
+            ->select([
+                'id',
+                'name',
+                'description',
+                'first_record_postdate',
+                'last_record_postdate',
+                'last_updated',
+                'active',
+                'backfill',
+                'minfilestoformrelease',
+                'minsizetoformrelease',
+                'backfill_target',
+            ])
+            ->orderBy('name');
 
         if ($groupname !== '') {
             $groups->where('name', 'like', '%'.$groupname.'%');

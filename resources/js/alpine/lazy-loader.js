@@ -57,7 +57,7 @@ const lazyComponentMap = {
     'adminInvitations': () => import('./components/admin/features.js'), // same file
     'adminRegexForm':  () => import('./components/admin/features.js'),  // same file
     'tinyMceEditor':   () => import('./components/admin/features.js'),  // same file
-    'verifyUser':      () => import('./components/admin/features.js'),  // same file
+    'verifyUser':      () => import('./components/admin/verify-user.js'),
     'tmuxEdit':        () => import('./components/admin/features.js'),  // same file
 };
 

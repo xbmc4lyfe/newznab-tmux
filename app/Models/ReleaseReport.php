@@ -126,8 +126,29 @@ class ReleaseReport extends Model
         int $perPage = 50
     ): LengthAwarePaginator {
         $query = self::query()
-            ->with(['release', 'user', 'reviewer', 'responder'])
-            ->orderBy('created_at', 'desc');
+            ->select([
+                'id',
+                'releases_id',
+                'users_id',
+                'reason',
+                'description',
+                'response',
+                'status',
+                'reviewed_by',
+                'reviewed_at',
+                'responded_by',
+                'responded_at',
+                'response_is_public',
+                'created_at',
+                'updated_at',
+            ])
+            ->with([
+                'release:id,guid,searchname,size',
+                'user:id,username',
+                'reviewer:id,username',
+                'responder:id,username',
+            ])
+            ->orderByDesc('created_at');
 
         if ($status !== null && $status !== 'all') {
             $query->where('status', $status);

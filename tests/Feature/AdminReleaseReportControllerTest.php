@@ -2,10 +2,80 @@
 
 namespace Tests\Feature;
 
+use Illuminate\Contracts\Console\Kernel;
+use PDO;
 use Tests\TestCase;
 
 class AdminReleaseReportControllerTest extends TestCase
 {
+    private string $databasePath = '';
+
+    /**
+     * @var array<string, string|false>
+     */
+    private array $originalEnvironment = [];
+
+    public function createApplication()
+    {
+        $this->databasePath = sys_get_temp_dir().'/nntmux-admin-release-report-test.sqlite';
+
+        $this->originalEnvironment = [
+            'APP_ENV' => getenv('APP_ENV'),
+            'DB_CONNECTION' => getenv('DB_CONNECTION'),
+            'DB_DATABASE' => getenv('DB_DATABASE'),
+        ];
+
+        if (file_exists($this->databasePath)) {
+            unlink($this->databasePath);
+        }
+
+        $pdo = new PDO('sqlite:'.$this->databasePath);
+        $pdo->exec('CREATE TABLE settings (name VARCHAR PRIMARY KEY, value TEXT NULL)');
+        $pdo->exec("INSERT INTO settings (name, value) VALUES
+            ('categorizeforeign', '0'),
+            ('catwebdl', '0'),
+            ('innerfileblacklist', ''),
+            ('title', 'NNTmux Test'),
+            ('home_link', '/')");
+
+        $this->setEnvironmentValue('APP_ENV', 'testing');
+        $this->setEnvironmentValue('DB_CONNECTION', 'sqlite');
+        $this->setEnvironmentValue('DB_DATABASE', $this->databasePath);
+
+        $app = require __DIR__.'/../../bootstrap/app.php';
+
+        $app->make(Kernel::class)->bootstrap();
+
+        return $app;
+    }
+
+    protected function tearDown(): void
+    {
+        if ($this->databasePath !== '' && file_exists($this->databasePath)) {
+            unlink($this->databasePath);
+        }
+
+        foreach ($this->originalEnvironment as $key => $value) {
+            $this->setEnvironmentValue($key, $value === false ? null : $value);
+        }
+
+        parent::tearDown();
+    }
+
+    private function setEnvironmentValue(string $key, ?string $value): void
+    {
+        if ($value === null) {
+            putenv($key);
+            unset($_ENV[$key], $_SERVER[$key]);
+
+            return;
+        }
+
+        putenv($key.'='.$value);
+        $_ENV[$key] = $value;
+        $_SERVER[$key] = $value;
+    }
+
     /**
      * Test that the controller has the revert method.
      */
@@ -28,15 +98,21 @@ class AdminReleaseReportControllerTest extends TestCase
      */
     public function test_bulk_action_supports_revert(): void
     {
-        $controllerPath = app_path('Http/Controllers/Admin/AdminReleaseReportController.php');
+        $requestPath = app_path('Http/Requests/Admin/AdminReleaseReportBulkActionRequest.php');
 
-        $this->assertFileExists($controllerPath);
+        $this->assertFileExists($requestPath);
 
-        $content = file_get_contents($controllerPath);
+        $content = file_get_contents($requestPath);
 
         // Check that bulk action validation includes revert
-        $this->assertStringContainsString("'action' => 'required|in:dismiss,resolve,reviewed,delete,revert'", $content);
-        $this->assertStringContainsString("'revert' => 'reverted to reviewed'", $content);
+        $this->assertStringContainsString("'in:dismiss,resolve,reviewed,delete,revert'", $content);
+        $this->assertStringContainsString('public function reportIds', $content);
+        $this->assertStringContainsString('public function actionName', $content);
+
+        $controllerPath = app_path('Http/Controllers/Admin/AdminReleaseReportController.php');
+        $controllerContent = file_get_contents($controllerPath);
+        $this->assertStringContainsString("'revert' => 'reverted to reviewed'", $controllerContent);
+        $this->assertStringContainsString('bulkUpdateReportStatuses', $controllerContent);
     }
 
     /**
@@ -125,6 +201,38 @@ class AdminReleaseReportControllerTest extends TestCase
         $this->assertStringNotContainsString('.report-checkbox', $content);
         $this->assertStringNotContainsString('.report-description-btn', $content);
         $this->assertStringNotContainsString('.revert-report-btn', $content);
+    }
+
+    public function test_verify_user_component_is_split_from_legacy_admin_features_bundle(): void
+    {
+        $loaderPath = resource_path('js/alpine/lazy-loader.js');
+        $featuresPath = resource_path('js/alpine/components/admin/features.js');
+        $verifyPath = resource_path('js/alpine/components/admin/verify-user.js');
+
+        $this->assertFileExists($loaderPath);
+        $this->assertFileExists($featuresPath);
+        $this->assertFileExists($verifyPath);
+
+        $loaderContent = file_get_contents($loaderPath);
+        $featuresContent = file_get_contents($featuresPath);
+        $verifyContent = file_get_contents($verifyPath);
+
+        $this->assertStringContainsString("'verifyUser':      () => import('./components/admin/verify-user.js')", $loaderContent);
+        $this->assertStringNotContainsString("Alpine.data('verifyUser'", $featuresContent);
+        $this->assertStringContainsString("Alpine.data('verifyUser'", $verifyContent);
+    }
+
+    public function test_release_report_list_uses_column_scoped_eager_loading(): void
+    {
+        $modelPath = app_path('Models/ReleaseReport.php');
+
+        $this->assertFileExists($modelPath);
+
+        $content = file_get_contents($modelPath);
+
+        $this->assertStringContainsString("'release:id,guid,searchname,size'", $content);
+        $this->assertStringContainsString("'user:id,username'", $content);
+        $this->assertStringContainsString("->orderByDesc('created_at')", $content);
     }
 
     /**

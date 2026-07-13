@@ -28,18 +28,9 @@
         </div>
     @endif
 
-    <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm">
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex flex-col md:flex-row md:justify-between md:items-center gap-4">
-                <div>
-                    <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                        <i class="fas fa-flag mr-2 text-red-500"></i>{{ $title }}
-                    </h1>
-                    <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Manage release reports submitted by users</p>
-                </div>
-
-                <!-- Status Stats -->
+    <x-admin.card>
+        <x-admin.page-header :title="$title" icon="fas fa-flag" subtitle="Manage release reports submitted by users.">
+            <x-slot:actions>
                 <div class="flex flex-wrap gap-2">
                     <a href="{{ route('admin.release-reports', ['status' => 'pending']) }}"
                        class="px-3 py-1.5 rounded-full text-sm font-medium transition {{ $status === 'pending' ? 'bg-yellow-500 text-white' : 'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200 hover:bg-yellow-200 dark:hover:bg-yellow-800' }}">
@@ -62,25 +53,27 @@
                         <i class="fas fa-list mr-1"></i> All ({{ $statusCounts['total'] }})
                     </a>
                 </div>
-            </div>
-        </div>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Reports Table -->
         @if($reportsList->count() > 0)
             <form id="bulk-action-form" method="POST" action="{{ route('admin.release-reports.bulk') }}" @submit="validateBulkAction($event)">
                 @csrf
-                <div class="px-6 py-3 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                <x-admin.action-bar>
                     <div class="flex flex-wrap items-center gap-2">
-                        <button type="button"
+                        <x-admin.button type="button"
                                 @click="selectAll()"
-                                class="px-3 py-1.5 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 rounded-lg hover:bg-blue-200 dark:hover:bg-blue-800 transition text-sm font-medium">
-                            <i class="fas fa-check-square mr-1"></i> Select All
-                        </button>
-                        <button type="button"
+                                tone="gray"
+                                icon="fas fa-check-square">
+                            Select All
+                        </x-admin.button>
+                        <x-admin.button type="button"
                                 @click="clearSelection()"
-                                class="px-3 py-1.5 bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition text-sm font-medium">
-                            <i class="fas fa-square mr-1"></i> Clear Selection
-                        </button>
+                                tone="gray"
+                                icon="fas fa-square">
+                            Clear Selection
+                        </x-admin.button>
                         <span class="text-sm text-gray-600 dark:text-gray-400">
                             <span x-text="selectedCount"></span> selected
                         </span>
@@ -95,29 +88,23 @@
                             <option value="revert">Revert to Reviewed</option>
                             <option value="delete">Delete Releases & Resolve</option>
                         </select>
-                        <button type="submit" class="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition">
-                            Apply
-                        </button>
+                        <x-admin.button type="submit" icon="fas fa-check">Apply</x-admin.button>
                     </div>
-                </div>
+                </x-admin.action-bar>
             </form>
 
-            <div class="overflow-x-auto">
-                <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                    <thead class="bg-gray-50 dark:bg-gray-900">
-                        <tr>
-                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-10">Select</th>
-                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">ID</th>
-                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Release</th>
-                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Reporter</th>
-                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Reason</th>
-                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Response</th>
-                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
-                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Date</th>
-                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+            <x-admin.data-table sticky>
+                <x-slot:head>
+                            <x-admin.th class="w-10">Select</x-admin.th>
+                            <x-admin.th>ID</x-admin.th>
+                            <x-admin.th>Release</x-admin.th>
+                            <x-admin.th>Reporter</x-admin.th>
+                            <x-admin.th>Reason</x-admin.th>
+                            <x-admin.th>Response</x-admin.th>
+                            <x-admin.th>Status</x-admin.th>
+                            <x-admin.th>Date</x-admin.th>
+                            <x-admin.th>Actions</x-admin.th>
+                </x-slot:head>
                         @foreach($reportsList as $report)
                             <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
                                 <td class="px-4 py-4 whitespace-nowrap">
@@ -332,9 +319,7 @@
                                 </td>
                             </tr>
                         @endforeach
-                    </tbody>
-                </table>
-            </div>
+            </x-admin.data-table>
 
             <!-- Pagination -->
             <div class="px-6 py-4 border-t border-gray-200 dark:border-gray-700">
@@ -354,7 +339,7 @@
                 </p>
             </div>
         @endif
-    </div>
+    </x-admin.card>
     </div>
 
 <!-- Report Description Modal -->
@@ -525,4 +510,3 @@
 </div>
 </div>
 @endsection
-

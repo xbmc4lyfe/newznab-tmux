@@ -2,29 +2,15 @@
 
 @section('content')
 <div x-data="adminGroups" class="space-y-6" data-ajax-url="{{ url('/admin/ajax') }}" data-csrf-token="{{ csrf_token() }}">
-    <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm">
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex flex-wrap justify-between items-center gap-3">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-100">
-                    <i class="fas fa-users mr-2"></i>{{ $title ?? 'Group List' }}
-                </h1>
-                <div class="flex flex-wrap gap-2">
-                    <a href="{{ url('/admin/group-list-active') }}" class="px-3 py-2 bg-blue-600 dark:bg-blue-700 text-white text-sm rounded-lg hover:bg-blue-700">
-                        <i class="fas fa-check-circle mr-1"></i>Active Groups
-                    </a>
-                    <a href="{{ url('/admin/group-list-inactive') }}" class="px-3 py-2 bg-gray-600 text-white text-sm rounded-lg hover:bg-gray-700">
-                        <i class="fas fa-times-circle mr-1"></i>Inactive Groups
-                    </a>
-                    <a href="{{ url('/admin/group-list') }}" class="px-3 py-2 bg-indigo-600 text-white text-sm rounded-lg hover:bg-indigo-700">
-                        <i class="fas fa-list mr-1"></i>All Groups
-                    </a>
-                    <a href="{{ url('/admin/group-bulk') }}" class="px-3 py-2 bg-green-600 dark:bg-green-700 text-white text-sm rounded-lg hover:bg-green-700">
-                        <i class="fas fa-plus-circle mr-1"></i>Bulk Add
-                    </a>
-                </div>
-            </div>
-        </div>
+    <x-admin.card>
+        <x-admin.page-header :title="$title ?? 'Group List'" icon="fas fa-users" subtitle="Activate, backfill, reset, and purge indexed Usenet groups.">
+            <x-slot:actions>
+                <x-admin.button :href="url('/admin/group-list-active')" icon="fas fa-check-circle">Active</x-admin.button>
+                <x-admin.button :href="url('/admin/group-list-inactive')" tone="gray" icon="fas fa-times-circle">Inactive</x-admin.button>
+                <x-admin.button :href="url('/admin/group-list')" tone="gray" icon="fas fa-list">All</x-admin.button>
+                <x-admin.button :href="url('/admin/group-bulk')" tone="success" icon="fas fa-plus-circle">Bulk Add</x-admin.button>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Info Alert -->
         <div class="px-6 py-4 bg-blue-50 dark:bg-blue-900/20 border-b border-blue-100 dark:border-blue-900">
@@ -44,8 +30,7 @@
         @endif
 
         @if($grouplist && $grouplist->count() > 0)
-            <!-- Search and Actions Bar -->
-            <div class="px-6 py-4 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700">
+            <x-admin.action-bar>
                 <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
                     <!-- Search Form -->
                     <div>
@@ -62,9 +47,7 @@
                                            class="pl-10 w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:text-gray-100 dark:placeholder-gray-400"
                                            placeholder="Search for group...">
                                 </div>
-                                <button type="submit" class="px-4 py-2 bg-blue-600 dark:bg-blue-700 text-white rounded-lg hover:bg-blue-700">
-                                    Go
-                                </button>
+                                <x-admin.button type="submit" icon="fas fa-search">Go</x-admin.button>
                             </div>
                         </form>
                     </div>
@@ -81,54 +64,54 @@
                             <span id="selection-counter" class="hidden text-sm text-gray-600 dark:text-gray-400 mr-2">
                                 <span id="selected-count">0</span> selected
                             </span>
-                            <button type="button"
+                            <x-admin.button type="button"
                                     id="reset-selected-btn"
                                     @click="handleAction('show-reset-selected-modal')"
-                                    class="hidden px-3 py-2 bg-orange-600 dark:bg-orange-700 text-white text-sm rounded-lg hover:bg-orange-700 dark:hover:bg-orange-600">
-                                <i class="fas fa-refresh mr-1"></i> Reset Selected
-                            </button>
-                            <button type="button"
+                                    tone="warning"
+                                    icon="fas fa-refresh"
+                                    class="hidden">
+                                Reset Selected
+                            </x-admin.button>
+                            <x-admin.button type="button"
                                     @click="handleAction('show-reset-modal')"
-                                    class="px-3 py-2 bg-yellow-600 text-white text-sm rounded-lg hover:bg-yellow-700">
-                                <i class="fas fa-refresh mr-1"></i> Reset All
-                            </button>
-                            <button type="button"
+                                    tone="warning"
+                                    icon="fas fa-refresh">
+                                Reset All
+                            </x-admin.button>
+                            <x-admin.button type="button"
                                     @click="handleAction('show-purge-modal')"
-                                    class="px-3 py-2 bg-red-600 dark:bg-red-700 text-white text-sm rounded-lg hover:bg-red-700">
-                                <i class="fas fa-trash mr-1"></i> Purge All
-                            </button>
+                                    tone="danger"
+                                    icon="fas fa-trash">
+                                Purge All
+                            </x-admin.button>
                         </div>
                     </div>
                 </div>
-            </div>
+            </x-admin.action-bar>
 
             <!-- Groups Table -->
-            <div class="overflow-x-auto">
-                <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                    <thead class="bg-gray-50 dark:bg-gray-900">
-                        <tr>
-                            <th class="px-4 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-12">
+            <x-admin.data-table sticky>
+                <x-slot:head>
+                            <x-admin.th align="center" class="w-12">
                                 <input type="checkbox"
                                        id="select-all-groups"
                                        x-model="allChecked"
                                        @change="toggleAllCheckboxes()"
                                        class="form-checkbox h-4 w-4 text-blue-600 border-gray-300 dark:border-gray-600 rounded focus:ring-blue-500 dark:bg-gray-700"
                                        title="Select all groups on this page">
-                            </th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Group</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">First Post</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Last Post</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Last Updated</th>
-                            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-32">Status</th>
-                            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-32">Backfill</th>
-                            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-24">Releases</th>
-                            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-24">Min Files</th>
-                            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-24">Min Size</th>
-                            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-32">Backfill Days</th>
-                            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-40">Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                            </x-admin.th>
+                            <x-admin.th>Group</x-admin.th>
+                            <x-admin.th>First Post</x-admin.th>
+                            <x-admin.th>Last Post</x-admin.th>
+                            <x-admin.th>Last Updated</x-admin.th>
+                            <x-admin.th align="center" class="w-32">Status</x-admin.th>
+                            <x-admin.th align="center" class="w-32">Backfill</x-admin.th>
+                            <x-admin.th align="center" class="w-24">Releases</x-admin.th>
+                            <x-admin.th align="center" class="w-24">Min Files</x-admin.th>
+                            <x-admin.th align="center" class="w-24">Min Size</x-admin.th>
+                            <x-admin.th align="center" class="w-32">Backfill Days</x-admin.th>
+                            <x-admin.th align="center" class="w-40">Actions</x-admin.th>
+                </x-slot:head>
                         @foreach($grouplist as $group)
                             <tr id="grouprow-{{ $group->id }}" class="hover:bg-gray-50 dark:hover:bg-gray-700 group-row">
                                 <td class="px-4 py-4 text-center">
@@ -243,9 +226,7 @@
                                 </td>
                             </tr>
                         @endforeach
-                    </tbody>
-                </table>
-            </div>
+            </x-admin.data-table>
 
             <!-- Footer -->
             <div class="px-6 py-4 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
@@ -259,16 +240,11 @@
                 </div>
             </div>
         @else
-            <div class="px-6 py-12 text-center">
-                <i class="fas fa-exclamation-triangle text-gray-400 text-5xl mb-4"></i>
-                <h3 class="text-lg font-medium text-gray-900 dark:text-gray-100 mb-2">No groups available</h3>
-                <p class="text-gray-500 mb-4">No groups have been added yet.</p>
-                <a href="{{ url('/admin/group-bulk') }}" class="inline-flex items-center px-4 py-2 bg-green-600 dark:bg-green-700 text-white rounded-lg hover:bg-green-700">
-                    <i class="fas fa-plus-circle mr-2"></i>Add Groups
-                </a>
-            </div>
+            <x-admin.empty-state icon="fas fa-exclamation-triangle" title="No groups available" message="No groups have been added yet.">
+                <x-admin.button :href="url('/admin/group-bulk')" tone="success" icon="fas fa-plus-circle" class="mt-4">Add Groups</x-admin.button>
+            </x-admin.empty-state>
         @endif
-    </div>
+    </x-admin.card>
 
     <!-- Reset All Modal -->
     <div x-show="resetAllOpen"
@@ -385,4 +361,3 @@
 </div>
 
 @endsection
-

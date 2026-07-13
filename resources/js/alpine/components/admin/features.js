@@ -199,23 +199,6 @@ Alpine.data('adminUserEdit', () => ({
     }
 }));
 
-// Verify User Modal
-Alpine.data('verifyUser', () => ({
-    open: false,
-    _form: null,
-
-    show(form) { this._form = form; this.open = true; },
-    hide() { this.open = false; this._form = null; },
-    submit() { if (this._form) this._form.submit(); this.hide(); },
-
-    init() {
-        const self = this;
-        window.showVerifyModal = function(e, form) { e.preventDefault(); self.show(form); };
-        window.hideVerifyModal = function() { self.hide(); };
-        window.submitVerifyForm = function() { self.submit(); };
-    }
-}));
-
 // Admin deleted users
 Alpine.data('adminDeletedUsers', () => ({
     allChecked: false,

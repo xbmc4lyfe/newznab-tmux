@@ -5,7 +5,7 @@
     <x-admin.card>
         <x-admin.page-header :title="$title" icon="fas fa-file-lines" subtitle="Browse files from storage/logs and search inside the selected log." />
 
-        <x-admin.search-bar>
+        <x-admin.filter-panel>
             @php
                 $clearSearchParams = array_filter([
                     'file' => $selectedFile !== '' ? $selectedFile : null,
@@ -50,31 +50,19 @@
                 </div>
 
                 <div class="lg:col-span-4 flex flex-wrap gap-2">
-                    <button type="submit" class="inline-flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">
-                        <i class="fas fa-search mr-2"></i>Apply
-                    </button>
+                    <x-admin.button type="submit" icon="fas fa-search">Apply</x-admin.button>
 
                     @if($selectedFile !== '')
-                        <a href="{{ route('admin.logs.index', $clearSearchParams) }}"
-                           class="inline-flex items-center px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 transition">
-                            <i class="fas fa-eraser mr-2"></i>Clear Search
-                        </a>
+                        <x-admin.button :href="route('admin.logs.index', $clearSearchParams)" tone="gray" icon="fas fa-eraser">Clear Search</x-admin.button>
                     @endif
 
-                    <a href="{{ route('admin.logs.index') }}"
-                       class="inline-flex items-center px-4 py-2 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition">
-                        <i class="fas fa-rotate-left mr-2"></i>Reset
-                    </a>
+                    <x-admin.button :href="route('admin.logs.index')" tone="ghost" icon="fas fa-rotate-left">Reset</x-admin.button>
                 </div>
             </form>
-        </x-admin.search-bar>
+        </x-admin.filter-panel>
 
         @if(empty($availableLogs))
-            <div class="px-6 py-12 text-center">
-                <i class="fas fa-file-circle-xmark text-gray-400 dark:text-gray-600 text-5xl mb-4"></i>
-                <h3 class="text-lg font-medium text-gray-900 dark:text-gray-100 mb-2">No log files found</h3>
-                <p class="text-gray-500 dark:text-gray-400">The `storage/logs` directory does not currently contain any readable files.</p>
-            </div>
+            <x-admin.empty-state icon="fas fa-file-circle-xmark" title="No log files found" message="The storage/logs directory does not currently contain any readable files." />
         @elseif($selectedLog !== null)
             <div class="px-6 py-4 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700">
                 <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 text-sm">
@@ -120,11 +108,7 @@
 
                     <x-admin.pagination :paginator="$searchResults" />
                 @else
-                    <div class="px-6 py-12 text-center">
-                        <i class="fas fa-magnifying-glass text-gray-400 dark:text-gray-600 text-4xl mb-4"></i>
-                        <h3 class="text-lg font-medium text-gray-900 dark:text-gray-100 mb-2">No search results</h3>
-                        <p class="text-gray-500 dark:text-gray-400">Try a different search term or clear the search to view the latest lines.</p>
-                    </div>
+                    <x-admin.empty-state icon="fas fa-magnifying-glass" title="No search results" message="Try a different search term or clear the search to view the latest lines." />
                 @endif
             @elseif($tailView !== null)
                 <div class="px-6 py-3 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 text-sm text-gray-700 dark:text-gray-300">
@@ -136,11 +120,7 @@
                 </div>
             @endif
         @else
-            <div class="px-6 py-12 text-center">
-                <i class="fas fa-file-lines text-gray-400 dark:text-gray-600 text-5xl mb-4"></i>
-                <h3 class="text-lg font-medium text-gray-900 dark:text-gray-100 mb-2">Select a log file</h3>
-                <p class="text-gray-500 dark:text-gray-400">Choose a file from the dropdown above to inspect its contents.</p>
-            </div>
+            <x-admin.empty-state icon="fas fa-file-lines" title="Select a log file" message="Choose a file from the dropdown above to inspect its contents." />
         @endif
     </x-admin.card>
 </div>

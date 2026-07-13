@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\BasePageController;
+use App\Http\Requests\Admin\AdminGroupListRequest;
 use App\Models\UsenetGroup;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -15,9 +16,9 @@ class AdminGroupController extends BasePageController
     /**
      * @throws \Exception
      */
-    public function index(Request $request): mixed
+    public function index(AdminGroupListRequest $request): mixed
     {
-        $groupname = $request->input('groupname') ?? '';
+        $groupname = $request->groupName();
         $grouplist = UsenetGroup::getGroupsRange($groupname);
         $title = 'Group List';
 
@@ -106,15 +107,10 @@ class AdminGroupController extends BasePageController
     /**
      * @throws \Exception
      */
-    public function active(Request $request): mixed
+    public function active(AdminGroupListRequest $request): mixed
     {
-        $gname = '';
-        if (! empty($request->input('groupname'))) {
-            $gname = $request->input('groupname');
-        }
-
-        $groupname = ! empty($request->input('groupname')) ? $request->input('groupname') : '';
-        $grouplist = UsenetGroup::getGroupsRange($gname, true);
+        $groupname = $request->groupName();
+        $grouplist = UsenetGroup::getGroupsRange($groupname, true);
         $title = 'Active Groups';
 
         return view('admin.groups.index', compact('title', 'groupname', 'grouplist'));
@@ -123,15 +119,10 @@ class AdminGroupController extends BasePageController
     /**
      * @throws \Exception
      */
-    public function inactive(Request $request): mixed
+    public function inactive(AdminGroupListRequest $request): mixed
     {
-        $gname = '';
-        if (! empty($request->input('groupname'))) {
-            $gname = $request->input('groupname');
-        }
-
-        $groupname = ! empty($request->input('groupname')) ? $request->input('groupname') : '';
-        $grouplist = UsenetGroup::getGroupsRange($gname, false);
+        $groupname = $request->groupName();
+        $grouplist = UsenetGroup::getGroupsRange($groupname, false);
         $title = 'Inactive Groups';
 
         return view('admin.groups.index', compact('title', 'groupname', 'grouplist'));

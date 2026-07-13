@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\BasePageController;
+use App\Http\Requests\Admin\AdminReleaseReportBulkActionRequest;
+use App\Http\Requests\Admin\AdminReleaseReportListRequest;
 use App\Models\Release;
 use App\Models\ReleaseReport;
 use App\Services\Releases\ReleaseBrowseService;
@@ -18,11 +20,11 @@ class AdminReleaseReportController extends BasePageController
     /**
      * Display a listing of release reports.
      */
-    public function index(Request $request): View
+    public function index(AdminReleaseReportListRequest $request): View
     {
         $this->setAdminPrefs();
 
-        $status = $request->input('status', 'pending');
+        $status = $request->status();
         $reportsList = ReleaseReport::getReportsRange($status, 50);
         $statusCounts = ReleaseReport::getCountByStatus();
 
@@ -165,62 +167,13 @@ class AdminReleaseReportController extends BasePageController
     /**
      * Bulk update report statuses.
      */
-    public function bulkAction(Request $request): RedirectResponse
+    public function bulkAction(AdminReleaseReportBulkActionRequest $request): RedirectResponse
     {
-        $request->validate([
-            'action' => 'required|in:dismiss,resolve,reviewed,delete,revert',
-            'report_ids' => 'required|array',
-            'report_ids.*' => 'integer',
-        ]);
-
-        $action = $request->input('action');
-        $reportIds = $request->input('report_ids');
-
-        $count = 0;
-
-        foreach ($reportIds as $reportId) {
-            $report = ReleaseReport::with('release')->find($reportId);
-            if (! $report) {
-                continue;
-            }
-
-            if ($action === 'delete' && $report->release) {
-                $releaseId = $report->releases_id;
-                Release::where('id', $releaseId)->delete();
-                ReleaseReport::where('releases_id', $releaseId)
-                    ->update([
-                        'status' => 'resolved',
-                        'reviewed_by' => Auth::id(),
-                        'reviewed_at' => now(),
-                    ]);
-            } elseif ($action === 'dismiss') {
-                $report->update([
-                    'status' => 'dismissed',
-                    'reviewed_by' => Auth::id(),
-                    'reviewed_at' => now(),
-                ]);
-            } elseif ($action === 'resolve') {
-                $report->update([
-                    'status' => 'resolved',
-                    'reviewed_by' => Auth::id(),
-                    'reviewed_at' => now(),
-                ]);
-            } elseif ($action === 'reviewed') {
-                $report->update([
-                    'status' => 'reviewed',
-                    'reviewed_by' => Auth::id(),
-                    'reviewed_at' => now(),
-                ]);
-            } elseif ($action === 'revert' && in_array($report->status, ['resolved', 'dismissed'])) {
-                $report->update([
-                    'status' => 'reviewed',
-                    'reviewed_by' => Auth::id(),
-                    'reviewed_at' => now(),
-                ]);
-            }
-
-            $count++;
-        }
+        $action = $request->actionName();
+        $reportIds = $request->reportIds();
+        $count = $action === 'delete'
+            ? $this->bulkDeleteReportedReleases($reportIds)
+            : $this->bulkUpdateReportStatuses($reportIds, $action);
 
         if ($count > 0) {
             ReleaseBrowseService::bumpCacheVersion();
@@ -236,5 +189,67 @@ class AdminReleaseReportController extends BasePageController
         };
 
         return redirect()->back()->with('success', "{$count} report(s) {$actionLabel} successfully.");
+    }
+
+    /**
+     * @param  list<int>  $reportIds
+     */
+    private function bulkUpdateReportStatuses(array $reportIds, string $action): int
+    {
+        $status = match ($action) {
+            'dismiss' => 'dismissed',
+            'resolve' => 'resolved',
+            'reviewed', 'revert' => 'reviewed',
+            default => null,
+        };
+
+        if ($status === null) {
+            return 0;
+        }
+
+        $query = ReleaseReport::query()
+            ->whereIn('id', $reportIds)
+            ->when($action === 'revert', fn ($query) => $query->whereIn('status', ['resolved', 'dismissed']));
+
+        $count = (clone $query)->count();
+
+        $query->update([
+            'status' => $status,
+            'reviewed_by' => Auth::id(),
+            'reviewed_at' => now(),
+        ]);
+
+        return $count;
+    }
+
+    /**
+     * @param  list<int>  $reportIds
+     */
+    private function bulkDeleteReportedReleases(array $reportIds): int
+    {
+        $reports = ReleaseReport::query()
+            ->with('release:id')
+            ->whereIn('id', $reportIds)
+            ->get(['id', 'releases_id']);
+
+        $count = 0;
+
+        foreach ($reports as $report) {
+            if (! $report->release) {
+                continue;
+            }
+
+            $releaseId = $report->releases_id;
+            Release::where('id', $releaseId)->delete();
+            ReleaseReport::where('releases_id', $releaseId)
+                ->update([
+                    'status' => 'resolved',
+                    'reviewed_by' => Auth::id(),
+                    'reviewed_at' => now(),
+                ]);
+            $count++;
+        }
+
+        return $count;
     }
 }

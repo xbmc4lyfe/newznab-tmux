@@ -2,17 +2,15 @@
 
 @section('content')
 <div class="space-y-6" x-data="adminUserList">
-    <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
+    <x-admin.card>
         <x-admin.page-header :title="$title" icon="fas fa-users">
             <x-slot:actions>
-                <a href="{{ url('admin/user-edit?action=add') }}" class="px-4 py-2 bg-blue-600 dark:bg-blue-700 text-white rounded-lg hover:bg-blue-700 dark:hover:bg-blue-800">
-                    <i class="fas fa-plus mr-2"></i>Add New User
-                </a>
+                <x-admin.button :href="url('admin/user-edit?action=add')" icon="fas fa-plus">Add New User</x-admin.button>
             </x-slot:actions>
         </x-admin.page-header>
 
         <!-- Search Filters -->
-        <x-admin.search-bar>
+        <x-admin.filter-panel>
             <form method="get" action="{{ url('admin/user-list') }}">
                 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                     <div>
@@ -83,15 +81,11 @@
                     </div>
                 </div>
                 <div class="mt-4 flex gap-2">
-                    <button type="submit" class="px-4 py-2 bg-blue-600 dark:bg-blue-700 text-white rounded-md hover:bg-blue-700 dark:hover:bg-blue-800">
-                        <i class="fas fa-search mr-2"></i>Filter
-                    </button>
-                    <a href="{{ url('admin/user-list') }}" class="px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-300 dark:hover:bg-gray-600">
-                        <i class="fas fa-times mr-2"></i>Clear
-                    </a>
+                    <x-admin.button type="submit" icon="fas fa-search">Filter</x-admin.button>
+                    <x-admin.button :href="url('admin/user-list')" tone="gray" icon="fas fa-times">Clear</x-admin.button>
                 </div>
             </form>
-        </x-admin.search-bar>
+        </x-admin.filter-panel>
 
         <!-- Validation Messages -->
         @if($errors->any())
@@ -120,11 +114,12 @@
                         <option value="resend_verification">Resend Verification Email</option>
                         <option value="delete">Soft Delete Selected</option>
                     </select>
-                    <button type="submit"
+                    <x-admin.button type="submit"
                             id="bulkUserActionBtn"
-                            class="w-full md:w-auto px-4 py-2 bg-blue-600 dark:bg-blue-700 text-white rounded-md hover:bg-blue-700 dark:hover:bg-blue-800">
-                        <i class="fas fa-check mr-2"></i>Apply
-                    </button>
+                            class="w-full md:w-auto"
+                            icon="fas fa-check">
+                        Apply
+                    </x-admin.button>
                     <p class="text-xs text-gray-500 dark:text-gray-400">
                         Select non-admin active users below. Deleted users are managed from the Deleted Users page.
                     </p>
@@ -400,13 +395,9 @@
                 {{ $userlist->links() }}
             </div>
         @else
-            <div class="px-6 py-12 text-center">
-                <i class="fas fa-users text-gray-400 text-5xl mb-4"></i>
-                <h3 class="text-lg font-medium text-gray-900 dark:text-gray-100 mb-2">No users found</h3>
-                <p class="text-gray-500">Try adjusting your search filters or add a new user.</p>
-            </div>
+            <x-admin.empty-state icon="fas fa-users" title="No users found" message="Try adjusting your search filters or add a new user." />
         @endif
-    </div>
+    </x-admin.card>
 </div>
 
 <!-- Verify User Confirmation Modal (x-data mounts verifyUser so showVerifyModal/submitVerifyForm exist) -->

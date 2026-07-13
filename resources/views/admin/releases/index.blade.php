@@ -17,7 +17,7 @@
             </div>
         @endif
 
-        <div class="px-6 py-4 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700">
+        <x-admin.filter-panel>
             <form method="GET" action="{{ route('admin.release-list') }}" class="flex flex-col sm:flex-row gap-2">
                 <div class="relative flex-1">
                     <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
@@ -37,16 +37,16 @@
                         </option>
                     @endforeach
                 </select>
-                <button type="submit" class="px-4 py-2 bg-blue-600 dark:bg-blue-700 text-white rounded-lg hover:bg-blue-700 dark:hover:bg-blue-800">
+                <x-admin.button type="submit" icon="fas fa-filter">
                     Apply
-                </button>
+                </x-admin.button>
                 @if(request('search') || (request()->filled('category_id') && (int) request('category_id') !== -1))
-                    <a href="{{ route('admin.release-list') }}" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-center">
+                    <x-admin.button :href="route('admin.release-list')" tone="gray" icon="fas fa-eraser">
                         Clear
-                    </a>
+                    </x-admin.button>
                 @endif
             </form>
-        </div>
+        </x-admin.filter-panel>
 
         @if($releaselist->count() > 0)
             <form id="bulk-category-form"
@@ -54,18 +54,20 @@
                   action="{{ route('admin.release-bulk-category') }}"
                   @submit="validateBulkAction($event)">
                 @csrf
-                <div class="px-6 py-3 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                <x-admin.action-bar>
                     <div class="flex flex-wrap items-center gap-2">
-                        <button type="button"
+                        <x-admin.button type="button"
                                 @click="selectAll()"
-                                class="px-3 py-1.5 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 rounded-lg hover:bg-blue-200 dark:hover:bg-blue-800 transition text-sm font-medium">
-                            <i class="fas fa-check-square mr-1"></i> Select All
-                        </button>
-                        <button type="button"
+                                tone="gray"
+                                icon="fas fa-check-square">
+                            Select All
+                        </x-admin.button>
+                        <x-admin.button type="button"
                                 @click="clearSelection()"
-                                class="px-3 py-1.5 bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition text-sm font-medium">
-                            <i class="fas fa-square mr-1"></i> Clear Selection
-                        </button>
+                                tone="gray"
+                                icon="fas fa-square">
+                            Clear Selection
+                        </x-admin.button>
                         <span class="text-sm text-gray-600 dark:text-gray-400">
                             <span x-text="selectedCount"></span> selected
                         </span>
@@ -79,14 +81,12 @@
                                 @endif
                             @endforeach
                         </select>
-                        <button type="submit" class="px-4 py-2 bg-green-600 text-white text-sm rounded-lg hover:bg-green-700 transition">
-                            <i class="fas fa-tags mr-1"></i> Change Category
-                        </button>
+                        <x-admin.button type="submit" tone="success" icon="fas fa-tags">Change Category</x-admin.button>
                     </div>
-                </div>
+                </x-admin.action-bar>
             </form>
 
-            <x-admin.data-table>
+            <x-admin.data-table sticky>
                 <x-slot:head>
                     <x-admin.th class="w-10">
                         <span class="sr-only">Select</span>
@@ -172,7 +172,7 @@
 
             <x-admin.pagination :paginator="$releaselist" />
         @else
-            <x-empty-state
+            <x-admin.empty-state
                 icon="fas fa-list"
                 title="No releases found"
                 message="{{ request('search') || (request()->filled('category_id') && (int) request('category_id') !== -1) ? 'No releases match your filters.' : 'No releases are currently available in the system.' }}"

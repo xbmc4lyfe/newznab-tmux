@@ -386,15 +386,18 @@ class Release extends Model
     public static function getReleasesRange(int $page = 1, ?string $search = null, ?int $categoryId = null): mixed
     {
         $search = $search !== null && $search !== '' ? $search : null;
-        $hasFilters = $search !== null || $categoryId !== null;
 
         if ($search !== null && Search::isAvailable()) {
             return self::getReleasesRangeFromSearchIndex($page, $search, $categoryId);
         }
 
-        if (! $hasFilters) {
+        $cacheable = $search === null;
+        $cacheKey = null;
+
+        if ($cacheable) {
             $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_long'));
-            $cacheKey = md5('releasesRange_'.$page);
+            $version = Cache::get('adminReleasesRangeVersion', 1);
+            $cacheKey = md5('releasesRange_'.$version.'_'.$page.'_'.($categoryId ?? 'all'));
             $releases = Cache::get($cacheKey);
             if ($releases !== null) {
                 return $releases;
@@ -413,9 +416,8 @@ class Release extends Model
 
         $releases = $query->paginate(config('nntmux.items_per_page'), ['*'], 'page', $page);
 
-        if (! $hasFilters) {
-            $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_long'));
-            Cache::put(md5('releasesRange_'.$page), $releases, $expiresAt);
+        if ($cacheable && $cacheKey !== null) {
+            Cache::put($cacheKey, $releases, $expiresAt);
         }
 
         return $releases;
@@ -465,6 +467,8 @@ class Release extends Model
      */
     public static function clearAdminReleasesRangeCache(int $maxPages = 25): void
     {
+        Cache::forever('adminReleasesRangeVersion', ((int) Cache::get('adminReleasesRangeVersion', 1)) + 1);
+
         for ($page = 1; $page <= $maxPages; $page++) {
             Cache::forget(md5('releasesRange_'.$page));
         }
