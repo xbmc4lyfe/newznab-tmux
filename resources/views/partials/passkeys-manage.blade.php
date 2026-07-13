@@ -18,10 +18,10 @@
     data-passkeys='@json($passkeyPayload)'
 >
     <p class="text-sm text-gray-600 dark:text-gray-300">
-        Register a passkey using Windows Hello, Touch ID / Face ID, your phone, a password manager, or a FIDO2 security key.
+        Register a passkey using your browser, password manager, Windows Hello, Touch ID / Face ID, or your phone.
     </p>
     <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
-        On a Windows domain / managed device the browser will show all available options. If Windows Hello is still disabled by group policy, you can fall back to a hardware security key or scan a QR code with your phone.
+        Hardware security keys are available separately when you want to use a USB/FIDO2 key.
     </p>
 
     <template x-if="!supported">
@@ -32,7 +32,7 @@
 
     <template x-if="supported">
         <div class="mt-4 space-y-4">
-            <form @submit.prevent="createPasskey()" class="space-y-3">
+            <form @submit.prevent="createBrowserPasskey()" class="space-y-3">
                 <label for="passkey_name" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
                     Passkey name
                 </label>
@@ -48,13 +48,24 @@
                     >
                     <button
                         type="submit"
-                        :disabled="busy"
+                        :disabled="busy || browserPasskeyBlocked()"
                         class="rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-primary-700 dark:hover:bg-primary-800"
                     >
                         <i class="fas fa-plus mr-2"></i>
-                        <span x-text="busy ? 'Creating...' : 'Create passkey'"></span>
+                        <span x-text="busy ? 'Creating...' : 'Create browser/app passkey'"></span>
                     </button>
                 </div>
+                <p x-show="browserPasskeyNotice()" x-text="browserPasskeyNotice()" x-cloak class="text-xs text-yellow-700 dark:text-yellow-300">
+                </p>
+                <button
+                    type="button"
+                    @click="createSecurityKeyPasskey()"
+                    :disabled="busy || !name"
+                    class="inline-flex items-center rounded-lg border border-gray-300 px-3 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+                >
+                    <i class="fas fa-key mr-2"></i>
+                    Use USB security key
+                </button>
             </form>
 
             <p x-show="error" x-text="error" class="text-sm text-red-600 dark:text-red-400"></p>

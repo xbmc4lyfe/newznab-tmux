@@ -2,6 +2,8 @@ import Alpine from '@alpinejs/csp';
 
 Alpine.data('passkeyManage', () => ({
     supported: false,
+    platformAvailable: false,
+    platformChecked: false,
     busy: false,
     name: '',
     error: '',
@@ -14,6 +16,7 @@ Alpine.data('passkeyManage', () => ({
     init() {
         this.supported = typeof window.browserSupportsWebAuthn === 'function'
             && window.browserSupportsWebAuthn();
+        void this.detectPlatformAuthenticator();
 
         // Capture URLs from the root element's data attributes once, so we don't
         // depend on $el inside event handlers (which may resolve to the triggering
@@ -41,7 +44,54 @@ Alpine.data('passkeyManage', () => ({
         }
     },
 
+    async detectPlatformAuthenticator() {
+        this.platformAvailable = typeof window.platformAuthenticatorIsAvailable === 'function'
+            && await window.platformAuthenticatorIsAvailable();
+        this.platformChecked = true;
+    },
+
+    isOperaOnWindows() {
+        const userAgent = window.navigator?.userAgent || '';
+        const platform = window.navigator?.platform || '';
+
+        return (userAgent.includes('OPR/') || userAgent.includes('Opera'))
+            && (userAgent.includes('Windows') || platform.startsWith('Win'));
+    },
+
     async createPasskey() {
+        return this.createBrowserPasskey();
+    },
+
+    async createBrowserPasskey() {
+        if (this.browserPasskeyBlocked()) {
+            this.error = 'Opera on Windows is routing passkey creation through Windows Security and cannot create a browser/app passkey here. Use Edge/Chrome with Windows Hello or a password-manager passkey provider, or use the USB security key button.';
+            return;
+        }
+
+        return this.createPasskeyWithMode('browser');
+    },
+
+    browserPasskeyBlocked() {
+        return this.isOperaOnWindows();
+    },
+
+    browserPasskeyNotice() {
+        if (this.browserPasskeyBlocked()) {
+            return 'Opera on Windows routes browser/app passkey creation through Windows Security on this setup. Use Edge/Chrome with Windows Hello or a password-manager passkey provider, or use the USB security key button.';
+        }
+
+        if (this.platformChecked && !this.platformAvailable) {
+            return 'This browser did not report a built-in platform passkey provider. You can still try browser/app passkey creation; if it fails, enable Windows Hello or a password-manager passkey provider, or use the USB security key button.';
+        }
+
+        return '';
+    },
+
+    async createSecurityKeyPasskey() {
+        return this.createPasskeyWithMode('security-key');
+    },
+
+    async createPasskeyWithMode(mode) {
         if (!this.supported) {
             this.error = 'Your browser does not support passkeys.';
             return;
@@ -60,7 +110,9 @@ Alpine.data('passkeyManage', () => ({
             });
             const options = optionsResponse.data?.options;
 
-            const registration = await this.startRegistrationWithFallback(options);
+            const registration = mode === 'security-key'
+                ? await window.startRegistration({ optionsJSON: this.withSecurityKeyHint(options) })
+                : await this.startBrowserPasskeyRegistration(options);
 
             const storeResponse = await window.axios.post(storeUrl, {
                 name: this.name,
@@ -118,24 +170,54 @@ Alpine.data('passkeyManage', () => ({
         }
     },
 
-    async startRegistrationWithFallback(options) {
-        try {
-            return await window.startRegistration({ optionsJSON: options });
-        } catch (error) {
-            if (!this.shouldTryBrowserPasskeyRegistration(error)) {
-                throw error;
-            }
-
-            return window.startRegistration({
-                optionsJSON: options,
-                useAutoRegister: true,
-            });
-        }
+    async startBrowserPasskeyRegistration(options) {
+        return window.startRegistration({ optionsJSON: this.withBrowserPasskeyHints(options) });
     },
 
-    shouldTryBrowserPasskeyRegistration(error) {
-        return error instanceof Error
-            && ['NotAllowedError', 'ConstraintError', 'UnknownError'].includes(error.name);
+    withBrowserPasskeyHints(options) {
+        const normalized = this.cloneOptions(options);
+        normalized.hints = ['client-device'];
+        normalized.authenticatorSelection = {
+            ...normalized.authenticatorSelection,
+            authenticatorAttachment: 'platform',
+            residentKey: normalized.authenticatorSelection?.residentKey || 'preferred',
+            userVerification: normalized.authenticatorSelection?.userVerification || 'preferred',
+        };
+
+        if (normalized.publicKey) {
+            normalized.publicKey.hints = ['client-device'];
+            normalized.publicKey.authenticatorSelection = {
+                ...normalized.publicKey.authenticatorSelection,
+                authenticatorAttachment: 'platform',
+                residentKey: normalized.publicKey.authenticatorSelection?.residentKey || 'preferred',
+                userVerification: normalized.publicKey.authenticatorSelection?.userVerification || 'preferred',
+            };
+        }
+
+        return normalized;
+    },
+
+    withSecurityKeyHint(options) {
+        const normalized = this.cloneOptions(options);
+        normalized.hints = ['security-key', 'client-device', 'hybrid'];
+        normalized.authenticatorSelection = {
+            ...normalized.authenticatorSelection,
+            authenticatorAttachment: 'cross-platform',
+        };
+
+        if (normalized.publicKey) {
+            normalized.publicKey.hints = ['security-key', 'client-device', 'hybrid'];
+            normalized.publicKey.authenticatorSelection = {
+                ...normalized.publicKey.authenticatorSelection,
+                authenticatorAttachment: 'cross-platform',
+            };
+        }
+
+        return normalized;
+    },
+
+    cloneOptions(options) {
+        return JSON.parse(JSON.stringify(options));
     },
 
     formatDate(value) {

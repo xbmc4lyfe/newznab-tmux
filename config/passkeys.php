@@ -69,14 +69,16 @@ return [
     /*
      * WebAuthn Level 3 client hints. Modern Chromium based browsers (including
      * Edge on Windows) use these to render a richer credential chooser that
-     * lists Windows Hello, mobile (hybrid/QR) and security keys side by side.
+     * lists local browser/app passkeys and mobile (hybrid/QR) options first.
+     * Security keys are still allowed by WebAuthn, but are not the default hint
+     * because managed Windows devices can otherwise jump straight to the USB
+     * security-key prompt.
      *
      * Allowed values: "client-device", "hybrid", "security-key".
      */
     'hints' => [
         'client-device',
         'hybrid',
-        'security-key',
     ],
 
     /*
