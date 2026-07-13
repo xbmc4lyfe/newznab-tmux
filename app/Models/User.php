@@ -364,16 +364,22 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
 
     /**
      * Scope to get active (non-disabled) users.
+     *
+     * @param  Builder<User>  $query
+     * @return Builder<User>
      */
-    public function scopeActive(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeActive(Builder $query): Builder
     {
         return $query->where('roles_id', '!=', UserRole::DISABLED->value);
     }
 
     /**
      * Scope to get verified users.
+     *
+     * @param  Builder<User>  $query
+     * @return Builder<User>
      */
-    public function scopeVerified(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeVerified(Builder $query): Builder
     {
         return $query->where(function (Builder $verifiedQuery): void {
             $verifiedQuery
@@ -428,8 +434,11 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
 
     /**
      * Scope to filter users by role.
+     *
+     * @param  Builder<User>  $query
+     * @return Builder<User>
      */
-    public function scopeWithRole(Builder $query, int|string $role): Builder // @phpstan-ignore missingType.generics
+    public function scopeWithRole(Builder $query, int|string $role): Builder
     {
         if (is_numeric($role)) {
             return $query->where('roles_id', (int) $role);
@@ -440,8 +449,11 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
 
     /**
      * Scope to get users with roles expiring within specified days.
+     *
+     * @param  Builder<User>  $query
+     * @return Builder<User>
      */
-    public function scopeExpiringSoon(Builder $query, int $days = 7): Builder // @phpstan-ignore missingType.generics
+    public function scopeExpiringSoon(Builder $query, int $days = 7): Builder
     {
         return $query->whereNotNull('rolechangedate')
             ->whereBetween('rolechangedate', [now(), now()->addDays($days)]);
@@ -449,8 +461,11 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
 
     /**
      * Scope to get users with expired roles.
+     *
+     * @param  Builder<User>  $query
+     * @return Builder<User>
      */
-    public function scopeExpired(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeExpired(Builder $query): Builder
     {
         return $query->whereNotNull('rolechangedate')
             ->where('rolechangedate', '<', now());
@@ -458,8 +473,11 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
 
     /**
      * Scope to exclude sharing email.
+     *
+     * @param  Builder<User>  $query
+     * @return Builder<User>
      */
-    public function scopeExcludeSharing(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeExcludeSharing(Builder $query): Builder
     {
         return $query->where('email', '!=', 'sharing@nZEDb.com');
     }

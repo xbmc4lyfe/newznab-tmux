@@ -11,6 +11,7 @@ use App\Services\Releases\ReleaseManagementService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
 
 class CleanNZB extends Command
 {
@@ -22,6 +23,8 @@ class CleanNZB extends Command
     protected $signature = 'nntmux:nzbclean
     {--notindb : Delete NZBs that dont exist in database}
     {--notondisk : Delete release in database that dont have a NZB on disk}
+    {--temps : Delete stale temporary NZB files left by interrupted creation}
+    {--temp-age-hours=24 : Minimum temporary NZB age in hours before deletion}
     {--chunksize=25000 : Chunk size for releases query}
     {--delete : Pass this argument to actually delete the files. Otherwise it\'s just a dry run.}';
 
@@ -38,7 +41,7 @@ class CleanNZB extends Command
     public function handle(): void
     {
         // Check if any options are false
-        if (! $this->option('notindb') && ! $this->option('notondisk')) {
+        if (! $this->option('notindb') && ! $this->option('notondisk') && ! $this->option('temps')) {
             $this->error('You must specify at least one option. See: --help');
             exit();
         }
@@ -47,6 +50,9 @@ class CleanNZB extends Command
         }
         if ($this->option('notondisk')) {
             $this->GetReleasesWithNoNZBOnDisk($this->option('delete'));
+        }
+        if ($this->option('temps')) {
+            $this->cleanTemporaryNzbFiles($this->option('delete'));
         }
     }
 
@@ -104,5 +110,33 @@ class CleanNZB extends Command
             }
         });
         $this->info("Checked: $checked / Deleted: $deleted");
+    }
+
+    private function cleanTemporaryNzbFiles(mixed $delete = false): void
+    {
+        $nzb = app(NzbService::class);
+        $ageHours = max(1, (int) $this->option('temp-age-hours'));
+        $olderThanSeconds = $ageHours * 3600;
+
+        if (! $delete) {
+            $paths = $nzb->findStaleTemporaryNzbPaths($olderThanSeconds);
+            foreach ($paths as $path) {
+                $this->line("Would delete stale temporary NZB: {$path}");
+            }
+
+            $this->info('Checked stale temporary NZBs: '.count($paths).' would be deleted.');
+
+            return;
+        }
+
+        $deleted = $nzb->cleanupStaleTemporaryNzbs($olderThanSeconds);
+        if ($deleted > 0) {
+            Log::channel('nzb_creation')->warning('Deleted stale temporary NZB files', [
+                'count' => $deleted,
+                'older_than_hours' => $ageHours,
+            ]);
+        }
+
+        $this->info("Deleted stale temporary NZBs: {$deleted}");
     }
 }

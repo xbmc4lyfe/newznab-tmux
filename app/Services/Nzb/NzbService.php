@@ -10,11 +10,13 @@ use App\Models\Part;
 use App\Models\Release;
 use App\Models\Settings;
 use App\Services\CollectionCleanupService;
+use App\Support\Data\NzbCreationResult;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Throwable;
 
 /**
  * Service for managing NZB files on disk.
@@ -83,130 +85,180 @@ class NzbService
     /**
      * Write an NZB file for a release.
      *
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function writeNzbForReleaseId(Release $release): bool
     {
-        $collections = Collection::whereReleasesId($release->id)
-            ->join('usenet_groups', 'collections.groups_id', '=', 'usenet_groups.id')
-            ->select(['collections.*', DB::raw('UNIX_TIMESTAMP(collections.date) AS udate'), 'usenet_groups.name as groupname'])
-            ->get();
+        return $this->createNzbForRelease($release)->success;
+    }
+
+    public function createNzbForRelease(Release $release): NzbCreationResult
+    {
+        try {
+            $collections = Collection::whereReleasesId($release->id)
+                ->join('usenet_groups', 'collections.groups_id', '=', 'usenet_groups.id')
+                ->select(['collections.*', DB::raw('UNIX_TIMESTAMP(collections.date) AS udate'), 'usenet_groups.name as groupname'])
+                ->get();
+        } catch (Throwable $e) {
+            return NzbCreationResult::transient('Failed to load release collections: '.$e->getMessage());
+        }
 
         if ($collections->isEmpty()) {
-            return false;
+            return NzbCreationResult::deterministic('Release has no collections to write into an NZB.');
         }
 
         // Pre-load every binary and part for the release in two flat queries
         // and group them in PHP, instead of issuing one binaries SELECT per
         // collection and one parts SELECT per binary (1 + N + N*M queries).
-        $collectionIds = $collections->pluck('id')->all();
-        $binariesByCollection = Binary::query()
-            ->whereIn('collections_id', $collectionIds)
-            ->orderBy('name')
-            ->get(['id', 'collections_id', 'name', 'totalparts'])
-            ->groupBy('collections_id');
+        $collectionIds = $collections->pluck('id')->map(static fn (mixed $id): int => (int) $id)->all();
+        try {
+            $binariesByCollection = Binary::query()
+                ->whereIn('collections_id', $collectionIds)
+                ->orderBy('name')
+                ->get(['id', 'collections_id', 'name', 'totalparts'])
+                ->groupBy('collections_id');
 
-        $allBinaryIds = $binariesByCollection->flatten(1)->pluck('id')->all();
-        $partsByBinary = $allBinaryIds === []
-            ? collect()
-            : Part::query()
-                ->whereIn('binaries_id', $allBinaryIds)
-                // distinct() preserves the dedup the previous per-binary
-                // query had, in case two rows share (messageid, size,
-                // partnumber) for the same binary (defensive).
-                ->distinct()
-                ->orderBy('partnumber')
-                ->get(['binaries_id', 'messageid', 'size', 'partnumber'])
-                ->groupBy('binaries_id');
+            $allBinaryIds = $binariesByCollection->flatten(1)->pluck('id')->all();
+            $partsByBinary = $allBinaryIds === []
+                ? collect()
+                : Part::query()
+                    ->whereIn('binaries_id', $allBinaryIds)
+                    // distinct() preserves the dedup the previous per-binary
+                    // query had, in case two rows share (messageid, size,
+                    // partnumber) for the same binary (defensive).
+                    ->distinct()
+                    ->orderBy('partnumber')
+                    ->get(['binaries_id', 'messageid', 'size', 'partnumber'])
+                    ->groupBy('binaries_id');
+        } catch (Throwable $e) {
+            return NzbCreationResult::transient('Failed to load NZB binaries or parts: '.$e->getMessage(), $collectionIds);
+        }
 
         $XMLWriter = new \XMLWriter;
         $XMLWriter->openMemory();
         $XMLWriter->setIndent(true);
         $XMLWriter->setIndentString('  ');
 
-        $XMLWriter->startDocument('1.0', 'UTF-8');
-        $XMLWriter->startDtd(self::NZB_DTD_NAME, self::NZB_DTD_PUBLIC, self::NZB_DTD_EXTERNAL);
-        $XMLWriter->endDtd();
-        $XMLWriter->writeComment($this->nzbCommentString);
+        $path = null;
+        $tempPath = null;
+        $gz = null;
 
-        $XMLWriter->startElement('nzb');
-        $XMLWriter->writeAttribute('xmlns', self::NZB_XML_NS);
-        $XMLWriter->startElement('head');
-        $XMLWriter->startElement('meta');
-        $XMLWriter->writeAttribute('type', 'category');
-        $XMLWriter->text(! empty($release->category->parent) ? $release->category->parent->title.' >'.$release->category->title : 'Other > Misc');
-        $XMLWriter->endElement();
-        $XMLWriter->startElement('meta');
-        $XMLWriter->writeAttribute('type', 'name');
-        $XMLWriter->text($release->name);
-        $XMLWriter->endElement();
-        $XMLWriter->endElement(); // head
+        try {
+            $path = ($this->buildNzbPath($release->guid, $this->nzbSplitLevel, true).$release->guid.'.nzb.gz');
+            $tempPath = $this->temporaryNzbPath($path);
+            $gz = $this->openGzipFile($tempPath);
 
-        foreach ($collections as $collection) {
-            $binaries = $binariesByCollection->get($collection->id);
-            if ($binaries === null || $binaries->isEmpty()) {
-                return false;
+            if ($gz === false) {
+                return NzbCreationResult::transient("Failed to open temporary NZB file for writing: {$tempPath}", $collectionIds, $path);
             }
 
-            $poster = $collection->fromname;
+            $XMLWriter->startDocument('1.0', 'UTF-8');
+            $XMLWriter->startDtd(self::NZB_DTD_NAME, self::NZB_DTD_PUBLIC, self::NZB_DTD_EXTERNAL);
+            $XMLWriter->endDtd();
+            $XMLWriter->writeComment($this->nzbCommentString);
 
-            foreach ($binaries as $binary) {
-                $parts = $partsByBinary->get($binary->id);
-                if ($parts === null || $parts->isEmpty()) {
-                    return false;
+            $XMLWriter->startElement('nzb');
+            $XMLWriter->writeAttribute('xmlns', self::NZB_XML_NS);
+            $XMLWriter->startElement('head');
+            $XMLWriter->startElement('meta');
+            $XMLWriter->writeAttribute('type', 'category');
+            $XMLWriter->text(! empty($release->category->parent) ? $release->category->parent->title.' >'.$release->category->title : 'Other > Misc');
+            $XMLWriter->endElement();
+            $XMLWriter->startElement('meta');
+            $XMLWriter->writeAttribute('type', 'name');
+            $XMLWriter->text($release->name);
+            $XMLWriter->endElement();
+            $XMLWriter->endElement(); // head
+            if (! $this->flushXmlWriter($XMLWriter, $gz)) {
+                return NzbCreationResult::transient("Failed to write NZB header to temporary file: {$tempPath}", $collectionIds, $path);
+            }
+
+            foreach ($collections as $collection) {
+                $binaries = $binariesByCollection->get($collection->id);
+                if ($binaries === null || $binaries->isEmpty()) {
+                    return NzbCreationResult::deterministic("Collection {$collection->id} has no binaries.", $collectionIds, $path);
                 }
 
-                $subject = $this->buildBinarySubject($binary->name, $binary->totalparts);
-                $XMLWriter->startElement('file');
-                $XMLWriter->writeAttribute('poster', (string) $poster);
-                $XMLWriter->writeAttribute('date', (string) $collection->udate);
-                $XMLWriter->writeAttribute('subject', (string) $subject);
-                $XMLWriter->startElement('groups');
-                if (preg_match_all('#(\S+):\S+#', $collection->xref, $hits)) {
-                    $hits = array_values(array_unique($hits[1]));
-                    foreach ($hits as $group) {
+                $groups = $this->groupsFromXref((string) $collection->xref);
+                if ($groups === []) {
+                    return NzbCreationResult::deterministic("Collection {$collection->id} has no valid xref groups.", $collectionIds, $path);
+                }
+
+                $poster = $collection->fromname;
+
+                foreach ($binaries as $binary) {
+                    $parts = $partsByBinary->get($binary->id);
+                    if ($parts === null || $parts->isEmpty()) {
+                        return NzbCreationResult::deterministic("Binary {$binary->id} has no parts.", $collectionIds, $path);
+                    }
+
+                    $subject = $this->buildBinarySubject($binary->name, $binary->totalparts);
+                    $XMLWriter->startElement('file');
+                    $XMLWriter->writeAttribute('poster', (string) $poster);
+                    $XMLWriter->writeAttribute('date', (string) $collection->udate);
+                    $XMLWriter->writeAttribute('subject', (string) $subject);
+                    $XMLWriter->startElement('groups');
+                    foreach ($groups as $group) {
                         $XMLWriter->writeElement('group', $group);
                     }
-                } elseif (preg_match_all('#(\S+)#', $collection->xref, $hits)) {
-                    $hits = array_values(array_unique($hits[1]));
-                    foreach ($hits as $group) {
-                        $XMLWriter->writeElement('group', $group);
+                    $XMLWriter->endElement(); // groups
+                    $XMLWriter->startElement('segments');
+                    foreach ($parts as $part) {
+                        $messageId = $this->normalizeSegmentMessageId($part->messageid);
+                        if ($messageId === '') {
+                            return NzbCreationResult::deterministic("Part {$part->partnumber} for binary {$binary->id} has an empty message ID.", $collectionIds, $path);
+                        }
+
+                        $XMLWriter->startElement('segment');
+                        $XMLWriter->writeAttribute('bytes', (string) $part->size);
+                        $XMLWriter->writeAttribute('number', (string) $part->partnumber);
+                        $XMLWriter->text($messageId);
+                        $XMLWriter->endElement();
                     }
-                } else {
-                    return false;
+                    $XMLWriter->endElement(); // segments
+                    $XMLWriter->endElement(); // file
+
+                    if (! $this->flushXmlWriter($XMLWriter, $gz)) {
+                        return NzbCreationResult::transient("Failed to write NZB file entry to temporary file: {$tempPath}", $collectionIds, $path);
+                    }
                 }
-                $XMLWriter->endElement(); // groups
-                $XMLWriter->startElement('segments');
-                foreach ($parts as $part) {
-                    $messageId = $this->normalizeSegmentMessageId($part->messageid);
-                    $XMLWriter->startElement('segment');
-                    $XMLWriter->writeAttribute('bytes', (string) $part->size);
-                    $XMLWriter->writeAttribute('number', (string) $part->partnumber);
-                    $XMLWriter->text($messageId);
-                    $XMLWriter->endElement();
-                }
-                $XMLWriter->endElement(); // segments
-                $XMLWriter->endElement(); // file
+            }
+
+            $XMLWriter->writeComment($this->siteCommentString);
+            $XMLWriter->endElement(); // nzb
+            $XMLWriter->endDocument();
+            if (! $this->flushXmlWriter($XMLWriter, $gz)) {
+                return NzbCreationResult::transient("Failed to write NZB footer to temporary file: {$tempPath}", $collectionIds, $path);
+            }
+
+            $closed = gzclose($gz);
+            $gz = null;
+            if (! $closed) {
+                return NzbCreationResult::transient("Failed to close temporary NZB file: {$tempPath}", $collectionIds, $path);
+            }
+
+            if (! $this->moveTemporaryNzbIntoPlace($tempPath, $path)) {
+                return NzbCreationResult::transient("Failed to move temporary NZB into place: {$tempPath} -> {$path}", $collectionIds, $path);
+            }
+            $tempPath = null;
+
+            if (! File::isFile($path) || ! is_readable($path)) {
+                return NzbCreationResult::transient("Final NZB file is missing or unreadable: {$path}", $collectionIds, $path);
+            }
+
+            // Mark release as having NZB.
+            $release->update($this->successfulReleaseUpdateValues());
+        } catch (Throwable $e) {
+            return NzbCreationResult::transient('Failed to write NZB file: '.$e->getMessage(), $collectionIds, $path);
+        } finally {
+            unset($XMLWriter);
+            if (is_resource($gz)) {
+                gzclose($gz);
+            }
+            if ($tempPath !== null && File::isFile($tempPath)) {
+                File::delete($tempPath);
             }
         }
-        $XMLWriter->writeComment($this->siteCommentString);
-        $XMLWriter->endElement(); // nzb
-        $XMLWriter->endDocument();
-        $path = ($this->buildNzbPath($release->guid, $this->nzbSplitLevel, true).$release->guid.'.nzb.gz');
-        $fp = gzopen($path, 'wb7');
-        if (! $fp) {
-            return false;
-        }
-        gzwrite($fp, $XMLWriter->outputMemory());
-        gzclose($fp);
-        unset($XMLWriter);
-        if (! File::isFile($path)) {
-            echo "ERROR: $path does not exist.\n";
-
-            return false;
-        }
-        // Mark release as having NZB.
-        $release->update(['nzbstatus' => self::NZB_ADDED]);
 
         // Delete CBP (Collections, Binaries, Parts) for release that has its NZB created.
         // Use a transaction to ensure cascading deletes complete properly.
@@ -216,7 +268,7 @@ class NzbService
                 'NZB cleanup',
                 false
             );
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             // Log the error but don't fail the NZB creation since the file was written successfully
             Log::warning('Failed to delete collections for release '.$release->id.': '.$e->getMessage());
         }
@@ -224,7 +276,7 @@ class NzbService
         // Chmod to fix issues some users have with file permissions.
         chmod($path, 0777);
 
-        return true;
+        return NzbCreationResult::success($path, $collectionIds);
     }
 
     /**
@@ -338,6 +390,82 @@ class NzbService
         }
 
         return File::delete($nzbPath);
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function findStaleTemporaryNzbPaths(int $olderThanSeconds = 86400): array
+    {
+        $cutoff = time() - max(1, $olderThanSeconds);
+        $paths = [];
+
+        foreach (array_unique($this->siteNzbPaths) as $basePath) {
+            if (! File::isDirectory($basePath)) {
+                continue;
+            }
+
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($basePath, \FilesystemIterator::SKIP_DOTS),
+                \RecursiveIteratorIterator::LEAVES_ONLY
+            );
+
+            foreach ($iterator as $file) {
+                if (! $file->isFile() || $file->isLink()) {
+                    continue;
+                }
+
+                $path = $file->getPathname();
+                if (! $this->isTemporaryNzbPath($path)) {
+                    continue;
+                }
+
+                try {
+                    if ($file->getMTime() <= $cutoff) {
+                        $paths[] = $path;
+                    }
+                } catch (Throwable $e) {
+                    Log::channel('nzb_creation')->warning('Failed to inspect temporary NZB file', [
+                        'path' => $path,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+        }
+
+        sort($paths);
+
+        return $paths;
+    }
+
+    public function cleanupStaleTemporaryNzbs(int $olderThanSeconds = 86400): int
+    {
+        $deleted = 0;
+
+        foreach ($this->findStaleTemporaryNzbPaths($olderThanSeconds) as $path) {
+            if (! File::isFile($path)) {
+                continue;
+            }
+
+            try {
+                if (File::delete($path)) {
+                    $deleted++;
+
+                    continue;
+                }
+
+                Log::channel('nzb_creation')->warning('Failed to delete stale temporary NZB file', [
+                    'path' => $path,
+                ]);
+            } catch (Throwable $e) {
+                Log::channel('nzb_creation')->warning('Failed to delete stale temporary NZB file', [
+                    'path' => $path,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return $deleted;
     }
 
     /**
@@ -455,5 +583,80 @@ class NzbService
         }
 
         return trim($messageId);
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function groupsFromXref(string $xref): array
+    {
+        if (preg_match_all('#(\S+):\S+#', $xref, $hits)) {
+            return array_values(array_unique($hits[1]));
+        }
+
+        if (preg_match_all('#(\S+)#', $xref, $hits)) {
+            return array_values(array_unique($hits[1]));
+        }
+
+        return [];
+    }
+
+    private function temporaryNzbPath(string $path): string
+    {
+        return $path.'.tmp.'.getmypid().'.'.bin2hex(random_bytes(6));
+    }
+
+    private function isTemporaryNzbPath(string $path): bool
+    {
+        return preg_match('/\.nzb\.gz\.tmp\.\d+\.[0-9a-f]{12}$/', basename($path)) === 1;
+    }
+
+    /**
+     * @return resource|false
+     */
+    protected function openGzipFile(string $path): mixed
+    {
+        return gzopen($path, 'wb7');
+    }
+
+    /**
+     * @param  resource  $gz
+     *
+     * @phpstan-impure
+     */
+    private function flushXmlWriter(\XMLWriter $XMLWriter, mixed $gz): bool
+    {
+        $buffer = $XMLWriter->outputMemory(true);
+        if ($buffer === '') {
+            return true;
+        }
+
+        $written = gzwrite($gz, $buffer);
+
+        return $written !== false && $written === \strlen($buffer);
+    }
+
+    protected function moveTemporaryNzbIntoPlace(string $temporaryPath, string $finalPath): bool
+    {
+        return rename($temporaryPath, $finalPath);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function successfulReleaseUpdateValues(): array
+    {
+        $values = ['nzbstatus' => self::NZB_ADDED];
+
+        if (NzbCreationCandidateQuery::supportsClaims()) {
+            $values += [
+                NzbCreationCandidateQuery::ATTEMPTS_COLUMN => 0,
+                NzbCreationCandidateQuery::LAST_ERROR_COLUMN => null,
+                NzbCreationCandidateQuery::CLAIMED_AT_COLUMN => null,
+                NzbCreationCandidateQuery::CLAIM_TOKEN_COLUMN => null,
+            ];
+        }
+
+        return $values;
     }
 }

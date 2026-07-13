@@ -98,42 +98,57 @@ class Invitation extends Model // @phpstan-ignore missingType.iterableValue
 
     /**
      * Scope to get only active invitations
+     *
+     * @param  Builder<Invitation>  $query
+     * @return Builder<Invitation>
      */
-    public function scopeActive(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeActive(Builder $query): Builder
     {
         return $query->where('is_active', true);
     }
 
     /**
      * Scope to get valid (active and not expired) invitations
+     *
+     * @param  Builder<Invitation>  $query
+     * @return Builder<Invitation>
      */
-    public function scopeValid(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeValid(Builder $query): Builder
     {
-        return $query->active() // @phpstan-ignore method.notFound
+        return $query->active()
             ->where('expires_at', '>', now())
             ->whereNull('used_at');
     }
 
     /**
      * Scope to get expired invitations
+     *
+     * @param  Builder<Invitation>  $query
+     * @return Builder<Invitation>
      */
-    public function scopeExpired(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeExpired(Builder $query): Builder
     {
         return $query->where('expires_at', '<=', now());
     }
 
     /**
      * Scope to get unused invitations
+     *
+     * @param  Builder<Invitation>  $query
+     * @return Builder<Invitation>
      */
-    public function scopeUnused(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeUnused(Builder $query): Builder
     {
         return $query->whereNull('used_at');
     }
 
     /**
      * Scope to get used invitations
+     *
+     * @param  Builder<Invitation>  $query
+     * @return Builder<Invitation>
      */
-    public function scopeUsed(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeUsed(Builder $query): Builder
     {
         return $query->whereNotNull('used_at');
     }

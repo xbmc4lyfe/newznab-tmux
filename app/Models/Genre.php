@@ -73,24 +73,33 @@ class Genre extends Model
 
     /**
      * Scope to filter disabled genres.
+     *
+     * @param  Builder<Genre>  $query
+     * @return Builder<Genre>
      */
-    public function scopeDisabled(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeDisabled(Builder $query): Builder
     {
         return $query->where('disabled', '=', 1);
     }
 
     /**
      * Scope to filter enabled genres.
+     *
+     * @param  Builder<Genre>  $query
+     * @return Builder<Genre>
      */
-    public function scopeEnabled(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeEnabled(Builder $query): Builder
     {
         return $query->where('disabled', '=', 0);
     }
 
     /**
      * Scope to filter by type.
+     *
+     * @param  Builder<Genre>  $query
+     * @return Builder<Genre>
      */
-    public function scopeOfType(Builder $query, string $type): Builder // @phpstan-ignore missingType.generics
+    public function scopeOfType(Builder $query, string $type): Builder
     {
         if (! empty($type)) {
             return $query->where('type', '=', $type);

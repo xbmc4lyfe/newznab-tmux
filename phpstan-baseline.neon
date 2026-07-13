@@ -259,12 +259,6 @@ parameters:
 			path: app/Http/Controllers/Admin/AdminPageController.php
 
 		-
-			message: '#^Using nullsafe method call on non\-nullable type Carbon\\Carbon\. Use \-\> instead\.$#'
-			identifier: nullsafe.neverNull
-			count: 2
-			path: app/Http/Controllers/Admin/AdminRegistrationController.php
-
-		-
 			message: '#^Access to an undefined property Illuminate\\Database\\Eloquent\\Model\:\:\$id\.$#'
 			identifier: property.notFound
 			count: 1
@@ -367,12 +361,6 @@ parameters:
 			path: app/Http/Controllers/Auth/PasskeyManagementController.php
 
 		-
-			message: '#^Using nullsafe property access on non\-nullable type Spatie\\LaravelPasskeys\\Models\\Passkey\. Use \-\> instead\.$#'
-			identifier: nullsafe.neverNull
-			count: 4
-			path: app/Http/Controllers/Auth/PasskeyManagementController.php
-
-		-
 			message: '#^Method App\\Http\\Controllers\\Auth\\RegisterController\:\:rejectUnavailableRegistration\(\) has parameter \$status with no value type specified in iterable type array\.$#'
 			identifier: missingType.iterableValue
 			count: 1
@@ -451,84 +439,6 @@ parameters:
 			path: app/Models/Category.php
 
 		-
-			message: '#^Method App\\Models\\Content\:\:scopeActive\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Content.php
-
-		-
-			message: '#^Method App\\Models\\Content\:\:scopeForRole\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Content.php
-
-		-
-			message: '#^Method App\\Models\\Content\:\:scopeFrontPage\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Content.php
-
-		-
-			message: '#^Method App\\Models\\Content\:\:scopeOfType\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Content.php
-
-		-
-			message: '#^Method App\\Models\\Content\:\:scopeOrdered\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Content.php
-
-		-
-			message: '#^Method App\\Models\\Genre\:\:scopeDisabled\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Genre.php
-
-		-
-			message: '#^Method App\\Models\\Genre\:\:scopeEnabled\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Genre.php
-
-		-
-			message: '#^Method App\\Models\\Genre\:\:scopeOfType\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Genre.php
-
-		-
-			message: '#^Method App\\Models\\Invitation\:\:scopeActive\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Invitation.php
-
-		-
-			message: '#^Method App\\Models\\Invitation\:\:scopeExpired\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Invitation.php
-
-		-
-			message: '#^Method App\\Models\\Invitation\:\:scopeUnused\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Invitation.php
-
-		-
-			message: '#^Method App\\Models\\Invitation\:\:scopeUsed\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Invitation.php
-
-		-
-			message: '#^Method App\\Models\\Invitation\:\:scopeValid\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/Invitation.php
-
-		-
 			message: '#^Call to an undefined method Illuminate\\Database\\Eloquent\\Builder\:\:enabled\(\)\.$#'
 			identifier: method.notFound
 			count: 1
@@ -573,42 +483,6 @@ parameters:
 		-
 			message: '#^Method App\\Models\\User\:\:findVerifiedByApiToken\(\) should return App\\Models\\User\|null but returns Illuminate\\Database\\Eloquent\\Model\|null\.$#'
 			identifier: return.type
-			count: 1
-			path: app/Models/User.php
-
-		-
-			message: '#^Method App\\Models\\User\:\:scopeActive\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/User.php
-
-		-
-			message: '#^Method App\\Models\\User\:\:scopeExcludeSharing\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/User.php
-
-		-
-			message: '#^Method App\\Models\\User\:\:scopeExpired\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/User.php
-
-		-
-			message: '#^Method App\\Models\\User\:\:scopeExpiringSoon\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/User.php
-
-		-
-			message: '#^Method App\\Models\\User\:\:scopeVerified\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
-			count: 1
-			path: app/Models/User.php
-
-		-
-			message: '#^Method App\\Models\\User\:\:scopeWithRole\(\) return type with generic class Illuminate\\Database\\Eloquent\\Builder does not specify its types\: TModel$#'
-			identifier: missingType.generics
 			count: 1
 			path: app/Models/User.php
 
@@ -1020,13 +894,6 @@ parameters:
 			identifier: argument.templateType
 			count: 1
 			path: app/Services/NfoService.php
-
-		-
-			message: '#^Using nullsafe method call on non\-nullable type Carbon\\Carbon\. Use \-\> instead\.$#'
-			identifier: nullsafe.neverNull
-			count: 2
-			path: app/Services/RegistrationStatusService.php
-
 
 		-
 			message: '#^Call to function is_int\(\) with string\|null will always evaluate to false\.$#'

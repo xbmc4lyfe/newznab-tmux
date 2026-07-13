@@ -95,24 +95,33 @@ class Content extends Model
 
     /**
      * Scope: Get only active content.
+     *
+     * @param  Builder<Content>  $query
+     * @return Builder<Content>
      */
-    public function scopeActive(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeActive(Builder $query): Builder
     {
         return $query->where('status', self::STATUS_ENABLED);
     }
 
     /**
      * Scope: Get content of a specific type.
+     *
+     * @param  Builder<Content>  $query
+     * @return Builder<Content>
      */
-    public function scopeOfType(Builder $query, int $type): Builder // @phpstan-ignore missingType.generics
+    public function scopeOfType(Builder $query, int $type): Builder
     {
         return $query->where('contenttype', $type);
     }
 
     /**
      * Scope: Get content accessible by a specific role.
+     *
+     * @param  Builder<Content>  $query
+     * @return Builder<Content>
      */
-    public function scopeForRole(Builder $query, int $role): Builder // @phpstan-ignore missingType.generics
+    public function scopeForRole(Builder $query, int $role): Builder
     {
         // Admins and moderators can see everything
         if (\in_array($role, [UserRole::ADMIN->value, UserRole::MODERATOR->value], true)) {
@@ -128,8 +137,11 @@ class Content extends Model
 
     /**
      * Scope: Order content by type and ordinal within each type.
+     *
+     * @param  Builder<Content>  $query
+     * @return Builder<Content>
      */
-    public function scopeOrdered(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeOrdered(Builder $query): Builder
     {
         return $query
             ->orderBy('contenttype')
@@ -138,10 +150,13 @@ class Content extends Model
 
     /**
      * Scope: Get front page content.
+     *
+     * @param  Builder<Content>  $query
+     * @return Builder<Content>
      */
-    public function scopeFrontPage(Builder $query): Builder // @phpstan-ignore missingType.generics
+    public function scopeFrontPage(Builder $query): Builder
     {
-        return $query->active() // @phpstan-ignore method.notFound
+        return $query->active()
             ->ofType(self::TYPE_INDEX)
             ->ordered();
     }

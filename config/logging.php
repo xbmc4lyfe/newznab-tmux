@@ -144,6 +144,15 @@ return [
             'permission' => 0775,
             'locking' => false,
         ],
+        'nzb_creation' => [
+            'driver' => 'daily',
+            'path' => storage_path('logs/nzb_creation.log'),
+            'level' => 'debug',
+            'days' => 7,
+            'bubble' => true,
+            'permission' => 0775,
+            'locking' => false,
+        ],
 
         'user_login' => [
             'driver' => 'daily',
