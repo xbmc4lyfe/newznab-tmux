@@ -18,6 +18,16 @@ class PasswordSecurity extends Model
     protected $guarded = [];
 
     /**
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'google2fa_enable' => 'boolean',
+        ];
+    }
+
+    /**
      * @return BelongsTo<User, $this>
      */
     public function user(): BelongsTo

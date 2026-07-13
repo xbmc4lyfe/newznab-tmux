@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Support;
 
+use App\Models\TrustedDevice;
 use PragmaRX\Google2FALaravel\Exceptions\InvalidSecretKey;
 use PragmaRX\Google2FALaravel\Support\Authenticator;
 
@@ -32,32 +33,10 @@ class Google2FAAuthenticator extends Authenticator
     /**
      * Directly validate the cookie without any output or logging
      */
-    private function checkCookieValidity(mixed $cookie): mixed
+    private function checkCookieValidity(mixed $cookie): bool
     {
         try {
-            $data = @json_decode($cookie, true);
-
-            if (! is_array($data)) {
-                return false;
-            }
-
-            // Validate all required fields
-            if (! isset($data['user_id'], $data['token'], $data['expires_at'])) {
-                return false;
-            }
-
-            // Ensure the user ID matches
-            if ((int) $data['user_id'] !== (int) $this->getUser()->id) {
-                return false;
-            }
-
-            // Ensure the token is not expired
-            if (time() > $data['expires_at']) {
-                return false;
-            }
-
-            // All checks passed - this is a valid cookie
-            return true;
+            return $this->trustedDeviceCookieIsValid($cookie);
         } catch (\Exception $e) {
             return false;
         }
@@ -83,37 +62,7 @@ class Google2FAAuthenticator extends Authenticator
     protected function isDeviceTrusted(): bool
     {
         try {
-            $cookie = request()->cookie('2fa_trusted_device');
-            $user = $this->getUser();
-
-            if (! $cookie) {
-                return false;
-            }
-
-            $data = @json_decode($cookie, true);
-
-            // Check for JSON decode errors silently
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                return false;
-            }
-
-            // Validate the required fields silently
-            if (! isset($data['user_id'], $data['token'], $data['expires_at'])) {
-                return false;
-            }
-
-            // Check if the token belongs to the current user
-            if ((int) $data['user_id'] !== (int) $user->id) {
-                return false;
-            }
-
-            // Check if the token is expired
-            if (time() > $data['expires_at']) {
-                return false;
-            }
-
-            // Device is trusted and token is valid
-            return true;
+            return $this->trustedDeviceCookieIsValid(request()->cookie('2fa_trusted_device'));
         } catch (\Exception $e) {
             // Silently handle any exceptions
             return false;
@@ -146,18 +95,10 @@ class Google2FAAuthenticator extends Authenticator
 
         if ($trustedCookie && auth()->check()) {
             try {
-                $cookieData = json_decode($trustedCookie, true);
-
-                if (json_last_error() === JSON_ERROR_NONE &&
-                    isset($cookieData['user_id'], $cookieData['token'], $cookieData['expires_at']) &&
-                    (int) $cookieData['user_id'] === (int) auth()->id() &&
-                    time() <= $cookieData['expires_at']) {
-
-                    // If we have a valid cookie, force-disable 2FA
+                if ($this->trustedDeviceCookieIsValid($trustedCookie)) {
                     session([config('google2fa.session_var') => true]);
                     session([config('google2fa.session_var').'.auth.passed_at' => time()]);
 
-                    // Completely disable 2FA for this request
                     return false;
                 }
             } catch (\Exception $e) {
@@ -167,5 +108,33 @@ class Google2FAAuthenticator extends Authenticator
 
         // Otherwise, use the parent implementation
         return parent::isEnabled();
+    }
+
+    private function trustedDeviceCookieIsValid(mixed $cookie): bool
+    {
+        if (! is_string($cookie) || $cookie === '') {
+            return false;
+        }
+
+        $data = json_decode($cookie, true);
+
+        if (json_last_error() !== JSON_ERROR_NONE || ! is_array($data)) {
+            return false;
+        }
+
+        if (! isset($data['user_id'], $data['token'], $data['expires_at'])) {
+            return false;
+        }
+
+        $user = $this->getUser();
+        if ((int) $data['user_id'] !== (int) $user->id) {
+            return false;
+        }
+
+        if (time() > (int) $data['expires_at']) {
+            return false;
+        }
+
+        return TrustedDevice::findValidForUser((int) $user->id, (string) $data['token']) !== null;
     }
 }

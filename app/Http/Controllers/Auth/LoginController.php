@@ -120,7 +120,7 @@ class LoginController extends Controller
 
             $passwordBreached = $this->isPasswordBreached((string) $request->input('password'));
 
-            if ($user->passwordSecurity && $user->passwordSecurity->google2fa_enable) {
+            if ($this->userRequiresTwoFactor($user)) {
                 if ($this->trustedDeviceCookieIsValid($request, $user)) {
                     session([config('google2fa.session_var') => true]);
                     session([config('google2fa.session_var').'.auth.passed_at' => time()]);
@@ -135,13 +135,7 @@ class LoginController extends Controller
                     );
                 }
 
-                Auth::logoutOtherDevices((string) $request->input('password'));
-                $request->session()->put('url.intended', $this->redirectPath());
-                $request->session()->put('2fa:remember', $rememberMe);
-                $request->session()->put('2fa:password_breached', $passwordBreached);
-
-                Auth::logout();
-                $request->session()->put('2fa:user:id', $user->id);
+                $this->prepareTwoFactorChallenge($request, $user, $rememberMe, $passwordBreached);
 
                 return redirect()->route('2fa.verify');
             }
@@ -260,6 +254,32 @@ class LoginController extends Controller
         }
 
         return $redirect;
+    }
+
+    private function userRequiresTwoFactor(User $user): bool
+    {
+        $user->unsetRelation('passwordSecurity');
+        $passwordSecurity = $user->passwordSecurity()->first();
+
+        return $passwordSecurity !== null
+            && $passwordSecurity->google2fa_enable === true
+            && is_string($passwordSecurity->google2fa_secret)
+            && $passwordSecurity->google2fa_secret !== '';
+    }
+
+    private function prepareTwoFactorChallenge(Request $request, User $user, bool $rememberMe, bool $passwordBreached): void
+    {
+        $sessionVar = config('google2fa.session_var');
+        if (is_string($sessionVar) && $sessionVar !== '') {
+            $request->session()->forget($sessionVar);
+        }
+
+        $request->session()->put('url.intended', $this->redirectPath());
+        $request->session()->put('2fa:remember', $rememberMe);
+        $request->session()->put('2fa:password_breached', $passwordBreached);
+
+        Auth::logout();
+        $request->session()->put('2fa:user:id', $user->id);
     }
 
     private function trustedDeviceCookieIsValid(Request $request, User $user): bool

@@ -6,14 +6,17 @@ namespace Tests\Feature\Auth;
 
 use App\Events\UserLoggedIn;
 use App\Models\PasswordSecurity;
+use App\Models\TrustedDevice;
 use App\Models\User;
 use App\Services\PasswordBreachService;
+use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Schema;
+use PDO;
 use PragmaRX\Google2FALaravel\Facade as Google2FA;
 use Spatie\Permission\Models\Role;
 use Spatie\Permission\PermissionRegistrar;
@@ -21,13 +24,54 @@ use Tests\TestCase;
 
 class RememberMeAuthenticationTest extends TestCase
 {
+    private string $databasePath;
+
+    /**
+     * @var array<string, string|false>
+     */
+    private array $originalEnvironment = [];
+
+    public function createApplication()
+    {
+        $this->databasePath = sys_get_temp_dir().'/nntmux-remember-me-auth-test.sqlite';
+
+        $this->originalEnvironment = [
+            'APP_ENV' => getenv('APP_ENV'),
+            'DB_CONNECTION' => getenv('DB_CONNECTION'),
+            'DB_DATABASE' => getenv('DB_DATABASE'),
+        ];
+
+        if (file_exists($this->databasePath)) {
+            unlink($this->databasePath);
+        }
+
+        $pdo = new PDO('sqlite:'.$this->databasePath);
+        $pdo->exec('CREATE TABLE settings (name VARCHAR PRIMARY KEY, value TEXT NULL)');
+        $pdo->exec("INSERT INTO settings (name, value) VALUES
+            ('categorizeforeign', '0'),
+            ('catwebdl', '0'),
+            ('innerfileblacklist', ''),
+            ('title', 'NNTmux Test'),
+            ('home_link', '/')");
+
+        $this->setEnvironmentValue('APP_ENV', 'testing');
+        $this->setEnvironmentValue('DB_CONNECTION', 'sqlite');
+        $this->setEnvironmentValue('DB_DATABASE', $this->databasePath);
+
+        $app = require __DIR__.'/../../../bootstrap/app.php';
+
+        $app->make(Kernel::class)->bootstrap();
+
+        return $app;
+    }
+
     protected function setUp(): void
     {
         parent::setUp();
 
         config([
             'database.default' => 'sqlite',
-            'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.database' => $this->databasePath,
             'app.key' => 'base64:'.base64_encode(random_bytes(32)),
             'session.driver' => 'array',
             'google2fa.session_var' => 'google2fa',
@@ -48,6 +92,19 @@ class RememberMeAuthenticationTest extends TestCase
         });
 
         Route::middleware(['web', 'auth'])->get('__remember_me_probe', fn () => response('ok', 200));
+    }
+
+    protected function tearDown(): void
+    {
+        if ($this->databasePath !== '' && file_exists($this->databasePath)) {
+            unlink($this->databasePath);
+        }
+
+        parent::tearDown();
+
+        foreach ($this->originalEnvironment as $key => $value) {
+            $this->setEnvironmentValue($key, $value === false ? null : $value);
+        }
     }
 
     public function test_password_login_with_remember_me_queues_recaller_cookie(): void
@@ -149,6 +206,7 @@ class RememberMeAuthenticationTest extends TestCase
         $this->assertGuest();
         $this->assertTrue((bool) session('2fa:remember'));
         $this->assertSame($user->id, session('2fa:user:id'));
+        $this->assertFalse((bool) session(config('google2fa.session_var')));
 
         $verifyResponse = $this->post(route('2fa.post'), [
             'one_time_password' => Google2FA::getCurrentOtp($secret),
@@ -159,6 +217,8 @@ class RememberMeAuthenticationTest extends TestCase
         $this->assertAuthenticatedAs($user);
         $this->assertTrue((bool) session(config('google2fa.session_var')));
         $this->assertNull(session('2fa:remember'));
+        $this->assertNull(session('2fa:user:id'));
+        $this->assertNull(session('2fa:password_breached'));
     }
 
     public function test_two_factor_login_without_remember_me_does_not_queue_recaller_cookie_after_otp_success(): void
@@ -186,6 +246,63 @@ class RememberMeAuthenticationTest extends TestCase
         $this->assertAuthenticatedAs($user);
     }
 
+    public function test_two_factor_login_with_valid_trusted_device_logs_in_without_otp(): void
+    {
+        Event::fake([UserLoggedIn::class]);
+        $user = $this->createUser('trusted-2fa@example.test');
+        PasswordSecurity::query()->create([
+            'user_id' => $user->id,
+            'google2fa_enable' => 1,
+            'google2fa_secret' => Google2FA::generateSecretKey(),
+        ]);
+        $trustedDevice = TrustedDevice::issueForUser($user, '127.0.0.1', 'Feature Test');
+        $cookieValue = json_encode([
+            'user_id' => $user->id,
+            'token' => $trustedDevice['plain'],
+            'expires_at' => $trustedDevice['device']->expires_at->getTimestamp(),
+        ], JSON_THROW_ON_ERROR);
+
+        $response = $this
+            ->withCookie('2fa_trusted_device', $cookieValue)
+            ->post(route('login'), [
+                'username' => $user->email,
+                'password' => 'password',
+            ]);
+
+        $response->assertRedirect('/');
+        $this->assertAuthenticatedAs($user);
+        $this->assertTrue((bool) session(config('google2fa.session_var')));
+        $this->assertNull(session('2fa:user:id'));
+    }
+
+    public function test_two_factor_login_with_forged_trusted_device_cookie_still_requires_otp(): void
+    {
+        Event::fake([UserLoggedIn::class]);
+        $user = $this->createUser('forged-2fa@example.test');
+        PasswordSecurity::query()->create([
+            'user_id' => $user->id,
+            'google2fa_enable' => 1,
+            'google2fa_secret' => Google2FA::generateSecretKey(),
+        ]);
+        $cookieValue = json_encode([
+            'user_id' => $user->id,
+            'token' => 'forged-client-token',
+            'expires_at' => time() + 3600,
+        ], JSON_THROW_ON_ERROR);
+
+        $response = $this
+            ->withCookie('2fa_trusted_device', $cookieValue)
+            ->post(route('login'), [
+                'username' => $user->email,
+                'password' => 'password',
+            ]);
+
+        $response->assertRedirect(route('2fa.verify'));
+        $this->assertGuest();
+        $this->assertSame($user->id, session('2fa:user:id'));
+        $this->assertFalse((bool) session(config('google2fa.session_var')));
+    }
+
     private function recallerCookieName(): string
     {
         return Auth::guard()->getRecallerName();
@@ -193,6 +310,21 @@ class RememberMeAuthenticationTest extends TestCase
 
     protected function createSchema(): void
     {
+        foreach ([
+            'user_activities',
+            'trusted_devices',
+            'role_has_permissions',
+            'model_has_permissions',
+            'model_has_roles',
+            'password_securities',
+            'users',
+            'permissions',
+            'roles',
+            'settings',
+        ] as $table) {
+            Schema::dropIfExists($table);
+        }
+
         Schema::create('settings', function (Blueprint $table): void {
             $table->string('name')->primary();
             $table->text('value')->nullable();
@@ -242,6 +374,19 @@ class RememberMeAuthenticationTest extends TestCase
             $table->timestamps();
         });
 
+        Schema::create('trusted_devices', function (Blueprint $table): void {
+            $table->id();
+            $table->unsignedInteger('user_id');
+            $table->string('token_hash', 64)->unique();
+            $table->timestamp('expires_at')->index();
+            $table->timestamp('last_used_at')->nullable();
+            $table->string('ip_address', 45)->nullable();
+            $table->string('user_agent', 500)->nullable();
+            $table->timestamps();
+
+            $table->index(['user_id', 'expires_at']);
+        });
+
         Schema::create('model_has_roles', function (Blueprint $table): void {
             $table->unsignedInteger('role_id');
             $table->string('model_type');
@@ -280,6 +425,7 @@ class RememberMeAuthenticationTest extends TestCase
             ['name' => 'home_link', 'value' => '/'],
             ['name' => 'categorizeforeign', 'value' => '0'],
             ['name' => 'catwebdl', 'value' => '0'],
+            ['name' => 'innerfileblacklist', 'value' => ''],
         ]);
     }
 
@@ -305,5 +451,19 @@ class RememberMeAuthenticationTest extends TestCase
         $user->assignRole($role);
 
         return $user->fresh();
+    }
+
+    private function setEnvironmentValue(string $key, ?string $value): void
+    {
+        if ($value === null) {
+            putenv($key);
+            unset($_ENV[$key], $_SERVER[$key]);
+
+            return;
+        }
+
+        putenv($key.'='.$value);
+        $_ENV[$key] = $value;
+        $_SERVER[$key] = $value;
     }
 }
