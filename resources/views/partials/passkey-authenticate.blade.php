@@ -10,7 +10,7 @@
     class="mt-6"
 >
     <p class="mt-3 text-xs text-gray-500 dark:text-gray-400">
-        On managed/company devices, platform passkeys may be unavailable due to policy. Use a FIDO2 security key if prompted.
+        Saved browser and password-manager passkeys can appear from the username field. Security keys are still supported.
     </p>
 
     @if($message = session('authenticatePasskey::message'))
@@ -26,6 +26,21 @@
         <input type="hidden" name="cf-turnstile-response" x-ref="turnstileResponse" value="">
         <input type="hidden" name="g-recaptcha-response" x-ref="recaptchaResponse" value="">
     </form>
+
+    <div x-show="supportsAutofill" x-cloak class="mt-4">
+        <label for="passkey-autofill" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+            Username or email
+        </label>
+        <input
+            id="passkey-autofill"
+            x-ref="browserPasskeyInput"
+            type="text"
+            autocomplete="username webauthn"
+            inputmode="email"
+            class="mt-2 block w-full rounded-lg border border-gray-300 px-3 py-3 text-sm text-gray-900 shadow-sm transition focus:border-blue-500 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white"
+            placeholder="Choose a saved passkey"
+        >
+    </div>
 
     <div class="mt-4 flex items-center">
         <input

@@ -60,7 +60,7 @@ Alpine.data('passkeyManage', () => ({
             });
             const options = optionsResponse.data?.options;
 
-            const registration = await window.startRegistration({ optionsJSON: options });
+            const registration = await this.startRegistrationWithFallback(options);
 
             const storeResponse = await window.axios.post(storeUrl, {
                 name: this.name,
@@ -116,6 +116,26 @@ Alpine.data('passkeyManage', () => ({
         } catch (error) {
             this.error = this.extractErrorMessage(error);
         }
+    },
+
+    async startRegistrationWithFallback(options) {
+        try {
+            return await window.startRegistration({ optionsJSON: options });
+        } catch (error) {
+            if (!this.shouldTryBrowserPasskeyRegistration(error)) {
+                throw error;
+            }
+
+            return window.startRegistration({
+                optionsJSON: options,
+                useAutoRegister: true,
+            });
+        }
+    },
+
+    shouldTryBrowserPasskeyRegistration(error) {
+        return error instanceof Error
+            && ['NotAllowedError', 'ConstraintError', 'UnknownError'].includes(error.name);
     },
 
     formatDate(value) {
