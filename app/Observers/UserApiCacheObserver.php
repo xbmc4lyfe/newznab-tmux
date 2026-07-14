@@ -43,7 +43,6 @@ class UserApiCacheObserver
         $tokenHash = md5($apiToken);
 
         Cache::forget('api_user:'.$tokenHash);
-        Cache::forget('api_rate_limit_user:'.$tokenHash);
         Cache::forget('api_user_stats:'.$user->id);
         Cache::forget(User::categoryExclusionCacheKey($user->id));
     }

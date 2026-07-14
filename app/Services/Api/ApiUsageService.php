@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace App\Services\Api;
 
-use App\Events\UserAccessedApi;
+use App\Jobs\RecordApiUsage;
 use App\Models\User;
-use App\Models\UserRequest;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 final class ApiUsageService
 {
@@ -30,7 +30,24 @@ final class ApiUsageService
 
     public function record(User $user, Request $request): void
     {
-        UserRequest::addApiRequest($user->id, $request->getRequestUri());
-        event(new UserAccessedApi($user, $request->ip()));
+        $job = new RecordApiUsage(
+            $user->id,
+            $request->getRequestUri(),
+            $request->ip(),
+            now()->toDateTimeString(),
+        );
+
+        if ((bool) config('nntmux.api.async_audit', true)) {
+            try {
+                dispatch($job);
+            } catch (Throwable) {
+                // Preserve audit and quota correctness when the queue backend is unavailable.
+                $job->handle();
+            }
+
+            return;
+        }
+
+        $job->handle();
     }
 }

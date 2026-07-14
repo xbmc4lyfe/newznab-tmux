@@ -348,5 +348,6 @@ class RegistrationStatusService
     private function forgetDashboardSnapshot(): void
     {
         Cache::forget(AdminDashboardSnapshotService::CACHE_KEY);
+        Cache::forget('api_registration_status');
     }
 }

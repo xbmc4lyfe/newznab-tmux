@@ -8,6 +8,7 @@ use App\Http\Middleware\EnforceSessionToken;
 use App\Http\Middleware\EnsureAuthenticatedUsersAreVerified;
 use App\Http\Middleware\ForceJsonOnAPI;
 use App\Http\Middleware\Google2FAMiddleware;
+use App\Http\Middleware\MeasureApiPerformance;
 use App\Http\Middleware\NoCacheForAuthenticatedUsers;
 use App\Http\Middleware\SetUserTimezone;
 use App\Http\Middleware\ThrottleApiRequestsByToken;
@@ -60,6 +61,7 @@ return Application::configure(basePath: dirname(__DIR__))
             PreventRequestsDuringMaintenance::class,
             ForceJsonOnAPI::class,
             BlockAbusiveServices::class, // Block AIOStreams, Oracle Cloud, UsenetStreamer, Cloudflare WARP
+            MeasureApiPerformance::class,
         ]);
 
         $middleware->replace(

@@ -552,26 +552,43 @@ class Release extends Model
      * Lighter version of getByGuid() optimized for API details responses.
      * Skips video.tvInfo, releaseGroup, and fields not used by DetailsTransformer/XML_Response.
      */
-    public static function getByGuidForApi(mixed $guid): mixed
+    public static function getByGuidForApi(mixed $guid, bool $includeV1CompatibilityFields = true): mixed
     {
         $categoryNameExpression = DB::connection()->getDriverName() === 'sqlite'
             ? "cp.title || ' > ' || c.title AS category_name"
             : "CONCAT(cp.title, ' > ', c.title) AS category_name";
 
-        $query = DB::table('releases')
-            ->select([
-                'releases.id',
-                'releases.searchname',
-                'releases.guid',
-                'releases.postdate',
-                'releases.categories_id',
-                'releases.size',
-                'releases.totalpart',
-                'releases.fromname',
-                'releases.passwordstatus',
-                'releases.grabs',
-                'releases.comments',
-                'releases.adddate',
+        $columns = [
+            'releases.id',
+            'releases.searchname',
+            'releases.guid',
+            'releases.postdate',
+            'releases.categories_id',
+            'releases.size',
+            'releases.totalpart',
+            'releases.fromname',
+            'releases.passwordstatus',
+            'releases.grabs',
+            'releases.comments',
+            'releases.adddate',
+            DB::raw($categoryNameExpression),
+            'v.tvdb',
+            'v.trakt',
+            'v.tvrage',
+            'v.tvmaze',
+            'v.imdb',
+            'v.tmdb',
+            'm.imdbid',
+            'm.tmdbid',
+            'm.traktid',
+            'tve.title',
+            'tve.series',
+            'tve.episode',
+            'tve.firstaired',
+        ];
+
+        if ($includeV1CompatibilityFields) {
+            array_push($columns,
                 'releases.videos_id',
                 'releases.tv_episodes_id',
                 'releases.haspreview',
@@ -582,25 +599,14 @@ class Release extends Model
                 'c.root_categories_id as parentid',
                 'cp.title as parent_category',
                 'c.title as sub_category',
-                DB::raw($categoryNameExpression),
                 'g.name as group_name',
-                'v.tvdb',
-                'v.trakt',
-                'v.tvrage',
-                'v.tvmaze',
-                'v.imdb',
-                'v.tmdb',
-                'm.imdbid',
-                'm.tmdbid',
-                'm.traktid',
-                'tve.title',
-                'tve.series',
-                'tve.episode',
-                'tve.firstaired',
-            ])
+            );
+        }
+
+        $query = DB::table('releases')
+            ->select($columns)
             ->leftJoin('categories as c', 'c.id', '=', 'releases.categories_id')
             ->leftJoin('root_categories as cp', 'cp.id', '=', 'c.root_categories_id')
-            ->leftJoin('usenet_groups as g', 'g.id', '=', 'releases.groups_id')
             ->leftJoin('videos as v', function ($join): void {
                 $join->on('releases.videos_id', '=', 'v.id')
                     ->where('releases.videos_id', '>', 0);
@@ -613,6 +619,10 @@ class Release extends Model
                 $join->on('m.id', '=', 'releases.movieinfo_id')
                     ->where('releases.movieinfo_id', '>', 0);
             });
+
+        if ($includeV1CompatibilityFields) {
+            $query->leftJoin('usenet_groups as g', 'g.id', '=', 'releases.groups_id');
+        }
 
         if (is_array($guid)) {
             $query->whereIn('releases.guid', $guid);

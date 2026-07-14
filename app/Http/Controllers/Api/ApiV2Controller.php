@@ -83,7 +83,8 @@ class ApiV2Controller extends BasePageController
         }
 
         $apiToken = $request->input('api_token');
-        $user = $this->userResolver->v2((string) $apiToken);
+        $resolved = $request->attributes->get('nntmux.api_user');
+        $user = $resolved instanceof User ? $resolved : $this->userResolver->v2((string) $apiToken);
 
         if (! $user || ! $user->hasVerifiedEmail()) {
             return apiJsonError(100);
@@ -191,9 +192,15 @@ class ApiV2Controller extends BasePageController
         return $sort;
     }
 
-    public function capabilities(): JsonResponse
+    public function capabilities(Request $request): JsonResponse
     {
-        return $this->jsonResponse($this->capabilitiesService->v2());
+        $response = $this->jsonResponse($this->capabilitiesService->v2());
+        $response->setPublic();
+        $response->setMaxAge(300);
+        $response->setEtag(hash('sha256', (string) $response->getContent()));
+        $response->isNotModified($request);
+
+        return $response;
     }
 
     /**
@@ -660,7 +667,7 @@ class ApiV2Controller extends BasePageController
         $guid = $request->input('id');
         $relData = $this->releaseRowCache->remember('v2', 'details', [
             'guid' => $guid,
-        ], fn () => Release::getByGuidForApi($guid));
+        ], fn () => Release::getByGuidForApi($guid, false));
 
         if ($relData === null) {
             return $this->jsonResponse(['error' => 'No such item'], 404);

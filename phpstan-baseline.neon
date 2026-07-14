@@ -373,18 +373,6 @@ parameters:
 			path: app/Http/Controllers/CoverController.php
 
 		-
-			message: '#^Access to an undefined property Illuminate\\Database\\Eloquent\\Model\:\:\$roles_id\.$#'
-			identifier: property.notFound
-			count: 1
-			path: app/Http/Middleware/ThrottleApiRequestsByToken.php
-
-		-
-			message: '#^Method App\\Http\\Middleware\\ThrottleApiRequestsByToken\:\:resolveUser\(\) should return App\\Models\\User\|null but returns Illuminate\\Database\\Eloquent\\Model\|null\.$#'
-			identifier: return.type
-			count: 1
-			path: app/Http/Middleware/ThrottleApiRequestsByToken.php
-
-		-
 			message: '#^Method App\\Http\\Requests\\Admin\\RegistrationPeriodRequest\:\:after\(\) return type has no value type specified in iterable type array\.$#'
 			identifier: missingType.iterableValue
 			count: 1

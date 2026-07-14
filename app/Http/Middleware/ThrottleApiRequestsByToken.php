@@ -6,11 +6,11 @@ namespace App\Http\Middleware;
 
 use App\Enums\UserRole;
 use App\Models\User;
+use App\Services\Api\ApiUserResolver;
 use Closure;
 use Illuminate\Cache\RateLimiter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
 use Symfony\Component\HttpFoundation\Response;
 
 class ThrottleApiRequestsByToken
@@ -19,7 +19,10 @@ class ThrottleApiRequestsByToken
 
     private const int DECAY_SECONDS = 60;
 
-    public function __construct(private readonly RateLimiter $limiter) {}
+    public function __construct(
+        private readonly RateLimiter $limiter,
+        private readonly ApiUserResolver $userResolver,
+    ) {}
 
     /**
      * Handle an incoming request.
@@ -33,6 +36,8 @@ class ThrottleApiRequestsByToken
         if ($user === null) {
             return $next($request);
         }
+
+        $request->attributes->set('nntmux.api_user', $user);
 
         $maxAttempts = max(1, (int) ($user->rate_limit ?: self::DEFAULT_RATE_LIMIT));
         $rateLimitKey = $this->rateLimitKey($user->id);
@@ -60,11 +65,9 @@ class ThrottleApiRequestsByToken
             return null;
         }
 
-        $user = Cache::remember('api_rate_limit_user:'.md5($apiToken), 300, static function () use ($apiToken) {
-            return User::verifiedApiTokenQuery($apiToken)
-                ->select(['id', 'roles_id', 'api_token', 'rate_limit'])
-                ->first();
-        });
+        $user = $request->filled('api_token')
+            ? $this->userResolver->v2($apiToken)
+            : $this->userResolver->v1($apiToken);
 
         if ($user?->roles_id === UserRole::DISABLED->value) {
             return null;

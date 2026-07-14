@@ -56,6 +56,34 @@ class ApiPerformanceHelpersTest extends TestCase
         $this->assertSame(1, $calls);
     }
 
+    public function test_release_row_cache_canonicalizes_equivalent_parameters(): void
+    {
+        Search::shouldReceive('getCurrentDriver')->twice()->andReturn('testing');
+
+        $calls = 0;
+        $cache = new ApiReleaseRowCache;
+        $first = $cache->remember('v2', 'search', [
+            'category' => [5030, 5040, 5030],
+            'id' => ' ubuntu ',
+        ], function () use (&$calls): array {
+            $calls++;
+
+            return ['result'];
+        });
+        $second = $cache->remember('v2', 'search', [
+            'id' => 'ubuntu',
+            'category' => [5040, 5030],
+        ], function () use (&$calls): array {
+            $calls++;
+
+            return ['different'];
+        });
+
+        $this->assertSame(['result'], $first);
+        $this->assertSame(['result'], $second);
+        $this->assertSame(1, $calls);
+    }
+
     public function test_get_by_guid_for_api_returns_plain_row_without_model_hydration(): void
     {
         $this->createReleaseDetailsSchema();
@@ -102,6 +130,42 @@ class ApiPerformanceHelpersTest extends TestCase
         $this->assertSame('release-guid', $row->guid);
         $this->assertSame('TV > SD', $row->category_name);
         $this->assertSame('alt.binaries.test', $row->group_name);
+    }
+
+    public function test_v2_details_query_omits_v1_compatibility_fields(): void
+    {
+        $this->createReleaseDetailsSchema();
+
+        DB::table('root_categories')->insert(['id' => 5000, 'title' => 'TV']);
+        DB::table('categories')->insert(['id' => 5030, 'title' => 'SD', 'root_categories_id' => 5000]);
+        DB::table('releases')->insert([
+            'id' => 1,
+            'searchname' => 'Ubuntu.Release',
+            'guid' => 'release-guid',
+            'postdate' => '2026-01-02 00:00:00',
+            'categories_id' => 5030,
+            'size' => 123456,
+            'totalpart' => 10,
+            'passwordstatus' => 0,
+            'grabs' => 2,
+            'comments' => 1,
+            'adddate' => '2026-01-03 00:00:00',
+            'videos_id' => 0,
+            'tv_episodes_id' => 0,
+            'haspreview' => 0,
+            'nfostatus' => 0,
+            'movieinfo_id' => 0,
+            'musicinfo_id' => 0,
+            'consoleinfo_id' => 0,
+        ]);
+
+        $row = Release::getByGuidForApi('release-guid', false);
+
+        $this->assertInstanceOf(\stdClass::class, $row);
+        $this->assertSame('TV > SD', $row->category_name);
+        $this->assertObjectNotHasProperty('group_name', $row);
+        $this->assertObjectNotHasProperty('haspreview', $row);
+        $this->assertObjectNotHasProperty('nfostatus', $row);
     }
 
     public function test_release_data_fast_array_matches_existing_data_output(): void

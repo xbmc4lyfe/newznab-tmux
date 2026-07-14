@@ -21,6 +21,16 @@ return [
     'purge_inactive_users' => env('PURGE_INACTIVE_USERS', false),
     'purge_inactive_users_days' => env('PURGE_INACTIVE_USERS_DAYS', 180),
     'mysql_search_fallback' => env('MYSQL_SEARCH_FALLBACK', false), // Disable MySQL LIKE fallback when Manticore/Elasticsearch return no results
+    'api' => [
+        'release_cache_ttl' => (int) env('API_RELEASE_CACHE_TTL', 600),
+        'release_cache_jitter' => (int) env('API_RELEASE_CACHE_JITTER', 60),
+        'release_cache_stale_ttl' => (int) env('API_RELEASE_CACHE_STALE_TTL', 900),
+        'release_cache_lock_ttl' => (int) env('API_RELEASE_CACHE_LOCK_TTL', 15),
+        'async_audit' => (bool) env('API_ASYNC_AUDIT', true),
+        'audit_queue' => env('API_AUDIT_QUEUE', 'api-audit'),
+        'access_update_interval' => (int) env('API_ACCESS_UPDATE_INTERVAL', 60),
+        'metrics_sample_rate' => (float) env('API_METRICS_SAMPLE_RATE', 0.01),
+    ],
     'block_proxy_indexer_apps' => (bool) env('BLOCK_PROXY_INDEXER_APPS', false),
     'block_proxy_indexer_app_user_agents' => env('BLOCK_PROXY_INDEXER_APP_USER_AGENTS', 'Prowlarr/,NZBHydra2'),
 

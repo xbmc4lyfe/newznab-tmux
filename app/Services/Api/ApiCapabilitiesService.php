@@ -42,7 +42,7 @@ final readonly class ApiCapabilitiesService
             ],
         ]);
 
-        $status = $this->registrationStatus->resolve();
+        $status = $this->registrationStatus();
         $data['registration'] = $this->registration($status);
         $data['categories'] = $includeCatalogs ? Category::getForMenu() : null;
         $data['groups'] = $includeCatalogs ? $this->groups() : null;
@@ -79,7 +79,7 @@ final readonly class ApiCapabilitiesService
             ];
         });
 
-        $status = $this->registrationStatus->resolve();
+        $status = $this->registrationStatus();
         $data['registration'] = $this->registration($status);
 
         return $data;
@@ -125,5 +125,18 @@ final readonly class ApiCapabilitiesService
             'available' => $status['available'] ? 'yes' : 'no',
             'open' => $status['is_open'] ? 'yes' : 'no',
         ];
+    }
+
+    /** @return array{available: bool, is_open: bool} */
+    private function registrationStatus(): array
+    {
+        return Cache::remember('api_registration_status', 15, function (): array {
+            $status = $this->registrationStatus->resolve();
+
+            return [
+                'available' => $status['available'],
+                'is_open' => $status['is_open'],
+            ];
+        });
     }
 }

@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers\Api;
 
-use App\Events\UserAccessedApi;
 use App\Http\Controllers\BasePageController;
 use App\Http\Controllers\GetNzbController;
 use App\Models\Category;
@@ -12,7 +11,6 @@ use App\Models\Release;
 use App\Models\ReleaseNfo;
 use App\Models\Settings;
 use App\Models\User;
-use App\Models\UserRequest;
 use App\Services\Api\ApiCapabilitiesService;
 use App\Services\Api\ApiQueryParameters;
 use App\Services\Api\ApiReleaseRowCache;
@@ -49,7 +47,7 @@ class ApiController extends BasePageController
 
     private ?ApiQueryParameters $queryParameters = null;
 
-    private ?ApiUsageService $usageService = null;
+    private ApiUsageService $usageService;
 
     private ApiUserResolver $userResolver;
 
@@ -153,7 +151,8 @@ class ApiController extends BasePageController
             $apiKey = $request->input('apikey');
 
             // Cache user lookup for 5 minutes to avoid repeated DB hits (same pattern as API v2)
-            $res = $this->userResolver->v1((string) $apiKey);
+            $resolved = $request->attributes->get('nntmux.api_user');
+            $res = $resolved instanceof User ? $resolved : $this->userResolver->v1((string) $apiKey);
 
             if ($res === null) {
                 return showApiError(100, 'Incorrect user credentials (wrong API key)');
@@ -177,9 +176,8 @@ class ApiController extends BasePageController
             $grabs = (int) ($userStats->grab_count ?? 0);
         }
 
-        // Record user access to the api, if its been called by a user (i.e. capabilities request do not require a user to be logged in or key provided).
+        // Quota enforcement happens before endpoint-specific request recording.
         if ($uid !== '') {
-            event(new UserAccessedApi($res, $request->ip()));
             if ($thisRequests > $maxRequests) {
                 return showApiError(500, 'Request limit reached ('.$thisRequests.'/'.$maxRequests.')');
             }
@@ -218,7 +216,7 @@ class ApiController extends BasePageController
                     return $sort;
                 }
                 $groupName = $this->group($request);
-                UserRequest::addApiRequest($uid, $request->getRequestUri());
+                $this->usageService->record($res, $request);
                 $categoryID = $this->categoryID($request);
                 $limit = $this->limit($request);
 
@@ -278,7 +276,7 @@ class ApiController extends BasePageController
                 if (! is_string($sort)) {
                     return $sort;
                 }
-                UserRequest::addApiRequest($uid, $request->getRequestUri());
+                $this->usageService->record($res, $request);
                 $categoryID = $this->categoryID($request);
                 $limit = $this->limit($request);
 
@@ -380,7 +378,7 @@ class ApiController extends BasePageController
                 if (! is_string($sort)) {
                     return $sort;
                 }
-                UserRequest::addApiRequest($uid, $request->getRequestUri());
+                $this->usageService->record($res, $request);
                 $categoryID = $this->categoryID($request);
                 $limit = $this->limit($request);
 
@@ -469,7 +467,7 @@ class ApiController extends BasePageController
                     return $sort;
                 }
                 $groupName = $this->group($request);
-                UserRequest::addApiRequest($uid, $request->getRequestUri());
+                $this->usageService->record($res, $request);
                 $categoryID = $this->categoryID($request);
                 $limit = $this->limit($request);
 
@@ -533,7 +531,7 @@ class ApiController extends BasePageController
                     return $sort;
                 }
                 $groupName = $this->group($request);
-                UserRequest::addApiRequest($uid, $request->getRequestUri());
+                $this->usageService->record($res, $request);
                 $categoryID = $this->categoryID($request);
                 $limit = $this->limit($request);
 
@@ -599,7 +597,7 @@ class ApiController extends BasePageController
                 if (! is_string($sort)) {
                     return $sort;
                 }
-                UserRequest::addApiRequest($uid, $request->getRequestUri());
+                $this->usageService->record($res, $request);
                 $limit = $this->limit($request);
                 $categoryID = $this->categoryID($request);
                 $relData = $this->releaseRowCache->remember('v1', 'anime', [
@@ -632,7 +630,7 @@ class ApiController extends BasePageController
                 if ($emptyParameterError !== null) {
                     return $emptyParameterError;
                 }
-                UserRequest::addApiRequest($uid, $request->getRequestUri());
+                $this->usageService->record($res, $request);
                 $relData = Release::checkGuidForApi($request->input('id'));
                 if ($relData) {
                     $request->attributes->set(GetNzbController::REQUEST_USER_ATTRIBUTE, $res);
@@ -648,7 +646,7 @@ class ApiController extends BasePageController
                     return showApiError(200, 'Missing parameter (guid is required for single release details)');
                 }
 
-                UserRequest::addApiRequest($uid, $request->getRequestUri());
+                $this->usageService->record($res, $request);
                 $guid = $request->input('id');
                 $data = $this->releaseRowCache->remember('v1', 'details', [
                     'guid' => $guid,
@@ -662,7 +660,7 @@ class ApiController extends BasePageController
                     return showApiError(200, 'Missing parameter (id is required for retrieving an NFO)');
                 }
 
-                UserRequest::addApiRequest($uid, $request->getRequestUri());
+                $this->usageService->record($res, $request);
                 $rel = Release::query()->where('guid', $request->input('id'))->first(['id', 'searchname']);
 
                 if ($rel) {
@@ -717,7 +715,7 @@ class ApiController extends BasePageController
                     return showApiError(600, 'Failed to load upload (no file)');
                 }
 
-                UserRequest::addApiRequest($uid, $request->getRequestUri());
+                $this->usageService->record($res, $request);
 
                 $nzbFile = $request->file('file');
 
@@ -930,7 +928,7 @@ class ApiController extends BasePageController
 
     private function usage(): ApiUsageService
     {
-        return $this->usageService ?? new ApiUsageService;
+        return $this->usageService;
     }
 
     public function addCoverURL(mixed &$releases, callable $getCoverURL): void

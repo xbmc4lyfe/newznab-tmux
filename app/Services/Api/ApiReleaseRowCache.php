@@ -14,16 +14,6 @@ class ApiReleaseRowCache
 
     private const NULL_SENTINEL = ['__nntmux_api_release_row_cache_null' => true];
 
-    private const BASE_TTL_SECONDS = 600;
-
-    private const MAX_TTL_JITTER_SECONDS = 60;
-
-    private const LOCK_TTL_SECONDS = 10;
-
-    private const WAIT_ATTEMPTS = 30;
-
-    private const WAIT_MICROSECONDS = 100_000;
-
     /**
      * Cache release rows only. User-specific response fields should be built after this returns.
      *
@@ -36,44 +26,44 @@ class ApiReleaseRowCache
 
         [$hit, $cached] = $this->getCachedValue($cacheKey);
         if ($hit) {
+            $this->markRequest('hit');
             $this->logCacheEvent('hit', $apiVersion, $scope);
 
             return $cached;
         }
 
-        $lockKey = $cacheKey.':lock';
-        if (Cache::add($lockKey, true, self::LOCK_TTL_SECONDS)) {
+        $lock = Cache::lock($cacheKey.':lock', max(1, (int) config('nntmux.api.release_cache_lock_ttl', 15)));
+        if ($lock->get()) {
             try {
                 [$hit, $cached] = $this->getCachedValue($cacheKey);
                 if ($hit) {
+                    $this->markRequest('hit_after_lock');
                     $this->logCacheEvent('hit_after_lock', $apiVersion, $scope);
 
                     return $cached;
                 }
 
                 $this->logCacheEvent('miss_lock_owner', $apiVersion, $scope);
+                $this->markRequest('miss');
                 $rows = $callback();
                 $this->putCachedValue($cacheKey, $rows);
 
                 return $rows;
             } finally {
-                Cache::forget($lockKey);
+                $lock->release();
             }
         }
 
-        $this->logCacheEvent('lock_wait', $apiVersion, $scope);
-        for ($attempt = 0; $attempt < self::WAIT_ATTEMPTS; $attempt++) {
-            usleep(self::WAIT_MICROSECONDS);
+        [$staleHit, $stale] = $this->getCachedValue($cacheKey.':stale');
+        if ($staleHit) {
+            $this->markRequest('stale');
+            $this->logCacheEvent('stale_while_refresh', $apiVersion, $scope);
 
-            [$hit, $cached] = $this->getCachedValue($cacheKey);
-            if ($hit) {
-                $this->logCacheEvent('hit_after_wait', $apiVersion, $scope);
-
-                return $cached;
-            }
+            return $stale;
         }
 
-        $this->logCacheEvent('miss_after_wait', $apiVersion, $scope);
+        $this->logCacheEvent('miss_lock_contended', $apiVersion, $scope);
+        $this->markRequest('miss_contended');
         $rows = $callback();
         $this->putCachedValue($cacheKey, $rows);
 
@@ -88,13 +78,16 @@ class ApiReleaseRowCache
         return 'api_release_rows:'.$apiVersion.':'.$scope.':'.md5(serialize([
             'driver' => Search::getCurrentDriver(),
             'release_version' => Cache::get('releases:cache_version', 1),
-            'parameters' => $parameters,
+            'parameters' => $this->normalize($parameters),
         ]));
     }
 
     private function ttlSeconds(): int
     {
-        return self::BASE_TTL_SECONDS + mt_rand(0, self::MAX_TTL_JITTER_SECONDS);
+        $ttl = max(1, (int) config('nntmux.api.release_cache_ttl', 600));
+        $jitter = max(0, (int) config('nntmux.api.release_cache_jitter', 60));
+
+        return $ttl + ($jitter > 0 ? random_int(0, $jitter) : 0);
     }
 
     /**
@@ -116,11 +109,34 @@ class ApiReleaseRowCache
 
     private function putCachedValue(string $cacheKey, mixed $value): void
     {
+        $cached = $value === null ? self::NULL_SENTINEL : $value;
+        $staleTtl = max($this->ttlSeconds(), (int) config('nntmux.api.release_cache_stale_ttl', 900));
         Cache::put(
             $cacheKey,
-            $value === null ? self::NULL_SENTINEL : $value,
+            $cached,
             $this->ttlSeconds()
         );
+        Cache::put($cacheKey.':stale', $cached, $staleTtl);
+    }
+
+    /** @param array<string, mixed> $parameters
+     * @return array<string, mixed>
+     */
+    private function normalize(array $parameters): array
+    {
+        ksort($parameters);
+        foreach ($parameters as &$value) {
+            if (is_array($value)) {
+                $value = array_is_list($value) ? array_values(array_unique($value, SORT_REGULAR)) : $this->normalize($value);
+                if (array_is_list($value)) {
+                    sort($value);
+                }
+            } elseif (is_string($value)) {
+                $value = trim($value);
+            }
+        }
+
+        return $parameters;
     }
 
     private function logCacheEvent(string $event, string $apiVersion, string $scope): void
@@ -133,5 +149,14 @@ class ApiReleaseRowCache
             'version' => $apiVersion,
             'scope' => $scope,
         ]);
+    }
+
+    private function markRequest(string $status): void
+    {
+        if (app()->runningInConsole()) {
+            return;
+        }
+
+        request()->attributes->set('nntmux.api_release_cache', $status);
     }
 }
