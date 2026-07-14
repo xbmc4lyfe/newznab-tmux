@@ -9,26 +9,67 @@ use App\Http\Controllers\Api\ApiV2Controller;
 use App\Models\Category;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
+use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Filesystem\Filesystem;
 use Illuminate\Http\Request;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Mockery;
+use PDO;
 use ReflectionClass;
 use Tests\TestCase;
 
 class ApiRequestMatrixTest extends TestCase
 {
+    private string $nzbUploadFolder;
+
+    private string $databasePath;
+
+    /** @var array<string, string|false> */
+    private array $originalEnvironment = [];
+
+    public function createApplication()
+    {
+        $this->databasePath = sys_get_temp_dir().'/nntmux-api-matrix-test.sqlite';
+        $this->originalEnvironment = [
+            'APP_ENV' => getenv('APP_ENV'),
+            'DB_CONNECTION' => getenv('DB_CONNECTION'),
+            'DB_DATABASE' => getenv('DB_DATABASE'),
+        ];
+
+        if (file_exists($this->databasePath)) {
+            unlink($this->databasePath);
+        }
+
+        $pdo = new PDO('sqlite:'.$this->databasePath);
+        $pdo->exec('CREATE TABLE settings (name VARCHAR PRIMARY KEY, value TEXT NULL)');
+        $pdo->exec("INSERT INTO settings (name, value) VALUES
+            ('categorizeforeign', '0'),
+            ('catwebdl', '0'),
+            ('innerfileblacklist', '')");
+
+        $this->setEnvironmentValue('APP_ENV', 'testing');
+        $this->setEnvironmentValue('DB_CONNECTION', 'sqlite');
+        $this->setEnvironmentValue('DB_DATABASE', $this->databasePath);
+
+        $app = require __DIR__.'/../../bootstrap/app.php';
+        $app->make(Kernel::class)->bootstrap();
+
+        return $app;
+    }
+
     protected function setUp(): void
     {
         parent::setUp();
 
         config([
             'database.default' => 'sqlite',
-            'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.database' => $this->databasePath,
             'mail.from.address' => 'api-matrix@example.test',
             'app.key' => 'base64:'.base64_encode(random_bytes(32)),
         ]);
@@ -36,9 +77,28 @@ class ApiRequestMatrixTest extends TestCase
         DB::purge();
         DB::reconnect();
         Cache::flush();
+        Schema::dropAllTables();
+
+        $this->nzbUploadFolder = sys_get_temp_dir().'/nntmux-api-matrix-'.bin2hex(random_bytes(6));
+        config(['nntmux.nzb_upload_folder' => $this->nzbUploadFolder]);
 
         $this->createSchema();
         $this->seedData();
+    }
+
+    protected function tearDown(): void
+    {
+        (new Filesystem)->deleteDirectory($this->nzbUploadFolder);
+
+        if (file_exists($this->databasePath)) {
+            unlink($this->databasePath);
+        }
+
+        parent::tearDown();
+
+        foreach ($this->originalEnvironment as $key => $value) {
+            $this->setEnvironmentValue($key, $value === false ? null : $value);
+        }
     }
 
     public function test_v1_invalid_sort_returns_xml_201_error(): void
@@ -630,6 +690,71 @@ class ApiRequestMatrixTest extends TestCase
             ->assertJsonPath('password', 0);
     }
 
+    public function test_v2_nzbadd_stages_a_paired_nzb_and_nfo(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+        $nzb = UploadedFile::fake()->createWithContent(
+            'Release.nzb',
+            '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"></nzb>',
+        );
+        $nfo = UploadedFile::fake()->createWithContent('Release.nfo', 'release information');
+
+        $this->post('/api/v2/nzbadd', [
+            'api_token' => $token,
+            'cat' => '5040',
+            'nzb' => $nzb,
+            'nfo' => $nfo,
+        ])->assertCreated()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('status', 'staged')
+            ->assertJsonPath('name', 'Release')
+            ->assertJsonPath('category', '5040')
+            ->assertJsonPath('files.nzb.filename', 'Release.nzb')
+            ->assertJsonPath('files.nfo.filename', 'Release.nfo');
+
+        $this->assertFileExists($this->nzbUploadFolder.'/Release.nzb');
+        $this->assertFileExists($this->nzbUploadFolder.'/Release.nfo');
+        $this->assertSame(0, DB::table('user_requests')->count());
+    }
+
+    public function test_v2_nzbadd_ignores_an_exhausted_api_quota_without_recording_usage(): void
+    {
+        $userId = (int) DB::table('users')->value('id');
+        $token = (string) DB::table('users')->value('api_token');
+        DB::table('roles')->where('id', 1)->update(['apirequests' => 0]);
+        DB::table('user_requests')->insert([
+            'users_id' => $userId,
+            'request' => '/api/v2/search?api_token=redacted',
+            'timestamp' => now(),
+        ]);
+
+        $this->post('/api/v2/nzbadd', [
+            'api_token' => $token,
+            'nzb' => UploadedFile::fake()->createWithContent(
+                'QuotaExempt.nzb',
+                '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"></nzb>',
+            ),
+        ])->assertCreated();
+
+        $this->assertSame(1, DB::table('user_requests')->count());
+        $this->assertFileExists($this->nzbUploadFolder.'/QuotaExempt.nzb');
+    }
+
+    public function test_v2_nzbadd_requires_posting_privileges(): void
+    {
+        DB::table('users')->update(['can_post' => false]);
+        $token = (string) DB::table('users')->value('api_token');
+
+        $this->post('/api/v2/nzbadd', [
+            'api_token' => $token,
+            'nzb' => UploadedFile::fake()->createWithContent(
+                'Release.nzb',
+                '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"></nzb>',
+            ),
+        ])->assertForbidden()
+            ->assertJsonPath('error', 'Insufficient privileges/not authorized');
+    }
+
     private function createSchema(): void
     {
         Schema::create('roles', function (Blueprint $table): void {
@@ -655,6 +780,7 @@ class ApiRequestMatrixTest extends TestCase
             $table->boolean('verified')->default(true);
             $table->timestamp('email_verified_at')->nullable();
             $table->integer('rate_limit')->default(60);
+            $table->boolean('can_post')->default(true);
             $table->timestamps();
             $table->softDeletes();
         });
@@ -800,13 +926,29 @@ class ApiRequestMatrixTest extends TestCase
         });
     }
 
+    private function setEnvironmentValue(string $key, ?string $value): void
+    {
+        if ($value === null) {
+            putenv($key);
+            unset($_ENV[$key], $_SERVER[$key]);
+
+            return;
+        }
+
+        putenv($key.'='.$value);
+        $_ENV[$key] = $value;
+        $_SERVER[$key] = $value;
+    }
+
     private function seedData(): void
     {
         DB::table('settings')->insert([
             ['name' => 'strapline', 'value' => 'Test strapline'],
             ['name' => 'metakeywords', 'value' => 'test,api'],
             ['name' => 'registerstatus', 'value' => '0'],
+            ['name' => 'categorizeforeign', 'value' => '0'],
             ['name' => 'catwebdl', 'value' => '0'],
+            ['name' => 'innerfileblacklist', 'value' => ''],
             ['name' => 'title', 'value' => 'NNTmux Test'],
             ['name' => 'home_link', 'value' => '/'],
         ]);

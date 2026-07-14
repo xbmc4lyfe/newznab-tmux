@@ -21,6 +21,7 @@ https://<host>/api/v2
 - `GET /capabilities` is public.
 - All other v2 routes require `api_token`.
 - Route-level middleware uses token-aware throttling (`apiRateLimit`) and accepts `api_token` or the legacy `apikey` alias when that middleware is reused.
+- `POST /nzbadd` is intentionally exempt from route-level rate limiting and API request quotas, and uploads are not recorded as API usage. Authentication and posting privileges still apply.
 - Controller-level auth errors return a JSON error envelope:
 
 ```json
@@ -185,6 +186,57 @@ Selectors:
 - Auth: required
 - Requires `id` (GUID)
 
+## 10) Add NZB
+
+- `POST /nzbadd`
+- Auth: required; the user must have posting privileges (`can_post`)
+- Content type: `multipart/form-data`
+
+Fields:
+
+| Field | Required | Notes |
+|---|---|---|
+| `api_token` | yes | API token for a verified, enabled user. |
+| `nzb` | yes | Valid `.nzb` file staged for deferred import. |
+| `nfo` | no | Matching `.nfo` file, maximum 65,535 bytes. |
+| `cat` | no | Echoed as response metadata; it does not affect import categorization. |
+
+When `nfo` is supplied, its basename must match the NZB basename
+case-insensitively (for example, `Release.nzb` and `Release.nfo`). The request
+is atomic: both files are validated before staging, existing files are never
+overwritten, and a partial write is rolled back.
+
+NZB-only example:
+
+```bash
+curl -X POST -F "api_token=<token>" -F "nzb=@Release.nzb" https://<host>/api/v2/nzbadd
+```
+
+Paired example:
+
+```bash
+curl -X POST -F "api_token=<token>" -F "cat=5040" -F "nzb=@Release.nzb" -F "nfo=@Release.nfo" https://<host>/api/v2/nzbadd
+```
+
+Successful staging returns HTTP `201`:
+
+```json
+{
+  "success": true,
+  "status": "staged",
+  "name": "Release",
+  "category": "5040",
+  "files": {
+    "nzb": { "filename": "Release.nzb", "type": "nzb" },
+    "nfo": { "filename": "Release.nfo", "type": "nfo" }
+  }
+}
+```
+
+Staging does not synchronously create a release. The existing importer consumes
+the files from `NZB_UPLOAD_FOLDER` later. NZB-only responses set `files.nfo` to
+`null`.
+
 ## Response Models
 
 ### Search Envelope (`/search`, `/tv`, `/movies`, `/audio`, `/books`, `/anime`)
@@ -226,9 +278,6 @@ The following are intentionally not part of v2 JSON API:
 - `commentadd`
 - `cartadd`
 - `cartdel`
-- `nzbadd`
-
-NZB upload remains in v1 (`/api/v1/api?t=nzbadd`).
 
 ## Postman Collection
 

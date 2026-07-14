@@ -22,6 +22,7 @@ Route::prefix('v1')->group(function () {
 
 Route::prefix('v2')->group(function () {
     Route::get('capabilities', [ApiV2Controller::class, 'capabilities']);
+    Route::post('nzbadd', [ApiV2Controller::class, 'nzbAdd']);
 });
 
 Route::prefix('v2')->middleware('apiRateLimit')->group(function () {

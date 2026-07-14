@@ -574,7 +574,74 @@
           "body": "{\n  \"error\": \"Missing parameter (api_token)\"\n}"
         }
       ]
+    },
+    {
+      "name": "Add NZB",
+      "item": [
+        {
+          "name": "Stage NZB Only",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "api_token", "value": "{{apiToken}}", "type": "text" },
+                { "key": "nzb", "type": "file", "src": "Release.nzb" }
+              ]
+            },
+            "description": "Stages one NZB for deferred import. The authenticated user must have posting privileges.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v2/nzbadd",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v2", "nzbadd"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Stage Paired NZB and NFO",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "api_token", "value": "{{apiToken}}", "type": "text" },
+                { "key": "cat", "value": "5040", "type": "text" },
+                { "key": "nzb", "type": "file", "src": "Release.nzb" },
+                { "key": "nfo", "type": "file", "src": "Release.nfo" }
+              ]
+            },
+            "description": "Atomically stages an NZB and an optional NFO with a matching basename. Category is echoed metadata only.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v2/nzbadd",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v2", "nzbadd"]
+            }
+          },
+          "response": [
+            {
+              "name": "Created",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/v2/nzbadd",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["api", "v2", "nzbadd"]
+                }
+              },
+              "status": "Created",
+              "code": 201,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"success\": true,\n  \"status\": \"staged\",\n  \"name\": \"Release\",\n  \"category\": \"5040\",\n  \"files\": {\n    \"nzb\": { \"filename\": \"Release.nzb\", \"type\": \"nzb\" },\n    \"nfo\": { \"filename\": \"Release.nfo\", \"type\": \"nfo\" }\n  }\n}"
+            }
+          ]
+        }
+      ]
     }
   ]
 }
-

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Http\Controllers\Api;
 
 use App\Data\Api\ReleaseData;
+use App\Exceptions\NzbUploadException;
 use App\Facades\Search;
 use App\Http\Controllers\BasePageController;
 use App\Http\Controllers\GetNzbController;
@@ -17,6 +18,7 @@ use App\Services\Api\ApiReleaseRowCache;
 use App\Services\Api\ApiUsageService;
 use App\Services\Api\ApiUserResolver;
 use App\Services\Api\V2\ApiV2Presenter;
+use App\Services\Nzb\NzbUploadStagingService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
 use App\Services\Search\DTO\SearchCursor;
@@ -27,6 +29,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Routing\Redirector;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
@@ -52,6 +55,8 @@ class ApiV2Controller extends BasePageController
 
     private SearchCursorCodec $cursorCodec;
 
+    private NzbUploadStagingService $nzbUploadStagingService;
+
     /** @var array{enabled: bool, offset: int, limit: int, query_hash: string, cursor: SearchCursor|null} */
     private array $paginationContext = ['enabled' => false, 'offset' => 0, 'limit' => 0, 'query_hash' => '', 'cursor' => null];
 
@@ -70,6 +75,7 @@ class ApiV2Controller extends BasePageController
         ?ApiV2Presenter $presenter = null,
         ?ApiCapabilitiesService $capabilitiesService = null,
         ?SearchCursorCodec $cursorCodec = null,
+        ?NzbUploadStagingService $nzbUploadStagingService = null,
     ) {
         $this->releaseSearchService = $releaseSearchService;
         $this->releaseBrowseService = $releaseBrowseService;
@@ -80,13 +86,14 @@ class ApiV2Controller extends BasePageController
         $this->presenter = $presenter ?? app(ApiV2Presenter::class);
         $this->capabilitiesService = $capabilitiesService ?? app(ApiCapabilitiesService::class);
         $this->cursorCodec = $cursorCodec ?? app(SearchCursorCodec::class);
+        $this->nzbUploadStagingService = $nzbUploadStagingService ?? app(NzbUploadStagingService::class);
     }
 
     /**
      * Validate API token and return cached user, or a normalized JSON API error on failure.
      * Caches user lookup for 5 minutes to reduce DB hits.
      */
-    private function resolveUser(Request $request): User|JsonResponse
+    private function resolveUser(Request $request, bool $enforceRequestLimit = true): User|JsonResponse
     {
         if ($request->missing('api_token') || $request->isNotFilled('api_token')) {
             return apiJsonError(200, 'Missing parameter (api_token)');
@@ -106,11 +113,13 @@ class ApiV2Controller extends BasePageController
 
         $user->loadMissing('role');
 
-        $userStats = $this->userStatsFor($user);
-        $thisRequests = (int) ($userStats->api_count ?? 0);
-        $maxRequests = (int) $user->role->apirequests;
-        if ($thisRequests > $maxRequests) {
-            return apiJsonError(500, 'Request limit reached');
+        if ($enforceRequestLimit) {
+            $userStats = $this->userStatsFor($user);
+            $thisRequests = (int) ($userStats->api_count ?? 0);
+            $maxRequests = (int) $user->role->apirequests;
+            if ($thisRequests > $maxRequests) {
+                return apiJsonError(500, 'Request limit reached');
+            }
         }
 
         return $user;
@@ -742,6 +751,42 @@ class ApiV2Controller extends BasePageController
         }
 
         return $this->jsonResponse(['data' => 'No such item (the guid you provided has no release in our database)'], 404);
+    }
+
+    public function nzbAdd(Request $request): JsonResponse
+    {
+        $user = $this->resolveUser($request, false);
+        if ($user instanceof JsonResponse) {
+            return $user;
+        }
+
+        if (! $user->can_post) {
+            return $this->jsonResponse(['error' => 'Insufficient privileges/not authorized'], 403);
+        }
+
+        $nzb = $request->file('nzb');
+        if (! $nzb instanceof UploadedFile) {
+            return $this->jsonResponse(['error' => 'Missing parameter (nzb file is required)'], 400);
+        }
+
+        $nfo = $request->file('nfo');
+        if ($nfo !== null && ! $nfo instanceof UploadedFile) {
+            return $this->jsonResponse(['error' => 'Invalid nfo upload'], 400);
+        }
+
+        try {
+            $staged = $this->nzbUploadStagingService->stage($nzb, $nfo);
+        } catch (NzbUploadException $exception) {
+            return $this->jsonResponse(['error' => $exception->getMessage()], $exception->status);
+        }
+
+        return $this->jsonResponse([
+            'success' => true,
+            'status' => 'staged',
+            'name' => $staged['name'],
+            'category' => $request->input('cat'),
+            'files' => $staged['files'],
+        ], 201);
     }
 
     public function details(Request $request): JsonResponse
