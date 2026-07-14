@@ -13,6 +13,10 @@ return [
     */
     'default' => env('SEARCH_DRIVER', 'manticore'),
 
+    'index_generation' => env('SEARCH_INDEX_GENERATION', '1'),
+
+    'cursor_ttl_minutes' => (int) env('SEARCH_CURSOR_TTL_MINUTES', 15),
+
     /*
     |--------------------------------------------------------------------------
     | Search Driver Configurations

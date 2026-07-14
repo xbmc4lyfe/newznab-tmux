@@ -11,6 +11,8 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Models\Settings;
 use App\Models\UsenetGroup;
+use App\Services\Search\DTO\ReleaseSearchQuery;
+use App\Services\Search\DTO\SearchCursor;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Cache;
@@ -116,7 +118,8 @@ class ReleaseSearchService
                 'try_fuzzy' => true,
             ];
 
-            $filtered = Search::searchReleasesFiltered($criteria, $limit, $offset);
+            $searchPage = Search::searchReleasePage(ReleaseSearchQuery::fromCriteria($criteria, $limit, $offset));
+            $filtered = $searchPage->legacy();
 
             if ($filtered['ids'] !== []) {
                 $ids = array_map(static fn (int|string $id): int => (int) $id, $filtered['ids']);
@@ -214,7 +217,7 @@ class ReleaseSearchService
      * @param  array<int, int>  $excludedCats
      * @return Collection|mixed
      */
-    public function apiSearch(mixed $searchName, mixed $groupName, int $offset = 0, int $limit = 1000, int $maxAge = -1, array $excludedCats = [], array $cat = [-1], int $minSize = 0, string $orderBy = 'posted_desc'): mixed
+    public function apiSearch(mixed $searchName, mixed $groupName, int $offset = 0, int $limit = 1000, int $maxAge = -1, array $excludedCats = [], array $cat = [-1], int $minSize = 0, string $orderBy = 'posted_desc', ?SearchCursor $cursor = null): mixed
     {
         if (config('app.debug')) {
             Log::debug('ReleaseSearchService::apiSearch called', [
@@ -258,7 +261,12 @@ class ReleaseSearchService
                 'try_fuzzy' => true,
             ];
 
-            $filtered = Search::searchReleasesFiltered($criteria, $limit, $offset);
+            $criteria['track_total'] = $cursor === null;
+            $searchPage = Search::searchReleasePage(ReleaseSearchQuery::fromCriteria($criteria, $limit, $offset, $cursor));
+            $filtered = $searchPage->legacy();
+            if ($cursor !== null && $filtered['total'] === 0) {
+                $filtered['total'] = $cursor->total;
+            }
 
             if ($filtered['ids'] === [] && $hasText && config('nntmux.mysql_search_fallback', false) === true) {
                 return $this->apiSearchLegacyMysql($searchName, $groupName, $offset, $limit, $maxAge, $excludedCats, $cat, $minSize, $orderBy);
@@ -304,6 +312,8 @@ class ReleaseSearchService
 
             if ($releases->isNotEmpty()) {
                 $releases[0]->_totalrows = $filtered['total'];
+                $releases[0]->_search_last_sort = $searchPage->lastSortValues;
+                $releases[0]->_search_has_more = $searchPage->hasMore;
             }
 
             $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_medium'));

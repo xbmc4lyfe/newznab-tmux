@@ -15,6 +15,8 @@ use App\Models\Release;
 use App\Models\SteamApp;
 use App\Models\Video;
 use App\Services\Search\Contracts\SearchDriverInterface;
+use App\Services\Search\DTO\ReleaseSearchQuery;
+use App\Services\Search\DTO\SearchPage;
 use App\Services\Search\Support\ManticoreClientFactory;
 use App\Support\ReleaseSearchIndexDocument;
 use App\Support\SecondaryIndexDocuments;
@@ -31,6 +33,12 @@ use Manticoresearch\Search;
  */
 class ManticoreSearchDriver implements SearchDriverInterface
 {
+    private const AVAILABILITY_CHECK_CACHE_TTL = 30;
+
+    private static ?bool $availabilityCache = null;
+
+    private static ?int $availabilityCacheTime = null;
+
     /**
      * @var array<string, mixed>
      */
@@ -74,17 +82,45 @@ class ManticoreSearchDriver implements SearchDriverInterface
      */
     public function isAvailable(): bool
     {
+        $now = time();
+        if (self::$availabilityCache !== null && self::$availabilityCacheTime !== null
+            && ($now - self::$availabilityCacheTime) < self::AVAILABILITY_CHECK_CACHE_TTL) {
+            return self::$availabilityCache;
+        }
+
         try {
             $status = $this->manticoreSearch->nodes()->status();
 
-            return ! empty($status);
+            self::$availabilityCache = ! empty($status);
+            self::$availabilityCacheTime = $now;
+
+            return self::$availabilityCache;
         } catch (\Throwable $e) {
+            self::$availabilityCache = false;
+            self::$availabilityCacheTime = $now;
             if (config('app.debug')) {
                 Log::debug('ManticoreSearch not available: '.$e->getMessage());
             }
 
             return false;
         }
+    }
+
+    public function searchReleasePage(ReleaseSearchQuery $query): SearchPage
+    {
+        $startedAt = hrtime(true);
+        $result = $this->searchReleasesFiltered($query->criteria(), $query->limit, $query->offset);
+
+        return new SearchPage(
+            ids: array_map(static fn (int|string $id): int => (int) $id, $result['ids']),
+            total: (int) $result['total'],
+            fuzzy: (bool) $result['fuzzy'],
+            driver: $this->getDriverName(),
+            available: (bool) ($result['available'] ?? true),
+            durationMs: (hrtime(true) - $startedAt) / 1_000_000,
+            lastSortValues: $result['last_sort'] ?? [],
+            hasMore: (bool) ($result['has_more'] ?? (($query->offset + count($result['ids'])) < (int) $result['total'])),
+        );
     }
 
     /**
@@ -2467,7 +2503,7 @@ class ManticoreSearchDriver implements SearchDriverInterface
     public function searchReleasesFiltered(array $criteria, int $limit, int $offset = 0): array
     {
         if (! $this->isAvailable()) {
-            return ['ids' => [], 'total' => 0, 'fuzzy' => false];
+            return ['ids' => [], 'total' => 0, 'fuzzy' => false, 'available' => false];
         }
 
         $phrases = $criteria['phrases'] ?? null;
@@ -2539,7 +2575,7 @@ class ManticoreSearchDriver implements SearchDriverInterface
                     'criteria' => $criteria,
                 ]);
 
-                return ['ids' => [], 'total' => 0, 'fuzzy' => $useFuzzy];
+                return ['ids' => [], 'total' => 0, 'fuzzy' => $useFuzzy, 'available' => false];
             }
 
             $ids = [];
@@ -2551,12 +2587,17 @@ class ManticoreSearchDriver implements SearchDriverInterface
                 'ids' => $ids,
                 'total' => (int) $results->getTotal(),
                 'fuzzy' => $useFuzzy,
+                'available' => true,
+                // Manticore uses the compatible offset cursor until the PHP client
+                // supports a compound search-after predicate without raw SQL.
+                'last_sort' => [],
+                'has_more' => $offset + count($ids) < (int) $results->getTotal(),
             ];
         };
 
         if ($hasText) {
             $first = $execute(false);
-            if ($first['ids'] !== [] || ! $tryFuzzy || ! $this->isFuzzyEnabled() || self::queryHasNegation($phrases)) {
+            if ($first['ids'] !== [] || ($first['available'] ?? true) === false || ! $tryFuzzy || ! $this->isFuzzyEnabled() || self::queryHasNegation($phrases)) {
                 return $first;
             }
 

@@ -24,8 +24,9 @@ final class ApiV2Presenter
     /**
      * @param  iterable<int, Release|\stdClass>  $rows
      * @param  array<string, mixed>  $usage
+     * @param  array{next_cursor: string|null, has_more: bool}|null  $pagination
      */
-    public function search(iterable $rows, User $user, array $usage): JsonResponse
+    public function search(iterable $rows, User $user, array $usage, ?array $pagination = null): JsonResponse
     {
         $rows = is_array($rows) ? $rows : iterator_to_array($rows, false);
         $results = [];
@@ -33,11 +34,16 @@ final class ApiV2Presenter
             $results[] = ReleaseData::toArrayFromRelease($row, $user, url('/details').'/', url('/getnzb'));
         }
 
-        return $this->json(array_merge(
+        $payload = array_merge(
             ['Total' => (int) ($rows[0]->_totalrows ?? 0)],
             $usage,
             ['results' => $results],
-        ));
+        );
+        if ($pagination !== null) {
+            $payload['pagination'] = $pagination;
+        }
+
+        return $this->json($payload);
     }
 
     public function details(Release|\stdClass $release, User $user): JsonResponse

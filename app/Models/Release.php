@@ -49,6 +49,8 @@ use Illuminate\Support\Facades\DB;
  * @property float|null $diff_percent Computed column (difference percentage)
  * @property int|null $releases_id From raw query alias
  * @property int|null $_totalcount From subquery count
+ * @property list<int|float|string>|null $_search_last_sort Transient search cursor tuple
+ * @property bool|null $_search_has_more Transient search pagination state
  */
 class Release extends Model
 {

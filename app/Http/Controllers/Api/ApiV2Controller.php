@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Http\Controllers\Api;
 
 use App\Data\Api\ReleaseData;
+use App\Facades\Search;
 use App\Http\Controllers\BasePageController;
 use App\Http\Controllers\GetNzbController;
 use App\Models\Category;
@@ -18,6 +19,8 @@ use App\Services\Api\ApiUserResolver;
 use App\Services\Api\V2\ApiV2Presenter;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
+use App\Services\Search\DTO\SearchCursor;
+use App\Services\Search\SearchCursorCodec;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Contracts\Routing\ResponseFactory;
 use Illuminate\Http\JsonResponse;
@@ -47,6 +50,11 @@ class ApiV2Controller extends BasePageController
 
     private ApiCapabilitiesService $capabilitiesService;
 
+    private SearchCursorCodec $cursorCodec;
+
+    /** @var array{enabled: bool, offset: int, limit: int, query_hash: string, cursor: SearchCursor|null} */
+    private array $paginationContext = ['enabled' => false, 'offset' => 0, 'limit' => 0, 'query_hash' => '', 'cursor' => null];
+
     /**
      * @var array<int, object>
      */
@@ -61,6 +69,7 @@ class ApiV2Controller extends BasePageController
         ?ApiUserResolver $userResolver = null,
         ?ApiV2Presenter $presenter = null,
         ?ApiCapabilitiesService $capabilitiesService = null,
+        ?SearchCursorCodec $cursorCodec = null,
     ) {
         $this->releaseSearchService = $releaseSearchService;
         $this->releaseBrowseService = $releaseBrowseService;
@@ -70,6 +79,7 @@ class ApiV2Controller extends BasePageController
         $this->userResolver = $userResolver ?? app(ApiUserResolver::class);
         $this->presenter = $presenter ?? app(ApiV2Presenter::class);
         $this->capabilitiesService = $capabilitiesService ?? app(ApiCapabilitiesService::class);
+        $this->cursorCodec = $cursorCodec ?? app(SearchCursorCodec::class);
     }
 
     /**
@@ -157,7 +167,63 @@ class ApiV2Controller extends BasePageController
      */
     private function buildSearchResponse(iterable $rows, User $user): JsonResponse
     {
-        return $this->presenter->search($rows, $user, $this->buildUserStatsResponse($user));
+        $rows = is_array($rows) ? $rows : iterator_to_array($rows, false);
+        $pagination = null;
+        if ($this->paginationContext['enabled']) {
+            $total = (int) ($rows[0]->_totalrows ?? 0);
+            $nextOffset = $this->paginationContext['offset'] + count($rows);
+            $hasMore = (bool) ($rows[0]->_search_has_more ?? (count($rows) === $this->paginationContext['limit'] && $nextOffset < $total));
+            $lastSort = $rows[0]->_search_last_sort ?? [];
+            $cursorPosition = is_array($lastSort) && count($lastSort) === 2 ? array_values($lastSort) : [$nextOffset];
+            $nextCursor = $hasMore ? $this->cursorCodec->encode(new SearchCursor(
+                sortValues: $cursorPosition,
+                total: $total,
+                queryHash: $this->paginationContext['query_hash'],
+                driver: Search::getCurrentDriver(),
+                indexGeneration: (string) config('search.index_generation', '1'),
+                expiresAt: time() + ((int) config('search.cursor_ttl_minutes', 15) * 60),
+            )) : null;
+            $pagination = ['next_cursor' => $nextCursor, 'has_more' => $hasMore];
+        }
+
+        return $this->presenter->search($rows, $user, $this->buildUserStatsResponse($user), $pagination);
+    }
+
+    private function resolvePaginationOffset(Request $request, int $limit): int|JsonResponse
+    {
+        $offset = $this->queryParameters->offset($request);
+        if (! $request->has('cursor')) {
+            $this->paginationContext = ['enabled' => false, 'offset' => $offset, 'limit' => $limit, 'query_hash' => '', 'cursor' => null];
+
+            return $offset;
+        }
+        if ($offset > 0) {
+            return $this->jsonResponse(['error' => 'cursor cannot be combined with a nonzero offset'], 400);
+        }
+
+        $query = $request->query();
+        unset($query['api_token'], $query['cursor'], $query['offset']);
+        ksort($query);
+        $queryHash = hash('sha256', json_encode($query, JSON_THROW_ON_ERROR));
+        $token = trim((string) $request->input('cursor', ''));
+        $cursor = null;
+        if ($token !== '') {
+            try {
+                $cursor = $this->cursorCodec->decode($token);
+            } catch (\InvalidArgumentException $e) {
+                return $this->jsonResponse(['error' => $e->getMessage()], 400);
+            }
+            if ($cursor->queryHash !== $queryHash
+                || $cursor->driver !== Search::getCurrentDriver()
+                || $cursor->indexGeneration !== (string) config('search.index_generation', '1')) {
+                return $this->jsonResponse(['error' => 'Search cursor does not match this query or index generation.'], 400);
+            }
+            $offset = count($cursor->sortValues) === 1 ? max(0, (int) $cursor->sortValues[0]) : 0;
+        }
+
+        $this->paginationContext = ['enabled' => true, 'offset' => $offset, 'limit' => $limit, 'query_hash' => $queryHash, 'cursor' => $cursor];
+
+        return $offset;
     }
 
     private function parseMaxAge(Request $request): int|JsonResponse
@@ -224,8 +290,11 @@ class ApiV2Controller extends BasePageController
         if ($searchName === '' && ! imdb_id_is_valid($imdbId) && $tmdbId <= 0 && $traktId <= 0) {
             return $this->jsonResponse(['error' => 'Specify id (query), imdbid, tmdbid, or traktid'], 400);
         }
-        $offset = $this->queryParameters->offset($request);
         $limit = $this->queryParameters->limit($request);
+        $offset = $this->resolvePaginationOffset($request, $limit);
+        if (! is_int($offset)) {
+            return $offset;
+        }
         $categoryID = $this->queryParameters->categories($request);
         $maxAge = $this->parseMaxAge($request);
         if (! is_int($maxAge)) {
@@ -242,6 +311,7 @@ class ApiV2Controller extends BasePageController
             'tmdbid' => $tmdbId,
             'traktid' => $traktId,
             'offset' => $offset,
+            'cursor' => $request->input('cursor'),
             'limit' => $limit,
             'id' => $searchName,
             'sort' => $sort,
@@ -284,8 +354,11 @@ class ApiV2Controller extends BasePageController
             return $this->jsonResponse(['error' => 'Incorrect parameter (id must not be empty)'], 400);
         }
 
-        $offset = $this->queryParameters->offset($request);
         $limit = $this->queryParameters->limit($request);
+        $offset = $this->resolvePaginationOffset($request, $limit);
+        if (! is_int($offset)) {
+            return $offset;
+        }
         $categoryID = $this->queryParameters->categories($request);
         $maxAge = $this->parseMaxAge($request);
         if (! is_int($maxAge)) {
@@ -311,6 +384,7 @@ class ApiV2Controller extends BasePageController
             'id' => $searchName,
             'group' => $groupName,
             'offset' => $offset,
+            'cursor' => $request->input('cursor'),
             'limit' => $limit,
             'sort' => $sort,
             'category' => $categoryID,
@@ -361,8 +435,11 @@ class ApiV2Controller extends BasePageController
             return $this->jsonResponse(['error' => 'Incorrect parameter (id must not be empty)'], 400);
         }
 
-        $offset = $this->queryParameters->offset($request);
         $limit = $this->queryParameters->limit($request);
+        $offset = $this->resolvePaginationOffset($request, $limit);
+        if (! is_int($offset)) {
+            return $offset;
+        }
         $categoryID = $this->queryParameters->categories($request);
         $maxAge = $this->parseMaxAge($request);
         if (! is_int($maxAge)) {
@@ -388,6 +465,7 @@ class ApiV2Controller extends BasePageController
             'id' => $searchName,
             'group' => $groupName,
             'offset' => $offset,
+            'cursor' => $request->input('cursor'),
             'limit' => $limit,
             'sort' => $sort,
             'category' => $categoryID,
@@ -441,8 +519,11 @@ class ApiV2Controller extends BasePageController
             return $this->jsonResponse(['error' => 'Specify id (query), anidbid, or anilistid'], 400);
         }
 
-        $offset = $this->queryParameters->offset($request);
         $limit = $this->queryParameters->limit($request);
+        $offset = $this->resolvePaginationOffset($request, $limit);
+        if (! is_int($offset)) {
+            return $offset;
+        }
         $categoryID = $this->queryParameters->categories($request);
         $maxAge = $this->parseMaxAge($request);
         if (! is_int($maxAge)) {
@@ -460,6 +541,7 @@ class ApiV2Controller extends BasePageController
             'anidbid' => $anidb,
             'anilistid' => $anilist,
             'offset' => $offset,
+            'cursor' => $request->input('cursor'),
             'limit' => $limit,
             'sort' => $sort,
             'category' => $categoryID,
@@ -493,7 +575,6 @@ class ApiV2Controller extends BasePageController
 
         $this->recordApiRequest($user, $request);
 
-        $offset = $this->queryParameters->offset($request);
         $catExclusions = User::getCachedCategoryExclusionById($user->id);
         $minSize = $request->has('minsize') && $request->input('minsize') > 0 ? $request->input('minsize') : 0;
         $maxAge = $this->parseMaxAge($request);
@@ -510,12 +591,17 @@ class ApiV2Controller extends BasePageController
         }
         $categoryID = $this->queryParameters->categories($request);
         $limit = $this->queryParameters->limit($request);
+        $offset = $this->resolvePaginationOffset($request, $limit);
+        if (! is_int($offset)) {
+            return $offset;
+        }
 
         $searchName = $request->input('id');
         $relData = $this->releaseRowCache->remember('v2', 'search', [
             'id' => $searchName,
             'group' => $groupName,
             'offset' => $offset,
+            'cursor' => $request->input('cursor'),
             'limit' => $limit,
             'sort' => $sort,
             'category' => $categoryID,
@@ -533,7 +619,8 @@ class ApiV2Controller extends BasePageController
                     $catExclusions,
                     $categoryID,
                     $minSize,
-                    $sort
+                    $sort,
+                    $this->paginationContext['cursor'],
                 );
             }
 
@@ -598,8 +685,11 @@ class ApiV2Controller extends BasePageController
             $airDate = str_replace('/', '-', $year[0].'-'.$episode);
         }
 
-        $offset = $this->queryParameters->offset($request);
         $limit = $this->queryParameters->limit($request);
+        $offset = $this->resolvePaginationOffset($request, $limit);
+        if (! is_int($offset)) {
+            return $offset;
+        }
         $categoryID = $this->queryParameters->categories($request);
         $airDate = $airDate ?? '';
         $searchName = $request->input('id') ?? '';
@@ -610,6 +700,7 @@ class ApiV2Controller extends BasePageController
             'episode' => $episode,
             'air_date' => $airDate,
             'offset' => $offset,
+            'cursor' => $request->input('cursor'),
             'limit' => $limit,
             'id' => $searchName,
             'category' => $categoryID,

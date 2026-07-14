@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services\Search\Contracts;
 
 use App\Enums\SecondarySearchIndex;
+use App\Services\Search\DTO\ReleaseSearchQuery;
+use App\Services\Search\DTO\SearchPage;
 
 /**
  * Interface for full-text search services (ManticoreSearch, Elasticsearch).
@@ -351,6 +353,8 @@ interface SearchServiceInterface
      * @return array{ids: list<int>, total: int, fuzzy: bool}
      */
     public function searchReleasesFiltered(array $criteria, int $limit, int $offset = 0): array;
+
+    public function searchReleasePage(ReleaseSearchQuery $query): SearchPage;
 
     /**
      * Upsert a metadata document (music, books, games, console, steam, anime).

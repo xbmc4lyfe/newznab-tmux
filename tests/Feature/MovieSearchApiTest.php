@@ -6,6 +6,8 @@ namespace Tests\Feature;
 
 use App\Models\Release;
 use App\Services\Releases\ReleaseSearchService;
+use App\Services\Search\DTO\ReleaseSearchQuery;
+use App\Services\Search\DTO\SearchPage;
 use App\Services\Search\SearchService;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Cache;
@@ -140,19 +142,17 @@ final class MovieSearchApiTest extends TestCase
     {
         $mock = Mockery::mock(SearchService::class, [$this->app]);
         $mock->shouldReceive('isAvailable')->andReturn(true);
-        $mock->shouldReceive('searchReleasesFiltered')
+        $mock->shouldReceive('searchReleasePage')
             ->once()
-            ->withArgs(function (array $criteria, int $limit, int $offset): bool {
+            ->withArgs(function (ReleaseSearchQuery $query): bool {
+                $criteria = $query->criteria();
+
                 return ($criteria['phrases'] ?? null) === 'Resurrection 2025'
                     && ($criteria['try_fuzzy'] ?? null) === true
-                    && $limit === 100
-                    && $offset === 0;
+                    && $query->limit === 100
+                    && $query->offset === 0;
             })
-            ->andReturn([
-                'ids' => [],
-                'total' => 0,
-                'fuzzy' => false,
-            ]);
+            ->andReturn(new SearchPage([], 0, false, 'manticore'));
 
         $this->app->instance(SearchService::class, $mock);
 

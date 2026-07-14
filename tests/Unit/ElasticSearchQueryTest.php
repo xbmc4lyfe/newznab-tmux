@@ -54,4 +54,17 @@ final class ElasticSearchQueryTest extends TestCase
             'Expected indexSearch/indexSearchApi/indexSearchTMA to use RELEASE_TEXT_FIELDS.'
         );
     }
+
+    #[Test]
+    public function filtered_release_search_supports_search_after_without_loading_source(): void
+    {
+        $driverSource = file_get_contents(__DIR__.'/../../app/Services/Search/Drivers/ElasticSearchDriver.php');
+
+        $this->assertIsString($driverSource);
+        $methodSource = strstr($driverSource, 'public function searchReleasesFiltered');
+        $this->assertIsString($methodSource);
+        $this->assertStringContainsString("\$body['search_after']", $methodSource);
+        $this->assertStringContainsString("'_source' => false", $methodSource);
+        $this->assertStringContainsString("'track_total_hits' => (bool)", $methodSource);
+    }
 }

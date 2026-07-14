@@ -14,6 +14,8 @@ use App\Models\Release;
 use App\Models\SteamApp;
 use App\Models\Video;
 use App\Services\Search\Contracts\SearchDriverInterface;
+use App\Services\Search\DTO\ReleaseSearchQuery;
+use App\Services\Search\DTO\SearchPage;
 use App\Services\Search\Support\ElasticsearchClientFactory;
 use App\Services\Search\Support\ElasticsearchResponseHelper;
 use App\Support\SecondaryIndexDocuments;
@@ -91,6 +93,23 @@ class ElasticSearchDriver implements SearchDriverInterface
     public function isAvailable(): bool
     {
         return $this->isElasticsearchAvailable();
+    }
+
+    public function searchReleasePage(ReleaseSearchQuery $query): SearchPage
+    {
+        $startedAt = hrtime(true);
+        $result = $this->searchReleasesFiltered($query->criteria(), $query->limit, $query->offset);
+
+        return new SearchPage(
+            ids: array_map(static fn (int|string $id): int => (int) $id, $result['ids']),
+            total: (int) $result['total'],
+            fuzzy: (bool) $result['fuzzy'],
+            driver: $this->getDriverName(),
+            available: (bool) ($result['available'] ?? true),
+            durationMs: (hrtime(true) - $startedAt) / 1_000_000,
+            lastSortValues: $result['last_sort'] ?? [],
+            hasMore: (bool) ($result['has_more'] ?? (($query->offset + count($result['ids'])) < (int) $result['total'])),
+        );
     }
 
     /**
@@ -2859,7 +2878,7 @@ class ElasticSearchDriver implements SearchDriverInterface
     public function searchReleasesFiltered(array $criteria, int $limit, int $offset = 0): array
     {
         if (! $this->isElasticsearchAvailable()) {
-            return ['ids' => [], 'total' => 0, 'fuzzy' => false];
+            return ['ids' => [], 'total' => 0, 'fuzzy' => false, 'available' => false];
         }
 
         $phrases = $criteria['phrases'] ?? null;
@@ -2936,38 +2955,54 @@ class ElasticSearchDriver implements SearchDriverInterface
 
             try {
                 $client = $this->getClient();
+                $body = [
+                    'query' => $query,
+                    'sort' => [
+                        [$sortField => ['order' => $order]],
+                        ['id' => ['order' => $order]],
+                    ],
+                    'size' => max(1, min($limit, self::MAX_RESULTS)),
+                    'track_total_hits' => (bool) ($criteria['track_total'] ?? true),
+                    '_source' => false,
+                ];
+                $cursorSort = $criteria['cursor_sort'] ?? null;
+                if (is_array($cursorSort) && count($cursorSort) === 2) {
+                    $body['search_after'] = array_values($cursorSort);
+                } else {
+                    $body['from'] = max(0, $offset);
+                }
+
                 $response = $client->search([
                     'index' => $this->getReleasesIndex(),
-                    'body' => [
-                        'query' => $query,
-                        'sort' => [
-                            [$sortField => ['order' => $order]],
-                            ['id' => ['order' => $order]],
-                        ],
-                        'from' => max(0, $offset),
-                        'size' => max(1, min($limit, self::MAX_RESULTS)),
-                        'track_total_hits' => true,
-                        '_source' => false,
-                    ],
+                    'body' => $body,
                 ]);
 
                 $ids = [];
-                foreach ($response['hits']['hits'] ?? [] as $hit) {
+                $hits = $response['hits']['hits'] ?? [];
+                foreach ($hits as $hit) {
                     $ids[] = (int) ($hit['_id'] ?? 0);
                 }
                 $total = (int) ($response['hits']['total']['value'] ?? $response['hits']['total'] ?? 0);
+                $lastHit = $hits === [] ? null : $hits[array_key_last($hits)];
 
-                return ['ids' => $ids, 'total' => $total, 'fuzzy' => $useFuzzy];
+                return [
+                    'ids' => $ids,
+                    'total' => $total,
+                    'fuzzy' => $useFuzzy,
+                    'available' => true,
+                    'last_sort' => is_array($lastHit) && is_array($lastHit['sort'] ?? null) ? array_values($lastHit['sort']) : [],
+                    'has_more' => count($ids) === max(1, min($limit, self::MAX_RESULTS)) && ($total === 0 || count($ids) + $offset < $total),
+                ];
             } catch (\Throwable $e) {
                 Log::error('ElasticSearch searchReleasesFiltered error: '.$e->getMessage());
 
-                return ['ids' => [], 'total' => 0, 'fuzzy' => $useFuzzy];
+                return ['ids' => [], 'total' => 0, 'fuzzy' => $useFuzzy, 'available' => false];
             }
         };
 
         if ($hasText) {
             $first = $run(false);
-            if ($first['ids'] !== [] || ! $tryFuzzy || ! $this->isFuzzyEnabled()) {
+            if ($first['ids'] !== [] || ($first['available'] ?? true) === false || ! $tryFuzzy || ! $this->isFuzzyEnabled()) {
                 return $first;
             }
 
