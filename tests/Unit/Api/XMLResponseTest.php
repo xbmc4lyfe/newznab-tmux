@@ -99,6 +99,21 @@ final class XMLResponseTest extends TestCase
         self::assertStringContainsString('<newznab:attr name="group" value="alt.binaries.testing"/>', $xml);
     }
 
+    public function test_extended_api_falls_back_to_adddate_for_invalid_postdate(): void
+    {
+        $release = $this->release([
+            'postdate' => 'not-a-date',
+        ]);
+
+        $array = $this->response([$release], ['extended' => '1'])->returnArray();
+
+        self::assertIsArray($array);
+        self::assertSame(
+            date(DATE_RSS, strtotime('2026-05-29 12:00:00')),
+            $array['item'][0]['attr']['usenetdate']
+        );
+    }
+
     public function test_api_rows_are_normalized_from_supported_payload_shapes(): void
     {
         $arrayRow = (array) $this->release([

@@ -124,7 +124,11 @@ final readonly class ReleaseItemPayloadBuilder
         $attributes['grabs'] = $this->value($release, 'grabs');
         $attributes['comments'] = $this->value($release, 'comments');
         $attributes['password'] = $this->value($release, 'passwordstatus');
-        $attributes['usenetdate'] = date(DATE_RSS, strtotime((string) $this->value($release, 'postdate')));
+        $usenetTimestamp = $this->timestamp($this->value($release, 'postdate'))
+            ?? $this->timestamp($this->value($release, 'adddate'));
+        if ($usenetTimestamp !== null) {
+            $attributes['usenetdate'] = date(DATE_RSS, $usenetTimestamp);
+        }
 
         $groupName = $this->value($release, 'group_name');
         if (! empty($groupName)) {
@@ -222,5 +226,20 @@ final readonly class ReleaseItemPayloadBuilder
         }
 
         return null;
+    }
+
+    private function timestamp(mixed $value): ?int
+    {
+        if (\is_int($value)) {
+            return $value;
+        }
+
+        if (! \is_string($value) || trim($value) === '') {
+            return null;
+        }
+
+        $timestamp = strtotime($value);
+
+        return $timestamp === false ? null : $timestamp;
     }
 }
