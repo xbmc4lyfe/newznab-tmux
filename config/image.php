@@ -4,17 +4,17 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Image Driver
+    | Default Image Driver
     |--------------------------------------------------------------------------
     |
-    | Intervention Image supports "GD Library" and "Imagick" to process images
-    | internally. You may choose one of them according to your PHP
-    | configuration. By default PHP's "GD Library" implementation is used.
+    | This option controls the default image processing driver that will be
+    | used when manipulating or converting images. This driver is always
+    | utilized unless another driver is explicitly specified instead.
     |
     | Supported: "gd", "imagick"
     |
     */
 
-    'driver' => 'imagick',
+    'default' => env('IMAGE_DRIVER', 'imagick'),
 
 ];

@@ -51,7 +51,7 @@
         "dariusiii/tv-maze-php-api": "^2.0.0",
         "elasticsearch/elasticsearch": "^8.19",
         "guzzlehttp/guzzle": "^7.9",
-        "intervention/image": "^3.11",
+        "intervention/image": "^4.0",
         "laravel/framework": "^13.0",
         "laravel/horizon": "^5.45",
         "laravel/pulse": "^1.7",

@@ -4,13 +4,12 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use Illuminate\Image\Image as LaravelImage;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Image;
 use Illuminate\Support\Facades\Log;
-use Intervention\Image\Drivers\Imagick\Driver;
-use Intervention\Image\Exceptions\NotWritableException;
-use Intervention\Image\ImageManager;
-use Intervention\Image\Interfaces\ImageInterface;
 use Spatie\LaravelImageOptimizer\Facades\ImageOptimizer;
+use Throwable;
 
 /**
  * Resize/save/delete images to disk.
@@ -56,7 +55,7 @@ class ReleaseImageService
         $this->vidSavePath = storage_path('covers/video/');
     }
 
-    protected function fetchImage(string $imgLoc): bool|ImageInterface
+    protected function fetchImage(string $imgLoc): bool|LaravelImage
     {
         try {
             // Create context with timeout settings for file_get_contents
@@ -107,9 +106,8 @@ class ReleaseImageService
                 return false;
             }
 
-            $manager = new ImageManager(Driver::class);
-            $img = $manager->read($imageData);
-        } catch (\Exception $e) {
+            return Image::fromBytes($imageData);
+        } catch (Throwable $e) {
             if ($e->getCode() === 404) {
                 cli()->notice('Data not available on server');
             } elseif ($e->getCode() === 503) {
@@ -118,15 +116,9 @@ class ReleaseImageService
                 Log::debug('Exception fetching image from '.$imgLoc.': '.$e->getMessage());
                 cli()->notice('Unable to fetch image: '.$e->getMessage());
             }
-
-            $img = false;
-        } catch (\Error $e) {
-            Log::debug('Error fetching image from '.$imgLoc.': '.$e->getMessage());
-            cli()->info($e->getMessage());
-            $img = false;
         }
 
-        return $img;
+        return false;
     }
 
     /**
@@ -153,34 +145,38 @@ class ReleaseImageService
             return 0;
         }
 
-        // Check if we need to resize it.
-        if ($imgMaxWidth !== 0 && $imgMaxHeight !== 0) {
-            $width = $cover->width();
-            $height = $cover->height();
-            if ($width !== 0 || $height !== 0) {
-                $ratio = min($imgMaxHeight / $height, $imgMaxWidth / $width);
-                // New dimensions
-                $new_width = (int) ($ratio * $width);
-                $new_height = (int) ($ratio * $height);
-                if ($new_width < $width && $new_width > 10 && $new_height > 10) {
-                    $cover->resize($new_width, $new_height);
+        $coverPath = $imgSavePath.$imgName.'.jpg';
 
-                    if ($saveThumb) {
-                        $cover->toJpeg(100)->save($imgSavePath.$imgName.'_thumb.jpg');
-                        // Optimize the thumbnail.
-                        ImageOptimizer::optimize($imgSavePath.$imgName.'_thumb.jpg');
+        try {
+            $shouldSaveThumb = false;
+
+            // Check if we need to resize it.
+            if ($imgMaxWidth !== 0 && $imgMaxHeight !== 0) {
+                $width = $cover->width();
+                $height = $cover->height();
+                if ($width !== 0 || $height !== 0) {
+                    $ratio = min($imgMaxHeight / $height, $imgMaxWidth / $width);
+                    // New dimensions
+                    $new_width = (int) ($ratio * $width);
+                    $new_height = (int) ($ratio * $height);
+                    if ($new_width < $width && $new_width > 10 && $new_height > 10) {
+                        $cover = $cover->resize($new_width, $new_height);
+                        $shouldSaveThumb = $saveThumb;
                     }
                 }
             }
-        }
-        // Store it on the hard drive.
-        $coverPath = $imgSavePath.$imgName.'.jpg';
-        try {
-            $cover->toJpeg(100)->save($coverPath);
-            // Optimize the image.
-            ImageOptimizer::optimize($coverPath);
-        } catch (NotWritableException $e) {
-            Log::debug('NotWritableException saving image to '.$coverPath.': '.$e->getMessage());
+
+            $jpeg = $cover->toJpeg()->quality(100)->toBytes();
+
+            if ($shouldSaveThumb && ! $this->writeOptimizedImage($imgSavePath.$imgName.'_thumb.jpg', $jpeg)) {
+                return 0;
+            }
+
+            if (! $this->writeOptimizedImage($coverPath, $jpeg)) {
+                return 0;
+            }
+        } catch (Throwable $e) {
+            Log::debug('Unable to process image '.$imgLoc.' for '.$coverPath.': '.$e->getMessage());
 
             return 0;
         }
@@ -192,6 +188,25 @@ class ReleaseImageService
         }
 
         return 1;
+    }
+
+    private function writeOptimizedImage(string $path, string $contents): bool
+    {
+        if (File::put($path, $contents) === false) {
+            Log::debug('Unable to write image to '.$path);
+
+            return false;
+        }
+
+        ImageOptimizer::optimize($path);
+
+        if (! File::isReadable($path)) {
+            Log::debug('Image was not readable after save: '.$path);
+
+            return false;
+        }
+
+        return true;
     }
 
     /**
