@@ -1,10 +1,14 @@
 {
     "agents": [
+        "cursor",
         "phpstorm-copilot"
     ],
     "cloud": false,
     "editors": [
+        "cursor",
         "phpstorm-copilot"
     ],
-    "guidelines": true
+    "guidelines": true,
+    "mcp": true,
+    "sail": true
 }
