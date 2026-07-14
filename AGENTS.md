@@ -137,6 +137,8 @@ find app -name "*.php" | xargs php -l  # PHP syntax lint on all changed files
 
 Auto-runs: PHP lint, Composer lock validation, Pint formatting. Commit limits: 200 char subject, 72 char body.
 
+When completing a task, stage newly created project files with Git. Do not stage temporary files or planning documents.
+
 ## Key Directories
 
 | Path | Purpose |
