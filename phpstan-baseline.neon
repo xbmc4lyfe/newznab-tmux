@@ -277,42 +277,6 @@ parameters:
 			path: app/Http/Controllers/Admin/DeletedUsersController.php
 
 		-
-			message: '#^Access to an undefined property Illuminate\\Database\\Eloquent\\Model\:\:\$id\.$#'
-			identifier: property.notFound
-			count: 1
-			path: app/Http/Controllers/Api/ApiController.php
-
-		-
-			message: '#^Access to an undefined property Illuminate\\Database\\Eloquent\\Model\:\:\$is_disabled\.$#'
-			identifier: property.notFound
-			count: 1
-			path: app/Http/Controllers/Api/ApiController.php
-
-		-
-			message: '#^Access to an undefined property Illuminate\\Database\\Eloquent\\Model\:\:\$role\.$#'
-			identifier: property.notFound
-			count: 2
-			path: app/Http/Controllers/Api/ApiController.php
-
-		-
-			message: '#^Call to an undefined method Illuminate\\Database\\Eloquent\\Model\:\:hasRole\(\)\.$#'
-			identifier: method.notFound
-			count: 1
-			path: app/Http/Controllers/Api/ApiController.php
-
-		-
-			message: '#^Method App\\Http\\Controllers\\Api\\ApiController\:\:categoryID\(\) should return array\<string, mixed\> but returns array\<int, int\>\.$#'
-			identifier: return.type
-			count: 3
-			path: app/Http/Controllers/Api/ApiController.php
-
-		-
-			message: '#^Method App\\Http\\Controllers\\Api\\ApiController\:\:categoryID\(\) should return array\<string, mixed\> but returns list\<string\>\.$#'
-			identifier: return.type
-			count: 1
-			path: app/Http/Controllers/Api/ApiController.php
-
-		-
 			message: '#^Call to function is_array\(\) with bool\|int\|string will always evaluate to false\.$#'
 			identifier: function.impossibleType
 			count: 1

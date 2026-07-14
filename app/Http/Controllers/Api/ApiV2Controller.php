@@ -4,22 +4,18 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers\Api;
 
-use App\Data\Api\CategoryData;
-use App\Data\Api\DetailsData;
 use App\Data\Api\ReleaseData;
-use App\Events\UserAccessedApi;
 use App\Http\Controllers\BasePageController;
 use App\Http\Controllers\GetNzbController;
 use App\Models\Category;
-use App\Models\Genre;
 use App\Models\Release;
-use App\Models\RootCategory;
-use App\Models\Settings;
-use App\Models\UsenetGroup;
 use App\Models\User;
-use App\Models\UserRequest;
+use App\Services\Api\ApiCapabilitiesService;
+use App\Services\Api\ApiQueryParameters;
 use App\Services\Api\ApiReleaseRowCache;
-use App\Services\RegistrationStatusService;
+use App\Services\Api\ApiUsageService;
+use App\Services\Api\ApiUserResolver;
+use App\Services\Api\V2\ApiV2Presenter;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
 use Illuminate\Contracts\Foundation\Application;
@@ -31,20 +27,25 @@ use Illuminate\Http\Response;
 use Illuminate\Routing\Redirector;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 
 class ApiV2Controller extends BasePageController
 {
-    private const JSON_ENCODING_OPTIONS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
-
-    private ApiController $api;
-
     private ReleaseSearchService $releaseSearchService;
 
     private ReleaseBrowseService $releaseBrowseService;
 
     private ApiReleaseRowCache $releaseRowCache;
+
+    private ApiQueryParameters $queryParameters;
+
+    private ApiUsageService $usageService;
+
+    private ApiUserResolver $userResolver;
+
+    private ApiV2Presenter $presenter;
+
+    private ApiCapabilitiesService $capabilitiesService;
 
     /**
      * @var array<int, object>
@@ -52,15 +53,23 @@ class ApiV2Controller extends BasePageController
     private array $resolvedUserStats = [];
 
     public function __construct(
-        ApiController $api,
         ReleaseSearchService $releaseSearchService,
         ReleaseBrowseService $releaseBrowseService,
-        ?ApiReleaseRowCache $releaseRowCache = null
+        ?ApiReleaseRowCache $releaseRowCache = null,
+        ?ApiQueryParameters $queryParameters = null,
+        ?ApiUsageService $usageService = null,
+        ?ApiUserResolver $userResolver = null,
+        ?ApiV2Presenter $presenter = null,
+        ?ApiCapabilitiesService $capabilitiesService = null,
     ) {
-        $this->api = $api;
         $this->releaseSearchService = $releaseSearchService;
         $this->releaseBrowseService = $releaseBrowseService;
         $this->releaseRowCache = $releaseRowCache ?? app(ApiReleaseRowCache::class);
+        $this->queryParameters = $queryParameters ?? app(ApiQueryParameters::class);
+        $this->usageService = $usageService ?? app(ApiUsageService::class);
+        $this->userResolver = $userResolver ?? app(ApiUserResolver::class);
+        $this->presenter = $presenter ?? app(ApiV2Presenter::class);
+        $this->capabilitiesService = $capabilitiesService ?? app(ApiCapabilitiesService::class);
     }
 
     /**
@@ -74,14 +83,7 @@ class ApiV2Controller extends BasePageController
         }
 
         $apiToken = $request->input('api_token');
-        $userCacheKey = 'api_user:'.md5((string) $apiToken);
-
-        $user = Cache::remember($userCacheKey, 300, function () use ($apiToken) {
-            return User::query()
-                ->whereApiToken((string) $apiToken)
-                ->with('role')
-                ->first();
-        });
+        $user = $this->userResolver->v2((string) $apiToken);
 
         if (! $user || ! $user->hasVerifiedEmail()) {
             return apiJsonError(100);
@@ -125,13 +127,12 @@ class ApiV2Controller extends BasePageController
 
     private function userStatsFor(User $user): object
     {
-        return $this->resolvedUserStats[$user->id] ??= $this->api->getCachedUserStats($user->id);
+        return $this->resolvedUserStats[$user->id] ??= $this->usageService->statistics($user->id);
     }
 
     private function recordApiRequest(User $user, Request $request): void
     {
-        UserRequest::addApiRequest($user->id, $request->getRequestUri());
-        event(new UserAccessedApi($user, $request->ip()));
+        $this->usageService->record($user, $request);
     }
 
     /**
@@ -139,7 +140,7 @@ class ApiV2Controller extends BasePageController
      */
     private function jsonResponse(array $data, int $status = 200): JsonResponse
     {
-        return response()->json($data, $status, [], self::JSON_ENCODING_OPTIONS);
+        return $this->presenter->json($data, $status);
     }
 
     /**
@@ -155,21 +156,7 @@ class ApiV2Controller extends BasePageController
      */
     private function buildSearchResponse(iterable $rows, User $user): JsonResponse
     {
-        $rowsArray = is_array($rows) ? $rows : iterator_to_array($rows, false);
-        $total = (int) ($rowsArray[0]->_totalrows ?? 0);
-        $detailsBaseUrl = url('/details').'/';
-        $getNzbBaseUrl = url('/getnzb');
-
-        $results = [];
-        foreach ($rowsArray as $row) {
-            $results[] = ReleaseData::toArrayFromRelease($row, $user, $detailsBaseUrl, $getNzbBaseUrl);
-        }
-
-        return $this->jsonResponse(array_merge(
-            ['Total' => $total],
-            $this->buildUserStatsResponse($user),
-            ['results' => $results],
-        ));
+        return $this->presenter->search($rows, $user, $this->buildUserStatsResponse($user));
     }
 
     private function parseMaxAge(Request $request): int|JsonResponse
@@ -206,69 +193,7 @@ class ApiV2Controller extends BasePageController
 
     public function capabilities(): JsonResponse
     {
-        // Cache the full capabilities response for 10 minutes
-        $capabilities = Cache::remember('api_v2_capabilities', 600, function () {
-            $category = Category::getForApi();
-
-            return [
-                'server' => [
-                    'title' => config('app.name'),
-                    'strapline' => Settings::settingValue('strapline'),
-                    'email' => config('mail.from.address'),
-                    'url' => url('/'),
-                ],
-                'limits' => [
-                    'max' => 100,
-                    'default' => 100,
-                ],
-                'searching' => [
-                    'search' => ['available' => 'yes', 'supportedParams' => 'id,group,minsize,maxsize,maxage,cat,limit,offset,sort'],
-                    'tv-search' => ['available' => 'yes', 'supportedParams' => 'id,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxsize,maxage,limit,offset,sort'],
-                    'movie-search' => ['available' => 'yes', 'supportedParams' => 'id,imdbid,tmdbid,traktid,genre,cat,minsize,maxsize,maxage,limit,offset,sort'],
-                    'audio-search' => ['available' => 'yes', 'supportedParams' => 'id,cat,minsize,maxsize,maxage,group,limit,offset,sort'],
-                    'book-search' => ['available' => 'yes', 'supportedParams' => 'id,cat,minsize,maxsize,maxage,group,limit,offset,sort'],
-                    'anime-search' => ['available' => 'yes', 'supportedParams' => 'id,anidbid,anilistid,cat,minsize,maxsize,maxage,limit,offset,sort'],
-                ],
-                'categories' => $category
-                    ->map(static fn (RootCategory $rootCategory): array => CategoryData::fromCategory($rootCategory)->toArray())
-                    ->values()
-                    ->all(),
-                'groups' => Schema::hasTable('usenet_groups')
-                    ? UsenetGroup::query()
-                        ->where('active', 1)
-                        ->orderBy('name')
-                        ->get(['name', 'description', 'last_updated'])
-                        ->map(static fn (UsenetGroup $group): array => [
-                            'name' => $group->name,
-                            'description' => (string) ($group->description ?? ''),
-                            'lastupdate' => $group->last_updated ? Carbon::parse($group->last_updated)->toRfc2822String() : '',
-                        ])
-                        ->values()
-                        ->all()
-                    : [],
-                'genres' => Schema::hasTable('genres')
-                    ? Genre::query()
-                        ->enabled()
-                        ->orderBy('title')
-                        ->get(['id', 'title', 'type'])
-                        ->map(static fn (Genre $genre): array => [
-                            'id' => $genre->id,
-                            'name' => $genre->title,
-                            'categoryid' => (int) ($genre->type ?? 0),
-                        ])
-                        ->values()
-                        ->all()
-                    : [],
-            ];
-        });
-
-        $registrationStatus = app(RegistrationStatusService::class)->resolve();
-        $capabilities['registration'] = [
-            'available' => $registrationStatus['available'] ? 'yes' : 'no',
-            'open' => $registrationStatus['is_open'] ? 'yes' : 'no',
-        ];
-
-        return $this->jsonResponse($capabilities);
+        return $this->jsonResponse($this->capabilitiesService->v2());
     }
 
     /**
@@ -292,9 +217,9 @@ class ApiV2Controller extends BasePageController
         if ($searchName === '' && ! imdb_id_is_valid($imdbId) && $tmdbId <= 0 && $traktId <= 0) {
             return $this->jsonResponse(['error' => 'Specify id (query), imdbid, tmdbid, or traktid'], 400);
         }
-        $offset = $this->api->offset($request);
-        $limit = $this->api->limit($request);
-        $categoryID = $this->api->categoryID($request);
+        $offset = $this->queryParameters->offset($request);
+        $limit = $this->queryParameters->limit($request);
+        $categoryID = $this->queryParameters->categories($request);
         $maxAge = $this->parseMaxAge($request);
         if (! is_int($maxAge)) {
             return $maxAge;
@@ -352,9 +277,9 @@ class ApiV2Controller extends BasePageController
             return $this->jsonResponse(['error' => 'Incorrect parameter (id must not be empty)'], 400);
         }
 
-        $offset = $this->api->offset($request);
-        $limit = $this->api->limit($request);
-        $categoryID = $this->api->categoryID($request);
+        $offset = $this->queryParameters->offset($request);
+        $limit = $this->queryParameters->limit($request);
+        $categoryID = $this->queryParameters->categories($request);
         $maxAge = $this->parseMaxAge($request);
         if (! is_int($maxAge)) {
             return $maxAge;
@@ -366,7 +291,7 @@ class ApiV2Controller extends BasePageController
 
         $minSize = max(0, (int) $request->input('minsize', 0));
         $catExclusions = User::getCachedCategoryExclusionById($user->id);
-        $groupName = $this->api->group($request);
+        $groupName = $this->queryParameters->group($request);
         $searchName = (string) $request->input('id', '');
 
         if ($searchName === '') {
@@ -429,9 +354,9 @@ class ApiV2Controller extends BasePageController
             return $this->jsonResponse(['error' => 'Incorrect parameter (id must not be empty)'], 400);
         }
 
-        $offset = $this->api->offset($request);
-        $limit = $this->api->limit($request);
-        $categoryID = $this->api->categoryID($request);
+        $offset = $this->queryParameters->offset($request);
+        $limit = $this->queryParameters->limit($request);
+        $categoryID = $this->queryParameters->categories($request);
         $maxAge = $this->parseMaxAge($request);
         if (! is_int($maxAge)) {
             return $maxAge;
@@ -443,7 +368,7 @@ class ApiV2Controller extends BasePageController
 
         $minSize = max(0, (int) $request->input('minsize', 0));
         $catExclusions = User::getCachedCategoryExclusionById($user->id);
-        $groupName = $this->api->group($request);
+        $groupName = $this->queryParameters->group($request);
         $searchName = (string) $request->input('id', '');
 
         if ($searchName === '') {
@@ -509,9 +434,9 @@ class ApiV2Controller extends BasePageController
             return $this->jsonResponse(['error' => 'Specify id (query), anidbid, or anilistid'], 400);
         }
 
-        $offset = $this->api->offset($request);
-        $limit = $this->api->limit($request);
-        $categoryID = $this->api->categoryID($request);
+        $offset = $this->queryParameters->offset($request);
+        $limit = $this->queryParameters->limit($request);
+        $categoryID = $this->queryParameters->categories($request);
         $maxAge = $this->parseMaxAge($request);
         if (! is_int($maxAge)) {
             return $maxAge;
@@ -561,7 +486,7 @@ class ApiV2Controller extends BasePageController
 
         $this->recordApiRequest($user, $request);
 
-        $offset = $this->api->offset($request);
+        $offset = $this->queryParameters->offset($request);
         $catExclusions = User::getCachedCategoryExclusionById($user->id);
         $minSize = $request->has('minsize') && $request->input('minsize') > 0 ? $request->input('minsize') : 0;
         $maxAge = $this->parseMaxAge($request);
@@ -572,12 +497,12 @@ class ApiV2Controller extends BasePageController
         if (! is_string($sort)) {
             return $sort;
         }
-        $groupName = $this->api->group($request);
+        $groupName = $this->queryParameters->group($request);
         if (is_array($groupName)) {
             $groupName = $groupName[0] ?? -1;
         }
-        $categoryID = $this->api->categoryID($request);
-        $limit = $this->api->limit($request);
+        $categoryID = $this->queryParameters->categories($request);
+        $limit = $this->queryParameters->limit($request);
 
         $searchName = $request->input('id');
         $relData = $this->releaseRowCache->remember('v2', 'search', [
@@ -634,16 +559,6 @@ class ApiV2Controller extends BasePageController
 
         $catExclusions = User::getCachedCategoryExclusionById($user->id);
         $minSize = $request->has('minsize') && $request->input('minsize') > 0 ? $request->input('minsize') : 0;
-        $this->api->verifyEmptyParameter($request, 'id');
-        $this->api->verifyEmptyParameter($request, 'vid');
-        $this->api->verifyEmptyParameter($request, 'tvdbid');
-        $this->api->verifyEmptyParameter($request, 'traktid');
-        $this->api->verifyEmptyParameter($request, 'rid');
-        $this->api->verifyEmptyParameter($request, 'tvmazeid');
-        $this->api->verifyEmptyParameter($request, 'imdbid');
-        $this->api->verifyEmptyParameter($request, 'tmdbid');
-        $this->api->verifyEmptyParameter($request, 'season');
-        $this->api->verifyEmptyParameter($request, 'ep');
         if (! $this->hasTvSearchParameters($request)) {
             return $this->jsonResponse(['error' => 'Specify id (query), vid, tvdbid, traktid, rid, tvmazeid, imdbid, or tmdbid'], 400);
         }
@@ -676,9 +591,9 @@ class ApiV2Controller extends BasePageController
             $airDate = str_replace('/', '-', $year[0].'-'.$episode);
         }
 
-        $offset = $this->api->offset($request);
-        $limit = $this->api->limit($request);
-        $categoryID = $this->api->categoryID($request);
+        $offset = $this->queryParameters->offset($request);
+        $limit = $this->queryParameters->limit($request);
+        $categoryID = $this->queryParameters->categories($request);
         $airDate = $airDate ?? '';
         $searchName = $request->input('id') ?? '';
 
@@ -751,12 +666,7 @@ class ApiV2Controller extends BasePageController
             return $this->jsonResponse(['error' => 'No such item'], 404);
         }
 
-        return $this->jsonResponse(DetailsData::toArrayFromRelease(
-            $relData,
-            $user,
-            url('/details').'/',
-            url('/getnzb')
-        ));
+        return $this->presenter->details($relData, $user);
     }
 
     private function hasTvSearchParameters(Request $request): bool

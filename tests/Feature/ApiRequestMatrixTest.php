@@ -135,7 +135,7 @@ class ApiRequestMatrixTest extends TestCase
         $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
         $releaseBrowseService->shouldNotReceive('getBrowseRangeForApi');
 
-        $controller = new ApiV2Controller(app(ApiController::class), $releaseSearchService, $releaseBrowseService);
+        $controller = new ApiV2Controller($releaseSearchService, $releaseBrowseService);
 
         $firstResponse = $controller->apiSearch($request);
         $secondResponse = $controller->apiSearch($request);
@@ -178,7 +178,7 @@ class ApiRequestMatrixTest extends TestCase
         $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
         $releaseBrowseService->shouldNotReceive('getBrowseRangeForApi');
 
-        $controller = new ApiV2Controller(app(ApiController::class), $releaseSearchService, $releaseBrowseService);
+        $controller = new ApiV2Controller($releaseSearchService, $releaseBrowseService);
         $response = $controller->apiSearch($request);
 
         $content = $response->getContent();
@@ -493,7 +493,7 @@ class ApiRequestMatrixTest extends TestCase
             )
             ->andReturn(collect());
 
-        $controller = new ApiV2Controller(app(ApiController::class), $releaseSearchService, $releaseBrowseService);
+        $controller = new ApiV2Controller($releaseSearchService, $releaseBrowseService);
 
         $response = $controller->audio($request);
 
@@ -527,7 +527,7 @@ class ApiRequestMatrixTest extends TestCase
             )
             ->andReturn(collect());
 
-        $controller = new ApiV2Controller(app(ApiController::class), $releaseSearchService, $releaseBrowseService);
+        $controller = new ApiV2Controller($releaseSearchService, $releaseBrowseService);
 
         $response = $controller->books($request);
 
@@ -564,7 +564,7 @@ class ApiRequestMatrixTest extends TestCase
                 )
                 ->andReturn(collect());
 
-            $controller = new ApiV2Controller(app(ApiController::class), $releaseSearchService, $releaseBrowseService);
+            $controller = new ApiV2Controller($releaseSearchService, $releaseBrowseService);
             $response = $controller->{$expectation['method']}($request);
 
             $this->assertSame(200, $response->getStatusCode());

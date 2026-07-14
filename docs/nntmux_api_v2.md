@@ -65,32 +65,27 @@ JSON sorting response snippet (`sort=size_desc`):
 ```http
 HTTP/1.1 200 OK
 Content-Type: application/json
-X-Total-Count: 2
-X-Api-Current: 0
-X-Api-Max: 100
-X-Grab-Current: 0
-X-Grab-Max: 100
-X-Api-Oldest-Time:
-X-Grab-Oldest-Time:
-
-[
-  { "title": "Ubuntu ISO x64", "size": 734003200 },
-  { "title": "Ubuntu ISO x86", "size": 367001600 }
-]
+{
+  "Total": 2,
+  "apiCurrent": 0,
+  "apiMax": 100,
+  "grabCurrent": 0,
+  "grabMax": 100,
+  "apiOldestTime": "",
+  "grabOldestTime": "",
+  "results": [
+    { "title": "Ubuntu ISO x64", "size": 734003200 },
+    { "title": "Ubuntu ISO x86", "size": 367001600 }
+  ]
+}
 ```
 
 Releases are ordered largest-to-smallest because `sort=size_desc`.
 
-> **Breaking change (April 2026):** the legacy `Results` (capital R) JSON
-> envelope — previously produced by `spatie/laravel-fractal` — has been
-> removed entirely. Search endpoints now return a bare top-level JSON array of
-> `App\Data\Api\ReleaseData` payloads. Pagination total and per-user API/grab
-> quotas have moved to response headers (`X-Total-Count`, `X-Api-Current`,
-> `X-Api-Max`, `X-Grab-Current`, `X-Grab-Max`, `X-Api-Oldest-Time`,
-> `X-Grab-Oldest-Time`). Movie/TV-only fields (`tvdbid`, `imdbid`, `season`, …)
-> are omitted from each release object when not applicable to its category,
-> instead of being emitted as `null`. TypeScript definitions are auto-generated
-> to `resources/js/types/generated.d.ts`.
+> The legacy `Results` (capital R) Fractal field has been replaced by the
+> lower-case `results` field. Search responses retain pagination and quota
+> metadata in the top-level JSON object. Movie/TV-only fields (`tvdbid`,
+> `imdbid`, `season`, …) are omitted when they do not apply to a release.
 
 ## Endpoints
 
@@ -213,7 +208,9 @@ Returns a single release object (not envelope). Download field name is `link` (n
 
 ## Error Response Conventions
 
-- Missing/invalid token: JSON `403`
+- Missing token: JSON `400`
+- Invalid token: JSON `401`
+- Disabled account: JSON `403`
 - Invalid `maxage`: JSON `400`
 - Invalid `sort`: JSON `400`
 - Missing required endpoint parameter (`id`, etc.): JSON `400`

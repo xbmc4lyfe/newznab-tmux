@@ -8,15 +8,17 @@ use App\Events\UserAccessedApi;
 use App\Http\Controllers\BasePageController;
 use App\Http\Controllers\GetNzbController;
 use App\Models\Category;
-use App\Models\Genre;
 use App\Models\Release;
 use App\Models\ReleaseNfo;
 use App\Models\Settings;
-use App\Models\UsenetGroup;
 use App\Models\User;
 use App\Models\UserRequest;
+use App\Services\Api\ApiCapabilitiesService;
+use App\Services\Api\ApiQueryParameters;
 use App\Services\Api\ApiReleaseRowCache;
-use App\Services\RegistrationStatusService;
+use App\Services\Api\ApiUsageService;
+use App\Services\Api\ApiUserResolver;
+use App\Services\Api\V1\ApiV1Presenter;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
 use App\Support\FilenameSanitizer;
@@ -31,7 +33,6 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\HeaderUtils;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -46,15 +47,35 @@ class ApiController extends BasePageController
 
     protected ApiReleaseRowCache $releaseRowCache;
 
+    private ?ApiQueryParameters $queryParameters = null;
+
+    private ?ApiUsageService $usageService = null;
+
+    private ApiUserResolver $userResolver;
+
+    private ApiCapabilitiesService $capabilitiesService;
+
+    private ApiV1Presenter $presenter;
+
     public function __construct(
         ReleaseSearchService $releaseSearchService,
         ReleaseBrowseService $releaseBrowseService,
-        ?ApiReleaseRowCache $releaseRowCache = null
+        ?ApiReleaseRowCache $releaseRowCache = null,
+        ?ApiQueryParameters $queryParameters = null,
+        ?ApiUsageService $usageService = null,
+        ?ApiUserResolver $userResolver = null,
+        ?ApiCapabilitiesService $capabilitiesService = null,
+        ?ApiV1Presenter $presenter = null,
     ) {
         parent::__construct();
         $this->releaseSearchService = $releaseSearchService;
         $this->releaseBrowseService = $releaseBrowseService;
         $this->releaseRowCache = $releaseRowCache ?? app(ApiReleaseRowCache::class);
+        $this->queryParameters = $queryParameters ?? app(ApiQueryParameters::class);
+        $this->usageService = $usageService ?? app(ApiUsageService::class);
+        $this->userResolver = $userResolver ?? app(ApiUserResolver::class);
+        $this->capabilitiesService = $capabilitiesService ?? app(ApiCapabilitiesService::class);
+        $this->presenter = $presenter ?? app(ApiV1Presenter::class);
     }
 
     /**
@@ -132,12 +153,7 @@ class ApiController extends BasePageController
             $apiKey = $request->input('apikey');
 
             // Cache user lookup for 5 minutes to avoid repeated DB hits (same pattern as API v2)
-            $userCacheKey = 'api_user:'.md5((string) $apiKey);
-            $res = Cache::remember($userCacheKey, 300, function () use ($apiKey) {
-                return User::verifiedApiTokenQuery($apiKey)
-                    ->with('role')
-                    ->first();
-            });
+            $res = $this->userResolver->v1((string) $apiKey);
 
             if ($res === null) {
                 return showApiError(100, 'Incorrect user credentials (wrong API key)');
@@ -768,35 +784,8 @@ class ApiController extends BasePageController
     public function output(mixed $data, array $params, bool $xml, int $offset, string $type = '', array $headers = [])
     {
         $this->type = $type;
-        $options = [
-            'Parameters' => $params,
-            'Data' => $data,
-            'Server' => $this->getForMenu(),
-            'Offset' => $offset,
-            'Type' => $type,
-        ];
 
-        $xmlResponse = new XML_Response($options);
-
-        if ($xml) {
-            $response = $xmlResponse->returnXML();
-            $contentType = 'text/xml';
-        } else {
-            $arrayData = $xmlResponse->returnArray();
-            if ($arrayData === false) {
-                return showApiError(201);
-            }
-            $response = json_encode($arrayData, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
-            $contentType = 'application/json';
-        }
-        if ($response === false) {
-            return showApiError(201);
-        }
-
-        return response($response, 200, array_merge([
-            'Content-type' => $contentType,
-            'Content-Length' => (string) \strlen($response),
-        ], $headers));
+        return $this->presenter->output($data, $params, $xml, $offset, $type, $headers);
     }
 
     /**
@@ -811,72 +800,7 @@ class ApiController extends BasePageController
     {
         $includeCats = $this->type === 'caps';
 
-        // Cache the server info blob (without categories) for 10 minutes
-        $serverInfo = Cache::remember('api_v1_server_menu', 600, function () {
-            $serverroot = url('/');
-
-            return [
-                'server' => [
-                    'title' => config('app.name'),
-                    'strapline' => Settings::settingValue('strapline'),
-                    'email' => config('mail.from.address'),
-                    'meta' => Settings::settingValue('metakeywords'),
-                    'url' => $serverroot,
-                    'image' => $serverroot.'/assets/images/tmux_logo.png',
-                ],
-                'limits' => [
-                    'max' => 100,
-                    'default' => 100,
-                ],
-                'searching' => [
-                    'search' => ['available' => 'yes', 'supportedParams' => 'q,group,minsize,maxsize,maxage,cat,limit,offset,attrs,extended,del,sort'],
-                    'tv-search' => ['available' => 'yes', 'supportedParams' => 'q,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort'],
-                    'movie-search' => ['available' => 'yes', 'supportedParams' => 'q,imdbid,tmdbid,traktid,genre,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort'],
-                    'audio-search' => ['available' => 'yes', 'supportedParams' => 'q,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort'],
-                    'book-search' => ['available' => 'yes', 'supportedParams' => 'q,title,author,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort'],
-                    'anime-search' => ['available' => 'yes', 'supportedParams' => 'q,anidbid,anilistid,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort'],
-                ],
-            ];
-        });
-
-        $registrationStatus = app(RegistrationStatusService::class)->resolve();
-        $serverInfo['registration'] = [
-            'available' => $registrationStatus['available'] ? 'yes' : 'no',
-            'open' => $registrationStatus['is_open'] ? 'yes' : 'no',
-        ];
-
-        // Only load categories for caps requests (also cached via Category::getForMenu)
-        $serverInfo['categories'] = $includeCats ? Category::getForMenu() : null;
-        $serverInfo['groups'] = $includeCats
-            ? (Schema::hasTable('usenet_groups')
-                ? UsenetGroup::query()
-                    ->where('active', 1)
-                    ->orderBy('name')
-                    ->get(['name', 'description', 'last_updated'])
-                    ->map(static fn (UsenetGroup $group): array => [
-                        'name' => $group->name,
-                        'description' => (string) ($group->description ?? ''),
-                        'lastupdate' => $group->last_updated ? Carbon::parse($group->last_updated)->toRfc2822String() : '',
-                    ])
-                    ->all()
-                : [])
-            : null;
-        $serverInfo['genres'] = $includeCats
-            ? (Schema::hasTable('genres')
-                ? Genre::query()
-                    ->enabled()
-                    ->orderBy('title')
-                    ->get(['id', 'title', 'type'])
-                    ->map(static fn (Genre $genre): array => [
-                        'id' => $genre->id,
-                        'name' => $genre->title,
-                        'categoryid' => (int) ($genre->type ?? 0),
-                    ])
-                    ->all()
-                : [])
-            : null;
-
-        return $serverInfo;
+        return $this->capabilitiesService->v1($includeCats);
     }
 
     /**
@@ -901,39 +825,11 @@ class ApiController extends BasePageController
     /**
      * Verify cat parameter.
      *
-     * @return array<string, mixed>
+     * @return array<int, string|int>
      */
     public function categoryID(Request $request): array
     {
-        $categoryID = [-1];
-        if (! $request->has('cat')) {
-            return $categoryID;
-        }
-
-        $rawCategoryIDs = $request->input('cat');
-        if (is_array($rawCategoryIDs)) {
-            $categoryIDs = implode(',', array_values(array_filter(array_map(
-                static fn (mixed $categoryId): string => urldecode(trim((string) $categoryId)),
-                $rawCategoryIDs
-            ), static fn (string $categoryId): bool => $categoryId !== '')));
-        } elseif (is_scalar($rawCategoryIDs)) {
-            $categoryIDs = urldecode(trim((string) $rawCategoryIDs));
-        } else {
-            return $categoryID;
-        }
-
-        if ($categoryIDs === '') {
-            return $categoryID;
-        }
-
-        // Append Web-DL category ID if HD present for SickBeard / Sonarr compatibility.
-        if (str_contains($categoryIDs, (string) Category::TV_HD) && ! str_contains($categoryIDs, (string) Category::TV_WEBDL) && (int) Settings::settingValue('catwebdl') === 0) {
-            $categoryIDs .= (','.Category::TV_WEBDL);
-        }
-
-        $categoryID = array_values(array_filter(array_map('trim', explode(',', $categoryIDs)), static fn (string $categoryId): bool => $categoryId !== ''));
-
-        return $categoryID;
+        return $this->parameters()->categories($request);
     }
 
     /**
@@ -943,15 +839,7 @@ class ApiController extends BasePageController
      */
     public function group(Request $request): string|int|bool
     {
-        $groupName = -1;
-        if ($request->has('group')) {
-            $group = UsenetGroup::isValidGroup($request->input('group'));
-            if ($group !== false) {
-                $groupName = $group;
-            }
-        }
-
-        return $groupName;
+        return $this->parameters()->group($request);
     }
 
     /**
@@ -959,12 +847,7 @@ class ApiController extends BasePageController
      */
     public function limit(Request $request): int
     {
-        $limit = 100;
-        if ($request->has('limit') && is_numeric($request->input('limit'))) {
-            $limit = (int) $request->input('limit');
-        }
-
-        return $limit;
+        return $this->parameters()->limit($request);
     }
 
     /**
@@ -972,12 +855,7 @@ class ApiController extends BasePageController
      */
     public function offset(Request $request): int
     {
-        $offset = 0;
-        if ($request->has('offset') && is_numeric($request->input('offset'))) {
-            $offset = (int) $request->input('offset');
-        }
-
-        return $offset;
+        return $this->parameters()->offset($request);
     }
 
     /**
@@ -1042,19 +920,17 @@ class ApiController extends BasePageController
      */
     public function getCachedUserStats(int $userId): object
     {
-        $cacheKey = 'api_user_stats:'.$userId;
+        return $this->usage()->statistics($userId);
+    }
 
-        return Cache::remember($cacheKey, 60, function () use ($userId) {
-            $oneDayAgo = now()->subDay()->toDateTimeString();
+    private function parameters(): ApiQueryParameters
+    {
+        return $this->queryParameters ?? new ApiQueryParameters;
+    }
 
-            return DB::selectOne('
-                SELECT
-                    (SELECT COUNT(*) FROM user_requests WHERE users_id = ? AND timestamp > ?) as api_count,
-                    (SELECT COUNT(*) FROM user_downloads WHERE users_id = ? AND timestamp > ?) as grab_count,
-                    (SELECT MIN(timestamp) FROM user_requests WHERE users_id = ? AND timestamp > ?) as api_time,
-                    (SELECT MIN(timestamp) FROM user_downloads WHERE users_id = ? AND timestamp > ?) as grab_time
-            ', [$userId, $oneDayAgo, $userId, $oneDayAgo, $userId, $oneDayAgo, $userId, $oneDayAgo]);
-        });
+    private function usage(): ApiUsageService
+    {
+        return $this->usageService ?? new ApiUsageService;
     }
 
     public function addCoverURL(mixed &$releases, callable $getCoverURL): void
