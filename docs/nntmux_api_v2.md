@@ -198,13 +198,12 @@ Fields:
 |---|---|---|
 | `api_token` | yes | API token for a verified, enabled user. |
 | `nzb` | yes | Valid `.nzb` file staged for deferred import. |
-| `nfo` | no | Matching `.nfo` file, maximum 65,535 bytes. |
+| `nfo` | no | `.nfo` file with any safe basename, maximum 65,535 bytes. |
 | `cat` | no | Echoed as response metadata; it does not affect import categorization. |
 
-When `nfo` is supplied, its basename must match the NZB basename
-case-insensitively (for example, `Release.nzb` and `Release.nfo`). The request
-is atomic: both files are validated before staging, existing files are never
-overwritten, and a partial write is rolled back.
+When `nfo` is supplied, its basename does not need to match the NZB basename.
+The request is atomic: both files are validated before staging in an isolated
+upload directory, and a partial write is rolled back.
 
 NZB-only example:
 
@@ -215,7 +214,7 @@ curl -X POST -F "api_token=<token>" -F "nzb=@Release.nzb" https://<host>/api/v2/
 Paired example:
 
 ```bash
-curl -X POST -F "api_token=<token>" -F "cat=5040" -F "nzb=@Release.nzb" -F "nfo=@Release.nfo" https://<host>/api/v2/nzbadd
+curl -X POST -F "api_token=<token>" -F "cat=5040" -F "nzb=@Release.nzb" -F "nfo=@scene-info.nfo" https://<host>/api/v2/nzbadd
 ```
 
 Successful staging returns HTTP `201`:
@@ -228,14 +227,24 @@ Successful staging returns HTTP `201`:
   "category": "5040",
   "files": {
     "nzb": { "filename": "Release.nzb", "type": "nzb" },
-    "nfo": { "filename": "Release.nfo", "type": "nfo" }
+    "nfo": { "filename": "scene-info.nfo", "type": "nfo" }
   }
 }
 ```
 
-Staging does not synchronously create a release. The existing importer consumes
-the files from `NZB_UPLOAD_FOLDER` later. NZB-only responses set `files.nfo` to
-`null`.
+Staging does not synchronously create a release. Import the NZB files first,
+then import their paired NFO files using the manifest identity recorded by the
+NZB importer:
+
+```bash
+php artisan nntmux:import-nzbs --folder=/path/to/NZB_UPLOAD_FOLDER
+php artisan nntmux:import-nfos --folder=/path/to/NZB_UPLOAD_FOLDER
+```
+
+The NFO importer replaces an existing NFO for the resolved release. Add
+`--delete` to remove successfully imported NFO payloads or `--delete-failed`
+to remove payloads that cannot be linked. NZB-only responses set `files.nfo`
+to `null`.
 
 ## Response Models
 

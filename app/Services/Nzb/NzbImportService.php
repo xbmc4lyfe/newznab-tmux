@@ -59,6 +59,8 @@ class NzbImportService
      */
     protected string $relGuid;
 
+    protected ?int $relId = null;
+
     public mixed $echoCLI;
 
     public NzbService $nzb;
@@ -84,10 +86,18 @@ class NzbImportService
     /**
      * Begin importing NZB files.
      *
+     * @param  null|callable(array{path:string,status:NzbImportStatus,release_id:int|null,release_guid:string|null}):void  $resultCallback
+     *
      * @throws FileNotFoundException
      */
-    public function beginImport(mixed $filesToProcess, bool $useNzbName = false, bool $delete = false, bool $deleteFailed = false, int $source = 1): bool|string
-    {
+    public function beginImport(
+        mixed $filesToProcess,
+        bool $useNzbName = false,
+        bool $delete = false,
+        bool $deleteFailed = false,
+        int $source = 1,
+        ?callable $resultCallback = null,
+    ): bool|string {
         // Get all the groups in the DB.
         if (! $this->getAllGroups()) {
             if ($this->browser) {
@@ -104,7 +114,8 @@ class NzbImportService
         $nzbFiles = [];
         foreach ($filesToProcess as $file) {
             $filePath = $file instanceof \SplFileInfo ? $file->getPathname() : (string) $file;
-            if (Str::endsWith($filePath, '.nzb') || Str::endsWith($filePath, '.nzb.gz')) {
+            $lowerFilePath = strtolower($filePath);
+            if (Str::endsWith($lowerFilePath, '.nzb') || Str::endsWith($lowerFilePath, '.nzb.gz')) {
                 $nzbFiles[] = $filePath;
             }
         }
@@ -123,12 +134,33 @@ class NzbImportService
             $this->echoOut("Filtered out {$totalFilesFiltered} non-NZB files. Processing ".count($nzbFiles).' NZB files.');
         }
 
+        $reportResult = static function (
+            string $path,
+            NzbImportStatus $status,
+            ?int $releaseId = null,
+            ?string $releaseGuid = null,
+        ) use ($resultCallback): void {
+            if ($resultCallback === null) {
+                return;
+            }
+
+            $resultCallback([
+                'path' => $path,
+                'status' => $status,
+                'release_id' => $status === NzbImportStatus::Inserted ? $releaseId : null,
+                'release_guid' => $status === NzbImportStatus::Inserted ? $releaseGuid : null,
+            ]);
+        };
+
         // Loop over the NZB file names only.
         foreach ($nzbFiles as $nzbFilePath) {
             // Check if the file is really there.
             if (File::isFile($nzbFilePath)) {
+                $this->relGuid = '';
+                $this->relId = null;
+
                 // Get the contents of the NZB file as a string.
-                if (Str::endsWith($nzbFilePath, '.nzb.gz')) {
+                if (Str::endsWith(strtolower($nzbFilePath), '.nzb.gz')) {
                     $nzbString = unzipGzipFile($nzbFilePath);
                 } else {
                     $nzbString = File::get($nzbFilePath);
@@ -136,6 +168,7 @@ class NzbImportService
 
                 if ($nzbString === false) {
                     $this->echoOut('ERROR: Unable to read: '.$nzbFilePath);
+                    $reportResult($nzbFilePath, NzbImportStatus::Failed);
 
                     if ($deleteFailed) {
                         File::delete($nzbFilePath);
@@ -149,6 +182,7 @@ class NzbImportService
                 $nzbXML = @simplexml_load_string($nzbString);
                 if ($nzbXML === false || strtolower($nzbXML->getName()) !== 'nzb') {
                     $this->echoOut('ERROR: Unable to load NZB XML data: '.$nzbFilePath);
+                    $reportResult($nzbFilePath, NzbImportStatus::Failed);
 
                     if ($deleteFailed) {
                         File::delete($nzbFilePath);
@@ -181,12 +215,15 @@ class NzbImportService
 
                         // Remove the release.
                         Release::query()->where('guid', $this->relGuid)->delete();
+                        $reportResult($nzbFilePath, NzbImportStatus::Failed);
 
                         if ($deleteFailed) {
                             File::delete($nzbFilePath);
                         }
                         $nzbsSkipped++;
                     } else {
+                        $reportResult($nzbFilePath, NzbImportStatus::Inserted, $this->relId, $this->relGuid);
+
                         if ($delete) {
                             // Remove the nzb file.
                             File::delete($nzbFilePath);
@@ -195,6 +232,8 @@ class NzbImportService
                         $nzbsImported++;
                     }
                 } else {
+                    $reportResult($nzbFilePath, $importStatus);
+
                     if ($importStatus === NzbImportStatus::Duplicate) {
                         $nzbsDuplicate++;
 
@@ -218,6 +257,7 @@ class NzbImportService
                 }
             } else {
                 $this->echoOut('ERROR: Unable to fetch: '.$nzbFilePath);
+                $reportResult($nzbFilePath, NzbImportStatus::Failed);
                 $nzbsSkipped++;
             }
         }
@@ -481,6 +521,8 @@ class NzbImportService
 
             return NzbImportStatus::Failed;
         }
+
+        $this->relId = (int) $relID;
 
         return NzbImportStatus::Inserted;
     }

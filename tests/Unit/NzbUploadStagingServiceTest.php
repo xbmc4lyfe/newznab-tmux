@@ -5,11 +5,11 @@ declare(strict_types=1);
 namespace Tests\Unit;
 
 use App\Exceptions\NzbUploadException;
+use App\Services\Nzb\NzbUploadManifestService;
 use App\Services\Nzb\NzbUploadStagingService;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Http\UploadedFile;
-use Mockery;
 use PDO;
 use Tests\TestCase;
 
@@ -75,41 +75,59 @@ final class NzbUploadStagingServiceTest extends TestCase
         }
     }
 
-    public function test_it_stages_a_matching_nzb_and_nfo_pair(): void
+    public function test_it_stages_an_nzb_and_arbitrarily_named_nfo_with_a_manifest(): void
     {
         $result = (new NzbUploadStagingService(new Filesystem))->stage(
             $this->nzb('Release.nzb'),
-            UploadedFile::fake()->createWithContent('Release.nfo', 'release information'),
+            UploadedFile::fake()->createWithContent('scene-info.nfo', 'release information'),
+        );
+
+        $uploadDirectory = $this->onlyUploadDirectory();
+        $manifest = json_decode(
+            (string) file_get_contents($uploadDirectory.'/'.NzbUploadManifestService::FILENAME),
+            true,
+            flags: JSON_THROW_ON_ERROR,
         );
 
         $this->assertSame('Release', $result['name']);
         $this->assertSame('Release.nzb', $result['files']['nzb']['filename']);
-        $this->assertSame('Release.nfo', $result['files']['nfo']['filename']);
-        $this->assertFileExists($this->uploadFolder.'/Release.nzb');
-        $this->assertFileExists($this->uploadFolder.'/Release.nfo');
+        $this->assertSame('scene-info.nfo', $result['files']['nfo']['filename']);
+        $this->assertFileExists($uploadDirectory.'/Release.nzb');
+        $this->assertFileExists($uploadDirectory.'/scene-info.nfo');
+        $this->assertSame(NzbUploadManifestService::STATE_STAGED, $manifest['state']);
+        $this->assertSame('Release.nzb', $manifest['nzb']['filename']);
+        $this->assertSame('scene-info.nfo', $manifest['nfo']['filename']);
+        $this->assertSame(basename($uploadDirectory), $manifest['upload_id']);
     }
 
     public function test_it_stages_an_nzb_without_an_nfo(): void
     {
         $result = (new NzbUploadStagingService(new Filesystem))->stage($this->nzb('Solo.nzb'));
 
+        $uploadDirectory = $this->onlyUploadDirectory();
+
         $this->assertNull($result['files']['nfo']);
-        $this->assertFileExists($this->uploadFolder.'/Solo.nzb');
+        $this->assertFileExists($uploadDirectory.'/Solo.nzb');
+        $this->assertFileExists($uploadDirectory.'/'.NzbUploadManifestService::FILENAME);
     }
 
-    public function test_it_rejects_mismatched_pair_names_before_writing(): void
+    public function test_it_isolates_repeated_generic_nfo_names(): void
     {
-        try {
-            (new NzbUploadStagingService(new Filesystem))->stage(
-                $this->nzb('Release.nzb'),
-                UploadedFile::fake()->createWithContent('Different.nfo', 'release information'),
-            );
-            $this->fail('Expected a mismatched pair to be rejected.');
-        } catch (NzbUploadException $exception) {
-            $this->assertSame(400, $exception->status);
-        }
+        $service = new NzbUploadStagingService(new Filesystem);
+        $service->stage(
+            $this->nzb('First.nzb'),
+            UploadedFile::fake()->createWithContent('info.nfo', 'first release information'),
+        );
+        $service->stage(
+            $this->nzb('Second.nzb'),
+            UploadedFile::fake()->createWithContent('info.nfo', 'second release information'),
+        );
 
-        $this->assertDirectoryDoesNotExist($this->uploadFolder);
+        $directories = (new Filesystem)->directories($this->uploadFolder);
+        $this->assertCount(2, $directories);
+        foreach ($directories as $directory) {
+            $this->assertFileExists($directory.'/info.nfo');
+        }
     }
 
     public function test_it_rejects_an_invalid_nzb_payload(): void
@@ -133,37 +151,19 @@ final class NzbUploadStagingServiceTest extends TestCase
         );
     }
 
-    public function test_it_rejects_a_collision_without_writing_either_file(): void
-    {
-        (new Filesystem)->makeDirectory($this->uploadFolder, 0775, true);
-        file_put_contents($this->uploadFolder.'/Release.nfo', 'pending');
-
-        try {
-            (new NzbUploadStagingService(new Filesystem))->stage(
-                $this->nzb('Release.nzb'),
-                UploadedFile::fake()->createWithContent('Release.nfo', 'new information'),
-            );
-            $this->fail('Expected an existing staged file to be rejected.');
-        } catch (NzbUploadException $exception) {
-            $this->assertSame(409, $exception->status);
-        }
-
-        $this->assertFileDoesNotExist($this->uploadFolder.'/Release.nzb');
-        $this->assertSame('pending', file_get_contents($this->uploadFolder.'/Release.nfo'));
-    }
-
     public function test_it_rolls_back_the_nzb_when_the_nfo_write_fails(): void
     {
-        $nzbPath = $this->uploadFolder.'/Release.nzb';
-        $nfoPath = $this->uploadFolder.'/Release.nfo';
-        $filesystem = Mockery::mock(Filesystem::class);
-        $filesystem->shouldReceive('isDirectory')->once()->with($this->uploadFolder)->andReturnTrue();
-        $filesystem->shouldReceive('exists')->once()->with($nzbPath)->andReturnFalse();
-        $filesystem->shouldReceive('exists')->once()->with($nfoPath)->andReturnFalse();
-        $filesystem->shouldReceive('put')->once()->with($nzbPath, Mockery::type('string'))->andReturn(100);
-        $filesystem->shouldReceive('put')->once()->with($nfoPath, 'release information')->andReturnFalse();
-        $filesystem->shouldReceive('exists')->once()->with($nzbPath)->andReturnTrue();
-        $filesystem->shouldReceive('delete')->once()->with($nzbPath)->andReturnTrue();
+        $filesystem = new class extends Filesystem
+        {
+            public function put($path, $contents, $lock = false): int|bool
+            {
+                if (str_ends_with((string) $path, '.nfo')) {
+                    return false;
+                }
+
+                return parent::put($path, $contents, $lock);
+            }
+        };
 
         $this->expectException(NzbUploadException::class);
         $this->expectExceptionMessage('Failed to write Release.nfo to disk');
@@ -174,12 +174,43 @@ final class NzbUploadStagingServiceTest extends TestCase
         );
     }
 
+    public function test_rollback_removes_the_partial_upload_directory(): void
+    {
+        $filesystem = new class extends Filesystem
+        {
+            public function put($path, $contents, $lock = false): int|bool
+            {
+                return str_ends_with((string) $path, '.nfo')
+                    ? false
+                    : parent::put($path, $contents, $lock);
+            }
+        };
+
+        try {
+            (new NzbUploadStagingService($filesystem))->stage(
+                $this->nzb('Release.nzb'),
+                UploadedFile::fake()->createWithContent('Release.nfo', 'release information'),
+            );
+            $this->fail('Expected staged pair write to fail.');
+        } catch (NzbUploadException) {
+            $this->assertSame([], $filesystem->directories($this->uploadFolder));
+        }
+    }
+
     private function nzb(string $name): UploadedFile
     {
         return UploadedFile::fake()->createWithContent(
             $name,
             '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"></nzb>',
         );
+    }
+
+    private function onlyUploadDirectory(): string
+    {
+        $directories = (new Filesystem)->directories($this->uploadFolder);
+        $this->assertCount(1, $directories);
+
+        return $directories[0];
     }
 
     private function setEnvironmentValue(string $key, ?string $value): void

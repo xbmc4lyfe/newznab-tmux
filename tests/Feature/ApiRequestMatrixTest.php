@@ -690,14 +690,61 @@ class ApiRequestMatrixTest extends TestCase
             ->assertJsonPath('password', 0);
     }
 
-    public function test_v2_nzbadd_stages_a_paired_nzb_and_nfo(): void
+    public function test_v1_nzbadd_stages_differently_named_nzb_and_nfo_fields(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+
+        $this->post('/api/v1/api?t=nzbadd&apikey='.$token, [
+            'cat' => '5040',
+            'nzb' => UploadedFile::fake()->createWithContent(
+                'Release.nzb',
+                '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"></nzb>',
+            ),
+            'nfo' => UploadedFile::fake()->createWithContent('scene-info.nfo', 'release information'),
+        ])->assertOk()
+            ->assertHeader('Content-Type', 'text/xml; charset=UTF-8')
+            ->assertSee('<success id="0" guid="" categoryid="5040" name="Release" />', false);
+
+        $this->assertNotNull($this->findStagedFile('Release.nzb'));
+        $this->assertNotNull($this->findStagedFile('scene-info.nfo'));
+        $this->assertNotNull($this->findStagedFile('nntmux-upload.json'));
+    }
+
+    public function test_v1_nzbadd_preserves_legacy_file_fallback_and_rejects_mixed_contracts(): void
+    {
+        $token = (string) DB::table('users')->value('api_token');
+
+        $this->post('/api/v1/api?t=nzbadd&apikey='.$token, [
+            'file' => UploadedFile::fake()->createWithContent(
+                'Legacy.nzb',
+                '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"></nzb>',
+            ),
+        ])->assertOk()
+            ->assertSee('name="Legacy"', false);
+
+        $this->assertNotNull($this->findStagedFile('Legacy.nzb'));
+
+        $this->post('/api/v1/api?t=nzbadd&apikey='.$token, [
+            'file' => UploadedFile::fake()->createWithContent(
+                'Mixed.nzb',
+                '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"></nzb>',
+            ),
+            'nzb' => UploadedFile::fake()->createWithContent(
+                'Modern.nzb',
+                '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"></nzb>',
+            ),
+        ])->assertBadRequest()
+            ->assertSee('<error code="201"', false);
+    }
+
+    public function test_v2_nzbadd_stages_a_differently_named_nzb_and_nfo(): void
     {
         $token = (string) DB::table('users')->value('api_token');
         $nzb = UploadedFile::fake()->createWithContent(
             'Release.nzb',
             '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"></nzb>',
         );
-        $nfo = UploadedFile::fake()->createWithContent('Release.nfo', 'release information');
+        $nfo = UploadedFile::fake()->createWithContent('scene-info.nfo', 'release information');
 
         $this->post('/api/v2/nzbadd', [
             'api_token' => $token,
@@ -710,10 +757,11 @@ class ApiRequestMatrixTest extends TestCase
             ->assertJsonPath('name', 'Release')
             ->assertJsonPath('category', '5040')
             ->assertJsonPath('files.nzb.filename', 'Release.nzb')
-            ->assertJsonPath('files.nfo.filename', 'Release.nfo');
+            ->assertJsonPath('files.nfo.filename', 'scene-info.nfo');
 
-        $this->assertFileExists($this->nzbUploadFolder.'/Release.nzb');
-        $this->assertFileExists($this->nzbUploadFolder.'/Release.nfo');
+        $this->assertNotNull($this->findStagedFile('Release.nzb'));
+        $this->assertNotNull($this->findStagedFile('scene-info.nfo'));
+        $this->assertNotNull($this->findStagedFile('nntmux-upload.json'));
         $this->assertSame(0, DB::table('user_requests')->count());
     }
 
@@ -737,7 +785,7 @@ class ApiRequestMatrixTest extends TestCase
         ])->assertCreated();
 
         $this->assertSame(1, DB::table('user_requests')->count());
-        $this->assertFileExists($this->nzbUploadFolder.'/QuotaExempt.nzb');
+        $this->assertNotNull($this->findStagedFile('QuotaExempt.nzb'));
     }
 
     public function test_v2_nzbadd_requires_posting_privileges(): void
@@ -924,6 +972,17 @@ class ApiRequestMatrixTest extends TestCase
             $table->unsignedInteger('updated_by')->nullable();
             $table->timestamps();
         });
+    }
+
+    private function findStagedFile(string $filename): ?string
+    {
+        foreach ((new Filesystem)->allFiles($this->nzbUploadFolder) as $file) {
+            if ($file->getFilename() === $filename) {
+                return $file->getPathname();
+            }
+        }
+
+        return null;
     }
 
     private function setEnvironmentValue(string $key, ?string $value): void

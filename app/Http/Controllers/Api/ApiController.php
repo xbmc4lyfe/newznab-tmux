@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers\Api;
 
+use App\Exceptions\NzbUploadException;
 use App\Http\Controllers\BasePageController;
 use App\Http\Controllers\GetNzbController;
 use App\Models\Category;
@@ -17,6 +18,7 @@ use App\Services\Api\ApiReleaseRowCache;
 use App\Services\Api\ApiUsageService;
 use App\Services\Api\ApiUserResolver;
 use App\Services\Api\V1\ApiV1Presenter;
+use App\Services\Nzb\NzbUploadStagingService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
 use App\Support\FilenameSanitizer;
@@ -25,12 +27,11 @@ use Illuminate\Contracts\Routing\ResponseFactory;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Routing\Redirector;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\File;
-use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\HeaderUtils;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -55,6 +56,8 @@ class ApiController extends BasePageController
 
     private ApiV1Presenter $presenter;
 
+    private NzbUploadStagingService $nzbUploadStagingService;
+
     public function __construct(
         ReleaseSearchService $releaseSearchService,
         ReleaseBrowseService $releaseBrowseService,
@@ -64,6 +67,7 @@ class ApiController extends BasePageController
         ?ApiUserResolver $userResolver = null,
         ?ApiCapabilitiesService $capabilitiesService = null,
         ?ApiV1Presenter $presenter = null,
+        ?NzbUploadStagingService $nzbUploadStagingService = null,
     ) {
         parent::__construct();
         $this->releaseSearchService = $releaseSearchService;
@@ -74,6 +78,7 @@ class ApiController extends BasePageController
         $this->userResolver = $userResolver ?? app(ApiUserResolver::class);
         $this->capabilitiesService = $capabilitiesService ?? app(ApiCapabilitiesService::class);
         $this->presenter = $presenter ?? app(ApiV1Presenter::class);
+        $this->nzbUploadStagingService = $nzbUploadStagingService ?? app(NzbUploadStagingService::class);
     }
 
     /**
@@ -695,76 +700,60 @@ class ApiController extends BasePageController
                 }
                 break;
                 //
-                // nzb / nfo add request
-                // curl -X POST -F "file=@./The.File.nzb" "site_url/api/V1/api?t=nzbadd&apikey=xxx"
-                // curl -X POST -F "file=@./The.File.nfo" "site_url/api/V1/api?t=nzbadd&apikey=xxx"
+                // Paired NZB / NFO add request. The legacy single `file` field remains supported.
                 //
             case 'nzbAdd':
                 if (! User::canPost($uid)) {
                     return showApiError(102, 'Insufficient privileges/not authorized');
                 }
 
-                if ($request->missing('file')) {
-                    return showApiError(200, 'Missing parameter (file is required for adding an NZB or NFO)');
-                }
-                if ($request->missing('apikey')) {
-                    return showApiError(200, 'Missing parameter (apikey is required for adding an NZB or NFO)');
-                }
+                $usesLegacyField = $request->has('file') || $request->hasFile('file');
+                $usesModernFields = $request->hasAny(['nzb', 'nfo'])
+                    || $request->hasFile('nzb')
+                    || $request->hasFile('nfo');
 
-                if (! $request->hasFile('file')) {
-                    return showApiError(600, 'Failed to load upload (no file)');
+                if ($usesLegacyField && $usesModernFields) {
+                    return showApiError(201, 'Use either file or nzb/nfo upload fields, not both');
+                }
+                if (! $usesLegacyField && ! $usesModernFields) {
+                    return showApiError(200, 'Missing parameter (nzb file is required)');
                 }
 
                 $this->usageService->record($res, $request);
 
-                $nzbFile = $request->file('file');
+                try {
+                    if ($usesModernFields) {
+                        $nzb = $request->file('nzb');
+                        if (! $nzb instanceof UploadedFile) {
+                            return showApiError(200, 'Missing parameter (nzb file is required)');
+                        }
 
-                // Save the file to the server, get the name without the extension.
-                if ($nzbFile !== null) {
-                    $ext = strtolower((string) $nzbFile->getClientOriginalExtension());
-                    if (! in_array($ext, ['nzb', 'nfo'], true)) {
-                        return showApiError(600, 'Failed to load NZB (file is not an NZB or NFO file)');
+                        $nfo = $request->file('nfo');
+                        if ($nfo !== null && ! $nfo instanceof UploadedFile) {
+                            return showApiError(600, 'Invalid nfo upload');
+                        }
+
+                        $staged = $this->nzbUploadStagingService->stage($nzb, $nfo);
+                        $name = $staged['name'];
+                    } else {
+                        $file = $request->file('file');
+                        if (! $file instanceof UploadedFile) {
+                            return showApiError(600, 'Failed to load upload (no file)');
+                        }
+
+                        $name = $this->nzbUploadStagingService->stageLegacyFile($file)['name'];
                     }
-
-                    $content = $nzbFile->getContent();
-                    if (! is_string($content)) {
-                        return showApiError(600, 'Failed to load upload');
-                    }
-
-                    if ($ext === 'nzb' && ! isValidNewznabNzb($content)) {
-                        return showApiError(600, 'Failed to load NZB (invalid NZB payload)');
-                    }
-
-                    // Same max raw size as NfoService::MAX_NFO_SIZE (64KB).
-                    $maxNfoUploadBytes = 65535;
-                    if ($ext === 'nfo' && ($content === '' || strlen($content) > $maxNfoUploadBytes)) {
-                        return showApiError(600, 'Failed to load NFO (empty or too large)');
-                    }
-
-                    if (! File::isDirectory(config('nntmux.nzb_upload_folder'))) {
-                        @File::makeDirectory(config('nntmux.nzb_upload_folder'), 0775, true);
-                    }
-
-                    if (File::put(config('nntmux.nzb_upload_folder').$nzbFile->getClientOriginalName(), $content)) {
-                        Log::channel('nzb_upload')->info('File uploaded by API: '.$nzbFile->getClientOriginalName().' (type: '.$ext.')');
-
-                        $successXml = sprintf(
-                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<success id=\"0\" guid=\"\" categoryid=\"%s\" name=\"%s\" />\n",
-                            (string) $request->input('cat', ''),
-                            htmlspecialchars(pathinfo($nzbFile->getClientOriginalName(), PATHINFO_FILENAME), ENT_QUOTES, 'UTF-8')
-                        );
-
-                        return response($successXml, 200)->header('Content-type', 'text/xml');
-                    }
-
-                    Log::channel('nzb_upload')->warning('File upload by API failed to write: '.$nzbFile->getClientOriginalName().' (type: '.$ext.')');
-                } else {
-                    Log::channel('nzb_upload')->warning('File upload by API failed: no file provided');
-
-                    return showApiError(603, 'Failed to write file to disk');
+                } catch (NzbUploadException $exception) {
+                    return showApiError(600, $exception->getMessage());
                 }
 
-                return showApiError(603, 'Failed to write file to disk');
+                $successXml = sprintf(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<success id=\"0\" guid=\"\" categoryid=\"%s\" name=\"%s\" />\n",
+                    (string) $request->input('cat', ''),
+                    htmlspecialchars($name, ENT_QUOTES, 'UTF-8')
+                );
+
+                return response($successXml, 200)->header('Content-type', 'text/xml');
 
                 // Capabilities request.
             case 'c':

@@ -8,12 +8,20 @@ use App\Exceptions\NzbUploadException;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 final class NzbUploadStagingService
 {
     private const MAX_NFO_SIZE = 65535;
 
-    public function __construct(private readonly Filesystem $filesystem) {}
+    private NzbUploadManifestService $manifests;
+
+    public function __construct(
+        private readonly Filesystem $filesystem,
+        ?NzbUploadManifestService $manifests = null,
+    ) {
+        $this->manifests = $manifests ?? new NzbUploadManifestService($filesystem);
+    }
 
     /**
      * @return array{name:string,files:array{nzb:array{filename:string,type:string},nfo:array{filename:string,type:string}|null}}
@@ -22,20 +30,12 @@ final class NzbUploadStagingService
     {
         [$nzbName, $nzbBase, $nzbContent] = $this->validateFile($nzb, 'nzb');
         $nfoDetails = $nfo === null ? null : $this->validateFile($nfo, 'nfo');
+        $folder = $this->ensureUploadFolder();
 
-        if ($nfoDetails !== null && strcasecmp($nzbBase, $nfoDetails[1]) !== 0) {
-            throw new NzbUploadException('NZB and NFO filenames must have matching basenames', 400);
-        }
-
-        $folder = config('nntmux.nzb_upload_folder');
-        if (! is_string($folder) || trim($folder) === '') {
-            throw new NzbUploadException('NZB upload folder is not configured', 500);
-        }
-
-        $folder = rtrim($folder, DIRECTORY_SEPARATOR);
-        if (! $this->filesystem->isDirectory($folder)
-            && ! $this->filesystem->makeDirectory($folder, 0775, true)) {
-            throw new NzbUploadException('Failed to create NZB upload folder', 500);
+        $uploadId = Str::uuid()->toString();
+        $uploadDirectory = $folder.DIRECTORY_SEPARATOR.$uploadId;
+        if (! $this->filesystem->makeDirectory($uploadDirectory, 0775, true)) {
+            throw new NzbUploadException('Failed to create upload staging directory', 500);
         }
 
         $files = [[$nzbName, $nzbContent, 'nzb']];
@@ -43,32 +43,26 @@ final class NzbUploadStagingService
             $files[] = [$nfoDetails[0], $nfoDetails[2], 'nfo'];
         }
 
-        foreach ($files as [$filename]) {
-            if ($this->filesystem->exists($folder.DIRECTORY_SEPARATOR.$filename)) {
-                throw new NzbUploadException("A staged file named {$filename} already exists", 409);
-            }
-        }
-
-        $created = [];
         try {
             foreach ($files as [$filename, $content, $type]) {
-                $path = $folder.DIRECTORY_SEPARATOR.$filename;
+                $path = $uploadDirectory.DIRECTORY_SEPARATOR.$filename;
                 if ($this->filesystem->put($path, $content) === false) {
                     throw new NzbUploadException("Failed to write {$filename} to disk", 500);
                 }
-                $created[] = $path;
-            }
-        } catch (\Throwable $exception) {
-            $rollbackFailed = false;
-            foreach ($created as $path) {
-                if ($this->filesystem->exists($path) && ! $this->filesystem->delete($path)) {
-                    $rollbackFailed = true;
-                }
             }
 
-            if ($rollbackFailed) {
-                Log::channel('nzb_upload')->error('Failed to roll back partial API v2 upload', [
-                    'files' => array_map('basename', $created),
+            $this->manifests->create(
+                $uploadDirectory,
+                $uploadId,
+                $nzbName,
+                $nfoDetails[0] ?? null,
+            );
+        } catch (\Throwable $exception) {
+            if ($this->filesystem->isDirectory($uploadDirectory)
+                && ! $this->filesystem->deleteDirectory($uploadDirectory)) {
+                Log::channel('nzb_upload')->error('Failed to roll back partial API upload', [
+                    'upload_id' => $uploadId,
+                    'files' => array_column($files, 0),
                 ]);
 
                 throw new NzbUploadException('Failed to write upload pair and roll back partial files', 500);
@@ -82,7 +76,8 @@ final class NzbUploadStagingService
         }
 
         foreach ($files as [$filename, , $type]) {
-            Log::channel('nzb_upload')->info('File uploaded by API v2', [
+            Log::channel('nzb_upload')->info('File staged by API', [
+                'upload_id' => $uploadId,
                 'filename' => $filename,
                 'type' => $type,
             ]);
@@ -95,6 +90,46 @@ final class NzbUploadStagingService
                 'nfo' => $nfoDetails === null ? null : ['filename' => $nfoDetails[0], 'type' => 'nfo'],
             ],
         ];
+    }
+
+    /**
+     * Preserve the API v1 single-file fallback while routing NZBs through manifested staging.
+     *
+     * @return array{name:string,filename:string,type:'nzb'|'nfo'}
+     */
+    public function stageLegacyFile(UploadedFile $file): array
+    {
+        $extension = strtolower((string) $file->getClientOriginalExtension());
+        if (! in_array($extension, ['nzb', 'nfo'], true)) {
+            throw new NzbUploadException('File is not an NZB or NFO file', 400);
+        }
+
+        if ($extension === 'nzb') {
+            $staged = $this->stage($file);
+
+            return [
+                'name' => $staged['name'],
+                'filename' => $staged['files']['nzb']['filename'],
+                'type' => 'nzb',
+            ];
+        }
+
+        [$filename, $basename, $content] = $this->validateFile($file, 'nfo');
+        $folder = $this->ensureUploadFolder();
+        $path = $folder.DIRECTORY_SEPARATOR.$filename;
+        if ($this->filesystem->exists($path)) {
+            throw new NzbUploadException("A staged file named {$filename} already exists", 409);
+        }
+        if ($this->filesystem->put($path, $content) === false) {
+            throw new NzbUploadException("Failed to write {$filename} to disk", 500);
+        }
+
+        Log::channel('nzb_upload')->info('Legacy NFO file staged by API v1', [
+            'filename' => $filename,
+            'type' => 'nfo',
+        ]);
+
+        return ['name' => $basename, 'filename' => $filename, 'type' => 'nfo'];
     }
 
     /** @return array{string,string,string} */
@@ -134,5 +169,21 @@ final class NzbUploadStagingService
         }
 
         return [$filename, $basename, $content];
+    }
+
+    private function ensureUploadFolder(): string
+    {
+        $folder = config('nntmux.nzb_upload_folder');
+        if (! is_string($folder) || trim($folder) === '') {
+            throw new NzbUploadException('NZB upload folder is not configured', 500);
+        }
+
+        $folder = rtrim($folder, DIRECTORY_SEPARATOR);
+        if (! $this->filesystem->isDirectory($folder)
+            && ! $this->filesystem->makeDirectory($folder, 0775, true)) {
+            throw new NzbUploadException('Failed to create NZB upload folder', 500);
+        }
+
+        return $folder;
     }
 }

@@ -225,15 +225,23 @@ newznab-tmux https://github.com/NNTmux/newznab-tmux
    Parameters:
    t=nzbadd
    apikey=xxxx
-   file=<multipart nzb or nfo file>
+   nzb=<multipart nzb file>
 
    Optional:
-   cat, includemeta, dupecheck, nfo, medianfo
+   nfo=<multipart nfo file with any basename>
+   cat, includemeta, dupecheck, medianfo
+
+   Legacy fallback:
+   file=<single multipart nzb or nfo file>
+
+   The legacy file field cannot be mixed with nzb or nfo in the same request.
 
    Behavior:
-   Valid .nzb and .nfo uploads are written to the same NZB upload folder
-   (NZB_UPLOAD_FOLDER). NFO files are not linked to releases at upload time;
-   a separate import command is expected to process them later.
+   The nzb/nfo fields use the same atomic manifested staging flow as API v2.
+   Each pair is isolated below NZB_UPLOAD_FOLDER and the NFO basename does not
+   need to match the NZB basename. Run nntmux:import-nzbs first and then
+   nntmux:import-nfos for the same folder to link the NFO to the new release.
+   Duplicate or failed NZB imports do not link their NFO files.
 
    Error handling:
    Uses XML error codes from section 6.
