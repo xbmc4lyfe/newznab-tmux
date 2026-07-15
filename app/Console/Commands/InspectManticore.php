@@ -37,8 +37,8 @@ final class InspectManticore extends Command
                 }
                 $actual = $client->table($table)->describe();
                 $comparison = ManticoreSchemaInspector::compareColumns(is_array($actual) ? $actual : [], $definition['columns']);
-                $actualSettings = $client->sql("SHOW TABLE {$table} SETTINGS", true);
-                $missingSettings = ManticoreSchemaInspector::missingSettings($actualSettings, $definition['settings']);
+                $actualSettings = $client->tables()->settings(['table' => $table]);
+                $missingSettings = ManticoreSchemaInspector::missingSettings($actualSettings, ManticoreIndexRegistry::inspectableSettings());
                 $needsRebuild = $comparison['missing'] !== [] || $comparison['incompatible'] !== [] || $missingSettings !== [];
                 $report['tables'][$table] = [...$comparison, 'missing_settings' => $missingSettings, 'needs_rebuild' => $needsRebuild];
                 $report['compatible'] = $report['compatible'] && ! $needsRebuild;

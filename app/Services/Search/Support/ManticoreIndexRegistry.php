@@ -83,6 +83,14 @@ final class ManticoreIndexRegistry
         };
     }
 
+    /** @return array<string, int|string> */
+    public static function inspectableSettings(): array
+    {
+        // Manticore 28 omits defaults/no-op settings such as min_prefix_len=0
+        // and exact_words from SHOW TABLE ... SETTINGS / SHOW CREATE TABLE.
+        return ['min_infix_len' => 2, 'index_field_lengths' => 1];
+    }
+
     /** @param array<string, string> $configuredIndexes */
     public static function logicalName(string $table, array $configuredIndexes = []): ?string
     {

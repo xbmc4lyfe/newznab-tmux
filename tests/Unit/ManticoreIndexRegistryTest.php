@@ -57,6 +57,59 @@ final class ManticoreIndexRegistryTest extends TestCase
     }
 
     #[Test]
+    public function it_accepts_the_php_clients_associative_describe_response(): void
+    {
+        $result = ManticoreSchemaInspector::compareColumns(
+            [
+                'passwordstatus' => ['Type' => 'bigint', 'Properties' => []],
+                'haspreview' => ['Type' => 'bigint', 'Properties' => []],
+            ],
+            ['passwordstatus' => ['type' => 'bigint'], 'haspreview' => ['type' => 'bigint']]
+        );
+
+        self::assertSame([], $result['missing']);
+        self::assertSame([], $result['incompatible']);
+    }
+
+    #[Test]
+    public function it_treats_manticore_uint_as_the_integer_schema_type(): void
+    {
+        $result = ManticoreSchemaInspector::compareColumns(
+            ['categories_id' => ['Type' => 'uint']],
+            ['categories_id' => ['type' => 'integer']]
+        );
+
+        self::assertSame([], $result['incompatible']);
+    }
+
+    #[Test]
+    public function it_compares_settings_by_name_and_value(): void
+    {
+        $actual = [
+            'min_infix_len' => ['Value' => '2'],
+            'exact_words' => ['Value' => '1'],
+            'index_field_lengths' => ['Value' => '1'],
+        ];
+
+        self::assertSame([], ManticoreSchemaInspector::missingSettings($actual, [
+            'min_infix_len' => 2,
+            'exact_words' => 1,
+            'index_field_lengths' => 1,
+        ]));
+    }
+
+    #[Test]
+    public function it_parses_manticore_28_bundled_settings_response(): void
+    {
+        $actual = ['settings' => "min_infix_len = 2\nindex_field_lengths = 1"];
+
+        self::assertSame([], ManticoreSchemaInspector::missingSettings(
+            $actual,
+            ManticoreIndexRegistry::inspectableSettings()
+        ));
+    }
+
+    #[Test]
     public function benchmark_fixture_is_versioned_and_covers_every_table(): void
     {
         $fixture = json_decode((string) file_get_contents(__DIR__.'/../Fixtures/Search/manticore-relevance-v1.json'), true, flags: JSON_THROW_ON_ERROR);
