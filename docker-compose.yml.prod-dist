@@ -111,7 +111,7 @@ services:
             retries: 3
             timeout: 5s
     manticore:
-        image: manticoresearch/manticore
+        image: manticoresearch/manticore:28.4.4
         profiles:
             - manticore
         environment:
@@ -130,7 +130,7 @@ services:
                 soft: -1
                 hard: -1
         volumes:
-            - 'manticore:/var/lib/manticore'
+            - 'manticore:/var/lib/manticore/data'
             - ./config/manticore.conf:/etc/manticoresearch/manticore.conf
         networks:
             - nntmux

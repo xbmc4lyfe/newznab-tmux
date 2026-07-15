@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "thresholds": {
+    "top_5_precision": 0.8,
+    "top_10_precision": 0.8,
+    "max_zero_result_rate": 0.05,
+    "max_fuzzy_fallback_rate": 0.25,
+    "max_p95_latency_ms": 250
+  },
+  "queries": [
+    {"index": "releases", "query": "The.Matrix.1999.1080p", "expected_terms": ["matrix", "1999"], "fuzzy": false},
+    {"index": "releases", "query": "\"breaking bad\" -german", "expected_terms": ["breaking bad"], "excluded_terms": ["german"], "fuzzy": false},
+    {"index": "releases", "query": "Oppenhiemer 2023", "expected_terms": ["oppenheimer", "2023"], "fuzzy": true},
+    {"index": "predb", "query": "Ubuntu.24.04-LTS", "expected_terms": ["ubuntu", "24.04"], "fuzzy": false},
+    {"index": "movies", "query": "Blade Runner 2049", "expected_terms": ["blade runner", "2049"], "fuzzy": false},
+    {"index": "tvshows", "query": "Better Call Saul", "expected_terms": ["better call saul"], "fuzzy": false},
+    {"index": "music", "query": "Daft Punk Discovery", "expected_terms": ["daft punk", "discovery"], "fuzzy": false},
+    {"index": "books", "query": "Frank Herbert Dune", "expected_terms": ["frank herbert", "dune"], "fuzzy": false},
+    {"index": "games", "query": "Baldur's Gate 3", "expected_terms": ["baldur", "gate"], "fuzzy": false},
+    {"index": "console", "query": "Zelda Tears of the Kingdom", "expected_terms": ["zelda", "kingdom"], "fuzzy": false},
+    {"index": "steam", "query": "Cyberpunk 2077", "expected_terms": ["cyberpunk", "2077"], "fuzzy": false},
+    {"index": "anime", "query": "Fullmetal Alchemist Brotherhood", "expected_terms": ["fullmetal alchemist"], "fuzzy": false}
+  ]
+}

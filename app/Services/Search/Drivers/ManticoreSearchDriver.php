@@ -18,6 +18,7 @@ use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
 use App\Services\Search\Support\ManticoreClientFactory;
+use App\Services\Search\Support\ManticoreIndexRegistry;
 use App\Support\ReleaseSearchIndexDocument;
 use App\Support\SecondaryIndexDocuments;
 use Illuminate\Support\Facades\Cache;
@@ -856,123 +857,17 @@ class ManticoreSearchDriver implements SearchDriverInterface
         }
 
         try {
-            $indices = $this->manticoreSearch->tables();
+            $logical = ManticoreIndexRegistry::logicalName($index, $this->config['indexes'] ?? []);
+            $definition = $logical === null ? null : (ManticoreIndexRegistry::definitions()[$logical] ?? null);
 
-            if ($index === 'releases_rt') {
-                $indices->create([
-                    'index' => $index,
-                    'body' => [
-                        'settings' => [
-                            'min_prefix_len' => 0,
-                            'min_infix_len' => 2,
-                        ],
-                        'columns' => [
-                            'name' => ['type' => 'text'],
-                            'searchname' => ['type' => 'text'],
-                            'fromname' => ['type' => 'text'],
-                            'filename' => ['type' => 'text'],
-                            'categories_id' => ['type' => 'integer'],
-                            'imdbid' => ['type' => 'string'],
-                            'tmdbid' => ['type' => 'integer'],
-                            'traktid' => ['type' => 'integer'],
-                            'tvdb' => ['type' => 'integer'],
-                            'tvmaze' => ['type' => 'integer'],
-                            'tvrage' => ['type' => 'integer'],
-                            'videos_id' => ['type' => 'integer'],
-                            'movieinfo_id' => ['type' => 'integer'],
-                            'size' => ['type' => 'bigint'],
-                            'postdate_ts' => ['type' => 'bigint'],
-                            'adddate_ts' => ['type' => 'bigint'],
-                            'totalpart' => ['type' => 'integer'],
-                            'grabs' => ['type' => 'integer'],
-                            'passwordstatus' => ['type' => 'bigint'],
-                            'groups_id' => ['type' => 'integer'],
-                            'nzbstatus' => ['type' => 'integer'],
-                            'haspreview' => ['type' => 'bigint'],
-                        ],
-                    ],
-                ]);
-                cli()->info('Created releases_rt index with external ID fields and infix search support');
-            } elseif ($index === 'predb_rt') {
-                $indices->create([
-                    'index' => $index,
-                    'body' => [
-                        'settings' => [
-                            'min_prefix_len' => 0,
-                            'min_infix_len' => 2,
-                        ],
-                        'columns' => [
-                            'title' => ['type' => 'text'],
-                            'filename' => ['type' => 'text'],
-                            'source' => ['type' => 'text'],
-                        ],
-                    ],
-                ]);
-                cli()->info('Created predb_rt index with infix search support');
-            } elseif ($index === 'movies_rt') {
-                $indices->create([
-                    'index' => $index,
-                    'body' => [
-                        'settings' => [
-                            'min_prefix_len' => 0,
-                            'min_infix_len' => 2,
-                        ],
-                        'columns' => [
-                            'imdbid' => ['type' => 'string'],
-                            'tmdbid' => ['type' => 'integer'],
-                            'traktid' => ['type' => 'integer'],
-                            'title' => ['type' => 'text'],
-                            'year' => ['type' => 'text'],
-                            'genre' => ['type' => 'text'],
-                            'actors' => ['type' => 'text'],
-                            'director' => ['type' => 'text'],
-                            'rating' => ['type' => 'text'],
-                            'plot' => ['type' => 'text'],
-                        ],
-                    ],
-                ]);
-                cli()->info('Created movies_rt index with infix search support');
-            } elseif ($index === 'tvshows_rt') {
-                $indices->create([
-                    'index' => $index,
-                    'body' => [
-                        'settings' => [
-                            'min_prefix_len' => 0,
-                            'min_infix_len' => 2,
-                        ],
-                        'columns' => [
-                            'title' => ['type' => 'text'],
-                            'tvdb' => ['type' => 'integer'],
-                            'trakt' => ['type' => 'integer'],
-                            'tvmaze' => ['type' => 'integer'],
-                            'tvrage' => ['type' => 'integer'],
-                            'imdb' => ['type' => 'string'],
-                            'tmdb' => ['type' => 'integer'],
-                            'started' => ['type' => 'text'],
-                            'type' => ['type' => 'integer'],
-                        ],
-                    ],
-                ]);
-                cli()->info('Created tvshows_rt index with infix search support');
-            } else {
-                foreach (SecondarySearchIndex::cases() as $secondary) {
-                    if ($index === $this->getSecondaryIndexName($secondary)) {
-                        $indices->create([
-                            'index' => $index,
-                            'body' => [
-                                'settings' => [
-                                    'min_prefix_len' => 0,
-                                    'min_infix_len' => 2,
-                                ],
-                                'columns' => $secondary->manticoreColumns(),
-                            ],
-                        ]);
-                        cli()->info("Created {$index} secondary metadata index");
+            if ($definition === null) {
+                cli()->error("No Manticore schema is registered for {$index}");
 
-                        break;
-                    }
-                }
+                return;
             }
+
+            $this->manticoreSearch->tables()->create(['index' => $index, 'body' => $definition]);
+            cli()->info("Created {$index} with the configured Manticore schema");
         } catch (\Throwable $e) {
             if (! str_contains($e->getMessage(), 'already exists')) {
                 cli()->error('Error creating index '.$index.': '.$e->getMessage());
@@ -1155,11 +1050,14 @@ class ManticoreSearchDriver implements SearchDriverInterface
         }
 
         $normalizedLimit = $this->normalizeSearchLimit($limit);
+        $logical = ManticoreIndexRegistry::logicalName($index, $this->config['indexes'] ?? []);
+        $profile = ManticoreIndexRegistry::profile($logical ?? '');
         $fuzzyConfig = $this->getFuzzyConfig();
-        $distance = $fuzzyConfig['max_distance'] ?? 2;
+        $distance = min((int) ($fuzzyConfig['max_distance'] ?? 2), $profile['fuzzy_distance']);
 
         // Create cache key for fuzzy search results
         $cacheKey = 'manticore:fuzzy:'.md5(serialize([
+            'generation' => config('search.index_generation', '1'),
             'index' => $index,
             'array' => $searchArray,
             'limit' => $normalizedLimit,
@@ -1215,6 +1113,7 @@ class ManticoreSearchDriver implements SearchDriverInterface
                 ->search($searchExpr)
                 ->option('fuzzy', true)
                 ->option('distance', $distance)
+                ->option('field_weights', $profile['fields'])
                 ->limit($normalizedLimit);
 
             $results = $query->get();
@@ -1308,6 +1207,8 @@ class ManticoreSearchDriver implements SearchDriverInterface
         }
 
         $normalizedLimit = $this->normalizeSearchLimit($limit);
+        $logical = ManticoreIndexRegistry::logicalName($rt_index, $this->config['indexes'] ?? []);
+        $profile = ManticoreIndexRegistry::profile($logical ?? '');
 
         if (config('app.debug')) {
             Log::debug('ManticoreSearch::searchIndexes called', [
@@ -1321,11 +1222,13 @@ class ManticoreSearchDriver implements SearchDriverInterface
 
         // Create cache key for search results
         $cacheKey = md5(serialize([
+            'generation' => config('search.index_generation', '1'),
             'index' => $rt_index,
             'search' => $searchString,
             'columns' => $column,
             'array' => $searchArray,
             'limit' => $normalizedLimit,
+            'profile' => $profile,
         ]));
 
         $cached = Cache::get($cacheKey);
@@ -1400,7 +1303,8 @@ class ManticoreSearchDriver implements SearchDriverInterface
             // Use a fresh Search instance for every query to avoid parameter accumulation across calls
             $query = (new Search($this->manticoreSearch))
                 ->setTable($rt_index)
-                ->option('ranker', 'sph04')
+                ->option('ranker', $profile['ranker'])
+                ->option('field_weights', $profile['fields'])
                 ->maxMatches($normalizedLimit)
                 ->limit($normalizedLimit)
                 ->stripBadUtf8(true)
@@ -1417,7 +1321,8 @@ class ManticoreSearchDriver implements SearchDriverInterface
                 try {
                     $query = (new Search($this->manticoreSearch))
                         ->setTable($rt_index)
-                        ->option('ranker', 'sph04')
+                        ->option('ranker', $profile['ranker'])
+                        ->option('field_weights', $profile['fields'])
                         ->maxMatches($normalizedLimit)
                         ->limit($normalizedLimit)
                         ->stripBadUtf8(true)
@@ -1516,7 +1421,12 @@ class ManticoreSearchDriver implements SearchDriverInterface
         }
 
         $index = $index ?? ($this->config['indexes']['releases'] ?? 'releases_rt');
-        $cacheKey = 'manticore:autocomplete:'.md5($index.$query);
+        $logical = ManticoreIndexRegistry::logicalName($index, $this->config['indexes'] ?? []);
+        $fields = ManticoreIndexRegistry::autocompleteFields($logical ?? '');
+        if ($fields === []) {
+            return [];
+        }
+        $cacheKey = 'manticore:autocomplete:'.config('search.index_generation', '1').':'.md5($index.$query);
 
         $cached = Cache::get($cacheKey);
         if ($cached !== null) {
@@ -1533,8 +1443,7 @@ class ManticoreSearchDriver implements SearchDriverInterface
                 return [];
             }
 
-            // Use relaxed search on searchname field
-            $searchExpr = '@@relaxed @searchname '.$escapedQuery;
+            $searchExpr = '@@relaxed @('.implode(',', $fields).') '.$escapedQuery.'*';
 
             $search = (new Search($this->manticoreSearch))
                 ->setTable($index)
@@ -1545,10 +1454,16 @@ class ManticoreSearchDriver implements SearchDriverInterface
 
             $results = $search->get();
 
-            $seen = [];
+            $ranked = [];
             foreach ($results as $doc) {
                 $data = $doc->getData();
-                $searchname = $data['searchname'] ?? '';
+                $searchname = '';
+                foreach ($fields as $field) {
+                    if (! empty($data[$field])) {
+                        $searchname = (string) $data[$field];
+                        break;
+                    }
+                }
 
                 if (empty($searchname)) {
                     continue;
@@ -1556,19 +1471,28 @@ class ManticoreSearchDriver implements SearchDriverInterface
 
                 // Create a clean suggestion from the searchname
                 $suggestion = $this->extractSuggestion($searchname, $query);
-
-                if (! empty($suggestion) && ! isset($seen[strtolower($suggestion)])) {
-                    $seen[strtolower($suggestion)] = true;
-                    $suggestions[] = [
-                        'suggest' => $suggestion,
-                        'distance' => 0,
-                        'docs' => 1,
-                    ];
+                if ($suggestion === null || $suggestion === '') {
+                    continue;
                 }
 
-                if (count($suggestions) >= $maxResults) {
-                    break;
+                $normalized = mb_strtolower(trim((string) preg_replace('/\s+/', ' ', $suggestion)));
+                if ($normalized !== '') {
+                    if (! isset($ranked[$normalized])) {
+                        $ranked[$normalized] = [
+                            'suggest' => $suggestion,
+                            'distance' => 0,
+                            'docs' => 0,
+                            'prefix' => str_starts_with($normalized, mb_strtolower($query)) ? 1 : 0,
+                        ];
+                    }
+                    $ranked[$normalized]['docs']++;
                 }
+            }
+
+            uasort($ranked, static fn (array $a, array $b): int => [$b['prefix'], $b['docs']] <=> [$a['prefix'], $a['docs']]);
+            foreach (array_slice($ranked, 0, $maxResults) as $item) {
+                unset($item['prefix']);
+                $suggestions[] = $item;
             }
         } catch (\Throwable $e) {
             if (config('app.debug')) {
@@ -1594,13 +1518,13 @@ class ManticoreSearchDriver implements SearchDriverInterface
     private function extractSuggestion(string $searchname, string $query): ?string
     {
         // Clean up the searchname - remove file extensions, quality tags at the end
-        $clean = preg_replace('/\.(mkv|avi|mp4|wmv|nfo|nzb|par2|rar|zip|r\d+)$/i', '', $searchname);
+        $clean = (string) preg_replace('/\.(mkv|avi|mp4|wmv|nfo|nzb|par2|rar|zip|r\d+)$/i', '', $searchname);
 
         // Replace dots and underscores with spaces for readability
         $clean = str_replace(['.', '_'], ' ', $clean);
 
         // Remove multiple spaces
-        $clean = preg_replace('/\s+/', ' ', $clean);
+        $clean = (string) preg_replace('/\s+/', ' ', $clean);
         $clean = trim($clean);
 
         if (empty($clean)) {
@@ -1622,9 +1546,9 @@ class ManticoreSearchDriver implements SearchDriverInterface
 
             // Clean up - don't cut mid-word
             if ($start > 0) {
-                $extracted = preg_replace('/^\S*\s/', '', $extracted);
+                $extracted = (string) preg_replace('/^\S*\s/', '', $extracted);
             }
-            $extracted = preg_replace('/\s\S*$/', '', $extracted);
+            $extracted = (string) preg_replace('/\s\S*$/', '', $extracted);
 
             return trim($extracted);
         }
@@ -1664,7 +1588,7 @@ class ManticoreSearchDriver implements SearchDriverInterface
         }
 
         $index = $index ?? ($this->config['indexes']['releases'] ?? 'releases_rt');
-        $cacheKey = 'manticore:suggest:'.md5($index.$query);
+        $cacheKey = 'manticore:suggest:'.config('search.index_generation', '1').':'.md5($index.$query);
 
         $cached = Cache::get($cacheKey);
         if ($cached !== null) {
@@ -1730,8 +1654,12 @@ class ManticoreSearchDriver implements SearchDriverInterface
                 return [];
             }
 
-            // Use relaxed search to find partial matches
-            $searchExpr = '@@relaxed @searchname '.$escapedQuery;
+            $logical = ManticoreIndexRegistry::logicalName($index, $this->config['indexes'] ?? []);
+            $fields = ManticoreIndexRegistry::autocompleteFields($logical ?? '');
+            if ($fields === []) {
+                return [];
+            }
+            $searchExpr = '@@relaxed @('.implode(',', $fields).') '.$escapedQuery;
 
             $search = (new Search($this->manticoreSearch))
                 ->setTable($index)
@@ -1745,10 +1673,16 @@ class ManticoreSearchDriver implements SearchDriverInterface
             $termCounts = [];
             foreach ($results as $doc) {
                 $data = $doc->getData();
-                $searchname = $data['searchname'] ?? '';
+                $searchname = '';
+                foreach ($fields as $field) {
+                    if (! empty($data[$field])) {
+                        $searchname = (string) $data[$field];
+                        break;
+                    }
+                }
 
                 // Extract words from searchname
-                $words = preg_split('/[\s.\-_]+/', strtolower($searchname));
+                $words = preg_split('/[\s.\-_]+/', strtolower($searchname)) ?: [];
                 foreach ($words as $word) {
                     if (strlen($word) >= 3 && $word !== strtolower($query)) {
                         // Check if word is similar to query (within edit distance)
@@ -2524,9 +2458,15 @@ class ManticoreSearchDriver implements SearchDriverInterface
                     if ($searchString === '') {
                         return ['ids' => [], 'total' => 0, 'fuzzy' => false];
                     }
+                    $profile = ManticoreIndexRegistry::profile('releases');
+                    $distance = min(
+                        (int) ($this->getFuzzyConfig()['max_distance'] ?? 2),
+                        $profile['fuzzy_distance']
+                    );
                     $query->search($searchString)
                         ->option('fuzzy', true)
-                        ->option('distance', (int) ($this->getFuzzyConfig()['max_distance'] ?? 2));
+                        ->option('distance', $distance)
+                        ->option('field_weights', $profile['fields']);
                 } else {
                     $searchArray = $this->phrasesToSearchArray($phrases);
                     $terms = [];
@@ -2542,7 +2482,10 @@ class ManticoreSearchDriver implements SearchDriverInterface
                     if ($terms === []) {
                         return ['ids' => [], 'total' => 0, 'fuzzy' => false];
                     }
-                    $query->search(implode(' ', $terms))->option('ranker', 'sph04');
+                    $profile = ManticoreIndexRegistry::profile('releases');
+                    $query->search(implode(' ', $terms))
+                        ->option('ranker', $profile['ranker'])
+                        ->option('field_weights', $profile['fields']);
                 }
             }
 
@@ -2609,6 +2552,7 @@ class ManticoreSearchDriver implements SearchDriverInterface
 
     /**
      * @param  array<string, mixed>|string  $phrases
+     * @return array<string, mixed>
      */
     private function phrasesToSearchArray(array|string $phrases): array
     {

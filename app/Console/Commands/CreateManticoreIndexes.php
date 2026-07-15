@@ -4,263 +4,85 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
-use App\Enums\SecondarySearchIndex;
 use App\Services\Search\Support\ManticoreClientFactory;
+use App\Services\Search\Support\ManticoreIndexRegistry;
 use Illuminate\Console\Command;
 use Manticoresearch\Client;
 use Manticoresearch\Exceptions\ResponseException;
 
 class CreateManticoreIndexes extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
-    protected $signature = 'manticore:create-indexes
-                                        {--drop : Drop existing indexes before creating}';
+    protected $signature = 'manticore:create-indexes {--drop : Drop existing indexes before creating}';
 
-    /**
-     * The console command description.
-     *
-     * @var string
-     */
     protected $description = 'Create Manticore Search indexes based on configuration';
 
     protected Client $client;
 
-    /**
-     * Execute the console command.
-     */
     public function handle(): int
     {
         $this->info('Creating Manticore Search indexes...');
-
-        $dropExisting = $this->option('drop');
-
-        $this->client = ManticoreClientFactory::make(config('search.drivers.manticore', config('manticoresearch', [])));
-
-        // We'll skip checking for data_dir this way since it may not be accessible via API
-        // but instead provide better error handling during index creation
-
-        // If you encounter data_dir errors, ensure it's properly set in config/manticore.conf:
-        // data_dir = /path/to/data
-        // And make sure the path exists and has proper permissions
+        $this->client = ManticoreClientFactory::make(config('search.drivers.manticore', []));
 
         try {
             $this->client->nodes()->status();
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             $this->error('Failed to connect to Manticore Search: '.$e->getMessage());
-            $this->info('Please check if Manticore Search is running and properly configured.');
+            $this->info('Check the configured host, authentication, and whether Manticore is running.');
 
-            return 1;
+            return self::FAILURE;
         }
 
-        // Define indexes and their schema
-        $indexes = [
-            'releases_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => [
-                    'name' => ['type' => 'text'],
-                    'searchname' => ['type' => 'text'],
-                    'fromname' => ['type' => 'text'],
-                    'filename' => ['type' => 'text'],
-                    'categories_id' => ['type' => 'integer'],
-                    // External media IDs for efficient searching
-                    'imdbid' => ['type' => 'string'],
-                    'tmdbid' => ['type' => 'integer'],
-                    'traktid' => ['type' => 'integer'],
-                    'tvdb' => ['type' => 'integer'],
-                    'tvmaze' => ['type' => 'integer'],
-                    'tvrage' => ['type' => 'integer'],
-                    'videos_id' => ['type' => 'integer'],
-                    'movieinfo_id' => ['type' => 'integer'],
-                    'size' => ['type' => 'bigint'],
-                    'postdate_ts' => ['type' => 'bigint'],
-                    'adddate_ts' => ['type' => 'bigint'],
-                    'totalpart' => ['type' => 'integer'],
-                    'grabs' => ['type' => 'integer'],
-                    'passwordstatus' => ['type' => 'bigint'],
-                    'groups_id' => ['type' => 'integer'],
-                    'nzbstatus' => ['type' => 'integer'],
-                    'haspreview' => ['type' => 'bigint'],
-                ],
-            ],
-            'predb_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => [
-                    'title' => ['type' => 'text', 'attribute' => true],
-                    'filename' => ['type' => 'text', 'attribute' => true],
-                    'source' => ['type' => 'string', 'attribute' => true],
-                ],
-            ],
-            'movies_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => [
-                    'imdbid' => ['type' => 'string'],
-                    'tmdbid' => ['type' => 'integer'],
-                    'traktid' => ['type' => 'integer'],
-                    'title' => ['type' => 'text'],
-                    'year' => ['type' => 'text'],
-                    'genre' => ['type' => 'text'],
-                    'actors' => ['type' => 'text'],
-                    'director' => ['type' => 'text'],
-                    'rating' => ['type' => 'text'],
-                    'plot' => ['type' => 'text'],
-                ],
-            ],
-            'tvshows_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => [
-                    'title' => ['type' => 'text'],
-                    'tvdb' => ['type' => 'integer'],
-                    'trakt' => ['type' => 'integer'],
-                    'tvmaze' => ['type' => 'integer'],
-                    'tvrage' => ['type' => 'integer'],
-                    'imdb' => ['type' => 'string'],
-                    'tmdb' => ['type' => 'integer'],
-                    'started' => ['type' => 'text'],
-                    'type' => ['type' => 'integer'],
-                ],
-            ],
-            'music_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => SecondarySearchIndex::Music->manticoreColumns(),
-            ],
-            'books_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => SecondarySearchIndex::Books->manticoreColumns(),
-            ],
-            'games_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => SecondarySearchIndex::Games->manticoreColumns(),
-            ],
-            'console_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => SecondarySearchIndex::Console->manticoreColumns(),
-            ],
-            'steam_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => SecondarySearchIndex::Steam->manticoreColumns(),
-            ],
-            'anime_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => SecondarySearchIndex::Anime->manticoreColumns(),
-            ],
-        ];
-
+        $configuredNames = config('search.drivers.manticore.indexes', []);
         $hasErrors = false;
-
-        // Create each index
-        foreach ($indexes as $indexName => $schema) {
-            if (! $this->createIndex($indexName, $schema, $dropExisting)) {
+        foreach (ManticoreIndexRegistry::definitions() as $logical => $schema) {
+            $indexName = (string) ($configuredNames[$logical] ?? $logical.'_rt');
+            if (! $this->createIndex($indexName, $schema, (bool) $this->option('drop'))) {
                 $hasErrors = true;
             }
         }
 
         if ($hasErrors) {
-            $this->error('Some errors occurred during index creation.');
+            $this->error('Some Manticore tables could not be created.');
 
-            return 1;
+            return self::FAILURE;
         }
 
-        $this->info('All Manticore Search indexes created successfully!');
+        $this->info('All Manticore Search tables are ready.');
 
-        return 0;
+        return self::SUCCESS;
     }
 
-    /**
-     * Create a single index with error handling.
-     *
-     * @param  array<string, mixed>  $schema
-     */
+    /** @param array<string, mixed> $schema */
     protected function createIndex(string $indexName, array $schema, bool $dropExisting): bool
     {
-        $this->info("Creating {$indexName} index...");
-        $indices = $this->client->tables();
+        $tables = $this->client->tables();
 
         try {
-            // Optionally drop existing index
             if ($dropExisting) {
-                try {
-                    $this->info("Dropping existing {$indexName} index...");
-                    $indices->drop(['index' => $indexName, 'body' => ['silent' => true]]);
-                    $this->info("Successfully dropped {$indexName} index.");
-                } catch (ResponseException $e) {
-                    if (! str_contains($e->getMessage(), 'unknown index')) {
-                        $this->warn("Warning when dropping {$indexName} index: ".$e->getMessage());
-                    }
-                }
+                $this->info("Dropping {$indexName}...");
+                $tables->drop(['index' => $indexName, 'body' => ['silent' => true]]);
             }
 
-            // Instead of checking if index exists (which doesn't work),
-            // try to create it directly and handle any errors
-            // that might occur if it already exists
-            $response = $indices->create([
-                'index' => $indexName,
-                'body' => $schema,
-            ]);
-
-            $this->info("Successfully created {$indexName} index.");
-            $this->line('Response: '.json_encode($response, JSON_PRETTY_PRINT));
+            $tables->create(['index' => $indexName, 'body' => $schema]);
+            $this->info("Created {$indexName}.");
 
             return true;
         } catch (ResponseException $e) {
-            // Check if the error is because the index already exists
             if (str_contains($e->getMessage(), 'already exists')) {
-                $this->warn("Index {$indexName} already exists. Use --drop option to recreate it.");
+                $this->warn("{$indexName} already exists; use --drop during a maintenance rebuild.");
 
                 return true;
             }
 
-            // Check for data_dir configuration error
             if (str_contains($e->getMessage(), 'data_dir')) {
-                $this->error("Failed to create {$indexName} index: ".$e->getMessage());
-                $this->newLine();
-                $this->warn('ManticoreSearch requires data_dir to be set in its configuration file.');
-                $this->info('To fix this, edit your ManticoreSearch config file (usually /etc/manticoresearch/manticore.conf):');
-                $this->line('  1. Add or uncomment: data_dir = /var/lib/manticore');
-                $this->line('  2. Ensure the directory exists and is writable by the manticore user');
-                $this->line('  3. Restart ManticoreSearch: sudo systemctl restart manticore');
-
-                return false;
+                $this->error("Failed to create {$indexName}: configure a writable Manticore data_dir.");
+            } else {
+                $this->error("Failed to create {$indexName}: ".$e->getMessage());
             }
 
-            $this->error("Failed to create {$indexName} index: ".$e->getMessage());
-
             return false;
-        } catch (\Exception $e) {
-            $this->error("Failed to create {$indexName} index: ".$e->getMessage());
+        } catch (\Throwable $e) {
+            $this->error("Failed to create {$indexName}: ".$e->getMessage());
 
             return false;
         }
