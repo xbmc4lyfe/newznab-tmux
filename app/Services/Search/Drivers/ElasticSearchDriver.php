@@ -1256,8 +1256,18 @@ class ElasticSearchDriver implements SearchDriverInterface
      */
     public function deleteRelease(int $id): void
     {
-        if (empty($id) || ! $this->isElasticsearchAvailable()) {
-            if (empty($id)) {
+        $this->deleteReleases([$id]);
+    }
+
+    public function deleteReleases(iterable $ids): void
+    {
+        $ids = array_values(array_unique(array_filter(
+            array_map('intval', is_array($ids) ? $ids : iterator_to_array($ids)),
+            static fn (int $id): bool => $id > 0
+        )));
+
+        if ($ids === [] || ! $this->isElasticsearchAvailable()) {
+            if ($ids === []) {
                 Log::warning('ElasticSearch: Cannot delete release without ID');
             }
 
@@ -1266,30 +1276,31 @@ class ElasticSearchDriver implements SearchDriverInterface
 
         try {
             $client = $this->getClient();
-            $client->delete([
-                'index' => $this->getReleasesIndex(),
-                'id' => $id,
-            ]);
+            $body = [];
+            foreach ($ids as $id) {
+                $body[] = ['delete' => ['_index' => $this->getReleasesIndex(), '_id' => $id]];
+            }
+            $client->bulk(['body' => $body]);
 
         } catch (\Throwable $e) {
             if (ElasticsearchResponseHelper::isNotFound($e)) {
                 if (config('app.debug')) {
-                    Log::debug('ElasticSearch deleteRelease: document not found', ['release_id' => $id]);
+                    Log::debug('ElasticSearch deleteReleases: document not found', ['release_ids' => $ids]);
                 }
 
                 return;
             }
 
             if ($e instanceof ElasticsearchException) {
-                Log::error('ElasticSearch deleteRelease error: '.$e->getMessage(), [
-                    'release_id' => $id,
+                Log::error('ElasticSearch deleteReleases error: '.$e->getMessage(), [
+                    'release_ids' => $ids,
                 ]);
 
                 return;
             }
 
-            Log::error('ElasticSearch deleteRelease unexpected error: '.$e->getMessage(), [
-                'release_id' => $id,
+            Log::error('ElasticSearch deleteReleases unexpected error: '.$e->getMessage(), [
+                'release_ids' => $ids,
             ]);
         }
     }

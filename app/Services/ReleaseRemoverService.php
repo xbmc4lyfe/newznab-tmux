@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Enums\BlacklistConstants;
-use App\Facades\Search;
 use App\Models\Category;
 use App\Models\Settings;
 use App\Services\Nzb\NzbService;
@@ -13,12 +12,17 @@ use App\Services\Releases\ReleaseManagementService;
 use Carbon\Carbon;
 use Exception;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Handles removing of various unwanted releases.
  */
 class ReleaseRemoverService
 {
+    private const int BATCH_SIZE = 500;
+
+    private const int BATCH_PAUSE_US = 10000;
+
     // Crap removal types
     private const string TYPE_BLACKLIST = 'blacklist';
 
@@ -71,11 +75,6 @@ class ReleaseRemoverService
     protected string $query = '';
 
     protected ReleaseManagementService $releaseManagement;
-
-    /**
-     * @var array<string, mixed>
-     */
-    protected array $result = [];
 
     private NzbService $nzb;
 
@@ -587,40 +586,6 @@ class ReleaseRemoverService
     }
 
     /**
-     * Get group IDs clause for a regex group name pattern.
-     *
-     * @return string|null Group IDs clause or null if no groups found
-     */
-    private function getGroupIDsClause(string $groupname): ?string
-    {
-        if (strtolower($groupname) === 'alt.binaries.*') {
-            return '';
-        }
-
-        $groupIDs = DB::select(
-            'SELECT id FROM usenet_groups WHERE name REGEXP '.escapeString($groupname)
-        );
-
-        if (empty($groupIDs)) {
-            return null;
-        }
-
-        $ids = collect($groupIDs)->pluck('id')->implode(',');
-
-        return ' AND r.groups_id IN ('.$ids.') ';
-    }
-
-    /**
-     * Perform search using configured search engine.
-     *
-     * @return array<string, mixed>
-     */
-    private function performSearch(string $regexMatch): array
-    {
-        return Search::searchReleases($regexMatch, 100);
-    }
-
-    /**
      * Remove releases using the site blacklist regexes.
      *
      * @throws Exception
@@ -650,77 +615,33 @@ class ReleaseRemoverService
             return true;
         }
 
-        foreach ($regexList as $regex) {
-            $this->processBlacklistRegex($regex);
+        $rules = $this->compileBlacklistRules($regexList);
+        if ($rules === []) {
+            return true;
         }
 
-        return true;
-    }
+        $this->processPhpMatchedCandidates(
+            'SELECT r.id, r.guid, r.searchname, r.fromname, r.groups_id FROM releases r WHERE 1=1 '.$this->crapTime,
+            function (object $release) use ($rules): ?string {
+                foreach ($rules as $rule) {
+                    if (! $this->ruleAppliesToGroup($rule, (int) $release->groups_id)) {
+                        continue;
+                    }
 
-    /**
-     * Process a single blacklist regex.
-     *
-     * @throws Exception
-     */
-    private function processBlacklistRegex(object $regex): void
-    {
-        $dbRegex = escapeString($regex->regex);
-        $regexMatch = ($this->crapTime === '') ? $this->extractSrchFromRegx($dbRegex) : '';
+                    $value = (int) $rule->msgcol === BlacklistConstants::BLACKLIST_FIELD_SUBJECT
+                        ? (string) $release->searchname
+                        : (string) $release->fromname;
 
-        [$regexSQL, $opTypeName] = $this->buildBlacklistRegexSQL((int) $regex->msgcol, $dbRegex);
+                    if (preg_match($rule->pattern, $value) === 1) {
+                        return 'Blacklist ['.$rule->id.']';
+                    }
+                }
 
-        if ($regexSQL === '') {
-            return;
-        }
-
-        $groupID = $this->getGroupIDsClause($regex->groupname);
-        if ($groupID === null) {
-            return;
-        }
-
-        $this->method = 'Blacklist ['.$regex->id.']';
-        $this->logBlacklistOperation($opTypeName, $regexMatch);
-
-        $searchResult = ($opTypeName === 'Subject') ? $this->performSearch($regexMatch) : '';
-
-        $this->query = sprintf(
-            'SELECT r.guid, r.searchname, r.id FROM releases r %s %s %s %s',
-            $regexSQL,
-            ! empty($searchResult) ? ' WHERE r.id IN ('.implode(',', $searchResult).')' : '',
-            $groupID,
-            $this->crapTime
+                return null;
+            }
         );
 
-        if ($this->checkSelectQuery()) {
-            $this->deleteReleases();
-        }
-    }
-
-    /**
-     * Build the regex SQL and operation type name for blacklist.
-     *
-     * @return list<string>
-     */
-    private function buildBlacklistRegexSQL(int $msgcol, string $dbRegex): array
-    {
-        return match ($msgcol) {
-            BlacklistConstants::BLACKLIST_FIELD_SUBJECT => [sprintf('WHERE r.searchname REGEXP %s', $dbRegex), 'Subject'],
-            BlacklistConstants::BLACKLIST_FIELD_FROM => ['WHERE r.fromname REGEXP '.$dbRegex, 'Poster'],
-            default => ['', ''],
-        };
-    }
-
-    /**
-     * Log blacklist operation details.
-     */
-    private function logBlacklistOperation(string $opTypeName, string $regexMatch): void
-    {
-        cli()->header(sprintf(
-            'Finding crap releases for %s: Using only REGEXP method against release %s.%s',
-            $this->method,
-            $opTypeName,
-            PHP_EOL
-        ), true);
+        return true;
     }
 
     /**
@@ -746,48 +667,155 @@ class ReleaseRemoverService
             return true;
         }
 
-        foreach ($allRegex as $regex) {
-            $this->processBlacklistFilesRegex($regex);
+        $rules = $this->compileBlacklistRules($allRegex);
+        if ($rules === []) {
+            return true;
         }
+
+        $this->processPhpMatchedCandidates(
+            'SELECT r.id, r.guid, r.searchname, r.groups_id FROM releases r '.
+            'WHERE EXISTS (SELECT 1 FROM release_files rf WHERE rf.releases_id = r.id) '.$this->crapTime,
+            function (object $release) use ($rules): ?string {
+                foreach ($rules as $rule) {
+                    if (! $this->ruleAppliesToGroup($rule, (int) $release->groups_id)) {
+                        continue;
+                    }
+
+                    foreach ($release->file_names as $name) {
+                        if (preg_match($rule->pattern, (string) $name) === 1) {
+                            return 'Blacklist Files '.$rule->id;
+                        }
+                    }
+                }
+
+                return null;
+            },
+            true
+        );
 
         return true;
     }
 
     /**
-     * Process a single blacklist files regex.
-     *
-     * @throws Exception
+     * @param  array<int, object>  $rules
+     * @return array<int, object>
      */
-    private function processBlacklistFilesRegex(object $regex): void
+    private function compileBlacklistRules(array $rules): array
     {
-        $regexSQL = sprintf(
-            'JOIN release_files rf ON r.id = rf.releases_id WHERE rf.name REGEXP %s',
-            escapeString($regex->regex)
-        );
+        $groups = DB::table('usenet_groups')->pluck('name', 'id');
+        $compiled = [];
 
-        $groupID = $this->getGroupIDsClause($regex->groupname);
-        if ($groupID === null) {
-            return;
+        foreach ($rules as $rule) {
+            $pattern = '/'.$rule->regex.'/i';
+            if (@preg_match($pattern, '') === false) {
+                Log::warning('Skipping invalid release-removal blacklist regex', [
+                    'blacklist_id' => $rule->id,
+                    'regex' => $rule->regex,
+                ]);
+
+                continue;
+            }
+
+            $rule->pattern = $pattern;
+            $rule->group_ids = null;
+
+            if (strtolower((string) $rule->groupname) !== 'alt.binaries.*') {
+                $groupPattern = '/'.$rule->groupname.'/i';
+                if (@preg_match($groupPattern, '') === false) {
+                    Log::warning('Skipping blacklist with invalid group regex', [
+                        'blacklist_id' => $rule->id,
+                        'group_regex' => $rule->groupname,
+                    ]);
+
+                    continue;
+                }
+
+                $rule->group_ids = $groups
+                    ->filter(static fn (string $name): bool => preg_match($groupPattern, $name) === 1)
+                    ->keys()
+                    ->map(static fn (int|string $id): int => (int) $id)
+                    ->all();
+
+                if ($rule->group_ids === []) {
+                    continue;
+                }
+            }
+
+            $compiled[] = $rule;
         }
 
-        $this->method = 'Blacklist Files '.$regex->id;
+        return $compiled;
+    }
 
-        cli()->header(sprintf(
-            'Finding crap releases for %s: Using only REGEXP method against release filenames.%s',
-            $this->method,
-            PHP_EOL
-        ), true);
+    private function ruleAppliesToGroup(object $rule, int $groupId): bool
+    {
+        return $rule->group_ids === null || in_array($groupId, $rule->group_ids, true);
+    }
 
-        $this->query = sprintf(
-            'SELECT DISTINCT r.id, r.guid, r.searchname FROM releases r %s %s %s',
-            $regexSQL,
-            $groupID,
-            $this->crapTime
-        );
+    /**
+     * @param  callable(object): ?string  $matcher
+     */
+    private function processPhpMatchedCandidates(string $candidateSql, callable $matcher, bool $includeFiles = false): void
+    {
+        $lastId = 0;
 
-        if ($this->checkSelectQuery()) {
-            $this->deleteReleases();
-        }
+        do {
+            $candidates = DB::select(
+                'SELECT candidates.* FROM ('.$this->cleanSpaces($candidateSql).') candidates '.
+                'WHERE candidates.id > ? ORDER BY candidates.id ASC LIMIT '.self::BATCH_SIZE,
+                [$lastId]
+            );
+
+            if ($candidates === []) {
+                break;
+            }
+
+            $lastId = (int) end($candidates)->id;
+            $matches = collect();
+
+            if ($includeFiles) {
+                $fileNames = DB::table('release_files')
+                    ->whereIn('releases_id', array_column($candidates, 'id'))
+                    ->select(['releases_id', 'name'])
+                    ->get()
+                    ->groupBy('releases_id');
+
+                foreach ($candidates as $candidate) {
+                    $candidate->file_names = $fileNames
+                        ->get((int) $candidate->id, collect())
+                        ->pluck('name');
+                }
+            }
+
+            foreach ($candidates as $candidate) {
+                $method = $matcher($candidate);
+                if ($method === null) {
+                    continue;
+                }
+
+                $candidate->removal_method = $method;
+                $matches->push($candidate);
+            }
+
+            foreach ($matches as $release) {
+                if ($this->echoCLI) {
+                    cli()->primary(
+                        ($this->delete ? 'Deleting: ' : 'Would be deleting: ').$release->removal_method.': '.$release->searchname,
+                        true
+                    );
+                }
+            }
+
+            if ($this->delete && $matches->isNotEmpty()) {
+                $this->releaseManagement->deleteBatch($matches, $this->nzb, $this->releaseImage);
+            }
+
+            $this->deletedCount += $matches->count();
+
+            if (count($candidates) === self::BATCH_SIZE) {
+                usleep(self::BATCH_PAUSE_US);
+            }
+        } while (true);
     }
 
     /**
@@ -934,20 +962,41 @@ class ReleaseRemoverService
      */
     protected function deleteReleases(): bool
     {
-        $deletedCount = 0;
-        foreach ($this->result as $release) {
-            if ($this->delete) {
-                $this->releaseManagement->deleteSingleWithService(['g' => $release->guid, 'i' => $release->id], $this->nzb, $this->releaseImage);
-                if ($this->echoCLI) {
-                    cli()->primary('Deleting: '.$this->method.': '.$release->searchname, true);
-                }
-            } elseif ($this->echoCLI) {
-                cli()->primary('Would be deleting: '.$this->method.': '.$release->searchname, true);
-            }
-            $deletedCount++;
-        }
+        $lastId = 0;
 
-        $this->deletedCount += $deletedCount;
+        do {
+            $batch = DB::select(
+                'SELECT candidates.id, candidates.guid, candidates.searchname FROM ('.$this->cleanSpaces($this->query).') candidates '.
+                'WHERE candidates.id > ? ORDER BY candidates.id ASC LIMIT '.self::BATCH_SIZE,
+                [$lastId]
+            );
+
+            if ($batch === []) {
+                break;
+            }
+
+            $batch = collect($batch)->unique('id')->values();
+            $lastId = (int) $batch->max('id');
+
+            foreach ($batch as $release) {
+                if ($this->echoCLI) {
+                    cli()->primary(
+                        ($this->delete ? 'Deleting: ' : 'Would be deleting: ').$this->method.': '.$release->searchname,
+                        true
+                    );
+                }
+            }
+
+            if ($this->delete) {
+                $this->releaseManagement->deleteBatch($batch, $this->nzb, $this->releaseImage);
+            }
+
+            $this->deletedCount += $batch->count();
+
+            if ($batch->count() === self::BATCH_SIZE) {
+                usleep(self::BATCH_PAUSE_US);
+            }
+        } while (true);
 
         return true;
     }
@@ -959,7 +1008,9 @@ class ReleaseRemoverService
      */
     protected function checkSelectQuery(): bool
     {
-        $result = DB::select($this->cleanSpaces($this->query));
+        $result = DB::select(
+            'SELECT 1 FROM ('.$this->cleanSpaces($this->query).') candidates LIMIT 1'
+        );
         if (empty($result)) {
             $this->error = '';
             if ($this->method === 'userCriteria') {
@@ -968,7 +1019,6 @@ class ReleaseRemoverService
 
             return false;
         }
-        $this->result = $result;
 
         return true;
     }
@@ -1198,72 +1248,5 @@ class ReleaseRemoverService
         }
 
         return false;
-    }
-
-    /**
-     * Extract search terms from a regex pattern for fulltext search optimization.
-     *
-     * @return array<string, mixed>
-     */
-    protected function extractSrchFromRegx(string $dbRegex = ''): array|string
-    {
-        $patterns = [
-            ['offset' => 2, 'length' => 17, 'match' => 'brazilian|chinese', 'search' => 'brazilian', 'useLastParen' => false],
-            ['offset' => 7, 'length' => 11, 'match' => 'bl|cz|de|es', 'search' => 'bl|cz', 'useLastParen' => false, 'wrapQuotes' => true],
-            ['offset' => 8, 'length' => 5, 'match' => '19|20', 'search' => 'bl|cz', 'useLastParen' => true, 'wrapQuotes' => true],
-            ['offset' => 7, 'length' => 14, 'match' => 'chinese.subbed', 'search' => 'chinese', 'useLastParen' => true, 'cleanChars' => true],
-            ['offset' => 8, 'length' => 2, 'match' => '4u', 'search' => '4u', 'useLastParen' => false, 'replace4u' => true],
-            ['offset' => 8, 'length' => 5, 'match' => 'bd|dl', 'search' => 'bd|dl', 'useLastParen' => true, 'replaceBdDl' => true],
-            ['offset' => 7, 'length' => 9, 'match' => 'imageset|', 'search' => 'imageset', 'useLastParen' => false],
-            ['offset' => 1, 'length' => 9, 'match' => 'hdnectar|', 'stripQuotes' => true],
-            ['offset' => 1, 'length' => 10, 'match' => 'Passworded', 'stripQuotes' => true],
-        ];
-
-        foreach ($patterns as $pattern) {
-            if (substr($dbRegex, $pattern['offset'], $pattern['length']) !== $pattern['match']) {
-                continue;
-            }
-
-            // Handle simple quote stripping patterns
-            if (! empty($pattern['stripQuotes'])) {
-                return str_replace('\'', '', $dbRegex);
-            }
-
-            $searchPos = strpos($dbRegex, $pattern['search']);
-            if ($searchPos === false) {
-                continue;
-            }
-
-            $parenPos = ! empty($pattern['useLastParen'])
-                ? strrpos($dbRegex, ')')
-                : strpos($dbRegex, ')');
-
-            $extracted = substr($dbRegex, $searchPos, $parenPos - $searchPos);
-
-            // Apply specific transformations
-            if (! empty($pattern['wrapQuotes'])) {
-                return '"'.str_replace('|', '" "', $extracted).'"';
-            }
-
-            if (! empty($pattern['cleanChars'])) {
-                return str_replace(
-                    ['-', '(', ')', '.', '?', 'nl  subed|bed|s'],
-                    ['', '', '', ' ', '', 'nlsubs|nlsubbed|nlsubed'],
-                    $extracted
-                );
-            }
-
-            if (! empty($pattern['replace4u'])) {
-                return str_replace(['4u.nl', 'nov[ a]*rip'], ['"4u" "nl"', 'nova'], $extracted);
-            }
-
-            if (! empty($pattern['replaceBdDl'])) {
-                return str_replace(['bd|dl)mux', '\\', ']', '['], ['bdmux|dlmux', '', '', ''], $extracted);
-            }
-
-            return $extracted;
-        }
-
-        return '';
     }
 }

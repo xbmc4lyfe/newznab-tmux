@@ -79,6 +79,13 @@ interface SearchServiceInterface
     public function deleteRelease(int $id): void;
 
     /**
+     * Delete multiple releases from the index in one request.
+     *
+     * @param  iterable<int|string>  $ids
+     */
+    public function deleteReleases(iterable $ids): void;
+
+    /**
      * Insert a predb record into the search index.
      *
      * @param  array<string, mixed>  $parameters  Predb data with 'id', 'title', 'filename', 'source'

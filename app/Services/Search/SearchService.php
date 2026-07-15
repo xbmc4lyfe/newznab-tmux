@@ -164,7 +164,12 @@ class SearchService extends Manager implements SearchServiceInterface
      */
     public function deleteRelease(int $id): void
     {
-        $this->driver()->deleteRelease($id);
+        $this->deleteReleases([$id]);
+    }
+
+    public function deleteReleases(iterable $ids): void
+    {
+        $this->driver()->deleteReleases($ids);
     }
 
     /**

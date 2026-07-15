@@ -14,6 +14,7 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Service for managing releases (delete, update, export).
@@ -88,6 +89,62 @@ class ReleaseManagementService
     }
 
     /**
+     * Delete a bounded set of releases while batching search and database work.
+     *
+     * @param  iterable<int, object|array<string, mixed>>  $releases
+     */
+    public function deleteBatch(iterable $releases, NzbService $nzb, ReleaseImageService $releaseImage): int
+    {
+        $rows = collect($releases)
+            ->map(static fn (object|array $release): array => [
+                'id' => (int) data_get($release, 'id'),
+                'guid' => (string) data_get($release, 'guid'),
+            ])
+            ->filter(static fn (array $release): bool => $release['id'] > 0 && $release['guid'] !== '')
+            ->unique('id')
+            ->values();
+
+        if ($rows->isEmpty()) {
+            return 0;
+        }
+
+        foreach ($rows as $release) {
+            try {
+                $nzb->deleteNzb($release['guid']);
+                $releaseImage->delete($release['guid']);
+            } catch (Throwable $e) {
+                Log::error('Release batch filesystem cleanup failed', [
+                    'release_id' => $release['id'],
+                    'guid' => $release['guid'],
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        $ids = $rows->pluck('id')->all();
+
+        try {
+            Search::deleteReleases($ids);
+        } catch (Throwable $e) {
+            Log::error('Release batch search cleanup failed', [
+                'release_ids' => $ids,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        try {
+            return Release::query()->whereIn('id', $ids)->delete();
+        } catch (Throwable $e) {
+            Log::error('Release batch database cleanup failed', [
+                'release_ids' => $ids,
+                'error' => $e->getMessage(),
+            ]);
+
+            return 0;
+        }
+    }
+
+    /**
      * @return bool|int
      */
     public function updateMulti(mixed $guids, mixed $category, mixed $grabs, mixed $videoId, mixed $episodeId, mixed $anidbId, mixed $imdbId)
@@ -157,7 +214,7 @@ class ReleaseManagementService
 
             try {
                 Search::updateRelease($intId);
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 Log::error('ReleaseManagementService: Failed to sync release to search index after category change', [
                     'release_id' => $intId,
                     'error' => $e->getMessage(),

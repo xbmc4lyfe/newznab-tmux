@@ -345,18 +345,32 @@ class ManticoreSearchDriver implements SearchDriverInterface
      */
     public function deleteRelease(int $id): void
     {
-        if (empty($id)) {
+        $this->deleteReleases([$id]);
+    }
+
+    public function deleteReleases(iterable $ids): void
+    {
+        $ids = array_values(array_unique(array_filter(
+            array_map('intval', is_array($ids) ? $ids : iterator_to_array($ids)),
+            static fn (int $id): bool => $id > 0
+        )));
+
+        if ($ids === []) {
             Log::warning('ManticoreSearch: Cannot delete release without ID');
 
             return;
         }
 
         try {
-            $this->manticoreSearch->table($this->config['indexes']['releases'])
-                ->deleteDocument($id);
+            $index = str_replace('`', '``', $this->getReleasesIndex());
+            $this->manticoreSearch->sql(sprintf(
+                'DELETE FROM `%s` WHERE id IN (%s)',
+                $index,
+                implode(',', $ids)
+            ));
         } catch (ResponseException $e) {
-            Log::error('ManticoreSearch deleteRelease error: '.$e->getMessage(), [
-                'id' => $id,
+            Log::error('ManticoreSearch deleteReleases error: '.$e->getMessage(), [
+                'ids' => $ids,
             ]);
         }
     }
