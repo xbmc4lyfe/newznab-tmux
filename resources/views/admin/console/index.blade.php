@@ -34,11 +34,12 @@
                         <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
                             <td class="px-6 py-4 whitespace-nowrap">
                                 @php
-                                    $coverPath = public_path('covers/console/' . $console->id . '.jpg');
-                                    $hasCover = file_exists($coverPath);
+                                    $coverPath = public_path('covers/console/' . $console->id . '.webp');
+                                    $legacyCoverPath = public_path('covers/console/' . $console->id . '.jpg');
+                                    $hasCover = file_exists($coverPath) || file_exists($legacyCoverPath);
                                 @endphp
                                 @if($hasCover)
-                                    <img src="{{ asset('covers/console/' . $console->id . '.jpg') }}"
+                                    <img src="{{ asset('covers/console/' . $console->id . (file_exists($coverPath) ? '.webp' : '.jpg')) }}"
                                          alt="{{ $console->title }}"
                                          class="h-16 w-12 object-cover rounded shadow"
                                          loading="lazy">
@@ -130,4 +131,3 @@
     </div>
 </div>
 @endsection
-

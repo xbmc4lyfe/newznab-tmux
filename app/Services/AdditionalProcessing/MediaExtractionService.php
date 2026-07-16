@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\AdditionalProcessing;
 
+use App\Enums\ImageAssetProfile;
 use App\Facades\Search;
 use App\Models\Category;
 use App\Models\Release;
@@ -95,29 +96,25 @@ class MediaExtractionService
                 $video->frame(TimeCode::fromString($time === '' ? '00:00:03:00' : $time))
                     ->save($fileName);
             }
+            if (! File::isFile($fileName)) {
+                return false;
+            }
+
+            return $this->releaseImage->saveLocalImage(
+                $guid.'_thumb',
+                $fileName,
+                $this->releaseImage->imgSavePath,
+                ImageAssetProfile::Preview,
+            )->success;
         } catch (\Throwable $e) {
             if ($this->config->debugMode) {
                 Log::error($e->getTraceAsString());
             }
 
             return false;
+        } finally {
+            File::delete($fileName);
         }
-
-        if (! File::isFile($fileName)) {
-            return false;
-        }
-
-        $saved = $this->releaseImage->saveImage(
-            $guid.'_thumb',
-            $fileName,
-            $this->releaseImage->imgSavePath,
-            800,
-            600
-        );
-
-        File::delete($fileName);
-
-        return $saved === 1;
     }
 
     /**
@@ -239,15 +236,14 @@ class MediaExtractionService
      */
     public function getJPGSample(string $fileLocation, string $guid): bool
     {
-        $saved = $this->releaseImage->saveImage(
+        $saved = $this->releaseImage->saveLocalImage(
             $guid.'_thumb',
             $fileLocation,
             $this->releaseImage->jpgSavePath,
-            650,
-            650
+            ImageAssetProfile::Sample,
         );
 
-        if ($saved === 1) {
+        if ($saved->success) {
             Release::query()->where('guid', $guid)->update(['jpgstatus' => 1]);
 
             return true;
@@ -459,7 +455,7 @@ class MediaExtractionService
 
         $type = @exif_imagetype($filePath);
 
-        return $type === IMAGETYPE_JPEG || $type === IMAGETYPE_PNG;
+        return in_array($type, [IMAGETYPE_JPEG, IMAGETYPE_PNG, IMAGETYPE_WEBP], true);
     }
 
     private function ffmpeg(): FFMpeg

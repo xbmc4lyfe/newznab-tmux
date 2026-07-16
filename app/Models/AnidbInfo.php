@@ -109,7 +109,7 @@ class AnidbInfo extends Model
      */
     public function getPicturePath(): string
     {
-        return storage_path('covers/anime/'.$this->anidbid.'.jpg');
+        return storage_path('covers/anime/'.$this->anidbid.'-cover.webp');
     }
 
     /**
@@ -117,7 +117,14 @@ class AnidbInfo extends Model
      */
     public function hasPictureImage(): bool
     {
-        return file_exists($this->getPicturePath());
+        $path = $this->getPicturePath();
+
+        $legacyPath = preg_replace('/\.webp$/', '.jpg', $path);
+        $oldLegacyPath = storage_path('covers/anime/'.$this->anidbid.'.jpg');
+
+        return file_exists($path)
+            || (is_string($legacyPath) && file_exists($legacyPath))
+            || file_exists($oldLegacyPath);
     }
 
     /**
@@ -136,7 +143,7 @@ class AnidbInfo extends Model
 
         // Otherwise construct the local path
         if ($this->hasPictureImage()) {
-            return url('/covers/anime/'.$this->anidbid.'.jpg');
+            return url('/covers/anime/'.$this->anidbid.'-cover.webp');
         }
 
         return null;

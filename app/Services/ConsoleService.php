@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Enums\ImageAssetProfile;
 use App\Enums\SecondarySearchIndex;
 use App\Facades\Search;
 use App\Models\Category;
@@ -698,13 +699,23 @@ class ConsoleService
                 ]);
 
             if ($con['cover'] === 1) {
-                $con['cover'] = $this->imageService->saveImage((string) $consoleId, $con['coverurl'], $this->imgSavePath, 250, 250);
+                $con['cover'] = (int) $this->imageService->saveRemoteImage(
+                    (string) $consoleId,
+                    $con['coverurl'],
+                    $this->imgSavePath,
+                    ImageAssetProfile::MetadataCover,
+                )->success;
             }
         } else {
             $consoleId = $check['id'];
 
             if ($con['cover'] === 1) {
-                $con['cover'] = $this->imageService->saveImage((string) $consoleId, $con['coverurl'], $this->imgSavePath, 250, 250);
+                $con['cover'] = (int) $this->imageService->saveRemoteImage(
+                    (string) $consoleId,
+                    $con['coverurl'],
+                    $this->imgSavePath,
+                    ImageAssetProfile::MetadataCover,
+                )->success;
             }
 
             $this->update(

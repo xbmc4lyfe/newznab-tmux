@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\TvProcessing\Providers;
 
+use App\Enums\ImageAssetProfile;
 use App\Services\ReleaseImageService;
 use App\Services\TmdbClient;
 use App\Services\TraktService;
@@ -382,7 +383,12 @@ class TvMazeProvider extends AbstractTvProvider
 
         // Try to get the Poster
         if (! empty($this->posterUrl)) {
-            $hasCover = $ri->saveImage((string) $videoId, $this->posterUrl, $this->imgSavePath);
+            $hasCover = (int) $ri->saveRemoteImage(
+                (string) $videoId,
+                $this->posterUrl,
+                $this->imgSavePath,
+                ImageAssetProfile::Original,
+            )->success;
 
             // Mark it retrieved if we saved an image
             if ($hasCover === 1) {

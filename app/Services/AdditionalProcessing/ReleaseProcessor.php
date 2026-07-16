@@ -292,7 +292,7 @@ class ReleaseProcessor
                 $fileLocation = $context->tmpPath.'samplepicture.jpg';
                 File::put($fileLocation, $result['data']);
 
-                if ($this->mediaService->isJpegData($fileLocation)
+                if ($this->mediaService->isValidImage($fileLocation)
                     && $this->mediaService->getJPGSample($fileLocation, $context->release->guid)
                 ) {
                     $context->markFound('jpgSample');

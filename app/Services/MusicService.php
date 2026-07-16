@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Enums\ImageAssetProfile;
 use App\Enums\SecondarySearchIndex;
 use App\Facades\Search;
 use App\Models\Category;
@@ -409,11 +410,21 @@ class MusicService
                 'created_at' => now(),
                 'updated_at' => now(),
             ]);
-            $mus['cover'] = $ri->saveImage((string) $musicId, $mus['coverurl'], $this->imgSavePath, 250, 250);
+            $mus['cover'] = (int) $ri->saveRemoteImage(
+                (string) $musicId,
+                $mus['coverurl'],
+                $this->imgSavePath,
+                ImageAssetProfile::MetadataCover,
+            )->success;
             MusicInfo::query()->where('id', $musicId)->update(['cover' => $mus['cover']]);
         } else {
             $musicId = $check['id'];
-            $mus['cover'] = $ri->saveImage((string) $musicId, $mus['coverurl'], $this->imgSavePath, 250, 250);
+            $mus['cover'] = (int) $ri->saveRemoteImage(
+                (string) $musicId,
+                $mus['coverurl'],
+                $this->imgSavePath,
+                ImageAssetProfile::MetadataCover,
+            )->success;
             MusicInfo::query()->where('id', $musicId)->update([
                 'title' => $mus['title'],
                 'asin' => $mus['asin'],
@@ -439,7 +450,12 @@ class MusicService
                     '   Year:   '.$year
                 );
             }
-            $mus['cover'] = $ri->saveImage((string) $musicId, $mus['coverurl'], $this->imgSavePath, 250, 250);
+            $mus['cover'] = (int) $ri->saveRemoteImage(
+                (string) $musicId,
+                $mus['coverurl'],
+                $this->imgSavePath,
+                ImageAssetProfile::MetadataCover,
+            )->success;
         } elseif ($this->echooutput) {
             if ($mus['artist'] === '') {
                 $artist = '';

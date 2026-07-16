@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Enums\ImageAssetProfile;
 use App\Enums\SecondarySearchIndex;
 use App\Facades\Search;
 use App\Models\Category;
@@ -677,12 +678,22 @@ class GamesService
 
             // Save cover image
             if ($game['cover'] === 1 && isset($game['coverurl'])) {
-                $game['cover'] = $this->imageService->saveImage((string) $gamesId, $game['coverurl'], $this->imgSavePath, 250, 250);
+                $game['cover'] = (int) $this->imageService->saveRemoteImage(
+                    (string) $gamesId,
+                    $game['coverurl'],
+                    $this->imgSavePath,
+                    ImageAssetProfile::MetadataCover,
+                )->success;
             }
 
             // Save backdrop image
             if ($game['backdrop'] === 1 && isset($game['backdropurl'])) {
-                $game['backdrop'] = $this->imageService->saveImage($gamesId.'-backdrop', $game['backdropurl'], $this->imgSavePath, 1920, 1024);
+                $game['backdrop'] = (int) $this->imageService->saveRemoteImage(
+                    $gamesId.'-backdrop',
+                    $game['backdropurl'],
+                    $this->imgSavePath,
+                    ImageAssetProfile::Backdrop,
+                )->success;
             }
         } elseif ($this->echoOutput) {
             cli()->headerOver('Nothing to update: ').

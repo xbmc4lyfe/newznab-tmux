@@ -84,7 +84,7 @@ class BookInfo extends Model
             return '';
         }
 
-        return storage_path('covers/book/'.$this->id.'.jpg');
+        return storage_path('covers/book/'.$this->id.'.webp');
     }
 
     /**
@@ -93,8 +93,13 @@ class BookInfo extends Model
     public function hasCoverImage(): bool
     {
         $coverPath = $this->getCoverPath();
+        if ($coverPath === '') {
+            return false;
+        }
 
-        return $coverPath !== '' && file_exists($coverPath);
+        $legacyPath = preg_replace('/\.webp$/', '.jpg', $coverPath);
+
+        return file_exists($coverPath) || (is_string($legacyPath) && file_exists($legacyPath));
     }
 
     /**
@@ -106,6 +111,6 @@ class BookInfo extends Model
             return null;
         }
 
-        return url('/covers/book/'.$this->id.'.jpg');
+        return url('/covers/book/'.$this->id.'.webp');
     }
 }

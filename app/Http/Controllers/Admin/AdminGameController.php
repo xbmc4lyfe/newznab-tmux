@@ -7,6 +7,7 @@ namespace App\Http\Controllers\Admin;
 use App\Http\Controllers\BasePageController;
 use App\Services\GamesService;
 use App\Services\GenreService;
+use App\Services\ReleaseImageService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 
@@ -57,17 +58,14 @@ class AdminGameController extends BasePageController
 
             switch ($action) {
                 case 'submit':
-                    $coverLoc = storage_path('covers/games/').$id.'.jpg';
+                    $coverDirectory = storage_path('covers/games/');
+                    $imageService = app(ReleaseImageService::class);
 
                     if ($request->hasFile('cover') && $request->file('cover')->isValid()) {
-                        $file = $request->file('cover');
-                        $file_info = getimagesize($file->getPathname());
-                        if (! empty($file_info)) {
-                            $file->move(storage_path('covers/games/'), $id.'.jpg');
-                        }
+                        $imageService->saveUploadedImage((string) $id, $request->file('cover'), $coverDirectory);
                     }
 
-                    $cover = file_exists($coverLoc) ? 1 : 0;
+                    $cover = (int) $imageService->imageExists($coverDirectory, (string) $id);
                     $releasedate = (empty($request->input('releasedate')) || ! strtotime($request->input('releasedate')))
                         ? $game['releasedate']
                         : Carbon::parse($request->input('releasedate'))->timestamp;

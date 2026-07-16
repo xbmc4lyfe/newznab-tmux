@@ -125,10 +125,10 @@
                             </label>
                             <div class="border border-gray-300 dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-900">
                                 @php
-                                    $hasCover = $anime['anidbid'] > 0 && file_exists(storage_path('covers/anime/' . $anime['anidbid'] . '-cover.jpg'));
+                                    $hasCover = $anime['anidbid'] > 0 && (file_exists(storage_path('covers/anime/' . $anime['anidbid'] . '-cover.webp')) || file_exists(storage_path('covers/anime/' . $anime['anidbid'] . '-cover.jpg')));
                                 @endphp
                                 @if($hasCover)
-                                    <img src="{{ url('/covers/anime/' . $anime['anidbid'] . '-cover.jpg') }}"
+                                    <img src="{{ url('/covers/anime/' . $anime['anidbid'] . '-cover.webp') }}"
                                          alt="{{ $anime['title'] }}"
                                          class="max-w-full h-auto mx-auto rounded shadow-lg"
                                          style="max-height: 400px;">
@@ -260,4 +260,3 @@
     </div>
 </div>
 @endsection
-

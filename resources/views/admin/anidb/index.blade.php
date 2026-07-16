@@ -61,10 +61,10 @@
                         <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
                             <td class="px-6 py-4 whitespace-nowrap">
                                 @php
-                                    $hasCover = $anime->anidbid > 0 && file_exists(storage_path('covers/anime/' . $anime->anidbid . '-cover.jpg'));
+                                    $hasCover = $anime->anidbid > 0 && (file_exists(storage_path('covers/anime/' . $anime->anidbid . '-cover.webp')) || file_exists(storage_path('covers/anime/' . $anime->anidbid . '-cover.jpg')));
                                 @endphp
                                 @if($hasCover)
-                                    <img src="{{ url('/covers/anime/' . $anime->anidbid . '-cover.jpg') }}"
+                                    <img src="{{ url('/covers/anime/' . $anime->anidbid . '-cover.webp') }}"
                                          alt="{{ $anime->title }}"
                                          class="h-16 w-12 object-cover rounded shadow"
                                          loading="lazy">
@@ -162,4 +162,3 @@
 
 {{-- Styles moved to resources/css/csp-safe.css --}}
 @endsection
-

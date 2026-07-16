@@ -9,6 +9,7 @@ use App\Http\Controllers\BasePageController;
 use App\Models\MovieInfo;
 use App\Models\Release;
 use App\Services\MovieService;
+use App\Services\ReleaseImageService;
 use App\Support\ReleaseSearchIndexSync;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -18,10 +19,13 @@ class AdminMovieController extends BasePageController
 {
     protected MovieService $movieService;
 
-    public function __construct(MovieService $movieService)
+    protected ReleaseImageService $imageService;
+
+    public function __construct(MovieService $movieService, ReleaseImageService $imageService)
     {
         parent::__construct();
         $this->movieService = $movieService;
+        $this->imageService = $imageService;
     }
 
     /**
@@ -158,8 +162,7 @@ class AdminMovieController extends BasePageController
 
         if ($action === 'submit') {
             try {
-                $coverLoc = public_path('covers/movies/'.$id.'-cover.jpg');
-                $backdropLoc = public_path('covers/movies/'.$id.'-backdrop.jpg');
+                $imageDirectory = public_path('covers/movies/');
 
                 // Ensure directory exists
                 if (! file_exists(public_path('covers/movies'))) {
@@ -168,18 +171,16 @@ class AdminMovieController extends BasePageController
 
                 // Handle cover upload
                 if ($request->hasFile('cover') && $request->file('cover')->isValid()) {
-                    $coverFile = $request->file('cover');
-                    $coverFile->move(public_path('covers/movies'), $id.'-cover.jpg');
+                    $this->imageService->saveUploadedImage($id.'-cover', $request->file('cover'), $imageDirectory);
                 }
 
                 // Handle backdrop upload
                 if ($request->hasFile('backdrop') && $request->file('backdrop')->isValid()) {
-                    $backdropFile = $request->file('backdrop');
-                    $backdropFile->move(public_path('covers/movies'), $id.'-backdrop.jpg');
+                    $this->imageService->saveUploadedImage($id.'-backdrop', $request->file('backdrop'), $imageDirectory);
                 }
 
-                $request->merge(['cover' => file_exists($coverLoc) ? 1 : 0]);
-                $request->merge(['backdrop' => file_exists($backdropLoc) ? 1 : 0]);
+                $request->merge(['cover' => (int) $this->imageService->imageExists($imageDirectory, $id.'-cover')]);
+                $request->merge(['backdrop' => (int) $this->imageService->imageExists($imageDirectory, $id.'-backdrop')]);
 
                 $this->movieService->update([
                     'actors' => $request->input('actors'),

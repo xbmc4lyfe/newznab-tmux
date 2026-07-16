@@ -16,6 +16,7 @@ use App\Services\ReleaseImageService;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 use Mockery;
 use PDO;
@@ -154,11 +155,44 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->assertSame(1, DB::table('par_hashes')->count());
     }
 
+    public function test_finalize_recognizes_webp_preview_and_sample_without_moving_them(): void
+    {
+        DB::table('releases')->insert($this->releaseRow());
+        Search::shouldReceive('updateRelease')->once()->with(1);
+
+        $imageService = new ReleaseImageService;
+        $preview = $imageService->imgSavePath.'guid-1_thumb.webp';
+        $sample = $imageService->jpgSavePath.'guid-1_thumb.webp';
+        File::ensureDirectoryExists(dirname($preview));
+        File::ensureDirectoryExists(dirname($sample));
+        File::put($preview, 'preview');
+        File::put($sample, 'sample');
+
+        try {
+            $manager = $this->makeManagerWithImageService($imageService);
+            $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+
+            $manager->finalizeRelease($context, false);
+
+            $this->assertSame(1, DB::table('releases')->where('id', 1)->value('haspreview'));
+            $this->assertSame(1, DB::table('releases')->where('id', 1)->value('jpgstatus'));
+        } finally {
+            File::delete([$preview, $sample]);
+        }
+    }
+
     private function makeManager(?NameFixingService $nameFixing = null): ReleaseFileManager
     {
+        return $this->makeManagerWithImageService(new ReleaseImageService, $nameFixing);
+    }
+
+    private function makeManagerWithImageService(
+        ReleaseImageService $imageService,
+        ?NameFixingService $nameFixing = null,
+    ): ReleaseFileManager {
         return new ReleaseFileManager(
             $this->makeConfig(),
-            new ReleaseImageService,
+            $imageService,
             new NfoService,
             new TestNzbService,
             $nameFixing ?? new CountingNameFixingService
@@ -232,6 +266,8 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $table->integer('categories_id')->default(10);
             $table->integer('passwordstatus')->default(-1);
             $table->integer('haspreview')->default(-1);
+            $table->integer('jpgstatus')->default(0);
+            $table->integer('videostatus')->default(0);
             $table->integer('nzbstatus')->default(1);
             $table->integer('rarinnerfilecount')->default(0);
             $table->integer('pp_timeout_count')->default(0);

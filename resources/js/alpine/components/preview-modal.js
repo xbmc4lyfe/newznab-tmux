@@ -6,7 +6,7 @@ import Alpine from '@alpinejs/csp';
 const prefetchedUrls = new Set();
 
 function buildImageUrl(guid, type) {
-    return '/covers/' + (type || 'preview') + '/' + guid + '_thumb.jpg';
+    return '/covers/' + (type || 'preview') + '/' + guid + '_thumb.webp';
 }
 
 function prefetchImage(guid, type) {

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\TvProcessing\Providers;
 
+use App\Enums\ImageAssetProfile;
 use App\Models\Video;
 use App\Services\ReleaseImageService;
 use App\Services\TmdbClient;
@@ -360,7 +361,12 @@ class TmdbProvider extends AbstractTvProvider
 
         // Try to get the Poster
         if (! empty($this->posterUrl)) {
-            $hascover = $ri->saveImage((string) $videoId, $this->posterUrl, $this->imgSavePath);
+            $hascover = (int) $ri->saveRemoteImage(
+                (string) $videoId,
+                $this->posterUrl,
+                $this->imgSavePath,
+                ImageAssetProfile::Original,
+            )->success;
 
             // Mark it retrieved if we saved an image
             if ($hascover === 1) {

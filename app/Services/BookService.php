@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Enums\ImageAssetProfile;
 use App\Enums\SecondarySearchIndex;
 use App\Facades\Search;
 use App\Models\BookInfo;
@@ -910,7 +911,12 @@ class BookService
                 }
             }
 
-            $book['cover'] = $ri->saveImage((string) $bookId, $book['coverurl'], $this->imgSavePath, 250, 250);
+            $book['cover'] = (int) $ri->saveRemoteImage(
+                (string) $bookId,
+                $book['coverurl'],
+                $this->imgSavePath,
+                ImageAssetProfile::MetadataCover,
+            )->success;
         } elseif ($this->echooutput) {
             cli()->header('Nothing to update: ').
             cli()->header($book['author'].

@@ -67,11 +67,12 @@
                         <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
                             <td class="px-6 py-4 whitespace-nowrap">
                                 @php
-                                    $coverPath = public_path('covers/tvshows/' . $show->id . '.jpg');
-                                    $hasCover = file_exists($coverPath);
+                                    $coverPath = public_path('covers/tvshows/' . $show->id . '.webp');
+                                    $legacyCoverPath = public_path('covers/tvshows/' . $show->id . '.jpg');
+                                    $hasCover = file_exists($coverPath) || file_exists($legacyCoverPath);
                                 @endphp
                                 @if($hasCover)
-                                    <img src="{{ asset('covers/tvshows/' . $show->id . '.jpg') }}"
+                                    <img src="{{ asset('covers/tvshows/' . $show->id . (file_exists($coverPath) ? '.webp' : '.jpg')) }}"
                                          alt="{{ $show->title }}"
                                          class="h-16 w-12 object-cover rounded shadow"
                                          loading="lazy">
@@ -199,4 +200,3 @@
 
 {{-- Styles moved to resources/css/csp-safe.css --}}
 @endsection
-

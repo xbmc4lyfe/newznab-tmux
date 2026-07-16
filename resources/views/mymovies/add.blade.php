@@ -22,7 +22,7 @@
             <div class="mb-6">
                 <div class="flex items-center gap-4 mb-4">
                     <img class="rounded-lg shadow-md w-24 h-auto"
-                         src="{{ url("/covers/movies/{$imdbid}-cover.jpg") }}"
+                         src="{{ url("/covers/movies/{$imdbid}-cover.webp") }}"
                          data-fallback-src="{{ url('/covers/movies/no-cover.jpg') }}"
                          alt="{{ e($movie['title'] ?? '') }}" />
 
@@ -146,7 +146,7 @@
                                 <tr class="hover:bg-gray-50 dark:hover:bg-gray-700/50 transition">
                                     <td class="px-4 py-3">
                                         <img class="rounded-lg shadow-sm max-w-[120px]"
-                                             src="{{ url('/covers/movies/' . (($movie['cover'] ?? 0) == 1 ? $movie['imdbid'] . '-cover.jpg' : 'no-cover.jpg')) }}"
+                                             src="{{ url('/covers/movies/' . (($movie['cover'] ?? 0) == 1 ? $movie['imdbid'] . '-cover.webp' : 'no-cover.jpg')) }}"
                                              alt="{{ e($movie['title'] ?? '') }}"/>
                                     </td>
                                     <td class="px-4 py-3">
@@ -212,7 +212,7 @@
                         <div class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
                             <div class="flex gap-3">
                                 <img class="rounded-lg shadow-sm w-20 h-auto shrink-0"
-                                     src="{{ url('/covers/movies/' . (($movie['cover'] ?? 0) == 1 ? $movie['imdbid'] . '-cover.jpg' : 'no-cover.jpg')) }}"
+                                     src="{{ url('/covers/movies/' . (($movie['cover'] ?? 0) == 1 ? $movie['imdbid'] . '-cover.webp' : 'no-cover.jpg')) }}"
                                      alt="{{ e($movie['title'] ?? '') }}"/>
                                 <div class="min-w-0 flex-1">
                                     <a href="{{ url("/Movies?imdb={$movie['imdbid']}") }}" class="text-gray-900 dark:text-gray-100 font-semibold hover:text-blue-600 dark:hover:text-blue-400 transition text-sm">
@@ -262,4 +262,3 @@
         </div>
     </div>
 </div>
-

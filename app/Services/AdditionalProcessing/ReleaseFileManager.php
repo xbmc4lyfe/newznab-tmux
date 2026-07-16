@@ -207,7 +207,7 @@ class ReleaseFileManager
         $updateRows = ['haspreview' => 0];
 
         // Check for existing samples
-        if (File::isFile($this->releaseImage->imgSavePath.$context->release->guid.'_thumb.jpg')) {
+        if ($this->releaseImage->imageExists($this->releaseImage->imgSavePath, $context->release->guid.'_thumb')) {
             $updateRows = ['haspreview' => 1];
         }
 
@@ -215,7 +215,7 @@ class ReleaseFileManager
             $updateRows['videostatus'] = 1;
         }
 
-        if (File::isFile($this->releaseImage->jpgSavePath.$context->release->guid.'_thumb.jpg')) {
+        if ($this->releaseImage->imageExists($this->releaseImage->jpgSavePath, $context->release->guid.'_thumb')) {
             $updateRows['jpgstatus'] = 1;
         }
 
@@ -304,11 +304,11 @@ class ReleaseFileManager
 
             // Delete preview assets
             try {
-                $files = [
-                    $this->releaseImage->imgSavePath.$guid.'_thumb.jpg',
-                    $this->releaseImage->jpgSavePath.$guid.'_thumb.jpg',
-                    $this->releaseImage->vidSavePath.$guid.'.ogv',
-                ];
+                $files = [$this->releaseImage->vidSavePath.$guid.'.ogv'];
+                foreach (['webp', 'jpg', 'jpeg'] as $extension) {
+                    $files[] = $this->releaseImage->imgSavePath.$guid.'_thumb.'.$extension;
+                    $files[] = $this->releaseImage->jpgSavePath.$guid.'_thumb.'.$extension;
+                }
                 foreach ($files as $file) {
                     if (File::exists($file)) {
                         File::delete($file);

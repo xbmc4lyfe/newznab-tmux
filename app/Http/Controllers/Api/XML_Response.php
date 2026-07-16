@@ -672,7 +672,7 @@ class XML_Response
             $dcov = ($dir === 'movies' ? '-cover' : '');
             $this->cdata .=
                 "\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" ".
-                "src=\"{$this->server['server']['url']}/covers/{$dir}/{$this->release->$column}{$dcov}.jpg\" ".
+                "src=\"{$this->server['server']['url']}/covers/{$dir}/{$this->release->$column}{$dcov}.webp\" ".
                 "width=\"120\" alt=\"{$this->release->searchname}\" />\n";
         }
         $size = human_filesize($this->release->size);

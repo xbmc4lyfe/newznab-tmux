@@ -52,11 +52,12 @@
                         <div class="border-2 border-dashed border-gray-300 dark:border-gray-600 rounded-lg p-4">
                             @php
                                 $imdbid = $movie['imdbid'] ?? $movie->imdbid ?? '';
-                                $coverPath = public_path('covers/movies/' . $imdbid . '-cover.jpg');
-                                $hasCover = file_exists($coverPath);
+                                $coverPath = public_path('covers/movies/' . $imdbid . '-cover.webp');
+                                $legacyCoverPath = public_path('covers/movies/' . $imdbid . '-cover.jpg');
+                                $hasCover = file_exists($coverPath) || file_exists($legacyCoverPath);
                             @endphp
                             @if($hasCover)
-                                <img src="{{ asset('covers/movies/' . $imdbid . '-cover.jpg') }}"
+                                <img src="{{ asset('covers/movies/' . $imdbid . (file_exists($coverPath) ? '-cover.webp' : '-cover.jpg')) }}"
                                      alt="Movie Cover"
                                      class="w-full h-auto rounded-lg mb-3">
                             @else
@@ -80,11 +81,12 @@
                         </label>
                         <div class="border-2 border-dashed border-gray-300 dark:border-gray-600 rounded-lg p-4">
                             @php
-                                $backdropPath = public_path('covers/movies/' . $imdbid . '-backdrop.jpg');
-                                $hasBackdrop = file_exists($backdropPath);
+                                $backdropPath = public_path('covers/movies/' . $imdbid . '-backdrop.webp');
+                                $legacyBackdropPath = public_path('covers/movies/' . $imdbid . '-backdrop.jpg');
+                                $hasBackdrop = file_exists($backdropPath) || file_exists($legacyBackdropPath);
                             @endphp
                             @if($hasBackdrop)
-                                <img src="{{ asset('covers/movies/' . $imdbid . '-backdrop.jpg') }}"
+                                <img src="{{ asset('covers/movies/' . $imdbid . (file_exists($backdropPath) ? '-backdrop.webp' : '-backdrop.jpg')) }}"
                                      alt="Movie Backdrop"
                                      class="w-full h-auto rounded-lg mb-3">
                             @else
@@ -389,4 +391,3 @@
     </div>
 </div>
 @endsection
-

@@ -82,7 +82,7 @@ class AdditionalProcessingServiceProvider extends ServiceProvider
         $this->app->singleton(ReleaseFileManager::class, function ($app) {
             return new ReleaseFileManager(
                 $app->make(ProcessingConfiguration::class),
-                new ReleaseImageService,
+                $app->make(ReleaseImageService::class),
                 new NfoService,
                 $app->make(NzbService::class),
                 new NameFixingService
@@ -93,7 +93,7 @@ class AdditionalProcessingServiceProvider extends ServiceProvider
         $this->app->singleton(MediaExtractionService::class, function ($app) {
             return new MediaExtractionService(
                 $app->make(ProcessingConfiguration::class),
-                new ReleaseImageService,
+                $app->make(ReleaseImageService::class),
                 $app->make(ReleaseExtraService::class),
                 new CategorizationService
             );

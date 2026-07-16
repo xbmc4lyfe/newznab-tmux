@@ -113,7 +113,7 @@
                             </label>
                             <div class="border border-gray-300 dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-900">
                                 @if(isset($book['cover']) && $book['cover'] == 1)
-                                    <img src="{{ asset('storage/covers/book/' . $book['id'] . '.jpg') }}"
+                                    <img src="{{ asset('storage/covers/book/' . $book['id'] . (file_exists(storage_path('covers/book/' . $book['id'] . '.webp')) ? '.webp' : '.jpg')) }}"
                                          alt="{{ $book['title'] }}"
                                          class="max-w-full h-auto mx-auto rounded shadow-lg img-max-h-400"
                                          data-fallback-src="{{ asset('images/no-cover.png') }}">
@@ -190,4 +190,3 @@
 
 {{-- Scripts moved to resources/js/csp-safe.js --}}
 @endsection
-

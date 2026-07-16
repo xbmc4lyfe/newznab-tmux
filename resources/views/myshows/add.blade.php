@@ -22,7 +22,7 @@
             <div class="mb-6">
                 <div class="flex items-center gap-4 mb-4">
                     <img class="rounded-lg shadow-md w-24 h-auto"
-                         src="{{ url("/covers/tvshows/{$video}_thumb.jpg") }}"
+                         src="{{ url("/covers/tvshows/{$video}_thumb.webp") }}"
                          data-fallback-src="{{ url('/covers/tvshows/no-cover.jpg') }}"
                          alt="{{ e($show['title'] ?? '') }}" />
 
@@ -87,5 +87,4 @@
         </div>
     </div>
 </div>
-
 

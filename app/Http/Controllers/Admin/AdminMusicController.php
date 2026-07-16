@@ -7,6 +7,7 @@ namespace App\Http\Controllers\Admin;
 use App\Http\Controllers\BasePageController;
 use App\Services\GenreService;
 use App\Services\MusicService;
+use App\Services\ReleaseImageService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 
@@ -56,17 +57,14 @@ class AdminMusicController extends BasePageController
 
             switch ($action) {
                 case 'submit':
-                    $coverLoc = storage_path('covers/music/'.$id.'.jpg');
+                    $coverDirectory = storage_path('covers/music/');
+                    $imageService = app(ReleaseImageService::class);
 
                     if ($request->hasFile('cover') && $request->file('cover')->isValid()) {
-                        $file = $request->file('cover');
-                        $file_info = getimagesize($file->getPathname());
-                        if (! empty($file_info)) {
-                            $file->move(storage_path('covers/music/'), $id.'.jpg');
-                        }
+                        $imageService->saveUploadedImage((string) $id, $request->file('cover'), $coverDirectory);
                     }
 
-                    $cover = file_exists($coverLoc) ? 1 : 0;
+                    $cover = (int) $imageService->imageExists($coverDirectory, (string) $id);
                     $salesrankInput = $request->input('salesrank');
                     $salesrank = (empty($salesrankInput) || ! ctype_digit((string) $salesrankInput)) ? null : (int) $salesrankInput;
                     $releasedateInput = $request->input('releasedate');

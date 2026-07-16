@@ -568,10 +568,10 @@ if (! function_exists('getReleaseCover')) {
 
         if ($coverType && $coverId) {
             if (in_array($coverType, ['movies', 'anime'], true)) {
-                return url("/covers/{$coverType}/{$coverId}-cover.jpg");
+                return url("/covers/{$coverType}/{$coverId}-cover.webp");
             }
 
-            return url("/covers/{$coverType}/{$coverId}.jpg");
+            return url("/covers/{$coverType}/{$coverId}.webp");
         }
 
         // Return placeholder image if no cover type/ID found
@@ -843,7 +843,7 @@ if (! function_exists('getCoverURL')) {
 
         $defaults = [
             'id' => null,
-            'suffix' => '-cover.jpg',
+            'suffix' => '-cover.webp',
             'type' => '',
         ];
         $options += $defaults;
@@ -860,7 +860,10 @@ if (! function_exists('getCoverURL')) {
             $cacheKey = $options['type'].':'.$options['id'];
 
             if (! isset($coverCache[$cacheKey])) {
-                $coverCache[$cacheKey] = file_exists(storage_path('covers/').$fileSpec);
+                $canonicalPath = storage_path('covers/').$fileSpec;
+                $legacyPath = preg_replace('/\.webp$/i', '.jpg', $canonicalPath);
+                $coverCache[$cacheKey] = file_exists($canonicalPath)
+                    || (is_string($legacyPath) && file_exists($legacyPath));
             }
 
             if (! $coverCache[$cacheKey]) {

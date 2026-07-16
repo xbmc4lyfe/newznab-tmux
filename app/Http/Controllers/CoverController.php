@@ -5,29 +5,24 @@ declare(strict_types=1);
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Response;
-use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\File;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
 
 class CoverController extends Controller
 {
-    /**
-     * @var array<int, string>
-     */
+    /** @var list<string> */
+    private const array VALID_TYPES = [
+        'anime', 'audio', 'audiosample', 'book', 'console', 'games', 'movies',
+        'music', 'preview', 'sample', 'tvrage', 'video', 'tvshows',
+    ];
+
+    /** @var list<string> */
     private const array NUMERIC_ID_TYPES = ['anime', 'book', 'console', 'games', 'music', 'tvshows'];
 
-    /**
-     * Serve cover images from storage
-     *
-     * @param  string  $type  The type of cover (movies, console, music, etc.)
-     * @param  string  $filename  The filename of the cover image
-     * @return BinaryFileResponse|Response
-     */
+    /** @return BinaryFileResponse|Response */
     public function show(string $type, string $filename)
     {
-        // Validate cover type
-        $validTypes = ['anime', 'audio', 'audiosample', 'book', 'console', 'games', 'movies', 'music', 'preview', 'sample', 'tvrage', 'video', 'tvshows'];
-
-        if (! in_array($type, $validTypes)) {
+        if (! in_array($type, self::VALID_TYPES, true) || ! $this->isValidFilename($filename)) {
             abort(404);
         }
 
@@ -35,64 +30,62 @@ class CoverController extends Controller
             return $this->respondWithPlaceholder();
         }
 
-        // Build the file path
-        // For preview and sample images, try with _thumb suffix first
-        if (in_array($type, ['preview', 'sample'], true)) {
-            $pathInfo = pathinfo($filename);
-            $thumbFilename = $pathInfo['filename'].'_thumb.'.($pathInfo['extension'] ?? 'jpg');
-            $thumbPath = storage_path("covers/{$type}/{$thumbFilename}");
-
-            // Use thumb path if it exists, otherwise fall back to original filename
-            if (file_exists($thumbPath)) {
-                $filePath = $thumbPath;
-            } else {
-                $filePath = storage_path("covers/{$type}/{$filename}");
-            }
-        } elseif ($type === 'anime') {
-            // For anime, try the requested filename first, then fall back to old format (without -cover)
-            $filePath = storage_path("covers/{$type}/{$filename}");
-
-            // If file doesn't exist and filename ends with -cover.jpg, try old format
-            if (! file_exists($filePath) && preg_match('/^(\d+)-cover\.jpg$/', $filename, $matches)) {
-                $oldFormatPath = storage_path("covers/{$type}/{$matches[1]}.jpg");
-                if (file_exists($oldFormatPath)) {
-                    $filePath = $oldFormatPath;
-                }
-            }
-        } else {
-            $filePath = storage_path("covers/{$type}/{$filename}");
+        $filePath = $this->resolveImagePath($type, $filename);
+        if ($filePath === null) {
+            return $this->respondWithPlaceholder();
         }
 
-        // Check if file exists
-        if (! file_exists($filePath)) {
-            // Return placeholder image
-            $placeholderPath = public_path('assets/images/no-cover.png');
-            if (file_exists($placeholderPath)) {
-                return response()->file($placeholderPath);
-            }
+        $contentType = File::mimeType($filePath);
+        if (! is_string($contentType) || ! in_array($contentType, ['image/jpeg', 'image/png', 'image/gif', 'image/webp'], true)) {
             abort(404);
         }
 
-        // Determine content type
-        $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-        $contentType = match ($extension) {
-            'jpg', 'jpeg' => 'image/jpeg',
-            'png' => 'image/png',
-            'gif' => 'image/gif',
-            'webp' => 'image/webp',
-            default => 'image/jpeg',
-        };
-
-        // Serve the file with proper headers
         return response()->file($filePath, [
             'Content-Type' => $contentType,
-            'Cache-Control' => 'public, max-age=31536000', // Cache for 1 year
+            'Cache-Control' => 'public, max-age=31536000',
         ]);
+    }
+
+    private function resolveImagePath(string $type, string $filename): ?string
+    {
+        $pathInfo = pathinfo($filename);
+        $basename = $pathInfo['filename'];
+        $requestedExtension = strtolower($pathInfo['extension']);
+        $basenames = [$basename];
+
+        if (in_array($type, ['preview', 'sample'], true) && ! str_ends_with($basename, '_thumb')) {
+            array_unshift($basenames, $basename.'_thumb');
+        }
+
+        if ($type === 'anime' && preg_match('/^(\d+)-cover$/', $basename, $matches) === 1) {
+            $basenames[] = $matches[1];
+        }
+
+        $extensions = array_values(array_unique([$requestedExtension, 'webp', 'jpg', 'jpeg']));
+        $roots = [storage_path('covers'), public_path('covers')];
+
+        foreach ($basenames as $candidateBasename) {
+            foreach ($extensions as $extension) {
+                foreach ($roots as $root) {
+                    $candidate = $root.DIRECTORY_SEPARATOR.$type.DIRECTORY_SEPARATOR.$candidateBasename.'.'.$extension;
+                    if (File::isFile($candidate) && File::isReadable($candidate)) {
+                        return $candidate;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function isValidFilename(string $filename): bool
+    {
+        return preg_match('/\A[A-Za-z0-9][A-Za-z0-9_-]*\.(?:webp|jpe?g|png|gif)\z/iD', $filename) === 1;
     }
 
     private function isInvalidNumericCoverFilename(string $filename): bool
     {
-        if (preg_match('/^(-?\d+)(?:-cover)?\.jpg$/', $filename, $matches) !== 1) {
+        if (preg_match('/^(-?\d+)(?:-cover)?\.(?:webp|jpe?g)$/i', $filename, $matches) !== 1) {
             return false;
         }
 
@@ -102,7 +95,7 @@ class CoverController extends Controller
     private function respondWithPlaceholder(): Response|BinaryFileResponse
     {
         $placeholderPath = public_path('assets/images/no-cover.png');
-        if (file_exists($placeholderPath)) {
+        if (File::isFile($placeholderPath)) {
             return response()->file($placeholderPath);
         }
 

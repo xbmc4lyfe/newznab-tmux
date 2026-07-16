@@ -96,7 +96,7 @@
                     <div class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden hover:shadow-lg transition-shadow duration-200">
                         <a href="{{ $guid ? url('/details/' . $guid) : '#' }}" class="block relative">
                             @if(!empty($result->cover))
-                                <img src="{{ url('/covers/book/' . $result->id . '.jpg') }}"
+                                <img src="{{ url('/covers/book/' . $result->id . '.webp') }}"
                                      alt="{{ $result->title }}"
                                      class="w-full h-64 object-cover"
                                      data-fallback-src="{{ url('/images/no-cover.png') }}">

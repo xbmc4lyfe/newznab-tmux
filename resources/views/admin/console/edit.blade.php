@@ -160,11 +160,12 @@
                             </label>
                             <div class="border border-gray-300 dark:border-gray-600 rounded-lg p-4 bg-gray-50 dark:bg-gray-900">
                                 @php
-                                    $coverPath = public_path('covers/console/' . $con['id'] . '.jpg');
-                                    $hasCover = file_exists($coverPath);
+                                    $coverPath = public_path('covers/console/' . $con['id'] . '.webp');
+                                    $legacyCoverPath = public_path('covers/console/' . $con['id'] . '.jpg');
+                                    $hasCover = file_exists($coverPath) || file_exists($legacyCoverPath);
                                 @endphp
                                 @if($hasCover)
-                                    <img src="{{ asset('covers/console/' . $con['id'] . '.jpg') }}"
+                                    <img src="{{ asset('covers/console/' . $con['id'] . (file_exists($coverPath) ? '.webp' : '.jpg')) }}"
                                          alt="{{ $con['title'] }}"
                                          class="max-w-full h-auto mx-auto rounded shadow-lg img-max-h-400">
                                 @else
@@ -240,4 +241,3 @@
 
 {{-- Scripts moved to resources/js/csp-safe.js --}}
 @endsection
-

@@ -7,6 +7,7 @@ namespace App\Http\Controllers\Admin;
 use App\Http\Controllers\BasePageController;
 use App\Models\BookInfo;
 use App\Services\BookService;
+use App\Services\ReleaseImageService;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
@@ -51,17 +52,14 @@ class AdminBookController extends BasePageController
 
             switch ($action) {
                 case 'submit':
-                    $coverLoc = storage_path('covers/book/'.$id.'.jpg');
+                    $coverDirectory = storage_path('covers/book/');
+                    $imageService = app(ReleaseImageService::class);
 
                     if ($request->hasFile('cover') && $request->file('cover')->isValid()) {
-                        $uploadedFile = $request->file('cover');
-                        $file_info = getimagesize($uploadedFile->getRealPath());
-                        if (! empty($file_info)) {
-                            $uploadedFile->move(storage_path('covers/book'), $id.'.jpg');
-                        }
+                        $imageService->saveUploadedImage((string) $id, $request->file('cover'), $coverDirectory);
                     }
 
-                    $hasCover = file_exists($coverLoc) ? 1 : 0;
+                    $hasCover = (int) $imageService->imageExists($coverDirectory, (string) $id);
                     $publishdate = (empty($request->input('publishdate')) || ! strtotime($request->input('publishdate')))
                         ? ($b['publishdate'] ?? null)
                         : Carbon::parse($request->input('publishdate'))->timestamp;

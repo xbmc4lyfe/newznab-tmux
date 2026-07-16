@@ -166,7 +166,7 @@
                         </label>
                         @if(!empty($game['cover']) && $game['cover'] == 1)
                             <div class="mb-3">
-                                <img src="{{ asset('storage/covers/games/' . $game['id'] . '.jpg') }}"
+                                <img src="{{ asset('storage/covers/games/' . $game['id'] . (file_exists(storage_path('covers/games/' . $game['id'] . '.webp')) ? '.webp' : '.jpg')) }}"
                                      alt="Game Cover"
                                      class="max-w-xs rounded-lg shadow-md border border-gray-300 dark:border-gray-600">
                             </div>
@@ -212,4 +212,3 @@
     </div>
 </div>
 @endsection
-

@@ -7,6 +7,7 @@ namespace App\Http\Controllers\Admin;
 use App\Http\Controllers\BasePageController;
 use App\Services\ConsoleService;
 use App\Services\GenreService;
+use App\Services\ReleaseImageService;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
@@ -16,10 +17,13 @@ class AdminConsoleController extends BasePageController
 {
     protected ConsoleService $consoleService;
 
-    public function __construct(ConsoleService $consoleService)
+    protected ReleaseImageService $imageService;
+
+    public function __construct(ConsoleService $consoleService, ReleaseImageService $imageService)
     {
         parent::__construct();
         $this->consoleService = $consoleService;
+        $this->imageService = $imageService;
     }
 
     /**
@@ -58,17 +62,13 @@ class AdminConsoleController extends BasePageController
 
             switch ($action) {
                 case 'submit':
-                    $coverLoc = storage_path('covers/console/'.$id.'.jpg');
+                    $coverDirectory = storage_path('covers/console/');
 
                     if ($request->hasFile('cover') && $request->file('cover')->isValid()) {
-                        $uploadedFile = $request->file('cover');
-                        $file_info = getimagesize($uploadedFile->getRealPath());
-                        if (! empty($file_info)) {
-                            $uploadedFile->move(storage_path('covers/console'), $id.'.jpg');
-                        }
+                        $this->imageService->saveUploadedImage((string) $id, $request->file('cover'), $coverDirectory);
                     }
 
-                    $hasCover = file_exists($coverLoc) ? 1 : 0;
+                    $hasCover = (int) $this->imageService->imageExists($coverDirectory, (string) $id);
                     $salesrank = (empty($request->input('salesrank')) || ! ctype_digit($request->input('salesrank'))) ? null : $request->input('salesrank');
                     $releasedate = (empty($request->input('releasedate')) || ! strtotime($request->input('releasedate')))
                         ? $con['releasedate']

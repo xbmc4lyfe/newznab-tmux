@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services;
 
 use aharen\OMDbAPI;
+use App\Enums\ImageAssetProfile;
 use App\Facades\Search;
 use App\Models\Category;
 use App\Models\MovieInfo;
@@ -194,7 +195,7 @@ class MovieService
         $genres = $data['genres'] ?? [];
         $genre = is_array($genres) ? implode(', ', $genres) : (string) $genres;
         $cover = 0;
-        if (File::isFile($this->imgSavePath.$imdbId.'-cover.jpg')) {
+        if ($this->releaseImage->imageExists($this->imgSavePath, $imdbId.'-cover')) {
             $cover = 1;
         }
 
@@ -362,7 +363,7 @@ class MovieService
         // Prefer Fanart.tv cover over TMDB,TMDB over IMDB,IMDB over OMDB and OMDB over iTunes.
         if (! empty($fanart['cover'])) {
             try {
-                $mov['cover'] = $this->releaseImage->saveImage($imdbId.'-cover', $fanart['cover'], $this->imgSavePath);
+                $mov['cover'] = $this->saveRemoteAsset($imdbId.'-cover', $fanart['cover']);
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save FanartTV cover for '.$imdbId.' from URL: '.$fanart['cover']);
                 }
@@ -374,7 +375,7 @@ class MovieService
 
         if ($mov['cover'] === 0 && ! empty($tmdb['cover'])) {
             try {
-                $mov['cover'] = $this->releaseImage->saveImage($imdbId.'-cover', $tmdb['cover'], $this->imgSavePath);
+                $mov['cover'] = $this->saveRemoteAsset($imdbId.'-cover', $tmdb['cover']);
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save TMDB cover for '.$imdbId.' from URL: '.$tmdb['cover']);
                 }
@@ -386,7 +387,7 @@ class MovieService
 
         if ($mov['cover'] === 0 && ! empty($imdb['cover'])) {
             try {
-                $mov['cover'] = $this->releaseImage->saveImage($imdbId.'-cover', $imdb['cover'], $this->imgSavePath);
+                $mov['cover'] = $this->saveRemoteAsset($imdbId.'-cover', $imdb['cover']);
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save IMDB cover for '.$imdbId.' from URL: '.$imdb['cover']);
                 }
@@ -398,7 +399,7 @@ class MovieService
 
         if ($mov['cover'] === 0 && ! empty($omdb['cover'])) {
             try {
-                $mov['cover'] = $this->releaseImage->saveImage($imdbId.'-cover', $omdb['cover'], $this->imgSavePath);
+                $mov['cover'] = $this->saveRemoteAsset($imdbId.'-cover', $omdb['cover']);
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save OMDB cover for '.$imdbId.' from URL: '.$omdb['cover']);
                 }
@@ -411,7 +412,7 @@ class MovieService
         // Backdrops.
         if (! empty($fanart['backdrop'])) {
             try {
-                $mov['backdrop'] = $this->releaseImage->saveImage($imdbId.'-backdrop', $fanart['backdrop'], $this->imgSavePath, 1920, 1024);
+                $mov['backdrop'] = $this->saveRemoteAsset($imdbId.'-backdrop', $fanart['backdrop'], ImageAssetProfile::Backdrop);
             } catch (\Throwable $e) {
                 Log::warning('Error saving FanartTV backdrop for '.$imdbId.': '.$e->getMessage());
                 $mov['backdrop'] = 0;
@@ -420,7 +421,7 @@ class MovieService
 
         if ($mov['backdrop'] === 0 && ! empty($tmdb['backdrop'])) {
             try {
-                $mov['backdrop'] = $this->releaseImage->saveImage($imdbId.'-backdrop', $tmdb['backdrop'], $this->imgSavePath, 1920, 1024);
+                $mov['backdrop'] = $this->saveRemoteAsset($imdbId.'-backdrop', $tmdb['backdrop'], ImageAssetProfile::Backdrop);
             } catch (\Throwable $e) {
                 Log::warning('Error saving TMDB backdrop for '.$imdbId.': '.$e->getMessage());
                 $mov['backdrop'] = 0;
@@ -430,7 +431,7 @@ class MovieService
         // Banner
         if (! empty($fanart['banner'])) {
             try {
-                $mov['banner'] = $this->releaseImage->saveImage($imdbId.'-banner', $fanart['banner'], $this->imgSavePath);
+                $mov['banner'] = $this->saveRemoteAsset($imdbId.'-banner', $fanart['banner']);
             } catch (\Throwable $e) {
                 Log::warning('Error saving FanartTV banner for '.$imdbId.': '.$e->getMessage());
                 $mov['banner'] = 0;
@@ -1521,8 +1522,7 @@ class MovieService
     {
         $record = MovieInfo::query()->select('cover')->where('imdbid', $imdbId)->first();
         $dbHas = $record !== null && (int) $record->cover === 1;
-        $filePath = $this->imgSavePath.$imdbId.'-cover.jpg';
-        $fileHas = File::isFile($filePath);
+        $fileHas = $this->releaseImage->imageExists($this->imgSavePath, $imdbId.'-cover');
 
         return $dbHas || $fileHas;
     }
@@ -1532,7 +1532,7 @@ class MovieService
         try {
             $fanart = $this->fetchFanartTVProperties($imdbId);
             if (! empty($fanart['cover'])) {
-                if ($this->releaseImage->saveImage($imdbId.'-cover', $fanart['cover'], $this->imgSavePath)) {
+                if ($this->saveRemoteAsset($imdbId.'-cover', $fanart['cover']) === 1) {
                     return true;
                 }
             }
@@ -1543,7 +1543,7 @@ class MovieService
         try {
             $tmdb = $this->fetchTMDBProperties($imdbId);
             if (! empty($tmdb['cover'])) {
-                if ($this->releaseImage->saveImage($imdbId.'-cover', $tmdb['cover'], $this->imgSavePath)) {
+                if ($this->saveRemoteAsset($imdbId.'-cover', $tmdb['cover']) === 1) {
                     return true;
                 }
             }
@@ -1554,7 +1554,7 @@ class MovieService
         try {
             $imdb = $this->fetchIMDBProperties($imdbId);
             if (! empty($imdb['cover'])) {
-                if ($this->releaseImage->saveImage($imdbId.'-cover', $imdb['cover'], $this->imgSavePath)) {
+                if ($this->saveRemoteAsset($imdbId.'-cover', $imdb['cover']) === 1) {
                     return true;
                 }
             }
@@ -1565,7 +1565,7 @@ class MovieService
         try {
             $omdb = $this->fetchOmdbAPIProperties($imdbId);
             if (! empty($omdb['cover'])) {
-                if ($this->releaseImage->saveImage($imdbId.'-cover', $omdb['cover'], $this->imgSavePath)) {
+                if ($this->saveRemoteAsset($imdbId.'-cover', $omdb['cover']) === 1) {
                     return true;
                 }
             }
@@ -1574,5 +1574,18 @@ class MovieService
         }
 
         return false;
+    }
+
+    private function saveRemoteAsset(
+        string $name,
+        string $url,
+        ImageAssetProfile $profile = ImageAssetProfile::Original,
+    ): int {
+        return (int) $this->releaseImage->saveRemoteImage(
+            $name,
+            $url,
+            $this->imgSavePath,
+            $profile,
+        )->success;
     }
 }

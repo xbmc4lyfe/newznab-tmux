@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\TvProcessing\Providers;
 
+use App\Enums\ImageAssetProfile;
 use App\Services\FanartTvService;
 use App\Services\ReleaseImageService;
 use App\Services\TmdbClient;
@@ -318,7 +319,12 @@ class TvdbProvider extends AbstractTvProvider
         $hasCover = 0;
 
         if (! empty($this->posterUrl)) {
-            $hasCover = $ri->saveImage((string) $videoId, $this->posterUrl, $this->imgSavePath);
+            $hasCover = (int) $ri->saveRemoteImage(
+                (string) $videoId,
+                $this->posterUrl,
+                $this->imgSavePath,
+                ImageAssetProfile::Original,
+            )->success;
             if ($hasCover === 1) {
                 $this->setCoverFound($videoId);
             }

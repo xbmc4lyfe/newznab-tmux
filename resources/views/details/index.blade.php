@@ -145,8 +145,8 @@
                         @if($hasPreviewImage)
                             <!-- Preview image -->
                             <div>
-                                <div class="block cursor-pointer image-modal-trigger" data-image-url="{{ url('/covers/preview/' . $release->guid . '_thumb.jpg') }}" data-image-title="Preview Image">
-                                    <img src="{{ url('/covers/preview/' . $release->guid . '_thumb.jpg') }}"
+                                <div class="block cursor-pointer image-modal-trigger" data-image-url="{{ url('/covers/preview/' . $release->guid . '_thumb.webp') }}" data-image-title="Preview Image">
+                                    <img src="{{ url('/covers/preview/' . $release->guid . '_thumb.webp') }}"
                                          alt="Preview"
                                          class="detail-gallery-image w-full h-auto rounded-lg"
                                          loading="lazy">
@@ -158,8 +158,8 @@
                         @if($hasSampleImage)
                             <!-- Sample image -->
                             <div>
-                                <div class="block cursor-pointer image-modal-trigger" data-image-url="{{ url('/covers/sample/' . $release->guid . '_thumb.jpg') }}" data-image-title="Sample Image">
-                                    <img src="{{ url('/covers/sample/' . $release->guid . '_thumb.jpg') }}"
+                                <div class="block cursor-pointer image-modal-trigger" data-image-url="{{ url('/covers/sample/' . $release->guid . '_thumb.webp') }}" data-image-title="Sample Image">
+                                    <img src="{{ url('/covers/sample/' . $release->guid . '_thumb.webp') }}"
                                          alt="Sample"
                                          class="detail-gallery-image w-full h-auto rounded-lg"
                                          loading="lazy">

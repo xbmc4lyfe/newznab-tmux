@@ -106,9 +106,15 @@ class GamesInfo extends Model
             return null;
         }
 
-        $path = config('nntmux_settings.covers_path').'/games/'.$this->id.'.jpg';
+        $path = config('nntmux_settings.covers_path').'/games/'.$this->id.'.webp';
 
-        return file_exists($path) ? $path : null;
+        if (file_exists($path)) {
+            return $path;
+        }
+
+        $legacyPath = preg_replace('/\.webp$/', '.jpg', $path);
+
+        return is_string($legacyPath) && file_exists($legacyPath) ? $legacyPath : null;
     }
 
     /**
@@ -120,8 +126,14 @@ class GamesInfo extends Model
             return null;
         }
 
-        $path = config('nntmux_settings.covers_path').'/games/'.$this->id.'-backdrop.jpg';
+        $path = config('nntmux_settings.covers_path').'/games/'.$this->id.'-backdrop.webp';
 
-        return file_exists($path) ? $path : null;
+        if (file_exists($path)) {
+            return $path;
+        }
+
+        $legacyPath = preg_replace('/\.webp$/', '.jpg', $path);
+
+        return is_string($legacyPath) && file_exists($legacyPath) ? $legacyPath : null;
     }
 }

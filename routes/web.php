@@ -91,7 +91,7 @@ use Spatie\LaravelPasskeys\Http\Controllers\GeneratePasskeyAuthenticationOptions
 
 // Serve cover images from storage - Must be public (no auth required)
 Route::get('/covers/{type}/{filename}', [CoverController::class, 'show'])
-    ->where('type', 'anime|audio|audiosample|book|console|games|movies|music|preview|sample|tvrage|video')
+    ->where('type', 'anime|audio|audiosample|book|console|games|movies|music|preview|sample|tvrage|video|tvshows')
     ->where('filename', '.*')
     ->name('covers.show');
 

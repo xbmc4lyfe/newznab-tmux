@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Enums\ImageAssetProfile;
 use App\Models\AnidbInfo;
 use App\Models\AnidbTitle;
 use GuzzleHttp\Client;
@@ -37,6 +38,8 @@ class PopulateAniListService
      */
     protected Client $client;
 
+    private ReleaseImageService $imageService;
+
     /**
      * Rate limiting: track requests and timestamps
      *
@@ -55,12 +58,13 @@ class PopulateAniListService
     /**
      * @throws \Exception
      */
-    public function __construct()
+    public function __construct(?ReleaseImageService $imageService = null)
     {
         $this->echooutput = config('nntmux.echocli');
 
         // Use storage_path directly to match CoverController expectations
         $this->imgSavePath = storage_path('covers/anime/');
+        $this->imageService = $imageService ?? new ReleaseImageService;
         $this->client = new Client([
             'base_uri' => self::API_URL,
             'timeout' => 30,
@@ -632,38 +636,25 @@ class PopulateAniListService
      */
     private function downloadCoverImage(int $anidbid, string $imageUrl): void
     {
-        // Use the format expected by getReleaseCover: {id}-cover.jpg
-        // This matches the format used by movies: {id}-cover.jpg
-        $coverFilename = $anidbid.'-cover.jpg';
-        $coverPath = $this->imgSavePath.$coverFilename;
-
-        if (file_exists($coverPath)) {
+        $coverName = $anidbid.'-cover';
+        if ($this->imageService->imageExists($this->imgSavePath, $coverName)) {
             return; // Already exists
         }
 
         try {
-            // Ensure directory exists with proper permissions
-            if (! is_dir($this->imgSavePath)) {
-                if (! mkdir($this->imgSavePath, 0755, true) && ! is_dir($this->imgSavePath)) {
-                    throw new \RuntimeException(sprintf('Directory "%s" was not created', $this->imgSavePath));
-                }
+            $result = $this->imageService->saveRemoteImage(
+                $coverName,
+                $imageUrl,
+                $this->imgSavePath,
+                ImageAssetProfile::Original,
+            );
+
+            if (! $result->success) {
+                throw new \RuntimeException($result->failureReason ?? 'Failed to process anime cover.');
             }
-
-            $response = $this->client->get($imageUrl);
-            $imageData = $response->getBody()->getContents();
-
-            // Write the image file
-            $bytesWritten = file_put_contents($coverPath, $imageData);
-
-            if ($bytesWritten === false) {
-                throw new \RuntimeException("Failed to write cover image to {$coverPath}");
-            }
-
-            // Set proper file permissions
-            chmod($coverPath, 0644);
 
             if ($this->echooutput) {
-                cli()->info("Downloaded cover image for ID {$anidbid} from AniList to {$coverPath}");
+                cli()->info("Downloaded cover image for ID {$anidbid} from AniList to {$result->path}");
             }
         } catch (GuzzleException $e) {
             if ($this->echooutput) {

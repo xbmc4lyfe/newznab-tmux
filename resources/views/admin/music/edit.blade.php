@@ -187,7 +187,7 @@
                         </label>
                         @if(!empty($mus['cover']) && $mus['cover'] == 1)
                             <div class="mb-3">
-                                <img src="{{ asset('storage/covers/music/' . $mus['id'] . '.jpg') }}"
+                                <img src="{{ asset('storage/covers/music/' . $mus['id'] . (file_exists(storage_path('covers/music/' . $mus['id'] . '.webp')) ? '.webp' : '.jpg')) }}"
                                      alt="Album Cover"
                                      class="max-w-xs rounded-lg shadow-md border border-gray-300 dark:border-gray-600">
                             </div>
@@ -233,4 +233,3 @@
     </div>
 </div>
 @endsection
-

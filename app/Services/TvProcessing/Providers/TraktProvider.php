@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\TvProcessing\Providers;
 
+use App\Enums\ImageAssetProfile;
 use App\Models\Video;
 use App\Services\ReleaseImageService;
 use App\Services\TraktService;
@@ -322,12 +323,22 @@ class TraktProvider extends AbstractTvProvider
 
         if ($this->posterUrl !== '') {
             // Try to get the Poster
-            $hasCover = $ri->saveImage((string) $videoId, $this->posterUrl, $this->imgSavePath);
+            $hasCover = (int) $ri->saveRemoteImage(
+                (string) $videoId,
+                $this->posterUrl,
+                $this->imgSavePath,
+                ImageAssetProfile::Original,
+            )->success;
         }
 
         // Couldn't get poster, try fan art instead
         if ($hasCover !== 1 && $this->fanartUrl !== '') {
-            $hasCover = $ri->saveImage((string) $videoId, $this->fanartUrl, $this->imgSavePath);
+            $hasCover = (int) $ri->saveRemoteImage(
+                (string) $videoId,
+                $this->fanartUrl,
+                $this->imgSavePath,
+                ImageAssetProfile::Original,
+            )->success;
         }
 
         // Mark it retrieved if we saved an image
