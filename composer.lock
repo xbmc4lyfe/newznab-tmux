@@ -5895,12 +5895,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/DariusIII/laravel-forum.git",
-                "reference": "c932f85a09d95137a762c0d53487fa2598292c5e"
+                "reference": "535740be7c14de6553186ff5645d6ee0517dc01b"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/DariusIII/laravel-forum/zipball/c932f85a09d95137a762c0d53487fa2598292c5e",
-                "reference": "c932f85a09d95137a762c0d53487fa2598292c5e",
+                "url": "https://api.github.com/repos/DariusIII/laravel-forum/zipball/535740be7c14de6553186ff5645d6ee0517dc01b",
+                "reference": "535740be7c14de6553186ff5645d6ee0517dc01b",
                 "shasum": ""
             },
             "require": {
@@ -5949,7 +5949,7 @@
             "support": {
                 "source": "https://github.com/DariusIII/laravel-forum/tree/8.x"
             },
-            "time": "2026-05-08T20:40:00+00:00"
+            "time": "2026-07-14T07:43:08+00:00"
         },
         {
             "name": "sentry/sentry",
