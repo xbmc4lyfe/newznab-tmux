@@ -52,12 +52,6 @@ class BookResource extends JsonResource
             return null;
         }
 
-        $coverPath = storage_path('covers/book/'.$this->id.'.webp');
-        $legacyPath = storage_path('covers/book/'.$this->id.'.jpg');
-        if (file_exists($coverPath) || file_exists($legacyPath)) {
-            return url('/covers/book/'.$this->id.'.webp');
-        }
-
-        return null;
+        return getImageAssetUrl('book', (string) $this->id);
     }
 }

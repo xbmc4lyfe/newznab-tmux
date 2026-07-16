@@ -127,6 +127,12 @@
             @php
                 $hasPreviewImage = isset($release->haspreview) && $release->haspreview == 1;
                 $hasSampleImage = isset($release->jpgstatus) && $release->jpgstatus == 1;
+                $previewImageUrl = $hasPreviewImage
+                    ? getImageAssetUrl('preview', $release->guid . '_thumb', asset('assets/images/no-cover.png'))
+                    : null;
+                $sampleImageUrl = $hasSampleImage
+                    ? getImageAssetUrl('sample', $release->guid . '_thumb', asset('assets/images/no-cover.png'))
+                    : null;
             @endphp
 
             @if($hasPreviewImage || $hasSampleImage)
@@ -145,8 +151,8 @@
                         @if($hasPreviewImage)
                             <!-- Preview image -->
                             <div>
-                                <div class="block cursor-pointer image-modal-trigger" data-image-url="{{ url('/covers/preview/' . $release->guid . '_thumb.webp') }}" data-image-title="Preview Image">
-                                    <img src="{{ url('/covers/preview/' . $release->guid . '_thumb.webp') }}"
+                                <div class="block cursor-pointer image-modal-trigger" data-image-url="{{ $previewImageUrl }}" data-image-title="Preview Image">
+                                    <img src="{{ $previewImageUrl }}"
                                          alt="Preview"
                                          class="detail-gallery-image w-full h-auto rounded-lg"
                                          loading="lazy">
@@ -158,8 +164,8 @@
                         @if($hasSampleImage)
                             <!-- Sample image -->
                             <div>
-                                <div class="block cursor-pointer image-modal-trigger" data-image-url="{{ url('/covers/sample/' . $release->guid . '_thumb.webp') }}" data-image-title="Sample Image">
-                                    <img src="{{ url('/covers/sample/' . $release->guid . '_thumb.webp') }}"
+                                <div class="block cursor-pointer image-modal-trigger" data-image-url="{{ $sampleImageUrl }}" data-image-title="Sample Image">
+                                    <img src="{{ $sampleImageUrl }}"
                                          alt="Sample"
                                          class="detail-gallery-image w-full h-auto rounded-lg"
                                          loading="lazy">

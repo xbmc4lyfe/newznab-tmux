@@ -93,7 +93,7 @@
                                     <div class="lg:col-span-1">
                                         <img class="series-detail-poster w-full h-auto rounded-lg"
                                              alt="{{ $seriestitles ?? '' }} Poster"
-                                             src="{{ url('/covers/tvshows/' . $show['id'] . '.webp') }}"/>
+                                             src="{{ getImageAssetUrl('tvshows', (string) $show['id'], url('/covers/tvshows/no-cover.jpg')) }}"/>
                                     </div>
                                     <div class="lg:col-span-3">
                                         <p class="text-gray-700 dark:text-gray-300 leading-relaxed">{{ $seriessummary }}</p>

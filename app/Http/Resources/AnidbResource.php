@@ -68,13 +68,11 @@ class AnidbResource extends JsonResource
         }
 
         // Otherwise construct the local path
-        $picturePath = storage_path('covers/anime/'.$this->anidbid.'-cover.webp');
-        $legacyPath = storage_path('covers/anime/'.$this->anidbid.'-cover.jpg');
-        $oldLegacyPath = storage_path('covers/anime/'.$this->anidbid.'.jpg');
-        if (file_exists($picturePath) || file_exists($legacyPath) || file_exists($oldLegacyPath)) {
-            return url('/covers/anime/'.$this->anidbid.'-cover.webp');
-        }
-
-        return null;
+        return getImageAssetUrl(
+            'anime',
+            $this->anidbid.'-cover',
+            null,
+            [(string) $this->anidbid]
+        );
     }
 }

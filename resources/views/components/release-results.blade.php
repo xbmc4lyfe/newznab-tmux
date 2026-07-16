@@ -76,6 +76,7 @@
                                         <button type="button"
                                                 class="preview-badge inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-purple-100 dark:bg-purple-900 text-purple-800 dark:text-purple-200 hover:bg-purple-200 dark:hover:bg-purple-800 transition cursor-pointer"
                                                 data-guid="{{ $result->guid }}"
+                                                data-image-url="{{ getImageAssetUrl('preview', $result->guid . '_thumb') }}"
                                                 title="View preview image">
                                             <i class="fas fa-image mr-1"></i> Preview
                                         </button>
@@ -84,6 +85,7 @@
                                         <button type="button"
                                                 class="sample-badge inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 hover:bg-green-200 dark:hover:bg-green-800 transition cursor-pointer"
                                                 data-guid="{{ $result->guid }}"
+                                                data-image-url="{{ getImageAssetUrl('sample', $result->guid . '_thumb') }}"
                                                 title="View sample image">
                                             <i class="fas fa-images mr-1"></i> Sample
                                         </button>

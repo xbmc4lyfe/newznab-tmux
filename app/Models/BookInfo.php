@@ -111,6 +111,6 @@ class BookInfo extends Model
             return null;
         }
 
-        return url('/covers/book/'.$this->id.'.webp');
+        return getImageAssetUrl('book', (string) $this->id);
     }
 }

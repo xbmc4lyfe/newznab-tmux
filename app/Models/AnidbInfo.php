@@ -143,7 +143,12 @@ class AnidbInfo extends Model
 
         // Otherwise construct the local path
         if ($this->hasPictureImage()) {
-            return url('/covers/anime/'.$this->anidbid.'-cover.webp');
+            return getImageAssetUrl(
+                'anime',
+                $this->anidbid.'-cover',
+                null,
+                [(string) $this->anidbid]
+            );
         }
 
         return null;

@@ -58,7 +58,7 @@ class MovieResource extends JsonResource
             return null;
         }
 
-        return url('/covers/movies/'.$this->imdbid.'-cover.webp');
+        return getImageAssetUrl('movies', (string) $this->imdbid.'-cover');
     }
 
     /**
@@ -70,6 +70,6 @@ class MovieResource extends JsonResource
             return null;
         }
 
-        return url('/covers/movies/'.$this->imdbid.'-backdrop.webp');
+        return getImageAssetUrl('movies', (string) $this->imdbid.'-backdrop');
     }
 }

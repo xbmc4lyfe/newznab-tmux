@@ -664,15 +664,16 @@ class XML_Response
                 $column = 'consoleinfo_id';
                 break;
             case ! empty($this->release->bo_cover):
-                $dir = 'books';
+                $dir = 'book';
                 $column = 'bookinfo_id';
                 break;
         }
         if (isset($dir, $column)) {
             $dcov = ($dir === 'movies' ? '-cover' : '');
+            $filename = resolveImageAssetFilename($dir, $this->release->$column.$dcov) ?? 'no-cover.jpg';
             $this->cdata .=
                 "\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" ".
-                "src=\"{$this->server['server']['url']}/covers/{$dir}/{$this->release->$column}{$dcov}.webp\" ".
+                "src=\"{$this->server['server']['url']}/covers/{$dir}/{$filename}\" ".
                 "width=\"120\" alt=\"{$this->release->searchname}\" />\n";
         }
         $size = human_filesize($this->release->size);

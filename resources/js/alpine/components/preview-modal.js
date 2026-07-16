@@ -9,8 +9,8 @@ function buildImageUrl(guid, type) {
     return '/covers/' + (type || 'preview') + '/' + guid + '_thumb.webp';
 }
 
-function prefetchImage(guid, type) {
-    const url = buildImageUrl(guid, type);
+function prefetchImage(guid, type, resolvedUrl) {
+    const url = resolvedUrl || buildImageUrl(guid, type);
     if (!prefetchedUrls.has(url)) {
         const img = new Image();
         img.src = url;
@@ -25,10 +25,10 @@ Alpine.data('previewModal', () => ({
     imageError: false,
     imageLoaded: false,
 
-    show(guid, type) {
+    show(guid, type, resolvedUrl) {
         type = type || 'preview';
         this.title = type === 'sample' ? 'Sample Image' : 'Preview Image';
-        const newUrl = buildImageUrl(guid, type);
+        const newUrl = resolvedUrl || buildImageUrl(guid, type);
 
         if (this.imageUrl === newUrl) {
             this.open = true;
@@ -64,18 +64,18 @@ Alpine.data('previewModal', () => ({
 
         document.addEventListener('click', function(e) {
             const preview = e.target.closest('.preview-badge');
-            if (preview) { e.preventDefault(); self.show(preview.dataset.guid, 'preview'); return; }
+            if (preview) { e.preventDefault(); self.show(preview.dataset.guid, 'preview', preview.dataset.imageUrl); return; }
             const sample = e.target.closest('.sample-badge');
-            if (sample) { e.preventDefault(); self.show(sample.dataset.guid, 'sample'); return; }
+            if (sample) { e.preventDefault(); self.show(sample.dataset.guid, 'sample', sample.dataset.imageUrl); return; }
             if (e.target.closest('[data-close-preview-modal]')) { e.preventDefault(); self.close(); }
         });
 
         // Prefetch on hover so the image is cached before click
         document.addEventListener('mouseover', function(e) {
             const preview = e.target.closest('.preview-badge');
-            if (preview) { prefetchImage(preview.dataset.guid, 'preview'); return; }
+            if (preview) { prefetchImage(preview.dataset.guid, 'preview', preview.dataset.imageUrl); return; }
             const sample = e.target.closest('.sample-badge');
-            if (sample) { prefetchImage(sample.dataset.guid, 'sample'); }
+            if (sample) { prefetchImage(sample.dataset.guid, 'sample', sample.dataset.imageUrl); }
         });
 
         document.addEventListener('keydown', function(e) {
@@ -91,9 +91,9 @@ Alpine.data('previewModal', () => ({
                         const type = el.classList.contains('sample-badge') ? 'sample' : 'preview';
                         const guid = el.dataset.guid;
                         if (typeof requestIdleCallback === 'function') {
-                            requestIdleCallback(function() { prefetchImage(guid, type); });
+                            requestIdleCallback(function() { prefetchImage(guid, type, el.dataset.imageUrl); });
                         } else {
-                            setTimeout(function() { prefetchImage(guid, type); }, 200);
+                            setTimeout(function() { prefetchImage(guid, type, el.dataset.imageUrl); }, 200);
                         }
                         observer.unobserve(el);
                     }

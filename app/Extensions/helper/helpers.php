@@ -508,6 +508,60 @@ if (! function_exists('release_flag')) {
     }
 }
 
+if (! function_exists('resolveImageAssetFilename')) {
+    /**
+     * Resolve the real on-disk extension before publishing an image URL.
+     *
+     * @param  list<string>  $alternateBasenames
+     */
+    function resolveImageAssetFilename(string $type, string $basename, array $alternateBasenames = []): ?string
+    {
+        if (preg_match('/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/D', $type) !== 1
+            || preg_match('/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/D', $basename) !== 1) {
+            return null;
+        }
+
+        $configuredRoot = config('nntmux_settings.covers_path');
+        $roots = array_values(array_unique(array_filter([
+            is_string($configuredRoot) && $configuredRoot !== '' ? rtrim($configuredRoot, '/\\') : null,
+            storage_path('covers'),
+            public_path('covers'),
+        ], static fn (mixed $root): bool => is_string($root) && $root !== '')));
+        $basenames = array_values(array_unique([$basename, ...$alternateBasenames]));
+
+        foreach (['webp', 'jpg', 'jpeg'] as $extension) {
+            foreach ($basenames as $candidateBasename) {
+                if (preg_match('/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/D', $candidateBasename) !== 1) {
+                    continue;
+                }
+
+                foreach ($roots as $root) {
+                    $path = $root.DIRECTORY_SEPARATOR.$type.DIRECTORY_SEPARATOR.$candidateBasename.'.'.$extension;
+                    if (is_file($path) && is_readable($path)) {
+                        return $candidateBasename.'.'.$extension;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+}
+
+if (! function_exists('getImageAssetUrl')) {
+    /**
+     * Return a URL containing the extension of the image that actually exists.
+     *
+     * @param  list<string>  $alternateBasenames
+     */
+    function getImageAssetUrl(string $type, string $basename, ?string $fallbackUrl = null, array $alternateBasenames = []): ?string
+    {
+        $filename = resolveImageAssetFilename($type, $basename, $alternateBasenames);
+
+        return $filename === null ? $fallbackUrl : url("/covers/{$type}/{$filename}");
+    }
+}
+
 if (! function_exists('getReleaseCover')) {
     /**
      * Get the cover image URL for a release based on its type and ID
@@ -567,11 +621,17 @@ if (! function_exists('getReleaseCover')) {
         }
 
         if ($coverType && $coverId) {
-            if (in_array($coverType, ['movies', 'anime'], true)) {
-                return url("/covers/{$coverType}/{$coverId}-cover.webp");
-            }
+            $basename = in_array($coverType, ['movies', 'anime'], true)
+                ? $coverId.'-cover'
+                : (string) $coverId;
+            $alternateBasenames = $coverType === 'anime' ? [(string) $coverId] : [];
 
-            return url("/covers/{$coverType}/{$coverId}.webp");
+            return getImageAssetUrl(
+                $coverType,
+                $basename,
+                asset('assets/images/no-cover.png'),
+                $alternateBasenames
+            ) ?? asset('assets/images/no-cover.png');
         }
 
         // Return placeholder image if no cover type/ID found
@@ -832,15 +892,12 @@ if (! function_exists('streamSslContextOptions')) {
 
 if (! function_exists('getCoverURL')) {
     /**
-     * Get cover URL for a release. Uses a short-lived in-memory cache to avoid
-     * repeated filesystem file_exists() calls for the same cover during a single request.
+     * Get the relative cover URL using the extension that exists on disk.
      *
      * @param  array<string, mixed>  $options
      */
     function getCoverURL(array $options = []): string
     {
-        static $coverCache = [];
-
         $defaults = [
             'id' => null,
             'suffix' => '-cover.webp',
@@ -852,23 +909,16 @@ if (! function_exists('getCoverURL')) {
 
         if (! empty($options['id']) && \in_array(
             $options['type'],
-            ['anime', 'audio', 'audiosample', 'book', 'console', 'games', 'movies', 'music', 'preview', 'sample', 'tvrage', 'video', 'xxx'],
+            ['anime', 'audio', 'audiosample', 'book', 'console', 'games', 'movies', 'music', 'preview', 'sample', 'tvrage', 'tvshows', 'video', 'xxx'],
             false
         )
         ) {
-            $fileSpec = sprintf($fileSpecTemplate, $options['type'], $options['id'], $options['suffix']);
-            $cacheKey = $options['type'].':'.$options['id'];
-
-            if (! isset($coverCache[$cacheKey])) {
-                $canonicalPath = storage_path('covers/').$fileSpec;
-                $legacyPath = preg_replace('/\.webp$/i', '.jpg', $canonicalPath);
-                $coverCache[$cacheKey] = file_exists($canonicalPath)
-                    || (is_string($legacyPath) && file_exists($legacyPath));
-            }
-
-            if (! $coverCache[$cacheKey]) {
-                $fileSpec = sprintf($fileSpecTemplate, $options['type'], 'no', $options['suffix']);
-            }
+            $suffix = preg_replace('/\.(?:webp|jpe?g)$/i', '', (string) $options['suffix']);
+            $basename = (string) $options['id'].(is_string($suffix) ? $suffix : '');
+            $filename = resolveImageAssetFilename((string) $options['type'], $basename);
+            $fileSpec = $filename === null
+                ? sprintf($fileSpecTemplate, $options['type'], 'no-cover', '.jpg')
+                : $options['type'].'/'.$filename;
         }
 
         return $fileSpec;
