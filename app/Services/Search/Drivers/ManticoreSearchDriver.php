@@ -362,12 +362,8 @@ class ManticoreSearchDriver implements SearchDriverInterface
         }
 
         try {
-            $index = str_replace('`', '``', $this->getReleasesIndex());
-            $this->manticoreSearch->sql(sprintf(
-                'DELETE FROM `%s` WHERE id IN (%s)',
-                $index,
-                implode(',', $ids)
-            ));
+            $this->manticoreSearch->table($this->getReleasesIndex())
+                ->deleteDocumentsByIds($ids);
         } catch (ResponseException $e) {
             Log::error('ManticoreSearch deleteReleases error: '.$e->getMessage(), [
                 'ids' => $ids,
