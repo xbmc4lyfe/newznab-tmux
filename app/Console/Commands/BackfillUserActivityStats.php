@@ -5,8 +5,6 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Models\UserActivityStat;
-use App\Models\UserDownload;
-use App\Models\UserRequest;
 use Carbon\Carbon;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -29,7 +27,7 @@ class BackfillUserActivityStats extends Command
      *
      * @var string
      */
-    protected $description = 'Backfill user activity stats (daily or hourly) from existing user_downloads and user_requests data';
+    protected $description = 'Backfill hourly activity from raw logs or daily activity from retained hourly aggregates';
 
     /**
      * Execute the console command.
@@ -77,24 +75,7 @@ class BackfillUserActivityStats extends Command
                 continue;
             }
 
-            // Count downloads for the date
-            $downloadsCount = UserDownload::query()
-                ->whereRaw('DATE(timestamp) = ?', [$date])
-                ->count();
-
-            // Count API hits for the date
-            $apiHitsCount = UserRequest::query()
-                ->whereRaw('DATE(timestamp) = ?', [$date])
-                ->count();
-
-            // Store or update the stats
-            UserActivityStat::updateOrCreate(
-                ['stat_date' => $date],
-                [
-                    'downloads_count' => $downloadsCount,
-                    'api_hits_count' => $apiHitsCount,
-                ]
-            );
+            UserActivityStat::collectDailyStats($date);
 
             $statsCollected++;
             $progressBar->advance();
@@ -137,28 +118,7 @@ class BackfillUserActivityStats extends Command
                 continue;
             }
 
-            // Count downloads for the hour
-            $downloadsCount = UserDownload::query()
-                ->where('timestamp', '>=', $hour)
-                ->where('timestamp', '<', Carbon::parse($hour)->addHour()->format('Y-m-d H:00:00'))
-                ->count();
-
-            // Count API hits for the hour
-            $apiHitsCount = UserRequest::query()
-                ->where('timestamp', '>=', $hour)
-                ->where('timestamp', '<', Carbon::parse($hour)->addHour()->format('Y-m-d H:00:00'))
-                ->count();
-
-            // Store or update the stats
-            DB::table('user_activity_stats_hourly')->updateOrInsert(
-                ['stat_hour' => $hour],
-                [
-                    'downloads_count' => $downloadsCount,
-                    'api_hits_count' => $apiHitsCount,
-                    'updated_at' => now(),
-                    'created_at' => DB::raw('COALESCE(created_at, NOW())'),
-                ]
-            );
+            UserActivityStat::collectHourlyStats($hour);
 
             $statsCollected++;
             $progressBar->advance();

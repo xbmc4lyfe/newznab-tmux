@@ -38,11 +38,8 @@ class UserStatsService
     /**
      * Get downloads per day for the last N days (inclusive of today).
      *
-     * Source layering — designed to avoid the 1-day rolling purge of
-     * `user_downloads` (see routes/console.php cleanup-api-request-logs):
-     *  - Closed days (today-(N-1) … yesterday) come from `user_activity_stats`.
-     *  - Today is composed of closed hours from `user_activity_stats_hourly`
-     *    + the in-progress hour from the live `user_downloads` table.
+     * Closed hours come from `user_activity_stats_hourly`; the current hour
+     * comes from the live `user_downloads` table.
      *
      * @return list<array<string, int|string>>
      */
@@ -65,8 +62,15 @@ class UserStatsService
      */
     public function getDownloadsPerHour(int $hours = 168): array
     {
-        // Use the aggregated hourly stats from UserActivityStat model
-        return UserActivityStat::getDownloadsPerHour($hours);
+        $result = UserActivityStat::getDownloadsPerHour($hours);
+
+        if ($result !== []) {
+            $result[count($result) - 1]['count'] = UserDownload::query()
+                ->where('timestamp', '>=', Carbon::now()->startOfHour())
+                ->count();
+        }
+
+        return $result;
     }
 
     /**
@@ -77,14 +81,12 @@ class UserStatsService
     public function getDownloadsPerMinute(int $minutes = 60): array
     {
         $startTime = Carbon::now()->subMinutes($minutes);
+        $minuteExpression = $this->minuteBucketExpression();
 
         $downloads = UserDownload::query()
-            ->select(
-                DB::raw('DATE_FORMAT(timestamp, "%Y-%m-%d %H:%i:00") as minute'),
-                DB::raw('COUNT(*) as count')
-            )
+            ->selectRaw($minuteExpression.' as minute, COUNT(*) as count')
             ->where('timestamp', '>=', $startTime)
-            ->groupBy(DB::raw('DATE_FORMAT(timestamp, "%Y-%m-%d %H:%i:00")'))
+            ->groupByRaw($minuteExpression)
             ->orderBy('minute', 'asc')
             ->get()
             ->keyBy('minute');
@@ -107,9 +109,8 @@ class UserStatsService
     /**
      * Get API hits per day for the last N days (inclusive of today).
      *
-     * Mirrors {@see self::getDownloadsPerDay()} — closed days from
-     * `user_activity_stats`, today composed of `user_activity_stats_hourly`
-     * + the in-progress hour from `user_requests`.
+     * Mirrors {@see self::getDownloadsPerDay()} using combined authenticated
+     * API v1/v2 and RSS requests from `user_requests`.
      *
      * @return list<array<string, int|string>>
      */
@@ -132,8 +133,15 @@ class UserStatsService
      */
     public function getApiHitsPerHour(int $hours = 168): array
     {
-        // Use the aggregated hourly stats from UserActivityStat model
-        return UserActivityStat::getApiHitsPerHour($hours);
+        $result = UserActivityStat::getApiHitsPerHour($hours);
+
+        if ($result !== []) {
+            $result[count($result) - 1]['count'] = UserRequest::query()
+                ->where('timestamp', '>=', Carbon::now()->startOfHour())
+                ->count();
+        }
+
+        return $result;
     }
 
     /**
@@ -144,15 +152,13 @@ class UserStatsService
     public function getApiHitsPerMinute(int $minutes = 60): array
     {
         $startTime = Carbon::now()->subMinutes($minutes);
+        $minuteExpression = $this->minuteBucketExpression();
 
         // Track actual API requests from user_requests table
         $apiHits = UserRequest::query()
-            ->select(
-                DB::raw('DATE_FORMAT(timestamp, "%Y-%m-%d %H:%i:00") as minute'),
-                DB::raw('COUNT(*) as count')
-            )
+            ->selectRaw($minuteExpression.' as minute, COUNT(*) as count')
             ->where('timestamp', '>=', $startTime)
-            ->groupBy(DB::raw('DATE_FORMAT(timestamp, "%Y-%m-%d %H:%i:00")'))
+            ->groupByRaw($minuteExpression)
             ->orderBy('minute', 'asc')
             ->get()
             ->keyBy('minute');
@@ -177,12 +183,8 @@ class UserStatsService
      *
      * Window: "today" and "(7d) = last 7 calendar days inclusive of today".
      *
-     * The live `user_downloads` / `user_requests` tables are pruned hourly to
-     * the last ~24h (see routes/console.php), so we layer sources to keep the
-     * totals consistent regardless of when the purge ran:
-     *  - Closed days (today-6 … yesterday) → `user_activity_stats`.
-     *  - Today's closed hours → `user_activity_stats_hourly`.
-     *  - Current in-progress hour → live `user_downloads` / `user_requests`.
+     * Closed hours come from `user_activity_stats_hourly`; the current
+     * in-progress hour comes from live `user_downloads` / `user_requests`.
      *
      * @return array{total_users: int, downloads_today: int, downloads_week: int, api_hits_today: int, api_hits_week: int}
      */
@@ -192,10 +194,9 @@ class UserStatsService
         $weekStart = Carbon::now()->subDays(6)->startOfDay();
         $currentHourStart = Carbon::now()->startOfHour();
 
-        // Closed days: [today-6 .. yesterday]
-        $historical = UserActivityStat::query()
-            ->where('stat_date', '>=', $weekStart->format('Y-m-d'))
-            ->where('stat_date', '<', $today->format('Y-m-d'))
+        $weekClosed = DB::table('user_activity_stats_hourly')
+            ->where('stat_hour', '>=', $weekStart->format('Y-m-d H:00:00'))
+            ->where('stat_hour', '<', $currentHourStart->format('Y-m-d H:00:00'))
             ->selectRaw('COALESCE(SUM(downloads_count), 0) as downloads, COALESCE(SUM(api_hits_count), 0) as api_hits')
             ->first();
 
@@ -220,9 +221,9 @@ class UserStatsService
         return [
             'total_users' => User::whereNull('deleted_at')->count(),
             'downloads_today' => $downloadsToday,
-            'downloads_week' => (int) ($historical->downloads ?? 0) + $downloadsToday,
+            'downloads_week' => (int) ($weekClosed->downloads ?? 0) + $downloadsCurrentHour,
             'api_hits_today' => $apiHitsToday,
-            'api_hits_week' => (int) ($historical->api_hits ?? 0) + $apiHitsToday,
+            'api_hits_week' => (int) ($weekClosed->api_hits ?? 0) + $apiHitsCurrentHour,
         ];
     }
 
@@ -247,10 +248,8 @@ class UserStatsService
     }
 
     /**
-     * Build a "last N days inclusive of today" series, layering closed days
-     * (from `user_activity_stats`), today's closed hours (from
-     * `user_activity_stats_hourly`) and the current in-progress hour from a
-     * caller-supplied live counter.
+     * Build a "last N days inclusive of today" series from hourly aggregates
+     * plus the current in-progress hour from a caller-supplied live counter.
      *
      * @param  callable(Carbon): int  $liveCurrentHourCounter
      * @return list<array{date: string, count: int}>
@@ -260,42 +259,42 @@ class UserStatsService
         $today = Carbon::now()->startOfDay();
         $startDate = $today->copy()->subDays($days - 1);
 
-        $historical = UserActivityStat::query()
-            ->select('stat_date', $statColumn)
-            ->where('stat_date', '>=', $startDate->format('Y-m-d'))
-            ->where('stat_date', '<', $today->format('Y-m-d'))
-            ->orderBy('stat_date', 'asc')
-            ->get()
-            ->keyBy(static fn (UserActivityStat $s): string => $s->stat_date instanceof Carbon
-                ? $s->stat_date->format('Y-m-d')
-                : (string) $s->stat_date);
+        $currentHourStart = Carbon::now()->startOfHour();
+        $hourly = DB::table('user_activity_stats_hourly')
+            ->select('stat_hour', $statColumn)
+            ->where('stat_hour', '>=', $startDate->format('Y-m-d H:00:00'))
+            ->where('stat_hour', '<', $currentHourStart->format('Y-m-d H:00:00'))
+            ->orderBy('stat_hour')
+            ->get();
+
+        $dailyCounts = [];
+        foreach ($hourly as $stat) {
+            $date = Carbon::parse((string) $stat->stat_hour)->format('Y-m-d');
+            $dailyCounts[$date] = ($dailyCounts[$date] ?? 0) + (int) $stat->{$statColumn};
+        }
 
         $result = [];
         $cursor = $startDate->copy();
-        while ($cursor->lt($today)) {
-            $stat = $historical->get($cursor->format('Y-m-d'));
+        while ($cursor->lte($today)) {
+            $date = $cursor->format('Y-m-d');
             $result[] = [
                 'date' => $cursor->format('M d'),
-                'count' => $stat ? (int) $stat->{$statColumn} : 0,
+                'count' => $dailyCounts[$date] ?? 0,
             ];
             $cursor->addDay();
         }
 
-        // Today: closed hours from hourly aggregate + the current hour from live.
-        $currentHourStart = Carbon::now()->startOfHour();
-        $hourlyColumn = $statColumn === 'api_hits_count' ? 'api_hits_count' : 'downloads_count';
-        $todayClosed = (int) DB::table('user_activity_stats_hourly')
-            ->where('stat_hour', '>=', $today->format('Y-m-d H:00:00'))
-            ->where('stat_hour', '<', $currentHourStart->format('Y-m-d H:00:00'))
-            ->sum($hourlyColumn);
-
-        $todayLive = (int) $liveCurrentHourCounter($currentHourStart);
-
-        $result[] = [
-            'date' => $today->format('M d'),
-            'count' => $todayClosed + $todayLive,
-        ];
+        if ($result !== []) {
+            $result[count($result) - 1]['count'] += (int) $liveCurrentHourCounter($currentHourStart);
+        }
 
         return $result;
+    }
+
+    private function minuteBucketExpression(): string
+    {
+        return DB::connection()->getDriverName() === 'sqlite'
+            ? "strftime('%Y-%m-%d %H:%M:00', timestamp)"
+            : 'DATE_FORMAT(timestamp, "%Y-%m-%d %H:%i:00")';
     }
 }

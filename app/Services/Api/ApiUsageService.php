@@ -4,8 +4,9 @@ declare(strict_types=1);
 
 namespace App\Services\Api;
 
-use App\Jobs\RecordApiUsage;
+use App\Jobs\UpdateUserApiAccess;
 use App\Models\User;
+use App\Models\UserRequest;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -30,18 +31,27 @@ final class ApiUsageService
 
     public function record(User $user, Request $request): void
     {
-        $job = new RecordApiUsage(
+        $occurredAt = now()->toDateTimeString();
+
+        // Request accounting drives quotas and admin statistics, so it must be
+        // durable before the response returns even when no queue worker runs.
+        UserRequest::recordApiRequest(
             $user->id,
             $request->getRequestUri(),
+            $occurredAt,
+        );
+
+        $job = new UpdateUserApiAccess(
+            $user->id,
             $request->ip(),
-            now()->toDateTimeString(),
+            $occurredAt,
         );
 
         if ((bool) config('nntmux.api.async_audit', true)) {
             try {
                 dispatch($job);
             } catch (Throwable) {
-                // Preserve audit and quota correctness when the queue backend is unavailable.
+                // Keep access metadata current when the queue backend is unavailable.
                 $job->handle();
             }
 

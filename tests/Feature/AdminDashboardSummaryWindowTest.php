@@ -10,8 +10,7 @@ use Tests\TestCase;
  * Locks in the "(7d) = last 7 calendar days inclusive of today" semantics
  * and the source layering used by the headline summary tiles:
  *
- *  - Closed days come from `user_activity_stats`.
- *  - Today's closed hours come from `user_activity_stats_hourly`.
+ *  - Every completed hour comes from `user_activity_stats_hourly`.
  *  - The current in-progress hour comes from the live `user_downloads` /
  *    `user_requests` tables (which are pruned hourly to ~24h).
  *
@@ -21,7 +20,7 @@ use Tests\TestCase;
  */
 class AdminDashboardSummaryWindowTest extends TestCase
 {
-    public function test_summary_window_layers_daily_hourly_and_live_sources(): void
+    public function test_summary_window_layers_hourly_and_live_sources(): void
     {
         $servicePath = app_path('Services/UserStatsService.php');
 
@@ -36,18 +35,16 @@ class AdminDashboardSummaryWindowTest extends TestCase
             'Summary window must be the last 7 calendar days inclusive of today.'
         );
 
-        // Closed days from the daily aggregate, strictly before today.
-        $this->assertStringContainsString('UserActivityStat::query()', $content);
+        // Every completed hour in the seven-day window comes from the retained
+        // hourly aggregate, including completed hours from today.
         $this->assertStringContainsString(
-            "->where('stat_date', '>=', \$weekStart->format('Y-m-d'))",
+            "->where('stat_hour', '>=', \$weekStart->format('Y-m-d H:00:00'))",
             $content
         );
         $this->assertStringContainsString(
-            "->where('stat_date', '<', \$today->format('Y-m-d'))",
+            "->where('stat_hour', '<', \$currentHourStart->format('Y-m-d H:00:00'))",
             $content
         );
-
-        // Today's closed hours from the hourly aggregate.
         $this->assertStringContainsString(
             "DB::table('user_activity_stats_hourly')",
             $content
@@ -67,13 +64,13 @@ class AdminDashboardSummaryWindowTest extends TestCase
             $content
         );
 
-        // Today and week totals must combine all three sources.
+        // Today and week totals combine closed hourly data with live data.
         $this->assertStringContainsString(
             "'downloads_today' => \$downloadsToday,",
             $content
         );
         $this->assertStringContainsString(
-            "'downloads_week' => (int) (\$historical->downloads ?? 0) + \$downloadsToday,",
+            "'downloads_week' => (int) (\$weekClosed->downloads ?? 0) + \$downloadsCurrentHour,",
             $content
         );
         $this->assertStringContainsString(
@@ -81,7 +78,7 @@ class AdminDashboardSummaryWindowTest extends TestCase
             $content
         );
         $this->assertStringContainsString(
-            "'api_hits_week' => (int) (\$historical->api_hits ?? 0) + \$apiHitsToday,",
+            "'api_hits_week' => (int) (\$weekClosed->api_hits ?? 0) + \$apiHitsCurrentHour,",
             $content
         );
 

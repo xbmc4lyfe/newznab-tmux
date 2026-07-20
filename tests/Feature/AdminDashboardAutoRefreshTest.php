@@ -16,14 +16,14 @@ class AdminDashboardAutoRefreshTest extends TestCase
 
         $this->assertStringContainsString('x-data="adminDashboard"', $content);
         $this->assertStringContainsString('data-data-url="{{ route(\'admin.api.dashboard-data\') }}"', $content);
-        $this->assertStringContainsString('data-refresh-interval="{{ 15 * 60 * 1000 }}"', $content);
+        $this->assertStringContainsString('data-refresh-interval="{{ 60 * 1000 }}"', $content);
         $this->assertStringContainsString('data-dashboard-content', $content);
         // The previous full-page-reload approach has been removed in favour of
         // updating headline tiles + widgets directly from the JSON payload.
         $this->assertStringNotContainsString('data-refresh-url=', $content);
     }
 
-    public function test_dashboard_blade_labels_match_fifteen_minute_refresh(): void
+    public function test_dashboard_blade_labels_match_one_minute_refresh(): void
     {
         $bladePath = resource_path('views/admin/dashboard.blade.php');
 
@@ -31,7 +31,7 @@ class AdminDashboardAutoRefreshTest extends TestCase
 
         $content = file_get_contents($bladePath);
 
-        $this->assertStringContainsString('Auto-refreshes every 15 minutes', $content);
+        $this->assertStringContainsString('Auto-refreshes every minute', $content);
         $this->assertStringContainsString('Last dashboard refresh:', $content);
         $this->assertStringContainsString('$dashboardLastRefreshedAt', $content);
         $this->assertStringContainsString('data-stat="last-refresh"', $content);
@@ -47,8 +47,7 @@ class AdminDashboardAutoRefreshTest extends TestCase
 
         $content = file_get_contents($scriptPath);
 
-        // Auto-refresh interval is preserved.
-        $this->assertStringContainsString('15 * 60 * 1000', $content);
+        $this->assertStringContainsString('60 * 1000', $content);
         // The fetch hits the cached JSON endpoint.
         $this->assertStringContainsString('this.$el.dataset.dataUrl', $content);
         // Each tick re-renders headline tiles + registration status + the

@@ -132,7 +132,16 @@ class UserRequest extends Model
         } else {
             $userID = User::query()->select(['id'])->where('api_token', $tokenOrUserId)->value('id');
         }
-        self::query()->insert(['users_id' => $userID, 'request' => $request, 'timestamp' => now()]);
+        self::recordApiRequest((int) $userID, $request, now()->toDateTimeString());
+    }
+
+    public static function recordApiRequest(int $userId, string $request, string $occurredAt): void
+    {
+        self::query()->insert([
+            'users_id' => $userId,
+            'request' => $request,
+            'timestamp' => $occurredAt,
+        ]);
     }
 
     /**

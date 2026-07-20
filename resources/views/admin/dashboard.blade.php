@@ -15,7 +15,7 @@
 <div x-data="adminDashboard"
      id="adminDashboard"
      data-data-url="{{ route('admin.api.dashboard-data') }}"
-     data-refresh-interval="{{ 15 * 60 * 1000 }}">
+     data-refresh-interval="{{ 60 * 1000 }}">
     <div class="space-y-6" data-dashboard-content>
     <!-- Welcome Section -->
     <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-6">
@@ -28,7 +28,7 @@
                 <p class="font-medium text-gray-700 dark:text-gray-200">
                     <i class="fas fa-sync-alt mr-1"></i> Last dashboard refresh: <span data-stat="last-refresh">{{ $dashboardLastRefreshedAt }}</span>
                 </p>
-                <p class="mt-1 text-xs text-green-600 dark:text-green-400">Auto-refreshes every 15 minutes</p>
+                <p class="mt-1 text-xs text-green-600 dark:text-green-400">Auto-refreshes every minute</p>
             </div>
         </div>
     </div>
@@ -322,7 +322,7 @@
                 <div class="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
                     <h4 class="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-4 flex items-center">
                         <i class="fas fa-chart-area mr-2 text-purple-600 dark:text-purple-400"></i>
-                        API Hits (Last 7 Days - Hourly)
+                        API/RSS Hits (Last 7 Days - Hourly)
                     </h4>
                     <div class="chart-container"><canvas id="apiHitsChart"></canvas></div>
                 </div>
@@ -336,7 +336,7 @@
                 <div class="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
                     <h4 class="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-4 flex items-center">
                         <i class="fas fa-chart-line mr-2 text-purple-600 dark:text-purple-400"></i>
-                        API Hits (Last 60 Minutes)
+                        API/RSS Hits (Last 60 Minutes)
                     </h4>
                     <div class="chart-container"><canvas id="apiHitsMinuteChart"></canvas></div>
                 </div>

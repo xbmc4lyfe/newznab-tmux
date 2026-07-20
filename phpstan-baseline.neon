@@ -1004,12 +1004,6 @@ parameters:
 			path: app/Services/UserStatsService.php
 
 		-
-			message: '#^Method App\\Services\\UserStatsService\:\:getDownloadsPerHour\(\) should return list\<array\<string, int\|string\|null\>\> but returns array\<string, mixed\>\.$#'
-			identifier: return.type
-			count: 1
-			path: app/Services/UserStatsService.php
-
-		-
 			message: '#^Method App\\Services\\UserStatsService\:\:getDownloadsPerMinute\(\) should return array\<string, mixed\> but returns list\<array\<string, int\|string\>\>\.$#'
 			identifier: return.type
 			count: 1

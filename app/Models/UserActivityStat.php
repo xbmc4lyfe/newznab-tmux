@@ -22,29 +22,34 @@ class UserActivityStat extends Model
 
     /**
      * Collect and store user activity stats for a specific date
-     * This aggregates data from user_downloads and user_requests tables
+     * This rolls up the retained hourly aggregates so the result cannot shrink
+     * after the raw user_downloads and user_requests rows are pruned.
      */
     public static function collectDailyStats(?string $date = null): void
     {
         $statDate = $date ? Carbon::parse($date)->format('Y-m-d') : Carbon::yesterday()->format('Y-m-d');
+        $dayStart = Carbon::parse($statDate)->startOfDay();
+        $dayEnd = $dayStart->copy()->addDay();
 
-        // Count downloads for the date
-        $downloadsCount = UserDownload::query()
-            ->whereRaw('DATE(timestamp) = ?', [$statDate])
-            ->count();
+        $totals = DB::table('user_activity_stats_hourly')
+            ->where('stat_hour', '>=', $dayStart->format('Y-m-d H:00:00'))
+            ->where('stat_hour', '<', $dayEnd->format('Y-m-d H:00:00'))
+            ->selectRaw('COALESCE(SUM(downloads_count), 0) as downloads, COALESCE(SUM(api_hits_count), 0) as api_hits')
+            ->first();
 
-        // Count API hits for the date
-        $apiHitsCount = UserRequest::query()
-            ->whereRaw('DATE(timestamp) = ?', [$statDate])
-            ->count();
+        $values = [
+            'downloads_count' => (int) ($totals->downloads ?? 0),
+            'api_hits_count' => (int) ($totals->api_hits ?? 0),
+            'updated_at' => now(),
+        ];
 
-        // Store or update the stats
-        self::updateOrCreate(
+        if (! DB::table('user_activity_stats')->where('stat_date', $statDate)->exists()) {
+            $values['created_at'] = now();
+        }
+
+        DB::table('user_activity_stats')->updateOrInsert(
             ['stat_date' => $statDate],
-            [
-                'downloads_count' => $downloadsCount,
-                'api_hits_count' => $apiHitsCount,
-            ]
+            $values,
         );
     }
 
@@ -111,9 +116,8 @@ class UserActivityStat extends Model
     /**
      * Get total downloads across the last N days inclusive of today.
      *
-     * Sums closed days from `user_activity_stats` and today's closed hours
-     * from `user_activity_stats_hourly`. The current in-progress hour is not
-     * included here — callers needing live "today" totals should use
+     * Sums closed hours from `user_activity_stats_hourly`. The current
+     * in-progress hour is not included here — callers needing live totals use
      * {@see UserStatsService::getSummaryStats()} which layers
      * the live tables on top.
      */
@@ -134,20 +138,13 @@ class UserActivityStat extends Model
 
     private static function sumLastNDays(int $days, string $column): int
     {
-        $today = Carbon::now()->startOfDay();
         $weekStart = Carbon::now()->subDays($days - 1)->startOfDay();
+        $currentHour = Carbon::now()->startOfHour();
 
-        $closedDays = (int) self::query()
-            ->where('stat_date', '>=', $weekStart->format('Y-m-d'))
-            ->where('stat_date', '<', $today->format('Y-m-d'))
+        return (int) DB::table('user_activity_stats_hourly')
+            ->where('stat_hour', '>=', $weekStart->format('Y-m-d H:00:00'))
+            ->where('stat_hour', '<', $currentHour->format('Y-m-d H:00:00'))
             ->sum($column);
-
-        $todayClosedHours = (int) DB::table('user_activity_stats_hourly')
-            ->where('stat_hour', '>=', $today->format('Y-m-d H:00:00'))
-            ->where('stat_hour', '<', Carbon::now()->startOfHour()->format('Y-m-d H:00:00'))
-            ->sum($column);
-
-        return $closedDays + $todayClosedHours;
     }
 
     /**

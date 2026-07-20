@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Unit;
 
 use App\Jobs\RecordApiUsage;
+use App\Jobs\UpdateUserApiAccess;
 use App\Models\User;
 use App\Services\Api\ApiUsageService;
 use Illuminate\Database\Schema\Blueprint;
@@ -44,7 +45,7 @@ final class ApiUsageServiceTest extends TestCase
         DB::table('users')->insert(['id' => 1]);
     }
 
-    public function test_async_record_dispatches_id_only_audit_job(): void
+    public function test_async_record_persists_usage_before_dispatching_metadata_update(): void
     {
         Queue::fake();
         config(['nntmux.api.async_audit' => true]);
@@ -54,12 +55,16 @@ final class ApiUsageServiceTest extends TestCase
 
         (new ApiUsageService)->record($user, $request);
 
-        Queue::assertPushed(RecordApiUsage::class, static fn (RecordApiUsage $job): bool => $job->userId === 1 && $job->requestUri === '/api/v2/search?api_token=secret&id=test'
+        Queue::assertPushed(UpdateUserApiAccess::class, static fn (UpdateUserApiAccess $job): bool => $job->userId === 1
+            && $job->ip === '127.0.0.1'
         );
-        $this->assertSame(0, DB::table('user_requests')->count());
+        $this->assertDatabaseHas('user_requests', [
+            'users_id' => 1,
+            'request' => '/api/v2/search?api_token=secret&id=test',
+        ]);
     }
 
-    public function test_audit_job_persists_each_request_and_coalesces_user_updates(): void
+    public function test_legacy_audit_job_persists_queued_requests_and_coalesces_user_updates(): void
     {
         config(['nntmux.api.access_update_interval' => 60]);
 

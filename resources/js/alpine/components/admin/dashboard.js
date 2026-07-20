@@ -52,7 +52,7 @@ Alpine.data('adminDashboard', () => ({
         this._scheduleRefresh();
     },
     _scheduleRefresh() {
-        const interval = Number.parseInt(this.$el.dataset.refreshInterval ?? '', 10) || (15 * 60 * 1000);
+        const interval = Number.parseInt(this.$el.dataset.refreshInterval ?? '', 10) || (60 * 1000);
         this._refreshInterval = window.setInterval(() => this._loadDashboardData(), interval);
         this._visibilityHandler = () => {
             if (!document.hidden && Date.now() - this._lastRefreshAt >= interval) {
@@ -159,8 +159,8 @@ Alpine.data('adminDashboard', () => ({
             { label: 'Total Users', value: summary.total_users, theme: 'blue' },
             { label: 'Downloads Today', value: summary.downloads_today, theme: 'green' },
             { label: 'Downloads (last 7d incl. today)', value: summary.downloads_week, theme: 'purple' },
-            { label: 'API Hits Today', value: summary.api_hits_today, theme: 'orange' },
-            { label: 'API Hits (last 7d incl. today)', value: summary.api_hits_week, theme: 'pink' },
+            { label: 'API/RSS Hits Today', value: summary.api_hits_today, theme: 'orange' },
+            { label: 'API/RSS Hits (last 7d incl. today)', value: summary.api_hits_week, theme: 'pink' },
         ];
         const summaryGrid = widget.querySelector('[data-summary-grid]');
         if (summaryGrid) {
@@ -209,11 +209,11 @@ Alpine.data('adminDashboard', () => ({
         }
         this._renderChart('downloadsChart', 'bar', 'Downloads', stats.downloads_per_hour ?? [],
             'rgba(34,197,94,0.7)', 'rgba(34,197,94,1)', false);
-        this._renderChart('apiHitsChart', 'line', 'API Hits', stats.api_hits_per_hour ?? [],
+        this._renderChart('apiHitsChart', 'line', 'API/RSS Hits', stats.api_hits_per_hour ?? [],
             'rgba(168,85,247,0.2)', 'rgba(168,85,247,1)', true);
         this._renderChart('downloadsMinuteChart', 'line', 'Downloads', stats.downloads_per_minute ?? [],
             'rgba(34,197,94,0.2)', 'rgba(34,197,94,1)', true);
-        this._renderChart('apiHitsMinuteChart', 'line', 'API Hits', stats.api_hits_per_minute ?? [],
+        this._renderChart('apiHitsMinuteChart', 'line', 'API/RSS Hits', stats.api_hits_per_minute ?? [],
             'rgba(168,85,247,0.2)', 'rgba(168,85,247,1)', true);
     },
     _renderSystemMetrics(metrics) {

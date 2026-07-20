@@ -37,11 +37,8 @@ final class RecordApiUsage implements ShouldQueue
 
     public function handle(): void
     {
-        UserRequest::query()->insert([
-            'users_id' => $this->userId,
-            'request' => $this->requestUri,
-            'timestamp' => $this->occurredAt,
-        ]);
+        // Legacy job retained while pre-deployment audit jobs drain.
+        UserRequest::recordApiRequest($this->userId, $this->requestUri, $this->occurredAt);
 
         $lockKey = 'api_access_update:'.$this->userId;
         $interval = max(1, (int) config('nntmux.api.access_update_interval', 60));
