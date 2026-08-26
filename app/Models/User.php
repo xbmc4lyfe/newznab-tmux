@@ -162,6 +162,16 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
     ];
 
     /**
+     * Roles eligible for automatic unverified-account cleanup.
+     *
+     * @var list<string>
+     */
+    private const UNVERIFIED_CLEANUP_ROLES = [
+        'User',
+        'FreeUser',
+    ];
+
+    /**
      * Days in a year for subscription calculations.
      */
     private const DAYS_PER_YEAR = 365;
@@ -1829,11 +1839,12 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
     // ===== Cleanup Methods =====
 
     /**
-     * Delete unverified users older than 3 days.
+     * Delete unverified User and FreeUser accounts older than 3 days.
      */
     public static function deleteUnVerified(): void
     {
         static::query()
+            ->whereHas('role', fn (Builder $roleQuery): Builder => $roleQuery->whereIn('name', self::UNVERIFIED_CLEANUP_ROLES))
             ->where('verified', false)
             ->whereNull('email_verified_at')
             ->where('created_at', '<', now()->subDays(3))
