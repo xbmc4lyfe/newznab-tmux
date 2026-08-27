@@ -1,4 +1,4 @@
-<div class="space-y-2 px-4">
+<div class="admin-sidebar-menu space-y-1 px-3 py-2">
     <!-- Dashboard -->
     <div class="mb-4">
         <a href="{{ route('admin.index') }}" class="flex items-center space-x-3 text-gray-300 dark:text-gray-400 hover:text-white dark:hover:text-white hover:bg-white/10 dark:hover:bg-white/5 py-2 px-3 rounded transition">
@@ -330,4 +330,3 @@
     </div>
 
 </div>
-

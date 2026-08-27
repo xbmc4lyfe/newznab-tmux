@@ -5,24 +5,25 @@
     'subtitle' => null,
 ])
 
-<div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-    <div class="flex flex-wrap justify-between items-center gap-3">
-        <div>
-            <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
+<div {{ $attributes->merge(['class' => 'admin-page-header px-4 py-5 sm:px-6']) }}>
+    <div class="flex flex-wrap items-start justify-between gap-4">
+        <div class="min-w-0">
+            <h1 class="flex items-center gap-3 text-2xl font-semibold tracking-tight text-gray-950 dark:text-white">
                 @if($icon)
-                    <i class="{{ $icon }} mr-2"></i>
+                    <span class="admin-page-header__icon flex h-10 w-10 shrink-0 items-center justify-center rounded-xl" aria-hidden="true">
+                        <i class="{{ $icon }}"></i>
+                    </span>
                 @endif
-                {{ $title }}
+                <span class="break-words">{{ $title }}</span>
             </h1>
             @if($subtitle)
                 <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">{{ $subtitle }}</p>
             @endif
         </div>
         @if(isset($actions))
-            <div class="flex flex-wrap gap-2">
+            <div class="admin-page-header__actions flex flex-wrap gap-2">
                 {{ $actions }}
             </div>
         @endif
     </div>
 </div>
-

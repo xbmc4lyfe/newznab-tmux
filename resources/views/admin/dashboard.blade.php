@@ -14,15 +14,17 @@
 
 <div x-data="adminDashboard"
      id="adminDashboard"
+     class="admin-dashboard-page"
      data-data-url="{{ route('admin.api.dashboard-data') }}"
      data-refresh-interval="{{ 60 * 1000 }}">
-    <div class="space-y-6" data-dashboard-content>
+    <div class="admin-dashboard-page__content space-y-6" data-dashboard-content>
     <!-- Welcome Section -->
-    <x-admin.card class="p-6">
+    <x-admin.card class="admin-dashboard-page__hero p-6">
         <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
-                <h2 class="text-2xl font-bold text-gray-800 dark:text-gray-200 mb-2">Admin Dashboard</h2>
-                <p class="text-gray-600">Welcome to the administration panel</p>
+                <p class="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-primary-600 dark:text-primary-300">Operations overview</p>
+                <h1 class="text-2xl font-semibold tracking-tight text-gray-950 dark:text-white sm:text-3xl">Admin Dashboard</h1>
+                <p class="mt-2 text-gray-600 dark:text-gray-300">Monitor index health, users, releases, and site activity from one workspace.</p>
             </div>
             <div class="rounded-lg bg-gray-50 dark:bg-gray-900 px-4 py-3 text-sm text-gray-600 dark:text-gray-300 lg:text-right">
                 <p class="font-medium text-gray-700 dark:text-gray-200">
@@ -34,7 +36,7 @@
     </x-admin.card>
 
     <!-- Stats Grid -->
-    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-6">
+    <div class="admin-dashboard-page__stats-grid grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
         <!-- Total Releases -->
         <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-6 border border-gray-200 dark:border-gray-700">
             <div class="flex items-center justify-between">

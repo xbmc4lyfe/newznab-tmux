@@ -41,6 +41,12 @@ class ContentSecurityPolicy
 
         // Reuse the nonce generated above (shared with Blade via csp_nonce())
 
+        $viteDevServerSources = $this->viteDevServerSources();
+        $viteAssetSource = $viteDevServerSources === null ? '' : ' '.$viteDevServerSources['asset'];
+        $viteConnectSources = $viteDevServerSources === null
+            ? ''
+            : ' '.$viteDevServerSources['asset'].' '.$viteDevServerSources['websocket'];
+
         // Build CSP directives for non-Turnstile pages
         // 'strict-dynamic' propagates trust from nonce-validated scripts to
         // dynamically loaded scripts (e.g. TinyMCE loaded via createElement).
@@ -51,14 +57,14 @@ class ContentSecurityPolicy
             // standard Alpine evaluator (new Function) that cannot be tree-shaken, and
             // TinyMCE (loaded from CDN on admin content pages) also relies on eval.
             // 'unsafe-inline' has been removed in favor of nonce-based validation.
-            "script-src 'self' 'nonce-{$nonce}' 'unsafe-eval' 'strict-dynamic' https://challenges.cloudflare.com https://cdn.tiny.cloud https://cdn.jsdelivr.net/ https://static.cloudflareinsights.com/ https://cdnjs.cloudflare.com/ https://unpkg.com/ https://cdn.tailwindcss.com/ https://code.jquery.com https://apis.google.com https://www.google.com https://www.gstatic.com https://ajax.cloudflare.com blob:",
-            "script-src-elem 'self' 'nonce-{$nonce}' https://challenges.cloudflare.com https://cdn.tiny.cloud https://cdn.jsdelivr.net/ https://static.cloudflareinsights.com/ https://cdnjs.cloudflare.com/ https://unpkg.com/ https://cdn.tailwindcss.com/ https://code.jquery.com https://apis.google.com https://www.google.com https://www.gstatic.com https://ajax.cloudflare.com",
+            "script-src 'self' 'nonce-{$nonce}' 'unsafe-eval' 'strict-dynamic' https://challenges.cloudflare.com https://cdn.tiny.cloud https://cdn.jsdelivr.net/ https://static.cloudflareinsights.com/ https://cdnjs.cloudflare.com/ https://unpkg.com/ https://cdn.tailwindcss.com/ https://code.jquery.com https://apis.google.com https://www.google.com https://www.gstatic.com https://ajax.cloudflare.com blob:{$viteAssetSource}",
+            "script-src-elem 'self' 'nonce-{$nonce}' https://challenges.cloudflare.com https://cdn.tiny.cloud https://cdn.jsdelivr.net/ https://static.cloudflareinsights.com/ https://cdnjs.cloudflare.com/ https://unpkg.com/ https://cdn.tailwindcss.com/ https://code.jquery.com https://apis.google.com https://www.google.com https://www.gstatic.com https://ajax.cloudflare.com{$viteAssetSource}",
             "script-src-attr 'none'",
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.bunny.net https://cdn.jsdelivr.net/ https://cdnjs.cloudflare.com/ https://cdn.tiny.cloud",
-            "style-src-elem 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.bunny.net https://cdn.jsdelivr.net/ https://cdnjs.cloudflare.com/ https://cdn.tiny.cloud",
-            "font-src 'self' https://fonts.gstatic.com https://fonts.bunny.net https://cdnjs.cloudflare.com/ https://cdn.tiny.cloud data:",
-            "img-src 'self' data: https: blob:",
-            "connect-src 'self' https://www.google.com https://cdn.tiny.cloud https://sp.tinymce.com",
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.bunny.net https://cdn.jsdelivr.net/ https://cdnjs.cloudflare.com/ https://cdn.tiny.cloud{$viteAssetSource}",
+            "style-src-elem 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.bunny.net https://cdn.jsdelivr.net/ https://cdnjs.cloudflare.com/ https://cdn.tiny.cloud{$viteAssetSource}",
+            "font-src 'self' https://fonts.gstatic.com https://fonts.bunny.net https://cdnjs.cloudflare.com/ https://cdn.tiny.cloud data:{$viteAssetSource}",
+            "img-src 'self' data: https: blob:{$viteAssetSource}",
+            "connect-src 'self' https://www.google.com https://cdn.tiny.cloud https://sp.tinymce.com{$viteConnectSources}",
             "frame-src 'self' https://www.google.com https://www.gstatic.com https://challenges.cloudflare.com https://cdn.tiny.cloud data: blob:",
             "child-src 'self' https://www.google.com https://challenges.cloudflare.com https://cdn.tiny.cloud blob:",
             "worker-src 'self' blob:",
@@ -82,5 +88,41 @@ class ContentSecurityPolicy
         $response->headers->set('Referrer-Policy', 'strict-origin-when-cross-origin');
 
         return $response;
+    }
+
+    /**
+     * @return array{asset: string, websocket: string}|null
+     */
+    private function viteDevServerSources(): ?array
+    {
+        if (config('app.env') !== 'local' || ! Vite::isRunningHot()) {
+            return null;
+        }
+
+        $hotUrl = trim((string) file_get_contents(Vite::hotFile()));
+        $parts = parse_url($hotUrl);
+
+        if (! is_array($parts)) {
+            return null;
+        }
+
+        $scheme = $parts['scheme'] ?? null;
+        $host = $parts['host'] ?? null;
+
+        if (! in_array($scheme, ['http', 'https'], true)
+            || ! is_string($host)
+            || ! in_array($host, ['localhost', '127.0.0.1', '::1'], true)) {
+            return null;
+        }
+
+        $urlHost = str_contains($host, ':') ? "[{$host}]" : $host;
+        $port = isset($parts['port']) ? ':'.$parts['port'] : '';
+        $assetOrigin = "{$scheme}://{$urlHost}{$port}";
+        $websocketScheme = $scheme === 'https' ? 'wss' : 'ws';
+
+        return [
+            'asset' => $assetOrigin,
+            'websocket' => "{$websocketScheme}://{$urlHost}{$port}",
+        ];
     }
 }

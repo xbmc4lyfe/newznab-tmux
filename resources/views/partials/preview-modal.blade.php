@@ -33,8 +33,8 @@
                     <h3 class="text-lg font-medium text-gray-900 dark:text-gray-100" id="preview-modal-title" x-text="title">
                         Preview Image
                     </h3>
-                    <button type="button" class="text-gray-400 hover:text-gray-500 dark:hover:text-gray-300" @click="close()">
-                        <i class="fas fa-times text-xl"></i>
+                    <button type="button" class="text-gray-400 hover:text-gray-500 dark:hover:text-gray-300" @click="close()" aria-label="Close preview">
+                        <i class="fas fa-times text-xl" aria-hidden="true"></i>
                     </button>
                 </div>
 
@@ -72,4 +72,3 @@
         </div>
     </div>
 </div>
-

@@ -1,14 +1,14 @@
-<nav class="bg-gray-800 dark:bg-gray-950 relative">
-    <div class="container mx-auto px-4">
+<nav class="layout-primary-nav relative" aria-label="Content categories">
+    <div class="container mx-auto max-w-[1600px] px-3 sm:px-5 lg:px-8">
         <div class="flex items-center justify-between h-16">
             <!-- Mobile menu button (visible below lg) -->
-            <button type="button" class="lg:hidden text-gray-300 dark:text-gray-400 hover:text-white dark:hover:text-white focus:outline-none p-2 touch-target" id="mobile-menu-toggle" aria-expanded="false" aria-controls="mobile-nav-panel">
-                <i class="fas fa-bars text-xl" id="mobile-menu-icon-open"></i>
-                <i class="fas fa-times text-xl hidden" id="mobile-menu-icon-close"></i>
+            <button type="button" class="touch-target rounded-xl p-2 text-gray-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 lg:hidden" id="mobile-menu-toggle" aria-label="Toggle category navigation" aria-expanded="false" aria-controls="mobile-nav-panel">
+                <i class="fas fa-bars text-xl" id="mobile-menu-icon-open" aria-hidden="true"></i>
+                <i class="fas fa-times text-xl hidden" id="mobile-menu-icon-close" aria-hidden="true"></i>
             </button>
 
             <!-- Desktop Navigation (visible at lg+) -->
-            <div class="hidden lg:flex lg:items-center lg:space-x-1 flex-1 min-w-0" id="desktop-nav">
+            <div class="layout-primary-nav__categories hidden min-w-0 flex-1 lg:flex lg:items-center lg:gap-1" id="desktop-nav">
                 @if(isset($parentcatlist))
                     @foreach($parentcatlist as $parentcat)
                         @if($parentcat['id'] == App\Models\Category::TV_ROOT)
@@ -165,13 +165,14 @@
             <!-- Right side: Search and User Menu -->
             <div class="flex items-center space-x-2 lg:space-x-4 ml-auto">
                 <!-- Mobile Search Toggle (visible below lg) -->
-                <button type="button" class="lg:hidden text-gray-300 hover:text-white p-2 touch-target" id="mobile-search-toggle">
-                    <i class="fa fa-search text-lg"></i>
+                <button type="button" class="touch-target rounded-xl p-2 text-gray-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 lg:hidden" id="mobile-search-toggle" aria-label="Toggle release search" aria-expanded="false" aria-controls="mobile-search-form">
+                    <i class="fa fa-search text-lg" aria-hidden="true"></i>
                 </button>
 
                 <!-- Desktop Search Form with Autocomplete (visible at lg+) -->
-                <form method="GET" action="{{ route('search') }}" class="hidden lg:flex items-center relative" id="header-search-form">
-                    <select name="t" class="bg-gray-700 text-white text-sm rounded-l-lg px-3 py-2 border-r border-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500">
+                <form method="GET" action="{{ route('search') }}" class="layout-primary-nav__search relative hidden items-center lg:flex" id="header-search-form" role="search">
+                    <label for="header-search-category" class="sr-only">Search category</label>
+                    <select id="header-search-category" name="t" class="bg-gray-700 text-white text-sm rounded-l-lg px-3 py-2 border-r border-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500">
                         <option value="-1">All</option>
                         @if(isset($parentcatlist))
                             @foreach($parentcatlist as $parentcat)
@@ -183,19 +184,20 @@
                         @endif
                     </select>
                     <div class="relative">
+                        <label for="header-search-input" class="sr-only">Search releases</label>
                         <input type="search"
                                name="search"
                                id="header-search-input"
                                value="{{ $header_menu_search ?? '' }}"
-                               placeholder="Search..."
+                               placeholder="Search releases"
                                autocomplete="off"
                                class="bg-gray-700 text-white text-sm px-3 py-2 w-40 xl:w-48 focus:outline-none focus:ring-2 focus:ring-primary-500">
                         <!-- Autocomplete dropdown for header -->
                         <div id="header-autocomplete-dropdown" class="hidden absolute z-50 w-64 mt-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg max-h-60 overflow-y-auto right-0">
                         </div>
                     </div>
-                    <button type="submit" class="bg-primary-600 dark:bg-primary-700 hover:bg-primary-700 dark:hover:bg-primary-800 text-white px-4 py-2 rounded-r-lg transition">
-                        <i class="fa fa-search"></i>
+                    <button type="submit" class="bg-primary-600 dark:bg-primary-700 hover:bg-primary-700 dark:hover:bg-primary-800 text-white px-4 py-2 rounded-r-lg transition" aria-label="Search releases">
+                        <i class="fa fa-search" aria-hidden="true"></i>
                     </button>
                 </form>
 

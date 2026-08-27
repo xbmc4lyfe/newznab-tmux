@@ -7,6 +7,7 @@ namespace Tests\Unit;
 use App\Http\Middleware\ContentSecurityPolicy;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
+use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Vite;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Facade;
@@ -16,32 +17,48 @@ use Symfony\Component\HttpFoundation\Response;
 
 class ContentSecurityPolicyTest extends TestCase
 {
-    private ?Container $originalContainer;
+    private Container $originalContainer;
+
+    private ?Application $originalFacadeApplication;
+
+    private string $hotFile;
 
     protected function setUp(): void
     {
         parent::setUp();
 
         $this->originalContainer = Container::getInstance();
+        $facadeApplication = Facade::getFacadeApplication();
+        $this->originalFacadeApplication = $facadeApplication instanceof Application ? $facadeApplication : null;
 
-        $container = new Container;
-        $container->instance('config', new Repository([
+        $application = new Application(dirname(__DIR__, 2));
+        $application->instance('config', new Repository([
+            'app' => ['env' => 'production'],
             'captcha' => [
                 'provider' => null,
                 'turnstile' => ['enabled' => false],
             ],
         ]));
-        $container->instance(Vite::class, new Vite);
+        $application->instance(Vite::class, new Vite);
 
-        Container::setInstance($container);
-        Facade::setFacadeApplication($container);
+        Container::setInstance($application);
+        Facade::setFacadeApplication($application);
+        Facade::clearResolvedInstances();
+
+        $this->hotFile = sys_get_temp_dir().'/nntmux-csp-hot-'.bin2hex(random_bytes(8));
+        app(Vite::class)->useHotFile($this->hotFile);
     }
 
     protected function tearDown(): void
     {
+        if (is_file($this->hotFile)) {
+            unlink($this->hotFile);
+        }
+
         Horizon::$nonceAttribute = '';
+        Facade::clearResolvedInstances();
         Container::setInstance($this->originalContainer);
-        Facade::setFacadeApplication($this->originalContainer);
+        Facade::setFacadeApplication($this->originalFacadeApplication);
 
         parent::tearDown();
     }
@@ -58,5 +75,53 @@ class ContentSecurityPolicyTest extends TestCase
         $this->assertStringContainsString("script-src 'self' 'nonce-{$nonce}'", (string) $response->headers->get('Content-Security-Policy'));
         $this->assertStringContainsString('https://fonts.bunny.net', (string) $response->headers->get('Content-Security-Policy'));
         $this->assertSame(4, substr_count((string) $response->getContent(), 'nonce="'.$nonce.'"'));
+    }
+
+    public function test_local_vite_hot_reload_sources_are_added_to_the_csp(): void
+    {
+        config()->set('app.env', 'local');
+        file_put_contents($this->hotFile, 'http://localhost:5173');
+
+        $response = (new ContentSecurityPolicy)->handle(
+            Request::create('/'),
+            static fn (): Response => new Response,
+        );
+
+        $csp = (string) $response->headers->get('Content-Security-Policy');
+
+        $this->assertStringContainsString("style-src-elem 'self' 'unsafe-inline'", $csp);
+        $this->assertStringContainsString('https://cdn.tiny.cloud http://localhost:5173', $csp);
+        $this->assertStringContainsString('https://sp.tinymce.com http://localhost:5173 ws://localhost:5173', $csp);
+    }
+
+    public function test_vite_hot_reload_sources_are_not_added_outside_local_environment(): void
+    {
+        file_put_contents($this->hotFile, 'http://localhost:5173');
+
+        $response = (new ContentSecurityPolicy)->handle(
+            Request::create('/'),
+            static fn (): Response => new Response,
+        );
+
+        $this->assertStringNotContainsString(
+            'http://localhost:5173',
+            (string) $response->headers->get('Content-Security-Policy'),
+        );
+    }
+
+    public function test_non_loopback_vite_hot_reload_sources_are_rejected(): void
+    {
+        config()->set('app.env', 'local');
+        file_put_contents($this->hotFile, 'https://assets.example.com:5173');
+
+        $response = (new ContentSecurityPolicy)->handle(
+            Request::create('/'),
+            static fn (): Response => new Response,
+        );
+
+        $this->assertStringNotContainsString(
+            'https://assets.example.com:5173',
+            (string) $response->headers->get('Content-Security-Policy'),
+        );
     }
 }

@@ -23,8 +23,8 @@
                     <i class="fas mr-2" :class="iconClass()"></i>
                     <span x-text="title">Confirm Action</span>
                 </h3>
-                <button type="button" @click="cancel()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
-                    <i class="fas fa-times text-xl"></i>
+                <button type="button" @click="cancel()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300" aria-label="Close confirmation">
+                    <i class="fas fa-times text-xl" aria-hidden="true"></i>
                 </button>
             </div>
         </div>
@@ -50,4 +50,3 @@
         </div>
     </div>
 </div>
-

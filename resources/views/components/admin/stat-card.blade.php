@@ -19,14 +19,14 @@
     $colors = $colorMap[$color] ?? $colorMap['blue'];
 @endphp
 
-<div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-6 border border-gray-200 dark:border-gray-700">
+<div {{ $attributes->merge(['class' => 'admin-stat-card surface-panel rounded-2xl border p-5 shadow-sm sm:p-6']) }}>
     <div class="flex items-center justify-between">
         <div>
             <p class="text-sm text-gray-500 dark:text-gray-400 mb-1">{{ $label }}</p>
             <p class="text-3xl font-bold text-gray-800 dark:text-gray-200">{{ $value }}</p>
         </div>
-        <div class="w-12 h-12 {{ $colors['bg'] }} rounded-lg flex items-center justify-center">
-            <i class="{{ $icon }} text-2xl {{ $colors['text'] }}"></i>
+        <div class="flex h-12 w-12 items-center justify-center rounded-xl {{ $colors['bg'] }}">
+            <i class="{{ $icon }} text-xl {{ $colors['text'] }}" aria-hidden="true"></i>
         </div>
     </div>
     @if($footer || isset($footerSlot))
@@ -39,4 +39,3 @@
         </div>
     @endif
 </div>
-

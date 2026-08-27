@@ -152,6 +152,249 @@
     display: none !important;
 }
 
+/* Shared application shell */
+.skip-link {
+    @apply fixed left-4 top-3 z-[100] -translate-y-20 rounded-xl bg-white px-4 py-2 text-sm font-semibold text-gray-950 shadow-xl transition-transform focus:translate-y-0 focus:outline-none focus:ring-2 focus:ring-primary-500 dark:bg-gray-900 dark:text-white;
+}
+
+:where(a, button, input, select, textarea, summary):focus-visible {
+    outline: 2px solid var(--color-primary-400);
+    outline-offset: 2px;
+}
+
+.layout-shell {
+    background-color: var(--surface-body);
+}
+
+.dark .layout-shell {
+    background-color: var(--surface-body-dark);
+}
+
+.layout-content {
+    isolation: isolate;
+}
+
+.layout-main {
+    background-color: var(--surface-body);
+    background-image:
+        radial-gradient(circle at 92% 0%, color-mix(in srgb, var(--color-primary-500) 9%, transparent), transparent 28rem),
+        linear-gradient(to bottom, color-mix(in srgb, var(--surface-body) 92%, white), var(--surface-body));
+    scroll-behavior: smooth;
+}
+
+.dark .layout-main {
+    background-color: var(--surface-body-dark);
+    background-image:
+        radial-gradient(circle at 92% 0%, color-mix(in srgb, var(--color-primary-500) 13%, transparent), transparent 30rem),
+        linear-gradient(to bottom, color-mix(in srgb, var(--surface-body-dark) 88%, black), var(--surface-body-dark));
+}
+
+.layout-sidebar {
+    border-right: 1px solid var(--surface-chrome-border);
+    background-image:
+        radial-gradient(circle at 10% 0%, color-mix(in srgb, var(--color-primary-400) 18%, transparent), transparent 18rem),
+        linear-gradient(to bottom, color-mix(in srgb, var(--surface-sidebar) 92%, black), var(--surface-sidebar));
+    box-shadow: 12px 0 36px rgb(15 23 42 / 0.14);
+}
+
+.dark .layout-sidebar {
+    border-right-color: var(--surface-chrome-border-dark);
+    background-image:
+        radial-gradient(circle at 10% 0%, color-mix(in srgb, var(--color-primary-500) 15%, transparent), transparent 18rem),
+        linear-gradient(to bottom, color-mix(in srgb, var(--surface-sidebar-dark) 92%, black), var(--surface-sidebar-dark));
+    box-shadow: 12px 0 40px rgb(0 0 0 / 0.3);
+}
+
+.layout-sidebar__brand {
+    min-height: 4.75rem;
+    border-bottom: 1px solid var(--surface-chrome-border);
+}
+
+.dark .layout-sidebar__brand {
+    border-bottom-color: var(--surface-chrome-border-dark);
+}
+
+.layout-sidebar__logo {
+    border: 1px solid rgb(255 255 255 / 0.1);
+    background: rgb(255 255 255 / 0.07);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.08);
+}
+
+.layout-sidebar__nav {
+    scrollbar-color: rgb(255 255 255 / 0.18) transparent;
+    scrollbar-width: thin;
+}
+
+.user-sidebar-menu > .sidebar-section > button,
+.user-sidebar-menu > a,
+.admin-sidebar-menu > div > button,
+.admin-sidebar-menu > div > a {
+    min-height: 2.75rem;
+    border-radius: 0.75rem;
+}
+
+.user-sidebar-menu .sidebar-submenu,
+.admin-sidebar-menu [x-show] {
+    border-left: 1px solid rgb(255 255 255 / 0.09);
+}
+
+.user-sidebar-menu .sidebar-submenu a,
+.admin-sidebar-menu [x-show] a {
+    min-height: 2.5rem;
+    border-radius: 0.625rem;
+}
+
+.admin-sidebar-menu > div {
+    margin-bottom: 0.25rem;
+}
+
+.layout-topbar {
+    border-bottom: 1px solid var(--surface-chrome-border);
+    background-image: linear-gradient(to right, color-mix(in srgb, var(--surface-header) 94%, black), var(--surface-header));
+    box-shadow: 0 8px 30px rgb(15 23 42 / 0.12);
+}
+
+.dark .layout-topbar {
+    border-bottom-color: var(--surface-chrome-border-dark);
+    background-image: linear-gradient(to right, color-mix(in srgb, var(--surface-header-dark) 94%, black), var(--surface-header-dark));
+    box-shadow: 0 8px 32px rgb(0 0 0 / 0.25);
+}
+
+.layout-primary-nav__search {
+    border-radius: 0.75rem;
+    box-shadow: 0 1px 0 rgb(255 255 255 / 0.08);
+}
+
+.layout-flash {
+    @apply flex items-start gap-3 rounded-2xl border px-4 py-3.5 text-sm font-medium shadow-sm;
+}
+
+.layout-flash > i {
+    @apply mt-0.5 shrink-0 text-base;
+}
+
+.layout-flash--success {
+    @apply border-emerald-200 bg-emerald-50/95 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/80 dark:text-emerald-100;
+}
+
+.layout-flash--error {
+    @apply border-red-200 bg-red-50/95 text-red-900 dark:border-red-800 dark:bg-red-950/80 dark:text-red-100;
+}
+
+.layout-flash--warning {
+    @apply border-amber-200 bg-amber-50/95 text-amber-950 dark:border-amber-800 dark:bg-amber-950/80 dark:text-amber-100;
+}
+
+.app-page-header,
+.admin-page-header {
+    border-bottom: 1px solid var(--border-default);
+    background-image: linear-gradient(120deg, color-mix(in srgb, var(--color-primary-50) 72%, white), transparent 62%);
+}
+
+.dark .app-page-header,
+.dark .admin-page-header {
+    border-bottom-color: var(--border-default-dark);
+    background-image: linear-gradient(120deg, color-mix(in srgb, var(--color-primary-950) 35%, transparent), transparent 62%);
+}
+
+.admin-page-header__icon {
+    border: 1px solid color-mix(in srgb, var(--color-primary-500) 24%, transparent);
+    background-color: color-mix(in srgb, var(--color-primary-500) 11%, transparent);
+    color: var(--color-primary-700);
+}
+
+.dark .admin-page-header__icon {
+    color: var(--color-primary-300);
+}
+
+.admin-card,
+.admin-stat-card,
+.admin-data-table-wrap {
+    border-color: var(--border-default);
+}
+
+.dark .admin-card,
+.dark .admin-stat-card,
+.dark .admin-data-table-wrap {
+    border-color: var(--border-default-dark);
+}
+
+.admin-stat-card {
+    background-image: linear-gradient(145deg, color-mix(in srgb, var(--color-primary-50) 42%, transparent), transparent 58%);
+}
+
+.dark .admin-stat-card {
+    background-image: linear-gradient(145deg, color-mix(in srgb, var(--color-primary-950) 24%, transparent), transparent 58%);
+}
+
+.admin-data-table-wrap {
+    border-radius: 0.875rem;
+}
+
+.admin-dashboard-page__hero {
+    position: relative;
+    overflow: hidden;
+    background-image:
+        radial-gradient(circle at 92% 20%, color-mix(in srgb, var(--color-primary-400) 18%, transparent), transparent 16rem),
+        linear-gradient(125deg, color-mix(in srgb, var(--color-primary-50) 78%, white), var(--surface-card) 62%);
+}
+
+.dark .admin-dashboard-page__hero {
+    background-image:
+        radial-gradient(circle at 92% 20%, color-mix(in srgb, var(--color-primary-500) 16%, transparent), transparent 18rem),
+        linear-gradient(125deg, color-mix(in srgb, var(--color-primary-950) 38%, var(--surface-card-dark)), var(--surface-card-dark) 62%);
+}
+
+.admin-dashboard-page__stats-grid > div,
+.admin-dashboard-page [data-widget] {
+    border-color: var(--border-default);
+    border-radius: 1rem;
+    background-color: var(--surface-card) !important;
+    box-shadow: 0 1px 2px rgb(15 23 42 / 0.04), 0 10px 30px rgb(15 23 42 / 0.04);
+}
+
+.dark .admin-dashboard-page__stats-grid > div,
+.dark .admin-dashboard-page [data-widget] {
+    border-color: var(--border-default-dark);
+    background-color: var(--surface-card-dark) !important;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.18), 0 12px 32px rgb(0 0 0 / 0.12);
+}
+
+.admin-dashboard-page__stats-grid > div {
+    background-image: linear-gradient(145deg, color-mix(in srgb, var(--color-primary-50) 36%, transparent), transparent 58%);
+}
+
+.dark .admin-dashboard-page__stats-grid > div {
+    background-image: linear-gradient(145deg, color-mix(in srgb, var(--color-primary-950) 20%, transparent), transparent 58%);
+}
+
+#sidebar a[aria-current="page"] {
+    background-color: color-mix(in srgb, var(--color-primary-500) 22%, transparent);
+    color: white;
+    box-shadow: inset 3px 0 0 var(--color-primary-400);
+}
+
+@media (max-width: 767px) {
+    .layout-sidebar {
+        box-shadow: 20px 0 60px rgb(2 6 23 / 0.42);
+    }
+
+    .layout-topbar__tools {
+        max-width: 60vw;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        scroll-behavior: auto !important;
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
+}
+
 /* Default document flow - public/guest pages need vertical scrolling */
 html,
 body {

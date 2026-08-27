@@ -1,4 +1,4 @@
-<nav class="flex flex-col space-y-1 p-4">
+<div class="user-sidebar-menu flex flex-col gap-1 px-3 py-2">
     <!-- Browse Menu -->
     <div class="sidebar-section">
         <button class="sidebar-toggle w-full flex items-center justify-between px-4 py-3 text-white hover:bg-white/10 rounded-lg transition" data-target="submenu1">
@@ -185,4 +185,4 @@
             @csrf
         </form>
     @endauth
-</nav>
+</div>

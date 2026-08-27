@@ -30,12 +30,12 @@
                 <div class="flex-1 text-sm text-gray-700 dark:text-gray-300" x-text="toast.message"></div>
                 <button type="button"
                         @click="dismiss(toast.id)"
-                        class="shrink-0 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition">
-                    <i class="fas fa-times"></i>
+                        class="shrink-0 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition"
+                        aria-label="Dismiss notification">
+                    <i class="fas fa-times" aria-hidden="true"></i>
                 </button>
             </div>
         </div>
     </template>
 </div>
-
 

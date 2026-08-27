@@ -50,6 +50,17 @@ Alpine.data('mobileSidebar', () => ({
  * Document-level delegation for mobile menu elements without x-data.
  */
 (function() {
+    document.querySelectorAll('#sidebar a[href]').forEach(function(link) {
+        try {
+            var linkUrl = new URL(link.href, window.location.origin);
+            if (linkUrl.origin === window.location.origin && linkUrl.pathname === window.location.pathname) {
+                link.setAttribute('aria-current', 'page');
+            }
+        } catch (_error) {
+            // Ignore malformed or non-navigational URLs.
+        }
+    });
+
     var toggle = document.getElementById('mobile-menu-toggle');
     var panel = document.getElementById('mobile-nav-panel');
     var iconOpen = document.getElementById('mobile-menu-icon-open');
@@ -82,6 +93,7 @@ Alpine.data('mobileSidebar', () => ({
         searchToggle.addEventListener('click', function(ev) {
             ev.preventDefault();
             searchForm.classList.toggle('hidden');
+            searchToggle.setAttribute('aria-expanded', searchForm.classList.contains('hidden') ? 'false' : 'true');
             if (panel && !searchForm.classList.contains('hidden')) {
                 panel.classList.add('hidden');
                 if (iconOpen && iconClose) { iconOpen.classList.remove('hidden'); iconClose.classList.add('hidden'); }
@@ -91,10 +103,44 @@ Alpine.data('mobileSidebar', () => ({
     }
 
     var mobileSidebarToggle = document.getElementById('mobile-sidebar-toggle');
+    var mobileSidebarClose = document.getElementById('mobile-sidebar-close');
+    var mobileSidebarBackdrop = document.getElementById('mobile-sidebar-backdrop');
+
+    function setMobileSidebar(open) {
+        var sidebar = document.getElementById('sidebar');
+        if (!sidebar || !mobileSidebarToggle) return;
+
+        sidebar.classList.toggle('hidden', !open);
+        sidebar.classList.toggle('flex', open);
+        mobileSidebarBackdrop?.classList.toggle('hidden', !open);
+        mobileSidebarToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        mobileSidebarToggle.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+
+        if (open) {
+            mobileSidebarClose?.focus();
+        } else if (window.innerWidth < 768) {
+            mobileSidebarToggle.focus();
+        }
+    }
+
     if (mobileSidebarToggle && !mobileSidebarToggle.closest('[x-data]')) {
         mobileSidebarToggle.addEventListener('click', function() {
             var sidebar = document.getElementById('sidebar');
-            if (sidebar) { sidebar.classList.toggle('hidden'); sidebar.classList.toggle('flex'); }
+            if (sidebar) setMobileSidebar(sidebar.classList.contains('hidden'));
+        });
+
+        mobileSidebarClose?.addEventListener('click', function() {
+            setMobileSidebar(false);
+        });
+
+        mobileSidebarBackdrop?.addEventListener('click', function() {
+            setMobileSidebar(false);
+        });
+
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape' && mobileSidebarToggle.getAttribute('aria-expanded') === 'true') {
+                setMobileSidebar(false);
+            }
         });
     }
 
@@ -104,6 +150,10 @@ Alpine.data('mobileSidebar', () => ({
             if (searchForm) searchForm.classList.add('hidden');
             if (iconOpen && iconClose) { iconOpen.classList.remove('hidden'); iconClose.classList.add('hidden'); }
             if (toggle) toggle.setAttribute('aria-expanded', 'false');
+        }
+
+        if (window.innerWidth >= 768 && mobileSidebarToggle) {
+            setMobileSidebar(false);
         }
     });
 })();

@@ -5,7 +5,7 @@
     'striped' => false,
 ])
 
-<div class="overflow-x-auto overscroll-x-contain">
+<div class="admin-data-table-wrap overflow-x-auto overscroll-x-contain">
     <table {{ $attributes->merge(['class' => 'min-w-full table-auto divide-y divide-gray-200 dark:divide-gray-700']) }}>
         @if(isset($head))
             <thead @class([

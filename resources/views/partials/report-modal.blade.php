@@ -36,8 +36,8 @@
                     <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="report-modal-title">
                         <i class="fas fa-flag text-red-500 mr-2"></i>Report Release
                     </h3>
-                    <button type="button" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300" @click="close()">
-                        <i class="fas fa-times"></i>
+                    <button type="button" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300" @click="close()" aria-label="Close report form">
+                        <i class="fas fa-times" aria-hidden="true"></i>
                     </button>
                 </div>
 

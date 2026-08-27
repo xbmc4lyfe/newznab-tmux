@@ -33,8 +33,8 @@
                     <h3 class="text-lg font-medium text-gray-900 dark:text-gray-100" id="nfo-modal-title">
                         <i class="fas fa-file-alt mr-2 text-yellow-600 dark:text-yellow-400"></i>NFO File
                     </h3>
-                    <button type="button" class="text-gray-400 hover:text-gray-500 dark:hover:text-gray-300" @click="close()">
-                        <i class="fas fa-times text-xl"></i>
+                    <button type="button" class="text-gray-400 hover:text-gray-500 dark:hover:text-gray-300" @click="close()" aria-label="Close NFO preview">
+                        <i class="fas fa-times text-xl" aria-hidden="true"></i>
                     </button>
                 </div>
 
@@ -66,5 +66,4 @@
         </div>
     </div>
 </div>
-
 

@@ -33,50 +33,65 @@
     @stack('styles')
 </head>
 <body class="app-shell font-sans antialiased">
-    <div class="h-screen flex">
+    <a href="#main-content" class="skip-link">Skip to content</a>
+
+    <div class="layout-shell h-screen flex">
         <!-- Sidebar -->
         @auth
-            <aside id="sidebar" class="hidden md:flex md:flex-col w-64 text-white shrink-0 h-full overflow-y-auto">
-                <div class="flex items-center justify-between p-4 border-b border-white/10 dark:border-white/5">
-                    <a href="{{ $site['home_link'] ?? url('/') }}" class="flex items-center space-x-3">
-                        <img src="{{ asset('assets/images/logo.svg') }}" alt="{{ config('app.name') }} Logo" class="w-12 h-12" aria-hidden="true">
-                        <span class="text-xl font-semibold">{{ config('app.name') }}</span>
+            <aside id="sidebar" class="layout-sidebar fixed inset-y-0 left-0 z-50 hidden h-full w-72 shrink-0 flex-col overflow-y-auto text-white md:static md:z-auto md:flex md:w-64" aria-label="Account navigation">
+                <div class="layout-sidebar__brand flex items-center justify-between gap-3 p-4">
+                    <a href="{{ $site['home_link'] ?? url('/') }}" class="flex min-w-0 items-center gap-3 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400">
+                        <span class="layout-sidebar__logo flex h-11 w-11 shrink-0 items-center justify-center rounded-xl">
+                            <i class="fas fa-layer-group text-lg text-primary-300" aria-hidden="true"></i>
+                        </span>
+                        <span class="min-w-0">
+                            <span class="block truncate text-lg font-semibold">{{ config('app.name') }}</span>
+                            <span class="block text-xs font-medium text-white/55">Usenet workspace</span>
+                        </span>
                     </a>
+                    <button type="button" id="mobile-sidebar-close" class="touch-target inline-flex items-center justify-center rounded-xl text-white/70 hover:bg-white/10 hover:text-white md:hidden" aria-label="Close navigation">
+                        <i class="fas fa-xmark" aria-hidden="true"></i>
+                    </button>
                 </div>
 
-                <nav class="flex-1 overflow-y-auto py-4">
+                <nav class="layout-sidebar__nav flex-1 overflow-y-auto py-3" aria-label="User">
                     @include('partials.sidebar')
                 </nav>
             </aside>
+            <button type="button" id="mobile-sidebar-backdrop" class="layout-sidebar-backdrop fixed inset-0 z-40 hidden bg-slate-950/60 backdrop-blur-sm md:hidden" aria-label="Close navigation" tabindex="-1"></button>
         @endauth
 
         <!-- Main Content -->
-        <div class="flex-1 flex flex-col h-full overflow-hidden">
+        <div class="layout-content flex h-full min-w-0 flex-1 flex-col overflow-hidden">
             <!-- Top Navigation -->
             @auth
-                <header class="surface-header text-white shrink-0 z-10">
+                <header class="layout-topbar surface-header z-30 shrink-0 text-white">
                     @include('partials.header-menu')
                 </header>
             @endauth
 
             <!-- Page Content - This is the scrollable area -->
-            <main class="flex-1 overflow-y-auto shadow-inner ring-1 ring-black/10 dark:ring-white/5" data-scroll-container>
-                <div class="container mx-auto px-4 py-6 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+            <main id="main-content" class="layout-main flex-1 overflow-y-auto" data-scroll-container tabindex="-1">
+                <div class="layout-page-container container mx-auto max-w-[1600px] px-3 py-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:px-5 sm:py-6 lg:px-8">
                     @if(session('success'))
-                        <div class="mb-4 p-4 bg-green-100 dark:bg-green-900 border border-green-400 dark:border-green-700 text-green-700 dark:text-green-200 rounded-lg">
-                            {{ session('success') }}
+                        <div class="layout-flash layout-flash--success mb-5" role="status">
+                            <i class="fas fa-circle-check" aria-hidden="true"></i>
+                            <div>{{ session('success') }}</div>
                         </div>
                     @endif
 
                     @if(session('error'))
-                        <div class="mb-4 p-4 bg-red-100 dark:bg-red-900 border border-red-400 dark:border-red-700 text-red-700 dark:text-red-200 rounded-lg">
-                            @if(is_array(session('error')))
-                                @foreach(session('error') as $error)
-                                    <div>{{ $error }}</div>
-                                @endforeach
-                            @else
-                                {{ session('error') }}
-                            @endif
+                        <div class="layout-flash layout-flash--error mb-5" role="alert">
+                            <i class="fas fa-circle-exclamation" aria-hidden="true"></i>
+                            <div>
+                                @if(is_array(session('error')))
+                                    @foreach(session('error') as $error)
+                                        <div>{{ $error }}</div>
+                                    @endforeach
+                                @else
+                                    {{ session('error') }}
+                                @endif
+                            </div>
                         </div>
                     @endif
 
@@ -95,8 +110,9 @@
     </div>
 
     <!-- Mobile Sidebar Toggle -->
-    <button id="mobile-sidebar-toggle" class="md:hidden fixed z-50 bg-primary-600 dark:bg-primary-700 text-white p-4 rounded-full shadow-lg hover:bg-primary-700 dark:hover:bg-primary-800 transition-all touch-target bottom-[max(5rem,calc(env(safe-area-inset-bottom)+4rem))] right-[max(1rem,env(safe-area-inset-right))]" aria-label="Toggle Sidebar">
-        <i class="fas fa-bars text-lg"></i>
+    <button id="mobile-sidebar-toggle" class="layout-mobile-sidebar-toggle touch-target fixed z-30 inline-flex items-center gap-2 rounded-full bg-primary-600 px-4 py-3 text-sm font-semibold text-white shadow-lg transition hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 focus-visible:ring-offset-2 dark:bg-primary-700 dark:hover:bg-primary-600 md:hidden bottom-[max(5rem,calc(env(safe-area-inset-bottom)+4rem))] right-[max(1rem,env(safe-area-inset-right))]" aria-label="Open account navigation" aria-controls="sidebar" aria-expanded="false">
+        <i class="fas fa-compass" aria-hidden="true"></i>
+        <span>Navigate</span>
     </button>
 
     <!-- Back to Top -->
@@ -106,7 +122,8 @@
     @php $themePreference = $userTheme; @endphp
     @guest
         <button id="theme-toggle" class="fixed z-50 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 px-4 py-3 rounded-full shadow-lg hover:bg-gray-300 dark:hover:bg-gray-600 transition-all duration-200 flex items-center gap-2 touch-target bottom-[max(1rem,env(safe-area-inset-bottom))] right-[max(1rem,env(safe-area-inset-right))]"
-                title="{{ ucfirst($themePreference) }} Mode">
+                title="{{ ucfirst($themePreference) }} Mode"
+                aria-label="Change theme. Current theme: {{ $themePreference }}">
             <i id="theme-icon" class="fas {{ $themePreference === 'dark' ? 'fa-moon' : ($themePreference === 'system' ? 'fa-desktop' : 'fa-sun') }}"></i>
             <span id="theme-label" class="text-xs font-medium hidden sm:inline">{{ ucfirst($themePreference) }}</span>
         </button>

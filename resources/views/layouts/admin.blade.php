@@ -27,31 +27,51 @@
     @stack('meta')
     @stack('styles')
 </head>
-<body class="app-shell bg-gray-100 dark:bg-gray-900 font-sans antialiased">
-    <div class="h-screen flex">
+<body class="app-shell font-sans antialiased">
+    <a href="#main-content" class="skip-link">Skip to admin content</a>
+
+    <div class="layout-shell layout-shell--admin h-screen flex">
         <!-- Admin Sidebar -->
-        <aside id="sidebar" class="hidden md:flex md:flex-col w-64 bg-gray-900 dark:bg-gray-950 text-white shrink-0 h-full overflow-y-auto">
-            <div class="flex items-center justify-between p-4 border-b border-white/10 dark:border-white/5">
-                <a href="{{ route('admin.index') }}" class="flex items-center space-x-2">
-                    <i class="fas fa-cog text-2xl text-blue-500 dark:text-blue-400"></i>
-                    <span class="text-xl font-semibold">Admin Panel</span>
+        <aside id="sidebar" class="layout-sidebar layout-sidebar--admin fixed inset-y-0 left-0 z-50 hidden h-full w-72 shrink-0 flex-col overflow-y-auto text-white md:static md:z-auto md:flex md:w-64" aria-label="Admin navigation">
+            <div class="layout-sidebar__brand flex items-center justify-between gap-3 p-4">
+                <a href="{{ route('admin.index') }}" class="flex min-w-0 items-center gap-3 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400">
+                    <span class="layout-sidebar__logo flex h-11 w-11 shrink-0 items-center justify-center rounded-xl">
+                        <i class="fas fa-sliders text-lg text-primary-300" aria-hidden="true"></i>
+                    </span>
+                    <span class="min-w-0">
+                        <span class="block truncate text-lg font-semibold">Admin Panel</span>
+                        <span class="block text-xs font-medium text-white/55">Operations workspace</span>
+                    </span>
                 </a>
+                <button type="button" id="mobile-sidebar-close" class="touch-target inline-flex items-center justify-center rounded-xl text-white/70 hover:bg-white/10 hover:text-white md:hidden" aria-label="Close admin navigation">
+                    <i class="fas fa-xmark" aria-hidden="true"></i>
+                </button>
             </div>
 
-            <nav class="flex-1 overflow-y-auto py-4">
+            <nav class="layout-sidebar__nav flex-1 overflow-y-auto py-3" aria-label="Admin">
                 @include('partials.admin-menu')
             </nav>
         </aside>
+        <button type="button" id="mobile-sidebar-backdrop" class="layout-sidebar-backdrop fixed inset-0 z-40 hidden bg-slate-950/60 backdrop-blur-sm md:hidden" aria-label="Close admin navigation" tabindex="-1"></button>
 
         <!-- Main Content -->
-        <div class="flex-1 flex flex-col h-full overflow-hidden">
+        <div class="layout-content flex h-full min-w-0 flex-1 flex-col overflow-hidden">
             <!-- Top Bar -->
-            <header class="surface-header bg-gray-800 dark:bg-gray-950 text-white shrink-0 z-10">
-                <div class="flex items-center justify-between px-6 py-4">
-                    <h1 class="text-lg font-semibold text-gray-200">{{ $page_title ?? 'Admin Dashboard' }}</h1>
-                    <div class="flex items-center space-x-4">
-                        <button id="theme-toggle" class="bg-gray-700 dark:bg-gray-800 text-gray-100 dark:text-gray-200 px-3 py-2 rounded-lg shadow hover:bg-gray-600 dark:hover:bg-gray-700 transition-all duration-200 flex items-center gap-2 touch-target"
-                                title="{{ ucfirst($userTheme) }} Mode">
+            <header class="layout-topbar surface-header z-30 shrink-0 text-white">
+                <div class="layout-topbar__inner flex min-h-16 items-center justify-between gap-3 px-3 py-2 sm:px-5 lg:px-6">
+                    <div class="flex min-w-0 items-center gap-3">
+                        <button id="mobile-sidebar-toggle" type="button" class="touch-target inline-flex items-center justify-center rounded-xl border border-white/10 bg-white/5 text-white/80 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 md:hidden" aria-label="Open admin navigation" aria-controls="sidebar" aria-expanded="false">
+                            <i class="fas fa-bars" aria-hidden="true"></i>
+                        </button>
+                        <div class="min-w-0">
+                            <p class="text-[0.6875rem] font-semibold uppercase tracking-[0.16em] text-white/45">Administration</p>
+                            <p class="truncate text-sm font-semibold text-white sm:text-base">{{ $page_title ?? 'Dashboard' }}</p>
+                        </div>
+                    </div>
+                    <div class="layout-topbar__tools flex items-center gap-1 rounded-2xl border border-white/10 bg-white/5 p-1 shadow-sm backdrop-blur-sm sm:gap-2">
+                        <button id="theme-toggle" class="touch-target flex items-center gap-2 rounded-xl px-3 py-2 text-gray-100 transition hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400"
+                                title="{{ ucfirst($userTheme) }} Mode"
+                                aria-label="Change theme. Current theme: {{ $userTheme }}">
                             <i id="theme-icon" class="fas
                                 @if($userTheme === 'dark')
                                     fa-moon
@@ -65,13 +85,13 @@
                                 {{ ucfirst($userTheme) }}
                             </span>
                         </button>
-                        <a href="{{ url('/') }}" class="text-gray-300 dark:text-gray-400 hover:text-white transition">
-                            <i class="fas fa-home mr-1"></i> Back to Site
+                        <a href="{{ url('/') }}" class="touch-target inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-white/75 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400" title="Back to site" aria-label="View site">
+                            <i class="fas fa-arrow-up-right-from-square" aria-hidden="true"></i><span class="hidden lg:inline">View site</span>
                         </a>
                         <a href="{{ route('logout') }}"
                            data-logout
-                           class="text-red-400 hover:text-red-300 transition">
-                            <i class="fas fa-sign-out-alt mr-1"></i> Logout
+                           class="touch-target inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-red-300 transition hover:bg-red-400/10 hover:text-red-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300" title="Log out" aria-label="Log out">
+                            <i class="fas fa-sign-out-alt" aria-hidden="true"></i><span class="hidden xl:inline">Log out</span>
                         </a>
                         <form id="logout-form" action="{{ route('logout') }}" method="POST" class="hidden">
                             @csrf
@@ -81,23 +101,23 @@
             </header>
 
             <!-- Page Content - Scrollable Area -->
-            <main class="flex-1 overflow-y-auto p-6 rounded-xl shadow-inner ring-1 ring-black/10 dark:ring-white/5" data-scroll-container>
+            <main id="main-content" class="layout-main flex-1 overflow-y-auto p-3 sm:p-5 lg:p-6" data-scroll-container tabindex="-1">
                 @unless(trim($__env->yieldContent('suppress_layout_flash')))
                     @if(session('success'))
-                        <div class="mb-4 p-4 bg-green-50 dark:bg-green-900/20 border-l-4 border-green-500 dark:border-green-600 text-green-800 dark:text-green-200 rounded">
-                            <i class="fas fa-check-circle mr-2"></i>{{ session('success') }}
+                        <div class="layout-flash layout-flash--success mb-5" role="status">
+                            <i class="fas fa-circle-check" aria-hidden="true"></i><div>{{ session('success') }}</div>
                         </div>
                     @endif
 
                     @if(session('error'))
-                        <div class="mb-4 p-4 bg-red-50 dark:bg-red-900/20 border-l-4 border-red-500 dark:border-red-600 text-red-800 dark:text-red-200 rounded">
-                            <i class="fas fa-exclamation-circle mr-2"></i>{{ session('error') }}
+                        <div class="layout-flash layout-flash--error mb-5" role="alert">
+                            <i class="fas fa-circle-exclamation" aria-hidden="true"></i><div>{{ session('error') }}</div>
                         </div>
                     @endif
 
                     @if(session('warning'))
-                        <div class="mb-4 p-4 bg-yellow-50 dark:bg-yellow-900/20 border-l-4 border-yellow-500 dark:border-yellow-600 text-yellow-800 dark:text-yellow-200 rounded">
-                            <i class="fas fa-exclamation-triangle mr-2"></i>{{ session('warning') }}
+                        <div class="layout-flash layout-flash--warning mb-5" role="status">
+                            <i class="fas fa-triangle-exclamation" aria-hidden="true"></i><div>{{ session('warning') }}</div>
                         </div>
                     @endif
                 @endunless
@@ -106,7 +126,7 @@
             </main>
 
             <!-- Admin Footer - Fixed at bottom -->
-            <footer class="shrink-0">
+            <footer class="layout-footer shrink-0">
                 <div class="px-6 py-3">
                     <div class="flex flex-wrap items-center justify-between gap-2 text-sm text-gray-300 dark:text-gray-400">
                         <p>&copy; {{ now()->year }} <a href="https://github.com/NNTmux/newznab-tmux" class="text-primary-400 hover:text-primary-300 transition">NNTmux</a> Admin Panel</p>
@@ -146,4 +166,3 @@
     @endauth
 </body>
 </html>
-
