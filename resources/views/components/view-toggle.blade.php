@@ -85,31 +85,28 @@
     $showThumbnails = request()->query('thumbs', '0') === '1';
 @endphp
 
-<div class="flex items-center gap-2 text-sm">
-    <span class="text-gray-600 dark:text-gray-400">View:</span>
+<div class="inline-flex min-h-11 flex-wrap items-center gap-1 rounded-xl border border-gray-200 bg-white/80 p-1 text-sm shadow-sm dark:border-gray-700 dark:bg-gray-800/80" aria-label="Result view options">
+    <span class="px-2 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">View</span>
 
     @if($currentView === 'covers')
         {{-- Currently in cover view --}}
-        <span class="font-semibold text-gray-800 dark:text-gray-200">Covers</span>
-        <span class="text-gray-400 dark:text-gray-500">|</span>
-        <a href="{{ $listUrl }}" class="text-primary-600 dark:text-primary-400 hover:text-primary-800 dark:hover:text-primary-300">List</a>
+        <span class="inline-flex min-h-9 items-center rounded-lg bg-primary-600 px-3 font-semibold text-white shadow-sm">Covers</span>
+        <a href="{{ $listUrl }}" class="inline-flex min-h-9 items-center rounded-lg px-3 font-medium text-gray-600 transition hover:bg-gray-100 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-gray-700 dark:hover:text-white">List</a>
     @else
         {{-- Currently in list view --}}
         @if($covgroup || $shows)
-            <a href="{{ $coverUrl }}" class="text-primary-600 dark:text-primary-400 hover:text-primary-800 dark:hover:text-primary-300">Covers</a>
-            <span class="text-gray-400 dark:text-gray-500">|</span>
+            <a href="{{ $coverUrl }}" class="inline-flex min-h-9 items-center rounded-lg px-3 font-medium text-gray-600 transition hover:bg-gray-100 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-gray-700 dark:hover:text-white">Covers</a>
         @endif
-        <span class="font-semibold text-gray-800 dark:text-gray-200">List</span>
+        <span class="inline-flex min-h-9 items-center rounded-lg bg-primary-600 px-3 font-semibold text-white shadow-sm">List</span>
 
         {{-- Thumbnail toggle in list view - client-side via Alpine --}}
         @if($covgroup || $shows)
-            <span class="text-gray-400 dark:text-gray-500 ml-2">|</span>
             <button type="button"
                @click="toggleThumbs()"
-               class="inline-flex items-center gap-1 hover:text-primary-800 dark:hover:text-primary-300 cursor-pointer"
-               x-bind:class="showThumbs ? 'text-green-600 dark:text-green-400' : 'text-primary-600 dark:text-primary-400'"
+               class="inline-flex min-h-9 cursor-pointer items-center gap-1.5 rounded-lg px-3 font-medium transition hover:bg-gray-100 dark:hover:bg-gray-700"
+               x-bind:class="showThumbs ? 'text-green-700 dark:text-green-300' : 'text-gray-600 dark:text-gray-300'"
                x-bind:title="showThumbs ? 'Hide thumbnails' : 'Show thumbnails'">
-                <i class="fas fa-image text-xs"></i>
+                <i class="fas fa-image text-xs" aria-hidden="true"></i>
                 <span x-text="showThumbs ? 'Hide Thumbs' : 'Show Thumbs'"></span>
             </button>
         @endif

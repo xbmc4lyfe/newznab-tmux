@@ -3,17 +3,13 @@
 @section('content')
 <div class="space-y-6">
     <x-admin.card>
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                    <i class="fas fa-gamepad mr-2"></i>{{ $title }}
-                </h1>
-                <div class="text-sm text-gray-600 dark:text-gray-400">
-                    Total: {{ $consoleList->total() }} games
-                </div>
-            </div>
-        </div>
+        <x-admin.page-header :title="$title" icon="fas fa-gamepad">
+            <x-slot:actions>
+                <span class="inline-flex min-h-11 items-center rounded-xl border border-gray-200 bg-white/70 px-4 text-sm font-medium text-gray-700 dark:border-gray-600 dark:bg-gray-800/70 dark:text-gray-200">
+                    {{ number_format($consoleList->total()) }} games
+                </span>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Console Table -->
         <x-admin.data-table>

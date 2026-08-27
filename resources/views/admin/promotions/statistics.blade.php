@@ -2,20 +2,11 @@
 
 @section('content')
 <div class="space-y-6">
-    <!-- Header -->
-    <div class="mb-6">
-        <div class="flex justify-between items-center">
-            <div>
-                <h1 class="text-3xl font-bold text-gray-800 dark:text-gray-200">
-                    <i class="fas fa-chart-bar mr-2"></i>Promotion Statistics
-                </h1>
-                <p class="text-gray-600 dark:text-gray-400 mt-1">Overview of all promotion activities</p>
-            </div>
-            <a href="{{ route('admin.promotions.index') }}" class="px-4 py-2 bg-gray-600 dark:bg-gray-700 text-white rounded-lg hover:bg-gray-700">
-                <i class="fas fa-arrow-left mr-2"></i>Back to Promotions
-            </a>
-        </div>
-    </div>
+    <x-admin.page-header title="Promotion Statistics" icon="fas fa-chart-bar" subtitle="Overview of all promotion activities">
+        <x-slot:actions>
+            <x-admin.button :href="route('admin.promotions.index')" tone="gray" icon="fas fa-arrow-left">Back to Promotions</x-admin.button>
+        </x-slot:actions>
+    </x-admin.page-header>
 
     <!-- Date Range Filter -->
     <x-admin.card class="p-6 mb-6">
@@ -299,4 +290,3 @@
     </x-admin.card>
 </div>
 @endsection
-

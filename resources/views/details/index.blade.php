@@ -6,14 +6,12 @@
 
 @section('content')
 <div class="release-detail-page surface-panel rounded-xl shadow-sm p-6">
-    <div class="mb-6">
-        <h1 class="text-2xl font-bold text-gray-800 dark:text-gray-200 mb-2">Release Details</h1>
-        <nav class="text-sm text-gray-600 dark:text-gray-400">
-            <a href="{{ url('/') }}" class="hover:text-primary-600 dark:hover:text-primary-400">Home</a>
-            <i class="fas fa-chevron-right mx-2 text-xs"></i>
-            <span class="wrap-break-word break-all">{{ $release->searchname }}</span>
-        </nav>
-    </div>
+    <x-page-header title="Release details" :current="$release->searchname" eyebrow="Inspect this release" description="Review metadata, previews, files, reports, and download options for this indexed release." icon="fas fa-circle-info" class="mb-6">
+        <x-slot:stats>
+            <span class="workspace-hero__stat"><i class="fas fa-folder-open" aria-hidden="true"></i>{{ $release->category_name ?? 'Release' }}</span>
+            <span class="workspace-hero__stat"><i class="fas fa-database" aria-hidden="true"></i>{{ isset($release->size) ? number_format($release->size / 1073741824, 2).' GB' : 'Size unavailable' }}</span>
+        </x-slot:stats>
+    </x-page-header>
 
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <!-- Main Content -->

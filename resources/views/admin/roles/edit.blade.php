@@ -3,12 +3,7 @@
 @section('content')
 <div class="space-y-6">
     <x-admin.card>
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                <i class="fas fa-user-shield mr-2"></i>{{ $title }}
-            </h1>
-        </div>
+        <x-admin.page-header :title="$title" icon="fas fa-user-shield" />
 
         <!-- Role Edit Form -->
         @if($role)
@@ -254,4 +249,3 @@
     </x-admin.card>
 </div>
 @endsection
-

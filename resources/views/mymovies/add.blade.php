@@ -1,23 +1,11 @@
 <div class="max-w-4xl mx-auto">
-    <div class="bg-white dark:bg-gray-800 rounded-xl shadow-lg overflow-hidden border border-gray-200 dark:border-gray-700 mb-6">
-        <!-- Header -->
-        <div class="bg-linear-to-r from-blue-600 to-blue-700 px-6 py-4">
-            <div class="flex flex-col md:flex-row md:justify-between md:items-center gap-4">
-                <h3 class="text-xl font-bold text-white flex items-center">
-                    <i class="fa fa-film mr-2"></i>{{ ucfirst($type ?? 'add') }} Movie to Watchlist
-                </h3>
-                <nav aria-label="breadcrumb">
-                    <ol class="flex items-center space-x-2 text-sm text-blue-100">
-                        <li><a href="{{ url($site['home_link']) }}" class="hover:text-white transition">Home</a></li>
-                        <li><i class="fas fa-chevron-right text-xs"></i></li>
-                        <li><a href="{{ url('/mymovies') }}" class="hover:text-white transition">My Movies</a></li>
-                        <li><i class="fas fa-chevron-right text-xs"></i></li>
-                        <li class="text-white font-medium">{{ ucfirst($type ?? 'add') }} Movie</li>
-                    </ol>
-                </nav>
-            </div>
-        </div>
+    <x-page-header :title="ucfirst($type ?? 'add') . ' movie'" eyebrow="Movie watchlist" description="Choose how this movie should be organized in your saved collection." icon="fas fa-film">
+        <x-slot:actions>
+            <a href="{{ url('/mymovies') }}" class="workspace-hero__action"><i class="fas fa-arrow-left" aria-hidden="true"></i>My movies</a>
+        </x-slot:actions>
+    </x-page-header>
 
+    <div class="bg-white dark:bg-gray-800 rounded-xl shadow-lg overflow-hidden border border-gray-200 dark:border-gray-700 mb-6">
         <div class="p-6">
             <div class="mb-6">
                 <div class="flex items-center gap-4 mb-4">
@@ -90,21 +78,6 @@
 </div>
 <div class="max-w-4xl mx-auto">
     <div class="bg-white dark:bg-gray-800 rounded-xl shadow-lg overflow-hidden border border-gray-200 dark:border-gray-700">
-        <div class="bg-linear-to-r from-blue-600 to-blue-700 px-6 py-4">
-            <div class="flex flex-col md:flex-row md:justify-between md:items-center gap-4">
-                <h3 class="text-xl font-bold text-white flex items-center">
-                    <i class="fa fa-film mr-2"></i>My Movies
-                </h3>
-                <nav aria-label="breadcrumb">
-                    <ol class="flex items-center space-x-2 text-sm text-blue-100">
-                        <li><a href="{{ url($site['home_link']) }}" class="hover:text-white transition">Home</a></li>
-                        <li><i class="fas fa-chevron-right text-xs"></i></li>
-                        <li class="text-white font-medium">My Movies</li>
-                    </ol>
-                </nav>
-            </div>
-        </div>
-
         <div class="p-6">
             <div class="mb-6 p-4 bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-700 rounded-lg">
                 <div class="flex items-start">

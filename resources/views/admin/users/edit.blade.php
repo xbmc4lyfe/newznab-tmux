@@ -3,19 +3,13 @@
 @section('content')
 <div class="space-y-6">
     <x-admin.card>
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                    <i class="fas fa-user mr-2"></i>{{ $title }}
-                </h1>
+        <x-admin.page-header :title="$title" icon="fas fa-user">
+            <x-slot:actions>
                 @if(!empty($user['id']))
-                    <a href="{{ url('admin/user-role-history/' . $user['id']) }}" class="px-4 py-2 bg-purple-600 dark:bg-purple-700 text-white rounded-lg hover:bg-purple-700 dark:hover:bg-purple-800">
-                        <i class="fas fa-history mr-2"></i>View Role History
-                    </a>
+                    <x-admin.button :href="url('admin/user-role-history/'.$user['id'])" tone="gray" icon="fas fa-history">View Role History</x-admin.button>
                 @endif
-            </div>
-        </div>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Error Messages -->
         @if(!empty($error))
@@ -173,4 +167,3 @@
     </div>
 </x-admin.card>
 @endsection
-

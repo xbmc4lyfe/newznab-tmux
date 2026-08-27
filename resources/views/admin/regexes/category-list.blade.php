@@ -3,17 +3,11 @@
 @section('content')
 <div class="space-y-6">
     <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-100">
-                    <i class="fas fa-folder-open mr-2"></i>{{ $title ?? 'Category Regex List' }}
-                </h1>
-                <a href="{{ url('/admin/category-regexes-edit') }}" class="px-4 py-2 bg-blue-600 dark:bg-blue-700 text-white rounded-lg hover:bg-blue-700 dark:hover:bg-blue-800">
-                    <i class="fas fa-plus mr-2"></i>Add New Regex
-                </a>
-            </div>
-        </div>
+        <x-admin.page-header :title="$title ?? 'Category Regex List'" icon="fas fa-folder-open">
+            <x-slot:actions>
+                <x-admin.button :href="url('/admin/category-regexes-edit')" icon="fas fa-plus">Add New Regex</x-admin.button>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Info Alert -->
         <div class="px-6 py-4 bg-blue-50 dark:bg-blue-900/20 border-b border-blue-100 dark:border-blue-800">

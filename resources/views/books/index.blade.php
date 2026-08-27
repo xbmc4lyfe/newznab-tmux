@@ -2,20 +2,12 @@
 
 @section('content')
 <div class="surface-panel rounded-xl shadow-sm">
-    <!-- Breadcrumb -->
-    <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-        <nav aria-label="breadcrumb">
-            <ol class="flex items-center space-x-2 text-sm text-gray-600">
-                <li><a href="{{ url($site['home_link'] ?? '/') }}" class="hover:text-blue-600">Home</a></li>
-                <li><i class="fas fa-chevron-right text-xs mx-2"></i></li>
-                <li><a href="{{ url('/browse/Books') }}" class="hover:text-blue-600">Books</a></li>
-                @if(!empty($categorytitle) && $categorytitle !== 'All')
-                    <li><i class="fas fa-chevron-right text-xs mx-2"></i></li>
-                    <li class="text-gray-500">{{ $categorytitle }}</li>
-                @endif
-            </ol>
-        </nav>
-    </div>
+    <x-page-header title="Books" :current="!empty($categorytitle) ? $categorytitle : 'All books'" eyebrow="Discover and download" description="Browse books, compare releases, and narrow the library by author, title, or category." icon="fas fa-book-open">
+        <x-slot:stats>
+            <span class="workspace-hero__stat"><i class="fas fa-book" aria-hidden="true"></i>{{ number_format($results->total()) }} books</span>
+            <span class="workspace-hero__stat"><i class="fas fa-folder-open" aria-hidden="true"></i>{{ $categorytitle ?: 'All books' }}</span>
+        </x-slot:stats>
+    </x-page-header>
 
     <div class="px-6 py-4">
         <!-- Search Filters -->

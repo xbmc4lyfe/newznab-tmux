@@ -6,20 +6,12 @@
 
 @section('content')
 <div class="surface-panel rounded-xl shadow-sm">
-    <!-- Breadcrumb -->
-    <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-        <nav aria-label="breadcrumb">
-            <ol class="flex items-center space-x-2 text-sm text-gray-600 dark:text-gray-400">
-                <li><a href="{{ url($site['home_link'] ?? '/') }}" class="hover:text-blue-600 dark:hover:text-blue-400">Home</a></li>
-                <li><i class="fas fa-chevron-right text-xs mx-2"></i></li>
-                <li><a href="{{ url('/browse/Audio') }}" class="hover:text-blue-600 dark:hover:text-blue-400">Audio</a></li>
-                @if(!empty($categorytitle) && $categorytitle !== 'All')
-                    <li><i class="fas fa-chevron-right text-xs mx-2"></i></li>
-                    <li class="text-gray-500 dark:text-gray-400">{{ $categorytitle }}</li>
-                @endif
-            </ol>
-        </nav>
-    </div>
+    <x-page-header title="Music" :current="!empty($categorytitle) ? $categorytitle : 'All audio'" eyebrow="Listen and discover" description="Browse indexed music and refine the catalog by artist, title, genre, or year." icon="fas fa-headphones">
+        <x-slot:stats>
+            <span class="workspace-hero__stat"><i class="fas fa-compact-disc" aria-hidden="true"></i>{{ number_format($results->total()) }} releases</span>
+            <span class="workspace-hero__stat"><i class="fas fa-folder-open" aria-hidden="true"></i>{{ $categorytitle ?: 'All audio' }}</span>
+        </x-slot:stats>
+    </x-page-header>
 
     <div class="px-6 py-4">
         <!-- Search Filters -->

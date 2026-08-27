@@ -285,24 +285,161 @@
     @apply border-amber-200 bg-amber-50/95 text-amber-950 dark:border-amber-800 dark:bg-amber-950/80 dark:text-amber-100;
 }
 
-.app-page-header,
 .admin-page-header {
-    border-bottom: 1px solid var(--border-default);
-    background-image: linear-gradient(120deg, color-mix(in srgb, var(--color-primary-50) 72%, white), transparent 62%);
+    position: relative;
+    isolation: isolate;
+    border: 1px solid var(--border-default);
+    background-image:
+        radial-gradient(circle at 92% 12%, color-mix(in srgb, var(--color-primary-400) 16%, transparent), transparent 15rem),
+        linear-gradient(125deg, color-mix(in srgb, var(--color-primary-50) 80%, white), var(--surface-card) 68%);
 }
 
-.dark .app-page-header,
 .dark .admin-page-header {
-    border-bottom-color: var(--border-default-dark);
-    background-image: linear-gradient(120deg, color-mix(in srgb, var(--color-primary-950) 35%, transparent), transparent 62%);
+    border-color: var(--border-default-dark);
+    background-image:
+        radial-gradient(circle at 92% 12%, color-mix(in srgb, var(--color-primary-500) 18%, transparent), transparent 17rem),
+        linear-gradient(125deg, color-mix(in srgb, var(--color-primary-950) 42%, var(--surface-card-dark)), var(--surface-card-dark) 68%);
 }
 
+.app-page-header {
+    isolation: isolate;
+    border: 1px solid color-mix(in srgb, var(--color-primary-400) 20%, transparent);
+    background: linear-gradient(135deg, color-mix(in srgb, var(--color-primary-950) 92%, #020617), var(--color-primary-700));
+}
+
+.workspace-hero__glow {
+    position: absolute;
+    border-radius: 9999px;
+    background: rgb(255 255 255 / 0.12);
+    filter: blur(1px);
+    pointer-events: none;
+}
+
+.workspace-hero__glow--one {
+    width: 18rem;
+    height: 18rem;
+    top: -11rem;
+    right: 8%;
+}
+
+.workspace-hero__glow--two {
+    width: 11rem;
+    height: 11rem;
+    right: -4rem;
+    bottom: -6rem;
+    background: rgb(255 255 255 / 0.08);
+}
+
+.workspace-hero__icon,
+.workspace-hero__stat,
+.workspace-hero__action {
+    border: 1px solid rgb(255 255 255 / 0.18);
+    background: rgb(255 255 255 / 0.12);
+    color: #fff;
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.12);
+}
+
+.workspace-hero__icon {
+    display: inline-flex;
+    width: 3.25rem;
+    height: 3.25rem;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: center;
+    border-radius: 1rem;
+    font-size: 1.25rem;
+}
+
+.workspace-hero__stat,
+.workspace-hero__action {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    border-radius: 9999px;
+    background: rgb(15 23 42 / 0.24);
+    color: rgb(255 255 255 / 0.88);
+    backdrop-filter: blur(8px);
+}
+
+.workspace-hero__stat {
+    padding: 0.4rem 0.75rem;
+}
+
+.workspace-hero__action {
+    min-height: 2.75rem;
+    padding: 0.65rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+    transition: background-color 160ms ease, border-color 160ms ease, transform 160ms ease;
+}
+
+.workspace-hero__action:hover {
+    border-color: rgb(255 255 255 / 0.3);
+    background: rgb(255 255 255 / 0.16);
+    transform: translateY(-1px);
+}
+
+.workspace-hero__action:focus-visible {
+    outline: 2px solid rgb(255 255 255 / 0.9);
+    outline-offset: 2px;
+}
+
+.inline-search-widget {
+    display: grid;
+    width: min(100%, 17.5rem);
+    grid-template-columns: minmax(0, 1fr) 2.5rem;
+    align-items: center;
+    gap: 0.5rem;
+    isolation: isolate;
+}
+
+.inline-search-widget__field,
+.inline-search-widget__input {
+    width: 100%;
+    min-width: 0;
+}
+
+.inline-search-widget__input {
+    padding-inline-start: 2.5rem !important;
+}
+
+.inline-search-widget__button {
+    position: relative;
+    z-index: 1;
+}
+
+.workspace-page-header::after {
+    position: absolute;
+    z-index: -1;
+    width: 9rem;
+    height: 9rem;
+    right: -3rem;
+    bottom: -5rem;
+    border-radius: 9999px;
+    background: color-mix(in srgb, var(--color-primary-500) 10%, transparent);
+    content: '';
+}
+
+.workspace-page-header__icon,
 .admin-page-header__icon {
+    display: inline-flex;
+    width: 2.75rem;
+    height: 2.75rem;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: center;
     border: 1px solid color-mix(in srgb, var(--color-primary-500) 24%, transparent);
+    border-radius: 0.875rem;
     background-color: color-mix(in srgb, var(--color-primary-500) 11%, transparent);
     color: var(--color-primary-700);
 }
 
+.admin-page-header__icon {
+    width: 2.75rem;
+    height: 2.75rem;
+}
+
+.dark .workspace-page-header__icon,
 .dark .admin-page-header__icon {
     color: var(--color-primary-300);
 }
@@ -329,6 +466,17 @@
 
 .admin-data-table-wrap {
     border-radius: 0.875rem;
+    background-color: var(--surface-card);
+    box-shadow: 0 10px 32px -26px rgb(15 23 42 / 0.55);
+}
+
+.dark .admin-data-table-wrap {
+    background-color: var(--surface-card-dark);
+    box-shadow: 0 12px 34px -24px rgb(0 0 0 / 0.8);
+}
+
+.admin-data-table__head th {
+    background-image: linear-gradient(180deg, color-mix(in srgb, var(--surface-dropdown) 94%, white), var(--surface-dropdown));
 }
 
 .admin-dashboard-page__hero {
@@ -393,6 +541,183 @@
         animation-iteration-count: 1 !important;
         transition-duration: 0.01ms !important;
     }
+}
+
+/* Shared treatment for all first-party application views. */
+.app-view-stack > .surface-panel,
+.app-view-stack > .bg-white {
+    border: 1px solid var(--border-default);
+    border-radius: 1rem;
+    box-shadow: 0 12px 36px -28px rgb(15 23 42 / 0.55);
+}
+
+.dark .app-view-stack > .surface-panel,
+.dark .app-view-stack > .bg-white {
+    border-color: var(--border-default-dark);
+    box-shadow: 0 14px 38px -26px rgb(0 0 0 / 0.78);
+}
+
+.app-view-stack :where(a, button, input, select, textarea):focus-visible {
+    outline: 2px solid var(--color-primary-500);
+    outline-offset: 2px;
+}
+
+.app-view-stack :where(
+    input[type='text'],
+    input[type='search'],
+    input[type='email'],
+    input[type='url'],
+    input[type='tel'],
+    input[type='number'],
+    input[type='password'],
+    input[type='date'],
+    input[type='datetime-local'],
+    input[type='time'],
+    select,
+    textarea
+) {
+    border-radius: 0.75rem;
+    transition: border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease;
+}
+
+.app-view-stack :where(
+    input[type='text'],
+    input[type='search'],
+    input[type='email'],
+    input[type='url'],
+    input[type='tel'],
+    input[type='number'],
+    input[type='password'],
+    input[type='date'],
+    input[type='datetime-local'],
+    input[type='time'],
+    select
+) {
+    min-height: 2.75rem;
+}
+
+.app-view-stack :where(button, .btn) {
+    border-radius: 0.75rem;
+}
+
+.app-view-stack nav[aria-label='breadcrumb' i] a,
+.breadcrumb-bar a {
+    border-radius: 0.375rem;
+    font-weight: 500;
+}
+
+.breadcrumb-bar {
+    background-image: linear-gradient(90deg, color-mix(in srgb, var(--color-primary-50) 52%, transparent), transparent 65%);
+}
+
+.dark .breadcrumb-bar {
+    background-image: linear-gradient(90deg, color-mix(in srgb, var(--color-primary-950) 26%, transparent), transparent 65%);
+}
+
+.empty-state__icon {
+    border: 1px solid color-mix(in srgb, var(--color-primary-500) 18%, transparent);
+    background: color-mix(in srgb, var(--color-primary-500) 9%, white);
+    color: var(--color-primary-600);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.55);
+}
+
+.dark .empty-state__icon {
+    background: color-mix(in srgb, var(--color-primary-500) 16%, var(--surface-card-dark));
+    color: var(--color-primary-300);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05);
+}
+
+.catalog-results-toolbar,
+.catalog-release-row,
+.admin-card,
+.admin-stat-card {
+    transition: border-color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
+}
+
+.catalog-release-row:hover,
+.admin-card:hover,
+.admin-stat-card:hover {
+    border-color: color-mix(in srgb, var(--color-primary-500) 30%, var(--border-default));
+    box-shadow: 0 14px 34px -28px rgb(15 23 42 / 0.55);
+}
+
+.dark .catalog-release-row:hover,
+.dark .admin-card:hover,
+.dark .admin-stat-card:hover {
+    border-color: color-mix(in srgb, var(--color-primary-400) 34%, var(--border-default-dark));
+    box-shadow: 0 16px 36px -26px rgb(0 0 0 / 0.78);
+}
+
+.guest-view-stack {
+    min-height: 100vh;
+    background:
+        radial-gradient(circle at 12% 8%, color-mix(in srgb, var(--color-primary-500) 12%, transparent), transparent 28rem),
+        radial-gradient(circle at 92% 88%, color-mix(in srgb, var(--color-primary-400) 8%, transparent), transparent 24rem),
+        var(--surface-body);
+}
+
+.workspace-brand-mark {
+    border: 1px solid color-mix(in srgb, var(--color-primary-500) 24%, transparent);
+    background: color-mix(in srgb, var(--color-primary-500) 11%, white);
+    color: var(--color-primary-700);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.6), 0 12px 30px -20px rgb(15 23 42 / 0.5);
+}
+
+.dark .workspace-brand-mark {
+    background: color-mix(in srgb, var(--color-primary-500) 18%, var(--surface-card-dark));
+    color: var(--color-primary-300);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.06), 0 14px 32px -20px rgb(0 0 0 / 0.85);
+}
+
+.workspace-document-header {
+    background-image:
+        radial-gradient(circle at 92% 0%, color-mix(in srgb, var(--color-primary-500) 12%, transparent), transparent 12rem),
+        linear-gradient(120deg, color-mix(in srgb, var(--color-primary-50) 70%, white), transparent 68%);
+}
+
+.dark .workspace-document-header {
+    background-image:
+        radial-gradient(circle at 92% 0%, color-mix(in srgb, var(--color-primary-500) 14%, transparent), transparent 14rem),
+        linear-gradient(120deg, color-mix(in srgb, var(--color-primary-950) 34%, transparent), transparent 68%);
+}
+
+.header-gradient {
+    border: 1px solid color-mix(in srgb, var(--color-primary-500) 30%, transparent);
+    background:
+        radial-gradient(circle at 92% 12%, rgb(255 255 255 / 0.13), transparent 14rem),
+        linear-gradient(135deg, color-mix(in srgb, var(--color-primary-950) 92%, #020617), var(--color-primary-700));
+    color: #fff;
+}
+
+.info-card-gradient {
+    border-color: color-mix(in srgb, var(--color-primary-500) 32%, var(--border-default));
+    background:
+        linear-gradient(120deg, color-mix(in srgb, var(--color-primary-50) 72%, white), var(--surface-card));
+    box-shadow: 0 12px 30px -26px rgb(15 23 42 / 0.48);
+}
+
+.dark .info-card-gradient {
+    border-color: color-mix(in srgb, var(--color-primary-400) 34%, var(--border-default-dark));
+    background:
+        linear-gradient(120deg, color-mix(in srgb, var(--color-primary-950) 34%, var(--surface-card-dark)), var(--surface-card-dark));
+    box-shadow: 0 14px 32px -24px rgb(0 0 0 / 0.78);
+}
+
+.table-header-gradient {
+    background:
+        linear-gradient(90deg, color-mix(in srgb, var(--color-primary-50) 64%, white), var(--surface-card));
+}
+
+.dark .table-header-gradient {
+    background:
+        linear-gradient(90deg, color-mix(in srgb, var(--color-primary-950) 30%, var(--surface-card-dark)), var(--surface-card-dark));
+}
+
+.dark .guest-view-stack {
+    background:
+        radial-gradient(circle at 12% 8%, color-mix(in srgb, var(--color-primary-500) 15%, transparent), transparent 30rem),
+        radial-gradient(circle at 92% 88%, color-mix(in srgb, var(--color-primary-600) 10%, transparent), transparent 26rem),
+        var(--surface-body-dark);
 }
 
 /* Default document flow - public/guest pages need vertical scrolling */
@@ -514,6 +839,7 @@ footer {
 .surface-panel {
     background-color: var(--surface-card) !important;
     border-color: var(--border-default);
+    transition: border-color 180ms ease, box-shadow 180ms ease, background-color 180ms ease;
 }
 .surface-panel.border {
     border-width: 1px;
@@ -550,10 +876,13 @@ footer {
 .auth-card {
     background-color: var(--surface-card) !important;
     border: 1px solid var(--border-default);
+    border-radius: 1.25rem;
+    box-shadow: 0 24px 65px -38px rgb(15 23 42 / 0.55);
 }
 .dark .auth-card {
     background-color: var(--surface-card-dark) !important;
     border-color: var(--border-default-dark);
+    box-shadow: 0 26px 70px -38px rgb(0 0 0 / 0.9);
 }
 .release-chip {
     @apply inline-flex items-center rounded px-2 py-0.5 text-xs font-medium;
@@ -628,6 +957,11 @@ main table {
 main thead th {
     background-color: var(--surface-dropdown) !important;
     border-bottom-color: var(--border-default) !important;
+    color: rgb(241 245 249);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.045em;
+    text-transform: uppercase;
 }
 .dark main thead th {
     background-color: var(--surface-dropdown-dark) !important;
@@ -643,6 +977,7 @@ main tbody {
 main tbody tr {
     background-color: var(--surface-card) !important;
     border-bottom-color: var(--border-default);
+    transition: background-color 140ms ease;
 }
 .dark main tbody tr {
     background-color: var(--surface-card-dark) !important;

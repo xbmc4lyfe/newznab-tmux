@@ -3,17 +3,11 @@
 @section('content')
 <div x-data="adminReleaseList" class="space-y-6">
     <x-admin.card>
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                    <i class="fas fa-exclamation-triangle mr-2"></i>{{ $title }}
-                </h1>
-                <a href="{{ url('/admin/release-list') }}" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700">
-                    <i class="fas fa-list mr-2"></i>View All Releases
-                </a>
-            </div>
-        </div>
+        <x-admin.page-header :title="$title" icon="fas fa-exclamation-triangle">
+            <x-slot:actions>
+                <x-admin.button :href="url('/admin/release-list')" tone="gray" icon="fas fa-list">View All Releases</x-admin.button>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Success/Error/Warning Messages -->
         @if(session('success'))
@@ -181,4 +175,3 @@
     </x-admin.card>
 </div>
 @endsection
-

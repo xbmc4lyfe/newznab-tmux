@@ -3,16 +3,11 @@
 @section('content')
 <div class="space-y-6">
     <x-admin.card>
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-100">
-                    <i class="fas fa-shield-alt mr-2"></i>{{ $title }}
-                </h1>
-                <a href="{{ route('admin.gdpr-requests.index') }}" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700">
-                    <i class="fas fa-arrow-left mr-2"></i>Back
-                </a>
-            </div>
-        </div>
+        <x-admin.page-header :title="$title" icon="fas fa-shield-alt">
+            <x-slot:actions>
+                <x-admin.button :href="route('admin.gdpr-requests.index')" tone="gray" icon="fas fa-arrow-left">Back</x-admin.button>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         @if(session('success'))
             <div class="mx-6 mt-4 p-4 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg text-green-800 dark:text-green-200">
@@ -145,4 +140,3 @@
     </x-admin.card>
 </div>
 @endsection
-

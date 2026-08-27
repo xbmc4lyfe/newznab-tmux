@@ -1,2 +1,2 @@
 @blaze(fold: true)
-<textarea {{ $attributes->merge(['type' => 'text', 'class' => 'px-3 py-2 border-gray-300 dark:border-gray-600 focus:border-primary-500 focus:ring-primary-500 rounded-lg border shadow-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 transition']) }}>{{ $slot }}</textarea>
+<textarea {{ $attributes->merge(['class' => 'w-full rounded-xl border border-gray-300 bg-white px-3.5 py-2.5 text-gray-900 shadow-sm transition focus:border-primary-500 focus:ring-primary-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100']) }}>{{ $slot }}</textarea>

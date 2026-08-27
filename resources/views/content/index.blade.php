@@ -2,6 +2,8 @@
 
 @section('content')
 <div class="surface-panel rounded-xl shadow-sm">
+    <x-page-header :title="$front ? ($site['title'] ?? config('app.name')) : 'Content'" :eyebrow="$front ? 'Welcome' : 'Explore the site'" :description="$front ? 'Discover the latest site information and start exploring the index.' : 'Browse our published information and useful content pages.'" icon="fas fa-file-alt" />
+
     @if($front)
         <!-- Front Page Content -->
         <div class="px-6 py-8">
@@ -11,7 +13,7 @@
                         <article class="surface-panel rounded-lg shadow-sm p-6 border transition-shadow duration-200 hover:shadow-md">
                             <div class="surface-prose">
                                 @if(filled($item->title))
-                                    <h1 class="mb-4 text-3xl font-bold">{{ $item->title }}</h1>
+                                    <h2 class="mb-4 text-3xl font-bold">{{ $item->title }}</h2>
                                 @endif
 
                                 @if(isset($item->body))
@@ -37,8 +39,6 @@
         </div>
     @else
         <!-- Content List Page -->
-        <x-page-header title="Content" description="Browse our content pages" icon="fas fa-file-alt" />
-
         <div class="px-6 pb-6">
             @if(!empty($content) && count($content) > 0)
                 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">

@@ -51,6 +51,184 @@ class LayoutShellMarkupTest extends TestCase
         $this->assertStringContainsString('aria-label="Dismiss notification"', $this->view('partials/toast-notifications.blade.php'));
     }
 
+    public function test_desktop_header_search_uses_separated_fully_rounded_controls(): void
+    {
+        $markup = $this->view('partials/header-menu.blade.php');
+
+        $this->assertStringContainsString('layout-primary-nav__search relative hidden items-center gap-2 lg:flex', $markup);
+        $this->assertStringContainsString('id="header-search-category" name="t" class="rounded-lg', $markup);
+        $this->assertStringContainsString('class="w-40 rounded-lg border border-gray-600', $markup);
+        $this->assertStringContainsString('class="rounded-lg bg-primary-600', $markup);
+    }
+
+    public function test_profile_and_edit_profile_share_the_full_content_width(): void
+    {
+        $profile = $this->view('profile/index.blade.php');
+        $editProfile = $this->view('profile/edit.blade.php');
+
+        $this->assertStringContainsString('<div class="w-full">', $editProfile);
+        $this->assertStringNotContainsString('max-w-4xl', $editProfile);
+        $this->assertStringNotContainsString('max-w-4xl', $profile);
+    }
+
+    public function test_first_party_layouts_apply_the_shared_view_treatment(): void
+    {
+        $this->assertStringContainsString('class="app-view-stack layout-page-container', $this->view('layouts/main.blade.php'));
+        $this->assertStringContainsString('class="app-view-stack app-view-stack--admin', $this->view('layouts/admin.blade.php'));
+        $this->assertStringContainsString('class="guest-view-stack', $this->view('layouts/guest.blade.php'));
+    }
+
+    public function test_shared_page_components_use_the_modern_workspace_primitives(): void
+    {
+        $this->assertStringContainsString('workspace-hero', $this->view('components/page-header.blade.php'));
+        $this->assertStringContainsString('workspace-hero__glow', $this->view('components/page-header.blade.php'));
+        $this->assertStringContainsString('aria-label="Breadcrumb"', $this->view('components/page-header.blade.php'));
+        $this->assertStringContainsString('workspace-page-header', $this->view('components/admin/page-header.blade.php'));
+        $this->assertStringContainsString('rounded-2xl', $this->view('components/panel.blade.php'));
+        $this->assertStringContainsString('empty-state__icon', $this->view('components/empty-state.blade.php'));
+        $this->assertStringContainsString('min-h-11', $this->view('components/input.blade.php'));
+        $this->assertStringContainsString('rounded-xl', $this->view('components/select.blade.php'));
+        $this->assertStringContainsString('catalog-results-toolbar', $this->view('components/cover-results-toolbar.blade.php'));
+        $this->assertStringContainsString('catalog-release-row', $this->view('components/cover-release-list.blade.php'));
+        $this->assertStringContainsString('aria-label="Result view options"', $this->view('components/view-toggle.blade.php'));
+        $this->assertStringContainsString('aria-haspopup="menu"', $this->view('components/sort-dropdown.blade.php'));
+        $this->assertStringContainsString('aria-label="Search releases"', $this->view('components/search-autocomplete.blade.php'));
+        $this->assertStringContainsString('aria-label="Pagination"', $this->view('components/admin/pagination.blade.php'));
+    }
+
+    public function test_shared_view_styles_cover_application_admin_and_guest_surfaces(): void
+    {
+        $stylesheet = $this->resource('css/app.css');
+
+        $this->assertStringContainsString('.app-view-stack > .surface-panel', $stylesheet);
+        $this->assertStringContainsString('.workspace-page-header::after', $stylesheet);
+        $this->assertStringContainsString('.workspace-hero__glow', $stylesheet);
+        $this->assertStringContainsString('.workspace-hero__action', $stylesheet);
+        $this->assertStringContainsString('.inline-search-widget', $stylesheet);
+        $this->assertStringContainsString('.admin-data-table__head th', $stylesheet);
+        $this->assertStringContainsString('.guest-view-stack', $stylesheet);
+        $this->assertStringContainsString('.header-gradient', $stylesheet);
+        $this->assertStringContainsString('.workspace-document-header', $stylesheet);
+    }
+
+    public function test_every_first_party_admin_page_uses_the_canonical_page_header(): void
+    {
+        $adminViews = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator(
+                __DIR__.'/../../resources/views/admin',
+                \FilesystemIterator::SKIP_DOTS,
+            ),
+        );
+
+        foreach ($adminViews as $adminView) {
+            if (! str_ends_with($adminView->getFilename(), '.blade.php')) {
+                continue;
+            }
+
+            $markup = (string) file_get_contents($adminView->getPathname());
+
+            if (! str_contains($markup, "@extends('layouts.admin')")) {
+                continue;
+            }
+
+            preg_match_all("/@include\\('([^']+)'/", $markup, $includedViews);
+
+            foreach ($includedViews[1] as $includedView) {
+                $markup .= $this->view(str_replace('.', '/', $includedView).'.blade.php');
+            }
+
+            $relativePath = str_replace(__DIR__.'/../../resources/views/', '', $adminView->getPathname());
+
+            $this->assertStringContainsString(
+                '<x-admin.page-header',
+                $markup,
+                "{$relativePath} must use the canonical admin page header.",
+            );
+        }
+    }
+
+    public function test_every_main_layout_page_uses_the_canonical_user_hero(): void
+    {
+        $userViews = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator(
+                __DIR__.'/../../resources/views',
+                \FilesystemIterator::SKIP_DOTS,
+            ),
+        );
+
+        foreach ($userViews as $userView) {
+            if (! str_ends_with($userView->getFilename(), '.blade.php')) {
+                continue;
+            }
+
+            $markup = (string) file_get_contents($userView->getPathname());
+
+            if (preg_match('/@extends\([\'\"]layouts\.main[\'\"]\)/', $markup) !== 1) {
+                continue;
+            }
+
+            $relativePath = str_replace(__DIR__.'/../../resources/views/', '', $userView->getPathname());
+            $usesCanonicalHero = str_contains($markup, '<x-page-header') || str_contains($markup, 'movies-hero');
+
+            $this->assertTrue($usesCanonicalHero, "{$relativePath} must use the canonical user hero.");
+        }
+    }
+
+    public function test_first_party_content_fragments_use_the_canonical_user_hero(): void
+    {
+        foreach ([
+            'browsegroup/index.blade.php',
+            'mymovies/add.blade.php',
+            'mymovies/index.blade.php',
+            'myshows/add.blade.php',
+            'myshows/index.blade.php',
+        ] as $fragment) {
+            $this->assertStringContainsString(
+                '<x-page-header',
+                $this->view($fragment),
+                "{$fragment} must use the canonical user hero.",
+            );
+        }
+    }
+
+    public function test_catalog_hero_titles_use_category_names_without_a_library_suffix(): void
+    {
+        foreach ([
+            'books/index.blade.php' => 'title="Books"',
+            'console/index.blade.php' => 'title="Console"',
+            'games/index.blade.php' => 'title="Games"',
+            'movies/index.blade.php' => '>Movies</h1>',
+            'music/index.blade.php' => 'title="Music"',
+            'xxx/index.blade.php' => 'title="Adult"',
+        ] as $view => $categoryTitle) {
+            $markup = $this->view($view);
+
+            $this->assertStringContainsString($categoryTitle, $markup);
+            $this->assertDoesNotMatchRegularExpression('/(?:Movie|Book|Console|Games|Music|Adult) library/', $markup);
+        }
+    }
+
+    public function test_inline_search_reserves_independent_space_for_both_icons(): void
+    {
+        $markup = $this->view('components/inline-search.blade.php');
+        $stylesheet = $this->resource('css/app.css');
+
+        $this->assertStringContainsString('inline-search-widget__icon', $markup);
+        $this->assertStringContainsString('inline-search-widget__input', $markup);
+        $this->assertStringContainsString('inline-search-widget__button', $markup);
+        $this->assertStringContainsString('grid-template-columns: minmax(0, 1fr) 2.5rem;', $stylesheet);
+        $this->assertStringContainsString('gap: 0.5rem;', $stylesheet);
+        $this->assertStringContainsString('padding-inline-start: 2.5rem !important;', $stylesheet);
+    }
+
+    public function test_project_owned_welcome_view_does_not_reference_a_missing_logo_asset(): void
+    {
+        $welcome = $this->view('welcome.blade.php');
+
+        $this->assertStringNotContainsString('assets/images/logo.svg', $welcome);
+        $this->assertStringContainsString('workspace-brand-mark', $welcome);
+    }
+
     private function view(string $path): string
     {
         return $this->resource("views/{$path}");

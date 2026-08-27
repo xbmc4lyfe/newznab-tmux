@@ -3,17 +3,11 @@
 @section('content')
 <div class="space-y-6">
     <x-admin.card>
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                    <i class="fas fa-edit mr-2"></i>{{ $title }}
-                </h1>
-                <a href="{{ route('admin.show-list') }}" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700">
-                    <i class="fas fa-arrow-left mr-2"></i>Back to List
-                </a>
-            </div>
-        </div>
+        <x-admin.page-header :title="$title" icon="fas fa-edit">
+            <x-slot:actions>
+                <x-admin.button :href="route('admin.show-list')" tone="gray" icon="fas fa-arrow-left">Back to List</x-admin.button>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Edit Form -->
         <div class="p-6">
@@ -225,4 +219,3 @@
     </x-admin.card>
 </div>
 @endsection
-

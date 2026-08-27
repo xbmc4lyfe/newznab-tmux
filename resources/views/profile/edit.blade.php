@@ -1,14 +1,14 @@
 @extends('layouts.main')
 
 @section('content')
-<div class="max-w-4xl mx-auto">
-    <div class="surface-panel rounded-xl shadow-sm">
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200">
-            <h1 class="text-2xl font-bold text-gray-800">Edit Profile</h1>
-            <p class="text-gray-600 dark:text-gray-400 mt-1">Update your account settings and preferences</p>
-        </div>
+<div class="w-full">
+    <x-page-header title="Edit profile" eyebrow="Account settings" description="Update your account, security, downloads, and browsing preferences." icon="fas fa-user-pen">
+        <x-slot:actions>
+            <a href="{{ route('profile') }}" class="workspace-hero__action"><i class="fas fa-arrow-left" aria-hidden="true"></i>Back to profile</a>
+        </x-slot:actions>
+    </x-page-header>
 
+    <div class="surface-panel rounded-xl shadow-sm">
         <!-- Messages -->
         @if(session('success'))
             <div class="mx-6 mt-6 p-4 bg-green-50 border-l-4 border-green-500 text-green-800 rounded">
@@ -485,4 +485,3 @@
     </div>
 </div>
 @endsection
-

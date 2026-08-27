@@ -3,14 +3,7 @@
 @section('content')
 <div class="space-y-6">
     <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                    <i class="fas fa-history mr-2"></i>{{ $title }}
-                </h1>
-            </div>
-        </div>
+        <x-admin.page-header :title="$title" icon="fas fa-history" />
 
         <!-- Search Filters -->
         <div class="px-6 py-4 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700">
@@ -184,4 +177,3 @@
     </div>
 </div>
 @endsection
-

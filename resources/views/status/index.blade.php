@@ -47,9 +47,16 @@
 @endphp
 
 <div class="w-full max-w-5xl mx-auto">
+    <x-page-header title="Service status" eyebrow="Live system health" description="Current availability, performance, and incident updates for core services." icon="fas fa-heart-pulse">
+        <x-slot:stats>
+            <span class="workspace-hero__stat"><i class="fas fa-signal" aria-hidden="true"></i>{{ $overallStatus->label() }}</span>
+            <span class="workspace-hero__stat"><i class="fas fa-triangle-exclamation" aria-hidden="true"></i>{{ number_format($activeIncidents->count()) }} active {{ Str::plural('incident', $activeIncidents->count()) }}</span>
+        </x-slot:stats>
+    </x-page-header>
+
     <div class="surface-panel rounded-xl shadow-sm mb-6 overflow-hidden border {{ $overallBanner }}">
         <div class="px-6 py-5">
-            <h1 class="text-2xl font-bold tracking-tight">Service status</h1>
+            <h2 class="text-2xl font-bold tracking-tight">Current status</h2>
             <p class="mt-2 text-sm leading-relaxed">
                 Overall: <strong class="font-semibold">{{ $overallStatus->label() }}</strong>
                 @if($activeIncidents->isNotEmpty())
@@ -149,12 +156,5 @@
         </div>
     </div>
 
-    <nav class="text-sm text-gray-700 dark:text-gray-300" aria-label="breadcrumb">
-        <ol class="flex flex-wrap gap-2">
-            <li><a href="{{ url($site['home_link'] ?? '/') }}" class="text-primary-600 dark:text-primary-400 hover:underline">Home</a></li>
-            <li aria-hidden="true">/</li>
-            <li class="text-gray-800 dark:text-gray-200">Status</li>
-        </ol>
-    </nav>
 </div>
 @endsection

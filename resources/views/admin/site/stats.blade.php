@@ -2,18 +2,7 @@
 
 @section('content')
 <div class="space-y-6">
-    <!-- Header -->
-    <div class="mb-8">
-        <div class="flex items-center space-x-3">
-            <div class="flex items-center justify-center w-12 h-12 bg-linear-to-br from-blue-400 to-purple-500 rounded-xl shadow-md">
-                <i class="fas fa-chart-bar text-white text-xl"></i>
-            </div>
-            <div>
-                <h1 class="text-3xl font-bold text-gray-700 dark:text-white">{{ $title }}</h1>
-                <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Overview of your site's performance and activity</p>
-            </div>
-        </div>
-    </div>
+    <x-admin.page-header :title="$title" icon="fas fa-chart-bar" subtitle="Overview of your site's performance and activity" />
 
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <!-- Top Grabbers -->
@@ -159,4 +148,3 @@
     @endif
 </div>
 @endsection
-

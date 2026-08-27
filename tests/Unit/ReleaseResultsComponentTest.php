@@ -44,4 +44,18 @@ class ReleaseResultsComponentTest extends TestCase
         $this->assertStringContainsString('mediainfo-badge', $component);
         $this->assertStringContainsString('<x-report-button', $component);
     }
+
+    public function test_release_categories_link_to_the_matching_browse_filter(): void
+    {
+        $releaseResults = (string) file_get_contents(__DIR__.'/../../resources/views/components/release-results.blade.php');
+        $categoryLink = (string) file_get_contents(__DIR__.'/../../resources/views/components/release-category-link.blade.php');
+        $adultBrowse = (string) file_get_contents(__DIR__.'/../../resources/views/xxx/index.blade.php');
+
+        $this->assertSame(2, substr_count($releaseResults, '<x-release-category-link'));
+        $this->assertStringContainsString('<x-release-category-link', $adultBrowse);
+        $this->assertStringContainsString("route('browse'", $categoryLink);
+        $this->assertStringContainsString("preg_split('/\\s*>\\s*/u'", $categoryLink);
+        $this->assertStringContainsString('Browse releases in {{ $categoryLabel }}', $categoryLink);
+        $this->assertStringContainsString('@if($categoryUrl !== null)', $categoryLink);
+    }
 }

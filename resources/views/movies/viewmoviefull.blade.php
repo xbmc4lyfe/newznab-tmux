@@ -2,11 +2,16 @@
 
 @section('content')
 <div class="movie-detail-page bg-white dark:bg-gray-800 rounded-xl shadow-sm">
-    <x-breadcrumb :items="[
-        ['label' => 'Home', 'url' => url($site['home_link'] ?? '/'), 'icon' => 'fas fa-home'],
-        ['label' => 'Movies', 'url' => route('Movies')],
-        ['label' => $movie['title'] ?? 'Movie Details'],
-    ]" />
+    <x-page-header :title="$movie['title'] ?? 'Movie details'" eyebrow="Movie information" description="Explore the movie metadata, synopsis, ratings, and related release information." icon="fas fa-clapperboard">
+        <x-slot:stats>
+            @if(!empty($movie['year'] ?? null))
+                <span class="workspace-hero__stat"><i class="fas fa-calendar" aria-hidden="true"></i>{{ $movie['year'] }}</span>
+            @endif
+            @if(!empty($movie['rating'] ?? null))
+                <span class="workspace-hero__stat"><i class="fas fa-star" aria-hidden="true"></i>{{ $movie['rating'] }}/10</span>
+            @endif
+        </x-slot:stats>
+    </x-page-header>
 
     @if(isset($movie))
         <div class="px-6 py-6">
@@ -24,8 +29,6 @@
 
                 <!-- Movie Details -->
                 <div class="lg:col-span-2">
-                    <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100 mb-4">{{ $movie['title'] ?? 'Unknown Title' }}</h1>
-
                     @if(!empty($movie['tagline'] ?? null))
                         <p class="text-lg text-gray-600 dark:text-gray-400 italic mb-4">"{{ $movie['tagline'] }}"</p>
                     @endif
@@ -243,4 +246,3 @@
 </div>
 
 @endsection
-

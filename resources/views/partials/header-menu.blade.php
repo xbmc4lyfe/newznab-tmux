@@ -170,9 +170,9 @@
                 </button>
 
                 <!-- Desktop Search Form with Autocomplete (visible at lg+) -->
-                <form method="GET" action="{{ route('search') }}" class="layout-primary-nav__search relative hidden items-center lg:flex" id="header-search-form" role="search">
+                <form method="GET" action="{{ route('search') }}" class="layout-primary-nav__search relative hidden items-center gap-2 lg:flex" id="header-search-form" role="search">
                     <label for="header-search-category" class="sr-only">Search category</label>
-                    <select id="header-search-category" name="t" class="bg-gray-700 text-white text-sm rounded-l-lg px-3 py-2 border-r border-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500">
+                    <select id="header-search-category" name="t" class="rounded-lg border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary-500">
                         <option value="-1">All</option>
                         @if(isset($parentcatlist))
                             @foreach($parentcatlist as $parentcat)
@@ -191,12 +191,12 @@
                                value="{{ $header_menu_search ?? '' }}"
                                placeholder="Search releases"
                                autocomplete="off"
-                               class="bg-gray-700 text-white text-sm px-3 py-2 w-40 xl:w-48 focus:outline-none focus:ring-2 focus:ring-primary-500">
+                               class="w-40 rounded-lg border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary-500 xl:w-48">
                         <!-- Autocomplete dropdown for header -->
                         <div id="header-autocomplete-dropdown" class="hidden absolute z-50 w-64 mt-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg max-h-60 overflow-y-auto right-0">
                         </div>
                     </div>
-                    <button type="submit" class="bg-primary-600 dark:bg-primary-700 hover:bg-primary-700 dark:hover:bg-primary-800 text-white px-4 py-2 rounded-r-lg transition" aria-label="Search releases">
+                    <button type="submit" class="rounded-lg bg-primary-600 px-4 py-2 text-white transition hover:bg-primary-700 dark:bg-primary-700 dark:hover:bg-primary-800" aria-label="Search releases">
                         <i class="fa fa-search" aria-hidden="true"></i>
                     </button>
                 </form>

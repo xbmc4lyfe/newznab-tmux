@@ -18,22 +18,16 @@
      data-data-url="{{ route('admin.api.dashboard-data') }}"
      data-refresh-interval="{{ 60 * 1000 }}">
     <div class="admin-dashboard-page__content space-y-6" data-dashboard-content>
-    <!-- Welcome Section -->
-    <x-admin.card class="admin-dashboard-page__hero p-6">
-        <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div>
-                <p class="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-primary-600 dark:text-primary-300">Operations overview</p>
-                <h1 class="text-2xl font-semibold tracking-tight text-gray-950 dark:text-white sm:text-3xl">Admin Dashboard</h1>
-                <p class="mt-2 text-gray-600 dark:text-gray-300">Monitor index health, users, releases, and site activity from one workspace.</p>
-            </div>
-            <div class="rounded-lg bg-gray-50 dark:bg-gray-900 px-4 py-3 text-sm text-gray-600 dark:text-gray-300 lg:text-right">
+    <x-admin.page-header title="Admin Dashboard" icon="fas fa-gauge-high" subtitle="Monitor index health, users, releases, and site activity from one workspace." class="admin-dashboard-page__hero">
+        <x-slot:actions>
+            <div class="rounded-xl border border-gray-200 bg-white/70 px-4 py-2 text-sm text-gray-600 dark:border-gray-600 dark:bg-gray-800/70 dark:text-gray-300 lg:text-right">
                 <p class="font-medium text-gray-700 dark:text-gray-200">
                     <i class="fas fa-sync-alt mr-1"></i> Last dashboard refresh: <span data-stat="last-refresh">{{ $dashboardLastRefreshedAt }}</span>
                 </p>
                 <p class="mt-1 text-xs text-green-600 dark:text-green-400">Auto-refreshes every minute</p>
             </div>
-        </div>
-    </x-admin.card>
+        </x-slot:actions>
+    </x-admin.page-header>
 
     <!-- Stats Grid -->
     <div class="admin-dashboard-page__stats-grid grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">

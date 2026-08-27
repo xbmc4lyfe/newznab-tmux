@@ -4,16 +4,7 @@
 @section('content')
 <div class="w-full contact-page-container mx-auto">
     <div class="surface-panel rounded-xl shadow-sm mb-6">
-        <div class="surface-panel-alt px-6 py-4 border-b rounded-t-lg">
-            <h4 class="text-xl font-semibold text-gray-800 dark:text-gray-200 mb-0">Contact Us</h4>
-            <nav class="mt-2" aria-label="breadcrumb">
-                <ol class="flex space-x-2 text-sm">
-                    <li><a href="{{ url($site['home_link'] ?? '/') }}" class="text-primary-600 dark:text-primary-400 hover:text-primary-800 dark:hover:text-primary-300">Home</a></li>
-                    <li class="text-gray-500 dark:text-gray-400">/</li>
-                    <li class="text-gray-600 dark:text-gray-300">Contact</li>
-                </ol>
-            </nav>
-        </div>
+        <x-page-header title="Contact us" eyebrow="We are here to help" description="Send a message to the site team and we will get back to you as soon as possible." icon="fas fa-message" />
 
         <div class="px-6 py-8 lg:px-12 lg:py-10">
             @if(isset($msg) && $msg != '')
@@ -132,4 +123,3 @@
         {!! \App\Support\CaptchaHelper::renderJs() !!}
     @endif
 @endpush
-
