@@ -19,12 +19,18 @@
     "skills": [
         "infer-conventions",
         "laravel-best-practices",
+        "testing-best-practices",
         "configuring-horizon",
         "pulse-development",
         "livewire-development",
         "echo-development",
         "tailwindcss-development",
         "blaze-optimize",
-        "laravel-permission-development"
+        "laravel-permission-development",
+        "eloquent-best-practices",
+        "laravel-11-12-app-guidelines",
+        "laravel-quality",
+        "laravel-specialist",
+        "laravel-testing"
     ]
 }
