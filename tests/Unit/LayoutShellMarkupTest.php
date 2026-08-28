@@ -96,6 +96,21 @@ class LayoutShellMarkupTest extends TestCase
         $this->assertStringContainsString('aria-label="Pagination"', $this->view('components/admin/pagination.blade.php'));
     }
 
+    public function test_shared_user_hero_uses_compact_vertical_spacing(): void
+    {
+        $hero = $this->view('components/page-header.blade.php');
+
+        $this->assertStringContainsString('px-5 py-4', $hero);
+        $this->assertStringContainsString('sm:px-7 sm:py-5', $hero);
+        $this->assertStringContainsString('flex flex-col gap-4', $hero);
+        $this->assertStringContainsString('aria-label="Breadcrumb" class="mb-2', $hero);
+        $this->assertStringContainsString('class="mt-2 max-w-2xl text-sm leading-5', $hero);
+        $this->assertStringContainsString('app-page-header__meta flex min-w-0 flex-wrap', $hero);
+        $this->assertStringContainsString('@if(isset($stats) || isset($actions))', $hero);
+        $this->assertStringNotContainsString('mt-3 flex flex-wrap gap-2 text-sm', $hero);
+        $this->assertStringNotContainsString('sm:py-8', $hero);
+    }
+
     public function test_shared_view_styles_cover_application_admin_and_guest_surfaces(): void
     {
         $stylesheet = $this->resource('css/app.css');

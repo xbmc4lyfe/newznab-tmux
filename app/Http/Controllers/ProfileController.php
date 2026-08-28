@@ -176,7 +176,7 @@ class ProfileController extends BasePageController
                     // Update color scheme
                     if ($request->has('color_scheme')) {
                         $schemeValue = $request->input('color_scheme');
-                        if (in_array($schemeValue, ['blue', 'emerald', 'violet'], true)) {
+                        if (in_array($schemeValue, ['blue', 'indigo', 'cyan', 'teal', 'emerald', 'violet', 'pink', 'rose', 'red', 'orange', 'amber'], true)) {
                             User::where('id', $userid)->update(['color_scheme' => $schemeValue]);
                         }
                     }

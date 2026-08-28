@@ -128,26 +128,35 @@
                     <i class="fas fa-swatchbook mr-2 text-primary-600"></i>Color Scheme
                 </h3>
                 <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Choose the main color scheme for the site (sidebar, header, buttons, and accents).</p>
-                <div class="flex flex-wrap items-center gap-4">
-                    @php $currentScheme = $user->color_scheme ?? 'blue'; @endphp
-                    <label class="flex items-center gap-2 cursor-pointer">
-                        <input type="radio" name="color_scheme" value="blue" {{ $currentScheme === 'blue' ? 'checked' : '' }}
-                            class="sr-only profile-scheme-radio" data-scheme="blue">
-                        <span class="w-10 h-10 rounded-full bg-blue-600 ring-2 ring-offset-2 transition {{ $currentScheme === 'blue' ? 'ring-primary-500 ring-offset-gray-100 dark:ring-offset-gray-800' : 'ring-transparent ring-offset-gray-100 dark:ring-offset-gray-800 hover:ring-gray-300' }}" aria-hidden="true"></span>
-                        <span class="text-sm font-medium text-gray-700 dark:text-gray-300">Blue</span>
-                    </label>
-                    <label class="flex items-center gap-2 cursor-pointer">
-                        <input type="radio" name="color_scheme" value="emerald" {{ $currentScheme === 'emerald' ? 'checked' : '' }}
-                            class="sr-only profile-scheme-radio" data-scheme="emerald">
-                        <span class="w-10 h-10 rounded-full bg-emerald-600 ring-2 ring-offset-2 transition {{ $currentScheme === 'emerald' ? 'ring-primary-500 ring-offset-gray-100 dark:ring-offset-gray-800' : 'ring-transparent ring-offset-gray-100 dark:ring-offset-gray-800 hover:ring-gray-300' }}" aria-hidden="true"></span>
-                        <span class="text-sm font-medium text-gray-700 dark:text-gray-300">Emerald</span>
-                    </label>
-                    <label class="flex items-center gap-2 cursor-pointer">
-                        <input type="radio" name="color_scheme" value="violet" {{ $currentScheme === 'violet' ? 'checked' : '' }}
-                            class="sr-only profile-scheme-radio" data-scheme="violet">
-                        <span class="w-10 h-10 rounded-full bg-violet-600 ring-2 ring-offset-2 transition {{ $currentScheme === 'violet' ? 'ring-primary-500 ring-offset-gray-100 dark:ring-offset-gray-800' : 'ring-transparent ring-offset-gray-100 dark:ring-offset-gray-800 hover:ring-gray-300' }}" aria-hidden="true"></span>
-                        <span class="text-sm font-medium text-gray-700 dark:text-gray-300">Violet</span>
-                    </label>
+                @php
+                    $currentScheme = $user->color_scheme ?? 'blue';
+                    $colorSchemes = [
+                        ['value' => 'blue', 'label' => 'Blue', 'swatch' => 'bg-blue-600'],
+                        ['value' => 'indigo', 'label' => 'Indigo', 'swatch' => 'bg-indigo-600'],
+                        ['value' => 'cyan', 'label' => 'Cyan', 'swatch' => 'bg-cyan-600'],
+                        ['value' => 'teal', 'label' => 'Teal', 'swatch' => 'bg-teal-600'],
+                        ['value' => 'emerald', 'label' => 'Emerald', 'swatch' => 'bg-emerald-600'],
+                        ['value' => 'violet', 'label' => 'Violet', 'swatch' => 'bg-violet-600'],
+                        ['value' => 'pink', 'label' => 'Pink', 'swatch' => 'bg-pink-600'],
+                        ['value' => 'rose', 'label' => 'Rose', 'swatch' => 'bg-rose-600'],
+                        ['value' => 'red', 'label' => 'Red', 'swatch' => 'bg-red-600'],
+                        ['value' => 'orange', 'label' => 'Orange', 'swatch' => 'bg-orange-600'],
+                        ['value' => 'amber', 'label' => 'Amber', 'swatch' => 'bg-amber-600'],
+                    ];
+                @endphp
+                <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4">
+                    @foreach($colorSchemes as $scheme)
+                        <label class="flex cursor-pointer items-center gap-3 rounded-xl border border-gray-200 p-3 transition hover:border-primary-300 hover:bg-primary-50 dark:border-gray-700 dark:hover:border-primary-700 dark:hover:bg-primary-950/30">
+                            <input type="radio"
+                                name="color_scheme"
+                                value="{{ $scheme['value'] }}"
+                                {{ $currentScheme === $scheme['value'] ? 'checked' : '' }}
+                                class="sr-only profile-scheme-radio"
+                                data-scheme="{{ $scheme['value'] }}">
+                            <span class="h-10 w-10 shrink-0 rounded-full {{ $scheme['swatch'] }} ring-2 ring-offset-2 transition {{ $currentScheme === $scheme['value'] ? 'ring-primary-500 ring-offset-gray-100 dark:ring-offset-gray-800' : 'ring-transparent ring-offset-gray-100 hover:ring-gray-300 dark:ring-offset-gray-800' }}" aria-hidden="true"></span>
+                            <span class="text-sm font-medium text-gray-700 dark:text-gray-300">{{ $scheme['label'] }}</span>
+                        </label>
+                    @endforeach
                 </div>
                 <p class="mt-3 text-xs text-gray-500 dark:text-gray-400">
                     <i class="fas fa-info-circle mr-1"></i>Save your profile to apply the color scheme. You can also change it from the user menu in the header.

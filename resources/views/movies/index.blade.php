@@ -16,13 +16,13 @@
 @endphp
 
 <div class="space-y-5" x-data="moviesPage" data-movie-layout="{{ $movie_layout ?? 2 }}">
-    <section class="movies-hero relative overflow-hidden rounded-2xl px-5 py-6 text-white shadow-lg sm:px-7 sm:py-8" aria-labelledby="movies-heading">
+    <section class="movies-hero relative overflow-hidden rounded-2xl px-5 py-4 text-white shadow-lg sm:px-7 sm:py-5" aria-labelledby="movies-heading">
         <div class="movies-hero__glow movies-hero__glow--one" aria-hidden="true"></div>
         <div class="movies-hero__glow movies-hero__glow--two" aria-hidden="true"></div>
 
-        <div class="relative z-10 flex flex-col gap-6 xl:flex-row xl:items-end xl:justify-between">
-            <div class="max-w-3xl">
-                <nav aria-label="Breadcrumb" class="mb-4 text-sm text-white/70">
+        <div class="relative z-10 flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+            <div class="min-w-0 max-w-3xl xl:flex-1">
+                <nav aria-label="Breadcrumb" class="mb-2 text-sm text-white/70">
                     <ol class="flex flex-wrap items-center gap-2">
                         <li><a href="{{ url($site['home_link'] ?? '/') }}" class="rounded hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70">Home</a></li>
                         <li aria-hidden="true"><i class="fas fa-chevron-right text-[0.65rem]"></i></li>
@@ -38,11 +38,14 @@
                     </div>
                 </div>
 
-                <p class="mt-4 max-w-2xl text-sm leading-6 text-white/75 sm:text-base">
+                <p class="mt-2 max-w-2xl text-sm leading-5 text-white/75 sm:text-base">
                     Browse available movies, compare recent releases, and narrow the catalog by title, genre, year, or rating.
                 </p>
 
-                <div class="mt-5 flex flex-wrap gap-2 text-sm">
+            </div>
+
+            <div class="movies-hero__meta flex min-w-0 flex-wrap items-center gap-3 xl:max-w-[48%] xl:justify-end">
+                <div class="flex flex-wrap gap-2 text-sm xl:justify-end">
                     <span class="movies-hero__stat">
                         <i class="fas fa-film" aria-hidden="true"></i>
                         {{ isset($results) ? number_format($results->total()) : 0 }} movies
@@ -58,22 +61,22 @@
                         </span>
                     @endif
                 </div>
-            </div>
 
-            <div class="flex flex-wrap items-center gap-3">
-                <button type="button"
-                        @click="toggleLayout()"
-                        class="movies-hero__action"
-                        :aria-label="layout === 1 ? 'Switch to two-column movie grid' : 'Switch to one-column movie list'"
-                        title="Change movie layout">
-                    <i :class="layoutIcon" aria-hidden="true"></i>
-                    <span x-text="layoutLabel"></span>
-                </button>
+                <div class="flex flex-wrap items-center gap-3">
+                    <button type="button"
+                            @click="toggleLayout()"
+                            class="movies-hero__action"
+                            :aria-label="layout === 1 ? 'Switch to two-column movie grid' : 'Switch to one-column movie list'"
+                            title="Change movie layout">
+                        <i :class="layoutIcon" aria-hidden="true"></i>
+                        <span x-text="layoutLabel"></span>
+                    </button>
 
-                <a href="{{ route('trending-movies') }}" class="movies-hero__action movies-hero__action--accent">
-                    <i class="fas fa-fire" aria-hidden="true"></i>
-                    Trending now
-                </a>
+                    <a href="{{ route('trending-movies') }}" class="movies-hero__action movies-hero__action--accent">
+                        <i class="fas fa-fire" aria-hidden="true"></i>
+                        Trending now
+                    </a>
+                </div>
             </div>
         </div>
     </section>
