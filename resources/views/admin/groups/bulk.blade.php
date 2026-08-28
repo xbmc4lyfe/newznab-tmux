@@ -3,17 +3,11 @@
 @section('content')
 <div class="space-y-6">
     <x-admin.card>
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-100">
-                    <i class="fas fa-plus-square mr-2"></i>{{ $title ?? 'Bulk Add Newsgroups' }}
-                </h1>
-                <a href="{{ url('/admin/group-list') }}" class="px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600">
-                    <i class="fas fa-list mr-2"></i>View All Groups
-                </a>
-            </div>
-        </div>
+        <x-admin.page-header :title="$title ?? 'Bulk Add Newsgroups'" icon="fas fa-plus-square">
+            <x-slot:actions>
+                <x-admin.button :href="url('/admin/group-list')" tone="gray" icon="fas fa-list">View All Groups</x-admin.button>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <div class="px-6 py-6">
             @if(!empty($groupmsglist))
@@ -179,4 +173,3 @@
 </div>
 
 @endsection
-

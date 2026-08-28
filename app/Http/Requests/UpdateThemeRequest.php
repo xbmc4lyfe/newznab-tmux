@@ -15,7 +15,7 @@ class UpdateThemeRequest extends FormRequest
     {
         return [
             'theme_preference' => ['sometimes', 'in:light,dark,system'],
-            'color_scheme' => ['sometimes', 'in:blue,emerald,violet'],
+            'color_scheme' => ['sometimes', 'in:blue,indigo,cyan,teal,emerald,violet,pink,rose,red,orange,amber'],
         ];
     }
 }

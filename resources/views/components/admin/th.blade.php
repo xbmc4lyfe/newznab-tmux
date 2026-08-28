@@ -13,6 +13,6 @@
     $widthClass = $width ? "w-{$width}" : '';
 @endphp
 
-<th {{ $attributes->merge(['class' => "px-4 py-2.5 {$alignClass} text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide {$widthClass}"]) }}>
+<th {{ $attributes->merge(['class' => "px-4 py-3 {$alignClass} text-xs font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wider {$widthClass}"]) }}>
     {{ $slot }}
 </th>

@@ -5,7 +5,7 @@
     'subtitle' => null,
 ])
 
-<div {{ $attributes->merge(['class' => 'admin-page-header px-4 py-5 sm:px-6']) }}>
+<header {{ $attributes->merge(['class' => 'admin-page-header workspace-page-header overflow-hidden rounded-2xl px-5 py-6 shadow-sm sm:px-7']) }}>
     <div class="flex flex-wrap items-start justify-between gap-4">
         <div class="min-w-0">
             <h1 class="flex items-center gap-3 text-2xl font-semibold tracking-tight text-gray-950 dark:text-white">
@@ -26,4 +26,4 @@
             </div>
         @endif
     </div>
-</div>
+</header>

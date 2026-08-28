@@ -6,20 +6,12 @@
 
 @section('content')
 <div class="surface-panel rounded-xl shadow-sm">
-    <!-- Breadcrumb -->
-    <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-        <nav aria-label="breadcrumb">
-            <ol class="flex items-center space-x-2 text-sm text-gray-600">
-                <li><a href="{{ url($site['home_link'] ?? '/') }}" class="hover:text-blue-600">Home</a></li>
-                <li><i class="fas fa-chevron-right text-xs mx-2"></i></li>
-                <li><a href="{{ url('/browse/PC') }}" class="hover:text-blue-600">PC</a></li>
-                @if(!empty($catname) && $catname !== 'All')
-                    <li><i class="fas fa-chevron-right text-xs mx-2"></i></li>
-                    <li class="text-gray-500">{{ $catname }}</li>
-                @endif
-            </ol>
-        </nav>
-    </div>
+    <x-page-header title="Games" :current="!empty($catname) ? $catname : 'All games'" eyebrow="Play and discover" description="Browse PC games and refine the catalog by title, genre, year, or category." icon="fas fa-dice-d20">
+        <x-slot:stats>
+            <span class="workspace-hero__stat"><i class="fas fa-gamepad" aria-hidden="true"></i>{{ number_format($results->total()) }} games</span>
+            <span class="workspace-hero__stat"><i class="fas fa-folder-open" aria-hidden="true"></i>{{ $catname ?: 'All games' }}</span>
+        </x-slot:stats>
+    </x-page-header>
 
     <div class="px-6 py-4">
         <!-- Search Filters -->

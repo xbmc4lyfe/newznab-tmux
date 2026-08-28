@@ -135,9 +135,11 @@
                         </div>
                     </td>
                     <td class="px-3 py-4 whitespace-nowrap">
-                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary-100 dark:bg-primary-900/50 text-primary-800 dark:text-primary-200">
-                            {{ $result->category_name ?? 'Other' }}
-                        </span>
+                        <x-release-category-link
+                            :category-name="$result->category_name ?? null"
+                            :parent-category="$result->parent_category ?? null"
+                            :sub-category="$result->sub_category ?? null"
+                        />
                     </td>
                     <td class="px-3 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
                         {{ $dateValue ? userDateDiffForHumans($dateValue) : 'Unknown' }}
@@ -238,9 +240,11 @@
                         @endif
                     </div>
                     <div class="flex flex-wrap items-center gap-2 mt-2 text-sm text-gray-600 dark:text-gray-400">
-                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary-100 dark:bg-primary-900/50 text-primary-800 dark:text-primary-200">
-                            {{ $result->category_name ?? 'Other' }}
-                        </span>
+                        <x-release-category-link
+                            :category-name="$result->category_name ?? null"
+                            :parent-category="$result->parent_category ?? null"
+                            :sub-category="$result->sub_category ?? null"
+                        />
                         <span><i class="fas fa-clock mr-1"></i>{{ $dateValue ? userDateDiffForHumans($dateValue) : 'Unknown' }}</span>
                         <span><i class="fas fa-hdd mr-1"></i>{{ $sizeLabel }}</span>
                         <span><i class="fas fa-file mr-1"></i>{{ $result->totalpart ?? 0 }} files</span>

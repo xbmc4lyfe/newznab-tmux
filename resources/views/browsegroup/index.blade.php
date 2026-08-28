@@ -1,23 +1,11 @@
-<!-- Breadcrumb -->
-<div class="mb-6">
-    <nav aria-label="breadcrumb">
-        <ol class="flex items-center space-x-2 text-sm">
-            <li>
-                <a href="{{ url($site['home_link']) }}" class="text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:text-blue-400 transition-colors">
-                    Home
-                </a>
-            </li>
-            <li class="text-gray-400">/</li>
-            <li>
-                <a href="{{ url('/browse') }}" class="text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:text-blue-400 transition-colors">
-                    Browse
-                </a>
-            </li>
-            <li class="text-gray-400">/</li>
-            <li class="text-gray-900 dark:text-gray-100 font-medium">Groups</li>
-        </ol>
-    </nav>
-</div>
+<x-page-header title="Browse groups" eyebrow="Explore Usenet" description="Search indexed groups and jump directly into their available releases." icon="fas fa-layer-group">
+    <x-slot:stats>
+        <span class="workspace-hero__stat"><i class="fas fa-list" aria-hidden="true"></i>{{ isset($results) ? number_format($results->total()) : 0 }} groups</span>
+        @if(!empty($search))
+            <span class="workspace-hero__stat"><i class="fas fa-filter" aria-hidden="true"></i>Filtered by {{ $search }}</span>
+        @endif
+    </x-slot:stats>
+</x-page-header>
 
 {!! $site['adbrowse'] ?? '' !!}
 
@@ -138,4 +126,3 @@
         </div>
     </div>
 @endif
-

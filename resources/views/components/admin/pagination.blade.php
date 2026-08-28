@@ -10,8 +10,7 @@
             ? 'border-b border-gray-200 dark:border-gray-700'
             : 'border-t border-gray-200 dark:border-gray-700';
     @endphp
-    <div class="px-6 py-4 {{ $borderClass }} bg-gray-50 dark:bg-gray-900">
+    <nav class="surface-panel-alt px-6 py-4 {{ $borderClass }}" aria-label="Pagination">
         {{ $paginator->onEachSide(5)->links() }}
-    </div>
+    </nav>
 @endif
-

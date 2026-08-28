@@ -1,23 +1,18 @@
 @extends('layouts.main')
 
 @section('content')
-<div class="surface-panel rounded-xl shadow-sm">
-    <!-- Header -->
-    <div class="surface-panel-alt px-6 py-4 border-b">
-        <div class="flex justify-between items-center">
-            <h3 class="text-2xl font-bold text-gray-800 dark:text-gray-200 flex items-center">
-                <i class="fa fa-tv mr-3 text-primary-600 dark:text-primary-400"></i>TV Series
-            </h3>
-            <nav aria-label="breadcrumb">
-                <ol class="flex items-center space-x-2 text-sm text-gray-600 dark:text-gray-400">
-                    <li><a href="{{ url($site['home_link'] ?? '/') }}" class="hover:text-primary-600 dark:hover:text-primary-400">Home</a></li>
-                    <li><i class="fas fa-chevron-right text-xs mx-2"></i></li>
-                    <li class="text-gray-500 dark:text-gray-400">TV Series List</li>
-                </ol>
-            </nav>
-        </div>
-    </div>
+<x-page-header title="TV series" eyebrow="Discover and follow" description="Browse available series, find a title, and manage the shows you follow." icon="fas fa-tv">
+    <x-slot:stats>
+        <span class="workspace-hero__stat"><i class="fas fa-list" aria-hidden="true"></i>{{ number_format(count($serieslist)) }} groups</span>
+        <span class="workspace-hero__stat"><i class="fas fa-font" aria-hidden="true"></i>{{ $seriesletter }} range</span>
+    </x-slot:stats>
+    <x-slot:actions>
+        <a href="{{ route('trending-tv') }}" class="workspace-hero__action"><i class="fas fa-fire" aria-hidden="true"></i>Trending shows</a>
+        <a href="{{ route('myshows') }}" class="workspace-hero__action"><i class="fas fa-list" aria-hidden="true"></i>My shows</a>
+    </x-slot:actions>
+</x-page-header>
 
+<div class="surface-panel rounded-xl shadow-sm">
     <div class="px-6 py-4">
         <!-- Alphabet navigation -->
         <div class="mb-4">
@@ -225,4 +220,3 @@
     </div>
 </div>
 @endsection
-

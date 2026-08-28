@@ -3,9 +3,9 @@
 @section('content')
     <div class="container mx-auto px-4 py-6">
         <div class="max-w-4xl mx-auto">
-            <div class="bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700">
+            <div class="auth-card overflow-hidden rounded-2xl border shadow-sm">
                 <!-- Header -->
-                <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+                <div class="workspace-document-header border-b border-gray-200 px-6 py-5 dark:border-gray-700">
                     <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200 mb-2">Terms and Conditions</h1>
                     <nav aria-label="breadcrumb">
                         <ol class="flex text-sm text-gray-600 dark:text-gray-400">
@@ -104,4 +104,3 @@
         </div>
     </div>
 @endsection
-

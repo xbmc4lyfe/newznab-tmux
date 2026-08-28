@@ -2,9 +2,9 @@
     'items' => []
 ])
 
-<div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+<div class="breadcrumb-bar border-b border-gray-200 px-5 py-3.5 dark:border-gray-700 sm:px-6">
     <nav class="flex" aria-label="Breadcrumb">
-        <ol class="inline-flex items-center space-x-1 md:space-x-2 text-sm">
+        <ol class="inline-flex flex-wrap items-center gap-1.5 text-sm">
             @foreach($items as $index => $item)
                 @if($index > 0)
                     <li aria-hidden="true">
@@ -15,14 +15,14 @@
                     @if(!empty($item['url']))
                         <a href="{{ $item['url'] }}" class="text-gray-700 dark:text-gray-300 hover:text-primary-600 dark:hover:text-primary-400 inline-flex items-center transition">
                             @if(!empty($item['icon']))
-                                <i class="{{ $item['icon'] }} mr-1.5"></i>
+                                <i class="{{ $item['icon'] }} mr-1.5" aria-hidden="true"></i>
                             @endif
                             {{ $item['label'] }}
                         </a>
                     @else
                         <span class="text-gray-500 dark:text-gray-400 inline-flex items-center">
                             @if(!empty($item['icon']))
-                                <i class="{{ $item['icon'] }} mr-1.5"></i>
+                                <i class="{{ $item['icon'] }} mr-1.5" aria-hidden="true"></i>
                             @endif
                             {{ $item['label'] }}
                         </span>
@@ -32,4 +32,3 @@
         </ol>
     </nav>
 </div>
-

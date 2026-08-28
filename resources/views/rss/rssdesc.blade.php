@@ -1,12 +1,9 @@
 @extends('layouts.main')
 
 @section('content')
+<x-page-header :title="$title" eyebrow="Feeds and automation" description="Build authenticated RSS feeds for categories, saved content, and direct NZB downloads." icon="fas fa-rss" />
+
 <div class="surface-panel rounded-xl shadow-sm mb-6">
-    <div class="surface-panel-alt px-6 py-4 border-b rounded-t-lg">
-        <h3 class="text-2xl font-bold text-gray-900 dark:text-gray-100 flex items-center">
-            <i class="fa fa-rss mr-2 text-primary-500 dark:text-primary-400"></i>{{ $title }}
-        </h3>
-    </div>
     <div class="p-6">
         <p class="text-lg text-gray-700 dark:text-gray-300 mb-6 dark:text-gray-300">
             Here you can find RSS feeds for various categories and content types. These feeds provide either descriptions or
@@ -288,4 +285,3 @@
 
 {{-- Copy to clipboard functionality moved to csp-safe.js --}}
 @endsection
-

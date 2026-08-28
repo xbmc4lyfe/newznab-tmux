@@ -101,7 +101,7 @@
             </header>
 
             <!-- Page Content - Scrollable Area -->
-            <main id="main-content" class="layout-main flex-1 overflow-y-auto p-3 sm:p-5 lg:p-6" data-scroll-container tabindex="-1">
+            <main id="main-content" class="app-view-stack app-view-stack--admin layout-main flex-1 overflow-y-auto p-3 sm:p-5 lg:p-6" data-scroll-container tabindex="-1">
                 @unless(trim($__env->yieldContent('suppress_layout_flash')))
                     @if(session('success'))
                         <div class="layout-flash layout-flash--success mb-5" role="status">

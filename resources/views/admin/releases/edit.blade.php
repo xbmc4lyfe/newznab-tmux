@@ -4,16 +4,11 @@
 
 @section('content')
 <div class="space-y-6">
-    <div class="mb-6">
-        <h1 class="text-3xl font-bold text-gray-800 dark:text-gray-100">Edit Release</h1>
-        <nav class="text-sm text-gray-600 dark:text-gray-400 mt-2">
-            <a href="{{ route('admin.index') }}" class="hover:text-blue-600">Dashboard</a>
-            <i class="fas fa-chevron-right mx-2 text-xs"></i>
-            <a href="{{ route('admin.release-list') }}" class="hover:text-blue-600">Releases</a>
-            <i class="fas fa-chevron-right mx-2 text-xs"></i>
-            <span>Edit</span>
-        </nav>
-    </div>
+    <x-admin.page-header title="Edit Release" icon="fas fa-edit">
+        <x-slot:actions>
+            <x-admin.button :href="route('admin.release-list')" tone="gray" icon="fas fa-arrow-left">Back to Releases</x-admin.button>
+        </x-slot:actions>
+    </x-admin.page-header>
 
     @if(session('success'))
         <div class="bg-green-100 dark:bg-green-900/20 border border-green-400 dark:border-green-900 text-green-700 dark:text-green-300 px-4 py-3 rounded mb-4">
@@ -253,4 +248,3 @@
     </div>
 </div>
 @endsection
-

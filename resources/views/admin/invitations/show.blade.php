@@ -3,35 +3,25 @@
 @section('content')
 <div class="space-y-6">
     <x-admin.card>
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                    <i class="fas fa-envelope mr-2"></i>{{ $title }}
-                </h1>
-                <div class="space-x-2">
+        <x-admin.page-header :title="$title" icon="fas fa-envelope">
+            <x-slot:actions>
+                <div class="flex flex-wrap gap-2">
                     @if(!$invitation->used_at)
                         <form method="POST" action="{{ url('admin/invitations/' . $invitation->id . '/resend') }}" class="inline">
                             @csrf
-                            <button type="submit" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700">
-                                <i class="fas fa-paper-plane mr-2"></i>Resend
-                            </button>
+                            <x-admin.button type="submit" tone="success" icon="fas fa-paper-plane">Resend</x-admin.button>
                         </form>
                         <form method="POST" action="{{ url('admin/invitations/' . $invitation->id . '/cancel') }}" class="inline"
                               x-data="confirmForm"
                               data-message="Are you sure you want to cancel this invitation?">
                             @csrf
-                            <button type="button" class="px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700" @click="submit()">
-                                <i class="fas fa-ban mr-2"></i>Cancel
-                            </button>
+                            <x-admin.button type="button" tone="warning" icon="fas fa-ban" @click="submit()">Cancel</x-admin.button>
                         </form>
                     @endif
-                    <a href="{{ url('admin/invitations') }}" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700">
-                        <i class="fas fa-arrow-left mr-2"></i>Back to List
-                    </a>
+                    <x-admin.button :href="url('admin/invitations')" tone="gray" icon="fas fa-arrow-left">Back to List</x-admin.button>
                 </div>
-            </div>
-        </div>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Invitation Details -->
         <div class="p-6">
@@ -205,4 +195,3 @@
 
 {{-- Scripts moved to resources/js/csp-safe.js --}}
 @endsection
-

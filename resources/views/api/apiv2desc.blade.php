@@ -2,11 +2,7 @@
 
 @section('content')
 <div class="surface-panel rounded-xl shadow-sm mb-6">
-    <div class="surface-panel-alt px-6 py-4 border-b rounded-t-lg">
-        <h3 class="text-2xl font-bold text-gray-900 dark:text-gray-100 flex items-center">
-            <i class="fa fa-code mr-2 text-primary-600 dark:text-primary-400"></i>{{ $title }}
-        </h3>
-    </div>
+    <x-page-header :title="$title" eyebrow="Developer resources" description="Build JSON integrations with the versioned API, authenticated search, and capability endpoints." icon="fas fa-code-branch" />
     <div class="p-6">
         <p class="text-lg text-gray-700 dark:text-gray-300 mb-6 dark:text-gray-300">
             Here lives the documentation for the API v2 for accessing NZB and index data. API functions can be called by providing an API token.

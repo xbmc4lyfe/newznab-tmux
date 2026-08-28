@@ -11,21 +11,22 @@
     }
 @endphp
 
-<div class="inline-search-widget flex items-center gap-2" data-base-url="{{ $baseUrl }}">
-    <div class="relative">
-        <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-            <i class="fas fa-search text-gray-400 dark:text-gray-500 text-sm"></i>
+<div class="inline-search-widget min-w-0" data-base-url="{{ $baseUrl }}">
+    <div class="inline-search-widget__field relative min-w-0">
+        <div class="inline-search-widget__icon pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
+            <i class="fas fa-search text-sm text-gray-400 dark:text-gray-500" aria-hidden="true"></i>
         </div>
         <input type="text"
                data-role="inline-search-input"
                placeholder="{{ $placeholder }}"
-               class="w-48 lg:w-56 pl-9 pr-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 transition"
+               class="inline-search-widget__input min-h-10 w-full rounded-xl border border-gray-300 bg-white py-2 pl-10 pr-3 text-sm text-gray-900 shadow-sm transition placeholder-gray-400 focus:border-primary-500 focus:ring-2 focus:ring-primary-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 dark:placeholder-gray-500"
+               aria-label="{{ $placeholder }}"
                autocomplete="off">
     </div>
     <button type="button"
             data-role="inline-search-btn"
-            class="px-3 py-1.5 bg-primary-600 dark:bg-primary-700 text-white rounded-lg hover:bg-primary-700 dark:hover:bg-primary-800 transition text-sm">
-        <i class="fas fa-search"></i>
+            class="inline-search-widget__button inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary-600 text-sm text-white shadow-sm transition hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-2 dark:bg-primary-700 dark:hover:bg-primary-600"
+            aria-label="Search">
+        <i class="fas fa-search" aria-hidden="true"></i>
     </button>
 </div>
-

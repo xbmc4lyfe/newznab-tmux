@@ -7,13 +7,13 @@
 ])
 
 @php
-    $base = 'inline-flex items-center justify-center gap-2 rounded-lg border font-semibold transition-colors duration-150 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 dark:focus:ring-offset-gray-900 disabled:cursor-not-allowed disabled:opacity-60';
+    $base = 'inline-flex items-center justify-center gap-2 rounded-xl border font-semibold shadow-sm transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-gray-900 disabled:cursor-not-allowed disabled:opacity-60';
 
     $sizes = [
-        'sm' => 'px-3 py-1.5 text-xs',
-        'md' => 'px-4 py-2 text-sm',
-        'lg' => 'px-6 py-3 text-base',
-        'icon' => 'h-9 w-9 p-0 text-sm',
+        'sm' => 'min-h-9 px-3 py-1.5 text-xs',
+        'md' => 'min-h-11 px-4 py-2 text-sm',
+        'lg' => 'min-h-12 px-6 py-3 text-base',
+        'icon' => 'h-11 w-11 p-0 text-sm',
     ];
 
     $variants = [

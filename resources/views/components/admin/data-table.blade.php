@@ -5,11 +5,11 @@
     'striped' => false,
 ])
 
-<div class="admin-data-table-wrap overflow-x-auto overscroll-x-contain">
+<div class="admin-data-table-wrap overflow-x-auto overscroll-x-contain rounded-xl border shadow-sm">
     <table {{ $attributes->merge(['class' => 'min-w-full table-auto divide-y divide-gray-200 dark:divide-gray-700']) }}>
         @if(isset($head))
             <thead @class([
-                'bg-gray-50 dark:bg-gray-900',
+                'admin-data-table__head',
                 'sticky top-0 z-10' => $sticky,
             ])>
                 <tr>
