@@ -7,21 +7,19 @@
 @section('content')
 <div class="surface-panel rounded-xl shadow-sm transition-colors duration-200">
     @php
-        $crumbs = [['label' => 'Home', 'url' => url($site['home_link'] ?? '/'), 'icon' => 'fas fa-home']];
-        $currentCategoryLabel = isset($catname) && is_string($catname) && strtolower($catname) === 'all'
-            ? 'All'
-            : ($catname ?? 'All');
-        if (isset($parentcat) && $parentcat != '') {
-            $crumbs[] = ['label' => $parentcat, 'url' => url('/browse/' . ($parentcat == 'music' ? 'Audio' : $parentcat))];
-            if (isset($catname) && $catname != '' && $catname != 'all') {
-                $crumbs[] = ['label' => $catname];
-            }
-        } else {
-            $crumbs[] = ['label' => 'Browse', 'url' => route('All')];
-            $crumbs[] = ['label' => $currentCategoryLabel];
-        }
+        $currentCategoryLabel = match (true) {
+            is_object($catname ?? null) => $catname->title ?? 'All',
+            is_string($catname ?? null) && strtolower($catname) !== 'all' => $catname,
+            default => 'All',
+        };
+        $browseTitle = !empty($parentcat) && $parentcat !== 'All' ? $parentcat : 'Browse releases';
     @endphp
-    <x-breadcrumb :items="$crumbs" />
+    <x-page-header :title="$browseTitle" :current="$currentCategoryLabel" eyebrow="Discover and download" description="Browse the latest indexed releases, refine the list, and send selections to your download basket." icon="fas fa-compass">
+        <x-slot:stats>
+            <span class="workspace-hero__stat"><i class="fas fa-layer-group" aria-hidden="true"></i>{{ number_format($results->total()) }} releases</span>
+            <span class="workspace-hero__stat"><i class="fas fa-folder-open" aria-hidden="true"></i>{{ $currentCategoryLabel }}</span>
+        </x-slot:stats>
+    </x-page-header>
 
     @if($results->count() > 0)
         @php

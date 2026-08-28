@@ -3,23 +3,12 @@
 @section('content')
 <div class="space-y-6">
     <x-admin.card>
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                    <i class="fas fa-gift mr-2"></i>Role Promotions
-                </h1>
-                <div class="flex gap-2">
-                    <a href="{{ route('admin.promotions.statistics') }}" class="px-4 py-2 bg-purple-600 dark:bg-purple-700 text-white rounded-lg hover:bg-purple-700">
-                        <i class="fas fa-chart-bar mr-2"></i>View Statistics
-                    </a>
-                    <a href="{{ route('admin.promotions.create') }}" class="px-4 py-2 bg-blue-600 dark:bg-blue-700 text-white rounded-lg hover:bg-blue-700">
-                        <i class="fas fa-plus mr-2"></i>Add New Promotion
-                    </a>
-                </div>
-            </div>
-        </div>
-
+        <x-admin.page-header title="Role Promotions" icon="fas fa-gift">
+            <x-slot:actions>
+                <x-admin.button :href="route('admin.promotions.statistics')" tone="gray" icon="fas fa-chart-bar">View Statistics</x-admin.button>
+                <x-admin.button :href="route('admin.promotions.create')" icon="fas fa-plus">Add New Promotion</x-admin.button>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Promotions Table -->
         @if(count($promotions) > 0)
@@ -135,4 +124,3 @@
     </x-admin.card>
 </div>
 @endsection
-

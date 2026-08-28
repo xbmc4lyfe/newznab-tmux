@@ -1,6 +1,18 @@
 @extends('layouts.main')
 
 @section('content')
+<x-page-header :title="$invite_mode ? 'My invitations' : 'Invitations disabled'" eyebrow="Invite and track" :description="$invite_mode ? 'Send invitations and follow their acceptance or expiry status.' : 'User invitations are currently unavailable on this site.'" icon="fas fa-envelope">
+    @if($invite_mode)
+        <x-slot:stats>
+            <span class="workspace-hero__stat"><i class="fas fa-paper-plane" aria-hidden="true"></i>{{ number_format($stats['total'] ?? 0) }} sent</span>
+            <span class="workspace-hero__stat"><i class="fas fa-clock" aria-hidden="true"></i>{{ number_format($stats['pending'] ?? 0) }} pending</span>
+        </x-slot:stats>
+        <x-slot:actions>
+            <a href="{{ url('/invitations/create') }}" class="workspace-hero__action"><i class="fas fa-plus" aria-hidden="true"></i>Send invitation</a>
+        </x-slot:actions>
+    @endif
+</x-page-header>
+
 @unless($invite_mode)
 <div class="max-w-4xl mx-auto px-4 py-3">
     <div class="bg-yellow-50 border border-yellow-200 text-yellow-800 rounded-lg p-6 shadow-sm dark:bg-yellow-900 dark:border-yellow-700 dark:text-yellow-300">
@@ -11,28 +23,6 @@
     </div>
 </div>
 @else
-<div class="mb-6">
-    <nav class="flex" aria-label="breadcrumb">
-        <ol class="inline-flex items-center space-x-1 md:space-x-3">
-            <li class="inline-flex items-center">
-                <a href="{{ $site['home_link'] }}" class="text-gray-700 dark:text-gray-300 hover:text-blue-600 dark:text-blue-400 dark:text-gray-400 dark:hover:text-white">Home</a>
-            </li>
-            <li>
-                <div class="flex items-center">
-                    <svg class="w-3 h-3 text-gray-400 mx-1" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd"></path></svg>
-                    <a href="{{ url('/profile') }}" class="text-gray-700 dark:text-gray-300 hover:text-blue-600 dark:text-blue-400 dark:text-gray-400 dark:hover:text-white">Profile</a>
-                </div>
-            </li>
-            <li aria-current="page">
-                <div class="flex items-center">
-                    <svg class="w-3 h-3 text-gray-400 mx-1" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd"></path></svg>
-                    <span class="text-gray-500 dark:text-gray-400">My Invitations</span>
-                </div>
-            </li>
-        </ol>
-    </nav>
-</div>
-
 <div class="px-4 py-3">
     <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm mb-4 dark:bg-gray-800">
         <div class="bg-gray-50 dark:bg-gray-900 px-6 py-4 border-b border-gray-200 dark:border-gray-700 rounded-t-lg flex justify-between items-center dark:bg-gray-700 dark:border-gray-600">
@@ -251,4 +241,3 @@
 </div>
 @endunless
 @endsection
-

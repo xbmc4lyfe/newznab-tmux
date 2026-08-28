@@ -72,7 +72,7 @@
 
             <!-- Page Content - This is the scrollable area -->
             <main id="main-content" class="layout-main flex-1 overflow-y-auto" data-scroll-container tabindex="-1">
-                <div class="layout-page-container container mx-auto max-w-[1600px] px-3 py-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:px-5 sm:py-6 lg:px-8">
+                <div class="app-view-stack layout-page-container container mx-auto max-w-[1600px] px-3 py-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:px-5 sm:py-6 lg:px-8">
                     @if(session('success'))
                         <div class="layout-flash layout-flash--success mb-5" role="status">
                             <i class="fas fa-circle-check" aria-hidden="true"></i>

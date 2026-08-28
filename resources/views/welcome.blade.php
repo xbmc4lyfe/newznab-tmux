@@ -4,8 +4,8 @@
 <div class="auth-page min-h-dvh px-4 py-10 sm:px-6 lg:px-8">
     <div class="mx-auto flex min-h-[calc(100dvh-5rem)] max-w-3xl items-center justify-center">
         <div class="auth-card w-full rounded-xl p-8 text-center shadow-xl">
-            <a href="{{ url('/') }}" class="inline-flex items-center justify-center">
-                <img src="{{ asset('assets/images/logo.svg') }}" alt="{{ config('app.name') }} Logo" class="h-16 w-16">
+            <a href="{{ url('/') }}" class="workspace-brand-mark inline-flex h-16 w-16 items-center justify-center rounded-2xl" aria-label="{{ config('app.name') }} home">
+                <i class="fas fa-layer-group text-2xl" aria-hidden="true"></i>
             </a>
 
             <h1 class="mt-6 text-3xl font-bold text-gray-900 dark:text-gray-100">{{ config('app.name') }}</h1>

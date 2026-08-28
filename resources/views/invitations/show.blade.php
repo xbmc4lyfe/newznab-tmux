@@ -2,19 +2,7 @@
 
 @section('content')
 <div class="max-w-4xl mx-auto px-4 py-3">
-    <nav class="flex mb-6" aria-label="breadcrumb">
-        <ol class="inline-flex items-center space-x-1 md:space-x-3">
-            <li class="inline-flex items-center">
-                <a href="{{ $site['home_link'] }}" class="text-gray-700 dark:text-gray-300 hover:text-blue-600 dark:text-blue-400 dark:text-gray-400 dark:hover:text-white">Home</a>
-            </li>
-            <li aria-current="page">
-                <div class="flex items-center">
-                    <svg class="w-3 h-3 text-gray-400 mx-1" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd"></path></svg>
-                    <span class="text-gray-500 dark:text-gray-400">Invitation</span>
-                </div>
-            </li>
-        </ol>
-    </nav>
+    <x-page-header :title="'Invitation to join ' . $site['title']" eyebrow="Welcome" description="Review this invitation and create your account securely." icon="fas fa-envelope-open" />
 
     <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm dark:bg-gray-800">
         <div class="bg-gray-50 dark:bg-gray-900 px-6 py-4 border-b border-gray-200 dark:border-gray-700 rounded-t-lg dark:bg-gray-700 dark:border-gray-600">
@@ -174,4 +162,3 @@
     </div>
 </div>
 @endsection
-

@@ -2,16 +2,11 @@
 
 @section('content')
 <div class="surface-panel rounded-xl shadow-sm">
-    <!-- Breadcrumb -->
-    <div class="surface-panel-alt px-6 py-4 border-b">
-        <nav aria-label="breadcrumb">
-            <ol class="flex items-center space-x-2 text-sm text-gray-600 dark:text-gray-400">
-                <li><a href="{{ url($site['home_link'] ?? '/') }}" class="hover:text-primary-600 dark:hover:text-primary-400">Home</a></li>
-                <li><i class="fas fa-chevron-right text-xs mx-2"></i></li>
-                <li class="text-gray-500 dark:text-gray-400">Download Basket</li>
-            </ol>
-        </nav>
-    </div>
+    <x-page-header title="Download basket" eyebrow="Your saved releases" description="Review saved NZBs, download selected releases, or use the private RSS feed with your downloader." icon="fas fa-basket-shopping">
+        <x-slot:stats>
+            <span class="workspace-hero__stat"><i class="fas fa-box-archive" aria-hidden="true"></i>{{ number_format(count($results)) }} saved</span>
+        </x-slot:stats>
+    </x-page-header>
 
     <div class="px-6 py-4">
 

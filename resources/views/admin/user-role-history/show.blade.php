@@ -3,22 +3,12 @@
 @section('content')
 <div class="space-y-6">
     <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                    <i class="fas fa-history mr-2"></i>{{ $title }}
-                </h1>
-                <div class="flex gap-2">
-                    <a href="{{ url('admin/user-edit?id=' . $user->id) }}" class="px-4 py-2 bg-blue-600 dark:bg-blue-700 text-white rounded-lg hover:bg-blue-700 dark:hover:bg-blue-800">
-                        <i class="fas fa-edit mr-2"></i>Edit User
-                    </a>
-                    <a href="{{ url('admin/user-role-history') }}" class="px-4 py-2 bg-gray-600 dark:bg-gray-700 text-white rounded-lg hover:bg-gray-700 dark:hover:bg-gray-800">
-                        <i class="fas fa-arrow-left mr-2"></i>Back to All
-                    </a>
-                </div>
-            </div>
-        </div>
+        <x-admin.page-header :title="$title" icon="fas fa-history">
+            <x-slot:actions>
+                <x-admin.button :href="url('admin/user-edit?id='.$user->id)" icon="fas fa-edit">Edit User</x-admin.button>
+                <x-admin.button :href="url('admin/user-role-history')" tone="gray" icon="fas fa-arrow-left">Back to All</x-admin.button>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- User Info -->
         <div class="px-6 py-4 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700">
@@ -170,4 +160,3 @@
     </div>
 </div>
 @endsection
-

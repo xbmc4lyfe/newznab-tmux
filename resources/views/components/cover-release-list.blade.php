@@ -20,9 +20,9 @@
 @endphp
 
 @if(!empty($displayReleases))
-    <div class="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
-        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">
-            Available Releases
+    <div class="mt-4 border-t border-gray-200 pt-4 dark:border-gray-700">
+        <h4 class="mb-2 text-sm font-semibold text-gray-800 dark:text-gray-200">
+            <i class="fas fa-box-open mr-1.5 text-primary-500" aria-hidden="true"></i>Available releases
             @if($totalReleaseCount > $maxReleases)
                 <span class="text-xs font-normal text-gray-500">(Showing {{ $maxReleases }} of {{ $totalReleaseCount }})</span>
             @endif
@@ -30,14 +30,14 @@
         <div class="space-y-2">
             @foreach($displayReleases as $release)
                 @if(!empty($release->searchname))
-                    <div class="surface-panel-alt rounded-lg p-2 border">
+                    <div class="catalog-release-row surface-panel-alt rounded-xl border p-3">
                         <div class="space-y-2">
                             <div class="{{ $shouldShowCheckbox ? 'flex items-start justify-between gap-2' : '' }}">
                                 <a href="{{ url('/details/' . $release->guid) }}" class="text-sm text-gray-800 dark:text-gray-200 hover:text-primary-600 dark:hover:text-primary-400 font-medium block break-all {{ $shouldShowCheckbox ? 'flex-1' : '' }}" title="{{ $release->searchname }}">
                                     {{ $release->searchname }}
                                 </a>
                                 @if($shouldShowCheckbox)
-                                    <label class="inline-flex items-center shrink-0">
+                                    <label class="inline-flex shrink-0 items-center" aria-label="Select {{ $release->searchname }}">
                                         <input type="checkbox" class="chkRelease form-checkbox h-4 w-4 text-primary-600" value="{{ $release->guid }}" name="release[]" @change="onCheckboxChange()">
                                     </label>
                                 @endif
@@ -46,12 +46,12 @@
                             <div class="flex flex-wrap items-center gap-1.5">
                                 @if(isset($release->size))
                                     <span class="release-chip">
-                                        <i class="fas fa-hdd mr-1"></i>{{ number_format($release->size / 1073741824, 2) }} GB
+                                        <i class="fas fa-hard-drive mr-1" aria-hidden="true"></i>{{ number_format($release->size / 1073741824, 2) }} GB
                                     </span>
                                 @endif
                                 @if(isset($release->postdate))
                                     <span class="release-chip">
-                                        <i class="fas fa-calendar-alt mr-1"></i>{{ date('M d, Y H:i', strtotime($release->postdate)) }}
+                                        <i class="fas fa-calendar-days mr-1" aria-hidden="true"></i>{{ date('M d, Y H:i', strtotime($release->postdate)) }}
                                     </span>
                                 @endif
                                 @if($shouldShowAddDate && isset($release->adddate))

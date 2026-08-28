@@ -13,16 +13,11 @@
 @section('content')
 <div class="space-y-6" x-data="showAddForm" data-config="{{ $configJson }}">
     <x-admin.card>
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
-            <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                <i class="fas fa-tv mr-2"></i>{{ $title }}
-            </h1>
-            <a href="{{ url('admin/show-list') }}"
-               class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm">
-                <i class="fas fa-arrow-left mr-2"></i>Back to TV Shows List
-            </a>
-        </div>
+        <x-admin.page-header :title="$title" icon="fas fa-tv">
+            <x-slot:actions>
+                <x-admin.button :href="url('admin/show-list')" tone="gray" icon="fas fa-arrow-left">Back to TV Shows List</x-admin.button>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Flash Messages -->
         @if(session('success'))
@@ -162,4 +157,3 @@
     </x-admin.card>
 </div>
 @endsection
-

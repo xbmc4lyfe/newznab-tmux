@@ -16,11 +16,11 @@ Alpine.data('moviesPage', () => ({
     },
 
     get layoutLabel() {
-        return this.layout === 1 ? '1 Column' : '2 Columns';
+        return this.layout === 1 ? 'Comfortable list' : 'Compact grid';
     },
 
     get layoutIcon() {
-        return this.layout === 1 ? 'fas fa-th-list' : 'fas fa-th-large';
+        return this.layout === 1 ? 'fas fa-list' : 'fas fa-table-cells-large';
     },
 
     toggleLayout() {

@@ -1,20 +1,17 @@
 @extends('layouts.main')
 
 @section('content')
-<div class="series-detail-page surface-panel rounded-xl shadow-sm">
-    <!-- Breadcrumb -->
-    <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-        <nav aria-label="breadcrumb">
-            <ol class="flex items-center space-x-2 text-sm text-gray-600">
-                <li><a href="{{ url($site['home_link'] ?? '/') }}" class="hover:text-blue-600">Home</a></li>
-                <li><i class="fas fa-chevron-right text-xs mx-2"></i></li>
-                <li><a href="{{ route('series') }}" class="hover:text-blue-600">TV Series</a></li>
-                <li><i class="fas fa-chevron-right text-xs mx-2"></i></li>
-                <li class="text-gray-500">{{ $seriestitles ?? '' }}</li>
-            </ol>
-        </nav>
-    </div>
+<x-page-header :title="!empty($seriestitles) ? $seriestitles : 'TV series'" eyebrow="Series details" description="Explore available seasons, episodes, and release information." icon="fas fa-tv">
+    <x-slot:stats>
+        <span class="workspace-hero__stat"><i class="fas fa-layer-group" aria-hidden="true"></i>{{ number_format($totalSeasonsAvailable ?? 0) }} seasons available</span>
+        <span class="workspace-hero__stat"><i class="fas fa-clapperboard" aria-hidden="true"></i>{{ number_format($episodeCount ?? 0) }} episodes available</span>
+    </x-slot:stats>
+    <x-slot:actions>
+        <a href="{{ route('series') }}" class="workspace-hero__action"><i class="fas fa-arrow-left" aria-hidden="true"></i>Back to TV shows</a>
+    </x-slot:actions>
+</x-page-header>
 
+<div class="series-detail-page surface-panel rounded-xl shadow-sm">
     <div class="px-6 py-4">
         @if(!empty($nodata))
             <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-4 text-yellow-800">

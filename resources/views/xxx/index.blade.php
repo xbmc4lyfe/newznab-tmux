@@ -6,13 +6,12 @@
 
 @section('content')
 <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm">
-    @php
-        $crumbs = [['label' => 'Home', 'url' => url($site['home_link'] ?? '/'), 'icon' => 'fas fa-home'], ['label' => 'XXX', 'url' => url('/XXX')]];
-        if (!empty($categorytitle) && $categorytitle !== 'All') {
-            $crumbs[] = ['label' => $categorytitle];
-        }
-    @endphp
-    <x-breadcrumb :items="$crumbs" />
+    <x-page-header title="Adult" :current="!empty($categorytitle) ? $categorytitle : 'All releases'" eyebrow="Browse the catalog" description="Explore adult releases by category, search the current collection, and choose your preferred ordering." icon="fas fa-user-lock">
+        <x-slot:stats>
+            <span class="workspace-hero__stat"><i class="fas fa-film" aria-hidden="true"></i>{{ number_format($results->total()) }} releases</span>
+            <span class="workspace-hero__stat"><i class="fas fa-folder-open" aria-hidden="true"></i>{{ $categorytitle ?: 'All releases' }}</span>
+        </x-slot:stats>
+    </x-page-header>
 
     <div class="px-6 py-4">
         <!-- Category and order -->
@@ -78,9 +77,11 @@
                                     </div>
                                 </td>
                                 <td class="px-3 py-4 whitespace-nowrap">
-                                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary-100 dark:bg-primary-900/50 text-primary-800 dark:text-primary-200">
-                                        {{ $result->category_name ?? 'Other' }}
-                                    </span>
+                                    <x-release-category-link
+                                        :category-name="$result->category_name ?? null"
+                                        :parent-category="$result->parent_category ?? null"
+                                        :sub-category="$result->sub_category ?? null"
+                                    />
                                 </td>
                                 <td class="px-3 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
                                     {{ userDateDiffForHumans($result->adddate ?? null) }}

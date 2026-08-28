@@ -2,16 +2,10 @@
 
 @section('content')
 <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm">
-    <x-breadcrumb :items="[
-        ['label' => 'Home', 'url' => url($site['home_link'] ?? '/'), 'icon' => 'fas fa-home'],
-        ['label' => 'Movies', 'url' => route('Movies')],
-        ['label' => 'Trailer'],
-    ]" />
+    <x-page-header :title="$movie['title'] ?? 'Movie trailer'" current="Trailer" eyebrow="Watch the preview" description="Watch the available trailer and review the key details for this movie." icon="fas fa-circle-play" />
 
     <div class="px-6 py-6">
         @if(isset($movie))
-            <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100 mb-6">{{ $movie['title'] ?? 'Movie Trailer' }}</h1>
-
             @if(isset($movie['trailer']) && $movie['trailer'])
                 <div class="aspect-w-16 aspect-h-9 mb-6">
                     <iframe src="https://www.youtube.com/embed/{{ $movie['trailer'] }}"
@@ -71,4 +65,3 @@
     </div>
 </div>
 @endsection
-

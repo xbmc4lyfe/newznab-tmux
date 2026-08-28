@@ -1,25 +1,14 @@
 
 <div class="max-w-7xl mx-auto">
-    <!-- Header Section -->
-    <div class="header-gradient rounded-xl shadow-lg mb-6 overflow-hidden">
-        <div class="px-8 py-6">
-            <div class="flex flex-col md:flex-row md:justify-between md:items-center gap-4">
-                <div>
-                    <h1 class="text-3xl font-bold text-white flex items-center">
-                        <i class="fa fa-tv mr-3"></i>My TV Shows
-                    </h1>
-                    <p class="text-blue-100 mt-2">Manage your favorite TV series and get automatic updates</p>
-                </div>
-                <nav aria-label="breadcrumb">
-                    <ol class="flex items-center space-x-2 text-sm text-blue-100">
-                        <li><a href="{{ url($site['home_link']) }}" class="hover:text-white transition">Home</a></li>
-                        <li><i class="fas fa-chevron-right text-xs"></i></li>
-                        <li class="text-white font-medium">My TV Shows</li>
-                    </ol>
-                </nav>
-            </div>
-        </div>
-    </div>
+    <x-page-header title="My TV shows" eyebrow="Your watchlist" description="Manage followed series and keep automatic updates flowing through your personal feed." icon="fas fa-tv">
+        <x-slot:stats>
+            <span class="workspace-hero__stat"><i class="fas fa-bookmark" aria-hidden="true"></i>{{ number_format(count($shows ?? [])) }} followed</span>
+        </x-slot:stats>
+        <x-slot:actions>
+            <a href="{{ url('/browse/TV') }}" class="workspace-hero__action"><i class="fas fa-list" aria-hidden="true"></i>Browse all series</a>
+            <a href="{{ url('/myshows/browse') }}" class="workspace-hero__action"><i class="fas fa-search" aria-hidden="true"></i>View releases</a>
+        </x-slot:actions>
+    </x-page-header>
 
     <!-- RSS Feed Info Card -->
     <div class="info-card-gradient border-l-4 border-blue-500 rounded-lg p-5 mb-6 shadow">
@@ -238,4 +227,3 @@
         </div>
     @endif
 </div>
-

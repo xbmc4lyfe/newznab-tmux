@@ -3,23 +3,14 @@
 @section('content')
 <div class="space-y-6">
     <x-admin.card>
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800 dark:text-gray-200">
-                    <i class="fas fa-tv mr-2"></i>{{ $title }}
-                </h1>
-                <div class="flex items-center gap-4">
-                    <div class="text-sm text-gray-600 dark:text-gray-400">
-                        Total: {{ $tvshowlist->total() }} shows
-                    </div>
-                    <a href="{{ route('admin.show-add') }}"
-                       class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm">
-                        <i class="fas fa-plus mr-2"></i>Add TV Show
-                    </a>
-                </div>
-            </div>
-        </div>
+        <x-admin.page-header :title="$title" icon="fas fa-tv">
+            <x-slot:actions>
+                <span class="inline-flex min-h-11 items-center rounded-xl border border-gray-200 bg-white/70 px-4 text-sm font-medium text-gray-700 dark:border-gray-600 dark:bg-gray-800/70 dark:text-gray-200">
+                    {{ number_format($tvshowlist->total()) }} shows
+                </span>
+                <x-admin.button :href="route('admin.show-add')" tone="success" icon="fas fa-plus">Add TV Show</x-admin.button>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Search Form -->
         <div class="px-6 py-4 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700">

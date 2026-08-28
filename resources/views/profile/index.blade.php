@@ -1,23 +1,23 @@
 @extends('layouts.main')
 
 @section('content')
-<!-- Breadcrumb -->
-<nav class="mb-4 text-sm" aria-label="breadcrumb">
-    <ol class="flex items-center space-x-2">
-        <li><a href="{{ url('/') }}" class="text-primary-600 dark:text-primary-400 hover:text-primary-800">Home</a></li>
-        <li class="text-gray-400">/</li>
-        <li><a href="#" class="text-primary-600 dark:text-primary-400 hover:text-primary-800">Profile</a></li>
-        <li class="text-gray-400">/</li>
-        <li class="text-gray-600">{{ $user->username }}</li>
-    </ol>
-</nav>
+<x-page-header :title="($publicview ?? false) ? $user->username : 'Your profile'" :current="$user->username" eyebrow="Account overview" description="Review account details, preferences, and download access." icon="fas fa-user-circle">
+    @if(($isadmin ?? false) || !$publicview)
+        <x-slot:actions>
+            <a href="{{ route('profileedit') }}" class="workspace-hero__action"><i class="fas fa-user-pen" aria-hidden="true"></i>Edit profile</a>
+            @if(!($isadmin ?? false) && !$publicview)
+                <a href="{{ route('privacy-center.index') }}" class="workspace-hero__action"><i class="fas fa-shield-alt" aria-hidden="true"></i>Privacy center</a>
+            @endif
+        </x-slot:actions>
+    @endif
+</x-page-header>
 
 <div class="surface-panel rounded-xl shadow-sm overflow-hidden">
         <!-- Profile Header -->
         <div class="surface-panel-alt border-b px-6 py-4 flex justify-between items-center">
-            <h1 class="text-xl font-semibold text-gray-800">
+            <h2 class="text-xl font-semibold text-gray-800">
                 <i class="fas fa-user mr-2"></i>User Profile
-            </h1>
+            </h2>
             <div class="flex gap-2">
                 @if(($isadmin ?? false) || !$publicview)
                     <a href="{{ route('profileedit') }}" class="px-4 py-2 bg-green-600 dark:bg-green-700 text-white text-sm rounded hover:bg-green-700 dark:hover:bg-green-800 transition">
@@ -418,4 +418,3 @@
 
 
 @endsection
-

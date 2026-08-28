@@ -2,11 +2,13 @@
     <button
         type="button"
         @click="toggle"
-        class="inline-flex items-center gap-2 px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500 dark:focus:ring-primary-400 transition shadow-sm"
+        class="inline-flex min-h-11 items-center gap-2 rounded-xl border border-gray-300 bg-white px-4 py-2 text-sm font-semibold text-gray-700 shadow-sm transition hover:border-primary-300 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-primary-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:border-primary-600 dark:hover:bg-gray-700 dark:focus:ring-primary-400"
+        aria-haspopup="menu"
+        x-bind:aria-expanded="open"
     >
-        <i class="fas {{ $currentIcon }} text-gray-500 dark:text-gray-300"></i>
+        <i class="fas {{ $currentIcon }} text-primary-600 dark:text-primary-400" aria-hidden="true"></i>
         <span>Sort: {{ $currentLabel }}</span>
-        <i class="fas fa-chevron-down text-xs text-gray-400 dark:text-gray-300 transition-transform" :class="chevronClass()"></i>
+        <i class="fas fa-chevron-down text-xs text-gray-400 transition-transform dark:text-gray-300" :class="chevronClass()" aria-hidden="true"></i>
     </button>
 
     <div x-show="open"
@@ -17,12 +19,14 @@
          x-transition:leave="transition ease-in duration-75"
          x-transition:leave-start="opacity-100 scale-100"
          x-transition:leave-end="opacity-0 scale-95"
-         class="absolute right-0 z-50 mt-2 w-56 origin-top-right rounded-lg bg-white dark:bg-gray-700 shadow-lg border border-gray-200 dark:border-gray-600 focus:outline-none">
+         class="absolute right-0 z-50 mt-2 w-56 origin-top-right overflow-hidden rounded-xl border border-gray-200 bg-white shadow-xl focus:outline-none dark:border-gray-600 dark:bg-gray-800"
+         role="menu">
         <div class="py-1 max-h-80 overflow-y-auto">
             @foreach($sortOptions as $sortKey => $sortData)
                 <a
                     href="{{ $sortUrls[$sortKey] }}"
-                    class="flex items-center gap-3 px-4 py-2 text-sm transition {{ $currentSort === $sortKey ? 'bg-primary-100 dark:bg-primary-600 text-primary-800 dark:text-white font-medium' : 'text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-600' }}"
+                    class="flex min-h-10 items-center gap-3 px-4 py-2 text-sm transition {{ $currentSort === $sortKey ? 'bg-primary-100 dark:bg-primary-700 text-primary-800 dark:text-white font-semibold' : 'text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700' }}"
+                    role="menuitem"
                 >
                     <i class="fas {{ $sortData['icon'] }} w-4 text-center {{ $currentSort === $sortKey ? 'text-primary-600 dark:text-primary-200' : 'text-gray-400 dark:text-gray-400' }}"></i>
                     <span class="flex-1">{{ $sortData['label'] }}</span>

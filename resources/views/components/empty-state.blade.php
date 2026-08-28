@@ -7,19 +7,18 @@
     'actionIcon' => null,
 ])
 
-<div class="px-6 py-12 text-center">
-    <div class="inline-flex items-center justify-center w-20 h-20 bg-gray-100 dark:bg-gray-700 rounded-full mb-6">
-        <i class="{{ $icon }} text-gray-400 dark:text-gray-500 text-4xl"></i>
+<div class="empty-state px-6 py-14 text-center">
+    <div class="empty-state__icon mb-6 inline-flex h-20 w-20 items-center justify-center rounded-2xl">
+        <i class="{{ $icon }} text-3xl" aria-hidden="true"></i>
     </div>
-    <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-2">{{ $title }}</h3>
-    <p class="text-gray-500 dark:text-gray-400 max-w-md mx-auto mb-4">{{ $message }}</p>
+    <h3 class="mb-2 text-xl font-semibold tracking-tight text-gray-900 dark:text-gray-100">{{ $title }}</h3>
+    <p class="mx-auto mb-5 max-w-md text-sm leading-6 text-gray-500 dark:text-gray-400">{{ $message }}</p>
     @if($actionUrl && $actionLabel)
-        <a href="{{ $actionUrl }}" class="inline-flex items-center px-4 py-2 bg-primary-600 dark:bg-primary-700 text-white rounded-lg hover:bg-primary-700 dark:hover:bg-primary-800 transition shadow-sm">
+        <a href="{{ $actionUrl }}" class="inline-flex min-h-11 items-center gap-2 rounded-xl bg-primary-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-2 dark:bg-primary-700 dark:hover:bg-primary-600">
             @if($actionIcon)
-                <i class="{{ $actionIcon }} mr-2"></i>
+                <i class="{{ $actionIcon }}" aria-hidden="true"></i>
             @endif
             {{ $actionLabel }}
         </a>
     @endif
 </div>
-

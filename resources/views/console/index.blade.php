@@ -7,15 +7,14 @@
 @section('content')
 <div class="surface-panel rounded-xl shadow-sm">
     @php
-        $crumbs = [['label' => 'Home', 'url' => url($site['home_link'] ?? '/'), 'icon' => 'fas fa-home']];
-        if (!empty($catname) && is_object($catname) && !empty($catname->parent)) {
-            $crumbs[] = ['label' => $catname->parent->title, 'url' => url('/browse/' . $catname->parent->title)];
-            $crumbs[] = ['label' => $catname->title, 'url' => url('/browse/' . $catname->title)];
-        } else {
-            $crumbs[] = ['label' => 'Console / ' . (is_object($catname) ? $catname->title : $catname)];
-        }
+        $consoleCategory = is_object($catname) ? $catname->title : ($catname ?: 'All consoles');
     @endphp
-    <x-breadcrumb :items="$crumbs" />
+    <x-page-header title="Console" :current="$consoleCategory" eyebrow="Games and releases" description="Explore console titles and compare every indexed release in one place." icon="fas fa-gamepad">
+        <x-slot:stats>
+            <span class="workspace-hero__stat"><i class="fas fa-gamepad" aria-hidden="true"></i>{{ number_format($results->total()) }} releases</span>
+            <span class="workspace-hero__stat"><i class="fas fa-folder-open" aria-hidden="true"></i>{{ $consoleCategory }}</span>
+        </x-slot:stats>
+    </x-page-header>
 
     @if($results->count() > 0)
         <form id="nzb_multi_operations_form" method="get" x-data="releaseMultiOps">

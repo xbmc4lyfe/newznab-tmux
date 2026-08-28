@@ -5,6 +5,7 @@
 import Alpine from '@alpinejs/csp';
 
 const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+const colorSchemes = ['blue', 'indigo', 'cyan', 'teal', 'emerald', 'violet', 'pink', 'rose', 'red', 'orange', 'amber'];
 
 Alpine.store('theme', {
     current: 'light',
@@ -19,18 +20,19 @@ Alpine.store('theme', {
 
         const schemeMeta = document.querySelector('meta[name="color-scheme-preference"]');
         const schemeData = document.getElementById('current-theme-data');
-        this.colorScheme = (isAuth && isAuth.content === 'true')
+        const preferredScheme = (isAuth && isAuth.content === 'true')
             ? (schemeMeta ? schemeMeta.content : (schemeData?.dataset?.colorScheme || 'blue'))
             : (localStorage.getItem('color_scheme') || 'blue');
+        this.colorScheme = colorSchemes.includes(preferredScheme) ? preferredScheme : 'blue';
 
         this.apply();
         this.applyScheme();
         this._listenOS();
     },
 
-    /** Set and persist color scheme (blue, emerald, violet) */
+    /** Set and persist a supported color scheme. */
     setScheme(scheme) {
-        if (!['blue', 'emerald', 'violet'].includes(scheme)) return;
+        if (!colorSchemes.includes(scheme)) return;
         this.colorScheme = scheme;
         this.applyScheme();
         this._save();
@@ -114,6 +116,7 @@ Alpine.store('theme', {
         // Update color scheme swatch buttons
         document.querySelectorAll('.dropdown-scheme-btn, .mobile-scheme-btn').forEach(function(btn) {
             var isActive = btn.dataset.scheme === self.colorScheme;
+            btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
             btn.classList.remove('ring-2', 'ring-offset-2', 'ring-offset-gray-900', 'ring-primary-500', 'ring-white');
             if (isActive) {
                 btn.classList.add('ring-2', 'ring-offset-2', 'ring-offset-gray-900', 'ring-primary-500', 'dark:ring-offset-gray-950');

@@ -23,10 +23,11 @@
 @endphp
 
 <form method="GET" action="{{ route('search') }}" class="relative" id="{{ $formId }}" data-autocomplete-form>
-    <div class="flex items-center">
+    <div class="flex items-stretch rounded-xl shadow-sm">
         @if($categorySelect && !empty($categories))
             <select name="t"
-                    class="bg-gray-700 text-white {{ $sizeClasses }} rounded-l border-r border-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500">
+                    aria-label="Search category"
+                    class="min-h-11 border border-r-0 border-gray-300 bg-gray-50 text-gray-800 {{ $sizeClasses }} rounded-l-xl focus:outline-none focus:ring-2 focus:ring-primary-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white">
                 <option value="-1">All</option>
                 @foreach($categories as $category)
                     @php
@@ -60,20 +61,21 @@
                    data-autocomplete-input="{{ $inputId }}-dropdown"
                    data-autocomplete-form="{{ $formId }}"
                    class="w-full bg-white dark:bg-gray-700 text-gray-900 dark:text-white {{ $sizeClasses }}
-                          {{ $categorySelect ? '' : 'rounded-l' }}
-                          {{ $submitButton ? '' : 'rounded-r' }}
+                          {{ $categorySelect ? '' : 'rounded-l-xl' }}
+                          {{ $submitButton ? '' : 'rounded-r-xl' }}
                           border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500">
 
             <!-- Autocomplete Dropdown -->
             <div id="{{ $inputId }}-dropdown"
-                 class="hidden absolute z-50 w-full mt-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg max-h-60 overflow-y-auto">
+                 class="absolute z-50 mt-2 hidden max-h-60 w-full overflow-y-auto rounded-xl border border-gray-300 bg-white shadow-xl dark:border-gray-600 dark:bg-gray-800">
             </div>
         </div>
 
         @if($submitButton)
             <button type="submit"
-                    class="bg-primary-600 dark:bg-primary-700 hover:bg-primary-700 dark:hover:bg-primary-800 text-white {{ $sizeClasses }} rounded-r transition font-medium">
-                <i class="fas fa-search"></i>
+                    aria-label="Search releases"
+                    class="min-h-11 rounded-r-xl bg-primary-600 text-white {{ $sizeClasses }} font-semibold transition hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 dark:bg-primary-700 dark:hover:bg-primary-600">
+                <i class="fas fa-search" aria-hidden="true"></i>
                 <span class="sr-only">Search</span>
             </button>
         @endif

@@ -3,17 +3,11 @@
 @section('content')
 <div class="space-y-6">
     <x-admin.card>
-        <!-- Header -->
-        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-            <div class="flex justify-between items-center">
-                <h1 class="text-2xl font-semibold text-gray-800">
-                    <i class="fas fa-edit mr-2"></i>{{ $title ?? 'Binary Black/Whitelist Edit' }}
-                </h1>
-                <a href="{{ url('/admin/binaryblacklist-list') }}" class="px-4 py-2 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200">
-                    <i class="fas fa-arrow-left mr-2"></i>Back to List
-                </a>
-            </div>
-        </div>
+        <x-admin.page-header :title="$title ?? 'Binary Black/Whitelist Edit'" icon="fas fa-edit">
+            <x-slot:actions>
+                <x-admin.button :href="url('/admin/binaryblacklist-list')" tone="gray" icon="fas fa-arrow-left">Back to List</x-admin.button>
+            </x-slot:actions>
+        </x-admin.page-header>
 
         <!-- Form -->
         <form action="{{ url('/admin/binaryblacklist-edit?action=submit') }}" method="POST" id="blacklistForm" class="px-6 py-6">
@@ -182,4 +176,3 @@
 
 {{-- Scripts moved to resources/js/csp-safe.js --}}
 @endsection
-
