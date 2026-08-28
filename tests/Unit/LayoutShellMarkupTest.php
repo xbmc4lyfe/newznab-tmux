@@ -51,6 +51,15 @@ class LayoutShellMarkupTest extends TestCase
         $this->assertStringContainsString('aria-label="Dismiss notification"', $this->view('partials/toast-notifications.blade.php'));
     }
 
+    public function test_site_header_links_use_the_configurable_home_setting(): void
+    {
+        $homeLink = "url(\$site['home_link'] ?? '/')";
+
+        $this->assertStringContainsString($homeLink, $this->view('layouts/main.blade.php'));
+        $this->assertStringContainsString($homeLink, $this->view('layouts/admin.blade.php'));
+        $this->assertStringNotContainsString('href="{{ url(\'/\') }}"', $this->view('layouts/admin.blade.php'));
+    }
+
     private function view(string $path): string
     {
         return $this->resource("views/{$path}");
