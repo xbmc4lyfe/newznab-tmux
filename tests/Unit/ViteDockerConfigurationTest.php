@@ -33,6 +33,14 @@ class ViteDockerConfigurationTest extends TestCase
         $this->assertLessThan($supervisorPosition, $unlinkPosition);
     }
 
+    public function test_nginx_serves_laravel_public_storage_without_a_host_symlink(): void
+    {
+        $nginxConfig = $this->projectFile('docker/8.5/nginx.conf');
+
+        $this->assertStringContainsString('location ^~ /storage/', $nginxConfig);
+        $this->assertStringContainsString('alias /var/www/html/storage/app/public/;', $nginxConfig);
+    }
+
     private function projectFile(string $path): string
     {
         return (string) file_get_contents(__DIR__."/../../{$path}");

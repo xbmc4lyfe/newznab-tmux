@@ -60,6 +60,20 @@ class LayoutShellMarkupTest extends TestCase
         $this->assertStringNotContainsString('href="{{ url(\'/\') }}"', $this->view('layouts/admin.blade.php'));
     }
 
+    public function test_shared_branding_uses_the_configurable_logo_without_workspace_copy(): void
+    {
+        foreach (['main', 'admin'] as $layout) {
+            $this->assertStringContainsString('<x-site-logo :url="$siteLogoUrl ?? null"', $this->view("layouts/{$layout}.blade.php"));
+        }
+
+        $this->assertStringNotContainsString('Usenet workspace', $this->view('layouts/main.blade.php'));
+
+        $settingsForm = $this->view('admin/site/edit.blade.php').$this->view('admin/site/sections/main-settings.blade.php');
+        $this->assertStringContainsString('enctype="multipart/form-data"', $settingsForm);
+        $this->assertStringContainsString('name="site_logo"', $settingsForm);
+        $this->assertStringContainsString('name="remove_site_logo"', $settingsForm);
+    }
+
     public function test_desktop_header_search_uses_separated_fully_rounded_controls(): void
     {
         $markup = $this->view('partials/header-menu.blade.php');

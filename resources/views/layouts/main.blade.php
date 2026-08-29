@@ -42,12 +42,9 @@
                 <div class="layout-sidebar__brand flex items-center justify-between gap-3 p-4">
                     <a href="{{ url($site['home_link'] ?? '/') }}" class="flex min-w-0 items-center gap-3 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400">
                         <span class="layout-sidebar__logo flex h-11 w-11 shrink-0 items-center justify-center rounded-xl">
-                            <i class="fas fa-layer-group text-lg text-primary-300" aria-hidden="true"></i>
+                            <x-site-logo :url="$siteLogoUrl ?? null" />
                         </span>
-                        <span class="min-w-0">
-                            <span class="block truncate text-lg font-semibold">{{ config('app.name') }}</span>
-                            <span class="block text-xs font-medium text-white/55">Usenet workspace</span>
-                        </span>
+                        <span class="min-w-0 truncate text-lg font-semibold">{{ config('app.name') }}</span>
                     </a>
                     <button type="button" id="mobile-sidebar-close" class="touch-target inline-flex items-center justify-center rounded-xl text-white/70 hover:bg-white/10 hover:text-white md:hidden" aria-label="Close navigation">
                         <i class="fas fa-xmark" aria-hidden="true"></i>

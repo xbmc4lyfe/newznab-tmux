@@ -9,6 +9,7 @@ use App\Models\Category;
 use App\Models\Content;
 use App\Models\Settings;
 use App\Models\User;
+use App\Services\SiteLogoService;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -28,6 +29,8 @@ class GlobalDataComposer
      * @var array<string, mixed>|null
      */
     private static ?array $resolvedData = null;
+
+    public function __construct(private readonly SiteLogoService $siteLogoService) {}
 
     /**
      * Bind data to the view.
@@ -55,10 +58,12 @@ class GlobalDataComposer
                 ->map(fn ($value) => Settings::convertValue($value))
                 ->all();
         });
+        $siteLogoPath = is_array($siteArray) ? ($siteArray['site_logo'] ?? null) : null;
 
         $viewData = [
             'serverroot' => url('/'),
             'site' => $siteArray,
+            'siteLogoUrl' => $this->siteLogoService->url($siteLogoPath),
         ];
 
         // Cached useful links for sidebar

@@ -10,13 +10,23 @@ use App\Models\ReleaseStat;
 use App\Models\RoleStat;
 use App\Models\Settings;
 use App\Models\SignupStat;
+use App\Services\SiteLogoService;
 use App\Support\SizeUnit;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rules\File;
 use Illuminate\View\View;
+use Throwable;
 
 class AdminSiteController extends BasePageController
 {
+    public function __construct(private readonly SiteLogoService $siteLogoService)
+    {
+        parent::__construct();
+    }
+
     /**
      * @return RedirectResponse|View
      *
@@ -33,14 +43,56 @@ class AdminSiteController extends BasePageController
 
         switch ($action) {
             case 'submit':
-                $data = $request->all();
+                $request->validate([
+                    'site_logo' => [
+                        'nullable',
+                        File::image()
+                            ->types(['png', 'jpg', 'jpeg', 'webp'])
+                            ->max('2mb'),
+                    ],
+                    'remove_site_logo' => ['nullable', 'boolean'],
+                ]);
+
+                $data = $request->except(['site_logo', 'remove_site_logo']);
+                $currentLogo = Settings::settingValue('site_logo');
+                $currentLogoPath = is_string($currentLogo) ? $currentLogo : null;
+                $storedLogoPath = null;
+                $uploadedLogo = $request->file('site_logo');
+
+                if ($uploadedLogo instanceof UploadedFile) {
+                    $storedLogoPath = $this->siteLogoService->store($uploadedLogo);
+                    $data['site_logo'] = $storedLogoPath;
+                } elseif ($request->boolean('remove_site_logo')) {
+                    $data['site_logo'] = '';
+                }
 
                 foreach (SizeUnit::SITE_SIZE_SETTINGS as $sizeKey) {
                     $data[$sizeKey] = SizeUnit::toBytes($data[$sizeKey] ?? null, $data[$sizeKey.'_unit'] ?? 'MB');
                     unset($data[$sizeKey.'_unit']);
                 }
 
-                Settings::settingsUpdate($data);
+                try {
+                    DB::transaction(function () use ($data): void {
+                        if (array_key_exists('site_logo', $data)) {
+                            Settings::query()->updateOrCreate(
+                                ['name' => 'site_logo'],
+                                ['value' => $data['site_logo']],
+                            );
+                        }
+
+                        Settings::settingsUpdate($data);
+                    });
+                } catch (Throwable $throwable) {
+                    if ($storedLogoPath !== null) {
+                        $this->siteLogoService->delete($storedLogoPath);
+                    }
+
+                    throw $throwable;
+                }
+
+                if (array_key_exists('site_logo', $data) && $currentLogoPath !== $data['site_logo']) {
+                    $this->siteLogoService->delete($currentLogoPath);
+                }
 
                 return redirect()->to('admin/site-edit')->with('success', 'Settings updated successfully');
 

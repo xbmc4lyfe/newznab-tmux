@@ -384,6 +384,10 @@ class SettingsTableSeeder extends Seeder
                 'name' => 'home_link',
                 'value' => '/',
             ],
+            147 => [
+                'name' => 'site_logo',
+                'value' => '',
+            ],
             150 => [
                 'name' => 'metadescription',
                 'value' => 'A usenet indexing website',

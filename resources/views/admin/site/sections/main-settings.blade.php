@@ -3,6 +3,34 @@
                     <h2 class="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-4">Main Site Settings, HTML Layout, Tags</h2>
 
                     <div class="space-y-4">
+                        <div class="rounded-xl border border-gray-200 bg-gray-50 p-4 dark:border-gray-700 dark:bg-gray-900/30">
+                            <div class="flex flex-col gap-4 sm:flex-row sm:items-center">
+                                <div class="layout-sidebar__logo flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-2xl">
+                                    <x-site-logo :url="$siteLogoUrl ?? null" image-class="h-full w-full object-contain p-2" />
+                                </div>
+
+                                <div class="min-w-0 flex-1">
+                                    <label for="site_logo" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                                        <i class="fas fa-image mr-1" aria-hidden="true"></i>Site Logo
+                                    </label>
+                                    <input type="file" id="site_logo" name="site_logo" accept="image/png,image/jpeg,image/webp" aria-describedby="site_logo_help"
+                                           class="mt-2 block w-full cursor-pointer rounded-xl border border-gray-300 bg-white text-sm text-gray-700 file:mr-4 file:border-0 file:bg-primary-600 file:px-4 file:py-2.5 file:font-semibold file:text-white hover:file:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200">
+                                    <p id="site_logo_help" class="mt-2 text-sm text-gray-500 dark:text-gray-400">PNG, JPEG, or WebP. Maximum 2 MB. A new upload replaces the current logo.</p>
+
+                                    @error('site_logo')
+                                        <p class="mt-2 text-sm font-medium text-red-600 dark:text-red-400">{{ $message }}</p>
+                                    @enderror
+
+                                    @if($siteLogoUrl ?? null)
+                                        <label class="mt-3 inline-flex cursor-pointer items-center gap-2 text-sm font-medium text-gray-700 dark:text-gray-300">
+                                            <input type="checkbox" name="remove_site_logo" value="1" class="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500 dark:border-gray-600 dark:bg-gray-800">
+                                            Remove current logo
+                                        </label>
+                                    @endif
+                                </div>
+                            </div>
+                        </div>
+
                         <div>
                             <label for="strapline" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
                                 <i class="fas fa-quote-right mr-1"></i>Strapline

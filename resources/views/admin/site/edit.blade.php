@@ -16,7 +16,7 @@
         @endif
 
         <!-- Site Settings Form -->
-        <form method="post" action="{{ url('admin/site-edit') }}" class="p-6">
+        <form method="post" action="{{ url('admin/site-edit') }}" enctype="multipart/form-data" class="p-6">
             @csrf
             <input type="hidden" name="action" value="submit">
 

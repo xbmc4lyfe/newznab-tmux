@@ -6,6 +6,7 @@ namespace App\View\Composers;
 
 use App\Models\Settings;
 use App\Models\User;
+use App\Services\SiteLogoService;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -18,6 +19,8 @@ class AdminDataComposer
      */
     private const CACHE_TTL = 300;
 
+    public function __construct(private readonly SiteLogoService $siteLogoService) {}
+
     /**
      * Bind lightweight admin data to the view.
      */
@@ -25,15 +28,18 @@ class AdminDataComposer
     {
         $user = Auth::user();
         $isNntmuxUser = $user instanceof User;
+        $site = $this->rememberWithCacheFallback('site_settings_array', self::CACHE_TTL, function () {
+            return Settings::query()
+                ->pluck('value', 'name')
+                ->map(fn ($value) => Settings::convertValue($value))
+                ->all();
+        });
+        $siteLogoPath = is_array($site) ? ($site['site_logo'] ?? null) : null;
 
         $view->with([
             'serverroot' => url('/'),
-            'site' => $this->rememberWithCacheFallback('site_settings_array', self::CACHE_TTL, function () {
-                return Settings::query()
-                    ->pluck('value', 'name')
-                    ->map(fn ($value) => Settings::convertValue($value))
-                    ->all();
-            }),
+            'site' => $site,
+            'siteLogoUrl' => $this->siteLogoService->url($siteLogoPath),
             'userdata' => $user,
             'loggedin' => $user !== null,
             'isadmin' => $isNntmuxUser && $user->hasRole('Admin'),

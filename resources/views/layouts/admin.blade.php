@@ -36,7 +36,7 @@
             <div class="layout-sidebar__brand flex items-center justify-between gap-3 p-4">
                 <a href="{{ route('admin.index') }}" class="flex min-w-0 items-center gap-3 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400">
                     <span class="layout-sidebar__logo flex h-11 w-11 shrink-0 items-center justify-center rounded-xl">
-                        <i class="fas fa-sliders text-lg text-primary-300" aria-hidden="true"></i>
+                        <x-site-logo :url="$siteLogoUrl ?? null" fallback-icon="fas fa-sliders" />
                     </span>
                     <span class="min-w-0">
                         <span class="block truncate text-lg font-semibold">Admin Panel</span>

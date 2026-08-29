@@ -5,13 +5,17 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Http\Controllers\Admin\AdminSiteController;
+use App\Services\SiteLogoService;
 use App\View\Composers\GlobalDataComposer;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Request;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Validation\ValidationException;
 use Illuminate\View\View;
 use PDO;
 use ReflectionClass;
@@ -154,6 +158,94 @@ class AdminSiteControllerTest extends TestCase
         $this->assertSame(['MB', 'GB'], $response->getData()['sizeUnits']);
     }
 
+    public function test_submit_stores_uploaded_site_logo_and_updates_setting(): void
+    {
+        Storage::fake('public');
+        DB::table('settings')->where('name', 'site_logo')->delete();
+        $logo = UploadedFile::fake()->image('logo.png', 256, 256);
+        $request = Request::create('/admin/site-edit', 'POST', ['action' => 'submit'], [], ['site_logo' => $logo]);
+
+        app(AdminSiteController::class)->edit($request);
+
+        $logoPath = $this->settingValue('site_logo');
+
+        $this->assertNotNull($logoPath);
+        $this->assertStringStartsWith('site-logos/', $logoPath);
+        Storage::disk('public')->assertExists($logoPath);
+    }
+
+    public function test_site_logo_url_is_root_relative(): void
+    {
+        $this->assertSame(
+            '/storage/site-logos/hanzo.png',
+            app(SiteLogoService::class)->url('site-logos/hanzo.png'),
+        );
+    }
+
+    public function test_submit_replaces_and_removes_managed_site_logos(): void
+    {
+        Storage::fake('public');
+        $oldLogoPath = 'site-logos/old-logo.png';
+        Storage::disk('public')->put($oldLogoPath, 'old-logo');
+        DB::table('settings')->where('name', 'site_logo')->update(['value' => $oldLogoPath]);
+        $replacement = UploadedFile::fake()->image('replacement.png', 256, 256);
+        $replaceRequest = Request::create('/admin/site-edit', 'POST', ['action' => 'submit'], [], ['site_logo' => $replacement]);
+
+        app(AdminSiteController::class)->edit($replaceRequest);
+
+        $replacementPath = $this->settingValue('site_logo');
+        $this->assertNotNull($replacementPath);
+        $this->assertNotSame($oldLogoPath, $replacementPath);
+        Storage::disk('public')->assertMissing($oldLogoPath);
+        Storage::disk('public')->assertExists($replacementPath);
+
+        $removeRequest = Request::create('/admin/site-edit', 'POST', [
+            'action' => 'submit',
+            'remove_site_logo' => '1',
+        ]);
+
+        app(AdminSiteController::class)->edit($removeRequest);
+
+        $this->assertSame('', $this->settingValue('site_logo'));
+        Storage::disk('public')->assertMissing($replacementPath);
+    }
+
+    public function test_submit_rejects_unsupported_site_logo_files(): void
+    {
+        Storage::fake('public');
+        $logo = UploadedFile::fake()->create('logo.svg', 10, 'image/svg+xml');
+        $request = Request::create('/admin/site-edit', 'POST', ['action' => 'submit'], [], ['site_logo' => $logo]);
+
+        $this->expectException(ValidationException::class);
+
+        app(AdminSiteController::class)->edit($request);
+    }
+
+    public function test_submit_rejects_oversized_site_logo_files(): void
+    {
+        Storage::fake('public');
+        $logo = UploadedFile::fake()->image('large-logo.png')->size(2049);
+        $request = Request::create('/admin/site-edit', 'POST', ['action' => 'submit'], [], ['site_logo' => $logo]);
+
+        $this->expectException(ValidationException::class);
+
+        app(AdminSiteController::class)->edit($request);
+    }
+
+    public function test_submit_does_not_delete_files_outside_the_managed_logo_directory(): void
+    {
+        Storage::fake('public');
+        $unmanagedPath = 'covers/keep.png';
+        Storage::disk('public')->put($unmanagedPath, 'keep');
+        DB::table('settings')->where('name', 'site_logo')->update(['value' => $unmanagedPath]);
+        $replacement = UploadedFile::fake()->image('replacement.png');
+        $request = Request::create('/admin/site-edit', 'POST', ['action' => 'submit'], [], ['site_logo' => $replacement]);
+
+        app(AdminSiteController::class)->edit($request);
+
+        Storage::disk('public')->assertExists($unmanagedPath);
+    }
+
     private function settingValue(string $name): ?string
     {
         $value = DB::table('settings')->where('name', $name)->value('value');
@@ -190,6 +282,7 @@ class AdminSiteControllerTest extends TestCase
         DB::table('settings')->upsert([
             ['name' => 'title', 'value' => 'NNTmux Test'],
             ['name' => 'home_link', 'value' => '/'],
+            ['name' => 'site_logo', 'value' => ''],
             ['name' => 'categorizeforeign', 'value' => '0'],
             ['name' => 'catwebdl', 'value' => '0'],
             ['name' => 'minsizetoformrelease', 'value' => '0'],
