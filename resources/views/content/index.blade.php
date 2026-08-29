@@ -2,7 +2,7 @@
 
 @section('content')
 <div class="surface-panel rounded-xl shadow-sm">
-    <x-page-header :title="$front ? ($site['title'] ?? config('app.name')) : 'Content'" :eyebrow="$front ? 'Welcome' : 'Explore the site'" :description="$front ? 'Discover the latest site information and start exploring the index.' : 'Browse our published information and useful content pages.'" icon="fas fa-file-alt" />
+    <x-page-header :title="$front ? auth()->user()->username : 'Content'" :eyebrow="$front ? 'Welcome' : 'Explore the site'" :description="$front ? 'Discover the latest site information and start exploring the index.' : 'Browse our published information and useful content pages.'" icon="fas fa-file-alt" />
 
     @if($front)
         <!-- Front Page Content -->

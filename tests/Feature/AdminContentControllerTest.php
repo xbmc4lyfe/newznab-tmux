@@ -164,6 +164,31 @@ class AdminContentControllerTest extends TestCase
         $response->assertSee('Useful Content');
     }
 
+    public function test_homepage_hero_displays_the_authenticated_username_instead_of_the_site_name(): void
+    {
+        $user = $this->createUserWithRole('User');
+
+        $this->createContent([
+            'title' => 'Homepage Content',
+            'body' => '<p>Homepage body.</p>',
+            'contenttype' => Content::TYPE_INDEX,
+            'status' => Content::STATUS_ENABLED,
+            'role' => Content::ROLE_LOGGED_IN,
+        ]);
+
+        $response = $this->actingAs($user)->get(route('home'));
+
+        $response->assertOk();
+        $this->assertMatchesRegularExpression(
+            '/<h1[^>]*>'.preg_quote($user->username, '/').'<\/h1>/',
+            $response->getContent(),
+        );
+        $this->assertDoesNotMatchRegularExpression(
+            '/<h1[^>]*>NNTmux Test<\/h1>/',
+            $response->getContent(),
+        );
+    }
+
     public function test_create_form_marks_title_as_optional(): void
     {
         $admin = $this->createUserWithRole('Admin');
