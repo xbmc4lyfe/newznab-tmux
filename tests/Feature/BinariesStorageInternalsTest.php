@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Services\Binaries\BinariesConfig;
+use App\Services\Binaries\BinariesService;
 use App\Services\Binaries\BinaryHandler;
 use App\Services\Binaries\CollectionHandler;
 use App\Services\Binaries\HeaderParser;
@@ -11,8 +12,13 @@ use App\Services\Binaries\HeaderStorageTransaction;
 use App\Services\Binaries\PartHandler;
 use App\Services\BlacklistService;
 use App\Services\CollectionsCleaningService;
+use App\Services\NNTP\NNTPService;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Mockery;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
 
 class BinariesStorageInternalsTest extends TestCase
@@ -247,7 +253,7 @@ class BinariesStorageInternalsTest extends TestCase
         $this->assertSame(200, (int) $part->size);
     }
 
-    public function test_invalid_message_id_rolls_back_the_header_chunk(): void
+    public function test_invalid_message_id_is_rejected_before_creating_rows(): void
     {
         $this->createHeaderStorageTables();
         $service = new HeaderStorageService($this->deterministicCollectionHandler(), config: new BinariesConfig(sqlChunkSize: 10));
@@ -258,6 +264,196 @@ class BinariesStorageInternalsTest extends TestCase
         $this->assertSame(0, DB::table('collections')->count());
         $this->assertSame(0, DB::table('binaries')->count());
         $this->assertSame(0, DB::table('parts')->count());
+    }
+
+    /** @return iterable<string, array{bool, int, string}> */
+    public static function invalidHeaders(): iterable
+    {
+        foreach ([true, false] as $repairTracking) {
+            foreach ([
+                'empty message ID' => [1, ''],
+                'non-ASCII message ID' => [1, "<invalid\u{00E9}@example>"],
+                'oversize message ID' => [1, str_repeat('x', 256)],
+                'zero part number' => [0, '<valid@example>'],
+            ] as $name => [$partNumber, $messageId]) {
+                yield $name.' tracking='.(int) $repairTracking => [$repairTracking, $partNumber, $messageId];
+            }
+        }
+    }
+
+    #[DataProvider('invalidHeaders')]
+    public function test_invalid_headers_do_not_discard_valid_neighbours(bool $repairTracking, int $partNumber, string $messageId): void
+    {
+        $this->createHeaderStorageTables();
+        $service = new HeaderStorageService($this->deterministicCollectionHandler(), config: new BinariesConfig);
+        $invalid = $this->parsedHeader(912, $partNumber, 'Invalid.Release');
+        $invalid['Message-ID'] = $messageId;
+
+        $failed = $service->store([
+            $this->parsedHeader(911, 1, 'Valid.Release'),
+            $invalid,
+            $this->parsedHeader(913, 2, 'Valid.Release'),
+        ], ['id' => 1, 'name' => 'alt.test'], $repairTracking);
+
+        $this->assertSame([912], $failed);
+        $this->assertSame([911, 913], DB::table('parts')->orderBy('number')->pluck('number')->all());
+        $this->assertSame(1, DB::table('collections')->count());
+        $this->assertSame(1, DB::table('binaries')->count());
+        $this->assertSame(2, (int) DB::table('binaries')->value('currentparts'));
+        $this->assertSame(200, (int) DB::table('collections')->value('filesize'));
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function repairModes(): iterable
+    {
+        yield 'update' => [true];
+        yield 'repair or backfill' => [false];
+    }
+
+    #[DataProvider('repairModes')]
+    public function test_database_rollback_reports_every_article_and_logs_without_debug(bool $repairTracking): void
+    {
+        $this->createHeaderStorageTables();
+        DB::statement("CREATE TRIGGER reject_parts BEFORE INSERT ON parts BEGIN SELECT RAISE(ABORT, 'test storage failure'); END");
+        config(['app.debug' => false]);
+        Log::spy();
+        $service = new HeaderStorageService($this->deterministicCollectionHandler(), config: new BinariesConfig);
+
+        $failed = $service->store([
+            $this->parsedHeader(914, 1),
+            $this->parsedHeader(915, 2),
+        ], ['id' => 1, 'name' => 'alt.test'], $repairTracking);
+
+        $this->assertSame([914, 915], $failed);
+        $this->assertSame(0, DB::table('parts')->count());
+        $this->assertSame(0, DB::table('binaries')->count());
+        $this->assertSame(0, DB::table('collections')->count());
+        $this->assertSame(0, DB::transactionLevel());
+        Log::shouldHaveReceived('error')->once()->with('Binary header storage chunk rolled back', Mockery::on(
+            static fn (array $context): bool => $context['groups_id'] === 1
+                && $context['article_count'] === 2
+                && $context['attempts'] === 1
+                && ! str_contains(json_encode($context), 'INSERT')
+                && ! str_contains(json_encode($context), 'Example.Release')
+        ));
+    }
+
+    public function test_part_repair_retains_rolled_back_articles_until_successful_retry(): void
+    {
+        $this->createHeaderStorageTables();
+        $this->createMissedPartsTable();
+        DB::table('missed_parts')->insert([
+            ['numberid' => 1001, 'groups_id' => 1],
+            ['numberid' => 1002, 'groups_id' => 1],
+            ['numberid' => 1001, 'groups_id' => 2],
+        ]);
+        DB::statement("CREATE TRIGGER reject_parts BEFORE INSERT ON parts BEGIN SELECT RAISE(ABORT, 'test storage failure'); END");
+        $headers = [$this->rawHeader(1001, 'Repair.Release (1/2)'), $this->rawHeader(1002, 'Repair.Release (2/2)')];
+        $service = $this->scanService($headers, 2);
+
+        $service->scan(['id' => 1, 'name' => 'alt.test'], 1001, 1002, 'partrepair', [1001, 1002]);
+
+        $this->assertSame(0, DB::table('parts')->count());
+        $this->assertSame([1001, 1002], DB::table('missed_parts')->where('groups_id', 1)->orderBy('numberid')->pluck('numberid')->all());
+
+        DB::statement('DROP TRIGGER reject_parts');
+        $service->scan(['id' => 1, 'name' => 'alt.test'], 1001, 1002, 'partrepair', [1001, 1002]);
+
+        $this->assertSame(2, DB::table('parts')->count());
+        $this->assertSame(0, DB::table('missed_parts')->where('groups_id', 1)->count());
+        $this->assertSame(1, DB::table('missed_parts')->where('groups_id', 2)->count());
+    }
+
+    /** @return iterable<string, array{int}> */
+    public static function lockFailures(): iterable
+    {
+        yield 'eventual success' => [1];
+        yield 'retry limit exhausted' => [5];
+    }
+
+    #[DataProvider('lockFailures')]
+    public function test_transient_database_failures_retry_without_losing_failure_accounting(int $failures): void
+    {
+        $this->createHeaderStorageTables();
+        config(['app.debug' => false]);
+        Log::spy();
+        $attempts = 0;
+        DB::listen(static function (QueryExecuted $query) use (&$attempts, $failures): void {
+            if (str_starts_with($query->sql, 'insert or ignore into "collections"') && ++$attempts <= $failures) {
+                throw new QueryException('sqlite', $query->sql, $query->bindings, new \PDOException('database is locked'));
+            }
+        });
+        $service = new HeaderStorageService($this->deterministicCollectionHandler(), config: new BinariesConfig);
+        $invalid = $this->parsedHeader(1200, 0);
+
+        $failed = $service->store([$invalid, $this->parsedHeader(1201, 1)], ['id' => 1, 'name' => 'alt.test'], false);
+
+        $this->assertSame(min($failures + 1, 5), $attempts);
+        $this->assertSame($failures === 1 ? [1200] : [1200, 1201], $failed);
+        $this->assertSame($failures === 1 ? 1 : 0, DB::table('parts')->count());
+        $this->assertSame(0, DB::transactionLevel());
+        if ($failures === 1) {
+            Log::shouldNotHaveReceived('error');
+        } else {
+            Log::shouldHaveReceived('error')->once()->with('Binary header storage chunk rolled back', Mockery::on(
+                static fn (array $context): bool => $context['attempts'] === 5 && $context['reason'] === 'Lock retries exhausted'
+            ));
+        }
+    }
+
+    public function test_part_repair_retires_filtered_articles_but_keeps_invalid_and_missing_articles(): void
+    {
+        $this->createHeaderStorageTables();
+        $this->createMissedPartsTable();
+        foreach (range(1101, 1105) as $number) {
+            DB::table('missed_parts')->insert(['numberid' => $number, 'groups_id' => 1]);
+        }
+        $invalid = $this->rawHeader(1104, 'Invalid.Release (1/2)');
+        $invalid['Message-ID'] = '';
+        $service = $this->scanService([
+            $this->rawHeader(1101, 'Valid.Release (1/2)'),
+            $this->rawHeader(1102, 'Text post'),
+            $this->rawHeader(1103, 'Blacklisted.Release (1/2)'),
+            $invalid,
+        ]);
+
+        $service->scan(['id' => 1, 'name' => 'alt.test'], 1101, 1105, 'partrepair', range(1101, 1105));
+
+        $this->assertSame([1101], DB::table('parts')->pluck('number')->all());
+        $this->assertSame([1104, 1105], DB::table('missed_parts')->orderBy('numberid')->pluck('numberid')->all());
+    }
+
+    /** @param list<array<string, mixed>> $headers */
+    private function scanService(array $headers, int $calls = 1): BinariesService
+    {
+        $nntp = Mockery::mock(NNTPService::class);
+        $nntp->shouldReceive('getOverview')->times($calls)->andReturn($headers);
+        $parser = new HeaderParser(new class extends BlacklistService
+        {
+            public function isBlackListed(array $msg, string $groupName): bool
+            {
+                return str_contains($msg['Subject'], 'Blacklisted.Release');
+            }
+        });
+        $config = new BinariesConfig(headerChunkSize: 2, sqlChunkSize: 2);
+
+        return new BinariesService(
+            $config,
+            $parser,
+            new HeaderStorageService($this->deterministicCollectionHandler(), config: $config),
+            nntp: $nntp,
+        );
+    }
+
+    private function createMissedPartsTable(): void
+    {
+        DB::statement('CREATE TABLE missed_parts (
+            id INTEGER PRIMARY KEY,
+            numberid INT,
+            groups_id INT,
+            attempts INT DEFAULT 0,
+            UNIQUE(numberid, groups_id)
+        )');
     }
 
     public function test_zero_file_number_uses_subject_and_poster_identity(): void

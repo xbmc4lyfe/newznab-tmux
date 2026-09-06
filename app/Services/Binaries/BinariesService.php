@@ -329,7 +329,12 @@ class BinariesService
                         $this->headerStorage->store($parseResult['headers'], $groupMySQL, $addToPartRepair)
                     );
                 } catch (\Throwable $e) {
-                    $this->logError('storeHeaders failed: '.$e->getMessage());
+                    Log::error('Binary header storage failed', [
+                        'groups_id' => $groupMySQL['id'],
+                        'article_count' => \count($parseResult['headers']),
+                        'exception' => $e::class,
+                        'code' => $e->getCode(),
+                    ]);
                     foreach ($parseResult['headers'] as $failedHeader) {
                         if (isset($failedHeader['Number'])) {
                             $headersNotInserted[] = $failedHeader['Number'];
@@ -351,7 +356,10 @@ class BinariesService
 
         // Handle repaired parts
         if ($partRepair && $repairedNumbers !== []) {
-            $this->missedPartHandler->removeRepairedParts(array_keys($repairedNumbers), $groupMySQL['id']);
+            $this->missedPartHandler->removeRepairedParts(
+                array_values(array_diff(array_keys($repairedNumbers), $headersNotInserted)),
+                $groupMySQL['id']
+            );
         }
 
         // Handle part repair tracking

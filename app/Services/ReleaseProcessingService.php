@@ -437,23 +437,16 @@ final class ReleaseProcessingService
             $query = Collection::query()
                 ->where('id', '>', $lastId)
                 ->where(function ($query) use ($statuses): void {
-                    $query->where('filecheck', CollectionFileCheckStatus::CompleteParts->value);
-                    if (Schema::hasColumn('collections', 'last_seen_at')) {
-                        $query->orWhere(function ($stale) use ($statuses): void {
+                    $query->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
+                        ->orWhere(function ($stale) use ($statuses): void {
                             $stale->whereIn('filecheck', array_values(array_diff(
                                 $statuses,
                                 [CollectionFileCheckStatus::CompleteParts->value]
                             )))->whereRaw(
-                                'COALESCE(last_seen_at, dateadded, added) < ?',
+                                'COALESCE(dateadded, added) < ?',
                                 [now()->subHours($this->settings->collectionDelayTime)]
                             );
                         });
-                    } else {
-                        $query->orWhereIn('filecheck', array_values(array_diff(
-                            $statuses,
-                            [CollectionFileCheckStatus::CompleteParts->value]
-                        )));
-                    }
                 })
                 ->when($groupId !== null, static fn ($q) => $q->where('groups_id', $groupId))
                 ->orderBy('id')
@@ -507,22 +500,22 @@ final class ReleaseProcessingService
                  ) a ON a.collections_id = c.id
                  SET c.filesize = COALESCE(a.filesize, 0),
                      c.totalfiles = CASE
-                        WHEN c.dateadded < DATE_SUB(NOW(), INTERVAL ? HOUR)
+                        WHEN COALESCE(c.dateadded, c.added) < ?
                          AND c.filecheck IN (0, 1, 10)
                         THEN COALESCE(a.currentfiles, 0) ELSE c.totalfiles END,
                      c.filecheck = CASE
                         WHEN c.totalfiles > 0
                          AND COALESCE(a.currentfiles, 0) IN (c.totalfiles, c.totalfiles + 1)
                          AND COALESCE(a.completefiles, 0) >= c.totalfiles THEN ?
-                        WHEN c.dateadded < DATE_SUB(NOW(), INTERVAL ? HOUR)
+                        WHEN COALESCE(c.dateadded, c.added) < ?
                          AND c.filecheck IN (0, 1, 10) THEN ?
                         ELSE c.filecheck END
                  WHERE c.id IN ({$idPlaceholders}) AND c.filecheck IN ({$statusPlaceholders})",
                 [
                     ...$collectionIds,
-                    $this->settings->collectionDelayTime,
+                    now()->subHours($this->settings->collectionDelayTime),
                     CollectionFileCheckStatus::CompleteParts->value,
-                    $this->settings->collectionDelayTime,
+                    now()->subHours($this->settings->collectionDelayTime),
                     CollectionFileCheckStatus::CompleteParts->value,
                     ...$collectionIds,
                     ...$statuses,
@@ -562,7 +555,9 @@ final class ReleaseProcessingService
                      FROM binaries WHERE collections_id = ?',
                     [$collectionId]
                 );
-                $stale = strtotime((string) $collection->dateadded) < now()->subHours($this->settings->collectionDelayTime)->timestamp
+                $createdAt = $collection->dateadded ?? $collection->added;
+                $stale = $createdAt !== null
+                    && strtotime((string) $createdAt) < now()->subHours($this->settings->collectionDelayTime)->timestamp
                     && \in_array((int) $collection->filecheck, [0, 1, 10], true);
                 $totalFiles = $stale ? (int) $aggregate->currentfiles : (int) $collection->totalfiles;
                 $ready = $totalFiles > 0

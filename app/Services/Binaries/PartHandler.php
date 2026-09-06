@@ -69,7 +69,7 @@ final class PartHandler
     {
         $partNumber = (int) ($header['matches'][2] ?? 0);
         $messageId = trim((string) ($header['Message-ID'] ?? ''));
-        if ($partNumber <= 0 || $messageId === '' || strlen($messageId) > 255 || preg_match('/^[\x20-\x7E]+$/D', $messageId) !== 1) {
+        if (self::validationError($header) !== null) {
             if (isset($header['Number'])) {
                 $this->failedPartNumbers[] = $header['Number'];
             }
@@ -91,6 +91,21 @@ final class PartHandler
         }
 
         return true;
+    }
+
+    /** @param array<string, mixed> $header */
+    public static function validationError(array $header): ?string
+    {
+        if ((int) ($header['matches'][2] ?? 0) <= 0) {
+            return 'Invalid part number';
+        }
+
+        $messageId = trim((string) ($header['Message-ID'] ?? ''));
+        if ($messageId === '' || strlen($messageId) > 255 || preg_match('/^[\x20-\x7E]+$/D', $messageId) !== 1) {
+            return 'Invalid message ID';
+        }
+
+        return null;
     }
 
     /**

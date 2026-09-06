@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Binaries;
 
 use App\Support\SqlError;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Orchestrates the header storage process.
@@ -49,7 +50,7 @@ final class HeaderStorageService
      *
      * @param  array<int, array<string, mixed>>  $headers  Parsed headers with 'matches' already populated
      * @param  array<string, mixed>  $groupMySQL  Group info from database
-     * @param  bool  $addToPartRepair  Whether to track failed inserts
+     * @param  bool  $addToPartRepair  Caller repair mode; failures are returned in every mode
      * @return array<int, int|string> Article numbers that failed to insert
      */
     public function store(array $headers, array $groupMySQL, bool $addToPartRepair = true): array
@@ -69,7 +70,31 @@ final class HeaderStorageService
         $total = \count($headers);
         for ($offset = 0; $offset < $total; $offset += $chunkSize) {
             $chunk = \array_slice($headers, $offset, $chunkSize);
-            $this->storeChunk($chunk, $groupMySQL, $addToPartRepair);
+            $validHeaders = [];
+            $rejections = [];
+            foreach ($chunk as $header) {
+                $reason = PartHandler::validationError($header);
+                if ($reason === null) {
+                    $validHeaders[] = $header;
+
+                    continue;
+                }
+
+                $rejections[$reason] = ($rejections[$reason] ?? 0) + 1;
+                if (isset($header['Number'])) {
+                    $this->failedInserts[] = $header['Number'];
+                }
+            }
+            if ($rejections !== []) {
+                Log::warning('Invalid binary headers rejected', [
+                    'groups_id' => $groupMySQL['id'],
+                    'article_count' => array_sum($rejections),
+                    'reasons' => $rejections,
+                ]);
+            }
+            if ($validHeaders !== []) {
+                $this->storeChunk($validHeaders, $groupMySQL, $addToPartRepair);
+            }
             unset($chunk);
         }
 
@@ -93,6 +118,16 @@ final class HeaderStorageService
 
             $attempt++;
             if ($attempt >= self::LOCK_RETRY_MAX || ! $this->isTransientLockError($this->lastStorageException)) {
+                Log::error('Binary header storage chunk rolled back', [
+                    'groups_id' => $groupMySQL['id'],
+                    'article_count' => \count($headers),
+                    'attempts' => $attempt,
+                    'reason' => $this->isTransientLockError($this->lastStorageException)
+                        ? 'Lock retries exhausted' : 'Storage failed',
+                    'exception' => $this->lastStorageException !== null ? $this->lastStorageException::class : null,
+                    'code' => $this->lastStorageException?->getCode(),
+                ]);
+
                 return;
             }
 
@@ -128,44 +163,48 @@ final class HeaderStorageService
 
         $transaction->begin();
 
-        $this->processHeaderChunk($headers, $groupMySQL, $transaction, $addToPartRepair);
+        try {
+            $this->processHeaderChunk($headers, $groupMySQL, $transaction);
 
-        // Flush remaining parts
-        if ($this->partHandler->hasPending()) {
-            if (! $this->partHandler->flush()) {
-                $transaction->markError();
+            // Flush remaining parts
+            if ($this->partHandler->hasPending()) {
+                if (! $this->partHandler->flush()) {
+                    $transaction->markError();
+                }
             }
-        }
 
-        // Flush binary aggregate updates
-        if (! $transaction->hasErrors()) {
-            if (! $this->binaryHandler->refreshAggregates(
-                $this->partHandler->getTouchedBinaryIds(),
-                $this->config->sqlChunkSize
-            )) {
-                $transaction->markError();
+            // Flush binary aggregate updates
+            if (! $transaction->hasErrors()) {
+                if (! $this->binaryHandler->refreshAggregates(
+                    $this->partHandler->getTouchedBinaryIds(),
+                    $this->config->sqlChunkSize
+                )) {
+                    $transaction->markError();
+                }
+                if (! $transaction->hasErrors() && ! $this->collectionHandler->refreshAggregates(
+                    $this->collectionHandler->getAllIds(),
+                    $this->config->sqlChunkSize
+                )) {
+                    $transaction->markError();
+                }
             }
-            if (! $transaction->hasErrors() && ! $this->collectionHandler->refreshAggregates(
-                $this->collectionHandler->getAllIds(),
-                $this->config->sqlChunkSize
-            )) {
-                $transaction->markError();
-            }
+
+        } catch (\Throwable $e) {
+            $this->lastStorageException = $e;
+            $transaction->markError();
         }
 
         // Finish transaction
         if (! $transaction->finish()) {
-            $this->lastStorageException = $transaction->getLastException()
+            $this->lastStorageException ??= $transaction->getLastException()
                 ?? $this->partHandler->getLastException()
                 ?? $this->binaryHandler->getLastException()
                 ?? $this->collectionHandler->getLastException();
-            if ($addToPartRepair) {
-                $this->failedInserts = array_merge(
-                    $this->failedInserts,
-                    $chunkNumbers,
-                    $this->partHandler->getFailedNumbers()
-                );
-            }
+            $this->failedInserts = array_merge(
+                $this->failedInserts,
+                $chunkNumbers,
+                $this->partHandler->getFailedNumbers()
+            );
 
             return false;
         }
@@ -187,7 +226,7 @@ final class HeaderStorageService
      * @param  array<int, array<string, mixed>>  $headers
      * @param  array<string, mixed>  $groupMySQL
      */
-    private function processHeaderChunk(array $headers, array $groupMySQL, HeaderStorageTransaction $transaction, bool $addToPartRepair): void
+    private function processHeaderChunk(array $headers, array $groupMySQL, HeaderStorageTransaction $transaction): void
     {
         $totalFilesByIndex = [];
         $fileNumbersByIndex = [];
@@ -209,7 +248,7 @@ final class HeaderStorageService
         $binaryRecords = [];
         foreach ($headers as $index => $header) {
             if (! isset($collectionIds[$index])) {
-                $this->markHeaderFailed($header, $transaction, $addToPartRepair);
+                $this->markHeaderFailed($header, $transaction);
 
                 continue;
             }
@@ -226,13 +265,13 @@ final class HeaderStorageService
         foreach ($binaryRecords as $index => $record) {
             $header = $record['header'];
             if (! isset($binaryIds[$index])) {
-                $this->markHeaderFailed($header, $transaction, $addToPartRepair);
+                $this->markHeaderFailed($header, $transaction);
 
                 continue;
             }
 
             if (! $this->partHandler->addPart($binaryIds[$index], $header)) {
-                $this->markHeaderFailed($header, $transaction, $addToPartRepair);
+                $this->markHeaderFailed($header, $transaction);
             }
         }
     }
@@ -249,10 +288,10 @@ final class HeaderStorageService
     }
 
     /** @param  array<string, mixed>  $header */
-    private function markHeaderFailed(array $header, HeaderStorageTransaction $transaction, bool $addToPartRepair): void
+    private function markHeaderFailed(array $header, HeaderStorageTransaction $transaction): void
     {
         $transaction->markError();
-        if ($addToPartRepair && isset($header['Number']) && (\is_int($header['Number']) || \is_string($header['Number']))) {
+        if (isset($header['Number']) && (\is_int($header['Number']) || \is_string($header['Number']))) {
             $this->failedInserts[] = $header['Number'];
         }
     }
