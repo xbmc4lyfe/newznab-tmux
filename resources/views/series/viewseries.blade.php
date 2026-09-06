@@ -201,27 +201,12 @@
                 <form id="nzb_multi_operations_form" method="get" x-data="releaseMultiOps">
                 <div class="series-episodes-card bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-sm">
                     <div class="px-4 py-3 bg-gray-50 dark:bg-gray-700 border-b border-gray-200 dark:border-gray-600">
-                        <div class="flex items-center justify-between">
+                        <div class="flex flex-wrap items-center justify-between gap-3">
                             <h5 class="text-lg font-semibold text-gray-800 dark:text-white">
                                 <i class="fa fa-list mr-2 text-blue-600 dark:text-blue-400"></i>
                                 Episodes & Releases
                             </h5>
-                            <div class="flex flex-wrap items-center gap-2">
-                                <small class="text-gray-600 dark:text-gray-400">With Selected:</small>
-                                <div class="flex gap-1">
-                                    <button type="button" class="nzb_multi_operations_download px-3 py-1 bg-green-600 dark:bg-green-700 text-white rounded hover:bg-green-700 dark:hover:bg-green-800 transition text-sm" title="Download NZBs">
-                                        <i class="fa fa-cloud-download"></i>
-                                    </button>
-                                    <button type="button" class="nzb_multi_operations_cart px-3 py-1 bg-blue-600 dark:bg-blue-700 text-white rounded hover:bg-blue-700 dark:hover:bg-blue-800 transition text-sm" title="Send to Download Basket">
-                                        <i class="fa fa-shopping-basket"></i>
-                                    </button>
-                                    @if(auth()->check() && auth()->user()->hasRole('Admin'))
-                                        <button type="button" class="nzb_multi_operations_delete px-3 py-1 bg-red-600 dark:bg-red-700 text-white rounded hover:bg-red-700 dark:hover:bg-red-800 transition text-sm" title="Delete">
-                                            <i class="fa fa-trash"></i>
-                                        </button>
-                                    @endif
-                                </div>
-                            </div>
+                            <x-release-bulk-actions />
                         </div>
                     </div>
 

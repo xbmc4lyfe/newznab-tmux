@@ -5,7 +5,7 @@
 @endpush
 
 @section('content')
-<div class="release-detail-page surface-panel rounded-xl shadow-sm p-6">
+<div class="release-detail-page surface-panel rounded-xl shadow-sm p-4 sm:p-6">
     <x-page-header title="Release details" :current="$release->searchname" eyebrow="Inspect this release" description="Review metadata, previews, files, reports, and download options for this indexed release." icon="fas fa-circle-info" class="mb-6">
         <x-slot:stats>
             <span class="workspace-hero__stat"><i class="fas fa-folder-open" aria-hidden="true"></i>{{ $release->category_name ?? 'Release' }}</span>
@@ -15,7 +15,7 @@
 
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <!-- Main Content -->
-        <div class="lg:col-span-2 space-y-6">
+        <div class="min-w-0 lg:col-span-2 space-y-6">
             @include('details.partials.cover-actions')
 
             @include('details.partials.preview-images')

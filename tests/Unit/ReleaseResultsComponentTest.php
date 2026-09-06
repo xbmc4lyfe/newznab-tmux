@@ -2,6 +2,12 @@
 
 namespace Tests\Unit;
 
+use Illuminate\Auth\GenericUser;
+use Illuminate\Container\Container;
+use Illuminate\Contracts\Auth\Factory;
+use Illuminate\Contracts\Auth\Guard;
+use Illuminate\Filesystem\Filesystem;
+use Illuminate\View\Compilers\BladeCompiler;
 use PHPUnit\Framework\TestCase;
 
 class ReleaseResultsComponentTest extends TestCase
@@ -24,17 +30,61 @@ class ReleaseResultsComponentTest extends TestCase
         $panel = (string) file_get_contents(__DIR__.'/../../resources/views/components/release-results-panel.blade.php');
 
         $this->assertStringContainsString('nzb_multi_operations_form', $panel);
-        $this->assertStringContainsString('nzb_multi_operations_download', $panel);
-        $this->assertStringContainsString('nzb_multi_operations_cart', $panel);
-        $this->assertStringContainsString('nzb_multi_operations_delete', $panel);
+        $this->assertStringContainsString('<x-release-bulk-actions />', $panel);
         $this->assertStringContainsString('$beforeActions', $panel);
         $this->assertStringContainsString('$toolbarRight', $panel);
         $this->assertStringContainsString('$summary', $panel);
     }
 
+    public function test_bulk_actions_render_named_controls_and_only_offer_delete_to_admins(): void
+    {
+        $originalContainer = Container::getInstance();
+        $compiler = new BladeCompiler(new Filesystem, sys_get_temp_dir());
+        $compiled = $compiler->compileString((string) file_get_contents(__DIR__.'/../../resources/views/components/release-bulk-actions.blade.php'));
+
+        try {
+            foreach (['guest', 'member', 'admin'] as $role) {
+                $container = new Container;
+                Container::setInstance($container);
+                $guard = $this->createMock(Guard::class);
+                $guard->method('check')->willReturn($role !== 'guest');
+                $user = new class(['role' => $role === 'admin' ? 'Admin' : 'User']) extends GenericUser
+                {
+                    public function hasRole(string $role): bool
+                    {
+                        return $this->role === $role;
+                    }
+                };
+                $guard->method('user')->willReturn($user);
+                $container->instance(Factory::class, $guard);
+
+                ob_start();
+                try {
+                    eval('?>'.$compiled);
+                    $html = (string) ob_get_contents();
+                } finally {
+                    ob_end_clean();
+                }
+
+                $this->assertStringContainsString('nzb_multi_operations_download', $html);
+                $this->assertStringContainsString('<span>Download</span>', $html);
+                $this->assertStringContainsString('nzb_multi_operations_cart', $html);
+                $this->assertStringContainsString('<span>Add to basket</span>', $html);
+                $this->assertSame($role === 'admin', str_contains($html, 'nzb_multi_operations_delete'));
+                $this->assertStringNotContainsString('type="submit"', $html);
+            }
+        } finally {
+            Container::setInstance($originalContainer);
+        }
+    }
+
     public function test_shared_release_results_component_keeps_expected_release_actions(): void
     {
         $component = (string) file_get_contents(__DIR__.'/../../resources/views/components/release-results.blade.php');
+        $this->assertSame(2, substr_count($component, '<x-release-row-actions'));
+        $this->assertSame(2, substr_count($component, '<x-release-badges'));
+        $component .= file_get_contents(__DIR__.'/../../resources/views/components/release-row-actions.blade.php');
+        $component .= file_get_contents(__DIR__.'/../../resources/views/components/release-badges.blade.php');
 
         $this->assertStringContainsString('download-nzb', $component);
         $this->assertStringContainsString('add-to-cart', $component);

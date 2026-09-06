@@ -735,6 +735,139 @@ dialog.app-modal::backdrop {
     z-index: 1;
 }
 
+.release-bulk-actions__button {
+    @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors;
+}
+
+.release-bulk-actions__button:focus-visible {
+    outline: 2px solid var(--color-primary-500);
+    outline-offset: 3px;
+}
+
+.release-results-toolbar__filters {
+    flex: 0 1 36rem;
+}
+
+.release-results-toolbar__filters .inline-search-widget {
+    flex: 1 1 14rem;
+    width: auto;
+}
+
+.release-results-table {
+    min-width: 64rem;
+}
+
+.release-result-name {
+    min-width: 18rem;
+}
+
+.release-result-title {
+    display: block;
+    overflow-wrap: anywhere;
+    font-weight: 600;
+    line-height: 1.6;
+}
+
+.release-result-source,
+.release-result-metadata {
+    overflow-wrap: anywhere;
+}
+
+.release-badges:has(> *) {
+    margin-top: 0.5rem;
+}
+
+.release-badges:not(:has(> *)) {
+    display: none;
+}
+
+.release-badges > button,
+.release-badges > a {
+    min-height: 2rem;
+}
+
+.release-row-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 1rem;
+}
+
+.release-row-actions > a,
+.release-row-actions > button {
+    @apply inline-flex min-h-11 min-w-11 items-center justify-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium transition-colors;
+    border-color: var(--border-default);
+    background-color: var(--surface-card);
+    color: rgb(55 65 81);
+}
+
+.dark .release-row-actions > a,
+.dark .release-row-actions > button {
+    border-color: var(--border-default-dark);
+    background-color: var(--surface-card-dark);
+    color: rgb(209 213 219);
+}
+
+.release-row-actions > a.release-row-actions__download {
+    background-color: var(--color-green-700);
+    border-color: transparent;
+    color: white;
+}
+
+.release-row-actions > :is(a, button):hover {
+    border-color: var(--color-primary-500);
+    color: var(--color-primary-600);
+}
+
+.dark .release-row-actions > :is(a, button):hover {
+    color: var(--color-primary-300);
+}
+
+.release-row-actions > a.release-row-actions__download:hover {
+    background-color: var(--color-green-800);
+    border-color: transparent;
+    color: white;
+}
+
+.release-row-actions--compact {
+    flex-wrap: nowrap;
+    margin-top: 0;
+}
+
+.release-row-actions--compact > a,
+.release-row-actions--compact > button {
+    padding: 0.5rem;
+}
+
+.release-row-actions--compact .report-label {
+    @apply sr-only;
+}
+
+.release-row-actions--compact .report-trigger i {
+    margin: 0;
+}
+
+.release-result-card:has(.chkRelease:checked) {
+    border-color: var(--color-primary-500);
+    box-shadow: inset 3px 0 var(--color-primary-500);
+}
+
+.release-result-row:has(.chkRelease:checked) > td:first-child {
+    box-shadow: inset 3px 0 var(--color-primary-500);
+}
+
+.release-row-actions > :focus-visible,
+.release-badges > :focus-visible {
+    outline: 2px solid var(--color-primary-500);
+    outline-offset: 3px;
+}
+
+.release-detail-actions > a,
+.release-detail-actions > button {
+    min-height: 2.75rem;
+}
+
 .workspace-page-header::after {
     position: absolute;
     z-index: -1;

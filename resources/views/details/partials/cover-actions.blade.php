@@ -1,18 +1,18 @@
             <!-- Cover Image and Title -->
             <div class="border-b border-gray-200 dark:border-gray-700 pb-4">
-                <div class="flex gap-4 mb-4">
+                <div class="flex flex-col gap-5 mb-4 sm:flex-row">
                     <!-- Cover Image -->
                     <div class="shrink-0">
                         <img src="{{ getReleaseCover($release) }}"
                              alt="{{ $release->searchname }}"
-                             class="detail-cover-image w-48 h-72 object-cover max-w-[192px] max-h-[288px]"
+                             class="detail-cover-image w-32 h-48 object-cover sm:w-40 sm:h-60"
                              data-fallback-src="{{ asset('assets/images/no-cover.png') }}">
                     </div>
 
                     <!-- Title and Actions -->
-                    <div class="flex-1">
+                    <div class="min-w-0 flex-1">
                         <div class="mb-3">
-                            <h2 class="text-xl font-bold text-gray-800 dark:text-gray-200 mb-2 wrap-break-word break-all">{{ $release->searchname }}</h2>
+                            <h2 class="release-result-title text-xl text-gray-800 dark:text-gray-200 mb-2">{{ $release->searchname }}</h2>
                             <div class="flex flex-wrap gap-2">
                                 @if(!empty($totalReportCount) && $totalReportCount > 0)
                                     <div class="inline-flex items-center px-3 py-1.5 rounded-lg text-sm font-medium bg-orange-100 dark:bg-orange-900 text-orange-800 dark:text-orange-200 border border-orange-200 dark:border-orange-800"
@@ -29,7 +29,7 @@
                                 @endif
                             </div>
                         </div>
-                        <div class="flex flex-wrap gap-2">
+                        <div class="release-detail-actions flex flex-wrap gap-2">
                             <a href="{{ url('/getnzb/' . $release->guid) }}" class="download-nzb release-action release-action-download px-4 py-2">
                                 <i class="fas fa-download mr-2"></i> Download NZB
                             </a>

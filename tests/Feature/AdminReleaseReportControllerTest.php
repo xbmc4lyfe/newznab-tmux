@@ -429,6 +429,7 @@ class AdminReleaseReportControllerTest extends TestCase
             $detailsView .= file_get_contents($detailsPartial);
         }
         $releaseResultsComponent = file_get_contents($releaseResultsComponentPath);
+        $releaseResultsComponent .= file_get_contents(resource_path('views/components/release-badges.blade.php'));
         $browseService = file_get_contents($browseServicePath);
 
         $this->assertStringContainsString('publicReportResponses', $detailsController);
