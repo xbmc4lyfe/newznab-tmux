@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 
-if [ ! -z "$WWWUSER" ]; then
-    usermod -u $WWWUSER sail
+if [ -n "$WWWUSER" ]; then
+    # Ubuntu already owns UID 1000 in the base image. Allow Sail to share the
+    # requested host UID so bind-mounted files remain accessible on the host.
+    if ! usermod -u "$WWWUSER" -o sail; then
+        echo "Unable to align the Sail UID with WWWUSER=$WWWUSER." >&2
+        exit 1
+    fi
 fi
 
 if [ ! -d /.composer ]; then
@@ -33,6 +38,15 @@ unlink /var/www/html/public/hot 2>/dev/null || true
 
 # Set timezone
 ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# Repair writable runtime directories left by containers that started before
+# the Sail UID was aligned with the host user.
+for d in storage/framework storage/logs bootstrap/cache; do
+    if [ -d "/var/www/html/$d" ]; then
+        chown -R sail:"${SAIL_GROUP}" "/var/www/html/$d" 2>/dev/null || true
+        chmod -R ug+rwX "/var/www/html/$d" 2>/dev/null || true
+    fi
+done
 
 if [ $# -gt 0 ]; then
     exec gosu $WWWUSER "$@"

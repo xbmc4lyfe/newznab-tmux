@@ -33,6 +33,23 @@ class ViteDockerConfigurationTest extends TestCase
         $this->assertLessThan($supervisorPosition, $unlinkPosition);
     }
 
+    public function test_container_startup_aligns_runtime_directory_ownership_with_the_host_user(): void
+    {
+        $startContainer = $this->projectFile('docker/8.5/start-container');
+
+        $this->assertStringContainsString('usermod -u "$WWWUSER" -o sail', $startContainer);
+        $this->assertStringContainsString('storage/framework storage/logs bootstrap/cache', $startContainer);
+        $this->assertStringContainsString('chown -R sail:"${SAIL_GROUP}"', $startContainer);
+        $this->assertStringContainsString('chmod -R ug+rwX', $startContainer);
+
+        $permissionRepairPosition = strpos($startContainer, 'chown -R sail:"${SAIL_GROUP}"');
+        $supervisorPosition = strpos($startContainer, 'exec /usr/bin/supervisord');
+
+        $this->assertNotFalse($permissionRepairPosition);
+        $this->assertNotFalse($supervisorPosition);
+        $this->assertLessThan($supervisorPosition, $permissionRepairPosition);
+    }
+
     public function test_nginx_serves_laravel_public_storage_without_a_host_symlink(): void
     {
         $nginxConfig = $this->projectFile('docker/8.5/nginx.conf');
