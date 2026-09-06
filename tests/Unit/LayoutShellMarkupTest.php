@@ -3,9 +3,61 @@
 namespace Tests\Unit;
 
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Process\Process;
 
 class LayoutShellMarkupTest extends TestCase
 {
+    public function test_layouts_allow_unrestricted_zoom_and_keep_safe_area_support(): void
+    {
+        foreach (['main', 'admin', 'guest'] as $layout) {
+            $markup = $this->view("layouts/{$layout}.blade.php");
+            preg_match('/<meta name="viewport" content="([^"]+)"/', $markup, $matches);
+
+            $this->assertArrayHasKey(1, $matches);
+            $this->assertStringContainsString('width=device-width', $matches[1]);
+            $this->assertStringContainsString('viewport-fit=cover', $matches[1]);
+            $this->assertStringNotContainsString('maximum-scale', $matches[1]);
+            $this->assertStringNotContainsString('user-scalable=no', $matches[1]);
+        }
+    }
+
+    public function test_frontend_motion_preferences_and_theme_accessibility_state(): void
+    {
+        $process = new Process(['node', __DIR__.'/../Fixtures/frontend-standards.mjs']);
+        $process->run();
+
+        $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput().$process->getOutput());
+    }
+
+    public function test_shared_modals_use_native_dialogs_with_accessible_names_and_dismissal(): void
+    {
+        foreach (['confirmation', 'nfo', 'image', 'preview', 'filelist', 'mediainfo', 'report'] as $modal) {
+            $markup = $this->view("partials/{$modal}-modal.blade.php");
+            $this->assertMatchesRegularExpression('/<dialog[^>]+x-modal="open"/s', $markup);
+            $this->assertMatchesRegularExpression('/aria-labelledby="([^"]+)"/', $markup);
+            preg_match('/aria-labelledby="([^"]+)"/', $markup, $label);
+            $this->assertStringContainsString('id="'.$label[1].'"', $markup);
+            $this->assertStringContainsString('@cancel.prevent=', $markup);
+            $this->assertStringContainsString('</dialog>', $markup);
+        }
+    }
+
+    public function test_auth_password_controls_load_their_component_and_expose_autofill_and_errors(): void
+    {
+        foreach (['login' => 'current-password', 'register' => 'new-password'] as $page => $autocomplete) {
+            $markup = $this->view("auth/{$page}.blade.php");
+            $this->assertStringContainsString('x-data="passwordToggle"', $markup);
+            $this->assertStringContainsString('x-ref="field"', $markup);
+            $this->assertStringContainsString('autocomplete="'.$autocomplete.'"', $markup);
+            $this->assertStringContainsString('autocomplete="username"', $markup);
+            $this->assertStringContainsString('aria-controls="password"', $markup);
+            $this->assertStringContainsString('aria-describedby="password-error"', $markup);
+            $this->assertStringContainsString('id="password-error"', $markup);
+        }
+
+        $this->assertStringContainsString('<main id="main-content"', $this->view('layouts/guest.blade.php'));
+    }
+
     public function test_user_and_admin_layouts_expose_accessible_shell_landmarks(): void
     {
         foreach (['main', 'admin'] as $layout) {
@@ -78,7 +130,7 @@ class LayoutShellMarkupTest extends TestCase
     {
         $markup = $this->view('partials/header-menu.blade.php');
 
-        $this->assertStringContainsString('layout-primary-nav__search relative hidden items-center gap-2 lg:flex', $markup);
+        $this->assertStringContainsString('layout-primary-nav__search relative hidden items-center gap-2 2xl:flex', $markup);
         $this->assertStringContainsString('id="header-search-category" name="t" class="rounded-lg', $markup);
         $this->assertStringContainsString('class="w-40 rounded-lg border border-gray-600', $markup);
         $this->assertStringContainsString('class="rounded-lg bg-primary-600', $markup);

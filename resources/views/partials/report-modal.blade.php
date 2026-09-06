@@ -1,10 +1,12 @@
 {{-- Shared Report Modal - Alpine.js CSP Safe --}}
 {{-- Rendered once in the layout via partials/release-modals, reused by all report-trigger buttons --}}
 @auth
-<div x-data="releaseReport"
+<dialog x-data="releaseReport"
      x-show="open"
+     x-modal="open"
+     @cancel.prevent="close()"
      x-cloak
-     class="fixed inset-0 z-50 overflow-y-auto"
+     class="app-modal fixed inset-0 z-50 overflow-y-auto"
      aria-labelledby="report-modal-title"
      role="dialog"
      aria-modal="true"
@@ -77,12 +79,12 @@
                     </div>
 
                     <!-- Error Message -->
-                    <div x-show="errorMsg" x-cloak class="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+                    <div role="alert" x-show="errorMsg" x-cloak class="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
                         <p class="text-sm text-red-600 dark:text-red-400" x-text="errorMsg"></p>
                     </div>
 
                     <!-- Success Message -->
-                    <div x-show="successMsg" x-cloak class="mb-4 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg">
+                    <div role="status" x-show="successMsg" x-cloak class="mb-4 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg">
                         <p class="text-sm text-green-600 dark:text-green-400" x-text="successMsg"></p>
                     </div>
 
@@ -104,5 +106,5 @@
             </div>
         </div>
     </div>
-</div>
+</dialog>
 @endauth

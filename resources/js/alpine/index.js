@@ -10,6 +10,7 @@ import Alpine from '@alpinejs/csp';
 
 // Make Alpine globally available
 window.Alpine = Alpine;
+import './modal.js';
 
 // --- Stores (must register before components that use them) ---
 import './stores/theme.js';

@@ -12,17 +12,25 @@ Alpine.store('theme', {
     colorScheme: 'blue',
 
     init() {
+        let storedTheme = 'light';
+        let storedScheme = 'blue';
+        try {
+            storedTheme = localStorage.getItem('theme') || storedTheme;
+            storedScheme = localStorage.getItem('color_scheme') || storedScheme;
+        } catch (_error) {
+            // Storage can be disabled by browser privacy settings.
+        }
         const meta = document.querySelector('meta[name="theme-preference"]');
         const isAuth = document.querySelector('meta[name="user-authenticated"]');
         this.current = (isAuth && isAuth.content === 'true')
             ? (meta ? meta.content : 'light')
-            : (localStorage.getItem('theme') || 'light');
+            : storedTheme;
 
         const schemeMeta = document.querySelector('meta[name="color-scheme-preference"]');
         const schemeData = document.getElementById('current-theme-data');
         const preferredScheme = (isAuth && isAuth.content === 'true')
             ? (schemeMeta ? schemeMeta.content : (schemeData?.dataset?.colorScheme || 'blue'))
-            : (localStorage.getItem('color_scheme') || 'blue');
+            : storedScheme;
         this.colorScheme = colorSchemes.includes(preferredScheme) ? preferredScheme : 'blue';
 
         this.apply();
@@ -94,12 +102,14 @@ Alpine.store('theme', {
         }
         if (toggle) {
             toggle.title = this.title();
+            toggle.setAttribute('aria-label', `Change theme. Current theme: ${this.label()}`);
         }
 
         // Update dropdown & mobile theme switcher buttons
         var self = this;
         document.querySelectorAll('.dropdown-theme-btn, .mobile-theme-btn').forEach(function(btn) {
             var isActive = btn.dataset.theme === self.current;
+            btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
             btn.classList.remove('bg-primary-600', 'bg-blue-600', 'text-white', 'text-gray-300', 'hover:bg-gray-800', 'hover:bg-gray-700', 'hover:text-white');
             if (isActive) {
                 btn.classList.add('bg-primary-600', 'text-white');
@@ -160,8 +170,12 @@ Alpine.store('theme', {
                 body: JSON.stringify(payload)
             }).catch(err => console.error('Error saving theme:', err));
         } else {
-            localStorage.setItem('theme', this.current);
-            localStorage.setItem('color_scheme', this.colorScheme);
+            try {
+                localStorage.setItem('theme', this.current);
+                localStorage.setItem('color_scheme', this.colorScheme);
+            } catch (_error) {
+                // Keep the selected theme for this page when persistence is unavailable.
+            }
         }
     }
 });

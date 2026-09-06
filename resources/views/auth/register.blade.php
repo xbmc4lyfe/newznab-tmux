@@ -5,7 +5,7 @@
     <div class="w-full max-w-md space-y-6 sm:space-y-8">
         <!-- Logo and Title -->
         <div class="text-center">
-            <a href="{{ url('/') }}" class="mb-3 inline-flex items-center justify-center sm:mb-4">
+            <a aria-label="Home" href="{{ url('/') }}" class="mb-3 inline-flex items-center justify-center sm:mb-4">
                 <div class="flex h-14 w-14 items-center justify-center rounded-full bg-primary-600 shadow-lg dark:bg-primary-700 sm:h-16 sm:w-16">
                     <i class="fas fa-file-download text-2xl text-white sm:text-3xl"></i>
                 </div>
@@ -51,7 +51,7 @@
 
                 <!-- Validation Error Messages -->
                 @if($errors->any())
-                    <div class="mb-4 p-4 rounded-lg bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-700">
+                    <div role="alert" class="mb-4 p-4 rounded-lg bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-700">
                         <div class="flex items-start">
                             <i class="fas fa-exclamation-circle text-red-600 dark:text-red-400 mr-3 mt-0.5"></i>
                             <div class="flex-1">
@@ -85,6 +85,8 @@
                                 id="username"
                                 type="text"
                                 name="username"
+                                @error('username') aria-invalid="true" aria-describedby="username-error" @enderror
+                                autocomplete="username"
                                 value="{{ old('username') }}"
                                 required
                                 autofocus
@@ -93,7 +95,7 @@
                             >
                         </div>
                         @error('username')
-                            <p class="mt-2 text-sm text-red-600">{{ $message }}</p>
+                            <p id="username-error" class="mt-2 text-sm text-red-600">{{ $message }}</p>
                         @enderror
                     </div>
 
@@ -110,6 +112,8 @@
                                 id="email"
                                 type="email"
                                 name="email"
+                                @error('email') aria-invalid="true" aria-describedby="email-error" @enderror
+                                autocomplete="email"
                                 value="{{ old('email', $email ?? '') }}"
                                 required
                                 class="block w-full pl-10 pr-3 py-3 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder-gray-400 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition @error('email') border-red-500 @enderror"
@@ -117,7 +121,7 @@
                             >
                         </div>
                         @error('email')
-                            <p class="mt-2 text-sm text-red-600">{{ $message }}</p>
+                            <p id="email-error" class="mt-2 text-sm text-red-600">{{ $message }}</p>
                         @enderror
                     </div>
 
@@ -126,24 +130,27 @@
                         <label for="password" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                             Password
                         </label>
-                        <div class="relative">
+                        <div class="relative" x-data="passwordToggle">
                             <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
                                 <i class="fas fa-lock text-gray-400"></i>
                             </div>
                             <input
                                 id="password"
+                                x-ref="field"
                                 type="password"
                                 name="password"
+                                @error('password') aria-invalid="true" aria-describedby="password-error" @enderror
+                                autocomplete="new-password"
                                 required
                                 class="block w-full pl-10 pr-10 py-3 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder-gray-400 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition @error('password') border-red-500 @enderror"
                                 placeholder="Create a strong password"
                             >
-                            <button type="button" class="password-toggle-btn absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200" data-field-id="password">
-                                <i class="fas fa-eye" id="password-eye"></i>
+                            <button type="button" class="password-toggle-btn absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200" @click="toggle()" aria-label="Show password" :aria-label="label()" aria-controls="password" :aria-pressed="visible">
+                                <i class="fas" :class="iconClass()" aria-hidden="true" id="password-eye"></i>
                             </button>
                         </div>
                         @error('password')
-                            <p class="mt-2 text-sm text-red-600 dark:text-red-400">{{ $message }}</p>
+                            <p id="password-error" class="mt-2 text-sm text-red-600 dark:text-red-400">{{ $message }}</p>
                         @enderror
                         <div class="mt-2 text-xs text-gray-500 dark:text-gray-400 space-y-1">
                             <p class="font-medium">Password requirements:</p>
@@ -161,20 +168,22 @@
                         <label for="password_confirmation" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                             Confirm Password
                         </label>
-                        <div class="relative">
+                        <div class="relative" x-data="passwordToggle">
                             <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
                                 <i class="fas fa-lock text-gray-400"></i>
                             </div>
                             <input
                                 id="password_confirmation"
+                                x-ref="field"
                                 type="password"
                                 name="password_confirmation"
+                                autocomplete="new-password"
                                 required
                                 class="block w-full pl-10 pr-10 py-3 border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder-gray-400 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition"
                                 placeholder="Confirm your password"
                             >
-                            <button type="button" class="password-toggle-btn absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200" data-field-id="password_confirmation">
-                                <i class="fas fa-eye" id="password_confirmation-eye"></i>
+                            <button type="button" class="password-toggle-btn absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200" @click="toggle()" aria-label="Show password" :aria-label="label()" aria-controls="password_confirmation" :aria-pressed="visible">
+                                <i class="fas" :class="iconClass()" aria-hidden="true" id="password_confirmation-eye"></i>
                             </button>
                         </div>
                     </div>

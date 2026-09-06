@@ -2,7 +2,7 @@
 <html lang="{{ str_replace('_', '-', app()->getLocale()) }}" class="app-shell">
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="color-scheme" content="light dark">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -107,10 +107,12 @@
     </div>
 
     <!-- Mobile Sidebar Toggle -->
-    <button id="mobile-sidebar-toggle" class="layout-mobile-sidebar-toggle touch-target fixed z-30 inline-flex items-center gap-2 rounded-full bg-primary-600 px-4 py-3 text-sm font-semibold text-white shadow-lg transition hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 focus-visible:ring-offset-2 dark:bg-primary-700 dark:hover:bg-primary-600 md:hidden bottom-[max(5rem,calc(env(safe-area-inset-bottom)+4rem))] right-[max(1rem,env(safe-area-inset-right))]" aria-label="Open account navigation" aria-controls="sidebar" aria-expanded="false">
-        <i class="fas fa-compass" aria-hidden="true"></i>
-        <span>Navigate</span>
-    </button>
+    @auth
+        <button type="button" id="mobile-sidebar-toggle" class="layout-mobile-sidebar-toggle touch-target fixed z-30 inline-flex items-center gap-2 rounded-full bg-primary-600 px-4 py-3 text-sm font-semibold text-white shadow-lg transition hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 focus-visible:ring-offset-2 dark:bg-primary-700 dark:hover:bg-primary-600 md:hidden bottom-[max(5rem,calc(env(safe-area-inset-bottom)+4rem))] right-[max(1rem,env(safe-area-inset-right))]" aria-label="Open account navigation" aria-controls="sidebar" aria-expanded="false">
+            <i class="fas fa-compass" aria-hidden="true"></i>
+            <span>Navigate</span>
+        </button>
+    @endauth
 
     <!-- Back to Top -->
     @include('partials.back-to-top')

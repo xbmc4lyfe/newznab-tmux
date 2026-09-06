@@ -11,8 +11,8 @@
         x-cloak
         @click="scrollToTop()"
         class="fixed z-40 bg-blue-600 dark:bg-blue-700 text-white p-3 rounded-full shadow-lg hover:bg-blue-700 dark:hover:bg-blue-800 transition-colors touch-target
-               bottom-[max(5.5rem,calc(env(safe-area-inset-bottom)+5rem))] right-[max(1rem,env(safe-area-inset-right))]
-               md:bottom-[max(1rem,env(safe-area-inset-bottom))] md:right-[max(1rem,env(safe-area-inset-right))]"
+               bottom-[max(5.5rem,calc(env(safe-area-inset-bottom)+5rem))] left-[max(1rem,env(safe-area-inset-left))]
+               md:left-auto md:bottom-[max(1rem,env(safe-area-inset-bottom))] md:right-[max(1rem,env(safe-area-inset-right))]"
         aria-label="Back to top">
     <i class="fas fa-chevron-up text-lg"></i>
 </button>

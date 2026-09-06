@@ -24,7 +24,7 @@
                 @if($icon)
                     <span class="workspace-hero__icon" aria-hidden="true"><i class="{{ $icon }}"></i></span>
                 @endif
-                <div>
+                <div class="min-w-0 flex-1">
                     @if($eyebrow)
                         <p class="mb-1 text-xs font-semibold uppercase tracking-[0.18em] text-white/65">{{ $eyebrow }}</p>
                     @endif

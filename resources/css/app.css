@@ -441,6 +441,43 @@
 }
 
 /* Shared application shell */
+#mobile-menu-icon-open.hidden,
+#mobile-menu-icon-close.hidden {
+    display: none;
+}
+
+.workspace-hero :is(h1, [aria-current="page"]) {
+    overflow-wrap: anywhere;
+}
+
+dialog.app-modal {
+    width: 100%;
+    height: 100dvh;
+    max-width: none;
+    max-height: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    color: inherit;
+}
+
+dialog.app-modal:not([open]) {
+    display: none !important;
+}
+
+dialog.app-modal:not(.confirmation-modal) {
+    background-color: transparent;
+}
+
+dialog.app-modal::backdrop {
+    background: transparent;
+}
+
+.confirmation-panel {
+    max-height: calc(100dvh - 2rem);
+    overflow-y: auto;
+}
+
 .skip-link {
     @apply fixed left-4 top-3 z-[100] -translate-y-20 rounded-xl bg-white px-4 py-2 text-sm font-semibold text-gray-950 shadow-xl transition-transform focus:translate-y-0 focus:outline-none focus:ring-2 focus:ring-primary-500 dark:bg-gray-900 dark:text-white;
 }
@@ -451,6 +488,8 @@
 }
 
 .layout-shell {
+    height: 100vh;
+    height: 100dvh;
     background-color: var(--surface-body);
 }
 
@@ -828,6 +867,13 @@
         animation-duration: 0.01ms !important;
         animation-iteration-count: 1 !important;
         transition-duration: 0.01ms !important;
+    }
+}
+
+@media (forced-colors: active) {
+    :focus-visible {
+        outline: 2px solid Highlight !important;
+        outline-offset: 2px !important;
     }
 }
 

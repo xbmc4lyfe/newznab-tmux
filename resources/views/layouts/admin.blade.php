@@ -2,7 +2,7 @@
 <html lang="{{ str_replace('_', '-', app()->getLocale()) }}" class="app-shell">
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="color-scheme" content="light dark">
     <meta name="csrf-token" content="{{ csrf_token() }}">
 
@@ -129,7 +129,7 @@
             <footer class="layout-footer shrink-0">
                 <div class="px-6 py-3">
                     <div class="flex flex-wrap items-center justify-between gap-2 text-sm text-gray-300 dark:text-gray-400">
-                        <p>&copy; {{ now()->year }} <a href="https://github.com/NNTmux/newznab-tmux" class="text-primary-400 hover:text-primary-300 transition">NNTmux</a> Admin Panel</p>
+                        <p>&copy; {{ now()->year }} <a href="https://github.com/NNTmux/newznab-tmux" class="text-primary-400 underline underline-offset-2 hover:text-primary-300 transition">NNTmux</a> Admin Panel</p>
                         <p>{{ config('app.name') }} v{{ config('nntmux.versions.git.tag') ?? '1.0.0' }}</p>
                     </div>
                 </div>

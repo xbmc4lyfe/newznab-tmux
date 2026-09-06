@@ -13,8 +13,14 @@
         var t = '{{ auth()->user()->theme_preference ?? "light" }}';
         var scheme = '{{ auth()->user()->color_scheme ?? "blue" }}';
     @else
-        var t = localStorage.getItem('theme') || 'light';
-        var scheme = localStorage.getItem('color_scheme') || 'blue';
+        var t = 'light';
+        var scheme = 'blue';
+        try {
+            t = localStorage.getItem('theme') || t;
+            scheme = localStorage.getItem('color_scheme') || scheme;
+        } catch (_error) {
+            // Browser privacy settings may disable storage.
+        }
     @endauth
     var allowedSchemes = ['blue', 'indigo', 'cyan', 'teal', 'emerald', 'violet', 'pink', 'rose', 'red', 'orange', 'amber'];
     if (allowedSchemes.indexOf(scheme) === -1) {

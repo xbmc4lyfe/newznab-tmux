@@ -49,36 +49,67 @@ Alpine.data('submenu', () => ({
  * elements that don't have x-data attributes yet.
  */
 (function() {
-    var containers = document.querySelectorAll('.dropdown-container');
-    containers.forEach(function(container) {
-        if (container.hasAttribute('x-data')) return;
-        var toggle = container.querySelector('.dropdown-toggle');
-        var menu = container.querySelector('.dropdown-menu');
-        if (!toggle || !menu) return;
-        var closeTimeout;
-        menu.style.display = 'none';
-        toggle.addEventListener('click', function(ev) {
-            ev.preventDefault(); ev.stopPropagation();
-            var isOpen = menu.style.display === 'block';
-            containers.forEach(function(c) { var m = c.querySelector('.dropdown-menu'); if (m && c !== container) m.style.display = 'none'; });
-            menu.style.display = isOpen ? 'none' : 'block';
-        });
-        container.addEventListener('mouseenter', function() { clearTimeout(closeTimeout); });
-        container.addEventListener('mouseleave', function() { closeTimeout = setTimeout(function() { menu.style.display = 'none'; }, 300); });
-        menu.addEventListener('mouseenter', function() { clearTimeout(closeTimeout); });
-    });
-    document.addEventListener('click', function(ev) {
-        if (!ev.target.closest('.dropdown-container')) containers.forEach(function(c) { var m = c.querySelector('.dropdown-menu'); if (m) m.style.display = 'none'; });
-    });
+    const disclosures = [];
 
-    // Nested submenus
-    document.querySelectorAll('.submenu-container').forEach(function(container) {
+    function register(container, toggleSelector, menuSelector, index, nested = false) {
         if (container.hasAttribute('x-data')) return;
-        var sub = container.querySelector('.submenu');
-        if (!sub) return;
-        var t;
-        container.addEventListener('mouseenter', function() { clearTimeout(t); sub.style.display = 'block'; });
-        container.addEventListener('mouseleave', function() { t = setTimeout(function() { sub.style.display = 'none'; }, 200); });
-        sub.addEventListener('mouseenter', function() { clearTimeout(t); });
+        const toggle = container.querySelector(toggleSelector);
+        const menu = container.querySelector(menuSelector);
+        if (!toggle || !menu) return;
+        let closeTimeout;
+        menu.id ||= `navigation-disclosure-${index}`;
+        toggle.setAttribute('aria-controls', menu.id);
+
+        function setOpen(open) {
+            clearTimeout(closeTimeout);
+            menu.style.display = open ? 'block' : 'none';
+            toggle.setAttribute('aria-expanded', String(open));
+            if (!open) {
+                disclosures.filter(item => menu.contains(item.container)).forEach(item => item.setOpen(false));
+            }
+        }
+
+        setOpen(false);
+        disclosures.push({ container, setOpen });
+        toggle.addEventListener('click', event => {
+            event.preventDefault();
+            const open = toggle.getAttribute('aria-expanded') !== 'true';
+            disclosures.filter(item => !item.container.contains(container)).forEach(item => item.setOpen(false));
+            setOpen(open);
+        });
+        container.addEventListener('keydown', event => {
+            if (event.key === 'Escape' && toggle.getAttribute('aria-expanded') === 'true') {
+                event.preventDefault();
+                event.stopPropagation();
+                setOpen(false);
+                toggle.focus();
+            } else if (event.target === toggle && event.key === (nested ? 'ArrowRight' : 'ArrowDown')) {
+                event.preventDefault();
+                setOpen(true);
+                menu.querySelector('a[href], button:not(:disabled)')?.focus();
+            }
+        });
+        container.addEventListener('focusout', event => {
+            if (!container.contains(event.relatedTarget)) setOpen(false);
+        });
+        container.addEventListener('mouseenter', () => {
+            clearTimeout(closeTimeout);
+            if (nested) setOpen(true);
+        });
+        container.addEventListener('mouseleave', () => {
+            closeTimeout = setTimeout(() => {
+                if (!container.contains(document.activeElement)) setOpen(false);
+            }, 300);
+        });
+    }
+
+    document.querySelectorAll('.dropdown-container').forEach((container, index) => {
+        register(container, '.dropdown-toggle', '.dropdown-menu', `menu-${index}`);
+    });
+    document.querySelectorAll('.submenu-container').forEach((container, index) => {
+        register(container, '.submenu-toggle', '.submenu', `submenu-${index}`, true);
+    });
+    document.addEventListener('click', event => {
+        disclosures.filter(item => !item.container.contains(event.target)).forEach(item => item.setOpen(false));
     });
 })();

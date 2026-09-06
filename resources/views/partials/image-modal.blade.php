@@ -1,8 +1,10 @@
 <!-- Image Modal - Alpine.js CSP Safe -->
-<div x-data="imageModal"
+<dialog x-data="imageModal"
      x-show="open"
+     x-modal="open"
+     @cancel.prevent="close()"
      x-cloak
-     class="fixed inset-0 z-50 overflow-y-auto"
+     class="app-modal fixed inset-0 z-50 overflow-y-auto"
      aria-labelledby="image-modal-title"
      role="dialog"
      aria-modal="true"
@@ -56,4 +58,4 @@
             </div>
         </div>
     </div>
-</div>
+</dialog>

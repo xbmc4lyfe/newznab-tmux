@@ -1,14 +1,14 @@
 <nav class="layout-primary-nav relative" aria-label="Content categories">
     <div class="container mx-auto max-w-[1600px] px-3 sm:px-5 lg:px-8">
         <div class="flex items-center justify-between h-16">
-            <!-- Mobile menu button (visible below lg) -->
-            <button type="button" class="touch-target rounded-xl p-2 text-gray-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 lg:hidden" id="mobile-menu-toggle" aria-label="Toggle category navigation" aria-expanded="false" aria-controls="mobile-nav-panel">
+            <!-- Category menu button (visible below 2xl) -->
+            <button type="button" class="touch-target rounded-xl p-2 text-gray-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 2xl:hidden" id="mobile-menu-toggle" aria-label="Toggle category navigation" aria-expanded="false" aria-controls="mobile-nav-panel">
                 <i class="fas fa-bars text-xl" id="mobile-menu-icon-open" aria-hidden="true"></i>
                 <i class="fas fa-times text-xl hidden" id="mobile-menu-icon-close" aria-hidden="true"></i>
             </button>
 
-            <!-- Desktop Navigation (visible at lg+) -->
-            <div class="layout-primary-nav__categories hidden min-w-0 flex-1 lg:flex lg:items-center lg:gap-1" id="desktop-nav">
+            <!-- Desktop Navigation (visible at 2xl+) -->
+            <div class="layout-primary-nav__categories hidden min-w-0 flex-1 2xl:flex 2xl:items-center 2xl:gap-1" id="desktop-nav">
                 @if(isset($parentcatlist))
                     @foreach($parentcatlist as $parentcat)
                         @if($parentcat['id'] == App\Models\Category::TV_ROOT)
@@ -26,10 +26,10 @@
                                     @foreach($parentcat['categories'] as $subcat)
                                         @if($subcat['id'] == App\Models\Category::TV_FOREIGN)
                                             <div class="relative submenu-container">
-                                                <a href="{{ url('/browse/TV/' . $subcat['title']) }}" class="submenu-toggle flex items-center justify-between px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white">
+                                                <button type="button" class="submenu-toggle w-full text-left flex items-center justify-between px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white">
                                                     <span>{{ $subcat['title'] }}</span>
                                                     <i class="fas fa-chevron-right text-xs"></i>
-                                                </a>
+                                                </button>
                                                 <div class="submenu absolute left-full top-0 w-40 bg-gray-900 dark:bg-gray-950 rounded-xl shadow-lg z-50 ml-0.5 hidden">
                                                     <a href="{{ url('/browse/TV/' . $subcat['title']) }}" class="block px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white">All Foreign</a>
                                                     <div class="border-t border-white/10 dark:border-white/5"></div>
@@ -61,17 +61,10 @@
                                     @foreach($parentcat['categories'] as $subcat)
                                         @if($subcat['id'] == App\Models\Category::MOVIE_FOREIGN)
                                             <div class="relative submenu-container">
-                                                @if(auth()->check() && auth()->user()->movieview == "1")
-                                                    <a href="{{ url('/' . $parentcat['title'] . '/' . $subcat['title']) }}" class="submenu-toggle flex items-center justify-between px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white">
-                                                        <span>{{ $subcat['title'] }}</span>
-                                                        <i class="fas fa-chevron-right text-xs"></i>
-                                                    </a>
-                                                @else
-                                                    <a href="{{ url('/browse/' . $parentcat['title'] . '/' . $subcat['title']) }}" class="submenu-toggle flex items-center justify-between px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white">
-                                                        <span>{{ $subcat['title'] }}</span>
-                                                        <i class="fas fa-chevron-right text-xs"></i>
-                                                    </a>
-                                                @endif
+                                                <button type="button" class="submenu-toggle w-full text-left flex items-center justify-between px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white">
+                                                    <span>{{ $subcat['title'] }}</span>
+                                                    <i class="fas fa-chevron-right text-xs"></i>
+                                                </button>
                                                 <div class="submenu absolute left-full top-0 w-40 bg-gray-900 dark:bg-gray-950 rounded-xl shadow-lg z-50 ml-0.5 hidden">
                                                     @if(auth()->check() && auth()->user()->movieview == "1")
                                                         <a href="{{ url('/' . $parentcat['title'] . '/' . $subcat['title']) }}" class="block px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white">All Foreign</a>
@@ -164,13 +157,13 @@
 
             <!-- Right side: Search and User Menu -->
             <div class="flex items-center space-x-2 lg:space-x-4 ml-auto">
-                <!-- Mobile Search Toggle (visible below lg) -->
-                <button type="button" class="touch-target rounded-xl p-2 text-gray-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 lg:hidden" id="mobile-search-toggle" aria-label="Toggle release search" aria-expanded="false" aria-controls="mobile-search-form">
+                <!-- Search toggle (visible below 2xl) -->
+                <button type="button" class="touch-target rounded-xl p-2 text-gray-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 2xl:hidden" id="mobile-search-toggle" aria-label="Toggle release search" aria-expanded="false" aria-controls="mobile-search-form">
                     <i class="fa fa-search text-lg" aria-hidden="true"></i>
                 </button>
 
-                <!-- Desktop Search Form with Autocomplete (visible at lg+) -->
-                <form method="GET" action="{{ route('search') }}" class="layout-primary-nav__search relative hidden items-center gap-2 lg:flex" id="header-search-form" role="search">
+                <!-- Desktop Search Form with Autocomplete (visible at 2xl+) -->
+                <form method="GET" action="{{ route('search') }}" class="layout-primary-nav__search relative hidden items-center gap-2 2xl:flex" id="header-search-form" role="search">
                     <label for="header-search-category" class="sr-only">Search category</label>
                     <select id="header-search-category" name="t" class="rounded-lg border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary-500">
                         <option value="-1">All</option>
@@ -271,11 +264,12 @@
         </div>
     </div>
 
-    <!-- Mobile Search Form (slides down below header, visible below lg) -->
-    <div id="mobile-search-form" class="lg:hidden hidden bg-gray-800 dark:bg-gray-950 border-t border-white/10 dark:border-white/5 shadow-lg z-50">
+    <!-- Mobile Search Form (slides down below header, visible below 2xl) -->
+    <div id="mobile-search-form" class="2xl:hidden hidden bg-gray-800 dark:bg-gray-950 border-t border-white/10 dark:border-white/5 shadow-lg z-50">
         <div class="container mx-auto px-4 py-3">
             <form method="GET" action="{{ route('search') }}" class="space-y-3" id="mobile-search-form-el">
-                <select name="t" class="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-3 focus:outline-none focus:ring-2 focus:ring-primary-500 touch-target">
+                <label for="mobile-search-category" class="sr-only">Search category</label>
+                <select id="mobile-search-category" name="t" class="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-3 focus:outline-none focus:ring-2 focus:ring-primary-500 touch-target">
                     <option value="-1">All Categories</option>
                     @if(isset($parentcatlist))
                         @foreach($parentcatlist as $parentcat)
@@ -287,6 +281,7 @@
                     @endif
                 </select>
                 <div class="relative">
+                    <label for="mobile-search-input" class="sr-only">Search releases</label>
                     <input type="search"
                            name="search"
                            id="mobile-search-input"
@@ -305,8 +300,8 @@
         </div>
     </div>
 
-    <!-- Mobile Navigation Panel (slides down below header, visible below lg) -->
-    <div id="mobile-nav-panel" class="lg:hidden hidden bg-gray-800 dark:bg-gray-950 border-t border-white/10 dark:border-white/5 shadow-lg z-50 max-h-[70vh] overflow-y-auto overscroll-contain">
+    <!-- Mobile Navigation Panel (slides down below header, visible below 2xl) -->
+    <div id="mobile-nav-panel" class="2xl:hidden hidden bg-gray-800 dark:bg-gray-950 border-t border-white/10 dark:border-white/5 shadow-lg z-50 max-h-[70vh] overflow-y-auto overscroll-contain">
         <div class="container mx-auto px-4 py-3">
             @if(isset($parentcatlist))
                 <div class="space-y-1">

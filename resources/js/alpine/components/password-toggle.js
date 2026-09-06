@@ -16,6 +16,10 @@ Alpine.data('passwordToggle', () => ({
 
     iconClass() {
         return this.visible ? 'fa-eye-slash' : 'fa-eye';
+    },
+
+    label() {
+        return this.visible ? 'Hide password' : 'Show password';
     }
 }));
 
