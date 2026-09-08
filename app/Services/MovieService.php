@@ -1233,10 +1233,8 @@ class MovieService
                 return false;
             }
 
-            $searchYear = (string) ($buffer->data->Search[0]->Year ?? '');
-            if ($this->currentYear !== '' && $searchYear !== ''
-                && preg_match('/(\d{4})/', $searchYear, $yearHits)
-                && $this->similarityPercent($this->currentYear, $yearHits[1]) < self::YEAR_MATCH_PERCENT) {
+            $searchResult = $buffer->data->Search[0];
+            if (! $this->matchesCurrentContext($searchResult->Title ?? '', $searchResult->Year ?? '')) {
                 return false;
             }
 
@@ -1264,8 +1262,7 @@ class MovieService
                 return false;
             }
 
-            if ($this->currentYear !== '' && ! empty($data['year'])
-                && $this->similarityPercent($this->currentYear, (string) $data['year']) < self::YEAR_MATCH_PERCENT) {
+            if (! $this->matchesCurrentContext($data['title'] ?? '', $data['year'] ?? '')) {
                 return false;
             }
 
@@ -1378,8 +1375,10 @@ class MovieService
 
             // Reject candidates from a conflicting year so sequels/remakes in adjacent
             // years (e.g. "Moana 2" (2024) for a "Moana" (2026) release) cannot match.
-            if (! empty($this->currentYear) && ! empty($match['year'])
-                && $this->similarityPercent($this->currentYear, $match['year']) < self::YEAR_MATCH_PERCENT) {
+            // Near-exact titles get a ±1 year tolerance for mislabeled release years.
+            $yearDifference = $this->yearDifference($match['year']);
+            if ($yearDifference !== null
+                && $yearDifference > ($this->isNearExactTitleMatch((string) $match['title'], $percent) ? 1 : 0)) {
                 continue;
             }
 
@@ -1455,18 +1454,20 @@ class MovieService
             return true;
         }
 
-        $yearKnown = $this->currentYear !== '' && ! empty($year);
-        $yearMatches = $yearKnown && $this->similarityPercent($this->currentYear, $year) >= self::YEAR_MATCH_PERCENT;
+        $titlePercent = empty($title) ? 0.0 : $this->similarityPercent($this->currentTitle, $title);
+        $nearExactTitle = ! empty($title) && $this->isNearExactTitleMatch((string) $title, $titlePercent);
+
+        $yearDifference = $this->yearDifference($year);
+        $yearMatches = $yearDifference === 0;
 
         // A conflicting year means a different movie (e.g. a "Moana" (2026) release
-        // matched to "Moana 2" (2024)).
-        if ($yearKnown && ! $yearMatches) {
+        // matched to "Moana 2" (2024)). Near-exact titles get a ±1 year tolerance:
+        // release groups occasionally mislabel the year (festival vs streaming release).
+        if ($yearDifference !== null && $yearDifference > ($nearExactTitle ? 1 : 0)) {
             $this->candidateMismatch = true;
 
             return false;
         }
-
-        $titlePercent = empty($title) ? 0.0 : $this->similarityPercent($this->currentTitle, $title);
 
         // Alternate/international titles are acceptable when the exact year confirms
         // the movie (e.g. a "Salve Geral Irmandade" (2026) release vs the locally
@@ -1478,6 +1479,34 @@ class MovieService
         }
 
         return true;
+    }
+
+    /**
+     * Absolute difference in years between the candidate and the current release,
+     * or null when either year is unknown.
+     */
+    private function yearDifference(mixed $year): ?int
+    {
+        if ($this->currentYear === '' || empty($year)) {
+            return null;
+        }
+
+        if (! preg_match('/(\d{4})/', (string) $year, $hits)) {
+            return null;
+        }
+
+        return abs((int) $this->currentYear - (int) $hits[1]);
+    }
+
+    private function isNearExactTitleMatch(string $candidateTitle, float $percent): bool
+    {
+        if ($percent >= 95) {
+            return true;
+        }
+
+        $normalize = static fn (string $value): string => (string) preg_replace('/[^a-z0-9]+/', '', strtolower($value));
+
+        return $normalize($candidateTitle) === $normalize($this->currentTitle);
     }
 
     /**

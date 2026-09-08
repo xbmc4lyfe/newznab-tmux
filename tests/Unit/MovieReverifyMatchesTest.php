@@ -66,6 +66,11 @@ class MovieReverifyMatchesTest extends ImdbScraperTestCase
             'title' => 'State of Fear',
             'year' => '2026',
         ]);
+        $movieService->update([
+            'imdbid' => '10703978',
+            'title' => 'The Free Fall',
+            'year' => '2021',
+        ]);
 
         Release::query()->insert([
             [
@@ -89,6 +94,13 @@ class MovieReverifyMatchesTest extends ImdbScraperTestCase
                 'imdbid' => '39369643',
                 'movieinfo_id' => 2,
             ],
+            [
+                'id' => 14,
+                'searchname' => 'The.Free.Fall.2022.1080p.AMZN.WEB-DL.DDP5.1.H.264-GPRS',
+                'categories_id' => 2000,
+                'imdbid' => '10703978',
+                'movieinfo_id' => 3,
+            ],
         ]);
 
         $this->artisan('movie:reverify-matches')->assertSuccessful();
@@ -98,6 +110,8 @@ class MovieReverifyMatchesTest extends ImdbScraperTestCase
         $this->assertSame('13622970', Release::query()->whereKey(12)->value('imdbid'));
         // Alternate/international title with matching year must be kept.
         $this->assertSame('39369643', Release::query()->whereKey(13)->value('imdbid'));
+        // Exact title with a one-year mislabel must be kept.
+        $this->assertSame('10703978', Release::query()->whereKey(14)->value('imdbid'));
     }
 
     #[Test]

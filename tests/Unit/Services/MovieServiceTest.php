@@ -94,7 +94,7 @@ class MovieServiceTest extends ImdbScraperTestCase
         ]);
 
         $this->setMovieServiceProperty($service, 'currentTitle', 'Example Movie');
-        $this->setMovieServiceProperty($service, 'currentYear', '2023');
+        $this->setMovieServiceProperty($service, 'currentYear', '2022');
 
         $this->assertFalse($service->fetchTraktTVProperties('8169447'));
     }
@@ -231,13 +231,60 @@ class MovieServiceTest extends ImdbScraperTestCase
         $service->update([
             'imdbid' => '0137523',
             'title' => 'Example Movie',
-            'year' => '2023',
+            'year' => '2022',
         ]);
 
         $this->setMovieServiceProperty($service, 'currentTitle', 'Example Movie');
         $this->setMovieServiceProperty($service, 'currentYear', '2024');
 
         $this->assertFalse($this->invokeLocalIMDBSearch($service));
+    }
+
+    #[Test]
+    public function it_allows_a_one_year_mislabel_for_exact_title_matches_in_local_search(): void
+    {
+        Cache::flush();
+
+        $service = new MovieService;
+        $service->echooutput = false;
+        $service->update([
+            'imdbid' => '10703978',
+            'title' => 'The Free Fall',
+            'year' => '2021',
+        ]);
+
+        $this->setMovieServiceProperty($service, 'currentTitle', 'The Free Fall');
+        $this->setMovieServiceProperty($service, 'currentYear', '2022');
+
+        $this->assertSame('10703978', $this->invokeLocalIMDBSearch($service));
+    }
+
+    #[Test]
+    public function it_accepts_a_candidate_with_a_one_year_mislabel_for_exact_title_matches(): void
+    {
+        Cache::flush();
+
+        $service = new MovieService;
+        $service->echooutput = false;
+        $service->update([
+            'imdbid' => '10703978',
+            'title' => 'The Free Fall',
+            'year' => '2021',
+        ]);
+
+        Release::query()->insert([
+            'id' => 6,
+            'searchname' => 'The.Free.Fall.2022.1080p.AMZN.WEB-DL.DDP5.1.H.264-GPRS',
+            'categories_id' => 2000,
+            'imdbid' => null,
+            'movieinfo_id' => null,
+        ]);
+
+        $this->setMovieServiceProperty($service, 'currentTitle', 'The Free Fall');
+        $this->setMovieServiceProperty($service, 'currentYear', '2022');
+
+        $this->assertSame('10703978', $service->doMovieUpdate('tt10703978', 'Local DB', 6));
+        $this->assertSame('10703978', Release::query()->whereKey(6)->value('imdbid'));
     }
 
     #[Test]
