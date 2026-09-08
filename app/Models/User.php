@@ -809,7 +809,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function findByEmail(string $email): ?static
     {
-        return static::whereEmail($email)->first();
+        return self::whereEmail($email)->first();
     }
 
     /**
@@ -817,7 +817,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function findByRssToken(string $token): ?static
     {
-        return static::whereApiToken($token)->first();
+        return self::whereApiToken($token)->first();
     }
 
     /**
@@ -825,7 +825,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function verifiedApiTokenQuery(string $token): Builder // @phpstan-ignore missingType.generics
     {
-        return static::query()
+        return self::query()
             ->verified()
             ->whereApiToken($token);
     }
@@ -835,7 +835,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function findVerifiedByApiToken(string $token): ?static
     {
-        return static::verifiedApiTokenQuery($token)->first();
+        return self::verifiedApiTokenQuery($token)->first();
     }
 
     /**
@@ -843,11 +843,11 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function findByResetGuid(string $guid): ?static
     {
-        if (static::whereApiToken($guid)->exists()) {
+        if (self::whereApiToken($guid)->exists()) {
             return null;
         }
 
-        return static::whereResetguid($guid)
+        return self::whereResetguid($guid)
             ->first();
     }
 
@@ -860,7 +860,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function deleteUser(int $id): void
     {
-        static::findOrFail($id)->delete();
+        self::findOrFail($id)->delete();
     }
 
     /**
@@ -882,7 +882,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
         int $bookview,
         string $style = 'None',
     ): int {
-        $user = static::findOrFail($id);
+        $user = self::findOrFail($id);
         $roleModel = Role::find($role);
 
         $user->update([
@@ -943,7 +943,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
             return false;
         }
 
-        $user = static::find($uid);
+        $user = self::find($uid);
         if (! $user) {
             Log::error('User not found', ['uid' => $uid]);
 
@@ -1258,7 +1258,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
         ];
 
         foreach ($periods as $period) {
-            $users = static::whereDate('rolechangedate', '=', $period)->get();
+            $users = self::whereDate('rolechangedate', '=', $period)->get();
             $days = $now->diffInDays($period, true);
 
             foreach ($users as $user) {
@@ -1272,7 +1272,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     private static function processExpiredRoles(CarbonImmutable $now): void
     {
-        static::expired()->each(function (self $user) use ($now) {
+        self::expired()->each(function (self $user) use ($now) {
             $oldRoleId = $user->roles_id;
             $oldExpiryDate = $user->rolechangedate;
 
@@ -1494,7 +1494,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
         }
 
         if ($userId > 0 && Hash::needsRehash($hash)) {
-            static::find($userId)?->update(['password' => Hash::make($password)]);
+            self::find($userId)?->update(['password' => Hash::make($password)]);
         }
 
         return true;
@@ -1525,7 +1525,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function updateRssKey(int $uid): int
     {
-        static::find($uid)?->update([
+        self::find($uid)?->update([
             'api_token' => md5(Str::random(60)),
         ]);
 
@@ -1537,7 +1537,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function updatePassResetGuid(int $id, ?string $guid): int
     {
-        static::find($id)?->update(['resetguid' => $guid]);
+        self::find($id)?->update(['resetguid' => $guid]);
 
         return SignupError::SUCCESS->value;
     }
@@ -1547,7 +1547,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function updatePassword(int $id, string $password): int
     {
-        static::find($id)?->update(['password' => Hash::make($password)]);
+        self::find($id)?->update(['password' => Hash::make($password)]);
 
         return SignupError::SUCCESS->value;
     }
@@ -1557,7 +1557,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function updateUserRoleChangeDate(int $id, string $roleChangeDate): int
     {
-        static::find($id)?->update(['rolechangedate' => $roleChangeDate]);
+        self::find($id)?->update(['rolechangedate' => $roleChangeDate]);
 
         return SignupError::SUCCESS->value;
     }
@@ -1567,7 +1567,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function incrementGrabs(int $id, int $num = 1): void
     {
-        static::query()
+        self::query()
             ->whereKey($id)
             ->increment('grabs', $num, ['lastdownload' => now()]);
     }
@@ -1662,7 +1662,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
             return -1;
         }
 
-        static::where('id', $invite->invited_by)->decrement('invites');
+        self::where('id', $invite->invited_by)->decrement('invites');
         $invite->markAsUsed(0);
 
         return $invite->invited_by;
@@ -1685,7 +1685,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
 
         $storeIps = config('nntmux:settings.store_user_ip') === true ? $host : '';
 
-        $user = static::create([
+        $user = self::create([
             'username' => $userName,
             'password' => $hashedPassword,
             'email' => $email,
@@ -1714,9 +1714,9 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
     public static function getCachedCategoryExclusionById(int $userId): array
     {
         return Cache::remember(
-            static::categoryExclusionCacheKey($userId),
+            self::categoryExclusionCacheKey($userId),
             300,
-            static fn (): array => static::getCategoryExclusionById($userId)
+            static fn (): array => self::getCategoryExclusionById($userId)
         );
     }
 
@@ -1730,7 +1730,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function getCategoryExclusionById(int $userId): array
     {
-        $user = static::findOrFail($userId);
+        $user = self::findOrFail($userId);
 
         $userAllowed = $user->getDirectPermissions()->pluck('name')->toArray();
         $roleAllowed = $user->getAllPermissions()->pluck('name')->toArray();
@@ -1797,7 +1797,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
             ]);
         }
 
-        Cache::forget(static::categoryExclusionCacheKey($this->id));
+        Cache::forget(self::categoryExclusionCacheKey($this->id));
     }
 
     /**
@@ -1811,10 +1811,10 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
     {
         $apiToken = $request->input('api_token') ?? $request->input('apikey');
         $user = is_string($apiToken) && $apiToken !== ''
-            ? static::findVerifiedByApiToken($apiToken)
+            ? self::findVerifiedByApiToken($apiToken)
             : null;
 
-        return $user ? static::getCategoryExclusionById($user->id) : [];
+        return $user ? self::getCategoryExclusionById($user->id) : [];
     }
 
     // ===== Invitation Methods =====
@@ -1826,7 +1826,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function sendInvite(string $serverUrl, int $uid, string $emailTo): string
     {
-        $user = static::findOrFail($uid);
+        $user = self::findOrFail($uid);
 
         $invitation = Invitation::createInvitation($emailTo, $user->id);
         $url = "{$serverUrl}/register?token={$invitation->token}";
@@ -1843,7 +1843,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function deleteUnVerified(): void
     {
-        static::query()
+        self::query()
             ->whereHas('role', fn (Builder $roleQuery): Builder => $roleQuery->whereIn('name', self::UNVERIFIED_CLEANUP_ROLES))
             ->where('verified', false)
             ->whereNull('email_verified_at')
@@ -1856,7 +1856,7 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
      */
     public static function canPost(int $userId): bool
     {
-        return (bool) static::where('id', $userId)->value('can_post');
+        return (bool) self::where('id', $userId)->value('can_post');
     }
 
     /**
