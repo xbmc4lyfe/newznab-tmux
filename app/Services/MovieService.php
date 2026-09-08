@@ -38,6 +38,12 @@ class MovieService
 
     protected string $currentYear = '';
 
+    /**
+     * Set when a metadata fetcher rejects a candidate IMDb id because its
+     * title or year does not match the release currently being processed.
+     */
+    protected bool $candidateMismatch = false;
+
     protected string $currentRelID = '';
 
     protected string $showPasswords;
@@ -323,6 +329,8 @@ class MovieService
 
     /**
      * Fetch IMDB/TMDB/TRAKT/OMDB/iTunes info for the movie.
+     *
+     * @phpstan-impure
      *
      * @throws \Exception
      */
@@ -723,7 +731,12 @@ class MovieService
         $cacheKey = 'imdb_movie_'.md5($imdbId);
         $expiresAt = now()->addDays(7);
         if (Cache::has($cacheKey)) {
-            return Cache::get($cacheKey);
+            $cached = Cache::get($cacheKey);
+            if ($cached === false) {
+                return false;
+            }
+
+            return $this->matchesCurrentContext($cached['title'] ?? '', $cached['year'] ?? '') ? $cached : false;
         }
         try {
             $scraper = app(ImdbScraper::class);
@@ -768,23 +781,13 @@ class MovieService
 
                 return false;
             }
-            if (! empty($this->currentTitle)) {
-                $percent = $this->similarityPercent($this->currentTitle, $scraped['title']);
-                if ($percent < self::MATCH_PERCENT) {
-                    Cache::put($cacheKey, false, now()->addHours(6));
-
-                    return false;
-                }
-                if (! empty($this->currentYear) && ! empty($scraped['year'])) {
-                    $yearPercent = $this->similarityPercent($this->currentYear, $scraped['year']);
-                    if ($yearPercent < self::YEAR_MATCH_PERCENT) {
-                        Cache::put($cacheKey, false, now()->addHours(6));
-
-                        return false;
-                    }
-                }
-            }
+            // Cache the raw metadata regardless of the current context; the title/year
+            // check is per-release and must not poison the cache for other releases.
             Cache::put($cacheKey, $scraped, $expiresAt);
+
+            if (! $this->matchesCurrentContext($scraped['title'], $scraped['year'] ?? '')) {
+                return false;
+            }
             if ($this->echooutput) {
                 $sourceLabel = match ($scraper->getLastFetchSource()) {
                     'imdbapi_dev' => 'IMDb fallback (imdbapi.dev)',
@@ -821,7 +824,12 @@ class MovieService
         $expiresAt = now()->addDays(7);
 
         if (Cache::has($cacheKey)) {
-            return Cache::get($cacheKey);
+            $cached = Cache::get($cacheKey);
+            if ($cached === false) {
+                return false;
+            }
+
+            return $this->matchesCurrentContext($cached['title'] ?? '', $cached['year'] ?? '') ? $cached : false;
         }
 
         try {
@@ -831,24 +839,6 @@ class MovieService
                 Cache::put($cacheKey, false, now()->addHours(6));
 
                 return false;
-            }
-
-            if (! empty($this->currentTitle)) {
-                $percent = $this->similarityPercent($this->currentTitle, $resp['title']);
-                if ($percent < self::MATCH_PERCENT) {
-                    Cache::put($cacheKey, false, now()->addHours(6));
-
-                    return false;
-                }
-            }
-
-            if (! empty($this->currentYear) && ! empty($resp['year'])) {
-                $percent = $this->similarityPercent($this->currentYear, $resp['year']);
-                if ($percent < self::YEAR_MATCH_PERCENT) {
-                    Cache::put($cacheKey, false, now()->addHours(6));
-
-                    return false;
-                }
             }
 
             $movieData = [
@@ -865,11 +855,15 @@ class MovieService
                 'trailer' => $resp['trailer'] ?? '',
             ];
 
+            Cache::put($cacheKey, $movieData, $expiresAt);
+
+            if (! $this->matchesCurrentContext($movieData['title'], $movieData['year'])) {
+                return false;
+            }
+
             if ($this->echooutput) {
                 cli()->info('Trakt found '.$movieData['title']);
             }
-
-            Cache::put($cacheKey, $movieData, $expiresAt);
 
             return $movieData;
 
@@ -973,6 +967,8 @@ class MovieService
      */
     public function doMovieUpdate(string $buffer, string $service, int $id, int $processImdb = 1): string|false
     {
+        $this->candidateMismatch = false;
+
         $existingImdbId = Release::query()->where('id', $id)->value('imdbid');
         if ($existingImdbId !== null && imdb_id_is_valid($existingImdbId)) {
             return $existingImdbId;
@@ -990,14 +986,13 @@ class MovieService
                     cli()->info($this->service.' found IMDBid: tt'.$imdbId);
                 }
 
-                $movieInfoId = MovieInfo::query()->where('imdbid', $imdbId)->first(['id']);
+                if (! $this->candidateMatchesLocalInfo($imdbId)) {
+                    if ($this->echooutput) {
+                        cli()->warning('Rejected tt'.$imdbId.' for release '.$id.': local title/year mismatch');
+                    }
 
-                Release::query()->where('id', $id)->update([
-                    'imdbid' => $imdbId,
-                    'movieinfo_id' => $movieInfoId !== null ? $movieInfoId['id'] : null,
-                ]);
-
-                Search::updateRelease($id);
+                    return false;
+                }
 
                 if ($processImdb === 1) {
                     $movCheck = $this->getMovieInfo($imdbId);
@@ -1007,19 +1002,28 @@ class MovieService
                         (isset($movCheck['updated_at']) &&
                             (time() - strtotime((string) $movCheck['updated_at'])) > $thirtyDaysInSeconds)) {
 
-                        $info = $this->updateMovieInfo($imdbId);
+                        $this->updateMovieInfo($imdbId);
 
-                        if ($info === true) {
-                            $freshMovieInfo = MovieInfo::query()->where('imdbid', $imdbId)->first(['id']);
+                        // A fetcher recognised the candidate but rejected its title/year
+                        // against this release: the IMDb id itself is wrong, so do not assign it.
+                        if ($this->candidateMismatch) {
+                            if ($this->echooutput) {
+                                cli()->warning('Rejected tt'.$imdbId.' for release '.$id.': metadata title/year mismatch');
+                            }
 
-                            Release::query()->where('id', $id)->update([
-                                'movieinfo_id' => $freshMovieInfo !== null ? $freshMovieInfo['id'] : null,
-                            ]);
-
-                            Search::updateRelease($id);
+                            return false;
                         }
                     }
                 }
+
+                $movieInfoId = MovieInfo::query()->where('imdbid', $imdbId)->first(['id']);
+
+                Release::query()->where('id', $id)->update([
+                    'imdbid' => $imdbId,
+                    'movieinfo_id' => $movieInfoId !== null ? $movieInfoId['id'] : null,
+                ]);
+
+                Search::updateRelease($id);
 
                 return $imdbId;
             } catch (\Exception $e) {
@@ -1229,6 +1233,13 @@ class MovieService
                 return false;
             }
 
+            $searchYear = (string) ($buffer->data->Search[0]->Year ?? '');
+            if ($this->currentYear !== '' && $searchYear !== ''
+                && preg_match('/(\d{4})/', $searchYear, $yearHits)
+                && $this->similarityPercent($this->currentYear, $yearHits[1]) < self::YEAR_MATCH_PERCENT) {
+                return false;
+            }
+
             $getIMDBid = $buffer->data->Search[0]->imdbID;
             $imdbId = $this->doMovieUpdate($getIMDBid, 'OMDbAPI', $releaseId);
 
@@ -1250,6 +1261,11 @@ class MovieService
         try {
             $data = $this->traktTv->client->getMovieSummary($movieName, 'full');
             if ($data === false || empty($data['ids']['imdb'])) {
+                return false;
+            }
+
+            if ($this->currentYear !== '' && ! empty($data['year'])
+                && $this->similarityPercent($this->currentYear, (string) $data['year']) < self::YEAR_MATCH_PERCENT) {
                 return false;
             }
 
@@ -1334,7 +1350,7 @@ class MovieService
         }
 
         $query = MovieInfo::query()
-            ->select(['imdbid', 'title'])
+            ->select(['imdbid', 'title', 'year'])
             ->where('title', 'like', '%'.$this->currentTitle.'%');
 
         if (! empty($this->currentYear)) {
@@ -1351,23 +1367,54 @@ class MovieService
             return false;
         }
 
+        $candidates = [];
+
         foreach ($potentialMatches as $match) {
             $percent = $this->similarityPercent($this->currentTitle, $match['title']);
 
-            if ($percent >= self::MATCH_PERCENT) {
-                Cache::put($cacheKey, $match['imdbid'], now()->addDays(7));
-
-                if ($this->echooutput) {
-                    cli()->info("Found local match: {$match['title']} ({$match['imdbid']})");
-                }
-
-                return $match['imdbid'];
+            if ($percent < self::MATCH_PERCENT) {
+                continue;
             }
+
+            // Reject candidates from a conflicting year so sequels/remakes in adjacent
+            // years (e.g. "Moana 2" (2024) for a "Moana" (2026) release) cannot match.
+            if (! empty($this->currentYear) && ! empty($match['year'])
+                && $this->similarityPercent($this->currentYear, $match['year']) < self::YEAR_MATCH_PERCENT) {
+                continue;
+            }
+
+            $candidates[] = ['imdbid' => $match['imdbid'], 'percent' => $percent];
+        }
+
+        $match = $this->pickBestLocalCandidate($candidates);
+
+        if ($match !== null) {
+            Cache::put($cacheKey, $match, now()->addDays(7));
+
+            if ($this->echooutput) {
+                cli()->info("Found local match: {$this->currentTitle} ({$match})");
+            }
+
+            return $match;
         }
 
         Cache::put($cacheKey, false, now()->addHours(6));
 
         return false;
+    }
+
+    /**
+     * @param  array<int, array{imdbid: string, percent: float}>  $candidates
+     */
+    private function pickBestLocalCandidate(array $candidates): ?string
+    {
+        if ($candidates === []) {
+            return null;
+        }
+
+        usort($candidates, static fn (array $a, array $b): int => $b['percent'] <=> $a['percent']);
+
+        return $candidates[0]['imdbid'];
     }
 
     /**
@@ -1395,6 +1442,74 @@ class MovieService
         similar_text($normalizedLeft, $normalizedRight, $percent);
 
         return $percent;
+    }
+
+    /**
+     * Validate fetched metadata against the release currently being processed.
+     * Sets $candidateMismatch when the candidate is rejected so callers can
+     * distinguish a wrong IMDb id from a plain fetch failure.
+     */
+    private function matchesCurrentContext(mixed $title, mixed $year): bool
+    {
+        if ($this->currentTitle === '') {
+            return true;
+        }
+
+        $yearKnown = $this->currentYear !== '' && ! empty($year);
+        $yearMatches = $yearKnown && $this->similarityPercent($this->currentYear, $year) >= self::YEAR_MATCH_PERCENT;
+
+        // A conflicting year means a different movie (e.g. a "Moana" (2026) release
+        // matched to "Moana 2" (2024)).
+        if ($yearKnown && ! $yearMatches) {
+            $this->candidateMismatch = true;
+
+            return false;
+        }
+
+        $titlePercent = empty($title) ? 0.0 : $this->similarityPercent($this->currentTitle, $title);
+
+        // Alternate/international titles are acceptable when the exact year confirms
+        // the movie (e.g. a "Salve Geral Irmandade" (2026) release vs the locally
+        // stored international title "State of Fear" (2026)).
+        if ($titlePercent < self::MATCH_PERCENT && ! $yearMatches) {
+            $this->candidateMismatch = true;
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Validate a candidate IMDb id against the locally stored movieinfo row (if any).
+     *
+     * @phpstan-impure
+     */
+    private function candidateMatchesLocalInfo(string $imdbId): bool
+    {
+        if ($this->currentTitle === '') {
+            return true;
+        }
+
+        $movieInfo = MovieInfo::query()->where('imdbid', $imdbId)->first(['title', 'year']);
+        if ($movieInfo === null) {
+            return true;
+        }
+
+        return $this->matchesCurrentContext($movieInfo->title, $movieInfo->year);
+    }
+
+    /**
+     * Re-verify a release's IMDb match against its searchname and the local movieinfo row.
+     * Returns null when the release cannot be verified (unparseable name or no local info).
+     */
+    public function verifyReleaseMovieMatch(string $searchname, string $imdbId): ?bool
+    {
+        if (! $this->parseMovieSearchName($searchname)) {
+            return null;
+        }
+
+        return $this->candidateMatchesLocalInfo($imdbId);
     }
 
     private function normalizeComparisonValue(mixed $value): ?string

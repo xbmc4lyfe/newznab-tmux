@@ -178,6 +178,161 @@ class MovieServiceTest extends ImdbScraperTestCase
         $this->assertNull(Release::query()->whereKey(2)->value('movieinfo_id'));
     }
 
+    #[Test]
+    public function it_does_not_match_sequels_from_adjacent_years_in_local_search(): void
+    {
+        Cache::flush();
+
+        $service = new MovieService;
+        $service->echooutput = false;
+        $service->update([
+            'imdbid' => '13622970',
+            'title' => 'Moana 2',
+            'year' => '2024',
+        ]);
+
+        $this->setMovieServiceProperty($service, 'currentTitle', 'Moana');
+        $this->setMovieServiceProperty($service, 'currentYear', '2026');
+
+        $this->assertFalse($this->invokeLocalIMDBSearch($service));
+    }
+
+    #[Test]
+    public function it_prefers_the_exact_year_title_match_in_local_search(): void
+    {
+        Cache::flush();
+
+        $service = new MovieService;
+        $service->echooutput = false;
+        $service->update([
+            'imdbid' => '13622970',
+            'title' => 'Moana 2',
+            'year' => '2024',
+        ]);
+        $service->update([
+            'imdbid' => '25347582',
+            'title' => 'Moana',
+            'year' => '2026',
+        ]);
+
+        $this->setMovieServiceProperty($service, 'currentTitle', 'Moana');
+        $this->setMovieServiceProperty($service, 'currentYear', '2026');
+
+        $this->assertSame('25347582', $this->invokeLocalIMDBSearch($service));
+    }
+
+    #[Test]
+    public function it_rejects_same_title_candidates_from_a_different_year_in_local_search(): void
+    {
+        Cache::flush();
+
+        $service = new MovieService;
+        $service->echooutput = false;
+        $service->update([
+            'imdbid' => '0137523',
+            'title' => 'Example Movie',
+            'year' => '2023',
+        ]);
+
+        $this->setMovieServiceProperty($service, 'currentTitle', 'Example Movie');
+        $this->setMovieServiceProperty($service, 'currentYear', '2024');
+
+        $this->assertFalse($this->invokeLocalIMDBSearch($service));
+    }
+
+    #[Test]
+    public function it_accepts_a_candidate_with_an_alternate_title_when_the_year_matches(): void
+    {
+        Cache::flush();
+
+        $service = new MovieService;
+        $service->echooutput = false;
+        $service->update([
+            'imdbid' => '39369643',
+            'title' => 'State of Fear',
+            'year' => '2026',
+        ]);
+
+        Release::query()->insert([
+            'id' => 5,
+            'searchname' => 'Salve.Geral.Irmandade.2026.2160p.Netflix.WEB-DL.HEVC.10bit.DDP5.1.Atmos.6Audios-QHstudIo',
+            'categories_id' => 2000,
+            'imdbid' => null,
+            'movieinfo_id' => null,
+        ]);
+
+        $this->setMovieServiceProperty($service, 'currentTitle', 'Salve Geral Irmandade');
+        $this->setMovieServiceProperty($service, 'currentYear', '2026');
+
+        $this->assertSame('39369643', $service->doMovieUpdate('tt39369643', 'IMDb(scrape)', 5));
+        $this->assertSame('39369643', Release::query()->whereKey(5)->value('imdbid'));
+    }
+
+    #[Test]
+    public function it_rejects_a_candidate_whose_local_movie_info_year_mismatches(): void
+    {
+        Cache::flush();
+
+        $service = new MovieService;
+        $service->echooutput = false;
+        $service->update([
+            'imdbid' => '13622970',
+            'title' => 'Moana 2',
+            'year' => '2024',
+        ]);
+
+        Release::query()->insert([
+            'id' => 3,
+            'searchname' => 'Moana.2026.1080p.AMZN.WEB-DL.H.264-HDShare',
+            'categories_id' => 2000,
+            'imdbid' => null,
+            'movieinfo_id' => null,
+        ]);
+
+        $this->setMovieServiceProperty($service, 'currentTitle', 'Moana');
+        $this->setMovieServiceProperty($service, 'currentYear', '2026');
+
+        $this->assertFalse($service->doMovieUpdate('tt13622970', 'Local DB', 3));
+        $this->assertNull(Release::query()->whereKey(3)->value('imdbid'));
+    }
+
+    #[Test]
+    public function it_does_not_assign_an_imdb_id_when_a_metadata_fetcher_rejects_the_candidate(): void
+    {
+        Cache::flush();
+
+        $service = new class extends MovieService
+        {
+            public function updateMovieInfo(string $imdbId): bool
+            {
+                $this->candidateMismatch = true;
+
+                return false;
+            }
+        };
+        $service->echooutput = false;
+
+        Release::query()->insert([
+            'id' => 4,
+            'searchname' => 'Moana.2026.1080p.AMZN.WEB-DL.H.264-HDShare',
+            'categories_id' => 2000,
+            'imdbid' => null,
+            'movieinfo_id' => null,
+        ]);
+
+        $result = $service->doMovieUpdate('tt0137523', 'IMDb(scrape)', 4);
+
+        $this->assertFalse($result);
+        $this->assertNull(Release::query()->whereKey(4)->value('imdbid'));
+    }
+
+    private function invokeLocalIMDBSearch(MovieService $service): string|false
+    {
+        $method = new \ReflectionMethod($service, 'localIMDBSearch');
+
+        return $method->invoke($service);
+    }
+
     /**
      * @param  array<string, mixed>  $response
      */
