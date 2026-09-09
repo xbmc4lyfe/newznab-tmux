@@ -237,6 +237,15 @@ class LayoutShellMarkupTest extends TestCase
         }
     }
 
+    public function test_predb_admin_page_displays_its_stored_size_without_numeric_conversion(): void
+    {
+        $markup = $this->view('admin/predb/index.blade.php');
+
+        $this->assertStringContainsString("{{ \$pre->size ?: '—' }}", $markup);
+        $this->assertStringNotContainsString('human_filesize($pre->size)', $markup);
+        $this->assertStringNotContainsString('bytesToSizeString', $markup);
+    }
+
     public function test_every_main_layout_page_uses_the_canonical_user_hero(): void
     {
         $userViews = new \RecursiveIteratorIterator(
