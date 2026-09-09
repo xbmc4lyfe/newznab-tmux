@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Tmux;
 
+use App\Facades\Yenc;
 use Illuminate\Support\Facades\Process;
 
 /**
@@ -205,6 +206,12 @@ class TmuxOutput extends Tmux
                 'stale for '.$this->relativeTime($this->runVar['timers']['timer3'])
             );
         }
+
+        $buffer .= sprintf(
+            $this->tmpMasks[1],
+            'yEnc Decoder:',
+            Yenc::decoderName()
+        );
 
         return $buffer.PHP_EOL;
     }

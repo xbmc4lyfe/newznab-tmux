@@ -13,6 +13,7 @@ use Illuminate\Support\Facades\Facade;
  * @method static string|false decode(string &$text, bool $ignore = false)
  * @method static string decodeIgnore(string &$text)
  * @method static bool enabled()
+ * @method static string decoderName()
  * @method static bool isYencEncoded(string $text)
  * @method static string encode(string $data, string $filename, int $lineLength = 128, bool $includeCrc32 = true)
  * @method static array|null extractMetadata(string $text)

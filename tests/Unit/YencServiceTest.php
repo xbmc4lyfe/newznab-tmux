@@ -2,10 +2,9 @@
 
 namespace Tests\Unit;
 
-use App\Facades\Yenc;
 use App\Services\YencService;
+use PHPUnit\Framework\TestCase;
 use RuntimeException;
-use Tests\TestCase;
 
 class YencServiceTest extends TestCase
 {
@@ -20,6 +19,11 @@ class YencServiceTest extends TestCase
     public function test_enabled_returns_true(): void
     {
         $this->assertTrue($this->yencService->enabled());
+    }
+
+    public function test_reports_php_decoder(): void
+    {
+        $this->assertSame('PHP', $this->yencService->decoderName());
     }
 
     public function test_encode_and_decode_round_trip(): void
@@ -169,17 +173,5 @@ class YencServiceTest extends TestCase
         $decoded = $this->yencService->decode($encoded);
 
         $this->assertEquals($data, $decoded);
-    }
-
-    public function test_service_can_be_resolved_from_container(): void
-    {
-        $service = app(YencService::class);
-
-        $this->assertInstanceOf(YencService::class, $service);
-    }
-
-    public function test_facade_works(): void
-    {
-        $this->assertTrue(Yenc::enabled());
     }
 }

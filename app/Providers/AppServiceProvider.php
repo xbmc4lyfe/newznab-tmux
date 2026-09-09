@@ -35,9 +35,12 @@ use App\Observers\RootCategoryObserver;
 use App\Observers\SteamAppObserver;
 use App\Observers\UsenetGroupObserver;
 use App\Observers\VideoObserver;
+use App\Services\Yenc\DecoderFactory;
+use App\Services\YencService;
 use App\View\Composers\AdminDataComposer;
 use App\View\Composers\GlobalDataComposer;
 use Illuminate\Auth\Events\Login;
+use Illuminate\Foundation\Application;
 use Illuminate\Pagination\Paginator;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
@@ -97,6 +100,13 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        //
+        $this->app->singleton(YencService::class, function (Application $app): YencService {
+            $decoder = (new DecoderFactory($app['log']))->make(
+                (string) $app['config']->get('yenc.decoder', 'auto'),
+                (string) $app['config']->get('yenc.native_library', ''),
+            );
+
+            return new YencService($decoder);
+        });
     }
 }

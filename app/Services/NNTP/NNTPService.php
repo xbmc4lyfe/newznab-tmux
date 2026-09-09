@@ -767,27 +767,7 @@ class NNTPService extends NntpClient
             return $this->_handleErrorResponse($response);
         }
 
-        // Use array to accumulate lines (faster than string concatenation)
-        $bodyParts = [];
-        $socket = $this->_socket;
-
-        while (! feof($socket)) {
-            $line = fgets($socket, 8192);
-            if ($line === false) {
-                return $this->throwError('Failed to read line from socket.', null);
-            }
-            if ($line === ".\r\n") {
-                $body = implode('', $bodyParts);
-
-                return $this->_yencService->decodeIgnore($body);
-            }
-            if ($line[0] === '.' && isset($line[1]) && $line[1] === '.') {
-                $line = substr($line, 1);
-            }
-            $bodyParts[] = $line;
-        }
-
-        return $this->throwError('End of stream! Connection lost?', null);
+        return $this->readBody();
     }
 
     /**
@@ -1073,41 +1053,35 @@ class NNTPService extends NntpClient
         }
 
         if ($response === ResponseCode::BodyFollows->value) {
-            // Use array to accumulate lines (faster than string concatenation for many appends)
-            $bodyParts = [];
-            $socket = $this->_socket;
-
-            // Continue until connection is lost
-            while (! feof($socket)) {
-                // Retrieve and append up to 8192 characters from the server (larger buffer = fewer syscalls)
-                $line = fgets($socket, 8192);
-
-                // If the socket is empty/ an error occurs, false is returned.
-                if ($line === false) {
-                    return $this->throwError('Failed to read line from socket.', null);
-                }
-
-                // Check if the line terminates the text response.
-                if ($line === ".\r\n") {
-                    // Join all parts and attempt to yEnc decode
-                    $body = implode('', $bodyParts);
-
-                    return $this->_yencService->decodeIgnore($body);
-                }
-
-                // Check for line that starts with double period, remove one.
-                if ($line[0] === '.' && isset($line[1]) && $line[1] === '.') {
-                    $line = substr($line, 1);
-                }
-
-                // Add the line to the array
-                $bodyParts[] = $line;
-            }
-
-            return $this->throwError('End of stream! Connection lost?', null);
+            return $this->readBody();
         }
 
         return $this->_handleErrorResponse($response);
+    }
+
+    /** Read one dot-terminated BODY response, removing NNTP dot stuffing exactly once. */
+    protected function readBody(): mixed
+    {
+        $body = '';
+        $line = '';
+        $socket = $this->_socket;
+        while (! feof($socket)) {
+            $fragment = fgets($socket, 8192);
+            if ($fragment === false) {
+                return $this->throwError('Failed to read line from socket.', null);
+            }
+            $line .= $fragment;
+            if (! str_ends_with($line, "\n")) {
+                continue;
+            }
+            if ($line === ".\r\n") {
+                return $this->_yencService->decodeIgnore($body);
+            }
+            $body .= str_starts_with($line, '..') ? substr($line, 1) : $line;
+            $line = '';
+        }
+
+        return $this->throwError('End of stream! Connection lost?', null);
     }
 
     /**
