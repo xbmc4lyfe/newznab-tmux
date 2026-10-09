@@ -676,7 +676,7 @@ class NfoService
                     '-inul',
                     '-p-',
                     '-@',
-                    '-',
+                    '--',
                     $archiveFile,
                     $nfoFilename,
                     $extractDir,

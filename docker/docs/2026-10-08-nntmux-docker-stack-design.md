@@ -433,6 +433,7 @@ alt.binaries.ath           alt.binaries.sounds.lossless  alt.binaries.sounds.mp3
 | Native yEnc unavailable under ZTS PHP | Dropped the RapidYenc stage and FFI; `YENC_DECODER=php` |
 | Some workers saw intermittent `stream_socket_client` connect failures; only about 16 of 73 connections were in use | Treated as transient: the next cycle retries. Another client sharing the same provider account may also be using its connection pool. |
 | Grafana showed its own login page: Caddy sorted `request_header -X-JWT-Assertion` after `forward_auth`, which deleted the JWT before it reached Grafana | Wrapped the `/grafana*` handlers in `route { }` so they run in the order written |
+| No mediainfo, samples or video previews. The cause was `unrar` exiting 7 (`Unknown option`) on NNTmux's lone `-` switch terminator, hidden by `extract_using_rar_info = 1` | Changed `-` to `--` at the three unrar call sites (BUGS.md #19), added a regression test, and set `extract_using_rar_info = 0` in `tuning.sql`. Verified end to end: `(vRAW)`, then `m` and `s`, giving Matroska/HEVC 1920×1072 in `video_data`. |
 | Post-processing panes exit right after start ("no work available") | Expected before any releases exist. The monitor respawns them on their timers. |
 
 ### Throughput tuning (2026-10-09)

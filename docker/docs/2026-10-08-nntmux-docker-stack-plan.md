@@ -1597,6 +1597,9 @@ UPDATE post_processing_configurations SET
     post_threads_non = 3,
     post_threads_amazon = 2,
     fix_name_threads = 2,
+    -- 0 = extract the first RAR/ZIP volume with unrar/unzip so ffmpeg and mediainfo get a video file;
+    -- 1 only lists archive contents (no samples, previews or mediainfo).
+    extract_using_rar_info = 0,
     updated_at = NOW();
 
 UPDATE tmux_configurations SET

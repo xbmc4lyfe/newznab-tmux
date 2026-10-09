@@ -85,6 +85,24 @@ These bugs turned up while building and running the self-hosted stack in `docker
   The tmux pane only says "no additional work". On the docker stack, 480,988 releases built up with zero media data, and 99% sat in Misc, because obfuscated posts can only be renamed from their PAR2 and file lists.
 - **Fix:** decouple the queue marker from the password-check feature. Always insert `-1`, and let `ProcessingConfiguration::$processPasswords` decide only whether a password result is recorded; `ReleaseFileManager.php:274` already does this. At minimum, document that the flag gates all post-processing.
 
+### 19. Every `unrar` extraction fails: a lone `-` is passed as the end-of-switches marker (Fixed)
+
+- **Where:** three call sites:
+  - `app/Services/AdditionalProcessing/ArchiveExtractionService.php:236`: `'-@', '-',` in `extractArchive()`
+  - `ArchiveExtractionService.php:399`: `extractSpecificFileWithExternalTools()`
+  - `app/Services/NfoService.php:678-679`: `extractNfoViaUnrar()`
+- **Bug:** `unrar` (6.21 confirmed) treats the lone `-` as an unknown option. It prints `ERROR: Unknown option:` and exits 7 before opening the archive. RAR's documented end-of-switches marker is `--`.
+- **Symptom:** nothing is ever extracted from RAR archives, so mediainfo, ffmpeg samples, video previews, inline JPGs and NFOs inside RARs are never produced. File lists still appear, because they come from the PHP RAR parser. Pane output shows `(cB)` downloads with no `(vRAW)`/`m`/`s`.
+- **Reproduce:** run `unrar e -ai -ep -c- -id -inul -kb -or -p- -r -y -@ - first.rar out/`. It exits 7. With `--` it extracts. On a real release, the `--` form pulled 2.3 MB of an `.mkv` from the first volume, and mediainfo read it as HEVC 1920×1072.
+- **Fix (staged):** use `'--'` at all three sites. Regression test: `tests/Feature/UnrarArgumentsTest.php`, using the stored-RAR fixture `tests/Fixtures/archives/stored-sample.rar`. After the fix, the live pipeline produced `(vRAW)`, `m` and `s`, with rows in `media_infos`, `video_data` and `audio_data`, and a preview.
+
+### 20. `extract_using_rar_info = 1` turns off all archive extraction without saying so (Open, documentation)
+
+- **Where:** `post_processing_configurations.extract_using_rar_info`. It is read in `ArchiveExtractionService::extractArchive()` and `prepareExtractionDirectories()`. Its default is `false` (`database/support/LegacySettingsManifest.php:121`).
+- **Bug:** with it on, only the PHP RAR/ZIP parser runs. It lists the files but extracts nothing, so mediainfo, samples and previews never get a file.
+- **Symptom:** this stack's database had it at `1`, even though the manifest default is `false`; I didn't find what set it. That hid bug #19, because `unrar` was never even called.
+- **Fix:** label the admin setting so it's clear that enabling it disables media extraction. The docker stack's `tuning.sql` now sets it to `0`.
+
 ## Packaging and deployment
 
 ### 11. `docker-compose.yml.prod-dist` starts a command that doesn't exist (Open)
