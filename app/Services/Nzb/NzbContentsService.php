@@ -46,7 +46,7 @@ class NzbContentsService
         $this->nfo = $nfo ?? new NfoService;
         $this->postProcessService = $postProcessService ?? app(PostProcessService::class);
         $this->lookupPar2 = (int) app(ConfigurationProvider::class)->postProcessing()->lookupPar2 === 1;
-        $this->alternateNntp = (bool) config('nntmux_nntp.use_alternate_nntp_server');
+        $this->alternateNntp = (bool) config('nntmux_nntp.alternate_article_fallback');
     }
 
     /**

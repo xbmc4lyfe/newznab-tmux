@@ -22,6 +22,14 @@ return [
     ],
 
     /*
+    | Run the scheduled `tmux:health-check --auto-restart` from the Laravel scheduler.
+    | Disable when the scheduler runs in a different container than the tmux engine
+    | (e.g. docker/docker-compose.yml): there it would start a second tmux session
+    | inside the scheduler container. The indexer container supervises itself instead.
+    */
+    'scheduled_health_check' => (bool) env('TMUX_SCHEDULED_HEALTH_CHECK', true),
+
+    /*
     | Fix-names pane. The "past 6 hours" passes always run; full-backlog passes (every release
     | not yet tried) run at most once per interval, and PreDB full-text matching runs each cycle.
     */
