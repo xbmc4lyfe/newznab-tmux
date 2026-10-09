@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Facades\Search;
 use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbService;
@@ -195,6 +196,7 @@ class ReleaseDuplicateFinderTest extends TestCase
     public function a_failed_fingerprint_write_removes_the_inserted_release(): void
     {
         DB::statement("CREATE TRIGGER block_fingerprint BEFORE UPDATE OF article_fingerprint ON releases BEGIN SELECT RAISE(ABORT, 'boom'); END");
+        $search = Search::spy();
         $this->app->instance(NzbService::class, $this->createMock(NzbService::class));
         $import = new NzbImportService(['Browser' => true]);
 
@@ -203,6 +205,7 @@ class ReleaseDuplicateFinderTest extends TestCase
             $this->fail('Expected the fingerprint write to fail.');
         } catch (QueryException) {
             $this->assertSame(0, DB::table('releases')->where('id', 1)->count());
+            $search->shouldHaveReceived('deleteRelease')->with(1)->once();
         }
     }
 

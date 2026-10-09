@@ -22,8 +22,9 @@ return new class extends Migration
         });
     }
 
-    public function down(): void
-    {
-        Schema::dropIfExists('cache_locks');
-    }
+    /**
+     * The lock table is shared cache infrastructure (also used by Cache::lock elsewhere) and may have
+     * existed before this migration, so it is intentionally left in place on rollback.
+     */
+    public function down(): void {}
 };

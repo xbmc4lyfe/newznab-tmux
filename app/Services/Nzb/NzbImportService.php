@@ -522,7 +522,8 @@ class NzbImportService
         try {
             ReleaseArticleFingerprintStore::store($releaseId, $fingerprint);
         } catch (\Throwable $exception) {
-            Release::query()->whereKey($releaseId)->delete();
+            // Delete through the model so ReleaseObserver also removes the search document.
+            Release::query()->find($releaseId)?->delete();
 
             throw $exception;
         }
@@ -550,7 +551,8 @@ class NzbImportService
         }
 
         if (! $stored) {
-            Release::query()->where('guid', $this->relGuid)->delete();
+            // Delete through the model so ReleaseObserver also removes the search document.
+            Release::query()->where('guid', $this->relGuid)->first()?->delete();
         }
 
         return [$stored, $path];
