@@ -113,7 +113,7 @@
                                 @if($guid)
                                     <a href="{{ url('/details/' . $guid) }}" class="block">
                                         @if(!empty($result->cover))
-                                            <img src="{{ url('/covers/music/' . $result->cover) }}"
+                                            <img src="{{ getImageAssetUrl('music', (string) $result->id, url('/images/no-cover.png')) }}"
                                                  alt="{{ $result->artist ?? '' }} - {{ $result->title ?? '' }}"
                                                  class="w-32 h-48 object-cover"
                                                  loading="lazy"

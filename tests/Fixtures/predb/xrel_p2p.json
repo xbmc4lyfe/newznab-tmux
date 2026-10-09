@@ -1,0 +1,68 @@
+{
+ "total_count": -1,
+ "pagination": {
+  "current_page": 1,
+  "per_page": 5,
+  "total_pages": -1
+ },
+ "list": [
+  {
+   "id": "8da12a1170835",
+   "dirname": "Animals.2026.2160p.NF.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-Kitsune",
+   "link_href": "https://www.xrel.to/p2p/460853-Animals-2026-2160p-NF-WEB-DL-DDP5-1-Atmos-DV-HDR-H-265-Kitsune/nfo.html",
+   "category": {
+    "meta_cat": "movie",
+    "sub_cat": "HD-2160p",
+    "id": "894aced519"
+   },
+   "main_lang": "english",
+   "pub_time": 1791576306,
+   "size_mb": 12200,
+   "group": {
+    "id": "573348711255",
+    "name": "Kitsune"
+   },
+   "num_ratings": 0,
+   "ext_info": {
+    "type": "movie",
+    "id": "8f62d61a1c27f",
+    "title": "Animals (2026)",
+    "link_href": "https://www.xrel.to/movie/115327/Animals-2026.html",
+    "uris": [
+     "imdb:tt31049299"
+    ]
+   },
+   "comments": 0
+  },
+  {
+   "id": "faa61a8770834",
+   "dirname": "Piranhaconda.2012.German.DL.EAC3.1080p.BluRay.x265-JellyfinPlex",
+   "link_href": "https://www.xrel.to/p2p/460852-Piranhaconda-2012-German-DL-EAC3-1080p-BluRay-x265-JellyfinPlex/nfo.html",
+   "category": {
+    "meta_cat": "movie",
+    "sub_cat": "HD-1080p",
+    "id": "968f458a2"
+   },
+   "main_lang": "german",
+   "pub_time": 1791575130,
+   "size_mb": 2850,
+   "group": {
+    "id": "84b8548315d2",
+    "name": "JellyfinPlex"
+   },
+   "num_ratings": 0,
+   "ext_info": {
+    "type": "movie",
+    "id": "e6cf887b1ad9d",
+    "title": "Piranhaconda",
+    "link_href": "https://www.xrel.to/movie/109981/Piranhaconda.html",
+    "rating": 3.4,
+    "num_ratings": 5,
+    "uris": [
+     "imdb:tt1886644"
+    ]
+   },
+   "comments": 0
+  }
+ ]
+}

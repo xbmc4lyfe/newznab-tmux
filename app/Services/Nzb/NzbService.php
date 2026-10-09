@@ -183,6 +183,7 @@ class NzbService
 
             $cursor = ['collection_id' => 0, 'name' => '', 'binary_id' => 0, 'partnumber' => 0];
             $openBinaryId = 0;
+            $fingerprintAccumulator = new NzbArticleFingerprint;
             do {
                 $page = $this->loadNzbRowPage((int) $release->id, $cursor);
                 foreach ($page as $row) {
@@ -221,6 +222,7 @@ class NzbService
                         return NzbCreationResult::deterministic("Part {$row->partnumber} for binary {$binaryId} has an empty message ID.", $collectionIds, $path);
                     }
 
+                    $fingerprintAccumulator->add($messageId);
                     $XMLWriter->startElement('segment');
                     $XMLWriter->writeAttribute('bytes', (string) $row->size);
                     $XMLWriter->writeAttribute('number', (string) $row->partnumber);
@@ -263,8 +265,10 @@ class NzbService
                 return NzbCreationResult::transient("Final NZB file is missing or unreadable: {$path}", $collectionIds, $path);
             }
 
-            DB::transaction(function () use ($release): void {
-                $release->update($this->successfulReleaseUpdateValues());
+            $fingerprint = $fingerprintAccumulator->value();
+
+            DB::transaction(function () use ($release, $fingerprint): void {
+                $release->update($this->successfulReleaseUpdateValues($fingerprint));
 
                 if (NzbCreationCandidateQuery::supportsFailureState()) {
                     ReleaseNzbCreationFailure::query()
@@ -658,27 +662,7 @@ class NzbService
      */
     private function normalizeSegmentMessageId(string $messageId): string
     {
-        $messageId = trim($messageId);
-
-        if ($messageId === '') {
-            return '';
-        }
-
-        if (
-            \strlen($messageId) >= 2
-            && (($messageId[0] === '"' && str_ends_with($messageId, '"'))
-                || ($messageId[0] === "'" && str_ends_with($messageId, "'")))
-        ) {
-            $messageId = substr($messageId, 1, -1);
-        }
-
-        $messageId = trim($messageId);
-
-        if (str_starts_with($messageId, '<') && str_ends_with($messageId, '>')) {
-            $messageId = substr($messageId, 1, -1);
-        }
-
-        return trim($messageId);
+        return NzbArticleFingerprint::normalizeMessageId($messageId);
     }
 
     /**
@@ -697,14 +681,27 @@ class NzbService
         return [];
     }
 
-    private function temporaryNzbPath(string $path): string
+    /**
+     * Temporary sibling for an NZB being written; recognised by {@see findStaleTemporaryNzbPaths()}.
+     */
+    public static function temporaryNzbPathFor(string $path): string
     {
         return $path.'.tmp.'.getmypid().'.'.bin2hex(random_bytes(6));
     }
 
-    private function isTemporaryNzbPath(string $path): bool
+    public static function isTemporaryNzbPathName(string $path): bool
     {
         return preg_match('/\.nzb\.gz\.tmp\.\d+\.[0-9a-f]{12}$/', basename($path)) === 1;
+    }
+
+    private function temporaryNzbPath(string $path): string
+    {
+        return self::temporaryNzbPathFor($path);
+    }
+
+    private function isTemporaryNzbPath(string $path): bool
+    {
+        return self::isTemporaryNzbPathName($path);
     }
 
     /**
@@ -740,9 +737,13 @@ class NzbService
     /**
      * @return array<string, mixed>
      */
-    private function successfulReleaseUpdateValues(): array
+    private function successfulReleaseUpdateValues(?string $articleFingerprint = null): array
     {
         $values = ['nzbstatus' => self::NZB_ADDED];
+
+        if ($articleFingerprint !== null && ReleaseArticleFingerprintStore::columnExists()) {
+            $values[ReleaseArticleFingerprintStore::COLUMN] = $articleFingerprint;
+        }
 
         if (NzbCreationCandidateQuery::supportsClaims()) {
             $values += [

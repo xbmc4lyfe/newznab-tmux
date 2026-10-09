@@ -17,4 +17,8 @@ return [
     'alternate_nntp_connections' => env('NNTP_CONNECTIONS_A', 1),
     'compressed_headers' => env('NNTP_COMPRESSED_HEADERS', false),
     'use_alternate_nntp_server' => env('USE_ALTERNATE_NNTP_SERVER', false),
+    // Retry articles missing on the primary against the alternate provider without moving header
+    // and post-processing connections to it (which USE_ALTERNATE_NNTP_SERVER also does).
+    // A blank NNTP_ALTERNATE_FALLBACK (as in .env.example) follows USE_ALTERNATE_NNTP_SERVER.
+    'alternate_article_fallback' => (bool) (blank(env('NNTP_ALTERNATE_FALLBACK')) ? env('USE_ALTERNATE_NNTP_SERVER', false) : env('NNTP_ALTERNATE_FALLBACK')),
 ];

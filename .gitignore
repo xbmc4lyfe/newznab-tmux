@@ -4,6 +4,7 @@ docker/.zsh_history
 docker/composer-auth.json
 docker/php-overrides.local.ini
 docker-compose.yml
+!docker/docker-compose.yml
 docker-compose.override.yml
 .env
 install.lock
@@ -94,3 +95,11 @@ deploy/**/__pycache__/
 /infra/ansible/inventory/*.yml
 /infra/ansible/inventory/*.json
 /infra/ansible/.cache/
+
+# Self-hosted docker/ stack runtime state and secrets
+/docker/data/
+/docker/logs/
+/docker/backups/
+/docker/.env
+/docker/config/app.env
+/docker/config/usenet_servers.json

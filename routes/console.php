@@ -61,7 +61,7 @@ Schedule::call(function () {
     UserDownload::where('timestamp', '<', now()->subDay())->delete();
 })->name('cleanup-api-request-logs')->hourly()->withoutOverlapping();
 // Check tmux health and auto-restart if monitor pane is dead
-Schedule::command('tmux:health-check --auto-restart')->everyThirtyMinutes()->withoutOverlapping();
+Schedule::command('tmux:health-check --auto-restart')->everyThirtyMinutes()->withoutOverlapping()->when(static fn (): bool => (bool) config('tmux.scheduled_health_check'));
 Schedule::command('nntmux:check-service-health')->everyMinute()->withoutOverlapping();
 Schedule::command('nntmux:search-repair --limit=100')->everyMinute()->withoutOverlapping();
 // Tail storage/logs into the Manticore log index used by the admin log viewer search
@@ -69,3 +69,5 @@ Schedule::command('nntmux:index-logs')->everyMinute()->withoutOverlapping()->run
 // Keep the admin dashboard snapshot (Cache::flexible) hot so admins never pay
 // the cold-cache cost when opening /admin/index.
 Schedule::command('admin:warm-dashboard')->everyFifteenMinutes()->withoutOverlapping();
+// Poll public PreDB JSON/RSS feeds (config/predb_feeds.php); the IRC scraper remains the realtime source
+Schedule::command('predb:import-feed --quiet')->everyFiveMinutes()->withoutOverlapping()->runInBackground()->when(static fn (): bool => (bool) config('predb_feeds.enabled'));
