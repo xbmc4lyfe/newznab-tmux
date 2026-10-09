@@ -41,7 +41,7 @@ final class PredbClubSource extends HttpFeedSource
         }
 
         $rows = $response->json('data.rows');
-        if (! is_array($rows)) {
+        if (! is_array($rows) || ! array_is_list($rows)) {
             throw new RuntimeException('predb.club returned an unexpected response (no data.rows).');
         }
 

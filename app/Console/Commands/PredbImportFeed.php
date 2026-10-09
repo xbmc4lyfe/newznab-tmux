@@ -14,6 +14,7 @@ use Illuminate\Console\Command;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
+use RuntimeException;
 use Throwable;
 
 class PredbImportFeed extends Command
@@ -88,9 +89,16 @@ class PredbImportFeed extends Command
                         $totals[$key] += $count;
                     }
 
-                    if ($since !== null && $this->reachedCutoff($entries, $since)) {
-                        $reachedCutoff = true;
-                        break;
+                    if ($since !== null) {
+                        $oldest = $this->oldestPredate($entries);
+                        if ($oldest === null) {
+                            // Undated entries (e.g. RSS without pubDate) cannot page back; stop, unverified.
+                            break;
+                        }
+                        if ($oldest->lessThan($since)) {
+                            $reachedCutoff = true;
+                            break;
+                        }
                     }
                 }
 
@@ -138,8 +146,19 @@ class PredbImportFeed extends Command
                     throw $e;
                 }
 
-                $retryAfter = $e instanceof RequestException ? $e->response->header('Retry-After') : null;
-                $wait = $this->retryAfterSeconds($retryAfter, (int) config('predb_feeds.rate_limit_wait_seconds', 60));
+                $response = $e instanceof RequestException ? $e->response : null;
+                $wait = $this->rateLimitWaitSeconds(
+                    $response?->header('Retry-After'),
+                    $response?->header('X-RateLimit-Reset'),
+                    (int) config('predb_feeds.rate_limit_wait_seconds', 60),
+                );
+
+                // Never retry before the server's reset; if that is too far away, give up on this run.
+                $maxWait = max(0, (int) config('predb_feeds.rate_limit_max_wait_seconds', 900));
+                if ($wait > $maxWait) {
+                    throw new RuntimeException("rate limited for {$wait}s (more than the {$maxWait}s maximum wait)", 0, $e);
+                }
+
                 Log::info('PreDB feed rate limited; backing off', ['source' => $source->key(), 'page' => $page, 'wait_seconds' => $wait]);
                 sleep($wait);
             }
@@ -147,23 +166,28 @@ class PredbImportFeed extends Command
     }
 
     /**
-     * Seconds to wait for a Retry-After header (delta-seconds or HTTP-date); the server's delay is
-     * never shortened. Falls back to $default when the header is missing or invalid.
+     * Seconds to wait before retrying a throttled request: Retry-After (delta-seconds or HTTP-date),
+     * else an epoch X-RateLimit-Reset (xREL), else $default. The server's delay is never shortened.
      */
-    private function retryAfterSeconds(?string $header, int $default): int
+    private function rateLimitWaitSeconds(?string $retryAfter, ?string $resetAt, int $default): int
     {
-        $header = trim((string) $header);
+        $retryAfter = trim((string) $retryAfter);
 
-        if ($header !== '' && ctype_digit($header)) {
-            return (int) $header;
+        if ($retryAfter !== '' && ctype_digit($retryAfter)) {
+            return (int) $retryAfter;
         }
 
-        if ($header !== '') {
+        if ($retryAfter !== '') {
             try {
-                return max(0, (int) ceil(CarbonImmutable::now()->diffInSeconds(CarbonImmutable::parse($header), false)));
+                return max(0, (int) ceil(CarbonImmutable::now()->diffInSeconds(CarbonImmutable::parse($retryAfter), false)));
             } catch (Throwable) {
                 // Not an HTTP-date either.
             }
+        }
+
+        $resetAt = trim((string) $resetAt);
+        if ($resetAt !== '' && ctype_digit($resetAt)) {
+            return max(0, (int) $resetAt - CarbonImmutable::now()->getTimestamp());
         }
 
         return max(0, $default);
@@ -172,12 +196,11 @@ class PredbImportFeed extends Command
     /**
      * @param  list<PredbFeedEntry>  $entries
      */
-    private function reachedCutoff(array $entries, CarbonImmutable $since): bool
+    private function oldestPredate(array $entries): ?CarbonImmutable
     {
         $dates = array_filter(array_map(static fn (PredbFeedEntry $entry): ?CarbonImmutable => $entry->predate, $entries));
 
-        // Sources without dates (e.g. RSS) cannot page back; stop after the first page.
-        return $dates === [] || min($dates)->lessThan($since);
+        return $dates === [] ? null : min($dates);
     }
 
     /**

@@ -6,6 +6,7 @@ namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
+use RuntimeException;
 use Throwable;
 
 /**
@@ -43,8 +44,11 @@ final class SrrdbSource extends HttpFeedSource
     public function fetch(int $page = 1): array
     {
         $rows = $this->http()->get(self::pageUrl($this->endpoint, max(1, $page)))->throw()->json('results');
+        if (! is_array($rows) || ! array_is_list($rows)) {
+            throw new RuntimeException('srrDB returned an unexpected response (no results list).');
+        }
 
-        return is_array($rows) ? $this->parseRows($rows) : [];
+        return $this->parseRows($rows);
     }
 
     /**

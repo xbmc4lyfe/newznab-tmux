@@ -38,7 +38,7 @@ final class PredbNetSource extends HttpFeedSource
         }
 
         $rows = $response->json('data');
-        if (! is_array($rows)) {
+        if (! is_array($rows) || ! array_is_list($rows)) {
             throw new RuntimeException('predb.net returned an unexpected response (no data).');
         }
 

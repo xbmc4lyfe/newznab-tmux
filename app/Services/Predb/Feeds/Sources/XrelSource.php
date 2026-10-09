@@ -6,6 +6,7 @@ namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
+use RuntimeException;
 
 /**
  * xREL API v2: scene releases (`/v2/release/latest.json`) or P2P releases (`/v2/p2p/releases.json`).
@@ -49,8 +50,11 @@ final class XrelSource extends HttpFeedSource
         }
 
         $rows = $response->json('list');
+        if (! is_array($rows) || ! array_is_list($rows)) {
+            throw new RuntimeException('xREL returned an unexpected response (no list).');
+        }
 
-        return is_array($rows) ? $this->parseRows($rows) : [];
+        return $this->parseRows($rows);
     }
 
     /**

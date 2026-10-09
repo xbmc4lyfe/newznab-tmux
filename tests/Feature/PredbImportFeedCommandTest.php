@@ -293,15 +293,27 @@ class PredbImportFeedCommandTest extends TestCase
     }
 
     #[Test]
-    public function retry_after_accepts_seconds_and_http_dates_without_shortening(): void
+    public function rate_limit_waits_use_retry_after_or_the_reset_header_without_shortening(): void
     {
-        $command = new ReflectionMethod(PredbImportFeed::class, 'retryAfterSeconds');
+        $wait = new ReflectionMethod(PredbImportFeed::class, 'rateLimitWaitSeconds');
         $instance = app(PredbImportFeed::class);
 
-        $this->assertSame(1200, $command->invoke($instance, '1200', 60));
-        $this->assertEqualsWithDelta(300, $command->invoke($instance, now()->addSeconds(300)->toRfc7231String(), 60), 2);
-        $this->assertSame(60, $command->invoke($instance, null, 60));
-        $this->assertSame(60, $command->invoke($instance, 'not-a-date', 60));
+        $this->assertSame(1200, $wait->invoke($instance, '1200', null, 60));
+        $this->assertEqualsWithDelta(300, $wait->invoke($instance, now()->addSeconds(300)->toRfc7231String(), null, 60), 2);
+        $this->assertEqualsWithDelta(120, $wait->invoke($instance, null, (string) now()->addSeconds(120)->getTimestamp(), 60), 2);
+        $this->assertSame(60, $wait->invoke($instance, null, null, 60));
+        $this->assertSame(60, $wait->invoke($instance, 'not-a-date', null, 60));
+    }
+
+    #[Test]
+    public function a_rate_limit_longer_than_the_max_wait_fails_the_source_without_retrying_early(): void
+    {
+        config(['predb_feeds.request_delay_ms' => 0, 'predb_feeds.rate_limit_max_wait_seconds' => 900]);
+        Http::fake(['predb.club/*' => Http::response(['message' => 'rate limit exceeded'], 429, ['Retry-After' => '3600'])]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club']])->assertFailed();
+
+        Http::assertSentCount(1);
     }
 
     #[Test]
@@ -405,6 +417,29 @@ class PredbImportFeedCommandTest extends TestCase
         $this->artisan('predb:import-feed', ['--source' => ['xrel']])->assertSuccessful();
 
         Http::assertSent(static fn (Request $request): bool => str_contains($request->url(), 'per_page=5'));
+    }
+
+    #[Test]
+    public function malformed_collections_fail_every_source(): void
+    {
+        Http::fake([
+            'predb.club/*' => Http::response(['status' => 'success', 'data' => ['rows' => ['unexpected' => 'object']]]),
+            'api.predb.net/*' => Http::response(['status' => 'success', 'data' => ['a' => 1]]),
+            'api.srrdb.com/*' => Http::response('<html>blocked</html>'),
+            'api.xrel.to/*' => Http::response(['pagination' => ['total_pages' => 3]]),
+        ]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club', 'predb_net', 'srrdb', 'xrel']])->assertFailed();
+    }
+
+    #[Test]
+    public function undated_history_pages_are_reported_incomplete(): void
+    {
+        Http::fake(['predb.me/*' => Http::response('<?xml version="1.0"?><rss version="2.0"><channel><item><title>No.Date-GRP</title></item></channel></rss>', 200, ['Content-Type' => 'application/xml'])]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_me'], '--since' => '14d'])
+            ->expectsOutputToContain('incomplete')
+            ->assertSuccessful();
     }
 
     private function fakeFeeds(): void

@@ -43,6 +43,8 @@ return [
     // On HTTP 429: wait (Retry-After when sent, else this many seconds) and retry the page.
     'rate_limit_wait_seconds' => (int) env('PREDB_FEED_RATE_LIMIT_WAIT', 60),
     'rate_limit_retries' => (int) env('PREDB_FEED_RATE_LIMIT_RETRIES', 5),
+    // If the server asks to wait longer than this, the source fails for this run instead of blocking.
+    'rate_limit_max_wait_seconds' => (int) env('PREDB_FEED_RATE_LIMIT_MAX_WAIT', 900),
 
     // Safety cap on pages per source for --since history imports.
     'max_pages' => (int) env('PREDB_FEED_MAX_PAGES', 2000),
