@@ -158,6 +158,18 @@ class PredbImportFeedCommandTest extends TestCase
     }
 
     #[Test]
+    public function the_scheduled_tmux_health_check_follows_its_flag(): void
+    {
+        $event = $this->scheduledEvent('tmux:health-check --auto-restart');
+
+        config(['tmux.scheduled_health_check' => true]);
+        $this->assertTrue($event->filtersPass($this->app));
+
+        config(['tmux.scheduled_health_check' => false]);
+        $this->assertFalse($event->filtersPass($this->app));
+    }
+
+    #[Test]
     public function since_mode_pages_back_until_entries_are_older_than_the_cutoff(): void
     {
         config(['predb_feeds.request_delay_ms' => 0]);

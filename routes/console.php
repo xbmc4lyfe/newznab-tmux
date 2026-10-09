@@ -61,7 +61,7 @@ Schedule::call(function () {
     UserDownload::where('timestamp', '<', now()->subDay())->delete();
 })->name('cleanup-api-request-logs')->hourly()->withoutOverlapping();
 // Check tmux health and auto-restart if monitor pane is dead
-Schedule::command('tmux:health-check --auto-restart')->everyThirtyMinutes()->withoutOverlapping();
+Schedule::command('tmux:health-check --auto-restart')->everyThirtyMinutes()->withoutOverlapping()->when(static fn (): bool => (bool) config('tmux.scheduled_health_check'));
 Schedule::command('nntmux:check-service-health')->everyMinute()->withoutOverlapping();
 Schedule::command('nntmux:search-repair --limit=100')->everyMinute()->withoutOverlapping();
 // Tail storage/logs into the Manticore log index used by the admin log viewer search
