@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Models\Predb;
+use App\Services\Predb\Feeds\FeedRateLimitedException;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
 use RuntimeException;
@@ -29,12 +30,19 @@ final class PredbNetSource extends HttpFeedSource
         ])->throw();
 
         if ($response->json('status') === 'error') {
-            throw new RuntimeException('predb.net API error: '.(string) $response->json('message', 'unknown'));
+            $message = (string) $response->json('message', 'unknown');
+
+            throw str_contains(strtolower($message), 'rate limit')
+                ? new FeedRateLimitedException('predb.net rate limited: '.$message)
+                : new RuntimeException('predb.net API error: '.$message);
         }
 
         $rows = $response->json('data');
+        if (! is_array($rows)) {
+            throw new RuntimeException('predb.net returned an unexpected response (no data).');
+        }
 
-        return is_array($rows) ? $this->parseRows($rows) : [];
+        return $this->parseRows($rows);
     }
 
     /**

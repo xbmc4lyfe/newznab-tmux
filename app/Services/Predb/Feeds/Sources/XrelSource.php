@@ -16,6 +16,9 @@ use Carbon\CarbonImmutable;
  */
 final class XrelSource extends HttpFeedSource
 {
+    /** xREL list endpoints accept per_page between 5 and 100. */
+    private const int MIN_PAGE_SIZE = 5;
+
     private const int MAX_PAGE_SIZE = 100;
 
     public function __construct(
@@ -36,7 +39,7 @@ final class XrelSource extends HttpFeedSource
     public function fetch(int $page = 1): array
     {
         $response = $this->http()->get($this->endpoint, [
-            'per_page' => min($this->pageSize, self::MAX_PAGE_SIZE),
+            'per_page' => max(self::MIN_PAGE_SIZE, min($this->pageSize, self::MAX_PAGE_SIZE)),
             'page' => max(1, $page),
         ])->throw();
 

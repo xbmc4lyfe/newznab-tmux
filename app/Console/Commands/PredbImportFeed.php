@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Services\Predb\Feeds\Contracts\PredbFeedSource;
+use App\Services\Predb\Feeds\FeedRateLimitedException;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Services\Predb\Feeds\PredbFeedSourceFactory;
@@ -120,7 +121,7 @@ class PredbImportFeed extends Command
     }
 
     /**
-     * Fetch one page, waiting and retrying when the source answers HTTP 429.
+     * Fetch one page, waiting and retrying when the source is throttled (HTTP 429 or a rate-limit envelope).
      *
      * @return list<PredbFeedEntry>
      */
@@ -131,12 +132,14 @@ class PredbImportFeed extends Command
         for ($attempt = 0; ; $attempt++) {
             try {
                 return $source->fetch($page);
-            } catch (RequestException $e) {
-                if ($e->response->status() !== 429 || $attempt >= $retries) {
+            } catch (RequestException|FeedRateLimitedException $e) {
+                $throttled = $e instanceof FeedRateLimitedException || $e->response->status() === 429;
+                if (! $throttled || $attempt >= $retries) {
                     throw $e;
                 }
 
-                $wait = $this->retryAfterSeconds($e->response->header('Retry-After'), (int) config('predb_feeds.rate_limit_wait_seconds', 60));
+                $retryAfter = $e instanceof RequestException ? $e->response->header('Retry-After') : null;
+                $wait = $this->retryAfterSeconds($retryAfter, (int) config('predb_feeds.rate_limit_wait_seconds', 60));
                 Log::info('PreDB feed rate limited; backing off', ['source' => $source->key(), 'page' => $page, 'wait_seconds' => $wait]);
                 sleep($wait);
             }

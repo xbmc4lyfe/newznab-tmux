@@ -372,6 +372,41 @@ class PredbImportFeedCommandTest extends TestCase
         $this->assertSame('irc.newer', DB::table('predb')->where('id', $id)->value('nukereason'));
     }
 
+    #[Test]
+    public function a_successful_response_without_the_expected_structure_fails_the_source(): void
+    {
+        Http::fake([
+            'predb.club/*' => Http::response('<html>proxy error</html>'),
+            'api.predb.net/*' => Http::response(['status' => 'success', 'unexpected' => true]),
+        ]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club', 'predb_net']])->assertFailed();
+    }
+
+    #[Test]
+    public function an_application_rate_limit_envelope_is_backed_off_and_retried(): void
+    {
+        config(['predb_feeds.request_delay_ms' => 0, 'predb_feeds.rate_limit_wait_seconds' => 0]);
+        Http::fakeSequence('predb.club/*')
+            ->push(['status' => 'error', 'message' => 'Rate limit exceeded, try again later', 'data' => null])
+            ->push((string) file_get_contents($this->fixture('predb_club.json')));
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club']])->assertSuccessful();
+
+        $this->assertSame(3, Predb::query()->count());
+    }
+
+    #[Test]
+    public function xrel_requests_are_clamped_to_its_minimum_page_size(): void
+    {
+        config(['predb_feeds.page_size' => 2]);
+        Http::fake(['api.xrel.to/*' => Http::response(['pagination' => ['total_pages' => 1], 'list' => []])]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['xrel']])->assertSuccessful();
+
+        Http::assertSent(static fn (Request $request): bool => str_contains($request->url(), 'per_page=5'));
+    }
+
     private function fakeFeeds(): void
     {
         Http::fake([
