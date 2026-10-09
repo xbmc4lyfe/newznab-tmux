@@ -135,7 +135,7 @@ class ReleasesRunner extends BaseRunner
 
         if ($mode === 'predbft') {
             $preCount = DB::select(
-                "SELECT COUNT(p.id) AS num FROM predb p WHERE LENGTH(p.title) >= 15 AND p.title NOT REGEXP '[\"\<\> ]' AND p.searched = 0 AND p.predate < (NOW() - INTERVAL 1 DAY)"
+                "SELECT COUNT(p.id) AS num FROM predb p WHERE LENGTH(p.title) >= 15 AND p.title NOT REGEXP '[\"\<\> ]' AND p.searched = 0 AND (p.predate < (NOW() - INTERVAL 1 DAY) OR (p.predate IS NULL AND p.imported_at < (NOW() - INTERVAL 1 DAY)))"
             );
             if (! empty($preCount) && (int) $preCount[0]->num > 0 && $maxPerRun > 0) {
                 $leftGuids = \array_slice($leftGuids, 0, (int) ceil($preCount[0]->num / $maxPerRun));

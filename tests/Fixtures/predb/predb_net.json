@@ -1,0 +1,4 @@
+{"status":"success","results":2,"time":"0.129s","results_total":14357119,"data":[
+{"id":14492896,"pretime":1791513594,"release":"WAR.2026.S01E02.FRENCH.WEB.H264-BAWLS","section":"TV-WEB-X264","files":0,"size":0,"status":0,"reason":"","group":"BAWLS","genre":"","url":"\/rls\/WAR.2026.S01E02.FRENCH.WEB.H264-BAWLS","nfo":"","nfo_img":""},
+{"id":14492890,"pretime":1791513000,"release":"Other.Show.S02E05.720p.HDTV.x264-GRP","section":"TV-720P","files":20,"size":850,"status":1,"reason":"bad.ivtc","group":"GRP","genre":"","url":"","nfo":"","nfo_img":""}
+],"page":1}
