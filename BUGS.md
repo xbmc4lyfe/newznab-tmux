@@ -103,6 +103,13 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** this stack's database had it at `1`, even though the manifest default is `false`; I didn't find what set it. That hid bug #19, because `unrar` was never even called.
 - **Fix:** label the admin setting so it's clear that enabling it disables media extraction. The docker stack's `tuning.sql` now sets it to `0`.
 
+### 21. The alternate NNTP provider can't be used as an article fallback alone (Fixed)
+
+- **Where:** `config('nntmux_nntp.use_alternate_nntp_server')` (`USE_ALTERNATE_NNTP_SERVER`). The header, backfill and post-process commands (e.g. `UpdateGroupHeaders.php:66`, `UpdatePostProcess.php:133`) connect to the alternate when it is true, and the article fetchers (`ProcessingConfiguration`, `PostProcessService`, `NfoService`, `NzbContentsService`) pass the same flag to `NNTPService::getMessagesByMessageID()`/`getMessages()` as the retry-on-alternate switch.
+- **Bug:** one flag means both "connect to the alternate" and "retry missing articles on the other provider". There is no way to keep headers on the primary and still fetch articles missing there from the alternate.
+- **Symptom:** with `USE_ALTERNATE_NNTP_SERVER=false` (the docker/ stack, which keeps headers on the primary), articles missing on the primary fail post-processing even though alternate credentials are configured.
+- **Fix (staged):** new `nntmux_nntp.alternate_article_fallback` (`NNTP_ALTERNATE_FALLBACK`, blank = follow `USE_ALTERNATE_NNTP_SERVER`, so upstream behavior is unchanged) drives the four article fetchers. The docker/ stack sets it to `true`. Test: `tests/Feature/NntpAlternateFallbackConfigTest.php`.
+
 ## Packaging and deployment
 
 ### 11. `docker-compose.yml.prod-dist` starts a command that doesn't exist (Open)
@@ -169,3 +176,9 @@ These bugs turned up while building and running the self-hosted stack in `docker
 | tmux panes died with "This account is currently not available": `www-data`'s login shell is `nologin` | Set `SHELL=/bin/bash` for the app services |
 | Grafana showed its own login page: Caddy's default directive order ran `request_header -X-JWT-Assertion` after `forward_auth`, deleting the JWT `forward_auth` had just added | Wrapped the handler in `route { }` |
 | Bulk-deleting groups while the indexer was running left 7,072 collections behind | Second cleanup pass. Prefer pausing the indexer (`make -C docker down` or `restart`) before large deletes |
+| `make backup` reported success and rotated out good backups when `mariadb-dump` failed (no `pipefail`); dumps were world-readable under umask 022 | `pipefail`, write to a `.partial` file, publish and prune only on success; backups dir `0700`, files `0600` |
+| `make init` stopped before `docker compose up -d` whenever every public PreDB feed was down | The PreDB seed is best effort (the scheduler polls every 5 minutes) |
+| `APP_URL` and Grafana's root URL were pinned to `localhost:8080`, so a changed `APP_PORT` or LAN access produced wrong absolute links and Grafana redirects | `APP_URL` in `docker/.env` (blank = `http://localhost:$APP_PORT`); `generate-env` syncs it into `config/app.env`, and `GF_SERVER_ROOT_URL` uses it |
+| `generate-env` exited on "Unresolved placeholders" when `config/app.env` had NNTP host/user/password but no port, SSL or connection count | Missing NNTP settings fall back to the same defaults as the JSON path |
+| On native Linux, app containers (UID 33) couldn't write `data/storage` or read the `0600` `config/app.env` created by the host user | `make perms` (run by `make env`) chowns the app mounts to 33 and gives group 33 read on `config/app.env`; a no-op on macOS |
+| Compose's `MARIADB_MEMORY` fallback (10g) disagreed with `docker/.env.example` and the tuning comment (13g) | Fallback raised to 13g |

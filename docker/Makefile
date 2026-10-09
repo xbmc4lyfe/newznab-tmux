@@ -7,6 +7,7 @@ DC       := docker compose --project-directory $(CURDIR) -f $(CURDIR)/docker-com
 APP_RUN  := $(DC) run --rm --no-deps web
 ARTISAN  := $(DC) exec -T web php artisan
 REPO     := $(abspath $(CURDIR)/..)
+HELPER_IMAGE ?= alpine:3.22.2
 -include $(CURDIR)/.env
 DB_EXEC   = $(DC) exec -T mariadb mariadb -uroot -p"$(DB_ROOTPASSWORD)" $(DB_DATABASE)
 s        ?=
@@ -22,10 +23,21 @@ help: ## Show targets
 .PHONY: env
 env: ## Generate docker/.env and config/app.env (secrets, NNTP creds); safe to re-run
 	@$(CURDIR)/bin/generate-env
+	@$(MAKE) --no-print-directory -C $(CURDIR) perms
 
 .PHONY: dirs
 dirs: ## Create bind-mount directories
 	@cd $(CURDIR) && mkdir -p $(DATA_DIRS)
+
+# The app containers run as 33:33 (www-data). Docker Desktop/OrbStack map bind-mount ownership
+# for them; a native Linux host does not, so hand the app mounts to 33 and let group 33 read
+# config/app.env (generate-env rewrites it as 0600, so env re-runs this).
+.PHONY: perms
+perms: dirs ## Linux hosts: let the app containers' user (33:33) use their bind mounts
+	@if [ "$$(uname -s)" = Linux ]; then \
+		docker run --rm -v $(CURDIR):/stack $(HELPER_IMAGE) sh -c \
+			'chown -R 33:33 /stack/data/storage /stack/data/install && chown $(shell id -u):33 /stack/config/app.env && chmod 0640 /stack/config/app.env'; \
+	fi
 
 .PHONY: build
 build: ## Build nntmux/base:local (root Dockerfile) and nntmux/app:local (overlay)
@@ -39,7 +51,8 @@ init: env dirs build ## First-time install: build, migrate+seed, indexes, groups
 	else $(APP_RUN) php artisan nntmux:deploy-init --no-interaction; fi
 	$(APP_RUN) php artisan monitoring:install --sail --no-interaction
 	$(MAKE) -C $(CURDIR) seed-db
-	$(APP_RUN) php artisan predb:import-feed --pages=20
+	@# Best effort: public PreDB feeds may be down, and the scheduler polls them every 5 minutes anyway.
+	-$(APP_RUN) php artisan predb:import-feed --pages=20
 	$(DC) up -d
 	@echo "NNTmux: http://localhost:$(or $(APP_PORT),8080)  (admin password: grep ADMIN_PASS docker/config/app.env)"
 
@@ -91,11 +104,16 @@ mysql: ## MariaDB client as root
 
 .PHONY: backup
 backup: ## Dump MariaDB to backups/ (keeps 7)
-	@mkdir -p $(CURDIR)/backups
+	@# Dumps hold password hashes and API keys: owner-only. Publish and prune only after the
+	@# whole pipeline succeeded, so a failed dump never replaces or rotates out a good backup.
+	@set -euo pipefail; umask 077; mkdir -p $(CURDIR)/backups; chmod 0700 $(CURDIR)/backups; \
+	out=$(CURDIR)/backups/nntmux-$$(date +%Y%m%d-%H%M%S).sql.gz; tmp=$$out.partial; \
+	trap 'rm -f "$$tmp"' EXIT; \
 	$(DC) exec -T mariadb mariadb-dump -uroot -p"$(DB_ROOTPASSWORD)" --single-transaction --quick --routines $(DB_DATABASE) \
-		| gzip > $(CURDIR)/backups/nntmux-$$(date +%Y%m%d-%H%M%S).sql.gz
-	@ls -1t $(CURDIR)/backups/nntmux-*.sql.gz | tail -n +8 | xargs -r rm --
-	@ls -lh $(CURDIR)/backups | tail -n 3
+		| gzip > "$$tmp"; \
+	mv "$$tmp" "$$out"; \
+	ls -1t $(CURDIR)/backups/nntmux-*.sql.gz | tail -n +8 | xargs -r rm --; \
+	ls -lh $(CURDIR)/backups | tail -n 3
 
 .PHONY: status
 status: ## Indexing progress snapshot (groups, binaries, releases, predb)

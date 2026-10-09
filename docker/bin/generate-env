@@ -108,6 +108,14 @@ def merge(existing: dict[str, str], wanted: dict[str, str]) -> dict[str, str]:
     return merged
 
 
+def app_url(compose_values: dict[str, str]) -> str:
+    """APP_URL from docker/.env, or http://localhost:<APP_PORT> when it is blank (as Compose derives it)."""
+    url = compose_values.get("APP_URL", "")
+    if url in PLACEHOLDERS:
+        url = f"http://localhost:{compose_values.get('APP_PORT') or '8080'}"
+    return url.rstrip("/")
+
+
 def write_secret(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -139,12 +147,16 @@ def main() -> None:
     app_values.update(parse(DOCKER_DIR / "config/app.env.example"))
     nntp_keys = ("NNTP_SERVER", "NNTP_USERNAME", "NNTP_PASSWORD", "NNTP_SERVER_A", "NNTP_USERNAME_A", "NNTP_PASSWORD_A")
     if all(existing_app.get(key, "") not in PLACEHOLDERS for key in nntp_keys):
-        primary = {"host": existing_app["NNTP_SERVER"]}
-        alternate = {"host": existing_app["NNTP_SERVER_A"]}
+        primary, alternate = (
+            {"host": existing_app[f"NNTP_SERVER{s}"], "username": existing_app[f"NNTP_USERNAME{s}"],
+             "password": existing_app[f"NNTP_PASSWORD{s}"]}
+            for s in ("", "_A")
+        )
     else:
         primary, alternate = nntp_servers()
-        app_values.update(nntp_values(primary, ""))
-        app_values.update(nntp_values(alternate, "_A"))
+    # Port/SSL/connections fall back to nntp_values() defaults; merge() keeps any app.env already has.
+    app_values.update(nntp_values(primary, ""))
+    app_values.update(nntp_values(alternate, "_A"))
     app_values.update({
         "APP_KEY": "base64:" + base64.b64encode(secrets.token_bytes(32)).decode(),
         "DB_PASSWORD": db_password,
@@ -155,12 +167,15 @@ def main() -> None:
         "SCRAPE_IRC_USERNAME": irc_nick(),
     })
     app_values = merge(existing_app, app_values)
+    # docker/.env owns the public origin (Grafana's root URL uses it too), so always sync it.
+    app_values["APP_URL"] = app_url(compose_values)
     unresolved = [k for k, v in app_values.items() if v in ("__GENERATED__", "__FROM_CONFIG__")]
     if unresolved:
         sys.exit(f"Unresolved placeholders in app.env: {', '.join(unresolved)}")
     write_secret(app_env_path, render(REPO_DIR / ".env.example", app_values))
 
     print(f"Wrote {compose_env_path.relative_to(REPO_DIR)} and {app_env_path.relative_to(REPO_DIR)} (mode 600).")
+    print(f"APP_URL={app_values['APP_URL']}")
     print(f"NNTP primary={primary['host']} alternate={alternate['host']}  IRC nick={app_values['SCRAPE_IRC_USERNAME']}")
     print(f"Admin login: {app_values['ADMIN_USER']} (password: grep ADMIN_PASS {app_env_path.relative_to(REPO_DIR)})")
 

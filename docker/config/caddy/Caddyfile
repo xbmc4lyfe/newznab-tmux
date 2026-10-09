@@ -3,7 +3,7 @@
 	auto_https off
 }
 
-# Front proxy for the NNTmux docker/ stack. Set APP_URL to match the published port.
+# Front proxy for the NNTmux docker/ stack. APP_URL in docker/.env must match the address clients use.
 :8080 {
 	encode zstd gzip
 

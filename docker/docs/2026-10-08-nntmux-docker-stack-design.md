@@ -98,7 +98,7 @@ All services share one bridge network, `nntmux`, on subnet `172.31.42.0/24`, whi
 | horizon | `php artisan horizon` | 1g | `horizon:status` |
 | scheduler | `php artisan schedule:work` | 1g | `pgrep -f schedule:work` |
 | indexer | `docker/app/bin/indexer.sh` (tmux, tty) | 6g | `tmux:health-check --require-session` |
-| mariadb | mariadbd with `conf.d/99-nntmux.cnf` | 10g | `healthcheck.sh --connect --innodb_initialized` |
+| mariadb | mariadbd with `conf.d/99-nntmux.cnf` | 13g | `healthcheck.sh --connect --innodb_initialized` |
 | redis | `redis-server /usr/local/etc/redis/redis.conf` | 1g | `redis-cli ping` |
 | manticore | searchd with the mounted conf | 3g | `mysql -P9306 -e 'SHOW TABLES'` |
 | mailpit | default | 128m | built in |
@@ -272,7 +272,7 @@ The settings cache lasts 300 seconds, so seeding runs `cache:clear` afterwards.
 ### 5.6 Environment highlights (`config/app.env`)
 
 ```
-APP_ENV=production   APP_DEBUG=false   APP_URL=http://localhost:8080   TRUSTED_PROXIES=172.31.42.0/24
+APP_ENV=production   APP_DEBUG=false   APP_URL=<from docker/.env APP_URL, default http://localhost:$APP_PORT>   TRUSTED_PROXIES=172.31.42.0/24
 DB_CONNECTION=mariadb  DB_HOST=mariadb  REDIS_HOST=redis  SEARCH_DRIVER=manticore
 MANTICORESEARCH_HOST=manticore  MANTICORESEARCH_PORT=9308
 CACHE_STORE=redis  QUEUE_CONNECTION=redis  SESSION_DRIVER=redis
@@ -280,7 +280,8 @@ HORIZON_QUEUES=api-audit,default,emails,incidents,contactemail,newreg,welcomeema
 MAIL_MAILER=smtp  MAIL_HOST=mailpit  MAIL_PORT=1025
 COVERS_PATH=/app/storage/covers  PATH_TO_NZBS=/app/storage/nzb
 TEMP_UNRAR_PATH=/var/tmp/nntmux/unrar  TEMP_UNZIP_PATH=/var/tmp/nntmux/unzip
-USE_ALTERNATE_NNTP_SERVER=false        # alternate = missing-article fallback only
+USE_ALTERNATE_NNTP_SERVER=false        # true would also move header connections to the alternate
+NNTP_ALTERNATE_FALLBACK=true           # alternate = missing-article fallback only
 NNTP_COMPRESSED_HEADERS=false          # GZIP XFEATURE headers produced decode errors against Newshosting
 YENC_DECODER=php                      # ZTS PHP: RapidYenc cannot load
 SCRAPE_IRC_SERVER=irc.synirc.net  SCRAPE_IRC_PORT=6697  SCRAPE_IRC_TLS=true  SCRAPE_IRC_USERNAME=<generated>
@@ -365,7 +366,7 @@ Units, each with one job:
 
    It is idempotent: it refuses to run if the lock already exists.
 6. Seed `config/seed/groups.sql` (20 groups, `active=1 backfill=1 backfill_target=3`) and `tuning.sql`, then run `cache:clear`.
-7. Run `predb:import-feed --pages=20`, which seeds about 2,000 recent pres per source.
+7. Run `predb:import-feed --pages=20`, which seeds about 2,000 recent pres per source. This step is best effort: a failure doesn't stop `init`.
 8. `compose up -d` everything; the indexer starts tmux.
 9. `php artisan monitoring:install --sail`-equivalent: generate the Grafana JWT keypair into `storage/app/monitoring`.
 

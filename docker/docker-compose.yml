@@ -142,7 +142,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 60s
-    mem_limit: ${MARIADB_MEMORY:-10g}
+    mem_limit: ${MARIADB_MEMORY:-13g}
 
   redis:
     image: ${REDIS_IMAGE:-redis:7.4.2-alpine}
@@ -223,7 +223,7 @@ services:
     user: "0:0"
     environment:
       PROMETHEUS_URL: http://prometheus:9090
-      GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s:${APP_PORT:-8080}/grafana/"
+      GF_SERVER_ROOT_URL: "${APP_URL:-http://localhost:${APP_PORT:-8080}}/grafana/"
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
       GF_SECURITY_ADMIN_USER: nntmux-grafana-admin
       GF_SECURITY_ALLOW_EMBEDDING: "true"

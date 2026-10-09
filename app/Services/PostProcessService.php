@@ -67,7 +67,7 @@ final class PostProcessService
     ) {
         $this->echoOutput = (bool) config('nntmux.echocli');
         $this->addPar2 = (bool) config('nntmux_settings.add_par2');
-        $this->alternateNNTP = (bool) config('nntmux_nntp.use_alternate_nntp_server');
+        $this->alternateNNTP = (bool) config('nntmux_nntp.alternate_article_fallback');
 
         // Core dependencies
         $this->nameFixingService = $nameFixingService ?? new NameFixingService;
