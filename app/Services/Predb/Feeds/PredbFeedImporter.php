@@ -103,7 +103,7 @@ class PredbFeedImporter
 
         if ($dryRun) {
             $shadow = $this->dryRunRows[$title] ?? clone $existing;
-            foreach (array_diff_key($changes, ['nuked_from' => true, 'nuked_status' => true]) as $column => $value) {
+            foreach (array_diff_key($changes, ['nuked_from' => true, 'nuked_status' => true, 'nukereason_from' => true]) as $column => $value) {
                 $shadow->setAttribute($column, $value);
             }
             $this->dryRunRows[$title] = $shadow;
@@ -160,9 +160,13 @@ class PredbFeedImporter
                 ->update(['nuked' => $changes['nuked'], 'nukereason' => $changes['nukereason'] ?? null]) > 0 || $changed;
         } elseif (array_key_exists('nukereason', $changes)) {
             // Same status: fill or correct the reason while the status still matches.
+            $observed = $changes['nukereason_from'] ?? null;
             $changed = DB::table('predb')
                 ->where('id', $id)
                 ->where('nuked', $changes['nuked_status'])
+                ->where(static fn ($query) => $observed === null || $observed === ''
+                    ? $query->whereNull('nukereason')->orWhere('nukereason', '')
+                    : $query->where('nukereason', $observed))
                 ->update(['nukereason' => $changes['nukereason']]) > 0 || $changed;
         }
 
@@ -228,6 +232,7 @@ class PredbFeedImporter
         } elseif ($entry->nuked !== Predb::PRE_NONUKE && $reason !== null && $reason !== (string) $existing->nukereason) {
             $changes['nukereason'] = $reason;
             $changes['nuked_status'] = $entry->nuked;
+            $changes['nukereason_from'] = $existing->nukereason;
         }
 
         return $changes;

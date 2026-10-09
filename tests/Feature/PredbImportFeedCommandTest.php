@@ -341,6 +341,37 @@ class PredbImportFeedCommandTest extends TestCase
         $this->search->shouldHaveReceived('updatePreDb')->with(Mockery::on(static fn (array $doc): bool => $doc['filename'] === 'new.name'))->once();
     }
 
+    #[Test]
+    public function a_history_import_that_ends_before_the_cutoff_is_reported_incomplete(): void
+    {
+        config(['predb_feeds.request_delay_ms' => 0]);
+        Http::fake(function (Request $request) {
+            parse_str((string) parse_url($request->url(), PHP_URL_QUERY), $query);
+            $rows = (int) ($query['page'] ?? 1) === 1
+                ? [['name' => 'Recent-GRP', 'cat' => 'TV', 'size' => 1, 'files' => 1, 'preAt' => now()->subDay()->getTimestamp(), 'nuke' => null]]
+                : [];
+
+            return Http::response(['data' => ['rows' => $rows]]);
+        });
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club'], '--since' => '14d'])
+            ->expectsOutputToContain('incomplete')
+            ->assertSuccessful();
+    }
+
+    #[Test]
+    public function a_reason_update_keeps_a_reason_written_meanwhile(): void
+    {
+        DB::table('predb')->insert(['title' => 'Reason-GRP', 'source' => '#PreNNTmux', 'nuked' => Predb::PRE_NUKED, 'nukereason' => 'irc.newer']);
+        $id = (int) DB::table('predb')->where('title', 'Reason-GRP')->value('id');
+
+        $changed = (new ReflectionMethod(PredbFeedImporter::class, 'applyChanges'))
+            ->invoke(app(PredbFeedImporter::class), $id, ['nukereason' => 'feed.reason', 'nuked_status' => Predb::PRE_NUKED, 'nukereason_from' => null]);
+
+        $this->assertFalse($changed);
+        $this->assertSame('irc.newer', DB::table('predb')->where('id', $id)->value('nukereason'));
+    }
+
     private function fakeFeeds(): void
     {
         Http::fake([

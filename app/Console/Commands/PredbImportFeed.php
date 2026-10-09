@@ -69,6 +69,8 @@ class PredbImportFeed extends Command
             $totals = ['inserted' => 0, 'updated' => 0, 'skipped' => 0];
             $status = 'ok';
 
+            $reachedCutoff = false;
+
             try {
                 for ($page = 1; $page <= $pages; $page++) {
                     if ($page > 1) {
@@ -86,11 +88,18 @@ class PredbImportFeed extends Command
                     }
 
                     if ($since !== null && $this->reachedCutoff($entries, $since)) {
+                        $reachedCutoff = true;
                         break;
                     }
                 }
 
                 $succeeded++;
+
+                if ($since !== null && ! $reachedCutoff) {
+                    // The source ran out of history (or --max-pages was hit) before the cutoff.
+                    $status = 'incomplete: history ended before '.$since->toDateString();
+                    Log::warning('PreDB history import incomplete', ['source' => $source->key(), 'since' => $since->toDateTimeString()]);
+                }
             } catch (Throwable $e) {
                 $status = 'failed: '.$e->getMessage();
                 Log::warning('PreDB feed source failed', ['source' => $source->key(), 'error' => $e->getMessage()]);
