@@ -281,11 +281,12 @@ final class NameFixingQueryService
              WHERE LENGTH(p.title) >= 15
              AND p.title NOT REGEXP \'["<> ]\'
              AND p.searched = 0
-             AND (p.predate IS NULL OR p.predate < ?)
+             AND (p.predate < ? OR (p.predate IS NULL AND p.imported_at < ?))
              AND MOD(p.id, ?) = ?
              ORDER BY p.predate ASC, p.id ASC
              LIMIT ?',
             [
+                CarbonImmutable::now()->subDay()->toDateTimeString(),
                 CarbonImmutable::now()->subDay()->toDateTimeString(),
                 $workerCount,
                 $workerSlot,
