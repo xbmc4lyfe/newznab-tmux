@@ -30,6 +30,8 @@ class TmuxFixNamesScheduleTest extends TestCase
             'tmux.fix_names.full_backlog' => true,
             'tmux.fix_names.full_backlog_interval_minutes' => 60,
             'tmux.fix_names.predbft' => true,
+            'cache.stores.fixnames_claims' => ['driver' => 'array'],
+            'tmux.fix_names.cache_store' => 'fixnames_claims',
         ]);
         Cache::flush();
     }
@@ -39,7 +41,7 @@ class TmuxFixNamesScheduleTest extends TestCase
     {
         $this->assertTrue($this->runTask(alive: true, renames: 5));
 
-        $this->assertFalse(Cache::has(self::SLOT));
+        $this->assertFalse(Cache::store('fixnames_claims')->has(self::SLOT));
         $this->assertSame([], $this->launched);
     }
 
@@ -49,7 +51,8 @@ class TmuxFixNamesScheduleTest extends TestCase
         $this->assertTrue($this->runTask(alive: false, renames: 5));
         $this->assertTrue($this->runTask(alive: false, renames: 5));
 
-        $this->assertTrue(Cache::has(self::SLOT));
+        $this->assertTrue(Cache::store('fixnames_claims')->has(self::SLOT));
+        $this->assertFalse(Cache::store('array')->has(self::SLOT), 'The claim must use the configured store, not the default.');
         $this->assertCount(2, $this->launched);
         foreach ([3, 9, 19] as $level) {
             $this->assertStringContainsString("releases:fix-names {$level} ", $this->launched[0]);
@@ -67,19 +70,31 @@ class TmuxFixNamesScheduleTest extends TestCase
     {
         $this->assertFalse($this->runTask(alive: false, renames: 5, respawnSucceeds: false));
 
-        $this->assertFalse(Cache::has(self::SLOT));
+        $this->assertFalse(Cache::store('fixnames_claims')->has(self::SLOT));
     }
 
     #[Test]
-    public function predb_matching_runs_without_standard_rename_work(): void
+    public function full_backlog_and_predb_passes_run_without_recent_rename_work(): void
     {
         $this->assertTrue($this->runTask(alive: false, renames: 0));
 
         $this->assertCount(1, $this->launched);
-        $this->assertStringContainsString('multiprocessing:fixrelnames', $this->launched[0]);
+        $this->assertStringContainsString('releases:fix-names 4 ', $this->launched[0]);
+        $this->assertStringNotContainsString('releases:fix-names 3 ', $this->launched[0]);
         $this->assertStringContainsString('predbft', $this->launched[0]);
-        $this->assertStringNotContainsString('releases:fix-names', $this->launched[0]);
-        $this->assertFalse(Cache::has(self::SLOT));
+        $this->assertTrue(Cache::store('fixnames_claims')->has(self::SLOT));
+    }
+
+    #[Test]
+    public function the_pane_idles_when_nothing_is_due(): void
+    {
+        config(['tmux.fix_names.predbft' => false]);
+        Cache::store('fixnames_claims')->put(self::SLOT, true, 3600);
+
+        $this->assertTrue($this->runTask(alive: false, renames: 0));
+
+        $this->assertCount(1, $this->launched);
+        $this->assertStringContainsString('no releases to process', $this->launched[0]);
     }
 
     #[Test]
@@ -97,7 +112,7 @@ class TmuxFixNamesScheduleTest extends TestCase
     #[Test]
     public function a_cache_outage_skips_the_full_backlog_pass_but_keeps_scheduling(): void
     {
-        Cache::shouldReceive('add')->andThrow(new RuntimeException('cache down'));
+        Cache::shouldReceive('store')->with('fixnames_claims')->andThrow(new RuntimeException('cache down'));
 
         $this->assertTrue($this->runTask(alive: false, renames: 5));
 

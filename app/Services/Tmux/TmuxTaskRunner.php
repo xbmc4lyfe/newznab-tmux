@@ -6,6 +6,7 @@ namespace App\Services\Tmux;
 
 use App\Enums\TmuxPaneRole;
 use App\Services\Configuration\ConfigurationProvider;
+use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Throwable;
@@ -445,24 +446,25 @@ class TmuxTaskRunner
             return $this->disablePane($pane, 'Fix Release Names', 'disabled in settings');
         }
 
-        // PreDB full-text matching has its own work source (unsearched PREs), so it still runs
-        // when no standard rename work is pending.
-        if ($work === 0 && ! $predbft) {
-            return $this->disablePane($pane, 'Fix Release Names', 'no releases to process');
-        }
-
         // A running or sleeping pane keeps its current batch; nothing is claimed until a launch.
         if ($this->paneManager->isAlive($pane)) {
             return true;
         }
 
-        $fullBacklog = $work > 0 && $this->claimFullBacklogSlot();
+        // The recent-work count only covers the 6-hour levels. The full-backlog levels and PreDB
+        // full-text matching have their own work sources, so they are scheduled independently.
+        $fullBacklog = $this->claimFullBacklogSlot();
+
+        if ($work === 0 && ! $fullBacklog && ! $predbft) {
+            return $this->disablePane($pane, 'Fix Release Names', 'no releases to process');
+        }
+
         $sleep = (int) ($runVar['settings']['fix_timer'] ?? 300);
         $launched = $this->launch($pane, $this->batchCommand($this->fixNamesCommands($work > 0, $fullBacklog, $predbft)), ['log_pane' => 'fixnames', 'sleep' => $sleep]);
 
         if (! $launched && $fullBacklog) {
             try {
-                Cache::forget(self::FULL_BACKLOG_SLOT);
+                $this->fullBacklogClaimStore()->forget(self::FULL_BACKLOG_SLOT);
             } catch (Throwable $e) {
                 Log::warning('Could not release the fix-names full-backlog slot', ['error' => $e->getMessage()]);
             }
@@ -485,7 +487,7 @@ class TmuxTaskRunner
     {
         $artisan = escapeshellarg(PHP_BINARY).' '.escapeshellarg(base_path('artisan'));
         $levels = $renamePasses ? [3, 5, 7, 9, 11, 13, 15, 17, 19] : [];
-        if ($renamePasses && $fullBacklog) {
+        if ($fullBacklog) {
             array_push($levels, 4, 6, 8, 10, 12, 14, 16, 18, 20);
         }
 
@@ -513,13 +515,22 @@ class TmuxTaskRunner
         $interval = max(1, (int) config('tmux.fix_names.full_backlog_interval_minutes', 60));
 
         try {
-            return Cache::add(self::FULL_BACKLOG_SLOT, true, now()->addMinutes($interval));
+            return $this->fullBacklogClaimStore()->add(self::FULL_BACKLOG_SLOT, true, now()->addMinutes($interval));
         } catch (Throwable $e) {
             // The pass is optional: skip it this cycle rather than stopping the monitor.
             Log::warning('Skipping the fix-names full-backlog pass; cache unavailable', ['error' => $e->getMessage()]);
 
             return false;
         }
+    }
+
+    /**
+     * The claim must live in one backing store: a failover store could grant it twice when it
+     * switches backends mid-interval.
+     */
+    private function fullBacklogClaimStore(): Repository
+    {
+        return Cache::store((string) config('tmux.fix_names.cache_store', 'redis'));
     }
 
     /**

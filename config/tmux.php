@@ -29,6 +29,8 @@ return [
         'full_backlog' => (bool) env('TMUX_FIX_NAMES_FULL_BACKLOG', true),
         'full_backlog_interval_minutes' => (int) env('TMUX_FIX_NAMES_FULL_INTERVAL', 60),
         'predbft' => (bool) env('TMUX_FIX_NAMES_PREDBFT', true),
+        // Cache store for the once-per-interval claim; must be a single backend, not a failover store.
+        'cache_store' => (string) env('TMUX_FIX_NAMES_CACHE_STORE', 'redis'),
     ],
 
     'terminal' => [
