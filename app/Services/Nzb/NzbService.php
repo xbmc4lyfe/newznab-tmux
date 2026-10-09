@@ -681,14 +681,27 @@ class NzbService
         return [];
     }
 
-    private function temporaryNzbPath(string $path): string
+    /**
+     * Temporary sibling for an NZB being written; recognised by {@see findStaleTemporaryNzbPaths()}.
+     */
+    public static function temporaryNzbPathFor(string $path): string
     {
         return $path.'.tmp.'.getmypid().'.'.bin2hex(random_bytes(6));
     }
 
-    private function isTemporaryNzbPath(string $path): bool
+    public static function isTemporaryNzbPathName(string $path): bool
     {
         return preg_match('/\.nzb\.gz\.tmp\.\d+\.[0-9a-f]{12}$/', basename($path)) === 1;
+    }
+
+    private function temporaryNzbPath(string $path): string
+    {
+        return self::temporaryNzbPathFor($path);
+    }
+
+    private function isTemporaryNzbPath(string $path): bool
+    {
+        return self::isTemporaryNzbPathName($path);
     }
 
     /**

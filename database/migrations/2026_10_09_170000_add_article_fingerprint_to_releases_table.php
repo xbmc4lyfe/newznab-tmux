@@ -7,19 +7,23 @@ use Illuminate\Support\Facades\Schema;
 return new class extends Migration
 {
     /**
-     * Article identity of a release's NZB (sha1 of its sorted segment Message-IDs), used to keep
+     * Article identity of a release's NZB ({@see \App\Services\Nzb\NzbArticleFingerprint}), used to keep
      * NZB imports idempotent when release dedupe is disabled.
      */
     public function up(): void
     {
-        if (Schema::hasColumn('releases', 'article_fingerprint')) {
-            return;
+        // Column and index are checked independently so a re-run repairs a partial state.
+        if (! Schema::hasColumn('releases', 'article_fingerprint')) {
+            Schema::table('releases', function (Blueprint $table) {
+                $table->char('article_fingerprint', 40)->nullable();
+            });
         }
 
-        Schema::table('releases', function (Blueprint $table) {
-            $table->char('article_fingerprint', 40)->nullable();
-            $table->index('article_fingerprint', 'ix_releases_article_fingerprint');
-        });
+        if (! Schema::hasIndex('releases', 'ix_releases_article_fingerprint')) {
+            Schema::table('releases', function (Blueprint $table) {
+                $table->index('article_fingerprint', 'ix_releases_article_fingerprint');
+            });
+        }
     }
 
     public function down(): void
@@ -28,8 +32,13 @@ return new class extends Migration
             return;
         }
 
+        if (Schema::hasIndex('releases', 'ix_releases_article_fingerprint')) {
+            Schema::table('releases', function (Blueprint $table) {
+                $table->dropIndex('ix_releases_article_fingerprint');
+            });
+        }
+
         Schema::table('releases', function (Blueprint $table) {
-            $table->dropIndex('ix_releases_article_fingerprint');
             $table->dropColumn('article_fingerprint');
         });
     }

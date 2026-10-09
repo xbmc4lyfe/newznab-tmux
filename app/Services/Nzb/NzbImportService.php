@@ -225,6 +225,12 @@ class NzbImportService
                                 : [$status, false, null];
                         }
                     );
+                } catch (LockTimeoutException) {
+                    // Another worker is importing the same articles: not a failure, so never delete it.
+                    $this->echoOut('Another import of the same articles is in progress; leaving it for a retry: '.$nzbFilePath);
+                    $nzbsSkipped++;
+
+                    continue;
                 } catch (\Throwable $exception) {
                     Log::error('NZB import failed while scanning or inserting a release.', [
                         'path' => $nzbFilePath,
@@ -336,7 +342,7 @@ class NzbImportService
     {
         // Write next to the destination and rename into place, so a crash mid-write never leaves a
         // truncated gzip at the final path (which would look like a stored NZB).
-        $temporaryPath = $path.'.tmp-'.bin2hex(random_bytes(6));
+        $temporaryPath = NzbService::temporaryNzbPathFor($path);
         $handle = @gzopen($temporaryPath, 'w5');
         if ($handle === false) {
             Log::error('Unable to open imported NZB destination for writing.', ['path' => $path]);
