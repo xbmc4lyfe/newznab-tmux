@@ -15,8 +15,10 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\ReleaseCleaningService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Support\Utf8;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -65,6 +67,11 @@ class NzbImportService
     public mixed $echoCLI;
 
     public NzbService $nzb;
+
+    /**
+     * Seconds to wait for another import of the same articles to finish (dedupe disabled).
+     */
+    protected int $identityLockWaitSeconds = 30;
 
     /**
      * @param  array<string, mixed>  $options
@@ -565,6 +572,34 @@ class NzbImportService
      * @throws \Exception
      */
     protected function insertNZB(mixed $nzbDetails): NzbImportStatus
+    {
+        $fingerprint = ! (bool) config('nntmux.release_dedupe_enabled', true) ? ($nzbDetails['articleFingerprint'] ?? null) : null;
+
+        return $this->withArticleIdentityLock($fingerprint, fn (): NzbImportStatus => $this->insertNzbRelease($nzbDetails));
+    }
+
+    /**
+     * Serialise the identity check and insert for one set of articles, so two concurrent imports
+     * of the same NZB cannot both pass {@see findIdenticalArticleUpload()} (dedupe disabled).
+     *
+     * @template TResult
+     *
+     * @param  callable(): TResult  $callback
+     * @return TResult
+     *
+     * @throws LockTimeoutException When another import holds the lock for longer than the wait.
+     */
+    protected function withArticleIdentityLock(?string $fingerprint, callable $callback): mixed
+    {
+        if ($fingerprint === null) {
+            return $callback();
+        }
+
+        return Cache::lock('nzb-import-article:'.$fingerprint, max(60, $this->identityLockWaitSeconds * 2))
+            ->block($this->identityLockWaitSeconds, $callback);
+    }
+
+    protected function insertNzbRelease(mixed $nzbDetails): NzbImportStatus
     {
         // Make up a GUID for the release.
         $this->relGuid = Str::uuid()->toString();

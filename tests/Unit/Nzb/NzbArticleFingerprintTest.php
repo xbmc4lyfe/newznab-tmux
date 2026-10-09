@@ -34,9 +34,21 @@ final class NzbArticleFingerprintTest extends TestCase
     {
         $this->assertSame(
             NzbArticleFingerprint::fromContents(self::nzb([['a1@x', 'a2@x']])),
-            NzbArticleFingerprint::fromMessageIds(['<a2@x>', 'a1@x', 'a2@x']),
+            NzbArticleFingerprint::fromMessageIds(['<a2@x>', 'a1@x']),
         );
         $this->assertNull(NzbArticleFingerprint::fromMessageIds([]));
+    }
+
+    #[Test]
+    public function the_incremental_accumulator_matches_the_list_fingerprint_in_any_order(): void
+    {
+        $accumulator = new NzbArticleFingerprint;
+        foreach (['c3@x', '<a1@x>', 'b2@x'] as $messageId) {
+            $accumulator->add($messageId);
+        }
+
+        $this->assertSame(NzbArticleFingerprint::fromMessageIds(['a1@x', 'b2@x', 'c3@x']), $accumulator->value());
+        $this->assertNull((new NzbArticleFingerprint)->value());
     }
 
     #[Test]

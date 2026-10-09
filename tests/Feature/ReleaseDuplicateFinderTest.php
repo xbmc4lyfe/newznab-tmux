@@ -9,11 +9,14 @@ use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Support\Data\ProcessReleasesSettings;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\Test;
 use ReflectionMethod;
+use ReflectionProperty;
 use Tests\TestCase;
 use Tests\Unit\Nzb\NzbArticleFingerprintTest;
 
@@ -138,6 +141,34 @@ class ReleaseDuplicateFinderTest extends TestCase
 
         $this->assertSame('fp-guid', $find->invoke($import, 1_000_000_000, $fingerprint)?->guid);
         $this->assertSame('fp-guid', $find->invoke($import, 0, $fingerprint)?->guid);
+    }
+
+    #[Test]
+    public function concurrent_imports_of_the_same_articles_are_serialised_by_a_lock(): void
+    {
+        config(['cache.default' => 'array']);
+        $this->app->instance(NzbService::class, $this->createMock(NzbService::class));
+        $import = new NzbImportService(['Browser' => true]);
+        (new ReflectionProperty($import, 'identityLockWaitSeconds'))->setValue($import, 0);
+        $withLock = new ReflectionMethod($import, 'withArticleIdentityLock');
+
+        $this->assertSame('ran', $withLock->invoke($import, 'abc', static fn (): string => 'ran'));
+
+        $held = Cache::lock('nzb-import-article:abc', 60);
+        $this->assertTrue($held->get());
+        $ran = false;
+        try {
+            $withLock->invoke($import, 'abc', static function () use (&$ran): void {
+                $ran = true;
+            });
+            $this->fail('Expected the held lock to block the second import.');
+        } catch (LockTimeoutException) {
+            $this->assertFalse($ran);
+        } finally {
+            $held->release();
+        }
+
+        $this->assertSame('no-lock', $withLock->invoke($import, null, static fn (): string => 'no-lock'));
     }
 
     #[Test]

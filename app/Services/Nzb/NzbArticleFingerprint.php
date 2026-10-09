@@ -7,22 +7,42 @@ namespace App\Services\Nzb;
 use SimpleXMLElement;
 
 /**
- * Article identity of an NZB: a hash of its sorted, de-duplicated segment Message-IDs.
- * Two NZBs share a fingerprint only when they reference exactly the same articles.
+ * Article identity of an NZB: an order-independent multiset hash of its segment Message-IDs.
+ *
+ * Each Message-ID (angle brackets stripped) contributes its SHA-256 as eight 32-bit lanes that are
+ * summed modulo 2^32, plus a count. Accumulation is incremental and constant-memory, so the NZB
+ * writer can fingerprint while streaming, and two NZBs share a fingerprint only when they reference
+ * the same articles regardless of file or segment order.
  */
 final class NzbArticleFingerprint
 {
-    public static function fromXml(SimpleXMLElement $nzb): ?string
-    {
-        $messageIds = [];
+    /** @var list<int> */
+    private array $lanes = [0, 0, 0, 0, 0, 0, 0, 0];
 
-        foreach ($nzb->file as $file) {
-            foreach ($file->segments->segment as $segment) {
-                $messageIds[] = (string) $segment;
-            }
+    private int $count = 0;
+
+    public function add(string $messageId): void
+    {
+        $messageId = trim($messageId, " \t\n\r\0\x0B<>");
+        if ($messageId === '') {
+            return;
         }
 
-        return self::fromMessageIds($messageIds);
+        /** @var array<int, int> $words */
+        $words = unpack('N8', hash('sha256', $messageId, true));
+        foreach (array_values($words) as $lane => $word) {
+            $this->lanes[$lane] = ($this->lanes[$lane] + $word) & 0xFFFFFFFF;
+        }
+        $this->count++;
+    }
+
+    public function value(): ?string
+    {
+        if ($this->count === 0) {
+            return null;
+        }
+
+        return sha1(pack('J', $this->count).pack('N8', ...$this->lanes));
     }
 
     /**
@@ -30,23 +50,24 @@ final class NzbArticleFingerprint
      */
     public static function fromMessageIds(iterable $messageIds): ?string
     {
-        $unique = [];
-
+        $fingerprint = new self;
         foreach ($messageIds as $messageId) {
-            $messageId = trim($messageId, " \t\n\r\0\x0B<>");
-            if ($messageId !== '') {
-                $unique[$messageId] = true;
+            $fingerprint->add($messageId);
+        }
+
+        return $fingerprint->value();
+    }
+
+    public static function fromXml(SimpleXMLElement $nzb): ?string
+    {
+        $fingerprint = new self;
+        foreach ($nzb->file as $file) {
+            foreach ($file->segments->segment as $segment) {
+                $fingerprint->add((string) $segment);
             }
         }
 
-        if ($unique === []) {
-            return null;
-        }
-
-        $unique = array_map('strval', array_keys($unique));
-        sort($unique, SORT_STRING);
-
-        return sha1(implode("\n", $unique));
+        return $fingerprint->value();
     }
 
     public static function fromContents(string $contents): ?string

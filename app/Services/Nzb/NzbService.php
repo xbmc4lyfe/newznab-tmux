@@ -183,7 +183,7 @@ class NzbService
 
             $cursor = ['collection_id' => 0, 'name' => '', 'binary_id' => 0, 'partnumber' => 0];
             $openBinaryId = 0;
-            $articleIds = [];
+            $fingerprintAccumulator = new NzbArticleFingerprint;
             do {
                 $page = $this->loadNzbRowPage((int) $release->id, $cursor);
                 foreach ($page as $row) {
@@ -222,7 +222,7 @@ class NzbService
                         return NzbCreationResult::deterministic("Part {$row->partnumber} for binary {$binaryId} has an empty message ID.", $collectionIds, $path);
                     }
 
-                    $articleIds[] = $messageId;
+                    $fingerprintAccumulator->add($messageId);
                     $XMLWriter->startElement('segment');
                     $XMLWriter->writeAttribute('bytes', (string) $row->size);
                     $XMLWriter->writeAttribute('number', (string) $row->partnumber);
@@ -265,8 +265,7 @@ class NzbService
                 return NzbCreationResult::transient("Final NZB file is missing or unreadable: {$path}", $collectionIds, $path);
             }
 
-            $fingerprint = NzbArticleFingerprint::fromMessageIds($articleIds);
-            unset($articleIds);
+            $fingerprint = $fingerprintAccumulator->value();
 
             DB::transaction(function () use ($release, $fingerprint): void {
                 $release->update($this->successfulReleaseUpdateValues($fingerprint));
