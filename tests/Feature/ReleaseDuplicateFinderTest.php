@@ -67,6 +67,27 @@ class ReleaseDuplicateFinderTest extends TestCase
     }
 
     #[Test]
+    public function disabling_release_dedupe_still_rejects_an_identical_upload(): void
+    {
+        config(['nntmux.release_dedupe_enabled' => false]);
+
+        [$duplicate, $reason] = (new ReleaseDuplicateFinder)->findDuplicate('Show.S01E01.1080p.WEB.h264-GRP', 'Show.S01E01.1080p.WEB.h264-GRP', 42, 1_000_000_000, 'poster-a@example.com');
+
+        $this->assertNotNull($duplicate);
+        $this->assertSame('identical_upload', $reason);
+    }
+
+    #[Test]
+    public function disabling_release_dedupe_keeps_a_repost_by_another_poster(): void
+    {
+        config(['nntmux.release_dedupe_enabled' => false]);
+
+        [$duplicate] = (new ReleaseDuplicateFinder)->findDuplicate('Show.S01E01.1080p.WEB.h264-GRP', 'Show.S01E01.1080p.WEB.h264-GRP', 42, 1_000_000_000, 'poster-b@example.com');
+
+        $this->assertNull($duplicate);
+    }
+
+    #[Test]
     public function disabling_release_dedupe_also_disables_cross_post_cleanup(): void
     {
         $settings = new ProcessReleasesSettings(crossPostTime: 2);

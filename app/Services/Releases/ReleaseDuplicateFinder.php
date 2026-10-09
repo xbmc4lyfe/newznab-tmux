@@ -11,8 +11,8 @@ use Illuminate\Database\Eloquent\Builder;
  * Finds an existing release that should be treated as a duplicate of an incoming import.
  *
  * Uses (predb_id OR searchname) within a configurable size band. Falls back to raw {@see Release::$name}
- * when {@see Release::$searchname} is empty and there is no predb id. Disabled entirely when
- * `nntmux.release_dedupe_enabled` is false.
+ * when {@see Release::$searchname} is empty and there is no predb id. When
+ * `nntmux.release_dedupe_enabled` is false only an identical upload (same name, poster and size) matches.
  */
 final class ReleaseDuplicateFinder
 {
@@ -24,9 +24,10 @@ final class ReleaseDuplicateFinder
         string $searchName,
         int $predbId,
         int $filesize,
+        ?string $fromName = null,
     ): array {
         if (! (bool) config('nntmux.release_dedupe_enabled', true)) {
-            return [null, null];
+            return $this->findIdenticalUpload($cleanRelName, $fromName, $filesize);
         }
 
         $tolerance = (float) config('nntmux.release_dedupe_size_tolerance', 0.05);
@@ -62,6 +63,27 @@ final class ReleaseDuplicateFinder
         $reason = $this->resolveReason($dup, $searchName, $predbId);
 
         return [$dup, $reason];
+    }
+
+    /**
+     * With name/PreDB dedupe disabled, still reject the exact same upload (for example an NZB
+     * imported twice): same raw name, same poster and the same total size.
+     *
+     * @return array{0: ?Release, 1: ?string}
+     */
+    private function findIdenticalUpload(string $cleanRelName, ?string $fromName, int $filesize): array
+    {
+        if ($fromName === null || $fromName === '' || $cleanRelName === '') {
+            return [null, null];
+        }
+
+        $dup = Release::query()
+            ->where('name', $cleanRelName)
+            ->where('fromname', $fromName)
+            ->where('size', $filesize)
+            ->first(['id', 'predb_id', 'searchname', 'fromname', 'size', 'name']);
+
+        return $dup === null ? [null, null] : [$dup, 'identical_upload'];
     }
 
     private function resolveReason(Release $dup, string $searchName, int $predbId): string

@@ -586,7 +586,8 @@ class NzbImportService
             $escapedSubject,
             $escapedSearchName,
             $predbIdInt,
-            (int) $nzbDetails['totalSize']
+            (int) $nzbDetails['totalSize'],
+            (string) $escapedFromName
         );
 
         if ($dupeCheck !== null) {

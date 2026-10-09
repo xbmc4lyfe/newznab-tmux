@@ -71,11 +71,12 @@ return [
     | Size tolerance for matching an existing release when deduping imports
     | (collections / NZB). Default 0.05 = ±5% on total bytes (par2/RAR drift).
     | Set release_dedupe_enabled to false to keep every upload of a release that
-    | was built from different articles (re-posts by other posters, alternates);
-    | this also skips the cross-post cleanup (same name + poster within the
-    | Cross Post Hours window) after release creation.
-    | Identical articles cross-posted to several groups are still merged into one
-    | collection via Xref before release creation.
+    | forms its own collection (re-posts by other posters, alternates); this also
+    | skips the cross-post cleanup (same name + poster within the Cross Post Hours
+    | window). An identical upload (same name, poster and size, e.g. an NZB imported
+    | twice) is still rejected. Collections are keyed by cleaned subject + file
+    | count, so cross-posted articles and same-subject reposts with the same file
+    | count are merged before release creation regardless of this setting.
     |
     */
     'release_dedupe_enabled' => (bool) env('RELEASE_DEDUPE_ENABLED', true),
