@@ -1,0 +1,68 @@
+{
+ "total_count": 1000,
+ "pagination": {
+  "current_page": 1,
+  "per_page": 5,
+  "total_pages": 200
+ },
+ "list": [
+  {
+   "id": "827d2f05372191",
+   "dirname": "The.Celebrity.Traitors.S02E04.1080p.HDTV.H264-DARKFLiX",
+   "link_href": "https://www.xrel.to/tv-nfo/3613073/The-Celebrity-Traitors-S02E04-1080p-HDTV-H264-DARKFLiX.html",
+   "time": 1791576763,
+   "group_name": "DARKFLiX",
+   "size": {
+    "number": 2371,
+    "unit": "MB"
+   },
+   "video_type": "HDTV",
+   "audio_type": "Stereo",
+   "num_ratings": 0,
+   "ext_info": {
+    "type": "tv",
+    "id": "7377eb8fccf4",
+    "title": "The Celebrity Traitors",
+    "link_href": "https://www.xrel.to/tv/52468/The-Celebrity-Traitors.html",
+    "uris": [
+     "imdb:tt33248156"
+    ]
+   },
+   "tv_season": 2,
+   "tv_episode": 4,
+   "comments": 0,
+   "flags": {
+    "english": true
+   }
+  },
+  {
+   "id": "6c734e2937218f",
+   "dirname": "The.Autopsy.of.Jane.Doe.2016.2160p.UHD.BluRay.H265-MALUS",
+   "link_href": "https://www.xrel.to/movie-nfo/3613071/The-Autopsy-of-Jane-Doe-2016-2160p-UHD-BluRay-H265-MALUS.html",
+   "time": 1791575161,
+   "group_name": "MALUS",
+   "size": {
+    "number": 55575,
+    "unit": "MB"
+   },
+   "video_type": "Blu-ray",
+   "audio_type": "DTS",
+   "num_ratings": 0,
+   "ext_info": {
+    "type": "movie",
+    "id": "33097f7928eb8",
+    "title": "The Autopsy of Jane Doe",
+    "link_href": "https://www.xrel.to/movie/167608/The-Autopsy-of-Jane-Doe.html",
+    "rating": 6.9,
+    "num_ratings": 16,
+    "uris": [
+     "imdb:tt3289956"
+    ]
+   },
+   "comments": 0,
+   "flags": {
+    "english": true
+   }
+  }
+ ]
+}
