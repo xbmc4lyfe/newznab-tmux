@@ -11,6 +11,7 @@ use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Support\Data\ProcessReleasesSettings;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\LockTimeoutException;
+use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -188,6 +189,21 @@ class ReleaseDuplicateFinderTest extends TestCase
         }
 
         $this->assertSame('no-lock', $withLock->invoke($import, null, static fn (): string => 'no-lock'));
+    }
+
+    #[Test]
+    public function a_failed_fingerprint_write_removes_the_inserted_release(): void
+    {
+        DB::statement("CREATE TRIGGER block_fingerprint BEFORE UPDATE OF article_fingerprint ON releases BEGIN SELECT RAISE(ABORT, 'boom'); END");
+        $this->app->instance(NzbService::class, $this->createMock(NzbService::class));
+        $import = new NzbImportService(['Browser' => true]);
+
+        try {
+            (new ReflectionMethod($import, 'persistArticleFingerprint'))->invoke($import, 1, NzbArticleFingerprint::fromMessageIds(['a1@x']));
+            $this->fail('Expected the fingerprint write to fail.');
+        } catch (QueryException) {
+            $this->assertSame(0, DB::table('releases')->where('id', 1)->count());
+        }
     }
 
     #[Test]

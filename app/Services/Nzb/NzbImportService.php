@@ -512,6 +512,23 @@ class NzbImportService
     }
 
     /**
+     * Record the article fingerprint of a just-inserted release; if that fails, remove the release
+     * so it is not left marked as having an NZB that was never stored.
+     *
+     * @throws \Throwable
+     */
+    protected function persistArticleFingerprint(int $releaseId, ?string $fingerprint): void
+    {
+        try {
+            ReleaseArticleFingerprintStore::store($releaseId, $fingerprint);
+        } catch (\Throwable $exception) {
+            Release::query()->whereKey($releaseId)->delete();
+
+            throw $exception;
+        }
+    }
+
+    /**
      * Store the compressed NZB for the release just inserted; on failure remove the release so its
      * fingerprint is never left without an NZB.
      *
@@ -771,7 +788,7 @@ class NzbImportService
         }
 
         $this->relId = (int) $relID;
-        ReleaseArticleFingerprintStore::store($this->relId, $nzbDetails['articleFingerprint'] ?? null);
+        $this->persistArticleFingerprint($this->relId, $nzbDetails['articleFingerprint'] ?? null);
 
         return NzbImportStatus::Inserted;
     }
