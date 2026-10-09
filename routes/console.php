@@ -69,3 +69,5 @@ Schedule::command('nntmux:index-logs')->everyMinute()->withoutOverlapping()->run
 // Keep the admin dashboard snapshot (Cache::flexible) hot so admins never pay
 // the cold-cache cost when opening /admin/index.
 Schedule::command('admin:warm-dashboard')->everyFifteenMinutes()->withoutOverlapping();
+// Poll public PreDB JSON/RSS feeds (config/predb_feeds.php); the IRC scraper remains the realtime source
+Schedule::command('predb:import-feed --quiet')->everyFiveMinutes()->withoutOverlapping()->runInBackground()->when(static fn (): bool => (bool) config('predb_feeds.enabled'));
