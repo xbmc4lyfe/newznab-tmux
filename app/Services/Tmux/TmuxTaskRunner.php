@@ -7,6 +7,8 @@ namespace App\Services\Tmux;
 use App\Enums\TmuxPaneRole;
 use App\Services\Configuration\ConfigurationProvider;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Service for running tasks in tmux panes
@@ -459,7 +461,11 @@ class TmuxTaskRunner
         $launched = $this->launch($pane, $this->batchCommand($this->fixNamesCommands($work > 0, $fullBacklog, $predbft)), ['log_pane' => 'fixnames', 'sleep' => $sleep]);
 
         if (! $launched && $fullBacklog) {
-            Cache::forget(self::FULL_BACKLOG_SLOT);
+            try {
+                Cache::forget(self::FULL_BACKLOG_SLOT);
+            } catch (Throwable $e) {
+                Log::warning('Could not release the fix-names full-backlog slot', ['error' => $e->getMessage()]);
+            }
         }
 
         return $launched;
@@ -506,7 +512,14 @@ class TmuxTaskRunner
 
         $interval = max(1, (int) config('tmux.fix_names.full_backlog_interval_minutes', 60));
 
-        return Cache::add(self::FULL_BACKLOG_SLOT, true, now()->addMinutes($interval));
+        try {
+            return Cache::add(self::FULL_BACKLOG_SLOT, true, now()->addMinutes($interval));
+        } catch (Throwable $e) {
+            // The pass is optional: skip it this cycle rather than stopping the monitor.
+            Log::warning('Skipping the fix-names full-backlog pass; cache unavailable', ['error' => $e->getMessage()]);
+
+            return false;
+        }
     }
 
     /**

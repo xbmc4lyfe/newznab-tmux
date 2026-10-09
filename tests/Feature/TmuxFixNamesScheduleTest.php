@@ -11,6 +11,7 @@ use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\MockObject\MockObject;
 use ReflectionMethod;
 use ReflectionProperty;
+use RuntimeException;
 use Tests\TestCase;
 
 class TmuxFixNamesScheduleTest extends TestCase
@@ -91,6 +92,17 @@ class TmuxFixNamesScheduleTest extends TestCase
         $this->assertStringNotContainsString('releases:fix-names 4 ', $this->launched[0]);
         $this->assertStringNotContainsString('predbft', $this->launched[0]);
         $this->assertStringContainsString('releases:fix-names 3 ', $this->launched[0]);
+    }
+
+    #[Test]
+    public function a_cache_outage_skips_the_full_backlog_pass_but_keeps_scheduling(): void
+    {
+        Cache::shouldReceive('add')->andThrow(new RuntimeException('cache down'));
+
+        $this->assertTrue($this->runTask(alive: false, renames: 5));
+
+        $this->assertStringContainsString('releases:fix-names 3 ', $this->launched[0]);
+        $this->assertStringNotContainsString('releases:fix-names 4 ', $this->launched[0]);
     }
 
     private function runTask(bool $alive, int $renames, bool $respawnSucceeds = true): bool
