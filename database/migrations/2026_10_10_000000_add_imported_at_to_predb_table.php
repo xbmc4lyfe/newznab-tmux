@@ -12,19 +12,31 @@ return new class extends Migration
      */
     public function up(): void
     {
-        if (Schema::hasColumn('predb', 'imported_at')) {
-            return;
+        if (! Schema::hasColumn('predb', 'imported_at')) {
+            Schema::table('predb', function (Blueprint $table) {
+                $table->dateTime('imported_at')->nullable()->useCurrent();
+            });
         }
 
-        Schema::table('predb', function (Blueprint $table) {
-            $table->dateTime('imported_at')->nullable()->useCurrent();
-        });
+        // Supports the undated branch of the fix-names eligibility query, next to the existing
+        // (searched, predate, id) index used by the dated branch.
+        if (! Schema::hasIndex('predb', 'ix_predb_searched_imported_at')) {
+            Schema::table('predb', function (Blueprint $table) {
+                $table->index(['searched', 'imported_at', 'id'], 'ix_predb_searched_imported_at');
+            });
+        }
     }
 
     public function down(): void
     {
         if (! Schema::hasColumn('predb', 'imported_at')) {
             return;
+        }
+
+        if (Schema::hasIndex('predb', 'ix_predb_searched_imported_at')) {
+            Schema::table('predb', function (Blueprint $table) {
+                $table->dropIndex('ix_predb_searched_imported_at');
+            });
         }
 
         Schema::table('predb', function (Blueprint $table) {

@@ -454,9 +454,10 @@ class PredbImportFeedCommandTest extends TestCase
     }
 
     #[Test]
-    public function since_mode_pages_srrdb_by_its_listing_time(): void
+    public function since_mode_pages_by_listing_time_when_a_source_has_no_pre_time(): void
     {
-        config(['predb_feeds.request_delay_ms' => 0]);
+        // srrDB is single-page by default; lift that here to exercise listedAt-based paging.
+        config(['predb_feeds.request_delay_ms' => 0, 'predb_feeds.single_page_sources' => []]);
         $requested = [];
         Http::fake(function (Request $request) use (&$requested) {
             $requested[] = $request->url();
@@ -488,6 +489,21 @@ class PredbImportFeedCommandTest extends TestCase
 
         $this->assertSame(1, $result['skipped']);
         $this->search->shouldHaveReceived('updatePreDb')->with(Mockery::on(static fn (array $doc): bool => $doc['title'] === 'Known-GRP' && $doc['filename'] === 'known.mkv'))->once();
+    }
+
+    #[Test]
+    public function srrdb_is_never_paged_deeply_and_is_not_a_default_source(): void
+    {
+        config(['predb_feeds.request_delay_ms' => 0]);
+        Http::fake(['api.srrdb.com/*' => Http::response(['results' => [['release' => 'Srr.Only-GRP', 'date' => now('Europe/Brussels')->subDay()->format('Y-m-d H:i:s')]]])]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['srrdb'], '--since' => '14d'])
+            ->expectsOutputToContain('incomplete')
+            ->assertSuccessful();
+        $this->artisan('predb:import-feed', ['--source' => ['srrdb'], '--pages' => 5])->assertSuccessful();
+
+        Http::assertSentCount(2);
+        $this->assertNotContains('srrdb', (require base_path('config/predb_feeds.php'))['sources']);
     }
 
     private function fakeFeeds(): void

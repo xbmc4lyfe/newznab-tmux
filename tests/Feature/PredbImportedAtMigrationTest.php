@@ -21,11 +21,14 @@ class PredbImportedAtMigrationTest extends TestCase
         Schema::create('predb', function (Blueprint $table): void {
             $table->increments('id');
             $table->string('title')->unique();
+            $table->tinyInteger('searched')->default(0);
         });
 
         $migration = require database_path('migrations/2026_10_10_000000_add_imported_at_to_predb_table.php');
         $migration->up();
         $migration->up();
+
+        $this->assertTrue(Schema::hasIndex('predb', 'ix_predb_searched_imported_at'));
 
         DB::table('predb')->insert(['title' => 'Fresh-GRP']);
         $this->assertNotNull(DB::table('predb')->where('title', 'Fresh-GRP')->value('imported_at'));

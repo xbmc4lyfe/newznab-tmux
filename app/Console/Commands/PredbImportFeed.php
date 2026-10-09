@@ -72,9 +72,11 @@ class PredbImportFeed extends Command
             $status = 'ok';
 
             $reachedCutoff = false;
+            $singlePage = in_array($source->key(), (array) config('predb_feeds.single_page_sources', []), true);
+            $sourcePages = $singlePage ? 1 : $pages;
 
             try {
-                for ($page = 1; $page <= $pages; $page++) {
+                for ($page = 1; $page <= $sourcePages; $page++) {
                     if ($page > 1) {
                         usleep(max(0, (int) config('predb_feeds.request_delay_ms', 1000)) * 1000);
                     }
@@ -105,8 +107,10 @@ class PredbImportFeed extends Command
                 $succeeded++;
 
                 if ($since !== null && ! $reachedCutoff) {
-                    // The source ran out of history (or --max-pages was hit) before the cutoff.
-                    $status = 'incomplete: history ended before '.$since->toDateString();
+                    // The source ran out of history, hit --max-pages, or may not be paged (single-page).
+                    $status = $singlePage
+                        ? 'incomplete: history paging is disabled for this source'
+                        : 'incomplete: history ended before '.$since->toDateString();
                     Log::warning('PreDB history import incomplete', ['source' => $source->key(), 'since' => $since->toDateTimeString()]);
                 }
             } catch (Throwable $e) {
