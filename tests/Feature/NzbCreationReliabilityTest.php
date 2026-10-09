@@ -7,6 +7,7 @@ namespace Tests\Feature;
 use App\Models\Release;
 use App\Services\Binaries\BinariesConfig;
 use App\Services\CollectionCleanupService;
+use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbCreationCandidateQuery;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseImageService;
@@ -277,6 +278,7 @@ class NzbCreationReliabilityTest extends TestCase
         $this->assertLessThan(strpos($xml, 'part03@example.test'), strpos($xml, 'part02@example.test'));
         $this->assertStringContainsString('<group>alt.test</group>', $xml);
         $this->assertSame(0, DB::table('release_nzb_creation_failures')->count());
+        $this->assertSame(NzbArticleFingerprint::fromContents($xml), DB::table('releases')->where('id', 1)->value('article_fingerprint'));
     }
 
     public function test_stale_temporary_nzb_cleanup_deletes_only_old_temp_files(): void
@@ -403,7 +405,8 @@ class NzbCreationReliabilityTest extends TestCase
             postdate DATETIME NULL,
             nzbstatus INTEGER,
             nzb_creation_claimed_at DATETIME NULL,
-            nzb_creation_claim_token VARCHAR(64) NULL
+            nzb_creation_claim_token VARCHAR(64) NULL,
+            article_fingerprint CHAR(40) NULL
         )');
         DB::statement('CREATE TABLE release_nzb_creation_failures (
             releases_id INTEGER PRIMARY KEY,

@@ -48,3 +48,11 @@ deploy/cloud/*
 !deploy/cloud/configure.php
 !deploy/cloud/health.php
 !deploy/cloud/process-health.php
+# Self-hosted docker/ stack runtime state (bind mounts, secrets, docs).
+docker/data/
+docker/logs/
+docker/backups/
+docker/.env
+docker/config/app.env
+docker/config/usenet_servers.json
+docker/docs/

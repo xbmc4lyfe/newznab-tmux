@@ -1,5 +1,7 @@
 <?php
 
+use App\Support\IrcChannelList;
+
 return [
     /***********************************************************************************************************************
      * You can use this to set the NICKNAME=>REALNAME and USERNAME below.
@@ -72,12 +74,8 @@ return [
      * This is a list of all the channels we fetch PRE's from.
      **********************************************************************************************************************/
 
-    'scrape_irc_channels' => serialize(
-        [
-            // '#Channel'                => 'Password',
-            '#PreNNTmux' => null,
-        ]
-    ),
+    // Comma-separated, optional ":password" per channel, e.g. "#PreNNTmux,#nZEDbPRE".
+    'scrape_irc_channels' => serialize(IrcChannelList::parse(env('SCRAPE_IRC_CHANNELS', '#PreNNTmux'))),
 
     /***********************************************************************************************************************
      * This is a list of all the sources we fetch PRE's from.

@@ -7,6 +7,8 @@ namespace Tests\Unit;
 use App\Enums\NzbImportStatus;
 use App\Models\Category;
 use App\Services\Nzb\NzbImportService;
+use App\Services\Nzb\NzbService;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Cache;
@@ -305,6 +307,91 @@ final class NzbImportServiceTest extends TestCase
 
         $this->assertFalse($service->writeForTest($path, '<nzb />'));
         $this->assertFileDoesNotExist($path);
+    }
+
+    public function test_compressed_nzb_is_written_to_a_temporary_file_and_renamed_into_place(): void
+    {
+        $directory = sys_get_temp_dir().'/nzb-atomic-'.bin2hex(random_bytes(5));
+        mkdir($directory);
+        $service = new class(['Browser' => true]) extends NzbImportService
+        {
+            public bool $failRename = false;
+
+            public function writeForTest(string $path, string $contents): bool
+            {
+                return $this->writeCompressedNzb($path, $contents);
+            }
+
+            protected function moveCompressedNzbIntoPlace(string $temporaryPath, string $finalPath): bool
+            {
+                return $this->failRename ? false : parent::moveCompressedNzbIntoPlace($temporaryPath, $finalPath);
+            }
+        };
+
+        $service->failRename = true;
+        $this->assertFalse($service->writeForTest($directory.'/failed.nzb.gz', '<nzb />'));
+        $this->assertSame([], array_values(array_diff(scandir($directory), ['.', '..'])));
+
+        $service->failRename = false;
+        $this->assertTrue($service->writeForTest($directory.'/stored.nzb.gz', '<nzb />'));
+        $this->assertSame(['stored.nzb.gz'], array_values(array_diff(scandir($directory), ['.', '..'])));
+        $this->assertSame('<nzb />', gzdecode((string) file_get_contents($directory.'/stored.nzb.gz')));
+
+        unlink($directory.'/stored.nzb.gz');
+        rmdir($directory);
+    }
+
+    public function test_lock_contention_leaves_the_nzb_for_a_retry_instead_of_failing_it(): void
+    {
+        $file = $this->makeNzbFile('locked');
+        $service = new class(['Browser' => true]) extends NzbImportService
+        {
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function withArticleIdentityLock(?string $fingerprint, callable $callback): mixed
+            {
+                throw new LockTimeoutException;
+            }
+        };
+
+        $result = $service->beginImport([$file], delete: true, deleteFailed: true);
+
+        $this->assertIsString($result);
+        $this->assertStringContainsString('leaving it for a retry', $result);
+        $this->assertStringNotContainsString('Problem inserting', $result);
+        $this->assertFileExists($file);
+        unlink($file);
+    }
+
+    public function test_temporary_nzb_names_are_recognised_by_the_stale_temp_cleanup(): void
+    {
+        $directory = sys_get_temp_dir().'/nzb-tmpname-'.bin2hex(random_bytes(5));
+        mkdir($directory);
+        $service = new class(['Browser' => true]) extends NzbImportService
+        {
+            public string $temporaryPath = '';
+
+            public function writeForTest(string $path, string $contents): bool
+            {
+                return $this->writeCompressedNzb($path, $contents);
+            }
+
+            protected function moveCompressedNzbIntoPlace(string $temporaryPath, string $finalPath): bool
+            {
+                $this->temporaryPath = $temporaryPath;
+
+                return parent::moveCompressedNzbIntoPlace($temporaryPath, $finalPath);
+            }
+        };
+
+        $this->assertTrue($service->writeForTest($directory.'/x.nzb.gz', '<nzb />'));
+        $this->assertTrue(NzbService::isTemporaryNzbPathName($service->temporaryPath));
+
+        unlink($directory.'/x.nzb.gz');
+        rmdir($directory);
     }
 
     private function makeNzbFile(string $suffix): string

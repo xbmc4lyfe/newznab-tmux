@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Generate docker/.env and docker/config/app.env for the NNTmux docker/ stack.
+
+- docker/.env            <- docker/.env.example with generated secrets
+- docker/config/app.env  <- repo .env.example + docker/config/app.env.example overrides
+                            + generated secrets + NNTP credentials from USENET_SERVERS_JSON
+
+Existing non-placeholder values are never overwritten, so this is safe to re-run.
+Environment overrides:
+  USENET_SERVERS_JSON  JSON file with a "usenet_servers" list (default: docker/config/usenet_servers.json,
+                       gitignored). Only read when config/app.env has no NNTP credentials yet.
+  NNTP_PRIMARY_HOST    host to use as primary   (default: news.newshosting.com)
+  NNTP_ALT_HOST        host to use as alternate (default: news.frugalusenet.com)
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import secrets
+import string
+import sys
+from pathlib import Path
+
+DOCKER_DIR = Path(__file__).resolve().parent.parent
+REPO_DIR = DOCKER_DIR.parent
+PLACEHOLDERS = {"__GENERATED__", "__FROM_CONFIG__", ""}
+LINE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+
+
+def parse(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for raw in path.read_text().splitlines():
+        match = LINE.match(raw)
+        if match:
+            values[match.group(1)] = match.group(2).strip()
+    return values
+
+
+def render(template: Path, values: dict[str, str]) -> str:
+    """Keep the template's comments/order, substitute values, append keys the template lacks."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in template.read_text().splitlines():
+        match = LINE.match(raw)
+        if match and match.group(1) in values:
+            key = match.group(1)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(f"{key}={values[key]}")
+        else:
+            out.append(raw)
+    extra = [k for k in values if k not in seen]
+    if extra:
+        out.append("")
+        out.append("# ── docker/ stack overrides ───────────────────────────────────────")
+        out.extend(f"{k}={values[k]}" for k in extra)
+    return "\n".join(out) + "\n"
+
+
+def password(length: int = 32) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def irc_nick() -> str:
+    words = ["quiet", "amber", "north", "maple", "river", "cobalt", "ember", "harbor", "willow", "cedar"]
+    animals = ["fox", "owl", "lynx", "heron", "otter", "wren", "badger", "falcon", "marten", "finch"]
+    return f"{secrets.choice(words)}{secrets.choice(animals)}{secrets.randbelow(9000) + 1000}"
+
+
+def nntp_servers() -> tuple[dict, dict]:
+    config_path = Path(os.environ.get("USENET_SERVERS_JSON", DOCKER_DIR / "config/usenet_servers.json"))
+    try:
+        servers = json.loads(config_path.read_text())["usenet_servers"]
+    except (OSError, KeyError, json.JSONDecodeError) as exc:
+        sys.exit(f"Cannot read usenet_servers from {config_path}: {exc}")
+    by_host = {s["host"]: s for s in servers}
+    primary_host = os.environ.get("NNTP_PRIMARY_HOST", "news.newshosting.com")
+    alt_host = os.environ.get("NNTP_ALT_HOST", "news.frugalusenet.com")
+    for host in (primary_host, alt_host):
+        if host not in by_host:
+            sys.exit(f"{host} not found in {config_path}; set NNTP_PRIMARY_HOST / NNTP_ALT_HOST")
+    return by_host[primary_host], by_host[alt_host]
+
+
+def nntp_values(server: dict, suffix: str) -> dict[str, str]:
+    return {
+        f"NNTP_SERVER{suffix}": server["host"],
+        f"NNTP_PORT{suffix}": str(server.get("port", 563)),
+        f"NNTP_USERNAME{suffix}": server["username"],
+        f"NNTP_PASSWORD{suffix}": server["password"],
+        f"NNTP_SSLENABLED{suffix}": "true" if server.get("ssl", True) else "false",
+        f"NNTP_CONNECTIONS{suffix}": str(server.get("connections", 10)),
+    }
+
+
+def merge(existing: dict[str, str], wanted: dict[str, str]) -> dict[str, str]:
+    merged = dict(wanted)
+    for key, value in existing.items():
+        if value not in PLACEHOLDERS:
+            merged[key] = value
+    return merged
+
+
+def app_url(compose_values: dict[str, str]) -> str:
+    """APP_URL from docker/.env, or http://localhost:<APP_PORT> when it is blank (as Compose derives it)."""
+    url = compose_values.get("APP_URL", "")
+    if url in PLACEHOLDERS:
+        url = f"http://localhost:{compose_values.get('APP_PORT') or '8080'}"
+    return url.rstrip("/")
+
+
+def write_secret(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(content)
+    os.chmod(path, 0o600)
+
+
+def main() -> None:
+    compose_env_path = DOCKER_DIR / ".env"
+    app_env_path = DOCKER_DIR / "config/app.env"
+
+    existing_compose = parse(compose_env_path)
+    existing_app = parse(app_env_path)
+
+    db_password = existing_app.get("DB_PASSWORD") or existing_compose.get("DB_PASSWORD") or ""
+    db_root = existing_app.get("DB_ROOTPASSWORD") or existing_compose.get("DB_ROOTPASSWORD") or ""
+    db_password = db_password if db_password not in PLACEHOLDERS else password()
+    db_root = db_root if db_root not in PLACEHOLDERS else password()
+
+    # docker/.env
+    compose_values = parse(DOCKER_DIR / ".env.example")
+    compose_values.update({"DB_PASSWORD": db_password, "DB_ROOTPASSWORD": db_root})
+    compose_values = merge(existing_compose, compose_values)
+    write_secret(compose_env_path, render(DOCKER_DIR / ".env.example", compose_values))
+
+    # docker/config/app.env
+    app_values = parse(REPO_DIR / ".env.example")
+    app_values.update(parse(DOCKER_DIR / "config/app.env.example"))
+    nntp_keys = ("NNTP_SERVER", "NNTP_USERNAME", "NNTP_PASSWORD", "NNTP_SERVER_A", "NNTP_USERNAME_A", "NNTP_PASSWORD_A")
+    if all(existing_app.get(key, "") not in PLACEHOLDERS for key in nntp_keys):
+        primary, alternate = (
+            {"host": existing_app[f"NNTP_SERVER{s}"], "username": existing_app[f"NNTP_USERNAME{s}"],
+             "password": existing_app[f"NNTP_PASSWORD{s}"]}
+            for s in ("", "_A")
+        )
+    else:
+        primary, alternate = nntp_servers()
+    # Port/SSL/connections fall back to nntp_values() defaults; merge() keeps any app.env already has.
+    app_values.update(nntp_values(primary, ""))
+    app_values.update(nntp_values(alternate, "_A"))
+    app_values.update({
+        "APP_KEY": "base64:" + base64.b64encode(secrets.token_bytes(32)).decode(),
+        "DB_PASSWORD": db_password,
+        "DB_ROOTPASSWORD": db_root,
+        "DB_DATABASE": compose_values["DB_DATABASE"],
+        "DB_USERNAME": compose_values["DB_USERNAME"],
+        "ADMIN_PASS": password(24),
+        "SCRAPE_IRC_USERNAME": irc_nick(),
+    })
+    app_values = merge(existing_app, app_values)
+    # docker/.env owns the public origin (Grafana's root URL uses it too), so always sync it.
+    app_values["APP_URL"] = app_url(compose_values)
+    unresolved = [k for k, v in app_values.items() if v in ("__GENERATED__", "__FROM_CONFIG__")]
+    if unresolved:
+        sys.exit(f"Unresolved placeholders in app.env: {', '.join(unresolved)}")
+    write_secret(app_env_path, render(REPO_DIR / ".env.example", app_values))
+
+    print(f"Wrote {compose_env_path.relative_to(REPO_DIR)} and {app_env_path.relative_to(REPO_DIR)} (mode 600).")
+    print(f"APP_URL={app_values['APP_URL']}")
+    print(f"NNTP primary={primary['host']} alternate={alternate['host']}  IRC nick={app_values['SCRAPE_IRC_USERNAME']}")
+    print(f"Admin login: {app_values['ADMIN_USER']} (password: grep ADMIN_PASS {app_env_path.relative_to(REPO_DIR)})")
+
+
+if __name__ == "__main__":
+    main()
