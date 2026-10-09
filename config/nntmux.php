@@ -70,8 +70,13 @@ return [
     |
     | Size tolerance for matching an existing release when deduping imports
     | (collections / NZB). Default 0.05 = ±5% on total bytes (par2/RAR drift).
+    | Set release_dedupe_enabled to false to keep every upload of a release that
+    | was built from different articles (re-posts by other posters, alternates).
+    | Identical articles cross-posted to several groups are still merged into one
+    | collection via Xref before release creation.
     |
     */
+    'release_dedupe_enabled' => (bool) env('RELEASE_DEDUPE_ENABLED', true),
     'release_dedupe_size_tolerance' => (float) env('RELEASE_DEDUPE_SIZE_TOLERANCE', 0.05),
     'btcpay_webhook_secret' => env('BTCPAY_SECRET'),
     'tmp_unrar_path' => env('TEMP_UNRAR_PATH', storage_path('tmp/unrar/')),
