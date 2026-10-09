@@ -307,6 +307,38 @@ final class NzbImportServiceTest extends TestCase
         $this->assertFileDoesNotExist($path);
     }
 
+    public function test_compressed_nzb_is_written_to_a_temporary_file_and_renamed_into_place(): void
+    {
+        $directory = sys_get_temp_dir().'/nzb-atomic-'.bin2hex(random_bytes(5));
+        mkdir($directory);
+        $service = new class(['Browser' => true]) extends NzbImportService
+        {
+            public bool $failRename = false;
+
+            public function writeForTest(string $path, string $contents): bool
+            {
+                return $this->writeCompressedNzb($path, $contents);
+            }
+
+            protected function moveCompressedNzbIntoPlace(string $temporaryPath, string $finalPath): bool
+            {
+                return $this->failRename ? false : parent::moveCompressedNzbIntoPlace($temporaryPath, $finalPath);
+            }
+        };
+
+        $service->failRename = true;
+        $this->assertFalse($service->writeForTest($directory.'/failed.nzb.gz', '<nzb />'));
+        $this->assertSame([], array_values(array_diff(scandir($directory), ['.', '..'])));
+
+        $service->failRename = false;
+        $this->assertTrue($service->writeForTest($directory.'/stored.nzb.gz', '<nzb />'));
+        $this->assertSame(['stored.nzb.gz'], array_values(array_diff(scandir($directory), ['.', '..'])));
+        $this->assertSame('<nzb />', gzdecode((string) file_get_contents($directory.'/stored.nzb.gz')));
+
+        unlink($directory.'/stored.nzb.gz');
+        rmdir($directory);
+    }
+
     private function makeNzbFile(string $suffix): string
     {
         $path = sys_get_temp_dir().'/'.$suffix.'-'.bin2hex(random_bytes(5)).'.nzb';

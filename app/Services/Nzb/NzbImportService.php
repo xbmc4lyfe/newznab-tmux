@@ -334,7 +334,10 @@ class NzbImportService
 
     protected function writeCompressedNzb(string $path, string $contents): bool
     {
-        $handle = @gzopen($path, 'w5');
+        // Write next to the destination and rename into place, so a crash mid-write never leaves a
+        // truncated gzip at the final path (which would look like a stored NZB).
+        $temporaryPath = $path.'.tmp-'.bin2hex(random_bytes(6));
+        $handle = @gzopen($temporaryPath, 'w5');
         if ($handle === false) {
             Log::error('Unable to open imported NZB destination for writing.', ['path' => $path]);
 
@@ -352,6 +355,12 @@ class NzbImportService
             }
 
             $handle = null;
+            if (! $this->moveCompressedNzbIntoPlace($temporaryPath, $path)) {
+                Log::error('Unable to move the imported NZB file into place.', ['path' => $path]);
+
+                return false;
+            }
+
             $stored = File::isFile($path);
 
             return $stored;
@@ -366,10 +375,18 @@ class NzbImportService
             if (\is_resource($handle)) {
                 @gzclose($handle);
             }
+            if (File::isFile($temporaryPath)) {
+                File::delete($temporaryPath);
+            }
             if (! $stored) {
                 File::delete($path);
             }
         }
+    }
+
+    protected function moveCompressedNzbIntoPlace(string $temporaryPath, string $finalPath): bool
+    {
+        return @rename($temporaryPath, $finalPath);
     }
 
     /**
