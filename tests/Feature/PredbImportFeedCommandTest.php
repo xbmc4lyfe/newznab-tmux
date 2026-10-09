@@ -7,6 +7,7 @@ namespace Tests\Feature;
 use App\Console\Commands\PredbImportFeed;
 use App\Facades\Search;
 use App\Models\Predb;
+use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Services\Predb\Feeds\PredbFeedImporter;
 use Illuminate\Console\Scheduling\Event;
 use Illuminate\Console\Scheduling\Schedule;
@@ -15,6 +16,7 @@ use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
+use Mockery;
 use Mockery\MockInterface;
 use PHPUnit\Framework\Attributes\Test;
 use ReflectionMethod;
@@ -307,6 +309,36 @@ class PredbImportFeedCommandTest extends TestCase
     {
         $this->artisan('predb:import-feed', ['--since' => '2026-02-31'])->assertFailed();
         $this->artisan('predb:import-feed', ['--since' => '2026-09-25garbage'])->assertFailed();
+    }
+
+    #[Test]
+    public function a_dry_run_counts_a_title_seen_twice_as_one_insert(): void
+    {
+        $importer = app(PredbFeedImporter::class);
+        $first = new PredbFeedEntry(title: 'Dup.Title-GRP', source: 'predb.club', category: 'TV');
+        $second = new PredbFeedEntry(title: 'Dup.Title-GRP', source: 'predb.net', category: 'TV-HD', size: '5MB');
+
+        $result = $importer->import([$first, $second, $first], dryRun: true);
+
+        $this->assertSame(['inserted' => 1, 'updated' => 1, 'skipped' => 1], $result);
+        $this->assertSame(0, Predb::query()->count());
+    }
+
+    #[Test]
+    public function the_search_index_is_refreshed_from_the_current_row(): void
+    {
+        DB::table('predb')->insert(['title' => 'Index-GRP', 'source' => '#PreNNTmux', 'filename' => 'old.name', 'size' => null]);
+        $id = (int) DB::table('predb')->where('title', 'Index-GRP')->value('id');
+        // Simulate the IRC scraper renaming the file after the importer read the row.
+        Predb::retrieved(static function (Predb $predb) use ($id): void {
+            if ((int) $predb->id === $id) {
+                DB::table('predb')->where('id', $id)->update(['filename' => 'new.name']);
+            }
+        });
+
+        app(PredbFeedImporter::class)->import([new PredbFeedEntry(title: 'Index-GRP', source: 'predb.club', size: '5MB')]);
+
+        $this->search->shouldHaveReceived('updatePreDb')->with(Mockery::on(static fn (array $doc): bool => $doc['filename'] === 'new.name'))->once();
     }
 
     private function fakeFeeds(): void

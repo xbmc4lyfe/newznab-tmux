@@ -19,6 +19,14 @@ use Illuminate\Support\Facades\Log;
 class PredbFeedImporter
 {
     /**
+     * Dry runs record what they would have written, so later pages and overlapping feeds in the
+     * same run are counted as updates/skips rather than as more inserts.
+     *
+     * @var array<string, Predb>
+     */
+    private array $dryRunRows = [];
+
+    /**
      * @param  iterable<PredbFeedEntry>  $entries
      * @return array{inserted: int, updated: int, skipped: int}
      */
@@ -57,10 +65,21 @@ class PredbFeedImporter
             return 'skipped';
         }
 
-        $existing = Predb::query()->where('title', $title)->first();
+        $existing = ($dryRun ? ($this->dryRunRows[$title] ?? null) : null) ?? Predb::query()->where('title', $title)->first();
 
         if ($existing === null) {
             if ($dryRun) {
+                $this->dryRunRows[$title] = new Predb([
+                    'title' => $title,
+                    'source' => $entry->source,
+                    'category' => $entry->category,
+                    'size' => $entry->size,
+                    'files' => $entry->files,
+                    'predate' => $entry->predate?->format('Y-m-d H:i:s'),
+                    'nuked' => $entry->nuked,
+                    'nukereason' => $entry->nukeReason,
+                ]);
+
                 return 'inserted';
             }
 
@@ -83,6 +102,12 @@ class PredbFeedImporter
         }
 
         if ($dryRun) {
+            $shadow = $this->dryRunRows[$title] ?? clone $existing;
+            foreach (array_diff_key($changes, ['nuked_from' => true, 'nuked_status' => true]) as $column => $value) {
+                $shadow->setAttribute($column, $value);
+            }
+            $this->dryRunRows[$title] = $shadow;
+
             return 'updated';
         }
 
@@ -90,11 +115,14 @@ class PredbFeedImporter
             return 'skipped';
         }
 
+        // Re-read the indexed fields: another ingester may have changed them since $existing was read.
+        $current = Predb::query()->find($existing->id, ['id', 'title', 'filename', 'source']) ?? $existing;
+
         Search::updatePreDb([
-            'id' => (int) $existing->id,
-            'title' => $existing->title,
-            'filename' => $existing->filename,
-            'source' => $existing->source,
+            'id' => (int) $current->id,
+            'title' => $current->title,
+            'filename' => $current->filename,
+            'source' => $current->source,
         ]);
 
         return 'updated';
