@@ -10,6 +10,7 @@ use Illuminate\Database\QueryException;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 /**
  * Upserts feed entries into the predb table by title, mirroring the IRC scraper:
@@ -65,11 +66,11 @@ class PredbFeedImporter
             return 'skipped';
         }
 
-        $existing = ($dryRun ? ($this->dryRunRows[$title] ?? null) : null) ?? Predb::query()->where('title', $title)->first();
+        $existing = ($dryRun ? ($this->dryRunRows[$this->shadowKey($title)] ?? null) : null) ?? Predb::query()->where('title', $title)->first();
 
         if ($existing === null) {
             if ($dryRun) {
-                $this->dryRunRows[$title] = new Predb([
+                $this->dryRunRows[$this->shadowKey($title)] = new Predb([
                     'title' => $title,
                     'source' => $entry->source,
                     'category' => $entry->category,
@@ -102,11 +103,11 @@ class PredbFeedImporter
         }
 
         if ($dryRun) {
-            $shadow = $this->dryRunRows[$title] ?? clone $existing;
+            $shadow = $this->dryRunRows[$this->shadowKey($title)] ?? clone $existing;
             foreach (array_diff_key($changes, ['nuked_from' => true, 'nuked_status' => true, 'nukereason_from' => true]) as $column => $value) {
                 $shadow->setAttribute($column, $value);
             }
-            $this->dryRunRows[$title] = $shadow;
+            $this->dryRunRows[$this->shadowKey($title)] = $shadow;
 
             return 'updated';
         }
@@ -126,6 +127,14 @@ class PredbFeedImporter
         ]);
 
         return 'updated';
+    }
+
+    /**
+     * Shadow key matching predb.title's case- and accent-insensitive collation.
+     */
+    private function shadowKey(string $title): string
+    {
+        return mb_strtolower(Str::ascii($title));
     }
 
     /**

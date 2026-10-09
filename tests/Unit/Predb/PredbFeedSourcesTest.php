@@ -72,11 +72,26 @@ final class PredbFeedSourcesTest extends TestCase
     }
 
     #[Test]
-    public function malformed_rss_yields_no_entries(): void
+    public function malformed_rss_is_rejected_but_an_empty_channel_is_not(): void
     {
         $source = new RssFeedSource('predb_me', 'predb.me', 'https://predb.me/?rss=1');
 
-        $this->assertSame([], $source->parseXml('<html>not rss'));
+        $this->assertSame([], $source->parseXml('<?xml version="1.0"?><rss version="2.0"><channel><title>x</title></channel></rss>'));
+
+        $this->expectException(\RuntimeException::class);
+        $source->parseXml('<html>not rss');
+    }
+
+    #[Test]
+    public function xrel_nuke_flags_mark_releases_nuked(): void
+    {
+        $entries = (new XrelSource('https://api.xrel.to/v2/release/latest.json'))->parseRows([
+            ['dirname' => 'Nuked.Release-GRP', 'time' => 1, 'flags' => ['nuke_rls' => true]],
+            ['dirname' => 'Clean.Release-GRP', 'time' => 1, 'flags' => ['english' => true]],
+        ]);
+
+        $this->assertSame(Predb::PRE_NUKED, $entries[0]->nuked);
+        $this->assertSame(Predb::PRE_NONUKE, $entries[1]->nuked);
     }
 
     #[Test]

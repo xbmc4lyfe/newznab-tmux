@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Predb\Feeds\Sources;
 
+use App\Models\Predb;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
 use RuntimeException;
@@ -11,7 +12,7 @@ use RuntimeException;
 /**
  * xREL API v2: scene releases (`/v2/release/latest.json`) or P2P releases (`/v2/p2p/releases.json`).
  *
- * Scene row: {dirname, time (unix), size: {number, unit}, ext_info: {type}}
+ * Scene row: {dirname, time (unix), size: {number, unit}, ext_info: {type}, flags: {nuke_rls}}
  * P2P row:   {dirname, pub_time (unix), size_mb, category: {meta_cat, sub_cat}}
  * Rate limit: 900 requests per hour (X-RateLimit-* headers).
  */
@@ -89,6 +90,7 @@ final class XrelSource extends HttpFeedSource
             category: $type !== '' ? strtoupper($type) : null,
             size: $this->sceneSize($row['size'] ?? null),
             predate: is_numeric($row['time'] ?? null) ? CarbonImmutable::createFromTimestampUTC((int) $row['time']) : null,
+            nuked: ! empty($row['flags']['nuke_rls']) ? Predb::PRE_NUKED : Predb::PRE_NONUKE,
         );
     }
 

@@ -442,6 +442,17 @@ class PredbImportFeedCommandTest extends TestCase
             ->assertSuccessful();
     }
 
+    #[Test]
+    public function a_dry_run_matches_titles_case_insensitively_like_the_database(): void
+    {
+        $result = app(PredbFeedImporter::class)->import([
+            new PredbFeedEntry(title: 'Release-GRP', source: 'predb.club'),
+            new PredbFeedEntry(title: 'release-grp', source: 'predb.net'),
+        ], dryRun: true);
+
+        $this->assertSame(1, $result['inserted']);
+    }
+
     private function fakeFeeds(): void
     {
         Http::fake([
