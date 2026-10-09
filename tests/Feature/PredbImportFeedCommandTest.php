@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Console\Commands\PredbImportFeed;
 use App\Facades\Search;
 use App\Models\Predb;
 use App\Services\Predb\Feeds\PredbFeedImporter;
@@ -59,6 +60,7 @@ class PredbImportFeedCommandTest extends TestCase
         });
 
         $this->search = Search::spy();
+        Http::preventStrayRequests();
     }
 
     #[Test]
@@ -261,6 +263,50 @@ class PredbImportFeedCommandTest extends TestCase
         $this->assertTrue($changed);
         $this->assertSame('5MB', DB::table('predb')->where('id', $id)->value('size'));
         $this->assertSame('TV', DB::table('predb')->where('id', $id)->value('category'));
+    }
+
+    #[Test]
+    public function a_nuke_change_only_applies_while_the_observed_status_is_unchanged(): void
+    {
+        DB::table('predb')->insert(['title' => 'Nuke-GRP', 'source' => '#PreNNTmux', 'nuked' => Predb::PRE_UNNUKED]);
+        $id = (int) DB::table('predb')->where('title', 'Nuke-GRP')->value('id');
+
+        // The feed planned NONUKE -> NUKED, but IRC has since recorded UNNUKED.
+        $changed = (new ReflectionMethod(PredbFeedImporter::class, 'applyChanges'))
+            ->invoke(app(PredbFeedImporter::class), $id, ['nuked' => Predb::PRE_NUKED, 'nukereason' => 'dupe', 'nuked_from' => Predb::PRE_NONUKE]);
+
+        $this->assertFalse($changed);
+        $this->assertSame(Predb::PRE_UNNUKED, (int) DB::table('predb')->where('id', $id)->value('nuked'));
+    }
+
+    #[Test]
+    public function a_missing_nuke_reason_is_filled_when_the_status_already_matches(): void
+    {
+        DB::table('predb')->insert(['title' => 'Some.Movie.2026.1080p.WEB.H264-NUKED', 'source' => '#PreNNTmux', 'nuked' => Predb::PRE_NUKED, 'nukereason' => null]);
+        Http::fake(['predb.club/*' => Http::response((string) file_get_contents($this->fixture('predb_club.json')))]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club']])->assertSuccessful();
+
+        $this->assertSame('dupe.2026-10-01', Predb::query()->where('title', 'Some.Movie.2026.1080p.WEB.H264-NUKED')->value('nukereason'));
+    }
+
+    #[Test]
+    public function retry_after_accepts_seconds_and_http_dates_without_shortening(): void
+    {
+        $command = new ReflectionMethod(PredbImportFeed::class, 'retryAfterSeconds');
+        $instance = app(PredbImportFeed::class);
+
+        $this->assertSame(1200, $command->invoke($instance, '1200', 60));
+        $this->assertEqualsWithDelta(300, $command->invoke($instance, now()->addSeconds(300)->toRfc7231String(), 60), 2);
+        $this->assertSame(60, $command->invoke($instance, null, 60));
+        $this->assertSame(60, $command->invoke($instance, 'not-a-date', 60));
+    }
+
+    #[Test]
+    public function impossible_or_trailing_since_dates_are_rejected(): void
+    {
+        $this->artisan('predb:import-feed', ['--since' => '2026-02-31'])->assertFailed();
+        $this->artisan('predb:import-feed', ['--since' => '2026-09-25garbage'])->assertFailed();
     }
 
     private function fakeFeeds(): void

@@ -23,7 +23,7 @@ class PredbImportFeed extends Command
     protected $signature = 'predb:import-feed
                             {--source=* : Feed source key(s) to poll (default: predb_feeds.sources)}
                             {--pages=1 : Number of pages to fetch per source (newest first)}
-                            {--since= : History mode: page back until entries are older than this (e.g. 14d, 36h, 2026-09-25)}
+                            {--since= : History mode: page back until entries are older than this (14d, 36h or a Y-m-d date)}
                             {--max-pages= : Cap on pages per source in history mode (default predb_feeds.max_pages)}
                             {--dry-run : Fetch and report without writing to the database}';
 
@@ -127,12 +127,34 @@ class PredbImportFeed extends Command
                     throw $e;
                 }
 
-                $retryAfter = $e->response->header('Retry-After');
-                $wait = is_numeric($retryAfter) ? (int) $retryAfter : (int) config('predb_feeds.rate_limit_wait_seconds', 60);
+                $wait = $this->retryAfterSeconds($e->response->header('Retry-After'), (int) config('predb_feeds.rate_limit_wait_seconds', 60));
                 Log::info('PreDB feed rate limited; backing off', ['source' => $source->key(), 'page' => $page, 'wait_seconds' => $wait]);
-                sleep(max(0, min($wait, 900)));
+                sleep($wait);
             }
         }
+    }
+
+    /**
+     * Seconds to wait for a Retry-After header (delta-seconds or HTTP-date); the server's delay is
+     * never shortened. Falls back to $default when the header is missing or invalid.
+     */
+    private function retryAfterSeconds(?string $header, int $default): int
+    {
+        $header = trim((string) $header);
+
+        if ($header !== '' && ctype_digit($header)) {
+            return (int) $header;
+        }
+
+        if ($header !== '') {
+            try {
+                return max(0, (int) ceil(CarbonImmutable::now()->diffInSeconds(CarbonImmutable::parse($header), false)));
+            } catch (Throwable) {
+                // Not an HTTP-date either.
+            }
+        }
+
+        return max(0, $default);
     }
 
     /**
@@ -162,14 +184,13 @@ class PredbImportFeed extends Command
                 : CarbonImmutable::now()->subHours((int) $match[1]);
         }
 
-        if (preg_match('/^\d{4}-\d{2}-\d{2}/', $value) !== 1) {
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $value) !== 1) {
             return false;
         }
 
-        try {
-            return CarbonImmutable::parse($value, 'UTC');
-        } catch (Throwable) {
-            return false;
-        }
+        // Strict: reject dates that would be normalised (e.g. 2026-02-31).
+        $date = CarbonImmutable::createFromFormat('!Y-m-d', $value, 'UTC');
+
+        return $date !== null && $date->format('Y-m-d') === $value ? $date : false;
     }
 }

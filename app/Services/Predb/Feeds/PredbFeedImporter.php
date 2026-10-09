@@ -125,10 +125,17 @@ class PredbFeedImporter
         }
 
         if (array_key_exists('nuked', $changes)) {
+            // Transition from the status that was read; if another ingester changed it since, keep theirs.
             $changed = DB::table('predb')
                 ->where('id', $id)
-                ->where('nuked', '!=', $changes['nuked'])
+                ->where('nuked', $changes['nuked_from'] ?? $changes['nuked'])
                 ->update(['nuked' => $changes['nuked'], 'nukereason' => $changes['nukereason'] ?? null]) > 0 || $changed;
+        } elseif (array_key_exists('nukereason', $changes)) {
+            // Same status: fill or correct the reason while the status still matches.
+            $changed = DB::table('predb')
+                ->where('id', $id)
+                ->where('nuked', $changes['nuked_status'])
+                ->update(['nukereason' => $changes['nukereason']]) > 0 || $changed;
         }
 
         return $changed;
@@ -184,9 +191,15 @@ class PredbFeedImporter
             $changes['predate'] = $entry->predate->format('Y-m-d H:i:s');
         }
 
+        $reason = $entry->nukeReason !== null ? mb_substr($entry->nukeReason, 0, 255) : null;
+
         if ($entry->nuked !== Predb::PRE_NONUKE && (int) $existing->nuked !== $entry->nuked) {
             $changes['nuked'] = $entry->nuked;
-            $changes['nukereason'] = $entry->nukeReason !== null ? mb_substr($entry->nukeReason, 0, 255) : $existing->nukereason;
+            $changes['nuked_from'] = (int) $existing->nuked;
+            $changes['nukereason'] = $reason ?? $existing->nukereason;
+        } elseif ($entry->nuked !== Predb::PRE_NONUKE && $reason !== null && $reason !== (string) $existing->nukereason) {
+            $changes['nukereason'] = $reason;
+            $changes['nuked_status'] = $entry->nuked;
         }
 
         return $changes;
