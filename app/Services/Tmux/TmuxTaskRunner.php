@@ -15,6 +15,8 @@ class TmuxTaskRunner
 {
     private const string CANCELLATION_TRAPS = "trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; ";
 
+    private const string FULL_BACKLOG_SLOT = 'tmux:fix-names:full-backlog';
+
     protected TmuxPaneManager $paneManager;
 
     protected string $sessionName;
@@ -435,20 +437,32 @@ class TmuxTaskRunner
         $enabled = (int) ($runVar['settings']['fix_names'] ?? 0);
         $work = (int) ($runVar['counts']['now']['processrenames'] ?? 0);
         $pane = $this->paneManager->paneForRole(TmuxPaneRole::FixNames, '1.0');
+        $predbft = (bool) config('tmux.fix_names.predbft', true);
 
         if ($enabled !== 1) {
             return $this->disablePane($pane, 'Fix Release Names', 'disabled in settings');
         }
 
-        if ($work === 0) {
+        // PreDB full-text matching has its own work source (unsearched PREs), so it still runs
+        // when no standard rename work is pending.
+        if ($work === 0 && ! $predbft) {
             return $this->disablePane($pane, 'Fix Release Names', 'no releases to process');
         }
 
-        $logName = 'fixnames';
-        $sleep = (int) ($runVar['settings']['fix_timer'] ?? 300);
-        $allCommands = $this->batchCommand($this->fixNamesCommands());
+        // A running or sleeping pane keeps its current batch; nothing is claimed until a launch.
+        if ($this->paneManager->isAlive($pane)) {
+            return true;
+        }
 
-        return $this->launch($pane, $allCommands, ['log_pane' => $logName, 'sleep' => $sleep]);
+        $fullBacklog = $work > 0 && $this->claimFullBacklogSlot();
+        $sleep = (int) ($runVar['settings']['fix_timer'] ?? 300);
+        $launched = $this->launch($pane, $this->batchCommand($this->fixNamesCommands($work > 0, $fullBacklog, $predbft)), ['log_pane' => 'fixnames', 'sleep' => $sleep]);
+
+        if (! $launched && $fullBacklog) {
+            Cache::forget(self::FULL_BACKLOG_SLOT);
+        }
+
+        return $launched;
     }
 
     /**
@@ -456,33 +470,43 @@ class TmuxTaskRunner
      *
      * The odd levels only look at releases added in the past 6 hours, so a release whose
      * post-processing finishes later would never be renamed. The matching full-backlog (even)
-     * levels therefore run as well, at most once per configured interval because they scan the
-     * whole backlog, followed by PreDB full-text matching (`predbft`).
+     * levels therefore run too, at most once per configured interval because they scan the whole
+     * backlog, followed by PreDB full-text matching (`predbft`).
      *
      * @return list<string>
      */
-    protected function fixNamesCommands(): array
+    protected function fixNamesCommands(bool $renamePasses, bool $fullBacklog, bool $predbft): array
     {
         $artisan = escapeshellarg(PHP_BINARY).' '.escapeshellarg(base_path('artisan'));
-        $commands = [];
-
-        foreach ([3, 5, 7, 9, 11, 13, 15, 17, 19] as $level) {
-            $commands[] = "{$artisan} releases:fix-names {$level} --update --category=other --set-status --show";
+        $levels = $renamePasses ? [3, 5, 7, 9, 11, 13, 15, 17, 19] : [];
+        if ($renamePasses && $fullBacklog) {
+            array_push($levels, 4, 6, 8, 10, 12, 14, 16, 18, 20);
         }
 
-        $interval = max(1, (int) config('tmux.fix_names.full_backlog_interval_minutes', 60));
-        if ((bool) config('tmux.fix_names.full_backlog', true)
-            && Cache::add('tmux:fix-names:full-backlog', true, now()->addMinutes($interval))) {
-            foreach ([4, 6, 8, 10, 12, 14, 16, 18, 20] as $level) {
-                $commands[] = "{$artisan} releases:fix-names {$level} --update --category=other --set-status --show";
-            }
-        }
+        $commands = array_map(
+            static fn (int $level): string => "{$artisan} releases:fix-names {$level} --update --category=other --set-status --show",
+            $levels,
+        );
 
-        if ((bool) config('tmux.fix_names.predbft', true)) {
+        if ($predbft) {
             $commands[] = "{$artisan} multiprocessing:fixrelnames predbft";
         }
 
         return $commands;
+    }
+
+    /**
+     * Atomically claim this interval's full-backlog run (at most one per interval across monitors).
+     */
+    private function claimFullBacklogSlot(): bool
+    {
+        if (! (bool) config('tmux.fix_names.full_backlog', true)) {
+            return false;
+        }
+
+        $interval = max(1, (int) config('tmux.fix_names.full_backlog_interval_minutes', 60));
+
+        return Cache::add(self::FULL_BACKLOG_SLOT, true, now()->addMinutes($interval));
     }
 
     /**

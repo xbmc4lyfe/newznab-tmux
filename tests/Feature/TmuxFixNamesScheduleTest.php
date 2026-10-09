@@ -4,40 +4,81 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Services\Tmux\TmuxPaneManager;
 use App\Services\Tmux\TmuxTaskRunner;
 use Illuminate\Support\Facades\Cache;
 use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\MockObject\MockObject;
 use ReflectionMethod;
+use ReflectionProperty;
 use Tests\TestCase;
 
 class TmuxFixNamesScheduleTest extends TestCase
 {
+    private const string SLOT = 'tmux:fix-names:full-backlog';
+
+    /** @var list<string> */
+    private array $launched = [];
+
     protected function setUp(): void
     {
         parent::setUp();
 
-        config(['cache.default' => 'array']);
+        config([
+            'cache.default' => 'array',
+            'tmux.fix_names.full_backlog' => true,
+            'tmux.fix_names.full_backlog_interval_minutes' => 60,
+            'tmux.fix_names.predbft' => true,
+        ]);
         Cache::flush();
     }
 
     #[Test]
-    public function recent_passes_always_run_and_full_backlog_passes_at_most_once_per_interval(): void
+    public function a_busy_pane_does_not_consume_the_full_backlog_interval(): void
     {
-        config(['tmux.fix_names.full_backlog' => true, 'tmux.fix_names.full_backlog_interval_minutes' => 60, 'tmux.fix_names.predbft' => true]);
+        $this->assertTrue($this->runTask(alive: true, renames: 5));
 
-        $first = $this->commands();
-        $second = $this->commands();
+        $this->assertFalse(Cache::has(self::SLOT));
+        $this->assertSame([], $this->launched);
+    }
 
-        foreach ([3, 5, 7, 9, 11, 13, 15, 17, 19] as $level) {
-            $this->assertContainsLevel($level, $first);
-            $this->assertContainsLevel($level, $second);
+    #[Test]
+    public function full_backlog_passes_run_once_per_interval_after_a_successful_launch(): void
+    {
+        $this->assertTrue($this->runTask(alive: false, renames: 5));
+        $this->assertTrue($this->runTask(alive: false, renames: 5));
+
+        $this->assertTrue(Cache::has(self::SLOT));
+        $this->assertCount(2, $this->launched);
+        foreach ([3, 9, 19] as $level) {
+            $this->assertStringContainsString("releases:fix-names {$level} ", $this->launched[0]);
+            $this->assertStringContainsString("releases:fix-names {$level} ", $this->launched[1]);
         }
-        foreach ([4, 6, 8, 10, 12, 14, 16, 18, 20] as $level) {
-            $this->assertContainsLevel($level, $first);
-            $this->assertNotContainsLevel($level, $second);
+        foreach ([4, 10, 20] as $level) {
+            $this->assertStringContainsString("releases:fix-names {$level} ", $this->launched[0]);
+            $this->assertStringNotContainsString("releases:fix-names {$level} ", $this->launched[1]);
         }
-        $this->assertTrue($this->hasPredbft($first));
-        $this->assertTrue($this->hasPredbft($second));
+        $this->assertStringContainsString('predbft', $this->launched[1]);
+    }
+
+    #[Test]
+    public function a_failed_launch_releases_the_full_backlog_interval(): void
+    {
+        $this->assertFalse($this->runTask(alive: false, renames: 5, respawnSucceeds: false));
+
+        $this->assertFalse(Cache::has(self::SLOT));
+    }
+
+    #[Test]
+    public function predb_matching_runs_without_standard_rename_work(): void
+    {
+        $this->assertTrue($this->runTask(alive: false, renames: 0));
+
+        $this->assertCount(1, $this->launched);
+        $this->assertStringContainsString('multiprocessing:fixrelnames', $this->launched[0]);
+        $this->assertStringContainsString('predbft', $this->launched[0]);
+        $this->assertStringNotContainsString('releases:fix-names', $this->launched[0]);
+        $this->assertFalse(Cache::has(self::SLOT));
     }
 
     #[Test]
@@ -45,42 +86,32 @@ class TmuxFixNamesScheduleTest extends TestCase
     {
         config(['tmux.fix_names.full_backlog' => false, 'tmux.fix_names.predbft' => false]);
 
-        $commands = $this->commands();
+        $this->assertTrue($this->runTask(alive: false, renames: 5));
 
-        $this->assertCount(9, $commands);
-        $this->assertNotContainsLevel(4, $commands);
-        $this->assertFalse($this->hasPredbft($commands));
+        $this->assertStringNotContainsString('releases:fix-names 4 ', $this->launched[0]);
+        $this->assertStringNotContainsString('predbft', $this->launched[0]);
+        $this->assertStringContainsString('releases:fix-names 3 ', $this->launched[0]);
     }
 
-    /**
-     * @return list<string>
-     */
-    private function commands(): array
+    private function runTask(bool $alive, int $renames, bool $respawnSucceeds = true): bool
     {
-        return (new ReflectionMethod(TmuxTaskRunner::class, 'fixNamesCommands'))->invoke(new TmuxTaskRunner('fixnames-test'));
-    }
+        $runner = new TmuxTaskRunner('fixnames-test');
+        /** @var TmuxPaneManager&MockObject $panes */
+        $panes = $this->createMock(TmuxPaneManager::class);
+        $panes->method('paneForRole')->willReturn('%1');
+        $panes->method('isAlive')->willReturn($alive);
+        $capture = function (string $pane, string|array $command) use ($respawnSucceeds): bool {
+            $this->launched[] = is_array($command) ? implode(' ', $command) : $command;
 
-    /**
-     * @param  list<string>  $commands
-     */
-    private function assertContainsLevel(int $level, array $commands): void
-    {
-        $this->assertNotEmpty(array_filter($commands, static fn (string $c): bool => preg_match("/releases:fix-names'? {$level} /", $c) === 1), "level {$level} missing");
-    }
+            return $respawnSucceeds;
+        };
+        $panes->method('respawnPane')->willReturnCallback($capture);
+        $panes->method('respawnLoggedPane')->willReturnCallback(static fn (string $pane, array $command, string $file): bool => $capture($pane, $command));
+        (new ReflectionProperty(TmuxTaskRunner::class, 'paneManager'))->setValue($runner, $panes);
 
-    /**
-     * @param  list<string>  $commands
-     */
-    private function assertNotContainsLevel(int $level, array $commands): void
-    {
-        $this->assertEmpty(array_filter($commands, static fn (string $c): bool => preg_match("/releases:fix-names'? {$level} /", $c) === 1), "level {$level} unexpected");
-    }
-
-    /**
-     * @param  list<string>  $commands
-     */
-    private function hasPredbft(array $commands): bool
-    {
-        return array_filter($commands, static fn (string $c): bool => str_contains($c, 'multiprocessing:fixrelnames') && str_contains($c, 'predbft')) !== [];
+        return (new ReflectionMethod(TmuxTaskRunner::class, 'runFixNamesTask'))->invoke($runner, [
+            'settings' => ['fix_names' => 1, 'fix_timer' => 0],
+            'counts' => ['now' => ['processrenames' => $renames]],
+        ]);
     }
 }
