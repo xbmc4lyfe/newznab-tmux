@@ -183,6 +183,7 @@ class NzbService
 
             $cursor = ['collection_id' => 0, 'name' => '', 'binary_id' => 0, 'partnumber' => 0];
             $openBinaryId = 0;
+            $articleIds = [];
             do {
                 $page = $this->loadNzbRowPage((int) $release->id, $cursor);
                 foreach ($page as $row) {
@@ -221,6 +222,7 @@ class NzbService
                         return NzbCreationResult::deterministic("Part {$row->partnumber} for binary {$binaryId} has an empty message ID.", $collectionIds, $path);
                     }
 
+                    $articleIds[] = $messageId;
                     $XMLWriter->startElement('segment');
                     $XMLWriter->writeAttribute('bytes', (string) $row->size);
                     $XMLWriter->writeAttribute('number', (string) $row->partnumber);
@@ -263,8 +265,11 @@ class NzbService
                 return NzbCreationResult::transient("Final NZB file is missing or unreadable: {$path}", $collectionIds, $path);
             }
 
-            DB::transaction(function () use ($release): void {
-                $release->update($this->successfulReleaseUpdateValues());
+            $fingerprint = NzbArticleFingerprint::fromMessageIds($articleIds);
+            unset($articleIds);
+
+            DB::transaction(function () use ($release, $fingerprint): void {
+                $release->update($this->successfulReleaseUpdateValues($fingerprint));
 
                 if (NzbCreationCandidateQuery::supportsFailureState()) {
                     ReleaseNzbCreationFailure::query()
@@ -740,9 +745,13 @@ class NzbService
     /**
      * @return array<string, mixed>
      */
-    private function successfulReleaseUpdateValues(): array
+    private function successfulReleaseUpdateValues(?string $articleFingerprint = null): array
     {
         $values = ['nzbstatus' => self::NZB_ADDED];
+
+        if ($articleFingerprint !== null && ReleaseArticleFingerprintStore::columnExists()) {
+            $values[ReleaseArticleFingerprintStore::COLUMN] = $articleFingerprint;
+        }
 
         if (NzbCreationCandidateQuery::supportsClaims()) {
             $values += [

@@ -18,21 +18,35 @@ final class NzbArticleFingerprint
 
         foreach ($nzb->file as $file) {
             foreach ($file->segments->segment as $segment) {
-                $messageId = trim((string) $segment, " \t\n\r\0\x0B<>");
-                if ($messageId !== '') {
-                    $messageIds[$messageId] = true;
-                }
+                $messageIds[] = (string) $segment;
             }
         }
 
-        if ($messageIds === []) {
+        return self::fromMessageIds($messageIds);
+    }
+
+    /**
+     * @param  iterable<string>  $messageIds  Segment Message-IDs, with or without angle brackets
+     */
+    public static function fromMessageIds(iterable $messageIds): ?string
+    {
+        $unique = [];
+
+        foreach ($messageIds as $messageId) {
+            $messageId = trim($messageId, " \t\n\r\0\x0B<>");
+            if ($messageId !== '') {
+                $unique[$messageId] = true;
+            }
+        }
+
+        if ($unique === []) {
             return null;
         }
 
-        $messageIds = array_keys($messageIds);
-        sort($messageIds, SORT_STRING);
+        $unique = array_map('strval', array_keys($unique));
+        sort($unique, SORT_STRING);
 
-        return sha1(implode("\n", $messageIds));
+        return sha1(implode("\n", $unique));
     }
 
     public static function fromContents(string $contents): ?string

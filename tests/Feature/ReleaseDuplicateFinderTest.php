@@ -36,6 +36,7 @@ class ReleaseDuplicateFinderTest extends TestCase
         Schema::create('releases', function (Blueprint $table): void {
             $table->increments('id');
             $table->string('guid')->default('');
+            $table->char('article_fingerprint', 40)->nullable()->index();
             $table->string('name')->default('');
             $table->string('searchname')->default('');
             $table->string('fromname')->nullable();
@@ -120,6 +121,23 @@ class ReleaseDuplicateFinderTest extends TestCase
         $match = (new ReflectionMethod($import, 'findIdenticalArticleUpload'))->invoke($import, 1_000_000_000, NzbArticleFingerprint::fromContents($stored));
 
         $this->assertSame('stored-guid', $match?->guid);
+    }
+
+    #[Test]
+    public function nzb_import_matches_a_persisted_fingerprint_whatever_the_size(): void
+    {
+        config(['nntmux.release_dedupe_enabled' => false]);
+        $fingerprint = NzbArticleFingerprint::fromMessageIds(['a1@x', 'a2@x']);
+        DB::table('releases')->insert(['guid' => 'fp-guid', 'name' => 'x', 'size' => 5, 'article_fingerprint' => $fingerprint]);
+
+        $nzb = $this->createMock(NzbService::class);
+        $nzb->expects($this->never())->method('readNzbContents');
+        $this->app->instance(NzbService::class, $nzb);
+        $import = new NzbImportService(['Browser' => true]);
+        $find = new ReflectionMethod($import, 'findIdenticalArticleUpload');
+
+        $this->assertSame('fp-guid', $find->invoke($import, 1_000_000_000, $fingerprint)?->guid);
+        $this->assertSame('fp-guid', $find->invoke($import, 0, $fingerprint)?->guid);
     }
 
     #[Test]

@@ -477,16 +477,26 @@ class NzbImportService
     }
 
     /**
-     * With release dedupe disabled, an NZB is still a duplicate when an existing release of the
-     * exact same size references exactly the same articles (e.g. the same file imported twice).
+     * With release dedupe disabled, an NZB is still a duplicate when an existing release references
+     * exactly the same articles (e.g. the same file imported twice), matched by article_fingerprint.
      */
     protected function findIdenticalArticleUpload(int $totalSize, ?string $fingerprint): ?Release
     {
-        if ($fingerprint === null || $totalSize <= 0) {
+        if ($fingerprint === null) {
             return null;
         }
 
-        $candidates = Release::query()->where('size', $totalSize)->select(['id', 'guid', 'name', 'searchname', 'fromname', 'size'])->lazyById(200);
+        $persisted = ReleaseArticleFingerprintStore::find($fingerprint);
+        if ($persisted !== null || $totalSize <= 0) {
+            return $persisted;
+        }
+
+        // Releases written before article_fingerprint existed: compare stored NZBs of the same size.
+        $candidates = Release::query()
+            ->where('size', $totalSize)
+            ->when(ReleaseArticleFingerprintStore::columnExists(), static fn ($query) => $query->whereNull(ReleaseArticleFingerprintStore::COLUMN))
+            ->select(['id', 'guid', 'name', 'searchname', 'fromname', 'size'])
+            ->lazyById(200);
 
         foreach ($candidates as $candidate) {
             $contents = $this->nzb->readNzbContents((string) $candidate->guid);
@@ -665,6 +675,7 @@ class NzbImportService
         }
 
         $this->relId = (int) $relID;
+        ReleaseArticleFingerprintStore::store($this->relId, $nzbDetails['articleFingerprint'] ?? null);
 
         return NzbImportStatus::Inserted;
     }

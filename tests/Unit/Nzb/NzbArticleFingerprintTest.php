@@ -30,6 +30,16 @@ final class NzbArticleFingerprintTest extends TestCase
     }
 
     #[Test]
+    public function message_id_lists_match_the_nzb_fingerprint(): void
+    {
+        $this->assertSame(
+            NzbArticleFingerprint::fromContents(self::nzb([['a1@x', 'a2@x']])),
+            NzbArticleFingerprint::fromMessageIds(['<a2@x>', 'a1@x', 'a2@x']),
+        );
+        $this->assertNull(NzbArticleFingerprint::fromMessageIds([]));
+    }
+
+    #[Test]
     public function unreadable_or_empty_nzbs_have_no_fingerprint(): void
     {
         $this->assertNull(NzbArticleFingerprint::fromContents('not xml'));
