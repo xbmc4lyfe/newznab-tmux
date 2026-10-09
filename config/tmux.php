@@ -21,6 +21,16 @@ return [
         'default_name' => 'nntmux',
     ],
 
+    /*
+    | Fix-names pane. The "past 6 hours" passes always run; full-backlog passes (every release
+    | not yet tried) run at most once per interval, and PreDB full-text matching runs each cycle.
+    */
+    'fix_names' => [
+        'full_backlog' => (bool) env('TMUX_FIX_NAMES_FULL_BACKLOG', true),
+        'full_backlog_interval_minutes' => (int) env('TMUX_FIX_NAMES_FULL_INTERVAL', 60),
+        'predbft' => (bool) env('TMUX_FIX_NAMES_PREDBFT', true),
+    ],
+
     'terminal' => [
         'type' => env('TMUX_TERMINAL', 'xterm-256color'),
         'escape_time' => 0,

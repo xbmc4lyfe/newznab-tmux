@@ -6,6 +6,7 @@ namespace App\Services\Tmux;
 
 use App\Enums\TmuxPaneRole;
 use App\Services\Configuration\ConfigurationProvider;
+use Illuminate\Support\Facades\Cache;
 
 /**
  * Service for running tasks in tmux panes
@@ -443,19 +444,45 @@ class TmuxTaskRunner
             return $this->disablePane($pane, 'Fix Release Names', 'no releases to process');
         }
 
-        $artisan = escapeshellarg(PHP_BINARY).' '.escapeshellarg(base_path('artisan'));
         $logName = 'fixnames';
+        $sleep = (int) ($runVar['settings']['fix_timer'] ?? 300);
+        $allCommands = $this->batchCommand($this->fixNamesCommands());
 
-        // Run multiple fix-names passes
+        return $this->launch($pane, $allCommands, ['log_pane' => $logName, 'sleep' => $sleep]);
+    }
+
+    /**
+     * Fix-names passes for one cycle.
+     *
+     * The odd levels only look at releases added in the past 6 hours, so a release whose
+     * post-processing finishes later would never be renamed. The matching full-backlog (even)
+     * levels therefore run as well, at most once per configured interval because they scan the
+     * whole backlog, followed by PreDB full-text matching (`predbft`).
+     *
+     * @return list<string>
+     */
+    protected function fixNamesCommands(): array
+    {
+        $artisan = escapeshellarg(PHP_BINARY).' '.escapeshellarg(base_path('artisan'));
         $commands = [];
+
         foreach ([3, 5, 7, 9, 11, 13, 15, 17, 19] as $level) {
             $commands[] = "{$artisan} releases:fix-names {$level} --update --category=other --set-status --show";
         }
 
-        $sleep = (int) ($runVar['settings']['fix_timer'] ?? 300);
-        $allCommands = $this->batchCommand($commands);
+        $interval = max(1, (int) config('tmux.fix_names.full_backlog_interval_minutes', 60));
+        if ((bool) config('tmux.fix_names.full_backlog', true)
+            && Cache::add('tmux:fix-names:full-backlog', true, now()->addMinutes($interval))) {
+            foreach ([4, 6, 8, 10, 12, 14, 16, 18, 20] as $level) {
+                $commands[] = "{$artisan} releases:fix-names {$level} --update --category=other --set-status --show";
+            }
+        }
 
-        return $this->launch($pane, $allCommands, ['log_pane' => $logName, 'sleep' => $sleep]);
+        if ((bool) config('tmux.fix_names.predbft', true)) {
+            $commands[] = "{$artisan} multiprocessing:fixrelnames predbft";
+        }
+
+        return $commands;
     }
 
     /**
