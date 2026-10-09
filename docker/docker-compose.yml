@@ -1,0 +1,300 @@
+# NNTmux self-hosted stack. All persistent state is bind-mounted under docker/data and docker/logs.
+# Design: docker/docs/2026-10-08-nntmux-docker-stack-design.md   Lifecycle: make -C docker help
+name: ${COMPOSE_PROJECT_NAME:-nntmux}
+
+x-app: &app
+  image: ${APP_IMAGE:-nntmux/app:local}
+  init: true
+  user: "33:33"
+  restart: unless-stopped
+  stop_grace_period: 120s
+  environment:
+    TZ: ${TZ:-UTC}
+    # www-data's login shell is nologin; tmux panes spawn $SHELL.
+    SHELL: /bin/bash
+    # Pulse's storage ingest upserts pulse_aggregates from every short-lived worker
+    # process and deadlocks under the tmux fan-out; only the web container records.
+    PULSE_ENABLED: "false"
+  volumes:
+    - ./config/app.env:/app/.env
+    - ./data/storage:/app/storage
+    - ./data/install:/app/_install
+  tmpfs:
+    - /var/tmp/nntmux:uid=33,gid=33,mode=0770,size=2g
+  networks: [nntmux]
+  depends_on:
+    mariadb:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    manticore:
+      condition: service_healthy
+
+services:
+  proxy:
+    image: ${CADDY_IMAGE:-caddy:2.10.2-alpine}
+    restart: unless-stopped
+    ports:
+      - "${PROXY_BIND:-127.0.0.1}:${APP_PORT:-8080}:8080"
+    volumes:
+      - ./config/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy/data:/data
+      - ./data/caddy/config:/config
+      - ./logs/caddy:/var/log/caddy
+    networks: [nntmux]
+    depends_on:
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    mem_limit: 256m
+
+  web:
+    <<: *app
+    environment:
+      TZ: ${TZ:-UTC}
+      SHELL: /bin/bash
+      PULSE_ENABLED: "true"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/up"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    mem_limit: ${WEB_MEMORY:-1g}
+
+  horizon:
+    <<: *app
+    command: ["php", "artisan", "horizon"]
+    healthcheck:
+      test: ["CMD", "php", "artisan", "horizon:status"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    mem_limit: ${HORIZON_MEMORY:-1g}
+
+  scheduler:
+    <<: *app
+    command: ["php", "artisan", "schedule:work"]
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "schedule:work"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    mem_limit: ${SCHEDULER_MEMORY:-1g}
+
+  indexer:
+    <<: *app
+    command: ["/usr/local/bin/nntmux-indexer"]
+    tty: true
+    stdin_open: true
+    environment:
+      TZ: ${TZ:-UTC}
+      SHELL: /bin/bash
+      PULSE_ENABLED: "false"
+      TERM: xterm-256color
+      TMUX_SESSION_NAME: nntmux
+    healthcheck:
+      test: ["CMD", "php", "artisan", "tmux:health-check", "--session=nntmux", "--require-session", "--quiet"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 120s
+    mem_limit: ${INDEXER_MEMORY:-6g}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      manticore:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+
+  mariadb:
+    image: ${MARIADB_IMAGE:-mariadb:11.4.8}
+    restart: unless-stopped
+    stop_grace_period: 120s
+    environment:
+      TZ: ${TZ:-UTC}
+      MARIADB_DATABASE: ${DB_DATABASE:-nntmux}
+      MARIADB_USER: ${DB_USERNAME:-nntmux}
+      MARIADB_PASSWORD: ${DB_PASSWORD:?run docker/bin/generate-env}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOTPASSWORD:?run docker/bin/generate-env}
+      MARIADB_AUTO_UPGRADE: "1"
+    volumes:
+      - ./data/mariadb:/var/lib/mysql
+      - ./config/mariadb/conf.d:/etc/mysql/conf.d:ro
+      - ./logs/mariadb:/var/log/mysql
+    networks: [nntmux]
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    mem_limit: ${MARIADB_MEMORY:-10g}
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4.2-alpine}
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - ./config/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./data/redis:/data
+    networks: [nntmux]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: ${REDIS_MEMORY:-1g}
+
+  manticore:
+    image: ${MANTICORE_IMAGE:-manticoresearch/manticore:28.4.4}
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-UTC}
+      EXTRA: "1"
+    volumes:
+      - ./config/manticore/manticore.conf:/etc/manticoresearch/manticore.conf
+      - ./data/manticore:/var/lib/manticore
+      - ./logs/manticore:/var/log/manticore
+    networks: [nntmux]
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 1048576
+        hard: 1048576
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD", "mysql", "-h127.0.0.1", "-P9306", "-e", "SHOW TABLES"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    mem_limit: ${MANTICORE_MEMORY:-3g}
+
+  mailpit:
+    image: ${MAILPIT_IMAGE:-axllent/mailpit:v1.27}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MAILPIT_PORT:-8025}:8025"
+    networks: [nntmux]
+    mem_limit: 128m
+
+  # ── Monitoring (Prometheus + Grafana); dashboards shared with docker/monitoring ──
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    restart: unless-stopped
+    user: "0:0"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/prometheus
+    networks: [nntmux]
+    mem_limit: 512m
+
+  pushgateway:
+    image: prom/pushgateway:v1.11.3
+    restart: unless-stopped
+    networks: [nntmux]
+    mem_limit: 128m
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    restart: unless-stopped
+    user: "0:0"
+    environment:
+      PROMETHEUS_URL: http://prometheus:9090
+      GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s:${APP_PORT:-8080}/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_USER: nntmux-grafana-admin
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_SECURITY_COOKIE_SAMESITE: lax
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_JWT_ENABLED: "true"
+      GF_AUTH_JWT_URL_LOGIN: "false"
+      GF_AUTH_JWT_HEADER_NAME: X-JWT-Assertion
+      GF_AUTH_JWT_KEY_FILE: /etc/grafana/nntmux-jwt/grafana-jwt.pub
+      GF_AUTH_JWT_USERNAME_CLAIM: sub
+      GF_AUTH_JWT_EMAIL_CLAIM: email
+      GF_AUTH_JWT_EXPECT_CLAIMS: '{"iss": "nntmux", "aud": "grafana"}'
+      GF_AUTH_JWT_AUTO_SIGN_UP: "true"
+      GF_AUTH_JWT_ROLE_ATTRIBUTE_PATH: role
+      GF_AUTH_JWT_ROLE_ATTRIBUTE_STRICT: "true"
+      GF_LIVE_MAX_CONNECTIONS: "0"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/nntmux/nntmux-host.json
+    volumes:
+      - ../docker/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../docker/monitoring/grafana/dashboards:/etc/grafana/dashboards/nntmux:ro
+      - ./data/storage/app/monitoring/public:/etc/grafana/nntmux-jwt:ro
+      - ./data/grafana:/var/lib/grafana
+    networks: [nntmux]
+    mem_limit: 512m
+
+  node-exporter:
+    image: prom/node-exporter:v1.12.1
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+    networks: [nntmux]
+    mem_limit: 64m
+
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.20.0
+    restart: unless-stopped
+    command:
+      - --mysqld.address=mariadb:3306
+      - --mysqld.username=root
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: ${DB_ROOTPASSWORD}
+    networks: [nntmux]
+    depends_on: [mariadb]
+    mem_limit: 64m
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.93.0
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    networks: [nntmux]
+    depends_on: [redis]
+    mem_limit: 64m
+
+networks:
+  nntmux:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.42.0/24

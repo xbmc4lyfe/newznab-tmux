@@ -1,0 +1,22 @@
+{
+	auto_https off
+	admin off
+	frankenphp
+}
+
+# Public application vhost (reached through the front proxy).
+:80 {
+	root * /app/public
+	encode zstd gzip
+	php_server
+}
+
+# Internal-only vhost for the front proxy's Grafana forward_auth. It sets the server
+# variable that AdminMonitoringController::authorizeGrafana requires (the role nginx's
+# auth_request plays in docker/8.5). Port 8081 is never published outside the compose network.
+:8081 {
+	root * /app/public
+	php_server {
+		env NNTMUX_GRAFANA_AUTH_REQUEST 1
+	}
+}

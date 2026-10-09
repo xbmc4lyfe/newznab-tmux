@@ -21,6 +21,14 @@ return [
         'default_name' => 'nntmux',
     ],
 
+    /*
+    | Run the scheduled `tmux:health-check --auto-restart` from the Laravel scheduler.
+    | Disable when the scheduler runs in a different container than the tmux engine
+    | (e.g. docker/docker-compose.yml): there it would start a second tmux session
+    | inside the scheduler container. The indexer container supervises itself instead.
+    */
+    'scheduled_health_check' => (bool) env('TMUX_SCHEDULED_HEALTH_CHECK', true),
+
     'terminal' => [
         'type' => env('TMUX_TERMINAL', 'xterm-256color'),
         'escape_time' => 0,

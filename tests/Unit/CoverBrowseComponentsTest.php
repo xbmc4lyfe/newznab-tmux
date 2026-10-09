@@ -17,6 +17,18 @@ class CoverBrowseComponentsTest extends TestCase
         $this->assertStringContainsString('<x-cover-results-toolbar', $games);
     }
 
+    public function test_music_and_games_covers_resolve_the_stored_image_by_metadata_id(): void
+    {
+        // Covers are saved as covers/{type}/{id}.webp|jpg; `cover` is only a 0/1 "has cover" flag.
+        $music = (string) file_get_contents(__DIR__.'/../../resources/views/music/index.blade.php');
+        $games = (string) file_get_contents(__DIR__.'/../../resources/views/games/index.blade.php');
+
+        $this->assertStringContainsString("getImageAssetUrl('music', (string) \$result->id", $music);
+        $this->assertStringContainsString("getImageAssetUrl('games', (string) \$result->id", $games);
+        $this->assertStringNotContainsString("url('/covers/music/' . \$result->cover)", $music);
+        $this->assertStringNotContainsString("url('/covers/games/' . \$result->cover)", $games);
+    }
+
     public function test_cover_browse_release_cards_use_shared_release_list_component(): void
     {
         $console = (string) file_get_contents(__DIR__.'/../../resources/views/console/index.blade.php');

@@ -1,0 +1,33 @@
+{
+	admin off
+	auto_https off
+}
+
+# Front proxy for the NNTmux docker/ stack. Set APP_URL to match the published port.
+:8080 {
+	encode zstd gzip
+
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	# Grafana: every request is authorised against the Laravel admin session by the web
+	# container's internal vhost (:8081). The JWT it returns is passed to Grafana as a
+	# header and never reaches the browser; a client-supplied header is always stripped.
+	# `route` keeps this literal order; otherwise Caddy sorts request_header after
+	# forward_auth and deletes the JWT forward_auth just copied in.
+	handle /grafana* {
+		route {
+			request_header -X-JWT-Assertion
+			forward_auth web:8081 {
+				uri /admin/monitoring/grafana-auth
+				copy_headers X-NNTmux-Grafana-JWT>X-JWT-Assertion
+			}
+			reverse_proxy grafana:3000
+		}
+	}
+
+	handle {
+		reverse_proxy web:80
+	}
+}
