@@ -662,27 +662,7 @@ class NzbService
      */
     private function normalizeSegmentMessageId(string $messageId): string
     {
-        $messageId = trim($messageId);
-
-        if ($messageId === '') {
-            return '';
-        }
-
-        if (
-            \strlen($messageId) >= 2
-            && (($messageId[0] === '"' && str_ends_with($messageId, '"'))
-                || ($messageId[0] === "'" && str_ends_with($messageId, "'")))
-        ) {
-            $messageId = substr($messageId, 1, -1);
-        }
-
-        $messageId = trim($messageId);
-
-        if (str_starts_with($messageId, '<') && str_ends_with($messageId, '>')) {
-            $messageId = substr($messageId, 1, -1);
-        }
-
-        return trim($messageId);
+        return NzbArticleFingerprint::normalizeMessageId($messageId);
     }
 
     /**

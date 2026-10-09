@@ -52,6 +52,16 @@ final class NzbArticleFingerprintTest extends TestCase
     }
 
     #[Test]
+    public function quoted_and_bracketed_message_ids_match_the_nzb_writer_normalisation(): void
+    {
+        $this->assertSame('part01@example.test', NzbArticleFingerprint::normalizeMessageId(' "<part01@example.test>" '));
+        $this->assertSame(
+            NzbArticleFingerprint::fromMessageIds(['part01@example.test', "'part02@example.test'"]),
+            NzbArticleFingerprint::fromMessageIds(['"<part01@example.test>"', 'part02@example.test']),
+        );
+    }
+
+    #[Test]
     public function unreadable_or_empty_nzbs_have_no_fingerprint(): void
     {
         $this->assertNull(NzbArticleFingerprint::fromContents('not xml'));

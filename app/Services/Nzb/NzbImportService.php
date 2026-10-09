@@ -15,6 +15,8 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\ReleaseCleaningService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Support\Utf8;
+use Illuminate\Cache\Lock;
+use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Support\Carbon;
@@ -72,6 +74,12 @@ class NzbImportService
      * Seconds to wait for another import of the same articles to finish (dedupe disabled).
      */
     protected int $identityLockWaitSeconds = 30;
+
+    /**
+     * Lease for the article lock; it must outlive the whole scan, insert and NZB write
+     * ({@see Lock::block()} releases it as soon as the import finishes).
+     */
+    protected int $identityLockSeconds = 3600;
 
     /**
      * @param  array<string, mixed>  $options
@@ -615,7 +623,12 @@ class NzbImportService
             return $callback();
         }
 
-        return Cache::lock('nzb-import-article:'.$fingerprint, max(60, $this->identityLockWaitSeconds * 2))
+        $store = Cache::store((string) config('nntmux.release_dedupe_lock_store', 'database'))->getStore();
+        if (! $store instanceof LockProvider) {
+            throw new \RuntimeException('The release_dedupe_lock_store cache store does not support locks.');
+        }
+
+        return $store->lock('nzb-import-article:'.$fingerprint, $this->identityLockSeconds)
             ->block($this->identityLockWaitSeconds, $callback);
     }
 

@@ -9,6 +9,7 @@ use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Support\Data\ProcessReleasesSettings;
+use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Cache;
@@ -162,7 +163,7 @@ class ReleaseDuplicateFinderTest extends TestCase
     #[Test]
     public function concurrent_imports_of_the_same_articles_are_serialised_by_a_lock(): void
     {
-        config(['cache.default' => 'array']);
+        config(['cache.default' => 'file', 'nntmux.release_dedupe_lock_store' => 'array']);
         $this->app->instance(NzbService::class, $this->createMock(NzbService::class));
         $import = new NzbImportService(['Browser' => true]);
         (new ReflectionProperty($import, 'identityLockWaitSeconds'))->setValue($import, 0);
@@ -170,7 +171,9 @@ class ReleaseDuplicateFinderTest extends TestCase
 
         $this->assertSame('ran', $withLock->invoke($import, 'abc', static fn (): string => 'ran'));
 
-        $held = Cache::lock('nzb-import-article:abc', 60);
+        $store = Cache::store('array')->getStore();
+        $this->assertInstanceOf(LockProvider::class, $store);
+        $held = $store->lock('nzb-import-article:abc', 60);
         $this->assertTrue($held->get());
         $ran = false;
         try {
