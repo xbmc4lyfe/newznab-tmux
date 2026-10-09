@@ -207,6 +207,20 @@ class PredbImportFeedCommandTest extends TestCase
     }
 
     #[Test]
+    public function client_errors_are_not_retried_but_server_errors_are(): void
+    {
+        Http::fakeSequence('predb.club/*')->push('missing', 404);
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club']])->assertFailed();
+        Http::assertSentCount(1);
+
+        Http::fakeSequence('api.predb.net/*')
+            ->push('oops', 503)
+            ->push((string) file_get_contents($this->fixture('predb_net.json')));
+        $this->artisan('predb:import-feed', ['--source' => ['predb_net']])->assertSuccessful();
+        $this->assertSame(2, Predb::query()->count());
+    }
+
+    #[Test]
     public function an_api_error_envelope_fails_the_source(): void
     {
         Http::fake(['predb.club/*' => Http::response(['status' => 'error', 'message' => 'maintenance', 'data' => null])]);
