@@ -15,8 +15,12 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\ReleaseCleaningService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Support\Utf8;
+use Illuminate\Cache\Lock;
+use Illuminate\Contracts\Cache\LockProvider;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -65,6 +69,17 @@ class NzbImportService
     public mixed $echoCLI;
 
     public NzbService $nzb;
+
+    /**
+     * Seconds to wait for another import of the same articles to finish (dedupe disabled).
+     */
+    protected int $identityLockWaitSeconds = 30;
+
+    /**
+     * Lease for the article lock; it must outlive the whole scan, insert and NZB write
+     * ({@see Lock::block()} releases it as soon as the import finishes).
+     */
+    protected int $identityLockSeconds = 3600;
 
     /**
      * @param  array<string, mixed>  $options
@@ -193,10 +208,29 @@ class NzbImportService
                     continue;
                 }
 
-                // Try to insert the NZB details into the DB.
+                // Try to insert the NZB details into the DB and store the compressed NZB. With release
+                // dedupe disabled both run under a per-article lock (see withArticleIdentityLock()).
                 $nzbFileName = $useNzbName === true ? $this->deriveReleaseNameFromNzbPath($nzbFilePath) : '';
+                $lockFingerprint = ! (bool) config('nntmux.release_dedupe_enabled', true) ? NzbArticleFingerprint::fromXml($nzbXML) : null;
+                $stored = false;
+                $path = null;
                 try {
-                    $importStatus = $this->scanNZBFile($nzbXML, $nzbFileName, $source);
+                    [$importStatus, $stored, $path] = $this->withArticleIdentityLock(
+                        $lockFingerprint,
+                        function () use ($nzbXML, $nzbFileName, $source, $nzbString): array {
+                            $status = $this->scanNZBFile($nzbXML, $nzbFileName, $source);
+
+                            return $status === NzbImportStatus::Inserted
+                                ? [$status, ...$this->storeImportedNzb($nzbString)]
+                                : [$status, false, null];
+                        }
+                    );
+                } catch (LockTimeoutException) {
+                    // Another worker is importing the same articles: not a failure, so never delete it.
+                    $this->echoOut('Another import of the same articles is in progress; leaving it for a retry: '.$nzbFilePath);
+                    $nzbsSkipped++;
+
+                    continue;
                 } catch (\Throwable $exception) {
                     Log::error('NZB import failed while scanning or inserting a release.', [
                         'path' => $nzbFilePath,
@@ -213,25 +247,9 @@ class NzbImportService
                 }
 
                 if ($importStatus === NzbImportStatus::Inserted) {
-                    $path = null;
-                    try {
-                        $path = $this->nzb->getNzbPath($this->relGuid, 0, true);
-                        $stored = $this->writeCompressedNzb($path, $nzbString);
-                    } catch (\Throwable $exception) {
-                        Log::error('NZB import failed while storing the compressed file.', [
-                            'guid' => $this->relGuid,
-                            'path' => $path,
-                            'exception' => $exception,
-                        ]);
-                        $stored = false;
-                    }
-
                     if (! $stored) {
                         $destination = $path ?? $this->relGuid;
                         $this->echoOut('ERROR: Problem compressing NZB file to: '.$destination);
-
-                        // Remove the release.
-                        Release::query()->where('guid', $this->relGuid)->delete();
                         $reportResult($nzbFilePath, NzbImportStatus::Failed);
 
                         if ($deleteFailed) {
@@ -322,7 +340,10 @@ class NzbImportService
 
     protected function writeCompressedNzb(string $path, string $contents): bool
     {
-        $handle = @gzopen($path, 'w5');
+        // Write next to the destination and rename into place, so a crash mid-write never leaves a
+        // truncated gzip at the final path (which would look like a stored NZB).
+        $temporaryPath = NzbService::temporaryNzbPathFor($path);
+        $handle = @gzopen($temporaryPath, 'w5');
         if ($handle === false) {
             Log::error('Unable to open imported NZB destination for writing.', ['path' => $path]);
 
@@ -340,6 +361,12 @@ class NzbImportService
             }
 
             $handle = null;
+            if (! $this->moveCompressedNzbIntoPlace($temporaryPath, $path)) {
+                Log::error('Unable to move the imported NZB file into place.', ['path' => $path]);
+
+                return false;
+            }
+
             $stored = File::isFile($path);
 
             return $stored;
@@ -354,10 +381,18 @@ class NzbImportService
             if (\is_resource($handle)) {
                 @gzclose($handle);
             }
+            if (File::isFile($temporaryPath)) {
+                File::delete($temporaryPath);
+            }
             if (! $stored) {
                 File::delete($path);
             }
         }
+    }
+
+    protected function moveCompressedNzbIntoPlace(string $temporaryPath, string $finalPath): bool
+    {
+        return @rename($temporaryPath, $finalPath);
     }
 
     /**
@@ -471,8 +506,94 @@ class NzbImportService
                 'totalFiles' => $totalFiles,
                 'totalSize' => $totalSize,
                 'nzbCategoryId' => $this->resolveNzbCategoryId($nzbXML),
+                'articleFingerprint' => NzbArticleFingerprint::fromXml($nzbXML),
             ]
         );
+    }
+
+    /**
+     * Record the article fingerprint of a just-inserted release; if that fails, remove the release
+     * so it is not left marked as having an NZB that was never stored.
+     *
+     * @throws \Throwable
+     */
+    protected function persistArticleFingerprint(int $releaseId, ?string $fingerprint): void
+    {
+        try {
+            ReleaseArticleFingerprintStore::store($releaseId, $fingerprint);
+        } catch (\Throwable $exception) {
+            // Delete through the model so ReleaseObserver also removes the search document.
+            Release::query()->find($releaseId)?->delete();
+
+            throw $exception;
+        }
+    }
+
+    /**
+     * Store the compressed NZB for the release just inserted; on failure remove the release so its
+     * fingerprint is never left without an NZB.
+     *
+     * @return array{0: bool, 1: ?string} Whether the NZB was stored, and its path when known
+     */
+    protected function storeImportedNzb(string $nzbString): array
+    {
+        $path = null;
+        try {
+            $path = $this->nzb->getNzbPath($this->relGuid, 0, true);
+            $stored = $this->writeCompressedNzb($path, $nzbString);
+        } catch (\Throwable $exception) {
+            Log::error('NZB import failed while storing the compressed file.', [
+                'guid' => $this->relGuid,
+                'path' => $path,
+                'exception' => $exception,
+            ]);
+            $stored = false;
+        }
+
+        if (! $stored) {
+            // Delete through the model so ReleaseObserver also removes the search document.
+            Release::query()->where('guid', $this->relGuid)->first()?->delete();
+        }
+
+        return [$stored, $path];
+    }
+
+    /**
+     * With release dedupe disabled, an NZB is still a duplicate when an existing release references
+     * exactly the same articles (e.g. the same file imported twice), matched by article_fingerprint.
+     */
+    protected function findIdenticalArticleUpload(int $totalSize, ?string $fingerprint): ?Release
+    {
+        if ($fingerprint === null) {
+            return null;
+        }
+
+        foreach (ReleaseArticleFingerprintStore::candidates($fingerprint) as $persisted) {
+            // A fingerprint without its stored NZB (e.g. an import that crashed mid-write) is ignored.
+            if ($this->nzb->nzbPath((string) $persisted->guid) !== false) {
+                return $persisted;
+            }
+        }
+
+        if ($totalSize <= 0) {
+            return null;
+        }
+
+        // Releases written before article_fingerprint existed: compare stored NZBs of the same size.
+        $candidates = Release::query()
+            ->where('size', $totalSize)
+            ->when(ReleaseArticleFingerprintStore::columnExists(), static fn ($query) => $query->whereNull(ReleaseArticleFingerprintStore::COLUMN))
+            ->select(['id', 'guid', 'name', 'searchname', 'fromname', 'size'])
+            ->lazyById(200);
+
+        foreach ($candidates as $candidate) {
+            $contents = $this->nzb->readNzbContents((string) $candidate->guid);
+            if ($contents !== false && NzbArticleFingerprint::fromContents($contents) === $fingerprint) {
+                return $candidate;
+            }
+        }
+
+        return null;
     }
 
     protected function resolveNzbCategoryId(mixed $nzbXML): ?int
@@ -524,6 +645,33 @@ class NzbImportService
         $resolvedCategoryIds = array_values(array_unique($resolvedCategoryIds));
 
         return count($resolvedCategoryIds) === 1 ? $resolvedCategoryIds[0] : null;
+    }
+
+    /**
+     * Serialise the identity check, insert and NZB file write for one set of articles, so two
+     * concurrent imports of the same NZB cannot both pass {@see findIdenticalArticleUpload()}
+     * and a fingerprint is never visible without its stored NZB (dedupe disabled).
+     *
+     * @template TResult
+     *
+     * @param  callable(): TResult  $callback
+     * @return TResult
+     *
+     * @throws LockTimeoutException When another import holds the lock for longer than the wait.
+     */
+    protected function withArticleIdentityLock(?string $fingerprint, callable $callback): mixed
+    {
+        if ($fingerprint === null) {
+            return $callback();
+        }
+
+        $store = Cache::store((string) config('nntmux.release_dedupe_lock_store', 'database'))->getStore();
+        if (! $store instanceof LockProvider) {
+            throw new \RuntimeException('The release_dedupe_lock_store cache store does not support locks.');
+        }
+
+        return $store->lock('nzb-import-article:'.$fingerprint, $this->identityLockSeconds)
+            ->block($this->identityLockWaitSeconds, $callback);
     }
 
     /**
@@ -589,6 +737,11 @@ class NzbImportService
             (int) $nzbDetails['totalSize']
         );
 
+        if ($dupeCheck === null && ! (bool) config('nntmux.release_dedupe_enabled', true)) {
+            $dupeCheck = $this->findIdenticalArticleUpload((int) $nzbDetails['totalSize'], $nzbDetails['articleFingerprint'] ?? null);
+            $dupeReason = $dupeCheck !== null ? 'identical_articles' : null;
+        }
+
         if ($dupeCheck !== null) {
             Log::info('NZB import skipped as duplicate', [
                 'reason' => $dupeReason,
@@ -637,6 +790,7 @@ class NzbImportService
         }
 
         $this->relId = (int) $relID;
+        $this->persistArticleFingerprint($this->relId, $nzbDetails['articleFingerprint'] ?? null);
 
         return NzbImportStatus::Inserted;
     }

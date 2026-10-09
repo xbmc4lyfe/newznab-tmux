@@ -71,9 +71,13 @@ final class ProcessReleasesSettings extends Data
         return $this->releaseRetentionDays > 0;
     }
 
+    /**
+     * Cross-post cleanup deletes same-name, same-poster releases; it is skipped when release
+     * dedupe is disabled so uploads built from different articles are kept.
+     */
     public function hasCrossPostDetection(): bool
     {
-        return $this->crossPostTime > 0;
+        return $this->crossPostTime > 0 && (bool) config('nntmux.release_dedupe_enabled', true);
     }
 
     public function hasCompletionCleanup(): bool
