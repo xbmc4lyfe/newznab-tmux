@@ -198,7 +198,7 @@ class PredbImportFeed extends Command
      */
     private function oldestPredate(array $entries): ?CarbonImmutable
     {
-        $dates = array_filter(array_map(static fn (PredbFeedEntry $entry): ?CarbonImmutable => $entry->predate, $entries));
+        $dates = array_filter(array_map(static fn (PredbFeedEntry $entry): ?CarbonImmutable => $entry->pagingTime(), $entries));
 
         return $dates === [] ? null : min($dates);
     }

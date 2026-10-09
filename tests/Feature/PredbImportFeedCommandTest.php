@@ -453,6 +453,25 @@ class PredbImportFeedCommandTest extends TestCase
         $this->assertSame(1, $result['inserted']);
     }
 
+    #[Test]
+    public function since_mode_pages_srrdb_by_its_listing_time(): void
+    {
+        config(['predb_feeds.request_delay_ms' => 0]);
+        $requested = [];
+        Http::fake(function (Request $request) use (&$requested) {
+            $requested[] = $request->url();
+            $skip = preg_match('/skip:(\d+)/', $request->url(), $m) === 1 ? (int) $m[1] : 0;
+            $days = $skip === 0 ? 1 : 20;
+
+            return Http::response(['results' => [['release' => 'Srr.Page'.$skip.'-GRP', 'date' => now('Europe/Brussels')->subDays($days)->format('Y-m-d H:i:s'), 'size' => 1]]]);
+        });
+
+        $this->artisan('predb:import-feed', ['--source' => ['srrdb'], '--since' => '14d'])->assertSuccessful();
+
+        $this->assertCount(2, $requested);
+        $this->assertNull(Predb::query()->where('title', 'Srr.Page0-GRP')->value('predate'));
+    }
+
     private function fakeFeeds(): void
     {
         Http::fake([

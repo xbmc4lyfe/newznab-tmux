@@ -12,7 +12,7 @@ use Throwable;
 /**
  * srrDB search API, newest first (`/v1/search/order:date-desc`), 45 results per page paged with `/skip:N`.
  *
- * Row shape: {release, date ("Y-m-d H:i:s" in srrDB's local time), size (bytes), hasNFO, hasSRS, isForeign}
+ * Row shape: {release, date (SRR upload time, "Y-m-d H:i:s" in srrDB's local time), size (bytes), hasNFO, hasSRS, isForeign}
  */
 final class SrrdbSource extends HttpFeedSource
 {
@@ -64,11 +64,12 @@ final class SrrdbSource extends HttpFeedSource
                 continue;
             }
 
+            // srrDB's `date` is when the SRR was added (possibly long after the PRE) and `size` can
+            // describe only an NFO, so neither is stored as PRE data; the date only drives paging.
             $entries[] = new PredbFeedEntry(
                 title: trim($row['release']),
                 source: 'srrdb',
-                size: is_numeric($row['size'] ?? null) ? PredbFeedEntry::sizeFromMegabytes((float) $row['size'] / 1048576) : null,
-                predate: $this->parseDate($row['date'] ?? null),
+                listedAt: $this->parseDate($row['date'] ?? null),
             );
         }
 

@@ -21,7 +21,18 @@ final readonly class PredbFeedEntry
         public ?CarbonImmutable $predate = null,
         public int $nuked = Predb::PRE_NONUKE,
         public ?string $nukeReason = null,
+        // When the feed listed the entry, if that is not the PRE time (e.g. srrDB's upload time).
+        // Used only to page history imports; never stored as predate.
+        public ?CarbonImmutable $listedAt = null,
     ) {}
+
+    /**
+     * Timestamp used to decide how far back a history import has paged.
+     */
+    public function pagingTime(): ?CarbonImmutable
+    {
+        return $this->predate ?? $this->listedAt;
+    }
 
     /**
      * Format a size given in megabytes the way IRC pre bots announce it (KB below 1 MB), or null when unknown.

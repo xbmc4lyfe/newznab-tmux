@@ -95,15 +95,18 @@ final class PredbFeedSourcesTest extends TestCase
     }
 
     #[Test]
-    public function srrdb_rows_convert_brussels_time_to_utc_and_bytes_to_megabytes(): void
+    public function srrdb_rows_keep_the_upload_time_for_paging_only_and_no_size(): void
     {
         $entries = (new SrrdbSource('https://api.srrdb.com/v1/search/order:date-desc'))->parseRows($this->json('srrdb.json')['results']);
 
         $this->assertCount(2, $entries);
         $this->assertSame('srrdb', $entries[1]->source);
         $this->assertSame('The.Celebrity.Traitors.S02E04.1080p.HDTV.H264-DARKFLiX', $entries[1]->title);
-        $this->assertSame('2026-10-09 20:12:51', $entries[1]->predate?->format('Y-m-d H:i:s'));
-        $this->assertSame('2408.48MB', $entries[1]->size);
+        // srrDB's date is when the SRR was added (Europe/Brussels), not the PRE time.
+        $this->assertNull($entries[1]->predate);
+        $this->assertSame('2026-10-09 20:12:51', $entries[1]->listedAt?->format('Y-m-d H:i:s'));
+        // srrDB sizes can describe only an NFO, so they are not used as release sizes.
+        $this->assertNull($entries[1]->size);
     }
 
     #[Test]
