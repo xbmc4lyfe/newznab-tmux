@@ -486,7 +486,7 @@ class NzbImportService
             return null;
         }
 
-        $candidates = Release::query()->where('size', $totalSize)->limit(50)->get(['id', 'guid', 'name', 'searchname', 'fromname', 'size']);
+        $candidates = Release::query()->where('size', $totalSize)->select(['id', 'guid', 'name', 'searchname', 'fromname', 'size'])->lazyById(200);
 
         foreach ($candidates as $candidate) {
             $contents = $this->nzb->readNzbContents((string) $candidate->guid);

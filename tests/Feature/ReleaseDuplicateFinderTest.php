@@ -104,6 +104,25 @@ class ReleaseDuplicateFinderTest extends TestCase
     }
 
     #[Test]
+    public function nzb_import_finds_identical_articles_beyond_the_first_candidates(): void
+    {
+        config(['nntmux.release_dedupe_enabled' => false]);
+        DB::table('releases')->insert(array_map(static fn (int $i): array => ['guid' => 'other-'.$i, 'name' => 'repost', 'size' => 1_000_000_000], range(1, 120)));
+        DB::table('releases')->insert(['guid' => 'stored-guid', 'name' => 'repost', 'size' => 1_000_000_000]);
+        $stored = NzbArticleFingerprintTest::nzb([['a1@x', 'a2@x']]);
+        $other = NzbArticleFingerprintTest::nzb([['o1@z']]);
+
+        $nzb = $this->createMock(NzbService::class);
+        $nzb->method('readNzbContents')->willReturnCallback(static fn (string $guid): string => $guid === 'stored-guid' ? $stored : $other);
+        $this->app->instance(NzbService::class, $nzb);
+        $import = new NzbImportService(['Browser' => true]);
+
+        $match = (new ReflectionMethod($import, 'findIdenticalArticleUpload'))->invoke($import, 1_000_000_000, NzbArticleFingerprint::fromContents($stored));
+
+        $this->assertSame('stored-guid', $match?->guid);
+    }
+
+    #[Test]
     public function disabling_release_dedupe_also_disables_cross_post_cleanup(): void
     {
         $settings = new ProcessReleasesSettings(crossPostTime: 2);
