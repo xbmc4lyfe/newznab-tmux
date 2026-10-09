@@ -233,7 +233,7 @@ class ArchiveExtractionService
                     File::put($fileName, $compressedData);
                     try {
                         $this->runExternalCommand($this->config->unrarPath, [
-                            'e', '-ai', '-ep', '-c-', '-id', '-inul', '-kb', '-or', '-p-', '-r', '-y', '-@', '-',
+                            'e', '-ai', '-ep', '-c-', '-id', '-inul', '-kb', '-or', '-p-', '-r', '-y', '-@', '--',
                             $fileName,
                             $tmpPath.'unrar/',
                         ]);
@@ -396,7 +396,7 @@ class ArchiveExtractionService
                 $tmpPath,
                 'rar',
                 fn (string $archiveFile, string $extractDir): array => [
-                    'e', '-y', '-c-', '-inul', '-p-', '-@', '-',
+                    'e', '-y', '-c-', '-inul', '-p-', '-@', '--',
                     $archiveFile,
                     $filename,
                     $extractDir,

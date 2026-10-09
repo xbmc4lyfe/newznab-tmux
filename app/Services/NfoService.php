@@ -601,7 +601,7 @@ class NfoService
             return false;
         }
 
-        $alternateNntp = (bool) config('nntmux_nntp.use_alternate_nntp_server');
+        $alternateNntp = (bool) config('nntmux_nntp.alternate_article_fallback');
         $maxSegments = 40;
         $triedArchive = false;
 
@@ -676,7 +676,7 @@ class NfoService
                     '-inul',
                     '-p-',
                     '-@',
-                    '-',
+                    '--',
                     $archiveFile,
                     $nfoFilename,
                     $extractDir,
