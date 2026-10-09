@@ -7,11 +7,12 @@ namespace App\Services\Predb\Feeds\Sources;
 use App\Models\Predb;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
+use RuntimeException;
 
 /**
  * api.predb.net JSON API.
  *
- * Row shape: {release, section, size (MB), files, pretime (unix), status (0 = ok, 1 = nuked, 2 = unnuked), reason, group}
+ * Row shape: {release, section, size (MB), files, pretime (unix), status (0 ok, 1 nuke, 2 unnuke, 3 delpre, 4 undelpre), reason, group}
  */
 final class PredbNetSource extends HttpFeedSource
 {
@@ -26,6 +27,10 @@ final class PredbNetSource extends HttpFeedSource
             'limit' => $this->pageSize,
             'page' => max(1, $page),
         ])->throw();
+
+        if ($response->json('status') === 'error') {
+            throw new RuntimeException('predb.net API error: '.(string) $response->json('message', 'unknown'));
+        }
 
         $rows = $response->json('data');
 
@@ -57,7 +62,7 @@ final class PredbNetSource extends HttpFeedSource
                 predate: is_numeric($row['pretime'] ?? null) ? CarbonImmutable::createFromTimestampUTC((int) $row['pretime']) : null,
                 nuked: match ($status) {
                     0 => Predb::PRE_NONUKE,
-                    2 => Predb::PRE_UNNUKED,
+                    2, 4 => Predb::PRE_UNNUKED, // unnuke, undelpre
                     default => Predb::PRE_NUKED,
                 },
                 nukeReason: $status === 0 ? null : $reason,

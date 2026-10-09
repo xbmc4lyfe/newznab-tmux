@@ -134,6 +134,36 @@ final class PredbFeedSourcesTest extends TestCase
     }
 
     #[Test]
+    public function undelpre_statuses_map_to_unnuked(): void
+    {
+        $net = (new PredbNetSource('https://api.predb.net/'))->parseRows([
+            ['release' => 'A-GRP', 'status' => 4, 'reason' => 'restored'],
+            ['release' => 'B-GRP', 'status' => 3, 'reason' => 'dupe'],
+        ]);
+        $club = (new PredbClubSource('https://predb.club/api/v1/'))->parseRows([
+            ['name' => 'C-GRP', 'nuke' => ['type' => 'undelpre', 'reason' => 'restored']],
+            ['name' => 'D-GRP', 'nuke' => ['type' => 'delpre', 'reason' => 'gone']],
+        ]);
+
+        $this->assertSame(Predb::PRE_UNNUKED, $net[0]->nuked);
+        $this->assertSame(Predb::PRE_NUKED, $net[1]->nuked);
+        $this->assertSame(Predb::PRE_UNNUKED, $club[0]->nuked);
+        $this->assertSame(Predb::PRE_NUKED, $club[1]->nuked);
+    }
+
+    #[Test]
+    public function xrel_symbolic_size_units_are_not_treated_as_megabytes(): void
+    {
+        $entries = (new XrelSource('https://api.xrel.to/v2/release/latest.json'))->parseRows([
+            ['dirname' => 'Rar.Only-GRP', 'time' => 1, 'size' => ['number' => 1, 'unit' => 'RAR']],
+            ['dirname' => 'Big.One-GRP', 'time' => 1, 'size' => ['number' => 2, 'unit' => 'GB']],
+        ]);
+
+        $this->assertNull($entries[0]->size);
+        $this->assertSame('2048MB', $entries[1]->size);
+    }
+
+    #[Test]
     public function irc_channel_lists_parse_names_and_optional_passwords(): void
     {
         $this->assertSame(['#PreNNTmux' => null, '#nZEDbPRE' => null, '#secret' => 'pw'], IrcChannelList::parse(' #PreNNTmux, nZEDbPRE ,#secret:pw,, '));

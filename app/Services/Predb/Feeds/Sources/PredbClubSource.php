@@ -7,6 +7,7 @@ namespace App\Services\Predb\Feeds\Sources;
 use App\Models\Predb;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
+use RuntimeException;
 
 /**
  * predb.club JSON API (predb.ovh-compatible v1 schema).
@@ -29,6 +30,10 @@ final class PredbClubSource extends HttpFeedSource
             'count' => min($this->pageSize, self::MAX_PAGE_SIZE),
             'page' => max(1, $page),
         ])->throw();
+
+        if ($response->json('status') === 'error') {
+            throw new RuntimeException('predb.club API error: '.(string) $response->json('message', 'unknown'));
+        }
 
         $rows = $response->json('data.rows');
 
@@ -76,7 +81,7 @@ final class PredbClubSource extends HttpFeedSource
 
         $reason = is_string($nuke['reason'] ?? null) && $nuke['reason'] !== '' ? $nuke['reason'] : null;
         $status = match (strtolower((string) ($nuke['type'] ?? 'nuke'))) {
-            'unnuke' => Predb::PRE_UNNUKED,
+            'unnuke', 'undelpre' => Predb::PRE_UNNUKED,
             'modnuke' => Predb::PRE_MODNUKE,
             'renuke' => Predb::PRE_RENUKED,
             'oldnuke' => Predb::PRE_OLDNUKE,

@@ -109,11 +109,13 @@ final class XrelSource extends HttpFeedSource
             return null;
         }
 
-        $megabytes = match (strtoupper((string) ($size['unit'] ?? 'MB'))) {
+        // Symbolic units such as RAR or NFO are not byte sizes.
+        $megabytes = match (strtoupper((string) ($size['unit'] ?? ''))) {
             'KB' => (float) $size['number'] / 1024,
+            'MB' => (float) $size['number'],
             'GB' => (float) $size['number'] * 1024,
             'TB' => (float) $size['number'] * 1048576,
-            default => (float) $size['number'],
+            default => null,
         };
 
         return PredbFeedEntry::sizeFromMegabytes($megabytes);

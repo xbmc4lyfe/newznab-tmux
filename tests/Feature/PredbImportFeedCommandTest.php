@@ -6,6 +6,7 @@ namespace Tests\Feature;
 
 use App\Facades\Search;
 use App\Models\Predb;
+use App\Services\Predb\Feeds\PredbFeedImporter;
 use Illuminate\Console\Scheduling\Event;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Database\Schema\Blueprint;
@@ -15,6 +16,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 use Mockery\MockInterface;
 use PHPUnit\Framework\Attributes\Test;
+use ReflectionMethod;
 use Tests\TestCase;
 
 class PredbImportFeedCommandTest extends TestCase
@@ -189,6 +191,62 @@ class PredbImportFeedCommandTest extends TestCase
     public function an_invalid_since_value_is_rejected(): void
     {
         $this->artisan('predb:import-feed', ['--since' => 'soon'])->assertFailed();
+    }
+
+    #[Test]
+    public function a_429_is_left_to_the_backoff_loop_instead_of_being_retried_immediately(): void
+    {
+        config(['predb_feeds.request_delay_ms' => 0, 'predb_feeds.rate_limit_retries' => 0]);
+        Http::fakeSequence('predb.club/*')
+            ->push(['message' => 'rate limit exceeded'], 429)
+            ->push((string) file_get_contents($this->fixture('predb_club.json')));
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club']])->assertFailed();
+
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function an_api_error_envelope_fails_the_source(): void
+    {
+        Http::fake(['predb.club/*' => Http::response(['status' => 'error', 'message' => 'maintenance', 'data' => null])]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club']])->assertFailed();
+    }
+
+    #[Test]
+    public function an_unknown_predate_is_stored_as_null_and_filled_later(): void
+    {
+        Http::fake(['predb.me/*' => Http::response((string) file_get_contents($this->fixture('predb_me.xml')), 200, ['Content-Type' => 'application/xml'])]);
+        $this->artisan('predb:import-feed', ['--source' => ['predb_me']])->assertSuccessful();
+        $this->assertNull(Predb::query()->where('title', 'Nybble_and_Nibble_CD32_AMIGA-bADkARMA')->value('predate'));
+
+        Http::fake(['predb.club/*' => Http::response((string) file_get_contents($this->fixture('predb_club.json')))]);
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club']])->assertSuccessful();
+        $this->assertNotNull(Predb::query()->where('title', 'Nybble_and_Nibble_CD32_AMIGA-bADkARMA')->value('predate'));
+    }
+
+    #[Test]
+    public function database_failures_fail_the_run_instead_of_being_counted_as_skipped(): void
+    {
+        Schema::drop('predb');
+        $this->fakeFeeds();
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club']])->assertFailed();
+    }
+
+    #[Test]
+    public function filling_missing_fields_never_overwrites_a_value_written_meanwhile(): void
+    {
+        DB::table('predb')->insert(['title' => 'Race-GRP', 'source' => '#PreNNTmux', 'size' => '5MB', 'category' => null]);
+        $id = (int) DB::table('predb')->where('title', 'Race-GRP')->value('id');
+
+        $changed = (new ReflectionMethod(PredbFeedImporter::class, 'applyChanges'))
+            ->invoke(app(PredbFeedImporter::class), $id, ['size' => '1MB', 'category' => 'TV']);
+
+        $this->assertTrue($changed);
+        $this->assertSame('5MB', DB::table('predb')->where('id', $id)->value('size'));
+        $this->assertSame('TV', DB::table('predb')->where('id', $id)->value('category'));
     }
 
     private function fakeFeeds(): void
