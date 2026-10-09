@@ -11,7 +11,8 @@ use Illuminate\Database\Eloquent\Builder;
  * Finds an existing release that should be treated as a duplicate of an incoming import.
  *
  * Uses (predb_id OR searchname) within a configurable size band. Falls back to raw {@see Release::$name}
- * when {@see Release::$searchname} is empty and there is no predb id.
+ * when {@see Release::$searchname} is empty and there is no predb id. Disabled entirely when
+ * `nntmux.release_dedupe_enabled` is false (NZB import then checks article identity itself).
  */
 final class ReleaseDuplicateFinder
 {
@@ -24,6 +25,10 @@ final class ReleaseDuplicateFinder
         int $predbId,
         int $filesize,
     ): array {
+        if (! (bool) config('nntmux.release_dedupe_enabled', true)) {
+            return [null, null];
+        }
+
         $tolerance = (float) config('nntmux.release_dedupe_size_tolerance', 0.05);
         $lowSize = (int) floor($filesize * (1 - $tolerance));
         $highSize = (int) ceil($filesize * (1 + $tolerance));
