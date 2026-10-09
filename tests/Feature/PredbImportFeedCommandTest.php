@@ -472,6 +472,17 @@ class PredbImportFeedCommandTest extends TestCase
         $this->assertNull(Predb::query()->where('title', 'Srr.Page0-GRP')->value('predate'));
     }
 
+    #[Test]
+    public function an_unchanged_existing_entry_is_re_indexed(): void
+    {
+        DB::table('predb')->insert(['title' => 'Known-GRP', 'source' => '#PreNNTmux', 'category' => 'TV', 'filename' => 'known.mkv']);
+
+        $result = app(PredbFeedImporter::class)->import([new PredbFeedEntry(title: 'Known-GRP', source: 'predb.club', category: 'TV')]);
+
+        $this->assertSame(1, $result['skipped']);
+        $this->search->shouldHaveReceived('updatePreDb')->with(Mockery::on(static fn (array $doc): bool => $doc['title'] === 'Known-GRP' && $doc['filename'] === 'known.mkv'))->once();
+    }
+
     private function fakeFeeds(): void
     {
         Http::fake([

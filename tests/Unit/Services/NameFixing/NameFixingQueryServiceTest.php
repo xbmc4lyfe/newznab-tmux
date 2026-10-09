@@ -111,4 +111,15 @@ class NameFixingQueryServiceTest extends TestCase
         $service = new NameFixingQueryService($database);
         $service->predbBatch(3, 4, 250);
     }
+
+    public function test_predb_batches_include_entries_with_an_unknown_predate(): void
+    {
+        $database = $this->createMock(ConnectionInterface::class);
+        $database->expects($this->once())
+            ->method('select')
+            ->with($this->callback(static fn (string $sql): bool => str_contains($sql, '(p.predate IS NULL OR p.predate < ?)')))
+            ->willReturn([]);
+
+        (new NameFixingQueryService($database))->predbBatch(1, 1, 10);
+    }
 }
