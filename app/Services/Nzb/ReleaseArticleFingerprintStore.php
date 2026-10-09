@@ -7,6 +7,7 @@ namespace App\Services\Nzb;
 use App\Models\Release;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\LazyCollection;
 use PDO;
 use WeakMap;
 
@@ -37,14 +38,17 @@ final class ReleaseArticleFingerprintStore
     }
 
     /**
+     * Releases recorded with this fingerprint, oldest first.
+     *
      * @param  list<string>  $columns
+     * @return LazyCollection<int, Release>
      */
-    public static function find(string $fingerprint, array $columns = ['id', 'guid', 'name', 'searchname', 'fromname', 'size']): ?Release
+    public static function candidates(string $fingerprint, array $columns = ['id', 'guid', 'name', 'searchname', 'fromname', 'size']): LazyCollection
     {
         if (! self::columnExists()) {
-            return null;
+            return LazyCollection::empty();
         }
 
-        return Release::query()->where(self::COLUMN, $fingerprint)->first($columns);
+        return Release::query()->where(self::COLUMN, $fingerprint)->select($columns)->lazyById(100);
     }
 }

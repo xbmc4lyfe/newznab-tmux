@@ -135,12 +135,28 @@ class ReleaseDuplicateFinderTest extends TestCase
 
         $nzb = $this->createMock(NzbService::class);
         $nzb->expects($this->never())->method('readNzbContents');
+        $nzb->method('nzbPath')->willReturn('/stored/fp-guid.nzb.gz');
         $this->app->instance(NzbService::class, $nzb);
         $import = new NzbImportService(['Browser' => true]);
         $find = new ReflectionMethod($import, 'findIdenticalArticleUpload');
 
         $this->assertSame('fp-guid', $find->invoke($import, 1_000_000_000, $fingerprint)?->guid);
         $this->assertSame('fp-guid', $find->invoke($import, 0, $fingerprint)?->guid);
+    }
+
+    #[Test]
+    public function a_persisted_fingerprint_without_a_stored_nzb_is_ignored(): void
+    {
+        config(['nntmux.release_dedupe_enabled' => false]);
+        $fingerprint = NzbArticleFingerprint::fromMessageIds(['a1@x', 'a2@x']);
+        DB::table('releases')->insert(['guid' => 'crashed-guid', 'name' => 'x', 'size' => 5, 'article_fingerprint' => $fingerprint]);
+
+        $nzb = $this->createMock(NzbService::class);
+        $nzb->method('nzbPath')->willReturn(false);
+        $this->app->instance(NzbService::class, $nzb);
+        $import = new NzbImportService(['Browser' => true]);
+
+        $this->assertNull((new ReflectionMethod($import, 'findIdenticalArticleUpload'))->invoke($import, 0, $fingerprint));
     }
 
     #[Test]
