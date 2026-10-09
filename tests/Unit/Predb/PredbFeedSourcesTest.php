@@ -9,6 +9,9 @@ use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Services\Predb\Feeds\Sources\PredbClubSource;
 use App\Services\Predb\Feeds\Sources\PredbNetSource;
 use App\Services\Predb\Feeds\Sources\RssFeedSource;
+use App\Services\Predb\Feeds\Sources\SrrdbSource;
+use App\Services\Predb\Feeds\Sources\XrelSource;
+use App\Support\IrcChannelList;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
@@ -69,11 +72,120 @@ final class PredbFeedSourcesTest extends TestCase
     }
 
     #[Test]
-    public function malformed_rss_yields_no_entries(): void
+    public function malformed_rss_is_rejected_but_an_empty_channel_is_not(): void
     {
         $source = new RssFeedSource('predb_me', 'predb.me', 'https://predb.me/?rss=1');
 
-        $this->assertSame([], $source->parseXml('<html>not rss'));
+        $this->assertSame([], $source->parseXml('<?xml version="1.0"?><rss version="2.0"><channel><title>x</title></channel></rss>'));
+
+        $this->expectException(\RuntimeException::class);
+        $source->parseXml('<html>not rss');
+    }
+
+    #[Test]
+    public function xrel_nuke_flags_mark_releases_nuked(): void
+    {
+        $entries = (new XrelSource('https://api.xrel.to/v2/release/latest.json'))->parseRows([
+            ['dirname' => 'Nuked.Release-GRP', 'time' => 1, 'flags' => ['nuke_rls' => true]],
+            ['dirname' => 'Clean.Release-GRP', 'time' => 1, 'flags' => ['english' => true]],
+        ]);
+
+        $this->assertSame(Predb::PRE_NUKED, $entries[0]->nuked);
+        $this->assertSame(Predb::PRE_NONUKE, $entries[1]->nuked);
+    }
+
+    #[Test]
+    public function srrdb_rows_keep_the_upload_time_for_paging_only_and_no_size(): void
+    {
+        $entries = (new SrrdbSource('https://api.srrdb.com/v1/search/order:date-desc'))->parseRows($this->json('srrdb.json')['results']);
+
+        $this->assertCount(2, $entries);
+        $this->assertSame('srrdb', $entries[1]->source);
+        $this->assertSame('The.Celebrity.Traitors.S02E04.1080p.HDTV.H264-DARKFLiX', $entries[1]->title);
+        // srrDB's date is when the SRR was added (Europe/Brussels), not the PRE time.
+        $this->assertNull($entries[1]->predate);
+        $this->assertSame('2026-10-09 20:12:51', $entries[1]->listedAt?->format('Y-m-d H:i:s'));
+        // srrDB sizes can describe only an NFO, so they are not used as release sizes.
+        $this->assertNull($entries[1]->size);
+    }
+
+    #[Test]
+    public function srrdb_pages_use_the_skip_offset(): void
+    {
+        $this->assertSame('https://api.srrdb.com/v1/search/order:date-desc', SrrdbSource::pageUrl('https://api.srrdb.com/v1/search/order:date-desc', 1));
+        $this->assertSame('https://api.srrdb.com/v1/search/order:date-desc/skip:90', SrrdbSource::pageUrl('https://api.srrdb.com/v1/search/order:date-desc/', 3));
+    }
+
+    #[Test]
+    public function xrel_scene_rows_map_category_size_and_time(): void
+    {
+        $entries = (new XrelSource('https://api.xrel.to/v2/release/latest.json'))->parseRows($this->json('xrel.json')['list']);
+
+        $this->assertCount(2, $entries);
+        $this->assertSame('xrel', $entries[0]->source);
+        $this->assertSame('The.Celebrity.Traitors.S02E04.1080p.HDTV.H264-DARKFLiX', $entries[0]->title);
+        $this->assertSame('TV', $entries[0]->category);
+        $this->assertSame('2371MB', $entries[0]->size);
+        $this->assertSame(1791576763, $entries[0]->predate?->getTimestamp());
+        $this->assertSame('MOVIE', $entries[1]->category);
+    }
+
+    #[Test]
+    public function xrel_p2p_rows_map_category_size_and_time(): void
+    {
+        $entries = (new XrelSource('https://api.xrel.to/v2/p2p/releases.json', p2p: true))->parseRows($this->json('xrel_p2p.json')['list']);
+
+        $this->assertCount(2, $entries);
+        $this->assertSame('xrel-p2p', $entries[0]->source);
+        $this->assertSame('Animals.2026.2160p.NF.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-Kitsune', $entries[0]->title);
+        $this->assertSame('MOVIE-HD-2160p', $entries[0]->category);
+        $this->assertSame('12200MB', $entries[0]->size);
+        $this->assertSame(1791576306, $entries[0]->predate?->getTimestamp());
+    }
+
+    #[Test]
+    public function sizes_under_one_megabyte_are_reported_in_kilobytes(): void
+    {
+        $this->assertSame('4KB', PredbFeedEntry::sizeFromMegabytes(4096 / 1048576));
+        $this->assertSame('119.53KB', PredbFeedEntry::sizeFromMegabytes(122400 / 1048576));
+        $this->assertSame('1MB', PredbFeedEntry::sizeFromMegabytes(1.0));
+    }
+
+    #[Test]
+    public function undelpre_statuses_map_to_unnuked(): void
+    {
+        $net = (new PredbNetSource('https://api.predb.net/'))->parseRows([
+            ['release' => 'A-GRP', 'status' => 4, 'reason' => 'restored'],
+            ['release' => 'B-GRP', 'status' => 3, 'reason' => 'dupe'],
+        ]);
+        $club = (new PredbClubSource('https://predb.club/api/v1/'))->parseRows([
+            ['name' => 'C-GRP', 'nuke' => ['type' => 'undelpre', 'reason' => 'restored']],
+            ['name' => 'D-GRP', 'nuke' => ['type' => 'delpre', 'reason' => 'gone']],
+        ]);
+
+        $this->assertSame(Predb::PRE_UNNUKED, $net[0]->nuked);
+        $this->assertSame(Predb::PRE_NUKED, $net[1]->nuked);
+        $this->assertSame(Predb::PRE_UNNUKED, $club[0]->nuked);
+        $this->assertSame(Predb::PRE_NUKED, $club[1]->nuked);
+    }
+
+    #[Test]
+    public function xrel_symbolic_size_units_are_not_treated_as_megabytes(): void
+    {
+        $entries = (new XrelSource('https://api.xrel.to/v2/release/latest.json'))->parseRows([
+            ['dirname' => 'Rar.Only-GRP', 'time' => 1, 'size' => ['number' => 1, 'unit' => 'RAR']],
+            ['dirname' => 'Big.One-GRP', 'time' => 1, 'size' => ['number' => 2, 'unit' => 'GB']],
+        ]);
+
+        $this->assertNull($entries[0]->size);
+        $this->assertSame('2048MB', $entries[1]->size);
+    }
+
+    #[Test]
+    public function irc_channel_lists_parse_names_and_optional_passwords(): void
+    {
+        $this->assertSame(['#PreNNTmux' => null, '#nZEDbPRE' => null, '#secret' => 'pw'], IrcChannelList::parse(' #PreNNTmux, nZEDbPRE ,#secret:pw,, '));
+        $this->assertSame(['#PreNNTmux' => null], IrcChannelList::parse(''));
     }
 
     /**

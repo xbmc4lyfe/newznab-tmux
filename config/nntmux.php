@@ -70,9 +70,21 @@ return [
     |
     | Size tolerance for matching an existing release when deduping imports
     | (collections / NZB). Default 0.05 = ±5% on total bytes (par2/RAR drift).
+    | Set release_dedupe_enabled to false to keep every upload of a release that
+    | forms its own collection (re-posts by other posters, alternates); this also
+    | skips the cross-post cleanup (same name + poster within the Cross Post Hours
+    | window). NZB import still rejects an NZB whose segment Message-IDs match an
+    | existing release (e.g. the same file imported twice). Collections are keyed
+    | by cleaned subject + file count, so cross-posted articles and same-subject
+    | reposts with the same file count are merged before release creation
+    | regardless of this setting.
     |
     */
+    'release_dedupe_enabled' => (bool) env('RELEASE_DEDUPE_ENABLED', true),
     'release_dedupe_size_tolerance' => (float) env('RELEASE_DEDUPE_SIZE_TOLERANCE', 0.05),
+    // Cache store for the per-article NZB import lock when dedupe is disabled. Use a store with real
+    // lock support (database needs the cache_locks table; redis works too), not a failover store.
+    'release_dedupe_lock_store' => (string) env('RELEASE_DEDUPE_LOCK_STORE', 'database'),
     'btcpay_webhook_secret' => env('BTCPAY_SECRET'),
     'tmp_unrar_path' => env('TEMP_UNRAR_PATH', storage_path('tmp/unrar/')),
     'tmp_unzip_path' => env('TEMP_UNZIP_PATH', storage_path('tmp/unzip/')),

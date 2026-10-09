@@ -102,13 +102,31 @@ class NameFixingQueryServiceTest extends TestCase
             ->with(
                 $this->callback(static fn (string $sql): bool => str_contains($sql, 'MOD(p.id, ?) = ?')
                     && ! str_contains($sql, 'OFFSET')),
-                $this->callback(static fn (array $bindings): bool => $bindings[1] === 4
-                    && $bindings[2] === 2
-                    && $bindings[3] === 250)
+                $this->callback(static fn (array $bindings): bool => $bindings[2] === 4
+                    && $bindings[3] === 2
+                    && $bindings[4] === 250)
             )
             ->willReturn([]);
 
         $service = new NameFixingQueryService($database);
         $service->predbBatch(3, 4, 250);
+    }
+
+    public function test_undated_predb_entries_become_eligible_a_day_after_import(): void
+    {
+        $database = $this->createMock(ConnectionInterface::class);
+        $database->expects($this->once())
+            ->method('select')
+            ->with($this->callback(static fn (string $sql): bool => str_contains($sql, '(p.predate < ? OR (p.predate IS NULL AND p.imported_at < ?))')))
+            ->willReturn([]);
+
+        (new NameFixingQueryService($database))->predbBatch(1, 1, 10);
+    }
+
+    public function test_the_releases_runner_counts_the_same_undated_predb_population(): void
+    {
+        $runner = (string) file_get_contents(dirname(__DIR__, 4).'/app/Services/Runners/ReleasesRunner.php');
+
+        $this->assertStringContainsString('(p.predate < (NOW() - INTERVAL 1 DAY) OR (p.predate IS NULL AND p.imported_at < (NOW() - INTERVAL 1 DAY)))', $runner);
     }
 }

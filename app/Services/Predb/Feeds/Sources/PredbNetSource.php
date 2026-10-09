@@ -5,13 +5,15 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Models\Predb;
+use App\Services\Predb\Feeds\FeedRateLimitedException;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
+use RuntimeException;
 
 /**
  * api.predb.net JSON API.
  *
- * Row shape: {release, section, size (MB), files, pretime (unix), status (0 = ok, 1 = nuked, 2 = unnuked), reason, group}
+ * Row shape: {release, section, size (MB), files, pretime (unix), status (0 ok, 1 nuke, 2 unnuke, 3 delpre, 4 undelpre), reason, group}
  */
 final class PredbNetSource extends HttpFeedSource
 {
@@ -27,9 +29,20 @@ final class PredbNetSource extends HttpFeedSource
             'page' => max(1, $page),
         ])->throw();
 
-        $rows = $response->json('data');
+        if ($response->json('status') === 'error') {
+            $message = (string) $response->json('message', 'unknown');
 
-        return is_array($rows) ? $this->parseRows($rows) : [];
+            throw str_contains(strtolower($message), 'rate limit')
+                ? new FeedRateLimitedException('predb.net rate limited: '.$message)
+                : new RuntimeException('predb.net API error: '.$message);
+        }
+
+        $rows = $response->json('data');
+        if (! is_array($rows) || ! array_is_list($rows)) {
+            throw new RuntimeException('predb.net returned an unexpected response (no data).');
+        }
+
+        return $this->parseRows($rows);
     }
 
     /**
@@ -57,7 +70,7 @@ final class PredbNetSource extends HttpFeedSource
                 predate: is_numeric($row['pretime'] ?? null) ? CarbonImmutable::createFromTimestampUTC((int) $row['pretime']) : null,
                 nuked: match ($status) {
                     0 => Predb::PRE_NONUKE,
-                    2 => Predb::PRE_UNNUKED,
+                    2, 4 => Predb::PRE_UNNUKED, // unnuke, undelpre
                     default => Predb::PRE_NUKED,
                 },
                 nukeReason: $status === 0 ? null : $reason,

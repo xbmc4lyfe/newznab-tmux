@@ -8,6 +8,8 @@ use App\Services\Predb\Feeds\Contracts\PredbFeedSource;
 use App\Services\Predb\Feeds\Sources\PredbClubSource;
 use App\Services\Predb\Feeds\Sources\PredbNetSource;
 use App\Services\Predb\Feeds\Sources\RssFeedSource;
+use App\Services\Predb\Feeds\Sources\SrrdbSource;
+use App\Services\Predb\Feeds\Sources\XrelSource;
 use InvalidArgumentException;
 
 /**
@@ -20,7 +22,7 @@ class PredbFeedSourceFactory
      */
     public function availableKeys(): array
     {
-        return ['predb_club', 'predb_net', 'predb_me'];
+        return ['predb_club', 'predb_net', 'predb_me', 'srrdb', 'xrel', 'xrel_p2p'];
     }
 
     /**
@@ -45,6 +47,9 @@ class PredbFeedSourceFactory
             'predb_club' => new PredbClubSource($endpoint, $pageSize, $timeout, $userAgent),
             'predb_net' => new PredbNetSource($endpoint, $pageSize, $timeout, $userAgent),
             'predb_me' => new RssFeedSource('predb_me', 'predb.me', $endpoint, $pageSize, $timeout, $userAgent),
+            'srrdb' => new SrrdbSource($endpoint, $pageSize, $timeout, $userAgent, (string) config('predb_feeds.srrdb_timezone', 'Europe/Brussels')),
+            'xrel' => new XrelSource($endpoint, $pageSize, $timeout, $userAgent),
+            'xrel_p2p' => new XrelSource($endpoint, $pageSize, $timeout, $userAgent, p2p: true),
             default => throw new InvalidArgumentException("Unknown PreDB feed source [{$key}]. Available: ".implode(', ', $this->availableKeys())),
         };
     }

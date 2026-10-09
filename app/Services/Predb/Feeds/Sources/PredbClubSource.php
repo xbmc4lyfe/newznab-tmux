@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Models\Predb;
+use App\Services\Predb\Feeds\FeedRateLimitedException;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
+use RuntimeException;
 
 /**
  * predb.club JSON API (predb.ovh-compatible v1 schema).
@@ -30,9 +32,20 @@ final class PredbClubSource extends HttpFeedSource
             'page' => max(1, $page),
         ])->throw();
 
-        $rows = $response->json('data.rows');
+        if ($response->json('status') === 'error') {
+            $message = (string) $response->json('message', 'unknown');
 
-        return is_array($rows) ? $this->parseRows($rows) : [];
+            throw str_contains(strtolower($message), 'rate limit')
+                ? new FeedRateLimitedException('predb.club rate limited: '.$message)
+                : new RuntimeException('predb.club API error: '.$message);
+        }
+
+        $rows = $response->json('data.rows');
+        if (! is_array($rows) || ! array_is_list($rows)) {
+            throw new RuntimeException('predb.club returned an unexpected response (no data.rows).');
+        }
+
+        return $this->parseRows($rows);
     }
 
     /**
@@ -76,7 +89,7 @@ final class PredbClubSource extends HttpFeedSource
 
         $reason = is_string($nuke['reason'] ?? null) && $nuke['reason'] !== '' ? $nuke['reason'] : null;
         $status = match (strtolower((string) ($nuke['type'] ?? 'nuke'))) {
-            'unnuke' => Predb::PRE_UNNUKED,
+            'unnuke', 'undelpre' => Predb::PRE_UNNUKED,
             'modnuke' => Predb::PRE_MODNUKE,
             'renuke' => Predb::PRE_RENUKED,
             'oldnuke' => Predb::PRE_OLDNUKE,

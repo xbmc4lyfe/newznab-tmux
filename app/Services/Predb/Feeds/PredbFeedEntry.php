@@ -21,10 +21,21 @@ final readonly class PredbFeedEntry
         public ?CarbonImmutable $predate = null,
         public int $nuked = Predb::PRE_NONUKE,
         public ?string $nukeReason = null,
+        // When the feed listed the entry, if that is not the PRE time (e.g. srrDB's upload time).
+        // Used only to page history imports; never stored as predate.
+        public ?CarbonImmutable $listedAt = null,
     ) {}
 
     /**
-     * Format a size given in megabytes the way IRC pre bots announce it, or null when unknown.
+     * Timestamp used to decide how far back a history import has paged.
+     */
+    public function pagingTime(): ?CarbonImmutable
+    {
+        return $this->predate ?? $this->listedAt;
+    }
+
+    /**
+     * Format a size given in megabytes the way IRC pre bots announce it (KB below 1 MB), or null when unknown.
      */
     public static function sizeFromMegabytes(int|float|null $megabytes): ?string
     {
@@ -32,7 +43,9 @@ final readonly class PredbFeedEntry
             return null;
         }
 
-        return rtrim(rtrim(number_format((float) $megabytes, 2, '.', ''), '0'), '.').'MB';
+        $format = static fn (float $value): string => rtrim(rtrim(number_format($value, 2, '.', ''), '0'), '.');
+
+        return $megabytes < 1 ? $format($megabytes * 1024).'KB' : $format((float) $megabytes).'MB';
     }
 
     /**

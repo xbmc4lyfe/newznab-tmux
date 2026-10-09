@@ -6,6 +6,7 @@ namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
+use RuntimeException;
 use SimpleXMLElement;
 use Throwable;
 
@@ -44,6 +45,8 @@ final class RssFeedSource extends HttpFeedSource
 
     /**
      * @return list<PredbFeedEntry>
+     *
+     * @throws RuntimeException When the body is not an RSS 2.0 document (e.g. an HTML error page).
      */
     public function parseXml(string $xml): array
     {
@@ -56,7 +59,11 @@ final class RssFeedSource extends HttpFeedSource
             libxml_use_internal_errors($previous);
         }
 
-        if ($document === false || ! isset($document->channel->item)) {
+        if ($document === false || strtolower($document->getName()) !== 'rss' || ! isset($document->channel)) {
+            throw new RuntimeException($this->sourceLabel.' returned an invalid RSS document.');
+        }
+
+        if (! isset($document->channel->item)) {
             return [];
         }
 
