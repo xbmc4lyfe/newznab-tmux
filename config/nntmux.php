@@ -73,10 +73,11 @@ return [
     | Set release_dedupe_enabled to false to keep every upload of a release that
     | forms its own collection (re-posts by other posters, alternates); this also
     | skips the cross-post cleanup (same name + poster within the Cross Post Hours
-    | window). An identical upload (same name, poster and size, e.g. an NZB imported
-    | twice) is still rejected. Collections are keyed by cleaned subject + file
-    | count, so cross-posted articles and same-subject reposts with the same file
-    | count are merged before release creation regardless of this setting.
+    | window). NZB import still rejects an NZB whose segment Message-IDs match an
+    | existing release (e.g. the same file imported twice). Collections are keyed
+    | by cleaned subject + file count, so cross-posted articles and same-subject
+    | reposts with the same file count are merged before release creation
+    | regardless of this setting.
     |
     */
     'release_dedupe_enabled' => (bool) env('RELEASE_DEDUPE_ENABLED', true),

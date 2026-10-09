@@ -103,8 +103,7 @@ class ReleaseCreationService
                 $cleanRelName,
                 $searchName,
                 $predbIdInt,
-                (int) $collection->filesize,
-                $fromName
+                (int) $collection->filesize
             );
 
             if ($dupeCheck === null) {

@@ -471,8 +471,31 @@ class NzbImportService
                 'totalFiles' => $totalFiles,
                 'totalSize' => $totalSize,
                 'nzbCategoryId' => $this->resolveNzbCategoryId($nzbXML),
+                'articleFingerprint' => NzbArticleFingerprint::fromXml($nzbXML),
             ]
         );
+    }
+
+    /**
+     * With release dedupe disabled, an NZB is still a duplicate when an existing release of the
+     * exact same size references exactly the same articles (e.g. the same file imported twice).
+     */
+    protected function findIdenticalArticleUpload(int $totalSize, ?string $fingerprint): ?Release
+    {
+        if ($fingerprint === null || $totalSize <= 0) {
+            return null;
+        }
+
+        $candidates = Release::query()->where('size', $totalSize)->limit(50)->get(['id', 'guid', 'name', 'searchname', 'fromname', 'size']);
+
+        foreach ($candidates as $candidate) {
+            $contents = $this->nzb->readNzbContents((string) $candidate->guid);
+            if ($contents !== false && NzbArticleFingerprint::fromContents($contents) === $fingerprint) {
+                return $candidate;
+            }
+        }
+
+        return null;
     }
 
     protected function resolveNzbCategoryId(mixed $nzbXML): ?int
@@ -586,9 +609,13 @@ class NzbImportService
             $escapedSubject,
             $escapedSearchName,
             $predbIdInt,
-            (int) $nzbDetails['totalSize'],
-            (string) $escapedFromName
+            (int) $nzbDetails['totalSize']
         );
+
+        if ($dupeCheck === null && ! (bool) config('nntmux.release_dedupe_enabled', true)) {
+            $dupeCheck = $this->findIdenticalArticleUpload((int) $nzbDetails['totalSize'], $nzbDetails['articleFingerprint'] ?? null);
+            $dupeReason = $dupeCheck !== null ? 'identical_articles' : null;
+        }
 
         if ($dupeCheck !== null) {
             Log::info('NZB import skipped as duplicate', [
