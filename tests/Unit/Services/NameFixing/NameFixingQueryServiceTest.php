@@ -122,4 +122,11 @@ class NameFixingQueryServiceTest extends TestCase
 
         (new NameFixingQueryService($database))->predbBatch(1, 1, 10);
     }
+
+    public function test_the_releases_runner_counts_the_same_undated_predb_population(): void
+    {
+        $runner = (string) file_get_contents(dirname(__DIR__, 4).'/app/Services/Runners/ReleasesRunner.php');
+
+        $this->assertStringContainsString('(p.predate IS NULL OR p.predate < (NOW() - INTERVAL 1 DAY))', $runner);
+    }
 }

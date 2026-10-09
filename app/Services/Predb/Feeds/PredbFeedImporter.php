@@ -100,8 +100,9 @@ class PredbFeedImporter
 
         if ($changes === []) {
             if (! $dryRun && $existing->exists) {
-                // Idempotent re-index, so a document dropped by an earlier failed index write recovers.
-                $this->reindex((int) $existing->id, $existing);
+                // Idempotent re-index from the current row (another ingester may have changed the
+                // indexed fields), so a document dropped by an earlier failed index write recovers.
+                $this->reindex((int) $existing->id, Predb::query()->find($existing->id, ['id', 'title', 'filename', 'source']) ?? $existing);
             }
 
             return 'skipped';

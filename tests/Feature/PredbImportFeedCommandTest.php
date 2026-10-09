@@ -473,9 +473,16 @@ class PredbImportFeedCommandTest extends TestCase
     }
 
     #[Test]
-    public function an_unchanged_existing_entry_is_re_indexed(): void
+    public function an_unchanged_existing_entry_is_re_indexed_from_the_current_row(): void
     {
-        DB::table('predb')->insert(['title' => 'Known-GRP', 'source' => '#PreNNTmux', 'category' => 'TV', 'filename' => 'known.mkv']);
+        DB::table('predb')->insert(['title' => 'Known-GRP', 'source' => '#PreNNTmux', 'category' => 'TV', 'filename' => 'old.mkv']);
+        $id = (int) DB::table('predb')->where('title', 'Known-GRP')->value('id');
+        // Simulate the IRC scraper renaming the file right after the importer's lookup.
+        Predb::retrieved(static function (Predb $predb) use ($id): void {
+            if ((int) $predb->id === $id) {
+                DB::table('predb')->where('id', $id)->update(['filename' => 'known.mkv']);
+            }
+        });
 
         $result = app(PredbFeedImporter::class)->import([new PredbFeedEntry(title: 'Known-GRP', source: 'predb.club', category: 'TV')]);
 
