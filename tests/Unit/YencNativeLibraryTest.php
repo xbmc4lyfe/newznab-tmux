@@ -26,9 +26,9 @@ final class YencNativeLibraryTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
-        if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || PHP_ZTS || ! extension_loaded('FFI')
+        if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || ! extension_loaded('FFI')
             || in_array(strtolower((string) ini_get('ffi.enable')), ['', '0', 'false', 'off'], true)) {
-            $this->markTestSkipped('Native ABI regressions require Linux CLI, NTS PHP and FFI.');
+            $this->markTestSkipped('Native ABI regressions require Linux CLI PHP with FFI.');
         }
         $compiler = (new ExecutableFinder)->find('cc');
         if ($compiler === null) {

@@ -19,8 +19,10 @@ final class NativePayloadDecoder implements RawPayloadDecoder
 
     public function __construct(string $path)
     {
-        if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || PHP_ZTS || ! extension_loaded('FFI')) {
-            throw new RuntimeException('Native yEnc requires Linux CLI, non-threaded PHP and FFI.');
+        // Thread-safe (ZTS) builds are fine here: a CLI process runs one thread, and
+        // FFI handles are cached per process. Server SAPIs stay on the PHP decoder.
+        if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || ! extension_loaded('FFI')) {
+            throw new RuntimeException('Native yEnc requires Linux CLI PHP with FFI.');
         }
         $resolved = realpath($path);
         if ($path === '' || $resolved === false || ! is_file($resolved)) {
