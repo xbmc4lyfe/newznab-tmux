@@ -33,7 +33,7 @@ final class IrcNetworks
     }
 
     /**
-     * @return array{name: string, format: string, source: ?string, server: string, port: int, tls: bool, tls_verify_peer_name: ?bool, channels: array<string, ?string>}
+     * @return array{name: string, type: string, format: string, source: ?string, server: string, port: int, tls: bool, tls_verify_peer_name: ?bool, channels: array<string, ?string>, url: ?string}
      */
     public static function resolve(string $key): array
     {
@@ -45,6 +45,7 @@ final class IrcNetworks
         if ($key === self::LEGACY) {
             return [
                 'name' => $key,
+                'type' => 'irc',
                 'format' => 'nntmux',
                 'source' => null,
                 'server' => (string) config('irc_settings.scrape_irc_server'),
@@ -52,6 +53,7 @@ final class IrcNetworks
                 'tls' => (bool) config('irc_settings.scrape_irc_tls'),
                 'tls_verify_peer_name' => null,
                 'channels' => self::legacyChannels(),
+                'url' => null,
             ];
         }
 
@@ -62,6 +64,7 @@ final class IrcNetworks
 
         return [
             'name' => $key,
+            'type' => (string) ($network['type'] ?? 'irc'),
             'format' => (string) ($network['format'] ?? ''),
             'source' => isset($network['source']) ? (string) $network['source'] : $key,
             'server' => (string) ($network['server'] ?? ''),
@@ -69,6 +72,7 @@ final class IrcNetworks
             'tls' => (bool) ($network['tls'] ?? false),
             'tls_verify_peer_name' => isset($network['tls_verify_peer_name']) ? (bool) $network['tls_verify_peer_name'] : null,
             'channels' => $channels,
+            'url' => isset($network['url']) ? (string) $network['url'] : null,
         ];
     }
 
