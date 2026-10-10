@@ -41,6 +41,9 @@ return [
         'release_cache_stale_ttl' => (int) env('API_RELEASE_CACHE_STALE_TTL', 900),
         'release_cache_lock_ttl' => (int) env('API_RELEASE_CACHE_LOCK_TTL', 15),
         'async_audit' => (bool) env('API_ASYNC_AUDIT', true),
+        // Cache store holding the per-user quota lock. Blank = the default store, or "database" when the
+        // default is a failover chain (a lock split across two backends could be granted twice).
+        'quota_lock_store' => (string) env('API_QUOTA_LOCK_STORE', ''),
         'audit_queue' => env('API_AUDIT_QUEUE', 'api-audit'),
         'access_update_interval' => (int) env('API_ACCESS_UPDATE_INTERVAL', 60),
         'metrics_sample_rate' => (float) env('API_METRICS_SAMPLE_RATE', 0.01),

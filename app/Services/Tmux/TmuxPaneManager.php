@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace App\Services\Tmux;
 
 use App\Enums\TmuxPaneRole;
+use Illuminate\Contracts\Process\InvokedProcess;
 use Illuminate\Contracts\Process\ProcessResult;
-use Illuminate\Process\Exceptions\ProcessTimedOutException;
 use Illuminate\Support\Facades\Process;
 use RuntimeException;
 
@@ -21,6 +21,17 @@ class TmuxPaneManager
      * waitForExit() waits in slices this long and checks for unreaped panes in between.
      */
     private const int EXIT_WAIT_SLICE_SECONDS = 1;
+
+    /**
+     * Seconds before asking tmux again to reap a pane that still has no exit status. The SIGCHLD can
+     * itself land in another libutempter window, so one request is not always enough.
+     */
+    private const int REAP_RETRY_SECONDS = 30;
+
+    /**
+     * How often waitForExit() checks whether its tmux waiter has been woken.
+     */
+    private const int EXIT_WAIT_TICK_MICROSECONDS = 50_000;
 
     protected string $sessionName;
 
@@ -37,11 +48,16 @@ class TmuxPaneManager
     private ?array $snapshot = null;
 
     /**
-     * Dead pane processes ("pane:pid") this manager has already asked tmux to reap.
+     * Dead pane processes ("pane:pid") this manager has asked tmux to reap, with when it last asked.
      *
-     * @var array<string, true>
+     * @var array<string, int>
      */
     private array $reapRequested = [];
+
+    /**
+     * The `wait-for` client shared by waitForExit() calls until tmux wakes it.
+     */
+    private ?InvokedProcess $exitWaiter = null;
 
     public function __construct(string $sessionName)
     {
@@ -187,26 +203,45 @@ class TmuxPaneManager
      * The pane-died hook wakes the wait at once, but it cannot be relied on alone: tmux
      * fires it only after reaping the pane process, which it can miss (see requestReap()),
      * and a wake-up sent while nobody is waiting goes to the stale waiter left by an earlier
-     * timed-out wait (tmux never removes those) instead of being remembered. So the wait
-     * runs in short slices and returns once a pane that was alive has died or gone.
+     * timed-out wait (tmux never removes those) instead of being remembered. So while one
+     * waiter runs, pane state is polled every slice, and the wait returns once a pane that
+     * was alive has died or gone.
+     *
+     * Every `wait-for` client stopped before the channel is signalled stays registered in
+     * tmux until the next signal, so the waiter is never stopped on a timeout: it is kept
+     * across calls (monitor cycles) and replaced only once tmux has woken it.
      */
     public function waitForExit(int $seconds): void
     {
         $deadline = microtime(true) + $seconds;
         $alive = $this->alivePanes();
-        do {
-            $slice = max(1, min(self::EXIT_WAIT_SLICE_SECONDS, (int) ceil($deadline - microtime(true))));
-            try {
-                Process::timeout($slice)->run(TmuxCommand::arguments(['wait-for', $this->eventChannel()]));
+        if ($this->exitWaiter === null || ! $this->exitWaiter->running()) {
+            $this->exitWaiter = Process::forever()->start(TmuxCommand::arguments(['wait-for', $this->eventChannel()]));
+        }
+        $nextPoll = microtime(true) + self::EXIT_WAIT_SLICE_SECONDS;
+
+        while (microtime(true) < $deadline) {
+            if (! $this->exitWaiter->running()) {
+                $this->exitWaiter = null; // Woken by the pane-died hook.
 
                 return;
-            } catch (ProcessTimedOutException) {
-                // Periodic reconciliation also detects topology changes and hangs.
             }
+            usleep(self::EXIT_WAIT_TICK_MICROSECONDS);
+            if (microtime(true) < $nextPoll) {
+                continue;
+            }
+            $nextPoll = microtime(true) + self::EXIT_WAIT_SLICE_SECONDS;
             if ($alive !== null && array_diff($alive, $this->alivePanes() ?? $alive) !== []) {
                 return;
             }
-        } while (microtime(true) < $deadline);
+        }
+    }
+
+    public function __destruct()
+    {
+        if ($this->exitWaiter?->running()) {
+            $this->exitWaiter->signal(defined('SIGTERM') ? SIGTERM : 15);
+        }
     }
 
     /**
@@ -460,17 +495,19 @@ class TmuxPaneManager
         [$panes, $serverPid] = $this->listPanes();
 
         // A dead pane should report how its process ended. When it does not, tmux has
-        // not reaped the process (see requestReap()); nudge it once per process.
+        // not reaped the process (see requestReap()); nudge it, at most every REAP_RETRY_SECONDS
+        // per process while the status is still missing.
+        $now = now()->getTimestamp();
         $unreaped = [];
         foreach ($panes as $id => $state) {
             if ($state['dead'] && $state['exit_code'] === null && $state['exit_signal'] === null
-                && ! isset($this->reapRequested[$id.':'.$state['pid']])) {
+                && $now - ($this->reapRequested[$id.':'.$state['pid']] ?? PHP_INT_MIN) >= self::REAP_RETRY_SECONDS) {
                 $unreaped[$id] = $state['pid'];
             }
         }
         if ($unreaped !== [] && $this->requestReap($serverPid)) {
             foreach ($unreaped as $id => $pid) {
-                $this->reapRequested[$id.':'.$pid] = true;
+                $this->reapRequested[$id.':'.$pid] = $now;
             }
             // tmux handles the signal from its event loop, so allow it a moment.
             for ($attempt = 0; $attempt < 10; $attempt++) {

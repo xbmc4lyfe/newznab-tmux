@@ -40,15 +40,9 @@ class CollectionsCleaningService
     public const int REGEX_MUSIC_MATCH = -20;
 
     /**
-     * The encodings that can decode printable ASCII differently from UTF-8 (2- and
-     * 4-byte code units), plus UTF-8 itself. See normalizeString().
-     *
-     * @var list<string>
+     * Normalized subjects remembered per process before the memo is cleared. See normalizeString().
      */
-    private const array ASCII_DETECTION_ENCODINGS = [
-        'UCS-4', 'UCS-4BE', 'UCS-4LE', 'UCS-2', 'UCS-2BE', 'UCS-2LE',
-        'UTF-32', 'UTF-32BE', 'UTF-32LE', 'UTF-16', 'UTF-16BE', 'UTF-16LE', 'UTF-8',
-    ];
+    private const int NORMALIZE_MEMO_SIZE = 4096;
 
     /**
      * Every encoding mbstring supports, cached per process.
@@ -58,11 +52,11 @@ class CollectionsCleaningService
     private static ?array $allEncodings = null;
 
     /**
-     * ASCII_DETECTION_ENCODINGS in mb_list_encodings() order, cached per process.
+     * Recent normalizeString() results keyed by the collapsed subject.
      *
-     * @var list<string>|null
+     * @var array<string, string>
      */
-    private static ?array $asciiDetectionEncodings = null;
+    private static array $normalizeMemo = [];
 
     /**
      * Cached file extension patterns
@@ -284,20 +278,23 @@ class CollectionsCleaningService
         // Collapse multiple spaces into one
         $normalized = trim(preg_replace('/\s\s+/', ' ', $subject));
 
-        // Ensure UTF-8 encoding. Collection hashes depend on this output, so it must
-        // match detection over every encoding, which can rewrite even plain ASCII
-        // (some even-length strings are detected as UCS-2). For printable ASCII without
-        // the UTF-7 (+), UTF7-IMAP (&) and HZ (~) escape characters, every encoding
-        // outside ASCII_DETECTION_ENCODINGS decodes like UTF-8 and comes after it in
-        // mb_list_encodings(), so detecting over just those, kept in list order, picks
-        // the same encoding while scanning 13 encodings instead of about 80.
-        self::$allEncodings ??= mb_list_encodings();
-        self::$asciiDetectionEncodings ??= array_values(array_intersect(self::$allEncodings, self::ASCII_DETECTION_ENCODINGS));
-        $candidates = preg_match('/^[\x20-\x25\x27-\x2a\x2c-\x7d]*$/', $normalized) === 1
-            ? self::$asciiDetectionEncodings
-            : self::$allEncodings;
+        // Ensure UTF-8 encoding. Collection hashes depend on this output, so it must be
+        // detection over every encoding: mbstring's choice depends on the whole candidate
+        // set, so even a reduced list that decodes each byte the same can pick another
+        // encoding (`S/3/S*Z%7}` is UTF-8 over all encodings but UCS-2 over a UTF/UCS
+        // subset). Detection is costly, but every part of a post shares its collection
+        // name, so the result is memoized per process.
+        if (isset(self::$normalizeMemo[$normalized])) {
+            return self::$normalizeMemo[$normalized];
+        }
 
-        return mb_convert_encoding($normalized, 'UTF-8', $candidates);
+        if (count(self::$normalizeMemo) >= self::NORMALIZE_MEMO_SIZE) {
+            self::$normalizeMemo = [];
+        }
+
+        self::$allEncodings ??= mb_list_encodings();
+
+        return self::$normalizeMemo[$normalized] = mb_convert_encoding($normalized, 'UTF-8', self::$allEncodings);
     }
 
     /**
