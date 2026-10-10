@@ -263,13 +263,14 @@ class SearchService extends Manager implements SearchServiceInterface
                 }
                 $driver->updateReleases($releaseIds);
             } catch (\Throwable $e) {
-                // The 'deferred' rows stay, so nntmux:search-repair retries these releases.
                 Log::error('Search: deferred release index flush failed: '.$e->getMessage(), ['releases' => count($releaseIds)]);
+                $this->handDeferredReleasesToRepair($releaseIds, failedOnly: false);
 
                 continue;
             }
 
             $this->clearDeferredReleaseMarkers($releaseIds);
+            $this->handDeferredReleasesToRepair($releaseIds, failedOnly: true);
         }
     }
 
@@ -289,7 +290,7 @@ class SearchService extends Manager implements SearchServiceInterface
                     'updated_at' => $now,
                 ]],
                 ['release_id'],
-                ['operation', 'last_error', 'next_attempt_at', 'resolved_at', 'updated_at'],
+                ['operation', 'attempts', 'last_error', 'next_attempt_at', 'resolved_at', 'updated_at'],
             );
         } catch (\Throwable $e) {
             Log::debug('Search: unable to record a deferred release index update', [
@@ -300,9 +301,9 @@ class SearchService extends Manager implements SearchServiceInterface
     }
 
     /**
-     * Remove this scope's markers for refreshed releases. A release whose refresh failed
-     * has had its row turned into an ordinary failure (operation 'upsert'), and a marker
-     * another scope has since taken over carries that scope's token; both stay.
+     * Remove this scope's markers for refreshed releases. A marker is written with zero
+     * attempts and a failed refresh counts one, so markers with attempts stay; so does a
+     * marker another scope has since taken over, which carries that scope's token.
      *
      * @param  list<int>  $releaseIds
      */
@@ -313,9 +314,33 @@ class SearchService extends Manager implements SearchServiceInterface
                 ->whereIn('release_id', $releaseIds)
                 ->where('operation', self::DEFERRED_RELEASE_OPERATION)
                 ->where('last_error', $this->deferralToken)
+                ->where('attempts', 0)
                 ->delete();
         } catch (\Throwable $e) {
             Log::debug('Search: unable to clear deferred release index markers', [
+                'releases' => count($releaseIds),
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * End this scope's lease on releases it could not refresh, so nntmux:search-repair
+     * retries them now instead of when the lease would have run out.
+     *
+     * @param  list<int>  $releaseIds
+     */
+    private function handDeferredReleasesToRepair(array $releaseIds, bool $failedOnly): void
+    {
+        try {
+            DB::table('search_index_failures')
+                ->whereIn('release_id', $releaseIds)
+                ->where('operation', self::DEFERRED_RELEASE_OPERATION)
+                ->where('last_error', $this->deferralToken)
+                ->when($failedOnly, static fn ($query) => $query->where('attempts', '>', 0))
+                ->update(['next_attempt_at' => now(), 'updated_at' => now()]);
+        } catch (\Throwable $e) {
+            Log::debug('Search: unable to hand deferred releases to repair', [
                 'releases' => count($releaseIds),
                 'error' => $e->getMessage(),
             ]);

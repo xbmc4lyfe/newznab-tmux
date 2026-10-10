@@ -415,20 +415,19 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
         try {
             $existing = DB::table('search_index_failures')
                 ->where('release_id', $releaseId)
-                ->first(['attempts']);
-            $attempts = ((int) ($existing->attempts ?? 0)) + 1;
-            DB::table('search_index_failures')->updateOrInsert(
-                ['release_id' => $releaseId],
-                [
-                    'operation' => $operation,
-                    'attempts' => $attempts,
-                    'last_error' => $phase,
-                    'next_attempt_at' => now()->addSeconds(min(3600, 2 ** min($attempts, 10))),
-                    'resolved_at' => null,
-                    'updated_at' => now(),
-                    'created_at' => now(),
-                ]
-            );
+                ->first(['attempts', 'operation']);
+            // A release pass may hold a deferral lease on this release. Then count the
+            // failure but keep its token and lease: the pass refreshes the release when it
+            // flushes, sees the count and hands the release to repair, and if the pass
+            // dies, repair takes over when the lease expires.
+            $countedOnLease = ($existing->operation ?? null) === SearchService::DEFERRED_RELEASE_OPERATION
+                && DB::table('search_index_failures')
+                    ->where('release_id', $releaseId)
+                    ->where('operation', SearchService::DEFERRED_RELEASE_OPERATION)
+                    ->increment('attempts', 1, ['updated_at' => now()]) > 0;
+            if (! $countedOnLease) {
+                $this->upsertReleaseIndexFailure($releaseId, $phase, $operation, ((int) ($existing->attempts ?? 0)) + 1);
+            }
         } catch (\Throwable $e) {
             Log::error('ManticoreSearch: unable to persist release index failure', [
                 'release_id' => $releaseId,
@@ -443,6 +442,22 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
                 'failures_total' => (int) Cache::get('search:index:failures:releases', 0),
             ]);
         }
+    }
+
+    private function upsertReleaseIndexFailure(int $releaseId, string $phase, string $operation, int $attempts): void
+    {
+        DB::table('search_index_failures')->updateOrInsert(
+            ['release_id' => $releaseId],
+            [
+                'operation' => $operation,
+                'attempts' => $attempts,
+                'last_error' => $phase,
+                'next_attempt_at' => now()->addSeconds(min(3600, 2 ** min($attempts, 10))),
+                'resolved_at' => null,
+                'updated_at' => now(),
+                'created_at' => now(),
+            ]
+        );
     }
 
     private function resolveReleaseIndexFailure(int $releaseId): void

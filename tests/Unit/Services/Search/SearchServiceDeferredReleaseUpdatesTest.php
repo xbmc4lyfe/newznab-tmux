@@ -97,11 +97,11 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
         $this->assertSame(0, DB::table('search_index_failures')->count());
     }
 
-    public function test_keeps_the_row_of_a_release_whose_refresh_failed(): void
+    public function test_hands_a_release_whose_refresh_failed_to_repair(): void
     {
         $search = $this->search(function (array $releaseIds): void {
-            // What ManticoreSearchDriver::recordReleaseIndexFailure() does for a failed release.
-            DB::table('search_index_failures')->where('release_id', 7)->update(['operation' => 'upsert', 'attempts' => 1]);
+            // What ManticoreSearchDriver::recordReleaseIndexFailure() does on a leased release.
+            DB::table('search_index_failures')->where('release_id', 7)->increment('attempts');
         });
 
         $search->deferReleaseUpdates(function () use ($search): void {
@@ -109,11 +109,13 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
             $search->updateRelease(7);
         });
 
-        $this->assertSame([7], DB::table('search_index_failures')->pluck('release_id')->map(static fn ($id): int => (int) $id)->all());
-        $this->assertSame('upsert', DB::table('search_index_failures')->value('operation'));
+        $row = DB::table('search_index_failures')->sole();
+        $this->assertSame(7, (int) $row->release_id);
+        $this->assertSame('deferred', $row->operation);
+        $this->assertLessThanOrEqual(now()->toDateTimeString(), (string) $row->next_attempt_at, 'Repair picks it up on its next run.');
     }
 
-    public function test_reopens_an_existing_failure_row_without_losing_its_attempt_count(): void
+    public function test_takes_over_an_existing_failure_row(): void
     {
         DB::table('search_index_failures')->insert([
             ['release_id' => 5, 'operation' => 'upsert', 'attempts' => 3, 'last_error' => 'old', 'next_attempt_at' => now()->addHour(), 'resolved_at' => null, 'created_at' => now(), 'updated_at' => now()],
@@ -130,7 +132,7 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
 
         $rows = DB::table('search_index_failures')->orderBy('release_id')->get()->keyBy('release_id');
         $this->assertSame('deferred', $rows[5]->operation);
-        $this->assertSame(3, (int) $rows[5]->attempts);
+        $this->assertSame(0, (int) $rows[5]->attempts, 'A marker starts at zero so a failed refresh shows up.');
         $this->assertSame('deferred', $rows[7]->operation);
         $this->assertNull($rows[7]->resolved_at, 'A resolved row is reopened so repair picks it up.');
     }
@@ -146,6 +148,7 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
         });
 
         $this->assertSame(1, DB::table('search_index_failures')->where('operation', 'deferred')->count());
+        $this->assertLessThanOrEqual(now()->toDateTimeString(), (string) DB::table('search_index_failures')->value('next_attempt_at'));
     }
 
     public function test_collects_for_the_whole_scope_and_refreshes_in_chunks_of_200(): void

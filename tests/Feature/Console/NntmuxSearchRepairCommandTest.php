@@ -47,14 +47,16 @@ final class NntmuxSearchRepairCommandTest extends SearchConsoleCommandTestCase
     public function test_keeps_the_row_when_the_refresh_fails(): void
     {
         $this->useDriver(static function (int $releaseId): void {
-            // What ManticoreSearchDriver::recordReleaseIndexFailure() does on failure.
-            DB::table('search_index_failures')->where('release_id', $releaseId)->update(['operation' => 'upsert', 'last_error' => 'updateRelease_query']);
+            // What ManticoreSearchDriver::recordReleaseIndexFailure() does on a leased release.
+            DB::table('search_index_failures')->where('release_id', $releaseId)->increment('attempts');
         });
         $this->insertMarker(5, 'deferred:dead', now()->subMinute());
 
         $this->artisan('nntmux:search-repair')->assertSuccessful();
 
-        $this->assertSame('upsert', DB::table('search_index_failures')->where('release_id', 5)->value('operation'));
+        $row = DB::table('search_index_failures')->where('release_id', 5)->sole();
+        $this->assertSame(1, (int) $row->attempts);
+        $this->assertGreaterThan(now()->toDateTimeString(), (string) $row->next_attempt_at, 'Retried with backoff.');
     }
 
     public function test_keeps_a_marker_its_release_pass_renewed_during_the_refresh(): void

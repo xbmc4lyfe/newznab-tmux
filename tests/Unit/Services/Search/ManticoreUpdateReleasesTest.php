@@ -86,6 +86,20 @@ final class ManticoreUpdateReleasesTest extends TestCase
         $this->assertNotNull($rows[2]->next_attempt_at);
     }
 
+    public function test_a_failure_counts_on_a_deferral_lease_without_taking_it_over(): void
+    {
+        Schema::drop('video_data');
+        DB::table('search_index_failures')->insert(['release_id' => 1, 'operation' => 'deferred', 'attempts' => 0, 'last_error' => 'deferred:owner', 'next_attempt_at' => now()->addMinutes(10)->startOfSecond(), 'created_at' => now(), 'updated_at' => now()]);
+
+        $this->driver($this->createStub(Table::class))->updateRelease(1);
+
+        $row = DB::table('search_index_failures')->where('release_id', 1)->sole();
+        $this->assertSame('deferred', $row->operation);
+        $this->assertSame('deferred:owner', $row->last_error);
+        $this->assertSame(1, (int) $row->attempts);
+        $this->assertSame(now()->addMinutes(10)->startOfSecond()->toDateTimeString(), (string) $row->next_attempt_at);
+    }
+
     public function test_removes_releases_that_no_longer_exist(): void
     {
         $table = $this->createMock(Table::class);

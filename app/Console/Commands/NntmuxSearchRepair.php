@@ -28,7 +28,7 @@ final class NntmuxSearchRepair extends Command
             ->orderBy('id')
             ->limit($limit);
 
-        $rows = $query->get(['release_id', 'operation', 'last_error']);
+        $rows = $query->get(['release_id', 'operation', 'attempts', 'last_error']);
         if ($rows->isEmpty()) {
             $this->info('No failed release index updates are due for repair.');
 
@@ -46,7 +46,7 @@ final class NntmuxSearchRepair extends Command
             if ($row->operation === 'delete') {
                 Search::deleteRelease($releaseId);
             } elseif ($row->operation === SearchService::DEFERRED_RELEASE_OPERATION) {
-                $this->repairExpiredDeferral($releaseId, (string) $row->last_error);
+                $this->repairExpiredDeferral($releaseId, (string) $row->last_error, (int) $row->attempts);
             } else {
                 Search::updateRelease($releaseId);
             }
@@ -58,19 +58,28 @@ final class NntmuxSearchRepair extends Command
     }
 
     /**
-     * Refresh a release whose deferral lease expired (its release pass died or ran long),
-     * then remove the marker unless the pass renewed it or the refresh failed (which
-     * turns the row into an ordinary failure).
+     * Refresh a release whose deferral lease expired (its release pass died, ran long or
+     * handed it over after a failed refresh), then remove the marker unless the pass
+     * renewed it. A failed refresh counts an attempt on the marker; it then stays and
+     * is retried with backoff.
      */
-    private function repairExpiredDeferral(int $releaseId, string $token): void
+    private function repairExpiredDeferral(int $releaseId, string $token, int $attempts): void
     {
         Search::updateRelease($releaseId);
 
-        DB::table('search_index_failures')
+        $marker = DB::table('search_index_failures')
             ->where('release_id', $releaseId)
             ->where('operation', SearchService::DEFERRED_RELEASE_OPERATION)
             ->where('last_error', $token)
-            ->where('next_attempt_at', '<=', now())
-            ->delete();
+            ->where('next_attempt_at', '<=', now());
+
+        if ((clone $marker)->where('attempts', $attempts)->delete() > 0) {
+            return;
+        }
+
+        $marker->where('attempts', '>', $attempts)->update([
+            'next_attempt_at' => now()->addSeconds(min(3600, 2 ** min($attempts + 1, 10))),
+            'updated_at' => now(),
+        ]);
     }
 }
