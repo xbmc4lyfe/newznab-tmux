@@ -30,8 +30,8 @@ use Illuminate\Support\Facades\DB;
 #[Description('Rename releases still named after a raw "[n/m] - \"file\"" posting subject')]
 class ReleasesCleanSubjectNames extends Command
 {
-    /** Search names that may still be a raw counter-and-file subject (`[1/9] - "`, `[1/9] "`, `[1/9]-"`). */
-    private const string RAW_SUBJECT_LIKE = '[%/%]%"%';
+    /** Search names that may still be a raw counter-and-file subject (`[1/9] - "`, `[1/9] "`, `[1/9]-"`, `[1/9] - #34;`). */
+    private const string RAW_SUBJECT_LIKE = '[%/%]%';
 
     public function handle(ReleaseCleaningService $cleaner, ReleaseUpdateService $updater): int
     {
@@ -50,6 +50,7 @@ class ReleasesCleanSubjectNames extends Command
                 ->where('r.id', '>', $lastId)
                 ->where('r.isrenamed', 0)
                 ->where('r.searchname', 'like', self::RAW_SUBJECT_LIKE)
+                ->where(fn ($quoted) => $quoted->where('r.searchname', 'like', '%"%')->orWhere('r.searchname', 'like', '%#34;%'))
                 ->orderBy('r.id')
                 ->limit($limit === 0 ? $chunk : min($chunk, $limit - $checked))
                 ->get(['r.id', 'r.name', 'r.searchname', 'r.fromname', 'r.groups_id', 'r.categories_id', 'g.name as group_name']);

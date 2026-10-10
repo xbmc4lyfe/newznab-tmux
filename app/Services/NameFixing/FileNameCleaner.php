@@ -91,7 +91,7 @@ class FileNameCleaner
             ...self::ARCHIVE_PATTERNS,
             '/\.(zst|tgz|lz4|enc|rev)$/i',
             '/\.vol\d+[+-]\d+$/i',
-            '/\.part\d{1,4}$/i',
+            '/\.part\d{0,4}$/i',
             self::VIDEO_EXTENSIONS,
             self::AUDIO_EXTENSIONS,
             self::IMAGE_EXTENSIONS,

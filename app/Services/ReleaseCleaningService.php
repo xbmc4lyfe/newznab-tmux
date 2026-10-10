@@ -23,7 +23,7 @@ class ReleaseCleaningService
     /**
      * `[01/10] - "file.ext"`: a file counter and a quoted file name, as most posting tools write them.
      */
-    private const string COUNTER_FILE_SUBJECT = '/^\[\s*\d+\s*\/\s*\d+\s*\]\s*-?\s*"(?P<file>[^"]{4,})"/';
+    private const string COUNTER_FILE_SUBJECT = '/^\[\s*\d+\s*\/\s*\d+\s*\]\s*-?\s*(?:"|#34;)(?P<file>(?:(?!"|#34;).){4,})(?:"|#34;)/';
 
     /**
      * Used for matching file extension endings in article subjects.
@@ -450,7 +450,7 @@ class ReleaseCleaningService
     {
         $fileNameCleaner = new FileNameCleaner;
         // Not fixerCleaner(): it drops every non-ASCII character, and these names may be accented.
-        $name = $fileNameCleaner->stripFileSuffixes($file);
+        $name = $fileNameCleaner->stripFileSuffixes($fileNameCleaner->extractFilenameFromPath($file));
         $name = preg_replace('/[.\-_](sample|proof|thumbs?)$/i', '', $name) ?? $name;
         $name = trim(preg_replace('/\s\s+/u', ' ', $name) ?? $name, " .-_\t");
 
@@ -472,7 +472,7 @@ class ReleaseCleaningService
     private function counterFileSubjectName(): ?array
     {
         // `lRap` is `yEnc` in ROT13: the whole subject is scrambled, so its file name is too.
-        if (preg_match(self::COUNTER_FILE_SUBJECT, $this->subject, $hit) !== 1 || preg_match('/"\s*lRap\b/', $this->subject) === 1) {
+        if (preg_match(self::COUNTER_FILE_SUBJECT, $this->subject, $hit) !== 1 || preg_match('/(?:"|#34;)\s*-?\s*lRap\b/i', $this->subject) === 1) {
             return null;
         }
         $fromFile = $this->releaseNameFromFile($hit['file']);

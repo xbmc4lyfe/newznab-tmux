@@ -52,6 +52,9 @@ class CounterSubjectNamingTest extends TestCase
         yield 'par2 of a rar' => ['[02/10] - "Some.App.v6.41.Multilingual-GRP.rar.par2" yEnc', 'Some.App.v6.41.Multilingual-GRP'];
         yield 'tar.zst' => ['[1/6] - "Some.Show.S01E01.1080p.WEB.h264-GRP.tar.zst" yEnc', 'Some.Show.S01E01.1080p.WEB.h264-GRP'];
         yield 'rar recovery volume' => ['[3/9] - "Movie.2020.1080p-GRP.001.rev" yEnc', 'Movie.2020.1080p-GRP'];
+        yield 'digitless part par2' => ['[1/2] - "Movie.2020.1080p-GRP.part.par2" yEnc', 'Movie.2020.1080p-GRP'];
+        yield 'encoded quotes' => ['[1/2] - #34;Movie.2020.1080p-GRP.mkv#34; yEnc', 'Movie.2020.1080p-GRP'];
+        yield 'path in the file name' => ['[1/2] - "C:\\posts\\Movie.2020.1080p-GRP.mkv" yEnc', 'Movie.2020.1080p-GRP'];
         yield 'vob' => ['[1/5] - "Movie.2020.1080p-GRP.vob" yEnc', 'Movie.2020.1080p-GRP'];
         yield 'accented name' => ['[1/5] - "Amélie.2001.1080p.BluRay-GRP.mkv" yEnc', 'Amélie.2001.1080p.BluRay-GRP'];
         yield 'spaced p2p name' => ['[01/11] - "Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR.mkv" yEnc', 'Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR'];
@@ -94,10 +97,10 @@ class CounterSubjectNamingTest extends TestCase
     #[Test]
     public function rot13_scrambled_subjects_keep_the_subject(): void
     {
-        foreach (['[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap', '[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap (1/2)'] as $subject) {
+        foreach (['[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap', '[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap (1/2)', '[1/2] - "Gur.Zngevk.1999.1080c-OEC" - lRap'] as $subject) {
             $meta = (new ReleaseCleaningService)->releaseCleaner($subject, 'x@y.z', 'alt.binaries.multimedia.rail');
 
-            $this->assertStringStartsWith('[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7"', $meta['cleansubject']);
+            $this->assertStringStartsWith((string) preg_replace('/"\s*(?:-\s*)?lRap.*$/', '"', $subject), $meta['cleansubject']);
         }
     }
 
