@@ -78,6 +78,48 @@ return [
     'scrape_irc_channels' => serialize(IrcChannelList::parse(env('SCRAPE_IRC_CHANNELS', '#PreNNTmux'))),
 
     /***********************************************************************************************************************
+     * Additional public scene pre channels. Each enabled network runs as its own `irc:scrape --network=<key>`
+     * process (plain `irc:scrape` supervises all enabled networks). They announce only a section and a release
+     * name, so entries are stored with the receive time as the PRE time and enriched by the PreDB feeds.
+     * The "synirc" network is the server and channels configured above (NNTmux bot format).
+     **********************************************************************************************************************/
+    'networks' => [
+        'synirc' => [
+            'enabled' => (bool) env('SCRAPE_IRC_SYNIRC_ENABLED', true),
+            'format' => 'nntmux',
+        ],
+        'corruptnet' => [
+            'enabled' => (bool) env('SCRAPE_IRC_CORRUPTNET_ENABLED', false),
+            'format' => 'corruptnet',
+            'source' => 'corrupt-net',
+            'server' => env('SCRAPE_IRC_CORRUPTNET_SERVER', 'irc.corrupt-net.org'),
+            'port' => (int) env('SCRAPE_IRC_CORRUPTNET_PORT', 6697),
+            'tls' => true,
+            'channels' => ['#pre' => null],
+        ],
+        'zenet' => [
+            'enabled' => (bool) env('SCRAPE_IRC_ZENET_ENABLED', false),
+            'format' => 'zenet',
+            'source' => 'zenet',
+            'server' => env('SCRAPE_IRC_ZENET_SERVER', 'irc.zenet.org'),
+            'port' => (int) env('SCRAPE_IRC_ZENET_PORT', 6697),
+            'tls' => true,
+            // zenet's TLS certificate does not name irc.zenet.org; the chain is still verified.
+            'tls_verify_peer_name' => false,
+            'channels' => ['#pre' => null],
+        ],
+        'predatabase' => [
+            'enabled' => (bool) env('SCRAPE_IRC_PREDATABASE_ENABLED', false),
+            'format' => 'predatabase',
+            'source' => 'predataba.se',
+            'server' => env('SCRAPE_IRC_PREDATABASE_SERVER', 'irc.predataba.se'),
+            'port' => (int) env('SCRAPE_IRC_PREDATABASE_PORT', 6697),
+            'tls' => true,
+            'channels' => ['#pre' => null],
+        ],
+    ],
+
+    /***********************************************************************************************************************
      * This is a list of all the sources we fetch PRE's from.
      * If you want to ignore a source=>change it from false to true.
      **********************************************************************************************************************/

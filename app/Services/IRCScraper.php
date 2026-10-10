@@ -7,6 +7,10 @@ namespace App\Services;
 use App\Facades\Search;
 use App\Models\Predb;
 use App\Models\UsenetGroup;
+use App\Services\Predb\Feeds\PredbFeedImporter;
+use App\Services\Predb\Irc\IrcNetworks;
+use App\Services\Predb\Irc\PreAnnounceParser;
+use Carbon\CarbonImmutable;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
@@ -59,15 +63,37 @@ class IRCScraper extends IRCClient
     protected string|false $_titleIgnoreRegex = false;
 
     /**
+     * Connection profile from IrcNetworks::resolve().
+     *
+     * @var array{name: string, format: string, source: ?string, server: string, port: int, tls: bool, tls_verify_peer_name: ?bool, channels: array<string, ?string>}
+     */
+    protected array $_network;
+
+    /**
+     * Parser for public pre channels; null for the NNTmux bot format.
+     */
+    protected ?PreAnnounceParser $_announceParser = null;
+
+    protected ?PredbFeedImporter $_importer = null;
+
+    /**
      * Construct.
      *
      * @param  bool  $silent  Run this in silent mode (no text output).
      * @param  bool  $debug  Turn on debug? Shows sent/received socket buffer messages.
+     * @param  string  $network  Key in irc_settings.networks to scrape.
      *
      * @throws \Exception
      */
-    public function __construct(bool $silent, bool $debug)
+    public function __construct(bool $silent, bool $debug, string $network = IrcNetworks::LEGACY)
     {
+        $this->_network = IrcNetworks::resolve($network);
+        if ($this->_network['format'] !== 'nntmux') {
+            $this->_announceParser = new PreAnnounceParser($this->_network['format'], (string) $this->_network['source']);
+            $this->_importer = app(PredbFeedImporter::class);
+        }
+        $this->_tlsVerifyPeerName = $this->_network['tls_verify_peer_name'];
+
         if (config('irc_settings.scrape_irc_source_ignore')) {
             try {
                 $ignored = unserialize(
@@ -123,56 +149,38 @@ class IRCScraper extends IRCClient
      */
     protected function _startScraping(): void
     {
+        $server = $this->_network['server'];
+        $port = $this->_network['port'];
+
         // Connect to IRC.
-        if ($this->connect((string) config('irc_settings.scrape_irc_server'), (int) config('irc_settings.scrape_irc_port'), (bool) config('irc_settings.scrape_irc_tls')) === false) {
+        if ($this->connect($server, $port, $this->_network['tls']) === false) {
             exit(
-                'Error connecting to ('.
-                config('irc_settings.scrape_irc_server').
-                ':'.
-                config('irc_settings.scrape_irc_port').
-                '). Please verify your server information and try again.'.
+                'Error connecting to ('.$server.':'.$port.'). Please verify your server information and try again.'.
                 PHP_EOL
             );
         }
 
-        // Normalize password to ?string
-        $password = config('irc_settings.scrape_irc_password');
+        // Normalize password to ?string. The server password belongs to the configured (synirc/ZNC) server only.
+        $password = $this->_network['name'] === IrcNetworks::LEGACY ? config('irc_settings.scrape_irc_password') : null;
         $password = ($password === false || $password === '' || $password === null) ? null : (string) $password;
 
         // Login to IRC. Note parameter order: nick, user, real, pass.
         if ($this->login((string) config('irc_settings.scrape_irc_nickname'), (string) config('irc_settings.scrape_irc_username'), (string) config('irc_settings.scrape_irc_realname'), $password) === false) {
             exit(
                 'Error logging in to: ('.
-                config('irc_settings.scrape_irc_server').':'.config('irc_settings.scrape_irc_port').') nickname: ('.config('irc_settings.scrape_irc_nickname').
+                $server.':'.$port.') nickname: ('.config('irc_settings.scrape_irc_nickname').
                 '). Verify your connection information, you might also be banned from this server or there might have been a connection issue.'.
                 PHP_EOL
             );
         }
 
         // Join channels.
-        $channelsCfg = config('irc_settings.scrape_irc_channels');
-        if ($channelsCfg) {
-            try {
-                $channels = unserialize((string) $channelsCfg, ['allowed_classes' => false]);
-            } catch (\ValueError $e) {
-                $channels = ['#PreNNTmux' => null];
-            }
-            if (! is_array($channels)) {
-                $channels = ['#PreNNTmux' => null];
-            }
-        } else {
-            $channels = ['#PreNNTmux' => null];
-        }
-        $this->joinChannels($channels);
+        $this->joinChannels($this->_network['channels']);
 
         if (! $this->_silent) {
             echo '['.
                 date('r').
-                '] [Scraping of IRC channels for ('.
-                config('irc_settings.scrape_irc_server').
-                ':'.
-                config('irc_settings.scrape_irc_port').
-                ') ('.
+                '] [Scraping of IRC channels for ('.$server.':'.$port.') ('.
                 config('irc_settings.scrape_irc_nickname').
                 ') started.]'.
                 PHP_EOL;
@@ -191,6 +199,12 @@ class IRCScraper extends IRCClient
     {
         if ($this->_debug && ! $this->_silent) {
             echo '[DEBUG] Processing message: '.$this->_channelData['message'].PHP_EOL;
+        }
+
+        if ($this->_announceParser !== null) {
+            $this->processAnnounce();
+
+            return;
         }
 
         if (preg_match(
@@ -276,6 +290,31 @@ class IRCScraper extends IRCClient
             if ($this->_debug && ! $this->_silent) {
                 echo '[DEBUG] Message did not match PRE regex pattern'.PHP_EOL;
             }
+        }
+    }
+
+    /**
+     * Store a pre announced on a public pre channel, using the PreDB feed import rules.
+     *
+     * @throws \Exception
+     */
+    protected function processAnnounce(): void
+    {
+        $entry = $this->_announceParser?->parse($this->_channelData['message'], CarbonImmutable::now('UTC'));
+        if ($entry === null || $this->_importer === null) {
+            return;
+        }
+
+        if (($this->_categoryIgnoreRegex !== false && $entry->category !== null && preg_match((string) $this->_categoryIgnoreRegex, $entry->category))
+            || ($this->_titleIgnoreRegex !== false && preg_match((string) $this->_titleIgnoreRegex, $entry->title))) {
+            return;
+        }
+
+        $result = $this->_importer->import([$entry]);
+
+        if (! $this->_silent && $result['skipped'] === 0) {
+            echo '['.date('r').'] ['.($result['inserted'] > 0 ? 'Added Pre ' : 'Updated Pre').'] ['.
+                $entry->source.'] ['.$entry->title.']'.($entry->category !== null ? ' ['.$entry->category.']' : '').PHP_EOL;
         }
     }
 
