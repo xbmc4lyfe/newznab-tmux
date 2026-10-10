@@ -271,6 +271,15 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** `Internal error: App\Console\Commands\UpdatePostProcess while analysing file …/ProcessReleasesCommand.php`, "Result is incomplete because of severe errors". This happens for any file under `app/Console/Commands`, so commands get no static analysis in CI or build containers.
 - **Fix:** resolve `PostProcessService` lazily in `handle()`, or make its settings load lazily.
 
+### 37. Release reconcile deadlocks with header storage on busy groups (Open)
+
+- **Where:** `ReleaseProcessingService::reconcileCollectionIds()` (`app/Services/ReleaseProcessingService.php:~458`) runs one transaction that updates every binary of up to 500 collections (`UPDATE binaries b … WHERE b.collections_id IN (…)`). It holds ~59k row locks, taken in `collections_id` order. At the same time, `BinaryHandler::refreshAggregates()` (`app/Services/Binaries/BinaryHandler.php:443`) updates the same `binaries` rows by id for each header chunk.
+- **Symptom:** InnoDB deadlocks between those two statements in alt.binaries.boneless (group 1). From 11:40 to 13:37 UTC on 2026-10-10:
+  - 386 header chunks (117k articles) were rolled back with `"reason":"Lock retries exhausted","code":"40001"`, and they fall back to part repair;
+  - the `releases` pane failed 38 times, exiting in `processIncompleteCollections()` before creating any releases for that pass.
+  It started before the PR #10 deploy and grew as the boneless collection backlog grew.
+- **Fix:** take the reconcile's binary locks in primary-key order, in smaller transactions (e.g. `SELECT id … WHERE collections_id IN (…) ORDER BY id FOR UPDATE`, then update by id in chunks). Alternatively, skip collections that are still receiving parts (`dateadded` within the last few minutes), so the reconcile and the header writers don't touch the same binaries.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |
