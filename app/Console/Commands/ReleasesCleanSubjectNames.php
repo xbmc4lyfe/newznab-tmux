@@ -81,15 +81,18 @@ class ReleasesCleanSubjectNames extends Command
                 $before = $updater->fixed;
                 // A name-fixing worker may have renamed it since this chunk was read. Lock the row, re-check it
                 // and rename it in one transaction, so that rename is never overwritten.
-                DB::transaction(function () use ($updater, $row, $name, $preId): void {
-                    $unchanged = DB::table('releases')->where('id', $row->id)->where('isrenamed', 0)->where('searchname', $row->searchname)->lockForUpdate()->exists();
-                    if (! $unchanged) {
-                        return;
-                    }
-                    // An exact PreDB title is a proper name, as at release creation; its type sets `isrenamed`.
-                    $preId > 0
-                        ? $updater->updateRelease($row, $name, 'Subject cleaner, PreDB exact', true, 'PreDB FT Exact, ', true, false, $preId)
-                        : $updater->updateRelease($row, $name, 'Subject cleaner', true, 'Subject, ', false, false, $preId);
+                // The search index update waits for the commit, so the row lock is never held across it.
+                $updater->deferSearchSync((int) $row->id, function () use ($updater, $row, $name, $preId): void {
+                    DB::transaction(function () use ($updater, $row, $name, $preId): void {
+                        $unchanged = DB::table('releases')->where('id', $row->id)->where('isrenamed', 0)->where('searchname', $row->searchname)->lockForUpdate()->exists();
+                        if (! $unchanged) {
+                            return;
+                        }
+                        // An exact PreDB title is a proper name, as at release creation; its type sets `isrenamed`.
+                        $preId > 0
+                            ? $updater->updateRelease($row, $name, 'Subject cleaner, PreDB exact', true, 'PreDB FT Exact, ', true, false, $preId)
+                            : $updater->updateRelease($row, $name, 'Subject cleaner', true, 'Subject, ', false, false, $preId);
+                    });
                 });
                 if ($updater->fixed > $before) {
                     $renamed++;
@@ -126,9 +129,10 @@ class ReleasesCleanSubjectNames extends Command
             return [null, 0];
         }
 
-        // Link the exact PreDB title, as release creation does.
+        // Link the exact PreDB title, as release creation does. Its title may have accents the ASCII-only
+        // update path would strip, so apply the same guard to it.
         if ($preId === 0 && ($pre = Predb::matchPre($name)) !== false) {
-            return [$pre['title'], (int) $pre['predb_id']];
+            return preg_match('/[^\x20-\x7E]/', $pre['title']) === 1 ? [null, 0] : [$pre['title'], (int) $pre['predb_id']];
         }
 
         return [$name, $preId];

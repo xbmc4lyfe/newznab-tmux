@@ -55,6 +55,7 @@ class CounterSubjectNamingTest extends TestCase
         yield 'digitless part par2' => ['[1/2] - "Movie.2020.1080p-GRP.part.par2" yEnc', 'Movie.2020.1080p-GRP'];
         yield 'encoded quotes' => ['[1/2] - #34;Movie.2020.1080p-GRP.mkv#34; yEnc', 'Movie.2020.1080p-GRP'];
         yield 'path in the file name' => ['[1/2] - "C:\\posts\\Movie.2020.1080p-GRP.mkv" yEnc', 'Movie.2020.1080p-GRP'];
+        yield 'title ending in a codec token' => ['[1/5] - "Movie.2020.1080p.DTS.mkv" yEnc', 'Movie.2020.1080p.DTS'];
         yield 'vob' => ['[1/5] - "Movie.2020.1080p-GRP.vob" yEnc', 'Movie.2020.1080p-GRP'];
         yield 'accented name' => ['[1/5] - "Amélie.2001.1080p.BluRay-GRP.mkv" yEnc', 'Amélie.2001.1080p.BluRay-GRP'];
         yield 'spaced p2p name' => ['[01/11] - "Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR.mkv" yEnc', 'Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR'];
@@ -133,6 +134,7 @@ class CounterSubjectNamingTest extends TestCase
 
         $calls = [];
         $updater = Mockery::mock(ReleaseUpdateService::class);
+        $updater->shouldReceive('deferSearchSync')->andReturnUsing(static fn (int $id, \Closure $work) => $work());
         $updater->shouldReceive('updateRelease')->andReturnUsing(function (object $release, string $name, string $method, bool $echo, string $type, bool $nameStatus, bool $show, int $preId) use (&$calls, $updater): void {
             $calls[] = [(int) $release->id, $name, $preId, $nameStatus, $type];
             $updater->fixed++;
@@ -163,6 +165,7 @@ class CounterSubjectNamingTest extends TestCase
 
         $calls = [];
         $updater = Mockery::mock(ReleaseUpdateService::class);
+        $updater->shouldReceive('deferSearchSync')->andReturnUsing(static fn (int $id, \Closure $work) => $work());
         $updater->shouldReceive('updateRelease')->andReturnUsing(function (object $release, string $name) use (&$calls, $updater): void {
             $calls[] = [(int) $release->id, $name];
             $updater->fixed++;
@@ -179,10 +182,27 @@ class CounterSubjectNamingTest extends TestCase
     }
 
     #[Test]
+    public function the_backlog_command_skips_a_pre_title_with_accents(): void
+    {
+        DB::table('releases')->insert(['id' => 1, 'name' => '[1/5] - "Amelie.2001.1080p-GRP.mkv" yEnc', 'searchname' => '[1/5] - "Amelie.2001.1080p-GRP.mkv"', 'fromname' => 'a@b.c', 'groups_id' => 1, 'categories_id' => 10, 'isrenamed' => 0]);
+        DB::table('predb')->insert(['id' => 5, 'title' => 'Amélie.2001.1080p-GRP', 'filename' => 'Amelie.2001.1080p-GRP']);
+        Search::shouldReceive('matchPredbExact')->with('Amelie.2001.1080p-GRP')->andReturn(['id' => 5]);
+
+        $updater = Mockery::mock(ReleaseUpdateService::class);
+        $updater->shouldNotReceive('updateRelease');
+        $this->app->instance(ReleaseUpdateService::class, $updater);
+
+        $this->artisan('releases:clean-subject-names')
+            ->expectsOutputToContain('Renamed 0 of 1 releases')
+            ->assertSuccessful();
+    }
+
+    #[Test]
     public function a_dry_run_writes_nothing(): void
     {
         DB::table('releases')->insert(['id' => 1, 'name' => '[1/9] - "Shes.the.Man.2006.BluRay.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR.par2" yEnc', 'searchname' => '[1/9] - "Shes.the.Man.2006.BluRay.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR.par2"', 'fromname' => 'a@b.c', 'groups_id' => 1, 'categories_id' => 2040, 'isrenamed' => 0]);
         $updater = Mockery::mock(ReleaseUpdateService::class);
+        $updater->shouldReceive('deferSearchSync')->andReturnUsing(static fn (int $id, \Closure $work) => $work());
         $updater->shouldNotReceive('updateRelease');
         $this->app->instance(ReleaseUpdateService::class, $updater);
 
