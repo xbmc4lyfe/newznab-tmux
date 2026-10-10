@@ -11,6 +11,7 @@ use App\Models\Release;
 use App\Models\ReleaseNamingRegex;
 use App\Models\UsenetGroup;
 use Illuminate\Support\Arr;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
@@ -35,6 +36,12 @@ class RegexService
      * @var array<string, mixed>
      */
     protected array $_regexCache = [];
+
+    /**
+     * How long a process reuses its copy of a group's regexes before checking the shared cache
+     * again, so edits still reach long-running workers within about a minute of the shared copy.
+     */
+    private const int LOCAL_REGEX_CACHE_SECONDS = 60;
 
     /**
      * Default category ID
@@ -307,6 +314,14 @@ class RegexService
      */
     protected function _fetchRegex(string $groupName): void
     {
+        // tryRegex() runs once per header, so reuse this process's copy for a short while
+        // instead of reading and unserializing the list from the shared cache every call.
+        // time() is far cheaper than building a Carbon instance on this per-header path.
+        $now = Carbon::hasTestNow() ? Carbon::now()->getTimestamp() : time();
+        if (isset($this->_regexCache[$groupName]['expires']) && $this->_regexCache[$groupName]['expires'] > $now) {
+            return;
+        }
+
         // Get all regex from DB which match the current group name. Cache them for 15 minutes. #CACHEDQUERY#
         $sql = sprintf(
             'SELECT r.id, r.regex %s FROM %s r WHERE \'%s\' REGEXP r.group_regex AND r.status = 1 ORDER BY r.ordinal ASC, r.group_regex ASC',
@@ -315,13 +330,12 @@ class RegexService
             $groupName
         );
 
-        $this->_regexCache[$groupName]['regex'] = Cache::get(md5($sql));
-        if ($this->_regexCache[$groupName]['regex'] !== null) {
-            return;
+        $regex = Cache::get(md5($sql));
+        if ($regex === null) {
+            $regex = DB::select($sql);
+            Cache::put(md5($sql), $regex, now()->addMinutes(config('nntmux.cache_expiry_long')));
         }
-        $this->_regexCache[$groupName]['regex'] = DB::select($sql);
-        $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_long'));
-        Cache::put(md5($sql), $this->_regexCache[$groupName]['regex'], $expiresAt);
+        $this->_regexCache[$groupName] = ['regex' => $regex, 'expires' => $now + self::LOCAL_REGEX_CACHE_SECONDS];
     }
 
     /**
