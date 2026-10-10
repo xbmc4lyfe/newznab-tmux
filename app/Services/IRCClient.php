@@ -43,6 +43,11 @@ class IRCClient
     protected bool $_remote_tls = false;
 
     /**
+     * Overrides TLS host name verification for this connection; null keeps the nntmux_ssl setting.
+     */
+    protected ?bool $_tlsVerifyPeerName = null;
+
+    /**
      * Time in seconds to timeout on connect.
      */
     protected int $_remote_connection_timeout = 30;
@@ -559,9 +564,16 @@ class IRCClient
         $this->_closeStream();
 
         // Create SSL/TLS context if using secure connection
-        $context = $this->_remote_tls
-            ? stream_context_create(streamSslContextOptions())
-            : null;
+        $context = null;
+        if ($this->_remote_tls) {
+            $options = streamSslContextOptions();
+            if ($this->_tlsVerifyPeerName !== null) {
+                foreach (array_keys($options) as $wrapper) {
+                    $options[$wrapper]['verify_peer_name'] = $this->_tlsVerifyPeerName;
+                }
+            }
+            $context = stream_context_create($options);
+        }
 
         $socket = stream_socket_client(
             $this->_remote_socket_string,
