@@ -27,6 +27,8 @@ return [
         'reconcile_batch_size' => (int) env('CBP_RECONCILE_BATCH_SIZE', 500),
         // Maximum flattened binary/part rows loaded while streaming an NZB.
         'nzb_stream_rows' => (int) env('CBP_NZB_STREAM_ROWS', 5000),
+        // Collection id span checked for orphans by one cleanup pass; passes resume from a stored cursor.
+        'orphan_scan_window' => (int) env('CBP_ORPHAN_SCAN_WINDOW', 250000),
         // Explicit maintenance-window approval for the destructive hash/key migration.
         'storage_migration_execute' => (bool) env('CBP_STORAGE_MIGRATION_EXECUTE', false),
     ],
