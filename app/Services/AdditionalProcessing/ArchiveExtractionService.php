@@ -49,6 +49,27 @@ class ArchiveExtractionService
         ReleaseProcessingContext $context,
         string $tmpPath
     ): array {
+        $result = $this->inspectCompressedData($compressedData, $context, $tmpPath);
+
+        if (! $result['success'] && ! $result['hasPassword']) {
+            if ($result['undecodable'] ?? false) {
+                $context->archiveListingUndecodable = true;
+            } else {
+                $context->archiveRetryable = true;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function inspectCompressedData(
+        string $compressedData,
+        ReleaseProcessingContext $context,
+        string $tmpPath
+    ): array {
         $result = [
             'success' => false,
             'files' => [],
@@ -126,6 +147,11 @@ class ArchiveExtractionService
             ? $this->archiveInfo->getArchiveFileList(false)
             : $this->archiveInfo->getArchiveFileList();
         if (! is_array($files) || count($files) === 0) {
+            // A compressed 7z header needs an LZMA decoder, which isn't available.
+            if ($listingOnly && (int) ($dataSummary['enc_header'] ?? 0) === 1) {
+                return [...$result, 'undecodable' => true];
+            }
+
             return $result;
         }
 

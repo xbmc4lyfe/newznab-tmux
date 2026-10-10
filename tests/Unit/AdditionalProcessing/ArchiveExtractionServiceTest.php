@@ -205,6 +205,38 @@ class ArchiveExtractionServiceTest extends TestCase
     }
 
     #[Test]
+    public function it_marks_a_7z_with_a_compressed_header_as_undecodable(): void
+    {
+        $service = new ArchiveExtractionService($this->makeConfig());
+        $archive = $this->sevenZip('Movie.2026.1080p.mkv', str_repeat('x', 100), compressedHeader: true);
+        $context = $this->sevenZipContext();
+
+        $joined = $service->withSevenZipEndHeader(substr($archive, 0, 40), substr($archive, -40));
+        $this->assertIsString($joined);
+
+        $result = $service->processCompressedData($joined, $context, sys_get_temp_dir().'/');
+
+        $this->assertFalse($result['success']);
+        $this->assertFalse($result['hasPassword']);
+        $this->assertTrue($context->archiveListingUndecodable);
+        $this->assertFalse($context->archiveRetryable);
+    }
+
+    #[Test]
+    public function it_marks_a_7z_missing_its_end_header_as_retryable(): void
+    {
+        $service = new ArchiveExtractionService($this->makeConfig());
+        $archive = $this->sevenZip('Movie.2026.1080p.mkv', str_repeat('x', 100));
+        $context = $this->sevenZipContext();
+
+        $result = $service->processCompressedData(substr($archive, 0, 40), $context, sys_get_temp_dir().'/');
+
+        $this->assertFalse($result['success']);
+        $this->assertFalse($context->archiveListingUndecodable);
+        $this->assertTrue($context->archiveRetryable);
+    }
+
+    #[Test]
     public function it_flags_encrypted_entries_of_a_7z(): void
     {
         $service = new ArchiveExtractionService($this->makeConfig());
