@@ -23,6 +23,7 @@ class CollectionsCleaningNormalizeStringTest extends TestCase
             'empty' => [''],
             'whitespace only' => ["   \t  "],
             'two ascii bytes detected as UCS-2' => ['!P'],
+            'utf-8 over every encoding but UCS-2 over a UTF/UCS subset' => ['S/3/S*Z%7}'],
             'four ascii bytes detected as UCS-2' => ['zzzz'],
             'four ascii bytes detected as UCS-4' => ['3333'],
             'even-length run detected as UCS-2' => [str_repeat('3', 24)],
@@ -72,6 +73,12 @@ class CollectionsCleaningNormalizeStringTest extends TestCase
 
             $this->assertSame(self::reference($subject), $this->normalize($subject), 'Subject: '.json_encode($subject));
         }
+    }
+
+    public function test_repeated_subjects_return_the_memoized_result(): void
+    {
+        $this->assertSame(self::reference('S/3/S*Z%7}'), $this->normalize('S/3/S*Z%7}'));
+        $this->assertSame(self::reference('S/3/S*Z%7}'), $this->normalize('  S/3/S*Z%7}  '));
     }
 
     public function test_collapses_and_trims_whitespace(): void

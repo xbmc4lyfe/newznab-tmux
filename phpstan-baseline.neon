@@ -800,12 +800,6 @@ parameters:
 			path: app/Services/Releases/ReleaseSearchService.php
 
 		-
-			message: '#^Method App\\Services\\Releases\\ReleaseSearchService\:\:apiSearchLegacyMysql\(\) has parameter \$excludedCats with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Services/Releases/ReleaseSearchService.php
-
-		-
 			message: '#^Method App\\Services\\Releases\\ReleaseSearchService\:\:intersectReleaseIdsWithSearchFilters\(\) has parameter \$releaseIds with no value type specified in iterable type array\.$#'
 			identifier: missingType.iterableValue
 			count: 1

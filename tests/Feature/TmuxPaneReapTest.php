@@ -51,7 +51,7 @@ class TmuxPaneReapTest extends TestCase
         $this->assertSame(2, $this->listCalls);
     }
 
-    public function test_asks_only_once_per_pane_process(): void
+    public function test_asks_at_most_every_retry_interval_while_the_status_is_missing(): void
     {
         $this->listings = [self::pane('%5', dead: true, pid: 4242)];
         $manager = $this->manager();
@@ -59,8 +59,13 @@ class TmuxPaneReapTest extends TestCase
         $this->assertNull($manager->paneSnapshot()['%5']['exit_code']);
         $manager->refresh();
         $this->assertNull($manager->paneSnapshot()['%5']['exit_code']);
-
         $this->assertSame([777], $this->reapRequests);
+
+        // The first SIGCHLD can land in another libutempter window; ask again later.
+        $this->travel(31)->seconds();
+        $manager->refresh();
+        $manager->paneSnapshot();
+        $this->assertSame([777, 777], $this->reapRequests);
     }
 
     public function test_asks_again_once_the_pane_runs_a_new_process(): void

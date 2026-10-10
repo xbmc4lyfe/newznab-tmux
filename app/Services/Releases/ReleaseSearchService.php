@@ -266,7 +266,16 @@ class ReleaseSearchService
             // The index has no sortable name attribute: let it filter, then order
             // and page the most recent matches by name in SQL (see apiSearchByName).
             if ($orderField === 'searchname') {
-                return $this->apiSearchByName($criteria, $offset, $limit, $orderDir);
+                $byName = $this->apiSearchByName($criteria, $offset, $limit, $orderDir);
+                if ($byName !== null) {
+                    return $byName;
+                }
+
+                // The index had no candidates (empty during a rebuild, or the query failed): fall back like the
+                // other sort orders do.
+                return $hasText && config('nntmux.mysql_search_fallback', false) === true
+                    ? $this->apiSearchLegacyMysql($searchName, $groupName, $offset, $limit, $maxAge, $excludedCats, $cat, $minSize, $orderBy, bypassIndex: true)
+                    : new Collection;
             }
 
             $criteria['track_total'] = $cursor === null;
@@ -296,7 +305,7 @@ class ReleaseSearchService
             }
 
             if ($filtered['ids'] === [] && $hasText && config('nntmux.mysql_search_fallback', false) === true) {
-                return $this->apiSearchLegacyMysql($searchName, $groupName, $offset, $limit, $maxAge, $excludedCats, $cat, $minSize, $orderBy);
+                return $this->apiSearchLegacyMysql($searchName, $groupName, $offset, $limit, $maxAge, $excludedCats, $cat, $minSize, $orderBy, bypassIndex: true);
             }
 
             if ($filtered['ids'] === []) {
@@ -359,9 +368,9 @@ class ReleaseSearchService
      * so clients can never page past what the ordering covers.
      *
      * @param  array<string, mixed>  $criteria
-     * @return Collection<int, Release>
+     * @return Collection<int, Release>|null Null when the index returned no candidates at all.
      */
-    private function apiSearchByName(array $criteria, int $offset, int $limit, string $orderDir): Collection
+    private function apiSearchByName(array $criteria, int $offset, int $limit, string $orderDir): ?Collection
     {
         $criteria['sort_field'] = 'postdate_ts';
         $criteria['sort_dir'] = 'desc';
@@ -370,7 +379,10 @@ class ReleaseSearchService
 
         $candidates = Search::searchReleasePage(ReleaseSearchQuery::fromCriteria($criteria, self::SEARCH_INDEX_MAX_CANDIDATES, 0));
         $total = count($candidates->ids);
-        if ($total === 0 || $offset >= $total) {
+        if ($total === 0) {
+            return null;
+        }
+        if ($offset >= $total) {
             return new Collection;
         }
 
@@ -414,14 +426,26 @@ class ReleaseSearchService
      *
      * @param  array<int|string, mixed>  $cat
      */
-    private function apiSearchLegacyMysql(mixed $searchName, mixed $groupName, int $offset, int $limit, int $maxAge, array $excludedCats, array $cat, int $minSize, string $orderBy = 'posted_desc'): mixed
+    /**
+     * @param  array<int, int|string>  $excludedCats
+     * @param  array<int, int|string>  $cat
+     * @param  bool  $bypassIndex  Find text candidates in MySQL only. Set when the index already returned no
+     *                             candidates for the full filters: an unfiltered index lookup could return only
+     *                             unrelated IDs and keep database-only matches out.
+     */
+    private function apiSearchLegacyMysql(mixed $searchName, mixed $groupName, int $offset, int $limit, int $maxAge, array $excludedCats, array $cat, int $minSize, string $orderBy = 'posted_desc', bool $bypassIndex = false): mixed
     {
         [$orderField, $orderDir] = $this->getBrowseOrder($orderBy);
         $searchLimit = $this->determineSearchCandidateLimit($offset, $limit);
 
         $searchResult = [];
         $hasText = $searchName !== -1 && $searchName !== '' && $searchName !== null;
-        if ($hasText) {
+        if ($hasText && $bypassIndex) {
+            $searchResult = $this->performMySQLSearch(['searchname' => $searchName], $searchLimit);
+            if ($searchResult === []) {
+                return collect();
+            }
+        } elseif ($hasText) {
             $fuzzyResult = Search::searchReleasesWithFuzzy($searchName, $searchLimit);
             $searchResult = $fuzzyResult['ids'] ?? [];
 

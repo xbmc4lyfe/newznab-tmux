@@ -128,7 +128,14 @@ final class MetadataSources
      */
     public static function logDailySummary(): bool
     {
-        if (! Cache::add(self::summaryCacheKey(), true, now()->addDay())) {
+        // Best effort: the tmux monitor calls this every cycle, and a cache outage must not stop it.
+        try {
+            if (! Cache::add(self::summaryCacheKey(), true, now()->addDay())) {
+                return false;
+            }
+        } catch (\Throwable $e) {
+            Log::debug('Metadata source summary skipped: '.$e->getMessage());
+
             return false;
         }
 
