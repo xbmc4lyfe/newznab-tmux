@@ -63,7 +63,9 @@ class IrcScraperCommand extends Command
             return self::FAILURE;
         }
 
-        return count($networks) === 1 ? $this->scrape($networks[0]) : $this->supervise($networks);
+        // An explicit --network is a supervisor child (or a manual one-off run). Otherwise supervise, even a
+        // single network, so a dropped connection or stale stream is restarted rather than ending the command.
+        return is_string($network) && $network !== '' ? $this->scrape($network) : $this->supervise($networks);
     }
 
     /**

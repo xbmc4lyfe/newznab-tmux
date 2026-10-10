@@ -64,6 +64,19 @@ final class WebSocketClientTest extends TestCase
     }
 
     #[Test]
+    public function an_oversized_fragmented_message_closes_the_connection(): void
+    {
+        [$client, $server] = $this->connectedPair(maxMessageBytes: 8);
+
+        fwrite($server, "\x01\x05aaaaa\x00\x05bbbbb");
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('exceeds 8 bytes');
+
+        $client->receive(1);
+    }
+
+    #[Test]
     public function unmasked_server_frames_decode_and_partial_frames_wait_for_more_bytes(): void
     {
         // predb.club's heartbeat: an unmasked ping frame carrying "hb".
@@ -79,12 +92,12 @@ final class WebSocketClientTest extends TestCase
      *
      * @return array{0: WebSocketClient, 1: resource}
      */
-    private function connectedPair(): array
+    private function connectedPair(int $maxMessageBytes = 4 * 1024 * 1024): array
     {
         [$clientEnd, $serverEnd] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         stream_set_timeout($clientEnd, 1);
 
-        $client = new WebSocketClient('ws://localhost/ws', timeout: 1);
+        $client = new WebSocketClient('ws://localhost/ws', timeout: 1, maxMessageBytes: $maxMessageBytes);
         (new ReflectionProperty(WebSocketClient::class, 'stream'))->setValue($client, $clientEnd);
 
         return [$client, $serverEnd];

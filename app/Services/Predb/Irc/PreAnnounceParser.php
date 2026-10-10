@@ -52,7 +52,7 @@ final class PreAnnounceParser
      */
     private const PATTERNS = [
         'corruptnet' => [
-            '/^(?<type>[A-Z]+):\s*\[(?<section>[^\]]+)\]\s+(?<title>\S+)$/',
+            '/^(?<type>PRE):\s*\[(?<section>[^\]]+)\]\s+(?<title>\S+)$/',
             '/^(?<type>INFO):\s*(?<title>\S+)\s+\[(?<files>\d+)F\s+(?<size>[\d.]+)MB\]/',
             '/^(?<type>[A-Z]+):\s*(?<title>\S+)\s+\[(?<reason>[^\]]*)\]/',
         ],
@@ -115,6 +115,11 @@ final class PreAnnounceParser
         $reason = trim($m['reason'] ?? '');
         $section = trim($m['section'] ?? '');
         $info = $type === 'INFO';
+
+        // An INFO line only counts when it carries both the file count and the size.
+        if ($info && (($m['files'] ?? '') === '' || ($m['size'] ?? '') === '')) {
+            return null;
+        }
 
         return new PredbFeedEntry(
             title: $title,
