@@ -38,6 +38,11 @@ class WebSocketClient
 
     private int $lastFrameAt = 0;
 
+    /**
+     * Fragments of a message still being received; kept across receive() calls that time out.
+     */
+    private string $partial = '';
+
     public function __construct(
         private readonly string $url,
         private readonly int $timeout = 15,
@@ -68,6 +73,7 @@ class WebSocketClient
         stream_set_timeout($stream, $this->timeout);
         $this->stream = $stream;
         $this->buffer = '';
+        $this->partial = '';
 
         $key = base64_encode(random_bytes(16));
         $origin = ($secure ? 'https' : 'http').'://'.$host;
@@ -96,7 +102,6 @@ class WebSocketClient
      */
     public function receive(int $idleSeconds): ?string
     {
-        $message = '';
         $deadline = time() + $idleSeconds;
 
         while (true) {
@@ -121,8 +126,11 @@ class WebSocketClient
                 case self::OP_TEXT:
                 case self::OP_BINARY:
                 case self::OP_CONTINUATION:
-                    $message .= $payload;
+                    $this->partial .= $payload;
                     if ($fin) {
+                        $message = $this->partial;
+                        $this->partial = '';
+
                         return $message;
                     }
                     break;
