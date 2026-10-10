@@ -231,6 +231,11 @@ class WebSocketClient
             }
             $length = unpack('J', substr($bytes, 2, 8))[1];
             $offset = 10;
+
+            // RFC 6455: the most significant bit of a 64-bit length must be 0 (it unpacks as negative).
+            if ($length < 0) {
+                throw new RuntimeException('WebSocket frame length has the reserved high bit set.');
+            }
         }
 
         if ($length > self::MAX_FRAME_BYTES) {

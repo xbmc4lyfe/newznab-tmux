@@ -42,12 +42,24 @@ final class WebSocketClientTest extends TestCase
     }
 
     #[Test]
+    public function a_64_bit_length_with_the_reserved_high_bit_is_rejected(): void
+    {
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('reserved high bit');
+
+        WebSocketClient::decodeFrame("\x81\x7F\x80\x00\x00\x00\x00\x00\x00\x05hello");
+    }
+
+    #[Test]
     public function the_host_header_names_non_default_ports(): void
     {
         $this->assertSame('predb.club', WebSocketClient::authority('predb.club', 443, true));
         $this->assertSame('predb.club:8443', WebSocketClient::authority('predb.club', 8443, true));
         $this->assertSame('localhost', WebSocketClient::authority('localhost', 80, false));
         $this->assertSame('localhost:9000', WebSocketClient::authority('localhost', 9000, false));
+        // parse_url() keeps IPv6 brackets, so the socket address and Host header are both bracketed.
+        $this->assertSame('[::1]', parse_url('ws://[::1]:9000/ws', PHP_URL_HOST));
+        $this->assertSame('[::1]:9000', WebSocketClient::authority('[::1]', 9000, false));
     }
 
     #[Test]
