@@ -69,6 +69,12 @@ class ReleaseProcessingContext
     public bool $archiveListingUndecodable = false;
 
     /**
+     * An archive attempt failed in a way a later pass may not: missing articles,
+     * an unavailable group, or data that couldn't be read yet.
+     */
+    public bool $archiveRetryable = false;
+
+    /**
      * @var list<array<string, mixed>>
      */
     public array $nzbContents = [];
@@ -204,6 +210,7 @@ class ReleaseProcessingContext
         $this->nzbHasCompressedFile = false;
         $this->archiveInspectionAttempted = false;
         $this->archiveListingUndecodable = false;
+        $this->archiveRetryable = false;
         $this->groupUnavailable = false;
         $this->workPlan = null;
         $this->releaseDownloadedArchives();

@@ -332,10 +332,12 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->assertSame(now()->subHour()->toDateTimeString(), (string) $release->archive_retry_at);
     }
 
-    #[DataProvider('unretriableArchiveScenarios')]
-    public function test_an_archive_is_not_retried_when_a_later_attempt_cannot_read_it(
+    #[DataProvider('archiveRetryScenarios')]
+    public function test_an_unreadable_archive_is_retried_only_when_a_later_attempt_could_read_it(
         bool $inspectionAttempted,
         bool $listingUndecodable,
+        bool $retryable,
+        bool $expectRetry,
     ): void {
         DB::table('releases')->insert($this->releaseRow());
         Search::shouldReceive('updateRelease')->once()->with(1);
@@ -344,22 +346,24 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $context->nzbHasCompressedFile = true;
         $context->archiveInspectionAttempted = $inspectionAttempted;
         $context->archiveListingUndecodable = $listingUndecodable;
+        $context->archiveRetryable = $retryable;
         $this->makeManager()->finalizeRelease($context, true);
 
         $release = DB::table('releases')->where('id', 1)->first();
         $this->assertSame(-1, (int) $release->passwordstatus);
-        $this->assertSame(0, (int) $release->haspreview);
-        $this->assertNull($release->archive_retry_at);
+        $this->assertSame($expectRetry ? -1 : 0, (int) $release->haspreview);
+        $this->assertSame($expectRetry, $release->archive_retry_at !== null);
     }
 
     /**
-     * @return array<string, array{bool, bool}>
+     * @return array<string, array{bool, bool, bool, bool}>
      */
-    public static function unretriableArchiveScenarios(): array
+    public static function archiveRetryScenarios(): array
     {
         return [
-            'inspection skipped (book flood or downloads disabled)' => [false, false],
-            'compressed 7z header' => [true, true],
+            'inspection skipped (book flood or downloads disabled)' => [false, false, false, false],
+            'only a compressed 7z header' => [true, true, false, false],
+            'compressed 7z header and another archive missing articles' => [true, true, true, true],
         ];
     }
 

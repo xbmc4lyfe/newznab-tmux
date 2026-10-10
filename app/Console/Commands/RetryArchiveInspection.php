@@ -8,6 +8,7 @@ use App\Models\Release;
 use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Query\Builder as QueryBuilder;
 
 class RetryArchiveInspection extends Command
 {
@@ -63,15 +64,33 @@ class RetryArchiveInspection extends Command
     }
 
     /**
+     * Releases the worker's candidate query would pick up again once queued:
+     * an enabled category and a size within the post-processing bounds.
+     *
      * @return Builder<Release>
      */
     private function eligible(): Builder
     {
-        return Release::query()
+        $query = Release::query()
             ->where('passwordstatus', -1)
             ->where('haspreview', 0)
             ->where('nzbstatus', 1)
-            ->whereNull(AdditionalCandidateQuery::ARCHIVE_RETRY_COLUMN);
+            ->whereNull(AdditionalCandidateQuery::ARCHIVE_RETRY_COLUMN)
+            ->whereIn('categories_id', static fn (QueryBuilder $categories) => $categories
+                ->select('id')
+                ->from('categories')
+                ->where('disablepreview', 0));
+
+        $min = AdditionalCandidateQuery::minSizeBytes();
+        $max = AdditionalCandidateQuery::maxSizeBytes();
+        if ($min > 0) {
+            $query->where('size', '>', $min);
+        }
+        if ($max > 0) {
+            $query->where('size', '<', $max);
+        }
+
+        return $query;
     }
 
     private function archiveType(string $name): string

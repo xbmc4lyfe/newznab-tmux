@@ -274,7 +274,7 @@ class ReleaseFileManager
                 // Only retry when inspection ran and a later attempt could still read the list.
                 $retried = $updateRows['haspreview'] === 0
                     && $context->archiveInspectionAttempted
-                    && ! $context->archiveListingUndecodable
+                    && (! $context->archiveListingUndecodable || $context->archiveRetryable)
                     && Release::query()
                         ->where('id', $context->release->id)
                         ->whereNull(AdditionalCandidateQuery::ARCHIVE_RETRY_COLUMN)

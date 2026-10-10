@@ -298,6 +298,8 @@ class ReleaseProcessor
                     $context->groupUnavailable = true;
                 }
                 if (! $result['success'] || ! is_string($result['data'])) {
+                    $context->archiveRetryable = true;
+
                     return;
                 }
 
@@ -606,6 +608,7 @@ class ReleaseProcessor
 
             if ($result['groupUnavailable']) {
                 $context->groupUnavailable = true;
+                $context->archiveRetryable = true;
                 $this->output->echoGroupUnavailable();
                 break;
             }
@@ -625,6 +628,7 @@ class ReleaseProcessor
                 }
             } else {
                 $failed++;
+                $context->archiveRetryable = true;
                 $this->output->echoCompressedFailure($failed);
             }
         }
