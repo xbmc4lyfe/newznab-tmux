@@ -88,6 +88,8 @@ return [
             'enabled' => (bool) env('SCRAPE_IRC_SYNIRC_ENABLED', true),
             'format' => 'nntmux',
         ],
+        // Each IRC network's parser reads every channel it joins: PRE lines add releases, INFO lines
+        // (in the *.spam channels) only fill in files and size for releases already stored.
         'corruptnet' => [
             'enabled' => (bool) env('SCRAPE_IRC_CORRUPTNET_ENABLED', false),
             'format' => 'corruptnet',
@@ -95,7 +97,7 @@ return [
             'server' => env('SCRAPE_IRC_CORRUPTNET_SERVER', 'irc.corrupt-net.org'),
             'port' => (int) env('SCRAPE_IRC_CORRUPTNET_PORT', 6697),
             'tls' => true,
-            'channels' => ['#pre' => null],
+            'channels' => ['#pre' => null, '#Pre.Spam' => null],
         ],
         'zenet' => [
             'enabled' => (bool) env('SCRAPE_IRC_ZENET_ENABLED', false),
@@ -106,7 +108,7 @@ return [
             'tls' => true,
             // zenet's TLS certificate does not name irc.zenet.org; the chain is still verified.
             'tls_verify_peer_name' => false,
-            'channels' => ['#pre' => null],
+            'channels' => ['#pre' => null, '#Pre.Spam' => null],
         ],
         'predatabase' => [
             'enabled' => (bool) env('SCRAPE_IRC_PREDATABASE_ENABLED', false),
@@ -115,7 +117,58 @@ return [
             'server' => env('SCRAPE_IRC_PREDATABASE_SERVER', 'irc.predataba.se'),
             'port' => (int) env('SCRAPE_IRC_PREDATABASE_PORT', 6697),
             'tls' => true,
+            // #p2ptrace announces P2P releases (WEB-DL groups) that the scene pre channels never carry.
+            'channels' => ['#pre' => null, '#pre.spam' => null, '#p2ptrace' => null],
+        ],
+        'efnet' => [
+            'enabled' => (bool) env('SCRAPE_IRC_EFNET_ENABLED', false),
+            'format' => 'corruptnet',
+            'source' => 'efnet',
+            'server' => env('SCRAPE_IRC_EFNET_SERVER', 'irc.efnet.org'),
+            'port' => (int) env('SCRAPE_IRC_EFNET_PORT', 6697),
+            'tls' => true,
             'channels' => ['#pre' => null],
+        ],
+        'abjects' => [
+            'enabled' => (bool) env('SCRAPE_IRC_ABJECTS_ENABLED', false),
+            'format' => 'zenet',
+            'source' => 'abjects',
+            'server' => env('SCRAPE_IRC_ABJECTS_SERVER', 'irc.abjects.net'),
+            'port' => (int) env('SCRAPE_IRC_ABJECTS_PORT', 6697),
+            'tls' => true,
+            'channels' => ['#MG-Pre' => null],
+        ],
+        'ngp' => [
+            'enabled' => (bool) env('SCRAPE_IRC_NGP_ENABLED', false),
+            'format' => 'ngp',
+            'source' => 'ngp.re',
+            'server' => env('SCRAPE_IRC_NGP_SERVER', 'irc.ngp.re'),
+            'port' => (int) env('SCRAPE_IRC_NGP_PORT', 6697),
+            'tls' => true,
+            'channels' => ['#ngpre' => null, '#ngpre.p2p.spam' => null],
+        ],
+        'rizon' => [
+            'enabled' => (bool) env('SCRAPE_IRC_RIZON_ENABLED', false),
+            'format' => 'rizon',
+            'source' => 'rizon',
+            'server' => env('SCRAPE_IRC_RIZON_SERVER', 'irc.rizon.net'),
+            'port' => (int) env('SCRAPE_IRC_RIZON_PORT', 6697),
+            'tls' => true,
+            'channels' => ['#pre' => null],
+        ],
+        // WebSocket push feeds (not IRC): the same rows as the predb.club and predb.net JSON APIs, about
+        // a second after the pre. The scheduled feed import still backfills anything missed while disconnected.
+        'predbclub_ws' => [
+            'enabled' => (bool) env('PREDB_STREAM_PREDB_CLUB_ENABLED', false),
+            'type' => 'websocket',
+            'format' => 'predb_club',
+            'url' => env('PREDB_STREAM_PREDB_CLUB_URL', 'wss://predb.club/api/v1/ws'),
+        ],
+        'predbnet_ws' => [
+            'enabled' => (bool) env('PREDB_STREAM_PREDB_NET_ENABLED', false),
+            'type' => 'websocket',
+            'format' => 'predb_net',
+            'url' => env('PREDB_STREAM_PREDB_NET_URL', 'wss://api.predb.net/ws'),
         ],
     ],
 

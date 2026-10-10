@@ -65,7 +65,7 @@ class IRCScraper extends IRCClient
     /**
      * Connection profile from IrcNetworks::resolve().
      *
-     * @var array{name: string, format: string, source: ?string, server: string, port: int, tls: bool, tls_verify_peer_name: ?bool, channels: array<string, ?string>}
+     * @var array{name: string, type: string, format: string, source: ?string, server: string, port: int, tls: bool, tls_verify_peer_name: ?bool, channels: array<string, ?string>, url: ?string}
      */
     protected array $_network;
 
@@ -154,10 +154,7 @@ class IRCScraper extends IRCClient
 
         // Connect to IRC.
         if ($this->connect($server, $port, $this->_network['tls']) === false) {
-            exit(
-                'Error connecting to ('.$server.':'.$port.'). Please verify your server information and try again.'.
-                PHP_EOL
-            );
+            $this->fail('Error connecting to ('.$server.':'.$port.'). Please verify your server information and try again.');
         }
 
         // Normalize password to ?string. The server password belongs to the configured (synirc/ZNC) server only.
@@ -166,11 +163,9 @@ class IRCScraper extends IRCClient
 
         // Login to IRC. Note parameter order: nick, user, real, pass.
         if ($this->login((string) config('irc_settings.scrape_irc_nickname'), (string) config('irc_settings.scrape_irc_username'), (string) config('irc_settings.scrape_irc_realname'), $password) === false) {
-            exit(
-                'Error logging in to: ('.
-                $server.':'.$port.') nickname: ('.config('irc_settings.scrape_irc_nickname').
-                '). Verify your connection information, you might also be banned from this server or there might have been a connection issue.'.
-                PHP_EOL
+            $this->fail(
+                'Error logging in to: ('.$server.':'.$port.') nickname: ('.config('irc_settings.scrape_irc_nickname').
+                '). Verify your connection information, you might also be banned from this server or there might have been a connection issue.'
             );
         }
 
@@ -188,6 +183,16 @@ class IRCScraper extends IRCClient
 
         // Scan incoming IRC messages.
         $this->readIncoming();
+    }
+
+    /**
+     * Report a fatal connection or login error and exit non-zero, so a supervisor can back off.
+     */
+    protected function fail(string $message): never
+    {
+        fwrite(STDERR, $message.PHP_EOL);
+
+        exit(1);
     }
 
     /**
@@ -313,7 +318,7 @@ class IRCScraper extends IRCClient
         $result = $this->_importer->import([$entry]);
 
         if (! $this->_silent && $result['skipped'] === 0) {
-            echo '['.date('r').'] ['.($result['inserted'] > 0 ? 'Added Pre ' : 'Updated Pre').'] ['.
+            echo '['.date('r').'] ['.($result['inserted'] > 0 ? 'Added Pre ' : ($entry->enrichOnly ? 'Info Pre  ' : 'Updated Pre')).'] ['.
                 $entry->source.'] ['.$entry->title.']'.($entry->category !== null ? ' ['.$entry->category.']' : '').PHP_EOL;
         }
     }
@@ -325,7 +330,7 @@ class IRCScraper extends IRCClient
      */
     protected function _checkForDupe(): void
     {
-        $this->_oldPre = Predb::query()->where('title', $this->_curPre['title'])->select(['category', 'size'])->first();
+        $this->_oldPre = Predb::query()->where('title', $this->_curPre['title'])->select(['category', 'size', 'source'])->first();
         if ($this->_oldPre === null) {
             if ($this->_debug && ! $this->_silent) {
                 echo '[DEBUG] New PRE found, inserting: '.$this->_curPre['title'].PHP_EOL;
@@ -448,7 +453,8 @@ class IRCScraper extends IRCClient
         $query = 'UPDATE predb SET ';
 
         $query .= (! empty($this->_curPre['size']) ? 'size = '.escapeString($this->_curPre['size']).', ' : '');
-        $query .= (! empty($this->_curPre['source']) ? 'source = '.escapeString($this->_curPre['source']).', ' : '');
+        // Keep the source of the ingester that stored the PRE first; an update only names a missing source.
+        $query .= (! empty($this->_curPre['source']) && empty($this->_oldPre['source']) ? 'source = '.escapeString($this->_curPre['source']).', ' : '');
         $query .= (! empty($this->_curPre['files']) ? 'files = '.escapeString($this->_curPre['files']).', ' : '');
         $query .= (! empty($this->_curPre['reason']) ? 'nukereason = '.escapeString($this->_curPre['reason']).', ' : '');
         $query .= (! empty($this->_curPre['reqid']) ? 'requestid = '.$this->_curPre['reqid'].', ' : '');
