@@ -8,6 +8,7 @@ use App\Services\Predb\Stream\WebSocketClient;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use ReflectionProperty;
 
 final class WebSocketClientTest extends TestCase
 {
@@ -41,6 +42,19 @@ final class WebSocketClientTest extends TestCase
     }
 
     #[Test]
+    public function a_fragmented_message_survives_an_idle_timeout_between_fragments(): void
+    {
+        [$client, $server] = $this->connectedPair();
+
+        // Server frames are unmasked: first fragment (FIN=0, text), then the final continuation (FIN=1).
+        fwrite($server, "\x01\x05{\"a\":");
+        $this->assertNull($client->receive(1));
+
+        fwrite($server, "\x80\x021}");
+        $this->assertSame('{"a":1}', $client->receive(1));
+    }
+
+    #[Test]
     public function unmasked_server_frames_decode_and_partial_frames_wait_for_more_bytes(): void
     {
         // predb.club's heartbeat: an unmasked ping frame carrying "hb".
@@ -49,5 +63,21 @@ final class WebSocketClientTest extends TestCase
         $this->assertSame([true, 0x9, 'hb', 4], WebSocketClient::decodeFrame($ping));
         $this->assertNull(WebSocketClient::decodeFrame("\x89\x02h"));
         $this->assertNull(WebSocketClient::decodeFrame("\x81"));
+    }
+
+    /**
+     * A client wired to one end of a local socket pair, skipping the HTTP handshake.
+     *
+     * @return array{0: WebSocketClient, 1: resource}
+     */
+    private function connectedPair(): array
+    {
+        [$clientEnd, $serverEnd] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        stream_set_timeout($clientEnd, 1);
+
+        $client = new WebSocketClient('ws://localhost/ws', timeout: 1);
+        (new ReflectionProperty(WebSocketClient::class, 'stream'))->setValue($client, $clientEnd);
+
+        return [$client, $serverEnd];
     }
 }
