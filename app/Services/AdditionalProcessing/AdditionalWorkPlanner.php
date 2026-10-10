@@ -11,7 +11,9 @@ use Illuminate\Support\Facades\Log;
 
 final readonly class AdditionalWorkPlanner
 {
-    private const string ARCHIVE_PATTERN = '/(\.(part\d+|[rz]\d+|rar|0+|0*10?|zipr\d{2,3}|zipx?)("|\s*\.rar)*($|[ ")]|-])|"[a-f0-9]{32}\.[1-9]\d{1,2}".*\(\d+\/\d{2,}\)$)/i';
+    private const string SEVEN_ZIP_PATTERN = '/([^"\s\/]+)\.7z(?:\.(\d{3}))?($|[ ")]|-)/i';
+
+    private const string ARCHIVE_PATTERN = '/(\.(part\d+|[rz]\d+|rar|7z|0+|0*10?|zipr\d{2,3}|zipx?)("|\s*\.rar)*($|[ ")]|-])|"[a-f0-9]{32}\.[1-9]\d{1,2}".*\(\d+\/\d{2,}\)$)/i';
 
     public function __construct(private ProcessingConfiguration $config) {}
 
@@ -29,6 +31,7 @@ final readonly class AdditionalWorkPlanner
         $bookFileCount = 0;
         $duplicateMessageIdCount = 0;
         $seenMessageIds = [];
+        $sevenZipTails = [];
 
         foreach (array_values($nzbContents) as $sourceIndex => $file) {
             if (! is_array($file)) {
@@ -41,6 +44,14 @@ final readonly class AdditionalWorkPlanner
 
                 if (preg_match($this->config->ignoreBookRegex, $title) === 1) {
                     $bookFileCount++;
+                }
+
+                // 7z keeps its file list at the end of the last volume.
+                $sevenZip = $this->sevenZipVolume($title);
+                if ($sevenZip !== null && $segments !== []
+                    && ($sevenZipTails[$sevenZip[0]][0] ?? -1) < $sevenZip[1]
+                ) {
+                    $sevenZipTails[$sevenZip[0]] = [$sevenZip[1], (string) $segments[array_key_last($segments)]];
                 }
 
                 if (preg_match(self::ARCHIVE_PATTERN, $title) === 1) {
@@ -108,9 +119,25 @@ final readonly class AdditionalWorkPlanner
             }
         }
 
+        foreach ($archiveCandidates as $index => $candidate) {
+            $sevenZip = $this->sevenZipVolume($candidate->title);
+            $tail = $sevenZip === null ? null : ($sevenZipTails[$sevenZip[0]][1] ?? null);
+            if ($tail !== null && $candidate->likelyFirstVolume && ! in_array($tail, $candidate->messageIds, true)) {
+                $archiveCandidates[$index] = new ArchiveCandidate(
+                    title: $candidate->title,
+                    messageIds: $candidate->messageIds,
+                    likelyFirstVolume: true,
+                    sourceIndex: $candidate->sourceIndex,
+                    tailMessageIds: [$tail],
+                );
+            }
+        }
+
         // A lone file without an extension can't be classified by name; sample its first segment.
         // The entry must stand for exactly one NZB file, not several merged by a stripped subject.
         $probeMessageId = '';
+        $probeTailMessageIds = [];
+        $probeContinuationMessageIds = [];
         if ($archiveCandidates === [] && count($nzbContents) === 1) {
             $only = array_values($nzbContents)[0];
             if (is_array($only) && isset($only['segments'][0])
@@ -118,6 +145,18 @@ final readonly class AdditionalWorkPlanner
                 && ! $this->hasFileExtension((string) ($only['title'] ?? ''))
             ) {
                 $probeMessageId = (string) $only['segments'][0];
+                $probeArchiveMessageIds = $this->extractSegments(
+                    $only['segments'],
+                    max(1, $this->config->maximumRarSegments),
+                    $seenMessageIds,
+                    $duplicateMessageIdCount,
+                );
+                $probeContinuationMessageIds = array_slice($probeArchiveMessageIds, 1);
+                // A 7z found by the probe needs its last segment for the file list.
+                $lastSegment = (string) $only['segments'][array_key_last($only['segments'])];
+                if ($lastSegment !== $probeMessageId) {
+                    $probeTailMessageIds = [$lastSegment];
+                }
             }
         }
 
@@ -148,6 +187,8 @@ final readonly class AdditionalWorkPlanner
             duplicateMessageIdCount: $duplicateMessageIdCount,
             unsupportedReasons: $unsupportedReasons,
             probeMessageId: $probeMessageId,
+            probeTailMessageIds: $probeTailMessageIds,
+            probeContinuationMessageIds: $probeContinuationMessageIds,
         );
     }
 
@@ -176,7 +217,28 @@ final readonly class AdditionalWorkPlanner
             return (int) $position[1] === 1;
         }
 
+        $sevenZip = $this->sevenZipVolume($title);
+        if ($sevenZip !== null) {
+            return $sevenZip[1] <= 1;
+        }
+
         return preg_match('/\.(rar|zip)($|[ ")]|-])/i', $title) === 1;
+    }
+
+    /**
+     * @return array{0: string, 1: int}|null set name and volume number (0 for a single .7z)
+     */
+    private function sevenZipVolume(string $title): ?array
+    {
+        if (preg_match('/"([^"\r\n]+)\.7z(?:\.(\d{3}))?"/i', $title, $match) === 1) {
+            return [strtolower($match[1]), (int) ($match[2] ?? 0)];
+        }
+
+        if (preg_match(self::SEVEN_ZIP_PATTERN, $title, $match) !== 1) {
+            return null;
+        }
+
+        return [strtolower($match[1]), (int) $match[2]];
     }
 
     /**
