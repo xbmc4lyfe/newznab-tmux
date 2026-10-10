@@ -588,8 +588,8 @@ class IRCClient
                 if ($remaining <= 0) {
                     break;
                 }
-                // Share what is left evenly, so every address gets an attempt (at least a second each).
-                $share = min($remaining, max(1.0, $remaining / (\count($addresses) - $index)));
+                // Share what is left evenly, so every address gets an attempt.
+                $share = $remaining / (\count($addresses) - $index);
                 $literal = str_contains($address, ':') ? '['.$address.']' : $address;
                 $socket = $this->_openSocket($this->_remote_transport.'://'.$literal.':'.$this->_remote_port, $this->_remote_host, $error_number, $error_string, $share);
                 if ($socket !== false) {
@@ -617,10 +617,13 @@ class IRCClient
     protected function _resolveAddresses(string $host): array
     {
         $addresses = [];
-        foreach (@dns_get_record($host, DNS_A | DNS_AAAA) ?: [] as $record) {
-            $address = $record['ip'] ?? $record['ipv6'] ?? null;
-            if (\is_string($address) && $address !== '') {
-                $addresses[] = $address;
+        // Query each type on its own: a failing AAAA lookup would make a combined query return nothing at all.
+        foreach ([DNS_A, DNS_AAAA] as $type) {
+            foreach (@dns_get_record($host, $type) ?: [] as $record) {
+                $address = $record['ip'] ?? $record['ipv6'] ?? null;
+                if (\is_string($address) && $address !== '') {
+                    $addresses[] = $address;
+                }
             }
         }
         shuffle($addresses);
