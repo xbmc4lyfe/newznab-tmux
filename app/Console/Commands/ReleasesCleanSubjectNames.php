@@ -30,8 +30,8 @@ use Illuminate\Support\Facades\DB;
 #[Description('Rename releases still named after a raw "[n/m] - \"file\"" posting subject')]
 class ReleasesCleanSubjectNames extends Command
 {
-    /** Search names that are still a raw counter-and-file subject. */
-    private const string RAW_SUBJECT_LIKE = '[%/%] - "%';
+    /** Search names that may still be a raw counter-and-file subject (`[1/9] - "`, `[1/9] "`, `[1/9]-"`). */
+    private const string RAW_SUBJECT_LIKE = '[%/%]%"%';
 
     public function handle(ReleaseCleaningService $cleaner, ReleaseUpdateService $updater): int
     {
@@ -77,8 +77,15 @@ class ReleasesCleanSubjectNames extends Command
                     continue;
                 }
 
+                // A name-fixing worker may have renamed it since this chunk was read; never overwrite that.
+                $unchanged = DB::table('releases')->where('id', $row->id)->where('isrenamed', 0)->where('searchname', $row->searchname)->exists();
+                if (! $unchanged) {
+                    continue;
+                }
+
                 $before = $updater->fixed;
-                $updater->updateRelease($row, $name, 'Subject cleaner', true, 'Subject, ', false, false, $preId);
+                // An exact PreDB title is a proper name, as at release creation.
+                $updater->updateRelease($row, $name, 'Subject cleaner', true, 'Subject, ', $preId > 0, false, $preId);
                 if ($updater->fixed > $before) {
                     $renamed++;
                     $linked += $preId > 0 ? 1 : 0;
@@ -98,12 +105,19 @@ class ReleasesCleanSubjectNames extends Command
      */
     private function cleanName(ReleaseCleaningService $cleaner, object $row): array
     {
-        $meta = $cleaner->releaseCleaner((string) $row->name, (string) $row->fromname, (string) $row->group_name);
+        // The search name kept the subject's original characters; `name` had `#%$@^` and the like removed.
+        $meta = $cleaner->releaseCleaner((string) $row->searchname, (string) $row->fromname, (string) $row->group_name);
         $name = is_array($meta) ? trim((string) ($meta['cleansubject'] ?? '')) : '';
         $preId = is_array($meta) ? max(0, (int) ($meta['predb'] ?? 0)) : 0;
 
         // Still a counter-and-file subject: no cleaner recognised it (for example a hashed file name).
         if ($name === '' || preg_match('/^\[\s*\d+\s*\/\s*\d+\s*\]/', $name) === 1) {
+            return [null, 0];
+        }
+
+        // The name-fixing update path drops non-ASCII characters, which would mangle an accented title.
+        // New releases keep it, so leave these rather than corrupt them.
+        if (preg_match('/[^\x20-\x7E]/', $name) === 1) {
             return [null, 0];
         }
 

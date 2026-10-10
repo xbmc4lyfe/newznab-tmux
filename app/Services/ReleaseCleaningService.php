@@ -23,11 +23,6 @@ class ReleaseCleaningService
     /**
      * `[01/10] - "file.ext"`: a file counter and a quoted file name, as most posting tools write them.
      */
-    /**
-     * One trailing file extension, archive volume or part marker, as stripped by releaseNameFromFile().
-     */
-    private const string FILE_SUFFIX = '/\.(?:par2|vol\d+[+-]\d+|part\d+|r\d{2,3}|\d{3}|rar|zip|7z|tar|zst|gz|bz2|xz|tgz|nfo|sfv|nzb|mkv|mp4|m4v|avi|ts|m2ts|wmv|mov|mpe?g|iso|img|flac|mp3|m4a|epub|pdf|mobi|azw3|cbr|cbz|srr|srt)$/i';
-
     private const string COUNTER_FILE_SUBJECT = '/^\[\s*\d+\s*\/\s*\d+\s*\]\s*-?\s*"(?P<file>[^"]{4,})"/';
 
     /**
@@ -212,7 +207,7 @@ class ReleaseCleaningService
             ];
         }
 
-        return [
+        return $this->counterFileSubjectName() ?? [
             'cleansubject' => $this->releaseCleanerHelper($this->subject),
             'properlynamed' => false,
         ];
@@ -424,17 +419,9 @@ class ReleaseCleaningService
      */
     public function generic(): array
     {
-        // Counter-and-filename subjects: `[01/10] - "Release.Name-GRP.mkv" yEnc`. The file name, minus its
-        // extension and part/volume markers, is the release name. Hashed (obfuscated) file names stay as
-        // before so the name-fixing passes can still find their real names.
-        if (preg_match(self::COUNTER_FILE_SUBJECT, $this->subject, $hit)) {
-            $fromFile = $this->releaseNameFromFile($hit['file']);
-            if ($fromFile !== null) {
-                return [
-                    'cleansubject' => $fromFile,
-                    'properlynamed' => false,
-                ];
-            }
+        $fromFile = $this->counterFileSubjectName();
+        if ($fromFile !== null) {
+            return $fromFile;
         }
 
         // This regex gets almost all of the predb release names also keep in mind that not every subject ends with yEnc, some are truncated, because of the 255 character limit and some have extra charaters tacked onto the end, like (5/10).
@@ -461,15 +448,31 @@ class ReleaseCleaningService
      */
     public function releaseNameFromFile(string $file): ?string
     {
-        $name = $this->fixerCleaner($file);
-        // Strip stacked extensions and markers (`.rar.par2`, `.tar.zst`, `.7z.003`, `.part01.rar`) until none is left.
-        do {
-            $previous = $name;
-            $name = preg_replace(self::FILE_SUFFIX, '', $name) ?? $name;
-        } while ($name !== $previous);
-        $name = trim($name, " .-_\t");
+        $fileNameCleaner = new FileNameCleaner;
+        // Not fixerCleaner(): it drops every non-ASCII character, and these names may be accented.
+        $name = $fileNameCleaner->stripFileSuffixes($file);
+        $name = preg_replace('/[.\-_](sample|proof|thumbs?)$/i', '', $name) ?? $name;
+        $name = trim(preg_replace('/\s\s+/u', ' ', $name) ?? $name, " .-_\t");
 
-        return (new FileNameCleaner)->isPlausibleReleaseTitle($name) ? $name : null;
+        return $fileNameCleaner->isPlausibleReleaseTitle($name) ? $name : null;
+    }
+
+    /**
+     * Counter-and-filename subjects: `[01/10] - "Release.Name-GRP.mkv" yEnc`. The file name, minus its
+     * extensions and part/volume markers, is the release name. Hashed (obfuscated) file names give null, so
+     * the subject stays and the name-fixing passes can still find their real names.
+     *
+     * @return array{cleansubject: string, properlynamed: false}|null
+     */
+    private function counterFileSubjectName(): ?array
+    {
+        // A trailing `lRap` is `yEnc` in ROT13: the whole subject is scrambled, so its file name is too.
+        if (preg_match(self::COUNTER_FILE_SUBJECT, $this->subject, $hit) !== 1 || preg_match('/\blRap\s*$/', $this->subject) === 1) {
+            return null;
+        }
+        $fromFile = $this->releaseNameFromFile($hit['file']);
+
+        return $fromFile === null ? null : ['cleansubject' => $fromFile, 'properlynamed' => false];
     }
 
     public function releaseCleanerHelper(string $subject): string

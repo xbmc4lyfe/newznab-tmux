@@ -51,6 +51,8 @@ class CounterSubjectNamingTest extends TestCase
         yield 'split 7z' => ['[2/9] - "Some.Movie.2020.1080p.BluRay.x264-GRP.7z.003" yEnc', 'Some.Movie.2020.1080p.BluRay.x264-GRP'];
         yield 'par2 of a rar' => ['[02/10] - "Some.App.v6.41.Multilingual-GRP.rar.par2" yEnc', 'Some.App.v6.41.Multilingual-GRP'];
         yield 'tar.zst' => ['[1/6] - "Some.Show.S01E01.1080p.WEB.h264-GRP.tar.zst" yEnc', 'Some.Show.S01E01.1080p.WEB.h264-GRP'];
+        yield 'vob' => ['[1/5] - "Movie.2020.1080p-GRP.vob" yEnc', 'Movie.2020.1080p-GRP'];
+        yield 'accented name' => ['[1/5] - "Amélie.2001.1080p.BluRay-GRP.mkv" yEnc', 'Amélie.2001.1080p.BluRay-GRP'];
         yield 'spaced p2p name' => ['[01/11] - "Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR.mkv" yEnc', 'Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR'];
     }
 
@@ -61,6 +63,14 @@ class CounterSubjectNamingTest extends TestCase
         $meta = (new ReleaseCleaningService)->releaseCleaner($subject, 'poster@example.com', 'alt.binaries.multimedia.rail');
 
         $this->assertSame($expected, $meta['cleansubject']);
+    }
+
+    #[Test]
+    public function teevee_subjects_no_group_regex_matches_get_the_file_based_release_name(): void
+    {
+        $meta = (new ReleaseCleaningService)->releaseCleaner('[01/11] - "Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR.mkv" yEnc', 'x@y.z', 'alt.binaries.teevee');
+
+        $this->assertSame('Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR', $meta['cleansubject']);
     }
 
     #[Test]
@@ -78,6 +88,14 @@ class CounterSubjectNamingTest extends TestCase
         $meta = (new ReleaseCleaningService)->releaseCleaner('[2/5] - "WinRAR 7.23 (x64) Final.rar.par2" yEnc', 'x@y.z', 'alt.binaries.multimedia.rail');
 
         $this->assertSame('[2/5] - "WinRAR 7.23 (x64) Final.rar.par2"', $meta['cleansubject']);
+    }
+
+    #[Test]
+    public function rot13_scrambled_subjects_keep_the_subject(): void
+    {
+        $meta = (new ReleaseCleaningService)->releaseCleaner('[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap', 'x@y.z', 'alt.binaries.multimedia.rail');
+
+        $this->assertSame('[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap', $meta['cleansubject']);
     }
 
     #[Test]
@@ -114,8 +132,35 @@ class CounterSubjectNamingTest extends TestCase
         // The hashed release is skipped, and the already-renamed one is never read.
         $this->assertSame([
             [1, 'Shes.the.Man.2006.BluRay.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR', 0, false],
-            [4, 'Dark.Phoenix.2019.UHD.BluRay.2160p.TrueHD.Atmos.7.1.HEVC.REMUX-FraMeSToR', 77, false],
+            [4, 'Dark.Phoenix.2019.UHD.BluRay.2160p.TrueHD.Atmos.7.1.HEVC.REMUX-FraMeSToR', 77, true],
         ], $calls);
+    }
+
+    #[Test]
+    public function the_backlog_command_cleans_the_search_name_and_skips_rows_changed_or_accented(): void
+    {
+        DB::table('releases')->insert([
+            // `name` lost the `%` when the release was created; the search name kept it.
+            ['id' => 1, 'name' => '[1/5] - "100.Wolf.2020.1080p-GRP.mkv" yEnc', 'searchname' => '[1/5] "100%.Wolf.2020.1080p-GRP.mkv"', 'fromname' => 'a@b.c', 'groups_id' => 1, 'categories_id' => 10, 'isrenamed' => 0],
+            ['id' => 2, 'name' => '[1/5] - "Amlie.2001.1080p.BluRay-GRP.mkv" yEnc', 'searchname' => '[1/5] - "Amélie.2001.1080p.BluRay-GRP.mkv"', 'fromname' => 'a@b.c', 'groups_id' => 1, 'categories_id' => 10, 'isrenamed' => 0],
+            ['id' => 3, 'name' => '[1/5] - "Other.Show.S01E01.1080p.WEB-GRP.mkv" yEnc', 'searchname' => '[1/5] - "Other.Show.S01E01.1080p.WEB-GRP.mkv"', 'fromname' => 'a@b.c', 'groups_id' => 1, 'categories_id' => 10, 'isrenamed' => 0],
+        ]);
+
+        $calls = [];
+        $updater = Mockery::mock(ReleaseUpdateService::class);
+        $updater->shouldReceive('updateRelease')->andReturnUsing(function (object $release, string $name) use (&$calls, $updater): void {
+            $calls[] = [(int) $release->id, $name];
+            $updater->fixed++;
+            // A name-fixing worker renames release 3 while this chunk is being processed.
+            DB::table('releases')->where('id', 3)->update(['searchname' => 'Other.Show.S01E01.1080p.WEB-GRP', 'isrenamed' => 1]);
+        });
+        $this->app->instance(ReleaseUpdateService::class, $updater);
+
+        $this->artisan('releases:clean-subject-names', ['--chunk' => 10])
+            ->expectsOutputToContain('Renamed 1 of 3 releases (0 linked to PreDB).')
+            ->assertSuccessful();
+
+        $this->assertSame([[1, '100%.Wolf.2020.1080p-GRP']], $calls);
     }
 
     #[Test]

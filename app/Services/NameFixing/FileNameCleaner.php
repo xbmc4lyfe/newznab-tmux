@@ -82,6 +82,33 @@ class FileNameCleaner
     private const SUBTITLE_EXTENSIONS = '/\.(srt|sub|idx|ass|ssa|vtt|sup)$/i';
 
     /**
+     * Strip every trailing file extension and archive part/volume marker, repeating until none is left, so
+     * stacked suffixes such as `.rar.par2`, `.tar.zst`, `.7z.003` and `.part01.rar` all go.
+     */
+    public function stripFileSuffixes(string $fileName): string
+    {
+        $patterns = [
+            ...self::ARCHIVE_PATTERNS,
+            '/\.(zst|tgz|lz4|enc)$/i',
+            '/\.vol\d+[+-]\d+$/i',
+            '/\.part\d{1,4}$/i',
+            self::VIDEO_EXTENSIONS,
+            self::AUDIO_EXTENSIONS,
+            self::IMAGE_EXTENSIONS,
+            self::EBOOK_EXTENSIONS,
+            self::GAMEAPP_EXTENSIONS,
+            self::SUBTITLE_EXTENSIONS,
+        ];
+
+        do {
+            $previous = $fileName;
+            $fileName = preg_replace($patterns, '', $fileName) ?? $fileName;
+        } while ($fileName !== $previous);
+
+        return $fileName;
+    }
+
+    /**
      * Clean a filename for PreDB matching.
      *
      * @param  string  $fileName  The filename to clean
