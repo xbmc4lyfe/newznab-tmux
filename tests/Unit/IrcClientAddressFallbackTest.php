@@ -41,6 +41,33 @@ class IrcClientAddressFallbackTest extends TestCase
     }
 
     #[Test]
+    public function it_connects_to_an_ipv6_address_literal(): void
+    {
+        $server = @stream_socket_server('tcp://[::1]:0', $errno, $error);
+        if ($server === false) {
+            $this->markTestSkipped('IPv6 loopback is not available.');
+        }
+        $port = (int) substr(strrchr((string) stream_socket_get_name($server, false), ':'), 1);
+
+        $client = new class extends IRCClient
+        {
+            protected function _resolveAddresses(string $host): array
+            {
+                return ['::1'];
+            }
+        };
+        $client->setConnectionRetries(0);
+        $client->setConnectionTimeout(2);
+
+        ob_start();
+        $connected = $client->connect('irc.invalid', $port);
+        ob_end_clean();
+
+        $this->assertTrue($connected);
+        fclose($server);
+    }
+
+    #[Test]
     public function it_still_fails_when_no_address_answers(): void
     {
         $client = new class extends IRCClient

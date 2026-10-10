@@ -569,7 +569,8 @@ class IRCClient
         // Try the rest of the host's addresses before giving up.
         if ($socket === false && filter_var($this->_remote_host, FILTER_VALIDATE_IP) === false) {
             foreach ($this->_resolveAddresses($this->_remote_host) as $address) {
-                $socket = $this->_openSocket($this->_remote_transport.'://'.$address.':'.$this->_remote_port, $this->_remote_host, $error_number, $error_string);
+                $literal = str_contains($address, ':') ? '['.$address.']' : $address;
+                $socket = $this->_openSocket($this->_remote_transport.'://'.$literal.':'.$this->_remote_port, $this->_remote_host, $error_number, $error_string);
                 if ($socket !== false) {
                     break;
                 }
@@ -588,16 +589,22 @@ class IRCClient
     }
 
     /**
-     * All IPv4 addresses of a host, in random order.
+     * All IPv4 and IPv6 addresses of a host, in random order.
      *
      * @return list<string>
      */
     protected function _resolveAddresses(string $host): array
     {
-        $addresses = gethostbynamel($host) ?: [];
+        $addresses = [];
+        foreach (@dns_get_record($host, DNS_A | DNS_AAAA) ?: [] as $record) {
+            $address = $record['ip'] ?? $record['ipv6'] ?? null;
+            if (\is_string($address) && $address !== '') {
+                $addresses[] = $address;
+            }
+        }
         shuffle($addresses);
 
-        return array_values($addresses);
+        return $addresses;
     }
 
     /**
