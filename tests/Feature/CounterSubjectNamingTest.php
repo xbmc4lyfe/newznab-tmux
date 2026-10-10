@@ -56,6 +56,7 @@ class CounterSubjectNamingTest extends TestCase
         yield 'encoded quotes' => ['[1/2] - #34;Movie.2020.1080p-GRP.mkv#34; yEnc', 'Movie.2020.1080p-GRP'];
         yield 'path in the file name' => ['[1/2] - "C:\\posts\\Movie.2020.1080p-GRP.mkv" yEnc', 'Movie.2020.1080p-GRP'];
         yield 'title ending in a codec token' => ['[1/5] - "Movie.2020.1080p.DTS.mkv" yEnc', 'Movie.2020.1080p.DTS'];
+        yield 'document' => ['[1/2] - "Book.Title-GRP.docx" yEnc', 'Book.Title-GRP'];
         yield 'vob' => ['[1/5] - "Movie.2020.1080p-GRP.vob" yEnc', 'Movie.2020.1080p-GRP'];
         yield 'accented name' => ['[1/5] - "Amélie.2001.1080p.BluRay-GRP.mkv" yEnc', 'Amélie.2001.1080p.BluRay-GRP'];
         yield 'spaced p2p name' => ['[01/11] - "Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR.mkv" yEnc', 'Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR'];
@@ -98,7 +99,7 @@ class CounterSubjectNamingTest extends TestCase
     #[Test]
     public function rot13_scrambled_subjects_keep_the_subject(): void
     {
-        foreach (['[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap', '[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap (1/2)', '[1/2] - "Gur.Zngevk.1999.1080c-OEC" - lRap'] as $subject) {
+        foreach (['[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap', '[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap (1/2)', '[1/2] - "Gur.Zngevk.1999.1080c-OEC" - lRap', '[1/2] - "Gur.Zngevk.1999.1080c-OEC" - 1.23 TO - lRap'] as $subject) {
             $meta = (new ReleaseCleaningService)->releaseCleaner($subject, 'x@y.z', 'alt.binaries.multimedia.rail');
 
             $this->assertStringStartsWith((string) preg_replace('/"\s*(?:-\s*)?lRap.*$/', '"', $subject), $meta['cleansubject']);

@@ -472,7 +472,11 @@ class ReleaseCleaningService
     private function counterFileSubjectName(): ?array
     {
         // `lRap` is `yEnc` in ROT13: the whole subject is scrambled, so its file name is too.
-        if (preg_match(self::COUNTER_FILE_SUBJECT, $this->subject, $hit) !== 1 || preg_match('/(?:"|#34;)\s*-?\s*lRap\b/i', $this->subject) === 1) {
+        if (preg_match(self::COUNTER_FILE_SUBJECT, $this->subject, $hit) !== 1) {
+            return null;
+        }
+        // Look after the file name only, past any size or counter between it and the marker.
+        if (preg_match('/\blRap\b/i', substr($this->subject, \strlen($hit[0]))) === 1) {
             return null;
         }
         $fromFile = $this->releaseNameFromFile($hit['file']);
