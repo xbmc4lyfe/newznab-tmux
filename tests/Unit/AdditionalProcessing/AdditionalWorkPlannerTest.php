@@ -84,6 +84,28 @@ class AdditionalWorkPlannerTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_the_last_volume_tail_for_numbered_split_volumes(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+
+        $plan = $planner->plan([
+            ['title' => '[2/3] - "abcdef.002" yEnc (1/3)', 'segments' => ['<v2-1>', '<v2-2>', '<v2-3>']],
+            ['title' => '[1/3] - "abcdef.001" yEnc (1/3)', 'segments' => ['<v1-1>', '<v1-2>', '<v1-3>']],
+            ['title' => '[3/3] - "abcdef.003" yEnc (1/2)', 'segments' => ['<v3-1>', '<v3-2>']],
+        ], 'alt.binaries.misc');
+        $rar = $planner->plan([
+            ['title' => 'Movie H.264 [1/1] - "Movie.H.264-GRP.rar" yEnc (1/2)', 'segments' => ['<r-1>', '<r-2>']],
+        ], 'alt.binaries.misc');
+
+        $this->assertSame('[1/3] - "abcdef.001" yEnc (1/3)', $plan->archiveCandidates[0]->title);
+        $this->assertTrue($plan->archiveCandidates[0]->likelyFirstVolume);
+        $this->assertSame(['<v3-2>'], $plan->archiveCandidates[0]->tailMessageIds);
+
+        $this->assertTrue($rar->archiveCandidates[0]->likelyFirstVolume);
+        $this->assertSame([], $rar->archiveCandidates[0]->tailMessageIds);
+    }
+
+    #[Test]
     public function it_reports_book_floods_and_releases_without_supported_candidates(): void
     {
         $planner = new AdditionalWorkPlanner($this->makeConfig());
