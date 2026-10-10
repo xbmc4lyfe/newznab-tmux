@@ -76,8 +76,9 @@ class WebSocketClient
         $this->partial = '';
 
         $key = base64_encode(random_bytes(16));
-        $origin = ($secure ? 'https' : 'http').'://'.$host;
-        $this->write("GET {$path} HTTP/1.1\r\nHost: {$host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n".
+        $authority = self::authority($host, $port, $secure);
+        $origin = ($secure ? 'https' : 'http').'://'.$authority;
+        $this->write("GET {$path} HTTP/1.1\r\nHost: {$authority}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n".
             "Sec-WebSocket-Key: {$key}\r\nSec-WebSocket-Version: 13\r\nOrigin: {$origin}\r\nUser-Agent: {$this->userAgent}\r\n\r\n");
 
         $headers = $this->readHandshake();
@@ -164,6 +165,16 @@ class WebSocketClient
             @fclose($this->stream);
         }
         $this->stream = null;
+    }
+
+    /**
+     * Host header value: the host, plus the port when it is not the scheme's default.
+     */
+    public static function authority(string $host, int $port, bool $secure): string
+    {
+        $host = str_contains($host, ':') && ! str_starts_with($host, '[') ? '['.$host.']' : $host;
+
+        return $port === ($secure ? 443 : 80) ? $host : $host.':'.$port;
     }
 
     /**

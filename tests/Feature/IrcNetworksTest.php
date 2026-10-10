@@ -77,6 +77,25 @@ class IrcNetworksTest extends TestCase
     }
 
     #[Test]
+    public function websocket_streams_start_without_an_irc_username(): void
+    {
+        config([
+            'irc_settings.scrape_irc_username' => '',
+            // A closed local port: the stream starts, then fails to connect instead of failing on the nickname.
+            'irc_settings.networks.predbclub_ws.url' => 'ws://127.0.0.1:9/ws',
+        ]);
+
+        $this->artisan('irc:scrape', ['--network' => 'predbclub_ws'])
+            ->expectsOutputToContain('WebSocket connect to 127.0.0.1:9 failed')
+            ->doesntExpectOutputToContain('You must put a username')
+            ->assertFailed();
+
+        $this->artisan('irc:scrape', ['--network' => 'zenet'])
+            ->expectsOutputToContain('You must put a username')
+            ->assertFailed();
+    }
+
+    #[Test]
     public function restarts_back_off_exponentially_up_to_an_hour(): void
     {
         $this->assertSame(

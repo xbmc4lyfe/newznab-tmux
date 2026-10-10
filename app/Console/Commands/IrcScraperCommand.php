@@ -47,25 +47,41 @@ class IrcScraperCommand extends Command
      */
     public function handle(): int
     {
-        if (config('irc_settings.scrape_irc_username') === '') {
-            $this->error('ERROR! You must put a username in config/irc_settings.php');
-
-            return self::FAILURE;
-        }
-
         $network = $this->option('network');
-        if (is_string($network) && $network !== '') {
-            return $this->scrape($network);
-        }
+        $networks = is_string($network) && $network !== '' ? [$network] : IrcNetworks::enabled();
 
-        $networks = IrcNetworks::enabled();
         if ($networks === []) {
             $this->error('No IRC networks are enabled in irc_settings.networks.');
 
             return self::FAILURE;
         }
 
+        // Only IRC connections need a nickname; WebSocket streams run without one.
+        if (config('irc_settings.scrape_irc_username') === '' && $this->needsIrcIdentity($networks)) {
+            $this->error('ERROR! You must put a username in config/irc_settings.php');
+
+            return self::FAILURE;
+        }
+
         return count($networks) === 1 ? $this->scrape($networks[0]) : $this->supervise($networks);
+    }
+
+    /**
+     * @param  list<string>  $networks
+     */
+    private function needsIrcIdentity(array $networks): bool
+    {
+        foreach ($networks as $network) {
+            try {
+                if (IrcNetworks::resolve($network)['type'] !== 'websocket') {
+                    return true;
+                }
+            } catch (\InvalidArgumentException) {
+                return true; // Unknown names fail later with a clearer error.
+            }
+        }
+
+        return false;
     }
 
     private function scrape(string $network): int

@@ -42,6 +42,15 @@ final class WebSocketClientTest extends TestCase
     }
 
     #[Test]
+    public function the_host_header_names_non_default_ports(): void
+    {
+        $this->assertSame('predb.club', WebSocketClient::authority('predb.club', 443, true));
+        $this->assertSame('predb.club:8443', WebSocketClient::authority('predb.club', 8443, true));
+        $this->assertSame('localhost', WebSocketClient::authority('localhost', 80, false));
+        $this->assertSame('localhost:9000', WebSocketClient::authority('localhost', 9000, false));
+    }
+
+    #[Test]
     public function a_fragmented_message_survives_an_idle_timeout_between_fragments(): void
     {
         [$client, $server] = $this->connectedPair();
