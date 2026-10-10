@@ -1396,6 +1396,22 @@ class ApiRequestMatrixTest extends TestCase
         $this->assertFalse($secondPage[0]->_search_has_more);
     }
 
+    public function test_name_sorted_api_search_falls_back_to_mysql_when_the_index_has_no_candidates(): void
+    {
+        config(['nntmux.mysql_search_fallback' => true]);
+        $pdo = DB::connection()->getPdo();
+        if ($pdo instanceof PDO && method_exists($pdo, 'sqliteCreateFunction')) {
+            $pdo->sqliteCreateFunction('CONCAT', static fn (...$parts): string => implode('', $parts));
+        }
+        Search::shouldReceive('isAvailable')->andReturn(true);
+        Search::shouldReceive('searchReleasePage')->once()->andReturn(new SearchPage(ids: [], total: 0, fuzzy: false, driver: 'manticore'));
+        Search::shouldReceive('searchReleasesWithFuzzy')->once()->andReturn(['ids' => [1], 'fuzzy' => false]);
+
+        $releases = app(ReleaseSearchService::class)->apiSearch('ubuntu', -1, 0, 10, -1, [], [-1], 0, 'name_asc');
+
+        $this->assertSame(['Ubuntu.Release'], $releases->pluck('searchname')->all());
+    }
+
     public function test_movie_name_search_filters_every_index_match_before_capping(): void
     {
         config(['search.default' => 'manticore', 'search.drivers.manticore.max_matches' => 7500]);

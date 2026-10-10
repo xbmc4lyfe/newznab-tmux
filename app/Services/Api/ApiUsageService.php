@@ -7,6 +7,7 @@ namespace App\Services\Api;
 use App\Jobs\UpdateUserApiAccess;
 use App\Models\User;
 use App\Models\UserRequest;
+use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Arr;
@@ -70,7 +71,12 @@ final class ApiUsageService
      */
     public function reserve(User $user, Request $request, int $maxRequests): ?int
     {
-        return Cache::lock('api_quota:'.$user->id, self::QUOTA_LOCK_SECONDS)
+        $store = Cache::store(self::quotaLockStore())->getStore();
+        if (! $store instanceof LockProvider) {
+            throw new \RuntimeException('The API quota lock store does not support locks.');
+        }
+
+        return $store->lock('api_quota:'.$user->id, self::QUOTA_LOCK_SECONDS)
             ->block(self::QUOTA_LOCK_WAIT_SECONDS, function () use ($user, $request, $maxRequests): ?int {
                 $used = UserRequest::query()
                     ->where('users_id', $user->id)
@@ -85,6 +91,23 @@ final class ApiUsageService
 
                 return $used + 1;
             });
+    }
+
+    /**
+     * Cache store for the quota lock: the configured one, else the default unless that is a failover chain.
+     * A failover store can hand the same lock out on two backends during an outage, letting concurrent
+     * requests both take the last quota slot, so it falls back to the database store instead.
+     */
+    public static function quotaLockStore(): ?string
+    {
+        $configured = trim((string) config('nntmux.api.quota_lock_store', ''));
+        if ($configured !== '') {
+            return $configured;
+        }
+
+        $default = (string) config('cache.default');
+
+        return config("cache.stores.{$default}.driver") === 'failover' ? 'database' : null;
     }
 
     public function record(User $user, Request $request): void

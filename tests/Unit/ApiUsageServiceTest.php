@@ -45,6 +45,22 @@ final class ApiUsageServiceTest extends TestCase
         DB::table('users')->insert(['id' => 1]);
     }
 
+    public function test_the_quota_lock_avoids_failover_cache_stores(): void
+    {
+        config([
+            'cache.default' => 'failover_redis_file',
+            'cache.stores.failover_redis_file' => ['driver' => 'failover', 'stores' => ['redis', 'file']],
+            'nntmux.api.quota_lock_store' => '',
+        ]);
+        $this->assertSame('database', ApiUsageService::quotaLockStore());
+
+        config(['cache.default' => 'redis']);
+        $this->assertNull(ApiUsageService::quotaLockStore());
+
+        config(['nntmux.api.quota_lock_store' => 'redis']);
+        $this->assertSame('redis', ApiUsageService::quotaLockStore());
+    }
+
     public function test_async_record_persists_usage_before_dispatching_metadata_update(): void
     {
         Queue::fake();

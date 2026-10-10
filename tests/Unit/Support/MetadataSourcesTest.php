@@ -93,6 +93,15 @@ class MetadataSourcesTest extends TestCase
         Log::shouldHaveReceived('info')->twice();
     }
 
+    public function test_a_cache_failure_skips_the_daily_summary_instead_of_throwing(): void
+    {
+        Cache::shouldReceive('add')->once()->andThrow(new \RuntimeException('Connection refused'));
+        Log::spy();
+
+        $this->assertFalse(MetadataSources::logDailySummary());
+        Log::shouldNotHaveReceived('info');
+    }
+
     public function test_startup_summary_always_logs_and_covers_the_day(): void
     {
         config(['tmdb.api_key' => '']);
