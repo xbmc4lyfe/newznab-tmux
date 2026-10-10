@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\Facade;
  * @method static string getPredbIndex()
  * @method static void insertRelease(array $parameters)
  * @method static void updateRelease(int|string $releaseID)
+ * @method static mixed deferReleaseUpdates(callable $work)
  * @method static void deleteRelease(int $id)
  * @method static void deleteReleases(iterable<int|string> $ids)
  * @method static void insertPredb(array $parameters)

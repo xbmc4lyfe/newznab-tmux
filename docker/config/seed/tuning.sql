@@ -1,10 +1,17 @@
 -- Runtime processing settings for the docker/ stack (typed single-row configuration tables).
--- Sized to stay well under the primary provider's connection limit (~30 of 73 NNTP connections).
+-- Sized to stay under the primary provider's connection limit: binaries (12) + backfill (30) +
+-- additional (16) + NFO (4) post-processing hold about 60 of its 73 NNTP connections. Those workers
+-- mostly wait on NNTP rather than CPU, so they run more threads than the 10 cores.
 -- Settings are cached for 300s; `make -C docker seed` clears the cache afterwards.
 UPDATE ingestion_configurations SET
-    binary_threads = 6,
-    backfill_threads = 4,
-    release_threads = 2,
+    binary_threads = 12,
+    backfill_threads = 30,
+    release_threads = 4,
+    -- 0 keeps every same-name/same-poster upload (no cross-post deletion).
+    cross_post_hours = 0,
+    -- Collections still receiving parts this long after their first article are released as they are.
+    -- 0 released (and re-reconciled) every collection immediately, racing header storage (BUGS #37).
+    collection_delay_hours = 2,
     max_messages = 20000,
     -- Drop collections under 2 MB before they become releases. Article-obfuscated posts in
     -- boneless/cores/comp otherwise yield one ~740 KB release per article.
@@ -14,11 +21,13 @@ UPDATE ingestion_configurations SET
     updated_at = NOW();
 
 UPDATE post_processing_configurations SET
-    post_threads = 8,
-    nfo_threads = 2,
+    post_threads = 16,
+    nfo_threads = 4,
     post_threads_non = 3,
     post_threads_amazon = 2,
-    fix_name_threads = 2,
+    fix_name_threads = 6,
+    -- PreDB full-text matching reads this many entries per worker per cycle (16 workers).
+    fix_names_per_run = 100,
     -- 0 = extract the first RAR/ZIP volume with unrar/unzip so ffmpeg and mediainfo get a video file;
     -- 1 only lists archive contents (no samples, previews or mediainfo).
     extract_using_rar_info = 0,
