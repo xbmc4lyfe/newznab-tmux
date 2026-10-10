@@ -594,8 +594,6 @@ final class CollectionHandler
     public function refreshAggregates(array $collectionIds, int $chunkSize = 500): bool
     {
         $collectionIds = array_values(array_unique(array_map('intval', $collectionIds)));
-        // Ascending ids: the release reconcile locks the same rows in this order (BUGS #37).
-        sort($collectionIds);
         if ($collectionIds === []) {
             return true;
         }

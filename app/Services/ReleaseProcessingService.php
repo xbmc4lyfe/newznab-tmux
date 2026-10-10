@@ -21,13 +21,13 @@ use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseManagementService;
+use App\Services\Search\SearchService;
 use App\Support\Data\NzbCreationResult;
 use App\Support\Data\ProcessReleasesSettings;
 use App\Support\Data\ReleaseCreationResult;
 use App\Support\Data\ReleaseDeleteStats;
 use App\Support\ReleaseSearchIndexSync;
 use DateTimeInterface;
-use Illuminate\Database\DetectsConcurrencyErrors;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -48,17 +48,9 @@ use Throwable;
  */
 final class ReleaseProcessingService
 {
-    use DetectsConcurrencyErrors;
-
     private const int BATCH_SIZE = 500;
 
     private const int MAX_RETRIES = 5;
-
-    /**
-     * Binaries or collections updated per statement while reconciling. Small, id-ordered
-     * chunks keep the row locks short and in the same order header storage takes them.
-     */
-    private const int RECONCILE_CHUNK = 200;
 
     private const int RETRY_BASE_DELAY_US = 20000;
 
@@ -273,14 +265,18 @@ final class ReleaseProcessingService
         do {
             $totals['iterations']++;
 
-            $result = $this->createReleases($normalizedGroupId);
+            // Index each release once per pass, in bulk, instead of at creation, for its NZB
+            // and again after categorization.
+            [$result, $nzbFilesAdded] = app(SearchService::class)->deferReleaseUpdates(function () use ($normalizedGroupId, $categorize): array {
+                $pass = $this->createReleasesAndNzbs($normalizedGroupId);
+                $this->categorizeReleases($categorize, $normalizedGroupId);
+
+                return $pass;
+            });
             $totals['releases'] += $result->added;
             $totals['dupes'] += $result->dupes;
-
-            $nzbFilesAdded = $this->createNZBs($normalizedGroupId);
             $totals['nzbs'] += $nzbFilesAdded;
 
-            $this->categorizeReleases($categorize, $normalizedGroupId);
             $this->postProcessReleases($postProcess, $nntp);
             $this->deleteCollections($normalizedGroupId);
 
@@ -461,184 +457,113 @@ final class ReleaseProcessingService
     }
 
     /**
+     * Recompute binary and collection aggregates from stored parts.
+     *
+     * Header storage writes the same binaries and collections inside its own
+     * transactions, and an UPDATE that joins parts locks every parts row it reads, even
+     * under READ-COMMITTED (~23k for one batch of a busy group), which deadlocked with it.
+     * So read the aggregates with plain SELECTs, which take no locks, and write only the
+     * rows that drifted, each by primary key and only if it still holds the values read;
+     * if header storage changed it meanwhile, its own aggregate refresh is newer.
+     *
      * @param  list<int>  $collectionIds
      * @param  list<int>  $statuses
      */
     private function reconcileCollectionIds(array $collectionIds, array $statuses): void
     {
-        if (DB::getDriverName() === 'sqlite') {
-            $this->reconcileCollectionIdsSqlite($collectionIds, $statuses);
+        $this->reconcileBinaryAggregates($collectionIds);
+        $this->reconcileCollectionAggregates($collectionIds, $statuses);
+    }
 
+    /**
+     * @param  list<int>  $collectionIds
+     */
+    private function reconcileBinaryAggregates(array $collectionIds): void
+    {
+        $binaries = DB::table('binaries')
+            ->whereIn('collections_id', $collectionIds)
+            ->orderBy('id')
+            ->get(['id', 'totalparts', 'currentparts', 'partsize', 'partcheck']);
+
+        foreach ($binaries->chunk(max(1, $this->binariesConfig->sqlChunkSize)) as $chunk) {
+            $parts = DB::table('parts')
+                ->whereIn('binaries_id', $chunk->pluck('id')->all())
+                ->groupBy('binaries_id')
+                ->selectRaw('binaries_id, COUNT(*) AS currentparts, COALESCE(SUM(size), 0) AS partsize')
+                ->get()
+                ->keyBy('binaries_id');
+
+            foreach ($chunk as $binary) {
+                $aggregate = $parts->get($binary->id);
+                $currentParts = (int) ($aggregate->currentparts ?? 0);
+                $partSize = (int) ($aggregate->partsize ?? 0);
+                $partCheck = $currentParts >= (int) $binary->totalparts ? 1 : 0;
+                if ($currentParts === (int) $binary->currentparts
+                    && $partSize === (int) $binary->partsize
+                    && $partCheck === (int) $binary->partcheck) {
+                    continue;
+                }
+
+                DB::table('binaries')
+                    ->where('id', $binary->id)
+                    ->where('currentparts', $binary->currentparts)
+                    ->where('partsize', $binary->partsize)
+                    ->update(['currentparts' => $currentParts, 'partsize' => $partSize, 'partcheck' => $partCheck]);
+            }
+        }
+    }
+
+    /**
+     * @param  list<int>  $collectionIds
+     * @param  list<int>  $statuses
+     */
+    private function reconcileCollectionAggregates(array $collectionIds, array $statuses): void
+    {
+        $collections = DB::table('collections')
+            ->whereIn('id', $collectionIds)
+            ->whereIn('filecheck', $statuses)
+            ->orderBy('id')
+            ->get(['id', 'totalfiles', 'filecheck', 'filesize', 'dateadded', 'added']);
+        if ($collections->isEmpty()) {
             return;
         }
 
-        // Binary aggregates are rebuilt from stored parts, so they can be refreshed in
-        // separate short statements: one transaction over every binary of the page held
-        // tens of thousands of row locks, taken in collection order, and deadlocked with
-        // header storage refreshing the same binaries by id (BUGS #37).
-        $binaryIds = DB::table('binaries')
-            ->whereIn('collections_id', $collectionIds)
-            ->orderBy('id')
-            ->pluck('id')
-            ->map(static fn ($id): int => (int) $id)
-            ->all();
-        foreach (array_chunk($binaryIds, self::RECONCILE_CHUNK) as $chunk) {
-            if (! $this->runReconcileStatement(fn (): int => $this->refreshBinaryAggregates($chunk))) {
-                // Leave this page for the next pass rather than size collections from stale counts.
-                return;
+        $aggregates = DB::table('binaries')
+            ->whereIn('collections_id', $collections->pluck('id')->all())
+            ->groupBy('collections_id')
+            ->selectRaw('collections_id, COUNT(*) AS currentfiles,
+                COALESCE(SUM(CASE WHEN partcheck = 1 THEN 1 ELSE 0 END), 0) AS completefiles,
+                COALESCE(SUM(partsize), 0) AS filesize')
+            ->get()
+            ->keyBy('collections_id');
+        $staleBefore = now()->subHours($this->settings->collectionDelayTime)->format('Y-m-d H:i:s');
+
+        foreach ($collections as $collection) {
+            $aggregate = $aggregates->get($collection->id);
+            $currentFiles = (int) ($aggregate->currentfiles ?? 0);
+            $fileSize = (int) ($aggregate->filesize ?? 0);
+            $createdAt = $collection->dateadded ?? $collection->added;
+            $stale = $createdAt !== null
+                && (string) $createdAt < $staleBefore
+                && \in_array((int) $collection->filecheck, [0, 1, 10], true);
+            $totalFiles = $stale ? $currentFiles : (int) $collection->totalfiles;
+            $ready = $totalFiles > 0
+                && \in_array($currentFiles, [$totalFiles, $totalFiles + 1], true)
+                && (int) ($aggregate->completefiles ?? 0) >= $totalFiles;
+            $fileCheck = $ready || $stale ? CollectionFileCheckStatus::CompleteParts->value : (int) $collection->filecheck;
+            if ($fileSize === (int) $collection->filesize
+                && $totalFiles === (int) $collection->totalfiles
+                && $fileCheck === (int) $collection->filecheck) {
+                continue;
             }
+
+            DB::table('collections')
+                ->where('id', $collection->id)
+                ->where('filecheck', $collection->filecheck)
+                ->where('totalfiles', $collection->totalfiles)
+                ->where('filesize', $collection->filesize)
+                ->update(['filesize' => $fileSize, 'totalfiles' => $totalFiles, 'filecheck' => $fileCheck]);
         }
-
-        foreach (array_chunk($collectionIds, self::RECONCILE_CHUNK) as $chunk) {
-            if (! $this->runReconcileStatement(fn (): int => $this->refreshCollectionReadiness($chunk, $statuses))) {
-                return;
-            }
-        }
-    }
-
-    /**
-     * Size collections from their binary aggregates and mark the ready (or stale) ones.
-     *
-     * @param  list<int>  $collectionIds
-     * @param  list<int>  $statuses
-     */
-    private function refreshCollectionReadiness(array $collectionIds, array $statuses): int
-    {
-        $idPlaceholders = implode(',', array_fill(0, \count($collectionIds), '?'));
-        $statusPlaceholders = implode(',', array_fill(0, \count($statuses), '?'));
-
-        return DB::update(
-            "UPDATE collections c
-                 LEFT JOIN (
-                    SELECT b.collections_id, COUNT(*) currentfiles,
-                           COALESCE(SUM(CASE WHEN b.partcheck = 1 THEN 1 ELSE 0 END), 0) completefiles,
-                           COALESCE(SUM(b.partsize), 0) filesize
-                    FROM binaries b WHERE b.collections_id IN ({$idPlaceholders}) GROUP BY b.collections_id
-                 ) a ON a.collections_id = c.id
-                 SET c.filesize = COALESCE(a.filesize, 0),
-                     c.totalfiles = CASE
-                        WHEN COALESCE(c.dateadded, c.added) < ?
-                         AND c.filecheck IN (0, 1, 10)
-                        THEN COALESCE(a.currentfiles, 0) ELSE c.totalfiles END,
-                     c.filecheck = CASE
-                        WHEN c.totalfiles > 0
-                         AND COALESCE(a.currentfiles, 0) IN (c.totalfiles, c.totalfiles + 1)
-                         AND COALESCE(a.completefiles, 0) >= c.totalfiles THEN ?
-                        WHEN COALESCE(c.dateadded, c.added) < ?
-                         AND c.filecheck IN (0, 1, 10) THEN ?
-                        ELSE c.filecheck END
-                 WHERE c.id IN ({$idPlaceholders}) AND c.filecheck IN ({$statusPlaceholders})",
-            [
-                ...$collectionIds,
-                now()->subHours($this->settings->collectionDelayTime),
-                CollectionFileCheckStatus::CompleteParts->value,
-                now()->subHours($this->settings->collectionDelayTime),
-                CollectionFileCheckStatus::CompleteParts->value,
-                ...$collectionIds,
-                ...$statuses,
-            ]
-        );
-    }
-
-    /**
-     * Recount parts for these binaries (ascending ids), resetting binaries without parts.
-     *
-     * @param  list<int>  $binaryIds
-     */
-    private function refreshBinaryAggregates(array $binaryIds): int
-    {
-        $placeholders = implode(',', array_fill(0, \count($binaryIds), '?'));
-
-        return DB::update(
-            "UPDATE binaries b
-             LEFT JOIN (
-                SELECT p.binaries_id, COUNT(*) currentparts, COALESCE(SUM(p.size), 0) partsize
-                FROM parts p WHERE p.binaries_id IN ({$placeholders}) GROUP BY p.binaries_id
-             ) p ON p.binaries_id = b.id
-             SET b.currentparts = COALESCE(p.currentparts, 0),
-                 b.partsize = COALESCE(p.partsize, 0),
-                 b.partcheck = CASE WHEN COALESCE(p.currentparts, 0) >= b.totalparts THEN 1 ELSE 0 END
-             WHERE b.id IN ({$placeholders})",
-            [...$binaryIds, ...$binaryIds]
-        );
-    }
-
-    /**
-     * Run one reconcile statement in its own transaction, retrying deadlocks. If it still
-     * loses to header storage, log it and report false so the page waits for the next
-     * pass instead of failing the whole release run.
-     *
-     * @param  callable(): int  $statement
-     *
-     * @throws Throwable Errors other than lock conflicts
-     */
-    private function runReconcileStatement(callable $statement): bool
-    {
-        try {
-            DB::transaction(static fn (): int => $statement(), self::MAX_RETRIES);
-
-            return true;
-        } catch (Throwable $e) {
-            if (! $this->causedByConcurrencyError($e)) {
-                throw $e;
-            }
-
-            Log::warning('Collection reconcile skipped a page after repeated lock conflicts; the next pass retries it', [
-                'error' => $e->getMessage(),
-            ]);
-
-            return false;
-        }
-    }
-
-    /**
-     * @param  list<int>  $collectionIds
-     * @param  list<int>  $statuses
-     */
-    private function reconcileCollectionIdsSqlite(array $collectionIds, array $statuses): void
-    {
-        DB::transaction(function () use ($collectionIds, $statuses): void {
-            foreach ($collectionIds as $collectionId) {
-                $binaryIds = DB::table('binaries')->where('collections_id', $collectionId)->pluck('id')->all();
-                foreach ($binaryIds as $binaryId) {
-                    $aggregate = DB::selectOne(
-                        'SELECT COUNT(*) currentparts, COALESCE(SUM(size), 0) partsize FROM parts WHERE binaries_id = ?',
-                        [$binaryId]
-                    );
-                    DB::update(
-                        'UPDATE binaries SET currentparts = ?, partsize = ?, partcheck = CASE WHEN ? >= totalparts THEN 1 ELSE 0 END WHERE id = ?',
-                        [(int) $aggregate->currentparts, (int) $aggregate->partsize, (int) $aggregate->currentparts, $binaryId]
-                    );
-                }
-
-                $collection = DB::table('collections')->where('id', $collectionId)->first();
-                if ($collection === null || ! \in_array((int) $collection->filecheck, $statuses, true)) {
-                    continue;
-                }
-                $aggregate = DB::selectOne(
-                    'SELECT COUNT(*) currentfiles,
-                            COALESCE(SUM(CASE WHEN partcheck = 1 THEN 1 ELSE 0 END), 0) completefiles,
-                            COALESCE(SUM(partsize), 0) filesize
-                     FROM binaries WHERE collections_id = ?',
-                    [$collectionId]
-                );
-                $createdAt = $collection->dateadded ?? $collection->added;
-                $stale = $createdAt !== null
-                    && strtotime((string) $createdAt) < now()->subHours($this->settings->collectionDelayTime)->timestamp
-                    && \in_array((int) $collection->filecheck, [0, 1, 10], true);
-                $totalFiles = $stale ? (int) $aggregate->currentfiles : (int) $collection->totalfiles;
-                $ready = $totalFiles > 0
-                    && \in_array((int) $aggregate->currentfiles, [$totalFiles, $totalFiles + 1], true)
-                    && (int) $aggregate->completefiles >= $totalFiles;
-                DB::table('collections')->where('id', $collectionId)->update([
-                    'filesize' => (int) $aggregate->filesize,
-                    'totalfiles' => $totalFiles,
-                    'filecheck' => $ready || $stale
-                        ? CollectionFileCheckStatus::CompleteParts->value
-                        : (int) $collection->filecheck,
-                ]);
-            }
-        }, self::MAX_RETRIES);
     }
 
     /**
@@ -725,6 +650,22 @@ final class ReleaseProcessingService
         );
 
         return ReleaseCreationResult::from($result);
+    }
+
+    /**
+     * Create releases and their NZBs, indexing each touched release once, in bulk, at the end
+     * of the pass instead of at creation and again when its NZB is written.
+     *
+     * @return array{0: ReleaseCreationResult, 1: int} The creation result and the number of NZBs written.
+     *
+     * @throws Throwable
+     */
+    public function createReleasesAndNzbs(int|string|null $groupID): array
+    {
+        return app(SearchService::class)->deferReleaseUpdates(fn (): array => [
+            $this->createReleases($groupID),
+            $this->createNZBs($groupID),
+        ]);
     }
 
     /**

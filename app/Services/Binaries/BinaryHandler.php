@@ -416,8 +416,6 @@ final class BinaryHandler
     public function refreshAggregates(array $binaryIds, int $chunkSize = 500): bool
     {
         $binaryIds = array_values(array_unique(array_map('intval', $binaryIds)));
-        // Ascending ids: the release reconcile locks the same rows in this order (BUGS #37).
-        sort($binaryIds);
         if ($binaryIds === []) {
             return true;
         }
