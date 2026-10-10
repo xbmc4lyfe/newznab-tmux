@@ -329,18 +329,31 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
             return;
         }
 
+        $this->insertReleaseDocument($parameters);
+    }
+
+    /**
+     * @param  array<string, mixed>  $parameters  Release projection with an id
+     * @return bool Whether the document was written
+     */
+    private function insertReleaseDocument(array $parameters): bool
+    {
         $releaseId = (int) $parameters['id'];
-        if (! $this->replaceReleaseDocumentWithRetry($parameters)) {
-            $this->recordReleaseIndexFailure($releaseId, 'insertRelease', 'upsert');
-            try {
-                ReindexReleaseJob::dispatch($releaseId)->delay(now()->addSeconds(2));
-            } catch (\Throwable $e) {
-                Log::error('ManticoreSearch: failed to queue ReindexReleaseJob', [
-                    'release_id' => $releaseId,
-                    'error' => $e->getMessage(),
-                ]);
-            }
+        if ($this->replaceReleaseDocumentWithRetry($parameters)) {
+            return true;
         }
+
+        $this->recordReleaseIndexFailure($releaseId, 'insertRelease', 'upsert');
+        try {
+            ReindexReleaseJob::dispatch($releaseId)->delay(now()->addSeconds(2));
+        } catch (\Throwable $e) {
+            Log::error('ManticoreSearch: failed to queue ReindexReleaseJob', [
+                'release_id' => $releaseId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return false;
     }
 
     /**
@@ -413,21 +426,7 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
     {
         Cache::increment('search:index:failures:releases');
         try {
-            $existing = DB::table('search_index_failures')
-                ->where('release_id', $releaseId)
-                ->first(['attempts', 'operation']);
-            // A release pass may hold a deferral lease on this release. Then count the
-            // failure but keep its token and lease: the pass refreshes the release when it
-            // flushes, sees the count and hands the release to repair, and if the pass
-            // dies, repair takes over when the lease expires.
-            $countedOnLease = ($existing->operation ?? null) === SearchService::DEFERRED_RELEASE_OPERATION
-                && DB::table('search_index_failures')
-                    ->where('release_id', $releaseId)
-                    ->where('operation', SearchService::DEFERRED_RELEASE_OPERATION)
-                    ->increment('attempts', 1, ['updated_at' => now()]) > 0;
-            if (! $countedOnLease) {
-                $this->upsertReleaseIndexFailure($releaseId, $phase, $operation, ((int) ($existing->attempts ?? 0)) + 1);
-            }
+            $this->persistReleaseIndexFailure($releaseId, $phase, $operation);
         } catch (\Throwable $e) {
             Log::error('ManticoreSearch: unable to persist release index failure', [
                 'release_id' => $releaseId,
@@ -444,20 +443,37 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
         }
     }
 
-    private function upsertReleaseIndexFailure(int $releaseId, string $phase, string $operation, int $attempts): void
+    /**
+     * Record the failure with conditional writes, so a deferral lease that a release
+     * pass writes concurrently is never replaced: on a lease the failure only counts an
+     * attempt, keeping the pass's token and lease (the pass hands the release to repair,
+     * or repair takes over when the lease expires).
+     */
+    private function persistReleaseIndexFailure(int $releaseId, string $phase, string $operation): void
     {
-        DB::table('search_index_failures')->updateOrInsert(
-            ['release_id' => $releaseId],
-            [
+        $failures = static fn () => DB::table('search_index_failures')->where('release_id', $releaseId);
+
+        for ($try = 0; $try < 3; $try++) {
+            $attempts = ((int) $failures()->value('attempts')) + 1;
+            $failure = [
                 'operation' => $operation,
-                'attempts' => $attempts,
                 'last_error' => $phase,
                 'next_attempt_at' => now()->addSeconds(min(3600, 2 ** min($attempts, 10))),
                 'resolved_at' => null,
                 'updated_at' => now(),
-                'created_at' => now(),
-            ]
-        );
+            ];
+
+            if ($failures()->where('operation', SearchService::DEFERRED_RELEASE_OPERATION)->increment('attempts', 1, ['updated_at' => now()]) > 0) {
+                return;
+            }
+            if ($failures()->where('operation', '!=', SearchService::DEFERRED_RELEASE_OPERATION)->update($failure + ['attempts' => DB::raw('attempts + 1')]) > 0) {
+                return;
+            }
+            if (DB::table('search_index_failures')->insertOrIgnore([$failure + ['release_id' => $releaseId, 'attempts' => 1, 'created_at' => now()]]) > 0) {
+                return;
+            }
+            // The row changed between the writes; look again.
+        }
     }
 
     private function resolveReleaseIndexFailure(int $releaseId): void
@@ -557,6 +573,16 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
             return;
         }
 
+        $this->deleteReleaseDocuments($ids);
+    }
+
+    /**
+     * @param  non-empty-list<int>  $ids
+     * @return bool Whether the documents were deleted
+     */
+    private function deleteReleaseDocuments(array $ids): bool
+    {
+
         $attempts = max(1, (int) ($this->config['retry_attempts'] ?? config('search.drivers.manticore.retry_attempts', 2)));
         $delayMs = max(0, (int) ($this->config['retry_delay_ms'] ?? config('search.drivers.manticore.retry_delay_ms', 100)));
 
@@ -568,7 +594,7 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
                     $this->resolveReleaseIndexFailure((int) $id);
                 }
 
-                return;
+                return true;
             } catch (\Throwable $e) {
                 if ($attempt < $attempts - 1) {
                     if ($delayMs > 0) {
@@ -586,6 +612,8 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
                 }
             }
         }
+
+        return false;
     }
 
     /**
@@ -958,22 +986,33 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
             return;
         }
 
-        try {
-            $release = ReleaseIndexProjection::forId((int) $releaseID);
+        $this->refreshRelease((int) $releaseID);
+    }
 
-            if ($release !== null) {
-                $this->insertRelease($release);
-            } else {
-                Log::warning('ManticoreSearch: Release not found for update, removing from index', ['id' => $releaseID]);
-                $this->recordReleaseNotFoundForIndex($releaseID);
-                $this->deleteRelease((int) $releaseID);
-            }
+    /**
+     * @return bool Whether the release's document now matches its row (or is gone with it)
+     */
+    private function refreshRelease(int $releaseId): bool
+    {
+        try {
+            $release = ReleaseIndexProjection::forId($releaseId);
         } catch (\Throwable $e) {
             Log::error('ManticoreSearch updateRelease error: '.$e->getMessage(), [
-                'release_id' => $releaseID,
+                'release_id' => $releaseId,
             ]);
-            $this->recordReleaseIndexFailure((int) $releaseID, 'updateRelease_query');
+            $this->recordReleaseIndexFailure($releaseId, 'updateRelease_query');
+
+            return false;
         }
+
+        if ($release !== null) {
+            return $this->insertReleaseDocument($release);
+        }
+
+        Log::warning('ManticoreSearch: Release not found for update, removing from index', ['id' => $releaseId]);
+        $this->recordReleaseNotFoundForIndex($releaseId);
+
+        return $this->deleteReleaseDocuments([$releaseId]);
     }
 
     /**
@@ -985,12 +1024,13 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
      * single-release path, which retries and records its own failure.
      *
      * @param  list<int>  $releaseIds
+     * @return list<int> The releases that could not be refreshed
      */
-    public function updateReleases(array $releaseIds): void
+    public function updateReleases(array $releaseIds): array
     {
         $releaseIds = array_values(array_unique(array_filter(array_map('intval', $releaseIds), static fn (int $id): bool => $id > 0)));
         if ($releaseIds === []) {
-            return;
+            return [];
         }
 
         try {
@@ -1001,34 +1041,36 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
             }
         } catch (\Throwable $e) {
             Log::error('ManticoreSearch updateReleases query error: '.$e->getMessage(), ['release_ids' => count($releaseIds)]);
-            foreach ($releaseIds as $releaseId) {
-                $this->updateRelease($releaseId);
-            }
 
-            return;
+            return array_values(array_filter($releaseIds, fn (int $releaseId): bool => ! $this->refreshRelease($releaseId)));
         }
 
+        $failed = [];
         $missing = array_values(array_diff($releaseIds, array_keys($documents)));
         foreach ($missing as $releaseId) {
             Log::warning('ManticoreSearch: Release not found for update, removing from index', ['id' => $releaseId]);
             $this->recordReleaseNotFoundForIndex($releaseId);
         }
-        if ($missing !== []) {
-            $this->deleteReleases($missing);
+        if ($missing !== [] && ! $this->deleteReleaseDocuments($missing)) {
+            $failed = $missing;
         }
         if ($documents === []) {
-            return;
+            return $failed;
         }
 
         if ($this->replaceReleaseDocumentsWithRetry($documents)) {
             $this->resolveReleaseIndexFailures(array_keys($documents));
 
-            return;
+            return $failed;
         }
 
-        foreach ($documents as $release) {
-            $this->insertRelease($release);
+        foreach ($documents as $releaseId => $release) {
+            if (! $this->insertReleaseDocument($release)) {
+                $failed[] = $releaseId;
+            }
         }
+
+        return $failed;
     }
 
     /**

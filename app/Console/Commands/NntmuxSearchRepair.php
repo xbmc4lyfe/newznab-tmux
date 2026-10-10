@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Facades\Search;
+use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
 use App\Services\Search\SearchService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -59,13 +60,19 @@ final class NntmuxSearchRepair extends Command
 
     /**
      * Refresh a release whose deferral lease expired (its release pass died, ran long or
-     * handed it over after a failed refresh), then remove the marker unless the pass
-     * renewed it. A failed refresh counts an attempt on the marker; it then stays and
-     * is retried with backoff.
+     * handed it over after a failed refresh). If the refresh worked, remove the marker
+     * unless the pass renewed it meanwhile; otherwise retry it with backoff.
      */
     private function repairExpiredDeferral(int $releaseId, string $token, int $attempts): void
     {
-        Search::updateRelease($releaseId);
+        $driver = Search::driver();
+        if ($driver instanceof BulkReleaseIndexUpdater) {
+            $refreshed = $driver->updateReleases([$releaseId]) === [];
+        } else {
+            // Only bulk drivers defer; after a driver switch, refresh on a best-effort basis.
+            $driver->updateRelease($releaseId);
+            $refreshed = true;
+        }
 
         $marker = DB::table('search_index_failures')
             ->where('release_id', $releaseId)
@@ -73,11 +80,13 @@ final class NntmuxSearchRepair extends Command
             ->where('last_error', $token)
             ->where('next_attempt_at', '<=', now());
 
-        if ((clone $marker)->where('attempts', $attempts)->delete() > 0) {
+        if ($refreshed) {
+            $marker->delete();
+
             return;
         }
 
-        $marker->where('attempts', '>', $attempts)->update([
+        $marker->update([
             'next_attempt_at' => now()->addSeconds(min(3600, 2 ** min($attempts + 1, 10))),
             'updated_at' => now(),
         ]);

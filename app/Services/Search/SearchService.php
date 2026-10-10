@@ -269,16 +269,18 @@ class SearchService extends Manager implements SearchServiceInterface
                 if (! $driver instanceof BulkReleaseIndexUpdater) {
                     throw new \LogicException('The search driver changed to one without bulk release updates.');
                 }
-                $driver->updateReleases($releaseIds);
+                $failed = $driver->updateReleases($releaseIds);
             } catch (\Throwable $e) {
                 Log::error('Search: deferred release index flush failed: '.$e->getMessage(), ['releases' => count($releaseIds)]);
-                $this->handDeferredReleasesToRepair($releaseIds, failedOnly: false);
+                $this->handDeferredReleasesToRepair($releaseIds);
 
                 continue;
             }
 
-            $this->clearDeferredReleaseMarkers($releaseIds);
-            $this->handDeferredReleasesToRepair($releaseIds, failedOnly: true);
+            $this->clearDeferredReleaseMarkers(array_values(array_diff($releaseIds, $failed)));
+            if ($failed !== []) {
+                $this->handDeferredReleasesToRepair($failed);
+            }
         }
     }
 
@@ -324,20 +326,22 @@ class SearchService extends Manager implements SearchServiceInterface
     }
 
     /**
-     * Remove this scope's markers for refreshed releases. A marker is written with zero
-     * attempts and a failed refresh counts one, so markers with attempts stay; so does a
-     * marker another scope has since taken over, which carries that scope's token.
+     * Remove this scope's markers for releases the driver reported refreshed. A marker
+     * another scope has since taken over carries that scope's token and stays.
      *
      * @param  list<int>  $releaseIds
      */
     private function clearDeferredReleaseMarkers(array $releaseIds): void
     {
+        if ($releaseIds === []) {
+            return;
+        }
+
         try {
             DB::table('search_index_failures')
                 ->whereIn('release_id', $releaseIds)
                 ->where('operation', self::DEFERRED_RELEASE_OPERATION)
                 ->where('last_error', $this->deferralToken)
-                ->where('attempts', 0)
                 ->delete();
         } catch (\Throwable $e) {
             Log::debug('Search: unable to clear deferred release index markers', [
@@ -353,14 +357,13 @@ class SearchService extends Manager implements SearchServiceInterface
      *
      * @param  list<int>  $releaseIds
      */
-    private function handDeferredReleasesToRepair(array $releaseIds, bool $failedOnly): void
+    private function handDeferredReleasesToRepair(array $releaseIds): void
     {
         try {
             DB::table('search_index_failures')
                 ->whereIn('release_id', $releaseIds)
                 ->where('operation', self::DEFERRED_RELEASE_OPERATION)
                 ->where('last_error', $this->deferralToken)
-                ->when($failedOnly, static fn ($query) => $query->where('attempts', '>', 0))
                 ->update(['next_attempt_at' => now(), 'updated_at' => now()]);
         } catch (\Throwable $e) {
             Log::debug('Search: unable to hand deferred releases to repair', [

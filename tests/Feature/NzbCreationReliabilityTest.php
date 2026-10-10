@@ -99,8 +99,10 @@ class NzbCreationReliabilityTest extends TestCase
         $bulkCalls = [];
         $singleCalls = [];
         $driver = $this->createStubForIntersectionOfInterfaces([SearchDriverInterface::class, BulkReleaseIndexUpdater::class]);
-        $driver->method('updateReleases')->willReturnCallback(static function (array $releaseIds) use (&$bulkCalls): void {
+        $driver->method('updateReleases')->willReturnCallback(static function (array $releaseIds) use (&$bulkCalls): array {
             $bulkCalls[] = $releaseIds;
+
+            return [];
         });
         $driver->method('updateRelease')->willReturnCallback(static function (int|string $releaseId) use (&$singleCalls): void {
             $singleCalls[] = (int) $releaseId;

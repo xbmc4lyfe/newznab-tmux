@@ -99,10 +99,8 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
 
     public function test_hands_a_release_whose_refresh_failed_to_repair(): void
     {
-        $search = $this->search(function (array $releaseIds): void {
-            // What ManticoreSearchDriver::recordReleaseIndexFailure() does on a leased release.
-            DB::table('search_index_failures')->where('release_id', 7)->increment('attempts');
-        });
+        // The driver reports 7 as not refreshed, even if it could not record the failure.
+        $search = $this->search(static fn (array $releaseIds): array => [7]);
 
         $search->deferReleaseUpdates(function () use ($search): void {
             $search->updateRelease(5);
@@ -287,17 +285,16 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
     }
 
     /**
-     * @param  (callable(list<int>): void)|null  $onBulk
+     * @param  (callable(list<int>): (list<int>|null))|null  $onBulk  May return the ids that failed
      */
     private function search(?callable $onBulk = null): SearchService
     {
         /** @var SearchDriverInterface&BulkReleaseIndexUpdater&Stub $driver */
         $driver = $this->createStubForIntersectionOfInterfaces([SearchDriverInterface::class, BulkReleaseIndexUpdater::class]);
-        $driver->method('updateReleases')->willReturnCallback(function (array $releaseIds) use ($onBulk): void {
+        $driver->method('updateReleases')->willReturnCallback(function (array $releaseIds) use ($onBulk): array {
             $this->bulkCalls[] = $releaseIds;
-            if ($onBulk !== null) {
-                $onBulk($releaseIds);
-            }
+
+            return $onBulk !== null ? ($onBulk($releaseIds) ?? []) : [];
         });
         $driver->method('updateRelease')->willReturnCallback(function (int|string $releaseId): void {
             $this->singleCalls[] = (int) $releaseId;

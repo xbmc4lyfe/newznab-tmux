@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Feature\Console;
 
 use App\Facades\Search;
+use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\SearchService;
 use Illuminate\Database\Schema\Blueprint;
@@ -46,9 +47,11 @@ final class NntmuxSearchRepairCommandTest extends SearchConsoleCommandTestCase
 
     public function test_keeps_the_row_when_the_refresh_fails(): void
     {
-        $this->useDriver(static function (int $releaseId): void {
+        $this->useDriver(static function (int $releaseId): bool {
             // What ManticoreSearchDriver::recordReleaseIndexFailure() does on a leased release.
             DB::table('search_index_failures')->where('release_id', $releaseId)->increment('attempts');
+
+            return false;
         });
         $this->insertMarker(5, 'deferred:dead', now()->subMinute());
 
@@ -61,8 +64,10 @@ final class NntmuxSearchRepairCommandTest extends SearchConsoleCommandTestCase
 
     public function test_keeps_a_marker_its_release_pass_renewed_during_the_refresh(): void
     {
-        $this->useDriver(static function (int $releaseId): void {
+        $this->useDriver(static function (int $releaseId): bool {
             DB::table('search_index_failures')->where('release_id', $releaseId)->update(['next_attempt_at' => now()->addMinutes(10)]);
+
+            return true;
         });
         $this->insertMarker(5, 'deferred:slow', now()->subMinute());
 
@@ -72,16 +77,21 @@ final class NntmuxSearchRepairCommandTest extends SearchConsoleCommandTestCase
     }
 
     /**
-     * @param  (callable(int): void)|null  $onUpdate
+     * @param  (callable(int): bool)|null  $onUpdate  Returns whether the refresh worked
      */
     private function useDriver(?callable $onUpdate = null): void
     {
-        $driver = $this->createStub(SearchDriverInterface::class);
-        $driver->method('updateRelease')->willReturnCallback(function (int|string $releaseId) use ($onUpdate): void {
-            $this->updated[] = (int) $releaseId;
-            if ($onUpdate !== null) {
-                $onUpdate((int) $releaseId);
+        $driver = $this->createStubForIntersectionOfInterfaces([SearchDriverInterface::class, BulkReleaseIndexUpdater::class]);
+        $driver->method('updateReleases')->willReturnCallback(function (array $releaseIds) use ($onUpdate): array {
+            $failed = [];
+            foreach ($releaseIds as $releaseId) {
+                $this->updated[] = $releaseId;
+                if ($onUpdate !== null && ! $onUpdate($releaseId)) {
+                    $failed[] = $releaseId;
+                }
             }
+
+            return $failed;
         });
         config(['search.default' => 'fake']);
         $search = new SearchService($this->app);

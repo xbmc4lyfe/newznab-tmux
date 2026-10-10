@@ -16,6 +16,7 @@ interface BulkReleaseIndexUpdater
      * Releases that no longer exist are removed from the index.
      *
      * @param  list<int>  $releaseIds
+     * @return list<int> The releases that could not be refreshed
      */
-    public function updateReleases(array $releaseIds): void;
+    public function updateReleases(array $releaseIds): array;
 }

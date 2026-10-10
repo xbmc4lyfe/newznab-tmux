@@ -9,6 +9,7 @@ use App\Services\Search\Support\ReleaseIndexProjection;
 use App\Support\ReleaseSearchIndexDocument;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use Manticoresearch\Client;
 use Manticoresearch\Exceptions\ResponseException;
@@ -64,7 +65,7 @@ final class ManticoreUpdateReleasesTest extends TestCase
         $table->expects($this->never())->method('replaceDocument');
         $table->expects($this->never())->method('deleteDocumentsByIds');
 
-        $this->driver($table)->updateReleases([2, 1, 2]);
+        $this->assertSame([], $this->driver($table)->updateReleases([2, 1, 2]));
 
         $this->assertNotNull(DB::table('search_index_failures')->where('release_id', 1)->value('resolved_at'));
     }
@@ -100,6 +101,26 @@ final class ManticoreUpdateReleasesTest extends TestCase
         $this->assertSame(now()->addMinutes(10)->startOfSecond()->toDateTimeString(), (string) $row->next_attempt_at);
     }
 
+    public function test_reports_releases_whose_document_could_not_be_written(): void
+    {
+        Queue::fake();
+        $request = $this->createStub(Request::class);
+        $response = $this->createStub(Response::class);
+        $response->method('getError')->willReturn('rejected');
+        $table = $this->createStub(Table::class);
+        $table->method('replaceDocuments')->willThrowException(new ResponseException($request, $response));
+        $table->method('replaceDocument')->willReturnCallback(static function (array $document, int $id) use ($request, $response): array {
+            if ($id === 2) {
+                throw new ResponseException($request, $response);
+            }
+
+            return [];
+        });
+
+        $this->assertSame([2], $this->driver($table, retryAttempts: 1)->updateReleases([1, 2]));
+        $this->assertSame([2], DB::table('search_index_failures')->whereNull('resolved_at')->pluck('release_id')->map(static fn ($id): int => (int) $id)->all());
+    }
+
     public function test_removes_releases_that_no_longer_exist(): void
     {
         $table = $this->createMock(Table::class);
@@ -108,7 +129,7 @@ final class ManticoreUpdateReleasesTest extends TestCase
         ));
         $table->expects($this->once())->method('deleteDocumentsByIds')->with([98, 99]);
 
-        $this->driver($table)->updateReleases([1, 98, 99]);
+        $this->assertSame([], $this->driver($table)->updateReleases([1, 98, 99]));
     }
 
     public function test_retries_one_by_one_when_the_bulk_replace_fails(): void
@@ -125,7 +146,7 @@ final class ManticoreUpdateReleasesTest extends TestCase
             return [];
         });
 
-        $this->driver($table, retryAttempts: 1)->updateReleases([1, 2]);
+        $this->assertSame([], $this->driver($table, retryAttempts: 1)->updateReleases([1, 2]));
 
         sort($replaced);
         $this->assertSame([1, 2], $replaced);
@@ -138,7 +159,7 @@ final class ManticoreUpdateReleasesTest extends TestCase
         $table->expects($this->never())->method('replaceDocuments');
         $table->expects($this->never())->method('replaceDocument');
 
-        $this->driver($table)->updateReleases([1, 2]);
+        $this->assertSame([1, 2], $this->driver($table)->updateReleases([1, 2]));
 
         $failures = DB::table('search_index_failures')->orderBy('release_id')->get();
         $this->assertSame([1, 2], $failures->pluck('release_id')->map(static fn ($id): int => (int) $id)->all());
