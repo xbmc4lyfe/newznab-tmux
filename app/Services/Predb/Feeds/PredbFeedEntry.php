@@ -24,6 +24,8 @@ final readonly class PredbFeedEntry
         // When the feed listed the entry, if that is not the PRE time (e.g. srrDB's upload time).
         // Used only to page history imports; never stored as predate.
         public ?CarbonImmutable $listedAt = null,
+        // Details-only entry (e.g. an IRC INFO line): it may fill in an existing row but never creates one.
+        public bool $enrichOnly = false,
     ) {}
 
     /**

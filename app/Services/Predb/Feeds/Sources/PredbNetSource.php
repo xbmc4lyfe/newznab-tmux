@@ -17,6 +17,11 @@ use RuntimeException;
  */
 final class PredbNetSource extends HttpFeedSource
 {
+    /**
+     * The API rejects later pages (HTTP 400), so only the newest 100 pages are reachable.
+     */
+    public const MAX_PAGE = 100;
+
     public function key(): string
     {
         return 'predb_net';
@@ -24,6 +29,10 @@ final class PredbNetSource extends HttpFeedSource
 
     public function fetch(int $page = 1): array
     {
+        if ($page > self::MAX_PAGE) {
+            return [];
+        }
+
         $response = $this->http()->get($this->endpoint, [
             'limit' => $this->pageSize,
             'page' => max(1, $page),

@@ -69,6 +69,10 @@ class PredbFeedImporter
         $existing = ($dryRun ? ($this->dryRunRows[$this->shadowKey($title)] ?? null) : null) ?? Predb::query()->where('title', $title)->first();
 
         if ($existing === null) {
+            if ($entry->enrichOnly) {
+                return 'skipped';
+            }
+
             if ($dryRun) {
                 $this->dryRunRows[$this->shadowKey($title)] = new Predb([
                     'title' => $title,
