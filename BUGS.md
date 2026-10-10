@@ -198,6 +198,19 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** on 2026-10-10, zenet and corrupt-net added about 20 pres between 00:43 and 00:47 UTC, but the database credited almost all of them to `srrdb`.
 - **Fix (staged):** an update only sets `source` when the row has none, matching `PredbFeedImporter`.
 
+### 37. Release reconcile deadlocks with header storage on busy groups (Fixed)
+
+- **Where:** `ReleaseProcessingService::reconcileCollectionIds()` updated every binary of a 500-collection page in one transaction (`UPDATE binaries b … WHERE b.collections_id IN (…)`). That held ~59k row locks, taken in `collections_id` order. At the same time `BinaryHandler::refreshAggregates()` updated the same `binaries` rows by id for each header chunk.
+- **Symptom:** InnoDB deadlocks in alt.binaries.boneless. From 11:40 to 13:37 UTC on 2026-10-10:
+  - 386 header chunks (117k articles) were rolled back with `"reason":"Lock retries exhausted","code":"40001"`, and they fall back to part repair;
+  - the `releases` pane failed 38 times in `processIncompleteCollections()`, before creating any releases for that pass.
+- **Made worse by:** `collection_delay_hours = 0`, which treats every collection as old enough to reconcile and release as it is. The reconcile then swept collections that header workers were still writing.
+- **Fix:**
+  - The reconcile now refreshes binaries in id-ordered chunks of 200, then sizes collections in chunks of 200. Each chunk is its own short transaction, and deadlocks are retried.
+  - A chunk that still loses is logged and left for the next pass instead of failing the run.
+  - Header storage sorts the binary and collection ids it refreshes, so both sides lock in ascending order.
+  - `tuning.sql` sets `collection_delay_hours = 2`, the app's own default.
+
 ## Packaging and deployment
 
 ### 11. `docker-compose.yml.prod-dist` starts a command that doesn't exist (Open)

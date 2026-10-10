@@ -27,6 +27,7 @@ use App\Support\Data\ReleaseCreationResult;
 use App\Support\Data\ReleaseDeleteStats;
 use App\Support\ReleaseSearchIndexSync;
 use DateTimeInterface;
+use Illuminate\Database\DetectsConcurrencyErrors;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -47,9 +48,17 @@ use Throwable;
  */
 final class ReleaseProcessingService
 {
+    use DetectsConcurrencyErrors;
+
     private const int BATCH_SIZE = 500;
 
     private const int MAX_RETRIES = 5;
+
+    /**
+     * Binaries or collections updated per statement while reconciling. Small, id-ordered
+     * chunks keep the row locks short and in the same order header storage takes them.
+     */
+    private const int RECONCILE_CHUNK = 200;
 
     private const int RETRY_BASE_DELAY_US = 20000;
 
@@ -463,26 +472,43 @@ final class ReleaseProcessingService
             return;
         }
 
+        // Binary aggregates are rebuilt from stored parts, so they can be refreshed in
+        // separate short statements: one transaction over every binary of the page held
+        // tens of thousands of row locks, taken in collection order, and deadlocked with
+        // header storage refreshing the same binaries by id (BUGS #37).
+        $binaryIds = DB::table('binaries')
+            ->whereIn('collections_id', $collectionIds)
+            ->orderBy('id')
+            ->pluck('id')
+            ->map(static fn ($id): int => (int) $id)
+            ->all();
+        foreach (array_chunk($binaryIds, self::RECONCILE_CHUNK) as $chunk) {
+            if (! $this->runReconcileStatement(fn (): int => $this->refreshBinaryAggregates($chunk))) {
+                // Leave this page for the next pass rather than size collections from stale counts.
+                return;
+            }
+        }
+
+        foreach (array_chunk($collectionIds, self::RECONCILE_CHUNK) as $chunk) {
+            if (! $this->runReconcileStatement(fn (): int => $this->refreshCollectionReadiness($chunk, $statuses))) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * Size collections from their binary aggregates and mark the ready (or stale) ones.
+     *
+     * @param  list<int>  $collectionIds
+     * @param  list<int>  $statuses
+     */
+    private function refreshCollectionReadiness(array $collectionIds, array $statuses): int
+    {
         $idPlaceholders = implode(',', array_fill(0, \count($collectionIds), '?'));
         $statusPlaceholders = implode(',', array_fill(0, \count($statuses), '?'));
 
-        DB::transaction(function () use ($collectionIds, $idPlaceholders, $statuses, $statusPlaceholders): void {
-            DB::update(
-                "UPDATE binaries b
-                 LEFT JOIN (
-                    SELECT p.binaries_id, COUNT(*) currentparts, COALESCE(SUM(p.size), 0) partsize
-                    FROM parts p INNER JOIN binaries selected ON selected.id = p.binaries_id
-                    WHERE selected.collections_id IN ({$idPlaceholders}) GROUP BY p.binaries_id
-                 ) p ON p.binaries_id = b.id
-                 SET b.currentparts = COALESCE(p.currentparts, 0),
-                     b.partsize = COALESCE(p.partsize, 0),
-                     b.partcheck = CASE WHEN COALESCE(p.currentparts, 0) >= b.totalparts THEN 1 ELSE 0 END
-                 WHERE b.collections_id IN ({$idPlaceholders})",
-                [...$collectionIds, ...$collectionIds]
-            );
-
-            DB::update(
-                "UPDATE collections c
+        return DB::update(
+            "UPDATE collections c
                  LEFT JOIN (
                     SELECT b.collections_id, COUNT(*) currentfiles,
                            COALESCE(SUM(CASE WHEN b.partcheck = 1 THEN 1 ELSE 0 END), 0) completefiles,
@@ -502,17 +528,67 @@ final class ReleaseProcessingService
                          AND c.filecheck IN (0, 1, 10) THEN ?
                         ELSE c.filecheck END
                  WHERE c.id IN ({$idPlaceholders}) AND c.filecheck IN ({$statusPlaceholders})",
-                [
-                    ...$collectionIds,
-                    now()->subHours($this->settings->collectionDelayTime),
-                    CollectionFileCheckStatus::CompleteParts->value,
-                    now()->subHours($this->settings->collectionDelayTime),
-                    CollectionFileCheckStatus::CompleteParts->value,
-                    ...$collectionIds,
-                    ...$statuses,
-                ]
-            );
-        }, self::MAX_RETRIES);
+            [
+                ...$collectionIds,
+                now()->subHours($this->settings->collectionDelayTime),
+                CollectionFileCheckStatus::CompleteParts->value,
+                now()->subHours($this->settings->collectionDelayTime),
+                CollectionFileCheckStatus::CompleteParts->value,
+                ...$collectionIds,
+                ...$statuses,
+            ]
+        );
+    }
+
+    /**
+     * Recount parts for these binaries (ascending ids), resetting binaries without parts.
+     *
+     * @param  list<int>  $binaryIds
+     */
+    private function refreshBinaryAggregates(array $binaryIds): int
+    {
+        $placeholders = implode(',', array_fill(0, \count($binaryIds), '?'));
+
+        return DB::update(
+            "UPDATE binaries b
+             LEFT JOIN (
+                SELECT p.binaries_id, COUNT(*) currentparts, COALESCE(SUM(p.size), 0) partsize
+                FROM parts p WHERE p.binaries_id IN ({$placeholders}) GROUP BY p.binaries_id
+             ) p ON p.binaries_id = b.id
+             SET b.currentparts = COALESCE(p.currentparts, 0),
+                 b.partsize = COALESCE(p.partsize, 0),
+                 b.partcheck = CASE WHEN COALESCE(p.currentparts, 0) >= b.totalparts THEN 1 ELSE 0 END
+             WHERE b.id IN ({$placeholders})",
+            [...$binaryIds, ...$binaryIds]
+        );
+    }
+
+    /**
+     * Run one reconcile statement in its own transaction, retrying deadlocks. If it still
+     * loses to header storage, log it and report false so the page waits for the next
+     * pass instead of failing the whole release run.
+     *
+     * @param  callable(): int  $statement
+     *
+     * @throws Throwable Errors other than lock conflicts
+     */
+    private function runReconcileStatement(callable $statement): bool
+    {
+        try {
+            DB::transaction(static fn (): int => $statement(), self::MAX_RETRIES);
+
+            return true;
+        } catch (Throwable $e) {
+            if (! $this->causedByConcurrencyError($e)) {
+                throw $e;
+            }
+
+            Log::warning('Collection reconcile skipped a page after repeated lock conflicts; the next pass retries it', [
+                'error' => $e->getMessage(),
+            ]);
+
+            return false;
+        }
     }
 
     /**
