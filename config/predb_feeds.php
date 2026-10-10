@@ -16,7 +16,7 @@ return [
 
     'sources' => array_values(array_filter(array_map(
         'trim',
-        explode(',', (string) env('PREDB_FEED_SOURCES', 'predb_club,predb_net,predb_me,xrel,xrel_p2p'))
+        explode(',', (string) env('PREDB_FEED_SOURCES', 'predb_club,predb_net,predb_me,predatabase,xrel,xrel_p2p'))
     ))),
 
     'page_size' => (int) env('PREDB_FEED_PAGE_SIZE', 100),
@@ -29,6 +29,7 @@ return [
         'predb_club' => 'https://predb.club/api/v1/',
         'predb_net' => 'https://api.predb.net/',
         'predb_me' => (string) env('PREDB_FEED_RSS_URL', 'https://predb.me/?rss=1'),
+        'predatabase' => 'https://predataba.se/api/search',
         'srrdb' => 'https://api.srrdb.com/v1/search/order:date-desc',
         'xrel' => 'https://api.xrel.to/v2/release/latest.json',
         'xrel_p2p' => 'https://api.xrel.to/v2/p2p/releases.json',
@@ -37,6 +38,9 @@ return [
     // Sources whose terms forbid scraping: never paged beyond the first page (srrDB: "Use but don't
     // scrape"). srrDB is also left out of the default source list; add it explicitly to opt in.
     'single_page_sources' => ['srrdb'],
+
+    // predataba.se: anonymous clients read 50 entries (5 requests) per run; a key lifts the depth limit.
+    'predatabase_api_key' => (string) env('PREDB_FEED_PREDATABASE_API_KEY', ''),
 
     // srrDB reports release dates in its own local time.
     'srrdb_timezone' => (string) env('PREDB_FEED_SRRDB_TIMEZONE', 'Europe/Brussels'),

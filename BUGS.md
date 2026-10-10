@@ -110,6 +110,12 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** with `USE_ALTERNATE_NNTP_SERVER=false` (the docker/ stack, which keeps headers on the primary), articles missing on the primary fail post-processing even though alternate credentials are configured.
 - **Fix (staged):** new `nntmux_nntp.alternate_article_fallback` (`NNTP_ALTERNATE_FALLBACK`, blank = follow `USE_ALTERNATE_NNTP_SERVER`, so upstream behavior is unchanged) drives the four article fetchers. The docker/ stack sets it to `true`. Test: `tests/Feature/NntpAlternateFallbackConfigTest.php`.
 
+### 24. The IRC scraper's only channel announces no pres, and it can't read the active pre channels (Fixed)
+
+- **Where:** `app/Services/IRCScraper.php` (one server from `scrape_irc_server`, one message regex for the NNTmux bot's `NEW: [DT: …]` format) and the `SCRAPE_IRC_CHANNELS` default `#PreNNTmux`.
+- **Symptom:** on 2026-10-09, a 2-minute capture of synirc `#PreNNTmux` showed only the bot's "still active" message, and the running `irc:scrape` stored no pres in 12 minutes. `#nZEDbPRE`'s topic reads "DEAD.". In the same window, corrupt-net `#pre` and zenet `#pre` each announced about 15 pres. The scraper can't use them: it connects to only one server, and those channels use different formats (`PRE: [FLAC] Name-GRP` and `(PRE) (MP3-WEB) (Name-GRP)`).
+- **Fix (staged):** `irc_settings.networks` profiles (`synirc`, `corruptnet`, `zenet`, and `predatabase`, which is off by default). Plain `irc:scrape` supervises one child process per enabled network (`irc:scrape --network=<key>`). The public channels are parsed by `PreAnnounceParser` and stored through `PredbFeedImporter`. zenet's TLS certificate doesn't name `irc.zenet.org`, so that profile turns off host name verification only. Tests: `tests/Unit/Predb/PreAnnounceParserTest.php` and `tests/Feature/IrcNetworksTest.php`.
+
 ## Packaging and deployment
 
 ### 11. `docker-compose.yml.prod-dist` starts a command that doesn't exist (Open)
