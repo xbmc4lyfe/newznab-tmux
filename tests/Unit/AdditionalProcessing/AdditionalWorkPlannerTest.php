@@ -56,6 +56,34 @@ class AdditionalWorkPlannerTest extends TestCase
     }
 
     #[Test]
+    public function it_selects_the_first_7z_volume_with_the_last_volume_tail(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+
+        $plan = $planner->plan([
+            ['title' => '[02/12] - "G9AJxkjPdN0iBdyG.7z.002" yEnc (1/3)', 'segments' => ['<v2-1>', '<v2-2>', '<v2-3>']],
+            ['title' => '[01/12] - "G9AJxkjPdN0iBdyG.7z.001" yEnc (1/3)', 'segments' => ['<v1-1>', '<v1-2>', '<v1-3>', '<v1-4>']],
+            ['title' => '[03/12] - "G9AJxkjPdN0iBdyG.7z.003" yEnc (1/2)', 'segments' => ['<v3-1>', '<v3-2>']],
+            ['title' => '[12/12] - "G9AJxkjPdN0iBdyG.vol00+01.par2" yEnc (1/1)', 'segments' => ['<par2>']],
+        ], 'alt.binaries.misc');
+        $single = $planner->plan([
+            ['title' => '"Some.Release.7z" yEnc (1/9)', 'segments' => ['<s-1>', '<s-2>', '<s-3>', '<s-4>', '<s-5>']],
+        ], 'alt.binaries.misc');
+
+        $this->assertSame(
+            ['[01/12] - "G9AJxkjPdN0iBdyG.7z.001" yEnc (1/3)'],
+            array_map(static fn (ArchiveCandidate $candidate): string => $candidate->title, $plan->prioritizedArchiveCandidates()),
+        );
+        $this->assertTrue($plan->archiveCandidates[0]->likelyFirstVolume);
+        $this->assertSame(['<v1-1>', '<v1-2>', '<v1-3>'], $plan->archiveCandidates[0]->messageIds);
+        $this->assertSame(['<v3-2>'], $plan->archiveCandidates[0]->tailMessageIds);
+
+        $this->assertTrue($single->hasCompressedFile());
+        $this->assertTrue($single->archiveCandidates[0]->likelyFirstVolume);
+        $this->assertSame(['<s-5>'], $single->archiveCandidates[0]->tailMessageIds);
+    }
+
+    #[Test]
     public function it_reports_book_floods_and_releases_without_supported_candidates(): void
     {
         $planner = new AdditionalWorkPlanner($this->makeConfig());
@@ -72,6 +100,39 @@ class AdditionalWorkPlannerTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_tails_separate_for_quoted_7z_names_containing_spaces(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+        $plan = $planner->plan([
+            ['title' => '"Alpha common.7z.003" yEnc', 'segments' => ['<alpha-tail>']],
+            ['title' => '"Beta common.7z.002" yEnc', 'segments' => ['<beta-tail>']],
+            ['title' => '"ALPHA COMMON.7z.001" yEnc', 'segments' => ['<alpha-head>']],
+            ['title' => '"Beta common.7z.001" yEnc', 'segments' => ['<beta-head>']],
+        ], 'alt.binaries.test');
+
+        $candidates = $plan->prioritizedArchiveCandidates();
+        $this->assertSame(['<alpha-tail>'], $candidates[0]->tailMessageIds);
+        $this->assertSame(['<beta-tail>'], $candidates[1]->tailMessageIds);
+        $this->assertTrue($candidates[0]->likelyFirstVolume);
+        $this->assertTrue($candidates[1]->likelyFirstVolume);
+    }
+
+    #[Test]
+    public function it_limits_probe_continuations_to_the_archive_segment_budget(): void
+    {
+        foreach ([0, 1, 2, 3] as $budget) {
+            $planner = new AdditionalWorkPlanner($this->makeConfig(['maximumRarSegments' => $budget]));
+            $plan = $planner->plan([
+                ['title' => '"obfuscated" yEnc', 'segments' => ['<first>', '<second>', '<third>', '<last>'], 'filecount' => 1],
+            ], 'alt.binaries.test');
+
+            $this->assertSame('<first>', $plan->probeMessageId);
+            $this->assertSame(array_slice(['<second>', '<third>'], 0, max(0, $budget - 1)), $plan->probeContinuationMessageIds);
+            $this->assertSame(['<last>'], $plan->probeTailMessageIds);
+        }
+    }
+
+    #[Test]
     public function it_probes_a_lone_file_without_an_extension(): void
     {
         $planner = new AdditionalWorkPlanner($this->makeConfig());
@@ -82,6 +143,23 @@ class AdditionalWorkPlannerTest extends TestCase
 
         $this->assertSame('<first>', $plan->probeMessageId);
         $this->assertSame([], $plan->unsupportedReasons);
+    }
+
+    #[Test]
+    public function it_keeps_the_last_segment_of_a_probed_file_for_a_7z_end_header(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+
+        $plan = $planner->plan([
+            ['title' => '"KlUC4yTqeaIpcTbOIYdzhqqWF" yEnc (1/103)', 'segments' => ['<first>', '<second>', '<last>'], 'filecount' => 1],
+        ], 'alt.binaries.misc');
+        $oneSegment = $planner->plan([
+            ['title' => '"KlUC4yTqeaIpcTbOIYdzhqqWF" yEnc (1/1)', 'segments' => ['<only>'], 'filecount' => 1],
+        ], 'alt.binaries.misc');
+
+        $this->assertSame('<first>', $plan->probeMessageId);
+        $this->assertSame(['<last>'], $plan->probeTailMessageIds);
+        $this->assertSame([], $oneSegment->probeTailMessageIds);
     }
 
     #[Test]

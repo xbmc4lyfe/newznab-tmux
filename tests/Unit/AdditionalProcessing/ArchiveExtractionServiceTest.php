@@ -15,6 +15,7 @@ use PHPUnit\Framework\TestCase;
 
 class ArchiveExtractionServiceTest extends TestCase
 {
+    use BuildsArchiveFixtures;
     use CreatesProcessingConfiguration;
 
     protected function tearDown(): void
@@ -125,6 +126,113 @@ class ArchiveExtractionServiceTest extends TestCase
                 $result['dataSummary']['archives']['nested.rar']['file_list'][0]['name'],
             );
         }
+    }
+
+    #[Test]
+    public function it_lists_a_7z_from_its_first_bytes_and_its_tail(): void
+    {
+        $service = new ArchiveExtractionService($this->makeConfig());
+        $archive = $this->sevenZip('Movie.2026.1080p.mkv', str_repeat('x', 100));
+        $head = substr($archive, 0, 40);
+
+        $this->assertTrue($service->needsSevenZipEndHeader($head));
+        $this->assertFalse($service->needsSevenZipEndHeader($archive));
+        $this->assertNull($service->withSevenZipEndHeader($head, str_repeat('y', 80)));
+
+        $joined = $service->withSevenZipEndHeader($head, substr($archive, -80));
+        $this->assertIsString($joined);
+
+        $result = $service->processCompressedData($joined, $this->sevenZipContext(), sys_get_temp_dir().'/');
+
+        $this->assertTrue($result['success']);
+        $this->assertFalse($result['hasPassword']);
+        $this->assertSame('7', $result['archiveMarker']);
+        $this->assertSame('Movie.2026.1080p.mkv', $result['files'][0]['name']);
+        $this->assertSame(100, $result['files'][0]['size']);
+        $this->assertSame(0, $result['files'][0]['pass']);
+        $this->assertTrue($result['listingOnly']);
+    }
+
+    #[Test]
+    public function it_lists_7z_without_recursion_or_preparing_extraction_directories(): void
+    {
+        $archiveInfo = Mockery::mock(ArchiveInfo::class);
+        $archiveInfo->type = ArchiveInfo::TYPE_SZIP;
+        $archiveInfo->error = '';
+        $archiveInfo->shouldReceive('setData')->once()->with('ARCHIVE', true)->andReturnTrue();
+        $archiveInfo->shouldReceive('getSummary')->once()->with(false)->andReturn(['main_type' => ArchiveInfo::TYPE_SZIP]);
+        $archiveInfo->shouldReceive('getArchiveFileList')->once()->with(false)->andReturn([
+            ['name' => 'nested.7z', 'size' => 20, 'pass' => 0],
+        ]);
+        $service = new ArchiveExtractionService($this->makeConfig(['extractUsingRarInfo' => false]), $archiveInfo);
+
+        $result = $service->processCompressedData('ARCHIVE', $this->sevenZipContext(), '/unused/');
+
+        $this->assertTrue($result['success']);
+        $this->assertTrue($result['listingOnly']);
+        $this->assertSame('nested.7z', $result['files'][0]['name']);
+    }
+
+    #[Test]
+    public function it_never_extracts_file_bytes_from_reconstructed_7z_headers(): void
+    {
+        $service = new ArchiveExtractionService($this->makeConfig());
+        $archive = $this->sevenZip('release.nfo', str_repeat('A', 20));
+        $joined = $service->withSevenZipEndHeader(substr($archive, 0, 40), substr($archive, -80));
+        $this->assertIsString($joined);
+
+        $result = $service->processCompressedData($joined, $this->sevenZipContext(), '/unused/');
+
+        $this->assertTrue($result['success']);
+        $this->assertSame('release.nfo', $result['files'][0]['name']);
+        $this->assertSame([], $service->extractSpecificFiles($joined, ['release.nfo'], '/unused/'));
+        $this->assertNull($service->extractSpecificFile($joined, 'release.nfo', '/unused/'));
+    }
+
+    #[Test]
+    public function it_reports_a_7z_with_an_encrypted_header_as_passworded(): void
+    {
+        $service = new ArchiveExtractionService($this->makeConfig());
+        $archive = $this->sevenZip('Movie.2026.1080p.mkv', str_repeat('x', 100), encryptedHeader: true);
+
+        $joined = $service->withSevenZipEndHeader(substr($archive, 0, 40), substr($archive, -40));
+        $this->assertIsString($joined);
+
+        $result = $service->processCompressedData($joined, $this->sevenZipContext(), sys_get_temp_dir().'/');
+
+        $this->assertTrue($result['hasPassword']);
+        $this->assertSame(ReleaseBrowseService::PASSWD_RAR, $result['passwordStatus']);
+    }
+
+    #[Test]
+    public function it_flags_encrypted_entries_of_a_7z(): void
+    {
+        $service = new ArchiveExtractionService($this->makeConfig());
+        $archive = $this->sevenZip('Movie.2026.1080p.mkv', str_repeat('x', 100), encryptedFile: true);
+
+        $joined = $service->withSevenZipEndHeader(substr($archive, 0, 40), substr($archive, -80));
+        $this->assertIsString($joined);
+
+        $result = $service->processCompressedData($joined, $this->sevenZipContext(), sys_get_temp_dir().'/');
+
+        $this->assertTrue($result['success']);
+        $this->assertSame(1, $result['files'][0]['pass']);
+    }
+
+    #[Test]
+    public function it_recognises_archive_signatures(): void
+    {
+        $this->assertTrue(ArchiveExtractionService::hasArchiveSignature($this->rar('a.mkv', 'x')));
+        $this->assertTrue(ArchiveExtractionService::hasArchiveSignature("Rar!\x1A\x07\x01\x00".str_repeat("\0", 8)));
+        $this->assertTrue(ArchiveExtractionService::hasArchiveSignature($this->zip('a.mkv', 'x')));
+        $this->assertTrue(ArchiveExtractionService::hasArchiveSignature($this->sevenZip('a.mkv', 'x')));
+        $this->assertFalse(ArchiveExtractionService::hasArchiveSignature("PAR2\0PKT".str_repeat("\0", 8)));
+        $this->assertFalse(ArchiveExtractionService::hasArchiveSignature("\x1A\x45\xDF\xA3".str_repeat("\0", 8)));
+    }
+
+    private function sevenZipContext(): ReleaseProcessingContext
+    {
+        return new ReleaseProcessingContext(new Release(['id' => 1, 'guid' => 'fixture-guid']));
     }
 
     /**
