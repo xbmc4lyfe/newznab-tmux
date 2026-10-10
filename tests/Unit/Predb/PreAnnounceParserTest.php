@@ -105,6 +105,7 @@ final class PreAnnounceParserTest extends TestCase
     {
         $this->assertNull((new PreAnnounceParser('corruptnet', 'c'))->parse('hello everyone'));
         $this->assertNull((new PreAnnounceParser('corruptnet', 'c'))->parse('PRE: [TV] not a release name'));
+        $this->assertNull((new PreAnnounceParser('corruptnet', 'c'))->parse('INFO: [X] Not.A.Release-GRP'));
         $this->assertNull((new PreAnnounceParser('zenet', 'z'))->parse('(GENRE) (Hamilton.2020.LATiN.SPANiSH.SUBBED.2160p.UHD.BluRay.x265-CEBRAY) (History/Drama)'));
         $this->assertNull((new PreAnnounceParser('zenet', 'z'))->parse('(URL) (Hamilton.2020.LATiN.SPANiSH.SUBBED.2160p.UHD.BluRay.x265-CEBRAY) (https://www.imdb.com/title/tt8503618/)'));
         $this->assertNull((new PreAnnounceParser('predatabase', 'p'))->parse('genre | Hamilton.2020.LATiN.SPANiSH.SUBBED.2160p.UHD.BluRay.x265-CEBRAY - History/Drama'));

@@ -47,6 +47,7 @@ class WebSocketClient
         private readonly string $url,
         private readonly int $timeout = 15,
         private readonly string $userAgent = 'NNTmux-PreDB-Importer/1.0',
+        private readonly int $maxMessageBytes = self::MAX_FRAME_BYTES,
     ) {}
 
     public function connect(): void
@@ -128,6 +129,11 @@ class WebSocketClient
                 case self::OP_BINARY:
                 case self::OP_CONTINUATION:
                     $this->partial .= $payload;
+                    if (strlen($this->partial) > $this->maxMessageBytes) {
+                        $this->partial = '';
+                        $this->close();
+                        throw new RuntimeException("WebSocket message exceeds {$this->maxMessageBytes} bytes.");
+                    }
                     if ($fin) {
                         $message = $this->partial;
                         $this->partial = '';
