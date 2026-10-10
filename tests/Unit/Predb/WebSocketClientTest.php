@@ -1,0 +1,53 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Unit\Predb;
+
+use App\Services\Predb\Stream\WebSocketClient;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\TestCase;
+
+final class WebSocketClientTest extends TestCase
+{
+    /**
+     * @return iterable<string, array{int}>
+     */
+    public static function payloadSizes(): iterable
+    {
+        yield 'empty' => [0];
+        yield 'small' => [125];
+        yield '16-bit length' => [300];
+        yield '64-bit length' => [70000];
+    }
+
+    #[Test]
+    #[DataProvider('payloadSizes')]
+    public function masked_client_frames_round_trip(int $size): void
+    {
+        $payload = str_repeat('{"a":1}', intdiv($size, 7) + 1);
+        $payload = substr($payload, 0, $size);
+
+        $frame = WebSocketClient::encodeFrame(0x1, $payload, "\x01\x02\x03\x04");
+        $decoded = WebSocketClient::decodeFrame($frame.'trailing');
+
+        $this->assertNotNull($decoded);
+        [$fin, $opcode, $body, $consumed] = $decoded;
+        $this->assertTrue($fin);
+        $this->assertSame(0x1, $opcode);
+        $this->assertSame($payload, $body);
+        $this->assertSame(strlen($frame), $consumed);
+    }
+
+    #[Test]
+    public function unmasked_server_frames_decode_and_partial_frames_wait_for_more_bytes(): void
+    {
+        // predb.club's heartbeat: an unmasked ping frame carrying "hb".
+        $ping = "\x89\x02hb";
+
+        $this->assertSame([true, 0x9, 'hb', 4], WebSocketClient::decodeFrame($ping));
+        $this->assertNull(WebSocketClient::decodeFrame("\x89\x02h"));
+        $this->assertNull(WebSocketClient::decodeFrame("\x81"));
+    }
+}

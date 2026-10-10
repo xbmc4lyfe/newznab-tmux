@@ -116,6 +116,27 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** on 2026-10-09, a 2-minute capture of synirc `#PreNNTmux` showed only the bot's "still active" message, and the running `irc:scrape` stored no pres in 12 minutes. `#nZEDbPRE`'s topic reads "DEAD.". In the same window, corrupt-net `#pre` and zenet `#pre` each announced about 15 pres. The scraper can't use them: it connects to only one server, and those channels use different formats (`PRE: [FLAC] Name-GRP` and `(PRE) (MP3-WEB) (Name-GRP)`).
 - **Fix (staged):** `irc_settings.networks` profiles (`synirc`, `corruptnet`, `zenet`, and `predatabase`, which is off by default). Plain `irc:scrape` supervises one child process per enabled network (`irc:scrape --network=<key>`). The public channels are parsed by `PreAnnounceParser` and stored through `PredbFeedImporter`. zenet's TLS certificate doesn't name `irc.zenet.org`, so that profile turns off host name verification only. Tests: `tests/Unit/Predb/PreAnnounceParserTest.php` and `tests/Feature/IrcNetworksTest.php`.
 
+### 25. `predb:import-feed --since` fails on predb.net after 100 pages instead of stopping (Fixed)
+
+- **Where:** `app/Services/Predb/Feeds/Sources/PredbNetSource.php::fetch()` and the history loop in `app/Console/Commands/PredbImportFeed.php`.
+- **Bug:** api.predb.net accepts only `page` 1 to 100 and has no date or offset parameter, so at most the newest 10,000 entries can be read. Page 101 returns HTTP 400 (`Invalid page number > Min: 1 > Max: 100`). The source turns that into an exception, so the run reports `failed` rather than `incomplete`.
+- **Symptom:** on 2026-10-10, `predb:import-feed --source=predb_net --since=7d` inserted 1,899 rows and then reported `failed: HTTP request returned status code 400`. It only reached about 4 days back. predb.club covered the full 7 days.
+- **Fix (staged):** `PredbNetSource::fetch()` returns no entries past `MAX_PAGE` (100), so a history import ends as `incomplete` instead of `failed`. Test: `tests/Feature/PredbImportFeedCommandTest.php`.
+
+### 26. `irc:scrape` retries a banned IRC network every 30 seconds indefinitely (Fixed)
+
+- **Where:** `IrcScraperCommand::supervise()` (fixed `RESTART_DELAY` of 30 s) and `IRCScraper::_startScraping()`, which calls `exit('…')` and so exits with code 0 on a failed login.
+- **Bug:** a login refused with a G-line (`Closing Link: … Banned (G-Lined)`) is treated like any other exit, so the supervisor reconnects every 30 seconds for as long as the ban lasts.
+- **Symptom:** on 2026-10-10 the host's VPN exit address (103.102.246.86, AS203020 HostRoyale) is listed in DroneBL as an open proxy. synirc and zenet G-line it, and the scraper reconnected to both twice a minute. That can get a ban extended.
+- **Fix (staged):** `IRCScraper` exits with code 1 on a failed connect or login (`fail()`), and the supervisor backs off per network: 30 s doubling to 1 hour (`IrcScraperCommand::restartDelay()`), reset once a child stays up for 10 minutes. Test: `tests/Feature/IrcNetworksTest.php`.
+
+### 29. IRC updates relabel a PRE's source to whoever repeated it (Fixed)
+
+- **Where:** `IRCScraper::_updatePre()` (`app/Services/IRCScraper.php`), which always wrote `source = <announcing source>` when it updated an existing row.
+- **Bug:** a later announcement of the same release overwrote the source of the ingester that stored it first. The synirc bot relays srrDB updates, so rows first stored from zenet or corrupt-net were relabelled `srrdb`.
+- **Symptom:** on 2026-10-10, zenet and corrupt-net added about 20 pres between 00:43 and 00:47 UTC, but the database credited almost all of them to `srrdb`.
+- **Fix (staged):** an update only sets `source` when the row has none, matching `PredbFeedImporter`.
+
 ## Packaging and deployment
 
 ### 11. `docker-compose.yml.prod-dist` starts a command that doesn't exist (Open)

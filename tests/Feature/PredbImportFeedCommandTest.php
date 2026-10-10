@@ -9,6 +9,8 @@ use App\Facades\Search;
 use App\Models\Predb;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Services\Predb\Feeds\PredbFeedImporter;
+use App\Services\Predb\Feeds\PredbFeedSourceFactory;
+use App\Services\Predb\Feeds\Sources\PredbNetSource;
 use Illuminate\Console\Scheduling\Event;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Database\Schema\Blueprint;
@@ -104,6 +106,29 @@ class PredbImportFeedCommandTest extends TestCase
         $this->assertSame('457MB', $row->size);
         $this->assertSame('32', $row->files);
         $this->search->shouldHaveReceived('updatePreDb')->once();
+    }
+
+    #[Test]
+    public function details_only_entries_fill_existing_rows_but_never_create_one(): void
+    {
+        DB::table('predb')->insert(['title' => 'Known.Release-GRP', 'source' => 'zenet', 'size' => null, 'files' => null]);
+        $info = static fn (string $title): PredbFeedEntry => new PredbFeedEntry(title: $title, source: 'corrupt-net', size: '67MB', files: '14', enrichOnly: true);
+
+        $result = app(PredbFeedImporter::class)->import([$info('Known.Release-GRP'), $info('Unknown.Release-GRP')]);
+
+        $this->assertSame(['inserted' => 0, 'updated' => 1, 'skipped' => 1], $result);
+        $row = Predb::query()->where('title', 'Known.Release-GRP')->firstOrFail();
+        $this->assertSame(['zenet', '67MB', '14'], [$row->source, $row->size, $row->files]);
+        $this->assertFalse(Predb::query()->where('title', 'Unknown.Release-GRP')->exists());
+    }
+
+    #[Test]
+    public function predb_net_history_stops_at_its_page_cap_instead_of_failing(): void
+    {
+        Http::fake(['api.predb.net/*' => Http::response(['status' => 'error', 'message' => 'Invalid page number > Min: 1 > Max: 100'], 400)]);
+
+        $this->assertSame([], app(PredbFeedSourceFactory::class)->makeOne('predb_net')->fetch(PredbNetSource::MAX_PAGE + 1));
+        Http::assertNothingSent();
     }
 
     #[Test]
