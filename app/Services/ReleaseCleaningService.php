@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Models\Predb;
+use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\NzbSplitUnwrapper;
 
 /**
@@ -18,6 +19,16 @@ class ReleaseCleaningService
      */
     /** @phpstan-ignore classConstant.unused */
     private const string REGEX_END = '[ -]{0,3}yEnc$/u';
+
+    /**
+     * `[01/10] - "file.ext"`: a file counter and a quoted file name, as most posting tools write them.
+     */
+    /**
+     * One trailing file extension, archive volume or part marker, as stripped by releaseNameFromFile().
+     */
+    private const string FILE_SUFFIX = '/\.(?:par2|vol\d+[+-]\d+|part\d+|r\d{2,3}|\d{3}|rar|zip|7z|tar|zst|gz|bz2|xz|tgz|nfo|sfv|nzb|mkv|mp4|m4v|avi|ts|m2ts|wmv|mov|mpe?g|iso|img|flac|mp3|m4a|epub|pdf|mobi|azw3|cbr|cbz|srr|srt)$/i';
+
+    private const string COUNTER_FILE_SUBJECT = '/^\[\s*\d+\s*\/\s*\d+\s*\]\s*-?\s*"(?P<file>[^"]{4,})"/';
 
     /**
      * Used for matching file extension endings in article subjects.
@@ -413,6 +424,19 @@ class ReleaseCleaningService
      */
     public function generic(): array
     {
+        // Counter-and-filename subjects: `[01/10] - "Release.Name-GRP.mkv" yEnc`. The file name, minus its
+        // extension and part/volume markers, is the release name. Hashed (obfuscated) file names stay as
+        // before so the name-fixing passes can still find their real names.
+        if (preg_match(self::COUNTER_FILE_SUBJECT, $this->subject, $hit)) {
+            $fromFile = $this->releaseNameFromFile($hit['file']);
+            if ($fromFile !== null) {
+                return [
+                    'cleansubject' => $fromFile,
+                    'properlynamed' => false,
+                ];
+            }
+        }
+
         // This regex gets almost all of the predb release names also keep in mind that not every subject ends with yEnc, some are truncated, because of the 255 character limit and some have extra charaters tacked onto the end, like (5/10).
         if (preg_match(
             '/^\[\d+\][\-_\s]{0,3}(\[(reup|full|repost.+?|part|re-repost|xtr|sample)(\])?[\-_\s]{0,3}\[[\- #@\.\w]+\][\-_\s]{0,3}|\[[\- #@\.\w]+\][\-_\s]{0,3}\[(reup|full|repost.+?|part|re-repost|xtr|sample)(\])?[\-_\s]{0,3}|\[.+?efnet\][\-_\s]{0,3}|\[(reup|full|repost.+?|part|re-repost|xtr|sample)(\])?[\-_\s]{0,3})(\[FULL\])?[\-_\s]{0,3}(\[ )?(\[)? ?(\/sz\/)?(F: - )?(?P<title>[\- _!@\.\'\w\(\)~]{10,}) ?(\])?[\-_\s]{0,3}(\[)? ?(REPOST|REPACK|SCENE|EXTRA PARS|REAL)? ?(\])?[\-_\s]{0,3}?(\[\d+[\-\/~]\d+\])?[\-_\s]{0,3}["|#34;]*.+["|#34;]* ?[yEnc]{0,4}/i',
@@ -430,6 +454,22 @@ class ReleaseCleaningService
             'cleansubject' => $this->releaseCleanerHelper($this->subject),
             'properlynamed' => false,
         ];
+    }
+
+    /**
+     * The release name a posted file name implies, or null when it does not look like a release name.
+     */
+    public function releaseNameFromFile(string $file): ?string
+    {
+        $name = $this->fixerCleaner($file);
+        // Strip stacked extensions and markers (`.rar.par2`, `.tar.zst`, `.7z.003`, `.part01.rar`) until none is left.
+        do {
+            $previous = $name;
+            $name = preg_replace(self::FILE_SUFFIX, '', $name) ?? $name;
+        } while ($name !== $previous);
+        $name = trim($name, " .-_\t");
+
+        return (new FileNameCleaner)->isPlausibleReleaseTitle($name) ? $name : null;
     }
 
     public function releaseCleanerHelper(string $subject): string
@@ -457,6 +497,8 @@ class ReleaseCleaningService
         // Remove part/volume markers from the end
         $cleanerName = preg_replace('/\.part\d+(\.rar)?$/i', '', $cleanerName);
         $cleanerName = preg_replace('/\.vol\d+\+\d+\.par2$/i', '', $cleanerName);
+        // `.par2` is already gone, so also strip a bare volume marker (both `vol01+02` and `vol01-02`).
+        $cleanerName = preg_replace('/\.vol\d+[+-]\d+$/i', '', $cleanerName);
         $cleanerName = preg_replace('/\d{1,3}\.rev"?$/i', '', $cleanerName);
 
         // Remove "Release Name" or "sample-" from the start
