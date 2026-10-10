@@ -11,7 +11,12 @@ use Illuminate\Support\Facades\Log;
 
 final readonly class AdditionalWorkPlanner
 {
-    private const string ARCHIVE_PATTERN = '/(\.(part\d+|[rz]\d+|rar|0+|0*10?|zipr\d{2,3}|zipx?)("|\s*\.rar)*($|[ ")]|-])|"[a-f0-9]{32}\.[1-9]\d{1,2}".*\(\d+\/\d{2,}\)$)/i';
+    private const string SEVEN_ZIP_PATTERN = '/([^"\s\/]+)\.7z(?:\.(\d{3}))?($|[ ")]|-)/i';
+
+    /** A quoted "name.001", or a bare one ending the subject or followed by yEnc or a part count. */
+    private const string NUMBERED_VOLUME_PATTERN = '/"([^"\r\n]+)\.(\d{3})"|(?:^|\s)([^"\s\/]+)\.(\d{3})(?=$|\s+(?:yEnc\b|\(\d+\/\d+\)))/i';
+
+    private const string ARCHIVE_PATTERN = '/(\.(part\d+|[rz]\d+|rar|7z|0+|0*10?|zipr\d{2,3}|zipx?)("|\s*\.rar)*($|[ ")]|-])|"[a-f0-9]{32}\.[1-9]\d{1,2}".*\(\d+\/\d{2,}\)$)/i';
 
     public function __construct(private ProcessingConfiguration $config) {}
 
@@ -29,6 +34,7 @@ final readonly class AdditionalWorkPlanner
         $bookFileCount = 0;
         $duplicateMessageIdCount = 0;
         $seenMessageIds = [];
+        $sevenZipTails = [];
 
         foreach (array_values($nzbContents) as $sourceIndex => $file) {
             if (! is_array($file)) {
@@ -41,6 +47,14 @@ final readonly class AdditionalWorkPlanner
 
                 if (preg_match($this->config->ignoreBookRegex, $title) === 1) {
                     $bookFileCount++;
+                }
+
+                // 7z keeps its file list at the end of the last volume.
+                $volume = $this->splitVolume($title);
+                if ($volume !== null && $segments !== []
+                    && ($sevenZipTails[$volume[0]][0] ?? -1) < $volume[1]
+                ) {
+                    $sevenZipTails[$volume[0]] = [$volume[1], (string) $segments[array_key_last($segments)]];
                 }
 
                 if (preg_match(self::ARCHIVE_PATTERN, $title) === 1) {
@@ -108,9 +122,25 @@ final readonly class AdditionalWorkPlanner
             }
         }
 
+        foreach ($archiveCandidates as $index => $candidate) {
+            $volume = $this->splitVolume($candidate->title);
+            $tail = $volume === null ? null : ($sevenZipTails[$volume[0]][1] ?? null);
+            if ($tail !== null && $candidate->likelyFirstVolume && ! in_array($tail, $candidate->messageIds, true)) {
+                $archiveCandidates[$index] = new ArchiveCandidate(
+                    title: $candidate->title,
+                    messageIds: $candidate->messageIds,
+                    likelyFirstVolume: true,
+                    sourceIndex: $candidate->sourceIndex,
+                    tailMessageIds: [$tail],
+                );
+            }
+        }
+
         // A lone file without an extension can't be classified by name; sample its first segment.
         // The entry must stand for exactly one NZB file, not several merged by a stripped subject.
         $probeMessageId = '';
+        $probeTailMessageIds = [];
+        $probeContinuationMessageIds = [];
         if ($archiveCandidates === [] && count($nzbContents) === 1) {
             $only = array_values($nzbContents)[0];
             if (is_array($only) && isset($only['segments'][0])
@@ -118,6 +148,18 @@ final readonly class AdditionalWorkPlanner
                 && ! $this->hasFileExtension((string) ($only['title'] ?? ''))
             ) {
                 $probeMessageId = (string) $only['segments'][0];
+                $probeArchiveMessageIds = $this->extractSegments(
+                    $only['segments'],
+                    max(1, $this->config->maximumRarSegments),
+                    $seenMessageIds,
+                    $duplicateMessageIdCount,
+                );
+                $probeContinuationMessageIds = array_slice($probeArchiveMessageIds, 1);
+                // A 7z found by the probe needs its last segment for the file list.
+                $lastSegment = (string) $only['segments'][array_key_last($only['segments'])];
+                if ($lastSegment !== $probeMessageId) {
+                    $probeTailMessageIds = [$lastSegment];
+                }
             }
         }
 
@@ -148,6 +190,8 @@ final readonly class AdditionalWorkPlanner
             duplicateMessageIdCount: $duplicateMessageIdCount,
             unsupportedReasons: $unsupportedReasons,
             probeMessageId: $probeMessageId,
+            probeTailMessageIds: $probeTailMessageIds,
+            probeContinuationMessageIds: $probeContinuationMessageIds,
         );
     }
 
@@ -176,7 +220,59 @@ final readonly class AdditionalWorkPlanner
             return (int) $position[1] === 1;
         }
 
-        return preg_match('/\.(rar|zip)($|[ ")]|-])/i', $title) === 1;
+        $sevenZip = $this->sevenZipVolume($title);
+        if ($sevenZip !== null) {
+            return $sevenZip[1] <= 1;
+        }
+
+        if (preg_match('/\.(rar|zip)($|[ ")]|-])/i', $title) === 1) {
+            return true;
+        }
+
+        $numbered = $this->numberedVolume($title);
+
+        return $numbered !== null && $numbered[1] <= 1;
+    }
+
+    /**
+     * A 7z volume, or a plain numbered split volume (`name.001`) that may turn out to be 7z
+     * once its first bytes are read, so the last volume's tail is kept for both.
+     *
+     * @return array{0: string, 1: int}|null set name and volume number (0 for a single .7z)
+     */
+    private function splitVolume(string $title): ?array
+    {
+        return $this->sevenZipVolume($title) ?? $this->numberedVolume($title);
+    }
+
+    /**
+     * @return array{0: string, 1: int}|null set name (kept apart from 7z set names) and volume number
+     */
+    private function numberedVolume(string $title): ?array
+    {
+        if (preg_match(self::NUMBERED_VOLUME_PATTERN, $title, $match) !== 1) {
+            return null;
+        }
+
+        $quoted = $match[1] !== '';
+
+        return ['#'.strtolower($quoted ? $match[1] : $match[3]), (int) ($quoted ? $match[2] : $match[4])];
+    }
+
+    /**
+     * @return array{0: string, 1: int}|null set name and volume number (0 for a single .7z)
+     */
+    private function sevenZipVolume(string $title): ?array
+    {
+        if (preg_match('/"([^"\r\n]+)\.7z(?:\.(\d{3}))?"/i', $title, $match) === 1) {
+            return [strtolower($match[1]), (int) ($match[2] ?? 0)];
+        }
+
+        if (preg_match(self::SEVEN_ZIP_PATTERN, $title, $match) !== 1) {
+            return null;
+        }
+
+        return [strtolower($match[1]), (int) $match[2]];
     }
 
     /**
