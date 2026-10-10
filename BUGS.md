@@ -250,6 +250,7 @@ These bugs turned up while building and running the self-hosted stack in `docker
 
 - **Log:** `production.ERROR: Binary header storage chunk rolled back {"groups_id":11,…,"attempts":10,"reason":"Lock retries exhausted"}`. Seen once about 25k groups were active with backfill on, even with `transaction-isolation = READ-COMMITTED`.
 - **Status:** this matches the known contention described in the wiki (issue #1874 / PR #1872). Not seen since cutting back to the 207 groups.
+- **Update (2026-10-10):** a related failure shows up with the 207 groups, 12 binaries threads, and 24 backfill threads. `Binary header storage chunk rolled back {"groups_id":1,…,"attempts":1,"reason":"Storage failed","exception":"Illuminate\\Database\\QueryException","code":"23000"}` was logged 85 times between 01:09 and 12:33 UTC, all in alt.binaries.boneless. A duplicate-key (23000) error is not retried, so the whole chunk is dropped and its articles fall back to part repair. Not root-caused; likely two workers inserting the same binary or part concurrently.
 
 ### 17. Compressed `XOVER` headers fail with the primary provider
 
@@ -262,6 +263,13 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Bug:** the lookups search with machine-generated release names. A stray `)` or `(` reaches Manticore's `query_string` unescaped.
 - **Symptom:** `ManticoreSearch searchIndexes ResponseException: "table predb_rt: query error: P08: syntax error, unexpected ')'"` with `"search":"idk_rza-everyone_knows_)-21ccf990"`; 6 times on 2026-10-09 and 5 on 2026-10-10. That release's PreDB lookup fails.
 - **Fix:** escape machine-generated names with `escapeString()` in `searchPredb()`, or have `prepareUserSearchQuery()` escape unbalanced parentheses.
+
+### 36. PHPStan can't analyse console commands without a database (Open)
+
+- **Where:** `UpdatePostProcess::__construct()` (`app/Console/Commands/UpdatePostProcess.php:50`) injects `PostProcessService`. Building it builds `NameFixingService` → `ReleaseUpdateService` → `CategorizationService` → `CategorizationPipeline`, which checks the settings table through `ConfigurationProvider` (`ConfigurationProvider.php:132`).
+- **Bug:** Larastan boots the app and resolves every console command. Without a reachable database, building `UpdatePostProcess` throws a `QueryException` (connection refused).
+- **Symptom:** `Internal error: App\Console\Commands\UpdatePostProcess while analysing file …/ProcessReleasesCommand.php`, "Result is incomplete because of severe errors". This happens for any file under `app/Console/Commands`, so commands get no static analysis in CI or build containers.
+- **Fix:** resolve `PostProcessService` lazily in `handle()`, or make its settings load lazily.
 
 ## Issues in the docker/ stack itself (all fixed)
 

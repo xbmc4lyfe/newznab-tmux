@@ -21,6 +21,7 @@ use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseManagementService;
+use App\Services\Search\SearchService;
 use App\Support\Data\NzbCreationResult;
 use App\Support\Data\ProcessReleasesSettings;
 use App\Support\Data\ReleaseCreationResult;
@@ -264,14 +265,18 @@ final class ReleaseProcessingService
         do {
             $totals['iterations']++;
 
-            $result = $this->createReleases($normalizedGroupId);
+            // Index each release once per pass, in bulk, instead of at creation, for its NZB
+            // and again after categorization.
+            [$result, $nzbFilesAdded] = app(SearchService::class)->deferReleaseUpdates(function () use ($normalizedGroupId, $categorize): array {
+                $pass = $this->createReleasesAndNzbs($normalizedGroupId);
+                $this->categorizeReleases($categorize, $normalizedGroupId);
+
+                return $pass;
+            });
             $totals['releases'] += $result->added;
             $totals['dupes'] += $result->dupes;
-
-            $nzbFilesAdded = $this->createNZBs($normalizedGroupId);
             $totals['nzbs'] += $nzbFilesAdded;
 
-            $this->categorizeReleases($categorize, $normalizedGroupId);
             $this->postProcessReleases($postProcess, $nntp);
             $this->deleteCollections($normalizedGroupId);
 
@@ -649,6 +654,22 @@ final class ReleaseProcessingService
         );
 
         return ReleaseCreationResult::from($result);
+    }
+
+    /**
+     * Create releases and their NZBs, indexing each touched release once, in bulk, at the end
+     * of the pass instead of at creation and again when its NZB is written.
+     *
+     * @return array{0: ReleaseCreationResult, 1: int} The creation result and the number of NZBs written.
+     *
+     * @throws Throwable
+     */
+    public function createReleasesAndNzbs(int|string|null $groupID): array
+    {
+        return app(SearchService::class)->deferReleaseUpdates(fn (): array => [
+            $this->createReleases($groupID),
+            $this->createNZBs($groupID),
+        ]);
     }
 
     /**
