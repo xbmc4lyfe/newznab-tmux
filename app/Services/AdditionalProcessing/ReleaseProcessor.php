@@ -295,6 +295,8 @@ class ReleaseProcessor
     private function processProbedArchive(ReleaseProcessingContext $context, ArchiveCandidate $candidate, string $data): void
     {
         if ($context->groupUnavailable) {
+            $context->archiveRetryable = true;
+
             return;
         }
 

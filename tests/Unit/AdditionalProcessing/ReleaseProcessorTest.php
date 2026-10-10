@@ -795,6 +795,55 @@ class ReleaseProcessorTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_a_probed_archive_retryable_when_the_group_drops_before_inspection(): void
+    {
+        $config = $this->makeConfig(['processPasswords' => true]);
+        $archive = $this->rar('Movie.2026.1080p.mkv', str_repeat('x', 100));
+        $nzbParser = Mockery::mock(NzbContentParser::class);
+        $nzbParser->shouldReceive('parseNzb')->once()->andReturn([
+            'error' => null,
+            'contents' => [
+                ['title' => '"kL2mN4pQ6rS8" yEnc (1/2)', 'segments' => ['<rar-1>', '<rar-2>'], 'size' => 800, 'filecount' => 1],
+                ['title' => '"tT1uU2vV3wW4" yEnc (1/1)', 'segments' => ['<other-1>'], 'size' => 700, 'filecount' => 1],
+            ],
+        ]);
+
+        $downloadService = Mockery::mock(UsenetDownloadService::class);
+        $this->expectDownloadScope($downloadService);
+        $downloadService->shouldReceive('download')
+            ->once()
+            ->with(DownloadKind::Compressed, ['<rar-1>'], '', 1)
+            ->andReturn(['success' => true, 'data' => substr($archive, 0, 60), 'groupUnavailable' => true, 'error' => null]);
+
+        $releaseManager = Mockery::mock(ReleaseFileManager::class);
+        $releaseManager->shouldReceive('processReleaseNameFromNzbContents')->once()->andReturnFalse();
+        $releaseManager->shouldNotReceive('deleteRelease');
+        $releaseManager->shouldNotReceive('addFileInfo');
+        $releaseManager->shouldReceive('finalizeRelease')->once()->andReturnNull();
+
+        $processor = new ReleaseProcessor(
+            $config,
+            $nzbParser,
+            new AdditionalWorkPlanner($config),
+            new ArchiveExtractionService($config),
+            Mockery::mock(MediaExtractionService::class),
+            $downloadService,
+            $releaseManager,
+            Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(),
+            $this->tempWorkspaceWithoutFiles(),
+            Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing()
+        );
+
+        $context = $this->makeContext();
+        $context->release->nfostatus = 1;
+        $processor->process($context, '/tmp/main/');
+
+        $this->assertTrue($context->groupUnavailable);
+        $this->assertTrue($context->archiveInspectionAttempted);
+        $this->assertTrue($context->archiveRetryable);
+    }
+
+    #[Test]
     public function it_probes_at_most_the_configured_number_of_files_and_never_deletes_a_multi_file_release(): void
     {
         $config = $this->makeConfig(['processPasswords' => true, 'archiveProbeFiles' => 2]);
