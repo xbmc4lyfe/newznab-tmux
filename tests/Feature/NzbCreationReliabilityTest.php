@@ -4,15 +4,20 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Facades\Search;
 use App\Models\Release;
 use App\Services\Binaries\BinariesConfig;
 use App\Services\CollectionCleanupService;
 use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbCreationCandidateQuery;
 use App\Services\Nzb\NzbService;
+use App\Services\ReleaseCreationService;
 use App\Services\ReleaseImageService;
 use App\Services\ReleaseProcessingService;
 use App\Services\Releases\ReleaseManagementService;
+use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
+use App\Services\Search\Contracts\SearchDriverInterface;
+use App\Services\Search\SearchService;
 use App\Support\Data\NzbCreationResult;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Support\Facades\DB;
@@ -86,6 +91,44 @@ class NzbCreationReliabilityTest extends TestCase
         foreach ($this->originalEnvironment as $key => $value) {
             $this->setEnvironmentValue($key, $value === false ? null : $value);
         }
+    }
+
+    public function test_a_release_pass_indexes_each_new_release_once_in_bulk(): void
+    {
+        DB::statement('CREATE TABLE search_index_failures (id INTEGER PRIMARY KEY AUTOINCREMENT, release_id INTEGER UNIQUE, operation VARCHAR(32), attempts INTEGER DEFAULT 0, last_error TEXT NULL, next_attempt_at DATETIME NULL, resolved_at DATETIME NULL, created_at DATETIME NULL, updated_at DATETIME NULL)');
+        $bulkCalls = [];
+        $singleCalls = [];
+        $driver = $this->createStubForIntersectionOfInterfaces([SearchDriverInterface::class, BulkReleaseIndexUpdater::class]);
+        $driver->method('updateReleases')->willReturnCallback(static function (array $releaseIds) use (&$bulkCalls): array {
+            $bulkCalls[] = $releaseIds;
+
+            return [];
+        });
+        $driver->method('updateRelease')->willReturnCallback(static function (int|string $releaseId) use (&$singleCalls): void {
+            $singleCalls[] = (int) $releaseId;
+        });
+        config(['search.default' => 'fake']);
+        $search = new SearchService($this->app);
+        $search->extend('fake', static fn (): SearchDriverInterface => $driver);
+        $this->app->instance(SearchService::class, $search);
+        Search::swap($search);
+
+        $this->insertRelease(1, 'a');
+        $this->insertCbp(200, 2000, 1);
+        $service = (new ReleaseProcessingService(
+            nzb: new IndexingNzbCreationService(NzbCreationResult::success('/tmp/a.nzb.gz', [200])),
+            releaseManagement: new DatabaseOnlyReleaseManagementService,
+            releaseCreationService: new IndexingReleaseCreationService([1]),
+            collectionCleanupService: app(CollectionCleanupService::class),
+        ))->setEchoCLI(false);
+
+        [$created, $nzbs] = $service->createReleasesAndNzbs(null);
+
+        $this->assertSame(1, $created->added);
+        $this->assertSame(1, $nzbs);
+        $this->assertSame([[1]], $bulkCalls, 'Indexed once for creation and NZB together.');
+        $this->assertSame([], $singleCalls);
+        $this->assertSame(0, DB::table('search_index_failures')->count());
     }
 
     public function test_candidate_query_skips_active_claims_and_recovers_stale_claims(): void
@@ -488,6 +531,42 @@ class FakeNzbCreationService extends NzbService
     public function createNzbForRelease(Release $release): NzbCreationResult
     {
         return $this->result;
+    }
+}
+
+/**
+ * Indexes the release as ReleaseObserver does when an NZB is written.
+ */
+class IndexingNzbCreationService extends FakeNzbCreationService
+{
+    public function createNzbForRelease(Release $release): NzbCreationResult
+    {
+        Search::updateRelease($release->id);
+
+        return parent::createNzbForRelease($release);
+    }
+}
+
+/**
+ * Indexes the releases as Release::insertRelease() does after creating them.
+ */
+class IndexingReleaseCreationService extends ReleaseCreationService
+{
+    /**
+     * @param  list<int>  $releaseIds
+     */
+    public function __construct(private readonly array $releaseIds) {}
+
+    /**
+     * @return array{added: int, dupes: int}
+     */
+    public function createReleases(int|string|null $groupID, int $limit, bool $echoCLI): array
+    {
+        foreach ($this->releaseIds as $releaseId) {
+            Search::updateRelease($releaseId);
+        }
+
+        return ['added' => count($this->releaseIds), 'dupes' => 0];
     }
 }
 
