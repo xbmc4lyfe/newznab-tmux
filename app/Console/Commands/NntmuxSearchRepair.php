@@ -65,23 +65,24 @@ final class NntmuxSearchRepair extends Command
      */
     private function repairExpiredDeferral(int $releaseId, string $token, int $attempts): void
     {
-        $driver = Search::driver();
-        if ($driver instanceof BulkReleaseIndexUpdater) {
-            $refreshed = $driver->updateReleases([$releaseId]) === [];
-        } else {
-            // Only bulk drivers defer; after a driver switch, refresh on a best-effort basis.
-            $driver->updateRelease($releaseId);
-            $refreshed = true;
-        }
-
         $marker = DB::table('search_index_failures')
             ->where('release_id', $releaseId)
             ->where('operation', SearchService::DEFERRED_RELEASE_OPERATION)
             ->where('last_error', $token)
             ->where('next_attempt_at', '<=', now());
 
-        if ($refreshed) {
-            $marker->delete();
+        $driver = Search::driver();
+        if (! $driver instanceof BulkReleaseIndexUpdater) {
+            // Only bulk drivers defer. After a switch to a driver that can't report
+            // success, keep the release as an ordinary failure for that driver's handling.
+            $marker->update(['operation' => 'upsert', 'last_error' => 'deferred lease expired', 'updated_at' => now()]);
+            Search::updateRelease($releaseId);
+
+            return;
+        }
+
+        if ($driver->updateReleases([$releaseId]) === []) {
+            $marker->where('attempts', $attempts)->delete();
 
             return;
         }

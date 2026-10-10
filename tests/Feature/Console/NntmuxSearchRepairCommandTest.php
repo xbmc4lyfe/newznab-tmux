@@ -76,6 +76,38 @@ final class NntmuxSearchRepairCommandTest extends SearchConsoleCommandTestCase
         $this->assertSame(1, DB::table('search_index_failures')->where('release_id', 5)->count());
     }
 
+    public function test_keeps_the_marker_when_a_failure_was_counted_during_a_successful_refresh(): void
+    {
+        $this->useDriver(static function (int $releaseId): bool {
+            DB::table('search_index_failures')->where('release_id', $releaseId)->increment('attempts');
+
+            return true;
+        });
+        $this->insertMarker(5, 'deferred:dead', now()->subMinute());
+
+        $this->artisan('nntmux:search-repair')->assertSuccessful();
+
+        $this->assertSame(1, DB::table('search_index_failures')->where('release_id', 5)->count());
+    }
+
+    public function test_turns_the_marker_into_an_ordinary_failure_for_a_driver_that_cannot_report_success(): void
+    {
+        $driver = $this->createStub(SearchDriverInterface::class);
+        $driver->method('updateRelease')->willReturnCallback(function (int|string $releaseId): void {
+            $this->updated[] = (int) $releaseId;
+        });
+        config(['search.default' => 'fake']);
+        $search = new SearchService($this->app);
+        $search->extend('fake', static fn (): SearchDriverInterface => $driver);
+        Search::swap($search);
+        $this->insertMarker(5, 'deferred:dead', now()->subMinute());
+
+        $this->artisan('nntmux:search-repair')->assertSuccessful();
+
+        $this->assertSame([5], $this->updated);
+        $this->assertSame('upsert', DB::table('search_index_failures')->where('release_id', 5)->value('operation'));
+    }
+
     /**
      * @param  (callable(int): bool)|null  $onUpdate  Returns whether the refresh worked
      */

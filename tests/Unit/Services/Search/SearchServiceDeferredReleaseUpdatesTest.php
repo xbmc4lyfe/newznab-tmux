@@ -113,6 +113,26 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
         $this->assertLessThanOrEqual(now()->toDateTimeString(), (string) $row->next_attempt_at, 'Repair picks it up on its next run.');
     }
 
+    public function test_keeps_a_marker_on_which_another_worker_counted_a_failure(): void
+    {
+        $search = $this->search(function (array $releaseIds): array {
+            // Another worker changed release 7 after the refresh read it, and its own
+            // index update failed (ManticoreSearchDriver counts that on the lease).
+            DB::table('search_index_failures')->where('release_id', 7)->increment('attempts');
+
+            return [];
+        });
+
+        $search->deferReleaseUpdates(function () use ($search): void {
+            $search->updateRelease(5);
+            $search->updateRelease(7);
+        });
+
+        $row = DB::table('search_index_failures')->sole();
+        $this->assertSame(7, (int) $row->release_id);
+        $this->assertLessThanOrEqual(now()->toDateTimeString(), (string) $row->next_attempt_at);
+    }
+
     public function test_takes_over_an_existing_failure_row(): void
     {
         DB::table('search_index_failures')->insert([
