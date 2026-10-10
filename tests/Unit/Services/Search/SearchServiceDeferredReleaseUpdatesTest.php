@@ -88,6 +88,8 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
             $markers = DB::table('search_index_failures')->orderBy('release_id')->get();
             $this->assertSame([5, 7], $markers->pluck('release_id')->map(static fn ($id): int => (int) $id)->all());
             $this->assertSame(['deferred'], $markers->pluck('operation')->unique()->values()->all());
+            $this->assertCount(1, $markers->pluck('last_error')->unique(), 'One token per scope.');
+            $this->assertStringStartsWith('deferred:', (string) $markers->first()->last_error);
             $this->assertSame(now()->addSeconds(600)->toDateTimeString(), (string) $markers->first()->next_attempt_at);
             $this->assertNull($markers->first()->resolved_at);
         });
@@ -146,19 +148,53 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
         $this->assertSame(1, DB::table('search_index_failures')->where('operation', 'deferred')->count());
     }
 
-    public function test_flushes_every_200_releases_without_waiting_for_the_scope_to_end(): void
+    public function test_collects_for_the_whole_scope_and_refreshes_in_chunks_of_200(): void
     {
         $search = $this->search();
 
         $search->deferReleaseUpdates(function () use ($search): void {
-            foreach (range(1, 201) as $releaseId) {
-                $search->updateRelease($releaseId);
+            foreach ([1, 2] as $phase) { // creation, then NZBs for the same releases
+                foreach (range(1, 201) as $releaseId) {
+                    $search->updateRelease($releaseId);
+                }
             }
-            $this->assertCount(1, $this->bulkCalls);
-            $this->assertSame(range(1, 200), $this->bulkCalls[0]);
+            $this->assertSame([], $this->bulkCalls);
         });
 
-        $this->assertSame([201], $this->bulkCalls[1]);
+        $this->assertSame([range(1, 200), [201]], $this->bulkCalls);
+    }
+
+    public function test_renews_the_lease_of_a_release_updated_again_after_five_minutes(): void
+    {
+        $search = $this->search();
+        $this->travelTo(now()->startOfSecond());
+
+        $search->deferReleaseUpdates(function () use ($search): void {
+            $search->updateRelease(5);
+            $this->travel(299)->seconds();
+            $search->updateRelease(5);
+            $this->assertSame(now()->subSeconds(299)->addSeconds(600)->toDateTimeString(), (string) DB::table('search_index_failures')->value('next_attempt_at'));
+
+            $this->travel(2)->seconds();
+            $search->updateRelease(5);
+            $this->assertSame(now()->addSeconds(600)->toDateTimeString(), (string) DB::table('search_index_failures')->value('next_attempt_at'));
+        });
+
+        $this->assertSame([[5]], $this->bulkCalls);
+    }
+
+    public function test_leaves_a_marker_another_scope_has_taken_over(): void
+    {
+        $search = $this->search(function (): void {
+            DB::table('search_index_failures')->where('release_id', 7)->update(['last_error' => 'deferred:other']);
+        });
+
+        $search->deferReleaseUpdates(function () use ($search): void {
+            $search->updateRelease(5);
+            $search->updateRelease(7);
+        });
+
+        $this->assertSame([7], DB::table('search_index_failures')->pluck('release_id')->map(static fn ($id): int => (int) $id)->all());
     }
 
     public function test_nested_scopes_flush_once_when_the_outermost_scope_ends(): void
@@ -196,7 +232,7 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
         $this->assertSame([9], $this->singleCalls, 'The scope is closed again after the failure.');
     }
 
-    public function test_drivers_without_bulk_support_refresh_each_release_once(): void
+    public function test_drivers_without_bulk_support_are_updated_immediately(): void
     {
         $driver = $this->createStub(SearchDriverInterface::class);
         $driver->method('updateRelease')->willReturnCallback(function (int|string $releaseId): void {
@@ -208,10 +244,10 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
             $search->updateRelease(5);
             $search->updateRelease(7);
             $search->updateRelease(5);
-            $this->assertSame([], $this->singleCalls);
+            $this->assertSame([5, 7, 5], $this->singleCalls, 'Their updateRelease() cannot report failure, so nothing is deferred.');
         });
 
-        $this->assertSame([5, 7], $this->singleCalls);
+        $this->assertSame([5, 7, 5], $this->singleCalls);
         $this->assertSame(0, DB::table('search_index_failures')->count());
     }
 

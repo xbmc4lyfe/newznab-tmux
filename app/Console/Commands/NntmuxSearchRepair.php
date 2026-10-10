@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Facades\Search;
+use App\Services\Search\SearchService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 
@@ -27,7 +28,7 @@ final class NntmuxSearchRepair extends Command
             ->orderBy('id')
             ->limit($limit);
 
-        $rows = $query->get(['release_id', 'operation']);
+        $rows = $query->get(['release_id', 'operation', 'last_error']);
         if ($rows->isEmpty()) {
             $this->info('No failed release index updates are due for repair.');
 
@@ -44,6 +45,8 @@ final class NntmuxSearchRepair extends Command
 
             if ($row->operation === 'delete') {
                 Search::deleteRelease($releaseId);
+            } elseif ($row->operation === SearchService::DEFERRED_RELEASE_OPERATION) {
+                $this->repairExpiredDeferral($releaseId, (string) $row->last_error);
             } else {
                 Search::updateRelease($releaseId);
             }
@@ -52,5 +55,22 @@ final class NntmuxSearchRepair extends Command
         $this->info(sprintf('%s release index failure(s) %s.', $rows->count(), $this->option('dry-run') ? 'reported' : 'processed'));
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Refresh a release whose deferral lease expired (its release pass died or ran long),
+     * then remove the marker unless the pass renewed it or the refresh failed (which
+     * turns the row into an ordinary failure).
+     */
+    private function repairExpiredDeferral(int $releaseId, string $token): void
+    {
+        Search::updateRelease($releaseId);
+
+        DB::table('search_index_failures')
+            ->where('release_id', $releaseId)
+            ->where('operation', SearchService::DEFERRED_RELEASE_OPERATION)
+            ->where('last_error', $token)
+            ->where('next_attempt_at', '<=', now())
+            ->delete();
     }
 }

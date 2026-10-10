@@ -26,27 +26,39 @@ use Illuminate\Support\Manager;
 class SearchService extends Manager implements SearchServiceInterface
 {
     /**
-     * Deferred release ids are refreshed in chunks of this size.
+     * search_index_failures.operation for a deferred update that has not been flushed.
+     */
+    public const string DEFERRED_RELEASE_OPERATION = 'deferred';
+
+    /**
+     * When the scope ends, deferred release ids are refreshed in chunks of this size.
      */
     private const int DEFERRED_RELEASE_CHUNK = 200;
 
     /**
-     * If a worker dies before flushing, nntmux:search-repair refreshes its deferred
-     * releases once this delay has passed.
+     * A deferral marker is a lease: if it is not renewed or cleared within this time
+     * (the worker died), nntmux:search-repair refreshes the release.
      */
-    private const int DEFERRED_RELEASE_REPAIR_DELAY_SECONDS = 600;
+    private const int DEFERRED_RELEASE_LEASE_SECONDS = 600;
 
     /**
-     * search_index_failures.operation for a deferred update that has not been flushed.
+     * A deferred release updated again after this long renews its lease.
      */
-    private const string DEFERRED_RELEASE_OPERATION = 'deferred';
+    private const int DEFERRED_RELEASE_RENEW_AFTER_SECONDS = 300;
 
     private int $releaseUpdateDeferralDepth = 0;
 
     /**
-     * Release ids whose index update waits for the end of the current deferral scope.
+     * Identifies the markers of the current scope (stored in last_error), so only
+     * this scope or an expired-lease repair removes them.
+     */
+    private string $deferralToken = '';
+
+    /**
+     * Release ids whose index update waits for the end of the current scope,
+     * mapped to when their marker was last written.
      *
-     * @var array<int, true>
+     * @var array<int, int>
      */
     private array $deferredReleaseIds = [];
 
@@ -184,7 +196,7 @@ class SearchService extends Manager implements SearchServiceInterface
     public function updateRelease(int|string $releaseID): void
     {
         $releaseId = (int) $releaseID;
-        if ($this->releaseUpdateDeferralDepth > 0 && $releaseId > 0) {
+        if ($this->releaseUpdateDeferralDepth > 0 && $releaseId > 0 && $this->driver() instanceof BulkReleaseIndexUpdater) {
             $this->deferReleaseUpdate($releaseId);
 
             return;
@@ -198,11 +210,12 @@ class SearchService extends Manager implements SearchServiceInterface
      *
      * Inside the scope, updateRelease() only records the id, so a release that is
      * created and then gets its NZB in the same pass is indexed once, from its final
-     * row, in bulk where the driver supports it. Each deferred id also gets a
-     * 'deferred' row in search_index_failures; flushing removes it, and if the worker
-     * dies first, nntmux:search-repair refreshes the release after a delay. Scopes nest;
-     * the outermost one flushes. Run it outside database transactions, so the flush
-     * reads committed rows.
+     * row, in bulk. Each deferred id also gets a 'deferred' row in search_index_failures
+     * holding this scope's token and a lease; the flush removes it, and if the worker
+     * dies first, nntmux:search-repair refreshes the release once the lease expires.
+     * Scopes nest; the outermost one flushes. Drivers without bulk support (whose
+     * updateRelease() can't report failure) are updated immediately as before. Run it
+     * outside database transactions, so the flush reads committed rows.
      *
      * @template TResult
      *
@@ -211,6 +224,9 @@ class SearchService extends Manager implements SearchServiceInterface
      */
     public function deferReleaseUpdates(callable $work): mixed
     {
+        if ($this->releaseUpdateDeferralDepth === 0) {
+            $this->deferralToken = self::DEFERRED_RELEASE_OPERATION.':'.bin2hex(random_bytes(8));
+        }
         $this->releaseUpdateDeferralDepth++;
         try {
             return $work();
@@ -224,34 +240,28 @@ class SearchService extends Manager implements SearchServiceInterface
 
     private function deferReleaseUpdate(int $releaseId): void
     {
-        if (isset($this->deferredReleaseIds[$releaseId])) {
+        $now = now()->getTimestamp();
+        $markedAt = $this->deferredReleaseIds[$releaseId] ?? null;
+        if ($markedAt !== null && $now - $markedAt < self::DEFERRED_RELEASE_RENEW_AFTER_SECONDS) {
             return;
         }
 
         $this->markReleaseUpdateDeferred($releaseId);
-        $this->deferredReleaseIds[$releaseId] = true;
-        if (count($this->deferredReleaseIds) >= self::DEFERRED_RELEASE_CHUNK) {
-            $this->flushDeferredReleaseUpdates();
-        }
+        $this->deferredReleaseIds[$releaseId] = $now;
     }
 
     private function flushDeferredReleaseUpdates(): void
     {
-        while ($this->deferredReleaseIds !== []) {
-            $releaseIds = array_slice(array_keys($this->deferredReleaseIds), 0, self::DEFERRED_RELEASE_CHUNK);
-            foreach ($releaseIds as $releaseId) {
-                unset($this->deferredReleaseIds[$releaseId]);
-            }
+        $chunks = array_chunk(array_keys($this->deferredReleaseIds), self::DEFERRED_RELEASE_CHUNK);
+        $this->deferredReleaseIds = [];
 
+        foreach ($chunks as $releaseIds) {
             try {
                 $driver = $this->driver();
-                if ($driver instanceof BulkReleaseIndexUpdater) {
-                    $driver->updateReleases($releaseIds);
-                } else {
-                    foreach ($releaseIds as $releaseId) {
-                        $driver->updateRelease($releaseId);
-                    }
+                if (! $driver instanceof BulkReleaseIndexUpdater) {
+                    throw new \LogicException('The search driver changed to one without bulk release updates.');
                 }
+                $driver->updateReleases($releaseIds);
             } catch (\Throwable $e) {
                 // The 'deferred' rows stay, so nntmux:search-repair retries these releases.
                 Log::error('Search: deferred release index flush failed: '.$e->getMessage(), ['releases' => count($releaseIds)]);
@@ -272,14 +282,14 @@ class SearchService extends Manager implements SearchServiceInterface
                     'release_id' => $releaseId,
                     'operation' => self::DEFERRED_RELEASE_OPERATION,
                     'attempts' => 0,
-                    'last_error' => self::DEFERRED_RELEASE_OPERATION,
-                    'next_attempt_at' => $now->copy()->addSeconds(self::DEFERRED_RELEASE_REPAIR_DELAY_SECONDS),
+                    'last_error' => $this->deferralToken,
+                    'next_attempt_at' => $now->copy()->addSeconds(self::DEFERRED_RELEASE_LEASE_SECONDS),
                     'resolved_at' => null,
                     'created_at' => $now,
                     'updated_at' => $now,
                 ]],
                 ['release_id'],
-                ['operation', 'next_attempt_at', 'resolved_at', 'updated_at'],
+                ['operation', 'last_error', 'next_attempt_at', 'resolved_at', 'updated_at'],
             );
         } catch (\Throwable $e) {
             Log::debug('Search: unable to record a deferred release index update', [
@@ -290,8 +300,9 @@ class SearchService extends Manager implements SearchServiceInterface
     }
 
     /**
-     * Remove the markers of refreshed releases. A release whose refresh failed has
-     * had its row turned into an ordinary failure (operation 'upsert'), which stays.
+     * Remove this scope's markers for refreshed releases. A release whose refresh failed
+     * has had its row turned into an ordinary failure (operation 'upsert'), and a marker
+     * another scope has since taken over carries that scope's token; both stay.
      *
      * @param  list<int>  $releaseIds
      */
@@ -301,6 +312,7 @@ class SearchService extends Manager implements SearchServiceInterface
             DB::table('search_index_failures')
                 ->whereIn('release_id', $releaseIds)
                 ->where('operation', self::DEFERRED_RELEASE_OPERATION)
+                ->where('last_error', $this->deferralToken)
                 ->delete();
         } catch (\Throwable $e) {
             Log::debug('Search: unable to clear deferred release index markers', [

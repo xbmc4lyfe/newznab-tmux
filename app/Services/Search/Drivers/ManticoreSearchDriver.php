@@ -18,6 +18,7 @@ use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
+use App\Services\Search\SearchService;
 use App\Services\Search\Support\ManticoreClientFactory;
 use App\Services\Search\Support\ManticoreIndexRegistry;
 use App\Services\Search\Support\ReleaseIndexProjection;
@@ -451,8 +452,11 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
         }
 
         try {
+            // A 'deferred' row is a lease owned by a running release pass (see
+            // SearchService::deferReleaseUpdates()); only that pass or repair removes it.
             DB::table('search_index_failures')
                 ->where('release_id', $releaseId)
+                ->where('operation', '!=', SearchService::DEFERRED_RELEASE_OPERATION)
                 ->update([
                     'resolved_at' => now(),
                     'next_attempt_at' => null,
@@ -1064,6 +1068,7 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
             DB::table('search_index_failures')
                 ->whereIn('release_id', $releaseIds)
                 ->whereNull('resolved_at')
+                ->where('operation', '!=', SearchService::DEFERRED_RELEASE_OPERATION)
                 ->update([
                     'resolved_at' => now(),
                     'next_attempt_at' => null,

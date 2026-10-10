@@ -15,7 +15,6 @@ use Manticoresearch\Exceptions\ResponseException;
 use Manticoresearch\Request;
 use Manticoresearch\Response;
 use Manticoresearch\Table;
-use PHPUnit\Framework\MockObject\MockObject;
 use Tests\TestCase;
 
 final class ManticoreUpdateReleasesTest extends TestCase
@@ -70,6 +69,23 @@ final class ManticoreUpdateReleasesTest extends TestCase
         $this->assertNotNull(DB::table('search_index_failures')->where('release_id', 1)->value('resolved_at'));
     }
 
+    public function test_leaves_deferral_markers_to_the_release_pass_that_owns_them(): void
+    {
+        DB::table('search_index_failures')->insert([
+            ['release_id' => 1, 'operation' => 'upsert', 'attempts' => 1, 'last_error' => 'x', 'next_attempt_at' => now(), 'created_at' => now(), 'updated_at' => now()],
+            ['release_id' => 2, 'operation' => 'deferred', 'attempts' => 0, 'last_error' => 'deferred:other', 'next_attempt_at' => now()->addMinutes(10), 'created_at' => now(), 'updated_at' => now()],
+        ]);
+        $table = $this->createStub(Table::class);
+
+        $this->driver($table)->updateReleases([1, 2]);
+        $this->driver($table)->updateRelease(2);
+
+        $rows = DB::table('search_index_failures')->get()->keyBy('release_id');
+        $this->assertNotNull($rows[1]->resolved_at);
+        $this->assertNull($rows[2]->resolved_at);
+        $this->assertNotNull($rows[2]->next_attempt_at);
+    }
+
     public function test_removes_releases_that_no_longer_exist(): void
     {
         $table = $this->createMock(Table::class);
@@ -115,7 +131,7 @@ final class ManticoreUpdateReleasesTest extends TestCase
         $this->assertSame(['updateRelease_query'], $failures->pluck('last_error')->unique()->values()->all());
     }
 
-    private function driver(Table&MockObject $table, int $retryAttempts = 2): ManticoreSearchDriver
+    private function driver(Table $table, int $retryAttempts = 2): ManticoreSearchDriver
     {
         $client = $this->createStub(Client::class);
         $client->method('table')->willReturn($table);
