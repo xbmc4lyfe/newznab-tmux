@@ -616,7 +616,8 @@ class IRCClient
      */
     protected function _resolveAddresses(string $host): array
     {
-        $addresses = [];
+        // The system resolver first, so /etc/hosts and other name services count, as they do for the first attempt.
+        $addresses = gethostbynamel($host) ?: [];
         // Query each type on its own: a failing AAAA lookup would make a combined query return nothing at all.
         foreach ([DNS_A, DNS_AAAA] as $type) {
             foreach (@dns_get_record($host, $type) ?: [] as $record) {
@@ -626,6 +627,7 @@ class IRCClient
                 }
             }
         }
+        $addresses = array_values(array_unique($addresses));
         shuffle($addresses);
 
         return $addresses;
