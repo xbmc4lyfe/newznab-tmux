@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Tmux;
 
 use App\Enums\TmuxPaneRole;
+use Illuminate\Contracts\Process\InvokedProcess;
 use Illuminate\Contracts\Process\ProcessResult;
 use Illuminate\Support\Facades\Process;
 use RuntimeException;
@@ -52,6 +53,11 @@ class TmuxPaneManager
      * @var array<string, int>
      */
     private array $reapRequested = [];
+
+    /**
+     * The `wait-for` client shared by waitForExit() calls until tmux wakes it.
+     */
+    private ?InvokedProcess $exitWaiter = null;
 
     public function __construct(string $sessionName)
     {
@@ -201,32 +207,40 @@ class TmuxPaneManager
      * waiter runs, pane state is polled every slice, and the wait returns once a pane that
      * was alive has died or gone.
      *
-     * Only one `wait-for` client is started per call: every client stopped before the
-     * channel is signalled stays registered in tmux, so a fresh waiter per slice would
-     * leak one per second while nothing exits.
+     * Every `wait-for` client stopped before the channel is signalled stays registered in
+     * tmux until the next signal, so the waiter is never stopped on a timeout: it is kept
+     * across calls (monitor cycles) and replaced only once tmux has woken it.
      */
     public function waitForExit(int $seconds): void
     {
         $deadline = microtime(true) + $seconds;
         $alive = $this->alivePanes();
-        $waiter = Process::timeout($seconds + 5)->start(TmuxCommand::arguments(['wait-for', $this->eventChannel()]));
+        if ($this->exitWaiter === null || ! $this->exitWaiter->running()) {
+            $this->exitWaiter = Process::forever()->start(TmuxCommand::arguments(['wait-for', $this->eventChannel()]));
+        }
         $nextPoll = microtime(true) + self::EXIT_WAIT_SLICE_SECONDS;
 
-        try {
-            while ($waiter->running() && microtime(true) < $deadline) {
-                usleep(self::EXIT_WAIT_TICK_MICROSECONDS);
-                if (microtime(true) < $nextPoll) {
-                    continue;
-                }
-                $nextPoll = microtime(true) + self::EXIT_WAIT_SLICE_SECONDS;
-                if ($alive !== null && array_diff($alive, $this->alivePanes() ?? $alive) !== []) {
-                    return;
-                }
+        while (microtime(true) < $deadline) {
+            if (! $this->exitWaiter->running()) {
+                $this->exitWaiter = null; // Woken by the pane-died hook.
+
+                return;
             }
-        } finally {
-            if ($waiter->running()) {
-                $waiter->stop(1);
+            usleep(self::EXIT_WAIT_TICK_MICROSECONDS);
+            if (microtime(true) < $nextPoll) {
+                continue;
             }
+            $nextPoll = microtime(true) + self::EXIT_WAIT_SLICE_SECONDS;
+            if ($alive !== null && array_diff($alive, $this->alivePanes() ?? $alive) !== []) {
+                return;
+            }
+        }
+    }
+
+    public function __destruct()
+    {
+        if ($this->exitWaiter?->running()) {
+            $this->exitWaiter->signal(defined('SIGTERM') ? SIGTERM : 15);
         }
     }
 

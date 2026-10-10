@@ -46,4 +46,15 @@ class TmuxWaitForExitTest extends TestCase
         $this->assertGreaterThanOrEqual(2.9, microtime(true) - $started);
         $this->assertSame(1, $this->waiters);
     }
+
+    public function test_the_waiter_is_reused_across_monitor_cycles_until_tmux_wakes_it(): void
+    {
+        $panes = new TmuxPaneManager('waiters');
+
+        $panes->waitForExit(1);
+        $panes->waitForExit(1);
+        $panes->waitForExit(1);
+
+        $this->assertSame(1, $this->waiters);
+    }
 }

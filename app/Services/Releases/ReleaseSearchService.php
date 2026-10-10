@@ -274,7 +274,7 @@ class ReleaseSearchService
                 // The index had no candidates (empty during a rebuild, or the query failed): fall back like the
                 // other sort orders do.
                 return $hasText && config('nntmux.mysql_search_fallback', false) === true
-                    ? $this->apiSearchLegacyMysql($searchName, $groupName, $offset, $limit, $maxAge, $excludedCats, $cat, $minSize, $orderBy)
+                    ? $this->apiSearchLegacyMysql($searchName, $groupName, $offset, $limit, $maxAge, $excludedCats, $cat, $minSize, $orderBy, bypassIndex: true)
                     : new Collection;
             }
 
@@ -305,7 +305,7 @@ class ReleaseSearchService
             }
 
             if ($filtered['ids'] === [] && $hasText && config('nntmux.mysql_search_fallback', false) === true) {
-                return $this->apiSearchLegacyMysql($searchName, $groupName, $offset, $limit, $maxAge, $excludedCats, $cat, $minSize, $orderBy);
+                return $this->apiSearchLegacyMysql($searchName, $groupName, $offset, $limit, $maxAge, $excludedCats, $cat, $minSize, $orderBy, bypassIndex: true);
             }
 
             if ($filtered['ids'] === []) {
@@ -426,14 +426,26 @@ class ReleaseSearchService
      *
      * @param  array<int|string, mixed>  $cat
      */
-    private function apiSearchLegacyMysql(mixed $searchName, mixed $groupName, int $offset, int $limit, int $maxAge, array $excludedCats, array $cat, int $minSize, string $orderBy = 'posted_desc'): mixed
+    /**
+     * @param  array<int, int|string>  $excludedCats
+     * @param  array<int, int|string>  $cat
+     * @param  bool  $bypassIndex  Find text candidates in MySQL only. Set when the index already returned no
+     *                             candidates for the full filters: an unfiltered index lookup could return only
+     *                             unrelated IDs and keep database-only matches out.
+     */
+    private function apiSearchLegacyMysql(mixed $searchName, mixed $groupName, int $offset, int $limit, int $maxAge, array $excludedCats, array $cat, int $minSize, string $orderBy = 'posted_desc', bool $bypassIndex = false): mixed
     {
         [$orderField, $orderDir] = $this->getBrowseOrder($orderBy);
         $searchLimit = $this->determineSearchCandidateLimit($offset, $limit);
 
         $searchResult = [];
         $hasText = $searchName !== -1 && $searchName !== '' && $searchName !== null;
-        if ($hasText) {
+        if ($hasText && $bypassIndex) {
+            $searchResult = $this->performMySQLSearch(['searchname' => $searchName], $searchLimit);
+            if ($searchResult === []) {
+                return collect();
+            }
+        } elseif ($hasText) {
             $fuzzyResult = Search::searchReleasesWithFuzzy($searchName, $searchLimit);
             $searchResult = $fuzzyResult['ids'] ?? [];
 
