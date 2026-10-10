@@ -17,6 +17,11 @@ class TmuxPaneManager
 {
     private const ROLE_OPTION = '@nntmux_role';
 
+    /**
+     * waitForExit() waits in slices this long and checks for unreaped panes in between.
+     */
+    private const int EXIT_WAIT_SLICE_SECONDS = 1;
+
     protected string $sessionName;
 
     /**
@@ -28,8 +33,15 @@ class TmuxPaneManager
 
     private TmuxSessionManager $sessionManager;
 
-    /** @var array<string, array{role: string, dead: bool, exit_code: ?int, pid: int, pipe: bool, window: string}>|null */
+    /** @var array<string, array{role: string, dead: bool, exit_code: ?int, exit_signal: ?int, pid: int, pipe: bool, window: string}>|null */
     private ?array $snapshot = null;
+
+    /**
+     * Dead pane processes ("pane:pid") this manager has already asked tmux to reap.
+     *
+     * @var array<string, true>
+     */
+    private array $reapRequested = [];
 
     public function __construct(string $sessionName)
     {
@@ -169,12 +181,44 @@ class TmuxPaneManager
         return 'nntmux-pane-exit-'.hash('sha256', $this->sessionName);
     }
 
+    /**
+     * Wait up to $seconds for a pane to exit.
+     *
+     * The pane-died hook wakes the wait at once, but it cannot be relied on alone: tmux
+     * fires it only after reaping the pane process, which it can miss (see requestReap()),
+     * and a wake-up sent while nobody is waiting goes to the stale waiter left by an earlier
+     * timed-out wait (tmux never removes those) instead of being remembered. So the wait
+     * runs in short slices and returns once a pane that was alive has died or gone.
+     */
     public function waitForExit(int $seconds): void
     {
+        $deadline = microtime(true) + $seconds;
+        $alive = $this->alivePanes();
+        do {
+            $slice = max(1, min(self::EXIT_WAIT_SLICE_SECONDS, (int) ceil($deadline - microtime(true))));
+            try {
+                Process::timeout($slice)->run(TmuxCommand::arguments(['wait-for', $this->eventChannel()]));
+
+                return;
+            } catch (ProcessTimedOutException) {
+                // Periodic reconciliation also detects topology changes and hangs.
+            }
+            if ($alive !== null && array_diff($alive, $this->alivePanes() ?? $alive) !== []) {
+                return;
+            }
+        } while (microtime(true) < $deadline);
+    }
+
+    /**
+     * @return list<string>|null Live pane IDs, or null when the session cannot be listed.
+     */
+    private function alivePanes(): ?array
+    {
+        $this->refresh();
         try {
-            Process::timeout($seconds)->run(TmuxCommand::arguments(['wait-for', $this->eventChannel()]));
-        } catch (ProcessTimedOutException) {
-            // Periodic reconciliation also detects topology changes and hangs.
+            return array_keys(array_filter($this->paneSnapshot(), static fn (array $state): bool => ! $state['dead']));
+        } catch (RuntimeException) {
+            return null;
         }
     }
 
@@ -407,29 +451,115 @@ class TmuxPaneManager
         $this->roleTargets = null;
     }
 
-    /** @return array<string, array{role: string, dead: bool, exit_code: ?int, pid: int, pipe: bool, window: string}> */
+    /** @return array<string, array{role: string, dead: bool, exit_code: ?int, exit_signal: ?int, pid: int, pipe: bool, window: string}> */
     public function paneSnapshot(): array
     {
         if ($this->snapshot !== null) {
             return $this->snapshot;
         }
+        [$panes, $serverPid] = $this->listPanes();
+
+        // A dead pane should report how its process ended. When it does not, tmux has
+        // not reaped the process (see requestReap()); nudge it once per process.
+        $unreaped = [];
+        foreach ($panes as $id => $state) {
+            if ($state['dead'] && $state['exit_code'] === null && $state['exit_signal'] === null
+                && ! isset($this->reapRequested[$id.':'.$state['pid']])) {
+                $unreaped[$id] = $state['pid'];
+            }
+        }
+        if ($unreaped !== [] && $this->requestReap($serverPid)) {
+            foreach ($unreaped as $id => $pid) {
+                $this->reapRequested[$id.':'.$pid] = true;
+            }
+            // tmux handles the signal from its event loop, so allow it a moment.
+            for ($attempt = 0; $attempt < 10; $attempt++) {
+                usleep(10000);
+                [$panes] = $this->listPanes();
+                if (! $this->hasUnreportedExit($panes, array_keys($unreaped))) {
+                    break;
+                }
+            }
+        }
+        $current = [];
+        foreach ($panes as $id => $state) {
+            $current[$id.':'.$state['pid']] = true;
+        }
+        $this->reapRequested = array_intersect_key($this->reapRequested, $current);
+
+        return $this->snapshot = $panes;
+    }
+
+    /**
+     * Ask the tmux server to reap exited pane processes.
+     *
+     * Debian's tmux is built with libutempter, which resets SIGCHLD to its default
+     * disposition while it removes a pane's login record. A pane process whose exit
+     * signal lands in that window is never reaped, so tmux shows the pane as dead
+     * with no exit status or signal. A fresh SIGCHLD makes tmux run its waitpid()
+     * loop and record how the process ended.
+     */
+    protected function requestReap(int $serverPid): bool
+    {
+        if ($serverPid <= 0 || ! function_exists('posix_kill') || ! defined('SIGCHLD')) {
+            return false;
+        }
+        // The PID comes from the tmux server; make sure it is that process in this PID namespace.
+        $command = @file_get_contents("/proc/{$serverPid}/comm");
+        if ($command === false || ! str_starts_with($command, 'tmux')) {
+            return false;
+        }
+
+        return posix_kill($serverPid, SIGCHLD);
+    }
+
+    /**
+     * @return array{array<string, array{role: string, dead: bool, exit_code: ?int, exit_signal: ?int, pid: int, pipe: bool, window: string}>, int}
+     */
+    private function listPanes(): array
+    {
         $result = Process::timeout(10)->run(TmuxCommand::arguments([
             'list-panes', '-s', '-t', $this->sessionManager->target(), '-F',
-            "#{pane_id}\t#{".self::ROLE_OPTION."}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}\t#{pane_pipe}\t#{window_id}",
+            "#{pane_id}\t#{".self::ROLE_OPTION."}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}\t#{pane_pipe}\t#{window_id}\t#{pane_dead_signal}\t#{pid}",
         ]));
         if (! $result->successful()) {
             throw new RuntimeException("Unable to list panes for tmux session '{$this->sessionName}'.");
         }
         $panes = [];
+        $serverPid = 0;
         foreach (preg_split('/\R/', trim($result->output())) ?: [] as $line) {
-            [$id, $role, $dead, $status, $pid, $pipe, $window] = array_pad(explode("\t", $line), 7, '');
+            [$id, $role, $dead, $status, $pid, $pipe, $window, $signal, $server] = array_pad(explode("\t", $line), 9, '');
             if (! preg_match('/^%[0-9]+$/', $id)) {
                 continue;
             }
-            $panes[$id] = ['role' => $role, 'dead' => $dead === '1', 'exit_code' => $status === '' ? null : (int) $status, 'pid' => (int) $pid, 'pipe' => $pipe === '1', 'window' => $window];
+            $panes[$id] = [
+                'role' => $role,
+                'dead' => $dead === '1',
+                'exit_code' => $status === '' ? null : (int) $status,
+                'exit_signal' => $signal === '' ? null : (int) $signal,
+                'pid' => (int) $pid,
+                'pipe' => $pipe === '1',
+                'window' => $window,
+            ];
+            $serverPid = (int) $server;
         }
 
-        return $this->snapshot = $panes;
+        return [$panes, $serverPid];
+    }
+
+    /**
+     * @param  array<string, array{role: string, dead: bool, exit_code: ?int, exit_signal: ?int, pid: int, pipe: bool, window: string}>  $panes
+     * @param  list<string>  $ids
+     */
+    private function hasUnreportedExit(array $panes, array $ids): bool
+    {
+        foreach ($ids as $id) {
+            if (isset($panes[$id]) && $panes[$id]['dead'] && $panes[$id]['exit_code'] === null && $panes[$id]['exit_signal'] === null) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public function isAlive(string $pane): bool

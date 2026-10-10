@@ -56,3 +56,4 @@ docker/.env
 docker/config/app.env
 docker/config/usenet_servers.json
 docker/docs/
+docker/app/nzb-yenc-ffi/target/

@@ -1,8 +1,8 @@
-# NNTmux self-hosted Docker stack: design spec
+# Design spec for the self-hosted stack
 
 - **Date:** 2026-10-08
-- **Status:** Approved (approach A). Implementation plan: [`2026-10-08-nntmux-docker-stack-plan.md`](./2026-10-08-nntmux-docker-stack-plan.md)
-- **Target host:** Apple M5 Mac with 32 GB RAM. OrbStack gives Docker 10 CPUs and about 24.5 GB on linux/arm64. About 400 GB of disk is free.
+- **Status:** approved (approach A). Implementation plan: [`2026-10-08-nntmux-docker-stack-plan.md`](./2026-10-08-nntmux-docker-stack-plan.md)
+- **Target host:** an Apple M5 Mac with 32 GB RAM. OrbStack gives Docker 10 CPUs and about 24.5 GB on linux/arm64. About 400 GB of disk is free.
 
 ## 1. Goal
 
@@ -23,7 +23,7 @@ Every container keeps its persistent files in bind mounts under `docker/`.
 **Success criteria**
 
 - `make -C docker up` brings every service to `healthy`.
-- The web UI answers on `http://localhost:8080` and an admin can log in.
+- The web UI answers on `http://localhost:8080` and an administrator can log in.
 - Within the first hour: active groups gain headers, then releases, and post-processing panes are working.
 - `predb` rows arrive from IRC (`source` like `#PreNNTmux`) and from the feed importer (`source` like `predb.club`).
 - Manticore `releases_rt` and `predb_rt` row counts track the database.
@@ -43,19 +43,19 @@ Every container keeps its persistent files in bind mounts under `docker/`.
 | D1 | Model the stack on `deploy/cloud/compose.yaml` (FrankenPHP image; separate web, horizon, scheduler and indexer services) | That is the maintained production layout. `docker-compose.yml.prod-dist` is broken: it calls `tmux-ui:start`, which does not exist. |
 | D2 | MariaDB **11.4.8** | The schema dumps use MariaDB-only collations (`utf8mb4_uca1400_ai_ci`). `deploy/cloud` pins 11.4.8. The user chose MariaDB. |
 | D3 | Manticore **28.4.4** with `EXTRA=1` | The version the code pins (ADR 0001). Buddy is needed for `/metrics`. |
-| D4 | Redis 7.4.2 with AOF and `noeviction` | Redis holds queues, locks and sessions. Evicting them would corrupt work. |
+| D4 | Redis 7.4.2 with AOF and `noeviction` | Redis holds queues, locks, and sessions. Evicting them would corrupt work. |
 | D5 | An overlay image on top of the root `Dockerfile` | The base image lacks several things NNTmux needs; see below. |
 | D6 | Primary NNTP = `news.newshosting.com` (73 connections); alternate = `news.frugalusenet.com` (170 connections) | Only two providers are supported. The alternate is only used to fetch articles missing on the primary. |
-| D7 | PreDB comes from the IRC scraper plus a **new** `predb:import-feed` command | Upstream has no RSS/API importer, and predb.ovh (the README's recommendation) no longer resolves. Live feeds checked on 2026-10-08: predb.club (JSON and RSS), api.predb.net (JSON), predb.me (RSS). |
-| D8 | Scheduler-side `tmux:health-check --auto-restart` is gated off; the indexer supervises itself | In a split-container layout, the scheduler sees no tmux session and would call `tmux:start` inside the scheduler container, creating a second ingest session. The upstream cloud stack has the same latent bug. |
+| D7 | PreDB comes from the IRC scraper plus a **new** `predb:import-feed` command | Upstream has no RSS/API importer, and predb.ovh (the README's recommendation) no longer resolves. Live feeds checked on 2026-10-08: predb.club (JSON and RSS), api.predb.net (JSON), and `predb.me` (RSS). |
+| D8 | Scheduler-side `tmux:health-check --auto-restart` is gated off; the indexer supervises itself | In a split-container layout, the scheduler sees no tmux session and would call `tmux:start` inside the scheduler container, creating a second indexing session. The upstream cloud stack has the same latent bug. |
 | D9 | Exposed on `localhost:8080` over plain HTTP | Chosen by the user. Caddy can bind to the LAN with `PROXY_BIND=0.0.0.0`. |
-| D10 | Start with a curated set of 20 groups, backfilled 3 days | Chosen by the user. Disk-safe; more groups can be added in the admin UI. |
+| D10 | Start with a curated set of 20 groups, backfilled 3 days | Chosen by the user. Disk-safe; more groups can be added in the administrator UI. |
 | D11 | Unrar/unzip scratch space is a `tmpfs` | It is ephemeral, high-churn I/O that should not go through the macOS file-sharing layer. This is the only non-bind-mount path, and it holds no state. |
 
 What the overlay image (D5) adds to the base image:
 
 - Debian **non-free `unrar`**: the base has `unrar-free`, which cannot read RAR5.
-- `iproute2`: NNTmux counts NNTP sockets with `ss`.
+- `iproute2`, because NNTmux counts NNTP sockets with `ss`.
 - `file`, `htop`, `git`.
 - `opcache`.
 - RapidYenc is **not** built. FrankenPHP's PHP is thread-safe (ZTS), and the RapidYenc FFI path requires a non-threaded build, so the stack runs `YENC_DECODER=php`. Bring-up confirmed this: an earlier build that included RapidYenc logged that native yEnc was unavailable.
@@ -144,7 +144,7 @@ docker/
 └── docs/                       # this spec + plan
 ```
 
-| Host path | Container path | Service(s) |
+| Host path | Container path | Services |
 |---|---|---|
 | `data/storage` | `/app/storage` (nzb, covers, logs, framework, `app/monitoring`) | web, horizon, scheduler, indexer |
 | `data/install` | `/app/_install` (`install.lock`) | app services |
@@ -162,8 +162,8 @@ docker/
 
 **Secrets.** `docker/bin/generate-env` reads `docker/config/usenet_servers.json` (gitignored; override with `USENET_SERVERS_JSON=`). It writes the following into `config/app.env` with mode 600:
 
-- The primary and alternate NNTP host, port, user, password and connection counts.
-- A random 32-byte `APP_KEY`, DB passwords and a 24-character admin password.
+- The primary and alternate NNTP host, port, user, password, and connection counts.
+- A random 32-byte `APP_KEY`, DB passwords and a 24-character administrator password.
 - A unique IRC nickname.
 
 It never overwrites an existing value, so re-running it is safe. No credential is ever written to a tracked file.
@@ -172,7 +172,7 @@ The ignore files gain entries for `docker/data/`, `docker/logs/`, `docker/backup
 
 ## 5. Tuning
 
-### 5.1 MariaDB (`config/mariadb/conf.d/99-nntmux.cnf`)
+### 5.1 Database server (`config/mariadb/conf.d/99-nntmux.cnf`)
 
 Based on the wiki's "Medium (32 GB)" profile, scaled to a 10 GB container cap.
 
@@ -245,7 +245,7 @@ maxmemory-policy noeviction
 save ""
 ```
 
-### 5.4 PHP
+### 5.4 Runtime settings
 
 Opcache:
 
@@ -255,7 +255,7 @@ Opcache:
 
 Limits:
 
-- CLI `memory_limit=2048M`, already set by `docker/8.5/php.ini`
+- Command-line `memory_limit=2048M`, already set by `docker/8.5/php.ini`
 
 ### 5.5 NNTmux runtime settings (`config/seed/tuning.sql`, typed config tables)
 
@@ -316,7 +316,7 @@ Units, each with one job:
   - It returns `{inserted, updated, skipped}`.
   - A row that raises an exception is logged and skipped, so the batch continues.
 - **`App\Console\Commands\PredbImportFeed`**: `predb:import-feed {--source=*} {--pages=1} {--dry-run}`.
-  - Iterates over the configured sources. One source failing (connection error or a non-2xx response) logs a warning and does not abort the others.
+  - Iterates over the configured sources. One source failing (connection error or a non-2xx response) logs a warning and does not stop the others.
   - Exit code: 0 if at least one source succeeded, 1 if all failed.
 - **`config/predb_feeds.php`** reads these env keys, all added to `.env.example`:
 
@@ -333,7 +333,7 @@ Units, each with one job:
 - **Tests:**
   - Unit: each source parser against JSON and XML fixtures in `tests/Fixtures/predb/`.
   - Feature: on SQLite, with `Search` faked, check that the importer inserts new titles, updates without clobbering existing values, and maps nukes.
-  - Feature: the command calls `Http::fake`, isolates a failing source, honours `--dry-run`, and stays disabled when off.
+  - Feature: the command calls `Http::fake`, isolates a failing source, honours `--dry-run`, and does nothing when turned off.
 
 ### 6.2 Scheduled health-check gate
 
@@ -360,7 +360,7 @@ Units, each with one job:
 5. `compose run --rm web php artisan nntmux:deploy-init`. This step:
    - checks the configuration
    - creates the directories
-   - runs `migrate --seed` and creates the admin user
+   - runs `migrate --seed` and creates the administrator user
    - runs `manticore:create-indexes`
    - writes `install.lock`
 
@@ -388,8 +388,8 @@ alt.binaries.ath           alt.binaries.sounds.lossless  alt.binaries.sounds.mp3
 | Watch the indexer | `make -C docker tmux`, which attaches to the tmux session (detach with Ctrl-a d) |
 | Logs | `make -C docker logs s=indexer`; Laravel logs are in `docker/data/storage/logs` |
 | Backup | `make -C docker backup`: `mariadb-dump --single-transaction` piped through gzip into `docker/backups/`, keeping 7. Manticore can be rebuilt with `nntmux:populate --manticore --all`. |
-| Add groups | Admin → Groups, or extend `groups.sql` and run `make -C docker seed` |
-| Grafana | `http://localhost:8080/grafana/` (admin session required), or Admin → System → Monitoring |
+| Add groups | The Groups page of the administrator UI, or extend `groups.sql` and run `make -C docker seed` |
+| Grafana | `http://localhost:8080/grafana/` (administrator session required), or the Monitoring page under System in the administrator UI |
 | Mail | `http://localhost:8025` |
 
 ## 9. Failure handling
@@ -401,7 +401,7 @@ alt.binaries.ath           alt.binaries.sounds.lossless  alt.binaries.sounds.mp3
 | A feed goes down | That source logs a warning. Other sources and IRC continue. |
 | An NNTP article is missing | NNTmux falls back to the alternate provider. |
 | Redis is full | `noeviction` returns errors rather than silently dropping queues. `maxmemory` is sized with headroom, and memory is monitored in Grafana. |
-| The disk fills up | Grafana's host dashboard shows it. Part retention (72h) and the hourly `clean:directories` keep transient data bounded. |
+| The disk fills up | Grafana's host dashboard shows it. Part retention (72 hours) and the hourly `clean:directories` keep transient data bounded. |
 
 ## 10. Risks and checks during bring-up
 
@@ -415,11 +415,11 @@ alt.binaries.ath           alt.binaries.sounds.lossless  alt.binaries.sounds.mp3
 ## 11. Testing and verification
 
 - **PHP:** the new and affected PHPUnit tests, Pint (`--dirty`), PHPStan, and `php -l`. These run in a container built from the `build` stage, since the host has no PHP.
-- **Stack:** `docker compose config` must be valid. Every service must be healthy. `curl -fsS localhost:8080/up` must succeed and the admin login page must render.
+- **Stack:** `docker compose config` must be valid. Every service must be healthy. `curl -fsS localhost:8080/up` must succeed and the administrator login page must render.
 - **Indexing:**
   - `usenet_groups.last_record > 0` for active groups.
   - `binaries`/`parts` row counts grow.
-  - `releases` count is above 0 within about an hour.
+  - `releases` count is greater than 0 within about an hour.
   - The tmux monitor pane shows connections on the primary.
 - **PreDB:** `SELECT source, COUNT(*) FROM predb GROUP BY source` shows both the IRC and the feed sources, and `predb_rt` has the same count.
 
@@ -433,8 +433,8 @@ alt.binaries.ath           alt.binaries.sounds.lossless  alt.binaries.sounds.mp3
 | Binaries workers failed in `_getXFeatureTextResponse` (compressed headers) | `NNTP_COMPRESSED_HEADERS=false`, the upstream default |
 | Native yEnc unavailable under ZTS PHP | Dropped the RapidYenc stage and FFI; `YENC_DECODER=php` |
 | Some workers saw intermittent `stream_socket_client` connect failures; only about 16 of 73 connections were in use | Treated as transient: the next cycle retries. Another client sharing the same provider account may also be using its connection pool. |
-| Grafana showed its own login page: Caddy sorted `request_header -X-JWT-Assertion` after `forward_auth`, which deleted the JWT before it reached Grafana | Wrapped the `/grafana*` handlers in `route { }` so they run in the order written |
-| No mediainfo, samples or video previews. The cause was `unrar` exiting 7 (`Unknown option`) on NNTmux's lone `-` switch terminator, hidden by `extract_using_rar_info = 1` | Changed `-` to `--` at the three unrar call sites (BUGS.md #19), added a regression test, and set `extract_using_rar_info = 0` in `tuning.sql`. Verified end to end: `(vRAW)`, then `m` and `s`, giving Matroska/HEVC 1920×1072 in `video_data`. |
+| Grafana showed its own login page because Caddy sorted `request_header -X-JWT-Assertion` after `forward_auth`, which deleted the JWT before it reached Grafana | Wrapped the `/grafana*` handlers in `route { }` so they run in the order written |
+| No mediainfo, samples, or video previews. The cause was `unrar` exiting 7 (`Unknown option`) on NNTmux's lone `-` switch terminator, hidden by `extract_using_rar_info = 1` | Changed `-` to `--` at the three unrar call sites (BUGS.md #19), added a regression test, and set `extract_using_rar_info = 0` in `tuning.sql`. Verified end to end: `(vRAW)`, then `m` and `s`, giving Matroska/HEVC 1920×1072 in `video_data`. |
 | Post-processing panes exit right after start ("no work available") | Expected before any releases exist. The monitor respawns them on their timers. |
 
 ### Throughput tuning (2026-10-09)
@@ -442,7 +442,8 @@ alt.binaries.ath           alt.binaries.sounds.lossless  alt.binaries.sounds.mp3
 | Observation | Change |
 |---|---|
 | MariaDB reached 9.87 of its 10 GiB cap | Raised `MARIADB_MEMORY` to 13g (the buffer pool stays at 8G) |
-| `pulse_aggregates` deadlocks: Pulse's storage ingest upserted from every short-lived worker | `PULSE_ENABLED=false` in the indexer, horizon and scheduler containers; web keeps recording |
+| `pulse_aggregates` deadlocked because Pulse's storage writer upserted from every short-lived worker | `PULSE_ENABLED=false` in the indexer, horizon and scheduler containers; web keeps recording |
 | The VM was CPU-saturated (load ~25 on 10 CPUs) and header chunks were rolled back on lock contention | Rebalanced workers toward backfill: binaries 20→6, backfill 8→12→16, post-processing 11→6; `innodb_io_capacity` raised to 4000/8000 |
-| The tmux monitor exact-`COUNT(*)`ed parts/binaries/collections every 60s (72M parts, about 10s per scan) | `TMUX_REFRESH_INTERVAL=900` |
+| The tmux monitor exact-`COUNT(*)`ed parts/binaries/collections every 60 seconds (72M parts, about 10 seconds per scan) | `TMUX_REFRESH_INTERVAL=900` |
 | Same-name uploads from different articles were dropped | `RELEASE_DEDUPE_ENABLED=false` and `RELEASE_DEDUPE_LOCK_STORE=database` (xbmc4lyfe/newznab-tmux#1, merged as `04ccaa5d6`); Cross Post Hours set to 0 |
+| 97% of releases (903k) were ~740 KB single-article fragments from article-obfuscated posts in boneless, cores, and comp | `min_size_to_form_release = 2097152` in `tuning.sql`. Existing fragments were left in place |

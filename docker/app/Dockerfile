@@ -2,11 +2,22 @@
 # Overlay for the self-hosted docker/ stack, built FROM the repository's production image
 # (root Dockerfile, tagged nntmux/base:local by `make -C docker build`).
 # Build context: repository root.
-# RapidYenc is not built: FrankenPHP's PHP is thread-safe (ZTS) and RapidYenc's FFI path needs NTS.
 ARG BASE_IMAGE=nntmux/base:local
+
+# Native yEnc decoder: nzb-decode behind RapidYenc's C ABI (docker/app/nzb-yenc-ffi),
+# loaded by App\Services\Yenc\NativePayloadDecoder through FFI.
+FROM rust:1.98-bookworm AS yenc
+WORKDIR /src
+COPY docker/app/nzb-yenc-ffi/ /src/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo test --release --locked \
+    && cargo build --release --locked \
+    && install -D -m 0644 target/release/libnzbyenc.so /out/libnzbyenc.so
 
 FROM ${BASE_IMAGE}
 USER root
+RUN install-php-extensions ffi
+COPY --from=yenc /out/libnzbyenc.so /usr/local/lib/nntmux/libnzbyenc.so
 # - unrar (non-free): unrar-free cannot open RAR5 archives used by most current posts.
 # - iproute2: NNTmux counts live NNTP sockets with `ss`.
 # - file, htop, git: helpers used by post-processing, the tmux htop pane and the monitor header.

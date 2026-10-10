@@ -10,6 +10,7 @@ use App\Services\Nzb\NzbService;
 use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Tests\Support\ConfigurationTestBuilder;
 use Tests\TestCase;
@@ -81,6 +82,60 @@ class CbpCleanupServiceTest extends TestCase
         $this->assertSame(0, DB::table('parts')->count());
         $this->assertSame(0, DB::table('binaries')->count());
         $this->assertSame(0, DB::table('collections')->count());
+    }
+
+    public function test_orphan_sweep_checks_one_id_window_per_pass_and_wraps_to_the_start(): void
+    {
+        config(['nntmux.cbp.orphan_scan_window' => 1000]);
+        foreach ([500, 600, 1500, 2500] as $id) {
+            $this->insertRecentCollection($id);
+        }
+        DB::table('binaries')->insert(['id' => 6000, 'name' => 'Kept.par2', 'collections_id' => 600, 'totalparts' => 1]);
+        $cleanup = app(CollectionCleanupService::class);
+
+        $cleanup->deleteFinishedAndOrphans(false);
+        $this->assertSame([600, 1500, 2500], $this->collectionIds());
+        $this->assertSame(1000, Cache::get(CollectionCleanupService::ORPHAN_SWEEP_CURSOR));
+
+        $cleanup->deleteFinishedAndOrphans(false);
+        $this->assertSame([600, 2500], $this->collectionIds());
+        $this->assertSame(2000, Cache::get(CollectionCleanupService::ORPHAN_SWEEP_CURSOR));
+
+        $cleanup->deleteFinishedAndOrphans(false);
+        $this->assertSame([600], $this->collectionIds());
+        $this->assertSame(0, Cache::get(CollectionCleanupService::ORPHAN_SWEEP_CURSOR));
+    }
+
+    public function test_cleanup_deletes_only_collections_whose_release_already_has_an_nzb(): void
+    {
+        DB::table('releases')->insert([
+            ['id' => 1, 'name' => 'Nzb.Done', 'nzbstatus' => NzbService::NZB_ADDED],
+            ['id' => 2, 'name' => 'Nzb.Pending', 'nzbstatus' => NzbService::NZB_NONE],
+        ]);
+        $this->insertRecentCollection(100, releasesId: 1);
+        $this->insertRecentCollection(200, releasesId: 2);
+        $this->insertRecentCollection(300);
+        foreach ([100, 200, 300] as $collectionId) {
+            DB::table('binaries')->insert(['name' => 'File.'.$collectionId, 'collections_id' => $collectionId, 'totalparts' => 1]);
+        }
+
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+
+        $this->assertSame([200, 300], $this->collectionIds());
+    }
+
+    public function test_orphan_sweep_is_skipped_while_another_worker_holds_the_lock(): void
+    {
+        $this->insertRecentCollection(500);
+        $lock = Cache::lock(CollectionCleanupService::ORPHAN_SWEEP_LOCK, 60);
+        $this->assertTrue($lock->get());
+
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+        $this->assertSame([500], $this->collectionIds());
+
+        $lock->release();
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+        $this->assertSame([], $this->collectionIds());
     }
 
     public function test_nzb_creation_cleans_up_collection_binary_and_parts_explicitly(): void
@@ -357,6 +412,35 @@ class CbpCleanupServiceTest extends TestCase
 
         $this->assertNotNull($dup);
         $this->assertSame('name_match_fallback', $reason);
+    }
+
+    private function insertRecentCollection(int $id, ?int $releasesId = null): void
+    {
+        DB::table('collections')->insert([
+            'id' => $id,
+            'subject' => 'Orphan.'.$id,
+            'fromname' => 'poster@example.com',
+            'date' => now()->format('Y-m-d H:i:s'),
+            'dateadded' => now()->format('Y-m-d H:i:s'),
+            'added' => now()->format('Y-m-d H:i:s'),
+            'xref' => 'alt.test:'.$id,
+            'groups_id' => 1,
+            'totalfiles' => 1,
+            'filesize' => 500,
+            'filecheck' => CollectionFileCheckStatus::Default->value,
+            'collectionhash' => 'orphan-hash-'.$id,
+            'collection_regexes_id' => 0,
+            'releases_id' => $releasesId,
+            'noise' => '',
+        ]);
+    }
+
+    /**
+     * @return list<int>
+     */
+    private function collectionIds(): array
+    {
+        return DB::table('collections')->orderBy('id')->pluck('id')->map(static fn ($id): int => (int) $id)->all();
     }
 
     private function seedConfiguration(): void
