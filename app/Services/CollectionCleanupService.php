@@ -7,6 +7,7 @@ namespace App\Services;
 use App\Services\Binaries\BinariesConfig;
 use App\Services\Configuration\ConfigurationProvider;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
@@ -29,6 +30,26 @@ class CollectionCleanupService
      * @var int[]
      */
     private const LOCK_DRIVER_CODES = [1213, 1205];
+
+    /**
+     * Cache lock that keeps the global orphan sweep to one worker at a time.
+     */
+    public const ORPHAN_SWEEP_LOCK = 'cbp:orphan-sweep:lock';
+
+    /**
+     * Cache key holding the collection id the next orphan sweep starts after.
+     */
+    public const ORPHAN_SWEEP_CURSOR = 'cbp:orphan-sweep:cursor';
+
+    /**
+     * Lock lifetime; a crashed sweeper releases the sweep after this long.
+     */
+    private const ORPHAN_SWEEP_LOCK_SECONDS = 600;
+
+    /**
+     * Hard cap on delete batches per sweep so a dense orphan window stays bounded.
+     */
+    private const ORPHAN_SWEEP_MAX_BATCHES = 20;
 
     private ?bool $cascadeDeleteReady = null;
 
@@ -143,42 +164,89 @@ class CollectionCleanupService
     /**
      * Delete collections that have no binaries (CBP orphans), in bounded batches.
      *
+     * Every per-group release job calls this, but the sweep is global, so a
+     * non-blocking cache lock keeps it to one worker at a time and the others
+     * skip it. Each sweep checks only one id window that resumes from a stored
+     * cursor: a NOT EXISTS scan from the lowest id has to probe `binaries` for
+     * every collection before it can return when there are few orphans.
+     */
+    private function deleteOrphanCollections(bool $echoCLI): int
+    {
+        $lock = Cache::lock(self::ORPHAN_SWEEP_LOCK, self::ORPHAN_SWEEP_LOCK_SECONDS);
+        if (! $lock->get()) {
+            return 0;
+        }
+
+        try {
+            return $this->sweepOrphanWindow($echoCLI);
+        } finally {
+            $lock->release();
+        }
+    }
+
+    /**
+     * Delete orphans in the id window after the stored cursor, then advance the
+     * cursor, wrapping to the start once the window reaches the highest id.
+     *
      * Uses the same two-phase pattern as deleteCollectionsMissedAfterNzb():
      * a plain NOT EXISTS SELECT against `binaries` (no row locks) followed
      * by a single-table DELETE FROM collections WHERE id IN (...). This
      * avoids cross-table lock acquisition between `collections` and
      * `binaries`, which can deadlock against concurrent BinaryHandler writes.
      */
-    private function deleteOrphanCollections(bool $echoCLI): int
+    private function sweepOrphanWindow(bool $echoCLI): int
     {
-        $deleted = 0;
-        $maxBatches = 20; // hard cap per cycle; bounded backlog drain
-        $batchSize = $this->sqlChunkSize();
+        $maxId = (int) DB::table('collections')->max('id');
+        if ($maxId === 0) {
+            Cache::forget(self::ORPHAN_SWEEP_CURSOR);
 
-        for ($i = 0; $i < $maxBatches; $i++) {
+            return 0;
+        }
+
+        $cursor = (int) Cache::get(self::ORPHAN_SWEEP_CURSOR, 0);
+        if ($cursor >= $maxId) {
+            $cursor = 0;
+        }
+        $windowEnd = min($cursor + $this->orphanScanWindow(), $maxId);
+        $batchSize = $this->sqlChunkSize();
+        $deleted = 0;
+
+        for ($i = 0; $i < self::ORPHAN_SWEEP_MAX_BATCHES; $i++) {
             $ids = DB::table('collections as c')
+                ->where('c.id', '>', $cursor)
+                ->where('c.id', '<=', $windowEnd)
                 ->whereNotExists(fn ($q) => $q->select(DB::raw(1))
                     ->from('binaries as b')
                     ->whereColumn('b.collections_id', 'c.id'))
                 ->orderBy('c.id')
                 ->limit($batchSize)
                 ->pluck('c.id')
+                ->map(static fn ($id): int => (int) $id)
                 ->all();
 
             if ($ids === []) {
+                $cursor = $windowEnd;
                 break;
             }
 
-            $affected = $this->deleteCollectionsAndDescendants($ids, 'Orphan cleanup', $echoCLI);
+            $deleted += $this->deleteCollectionsAndDescendants($ids, 'Orphan cleanup', $echoCLI);
 
-            $deleted += $affected;
-            if ($affected < $batchSize) {
+            if (count($ids) < $batchSize) {
+                $cursor = $windowEnd;
                 break;
             }
+            $cursor = $ids[array_key_last($ids)];
             usleep(10000);
         }
 
+        Cache::forever(self::ORPHAN_SWEEP_CURSOR, $cursor >= $maxId ? 0 : $cursor);
+
         return $deleted;
+    }
+
+    private function orphanScanWindow(): int
+    {
+        return max(1000, (int) config('nntmux.cbp.orphan_scan_window', 250000));
     }
 
     /**
@@ -186,7 +254,7 @@ class CollectionCleanupService
      * (releases.nzbstatus = 1). Batched in two phases per iteration:
      *
      *   1. Non-locking SELECT (autocommit MVCC snapshot) to gather a small
-     *      list of `collections.id` values whose joined release row has
+     *      list of `collections.id` values whose linked release row has
      *      nzbstatus = 1. No row locks are taken on `releases`.
      *   2. Single-table DELETE FROM collections WHERE id IN (...). The DELETE
      *      never references `releases`, so the lock graph reduces to one
@@ -205,9 +273,14 @@ class CollectionCleanupService
         $batchSize = $this->sqlChunkSize();
 
         for ($i = 0; $i < $maxBatches; $i++) {
+            // Drive from the few collections linked to a release: a join lets the
+            // optimizer start from every nzbstatus = 1 release instead.
             $ids = DB::table('collections as c')
-                ->join('releases as r', 'r.id', '=', 'c.releases_id')
-                ->where('r.nzbstatus', '=', 1)
+                ->whereNotNull('c.releases_id')
+                ->whereExists(fn ($q) => $q->select(DB::raw(1))
+                    ->from('releases as r')
+                    ->whereColumn('r.id', 'c.releases_id')
+                    ->where('r.nzbstatus', '=', 1))
                 ->orderBy('c.id')
                 ->limit($batchSize)
                 ->pluck('c.id')

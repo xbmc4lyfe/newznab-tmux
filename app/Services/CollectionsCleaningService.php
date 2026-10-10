@@ -40,6 +40,31 @@ class CollectionsCleaningService
     public const int REGEX_MUSIC_MATCH = -20;
 
     /**
+     * The encodings that can decode printable ASCII differently from UTF-8 (2- and
+     * 4-byte code units), plus UTF-8 itself. See normalizeString().
+     *
+     * @var list<string>
+     */
+    private const array ASCII_DETECTION_ENCODINGS = [
+        'UCS-4', 'UCS-4BE', 'UCS-4LE', 'UCS-2', 'UCS-2BE', 'UCS-2LE',
+        'UTF-32', 'UTF-32BE', 'UTF-32LE', 'UTF-16', 'UTF-16BE', 'UTF-16LE', 'UTF-8',
+    ];
+
+    /**
+     * Every encoding mbstring supports, cached per process.
+     *
+     * @var list<string>|null
+     */
+    private static ?array $allEncodings = null;
+
+    /**
+     * ASCII_DETECTION_ENCODINGS in mb_list_encodings() order, cached per process.
+     *
+     * @var list<string>|null
+     */
+    private static ?array $asciiDetectionEncodings = null;
+
+    /**
      * Cached file extension patterns
      */
     public string $e0;
@@ -259,8 +284,20 @@ class CollectionsCleaningService
         // Collapse multiple spaces into one
         $normalized = trim(preg_replace('/\s\s+/', ' ', $subject));
 
-        // Ensure UTF-8 encoding
-        return mb_convert_encoding($normalized, 'UTF-8', mb_list_encodings());
+        // Ensure UTF-8 encoding. Collection hashes depend on this output, so it must
+        // match detection over every encoding, which can rewrite even plain ASCII
+        // (some even-length strings are detected as UCS-2). For printable ASCII without
+        // the UTF-7 (+), UTF7-IMAP (&) and HZ (~) escape characters, every encoding
+        // outside ASCII_DETECTION_ENCODINGS decodes like UTF-8 and comes after it in
+        // mb_list_encodings(), so detecting over just those, kept in list order, picks
+        // the same encoding while scanning 13 encodings instead of about 80.
+        self::$allEncodings ??= mb_list_encodings();
+        self::$asciiDetectionEncodings ??= array_values(array_intersect(self::$allEncodings, self::ASCII_DETECTION_ENCODINGS));
+        $candidates = preg_match('/^[\x20-\x25\x27-\x2a\x2c-\x7d]*$/', $normalized) === 1
+            ? self::$asciiDetectionEncodings
+            : self::$allEncodings;
+
+        return mb_convert_encoding($normalized, 'UTF-8', $candidates);
     }
 
     /**
