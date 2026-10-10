@@ -82,6 +82,36 @@ class FileNameCleaner
     private const SUBTITLE_EXTENSIONS = '/\.(srt|sub|idx|ass|ssa|vtt|sup)$/i';
 
     /**
+     * Strip archive wrappers and part/volume markers repeatedly (`.rar.par2`, `.tar.zst`, `.7z.003`,
+     * `.part01.rar`), then at most one payload extension. Only one, so a title that ends in a token that is
+     * also an extension (`Movie.2020.1080p.DTS.mkv`) keeps it.
+     */
+    public function stripFileSuffixes(string $fileName): string
+    {
+        $wrappers = [
+            ...self::ARCHIVE_PATTERNS,
+            '/\.(zst|tgz|lz4|enc|rev)$/i',
+            '/\.vol\d+[+-]\d+$/i',
+            '/\.part\d{0,4}$/i',
+            '/\.(nfo|sfv|nzb|srr|srs)$/i',
+        ];
+
+        do {
+            $previous = $fileName;
+            $fileName = preg_replace($wrappers, '', $fileName) ?? $fileName;
+        } while ($fileName !== $previous);
+
+        foreach ([self::VIDEO_EXTENSIONS, self::AUDIO_EXTENSIONS, self::IMAGE_EXTENSIONS, self::EBOOK_EXTENSIONS, self::GAMEAPP_EXTENSIONS, self::SUBTITLE_EXTENSIONS] as $payload) {
+            $stripped = preg_replace($payload, '', $fileName) ?? $fileName;
+            if ($stripped !== $fileName) {
+                return $stripped;
+            }
+        }
+
+        return $fileName;
+    }
+
+    /**
      * Clean a filename for PreDB matching.
      *
      * @param  string  $fileName  The filename to clean
