@@ -13,9 +13,9 @@ namespace App\Services;
 class IRCClient
 {
     /**
-     * Longest wait, in seconds, on any one address while falling back through a host's other addresses.
+     * Longest wait, in seconds, on the first attempt when the host's other addresses can still be tried.
      */
-    private const FALLBACK_ATTEMPT_TIMEOUT = 5.0;
+    private const FIRST_ATTEMPT_TIMEOUT = 10.0;
 
     /**
      * Hostname IRC server used when connecting.
@@ -568,20 +568,30 @@ class IRCClient
     {
         $this->_closeStream();
 
-        $socket = $this->_openSocket($this->_remote_socket_string, null, $error_number, $error_string);
-
         // A round-robin host (irc.efnet.org) can list a dead server first, and PHP only tries one address.
-        // Try the rest of the host's addresses before giving up.
-        if ($socket === false && filter_var($this->_remote_host, FILTER_VALIDATE_IP) === false) {
-            // One shared budget, so extra addresses never multiply the caller's maximum wait.
-            $deadline = microtime(true) + $this->_remote_connection_timeout;
-            foreach ($this->_resolveAddresses($this->_remote_host) as $address) {
+        // Try the rest of the host's addresses before giving up. One budget, equal to the connection timeout,
+        // covers the host name attempt and every fallback, so extra addresses never multiply the maximum wait.
+        $canFallBack = filter_var($this->_remote_host, FILTER_VALIDATE_IP) === false;
+        $deadline = microtime(true) + $this->_remote_connection_timeout;
+        $socket = $this->_openSocket(
+            $this->_remote_socket_string,
+            null,
+            $error_number,
+            $error_string,
+            $canFallBack ? min($this->_remote_connection_timeout / 3, self::FIRST_ATTEMPT_TIMEOUT) : null
+        );
+
+        if ($socket === false && $canFallBack) {
+            $addresses = $this->_resolveAddresses($this->_remote_host);
+            foreach ($addresses as $index => $address) {
                 $remaining = $deadline - microtime(true);
                 if ($remaining <= 0) {
                     break;
                 }
+                // Share what is left evenly, so every address gets an attempt (at least a second each).
+                $share = min($remaining, max(1.0, $remaining / (\count($addresses) - $index)));
                 $literal = str_contains($address, ':') ? '['.$address.']' : $address;
-                $socket = $this->_openSocket($this->_remote_transport.'://'.$literal.':'.$this->_remote_port, $this->_remote_host, $error_number, $error_string, min($remaining, self::FALLBACK_ATTEMPT_TIMEOUT));
+                $socket = $this->_openSocket($this->_remote_transport.'://'.$literal.':'.$this->_remote_port, $this->_remote_host, $error_number, $error_string, $share);
                 if ($socket !== false) {
                     break;
                 }
