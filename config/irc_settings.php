@@ -125,8 +125,10 @@ return [
             'format' => 'corruptnet',
             'source' => 'efnet',
             'server' => env('SCRAPE_IRC_EFNET_SERVER', 'irc.efnet.org'),
-            'port' => (int) env('SCRAPE_IRC_EFNET_PORT', 6697),
-            'tls' => true,
+            // EFnet's servers present self-signed certificates, so verified TLS cannot connect. Plain IRC is
+            // the default (the channel is public and no password is sent); set TLS with port 6697 to opt in.
+            'port' => (int) env('SCRAPE_IRC_EFNET_PORT', 6667),
+            'tls' => (bool) env('SCRAPE_IRC_EFNET_TLS', false),
             'channels' => ['#pre' => null],
         ],
         'abjects' => [

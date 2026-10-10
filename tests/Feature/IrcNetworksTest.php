@@ -62,6 +62,8 @@ class IrcNetworksTest extends TestCase
         $this->assertSame(['#pre' => null, '#pre.spam' => null, '#p2ptrace' => null], IrcNetworks::resolve('predatabase')['channels']);
         $this->assertSame(['#pre' => null, '#Pre.Spam' => null], IrcNetworks::resolve('corruptnet')['channels']);
         $this->assertSame('corruptnet', IrcNetworks::resolve('efnet')['format']);
+        // EFnet's certificates are self-signed, so it defaults to plain IRC.
+        $this->assertSame([6667, false], [IrcNetworks::resolve('efnet')['port'], IrcNetworks::resolve('efnet')['tls']]);
         $this->assertSame('zenet', IrcNetworks::resolve('abjects')['format']);
         $this->assertSame('irc', IrcNetworks::resolve('ngp')['type']);
     }
