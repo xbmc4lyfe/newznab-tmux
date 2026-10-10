@@ -118,8 +118,7 @@ class UpdatePerGroup extends Command
         $this->releaseProcessingService->deleteUnwantedCollections($groupID);
 
         do {
-            $result = $this->releaseProcessingService->createReleases($groupID);
-            $nzbFilesAdded = $this->releaseProcessingService->createNZBs($groupID);
+            [$result, $nzbFilesAdded] = $this->releaseProcessingService->createReleasesAndNzbs($groupID);
 
             $shouldContinue = $result->total() >= $limit || $nzbFilesAdded >= $limit;
         } while ($shouldContinue);

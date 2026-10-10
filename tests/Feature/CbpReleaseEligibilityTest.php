@@ -133,9 +133,55 @@ class CbpReleaseEligibilityTest extends TestCase
         $this->assertStatus($inserted, CollectionFileCheckStatus::Inserted);
     }
 
+    public function test_reconcile_repairs_drifted_binary_aggregates_across_chunks(): void
+    {
+        $collectionId = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        $partial = (int) DB::table('binaries')->where('collections_id', $collectionId)->value('id');
+        $complete = DB::table('binaries')->insertGetId(['collections_id' => $collectionId, 'totalparts' => 2]);
+        foreach ([1, 2] as $part) {
+            DB::table('parts')->insert(['binaries_id' => $complete, 'partnumber' => $part, 'size' => 150, 'number' => 1000 + $part, 'messageid' => '<'.$complete.'-'.$part.'@example.test>']);
+        }
+        $empty = DB::table('binaries')->insertGetId(['collections_id' => $collectionId, 'totalparts' => 1]);
+        DB::table('binaries')->where('collections_id', $collectionId)->update(['currentparts' => 9, 'partsize' => 9, 'partcheck' => 1]);
+
+        $this->process(1);
+
+        $binaries = DB::table('binaries')->where('collections_id', $collectionId)->get()->keyBy('id');
+        $this->assertSame([1, 100, 0], [(int) $binaries[$partial]->currentparts, (int) $binaries[$partial]->partsize, (int) $binaries[$partial]->partcheck]);
+        $this->assertSame([2, 300, 1], [(int) $binaries[$complete]->currentparts, (int) $binaries[$complete]->partsize, (int) $binaries[$complete]->partcheck]);
+        $this->assertSame([0, 0, 0], [(int) $binaries[$empty]->currentparts, (int) $binaries[$empty]->partsize, (int) $binaries[$empty]->partcheck]);
+        $this->assertSame(400, (int) DB::table('collections')->where('id', $collectionId)->value('filesize'));
+    }
+
+    public function test_reconcile_writes_nothing_when_no_aggregate_drifted(): void
+    {
+        $first = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        $second = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        $reconciler = new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 2, reconcileBatchSize: 2));
+        $reconciler->processIncompleteCollections(1);
+        $this->assertStatus($first, CollectionFileCheckStatus::CompleteParts);
+        $this->assertStatus($second, CollectionFileCheckStatus::CompleteParts);
+
+        $writes = [];
+        DB::listen(static function ($query) use (&$writes): void {
+            if (preg_match('/^\s*update\b/i', $query->sql) === 1) {
+                $writes[] = $query->sql;
+            }
+        });
+        $reads = 0;
+        DB::listen(static function ($query) use (&$reads): void {
+            $reads += preg_match('/^\s*select\b.*\bfrom\s+[`"]?parts\b/is', $query->sql);
+        });
+        $reconciler->processIncompleteCollections(1);
+
+        $this->assertGreaterThan(0, $reads, 'The collections were reconciled again.');
+
+        $this->assertSame([], array_values(array_filter($writes, static fn (string $sql): bool => preg_match('/\b(binaries|collections)\b/', $sql) === 1)));
+    }
+
     private function process(?int $groupId): void
     {
-        $processor = new ReleaseProcessingService(binariesConfig: new BinariesConfig(reconcileBatchSize: 2));
+        $processor = new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 2, reconcileBatchSize: 2));
         $processor->processIncompleteCollections($groupId);
         $processor->processCollectionSizes($groupId);
     }
