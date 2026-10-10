@@ -13,6 +13,11 @@ namespace App\Services;
 class IRCClient
 {
     /**
+     * Longest wait, in seconds, on any one address while falling back through a host's other addresses.
+     */
+    private const FALLBACK_ATTEMPT_TIMEOUT = 5.0;
+
+    /**
      * Hostname IRC server used when connecting.
      */
     protected string $_remote_host = '';
@@ -568,9 +573,15 @@ class IRCClient
         // A round-robin host (irc.efnet.org) can list a dead server first, and PHP only tries one address.
         // Try the rest of the host's addresses before giving up.
         if ($socket === false && filter_var($this->_remote_host, FILTER_VALIDATE_IP) === false) {
+            // One shared budget, so extra addresses never multiply the caller's maximum wait.
+            $deadline = microtime(true) + $this->_remote_connection_timeout;
             foreach ($this->_resolveAddresses($this->_remote_host) as $address) {
+                $remaining = $deadline - microtime(true);
+                if ($remaining <= 0) {
+                    break;
+                }
                 $literal = str_contains($address, ':') ? '['.$address.']' : $address;
-                $socket = $this->_openSocket($this->_remote_transport.'://'.$literal.':'.$this->_remote_port, $this->_remote_host, $error_number, $error_string);
+                $socket = $this->_openSocket($this->_remote_transport.'://'.$literal.':'.$this->_remote_port, $this->_remote_host, $error_number, $error_string, min($remaining, self::FALLBACK_ATTEMPT_TIMEOUT));
                 if ($socket !== false) {
                     break;
                 }
@@ -613,7 +624,7 @@ class IRCClient
      * @param  string|null  $peerName  Host name to verify the TLS certificate against when connecting by IP address.
      * @return resource|false
      */
-    protected function _openSocket(string $socketString, ?string $peerName, ?int &$errorNumber, ?string &$errorString)
+    protected function _openSocket(string $socketString, ?string $peerName, ?int &$errorNumber, ?string &$errorString, ?float $timeout = null)
     {
         $context = null;
         if ($this->_remote_tls) {
@@ -629,7 +640,7 @@ class IRCClient
             $context = stream_context_create($options);
         }
 
-        return @stream_socket_client($socketString, $errorNumber, $errorString, $this->_remote_connection_timeout, STREAM_CLIENT_CONNECT, $context);
+        return @stream_socket_client($socketString, $errorNumber, $errorString, $timeout ?? $this->_remote_connection_timeout, STREAM_CLIENT_CONNECT, $context);
     }
 
     /**

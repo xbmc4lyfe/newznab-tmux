@@ -68,6 +68,30 @@ class IrcClientAddressFallbackTest extends TestCase
     }
 
     #[Test]
+    public function the_fallback_never_waits_longer_than_the_connection_timeout(): void
+    {
+        $client = new class extends IRCClient
+        {
+            protected function _resolveAddresses(string $host): array
+            {
+                // Non-routable addresses (TEST-NET-1) drop packets, so each attempt runs to its timeout.
+                return ['192.0.2.1', '192.0.2.2', '192.0.2.3', '192.0.2.4'];
+            }
+        };
+        $client->setConnectionRetries(0);
+        $client->setReConnectDelay(0);
+        $client->setConnectionTimeout(2);
+
+        $start = microtime(true);
+        ob_start();
+        $connected = $client->connect('irc.invalid', 6667);
+        ob_end_clean();
+
+        $this->assertFalse($connected);
+        $this->assertLessThan(6.0, microtime(true) - $start);
+    }
+
+    #[Test]
     public function it_still_fails_when_no_address_answers(): void
     {
         $client = new class extends IRCClient
