@@ -167,6 +167,7 @@ class ReleaseProcessor
                 }
 
                 if (! $bookFlood && $context->nzbHasCompressedFile) {
+                    $context->archiveInspectionAttempted = true;
                     $triedCompressedMids = [];
                     $metrics->measure(
                         ProcessingStage::ArchiveDownloads,

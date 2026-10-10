@@ -126,6 +126,11 @@ class ArchiveExtractionService
             ? $this->archiveInfo->getArchiveFileList(false)
             : $this->archiveInfo->getArchiveFileList();
         if (! is_array($files) || count($files) === 0) {
+            // A compressed 7z header needs an LZMA decoder, which isn't available.
+            if ($listingOnly && (int) ($dataSummary['enc_header'] ?? 0) === 1) {
+                $context->archiveListingUndecodable = true;
+            }
+
             return $result;
         }
 

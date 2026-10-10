@@ -58,6 +58,17 @@ class ReleaseProcessingContext
     public bool $nzbHasCompressedFile = false;
 
     /**
+     * Archive inspection ran for this release (not skipped for a book flood or disabled downloads).
+     */
+    public bool $archiveInspectionAttempted = false;
+
+    /**
+     * An archive was read but its file list can't be decoded here (a compressed 7z header),
+     * so retrying the release later won't produce one.
+     */
+    public bool $archiveListingUndecodable = false;
+
+    /**
      * @var list<array<string, mixed>>
      */
     public array $nzbContents = [];
@@ -191,6 +202,8 @@ class ReleaseProcessingContext
         $this->passwordStatus = 0;
         $this->releaseHasPassword = false;
         $this->nzbHasCompressedFile = false;
+        $this->archiveInspectionAttempted = false;
+        $this->archiveListingUndecodable = false;
         $this->groupUnavailable = false;
         $this->workPlan = null;
         $this->releaseDownloadedArchives();

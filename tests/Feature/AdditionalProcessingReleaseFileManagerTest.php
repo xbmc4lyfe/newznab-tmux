@@ -311,6 +311,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $manager = $this->makeManager();
         $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
         $context->nzbHasCompressedFile = true;
+        $context->archiveInspectionAttempted = true;
         $manager->finalizeRelease($context, true);
 
         $release = DB::table('releases')->where('id', 1)->first();
@@ -322,12 +323,44 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->travel(2)->hours();
         $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
         $context->nzbHasCompressedFile = true;
+        $context->archiveInspectionAttempted = true;
         $manager->finalizeRelease($context, true);
 
         $release = DB::table('releases')->where('id', 1)->first();
         $this->assertSame(-1, (int) $release->passwordstatus);
         $this->assertSame(0, (int) $release->haspreview);
         $this->assertSame(now()->subHour()->toDateTimeString(), (string) $release->archive_retry_at);
+    }
+
+    #[DataProvider('unretriableArchiveScenarios')]
+    public function test_an_archive_is_not_retried_when_a_later_attempt_cannot_read_it(
+        bool $inspectionAttempted,
+        bool $listingUndecodable,
+    ): void {
+        DB::table('releases')->insert($this->releaseRow());
+        Search::shouldReceive('updateRelease')->once()->with(1);
+
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context->nzbHasCompressedFile = true;
+        $context->archiveInspectionAttempted = $inspectionAttempted;
+        $context->archiveListingUndecodable = $listingUndecodable;
+        $this->makeManager()->finalizeRelease($context, true);
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame(-1, (int) $release->passwordstatus);
+        $this->assertSame(0, (int) $release->haspreview);
+        $this->assertNull($release->archive_retry_at);
+    }
+
+    /**
+     * @return array<string, array{bool, bool}>
+     */
+    public static function unretriableArchiveScenarios(): array
+    {
+        return [
+            'inspection skipped (book flood or downloads disabled)' => [false, false],
+            'compressed 7z header' => [true, true],
+        ];
     }
 
     #[DataProvider('probedArchiveScenarios')]
