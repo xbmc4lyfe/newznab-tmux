@@ -224,13 +224,6 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Bug:** the rule ignored every `docker-compose.yml` in the repository, including `docker/docker-compose.yml`.
 - **Fix (staged):** added `!docker/docker-compose.yml`.
 
-### 36. PHPStan can't run without a reachable MySQL server (Open)
-
-- **Where:** Larastan's `ConsoleApplicationResolver` builds every console command to read its options. Building `UpdatePostProcess` constructs `NameFixingService` → `ReleaseUpdateService` → `CategorizationService` → `CategorizationPipeline`, and `ConfigurationProvider::tableExists()` (`app/Services/Configuration/ConfigurationProvider.php:132`) calls `Schema::hasTable()` against the default connection.
-- **Symptom:** in `nntmux/build:local` with no database, `vendor/bin/phpstan analyse` stops with `Internal error: App\Console\Commands\UpdatePostProcess while analysing file …` (an `EntryNotFoundException` caused by `SQLSTATE[HY000] [2002] Connection refused`) and reports no results.
-- **Workaround:** run it with `DB_CONNECTION=sqlite DB_DATABASE=:memory:`.
-- **Fix:** have `ConfigurationProvider::tableExists()` treat a connection failure as a missing table, or stop building the categorization pipeline in command constructors.
-
 ## Documentation
 
 ### 15. Stale `README` and wiki content (Open)
@@ -276,6 +269,7 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Where:** `UpdatePostProcess::__construct()` (`app/Console/Commands/UpdatePostProcess.php:50`) injects `PostProcessService`. Building it builds `NameFixingService` → `ReleaseUpdateService` → `CategorizationService` → `CategorizationPipeline`, which checks the settings table through `ConfigurationProvider` (`ConfigurationProvider.php:132`).
 - **Bug:** Larastan boots the app and resolves every console command. Without a reachable database, building `UpdatePostProcess` throws a `QueryException` (connection refused).
 - **Symptom:** `Internal error: App\Console\Commands\UpdatePostProcess while analysing file …/ProcessReleasesCommand.php`, "Result is incomplete because of severe errors". This happens for any file under `app/Console/Commands`, so commands get no static analysis in CI or build containers.
+- **Workaround:** run PHPStan with `DB_CONNECTION=sqlite DB_DATABASE=:memory:`.
 - **Fix:** resolve `PostProcessService` lazily in `handle()`, or make its settings load lazily.
 
 ### 37. Release reconcile deadlocked with header storage on busy groups (Fixed)
