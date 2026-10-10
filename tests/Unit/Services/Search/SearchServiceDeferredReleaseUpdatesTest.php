@@ -137,6 +137,38 @@ final class SearchServiceDeferredReleaseUpdatesTest extends TestCase
         $this->assertNull($rows[7]->resolved_at, 'A resolved row is reopened so repair picks it up.');
     }
 
+    public function test_updates_immediately_when_the_marker_cannot_be_written(): void
+    {
+        $search = $this->search();
+        Schema::drop('search_index_failures');
+
+        $search->deferReleaseUpdates(function () use ($search): void {
+            $search->updateRelease(5);
+            $this->assertSame([5], $this->singleCalls);
+        });
+
+        $this->assertSame([], $this->bulkCalls);
+    }
+
+    public function test_updates_immediately_while_another_live_scope_holds_the_lease(): void
+    {
+        DB::table('search_index_failures')->insert([
+            ['release_id' => 5, 'operation' => 'deferred', 'attempts' => 0, 'last_error' => 'deferred:other', 'next_attempt_at' => now()->addMinutes(5), 'created_at' => now(), 'updated_at' => now()],
+            ['release_id' => 7, 'operation' => 'deferred', 'attempts' => 0, 'last_error' => 'deferred:dead', 'next_attempt_at' => now()->subMinute(), 'created_at' => now(), 'updated_at' => now()],
+        ]);
+        $search = $this->search();
+
+        $search->deferReleaseUpdates(function () use ($search): void {
+            $search->updateRelease(5);
+            $search->updateRelease(7);
+            $this->assertSame([5], $this->singleCalls);
+        });
+
+        $this->assertSame([[7]], $this->bulkCalls, 'An expired lease is taken over.');
+        $this->assertSame('deferred:other', DB::table('search_index_failures')->where('release_id', 5)->value('last_error'));
+        $this->assertSame(0, DB::table('search_index_failures')->where('release_id', 7)->count());
+    }
+
     public function test_a_failing_flush_leaves_markers_for_repair_and_does_not_throw(): void
     {
         $search = $this->search(function (): void {

@@ -246,7 +246,15 @@ class SearchService extends Manager implements SearchServiceInterface
             return;
         }
 
-        $this->markReleaseUpdateDeferred($releaseId);
+        if (! $this->markReleaseUpdateDeferred($releaseId)) {
+            // Without a lease of our own, a crash before the flush would leave nothing
+            // for repair, so index this release now.
+            unset($this->deferredReleaseIds[$releaseId]);
+            $this->driver()->updateRelease($releaseId);
+
+            return;
+        }
+
         $this->deferredReleaseIds[$releaseId] = $now;
     }
 
@@ -274,29 +282,44 @@ class SearchService extends Manager implements SearchServiceInterface
         }
     }
 
-    private function markReleaseUpdateDeferred(int $releaseId): void
+    /**
+     * Write or renew this scope's lease on a release. Fails, without touching the row,
+     * when another live scope holds the lease or the database write fails.
+     */
+    private function markReleaseUpdateDeferred(int $releaseId): bool
     {
         $now = now();
+        $lease = [
+            'operation' => self::DEFERRED_RELEASE_OPERATION,
+            'attempts' => 0,
+            'last_error' => $this->deferralToken,
+            'next_attempt_at' => $now->copy()->addSeconds(self::DEFERRED_RELEASE_LEASE_SECONDS),
+            'resolved_at' => null,
+            'updated_at' => $now,
+        ];
+
         try {
-            DB::table('search_index_failures')->upsert(
-                [[
-                    'release_id' => $releaseId,
-                    'operation' => self::DEFERRED_RELEASE_OPERATION,
-                    'attempts' => 0,
-                    'last_error' => $this->deferralToken,
-                    'next_attempt_at' => $now->copy()->addSeconds(self::DEFERRED_RELEASE_LEASE_SECONDS),
-                    'resolved_at' => null,
-                    'created_at' => $now,
-                    'updated_at' => $now,
-                ]],
-                ['release_id'],
-                ['operation', 'attempts', 'last_error', 'next_attempt_at', 'resolved_at', 'updated_at'],
-            );
+            if (DB::table('search_index_failures')->insertOrIgnore([$lease + ['release_id' => $releaseId, 'created_at' => $now]]) > 0) {
+                return true;
+            }
+
+            // Take over an ordinary failure row, renew our own lease, or take over a lease
+            // whose scope died; never another live scope's lease.
+            return DB::table('search_index_failures')
+                ->where('release_id', $releaseId)
+                ->where(function ($query) use ($now): void {
+                    $query->where('operation', '!=', self::DEFERRED_RELEASE_OPERATION)
+                        ->orWhere('last_error', $this->deferralToken)
+                        ->orWhere('next_attempt_at', '<=', $now);
+                })
+                ->update($lease) > 0;
         } catch (\Throwable $e) {
             Log::debug('Search: unable to record a deferred release index update', [
                 'release_id' => $releaseId,
                 'error' => $e->getMessage(),
             ]);
+
+            return false;
         }
     }
 
