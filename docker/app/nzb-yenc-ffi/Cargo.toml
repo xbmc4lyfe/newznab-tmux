@@ -3,7 +3,7 @@ name = "nzb-yenc-ffi"
 version = "0.1.0"
 edition = "2024"
 description = "C ABI shim exposing nzb-decode's yEnc decoder under RapidYenc's symbol names for NNTmux's FFI decoder"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 publish = false
 
 [lib]
