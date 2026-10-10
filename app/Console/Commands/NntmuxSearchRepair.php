@@ -74,8 +74,14 @@ final class NntmuxSearchRepair extends Command
         $driver = Search::driver();
         if (! $driver instanceof BulkReleaseIndexUpdater) {
             // Only bulk drivers defer. After a switch to a driver that can't report
-            // success, keep the release as an ordinary failure for that driver's handling.
-            $marker->update(['operation' => 'upsert', 'last_error' => 'deferred lease expired', 'updated_at' => now()]);
+            // success, keep the release as an ordinary failure, retried with backoff.
+            $marker->update([
+                'operation' => 'upsert',
+                'attempts' => $attempts + 1,
+                'last_error' => 'deferred lease expired',
+                'next_attempt_at' => $this->backoff($attempts + 1),
+                'updated_at' => now(),
+            ]);
             Search::updateRelease($releaseId);
 
             return;
@@ -88,8 +94,13 @@ final class NntmuxSearchRepair extends Command
         }
 
         $marker->update([
-            'next_attempt_at' => now()->addSeconds(min(3600, 2 ** min($attempts + 1, 10))),
+            'next_attempt_at' => $this->backoff($attempts + 1),
             'updated_at' => now(),
         ]);
+    }
+
+    private function backoff(int $attempts): \DateTimeInterface
+    {
+        return now()->addSeconds(min(3600, 2 ** min($attempts, 10)));
     }
 }

@@ -105,7 +105,10 @@ final class NntmuxSearchRepairCommandTest extends SearchConsoleCommandTestCase
         $this->artisan('nntmux:search-repair')->assertSuccessful();
 
         $this->assertSame([5], $this->updated);
-        $this->assertSame('upsert', DB::table('search_index_failures')->where('release_id', 5)->value('operation'));
+        $row = DB::table('search_index_failures')->where('release_id', 5)->sole();
+        $this->assertSame('upsert', $row->operation);
+        $this->assertSame(1, (int) $row->attempts);
+        $this->assertGreaterThan(now()->toDateTimeString(), (string) $row->next_attempt_at, 'Not due again on every run.');
     }
 
     /**
