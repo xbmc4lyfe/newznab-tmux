@@ -1405,7 +1405,8 @@ class ApiRequestMatrixTest extends TestCase
         }
         Search::shouldReceive('isAvailable')->andReturn(true);
         Search::shouldReceive('searchReleasePage')->once()->andReturn(new SearchPage(ids: [], total: 0, fuzzy: false, driver: 'manticore'));
-        Search::shouldReceive('searchReleasesWithFuzzy')->once()->andReturn(['ids' => [1], 'fuzzy' => false]);
+        // The index finds nothing either way, so the release must come from performMySQLSearch().
+        Search::shouldReceive('searchReleasesWithFuzzy')->once()->andReturn(['ids' => [], 'fuzzy' => false]);
 
         $releases = app(ReleaseSearchService::class)->apiSearch('ubuntu', -1, 0, 10, -1, [], [-1], 0, 'name_asc');
 

@@ -100,14 +100,15 @@ final class ApiUsageService
      */
     public static function quotaLockStore(): ?string
     {
+        $isFailover = static fn (string $store): bool => config("cache.stores.{$store}.driver") === 'failover';
+
+        // A failover store is never used, even when configured explicitly: it can grant the lock twice.
         $configured = trim((string) config('nntmux.api.quota_lock_store', ''));
         if ($configured !== '') {
-            return $configured;
+            return $isFailover($configured) ? 'database' : $configured;
         }
 
-        $default = (string) config('cache.default');
-
-        return config("cache.stores.{$default}.driver") === 'failover' ? 'database' : null;
+        return $isFailover((string) config('cache.default')) ? 'database' : null;
     }
 
     public function record(User $user, Request $request): void

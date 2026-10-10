@@ -59,6 +59,9 @@ final class ApiUsageServiceTest extends TestCase
 
         config(['nntmux.api.quota_lock_store' => 'redis']);
         $this->assertSame('redis', ApiUsageService::quotaLockStore());
+
+        config(['nntmux.api.quota_lock_store' => 'failover_redis_file']);
+        $this->assertSame('database', ApiUsageService::quotaLockStore());
     }
 
     public function test_async_record_persists_usage_before_dispatching_metadata_update(): void
