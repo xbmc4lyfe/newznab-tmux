@@ -89,7 +89,7 @@ class FileNameCleaner
     {
         $patterns = [
             ...self::ARCHIVE_PATTERNS,
-            '/\.(zst|tgz|lz4|enc)$/i',
+            '/\.(zst|tgz|lz4|enc|rev)$/i',
             '/\.vol\d+[+-]\d+$/i',
             '/\.part\d{1,4}$/i',
             self::VIDEO_EXTENSIONS,

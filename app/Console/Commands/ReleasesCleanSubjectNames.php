@@ -77,15 +77,19 @@ class ReleasesCleanSubjectNames extends Command
                     continue;
                 }
 
-                // A name-fixing worker may have renamed it since this chunk was read; never overwrite that.
-                $unchanged = DB::table('releases')->where('id', $row->id)->where('isrenamed', 0)->where('searchname', $row->searchname)->exists();
-                if (! $unchanged) {
-                    continue;
-                }
-
                 $before = $updater->fixed;
-                // An exact PreDB title is a proper name, as at release creation.
-                $updater->updateRelease($row, $name, 'Subject cleaner', true, 'Subject, ', $preId > 0, false, $preId);
+                // A name-fixing worker may have renamed it since this chunk was read. Lock the row, re-check it
+                // and rename it in one transaction, so that rename is never overwritten.
+                DB::transaction(function () use ($updater, $row, $name, $preId): void {
+                    $unchanged = DB::table('releases')->where('id', $row->id)->where('isrenamed', 0)->where('searchname', $row->searchname)->lockForUpdate()->exists();
+                    if (! $unchanged) {
+                        return;
+                    }
+                    // An exact PreDB title is a proper name, as at release creation; its type sets `isrenamed`.
+                    $preId > 0
+                        ? $updater->updateRelease($row, $name, 'Subject cleaner, PreDB exact', true, 'PreDB FT Exact, ', true, false, $preId)
+                        : $updater->updateRelease($row, $name, 'Subject cleaner', true, 'Subject, ', false, false, $preId);
+                });
                 if ($updater->fixed > $before) {
                     $renamed++;
                     $linked += $preId > 0 ? 1 : 0;

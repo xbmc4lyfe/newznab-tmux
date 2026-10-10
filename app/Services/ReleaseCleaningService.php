@@ -454,7 +454,12 @@ class ReleaseCleaningService
         $name = preg_replace('/[.\-_](sample|proof|thumbs?)$/i', '', $name) ?? $name;
         $name = trim(preg_replace('/\s\s+/u', ' ', $name) ?? $name, " .-_\t");
 
-        return $fileNameCleaner->isPlausibleReleaseTitle($name) ? $name : null;
+        // isPlausibleReleaseTitle() counts any final `.word` as a group suffix, which every dotted file name
+        // has (`Annual.Report.Final`). Check it with that last dot made a space, so only a `-GROUP` suffix, a
+        // year, quality or episode tag makes the name plausible.
+        $withoutDottedSuffix = preg_replace('/\.([^.\-]+)$/', ' $1', $name) ?? $name;
+
+        return $fileNameCleaner->isPlausibleReleaseTitle($withoutDottedSuffix) ? $name : null;
     }
 
     /**
@@ -466,8 +471,8 @@ class ReleaseCleaningService
      */
     private function counterFileSubjectName(): ?array
     {
-        // A trailing `lRap` is `yEnc` in ROT13: the whole subject is scrambled, so its file name is too.
-        if (preg_match(self::COUNTER_FILE_SUBJECT, $this->subject, $hit) !== 1 || preg_match('/\blRap\s*$/', $this->subject) === 1) {
+        // `lRap` is `yEnc` in ROT13: the whole subject is scrambled, so its file name is too.
+        if (preg_match(self::COUNTER_FILE_SUBJECT, $this->subject, $hit) !== 1 || preg_match('/"\s*lRap\b/', $this->subject) === 1) {
             return null;
         }
         $fromFile = $this->releaseNameFromFile($hit['file']);

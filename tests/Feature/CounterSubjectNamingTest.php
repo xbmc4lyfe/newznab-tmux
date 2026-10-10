@@ -51,6 +51,7 @@ class CounterSubjectNamingTest extends TestCase
         yield 'split 7z' => ['[2/9] - "Some.Movie.2020.1080p.BluRay.x264-GRP.7z.003" yEnc', 'Some.Movie.2020.1080p.BluRay.x264-GRP'];
         yield 'par2 of a rar' => ['[02/10] - "Some.App.v6.41.Multilingual-GRP.rar.par2" yEnc', 'Some.App.v6.41.Multilingual-GRP'];
         yield 'tar.zst' => ['[1/6] - "Some.Show.S01E01.1080p.WEB.h264-GRP.tar.zst" yEnc', 'Some.Show.S01E01.1080p.WEB.h264-GRP'];
+        yield 'rar recovery volume' => ['[3/9] - "Movie.2020.1080p-GRP.001.rev" yEnc', 'Movie.2020.1080p-GRP'];
         yield 'vob' => ['[1/5] - "Movie.2020.1080p-GRP.vob" yEnc', 'Movie.2020.1080p-GRP'];
         yield 'accented name' => ['[1/5] - "Amélie.2001.1080p.BluRay-GRP.mkv" yEnc', 'Amélie.2001.1080p.BluRay-GRP'];
         yield 'spaced p2p name' => ['[01/11] - "Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR.mkv" yEnc', 'Love Island US S08E07 720p AMZN WEB-DL DDP2 0 H 264-RAWR'];
@@ -93,9 +94,19 @@ class CounterSubjectNamingTest extends TestCase
     #[Test]
     public function rot13_scrambled_subjects_keep_the_subject(): void
     {
-        $meta = (new ReleaseCleaningService)->releaseCleaner('[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap', 'x@y.z', 'alt.binaries.multimedia.rail');
+        foreach (['[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap', '[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap (1/2)'] as $subject) {
+            $meta = (new ReleaseCleaningService)->releaseCleaner($subject, 'x@y.z', 'alt.binaries.multimedia.rail');
 
-        $this->assertSame('[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7" lRap', $meta['cleansubject']);
+            $this->assertStringStartsWith('[82/84] - "26992-D-K-KIvQ-D.iby582+88.CNE7"', $meta['cleansubject']);
+        }
+    }
+
+    #[Test]
+    public function a_dotted_file_name_without_any_release_signal_keeps_the_subject(): void
+    {
+        $meta = (new ReleaseCleaningService)->releaseCleaner('[1/2] - "Annual.Report.Final.pdf" yEnc', 'x@y.z', 'alt.binaries.multimedia.rail');
+
+        $this->assertStringStartsWith('[1/2] - "Annual.Report.Final.pdf"', $meta['cleansubject']);
     }
 
     #[Test]
@@ -120,7 +131,7 @@ class CounterSubjectNamingTest extends TestCase
         $calls = [];
         $updater = Mockery::mock(ReleaseUpdateService::class);
         $updater->shouldReceive('updateRelease')->andReturnUsing(function (object $release, string $name, string $method, bool $echo, string $type, bool $nameStatus, bool $show, int $preId) use (&$calls, $updater): void {
-            $calls[] = [(int) $release->id, $name, $preId, $nameStatus];
+            $calls[] = [(int) $release->id, $name, $preId, $nameStatus, $type];
             $updater->fixed++;
         });
         $this->app->instance(ReleaseUpdateService::class, $updater);
@@ -131,8 +142,9 @@ class CounterSubjectNamingTest extends TestCase
 
         // The hashed release is skipped, and the already-renamed one is never read.
         $this->assertSame([
-            [1, 'Shes.the.Man.2006.BluRay.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR', 0, false],
-            [4, 'Dark.Phoenix.2019.UHD.BluRay.2160p.TrueHD.Atmos.7.1.HEVC.REMUX-FraMeSToR', 77, true],
+            [1, 'Shes.the.Man.2006.BluRay.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR', 0, false, 'Subject, '],
+            // The PreDB type is the one that sets `isrenamed`.
+            [4, 'Dark.Phoenix.2019.UHD.BluRay.2160p.TrueHD.Atmos.7.1.HEVC.REMUX-FraMeSToR', 77, true, 'PreDB FT Exact, '],
         ], $calls);
     }
 
