@@ -28,7 +28,7 @@ final class CollectionDowntimeCompensator
      */
     public const int MIN_DOWNTIME_SECONDS = 300;
 
-    private const int ID_CHUNK = 50_000;
+    private const int WINDOW_SECONDS = 60;
 
     /**
      * Record that ingestion is running now. Called from the monitor loop.
@@ -59,17 +59,18 @@ final class CollectionDowntimeCompensator
             return 0;
         }
 
-        // A collection never gets more than a fresh full delay.
+        // A collection never gets more than a fresh full delay, and only the collections
+        // that were waiting when activity stopped lost time (newer ones were added by
+        // something running without the monitor and are left alone).
         $shift = min($downtime, max(0, $delayHours) * 3600);
-        $stillWaitingSince = Carbon::createFromTimestamp((int) $lastActive - $delayHours * 3600)->format('Y-m-d H:i:s');
-        $moved = $this->shiftDateAdded($stillWaitingSince, $shift);
+        $moved = $this->shiftDateAdded((int) $lastActive - max(0, $delayHours) * 3600, (int) $lastActive, $shift);
 
         $this->recordActivity();
 
         return $moved;
     }
 
-    private function shiftDateAdded(string $stillWaitingSince, int $seconds): int
+    private function shiftDateAdded(int $waitingFrom, int $waitingUntil, int $seconds): int
     {
         if ($seconds <= 0) {
             return 0;
@@ -78,14 +79,16 @@ final class CollectionDowntimeCompensator
         $shifted = DB::getDriverName() === 'sqlite'
             ? DB::raw("datetime(dateadded, '+{$seconds} seconds')")
             : DB::raw("dateadded + INTERVAL {$seconds} SECOND");
-        $maxId = (int) DB::table('collections')->max('id');
         $moved = 0;
 
-        for ($from = 0; $from < $maxId; $from += self::ID_CHUNK) {
+        // One dateadded window at a time, newest first: each UPDATE is a range on the
+        // dateadded index, and a moved row lands in a later window that is already done,
+        // so nothing is shifted twice (the walk follows the waiting rows, not the id range).
+        for ($windowEnd = $waitingUntil; $windowEnd > $waitingFrom; $windowEnd -= self::WINDOW_SECONDS) {
+            $windowStart = max($waitingFrom, $windowEnd - self::WINDOW_SECONDS);
             $moved += DB::table('collections')
-                ->where('id', '>', $from)
-                ->where('id', '<=', $from + self::ID_CHUNK)
-                ->where('dateadded', '>=', $stillWaitingSince)
+                ->where('dateadded', '>=', Carbon::createFromTimestamp($windowStart)->format('Y-m-d H:i:s'))
+                ->where('dateadded', $windowEnd === $waitingUntil ? '<=' : '<', Carbon::createFromTimestamp($windowEnd)->format('Y-m-d H:i:s'))
                 ->update(['dateadded' => $shifted]);
         }
 
