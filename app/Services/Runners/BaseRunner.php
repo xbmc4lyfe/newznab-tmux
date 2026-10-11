@@ -239,8 +239,14 @@ abstract class BaseRunner
             return '';
         }
 
-        $text = trim($process->getErrorOutput()."\n".$process->getOutput());
+        $tail = static function (string $text): string {
+            $text = trim(preg_replace('/\e\[[0-9;]*m/', '', $text) ?? $text);
 
-        return $text === '' ? '' : mb_substr(preg_replace('/\e\[[0-9;]*m/', '', $text) ?? $text, -600);
+            return mb_substr($text, -400);
+        };
+        $stderr = $tail($process->getErrorOutput());
+        $stdout = $tail($process->getOutput());
+
+        return trim(($stderr !== '' ? 'stderr: '.$stderr : '').($stdout !== '' ? "\nstdout: ".$stdout : ''));
     }
 }

@@ -73,6 +73,23 @@ class BaseRunnerTest extends TestCase
     }
 
     #[Test]
+    public function a_failed_workers_stderr_survives_verbose_stdout(): void
+    {
+        Log::spy();
+        $runner = new BaseRunnerTestDouble;
+        try {
+            $runner->pool(['failed' => [PHP_BINARY, '-r', 'fwrite(STDERR, "Cannot connect: too many connections"); echo str_repeat("progress line\n", 200); exit(1);']], 1, 3);
+            $this->fail('Expected a failed batch.');
+        } catch (RuntimeException) {
+            Log::shouldHaveReceived('error')->once()->with(
+                'Multiprocessing worker did not succeed',
+                \Mockery::on(static fn (array $context): bool => str_contains($context['output_tail'] ?? '', 'stderr: Cannot connect: too many connections')
+                    && str_contains($context['output_tail'], 'stdout: ')),
+            );
+        }
+    }
+
+    #[Test]
     public function asynchronous_pool_reports_nonzero_exit_codes(): void
     {
         $runner = new BaseRunnerTestDouble;
