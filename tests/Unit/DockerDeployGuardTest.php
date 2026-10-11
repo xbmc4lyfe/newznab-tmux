@@ -86,6 +86,62 @@ final class DockerDeployGuardTest extends TestCase
     }
 
     #[Test]
+    public function sessions_racing_for_one_stale_lock_never_deploy_at_the_same_time(): void
+    {
+        mkdir($this->dir.'/lock');
+        file_put_contents($this->dir.'/lock/owner', "pid=999999\nby=gone\n");
+
+        // Each deploy enters a critical section; mkdir fails if another one is inside it.
+        $critical = $this->dir.'/critical';
+        $command = ['run', 'up', '--', 'sh', '-c', "mkdir $critical || touch {$this->dir}/overlap; sleep 1; rmdir $critical 2>/dev/null; true"];
+
+        $processes = [];
+        foreach (range(1, 6) as $i) {
+            $processes[$i] = $this->guardProcess($command, ['DEPLOY_BY' => "session-$i"]);
+            $processes[$i]->start();
+        }
+        $codes = [];
+        foreach ($processes as $process) {
+            $process->wait();
+            $codes[] = $process->getExitCode();
+        }
+
+        $this->assertFileDoesNotExist($this->dir.'/overlap', 'two deploys ran at once');
+        $this->assertContains(0, $codes, 'one session should have deployed');
+        $this->assertEmpty(array_diff($codes, [0, 75]), 'every other session is refused, never crashes');
+    }
+
+    #[Test]
+    public function a_guarded_command_can_run_another_under_the_same_lock(): void
+    {
+        $inner = 'sh '.dirname(__DIR__, 2).'/docker/bin/deploy-guard run inner -- sh -c "echo inner > '.$this->dir.'/inner; test -d '.$this->dir.'/lock"';
+
+        $process = $this->guard(['run', 'deploy', '--', 'sh', '-c', $inner]);
+
+        $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput());
+        $this->assertFileExists($this->dir.'/inner');
+        $log = (string) file_get_contents($this->dir.'/deploy.log');
+        $this->assertStringContainsString('inner by=', $log);
+        $this->assertDirectoryDoesNotExist($this->dir.'/lock', 'the outer guard releases the lock once');
+    }
+
+    #[Test]
+    public function editing_an_untracked_file_without_renaming_it_counts_as_a_change(): void
+    {
+        $build = ['run', 'build', '--', 'sh', '-c', 'echo x >> '.$this->dir.'/builds'];
+        $flags = ['SKIP_IF_UNCHANGED' => '1', 'STAMP_ON_SUCCESS' => '1'];
+        file_put_contents($this->repo.'/notes.txt', "a\n");
+
+        $this->guard($build, $flags);
+        $this->guard($build, $flags);
+        $this->assertCount(1, file($this->dir.'/builds'), 'unchanged, so skipped');
+
+        file_put_contents($this->repo.'/notes.txt', "b\n");
+        $this->guard($build, $flags);
+        $this->assertCount(2, file($this->dir.'/builds'), 'same name, new contents, so rebuilt');
+    }
+
+    #[Test]
     public function the_command_status_is_passed_on_and_a_failed_run_is_not_stamped(): void
     {
         $process = $this->guard(['run', 'build', '--', 'sh', '-c', 'exit 3'], ['STAMP_ON_SUCCESS' => '1']);

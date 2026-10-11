@@ -55,7 +55,8 @@ build-images:
 	docker build -t nntmux/app:local -f $(CURDIR)/app/Dockerfile $(REPO)
 
 .PHONY: deploy
-deploy: build up ## Build when changed, then start/recreate the stack (use DEPLOY_BY=name)
+deploy: ## Build when changed, then start/recreate the stack, under one lock (DEPLOY_BY=name)
+	@FORCE="$(FORCE)" $(GUARD) run deploy -- $(MAKE) --no-print-directory -C $(CURDIR) build up
 
 .PHONY: init
 init: env dirs build ## First-time install: build, migrate+seed, indexes, groups, tuning, predb seed, start

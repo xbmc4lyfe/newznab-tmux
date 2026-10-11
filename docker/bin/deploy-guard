@@ -4,6 +4,9 @@
 #
 #   deploy-guard run <target> -- <command...>
 #
+# A guarded command may run another guarded command (make deploy runs build and up): the inner run
+# sees the lock is held by its own parent (DEPLOY_GUARD_HELD) and neither takes nor releases it.
+#
 # Environment:
 #   DEPLOY_BY            who is deploying (a session or person name); logged. Default: the login user.
 #   SKIP_IF_UNCHANGED=1  skip the command when the tree matches the last stamped deploy.
@@ -18,6 +21,7 @@ set -eu
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 REPO="${DEPLOY_REPO:-$(cd "$DIR/.." && pwd)}"
 LOCK="${DEPLOY_LOCK_DIR:-$DIR/.deploy.lock}"
+CLAIM="$LOCK.claim"
 LOG="${DEPLOY_LOG:-$DIR/.deploy.log}"
 STAMP="${DEPLOY_STAMP:-$DIR/.deploy.stamp}"
 BY="${DEPLOY_BY:-$(id -un)}"
@@ -26,12 +30,17 @@ hash_stdin() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
 }
 
-# HEAD plus uncommitted changes plus the names of untracked files: the image bakes the working tree.
+# HEAD plus uncommitted changes plus the names and contents of untracked files: the image bakes the
+# working tree.
 fingerprint() {
     head=$(git -C "$REPO" rev-parse HEAD)
     diff=$(git -C "$REPO" diff HEAD | hash_stdin)
-    untracked=$(git -C "$REPO" ls-files -o --exclude-standard | hash_stdin)
-    echo "$head $diff $untracked"
+    untracked=$(
+        cd "$REPO"
+        git ls-files -o --exclude-standard -z | xargs -0 cat 2>/dev/null | hash_stdin
+        git ls-files -o --exclude-standard | hash_stdin
+    )
+    echo "$head $diff $(echo "$untracked" | tr '\n' ' ')"
 }
 
 log() {
@@ -39,23 +48,71 @@ log() {
         "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)" "${2:-}" >>"$LOG"
 }
 
+owner_pid() {
+    sed -n 's/^pid=//p' "$LOCK/owner" 2>/dev/null || true
+}
+
+# The owner's pid, waiting a moment for a holder that has made the lock directory but not yet written
+# its owner file. An owner that stays empty belongs to a process that died in between.
+settled_owner_pid() {
+    pid=$(owner_pid)
+    waited=0
+    while [ -z "$pid" ] && [ -d "$LOCK" ] && [ "$waited" -lt 3 ]; do
+        sleep 0.4
+        pid=$(owner_pid)
+        waited=$((waited + 1))
+    done
+    echo "$pid"
+}
+
+alive() {
+    [ -n "$1" ] && kill -0 "$1" 2>/dev/null
+}
+
 release() {
     rm -rf "$LOCK"
 }
 
+busy() {
+    echo "deploy-guard: another deploy is running ($(tr '\n' ' ' <"$LOCK/owner" 2>/dev/null || echo starting)); leaving the stack alone." >&2
+    exit 75
+}
+
+# Take the lock. A lock whose owner has died is removed under a short-lived claim directory, so two
+# sessions that see the same stale lock cannot both remove it and then both take it.
 acquire() {
     target=$1
-    if ! mkdir "$LOCK" 2>/dev/null; then
-        owner_pid=$(sed -n 's/^pid=//p' "$LOCK/owner" 2>/dev/null || true)
-        if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
-            echo "deploy-guard: another deploy is running ($(tr '\n' ' ' <"$LOCK/owner")); leaving the stack alone." >&2
-            exit 75
+    attempts=0
+    while [ "$attempts" -lt 10 ]; do
+        attempts=$((attempts + 1))
+        if mkdir "$LOCK" 2>/dev/null; then
+            printf 'pid=%s\nby=%s\ntarget=%s\nsince=%s\n' "$$" "$BY" "$target" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$LOCK/owner"
+            return 0
         fi
-        echo "deploy-guard: removing a stale lock" >&2
-        rm -rf "$LOCK"
-        mkdir "$LOCK" 2>/dev/null || { echo "deploy-guard: lost the lock race; leaving the stack alone." >&2; exit 75; }
-    fi
-    printf 'pid=%s\nby=%s\ntarget=%s\nsince=%s\n' "$$" "$BY" "$target" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$LOCK/owner"
+
+        pid=$(settled_owner_pid)
+        if alive "$pid"; then
+            busy
+        fi
+
+        if mkdir "$CLAIM" 2>/dev/null; then
+            # Re-check while holding the claim: the lock may have been replaced by a live one meanwhile.
+            pid=$(settled_owner_pid)
+            if ! alive "$pid"; then
+                echo "deploy-guard: removing a stale lock" >&2
+                rm -rf "$LOCK"
+            fi
+            rmdir "$CLAIM" 2>/dev/null || true
+        else
+            # Someone else is clearing it. A claim older than a minute was left by a crashed process.
+            if [ -n "$(find "$CLAIM" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+                rmdir "$CLAIM" 2>/dev/null || true
+            else
+                sleep 0.3
+            fi
+        fi
+    done
+    busy
 }
 
 unchanged() {
@@ -74,9 +131,15 @@ cmd_run() {
     shift
     [ "$1" = -- ] && shift
 
-    acquire "$target"
-    trap release EXIT
-    trap 'exit 130' INT TERM
+    if [ -n "${DEPLOY_GUARD_HELD:-}" ] && [ "$(owner_pid)" = "$DEPLOY_GUARD_HELD" ] && alive "$DEPLOY_GUARD_HELD"; then
+        : # Our parent guard holds the lock; it also releases it.
+    else
+        acquire "$target"
+        trap release EXIT
+        trap 'exit 130' INT TERM
+        DEPLOY_GUARD_HELD=$$
+        export DEPLOY_GUARD_HELD
+    fi
 
     if unchanged; then
         log "$target" "result=skipped (nothing changed since the last deploy; FORCE=1 to override)"
