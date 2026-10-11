@@ -28,7 +28,7 @@ class TmuxMonitor extends Command
      */
     protected $signature = 'tmux:monitor
                             {--session= : Tmux session name}
-                            {--reset-collections : Reset old collections before starting}
+                            {--reset-collections : Kept for compatibility; collection delays are always compensated on start}
                             {--ready-channel= : Internal startup acknowledgement channel}';
 
     /**
@@ -53,10 +53,11 @@ class TmuxMonitor extends Command
     {
 
         try {
-            // Reset old collections if requested
-            if ($this->option('reset-collections')) {
-                $this->resetOldCollections();
-            }
+            // Give collections back the time lost while nothing was running. Always, not
+            // only with --reset-collections: a monitor recovered by tmux:health-check would
+            // otherwise overwrite the activity marker without compensating. A restart under
+            // a few minutes, or one right after tmux:start compensated, changes nothing.
+            $this->resetOldCollections();
 
             // Initialize services
             $sessionName = $this->option('session')

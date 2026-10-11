@@ -178,7 +178,7 @@ final class CollectionDowntimeCompensator
             $byValue = [];
             foreach ($rows as $row) {
                 $lastId = (int) $row->id;
-                $added = $this->timestampNotAfter((string) $row->dateadded, $lastActive);
+                $added = $this->timestampNotAfter((string) $row->dateadded, $now);
                 $shift = $added <= $lastActive ? $downtime : max(0, min($now - $added, $downtime));
                 if ($shift > 0) {
                     $byValue[$this->at($added + $shift)][] = $lastId;
@@ -194,8 +194,7 @@ final class CollectionDowntimeCompensator
 
     /**
      * A wall-clock value from a repeated fall-back hour names two instants; take the
-     * later one unless it is after $notAfter (a row can't predate itself, and rows were
-     * added before ingestion stopped).
+     * later one unless it is after $notAfter (the restart: no row was added after it).
      */
     private function timestampNotAfter(string $dateTime, int $notAfter): int
     {
@@ -213,14 +212,19 @@ final class CollectionDowntimeCompensator
     }
 
     /**
-     * The largest UTC-offset change, in seconds, in the span.
+     * The largest backward UTC-offset change (a fall-back, which repeats wall-clock
+     * times), in seconds, in the span. Spring-forward changes repeat nothing.
      */
     private function largestOffsetChange(int ...$timestamps): int
     {
         $zone = new \DateTimeZone(date_default_timezone_get());
         $offsets = array_column($zone->getTransitions(min($timestamps), max($timestamps)) ?: [], 'offset');
+        $largest = 0;
+        for ($i = 1, $n = \count($offsets); $i < $n; $i++) {
+            $largest = max($largest, $offsets[$i - 1] - $offsets[$i]);
+        }
 
-        return $offsets === [] ? 0 : max($offsets) - min($offsets);
+        return $largest;
     }
 
     /**
