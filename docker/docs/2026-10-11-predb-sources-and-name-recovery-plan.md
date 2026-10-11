@@ -22,7 +22,7 @@ Add cheap redundancy and catch gaps when a primary feed is down, without adding 
 | Source | Type | New rows seen | Work |
 |---|---|---|---|
 | scnlog.me RSS | HTTP feed | 0 of 40 (all already present) | Small code change: add the key to `PredbFeedSourceFactory::availableKeys()` and map it to an `RssFeedSource` in `makeOne()` (it throws for unknown keys), add the endpoint to `config/predb_feeds.php`, then list the key in `PREDB_FEED_SOURCES` |
-| opentrackers.org `#pre` | IRC | Not measured. The bots relay corrupt-net, zenet, and predb.se, which we already follow | Add a network entry to `config/irc_settings.php` (TLS 6697) and a parser for the `[PRE] [SECTION] name` line |
+| opentrackers.org `#pre` | IRC | Not measured. The bots relay corrupt-net, zenet, and predb.se, which we already follow | Add a network entry to `config/irc_settings.php` (TLS 6697) and a parser for the `[PRE] [SECTION] name` line. Like every optional network it needs environment keys: `SCRAPE_IRC_OPENTRACKERS_ENABLED` (default `false`) plus server, port, and TLS keys, each with a comment in `.env.example` |
 | ngp.re live stream | Pusher WebSocket plus HTML fragment | Overlaps the existing ngp IRC feed | Skip unless the IRC feed proves incomplete |
 
 Rejected: predb.dev (its `robots.txt` disallows everything), Skwirll's dump (`/api/dump` is disallowed and its terms say not to build a database from the API), private-tracker announce channels (accounts and rules), and sources that are dead or bot-walled.
@@ -38,7 +38,7 @@ Rejected: predb.dev (its `robots.txt` disallows everything), Skwirll's dump (`/a
 ### Acceptance
 
 - A new source's measured contribution is recorded in the PR.
-- A per-source health check covers it. No such checker is in the repo yet (the one used while writing this plan was a local scratch script), so Part A starts by adding it as `docker/bin/predb-health`: container state, IRC scraper processes, per-source inserts in a window, and a probe of each feed endpoint. New sources extend it.
+- A per-source health check covers it. No such checker is in the repo yet (the one used while writing this plan was a local scratch script), so Part A starts by adding it as `docker/bin/predb-health`: container state, IRC scraper processes, and a probe of each feed endpoint. Source activity is judged by successful polls, received messages, or parsed-entry timestamps per source, not by rows attributed to it: `predb.source` is set only on a new insert, so a healthy redundant source (scnlog, opentrackers) will often show zero attributed rows because another source won the race. New sources extend it.
 - Turning it off is a one-line config change.
 
 ## Part B: recovering names for hashed and raw releases
@@ -76,7 +76,8 @@ Each step is independent and reversible. Take them in order, and check the metri
 - Run a one-off pass outside peak load, then switch the setting. It runs inside the Docker stack (the app environment is `docker/config/app.env` and `mariadb` only resolves on the Compose network). `releases:fix-names` takes one method number from 3 to 20 per call, so loop, and stop at the first failure so a skipped source (methods 7 and 8 need NNTP) is never reported as done:
   `for level in 11 12 17 18 3 4 5 6 7 8 9 10 13 14 15 16 19 20; do make -C docker artisan cmd="releases:fix-names $level --update --category=all --set-status" || exit 1; done`
 - Order matters: with `--set-status`, the generic file and uid passes (methods 5, 6, 9, 10) set `proc_files` and `proc_uid` flags that the specialized passes (11, 12, 17, 18) also use to pick candidates, so the specialized ones run first above. Confirm the exact flag dependencies in the implementation PR, and check the scheduled order in `TmuxTaskRunner` (ascending 3 to 20) for the same issue.
-- Tests: the task builds the right command for each value.
+- Change the work predicate too. `Tmux::getTableCount(1)` computes `processrenames` from `Category::getCategoryOthersGroup()`, and `TmuxTaskRunner::runFixNamesTask()` only adds the recent (odd) passes when that count is nonzero. With `all`, count candidates across all categories (or run the recent passes unconditionally), otherwise non-Other work waits for a full-backlog slot.
+- Tests: the task builds the right command for each value, and the recent passes are scheduled when only a non-Other release is pending.
 
 **Step 3: relieve CPU.**
 - Decide the trade-off with the owner: more CPU for the indexer, or fewer backfill and post-processing threads while the backlog clears.
