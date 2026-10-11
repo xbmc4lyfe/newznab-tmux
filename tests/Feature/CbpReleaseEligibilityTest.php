@@ -6,6 +6,7 @@ namespace Tests\Feature;
 
 use App\Enums\CollectionFileCheckStatus;
 use App\Services\Binaries\BinariesConfig;
+use App\Services\Binaries\BinaryHandler;
 use App\Services\Binaries\CollectionHandler;
 use App\Services\Binaries\HeaderStorageService;
 use App\Services\CollectionsCleaningService;
@@ -177,6 +178,35 @@ class CbpReleaseEligibilityTest extends TestCase
         $this->assertGreaterThan(0, $reads, 'The collections were reconciled again.');
 
         $this->assertSame([], array_values(array_filter($writes, static fn (string $sql): bool => preg_match('/\b(binaries|collections)\b/', $sql) === 1)));
+    }
+
+    public function test_header_storage_aggregate_refresh_writes_parts_totals_across_chunks(): void
+    {
+        $collectionId = $this->collection(1, now()->format('Y-m-d H:i:s'));
+        $partial = (int) DB::table('binaries')->where('collections_id', $collectionId)->value('id');
+        $complete = DB::table('binaries')->insertGetId(['collections_id' => $collectionId, 'totalparts' => 2]);
+        foreach ([1, 2] as $part) {
+            DB::table('parts')->insert(['binaries_id' => $complete, 'partnumber' => $part, 'size' => 150, 'number' => 2000 + $part, 'messageid' => '<h'.$complete.'-'.$part.'@example.test>']);
+        }
+        $third = DB::table('binaries')->insertGetId(['collections_id' => $collectionId, 'totalparts' => 1]);
+        DB::table('parts')->insert(['binaries_id' => $third, 'partnumber' => 1, 'size' => 50, 'number' => 3001, 'messageid' => '<h'.$third.'@example.test>']);
+        DB::table('collections')->where('id', $collectionId)->update(['totalfiles' => 3, 'filecheck' => CollectionFileCheckStatus::Default->value]);
+
+        $this->assertTrue((new BinaryHandler)->refreshAggregates([$third, $partial, $complete], 2));
+        $this->assertTrue((new CollectionHandler(new CollectionsCleaningService))->refreshAggregates([$collectionId], 2));
+
+        $binaries = DB::table('binaries')->where('collections_id', $collectionId)->get()->keyBy('id');
+        $this->assertSame([1, 100, 0], [(int) $binaries[$partial]->currentparts, (int) $binaries[$partial]->partsize, (int) $binaries[$partial]->partcheck]);
+        $this->assertSame([2, 300, 1], [(int) $binaries[$complete]->currentparts, (int) $binaries[$complete]->partsize, (int) $binaries[$complete]->partcheck]);
+        $this->assertSame([1, 50, 1], [(int) $binaries[$third]->currentparts, (int) $binaries[$third]->partsize, (int) $binaries[$third]->partcheck]);
+        $this->assertSame(450, (int) DB::table('collections')->where('id', $collectionId)->value('filesize'));
+        $this->assertStatus($collectionId, CollectionFileCheckStatus::Default);
+
+        DB::table('parts')->insert(['binaries_id' => $partial, 'partnumber' => 2, 'size' => 100, 'number' => 1999, 'messageid' => '<h'.$partial.'-2@example.test>']);
+        (new BinaryHandler)->refreshAggregates([$partial], 2);
+        (new CollectionHandler(new CollectionsCleaningService))->refreshAggregates([$collectionId], 2);
+        $this->assertStatus($collectionId, CollectionFileCheckStatus::Sized);
+        $this->assertSame(550, (int) DB::table('collections')->where('id', $collectionId)->value('filesize'));
     }
 
     private function process(?int $groupId): void

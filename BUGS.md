@@ -252,6 +252,8 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Status:** this matches the known contention described in the wiki (issue #1874 / PR #1872). Not seen since cutting back to the 207 groups.
 - **Update (2026-10-10):** a related failure shows up with the 207 groups, 12 binaries threads, and 24 backfill threads. `Binary header storage chunk rolled back {"groups_id":1,…,"attempts":1,"reason":"Storage failed","exception":"Illuminate\\Database\\QueryException","code":"23000"}` was logged 85 times between 01:09 and 12:33 UTC, all in alt.binaries.boneless. A duplicate-key (23000) error is not retried, so the whole chunk is dropped and its articles fall back to part repair. Not root-caused; likely two workers inserting the same binary or part concurrently.
 
+- **Update (2026-10-10, after the BUGS #37 fix):** the remaining lock-retry rollbacks (27 in 10 minutes across groups 1, 9, 2, 20 and 42) were two header workers deadlocking: `BinaryHandler::refreshAggregates()` ran `UPDATE binaries … JOIN (SELECT … FROM parts …)`, which locks every `parts` row it reads (about 13k for 500 binaries) while another worker inserted binaries. `CollectionHandler::refreshAggregates()` did the same over `binaries`. Both now read the aggregates with a plain SELECT, which takes no locks, and write them back by primary key with literal values.
+
 ### 17. Compressed `XOVER` headers fail with the primary provider
 
 - **Symptom:** with `NNTP_COMPRESSED_HEADERS=true` on Newshosting, binaries workers fail in `NNTPService::_getXFeatureTextResponse()` → `throwError()` (`NNTPService.php:892,960`).
