@@ -23,6 +23,8 @@ abstract class TestCase extends BaseTestCase
      */
     private static ?array $baselineEnvironment = null;
 
+    private string $activityMarker = '';
+
     protected function setUp(): void
     {
         self::$baselineEnvironment ??= self::captureEnvironment();
@@ -31,7 +33,8 @@ abstract class TestCase extends BaseTestCase
 
         // Keep tests away from the real ingestion-activity marker under storage/: a test run
         // during an outage would otherwise erase the downtime the next start compensates.
-        $marker = sys_get_temp_dir().'/nntmux-test-activity-'.getmypid();
+        $marker = sys_get_temp_dir().'/nntmux-test-activity-'.bin2hex(random_bytes(12)).'/marker';
+        $this->activityMarker = $marker;
         $this->app->singleton(CollectionDowntimeCompensator::class, static fn (): CollectionDowntimeCompensator => new CollectionDowntimeCompensator($marker));
 
         if (is_file(public_path('build/manifest.json'))) {
@@ -58,6 +61,11 @@ abstract class TestCase extends BaseTestCase
         try {
             parent::tearDown();
         } finally {
+            if ($this->activityMarker !== '') {
+                @unlink($this->activityMarker);
+                @unlink($this->activityMarker.'.lock');
+                @rmdir(\dirname($this->activityMarker));
+            }
             foreach (self::$baselineEnvironment ?? [] as $key => $value) {
                 if ($value['getenv'] === false) {
                     putenv($key);

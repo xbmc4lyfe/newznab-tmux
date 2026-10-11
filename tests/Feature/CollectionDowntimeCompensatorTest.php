@@ -38,6 +38,7 @@ final class CollectionDowntimeCompensatorTest extends TestCase
     {
         MarkerIoFailures::$shortWrite = false;
         MarkerIoFailures::$renameFails = false;
+        MarkerIoFailures::$directorySyncFails = false;
         Schema::dropIfExists('collections');
         @unlink($this->marker);
         @unlink($this->marker.'.lock');
@@ -340,6 +341,59 @@ final class CollectionDowntimeCompensatorTest extends TestCase
             'UTC window' => ['UTC', '2026-10-11 11:00:00', '2026-10-11 12:00:00', '2026-10-11 10:30:00', '2026-10-11 11:30:00'],
             'DST keyset' => ['America/New_York', '2026-03-08 06:50:00', '2026-03-08 07:10:00', '2026-03-08 01:45:00', '2026-03-08 03:05:00'],
         ];
+    }
+
+    public function test_rows_inserted_during_a_dst_scan_are_not_compensated(): void
+    {
+        $previous = date_default_timezone_get();
+        date_default_timezone_set('America/New_York');
+        try {
+            $this->travelTo(Carbon::parse('2026-11-01 06:10:00', 'UTC'));
+            $this->lastActive(Carbon::parse('2026-11-01 05:50:00', 'UTC')->getTimestamp());
+            foreach (array_chunk(array_fill(0, 5000, ['dateadded' => '2026-11-01 01:45:00', 'filecheck' => 0]), 500) as $chunk) {
+                DB::table('collections')->insert($chunk);
+            }
+            $lateId = null;
+            DB::listen(static function ($query) use (&$lateId): void {
+                if ($lateId === null && str_starts_with($query->sql, 'select "id", "dateadded"')) {
+                    $lateId = DB::table('collections')->insertGetId(['dateadded' => '2026-11-01 01:11:00', 'filecheck' => 0]);
+                }
+            });
+
+            $this->assertSame(5000, $this->compensator()->compensate(2));
+            $this->assertNotNull($lateId);
+            $this->assertSame('2026-11-01 01:11:00', $this->dateAdded($lateId), 'A row inserted after the snapshot keeps its original age.');
+        } finally {
+            date_default_timezone_set($previous);
+        }
+    }
+
+    public function test_an_unsynced_directory_aborts_before_collections_move(): void
+    {
+        $this->lastActive(Carbon::now('UTC')->subHour()->getTimestamp());
+        $waiting = $this->collection('2026-10-11 10:30:00');
+        MarkerIoFailures::$directorySyncFails = true;
+        try {
+            $this->compensator()->compensate(2);
+            $this->fail('Directory synchronization must precede collection changes.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('Unable to sync', $exception->getMessage());
+        } finally {
+            MarkerIoFailures::$directorySyncFails = false;
+        }
+
+        $this->assertSame('2026-10-11 10:30:00', $this->dateAdded($waiting));
+    }
+
+    public function test_a_previous_test_activity_marker_is_not_reused(): void
+    {
+        $legacy = sys_get_temp_dir().'/nntmux-test-activity-'.getmypid();
+        file_put_contents($legacy, '123');
+        try {
+            $this->assertNull($this->app->make(CollectionDowntimeCompensator::class)->lastActivity());
+        } finally {
+            unlink($legacy);
+        }
     }
 
     public function test_tests_use_a_temporary_marker_not_the_real_one(): void

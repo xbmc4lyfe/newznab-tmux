@@ -116,8 +116,13 @@ final class CollectionDowntimeCompensator
         if (! $stale && ! $refreshRecent && $lastActive !== null) {
             return 0;
         }
+        $upperId = 0;
         if ($stale) {
             $delayHours ??= app(ConfigurationProvider::class)->ingestion()->collectionDelayHours;
+            // Capture the ID ceiling before the recovery time. Active header workers
+            // may insert rows while a widened DST scan walks subsequent chunks.
+            $upperId = (int) DB::table('collections')->max('id');
+            $now = Carbon::now('UTC')->getTimestamp();
         }
 
         // Claim before moving rows: an interrupted run can under-compensate rows,
@@ -127,7 +132,7 @@ final class CollectionDowntimeCompensator
             return 0;
         }
 
-        return $this->shiftDateAdded($lastActive, $now, max(0, $delayHours ?? 0) * 3600);
+        return $this->shiftDateAdded($lastActive, $now, max(0, $delayHours ?? 0) * 3600, $upperId);
     }
 
     /**
@@ -136,7 +141,7 @@ final class CollectionDowntimeCompensator
      * can't move them past the restart), and only the time since they were added for
      * those written in the moments after it.
      */
-    private function shiftDateAdded(int $lastActive, int $now, int $delaySeconds): int
+    private function shiftDateAdded(int $lastActive, int $now, int $delaySeconds, int $upperId): int
     {
         if ($delaySeconds <= 0) {
             return 0;
@@ -166,6 +171,7 @@ final class CollectionDowntimeCompensator
                 $lastActive,
                 $now,
                 $downtime,
+                $upperId,
             );
         }
         $moved = 0;
@@ -179,13 +185,14 @@ final class CollectionDowntimeCompensator
         $windowEnd = max($nowAt, $lastActiveAt);
         $inclusive = true;
         for ($window = 0; $window < self::MAX_WINDOWS; $window++) {
-            $newest = $this->newestWaiting($this->at($waitingFrom), $windowEnd, $inclusive);
+            $newest = $this->newestWaiting($this->at($waitingFrom), $windowEnd, $inclusive, $upperId);
             if ($newest === null) {
                 break;
             }
             $windowStartAt = $this->at(max($this->timestamp($newest) - self::WINDOW_SECONDS, $waitingFrom));
             $moved += DB::table('collections')
                 ->whereIn('filecheck', self::WAITING_FILECHECKS)
+                ->where('id', '<=', $upperId)
                 ->where('dateadded', '>=', $windowStartAt)
                 ->where('dateadded', '<=', $newest)
                 ->update(['dateadded' => $shifted]);
@@ -203,13 +210,14 @@ final class CollectionDowntimeCompensator
      * timezone arithmetic; every row is read and moved exactly once. This only runs for
      * a restart whose span crosses an offset change.
      */
-    private function shiftRowsById(string $from, string $to, int $waitingFrom, int $lastActive, int $now, int $downtime): int
+    private function shiftRowsById(string $from, string $to, int $waitingFrom, int $lastActive, int $now, int $downtime, int $upperId): int
     {
         $moved = 0;
         $lastId = 0;
         do {
             $rows = DB::table('collections')
                 ->whereIn('filecheck', self::WAITING_FILECHECKS)
+                ->where('id', '<=', $upperId)
                 ->where('dateadded', '>=', $from)
                 ->where('dateadded', '<=', $to)
                 ->where('id', '>', $lastId)
@@ -229,7 +237,8 @@ final class CollectionDowntimeCompensator
                 }
             }
             foreach ($byValue as $value => $ids) {
-                $moved += DB::table('collections')->whereIn('filecheck', self::WAITING_FILECHECKS)->whereIn('id', $ids)->update(['dateadded' => $value]);
+                $moved += DB::table('collections')->whereIn('filecheck', self::WAITING_FILECHECKS)
+                    ->where('id', '<=', $upperId)->whereIn('id', $ids)->update(['dateadded' => $value]);
             }
         } while ($rows->count() === self::ROW_CHUNK);
 
@@ -287,10 +296,11 @@ final class CollectionDowntimeCompensator
      * The newest dateadded at or after $from and before (or at) $before, found through
      * the dateadded index.
      */
-    private function newestWaiting(string $from, string $before, bool $inclusive): ?string
+    private function newestWaiting(string $from, string $before, bool $inclusive, int $upperId): ?string
     {
         $newest = DB::table('collections')
             ->whereIn('filecheck', self::WAITING_FILECHECKS)
+            ->where('id', '<=', $upperId)
             ->where('dateadded', '>=', $from)
             ->where('dateadded', $inclusive ? '<=' : '<', $before)
             ->max('dateadded');
@@ -353,6 +363,12 @@ final class CollectionDowntimeCompensator
             throw new \RuntimeException("Unable to write {$this->markerPath}.");
         }
 
+        $directoryStream = fopen($directory, 'r');
+        if ($directoryStream === false) {
+            unlink($temporary);
+            throw new \RuntimeException("Unable to sync {$this->markerPath} directory.");
+        }
+
         try {
             if (\dirname($temporary) !== realpath($directory)) {
                 throw new \RuntimeException("Unable to write {$this->markerPath} in its directory.");
@@ -372,7 +388,11 @@ final class CollectionDowntimeCompensator
             if (! rename($temporary, $this->markerPath)) {
                 throw new \RuntimeException("Unable to replace {$this->markerPath}.");
             }
+            if (! fsync($directoryStream)) {
+                throw new \RuntimeException("Unable to sync {$this->markerPath} directory.");
+            }
         } finally {
+            fclose($directoryStream);
             if (is_file($temporary)) {
                 unlink($temporary);
             }
