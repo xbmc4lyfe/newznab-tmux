@@ -409,7 +409,9 @@ final class ReleaseProcessingService
         ?callable $afterPass = null,
     ): array {
         $groupId = $this->normalizeGroupId($groupID);
-        $totals = $this->processReleaseCreationBatches($groupId, $afterCreation);
+        $totals = $this->hasReleaseCreationWork($groupId)
+            ? $this->processReleaseCreationBatches($groupId, $afterCreation)
+            : ['releases' => 0, 'nzbs' => 0, 'dupes' => 0, 'iterations' => 0];
         $windowSize = max(1, min(self::BATCH_SIZE, $this->settings->releaseCreationLimit));
 
         $this->processIncompleteCollections($groupId, function (array $ids) use ($groupId, $windowSize, $afterCreation, &$totals): void {
@@ -435,9 +437,11 @@ final class ReleaseProcessingService
         // Preserve the final sweep for collections completed concurrently by ingestion,
         // and the normal cursor/NZB retry behavior after preparation finishes.
         $this->processCollectionSizes($groupId);
-        $final = $this->processReleaseCreationBatches($groupId, $afterCreation);
-        foreach ($final as $key => $value) {
-            $totals[$key] += $value;
+        if ($this->hasReleaseCreationWork($groupId) || $totals['iterations'] === 0) {
+            $final = $this->processReleaseCreationBatches($groupId, $afterCreation);
+            foreach ($final as $key => $value) {
+                $totals[$key] += $value;
+            }
         }
         // Legacy callbacks perform retention cleanup across all collection states.
         // Run them only once every preparation page has had a chance to reconcile,
@@ -449,6 +453,13 @@ final class ReleaseProcessingService
         }
 
         return $totals;
+    }
+
+    private function hasReleaseCreationWork(?int $groupId): bool
+    {
+        return Collection::query()->where('filecheck', CollectionFileCheckStatus::Sized->value)
+            ->when($groupId !== null, static fn ($q) => $q->where('groups_id', $groupId))->exists()
+            || NzbCreationCandidateQuery::baseBuilder($groupId)->exists();
     }
 
     /**

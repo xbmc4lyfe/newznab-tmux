@@ -614,6 +614,53 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->assertSame(0, DB::table('collections')->count());
     }
 
+    public function test_idle_pipeline_runs_legacy_callbacks_once(): void
+    {
+        $categorized = 0;
+        $postProcessed = 0;
+        $totals = $this->service(new WindowTestReleaseCreationService)->processCollectionsAndReleases(1,
+            function () use (&$categorized): void {
+                $categorized++;
+            },
+            function () use (&$postProcessed): void {
+                $postProcessed++;
+            },
+        );
+
+        $this->assertSame(1, $categorized);
+        $this->assertSame(1, $postProcessed);
+        $this->assertSame(1, $totals['iterations']);
+    }
+
+    public function test_prepared_release_does_not_add_empty_callback_passes(): void
+    {
+        $this->insertCollection(1);
+        DB::table('collections')->where('id', 1)->update(['filecheck' => 2]);
+        DB::table('parts')->insert(['binaries_id' => 1, 'size' => 5000]);
+        $passes = 0;
+        $totals = $this->service(new WindowTestReleaseCreationService)->processCollectionsAndReleases(1,
+            afterPass: function () use (&$passes): void {
+                $passes++;
+            },
+        );
+
+        $this->assertSame(1, $totals['releases']);
+        $this->assertSame(1, $passes);
+        $this->assertSame(1, $totals['iterations']);
+    }
+
+    public function test_pipeline_still_drains_nzb_only_batches_without_collections(): void
+    {
+        foreach (range(1, 7) as $id) {
+            DB::table('releases')->insert(['id' => $id, 'guid' => 'release-'.$id, 'name' => 'Release.'.$id, 'groups_id' => 1, 'postdate' => now()]);
+        }
+        $totals = $this->service(new WindowTestReleaseCreationService)->processCollectionsAndReleases(1);
+
+        $this->assertSame(0, $totals['releases']);
+        $this->assertSame(7, $totals['nzbs']);
+        $this->assertSame(7, DB::table('releases')->where('nzbstatus', 1)->count());
+    }
+
     private function service(WindowTestReleaseCreationService $creation, ?CollectionCleanupService $cleanup = null, ?BinariesConfig $binariesConfig = null): ReleaseProcessingService
     {
         return (new ReleaseProcessingService(
