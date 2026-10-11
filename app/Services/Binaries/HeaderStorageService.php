@@ -58,6 +58,8 @@ final class HeaderStorageService
     public function store(array $headers, array $groupMySQL, bool $addToPartRepair = true): array
     {
         if (empty($headers)) {
+            $this->noteIngestion(); // A caught-up group is still live ingestion.
+
             return [];
         }
 
