@@ -20,7 +20,7 @@ use Illuminate\Support\Facades\DB;
  * expiring. Instead the monitor records when it was last active, and on start only the
  * collections still waiting at that moment get their lost time back.
  */
-final class CollectionDowntimeCompensator
+final class CollectionDowntimeCompensator implements CollectionReconciliationBarrier
 {
     /**
      * Restarts shorter than this (deploys, crash recovery) need no compensation.
@@ -102,6 +102,21 @@ final class CollectionDowntimeCompensator
     public function compensate(int $delayHours): int
     {
         return $this->withLockedMarker(fn (): int => $this->compensateLocked($delayHours, false));
+    }
+
+    /**
+     * @template TResult
+     *
+     * @param  callable(): TResult  $work
+     * @return TResult
+     */
+    public function withReconciliationBarrier(int $delayHours, callable $work): mixed
+    {
+        return $this->withLockedMarker(function () use ($delayHours, $work): mixed {
+            $this->compensateLocked($delayHours, false);
+
+            return $work();
+        });
     }
 
     /**
