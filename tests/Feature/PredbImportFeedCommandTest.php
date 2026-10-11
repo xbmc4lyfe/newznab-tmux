@@ -562,6 +562,15 @@ class PredbImportFeedCommandTest extends TestCase
     }
 
     #[Test]
+    public function the_predb_full_text_name_pass_runs_on_its_own_schedule(): void
+    {
+        $event = $this->scheduledEvent('multiprocessing:fixrelnames predbft');
+
+        $this->assertSame('*/5 * * * *', $event->expression);
+        $this->assertTrue($event->withoutOverlapping);
+    }
+
+    #[Test]
     public function releases_are_linked_to_late_arriving_predb_titles_on_a_schedule(): void
     {
         $event = $this->scheduledEvent('predb:check 3');
