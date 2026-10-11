@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Services\Tmux;
 
 use App\Models\Category;
-use App\Models\Collection;
 use App\Models\Release;
 use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
@@ -299,7 +298,8 @@ class TmuxMonitorService
         $timer = microtime(true);
 
         try {
-            $this->runVar['counts']['now']['collections_table'] = Collection::query()->count();
+            // Display-only and often over 10M rows; see Tmux::tableRowCount().
+            $this->runVar['counts']['now']['collections_table'] = $this->tmux->tableRowCount('collections');
             $this->runVar['counts']['now']['releases'] = Release::query()->count();
 
             foreach ($this->aggregateTableRowCounts($this->tmux->cbpmTableQuery()) as $key => $count) {

@@ -95,4 +95,24 @@ final class TmuxTableCountsTest extends TestCase
             (object) ['name' => 'missed_parts', 'row_count' => 2],
         ], $tmux->cbpmTableQuery());
     }
+
+    public function test_monitor_uses_the_row_estimate_for_a_large_collections_table(): void
+    {
+        DB::table('collections')->insert(['id' => 1]);
+        DB::table('releases')->insert([['id' => 1], ['id' => 2]]);
+        $tmux = $this->getMockBuilder(Tmux::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['proc_query', 'estimatedRowCount'])
+            ->getMock();
+        $tmux->method('proc_query')->willReturn('SELECT 0 AS active_groups');
+        $tmux->expects($this->atLeastOnce())->method('estimatedRowCount')->willReturnCallback(static fn (string $table): ?int => $table === 'collections' ? 14_100_000 : null);
+        $monitor = (new ReflectionClass(TmuxMonitorService::class))->newInstanceWithoutConstructor();
+        (new ReflectionProperty(TmuxMonitorService::class, 'tmux'))->setValue($monitor, $tmux);
+
+        (new ReflectionMethod(TmuxMonitorService::class, 'getTableCounts'))->invoke($monitor);
+        $counts = (new ReflectionProperty(TmuxMonitorService::class, 'runVar'))->getValue($monitor)['counts']['now'];
+
+        $this->assertSame(14_100_000, $counts['collections_table']);
+        $this->assertSame(2, $counts['releases'], 'Releases stay exact: the monitor shows how many were added.');
+    }
 }
