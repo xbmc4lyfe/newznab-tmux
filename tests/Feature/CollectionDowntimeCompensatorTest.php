@@ -39,9 +39,13 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         MarkerIoFailures::$shortWrite = false;
         MarkerIoFailures::$renameFails = false;
         MarkerIoFailures::$directorySyncFails = false;
+        MarkerIoFailures::$directorySyncCalls = 0;
+        MarkerIoFailures::$directorySyncFailFromCall = null;
+        MarkerIoFailures::$checkpointSyncFails = false;
         Schema::dropIfExists('collections');
         @unlink($this->marker);
         @unlink($this->marker.'.lock');
+        @unlink($this->marker.'.recovery');
         @rmdir(\dirname($this->marker));
 
         parent::tearDown();
@@ -165,6 +169,19 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         $this->assertSame(1, $updates, 'Only the occupied window, however high the ids or long the outage.');
     }
 
+    public function test_the_newest_waiting_lookup_skips_completed_rows_and_id_order(): void
+    {
+        $this->lastActive(Carbon::parse('2026-10-11 11:00:00')->getTimestamp());
+        $newest = $this->collection('2026-10-11 10:50:00');
+        $older = $this->collection('2026-10-11 10:20:00');
+        $completed = DB::table('collections')->insertGetId(['dateadded' => '2026-10-11 11:50:00', 'filecheck' => 4]);
+
+        $this->assertSame(2, $this->compensator()->compensate(2));
+        $this->assertSame('2026-10-11 11:50:00', $this->dateAdded($newest));
+        $this->assertSame('2026-10-11 11:20:00', $this->dateAdded($older));
+        $this->assertSame('2026-10-11 11:50:00', $this->dateAdded($completed));
+    }
+
     public function test_rows_crossing_into_a_later_window_are_shifted_once(): void
     {
         $this->lastActive(Carbon::parse('2026-10-11 11:00:00')->getTimestamp());
@@ -251,6 +268,22 @@ final class CollectionDowntimeCompensatorTest extends TestCase
             $this->compensator()->compensate(2);
 
             $this->assertSame('2026-03-08 03:05:00', $this->dateAdded($waiting), '01:45 EST plus 20 minutes is 03:05 EDT.');
+        } finally {
+            date_default_timezone_set($previous);
+        }
+    }
+
+    public function test_a_three_hour_fall_back_resolves_the_occurrence_before_restart(): void
+    {
+        $previous = date_default_timezone_get();
+        date_default_timezone_set('Antarctica/Casey');
+        try {
+            $this->travelTo(Carbon::parse('2022-03-12 13:10:00', 'UTC'));
+            $this->lastActive(Carbon::parse('2022-03-12 12:40:00', 'UTC')->getTimestamp());
+            $waiting = $this->collection('2022-03-12 23:10:00');
+
+            $this->assertSame(1, $this->compensator()->compensate(2));
+            $this->assertSame('2022-03-12 23:40:00', $this->dateAdded($waiting));
         } finally {
             date_default_timezone_set($previous);
         }
@@ -370,7 +403,8 @@ final class CollectionDowntimeCompensatorTest extends TestCase
 
     public function test_an_unsynced_directory_aborts_before_collections_move(): void
     {
-        $this->lastActive(Carbon::now('UTC')->subHour()->getTimestamp());
+        $previous = Carbon::now('UTC')->subHour()->getTimestamp();
+        $this->lastActive($previous);
         $waiting = $this->collection('2026-10-11 10:30:00');
         MarkerIoFailures::$directorySyncFails = true;
         try {
@@ -383,6 +417,9 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         }
 
         $this->assertSame('2026-10-11 10:30:00', $this->dateAdded($waiting));
+        $this->assertSame($previous, $this->compensator()->lastActivity(), 'The outage must remain claimable after directory synchronization fails.');
+        $this->assertSame(1, $this->compensator()->compensate(2));
+        $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting));
     }
 
     public function test_a_previous_test_activity_marker_is_not_reused(): void
@@ -394,6 +431,73 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         } finally {
             unlink($legacy);
         }
+    }
+
+    public function test_failed_publication_and_rollback_keep_durable_recovery_evidence(): void
+    {
+        $previous = Carbon::now('UTC')->subHour()->getTimestamp();
+        $this->lastActive($previous);
+        $waiting = $this->collection('2026-10-11 10:30:00');
+        MarkerIoFailures::$directorySyncCalls = 0;
+        MarkerIoFailures::$directorySyncFailFromCall = 2;
+        try {
+            $this->compensator()->compensate(2);
+            $this->fail('Failed rollback synchronization must be reported as unrecoverable.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('Unrecoverable', $exception->getMessage());
+        } finally {
+            MarkerIoFailures::$directorySyncFailFromCall = null;
+        }
+
+        $this->assertFileExists($this->marker.'.recovery');
+        $this->assertSame('2026-10-11 10:30:00', $this->dateAdded($waiting));
+        $this->assertSame(1, $this->compensator()->compensate(2));
+        $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting));
+        $this->assertFileDoesNotExist($this->marker.'.recovery');
+    }
+
+    public function test_an_interrupted_publication_recovers_the_original_interval(): void
+    {
+        $previous = Carbon::now('UTC')->subHour()->getTimestamp();
+        $this->lastActive(Carbon::now('UTC')->getTimestamp());
+        file_put_contents($this->marker.'.recovery', json_encode(['previous' => base64_encode((string) $previous)], JSON_THROW_ON_ERROR)."\n");
+        $waiting = $this->collection('2026-10-11 10:30:00');
+
+        $this->assertSame(1, $this->compensator()->compensate(2));
+        $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting));
+        $this->assertFileDoesNotExist($this->marker.'.recovery');
+    }
+
+    public function test_a_committed_recovery_record_never_reclaims_the_outage(): void
+    {
+        $previous = Carbon::now('UTC')->subHour()->getTimestamp();
+        $this->lastActive(Carbon::now('UTC')->getTimestamp());
+        file_put_contents($this->marker.'.recovery', json_encode(['previous' => base64_encode((string) $previous)], JSON_THROW_ON_ERROR)."\nCOMMITTED\n");
+        $waiting = $this->collection('2026-10-11 11:30:00');
+
+        $this->assertSame(0, $this->compensator()->compensate(2));
+        $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting));
+        $this->assertFileDoesNotExist($this->marker.'.recovery');
+    }
+
+    public function test_a_failed_checkpoint_sync_restores_the_claimable_interval(): void
+    {
+        $previous = Carbon::now('UTC')->subHour()->getTimestamp();
+        $this->lastActive($previous);
+        $waiting = $this->collection('2026-10-11 10:30:00');
+        MarkerIoFailures::$checkpointSyncFails = true;
+        try {
+            $this->compensator()->compensate(2);
+            $this->fail('A failed checkpoint must abort publication.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('Unable to persist', $exception->getMessage());
+        } finally {
+            MarkerIoFailures::$checkpointSyncFails = false;
+        }
+
+        $this->assertSame($previous, $this->compensator()->lastActivity());
+        $this->assertSame('2026-10-11 10:30:00', $this->dateAdded($waiting));
+        $this->assertSame(1, $this->compensator()->compensate(2));
     }
 
     public function test_tests_use_a_temporary_marker_not_the_real_one(): void

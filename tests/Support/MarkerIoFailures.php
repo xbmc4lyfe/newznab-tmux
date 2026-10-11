@@ -10,6 +10,12 @@ namespace Tests\Support {
         public static bool $renameFails = false;
 
         public static bool $directorySyncFails = false;
+
+        public static int $directorySyncCalls = 0;
+
+        public static ?int $directorySyncFailFromCall = null;
+
+        public static bool $checkpointSyncFails = false;
     }
 }
 
@@ -31,12 +37,24 @@ namespace App\Services\Tmux {
         return ! MarkerIoFailures::$renameFails && \rename($from, $to);
     }
 
-    /** @param resource $stream */
+    /**
+     * @param  resource  $stream
+     *
+     * @phpstan-impure
+     */
     function fsync($stream): bool
     {
-        $stat = fstat($stream);
-        if ($stat !== false && ($stat['mode'] & 0170000) === 0040000 && MarkerIoFailures::$directorySyncFails) {
+        $metadata = stream_get_meta_data($stream);
+        if (MarkerIoFailures::$checkpointSyncFails && str_ends_with($metadata['uri'] ?? '', '.recovery')) {
             return false;
+        }
+        $stat = fstat($stream);
+        if ($stat !== false && ($stat['mode'] & 0170000) === 0040000) {
+            MarkerIoFailures::$directorySyncCalls++;
+            $failFrom = MarkerIoFailures::$directorySyncFailFromCall;
+            if (MarkerIoFailures::$directorySyncFails || ($failFrom !== null && MarkerIoFailures::$directorySyncCalls >= $failFrom)) {
+                return false;
+            }
         }
 
         return \fsync($stream);

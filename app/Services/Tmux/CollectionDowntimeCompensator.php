@@ -254,14 +254,22 @@ final class CollectionDowntimeCompensator
         $first = $this->timestamp($dateTime);
         $value = substr($dateTime, 0, 19);
         $zone = new \DateTimeZone(date_default_timezone_get());
-        foreach ([3600, 1800, 7200] as $fold) {
-            $later = $first + $fold;
-            if ($later <= $notAfter && (new \DateTimeImmutable('@'.$later))->setTimezone($zone)->format('Y-m-d H:i:s') === $value) {
-                return $later;
+        $candidates = [$first];
+        $transitions = $zone->getTransitions($first - 7 * 86400, $first + 7 * 86400) ?: [];
+        for ($i = 1, $count = \count($transitions); $i < $count; $i++) {
+            $fold = $transitions[$i - 1]['offset'] - $transitions[$i]['offset'];
+            if ($fold <= 0) {
+                continue;
+            }
+            foreach ([$first - $fold, $first + $fold] as $candidate) {
+                if ((new \DateTimeImmutable('@'.$candidate))->setTimezone($zone)->format('Y-m-d H:i:s') === $value) {
+                    $candidates[] = $candidate;
+                }
             }
         }
+        $beforeRestart = array_filter($candidates, static fn (int $candidate): bool => $candidate <= $notAfter);
 
-        return $first;
+        return $beforeRestart === [] ? $first : max($beforeRestart);
     }
 
     /**
@@ -303,7 +311,8 @@ final class CollectionDowntimeCompensator
             ->where('id', '<=', $upperId)
             ->where('dateadded', '>=', $from)
             ->where('dateadded', $inclusive ? '<=' : '<', $before)
-            ->max('dateadded');
+            ->orderByDesc('dateadded')
+            ->value('dateadded');
 
         return $newest === null ? null : (string) $newest;
     }
@@ -344,6 +353,8 @@ final class CollectionDowntimeCompensator
                 throw new \RuntimeException("Unable to lock {$this->markerPath}.");
             }
 
+            $this->recoverPublication();
+
             return $work();
         } finally {
             flock($marker, LOCK_UN);
@@ -357,18 +368,129 @@ final class CollectionDowntimeCompensator
      */
     private function writeMarker(int $timestamp): void
     {
+        $directoryStream = fopen(\dirname($this->markerPath), 'r');
+        if ($directoryStream === false) {
+            throw new \RuntimeException('Unable to sync marker directory.');
+        }
+        $temporary = null;
+        $recoveryTemporary = null;
+        $published = false;
+        $recoveryPath = $this->markerPath.'.recovery';
+        try {
+            $previous = is_file($this->markerPath) ? file_get_contents($this->markerPath) : null;
+            if ($previous === false) {
+                throw new \RuntimeException('Unable to read marker before replacement.');
+            }
+            $temporary = $this->prepareMarker((string) $timestamp);
+            $record = json_encode(['previous' => $previous === null ? null : base64_encode($previous)], JSON_THROW_ON_ERROR)."\n";
+            $recoveryTemporary = $this->prepareMarker($record);
+            if (! rename($recoveryTemporary, $recoveryPath)) {
+                throw new \RuntimeException('Unable to replace marker recovery record.');
+            }
+            // Make recovery evidence durable while the original marker is still intact.
+            if (! fsync($directoryStream)) {
+                throw new \RuntimeException('Unable to sync marker recovery directory.');
+            }
+            if (! rename($temporary, $this->markerPath)) {
+                throw new \RuntimeException('Unable to replace marker.');
+            }
+            $published = true;
+            if (! fsync($directoryStream)) {
+                throw new \RuntimeException('Unable to sync marker directory.');
+            }
+            $checkpoint = fopen($recoveryPath, 'ab');
+            if ($checkpoint === false) {
+                throw new \RuntimeException('Unable to open marker recovery checkpoint.');
+            }
+            try {
+                $committed = "COMMITTED\n";
+                if (fwrite($checkpoint, $committed) !== \strlen($committed) || ! fflush($checkpoint) || ! fsync($checkpoint)) {
+                    throw new \RuntimeException('Unable to persist marker recovery checkpoint.');
+                }
+            } finally {
+                fclose($checkpoint);
+            }
+            // The committed record is durable before rows move. If this unlink is lost
+            // on a crash, recovery sees COMMITTED and never restores the old timestamp.
+            @unlink($recoveryPath);
+        } catch (\Throwable $exception) {
+            if ($published) {
+                $this->recoverPublication(forceRollback: true);
+            }
+            throw $exception;
+        } finally {
+            fclose($directoryStream);
+            foreach ([$temporary, $recoveryTemporary] as $path) {
+                if ($path !== null && is_file($path)) {
+                    unlink($path);
+                }
+            }
+        }
+    }
+
+    /**
+     * Under the stable lock, recover a publication that never reached its durable
+     * checkpoint. Persistent storage errors retain the previously synced evidence.
+     */
+    private function recoverPublication(bool $forceRollback = false): void
+    {
+        $recoveryPath = $this->markerPath.'.recovery';
+        if (! is_file($recoveryPath)) {
+            return;
+        }
+        $record = file_get_contents($recoveryPath);
+        if ($record === false) {
+            throw new \RuntimeException('Unrecoverable marker publication: recovery record is unreadable.');
+        }
+        if (! $forceRollback && str_contains($record, "\nCOMMITTED\n")) {
+            @unlink($recoveryPath);
+
+            return;
+        }
+        $metadata = json_decode(explode("\n", $record, 2)[0], true, 512, JSON_THROW_ON_ERROR);
+        if (! \is_array($metadata) || ! array_key_exists('previous', $metadata) || ($metadata['previous'] !== null && ! \is_string($metadata['previous']))) {
+            throw new \RuntimeException('Unrecoverable marker publication: invalid recovery record.');
+        }
+        $previous = $metadata['previous'] === null ? null : base64_decode($metadata['previous'], true);
+        if ($previous === false) {
+            throw new \RuntimeException('Unrecoverable marker publication: invalid recovery timestamp.');
+        }
+        $directoryStream = fopen(\dirname($this->markerPath), 'r');
+        if ($directoryStream === false) {
+            throw new \RuntimeException('Unrecoverable marker publication: directory is unavailable.');
+        }
+        $temporary = null;
+        try {
+            if ($previous !== null) {
+                $temporary = $this->prepareMarker($previous);
+                if (! rename($temporary, $this->markerPath)) {
+                    throw new \RuntimeException('Unrecoverable marker publication: timestamp cannot be restored.');
+                }
+            } elseif (is_file($this->markerPath) && ! unlink($this->markerPath)) {
+                throw new \RuntimeException('Unrecoverable marker publication: unknown timestamp cannot be removed.');
+            }
+            if (! fsync($directoryStream)) {
+                throw new \RuntimeException('Unrecoverable marker publication: rollback cannot be synced; recovery evidence retained.');
+            }
+            @unlink($recoveryPath);
+        } finally {
+            fclose($directoryStream);
+            if ($temporary !== null && is_file($temporary)) {
+                unlink($temporary);
+            }
+        }
+    }
+
+    /**
+     * Prepare a complete file before either publication or rollback changes the marker.
+     */
+    private function prepareMarker(string $value): string
+    {
         $directory = \dirname($this->markerPath);
         $temporary = tempnam($directory, 'activity-');
         if ($temporary === false) {
             throw new \RuntimeException("Unable to write {$this->markerPath}.");
         }
-
-        $directoryStream = fopen($directory, 'r');
-        if ($directoryStream === false) {
-            unlink($temporary);
-            throw new \RuntimeException("Unable to sync {$this->markerPath} directory.");
-        }
-
         try {
             if (\dirname($temporary) !== realpath($directory)) {
                 throw new \RuntimeException("Unable to write {$this->markerPath} in its directory.");
@@ -378,24 +500,17 @@ final class CollectionDowntimeCompensator
                 throw new \RuntimeException("Unable to write {$this->markerPath}.");
             }
             try {
-                $value = (string) $timestamp;
                 if (fwrite($stream, $value) !== \strlen($value) || ! fflush($stream) || ! fsync($stream)) {
                     throw new \RuntimeException("Unable to write {$this->markerPath}.");
                 }
             } finally {
                 fclose($stream);
             }
-            if (! rename($temporary, $this->markerPath)) {
-                throw new \RuntimeException("Unable to replace {$this->markerPath}.");
-            }
-            if (! fsync($directoryStream)) {
-                throw new \RuntimeException("Unable to sync {$this->markerPath} directory.");
-            }
-        } finally {
-            fclose($directoryStream);
-            if (is_file($temporary)) {
-                unlink($temporary);
-            }
+
+            return $temporary;
+        } catch (\Throwable $exception) {
+            unlink($temporary);
+            throw $exception;
         }
     }
 }

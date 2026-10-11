@@ -64,6 +64,7 @@ abstract class TestCase extends BaseTestCase
             if ($this->activityMarker !== '') {
                 @unlink($this->activityMarker);
                 @unlink($this->activityMarker.'.lock');
+                @unlink($this->activityMarker.'.recovery');
                 @rmdir(\dirname($this->activityMarker));
             }
             foreach (self::$baselineEnvironment ?? [] as $key => $value) {
