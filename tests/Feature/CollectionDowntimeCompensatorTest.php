@@ -217,11 +217,13 @@ final class CollectionDowntimeCompensatorTest extends TestCase
             $this->lastActive($lastActive);
             $repeatedHour = $this->collection('2026-11-01 01:10:00');
             $lateInRepeatedHour = $this->collection('2026-11-01 01:45:00');
+            $alreadyExpired = $this->collection('2026-11-01 00:55:00'); // 2h55 old at the 02:50 EST shutdown
 
             $this->compensator()->compensate(2);
 
             $this->assertSame('2026-11-01 01:40:00', $this->dateAdded($repeatedHour), 'Gets the 30 minutes back.');
             $this->assertSame('2026-11-01 02:15:00', $this->dateAdded($lateInRepeatedHour), 'Read as 01:45 EST, the occurrence before the shutdown.');
+            $this->assertSame('2026-11-01 00:55:00', $this->dateAdded($alreadyExpired), 'Inside the widened bound, but already expired.');
         } finally {
             date_default_timezone_set($previous);
         }

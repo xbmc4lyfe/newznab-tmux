@@ -141,6 +141,7 @@ final class CollectionDowntimeCompensator
             return $this->shiftRowsById(
                 $this->at($waitingFrom - $this->largestOffsetChange($waitingFrom, $lastActive, $now)),
                 max($nowAt, $lastActiveAt),
+                $waitingFrom,
                 $lastActive,
                 $now,
                 $downtime,
@@ -180,7 +181,7 @@ final class CollectionDowntimeCompensator
      * timezone arithmetic; every row is read and moved exactly once. This only runs for
      * a restart whose span crosses an offset change.
      */
-    private function shiftRowsById(string $from, string $to, int $lastActive, int $now, int $downtime): int
+    private function shiftRowsById(string $from, string $to, int $waitingFrom, int $lastActive, int $now, int $downtime): int
     {
         $moved = 0;
         $lastId = 0;
@@ -196,6 +197,9 @@ final class CollectionDowntimeCompensator
             foreach ($rows as $row) {
                 $lastId = (int) $row->id;
                 $added = $this->timestampNotAfter((string) $row->dateadded, $now);
+                if ($added < $waitingFrom) {
+                    continue; // Picked up only by the widened bound: it had already expired.
+                }
                 $shift = $added <= $lastActive ? $downtime : max(0, min($now - $added, $downtime));
                 if ($shift > 0) {
                     $byValue[$this->at($added + $shift)][] = $lastId;
