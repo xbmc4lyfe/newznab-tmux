@@ -844,6 +844,35 @@ class ReleaseProcessorTest extends TestCase
     }
 
     #[Test]
+    public function it_skips_multi_file_probes_with_every_download_option_off(): void
+    {
+        $config = $this->makeConfig();
+        $nzbParser = Mockery::mock(NzbContentParser::class);
+        $nzbParser->shouldReceive('parseNzb')->once()->andReturn([
+            'error' => null,
+            'contents' => array_map(
+                static fn (int $i): array => ['title' => '"obfuscated'.$i.'" yEnc (1/1)', 'segments' => ['<file-'.$i.'>'], 'size' => 100, 'filecount' => 1],
+                range(1, 3),
+            ),
+        ]);
+
+        $downloadService = Mockery::mock(UsenetDownloadService::class);
+        $this->expectDownloadScope($downloadService);
+        $downloadService->shouldNotReceive('download');
+
+        $releaseManager = Mockery::mock(ReleaseFileManager::class);
+        $releaseManager->shouldReceive('processReleaseNameFromNzbContents')->once()->andReturnFalse();
+        $releaseManager->shouldNotReceive('deleteRelease');
+        $releaseManager->shouldReceive('finalizeRelease')->once()->andReturnNull();
+
+        $context = $this->makeContext();
+        $this->multiFileProbeProcessor($config, $nzbParser, $downloadService, $releaseManager)
+            ->process($context, '/tmp/main/');
+
+        $this->assertFalse($context->nzbHasCompressedFile);
+    }
+
+    #[Test]
     public function it_probes_at_most_the_configured_number_of_files_and_never_deletes_a_multi_file_release(): void
     {
         $config = $this->makeConfig(['processPasswords' => true, 'archiveProbeFiles' => 2]);

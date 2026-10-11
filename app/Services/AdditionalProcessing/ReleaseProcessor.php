@@ -264,6 +264,11 @@ class ReleaseProcessor
      */
     private function downloadProbe(ReleaseProcessingContext $context): ?array
     {
+        // A multi-file probe only feeds archive inspection, which needs downloads enabled.
+        if ($context->workPlan?->probeIsOnlyFile !== true && ! $this->shouldProcessDownloads()) {
+            return null;
+        }
+
         foreach ($context->workPlan->probeCandidates ?? [] as $candidate) {
             if ($context->groupUnavailable) {
                 return null;
