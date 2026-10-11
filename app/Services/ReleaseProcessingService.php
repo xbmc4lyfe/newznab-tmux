@@ -546,7 +546,8 @@ final class ReleaseProcessingService
             $stale = $createdAt !== null
                 && (string) $createdAt < $staleBefore
                 && \in_array((int) $collection->filecheck, [0, 1, 10], true);
-            $totalFiles = $stale ? $currentFiles : (int) $collection->totalfiles;
+            $totalFiles = $stale && ! config('release_verification.required', true)
+                ? $currentFiles : (int) $collection->totalfiles;
             $ready = $totalFiles > 0
                 && \in_array($currentFiles, [$totalFiles, $totalFiles + 1], true)
                 && (int) ($aggregate->completefiles ?? 0) >= $totalFiles;
@@ -573,6 +574,9 @@ final class ReleaseProcessingService
      */
     public function deleteUnwantedCollections(int|string|null $groupID): void
     {
+        if (config('release_verification.required', true)) {
+            return;
+        }
         $startTime = now()->toImmutable();
         $this->outputSubHeader('Filtering Collections by Size/File Count');
 
@@ -1030,6 +1034,9 @@ final class ReleaseProcessingService
      */
     private function processStuckCollections(int $groupID): void
     {
+        if (config('release_verification.required', true)) {
+            return;
+        }
         $cutoff = $this->calculateStuckCollectionsCutoff();
         $totalDeleted = 0;
 

@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace App\Services\Binaries;
 
+use App\Services\Releases\Verification\CandidateRepository;
 use App\Support\SqlError;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * Orchestrates the header storage process.
@@ -17,6 +20,9 @@ use Illuminate\Support\Facades\Log;
 final class HeaderStorageService
 {
     private const int LOCK_RETRY_MAX = 10;
+
+    /** @var array<int, true> */
+    private array $verificationCollectionIds = [];
 
     private CollectionHandler $collectionHandler;
 
@@ -171,6 +177,7 @@ final class HeaderStorageService
     private function storeChunkAttempt(array $headers, array $groupMySQL, bool $addToPartRepair): bool
     {
         $this->lastStorageException = null;
+        $this->verificationCollectionIds = [];
         $this->collectionHandler->reset();
         $this->binaryHandler->reset();
         $this->partHandler->reset();
@@ -217,6 +224,9 @@ final class HeaderStorageService
                 }
             }
 
+            if (! $transaction->hasErrors()) {
+                $this->invalidateVerificationCandidates();
+            }
         } catch (\Throwable $e) {
             $this->lastStorageException = $e;
             $transaction->markError();
@@ -290,6 +300,25 @@ final class HeaderStorageService
             $transaction->getBatchNoise()
         );
 
+        if (config('release_verification.required', true)) {
+            $ids = array_values(array_unique($collectionIds));
+            sort($ids);
+            $locked = DB::table('collections')->whereIn('id', $ids)->orderBy('id')->lockForUpdate()->pluck('id')->all();
+            if (Schema::hasTable('release_verification_candidates')) {
+                $hashes = DB::table('collections')->whereIn('id', $ids)->pluck('collectionhash', 'id');
+                $identities = $hashes->map(static fn ($hash): string => bin2hex($hash))->all();
+                $active = DB::table('release_verification_candidates')->whereIn('source_identity', $identities)
+                    ->whereNull('release_id')->whereNotIn('status', ['expired'])->pluck('source_identity')->all();
+                $tracked = $hashes->filter(static fn ($hash): bool => in_array(bin2hex($hash), $active, true))->keys()->all();
+                foreach ($tracked as $id) {
+                    $this->verificationCollectionIds[(int) $id] = true;
+                }
+            }
+            if (count($locked) !== count($ids)) {
+                throw new \RuntimeException('Collection was archived during header resolution; retry ingestion.');
+            }
+        }
+
         $binaryRecords = [];
         foreach ($headers as $index => $header) {
             if (! isset($collectionIds[$index])) {
@@ -329,6 +358,13 @@ final class HeaderStorageService
             if (! $this->partHandler->addPart($binaryIds[$index], $header)) {
                 $this->markHeaderFailed($header, $transaction);
             }
+        }
+    }
+
+    private function invalidateVerificationCandidates(): void
+    {
+        if ($this->verificationCollectionIds !== []) {
+            app(CandidateRepository::class)->invalidateHotCollections(array_keys($this->verificationCollectionIds));
         }
     }
 

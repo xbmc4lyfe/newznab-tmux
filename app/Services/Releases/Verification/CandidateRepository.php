@@ -1,0 +1,293 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Services\Releases\Verification;
+
+use App\Services\CollectionCleanupService;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
+use RuntimeException;
+
+final class CandidateRepository
+{
+    public function __construct(private readonly ManifestStore $store, private readonly CollectionCleanupService $cleanup) {}
+
+    public function archive(int $collectionId): void
+    {
+        DB::transaction(function () use ($collectionId): void {
+            $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+            $collection = DB::table('collections')->where('id', $collectionId)->lockForUpdate()->first();
+            if ($collection === null || (int) $collection->filecheck === 4) {
+                return;
+            }
+            if ($state === null) {
+                throw new RuntimeException('Verification migration has not initialized capacity state.');
+            }
+            $sourceIdentity = bin2hex($collection->collectionhash);
+            $existing = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
+                ->orderByDesc('id')->lockForUpdate()->first();
+            $identity = $existing->identity ?? $sourceIdentity;
+            if ($existing !== null && $existing->release_id !== null) {
+                $identity = sha1($sourceIdentity.':generation:'.$existing->id);
+                $existing = null;
+            }
+            $manifest = $this->snapshot($collection);
+            $newArticles = true;
+            if ($existing !== null && $existing->manifest_path !== '') {
+                $oldManifest = $this->store->read($existing->manifest_path);
+                $manifest = $this->merge($oldManifest, $manifest);
+                $newArticles = $this->articleIdentity($oldManifest) !== $this->articleIdentity($manifest);
+            }
+            $path = $this->store->write($manifest);
+            $size = filesize($this->store->path($path));
+            if ($size === false) {
+                throw new RuntimeException('Cannot reserve manifest storage.');
+            }
+            $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + $size;
+            if ($pending > (int) config('release_verification.pending_bytes')) {
+                if ($existing === null || $existing->manifest_path !== $path) {
+                    unlink($this->store->path($path));
+                }
+                throw new RuntimeException('Pending verification capacity is full; original headers retained.');
+            }
+            $changed = $existing === null || $existing->manifest_path !== $path;
+            $dirty = $existing !== null && $existing->status === 'dirty';
+            $values = ['identity' => $identity, 'source_identity' => $sourceIdentity, 'groups_id' => (int) $collection->groups_id, 'manifest_path' => $path,
+                'manifest_bytes' => $size, 'manifest_hash' => substr($path, 0, 64)];
+            if ($changed || $dirty) {
+                $values += ['version' => (int) ($existing->version ?? 0) + 1, 'last_unique_at' => $newArticles ? now() : $existing->last_unique_at,
+                    'next_attempt_at' => now(), 'status' => 'pending', 'lease_token' => null, 'lease_until' => null, 'reason' => null];
+            }
+            if ($existing === null) {
+                DB::table('release_verification_candidates')->insert($values);
+            } else {
+                DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
+            }
+            DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
+            $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false);
+            if ($existing !== null && $existing->manifest_path !== $path) {
+                DB::afterCommit(function () use ($existing): void {
+                    $old = $this->store->path($existing->manifest_path);
+                    if (is_file($old)) {
+                        unlink($old);
+                    }
+                });
+            }
+        }, 5);
+    }
+
+    /** @param array<string, mixed> $manifest */
+    public function enqueue(array $manifest): void
+    {
+        DB::transaction(function () use ($manifest): void {
+            $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+            $identity = (string) $manifest['identity'];
+            if (DB::table('release_verification_candidates')->where('identity', $identity)->exists()) {
+                return;
+            }
+            $path = $this->store->write($manifest);
+            $bytes = (int) filesize($this->store->path($path));
+            if ((int) $state->pending_bytes + $bytes > (int) config('release_verification.pending_bytes')) {
+                @unlink($this->store->path($path));
+                throw new RuntimeException('Candidate capacity is full; import retained for retry.');
+            }
+            DB::table('release_verification_candidates')->insert(['identity' => $identity, 'source_identity' => $identity,
+                'groups_id' => (int) $manifest['groups_id'], 'manifest_path' => $path, 'manifest_bytes' => $bytes,
+                'manifest_hash' => substr($path, 0, 64), 'last_unique_at' => now(), 'next_attempt_at' => now()]);
+            DB::table('release_verification_state')->where('id', 1)->increment('pending_bytes', $bytes);
+        }, 5);
+    }
+
+    /** @param list<int> $ids */
+    public function invalidateHotCollections(array $ids): void
+    {
+        foreach (DB::table('collections')->whereIn('id', $ids)->orderBy('id')->get() as $collection) {
+            $identity = bin2hex($collection->collectionhash);
+            $candidates = DB::table('release_verification_candidates')->where('source_identity', $identity)
+                ->whereNull('release_id')->whereNotIn('status', ['expired'])->lockForUpdate()->get();
+            foreach ($candidates as $candidate) {
+                if ($candidate->manifest_path === '') {
+                    continue;
+                }
+                $old = $this->store->read($candidate->manifest_path);
+                $merged = $this->merge($old, $this->snapshot($collection));
+                if ($this->articleIdentity($old) === $this->articleIdentity($merged) && ! ($merged['conflict'] ?? false)) {
+                    continue;
+                }
+                DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
+                    'status' => 'dirty', 'lease_token' => null, 'lease_until' => null, 'version' => $candidate->version + 1,
+                    'last_unique_at' => $this->articleIdentity($old) !== $this->articleIdentity($merged) ? now() : $candidate->last_unique_at]);
+                DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
+            }
+        }
+    }
+
+    /** @param array<string, mixed> $manifest */
+    private function articleIdentity(array $manifest): string
+    {
+        $ids = [];
+        foreach ($manifest['files'] as $file) {
+            foreach ($file['segments'] as $part) {
+                $ids[] = $file['key'].':'.$part['number'].':'.$part['messageid'].':'.$part['bytes'];
+            }
+        }
+        sort($ids);
+
+        return hash('sha256', implode("\n", $ids));
+    }
+
+    public function capacityAvailable(): bool
+    {
+        if (! config('release_verification.required', true) || ! Schema::hasTable('release_verification_state')) {
+            return true;
+        }
+
+        $capacity = (int) config('release_verification.pending_bytes');
+        $reserve = min(33554432, (int) ($capacity / 10));
+
+        return (int) DB::table('release_verification_state')->where('id', 1)->value('pending_bytes') < $capacity - $reserve;
+    }
+
+    /** @return array<string, mixed> */
+    private function snapshot(object $collection): array
+    {
+        $groups = Schema::hasTable('collection_groups')
+            ? DB::table('collection_groups')->where('collections_id', $collection->id)->pluck('group_name')->all() : [];
+        if ($groups === []) {
+            $groups = [(string) DB::table('usenet_groups')->where('id', $collection->groups_id)->value('name')];
+        }
+        sort($groups);
+        $files = [];
+        $metadataBytes = 0;
+        foreach (DB::table('binaries')->where('collections_id', $collection->id)->orderBy('binaryhash')->cursor() as $binary) {
+            $segments = [];
+            foreach (DB::table('parts')->where('binaries_id', $binary->id)->orderBy('partnumber')->cursor() as $part) {
+                $metadataBytes += 128 + strlen($part->messageid);
+                if ($metadataBytes > 16777216) {
+                    throw new RuntimeException('Candidate exceeds metadata budget; headers retained.');
+                }
+                $segments[] = ['number' => (int) $part->partnumber, 'messageid' => $part->messageid, 'bytes' => (int) $part->size];
+            }
+            $files[] = ['key' => bin2hex($binary->binaryhash), 'subject' => $binary->name,
+                'totalparts' => (int) $binary->totalparts, 'segments' => $segments];
+        }
+
+        return ['identity' => bin2hex($collection->collectionhash), 'subject' => $collection->subject,
+            'fromname' => $collection->fromname, 'date' => $collection->date, 'groups_id' => (int) $collection->groups_id,
+            'regex_id' => (int) $collection->collection_regexes_id, 'expected_files' => (int) $collection->totalfiles,
+            'groups' => $groups, 'files' => $files, 'conflict' => false];
+    }
+
+    /** @param array<string, mixed> $old
+     * @param  array<string, mixed>  $new
+     * @return array<string, mixed>
+     */
+    private function merge(array $old, array $new): array
+    {
+        $files = array_column($old['files'], null, 'key');
+        foreach ($new['files'] as $file) {
+            $key = $file['key'];
+            if (! isset($files[$key])) {
+                $files[$key] = $file;
+
+                continue;
+            }
+            $previous = $files[$key];
+            if ($previous['subject'] !== $file['subject'] || $previous['totalparts'] !== $file['totalparts']) {
+                $old['conflict'] = true;
+            }
+            $parts = array_column($previous['segments'], null, 'number');
+            foreach ($file['segments'] as $segment) {
+                if (isset($parts[$segment['number']]) && $parts[$segment['number']] !== $segment) {
+                    $old['conflict'] = true;
+                } else {
+                    $parts[$segment['number']] = $segment;
+                }
+            }
+            ksort($parts);
+            $files[$key]['segments'] = array_values($parts);
+        }
+        ksort($files);
+        $old['files'] = array_values($files);
+        $old['groups'] = array_values(array_unique(array_merge($old['groups'], $new['groups'])));
+        sort($old['groups']);
+        if ($old['fromname'] !== $new['fromname'] || $old['expected_files'] !== $new['expected_files']) {
+            $old['conflict'] = true;
+        }
+
+        return $old;
+    }
+
+    public function expire(): void
+    {
+        $ids = DB::table('release_verification_candidates')->whereNull('release_id')
+            ->whereIn('status', ['pending', 'unknown', 'verifying', 'dirty'])
+            ->where('last_unique_at', '<', now()->subHours((int) config('release_verification.expiry_hours')))
+            ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
+            ->orderBy('id')->limit(100)->pluck('id');
+        foreach ($ids as $id) {
+            DB::transaction(function () use ($id): void {
+                DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
+                if ($row === null || $row->release_id !== null
+                    || $row->last_unique_at >= now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s')
+                    || ($row->lease_until !== null && $row->lease_until >= now()->format('Y-m-d H:i:s'))) {
+                    return;
+                }
+                DB::table('release_verification_state')->where('id', 1)->decrement('pending_bytes', (int) $row->manifest_bytes);
+                DB::table('release_verification_candidates')->where('id', $id)->update(['status' => 'expired',
+                    'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
+                DB::afterCommit(function () use ($row): void {
+                    if ($row->manifest_path !== '') {
+                        @unlink($this->store->path($row->manifest_path));
+                    }
+                    $root = (string) config('release_verification.storage_path').'/scratch/';
+                    foreach (glob($root.$row->id.'-*', GLOB_ONLYDIR) ?: [] as $directory) {
+                        File::deleteDirectory($directory);
+                    }
+                });
+            });
+        }
+    }
+
+    public function claim(): ?object
+    {
+        return DB::transaction(function (): ?object {
+            $query = DB::table('release_verification_candidates')->whereNull('release_id')
+                ->whereIn('status', ['pending', 'unknown', 'verifying'])->where('next_attempt_at', '<=', now())
+                ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
+                ->orderBy('next_attempt_at')->orderBy('id')->lockForUpdate();
+            $row = $query->first();
+            if ($row === null) {
+                return null;
+            }
+            $token = (string) Str::uuid();
+            DB::table('release_verification_candidates')->where('id', $row->id)->update([
+                'status' => 'verifying', 'lease_token' => $token,
+                'lease_until' => now()->addSeconds((int) config('release_verification.lease_seconds')),
+            ]);
+            $row->lease_token = $token;
+
+            return $row;
+        }, 5);
+    }
+
+    public function heartbeat(int $id, string $token): void
+    {
+        $changed = DB::table('release_verification_candidates')->where('id', $id)->where('lease_token', $token)
+            ->where('lease_until', '>=', now())->update(['lease_until' => now()->addSeconds((int) config('release_verification.lease_seconds'))]);
+        if ($changed !== 1 && ! DB::table('release_verification_candidates')->where('id', $id)->where('lease_token', $token)->where('lease_until', '>=', now())->exists()) {
+            throw new RuntimeException('Verification lease was lost.');
+        }
+    }
+
+    public function finish(object $claim, VerificationResult $result): void
+    {
+        DB::table('release_verification_candidates')->where('id', $claim->id)->where('lease_token', $claim->lease_token)
+            ->where('version', $claim->version)->update(['status' => 'unknown', 'reason' => substr($result->reason, 0, 2000),
+                'lease_token' => null, 'lease_until' => null, 'next_attempt_at' => now()->addSeconds((int) config('release_verification.retry_seconds'))]);
+    }
+}

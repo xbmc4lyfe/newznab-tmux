@@ -9,6 +9,7 @@ use App\Services\Binaries\BinariesService;
 use App\Services\Binaries\MissedPartHandler;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\NNTP\NNTPService;
+use App\Services\Releases\Verification\CandidateRepository;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -38,6 +39,12 @@ class GetArticleRange extends Command
      */
     public function handle(): int
     {
+        if (! app(CandidateRepository::class)->capacityAvailable()) {
+            $this->warn('Verification backlog is full; scan positions were preserved.');
+
+            return self::SUCCESS;
+        }
+
         $mode = $this->argument('mode');
         $groupName = $this->argument('group');
         $firstArticle = (int) $this->argument('first');

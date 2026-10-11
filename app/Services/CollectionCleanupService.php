@@ -6,6 +6,7 @@ namespace App\Services;
 
 use App\Services\Binaries\BinariesConfig;
 use App\Services\Configuration\ConfigurationProvider;
+use App\Services\Releases\Verification\CandidateRepository;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -96,6 +97,14 @@ class CollectionCleanupService
                 break;
             }
 
+            if (config('release_verification.required', true)) {
+                foreach ($ids as $id) {
+                    $row = DB::table('collections')->where('id', $id)->first(['filecheck']);
+                    if ($row !== null && (int) $row->filecheck !== 4) {
+                        app(CandidateRepository::class)->archive((int) $id);
+                    }
+                }
+            }
             $affected = $this->deleteCollectionsAndDescendants($ids, 'Cleanup', $echoCLI);
 
             $batchDeleted += $affected;

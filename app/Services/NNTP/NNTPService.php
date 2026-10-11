@@ -20,6 +20,39 @@ use DariusIII\NetNntp\Protocol\ResponseCode;
  */
 class NNTPService extends NntpClient
 {
+    /** Read one bounded, undecoded article for integrity verification. */
+    public function verificationArticle(string $messageId, int $maximumBytes): string
+    {
+        $messageId = trim($messageId, '<>');
+        if ($maximumBytes < 1 || preg_match('/\A[^\s<>\x00-\x1f\x7f]+\z/D', $messageId) !== 1) {
+            throw new \RuntimeException('Invalid verification article request.');
+        }
+        $response = $this->_sendCommand('BODY <'.$messageId.'>');
+        if ($response !== ResponseCode::BodyFollows->value) {
+            throw new \RuntimeException('Article is unavailable; retry verification later.');
+        }
+        $raw = '';
+        while (($line = fgets($this->_socket, min($maximumBytes + 1, 65536))) !== false) {
+            if ($line === ".\r\n" || $line === ".\n") {
+                return $raw;
+            }
+            if (! str_ends_with($line, "\n")) {
+                $this->doQuit();
+                throw new \RuntimeException('Verification article line is truncated or oversized.');
+            }
+            if (str_starts_with($line, '..')) {
+                $line = substr($line, 1);
+            }
+            if (strlen($raw) + strlen($line) > $maximumBytes) {
+                $this->doQuit();
+                throw new \RuntimeException('Article exceeds verification memory budget.');
+            }
+            $raw .= $line;
+        }
+        $this->doQuit();
+        throw new \RuntimeException('Truncated article response.');
+    }
+
     protected bool $_debugBool;
 
     protected bool $_echo;

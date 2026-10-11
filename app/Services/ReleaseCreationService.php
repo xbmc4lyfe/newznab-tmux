@@ -14,6 +14,7 @@ use App\Models\UsenetGroup;
 use App\Services\Categorization\CategorizationService;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Services\Releases\Verification\CandidateRepository;
 use App\Support\Utf8;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -37,6 +38,17 @@ class ReleaseCreationService
      */
     public function createReleases(int|string|null $groupID, int $limit, bool $echoCLI): array
     {
+        if (config('release_verification.required', true)) {
+            $ids = Collection::query()->where('filecheck', CollectionFileCheckStatus::Sized->value)
+                ->when(! empty($groupID), static fn ($q) => $q->where('groups_id', $groupID))
+                ->orderBy('id')->limit(max(1, $limit))->pluck('id');
+            foreach ($ids as $id) {
+                app(CandidateRepository::class)->archive((int) $id);
+            }
+
+            return ['added' => 0, 'dupes' => 0];
+        }
+
         $startTime = now()->toImmutable();
         $categorize = new CategorizationService;
         $returnCount = 0;

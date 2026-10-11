@@ -14,6 +14,8 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\ReleaseCleaningService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\NzbManifestReader;
 use App\Support\Utf8;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
@@ -246,7 +248,13 @@ class NzbImportService
                     $importStatus = NzbImportStatus::Failed;
                 }
 
-                if ($importStatus === NzbImportStatus::Inserted) {
+                if ($importStatus === NzbImportStatus::Queued) {
+                    $reportResult($nzbFilePath, $importStatus);
+                    $nzbsImported++;
+                    if ($delete) {
+                        File::delete($nzbFilePath);
+                    }
+                } elseif ($importStatus === NzbImportStatus::Inserted) {
                     if (! $stored) {
                         $destination = $path ?? $this->relGuid;
                         $this->echoOut('ERROR: Problem compressing NZB file to: '.$destination);
@@ -507,6 +515,7 @@ class NzbImportService
                 'totalSize' => $totalSize,
                 'nzbCategoryId' => $this->resolveNzbCategoryId($nzbXML),
                 'articleFingerprint' => NzbArticleFingerprint::fromXml($nzbXML),
+                'verificationXml' => config('release_verification.required', true) ? $nzbXML->asXML() : null,
             ]
         );
     }
@@ -681,6 +690,21 @@ class NzbImportService
      */
     protected function insertNZB(mixed $nzbDetails): NzbImportStatus
     {
+        if (config('release_verification.required', true)) {
+            if (! is_string($nzbDetails['verificationXml'] ?? null)) {
+                throw new \RuntimeException('NZB must be queued for download verification before publication.');
+            }
+            $info = (object) ['groups_id' => $nzbDetails['groups_id'],
+                'searchname' => $nzbDetails['useFName'] !== '' ? $nzbDetails['useFName'] : $nzbDetails['subject'],
+                'fromname' => $nzbDetails['from'], 'postdate' => $nzbDetails['postDate']];
+            $manifest = app(NzbManifestReader::class)->read($nzbDetails['verificationXml'], $info);
+            $manifest['identity'] = sha1('import:'.($nzbDetails['articleFingerprint'] ?? $nzbDetails['verificationXml']));
+            app(CandidateRepository::class)->enqueue($manifest);
+            $this->echoOut('NZB queued for download verification.');
+
+            return NzbImportStatus::Queued;
+        }
+
         // Make up a GUID for the release.
         $this->relGuid = Str::uuid()->toString();
 

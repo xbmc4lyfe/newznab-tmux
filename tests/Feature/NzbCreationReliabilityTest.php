@@ -65,6 +65,7 @@ class NzbCreationReliabilityTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        config(['release_verification.required' => false]);
 
         $this->tempNzbPath = sys_get_temp_dir().'/nntmux-nzb-reliability-'.uniqid('', true);
         mkdir($this->tempNzbPath, 0777, true);

@@ -21,6 +21,8 @@ final class NzbUploadManifestService
 
     public const STATE_NZB_FAILED = 'nzb_failed';
 
+    public const STATE_NZB_PENDING = 'nzb_pending';
+
     public const STATE_NFO_IMPORTED = 'nfo_imported';
 
     public const STATE_NFO_FAILED = 'nfo_failed';
@@ -130,6 +132,11 @@ final class NzbUploadManifestService
             $manifest['state'] = self::STATE_NZB_IMPORTED;
             $manifest['release_id'] = $releaseId;
             $manifest['release_guid'] = $releaseGuid;
+            $manifest['last_error'] = null;
+        } elseif ($status === NzbImportStatus::Queued) {
+            $manifest['state'] = self::STATE_NZB_PENDING;
+            $manifest['release_id'] = null;
+            $manifest['release_guid'] = null;
             $manifest['last_error'] = null;
         } elseif ($status === NzbImportStatus::Duplicate) {
             $manifest['state'] = self::STATE_NZB_DUPLICATE;

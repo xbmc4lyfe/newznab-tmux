@@ -1,0 +1,69 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Services\Releases\Verification;
+
+use App\Services\Nzb\NzbService;
+use RuntimeException;
+use XMLWriter;
+
+final class VerifiedNzbWriter
+{
+    public function __construct(private readonly NzbService $nzb) {}
+
+    /** @param array<string, mixed> $manifest */
+    public function write(array $manifest, string $guid): string
+    {
+        $xml = new XMLWriter;
+        $xml->openMemory();
+        $xml->startDocument('1.0', 'UTF-8');
+        $xml->startElement('nzb');
+        $xml->writeAttribute('xmlns', 'http://www.newzbin.com/DTD/2003/nzb');
+        foreach ($manifest['files'] as $file) {
+            if ($file['segments'] === []) {
+                continue;
+            }
+            $xml->startElement('file');
+            $xml->writeAttribute('poster', (string) $manifest['fromname']);
+            $xml->writeAttribute('date', (string) strtotime($manifest['date']));
+            $xml->writeAttribute('subject', $file['subject'].' (1/'.$file['totalparts'].')');
+            $xml->startElement('groups');
+            foreach ($manifest['groups'] as $group) {
+                $xml->writeElement('group', $group);
+            }
+            $xml->endElement();
+            $xml->startElement('segments');
+            foreach ($file['segments'] as $segment) {
+                $xml->startElement('segment');
+                $xml->writeAttribute('number', (string) $segment['number']);
+                $xml->writeAttribute('bytes', (string) $segment['bytes']);
+                $xml->text(trim($segment['messageid'], '<>'));
+                $xml->endElement();
+            }
+            $xml->endElement();
+            $xml->endElement();
+        }
+        $xml->endElement();
+        $xml->endDocument();
+        $path = $this->nzb->getNzbPath($guid, createIfNotExist: true);
+        $body = gzencode($xml->outputMemory());
+        $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
+        $handle = fopen($temporary, 'xb');
+        if ($body === false || $handle === false) {
+            throw new RuntimeException('Cannot write verified NZB.');
+        }
+        try {
+            if (fwrite($handle, $body) !== strlen($body) || ! fflush($handle) || ! fsync($handle)) {
+                throw new RuntimeException('Cannot persist verified NZB.');
+            }
+        } finally {
+            fclose($handle);
+        }
+        if (! rename($temporary, $path)) {
+            throw new RuntimeException('Cannot finalize verified NZB.');
+        }
+
+        return $path;
+    }
+}

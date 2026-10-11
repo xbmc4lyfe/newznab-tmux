@@ -1,0 +1,322 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Services\Releases\Verification;
+
+use dariusiii\rarinfo\Par2Info;
+use RuntimeException;
+use Symfony\Component\Process\Process;
+use Throwable;
+
+final class PayloadVerifier
+{
+    private int $initialScratchBytes = 0;
+
+    /** @param array<string, mixed> $options */
+    public function __construct(private readonly ArticleSource $source, private readonly array $options) {}
+
+    /** @param array<string, mixed> $manifest */
+    public function verify(array $manifest, string $directory, callable $heartbeat): VerificationResult
+    {
+        try {
+            return $this->downloadAndVerify($manifest, $directory, $heartbeat);
+        } catch (Throwable $error) {
+            return new VerificationResult('unknown', $error->getMessage());
+        }
+    }
+
+    /** @param array<string, mixed> $manifest */
+    private function downloadAndVerify(array $manifest, string $directory, callable $heartbeat): VerificationResult
+    {
+        if ($manifest['conflict'] ?? false) {
+            return new VerificationResult('unknown', 'Conflicting header identities require resolution.');
+        }
+        if (! is_dir($directory) && ! mkdir($directory, 0700, true) && ! is_dir($directory)) {
+            throw new RuntimeException('Scratch directory is unavailable.');
+        }
+        $cache = $directory.'/articles';
+        $data = $directory.'/data';
+        foreach ([$cache, $data] as $path) {
+            if (! is_dir($path) && ! mkdir($path, 0700)) {
+                throw new RuntimeException('Cannot allocate scratch storage.');
+            }
+        }
+        $files = [];
+        $filenameIdentities = [];
+        $available = $manifest;
+        $scratchRoot = dirname($directory);
+        $this->initialScratchBytes = $this->directoryBytes($scratchRoot);
+        $allocated = $this->initialScratchBytes - $this->directoryBytes($directory);
+        $networkFailure = false;
+        $requiredNames = [];
+        $fileChecksums = [];
+        foreach ($manifest['files'] as $index => $file) {
+            $ranges = [];
+            $identity = null;
+            $available['files'][$index]['segments'] = [];
+            foreach ($file['segments'] as $segment) {
+                $heartbeat();
+                $id = (string) $segment['messageid'];
+                $path = $cache.'/'.hash('sha256', $id);
+                $article = null;
+                if (is_file($path)) {
+                    $raw = file_get_contents($path);
+                    if ($raw !== false && strlen($raw) <= (int) $this->options['article_bytes']) {
+                        try {
+                            $article = VerifiedArticle::decode($raw);
+                        } catch (RuntimeException) {
+                            unlink($path);
+                        }
+                    }
+                }
+                if ($article === null) {
+                    try {
+                        $start = microtime(true);
+                        $raw = $this->source->fetch($id);
+                    } catch (RuntimeException) {
+                        $networkFailure = true;
+
+                        continue;
+                    }
+                    if (strlen($raw) > (int) $this->options['article_bytes']) {
+                        throw new RuntimeException('Article exceeds memory budget.');
+                    }
+                    try {
+                        $article = VerifiedArticle::decode($raw);
+                    } catch (ArticleIntegrityFailure) {
+                        continue;
+                    }
+                    $this->reserve($directory, $allocated + strlen($raw));
+                    if (file_put_contents($path.'.tmp', $raw, LOCK_EX) !== strlen($raw) || ! rename($path.'.tmp', $path)) {
+                        throw new RuntimeException('Cannot checkpoint downloaded article.');
+                    }
+                    $rate = (int) $this->options['bytes_per_second'];
+                    if ($rate > 0) {
+                        $wait = strlen($raw) / $rate - (microtime(true) - $start);
+                        while ($wait > 0) {
+                            $heartbeat();
+                            $pause = min(1.0, $wait);
+                            usleep((int) ($pause * 1000000));
+                            $wait -= $pause;
+                        }
+                    }
+                }
+                $allocated += filesize($path) ?: 0;
+                $this->reserve($directory, $allocated);
+                if ($article->part !== (int) $segment['number']) {
+                    throw new RuntimeException('Article part number differs from the manifest.');
+                }
+                if ($identity !== null && [$article->name, $article->size] !== [$identity->name, $identity->size]) {
+                    throw new RuntimeException('Conflicting file identities.');
+                }
+                if ($identity === null) {
+                    $normalizedName = mb_strtolower(\Normalizer::normalize($article->name) ?: $article->name);
+                    if (isset($filenameIdentities[$normalizedName])) {
+                        throw new RuntimeException('Filename aliases collide on the storage filesystem.');
+                    }
+                    $filenameIdentities[$normalizedName] = $article->name;
+                    if (isset($files[$article->name])) {
+                        throw new RuntimeException('Ambiguous duplicate filename.');
+                    }
+                    $identity = $article;
+                    $this->reserve($directory, $allocated + 3 * $article->size);
+                    $handle = fopen($data.'/'.$article->name, 'w+b');
+                    if ($handle === false || ! ftruncate($handle, $article->size)) {
+                        throw new RuntimeException('Cannot allocate decoded file.');
+                    }
+                    fclose($handle);
+                    $allocated += 3 * $article->size;
+                }
+                if ($article->fileChecksum !== null) {
+                    if (isset($fileChecksums[$article->name]) && $fileChecksums[$article->name] !== $article->fileChecksum) {
+                        throw new RuntimeException('Conflicting whole-file checksums.');
+                    }
+                    $fileChecksums[$article->name] = $article->fileChecksum;
+                }
+                $end = $article->offset + strlen($article->bytes);
+                foreach ($ranges as [$begin, $finish]) {
+                    if ($article->offset < $finish && $end > $begin) {
+                        throw new RuntimeException('Overlapping article ranges.');
+                    }
+                }
+                $handle = fopen($data.'/'.$article->name, 'r+b');
+                if ($handle === false || fseek($handle, $article->offset) !== 0
+                    || fwrite($handle, $article->bytes) !== strlen($article->bytes)) {
+                    throw new RuntimeException('Cannot assemble decoded file.');
+                }
+                fclose($handle);
+                $ranges[] = [$article->offset, $end];
+                $available['files'][$index]['segments'][] = $segment;
+                $available['files'][$index]['decoded_size'] = $article->size;
+            }
+            if ($identity !== null) {
+                sort($ranges);
+                $cursor = 0;
+                foreach ($ranges as [$begin, $end]) {
+                    if ($begin !== $cursor) {
+                        break;
+                    }
+                    $cursor = $end;
+                }
+                $files[$identity->name] = ['size' => $identity->size, 'complete' => $cursor === $identity->size && count($ranges) === (int) $file['totalparts']];
+                $requiredNames[] = $identity->name;
+            } else {
+                $subject = (string) $file['subject'];
+                $name = preg_match('/"([^"\r\n]+)"/', $subject, $match) ? $match[1] : $subject;
+                if ($name === '' || basename($name) !== $name || str_contains($name, '\\') || $name[0] === '.'
+                    || $name[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $name)
+                    || preg_match('/[\[\]]|yEnc/i', $name)) {
+                    return new VerificationResult('unknown', 'Required missing file identity is ambiguous.');
+                }
+                $requiredNames[] = $name;
+            }
+        }
+        if ($files === []) {
+            return new VerificationResult('unknown', 'No payload could be downloaded.');
+        }
+        $expected = (int) ($manifest['expected_files'] ?? 0);
+        $parity = array_filter(array_keys($files), static fn (string $name): bool => preg_match('/\.par2\z/i', $name) === 1);
+        $protected = [];
+        $repaired = false;
+        $sourceHashes = [];
+        $reservedSources = [];
+        foreach ($parity as $name) {
+            $heartbeat();
+            if (! $files[$name]['complete']) {
+                continue;
+            }
+            $par2 = new Par2Info;
+            if (! $par2->open($data.'/'.$name) || $par2->error !== '') {
+                throw new RuntimeException('Invalid PAR2 metadata.');
+            }
+            $descriptors = $par2->getFileList();
+            if ($descriptors === []) {
+                continue;
+            }
+            foreach ($descriptors as $descriptor) {
+                $filename = (string) ($descriptor['name'] ?? '');
+                if ($filename === '' || strlen($filename) > 200 || ! mb_check_encoding($filename, 'UTF-8') || preg_match('/[\x00-\x1f\x7f]/', $filename) || basename($filename) !== $filename || str_contains($filename, '\\')
+                    || $filename[0] === '.' || $filename[0] === '-') {
+                    throw new RuntimeException('Unsafe PAR2 filename.');
+                }
+                $normalizedName = mb_strtolower(\Normalizer::normalize($filename) ?: $filename);
+                if (isset($filenameIdentities[$normalizedName]) && $filenameIdentities[$normalizedName] !== $filename) {
+                    throw new RuntimeException('PAR2 filename aliases collide on the storage filesystem.');
+                }
+                $filenameIdentities[$normalizedName] = $filename;
+                if (isset($sourceHashes[$filename]) && $sourceHashes[$filename] !== $descriptor['hash']) {
+                    throw new RuntimeException('Conflicting PAR2 sets protect different content under one filename.');
+                }
+                $sourceHashes[$filename] = $descriptor['hash'];
+                $size = (int) $descriptor['size'];
+                if (! isset($files[$filename]) && ! isset($reservedSources[$filename])) {
+                    $allocated += 3 * $size;
+                    $reservedSources[$filename] = true;
+                }
+                $this->reserve($directory, $allocated);
+            }
+            $exit = $this->par2('v', $name, $data, $heartbeat);
+            if ($exit === 2 && ! $networkFailure) {
+                return new VerificationResult('unrepairable', 'Downloaded payload has insufficient validated PAR2 recovery data.');
+            }
+            if ($exit !== 0) {
+                if ($exit !== 1 || $this->par2('r', $name, $data, $heartbeat) !== 0
+                    || $this->par2('v', $name, $data, $heartbeat) !== 0) {
+                    return new VerificationResult('unknown', 'PAR2 has not proved this candidate repairable.');
+                }
+                $repaired = true;
+            }
+            foreach ($descriptors as $descriptor) {
+                $filename = (string) $descriptor['name'];
+                if (! is_file($data.'/'.$filename) || filesize($data.'/'.$filename) !== (int) $descriptor['size']
+                    || hash_file('md5', $data.'/'.$filename) !== $descriptor['hash']) {
+                    throw new RuntimeException('PAR2 source-file integrity verification failed.');
+                }
+                $protected[$filename] = true;
+            }
+        }
+        foreach ($requiredNames as $name) {
+            if (! isset($files[$name]) && ! isset($protected[$name])) {
+                return new VerificationResult('unknown', 'Required missing file is not protected by validated PAR2.');
+            }
+        }
+        foreach ($fileChecksums as $name => $checksum) {
+            if (hash_file('crc32b', $data.'/'.$name) !== $checksum) {
+                return new VerificationResult('unknown', 'Whole-file checksum verification failed.');
+            }
+        }
+        foreach ($sourceHashes as $name => $hash) {
+            if (hash_file('md5', $data.'/'.$name) !== $hash) {
+                return new VerificationResult('unknown', 'Final PAR2 integrity check failed.');
+            }
+        }
+        foreach ($files as $name => $info) {
+            if (! $info['complete'] && ! isset($protected[$name])) {
+                return new VerificationResult('unknown', 'Required file is incomplete and unverified by PAR2.');
+            }
+        }
+        $knownFiles = count(array_unique(array_merge(array_keys($files), array_keys($protected))));
+        if (($expected < 1 && $protected === []) || ($expected > count($manifest['files'])) || ($expected > 0 && $knownFiles < $expected)) {
+            return new VerificationResult('unknown', 'Declared file inventory cannot be proved complete.');
+        }
+        if ($networkFailure && $protected === []) {
+            return new VerificationResult('unknown', 'Missing articles require a successful PAR2 proof.');
+        }
+
+        $available['identity_hints'] = [];
+        foreach (array_keys($files) as $name) {
+            $available['identity_hints'][] = ['name' => $name, 'source' => 'yenc'];
+        }
+        foreach (array_keys($protected) as $name) {
+            $available['identity_hints'][] = ['name' => $name, 'source' => 'par2'];
+        }
+        $available['verified_bytes'] = array_sum(array_column($files, 'size'));
+        foreach (array_keys($protected) as $name) {
+            if (! isset($files[$name])) {
+                $available['verified_bytes'] += filesize($data.'/'.$name) ?: 0;
+            }
+        }
+
+        return new VerificationResult($repaired ? 'repaired' : 'complete', 'Downloaded payload verified.', $available);
+    }
+
+    private function directoryBytes(string $directory): int
+    {
+        if (! is_dir($directory)) {
+            return 0;
+        }
+        $bytes = 0;
+        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS));
+        foreach ($iterator as $file) {
+            if ($file->isFile()) {
+                $bytes += $file->getSize();
+            }
+        }
+
+        return $bytes;
+    }
+
+    private function reserve(string $directory, int $bytes): void
+    {
+        $free = disk_free_space($directory);
+        if ($bytes > (int) $this->options['scratch_bytes'] || $free === false
+            || $free < (int) $this->options['free_bytes'] + max(0, $bytes - $this->initialScratchBytes)) {
+            throw new RuntimeException('Verification is waiting for scratch capacity.');
+        }
+    }
+
+    private function par2(string $operation, string $name, string $directory, callable $heartbeat): int
+    {
+        $process = new Process([(string) $this->options['par2_binary'], $operation, '-q', '-t1', '-T1', '-m256', '--', $name], $directory);
+        $process->setTimeout(null);
+        $process->disableOutput();
+        $process->start();
+        while ($process->isRunning()) {
+            $heartbeat();
+            usleep(200000);
+        }
+
+        return $process->getExitCode() ?? -1;
+    }
+}

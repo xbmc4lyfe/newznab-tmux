@@ -7,6 +7,7 @@ namespace App\Services\Binaries;
 use App\Models\UsenetGroup;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
+use App\Services\Releases\Verification\CandidateRepository;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -199,6 +200,9 @@ class BinariesService
      */
     public function updateGroup(array $groupMySQL, int $maxHeaders = 0): void
     {
+        if (! app(CandidateRepository::class)->capacityAvailable()) {
+            return;
+        }
         $startGroup = now();
         $this->logIndexerStart();
 
