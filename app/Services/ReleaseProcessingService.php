@@ -22,6 +22,7 @@ use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseManagementService;
 use App\Services\Search\SearchService;
+use App\Services\Tmux\CollectionReconciliationBarrier;
 use App\Support\Data\NzbCreationResult;
 use App\Support\Data\ProcessReleasesSettings;
 use App\Support\Data\ReleaseCreationResult;
@@ -430,30 +431,52 @@ final class ReleaseProcessingService
         ];
 
         do {
-            $query = Collection::query()
-                ->where('id', '>', $lastId)
-                ->where(function ($query) use ($statuses): void {
-                    $query->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
-                        ->orWhere(function ($stale) use ($statuses): void {
-                            $stale->whereIn('filecheck', array_values(array_diff(
-                                $statuses,
-                                [CollectionFileCheckStatus::CompleteParts->value]
-                            )))->whereRaw(
-                                'COALESCE(dateadded, added) < ?',
-                                [now()->subHours($this->settings->collectionDelayTime)]
-                            );
-                        });
-                })
-                ->when($groupId !== null, static fn ($q) => $q->where('groups_id', $groupId))
-                ->orderBy('id')
-                ->limit($this->binariesConfig->reconcileBatchSize);
-            $ids = $query->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+            $ids = $this->withCollectionReconciliationBarrier(function () use ($lastId, $groupId, $statuses): array {
+                $query = Collection::query()
+                    ->where('id', '>', $lastId)
+                    ->where(function ($query) use ($statuses): void {
+                        $query->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
+                            ->orWhere(function ($stale) use ($statuses): void {
+                                $stale->whereIn('filecheck', array_values(array_diff(
+                                    $statuses,
+                                    [CollectionFileCheckStatus::CompleteParts->value]
+                                )))->whereRaw(
+                                    'COALESCE(dateadded, added) < ?',
+                                    [now()->subHours($this->settings->collectionDelayTime)]
+                                );
+                            });
+                    })
+                    ->when($groupId !== null, static fn ($q) => $q->where('groups_id', $groupId))
+                    ->orderBy('id')
+                    ->limit($this->binariesConfig->reconcileBatchSize);
+                $ids = $query->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+                if ($ids !== []) {
+                    $this->reconcileCollectionIds($ids, $statuses);
+                }
+
+                return $ids;
+            });
             if ($ids === []) {
                 break;
             }
             $lastId = (int) end($ids);
-            $this->reconcileCollectionIds($ids, $statuses);
         } while (\count($ids) === $this->binariesConfig->reconcileBatchSize);
+    }
+
+    /**
+     * @template TResult
+     *
+     * @param  callable(): TResult  $work
+     * @return TResult
+     */
+    private function withCollectionReconciliationBarrier(callable $work): mixed
+    {
+        if (! app()->bound(CollectionReconciliationBarrier::class)) {
+            return $work();
+        }
+
+        return app(CollectionReconciliationBarrier::class)
+            ->withReconciliationBarrier($this->settings->collectionDelayTime, $work);
     }
 
     /**
@@ -537,6 +560,7 @@ final class ReleaseProcessingService
             ->get()
             ->keyBy('collections_id');
         $staleBefore = now()->subHours($this->settings->collectionDelayTime)->format('Y-m-d H:i:s');
+        $changes = [];
 
         foreach ($collections as $collection) {
             $aggregate = $aggregates->get($collection->id);
@@ -558,12 +582,53 @@ final class ReleaseProcessingService
                 continue;
             }
 
-            DB::table('collections')
-                ->where('id', $collection->id)
-                ->where('filecheck', $collection->filecheck)
-                ->where('totalfiles', $collection->totalfiles)
-                ->where('filesize', $collection->filesize)
-                ->update(['filesize' => $fileSize, 'totalfiles' => $totalFiles, 'filecheck' => $fileCheck]);
+            $changes[] = [
+                'id' => (int) $collection->id,
+                'old' => [(int) $collection->filecheck, (int) $collection->totalfiles, (int) $collection->filesize],
+                'new' => [$fileSize, $totalFiles, $fileCheck],
+            ];
+        }
+
+        $this->writeCollectionAggregates($changes);
+    }
+
+    /**
+     * Write the changed aggregates in one UPDATE per batch instead of one per row (a group
+     * can have millions of stale collections). Each row is still written only if it holds
+     * the values read; otherwise header storage changed it and its own refresh is newer.
+     *
+     * @param  list<array{id: int, old: array{int, int, int}, new: array{int, int, int}}>  $changes
+     */
+    private function writeCollectionAggregates(array $changes): void
+    {
+        foreach (array_chunk($changes, max(1, min(500, $this->binariesConfig->sqlChunkSize))) as $chunk) {
+            $set = ['filesize' => [], 'totalfiles' => [], 'filecheck' => []];
+            $guard = [];
+            $bindings = ['filesize' => [], 'totalfiles' => [], 'filecheck' => [], 'guard' => [], 'ids' => []];
+            foreach ($chunk as $change) {
+                [$newSize, $newTotal, $newCheck] = $change['new'];
+                [$oldCheck, $oldTotal, $oldSize] = $change['old'];
+                foreach (['filesize' => $newSize, 'totalfiles' => $newTotal, 'filecheck' => $newCheck] as $column => $value) {
+                    $set[$column][] = 'WHEN ? THEN ?';
+                    array_push($bindings[$column], $change['id'], $value);
+                }
+                $guard[] = 'WHEN ? THEN (filecheck = ? AND totalfiles = ? AND filesize = ?)';
+                array_push($bindings['guard'], $change['id'], $oldCheck, $oldTotal, $oldSize);
+                $bindings['ids'][] = $change['id'];
+            }
+            $placeholders = implode(',', array_fill(0, \count($chunk), '?'));
+            $sql = 'UPDATE collections SET '
+                .'filesize = CASE id '.implode(' ', $set['filesize']).' END, '
+                .'totalfiles = CASE id '.implode(' ', $set['totalfiles']).' END, '
+                .'filecheck = CASE id '.implode(' ', $set['filecheck']).' END '
+                // A flat CASE rather than a chain of ORs, which SQLite rejects past ~1000 terms.
+                ."WHERE id IN ({$placeholders}) AND CASE id ".implode(' ', $guard).' ELSE 0 END';
+            $values = [...$bindings['filesize'], ...$bindings['totalfiles'], ...$bindings['filecheck'], ...$bindings['ids'], ...$bindings['guard']];
+            // Header storage locks collections in a different order inside its own
+            // transactions, so a batch can lose a deadlock: retry it. If retries run out
+            // the error propagates, as before, so later stages never size rows whose
+            // aggregates weren't written.
+            DB::transaction(static fn (): int => DB::update($sql, $values), self::MAX_RETRIES);
         }
     }
 
@@ -1037,11 +1102,12 @@ final class ReleaseProcessingService
         if (config('release_verification.required', true)) {
             return;
         }
-        $cutoff = $this->calculateStuckCollectionsCutoff();
         $totalDeleted = 0;
 
         do {
-            $affected = $this->deleteStuckCollectionBatch($groupID, $cutoff);
+            $affected = $this->withCollectionReconciliationBarrier(
+                fn (): int => $this->deleteStuckCollectionBatch($groupID, $this->calculateStuckCollectionsCutoff())
+            );
             $totalDeleted += $affected;
 
             if ($affected < self::BATCH_SIZE) {

@@ -12,6 +12,7 @@ use App\Services\Binaries\HeaderStorageService;
 use App\Services\Binaries\HeaderStorageTransaction;
 use App\Services\CollectionsCleaningService;
 use App\Services\ReleaseProcessingService;
+use App\Services\Tmux\CollectionReconciliationBarrier;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -349,6 +350,87 @@ class CbpReleaseEligibilityTest extends TestCase
             $this->assertStringNotContainsString('order by', $sql);
             $this->assertStringNotContainsString('coalesce(last_seen_at', $sql);
         }
+    }
+
+    public function test_reconcile_writes_changed_collections_in_batches(): void
+    {
+        $stale = [];
+        foreach (range(1, 5) as $i) {
+            $stale[] = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        }
+        $updates = 0;
+        DB::listen(static function ($query) use (&$updates): void {
+            $updates += preg_match('/^\s*update\s+[`"]?collections\b/i', $query->sql);
+        });
+
+        (new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 2, reconcileBatchSize: 500)))->processIncompleteCollections(1);
+
+        foreach ($stale as $id) {
+            $this->assertStatus($id, CollectionFileCheckStatus::CompleteParts);
+        }
+        $this->assertSame(3, $updates, 'Five changed collections in batches of two: three UPDATEs, not five.');
+    }
+
+    public function test_reconcile_handles_the_largest_configured_batches(): void
+    {
+        $rows = [];
+        foreach (range(1, 1001) as $i) {
+            $rows[] = ['groups_id' => 1, 'totalfiles' => 2, 'dateadded' => now()->subHours(3)->format('Y-m-d H:i:s'), 'added' => now()->subHours(3)->format('Y-m-d H:i:s')];
+        }
+        foreach (array_chunk($rows, 200) as $chunk) {
+            DB::table('collections')->insert($chunk);
+        }
+
+        (new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 1000, reconcileBatchSize: 2000)))->processIncompleteCollections(1);
+
+        $this->assertSame(1001, DB::table('collections')->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)->count());
+    }
+
+    public function test_reconciliation_waits_for_downtime_compensation_before_stale_selection(): void
+    {
+        $waiting = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        $this->app->instance(CollectionReconciliationBarrier::class, new class($waiting) implements CollectionReconciliationBarrier
+        {
+            public function __construct(private readonly int $collectionId) {}
+
+            public function withReconciliationBarrier(int $delayHours, callable $work): mixed
+            {
+                DB::table('collections')->where('id', $this->collectionId)->update(['dateadded' => now()]);
+
+                return $work();
+            }
+        });
+
+        $this->process(1);
+
+        $this->assertStatus($waiting, CollectionFileCheckStatus::Default);
+        $this->assertSame(2, (int) DB::table('collections')->where('id', $waiting)->value('totalfiles'));
+        $this->assertSame(1, DB::table('parts')->count());
+    }
+
+    public function test_stuck_cleanup_waits_for_downtime_compensation_before_deletion(): void
+    {
+        $waiting = $this->collection(1, now()->subDays(3)->format('Y-m-d H:i:s'));
+        DB::table('collections')->where('id', $waiting)->update(['last_seen_at' => null]);
+        $this->app->instance(CollectionReconciliationBarrier::class, new class($waiting) implements CollectionReconciliationBarrier
+        {
+            public function __construct(private readonly int $collectionId) {}
+
+            public function withReconciliationBarrier(int $delayHours, callable $work): mixed
+            {
+                DB::table('collections')->where('id', $this->collectionId)->update(['dateadded' => now()]);
+
+                return $work();
+            }
+        });
+
+        $service = new ReleaseProcessingService;
+        (new \ReflectionMethod($service, 'processStuckCollections'))->invoke($service, 1);
+
+        $this->assertSame(1, DB::table('collections')->where('id', $waiting)->count());
+        $this->assertStatus($waiting, CollectionFileCheckStatus::Default);
+        $this->assertSame(1, DB::table('binaries')->count());
+        $this->assertSame(1, DB::table('parts')->count());
     }
 
     private function process(?int $groupId): void
