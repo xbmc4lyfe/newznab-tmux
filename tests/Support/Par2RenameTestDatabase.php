@@ -34,6 +34,8 @@ trait Par2RenameTestDatabase
             $table->id();
             $table->string('name');
         });
+        $migration = require base_path('database/migrations/2026_10_11_215821_create_par2_rename_progress_table.php');
+        $migration->up();
         Schema::create('release_nfos', function (Blueprint $table): void {
             $table->integer('releases_id');
             $table->binary('nfo')->nullable();

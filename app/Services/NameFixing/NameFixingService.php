@@ -777,7 +777,7 @@ class NameFixingService
         bool $show,
         ?callable $par2Processor = null
     ): array {
-        $releases = $this->queries->standardCandidateBatch($leftGuid, $limit);
+        $releases = $this->reserveStandardBatch($leftGuid, $limit);
         if ($releases === []) {
             return ['checked' => 0, 'fixed' => 0];
         }
@@ -959,6 +959,43 @@ class NameFixingService
         ];
     }
 
+    /** @return list<object> */
+    private function reserveStandardBatch(string $leftGuid, int $limit): array
+    {
+        $cache = Cache::store((string) config('tmux.fix_names.cache_store', 'redis'));
+        $store = $cache->getStore();
+        if (! $store instanceof LockProvider) {
+            throw new RuntimeException('The grouped rename cache store must support atomic locks.');
+        }
+        $key = 'rename:standard:cursor:'.$leftGuid;
+        $lock = $store->lock($key.':lock', 120);
+        if (! $lock instanceof Lock) {
+            throw new RuntimeException('The grouped rename cache lock must support renewal.');
+        }
+        if (! $lock->get()) {
+            return [];
+        }
+        try {
+            $cursor = max(0, (int) $cache->get($key, 0));
+            $releases = $this->queries->standardCandidateBatch($leftGuid, $limit, $cursor > 0 ? $cursor : null);
+            if ($releases === [] && $cursor > 0) {
+                $releases = $this->queries->standardCandidateBatch($leftGuid, $limit);
+            }
+            if (! $lock->refresh()) {
+                return [];
+            }
+            if ($releases !== []) {
+                $cache->forever($key, min($this->releaseIds($releases)));
+            } else {
+                $cache->forget($key);
+            }
+
+            return $releases;
+        } finally {
+            $lock->release();
+        }
+    }
+
     /**
      * Match one PreDB title against indexed release candidates.
      */
@@ -1089,7 +1126,7 @@ class NameFixingService
                 if (! $this->refreshPar2Sweep($lock)) {
                     break;
                 }
-                $cache->put($key, ['after_id' => (int) $release->releases_id, 'through_id' => $throughId], 604800);
+                $cache->forever($key, ['after_id' => (int) $release->releases_id, 'through_id' => $throughId]);
             }
         } catch (Throwable $e) {
             Log::warning('PAR2 rename sweep stopped with work pending', ['error' => $e->getMessage()]);

@@ -4,21 +4,29 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Console\Commands\NntmuxResetDb;
+use App\Console\Commands\NntmuxResetTruncate;
 use App\Enums\Par2RenameOutcome;
 use App\Facades\Search;
 use App\Models\Category;
 use App\Models\Release;
 use App\Services\NameFixing\NameFixingService;
+use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
 use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
 use App\Services\Par2Processor;
 use App\Services\PostProcessService;
+use App\Support\Par2RenameProgress;
 use DariusIII\NetNntp\Error;
 use dariusiii\rarinfo\Par2Info;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Schema;
+use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
 use SimpleXMLElement;
 use Symfony\Component\Process\Process;
@@ -195,6 +203,106 @@ class Par2RenameProcessingTest extends TestCase
         $service->checkPar2($release->guid, $release->id, 1, 1, 0);
         $this->assertSame(['one', 'new'], $this->downloaded);
         $this->assertSame(0, (int) $release->fresh()->proc_par2);
+    }
+
+    /** @return array<string, array{?string}> */
+    public static function malformedProbeSizes(): array
+    {
+        return ['missing' => [null], 'empty' => [''], 'negative' => ['-1'], 'zero' => ['0'],
+            'nonnumeric' => ['unknown'], 'fractional' => ['1.5'], 'overflow' => ['999999999999999999999999']];
+    }
+
+    #[DataProvider('malformedProbeSizes')]
+    public function test_hidden_probes_with_invalid_byte_sizes_remain_pending_without_downloading(?string $bytes): void
+    {
+        $release = $this->release();
+        $attribute = $bytes === null ? '' : ' bytes="'.$bytes.'"';
+        $xml = new SimpleXMLElement('<nzb><file subject="hidden yEnc"><segments><segment'.$attribute.' number="1">hidden-id</segment></segments></file></nzb>');
+        $result = $this->service($xml)->checkPar2Result($release->guid, $release->id, 1, 1, 0);
+        $this->assertSame(Par2RenameOutcome::Retryable, $result);
+        $this->assertSame([], $this->downloaded);
+        $this->assertSame(0, (int) $release->fresh()->proc_par2);
+    }
+
+    public function test_throwing_probes_rotate_and_allow_a_later_volume_to_recover(): void
+    {
+        $release = $this->release();
+        config(['tmux.fix_names.par2_max_probes' => 1]);
+        $service = $this->service($this->nzb([
+            ['"release.par2" yEnc', 'index'], ['"release.vol001+002.par2" yEnc', 'volume'],
+        ]), ['index' => static fn (): never => throw new RuntimeException('Decode failed'),
+            'volume' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
+        $this->assertFalse($service->checkPar2($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(0, (int) $release->fresh()->proc_par2);
+        $this->assertTrue($service->checkPar2($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['index', 'volume'], $this->downloaded);
+    }
+
+    public function test_probe_progress_survives_a_sweep_longer_than_seven_days(): void
+    {
+        $this->freezeTime();
+        $release = $this->release();
+        config(['tmux.fix_names.par2_max_probes' => 1]);
+        $service = $this->service($this->nzb([
+            ['"hidden-one" yEnc', 'one'], ['"hidden-two" yEnc', 'two'],
+        ]), ['two' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
+        $this->assertFalse($service->checkPar2($release->guid, $release->id, 1, 1, 0));
+        $this->travel(8)->days();
+        $this->assertTrue($service->checkPar2($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['one', 'two'], $this->downloaded);
+    }
+
+    public function test_external_rename_clears_the_permanent_probe_checkpoint(): void
+    {
+        $release = $this->release();
+        config(['tmux.fix_names.par2_max_probes' => 1]);
+        $service = $this->service($this->nzb([
+            ['"hidden-one" yEnc', 'one'], ['"hidden-two" yEnc', 'two'],
+        ]));
+        $service->checkPar2($release->guid, $release->id, 1, 1, 0);
+        $this->assertNotNull(Par2RenameProgress::get($release->id));
+        Release::query()->where('id', $release->id)->update(['isrenamed' => 1]);
+        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertNull(Par2RenameProgress::get($release->id));
+        $this->assertSame(['one'], $this->downloaded);
+    }
+
+    public function test_raw_release_deletion_cascades_to_durable_probe_progress(): void
+    {
+        $release = $this->release();
+        $this->assertTrue(Par2RenameProgress::save($release->id, str_repeat('a', 64), 1, [0]));
+        DB::table('releases')->where('id', $release->id)->delete();
+        $this->assertNull(Par2RenameProgress::get($release->id));
+    }
+
+    public function test_terminal_status_cleanup_waits_for_commit_and_preserves_rolled_back_progress(): void
+    {
+        $release = $this->release();
+        Par2RenameProgress::save($release->id, str_repeat('a', 64), 1, [0]);
+        $updates = app(ReleaseUpdateService::class);
+        DB::beginTransaction();
+        $updates->updateSingleColumn('predb_id', 123, $release->id);
+        $this->assertNotNull(Par2RenameProgress::get($release->id));
+        DB::rollBack();
+        $this->assertNotNull(Par2RenameProgress::get($release->id));
+        $updates->updateSingleColumn('predb_id', 123, $release->id);
+        $this->assertNull(Par2RenameProgress::get($release->id));
+    }
+
+    public function test_concurrent_external_rename_cannot_recreate_probe_progress(): void
+    {
+        $release = $this->release();
+        $response = static function () use ($release): string {
+            Release::query()->where('id', $release->id)->update(['isrenamed' => 1]);
+
+            return 'Not a PAR2 packet';
+        };
+        $service = $this->service($this->nzb([
+            ['"hidden-one" yEnc', 'one'], ['"hidden-two" yEnc', 'two'],
+        ]), ['one' => $response]);
+        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertNull(Par2RenameProgress::get($release->id));
+        $this->assertSame(['one'], $this->downloaded);
     }
 
     public function test_corrupt_nzb_file_remains_pending_without_network_access(): void
@@ -422,6 +530,85 @@ PHP;
     private function release(): Release
     {
         return $this->pendingPar2Release();
+    }
+
+    public function test_article_reset_cascades_checkpoint_cleanup_for_deleted_releases(): void
+    {
+        $this->addGroupResetColumns();
+        $removed = $this->pendingPar2Release(['nzbstatus' => 0]);
+        $retained = $this->pendingPar2Release(['nzbstatus' => 1]);
+        foreach ([$removed, $retained] as $release) {
+            Par2RenameProgress::save($release->id, 'signature', 1, [0]);
+        }
+        $connection = DB::connection();
+        DB::swap(\Mockery::mock(DB::getFacadeRoot())->makePartial());
+        DB::shouldReceive('statement')->andReturnUsing(static function (string $sql) use ($connection): bool {
+            if (str_starts_with($sql, 'SET FOREIGN_KEY_CHECKS')) {
+                return $connection->statement(str_contains($sql, '= 0') ? 'PRAGMA foreign_keys = OFF' : 'PRAGMA foreign_keys = ON');
+            }
+
+            return true;
+        });
+        $command = \Mockery::mock(NntmuxResetTruncate::class)->makePartial();
+        $command->shouldReceive('info');
+        try {
+            $command->handle();
+            $this->assertNull($removed->fresh());
+            $this->assertNull(Par2RenameProgress::get($removed->id));
+            $this->assertNotNull($retained->fresh());
+            $this->assertNotNull(Par2RenameProgress::get($retained->id));
+        } finally {
+            DB::connection()->statement('PRAGMA foreign_keys = ON');
+        }
+    }
+
+    public function test_full_reset_removes_checkpoints_even_while_foreign_keys_are_disabled(): void
+    {
+        $this->addGroupResetColumns();
+        $release = $this->release();
+        Par2RenameProgress::save($release->id, 'signature', 1, [0]);
+        $connection = DB::connection();
+        DB::swap(\Mockery::mock(DB::getFacadeRoot())->makePartial());
+        DB::shouldReceive('statement')->andReturnUsing(static function (string $sql) use ($connection): bool {
+            if (str_contains($sql, 'FOREIGN_KEY_CHECKS = 0')) {
+                return $connection->statement('PRAGMA foreign_keys = OFF');
+            }
+            if ($sql === 'TRUNCATE TABLE par2_rename_progress') {
+                $connection->table('par2_rename_progress')->delete();
+            }
+            if ($sql === 'TRUNCATE TABLE releases') {
+                $connection->table('releases')->delete();
+                throw new RuntimeException('Stop before unrelated search and filesystem reset');
+            }
+
+            return true;
+        });
+        $command = \Mockery::mock(NntmuxResetDb::class)->makePartial();
+        $command->shouldReceive('confirm')->once()->andReturn(true);
+        $command->shouldReceive('info');
+        $this->app['env'] = 'local';
+        try {
+            $command->handle();
+            $this->fail('Expected to stop after releases were cleared');
+        } catch (RuntimeException $e) {
+            $this->assertSame('Stop before unrelated search and filesystem reset', $e->getMessage());
+            $this->assertNull($release->fresh());
+            $this->assertNull(Par2RenameProgress::get($release->id));
+        } finally {
+            $this->app['env'] = 'testing';
+            DB::connection()->statement('PRAGMA foreign_keys = ON');
+        }
+    }
+
+    private function addGroupResetColumns(): void
+    {
+        Schema::table('usenet_groups', static function (Blueprint $table): void {
+            $table->unsignedInteger('first_record')->default(0);
+            $table->unsignedInteger('last_record')->default(0);
+            foreach (['first_record_postdate', 'last_record_postdate', 'last_updated'] as $column) {
+                $table->timestamp($column)->nullable();
+            }
+        });
     }
 
     /** @param list<array{0: string, 1: string, 2?: int}> $files */

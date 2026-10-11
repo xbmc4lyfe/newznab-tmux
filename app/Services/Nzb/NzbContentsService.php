@@ -10,6 +10,7 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\NfoService;
 use App\Services\NNTP\NNTPService;
 use App\Services\PostProcessService;
+use App\Support\Par2RenameProgress;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Support\Facades\Cache;
@@ -288,6 +289,8 @@ class NzbContentsService
 
             $release = Release::query()->where('id', $relID)->first(['proc_par2', 'isrenamed']);
             if ($release === null || (int) $release->proc_par2 === 1) {
+                Par2RenameProgress::forget($relID);
+
                 return Par2RenameOutcome::NoMatch;
             }
             if ((int) $release->isrenamed === 1) {
@@ -295,6 +298,7 @@ class NzbContentsService
                     return Par2RenameOutcome::Deferred;
                 }
                 Release::query()->where('id', $relID)->update(['proc_par2' => 1]);
+                Par2RenameProgress::forget($relID);
 
                 return Par2RenameOutcome::NoMatch;
             }
@@ -306,8 +310,7 @@ class NzbContentsService
 
             $candidates = $this->par2Candidates($nzbFile);
             $signature = hash('sha256', serialize($candidates));
-            $key = 'rename:par2:progress:'.$relID;
-            $progress = $cache->get($key);
+            $progress = Par2RenameProgress::get($relID);
             $offset = is_array($progress) && ($progress['signature'] ?? '') === $signature
                 ? max(0, (int) ($progress['offset'] ?? 0)) : 0;
             $retry = [];
@@ -331,14 +334,19 @@ class NzbContentsService
                 }
 
                 $this->par2Stats['candidates_probed']++;
-                $outcome = $this->postProcessService->parsePAR2ForRename(
-                    $candidates[$index]['id'], $relID, $groupID, $this->nntp, $show,
-                    function () use ($lock): bool {
-                        $this->par2Stats['articles_received']++;
+                try {
+                    $outcome = $this->postProcessService->parsePAR2ForRename(
+                        $candidates[$index]['id'], $relID, $groupID, $this->nntp, $show,
+                        function () use ($lock): bool {
+                            $this->par2Stats['articles_received']++;
 
-                        return $this->refreshPar2Claim($lock);
-                    }, $candidates[$index]['explicit']
-                );
+                            return $this->refreshPar2Claim($lock);
+                        }, $candidates[$index]['explicit']
+                    );
+                } catch (Throwable $e) {
+                    Log::warning('PAR2 probe remains pending', ['release_id' => $relID, 'candidate_index' => $index, 'error' => $e->getMessage()]);
+                    $outcome = Par2RenameOutcome::Retryable;
+                }
                 if ($outcome === Par2RenameOutcome::Deferred || ! $this->refreshPar2Claim($lock)) {
                     return Par2RenameOutcome::Deferred;
                 }
@@ -352,7 +360,9 @@ class NzbContentsService
                     unset($retry[$index]);
                 }
                 $offset = max($offset, $index + 1);
-                $cache->put($key, ['signature' => $signature, 'offset' => $offset, 'retry_indexes' => array_keys($retry)], 604800);
+                if (! Par2RenameProgress::save($relID, $signature, $offset, array_keys($retry))) {
+                    return Par2RenameOutcome::NoMatch;
+                }
             }
 
             if ($outcome !== Par2RenameOutcome::Renamed && ($retry !== [] || ! $this->par2StructureValid)) {
@@ -363,11 +373,7 @@ class NzbContentsService
                 return Par2RenameOutcome::Deferred;
             }
             Release::query()->where('id', $relID)->update(['proc_par2' => 1]);
-            try {
-                $cache->forget($key);
-            } catch (Throwable $e) {
-                Log::warning('Could not clear completed PAR2 probe progress', ['release_id' => $relID, 'error' => $e->getMessage()]);
-            }
+            Par2RenameProgress::forget($relID);
 
             return $outcome;
         } catch (Throwable $e) {
@@ -431,10 +437,16 @@ class NzbContentsService
             } else {
                 $knownContent = preg_match('/\.(?:rar|r\d{2,3}|\d{3}|7z|zip|mkv|mp4|avi|m2ts|ts|iso|nfo|sfv|srr|srs|jpg|png|mp3|flac)(?:["\s]|$)/i', $subject);
                 $singlePart = count($file->segments->segment) === 1 && $this->parserService->extractPartsTotal($subject) <= 1;
-                $bytes = (int) $segment->attributes()->bytes;
-                if ((! $knownContent || $singlePart)
-                    && $bytes <= max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152))) {
-                    $hidden[$id] = ['id' => $id, 'explicit' => false, 'bytes' => $bytes];
+                if (! $knownContent || $singlePart) {
+                    $bytes = filter_var((string) $segment->attributes()->bytes, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+                    if ($bytes === false) {
+                        $this->par2StructureValid = false;
+
+                        continue;
+                    }
+                    if ($bytes <= max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152))) {
+                        $hidden[$id] = ['id' => $id, 'explicit' => false, 'bytes' => $bytes];
+                    }
                 }
             }
         }

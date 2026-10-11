@@ -124,8 +124,15 @@ final class NameFixingQueryService
     /**
      * @return list<object>
      */
-    public function standardCandidateBatch(string $leftGuid, int $limit): array
+    public function standardCandidateBatch(string $leftGuid, int $limit, ?int $beforeId = null): array
     {
+        $cursor = $beforeId === null ? '' : ' AND r.id < ?';
+        $bindings = [$leftGuid];
+        if ($beforeId !== null) {
+            $bindings[] = $beforeId;
+        }
+        $bindings[] = max(1, $limit);
+
         return $this->database->select(
             'SELECT r.id AS releases_id, r.id, r.name, r.searchname, r.fromname, r.guid,
                     r.groups_id, r.categories_id, r.size AS relsize, r.predb_id, r.nfostatus,
@@ -146,10 +153,10 @@ final class NameFixingQueryService
                 OR r.proc_hash16k = 0
                 OR r.proc_crc32 = 0
              )
-             AND r.categories_id IN ('.implode(',', Category::OTHERS_GROUP).')
+             AND r.categories_id IN ('.implode(',', Category::OTHERS_GROUP).')'.$cursor.'
              ORDER BY r.id DESC
              LIMIT ?',
-            [$leftGuid, max(1, $limit)]
+            $bindings
         );
     }
 

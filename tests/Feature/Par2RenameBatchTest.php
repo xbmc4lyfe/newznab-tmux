@@ -90,6 +90,85 @@ class Par2RenameBatchTest extends TestCase
         $this->assertSame(0, (int) $release->fresh()->proc_par2);
     }
 
+    public function test_grouped_retryable_releases_rotate_to_older_work_and_wrap_across_processes(): void
+    {
+        $ids = [];
+        for ($i = 0; $i < 3; $i++) {
+            $ids[] = $this->pendingPar2Release([
+                'leftguid' => 'a', 'proc_nfo' => 1, 'proc_files' => 1, 'proc_uid' => 1,
+                'proc_srr' => 1, 'proc_hash16k' => 1, 'proc_crc32' => 1,
+            ])->id;
+        }
+        $visited = [];
+        $processor = static function (object $release) use (&$visited): Par2RenameOutcome {
+            $visited[] = (int) $release->releases_id;
+
+            return Par2RenameOutcome::Retryable;
+        };
+        for ($i = 0; $i < 3; $i++) {
+            (new NameFixingService)->processStandardBatch('a', 2, false, $processor);
+        }
+        $this->assertSame([$ids[2], $ids[1], $ids[0], $ids[2], $ids[1]], $visited);
+        $this->assertSame(3, Release::query()->where('proc_par2', 0)->count());
+    }
+
+    public function test_sweep_cursor_survives_a_long_historical_cohort(): void
+    {
+        $this->freezeTime();
+        for ($i = 1; $i <= 3; $i++) {
+            $this->pendingPar2Release(['guid' => 'guid-'.$i]);
+        }
+        $this->bindNzb(['guid-1', 'guid-2']);
+        $this->runBatch();
+        $this->travel(8)->days();
+        $this->runBatch();
+        $this->assertSame(['guid-1', 'guid-2', 'guid-3'], $this->visited);
+    }
+
+    public function test_grouped_reservation_claim_defers_an_overlapping_selector(): void
+    {
+        $release = $this->pendingPar2Release(['leftguid' => 'a']);
+        $lock = Cache::store('array')->lock('rename:standard:cursor:a:lock', 120);
+        $this->assertTrue($lock->get());
+        try {
+            $result = (new NameFixingService)->processStandardBatch('a', 1, false,
+                static fn (): never => throw new RuntimeException('Must not process claimed work'));
+            $this->assertSame(['checked' => 0, 'fixed' => 0], $result);
+            $this->assertSame(0, (int) $release->fresh()->proc_par2);
+        } finally {
+            $lock->release();
+        }
+    }
+
+    public function test_interrupted_grouped_work_does_not_repeat_the_newest_slice_forever(): void
+    {
+        $older = $this->pendingPar2Release([
+            'leftguid' => 'a', 'proc_nfo' => 1, 'proc_files' => 1, 'proc_uid' => 1,
+            'proc_srr' => 1, 'proc_hash16k' => 1, 'proc_crc32' => 1,
+        ]);
+        $newer = $this->pendingPar2Release([
+            'leftguid' => 'a', 'proc_nfo' => 1, 'proc_files' => 1, 'proc_uid' => 1,
+            'proc_srr' => 1, 'proc_hash16k' => 1, 'proc_crc32' => 1,
+        ]);
+        try {
+            (new NameFixingService)->processStandardBatch('a', 1, false,
+                static fn (): never => throw new RuntimeException('Worker interrupted'));
+            $this->fail('Expected interrupted processing.');
+        } catch (RuntimeException $e) {
+            $this->assertSame('Worker interrupted', $e->getMessage());
+        }
+        $visited = [];
+        $processor = static function (object $release) use (&$visited): Par2RenameOutcome {
+            $visited[] = (int) $release->releases_id;
+
+            return Par2RenameOutcome::Retryable;
+        };
+        (new NameFixingService)->processStandardBatch('a', 1, false, $processor);
+        (new NameFixingService)->processStandardBatch('a', 1, false, $processor);
+        $this->assertSame([$older->id, $newer->id], $visited);
+        $this->assertSame(2, Release::query()->where('proc_par2', 0)->count());
+    }
+
     public function test_time_budget_yields_and_the_next_batch_resumes(): void
     {
         $this->freezeTime();
