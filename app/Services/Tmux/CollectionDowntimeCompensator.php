@@ -27,6 +27,8 @@ final class CollectionDowntimeCompensator
 
     private const int WINDOW_SECONDS = 60;
 
+    private const int ROW_CHUNK = 5_000;
+
     /**
      * Safety cap on UPDATE windows per start; each window holds at least one row.
      */
@@ -116,6 +118,9 @@ final class CollectionDowntimeCompensator
         $shifted = DB::getDriverName() === 'sqlite'
             ? DB::raw("datetime(dateadded, '+' || (CASE WHEN dateadded <= '{$lastActiveAt}' THEN {$downtime} ELSE MAX(0, MIN(strftime('%s', '{$nowAt}') - strftime('%s', dateadded), {$downtime})) END) || ' seconds')")
             : DB::raw("dateadded + INTERVAL (CASE WHEN dateadded <= '{$lastActiveAt}' THEN {$downtime} ELSE GREATEST(0, LEAST(TIMESTAMPDIFF(SECOND, dateadded, '{$nowAt}'), {$downtime})) END) SECOND");
+        if ($perValue) {
+            return $this->shiftRowsById($this->at($waitingFrom), max($nowAt, $lastActiveAt), $lastActive, $now, $downtime);
+        }
         $moved = 0;
 
         // One dateadded window at a time, newest first, jumping straight to the next
@@ -132,12 +137,10 @@ final class CollectionDowntimeCompensator
                 break;
             }
             $windowStartAt = $this->at(max($this->timestamp($newest) - self::WINDOW_SECONDS, $waitingFrom));
-            $moved += $perValue
-                ? $this->shiftEachValue($windowStartAt, $newest, $lastActive, $now, $downtime)
-                : DB::table('collections')
-                    ->where('dateadded', '>=', $windowStartAt)
-                    ->where('dateadded', '<=', $newest)
-                    ->update(['dateadded' => $shifted]);
+            $moved += DB::table('collections')
+                ->where('dateadded', '>=', $windowStartAt)
+                ->where('dateadded', '<=', $newest)
+                ->update(['dateadded' => $shifted]);
             $windowEnd = $windowStartAt;
             $inclusive = false;
         }
@@ -146,28 +149,37 @@ final class CollectionDowntimeCompensator
     }
 
     /**
-     * Shift each distinct dateadded value in the window through real timezone arithmetic,
-     * newest first so a moved value never lands on one still to be processed.
+     * Across a DST change, wall-clock values can move backwards even though real time
+     * moves forward, so the newest-first windows could meet a moved row again. Walk the
+     * waiting rows by id instead (a stable key), computing each new value with real
+     * timezone arithmetic; every row is read and moved exactly once. This only runs for
+     * a restart whose span crosses an offset change.
      */
-    private function shiftEachValue(string $from, string $to, int $lastActive, int $now, int $downtime): int
+    private function shiftRowsById(string $from, string $to, int $lastActive, int $now, int $downtime): int
     {
         $moved = 0;
-        $values = DB::table('collections')
-            ->where('dateadded', '>=', $from)
-            ->where('dateadded', '<=', $to)
-            ->distinct()
-            ->orderByDesc('dateadded')
-            ->pluck('dateadded');
-        foreach ($values as $value) {
-            $added = $this->timestamp((string) $value);
-            $shift = $added <= $lastActive ? $downtime : max(0, min($now - $added, $downtime));
-            if ($shift === 0) {
-                continue;
+        $lastId = 0;
+        do {
+            $rows = DB::table('collections')
+                ->where('dateadded', '>=', $from)
+                ->where('dateadded', '<=', $to)
+                ->where('id', '>', $lastId)
+                ->orderBy('id')
+                ->limit(self::ROW_CHUNK)
+                ->get(['id', 'dateadded']);
+            $byValue = [];
+            foreach ($rows as $row) {
+                $lastId = (int) $row->id;
+                $added = $this->timestamp((string) $row->dateadded);
+                $shift = $added <= $lastActive ? $downtime : max(0, min($now - $added, $downtime));
+                if ($shift > 0) {
+                    $byValue[$this->at($added + $shift)][] = $lastId;
+                }
             }
-            $moved += DB::table('collections')
-                ->where('dateadded', $value)
-                ->update(['dateadded' => $this->at($added + $shift)]);
-        }
+            foreach ($byValue as $value => $ids) {
+                $moved += DB::table('collections')->whereIn('id', $ids)->update(['dateadded' => $value]);
+            }
+        } while ($rows->count() === self::ROW_CHUNK);
 
         return $moved;
     }

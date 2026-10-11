@@ -176,10 +176,12 @@ final class CollectionDowntimeCompensatorTest extends TestCase
             Carbon::setTestNow(Carbon::createFromTimestamp($lastActive + 1200, 'UTC'));
             $this->lastActive($lastActive);
             $waiting = $this->collection('2026-11-01 01:30:00');
+            $ambiguous = $this->collection('2026-11-01 01:45:00'); // 01:45 EDT plus 20 minutes reads 01:05 EST
 
             $this->compensator()->compensate(2);
 
             $this->assertSame('2026-11-01 01:50:00', $this->dateAdded($waiting), 'Moved forward by the 20 real minutes.');
+            $this->assertSame('2026-11-01 01:05:00', $this->dateAdded($ambiguous), 'Moved once, though its wall clock reads earlier.');
         } finally {
             date_default_timezone_set($previous);
         }
