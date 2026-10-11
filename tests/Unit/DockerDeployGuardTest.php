@@ -141,6 +141,32 @@ final class DockerDeployGuardTest extends TestCase
     }
 
     #[Test]
+    public function an_untracked_file_whose_name_starts_with_a_dash_is_fingerprinted(): void
+    {
+        $build = ['run', 'build', '--', 'sh', '-c', 'echo x >> '.$this->dir.'/builds'];
+        $flags = ['SKIP_IF_UNCHANGED' => '1', 'STAMP_ON_SUCCESS' => '1'];
+        file_put_contents($this->repo.'/-notes', "a\n");
+
+        $this->guard($build, $flags);
+        file_put_contents($this->repo.'/-notes', "b\n");
+        $this->guard($build, $flags);
+
+        $this->assertCount(2, file($this->dir.'/builds'));
+    }
+
+    #[Test]
+    public function a_lock_owned_by_a_process_we_cannot_signal_counts_as_held(): void
+    {
+        // PID 1 is alive and, for a non-root user, owned by someone else.
+        symlink('pid=1 by=init target=up since=boot', $this->dir.'/lock');
+
+        $process = $this->guard(['run', 'up', '--', 'true']);
+
+        $this->assertSame(75, $process->getExitCode());
+        $this->assertStringContainsString('pid=1', $process->getErrorOutput());
+    }
+
+    #[Test]
     public function editing_an_untracked_file_without_renaming_it_counts_as_a_change(): void
     {
         $build = ['run', 'build', '--', 'sh', '-c', 'echo x >> '.$this->dir.'/builds'];

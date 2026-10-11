@@ -24,7 +24,8 @@ LOCK="${DEPLOY_LOCK_DIR:-$DIR/.deploy.lock}"
 CLAIM="$LOCK.claim"
 LOG="${DEPLOY_LOG:-$DIR/.deploy.log}"
 STAMP="${DEPLOY_STAMP:-$DIR/.deploy.stamp}"
-BY="${DEPLOY_BY:-$(id -un)}"
+WHO=$(id -un 2>/dev/null || id -u)
+BY="${DEPLOY_BY:-$WHO}"
 
 hash_stdin() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
@@ -35,9 +36,9 @@ untracked_hashes() {
     (
         cd "$REPO"
         if command -v sha256sum >/dev/null 2>&1; then
-            git ls-files -o --exclude-standard -z | xargs -0 sha256sum 2>/dev/null || true
+            git ls-files -o --exclude-standard -z | xargs -0 sha256sum -- 2>/dev/null || true
         else
-            git ls-files -o --exclude-standard -z | xargs -0 shasum -a 256 2>/dev/null || true
+            git ls-files -o --exclude-standard -z | xargs -0 shasum -a 256 -- 2>/dev/null || true
         fi
     )
 }
@@ -52,7 +53,7 @@ fingerprint() {
 }
 
 log() {
-    printf '%s %s by=%s user=%s head=%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$BY" "$(id -un)" \
+    printf '%s %s by=%s user=%s head=%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$BY" "$WHO" \
         "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)" "${2:-}" >>"$LOG"
 }
 
@@ -66,8 +67,10 @@ info_pid() {
     printf '%s' "$1" | sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p'
 }
 
+# `ps -p` works for another user's process too; `kill -0` fails with EPERM there and would make a live
+# owner look dead.
 alive() {
-    [ -n "$1" ] && kill -0 "$1" 2>/dev/null
+    [ -n "$1" ] && ps -p "$1" >/dev/null 2>&1
 }
 
 release() {
