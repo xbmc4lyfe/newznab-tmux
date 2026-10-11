@@ -185,6 +185,42 @@ class BinariesStorageInternalsTest extends TestCase
         $this->assertSame(325, (int) $binary->partsize);
     }
 
+    public function test_header_storage_writes_rows_in_unique_key_order_so_concurrent_workers_cannot_deadlock(): void
+    {
+        $this->createHeaderStorageTables();
+
+        $headers = [];
+        $number = 600;
+        foreach (['Zulu.Release', 'Alpha.Release', 'Mike.Release', 'Echo.Release'] as $subject) {
+            foreach ([3, 1, 2] as $partNumber) {
+                $headers[] = $this->parsedHeaderWithTotal(++$number, $partNumber, 3, $subject);
+            }
+        }
+
+        // One storage transaction, as in a live header chunk.
+        $service = new HeaderStorageService($this->deterministicCollectionHandler(), config: new BinariesConfig(sqlChunkSize: 100));
+        $this->assertSame([], $service->store($headers, ['id' => 1, 'name' => 'alt.test'], true));
+
+        $collectionHashes = DB::table('collections')->orderBy('id')->pluck('collectionhash')->all();
+        $sortedHashes = $collectionHashes;
+        sort($sortedHashes, SORT_STRING);
+        $this->assertCount(4, $collectionHashes);
+        $this->assertSame($sortedHashes, $collectionHashes);
+
+        $binaryKeys = DB::table('binaries')->orderBy('id')->get(['collections_id', 'binaryhash'])
+            ->map(static fn (object $row): array => [(int) $row->collections_id, (string) $row->binaryhash])->all();
+        $sortedBinaryKeys = $binaryKeys;
+        usort($sortedBinaryKeys, static fn (array $a, array $b): int => $a <=> $b);
+        $this->assertSame($sortedBinaryKeys, $binaryKeys);
+
+        $partKeys = DB::table('parts')->orderBy('rowid')->get(['binaries_id', 'partnumber'])
+            ->map(static fn (object $row): array => [(int) $row->binaries_id, (int) $row->partnumber])->all();
+        $sortedPartKeys = $partKeys;
+        usort($sortedPartKeys, static fn (array $a, array $b): int => $a <=> $b);
+        $this->assertCount(12, $partKeys);
+        $this->assertSame($sortedPartKeys, $partKeys);
+    }
+
     public function test_header_storage_batch_updates_binary_that_exists_before_chunk(): void
     {
         $this->createHeaderStorageTables();
