@@ -53,12 +53,6 @@ class TmuxMonitor extends Command
     {
 
         try {
-            // Give collections back the time lost while nothing was running. Always, not
-            // only with --reset-collections: a monitor recovered by tmux:health-check would
-            // otherwise overwrite the activity marker without compensating. A restart under
-            // a few minutes, or one right after tmux:start compensated, changes nothing.
-            $this->resetOldCollections();
-
             // Initialize services
             $sessionName = $this->option('session')
                 ?? app(ConfigurationProvider::class)->tmux()->sessionName;
@@ -75,6 +69,12 @@ class TmuxMonitor extends Command
 
                 return Command::FAILURE;
             }
+
+            // Give collections back the time lost while nothing was running. Always, not
+            // only with --reset-collections: a monitor recovered by tmux:health-check would
+            // otherwise overwrite the activity marker without compensating. Only once the
+            // session is known to exist, so a failed launch can't consume the outage.
+            $this->resetOldCollections();
 
             cli()->header('Starting Tmux Monitor');
             $this->info("📊 Monitoring session: {$sessionName}");
