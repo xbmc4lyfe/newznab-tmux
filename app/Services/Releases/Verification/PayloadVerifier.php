@@ -50,6 +50,7 @@ final class PayloadVerifier
         $allocated = $this->initialScratchBytes - $this->directoryBytes($directory);
         $networkFailure = false;
         $requiredNames = [];
+        $fileNames = [];
         $fileChecksums = [];
         foreach ($manifest['files'] as $index => $file) {
             $ranges = [];
@@ -161,6 +162,7 @@ final class PayloadVerifier
                 }
                 $files[$identity->name] = ['size' => $identity->size, 'complete' => $cursor === $identity->size && count($ranges) === (int) $file['totalparts']];
                 $requiredNames[] = $identity->name;
+                $fileNames[$index] = $identity->name;
             } else {
                 $subject = (string) $file['subject'];
                 $name = preg_match('/"([^"\r\n]+)"/', $subject, $match) ? $match[1] : $subject;
@@ -181,6 +183,7 @@ final class PayloadVerifier
         $repaired = false;
         $sourceHashes = [];
         $reservedSources = [];
+        $verifiedSetIds = [];
         foreach ($parity as $name) {
             $heartbeat();
             if (! $files[$name]['complete']) {
@@ -230,29 +233,56 @@ final class PayloadVerifier
             foreach ($descriptors as $descriptor) {
                 $filename = (string) $descriptor['name'];
                 if (! is_file($data.'/'.$filename) || filesize($data.'/'.$filename) !== (int) $descriptor['size']
-                    || hash_file('md5', $data.'/'.$filename) !== $descriptor['hash']) {
+                    || $this->checksum($data.'/'.$filename, 'md5', $heartbeat) !== $descriptor['hash']) {
                     throw new RuntimeException('PAR2 source-file integrity verification failed.');
                 }
                 $protected[$filename] = true;
             }
+            $mainSets = [];
+            $descriptorSets = [];
+            foreach ($par2->getPackets(true) ?: [] as $packet) {
+                if ($packet['head_type'] === Par2Info::PACKET_MAIN) {
+                    $mainSets[(string) $packet['head_set_id']] = true;
+                } elseif ($packet['head_type'] === Par2Info::PACKET_FILEDESC) {
+                    $descriptorSets[(string) $packet['head_set_id']] = true;
+                }
+            }
+            if (count($mainSets) === 1 && count($descriptorSets) === 1 && array_keys($mainSets) === array_keys($descriptorSets)) {
+                $verifiedSetIds += $mainSets;
+            }
+        }
+        $excludedRecovery = [];
+        foreach ($parity as $name) {
+            if ($files[$name]['complete'] || isset($protected[$name])
+                || preg_match('/\.vol\d+\+\d+\.par2\z/i', $name) !== 1) {
+                continue;
+            }
+            $partial = new Par2Info;
+            $partial->open($data.'/'.$name);
+            foreach ($partial->getPackets(true) ?: [] as $packet) {
+                if ($packet['head_type'] === Par2Info::PACKET_RECOVERY && isset($verifiedSetIds[(string) $packet['head_set_id']])) {
+                    $excludedRecovery[$name] = true;
+                    break;
+                }
+            }
         }
         foreach ($requiredNames as $name) {
-            if (! isset($files[$name]) && ! isset($protected[$name])) {
+            if (! isset($excludedRecovery[$name]) && ! isset($files[$name]) && ! isset($protected[$name])) {
                 return new VerificationResult('unknown', 'Required missing file is not protected by validated PAR2.');
             }
         }
         foreach ($fileChecksums as $name => $checksum) {
-            if (hash_file('crc32b', $data.'/'.$name) !== $checksum) {
+            if (! isset($excludedRecovery[$name]) && $this->checksum($data.'/'.$name, 'crc32b', $heartbeat) !== $checksum) {
                 return new VerificationResult('unknown', 'Whole-file checksum verification failed.');
             }
         }
         foreach ($sourceHashes as $name => $hash) {
-            if (hash_file('md5', $data.'/'.$name) !== $hash) {
+            if ($this->checksum($data.'/'.$name, 'md5', $heartbeat) !== $hash) {
                 return new VerificationResult('unknown', 'Final PAR2 integrity check failed.');
             }
         }
         foreach ($files as $name => $info) {
-            if (! $info['complete'] && ! isset($protected[$name])) {
+            if (! $info['complete'] && ! isset($protected[$name]) && ! isset($excludedRecovery[$name])) {
                 return new VerificationResult('unknown', 'Required file is incomplete and unverified by PAR2.');
             }
         }
@@ -263,6 +293,14 @@ final class PayloadVerifier
         if ($networkFailure && $protected === []) {
             return new VerificationResult('unknown', 'Missing articles require a successful PAR2 proof.');
         }
+
+        foreach ($fileNames as $index => $name) {
+            if (isset($excludedRecovery[$name])) {
+                unset($available['files'][$index], $files[$name]);
+            }
+        }
+        $available['files'] = array_values($available['files']);
+        $available['expected_files'] = max(0, $expected - count($excludedRecovery));
 
         $available['identity_hints'] = [];
         foreach (array_keys($files) as $name) {
@@ -279,6 +317,30 @@ final class PayloadVerifier
         }
 
         return new VerificationResult($repaired ? 'repaired' : 'complete', 'Downloaded payload verified.', $available);
+    }
+
+    private function checksum(string $path, string $algorithm, callable $heartbeat): string
+    {
+        $handle = fopen($path, 'rb');
+        if ($handle === false) {
+            throw new RuntimeException('Cannot open file for integrity verification.');
+        }
+        $context = hash_init($algorithm);
+        try {
+            while (! feof($handle)) {
+                $heartbeat();
+                $chunk = fread($handle, 1048576);
+                if ($chunk === false) {
+                    throw new RuntimeException('Cannot read file for integrity verification.');
+                }
+                hash_update($context, $chunk);
+            }
+            $heartbeat();
+
+            return hash_final($context);
+        } finally {
+            fclose($handle);
+        }
     }
 
     private function directoryBytes(string $directory): int

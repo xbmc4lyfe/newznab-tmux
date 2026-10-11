@@ -8,8 +8,10 @@ use App\Services\Releases\Verification\ArticleSource;
 use App\Services\Releases\Verification\PayloadVerifier;
 use App\Services\Releases\Verification\VerifiedArticle;
 use App\Services\YencService;
+use dariusiii\rarinfo\Par2Info;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Process\Process;
+use Tests\Fixtures\YencArticles;
 
 class ReleaseVerificationPayloadTest extends TestCase
 {
@@ -84,6 +86,72 @@ class ReleaseVerificationPayloadTest extends TestCase
             $this->assertSame([], $result->manifest['files'][0]['segments']);
         } finally {
             $this->removeDirectory($dir);
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_partial_redundant_recovery_volume_is_omitted_after_source_repair(): void
+    {
+        [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', str_repeat('movie-data', 64), 'set');
+        $volume = glob($fixture.'/*.vol*.par2')[0];
+        $bytes = file_get_contents($volume);
+        $partialName = 'set.vol99+1.par2';
+        $articles['partial@article'] = YencArticles::part(substr($bytes, 0, -1), $partialName, strlen($bytes), 1, 1, 2);
+        $files[] = ['key' => 'partial', 'subject' => $partialName, 'totalparts' => 2,
+            'segments' => [['number' => 1, 'messageid' => 'partial@article', 'bytes' => strlen($bytes) - 1],
+                ['number' => 2, 'messageid' => 'missing-parity@article', 'bytes' => 1]]];
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $result = $verifier->verify(['expected_files' => count($files), 'files' => $files], $scratch, static function (): void {});
+            $this->assertSame('repaired', $result->verdict, $result->reason);
+            $this->assertNotContains($partialName, array_column($result->manifest['files'], 'subject'));
+            $this->assertNotContains($partialName, array_column($result->manifest['identity_hints'], 'name'));
+            $this->assertSame(str_repeat('movie-data', 64), file_get_contents($scratch.'/data/movie.mkv'));
+        } finally {
+            $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_checksum_pass_renews_lease_between_bounded_reads(): void
+    {
+        [$verifier, $scratch] = $this->verifier([]);
+        $path = $scratch.'/large-source';
+        file_put_contents($path, str_repeat('x', 3 * 1048576));
+        $beats = 0;
+        try {
+            $checksum = (new \ReflectionMethod($verifier, 'checksum'))->invoke($verifier, $path, 'md5', static function () use (&$beats): void {
+                $beats++;
+            });
+            $this->assertSame(md5(str_repeat('x', 3 * 1048576)), $checksum);
+            $this->assertGreaterThanOrEqual(3, $beats);
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_foreign_creator_packet_cannot_authorize_omitting_foreign_recovery(): void
+    {
+        [$articles, $files, $primary] = $this->par2Upload('movie.mkv', str_repeat('movie-data', 64), 'primary');
+        [$unused, $unusedFiles, $foreign] = $this->par2Upload('other.bin', str_repeat('other-data', 64), 'foreign');
+        $parser = new Par2Info;
+        $this->assertTrue($parser->open($foreign.'/foreign.par2'));
+        $foreignId = hex2bin($parser->getPackets(true)[0]['head_set_id']);
+        $body = $foreignId.Par2Info::PACKET_CREATOR."foreign creator\0";
+        $creator = "PAR2\0PKT".pack('VV', 32 + strlen($body), 0).md5($body, true).$body;
+        $articles['primary.par2@article'] = (new YencService)->encode(file_get_contents($primary.'/primary.par2').$creator, 'primary.par2');
+        $bytes = file_get_contents(glob($foreign.'/*.vol*.par2')[0]);
+        $articles['partial@article'] = YencArticles::part(substr($bytes, 0, -1), 'primary.vol99+1.par2', strlen($bytes), 1, 1, 2);
+        $files[] = ['key' => 'partial', 'subject' => 'primary.vol99+1.par2', 'totalparts' => 2,
+            'segments' => [['number' => 1, 'messageid' => 'partial@article', 'bytes' => strlen($bytes) - 1],
+                ['number' => 2, 'messageid' => 'missing-parity@article', 'bytes' => 1]]];
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $result = $verifier->verify(['expected_files' => count($files), 'files' => $files], $scratch, static function (): void {});
+            $this->assertFalse($result->passed(), $result->reason);
+        } finally {
+            $this->removeDirectory($primary);
+            $this->removeDirectory($foreign);
             $this->removeDirectory($scratch);
         }
     }

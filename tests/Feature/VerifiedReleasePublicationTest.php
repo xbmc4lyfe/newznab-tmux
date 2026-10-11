@@ -14,9 +14,11 @@ use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedNzbWriter;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\DataProvider;
 
 class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
@@ -36,7 +38,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         $this->assertFalse(DB::table('collections')->where('id', $id)->exists());
     }
 
-    /** @return array<string, array{?int, int, ?string}> */
+    /** @return array<string, array{0: ?int, 1: int, 2: ?string, 3?: ?string}> */
     public static function verifiedSizes(): array
     {
         return [
@@ -46,13 +48,17 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             'metadata duplicate with missing NZB' => [12345, 12345, 'missing'],
             'metadata duplicate with corrupt compressed NZB' => [12345, 12345, 'corrupt'],
             'duplicate with exact verified article inventory' => [12345, 12345, 'exact'],
+            'database insert failure removes new NZB' => [12345, 12345, null, 'insert'],
+            'database retry removes rolled-back NZB' => [12345, 12345, null, 'retry'],
+            'after commit failure preserves published NZB' => [12345, 12345, null, 'after_commit'],
         ];
     }
 
     #[DataProvider('verifiedSizes')]
-    public function test_successful_download_publishes_exact_verified_nzb_once(?int $verifiedBytes, int $expectedSize, ?string $duplicateKind): void
+    public function test_successful_download_publishes_exact_verified_nzb_once(?int $verifiedBytes, int $expectedSize, ?string $duplicateKind, ?string $failure = null): void
     {
         config(['nntmux.release_dedupe_enabled' => $duplicateKind !== null, 'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
+        app('files')->ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
         Schema::create('releases', function (Blueprint $table): void {
             $table->id();
             foreach (['name', 'searchname', 'guid', 'leftguid', 'fromname', 'postdate', 'adddate'] as $column) {
@@ -71,7 +77,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $table->integer('releases_id');
             $table->integer('groups_id');
         });
-        Search::shouldReceive('updateRelease')->times($duplicateKind === 'exact' ? 0 : 1);
+        Search::shouldReceive('updateRelease')->times($duplicateKind === 'exact' || in_array($failure, ['insert', 'after_commit'], true) ? 0 : 1);
         $this->app->instance(ReleaseMetadataResolver::class,
             new class(app(ReleaseCleaningService::class)) extends ReleaseMetadataResolver
             {
@@ -89,7 +95,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $manifest['verified_bytes'] = $verifiedBytes;
         }
         if ($duplicateKind !== null) {
-            $duplicateGuid = '11111111111111111111111111111111';
+            $duplicateGuid = (string) Str::uuid();
             DB::table('releases')->insert([
                 'id' => 777, 'name' => 'Movie', 'searchname' => 'Movie', 'guid' => $duplicateGuid,
                 'leftguid' => '1', 'fromname' => 'poster', 'postdate' => $manifest['date'], 'adddate' => $manifest['date'],
@@ -114,7 +120,48 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             'last_unique_at' => now(), 'next_attempt_at' => now()]);
         DB::table('release_verification_state')->update(['pending_bytes' => filesize($store->path($path))]);
         $claim = app(CandidateRepository::class)->claim();
-        $id = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
+        if ($failure === 'insert') {
+            DB::unprepared("CREATE TRIGGER reject_release BEFORE INSERT ON releases BEGIN SELECT RAISE(ABORT, 'forced insert failure'); END");
+        }
+        $inserts = 0;
+        if (in_array($failure, ['retry', 'after_commit'], true)) {
+            DB::listen(function (QueryExecuted $event) use ($failure, &$inserts): void {
+                if (! str_starts_with($event->sql, 'insert into "releases"')) {
+                    return;
+                }
+                $inserts++;
+                if ($failure === 'retry' && $inserts === 1) {
+                    throw new \PDOException('deadlock detected');
+                }
+                if ($failure === 'after_commit') {
+                    DB::afterCommit(static function (): void {
+                        throw new \RuntimeException('forced after commit failure');
+                    });
+                }
+            });
+        }
+        try {
+            $id = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
+            $this->assertNotContains($failure, ['insert', 'after_commit']);
+        } catch (\Throwable $error) {
+            if ($failure === 'insert') {
+                $this->assertStringContainsString('forced insert failure', $error->getMessage());
+                $this->assertSame(0, DB::table('releases')->count());
+                $this->assertNull(DB::table('release_verification_candidates')->value('release_id'));
+                $this->assertCount(0, app('files')->allFiles(config('nntmux_settings.path_to_nzbs')));
+
+                return;
+            }
+            if ($failure !== 'after_commit') {
+                throw $error;
+            }
+            $this->assertSame('forced after commit failure', $error->getMessage());
+            $id = (int) DB::table('releases')->value('id');
+        }
+        if ($failure === 'retry') {
+            $this->assertSame(2, $inserts);
+            $this->assertCount(1, app('files')->allFiles(config('nntmux_settings.path_to_nzbs')));
+        }
         if ($duplicateKind === 'exact') {
             $this->assertSame(777, $id);
         } elseif ($duplicateKind !== null) {

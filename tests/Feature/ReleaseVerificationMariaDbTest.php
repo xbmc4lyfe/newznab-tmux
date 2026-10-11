@@ -34,7 +34,7 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
 
     private function dropVerificationTables(): void
     {
-        foreach (['parts', 'binaries', 'collections', 'usenet_groups', 'releases', 'release_verification_candidates', 'release_verification_state'] as $table) {
+        foreach (['parts', 'binaries', 'collections', 'usenet_groups', 'releases', 'release_verification_audit_retries', 'release_verification_candidates', 'release_verification_state'] as $table) {
             Schema::dropIfExists($table);
         }
     }

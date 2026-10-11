@@ -50,7 +50,12 @@ final class VerifiedReleasePublisher
                 return (int) $duplicate->id;
             }
             $guid = (string) Str::uuid();
-            $this->writer->write($manifest, $guid);
+            $path = $this->writer->write($manifest, $guid);
+            DB::afterRollBack(static function () use ($path): void {
+                if (is_file($path)) {
+                    unlink($path);
+                }
+            });
             $id = Release::insertRelease($metadata + [
                 'totalpart' => max((int) $manifest['expected_files'], count($manifest['files'])),
                 'groups_id' => (int) $manifest['groups_id'], 'guid' => $guid, 'postdate' => $manifest['date'],

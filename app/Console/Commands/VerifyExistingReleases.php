@@ -42,9 +42,29 @@ class VerifyExistingReleases extends Command
 
                 return self::SUCCESS;
             }
-            $cursor = $this->option('resume') ? (int) DB::table('release_verification_state')->where('id', 1)->value('audit_cursor') : (int) $this->option('since-id');
+            $state = DB::table('release_verification_state')->where('id', 1)->first();
+            if ($state === null) {
+                throw new \RuntimeException('Audit state is unavailable.');
+            }
+            $resume = (bool) $this->option('resume');
+            $cursor = $resume ? (int) $state->audit_cursor : (int) $this->option('since-id');
+            $limit = max(1, (int) $this->option('limit'));
+            $freshIds = Release::query()->where('id', '>', $cursor)->orderBy('id')->limit($limit)->pluck('id')->all();
+            $retryIds = $resume ? DB::table('release_verification_audit_retries')->where('next_attempt_at', '<=', now())
+                ->orderBy('next_attempt_at')->orderBy('release_id')->limit($limit)->pluck('release_id')->all() : [];
+            $retryTurn = (bool) $state->audit_retry_turn;
             $verifier = new PayloadVerifier(new NntpArticleSource(app(NNTPService::class)), (array) config('release_verification'));
-            foreach (Release::query()->where('id', '>', $cursor)->orderBy('id')->limit(max(1, (int) $this->option('limit')))->cursor() as $release) {
+            $attempted = 0;
+            while ($attempted < $limit && ($freshIds !== [] || $retryIds !== [])) {
+                $isRetry = $retryIds !== [] && ($retryTurn || $freshIds === []);
+                $id = (int) ($isRetry ? array_shift($retryIds) : array_shift($freshIds));
+                $release = Release::query()->find($id);
+                if ($release === null) {
+                    DB::table('release_verification_audit_retries')->where('release_id', $id)->delete();
+
+                    continue;
+                }
+                $attempted++;
                 $directory = $root.'/scratch/audit-'.$release->id;
                 try {
                     $xml = $nzb->readNzbContents($release->guid);
@@ -64,7 +84,24 @@ class VerifyExistingReleases extends Command
                 if (file_put_contents($root.'/audit.jsonl', $line."\n", FILE_APPEND | LOCK_EX) === false) {
                     throw new \RuntimeException('Cannot persist audit report.');
                 }
-                DB::table('release_verification_state')->where('id', 1)->update(['audit_cursor' => $release->id]);
+                DB::transaction(function () use ($id, $isRetry, $record): void {
+                    $current = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                    if ($current === null) {
+                        throw new \RuntimeException('Audit state is unavailable.');
+                    }
+                    if ($record['verdict'] === 'unknown') {
+                        DB::table('release_verification_audit_retries')->updateOrInsert(['release_id' => $id], [
+                            'next_attempt_at' => now()->addSeconds(max(1, (int) config('release_verification.retry_seconds'))),
+                            'reason' => mb_strcut($record['reason'], 0, 2000, 'UTF-8'),
+                        ]);
+                    } else {
+                        DB::table('release_verification_audit_retries')->where('release_id', $id)->delete();
+                    }
+                    DB::table('release_verification_state')->where('id', 1)->update([
+                        'audit_cursor' => max((int) $current->audit_cursor, $id), 'audit_retry_turn' => ! $isRetry,
+                    ]);
+                }, 5);
+                $retryTurn = ! $isRetry;
                 $this->line($line);
                 File::deleteDirectory($directory);
             }
