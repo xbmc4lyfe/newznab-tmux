@@ -25,9 +25,7 @@ final class NzbManifestReader
             $expected = 0;
             foreach ($document->file as $index => $file) {
                 $subject = (string) $file['subject'];
-                if (preg_match('/[\[(](\d+)\/(\d+)[\])]/', preg_replace('/\s*\(\d+\/\d+\)\s*$/', '', $subject), $count)) {
-                    $expected = max($expected, (int) $count[2]);
-                }
+                $expected = max($expected, self::declaredFileCount($subject));
                 $parts = preg_match('/\(\d+\/(\d+)\)\s*$/', $subject, $count) ? (int) $count[1] : 0;
                 $segments = [];
                 foreach ($file->segments->segment as $segment) {
@@ -62,5 +60,22 @@ final class NzbManifestReader
             libxml_clear_errors();
             libxml_use_internal_errors($previous);
         }
+    }
+
+    public static function declaredFileCount(string $subject): int
+    {
+        $outsideNames = preg_replace('/"[^"\r\n]*"|\'[^\'\r\n]*\'/', '', $subject) ?? '';
+        $outsideNames = preg_replace('/\s*\(\d+\/\d+\)\s*$/', '', $outsideNames) ?? '';
+        preg_match_all('/(?<!\S)[\[(](\d+)\/(\d+)[\])](?=\s|$)/', $outsideNames, $counts, PREG_SET_ORDER);
+        $expected = 0;
+        foreach ($counts as $count) {
+            $index = (int) $count[1];
+            $total = (int) $count[2];
+            if ($total > 0 && $index <= $total) {
+                $expected = max($expected, $total);
+            }
+        }
+
+        return $expected;
     }
 }

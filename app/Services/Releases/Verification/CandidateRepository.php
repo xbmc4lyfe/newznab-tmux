@@ -212,12 +212,22 @@ final class CandidateRepository
                 'totalparts' => (int) $binary->totalparts, 'segments' => $segments];
         }
 
+        $expected = (int) $collection->totalfiles;
+        if ((int) $collection->filecheck === 4) {
+            $expected = 0;
+            foreach ($files as $file) {
+                if (preg_match('/"[^"\r\n]+"|\'[^\'\r\n]+\'/', $file['subject']) === 1) {
+                    $expected = max($expected, NzbManifestReader::declaredFileCount($file['subject']));
+                }
+            }
+        }
+
         return ['identity' => bin2hex($collection->collectionhash), 'subject' => $collection->subject,
             'fromname' => $collection->fromname, 'date' => $collection->date, 'groups_id' => (int) $collection->groups_id,
             // Legacy insertion could overwrite the declared count with observed
-            // files. An unknown inventory needs PAR2 proof or later evidence.
+            // files. Recover explicit counters outside quoted filenames only.
             'regex_id' => (int) $collection->collection_regexes_id,
-            'expected_files' => (int) $collection->filecheck === 4 ? 0 : (int) $collection->totalfiles,
+            'expected_files' => $expected,
             'groups' => $groups, 'files' => $files, 'conflict' => false];
     }
 
