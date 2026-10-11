@@ -85,9 +85,18 @@ cmd_run() {
     fi
 
     log "$target" "result=started"
+    # The tree that goes into the build is the one fingerprinted now. Stamp it afterwards only if the
+    # shared checkout did not change in the meantime; otherwise the image holds older bytes than the stamp.
+    before=$(fingerprint)
     if "$@"; then rc=0; else rc=$?; fi
     if [ "$rc" -eq 0 ] && [ "${STAMP_ON_SUCCESS:-0}" = 1 ]; then
-        fingerprint >"$STAMP"
+        if [ "$(fingerprint)" = "$before" ]; then
+            printf '%s\n' "$before" >"$STAMP"
+        else
+            rm -f "$STAMP"
+            log "$target" "result=tree-changed-during-run (not stamped; the next build will run)"
+            echo "deploy-guard: the checkout changed while $target ran; not recording it as deployed." >&2
+        fi
     fi
     log "$target" "result=finished rc=$rc"
     exit "$rc"

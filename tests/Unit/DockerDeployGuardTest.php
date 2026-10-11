@@ -121,6 +121,24 @@ final class DockerDeployGuardTest extends TestCase
         $this->assertSame(3, $builds(), 'FORCE=1 always rebuilds');
     }
 
+    #[Test]
+    public function a_tree_that_changes_during_the_run_is_not_stamped(): void
+    {
+        $build = ['run', 'build', '--', 'sh', '-c', 'echo changed > '.$this->repo.'/app.txt'];
+        $flags = ['SKIP_IF_UNCHANGED' => '1', 'STAMP_ON_SUCCESS' => '1'];
+
+        $first = $this->guard($build, $flags);
+
+        $this->assertSame(0, $first->getExitCode());
+        $this->assertFileDoesNotExist($this->dir.'/stamp');
+        $this->assertStringContainsString('tree-changed-during-run', (string) file_get_contents($this->dir.'/deploy.log'));
+
+        // With the tree now settled, the next build runs and is stamped.
+        $second = $this->guard(['run', 'build', '--', 'true'], $flags);
+        $this->assertSame(0, $second->getExitCode());
+        $this->assertFileExists($this->dir.'/stamp');
+    }
+
     /**
      * @param  list<string>  $arguments
      * @param  array<string, string>  $env
