@@ -112,7 +112,7 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         });
 
         $this->assertSame(1, $this->compensator()->compensate(2));
-        $this->assertSame(180, $updates, 'One per minute from 09:00 to now, however high the ids.');
+        $this->assertSame(1, $updates, 'Only the occupied window, however high the ids or long the outage.');
     }
 
     public function test_rows_crossing_into_a_later_window_are_shifted_once(): void
@@ -135,6 +135,19 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         Cache::flush();
 
         $this->assertSame(Carbon::now()->getTimestamp(), $this->compensator()->lastActivity());
+    }
+
+    public function test_an_interrupted_start_never_shifts_rows_twice(): void
+    {
+        $this->lastActive(Carbon::parse('2026-10-11 11:00:00')->getTimestamp());
+        $waiting = $this->collection('2026-10-11 10:30:00');
+        $this->compensator()->compensate(2);
+
+        // A retry a minute later (the first start died after its updates).
+        $this->travel(1)->minutes();
+        $this->compensator()->compensate(2);
+
+        $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting));
     }
 
     private function compensator(): CollectionDowntimeCompensator

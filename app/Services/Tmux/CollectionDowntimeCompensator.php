@@ -82,11 +82,11 @@ final class CollectionDowntimeCompensator
         // time it lost: the downtime for those added before the last recorded activity,
         // and only the time since they were added for those written in the moments
         // after it, never more than one full delay.
-        $moved = $this->shiftDateAdded($lastActive, $now, max(0, $delayHours) * 3600);
-
+        // Record the new start first: if this run dies partway, the next start sees a
+        // short downtime and skips, so rows can be under-compensated but never shifted twice.
         $this->recordActivity();
 
-        return $moved;
+        return $this->shiftDateAdded($lastActive, $now, max(0, $delayHours) * 3600);
     }
 
     private function shiftDateAdded(int $lastActive, int $now, int $delaySeconds): int
@@ -102,19 +102,42 @@ final class CollectionDowntimeCompensator
             : DB::raw("dateadded + INTERVAL LEAST(TIMESTAMPDIFF(SECOND, GREATEST(dateadded, '{$lastActiveAt}'), '{$nowAt}'), {$delaySeconds}) SECOND");
         $moved = 0;
 
-        // One dateadded window at a time, newest first: each UPDATE is a range on the
-        // dateadded index, and a moved row lands in a later window that is already done
-        // (or at now), so nothing is shifted twice and the walk follows the waiting rows,
-        // not the id range.
-        $waitingFrom = $lastActive - $delaySeconds;
-        for ($windowEnd = $now; $windowEnd > $waitingFrom; $windowEnd -= self::WINDOW_SECONDS) {
-            $windowStart = max($waitingFrom, $windowEnd - self::WINDOW_SECONDS);
+        // One dateadded window at a time, newest first, jumping straight to the next
+        // occupied window: each UPDATE is a range on the dateadded index, and a moved row
+        // lands in a later window that is already done (or at now), so nothing is shifted
+        // twice, and the work follows the waiting rows rather than the id range or the
+        // length of the outage.
+        $waitingFrom = Carbon::createFromTimestamp($lastActive - $delaySeconds)->format('Y-m-d H:i:s');
+        $windowEnd = $nowAt;
+        $inclusive = true;
+        while (($newest = $this->newestWaiting($waitingFrom, $windowEnd, $inclusive)) !== null) {
+            $windowStart = max(
+                Carbon::parse($newest)->getTimestamp() - self::WINDOW_SECONDS,
+                $lastActive - $delaySeconds,
+            );
+            $windowStartAt = Carbon::createFromTimestamp($windowStart)->format('Y-m-d H:i:s');
             $moved += DB::table('collections')
-                ->where('dateadded', '>=', Carbon::createFromTimestamp($windowStart)->format('Y-m-d H:i:s'))
-                ->where('dateadded', $windowEnd === $now ? '<=' : '<', Carbon::createFromTimestamp($windowEnd)->format('Y-m-d H:i:s'))
+                ->where('dateadded', '>=', $windowStartAt)
+                ->where('dateadded', '<=', $newest)
                 ->update(['dateadded' => $shifted]);
+            $windowEnd = $windowStartAt;
+            $inclusive = false;
         }
 
         return $moved;
+    }
+
+    /**
+     * The newest dateadded at or after $from and before (or at) $before, found through
+     * the dateadded index.
+     */
+    private function newestWaiting(string $from, string $before, bool $inclusive): ?string
+    {
+        $newest = DB::table('collections')
+            ->where('dateadded', '>=', $from)
+            ->where('dateadded', $inclusive ? '<=' : '<', $before)
+            ->max('dateadded');
+
+        return $newest === null ? null : (string) $newest;
     }
 }
