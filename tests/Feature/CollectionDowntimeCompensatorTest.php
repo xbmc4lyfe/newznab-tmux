@@ -10,6 +10,7 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\Support\MarkerIoFailures;
 use Tests\TestCase;
 
@@ -28,6 +29,7 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         Schema::create('collections', static function (Blueprint $table): void {
             $table->increments('id');
             $table->dateTime('dateadded')->nullable();
+            $table->integer('filecheck')->default(0);
         });
         $this->travelTo(Carbon::parse('2026-10-11 12:00:00'));
     }
@@ -300,6 +302,44 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting));
         $this->assertSame(Carbon::now('UTC')->getTimestamp(), $this->compensator()->lastActivity());
         $this->assertSame(0, $this->compensator()->compensate(2), 'A subsequent tmux start must not compensate twice.');
+    }
+
+    #[DataProvider('compensationWindows')]
+    public function test_only_delay_waiting_statuses_receive_compensation(string $timezone, string $stopped, string $restarted, string $added, string $shifted): void
+    {
+        $previousTimezone = date_default_timezone_get();
+        date_default_timezone_set($timezone);
+        try {
+            $this->travelTo(Carbon::parse($restarted, 'UTC'));
+            $this->lastActive(Carbon::parse($stopped, 'UTC')->getTimestamp());
+            $waiting = [];
+            foreach ([0, 1, 10, 15, 16] as $status) {
+                $waiting[] = DB::table('collections')->insertGetId(['dateadded' => $added, 'filecheck' => $status]);
+            }
+            $finished = [];
+            foreach ([2, 3, 4, 5] as $status) {
+                $finished[] = DB::table('collections')->insertGetId(['dateadded' => $added, 'filecheck' => $status]);
+            }
+
+            $this->assertSame(5, $this->compensator()->compensate(2));
+            foreach ($waiting as $id) {
+                $this->assertSame($shifted, $this->dateAdded($id));
+            }
+            foreach ($finished as $id) {
+                $this->assertSame($added, $this->dateAdded($id), 'Completed data must keep its retention age.');
+            }
+        } finally {
+            date_default_timezone_set($previousTimezone);
+        }
+    }
+
+    /** @return array<string, array{string, string, string, string, string}> */
+    public static function compensationWindows(): array
+    {
+        return [
+            'UTC window' => ['UTC', '2026-10-11 11:00:00', '2026-10-11 12:00:00', '2026-10-11 10:30:00', '2026-10-11 11:30:00'],
+            'DST keyset' => ['America/New_York', '2026-03-08 06:50:00', '2026-03-08 07:10:00', '2026-03-08 01:45:00', '2026-03-08 03:05:00'],
+        ];
     }
 
     public function test_tests_use_a_temporary_marker_not_the_real_one(): void

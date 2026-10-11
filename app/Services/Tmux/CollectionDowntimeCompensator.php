@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Tmux;
 
+use App\Enums\CollectionFileCheckStatus;
 use App\Services\Configuration\ConfigurationProvider;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -31,6 +32,15 @@ final class CollectionDowntimeCompensator
     private const int NOTE_INTERVAL_SECONDS = 30;
 
     private const int ROW_CHUNK = 5_000;
+
+    /** Statuses whose reconciliation is gated by collectionDelayTime (10 is legacy). */
+    private const array WAITING_FILECHECKS = [
+        CollectionFileCheckStatus::Default->value,
+        CollectionFileCheckStatus::CompleteCollection->value,
+        CollectionFileCheckStatus::TempComplete->value,
+        CollectionFileCheckStatus::ZeroPart->value,
+        10,
+    ];
 
     /**
      * Safety cap on UPDATE windows per start; each window holds at least one row.
@@ -175,6 +185,7 @@ final class CollectionDowntimeCompensator
             }
             $windowStartAt = $this->at(max($this->timestamp($newest) - self::WINDOW_SECONDS, $waitingFrom));
             $moved += DB::table('collections')
+                ->whereIn('filecheck', self::WAITING_FILECHECKS)
                 ->where('dateadded', '>=', $windowStartAt)
                 ->where('dateadded', '<=', $newest)
                 ->update(['dateadded' => $shifted]);
@@ -198,6 +209,7 @@ final class CollectionDowntimeCompensator
         $lastId = 0;
         do {
             $rows = DB::table('collections')
+                ->whereIn('filecheck', self::WAITING_FILECHECKS)
                 ->where('dateadded', '>=', $from)
                 ->where('dateadded', '<=', $to)
                 ->where('id', '>', $lastId)
@@ -217,7 +229,7 @@ final class CollectionDowntimeCompensator
                 }
             }
             foreach ($byValue as $value => $ids) {
-                $moved += DB::table('collections')->whereIn('id', $ids)->update(['dateadded' => $value]);
+                $moved += DB::table('collections')->whereIn('filecheck', self::WAITING_FILECHECKS)->whereIn('id', $ids)->update(['dateadded' => $value]);
             }
         } while ($rows->count() === self::ROW_CHUNK);
 
@@ -278,6 +290,7 @@ final class CollectionDowntimeCompensator
     private function newestWaiting(string $from, string $before, bool $inclusive): ?string
     {
         $newest = DB::table('collections')
+            ->whereIn('filecheck', self::WAITING_FILECHECKS)
             ->where('dateadded', '>=', $from)
             ->where('dateadded', $inclusive ? '<=' : '<', $before)
             ->max('dateadded');
