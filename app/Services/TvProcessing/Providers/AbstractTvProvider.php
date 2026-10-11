@@ -236,7 +236,14 @@ abstract class AbstractTvProvider extends BaseVideoProvider
                     // use its row and update it instead of failing the whole batch. A locking read sees
                     // the other worker's committed row even inside a repeatable-read transaction, where a
                     // plain SELECT would still return the snapshot taken by the lookup above.
-                    $racedVideo = Video::query()->where('title', $show['title'])->lockForUpdate()->first(['id']);
+                    // Match the full unique key (ix_videos_title): different productions can share a title.
+                    $racedVideo = Video::query()
+                        ->where('title', $show['title'])
+                        ->where('type', $show['type'])
+                        ->where('started', $show['started'])
+                        ->where('countries_id', $show['country'] ?? '')
+                        ->lockForUpdate()
+                        ->first(['id']);
                     if ($racedVideo === null) {
                         throw $e;
                     }

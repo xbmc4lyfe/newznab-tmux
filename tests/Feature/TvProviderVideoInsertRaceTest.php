@@ -56,10 +56,12 @@ final class TvProviderVideoInsertRaceTest extends TestCase
             }
         };
         $raced = false;
-        // Simulate the other worker: insert the row right before this worker's own insert.
+        // Simulate the other workers: right before this worker's own insert, one adds a different production
+        // that shares the title (lower id, so a title-only lookup would pick it) and one adds this very show.
         Video::creating(function (Video $video) use (&$raced): void {
             if (! $raced) {
                 $raced = true;
+                DB::table('videos')->insert(['title' => 'Less Than Evil', 'type' => 0, 'countries_id' => 'US', 'started' => '2005-01-01 00:00:00']);
                 DB::table('videos')->insert(['title' => 'Less Than Evil', 'type' => 0, 'countries_id' => 'KR', 'started' => '2018-12-03 00:00:00']);
             }
         });
@@ -72,8 +74,9 @@ final class TvProviderVideoInsertRaceTest extends TestCase
         ]));
 
         $this->assertTrue($raced);
-        $this->assertSame(1, DB::table('videos')->count());
-        $this->assertSame((int) DB::table('videos')->value('id'), $id);
+        $this->assertSame(2, DB::table('videos')->count());
+        $this->assertSame((int) DB::table('videos')->where('countries_id', 'KR')->value('id'), $id);
+        $this->assertNotSame((int) DB::table('videos')->where('countries_id', 'US')->value('id'), $id);
         $this->assertSame($id, $provider->updatedId);
         // The supplementary row exists even though the winning worker never wrote one.
         $this->assertSame('OCN', DB::table('tv_info')->where('videos_id', $id)->value('publisher'));
