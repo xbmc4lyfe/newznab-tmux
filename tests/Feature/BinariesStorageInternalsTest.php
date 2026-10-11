@@ -185,6 +185,24 @@ class BinariesStorageInternalsTest extends TestCase
         $this->assertSame(325, (int) $binary->partsize);
     }
 
+    public function test_a_constraint_rollback_logs_the_key_but_not_the_value(): void
+    {
+        $this->createHeaderStorageTables();
+        DB::statement("CREATE TRIGGER reject_parts BEFORE INSERT ON parts BEGIN SELECT RAISE(ABORT, 'UNIQUE constraint failed: parts.messageid'); END");
+        config(['app.debug' => false]);
+        Log::spy();
+        $service = new HeaderStorageService($this->deterministicCollectionHandler(), config: new BinariesConfig);
+
+        $this->assertSame([920], $service->store([$this->parsedHeader(920, 1)], ['id' => 1, 'name' => 'alt.test'], true));
+
+        Log::shouldHaveReceived('error')->once()->with('Binary header storage chunk rolled back', Mockery::on(
+            static fn (array $context): bool => $context['reason'] === 'Storage failed'
+                && $context['driver_code'] === 19
+                && $context['constraint'] === 'parts.messageid'
+                && ! str_contains(json_encode($context), '920')
+        ));
+    }
+
     public function test_header_storage_writes_rows_in_unique_key_order_so_concurrent_workers_cannot_deadlock(): void
     {
         $this->createHeaderStorageTables();
@@ -197,8 +215,8 @@ class BinariesStorageInternalsTest extends TestCase
             }
         }
 
-        // One storage transaction, as in a live header chunk.
-        $service = new HeaderStorageService($this->deterministicCollectionHandler(), config: new BinariesConfig(sqlChunkSize: 100));
+        // One storage transaction, as in a live header chunk, written in several SQL chunks.
+        $service = new HeaderStorageService($this->deterministicCollectionHandler(), config: new BinariesConfig(sqlChunkSize: 5));
         $this->assertSame([], $service->store($headers, ['id' => 1, 'name' => 'alt.test'], true));
 
         $collectionHashes = DB::table('collections')->orderBy('id')->pluck('collectionhash')->all();
