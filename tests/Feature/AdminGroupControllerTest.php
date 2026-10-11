@@ -200,11 +200,12 @@ class AdminGroupControllerTest extends TestCase
             ['groups_id' => $busyId], ['groups_id' => $busyId], ['groups_id' => $busyId], ['groups_id' => $quietId],
         ]);
 
-        $groups = collect(UsenetGroup::getGroupsRange()->items())->keyBy('id');
+        $groups = collect(UsenetGroup::getGroupsRange('', null, true)->items())->keyBy('id');
 
         $this->assertSame(3, $groups[$busyId]->num_releases);
         $this->assertSame(1, $groups[$quietId]->num_releases);
         $this->assertSame(0, $groups[$emptyId]->num_releases);
+        $this->assertNull(UsenetGroup::getGroupsRange()->items()[0]->num_releases);
     }
 
     private function setEnvironmentValue(string $key, ?string $value): void

@@ -213,7 +213,7 @@ class UsenetGroup extends Model
         return $res === null ? 0 : $res->count('id');
     }
 
-    public static function getGroupsRange(string $groupname = '', mixed $active = null): LengthAwarePaginator // @phpstan-ignore missingType.generics
+    public static function getGroupsRange(string $groupname = '', mixed $active = null, bool $withReleaseCounts = false): LengthAwarePaginator // @phpstan-ignore missingType.generics
     {
         $groups = self::query()
             ->select([
@@ -242,7 +242,9 @@ class UsenetGroup extends Model
         }
 
         $page = $groups->paginate(config('nntmux.items_per_page'));
-        self::attachReleaseCounts($page);
+        if ($withReleaseCounts) {
+            self::attachReleaseCounts($page);
+        }
 
         return $page;
     }
