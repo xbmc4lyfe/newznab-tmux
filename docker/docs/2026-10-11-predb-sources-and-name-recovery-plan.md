@@ -21,7 +21,7 @@ Add cheap redundancy and catch gaps when a primary feed is down, without adding 
 
 | Source | Type | New rows seen | Work |
 |---|---|---|---|
-| scnlog.me RSS | HTTP feed | 0 of 40 (all already present) | Config only: reuse `RssFeedSource`, add the endpoint, list the key in `PREDB_FEED_SOURCES` |
+| scnlog.me RSS | HTTP feed | 0 of 40 (all already present) | Small code change: add the key to `PredbFeedSourceFactory::availableKeys()` and map it to an `RssFeedSource` in `makeOne()` (it throws for unknown keys), add the endpoint to `config/predb_feeds.php`, then list the key in `PREDB_FEED_SOURCES` |
 | opentrackers.org `#pre` | IRC | Not measured. The bots relay corrupt-net, zenet, and predb.se, which we already follow | Add a network entry to `config/irc_settings.php` (TLS 6697) and a parser for the `[PRE] [SECTION] name` line |
 | ngp.re live stream | Pusher WebSocket plus HTML fragment | Overlaps the existing ngp IRC feed | Skip unless the IRC feed proves incomplete |
 
@@ -57,9 +57,9 @@ Bottlenecks, ranked by effect:
 
 1. **Size gate.** `min_size_to_post_process` is 50 MB (`AdditionalCandidateQuery.php`, size filter). 1,046,196 pending releases (62% of all) are 1 to 50 MB and are never candidates.
 2. **Fix-names covers only the Other category.** `TmuxTaskRunner.php` runs `releases:fix-names ... --category=other`. That is 212k of 1.69M releases. `FixReleaseNames` already supports `--category=all`.
-3. **Small, infrequent fix-names batches.** `fix_names_per_run` is 100, and the full-backlog passes run at most once per 60 minutes.
+3. **Infrequent full-backlog fix-names passes.** The scheduled passes (`releases:fix-names` methods 3 to 20) read candidates in fixed 1,000-row batches, and the full-backlog (even) levels run at most once per 60 minutes (`tmux.fix_names.full_backlog_interval_minutes`). `fix_names_per_run` (100) is read only by `ForkingService` for `multiprocessing:fixrelnames predbft`, so it does not limit these passes.
 4. **CPU saturation.** The indexer runs near 485% CPU and 83% of its memory, with post-processing at `nice` 19. Thread settings compete: post 16, NFO 10, fix-names 6, binaries 12, backfill 30.
-5. **Per-cycle cap.** At most 16 GUID buckets per cycle and `max_additional_processed` of 100 per bucket, so about 1,600 releases per cycle.
+5. **Per-cycle cap.** At most 16 GUID buckets per cycle, each worker takes up to 4 batches (`--max-batches=4`), and `max_additional_processed` is 100 per batch. With 16 post-processing threads that allows roughly 6,400 releases per cycle; raising the limit to 250 would allow about 16,000, so the CPU and NNTP forecast must use that figure.
 6. **Order.** Newest first, so older releases wait behind the continuous inflow.
 
 ### Spec
@@ -68,20 +68,21 @@ Each step is independent and reversible. Take them in order, and check the metri
 
 **Step 1: settings only (no code).**
 - Lower `min_size_to_post_process` from 50 MB to 10 MB. Watch load and NNTP connection use for an hour before going lower.
-- Raise `fix_names_per_run` from 100 to 500, and `tmux.fix_names.full_backlog_interval_minutes` from 60 to 30.
+- Lower `tmux.fix_names.full_backlog_interval_minutes` from 60 to 30. (Raising `fix_names_per_run` only speeds the PreDB full-text pass, so it is not part of this step.)
 - Rollback: restore the old values; nothing else changes.
 
 **Step 2: let fix-names cover all categories (small code change).**
-- Make the category in `TmuxTaskRunner.php` configurable (`tmux.fix_names.category`, default `other` so behavior is unchanged until set to `all`).
-- Run a one-off `releases:fix-names <levels> --update --category=all` outside peak load, then switch the setting.
+- Make the category in `TmuxTaskRunner.php` configurable: `tmux.fix_names.category` in `config/tmux.php`, backed by a new `TMUX_FIX_NAMES_CATEGORY` key (default `other`, so behavior is unchanged until set to `all`). Add the key with that default and a short comment to `.env.example`.
+- Run a one-off pass outside peak load, then switch the setting. `releases:fix-names` takes one method number from 3 to 20 per call, so loop over them:
+  `for level in 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do php artisan releases:fix-names $level --update --category=all --set-status; done`
 - Tests: the task builds the right command for each value.
 
 **Step 3: relieve CPU.**
 - Decide the trade-off with the owner: more CPU for the indexer, or fewer backfill and post-processing threads while the backlog clears.
-- Do not run Step 3 changes through a full restart storm; deploy through `make -C docker deploy` (see the deploy guard).
+- Apply any change that needs a container restart through one deploy. `make -C docker deploy` comes from the deploy guard PR (xbmc4lyfe/newznab-tmux#27); until that merges, a single designated session runs `make build` and `make up`.
 
 **Step 4: optional tuning after the backlog shrinks.**
-- Raise `max_additional_processed` and `max_nfo_processed` from 100 to 250.
+- Raise `max_additional_processed` and `max_nfo_processed` from 100 to 250 only after re-forecasting load with the per-cycle figure above (up to about 16,000 releases per cycle).
 - Consider oldest-first ordering once inflow slows.
 
 ### Metrics
@@ -110,7 +111,7 @@ Record these before Step 1 and after each step (a saved query is enough):
 
 ## Order of work
 
-1. Merge the deploy guard so deploys stop restarting the stack mid-run.
+1. Merge the deploy guard (#27) so deploys stop restarting the stack mid-run.
 2. Part B step 1 (settings), then measure.
 3. Part B step 2 (code), then the one-off pass.
 4. Part A sources in any order; each is small and independent.
