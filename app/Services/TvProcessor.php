@@ -12,6 +12,8 @@ use App\Services\TvProcessing\Providers\TraktProvider;
 use App\Services\TvProcessing\Providers\TvdbProvider;
 use App\Services\TvProcessing\Providers\TvMazeProvider;
 use App\Support\SqlError;
+use GuzzleHttp\Exception\TransferException;
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Log;
 
 class TvProcessor
@@ -161,9 +163,9 @@ class TvProcessor
                 }
 
                 $processor->processSite($groupID, $guidChar, $processTV);
-            } catch (\Throwable $e) {
-                // An unreachable or rejecting provider (DNS failure, failed login) must not abort the
-                // run: the other providers still get their turn, and the unmatched releases stay
+            } catch (TransferException|ConnectionException $e) {
+                // An unreachable or rejecting provider (DNS failure, failed login, HTTP error) must not
+                // abort the run; database failures and other defects still propagate. The run goes on: the other providers still get their turn, and the unmatched releases stay
                 // pending for the next cycle.
                 Log::warning('TV provider failed, continuing with the next one', [
                     'provider' => $provider['name'],

@@ -3,6 +3,8 @@
 namespace Tests\Feature;
 
 use App\Services\TvProcessor;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Psr7\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Tests\TestCase;
@@ -45,7 +47,7 @@ class TvProcessorProviderFailureTest extends TestCase
         $processor = new TvProcessor(false);
         $providers = [
             ['name' => 'Broken', 'factory' => static function (): never {
-                throw new \RuntimeException('cURL error 6: Could not resolve host: api4.thetvdb.com');
+                throw new ConnectException('cURL error 6: Could not resolve host: api4.thetvdb.com', new Request('POST', 'https://api4.thetvdb.com/v4/login'));
             }, 'status' => 0],
             ['name' => 'Next', 'factory' => static fn () => $recorder('Next'), 'status' => 0],
         ];
@@ -59,5 +61,20 @@ class TvProcessorProviderFailureTest extends TestCase
             static fn (array $context): bool => $context['provider'] === 'Broken'
                 && str_contains($context['message'], 'Could not resolve host'),
         ));
+    }
+
+    public function test_a_provider_defect_that_is_not_an_outage_still_fails_the_worker(): void
+    {
+        $processor = new TvProcessor(false);
+        $property = new \ReflectionProperty($processor, 'providers');
+        $property->setValue($processor, [
+            ['name' => 'Defective', 'factory' => static function (): never {
+                throw new \TypeError('programming error');
+            }, 'status' => 0],
+        ]);
+
+        $this->expectException(\TypeError::class);
+
+        $processor->process('', '', 1);
     }
 }
