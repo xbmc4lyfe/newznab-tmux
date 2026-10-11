@@ -342,6 +342,14 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** `P08: syntax error, unexpected TOK_FIELDLIMIT near ' @searchname (…)'`. The `releases:fix-names predbft` pass searches `name` and `searchname` for every PreDB title, so on 2026-10-11 at 06:33–06:34 UTC it logged 570 of these in two minutes and matched no release. The query reproduces directly against Manticore, and the same query with a single `@@relaxed` succeeds.
 - **Fix (staged):** the terms are built by `buildFieldSearchExpression()`, which prefixes `@@relaxed` once. Single-field queries are unchanged. Covered by `ManticoreFieldSearchExpressionTest`, which fails without the change.
 
+### 47. Configured worker concurrency (79) exceeds the primary provider's connection cap (73) (Open, configuration)
+
+- **Where:** `ingestion_configurations` and `post_processing_configurations` thread settings against `NNTP_CONNECTIONS` (`docker/config/app.env`). Nothing enforces one connection budget across the separate worker pools.
+- **Symptom:** Newshosting answers a burst of logins with `Authentication rejected`, and the affected `articles:get-range` workers exit 1. This happened at 05:20, 05:25, 07:17, 07:21 and 09:14 UTC on 2026-10-11 (4 to 12 workers each), each time `multiprocessing:safe` launched its 12 workers on top of the others. The failed batch is re-queued on the next cycle, so nothing is lost.
+- **Numbers:** binaries/safe 12 + backfill 30 + additional post-processing 16 + NFO 10 + non-additional 3 + Amazon 2 + fix-names 6 = 79 workers that can hold a connection at once, against `NNTP_CONNECTIONS=73` (65 were established at one sample).
+- **Already fixed in code:** the login failure used to throw a `TypeError` and all 10 retries ran within about two seconds (BUGS #45); they now back off, and the error is returned to the caller.
+- **Suggested fix (tuning, not applied):** bring the sum under the cap, for example `backfill_threads` 30 → 24 and `nfo_threads` 10 → 6 (a total of 69), or raise the provider allowance. A shared connection pool across the pools would remove the mismatch for good.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |
