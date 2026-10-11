@@ -190,6 +190,15 @@ class TmuxHealthCheckCommandTest extends TestCase
         $this->artisan('tmux:health-check --auto-restart --session=custom-session')->assertExitCode(1);
     }
 
+    public function test_the_heartbeat_limit_never_drops_below_the_monitor_delay(): void
+    {
+        // A 300-second delay means a healthy heartbeat is up to 300 seconds old between beats.
+        config(['tmux.monitor.delay' => 300]);
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true]);
+        $this->fakeExistingMonitor(dead: false, heartbeat: time() - 250);
+        $this->artisan('tmux:health-check --auto-restart --session=custom-session')->assertExitCode(0);
+    }
+
     public function test_session_probe_reports_missing_even_when_stopped(): void
     {
         $this->fakeMissingSession();
