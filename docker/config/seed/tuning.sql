@@ -24,11 +24,11 @@ UPDATE ingestion_configurations SET
 
 UPDATE post_processing_configurations SET
     -- Additional post-processing (par2, files, NFO, media info) only for releases of 1 GB or more, so the
-    -- queue holds the large releases instead of 1.2M small ones. The candidate query is "size > minimum",
-    -- so the minimum is one byte under 1 GiB to include a release of exactly 1 GiB. The NFO worker has its
-    -- own minimum.
-    min_size_to_post_process = 1073741823,
-    min_size_to_process_nfo = 1073741823,
+    -- queue holds the large releases instead of 1.2M small ones. The candidate query is "size > minimum", so a
+    -- release of exactly 1 GiB is skipped; the round value is kept because the admin settings page rounds
+    -- sizes to whole units on save. The NFO worker has its own minimum.
+    min_size_to_post_process = 1073741824,
+    min_size_to_process_nfo = 1073741824,
     post_threads = 16,
     nfo_threads = 4,
     post_threads_non = 3,
