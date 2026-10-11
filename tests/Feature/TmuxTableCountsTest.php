@@ -172,4 +172,17 @@ final class TmuxTableCountsTest extends TestCase
         $this->assertSame(2, $state->getValue($monitor)['counts']['now']['collections_table']);
         $this->assertFalse($refresh->invoke($monitor), 'Already exact.');
     }
+
+    public function test_a_failed_exact_collections_count_is_retried_without_stopping_the_monitor(): void
+    {
+        DB::statement('DROP TABLE collections');
+        $monitor = (new ReflectionClass(TmuxMonitorService::class))->newInstanceWithoutConstructor();
+        $state = new ReflectionProperty(TmuxMonitorService::class, 'runVar');
+        $isEstimate = new ReflectionProperty(TmuxMonitorService::class, 'collectionsCountIsEstimate');
+        $isEstimate->setValue($monitor, true);
+        $state->setValue($monitor, ['settings' => ['collections_kill' => 2_000_000], 'counts' => ['now' => ['collections_table' => 14_100_000]]]);
+
+        $this->assertFalse((new ReflectionMethod(TmuxMonitorService::class, 'refreshCollectionCountForBackfillControls'))->invoke($monitor));
+        $this->assertTrue($isEstimate->getValue($monitor), 'Still marked as an estimate, so the next loop retries.');
+    }
 }

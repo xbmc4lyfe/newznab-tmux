@@ -311,10 +311,11 @@ class TmuxMonitorService
             // The collections kill switch and progressive backfill decide on this count,
             // so keep it exact when either is on; otherwise it is display-only and can be
             // over 10M rows, so use the row estimate (see Tmux::tableRowCount()).
-            $this->collectionsCountIsEstimate = ! $this->collectionCountDrivesBackfill();
-            $this->runVar['counts']['now']['collections_table'] = $this->collectionsCountIsEstimate
+            $estimate = ! $this->collectionCountDrivesBackfill();
+            $this->runVar['counts']['now']['collections_table'] = $estimate
                 ? $this->tmux->tableRowCount('collections')
                 : Collection::query()->count();
+            $this->collectionsCountIsEstimate = $estimate;
             $this->runVar['counts']['now']['releases'] = Release::query()->count();
 
             foreach ($this->aggregateTableRowCounts($this->tmux->cbpmTableQuery()) as $key => $count) {
@@ -350,7 +351,14 @@ class TmuxMonitorService
             return false;
         }
 
-        $this->runVar['counts']['now']['collections_table'] = Collection::query()->count();
+        try {
+            $this->runVar['counts']['now']['collections_table'] = Collection::query()->count();
+        } catch (\Exception $e) {
+            // Keep the flag set so the next loop retries.
+            logger()->error('Error counting collections for backfill controls: '.$e->getMessage());
+
+            return false;
+        }
         $this->collectionsCountIsEstimate = false;
 
         return true;
