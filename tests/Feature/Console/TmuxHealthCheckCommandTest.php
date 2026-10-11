@@ -183,9 +183,10 @@ class TmuxHealthCheckCommandTest extends TestCase
 
     public function test_the_heartbeat_tolerance_is_configurable(): void
     {
+        // Below the old 60-second floor: a 45-second-old heartbeat must now be stale.
         config(['tmux.monitor.heartbeat_max_age' => 30]);
         ConfigurationTestBuilder::updateRuntime(['tmux_running' => true]);
-        $this->fakeExistingMonitor(dead: false, heartbeat: time() - 90);
+        $this->fakeExistingMonitor(dead: false, heartbeat: time() - 45);
         $this->artisan('tmux:health-check --auto-restart --session=custom-session')->assertExitCode(1);
     }
 
