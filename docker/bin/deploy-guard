@@ -44,6 +44,8 @@ untracked_hashes() {
         else
             git ls-files -o --exclude-standard -z | xargs -0 shasum -a 256 -- 2>/dev/null || true
         fi
+        # Symlinks are hashed and statted through to their target above; also record where each points.
+        git ls-files -o --exclude-standard -z | xargs -0 -n1 sh -c 'if [ -L "$1" ]; then printf "link %s -> %s\n" "$1" "$(readlink "$1")"; fi' _ 2>/dev/null || true
         if stat -c '%a %n' . >/dev/null 2>&1; then
             git ls-files -o --exclude-standard -z | xargs -0 stat -c '%a %n' -- 2>/dev/null || true
         else

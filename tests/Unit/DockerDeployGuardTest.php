@@ -21,12 +21,13 @@ final class DockerDeployGuardTest extends TestCase
     {
         parent::setUp();
 
+        $this->dir = sys_get_temp_dir().'/deploy-guard-'.bin2hex(random_bytes(4));
+        $this->repo = $this->dir.'/repo';
+
         if ((new Process(['git', '--version']))->run() !== 0) {
             $this->markTestSkipped('git is not available.');
         }
 
-        $this->dir = sys_get_temp_dir().'/deploy-guard-'.bin2hex(random_bytes(4));
-        $this->repo = $this->dir.'/repo';
         mkdir($this->repo, 0777, true);
         $this->git('init', '-q');
         $this->git('config', 'user.email', 'test@example.com');
@@ -152,6 +153,23 @@ final class DockerDeployGuardTest extends TestCase
         $this->guard($build, $flags);
 
         $this->assertCount(2, file($this->dir.'/builds'));
+    }
+
+    #[Test]
+    public function retargeting_an_untracked_symlink_counts_as_a_change(): void
+    {
+        $build = ['run', 'build', '--', 'sh', '-c', 'echo x >> '.$this->dir.'/builds'];
+        $flags = ['SKIP_IF_UNCHANGED' => '1', 'STAMP_ON_SUCCESS' => '1'];
+        file_put_contents($this->repo.'/one.txt', "same\n");
+        file_put_contents($this->repo.'/two.txt', "same\n");
+        symlink('one.txt', $this->repo.'/current');
+
+        $this->guard($build, $flags);
+        unlink($this->repo.'/current');
+        symlink('two.txt', $this->repo.'/current');
+        $this->guard($build, $flags);
+
+        $this->assertCount(2, file($this->dir.'/builds'), 'same bytes at the end, different link, so rebuilt');
     }
 
     #[Test]
