@@ -577,7 +577,7 @@ final class ReleaseProcessingService
      */
     private function writeCollectionAggregates(array $changes): void
     {
-        foreach (array_chunk($changes, max(1, $this->binariesConfig->sqlChunkSize)) as $chunk) {
+        foreach (array_chunk($changes, max(1, min(500, $this->binariesConfig->sqlChunkSize))) as $chunk) {
             $set = ['filesize' => [], 'totalfiles' => [], 'filecheck' => []];
             $guard = [];
             $bindings = ['filesize' => [], 'totalfiles' => [], 'filecheck' => [], 'guard' => [], 'ids' => []];
@@ -588,7 +588,7 @@ final class ReleaseProcessingService
                     $set[$column][] = 'WHEN ? THEN ?';
                     array_push($bindings[$column], $change['id'], $value);
                 }
-                $guard[] = '(id = ? AND filecheck = ? AND totalfiles = ? AND filesize = ?)';
+                $guard[] = 'WHEN ? THEN (filecheck = ? AND totalfiles = ? AND filesize = ?)';
                 array_push($bindings['guard'], $change['id'], $oldCheck, $oldTotal, $oldSize);
                 $bindings['ids'][] = $change['id'];
             }
@@ -598,7 +598,8 @@ final class ReleaseProcessingService
                 .'filesize = CASE id '.implode(' ', $set['filesize']).' END, '
                 .'totalfiles = CASE id '.implode(' ', $set['totalfiles']).' END, '
                 .'filecheck = CASE id '.implode(' ', $set['filecheck']).' END '
-                ."WHERE id IN ({$placeholders}) AND (".implode(' OR ', $guard).')',
+                // A flat CASE rather than a chain of ORs, which SQLite rejects past ~1000 terms.
+                ."WHERE id IN ({$placeholders}) AND CASE id ".implode(' ', $guard).' ELSE 0 END',
                 [...$bindings['filesize'], ...$bindings['totalfiles'], ...$bindings['filecheck'], ...$bindings['ids'], ...$bindings['guard']]
             );
         }

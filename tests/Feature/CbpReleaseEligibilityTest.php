@@ -359,6 +359,21 @@ class CbpReleaseEligibilityTest extends TestCase
         $this->assertSame(3, $updates, 'Five changed collections in batches of two: three UPDATEs, not five.');
     }
 
+    public function test_reconcile_handles_the_largest_configured_batches(): void
+    {
+        $rows = [];
+        foreach (range(1, 1001) as $i) {
+            $rows[] = ['groups_id' => 1, 'totalfiles' => 2, 'dateadded' => now()->subHours(3)->format('Y-m-d H:i:s'), 'added' => now()->subHours(3)->format('Y-m-d H:i:s')];
+        }
+        foreach (array_chunk($rows, 200) as $chunk) {
+            DB::table('collections')->insert($chunk);
+        }
+
+        (new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 1000, reconcileBatchSize: 2000)))->processIncompleteCollections(1);
+
+        $this->assertSame(1001, DB::table('collections')->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)->count());
+    }
+
     private function process(?int $groupId): void
     {
         $processor = new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 2, reconcileBatchSize: 2));
