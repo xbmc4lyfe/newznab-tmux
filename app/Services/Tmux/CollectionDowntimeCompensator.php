@@ -52,8 +52,8 @@ final class CollectionDowntimeCompensator
      */
     public function recordActivity(): void
     {
-        $this->withLockedMarker(function ($marker): void {
-            $this->writeMarker($marker, Carbon::now('UTC')->getTimestamp());
+        $this->withLockedMarker(function (): void {
+            $this->writeMarker(Carbon::now('UTC')->getTimestamp());
         });
     }
 
@@ -90,10 +90,8 @@ final class CollectionDowntimeCompensator
      */
     public function compensate(int $delayHours): int
     {
-        return $this->withLockedMarker(function ($marker) use ($delayHours): int {
-            rewind($marker);
-            $value = trim((string) stream_get_contents($marker));
-            $lastActive = ctype_digit($value) ? (int) $value : null;
+        return $this->withLockedMarker(function () use ($delayHours): int {
+            $lastActive = $this->lastActivity();
             $now = Carbon::now('UTC')->getTimestamp();
 
             if ($lastActive !== null && $now - $lastActive < self::MIN_DOWNTIME_SECONDS) {
@@ -103,7 +101,7 @@ final class CollectionDowntimeCompensator
             // Record the new start before touching rows: if this run dies partway, the next
             // start sees a short downtime and skips, so rows can be under-compensated but
             // never shifted twice. Unknown downtime changes nothing.
-            $this->writeMarker($marker, $now);
+            $this->writeMarker($now);
             if ($lastActive === null) {
                 return 0;
             }
@@ -294,7 +292,7 @@ final class CollectionDowntimeCompensator
     /**
      * @template TResult
      *
-     * @param  callable(resource): TResult  $work
+     * @param  callable(): TResult  $work
      * @return TResult
      */
     private function withLockedMarker(callable $work): mixed
@@ -303,7 +301,7 @@ final class CollectionDowntimeCompensator
         if (! is_dir($directory)) {
             @mkdir($directory, 0775, true);
         }
-        $marker = fopen($this->markerPath, 'c+');
+        $marker = fopen($this->markerPath.'.lock', 'c+');
         if ($marker === false) {
             throw new \RuntimeException("Unable to open {$this->markerPath}.");
         }
@@ -313,7 +311,7 @@ final class CollectionDowntimeCompensator
                 throw new \RuntimeException("Unable to lock {$this->markerPath}.");
             }
 
-            return $work($marker);
+            return $work();
         } finally {
             flock($marker, LOCK_UN);
             fclose($marker);
@@ -321,17 +319,40 @@ final class CollectionDowntimeCompensator
     }
 
     /**
-     * @param  resource  $marker
+     * Publish only a complete, flushed timestamp. The separate lock file is never
+     * replaced, so waiters still serialize against the same inode after publication.
      */
-    private function writeMarker($marker, int $timestamp): void
+    private function writeMarker(int $timestamp): void
     {
-        $value = (string) $timestamp;
-        // Callers rely on the marker being saved before any row moves, so fail loudly.
-        // Overwrite in place, then trim: a failed write leaves the old timestamp (all are
-        // the same length) rather than an empty marker.
-        if (! rewind($marker) || fwrite($marker, $value) !== \strlen($value)
-            || ! ftruncate($marker, \strlen($value)) || ! fflush($marker)) {
+        $directory = \dirname($this->markerPath);
+        $temporary = tempnam($directory, 'activity-');
+        if ($temporary === false) {
             throw new \RuntimeException("Unable to write {$this->markerPath}.");
+        }
+
+        try {
+            if (\dirname($temporary) !== realpath($directory)) {
+                throw new \RuntimeException("Unable to write {$this->markerPath} in its directory.");
+            }
+            $stream = fopen($temporary, 'wb');
+            if ($stream === false) {
+                throw new \RuntimeException("Unable to write {$this->markerPath}.");
+            }
+            try {
+                $value = (string) $timestamp;
+                if (fwrite($stream, $value) !== \strlen($value) || ! fflush($stream) || ! fsync($stream)) {
+                    throw new \RuntimeException("Unable to write {$this->markerPath}.");
+                }
+            } finally {
+                fclose($stream);
+            }
+            if (! rename($temporary, $this->markerPath)) {
+                throw new \RuntimeException("Unable to replace {$this->markerPath}.");
+            }
+        } finally {
+            if (is_file($temporary)) {
+                unlink($temporary);
+            }
         }
     }
 }

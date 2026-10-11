@@ -10,7 +10,10 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Tests\Support\MarkerIoFailures;
 use Tests\TestCase;
+
+require_once __DIR__.'/../Support/MarkerIoFailures.php';
 
 final class CollectionDowntimeCompensatorTest extends TestCase
 {
@@ -31,8 +34,11 @@ final class CollectionDowntimeCompensatorTest extends TestCase
 
     protected function tearDown(): void
     {
+        MarkerIoFailures::$shortWrite = false;
+        MarkerIoFailures::$renameFails = false;
         Schema::dropIfExists('collections');
         @unlink($this->marker);
+        @unlink($this->marker.'.lock');
         @rmdir(\dirname($this->marker));
 
         parent::tearDown();
@@ -100,6 +106,47 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         $this->compensator()->recordActivity();
 
         $this->assertSame(Carbon::now()->getTimestamp(), $this->compensator()->lastActivity());
+    }
+
+    public function test_a_short_marker_write_preserves_the_outage_and_leaves_collections_untouched(): void
+    {
+        $previous = Carbon::now('UTC')->subHour()->getTimestamp();
+        $this->lastActive($previous);
+        $waiting = $this->collection('2026-10-11 10:30:00');
+        MarkerIoFailures::$shortWrite = true;
+
+        try {
+            $this->compensator()->compensate(2);
+            $this->fail('A partial marker write must abort compensation.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('Unable to write', $exception->getMessage());
+        } finally {
+            MarkerIoFailures::$shortWrite = false;
+        }
+
+        $this->assertSame($previous, $this->compensator()->lastActivity());
+        $this->assertSame('2026-10-11 10:30:00', $this->dateAdded($waiting));
+        $this->assertSame(1, $this->compensator()->compensate(2));
+        $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting));
+    }
+
+    public function test_a_failed_marker_replacement_preserves_the_previous_timestamp(): void
+    {
+        $previous = Carbon::now('UTC')->subHour()->getTimestamp();
+        $this->lastActive($previous);
+        MarkerIoFailures::$renameFails = true;
+
+        try {
+            $this->compensator()->recordActivity();
+            $this->fail('A failed replacement must abort the activity update.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('Unable to replace', $exception->getMessage());
+        } finally {
+            MarkerIoFailures::$renameFails = false;
+        }
+
+        $this->assertSame($previous, $this->compensator()->lastActivity());
+        $this->assertSame([], glob(\dirname($this->marker).'/activity-*'));
     }
 
     public function test_work_follows_the_waiting_window_not_the_id_range(): void
