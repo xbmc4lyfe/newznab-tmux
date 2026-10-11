@@ -73,7 +73,9 @@ Work proceeds from small contract corrections to broader operational decisions. 
 - [x] Clear the three movie lookup findings by using the Trakt provider's nullable result contract. `movie_null_fallbacks`: 20 tests / 48 assertions; full PHPStan clean.
 - [x] Clear the remaining three findings: preflight index-name return type and obsolete User/Trakt suppressions. Preflight/Trakt tests pass; full PHPStan clean.
 - [x] Finish the full regression suite and stage only this task's files. Pint, full PHPStan (zero errors), all-app/changed-test syntax lint, and independent source review pass.
-- [ ] Review, commit/push, and deploy these follow-up corrections separately from PR #57.
+- [x] Commit/push the follow-up corrections and open [PR #59](https://github.com/xbmc4lyfe/newznab-tmux/pull/59).
+- [ ] Complete current-head CI and thorough independent/Codex review of PR #59; resolve any findings.
+- [ ] Merge and deploy the reviewed follow-up corrections separately from PR #57.
 - [ ] Compare rename completion with release arrival rate and determine why historical probes mostly defer. Keep checkpoints/retry eligibility intact while evaluating efficiency.
 - [ ] Evaluate collection churn options above with evidence that large/slow uploads remain recoverable.
 - [ ] Re-enable the seven paused groups only after the backlog/churn recovery conditions are met.
@@ -86,4 +88,4 @@ Monitor baseline for the next comparison (2026-10-11 22:46:54 UTC): the Renames 
 
 Monitor comparison captured 2026-10-11 22:52:44 UTC: 465,869 unmatched (+34 versus baseline) and 24,334 matched (+17). In this short window names continue to recover, but unmatched rename work is still growing; measuring arrival rate and historical probe efficiency remains the next operational priority.
 
-Follow-up correction verification: all ten PHPStan findings are cleared; full analysis of 849 files reports zero errors with no added baseline entries. The complete local PHPUnit suite passes 2,671 tests and 21,108 assertions, with 93 existing skips and 54 PHPUnit notices. Pint, PHP syntax lint, and independent source review pass. The correction batch is prepared on `codex/phpstan-backlog-cleanup` and remains separate from the deployed rename redesign. PR review and release delivery are tracked above.
+Follow-up correction verification: all ten PHPStan findings are cleared; full analysis of 849 files reports zero errors with no added baseline entries. The complete local PHPUnit suite passes 2,671 tests and 21,108 assertions, with 93 existing skips and 54 PHPUnit notices. Pint, PHP syntax lint, and independent source review pass. The correction batch is prepared on `codex/phpstan-backlog-cleanup` and remains separate from the deployed rename redesign. The correction batch is published in [PR #59](https://github.com/xbmc4lyfe/newznab-tmux/pull/59); current-head CI/review and release delivery are tracked above.
