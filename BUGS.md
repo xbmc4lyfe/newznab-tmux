@@ -198,7 +198,7 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** on 2026-10-10, zenet and corrupt-net added about 20 pres between 00:43 and 00:47 UTC, but the database credited almost all of them to `srrdb`.
 - **Fix (staged):** an update only sets `source` when the row has none, matching `PredbFeedImporter`.
 
-### 36. Releases keep raw `[01/10] - "file.ext" yEnc` subjects as their names (Fixed)
+### 38. Releases keep raw `[01/10] - "file.ext" yEnc` subjects as their names (Fixed)
 
 - **Where:** `ReleaseCleaningService::generic()` (`app/Services/ReleaseCleaningService.php`), the fallback when no `release_naming_regexes` entry matches the group. It only stripped a trailing ` yEnc`. `fixerCleaner()` also missed hyphenated PAR2 volumes such as `.vol01-03.par2`.
 - **Symptom:** on 2026-10-10, 602,486 of 978,711 releases (62%) had search names like `[1/9] - "Shes.the.Man.2006.BluRay.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR.par2"`. About 44,000 of them carried real release names in Movies, TV, 0day and Misc. Because they were categorized from the raw subject, the fix-names passes (`--category=other`) never looked at them, and their names never matched PreDB.
