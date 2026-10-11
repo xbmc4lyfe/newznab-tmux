@@ -14,6 +14,7 @@ use App\Services\Releases\ReleaseBrowseService;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\QueryException;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
@@ -216,19 +217,31 @@ abstract class AbstractTvProvider extends BaseVideoProvider
             $existingVideo = Video::query()->where('title', $show['title'])->first(['id']);
             if ($existingVideo === null) {
                 // Insert the Show using Eloquent create() to trigger VideoObserver
-                $video = Video::create([
-                    'type' => $show['type'],
-                    'title' => $show['title'],
-                    'countries_id' => $show['country'] ?? '',
-                    'started' => $show['started'],
-                    'source' => $show['source'],
-                    'tvdb' => $show['tvdb'],
-                    'trakt' => $show['trakt'],
-                    'tvrage' => $show['tvrage'],
-                    'tvmaze' => $show['tvmaze'],
-                    'imdb' => $show['imdb'],
-                    'tmdb' => $show['tmdb'],
-                ]);
+                try {
+                    $video = Video::create([
+                        'type' => $show['type'],
+                        'title' => $show['title'],
+                        'countries_id' => $show['country'] ?? '',
+                        'started' => $show['started'],
+                        'source' => $show['source'],
+                        'tvdb' => $show['tvdb'],
+                        'trakt' => $show['trakt'],
+                        'tvrage' => $show['tvrage'],
+                        'tvmaze' => $show['tvmaze'],
+                        'imdb' => $show['imdb'],
+                        'tmdb' => $show['tmdb'],
+                    ]);
+                } catch (UniqueConstraintViolationException $e) {
+                    // Another worker inserted the same show between the lookup above and this insert:
+                    // use its row and update it instead of failing the whole batch.
+                    $racedVideo = Video::query()->where('title', $show['title'])->first(['id']);
+                    if ($racedVideo === null) {
+                        throw $e;
+                    }
+                    $this->update((int) $racedVideo->id, $show);
+
+                    return (int) $racedVideo->id;
+                }
                 $videoId = $video->id;
                 // Insert the supplementary show info
                 TvInfo::query()->insertOrIgnore([
