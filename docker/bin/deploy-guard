@@ -1,0 +1,99 @@
+#!/bin/sh
+# Deploy guard for the docker/ stack: one deploy at a time, a log of who deployed what, and no
+# rebuild when nothing changed.
+#
+#   deploy-guard run <target> -- <command...>
+#
+# Environment:
+#   DEPLOY_BY            who is deploying (a session or person name); logged. Default: the login user.
+#   SKIP_IF_UNCHANGED=1  skip the command when the tree matches the last stamped deploy.
+#   STAMP_ON_SUCCESS=1   record the tree fingerprint after the command succeeds.
+#   REQUIRE_IMAGE=<ref>  with SKIP_IF_UNCHANGED, only skip while this docker image still exists.
+#   FORCE=1              never skip.
+#   DEPLOY_LOCK_DIR, DEPLOY_LOG, DEPLOY_STAMP, DEPLOY_REPO  override the default paths (tests).
+#
+# Exit status: the command's, or 75 when another deploy holds the lock.
+set -eu
+
+DIR=$(cd "$(dirname "$0")/.." && pwd)
+REPO="${DEPLOY_REPO:-$(cd "$DIR/.." && pwd)}"
+LOCK="${DEPLOY_LOCK_DIR:-$DIR/.deploy.lock}"
+LOG="${DEPLOY_LOG:-$DIR/.deploy.log}"
+STAMP="${DEPLOY_STAMP:-$DIR/.deploy.stamp}"
+BY="${DEPLOY_BY:-$(id -un)}"
+
+hash_stdin() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
+}
+
+# HEAD plus uncommitted changes plus the names of untracked files: the image bakes the working tree.
+fingerprint() {
+    head=$(git -C "$REPO" rev-parse HEAD)
+    diff=$(git -C "$REPO" diff HEAD | hash_stdin)
+    untracked=$(git -C "$REPO" ls-files -o --exclude-standard | hash_stdin)
+    echo "$head $diff $untracked"
+}
+
+log() {
+    printf '%s %s by=%s user=%s head=%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$BY" "$(id -un)" \
+        "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)" "${2:-}" >>"$LOG"
+}
+
+release() {
+    rm -rf "$LOCK"
+}
+
+acquire() {
+    target=$1
+    if ! mkdir "$LOCK" 2>/dev/null; then
+        owner_pid=$(sed -n 's/^pid=//p' "$LOCK/owner" 2>/dev/null || true)
+        if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
+            echo "deploy-guard: another deploy is running ($(tr '\n' ' ' <"$LOCK/owner")); leaving the stack alone." >&2
+            exit 75
+        fi
+        echo "deploy-guard: removing a stale lock" >&2
+        rm -rf "$LOCK"
+        mkdir "$LOCK" 2>/dev/null || { echo "deploy-guard: lost the lock race; leaving the stack alone." >&2; exit 75; }
+    fi
+    printf 'pid=%s\nby=%s\ntarget=%s\nsince=%s\n' "$$" "$BY" "$target" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$LOCK/owner"
+}
+
+unchanged() {
+    [ "${FORCE:-0}" != 1 ] || return 1
+    [ "${SKIP_IF_UNCHANGED:-0}" = 1 ] || return 1
+    [ -f "$STAMP" ] || return 1
+    [ "$(cat "$STAMP")" = "$(fingerprint)" ] || return 1
+    if [ -n "${REQUIRE_IMAGE:-}" ]; then
+        docker image inspect "$REQUIRE_IMAGE" >/dev/null 2>&1 || return 1
+    fi
+}
+
+cmd_run() {
+    [ "$#" -ge 3 ] || { echo "usage: deploy-guard run <target> -- <command...>" >&2; exit 64; }
+    target=$1
+    shift
+    [ "$1" = -- ] && shift
+
+    acquire "$target"
+    trap release EXIT
+    trap 'exit 130' INT TERM
+
+    if unchanged; then
+        log "$target" "result=skipped (nothing changed since the last deploy; FORCE=1 to override)"
+        echo "deploy-guard: nothing changed since the last $target; skipping (FORCE=1 to override)."
+        exit 0
+    fi
+
+    log "$target" "result=started"
+    if "$@"; then rc=0; else rc=$?; fi
+    if [ "$rc" -eq 0 ] && [ "${STAMP_ON_SUCCESS:-0}" = 1 ]; then
+        fingerprint >"$STAMP"
+    fi
+    log "$target" "result=finished rc=$rc"
+    exit "$rc"
+}
+
+case "${1:-}" in
+    run) shift; cmd_run "$@" ;;
+    *) echo "usage: deploy-guard run <target> -- <command...>" >&2; exit 64 ;;
+esac
