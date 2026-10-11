@@ -19,124 +19,128 @@ final class CandidateRepository
 
     public function archive(int $collectionId): void
     {
-        DB::transaction(function () use ($collectionId): void {
-            $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
-            $collection = DB::table('collections')->where('id', $collectionId)->lockForUpdate()->first();
-            if ($collection === null) {
-                return;
-            }
-            if ((int) $collection->filecheck === 4
-                && ! $this->cleanup->verificationEligibleCollections()->where('collections.id', $collectionId)->exists()) {
-                return;
-            }
-            if ($state === null) {
-                throw new RuntimeException('Verification migration has not initialized capacity state.');
-            }
-            $sourceIdentity = bin2hex($collection->collectionhash);
-            $existing = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
-                ->orderByDesc('id')->lockForUpdate()->first();
-            $identity = $existing->identity ?? $sourceIdentity;
-            if ($existing !== null && $existing->release_id !== null) {
-                $identity = sha1($sourceIdentity.':generation:'.$existing->id);
-                $existing = null;
-            }
-            $manifest = $this->snapshot($collection);
-            $newArticles = true;
-            if ($existing !== null && $existing->manifest_path !== '') {
-                $oldManifest = $this->store->read($existing->manifest_path);
-                $manifest = $this->merge($oldManifest, $manifest);
-                $newArticles = $this->articleIdentity($oldManifest) !== $this->articleIdentity($manifest);
-            }
-            $path = $this->store->write($manifest);
-            $size = filesize($this->store->path($path));
-            if ($size === false) {
-                throw new RuntimeException('Cannot reserve manifest storage.');
-            }
-            $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
-            $lastUniqueAt = $existing === null ? $arrivalAt : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
-            $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
-            $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + ($expired ? 0 : $size);
-            if ($pending > (int) config('release_verification.pending_bytes')) {
-                if ($existing === null || $existing->manifest_path !== $path) {
-                    $this->store->deleteIfUnreferenced($path);
+        app(VerificationResetService::class)->withAdmission(function () use ($collectionId): void {
+            DB::transaction(function () use ($collectionId): void {
+                $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                $collection = DB::table('collections')->where('id', $collectionId)->lockForUpdate()->first();
+                if ($collection === null) {
+                    return;
                 }
-                throw new RuntimeException('Pending verification capacity is full; original headers retained.');
-            }
-            $changed = $existing === null || $existing->manifest_path !== $path;
-            $dirty = $existing !== null && $existing->status === 'dirty';
-            $values = ['identity' => $identity, 'source_identity' => $sourceIdentity, 'groups_id' => (int) $collection->groups_id, 'manifest_path' => $path,
-                'manifest_bytes' => $size, 'manifest_hash' => substr($path, 0, 64)];
-            if ($changed || $dirty) {
-                $values += ['version' => (int) ($existing->version ?? 0) + 1, 'last_unique_at' => $lastUniqueAt,
-                    'next_attempt_at' => now(), 'status' => 'pending', 'lease_token' => null, 'lease_until' => null, 'reason' => null];
-            }
-            if ($expired) {
-                $values = array_replace($values, ['status' => 'expired', 'last_unique_at' => $lastUniqueAt,
-                    'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
-            }
-            if ($existing === null) {
-                $candidateId = DB::table('release_verification_candidates')->insertGetId($values);
-            } else {
-                $candidateId = (int) $existing->id;
-                DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
-            }
-            DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
-            $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false, manifestArchived: true);
-            if ($expired) {
-                $expiredVersion = (int) ($values['version'] ?? $existing->version ?? 1);
-                DB::afterCommit(function () use ($path, $candidateId, $expiredVersion): void {
-                    $this->store->deleteIfUnreferenced($path);
-                    $this->deleteScratchThroughVersion($candidateId, $expiredVersion);
-                });
-            }
-            if ($existing !== null && $existing->manifest_path !== $path) {
-                DB::afterCommit(function () use ($existing): void {
-                    $this->store->deleteIfUnreferenced($existing->manifest_path);
-                });
-            }
-        }, 5);
+                if ((int) $collection->filecheck === 4
+                    && ! $this->cleanup->verificationEligibleCollections()->where('collections.id', $collectionId)->exists()) {
+                    return;
+                }
+                if ($state === null) {
+                    throw new RuntimeException('Verification migration has not initialized capacity state.');
+                }
+                $sourceIdentity = bin2hex($collection->collectionhash);
+                $existing = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
+                    ->orderByDesc('id')->lockForUpdate()->first();
+                $identity = $existing->identity ?? $sourceIdentity;
+                if ($existing !== null && $existing->release_id !== null) {
+                    $identity = sha1($sourceIdentity.':generation:'.$existing->id);
+                    $existing = null;
+                }
+                $manifest = $this->snapshot($collection);
+                $newArticles = true;
+                if ($existing !== null && $existing->manifest_path !== '') {
+                    $oldManifest = $this->store->read($existing->manifest_path);
+                    $manifest = $this->merge($oldManifest, $manifest);
+                    $newArticles = $this->articleIdentity($oldManifest) !== $this->articleIdentity($manifest);
+                }
+                $path = $this->store->write($manifest);
+                $size = filesize($this->store->path($path));
+                if ($size === false) {
+                    throw new RuntimeException('Cannot reserve manifest storage.');
+                }
+                $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
+                $lastUniqueAt = $existing === null ? $arrivalAt : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
+                $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
+                $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + ($expired ? 0 : $size);
+                if ($pending > (int) config('release_verification.pending_bytes')) {
+                    if ($existing === null || $existing->manifest_path !== $path) {
+                        $this->store->deleteIfUnreferenced($path);
+                    }
+                    throw new RuntimeException('Pending verification capacity is full; original headers retained.');
+                }
+                $changed = $existing === null || $existing->manifest_path !== $path;
+                $dirty = $existing !== null && $existing->status === 'dirty';
+                $values = ['identity' => $identity, 'source_identity' => $sourceIdentity, 'groups_id' => (int) $collection->groups_id, 'manifest_path' => $path,
+                    'manifest_bytes' => $size, 'manifest_hash' => substr($path, 0, 64)];
+                if ($changed || $dirty) {
+                    $values += ['version' => (int) ($existing->version ?? 0) + 1, 'last_unique_at' => $lastUniqueAt,
+                        'next_attempt_at' => now(), 'status' => 'pending', 'lease_token' => null, 'lease_until' => null, 'reason' => null];
+                }
+                if ($expired) {
+                    $values = array_replace($values, ['status' => 'expired', 'last_unique_at' => $lastUniqueAt,
+                        'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
+                }
+                if ($existing === null) {
+                    $candidateId = DB::table('release_verification_candidates')->insertGetId($values);
+                } else {
+                    $candidateId = (int) $existing->id;
+                    DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
+                }
+                DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
+                $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false, manifestArchived: true);
+                if ($expired) {
+                    $expiredVersion = (int) ($values['version'] ?? $existing->version ?? 1);
+                    DB::afterCommit(function () use ($path, $candidateId, $expiredVersion): void {
+                        $this->store->deleteIfUnreferenced($path);
+                        $this->deleteScratchThroughVersion($candidateId, $expiredVersion);
+                    });
+                }
+                if ($existing !== null && $existing->manifest_path !== $path) {
+                    DB::afterCommit(function () use ($existing): void {
+                        $this->store->deleteIfUnreferenced($existing->manifest_path);
+                    });
+                }
+            }, 5);
+        });
     }
 
     /** @param array<string, mixed> $manifest */
     public function enqueue(array $manifest): void
     {
-        DB::transaction(function () use ($manifest): void {
-            $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
-            $identity = (string) $manifest['identity'];
-            $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
-            if ($existing !== null && ($existing->release_id === null
-                || DB::table('releases')->where('id', $existing->release_id)->lockForUpdate()->first(['id']) !== null)) {
-                return;
-            }
-            if ($state === null) {
-                throw new RuntimeException('Verification migration has not initialized capacity state.');
-            }
-            $path = $this->store->write($manifest);
-            $bytes = (int) filesize($this->store->path($path));
-            $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + $bytes;
-            if ($pending > (int) config('release_verification.pending_bytes')) {
-                if ($existing === null || $existing->manifest_path !== $path) {
-                    $this->store->deleteIfUnreferenced($path);
+        app(VerificationResetService::class)->withAdmission(function () use ($manifest): void {
+            DB::transaction(function () use ($manifest): void {
+                $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                $identity = (string) $manifest['identity'];
+                $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
+                if ($existing !== null && ($existing->release_id === null
+                    || DB::table('releases')->where('id', $existing->release_id)->lockForUpdate()->first(['id']) !== null)) {
+                    return;
                 }
-                throw new RuntimeException('Candidate capacity is full; import retained for retry.');
-            }
-            $values = ['identity' => $identity, 'source_identity' => $identity,
-                'groups_id' => (int) $manifest['groups_id'], 'manifest_path' => $path, 'manifest_bytes' => $bytes,
-                'manifest_hash' => substr($path, 0, 64), 'last_unique_at' => now(), 'next_attempt_at' => now(),
-                'version' => (int) ($existing->version ?? 0) + 1, 'status' => 'pending', 'reason' => null,
-                'release_id' => null, 'verified_at' => null, 'lease_token' => null, 'lease_until' => null];
-            if ($existing === null) {
-                DB::table('release_verification_candidates')->insert($values);
-            } else {
-                DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
-                if ($existing->manifest_path !== '' && $existing->manifest_path !== $path) {
-                    DB::afterCommit(function () use ($existing): void {
-                        $this->store->deleteIfUnreferenced($existing->manifest_path);
-                    });
+                if ($state === null) {
+                    throw new RuntimeException('Verification migration has not initialized capacity state.');
                 }
-            }
-            DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
-        }, 5);
+                $path = $this->store->write($manifest);
+                $bytes = (int) filesize($this->store->path($path));
+                $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + $bytes;
+                if ($pending > (int) config('release_verification.pending_bytes')) {
+                    if ($existing === null || $existing->manifest_path !== $path) {
+                        $this->store->deleteIfUnreferenced($path);
+                    }
+                    throw new RuntimeException('Candidate capacity is full; import retained for retry.');
+                }
+                $values = ['identity' => $identity, 'source_identity' => $identity,
+                    'groups_id' => (int) $manifest['groups_id'], 'manifest_path' => $path, 'manifest_bytes' => $bytes,
+                    'manifest_hash' => substr($path, 0, 64), 'last_unique_at' => now(), 'next_attempt_at' => now(),
+                    'version' => (int) ($existing->version ?? 0) + 1, 'status' => 'pending', 'reason' => null,
+                    'release_id' => null, 'verified_at' => null, 'lease_token' => null, 'lease_until' => null];
+                if ($existing === null) {
+                    DB::table('release_verification_candidates')->insert($values);
+                } else {
+                    DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
+                    if ($existing->manifest_path !== '' && $existing->manifest_path !== $path) {
+                        DB::afterCommit(function () use ($existing): void {
+                            $this->store->deleteIfUnreferenced($existing->manifest_path);
+                        });
+                    }
+                }
+                DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
+            }, 5);
+        });
     }
 
     /** @param list<int> $ids */

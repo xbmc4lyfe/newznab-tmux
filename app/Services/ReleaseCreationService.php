@@ -10,10 +10,10 @@ use App\Models\Collection;
 use App\Models\Predb;
 use App\Models\Release;
 use App\Models\ReleaseRegex;
-use App\Models\UsenetGroup;
 use App\Services\Categorization\CategorizationService;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Services\Releases\ReleaseGroupResolver;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Support\Utf8;
 use Illuminate\Support\Facades\DB;
@@ -256,28 +256,7 @@ class ReleaseCreationService
         foreach ($namesByCollection as $names) {
             $allNames += $names;
         }
-        $idsByName = UsenetGroup::query()
-            ->whereIn('name', array_keys($allNames))
-            ->pluck('id', 'name')
-            ->map(static fn ($id): int => (int) $id)
-            ->all();
-        foreach (array_keys($allNames) as $name) {
-            $validName = UsenetGroup::isValidGroup($name);
-            if ($validName === false || isset($idsByName[$validName])) {
-                continue;
-            }
-            $idsByName[$validName] = (int) UsenetGroup::addGroup([
-                'name' => $validName,
-                'description' => 'Added by Release processing',
-                'backfill_target' => 1,
-                'first_record' => 0,
-                'last_record' => 0,
-                'active' => 0,
-                'backfill' => 0,
-                'minfilestoformrelease' => '',
-                'minsizetoformrelease' => '',
-            ]);
-        }
+        $idsByName = app(ReleaseGroupResolver::class)->idsByName(array_keys($allNames));
 
         $resolved = [];
         foreach ($namesByCollection as $collectionId => $names) {
@@ -287,6 +266,11 @@ class ReleaseCreationService
                 }
             }
         }
+
+        foreach ($resolved as &$ids) {
+            $ids = array_values(array_unique($ids));
+        }
+        unset($ids);
 
         return $resolved;
     }

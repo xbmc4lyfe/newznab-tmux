@@ -9,6 +9,7 @@ use App\Models\Release;
 use App\Models\ReleaseRegex;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Services\Releases\ReleaseGroupResolver;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use RuntimeException;
@@ -63,14 +64,13 @@ final class VerifiedReleasePublisher
                     throw new RuntimeException('Legacy release identity changed before publication.');
                 }
             }
-            [$duplicate] = $legacy === null
-                ? $this->duplicates->findDuplicate($metadata['name'], $metadata['searchname'], $metadata['predb_id'], $size) : [null];
-            $publishedDuplicate = $duplicate === null ? null : DB::table('releases')->where('id', $duplicate->id)
-                ->where('nzbstatus', NzbService::NZB_ADDED)->lockForUpdate()->first(['id', 'guid']);
-            if ($publishedDuplicate !== null && $this->writer->matches($manifest, (string) $publishedDuplicate->guid)) {
-                $this->markPublished($candidate->id, (int) $publishedDuplicate->id, $result);
+            $duplicateId = $legacy === null ? $this->findExactDuplicate($claim, $manifest, $metadata, $size) : null;
+            if ($duplicateId !== null) {
+                $this->recordGroups($duplicateId, $manifest['groups']);
+                app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
+                $this->markPublished($candidate->id, $duplicateId, $result);
 
-                return (int) $publishedDuplicate->id;
+                return $duplicateId;
             }
             $guid = $legacy === null ? (string) Str::uuid() : (string) $legacy->guid;
             $path = $this->writer->write($manifest, $guid);
@@ -97,13 +97,49 @@ final class VerifiedReleasePublisher
             }
             ReleaseRegex::insertOrIgnore(['releases_id' => $id, 'collection_regex_id' => $manifest['regex_id'],
                 'naming_regex_id' => $metadata['naming_regex_id']]);
-            foreach (DB::table('usenet_groups')->whereIn('name', $manifest['groups'])->pluck('id') as $groupId) {
-                DB::table('releases_groups')->insertOrIgnore(['releases_id' => $id, 'groups_id' => $groupId]);
-            }
+            $this->recordGroups((int) $id, $manifest['groups']);
+            app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
             $this->markPublished($candidate->id, (int) $id, $result);
 
             return (int) $id;
         }, 5);
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @param  array<string, mixed>  $metadata
+     */
+    private function findExactDuplicate(object $claim, array $manifest, array $metadata, int $size): ?int
+    {
+        $lastHeartbeat = 0.0;
+        $repository = app(CandidateRepository::class);
+        foreach ($this->duplicates->publishedCandidates($metadata['name'], $metadata['searchname'], $metadata['predb_id'], $size) as $duplicate) {
+            if (microtime(true) - $lastHeartbeat >= 1) {
+                $repository->heartbeat((int) $claim->id, $claim->lease_token);
+                $lastHeartbeat = microtime(true);
+            }
+            if (! $this->writer->matches($manifest, (string) $duplicate->guid)) {
+                continue;
+            }
+            $current = DB::table('releases')->where('id', $duplicate->id)->where('nzbstatus', NzbService::NZB_ADDED)
+                ->lockForUpdate()->first(['id', 'guid']);
+            if ($current !== null && $this->writer->matches($manifest, (string) $current->guid)) {
+                $repository->heartbeat((int) $claim->id, $claim->lease_token);
+
+                return (int) $current->id;
+            }
+        }
+        $repository->heartbeat((int) $claim->id, $claim->lease_token);
+
+        return null;
+    }
+
+    /** @param list<string> $names */
+    private function recordGroups(int $releaseId, array $names): void
+    {
+        foreach (array_unique(app(ReleaseGroupResolver::class)->idsByName($names)) as $groupId) {
+            DB::table('releases_groups')->insertOrIgnore(['releases_id' => $releaseId, 'groups_id' => $groupId]);
+        }
     }
 
     private function markPublished(int $candidateId, int $releaseId, VerificationResult $result): void

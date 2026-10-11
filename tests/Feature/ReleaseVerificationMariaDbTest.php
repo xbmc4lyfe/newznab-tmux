@@ -7,6 +7,7 @@ namespace Tests\Feature;
 use App\Services\CollectionCleanupService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\VerificationResetService;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -54,6 +55,38 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
         $this->assertNull(app(CandidateRepository::class)->claim());
         app(CandidateRepository::class)->heartbeat($claim->id, $claim->lease_token);
         $this->assertSame('verifying', DB::connection('verification_other')->table('release_verification_candidates')->value('status'));
+    }
+
+    public function test_reset_keeps_admissions_excluded_across_real_mysql_truncates(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $manifest = ['identity' => sha1('pre-reset'), 'groups_id' => 1, 'files' => [], 'expected_files' => 0];
+        $repository->enqueue($manifest);
+        $stored = DB::table('release_verification_candidates')->sole()->manifest_path;
+        DB::table('release_verification_audit_retries')->insert(['release_id' => 99, 'next_attempt_at' => now(), 'reason' => 'old outage']);
+        DB::table('release_verification_state')->update(['audit_cursor' => 99, 'audit_retry_turn' => true]);
+        app(VerificationResetService::class)->run(function () use ($repository, $manifest): void {
+            foreach (['parts', 'binaries', 'collections'] as $table) {
+                DB::statement('TRUNCATE TABLE '.$table);
+                $this->assertSame(0, DB::transactionLevel(), 'MySQL TRUNCATE must run outside a transaction.');
+                try {
+                    $repository->enqueue($manifest);
+                    $this->fail('An implicit commit must not release the admission exclusion.');
+                } catch (\RuntimeException $error) {
+                    $this->assertStringContainsString('active', $error->getMessage());
+                }
+            }
+        });
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
+        $this->assertSame(0, DB::table('release_verification_audit_retries')->count());
+        $state = DB::table('release_verification_state')->sole();
+        $this->assertSame(0, (int) $state->pending_bytes);
+        $this->assertSame(0, (int) $state->audit_cursor);
+        $this->assertFalse((bool) $state->audit_retry_turn);
+        $this->assertFileDoesNotExist(app(ManifestStore::class)->path($stored));
+        $this->assertNull($repository->claim());
+        $repository->enqueue($manifest);
+        $this->assertNotNull($repository->claim(), 'Fresh admissions must work after reset unlocks.');
     }
 
     public function test_cleanup_uses_current_reads_for_new_parts_inside_an_older_repeatable_read_snapshot(): void
