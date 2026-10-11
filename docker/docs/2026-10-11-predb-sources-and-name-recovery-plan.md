@@ -38,7 +38,7 @@ Rejected: predb.dev (its `robots.txt` disallows everything), Skwirll's dump (`/a
 ### Acceptance
 
 - A new source's measured contribution is recorded in the PR.
-- The health check (`predb-health.sh`) covers it.
+- A per-source health check covers it. No such checker is in the repo yet (the one used while writing this plan was a local scratch script), so Part A starts by adding it as `docker/bin/predb-health`: container state, IRC scraper processes, per-source inserts in a window, and a probe of each feed endpoint. New sources extend it.
 - Turning it off is a one-line config change.
 
 ## Part B: recovering names for hashed and raw releases
@@ -48,7 +48,7 @@ Rejected: predb.dev (its `robots.txt` disallows everything), Skwirll's dump (`/a
 | Stage | Pending | Done | Note |
 |---|---|---|---|
 | Additional processing (`passwordstatus=-1`) | 1,264,758 | about 426k | About 8.2k an hour (proxy) |
-| NFO (`proc_nfo=0`) | 1,691,309 | 78 | Effectively not running |
+| NFO download (`nfostatus`) | 1,326,600 not yet tried (`-1`) | about 394k tried (`0`: no NFO found), 471 found (`release_nfos` rows) | Running, but few releases carry an NFO. `proc_nfo` is only the per-source "name already checked" flag, so it is not a measure of NFO acquisition |
 | par2 (`proc_par2=0`) | 1,640,426 | about 51k | Not measured |
 | Files (`proc_files=0`) | 1,685,025 | about 6k | `release_files` has about 13k rows |
 | Renamed (`isrenamed=1`) | n/a | 7,108 | 5,369 outside the Other category |
@@ -69,7 +69,7 @@ Each step is independent and reversible. Take them in order, and check the metri
 **Step 1: settings only (no code).**
 - Lower `min_size_to_post_process` from 50 MB to 10 MB. Watch load and NNTP connection use for an hour before going lower.
 - Lower `tmux.fix_names.full_backlog_interval_minutes` from 60 to 30. (Raising `fix_names_per_run` only speeds the PreDB full-text pass, so it is not part of this step.)
-- Rollback: restore the old values; nothing else changes.
+- Rollback is operational only: restoring the old values stops new sub-10 MB candidates and the extra load. It does not undo work already done in the meantime (`passwordstatus` and `haspreview` updates, release-file and media rows), which stay.
 
 **Step 2: let fix-names cover all categories (small code change).**
 - Make the category in `TmuxTaskRunner.php` configurable: `tmux.fix_names.category` in `config/tmux.php`, backed by a new `TMUX_FIX_NAMES_CATEGORY` key (default `other`, so behavior is unchanged until set to `all`). Add the key with that default and a short comment to `.env.example`.
@@ -92,7 +92,7 @@ Record these before Step 1 and after each step (a saved query is enough):
 - Raw-subject releases: `searchname LIKE '[%'`.
 - `isrenamed = 1` count, split into Other and not Other.
 - `release_files` row count.
-- `proc_nfo`, `proc_par2`, and `proc_files` done counts.
+- NFO acquisition: `nfostatus` counts and `release_nfos` rows. The `proc_nfo`, `proc_par2`, and `proc_files` flags show which name sources have been checked, not whether downloads are happening.
 - PreDB-linked releases.
 - Indexer CPU and memory, and NNTP connection usage.
 
