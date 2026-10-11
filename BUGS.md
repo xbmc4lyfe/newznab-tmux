@@ -364,6 +364,19 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Already fixed in code:** the failure no longer throws a `TypeError` and retries back off (BUGS #45); a failed range is no longer lost (BUGS #48).
 - **Suggested fix (tuning, not applied):** leave headroom under the cap, for example `backfill_threads` 30 → 24, or raise the account allowance. A shared connection pool across the pools would remove the mismatch for good.
 
+### 50. A saturated database makes the tmux monitor loop outlast the 60-second heartbeat limit (Fixed)
+
+- **Where:** `TmuxHealthCheck` (`app/Console/Commands/TmuxHealthCheck.php`) called the monitor stale after `max(60, 6 × TMUX_MONITOR_DELAY)` seconds, and `INDEXER_MAX_FAILURES` (default 10, one check every 30 seconds) failed checks in a row make `indexer.sh` exit so Docker restarts the container and cancels every worker (the same chain as BUGS #44, which was measured when the default was 5).
+- **Symptom:** with 12 binaries and 30 backfill workers plus post-processing on one database, the loop (which runs database statistics) took over a minute. On 2026-10-11 the check logged `monitor_heartbeat_stale` three times in a row at 08:44–08:46 and twelve times between 10:25 and 10:45 UTC, within sight of the ten that trigger a restart.
+- **Fix (staged):** the limit is now `tmux.monitor.heartbeat_max_age` (`TMUX_HEARTBEAT_MAX_AGE`, default 180 s). A genuinely hung monitor is still reported once its heartbeat is 3 minutes old, and the supervisor restarts the container after the next `INDEXER_MAX_FAILURES` checks (default 10, 30 seconds apart), roughly 8 minutes in total. Covered by two new `TmuxHealthCheckCommandTest` cases.
+- **Related, not fixed:** the release stage is the real limiter. It updates `collections` one row at a time (`UPDATE collections SET filesize…, filecheck…`) across a table of about 14.5M rows, so a pass takes over an hour at low CPU while ingestion keeps adding collections. That needs less ingestion or a set-based release pass, and is recorded as open here.
+
+### 51. Two TV workers adding the same show: the loser dies on a duplicate key and fails its batch (Fixed)
+
+- **Where:** `AbstractTvProvider::add()` (`app/Services/TvProcessing/Providers/AbstractTvProvider.php`) looks a video up by title and, if there is none, calls `Video::create()`. Nothing stops a second worker from inserting the same show in between.
+- **Symptom:** `SQLSTATE[23000] 1062 Duplicate entry 'Less Than Evil-0-2018-12-03 00:00:00-KR' for key 'ix_videos_title'` escaped, killed the worker (exit 1) and failed the whole `postProcess_tv` batch on 2026-10-11 at 13:25 UTC (4 times that day).
+- **Fix (staged):** `add()` catches the unique violation, loads the row the other worker created and takes the normal update path. If the row can't be found the original exception is rethrown. Covered by `TvProviderVideoInsertRaceTest`, which fails without the change.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |
