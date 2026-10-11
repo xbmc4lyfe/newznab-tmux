@@ -242,6 +242,17 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         $this->assertSame(123, $this->compensator()->lastActivity(), 'Written seconds ago: left alone.');
     }
 
+    public function test_tests_use_a_temporary_marker_not_the_real_one(): void
+    {
+        $this->app->make(CollectionDowntimeCompensator::class)->recordActivity();
+
+        $this->assertFileDoesNotExist(storage_path('app/tmux/last-ingestion-activity.test-probe'));
+        $this->assertNotSame(
+            storage_path('app/tmux/last-ingestion-activity'),
+            (new \ReflectionProperty(CollectionDowntimeCompensator::class, 'markerPath'))->getValue($this->app->make(CollectionDowntimeCompensator::class)),
+        );
+    }
+
     private function compensator(): CollectionDowntimeCompensator
     {
         return new CollectionDowntimeCompensator($this->marker);

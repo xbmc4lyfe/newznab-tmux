@@ -2,6 +2,7 @@
 
 namespace Tests;
 
+use App\Services\Tmux\CollectionDowntimeCompensator;
 use Illuminate\Foundation\Testing\TestCase as BaseTestCase;
 use Illuminate\Foundation\Vite as ViteManager;
 use Illuminate\Support\HtmlString;
@@ -27,6 +28,11 @@ abstract class TestCase extends BaseTestCase
         self::$baselineEnvironment ??= self::captureEnvironment();
 
         parent::setUp();
+
+        // Keep tests away from the real ingestion-activity marker under storage/: a test run
+        // during an outage would otherwise erase the downtime the next start compensates.
+        $marker = sys_get_temp_dir().'/nntmux-test-activity-'.getmypid();
+        $this->app->singleton(CollectionDowntimeCompensator::class, static fn (): CollectionDowntimeCompensator => new CollectionDowntimeCompensator($marker));
 
         if (is_file(public_path('build/manifest.json'))) {
             return;
