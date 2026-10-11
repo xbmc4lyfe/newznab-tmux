@@ -150,6 +150,22 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting));
     }
 
+    public function test_works_in_a_timezone_west_of_utc(): void
+    {
+        $previous = date_default_timezone_get();
+        date_default_timezone_set('America/New_York');
+        try {
+            $this->travelTo(Carbon::parse('2026-10-11 12:00:00'));
+            $this->lastActive(Carbon::parse('2026-10-11 11:00:00')->getTimestamp());
+            $waiting = $this->collection('2026-10-11 10:30:00');
+
+            $this->assertSame(1, $this->compensator()->compensate(2));
+            $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting));
+        } finally {
+            date_default_timezone_set($previous);
+        }
+    }
+
     private function compensator(): CollectionDowntimeCompensator
     {
         return new CollectionDowntimeCompensator($this->marker);

@@ -16,22 +16,27 @@ use Illuminate\Support\Facades\DB;
  * for every collection older than the delay on every start, which on a busy indexer
  * rewrote millions of rows and, with frequent restarts, kept collections from ever
  * expiring. Instead the monitor records when it was last active, and on start only the
- * collections still waiting at that moment are pushed back by the downtime.
+ * collections still waiting at that moment get their lost time back.
  */
 final class CollectionDowntimeCompensator
 {
-    /**
-     * Kept under storage/ rather than the cache: it must survive container restarts and
-     * the Cache::flush() that the updater runs while tmux is stopped.
-     */
-    private readonly string $markerPath;
-
     /**
      * Restarts shorter than this (deploys, crash recovery) need no compensation.
      */
     public const int MIN_DOWNTIME_SECONDS = 300;
 
     private const int WINDOW_SECONDS = 60;
+
+    /**
+     * Safety cap on UPDATE windows per start; each window holds at least one row.
+     */
+    private const int MAX_WINDOWS = 100_000;
+
+    /**
+     * Kept under storage/ rather than the cache: it must survive container restarts and
+     * the Cache::flush() that the updater runs while tmux is stopped.
+     */
+    private readonly string $markerPath;
 
     public function __construct(?string $markerPath = null)
     {
@@ -43,11 +48,9 @@ final class CollectionDowntimeCompensator
      */
     public function recordActivity(): void
     {
-        $directory = \dirname($this->markerPath);
-        if (! is_dir($directory)) {
-            @mkdir($directory, 0775, true);
-        }
-        file_put_contents($this->markerPath, (string) Carbon::now()->getTimestamp(), LOCK_EX);
+        $this->withLockedMarker(function ($marker): void {
+            $this->writeMarker($marker, Carbon::now()->getTimestamp());
+        });
     }
 
     public function lastActivity(): ?int
@@ -60,46 +63,54 @@ final class CollectionDowntimeCompensator
     /**
      * Push back the collections that were still waiting when the indexer stopped.
      *
+     * The marker stays exclusively locked from reading it to the last update, so two
+     * overlapping starts can't both claim the same outage: the second one waits, then
+     * sees a short downtime.
+     *
      * @return int The number of collections whose dateadded moved.
      */
     public function compensate(int $delayHours): int
     {
-        $lastActive = $this->lastActivity();
-        $now = Carbon::now()->getTimestamp();
-        if ($lastActive === null) {
-            // Unknown downtime: leave the delays alone rather than extend everything.
-            $this->recordActivity();
+        return $this->withLockedMarker(function ($marker) use ($delayHours): int {
+            rewind($marker);
+            $value = trim((string) stream_get_contents($marker));
+            $lastActive = ctype_digit($value) ? (int) $value : null;
+            $now = Carbon::now()->getTimestamp();
 
-            return 0;
-        }
+            if ($lastActive !== null && $now - $lastActive < self::MIN_DOWNTIME_SECONDS) {
+                return 0;
+            }
 
-        $downtime = $now - (int) $lastActive;
-        if ($downtime < self::MIN_DOWNTIME_SECONDS) {
-            return 0;
-        }
+            // Record the new start before touching rows: if this run dies partway, the next
+            // start sees a short downtime and skips, so rows can be under-compensated but
+            // never shifted twice. Unknown downtime changes nothing.
+            $this->writeMarker($marker, $now);
+            if ($lastActive === null) {
+                return 0;
+            }
 
-        // Each collection that was waiting when ingestion stopped gets back the waiting
-        // time it lost: the downtime for those added before the last recorded activity,
-        // and only the time since they were added for those written in the moments
-        // after it, never more than one full delay.
-        // Record the new start first: if this run dies partway, the next start sees a
-        // short downtime and skips, so rows can be under-compensated but never shifted twice.
-        $this->recordActivity();
-
-        return $this->shiftDateAdded($lastActive, $now, max(0, $delayHours) * 3600);
+            return $this->shiftDateAdded($lastActive, $now, max(0, $delayHours) * 3600);
+        });
     }
 
+    /**
+     * Each collection that was waiting when ingestion stopped gets back the waiting time
+     * it lost: the downtime for those added before the last recorded activity, and only
+     * the time since they were added for those written in the moments after it, never
+     * more than one full delay.
+     */
     private function shiftDateAdded(int $lastActive, int $now, int $delaySeconds): int
     {
         if ($delaySeconds <= 0) {
             return 0;
         }
 
-        $lastActiveAt = Carbon::createFromTimestamp($lastActive)->format('Y-m-d H:i:s');
-        $nowAt = Carbon::createFromTimestamp($now)->format('Y-m-d H:i:s');
+        $lastActiveAt = $this->at($lastActive);
+        $nowAt = $this->at($now);
         $shifted = DB::getDriverName() === 'sqlite'
             ? DB::raw("datetime(dateadded, '+' || MIN(strftime('%s', '{$nowAt}') - MAX(strftime('%s', dateadded), strftime('%s', '{$lastActiveAt}')), {$delaySeconds}) || ' seconds')")
             : DB::raw("dateadded + INTERVAL LEAST(TIMESTAMPDIFF(SECOND, GREATEST(dateadded, '{$lastActiveAt}'), '{$nowAt}'), {$delaySeconds}) SECOND");
+        $waitingFrom = $lastActive - $delaySeconds;
         $moved = 0;
 
         // One dateadded window at a time, newest first, jumping straight to the next
@@ -107,15 +118,14 @@ final class CollectionDowntimeCompensator
         // lands in a later window that is already done (or at now), so nothing is shifted
         // twice, and the work follows the waiting rows rather than the id range or the
         // length of the outage.
-        $waitingFrom = Carbon::createFromTimestamp($lastActive - $delaySeconds)->format('Y-m-d H:i:s');
         $windowEnd = $nowAt;
         $inclusive = true;
-        while (($newest = $this->newestWaiting($waitingFrom, $windowEnd, $inclusive)) !== null) {
-            $windowStart = max(
-                Carbon::parse($newest)->getTimestamp() - self::WINDOW_SECONDS,
-                $lastActive - $delaySeconds,
-            );
-            $windowStartAt = Carbon::createFromTimestamp($windowStart)->format('Y-m-d H:i:s');
+        for ($window = 0; $window < self::MAX_WINDOWS; $window++) {
+            $newest = $this->newestWaiting($this->at($waitingFrom), $windowEnd, $inclusive);
+            if ($newest === null) {
+                break;
+            }
+            $windowStartAt = $this->at(max($this->timestamp($newest) - self::WINDOW_SECONDS, $waitingFrom));
             $moved += DB::table('collections')
                 ->where('dateadded', '>=', $windowStartAt)
                 ->where('dateadded', '<=', $newest)
@@ -139,5 +149,57 @@ final class CollectionDowntimeCompensator
             ->max('dateadded');
 
         return $newest === null ? null : (string) $newest;
+    }
+
+    /**
+     * Datetime columns hold application-timezone wall-clock values, so convert both ways
+     * in that timezone.
+     */
+    private function at(int $timestamp): string
+    {
+        return Carbon::createFromTimestamp($timestamp, date_default_timezone_get())->format('Y-m-d H:i:s');
+    }
+
+    private function timestamp(string $dateTime): int
+    {
+        return Carbon::createFromFormat('Y-m-d H:i:s', substr($dateTime, 0, 19), date_default_timezone_get())->getTimestamp();
+    }
+
+    /**
+     * @template TResult
+     *
+     * @param  callable(resource): TResult  $work
+     * @return TResult
+     */
+    private function withLockedMarker(callable $work): mixed
+    {
+        $directory = \dirname($this->markerPath);
+        if (! is_dir($directory)) {
+            @mkdir($directory, 0775, true);
+        }
+        $marker = fopen($this->markerPath, 'c+');
+        if ($marker === false) {
+            throw new \RuntimeException("Unable to open {$this->markerPath}.");
+        }
+
+        try {
+            flock($marker, LOCK_EX);
+
+            return $work($marker);
+        } finally {
+            flock($marker, LOCK_UN);
+            fclose($marker);
+        }
+    }
+
+    /**
+     * @param  resource  $marker
+     */
+    private function writeMarker($marker, int $timestamp): void
+    {
+        ftruncate($marker, 0);
+        rewind($marker);
+        fwrite($marker, (string) $timestamp);
+        fflush($marker);
     }
 }
