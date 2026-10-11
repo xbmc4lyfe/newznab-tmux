@@ -309,7 +309,9 @@ final class CollectionDowntimeCompensator
         }
 
         try {
-            flock($marker, LOCK_EX);
+            if (! flock($marker, LOCK_EX)) {
+                throw new \RuntimeException("Unable to lock {$this->markerPath}.");
+            }
 
             return $work($marker);
         } finally {
@@ -325,8 +327,10 @@ final class CollectionDowntimeCompensator
     {
         $value = (string) $timestamp;
         // Callers rely on the marker being saved before any row moves, so fail loudly.
-        if (! ftruncate($marker, 0) || ! rewind($marker)
-            || fwrite($marker, $value) !== \strlen($value) || ! fflush($marker)) {
+        // Overwrite in place, then trim: a failed write leaves the old timestamp (all are
+        // the same length) rather than an empty marker.
+        if (! rewind($marker) || fwrite($marker, $value) !== \strlen($value)
+            || ! ftruncate($marker, \strlen($value)) || ! fflush($marker)) {
             throw new \RuntimeException("Unable to write {$this->markerPath}.");
         }
     }
