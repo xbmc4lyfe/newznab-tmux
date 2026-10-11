@@ -15,8 +15,11 @@
 #   FORCE=1              never skip.
 #   DEPLOY_LOCK_DIR, DEPLOY_LOG, DEPLOY_STAMP, DEPLOY_REPO  override the default paths (tests).
 #
-# Exit status: the command's, or 75 when another deploy holds the lock.
+# Exit status: the command's; 75 when another deploy holds the lock; 76 when the checkout changed while a
+# STAMP_ON_SUCCESS command ran (the result is stale, so nothing downstream should use it).
 set -eu
+# The log, stamp and lock are shared by everyone who deploys from this checkout.
+umask 0002
 
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 REPO="${DEPLOY_REPO:-$(cd "$DIR/.." && pwd)}"
@@ -31,7 +34,8 @@ hash_stdin() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
 }
 
-# One "hash  path" line per untracked file, so file boundaries and names are part of the fingerprint.
+# One "hash  path" line per untracked file, plus its mode, so file boundaries, names, contents and
+# permissions (an execute bit survives COPY into the image) are all part of the fingerprint.
 untracked_hashes() {
     (
         cd "$REPO"
@@ -39,6 +43,11 @@ untracked_hashes() {
             git ls-files -o --exclude-standard -z | xargs -0 sha256sum -- 2>/dev/null || true
         else
             git ls-files -o --exclude-standard -z | xargs -0 shasum -a 256 -- 2>/dev/null || true
+        fi
+        if stat -c '%a %n' . >/dev/null 2>&1; then
+            git ls-files -o --exclude-standard -z | xargs -0 stat -c '%a %n' -- 2>/dev/null || true
+        else
+            git ls-files -o --exclude-standard -z | xargs -0 stat -f '%Lp %N' 2>/dev/null || true
         fi
     )
 }
@@ -69,8 +78,19 @@ info_pid() {
 
 # `ps -p` works for another user's process too; `kill -0` fails with EPERM there and would make a live
 # owner look dead.
-alive() {
-    [ -n "$1" ] && ps -p "$1" >/dev/null 2>&1
+# When a process started, with spaces turned into underscores; empty if the process does not exist.
+process_start() {
+    ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' '_' | tr -d '\n'
+}
+
+# True while the lock owner described by $1 (the lock text) is still the same process: its pid exists
+# and, when the lock recorded a start time, it started then. A reused pid has a different start time.
+owner_alive() {
+    pid=$(info_pid "$1")
+    [ -n "$pid" ] || return 1
+    ps -p "$pid" >/dev/null 2>&1 || return 1
+    recorded=$(printf '%s' "$1" | sed -n 's/.* start=\([^ ]*\).*/\1/p')
+    [ -z "$recorded" ] || [ "$recorded" = "$(process_start "$pid")" ]
 }
 
 release() {
@@ -87,7 +107,7 @@ busy() {
 # each other's fresh one.
 acquire() {
     target=$1
-    info="pid=$$ by=$BY target=$target since=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    info="pid=$$ by=$BY target=$target since=$(date -u '+%Y-%m-%dT%H:%M:%SZ') start=$(process_start "$$")"
     attempts=0
     while [ "$attempts" -lt 10 ]; do
         attempts=$((attempts + 1))
@@ -96,13 +116,13 @@ acquire() {
         fi
 
         seen=$(lock_info)
-        if alive "$(info_pid "$seen")"; then
+        if owner_alive "$seen"; then
             busy "$seen"
         fi
 
         if mkdir "$CLAIM" 2>/dev/null; then
             now=$(lock_info)
-            if [ -n "$now" ] && [ "$now" = "$seen" ] && ! alive "$(info_pid "$now")"; then
+            if [ -n "$now" ] && [ "$now" = "$seen" ] && ! owner_alive "$now"; then
                 echo "deploy-guard: removing a stale lock" >&2
                 rm -rf "$LOCK"
             fi
@@ -135,7 +155,7 @@ cmd_run() {
     shift
     [ "$1" = -- ] && shift
 
-    if [ -n "${DEPLOY_GUARD_HELD:-}" ] && [ "$(info_pid "$(lock_info)")" = "$DEPLOY_GUARD_HELD" ] && alive "$DEPLOY_GUARD_HELD"; then
+    if [ -n "${DEPLOY_GUARD_HELD:-}" ] && [ "$(info_pid "$(lock_info)")" = "$DEPLOY_GUARD_HELD" ] && owner_alive "$(lock_info)"; then
         : # Our parent guard holds the lock; it also releases it.
     else
         acquire "$target"
@@ -162,7 +182,8 @@ cmd_run() {
         else
             rm -f "$STAMP"
             log "$target" "result=tree-changed-during-run (not stamped; the next build will run)"
-            echo "deploy-guard: the checkout changed while $target ran; not recording it as deployed." >&2
+            echo "deploy-guard: the checkout changed while $target ran, so what was built is already out of date; not deploying it. Run again." >&2
+            rc=76
         fi
     fi
     log "$target" "result=finished rc=$rc"

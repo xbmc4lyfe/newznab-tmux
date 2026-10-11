@@ -155,6 +155,46 @@ final class DockerDeployGuardTest extends TestCase
     }
 
     #[Test]
+    public function a_lock_whose_pid_was_reused_by_another_process_is_stale(): void
+    {
+        // PID 1 exists, but it did not start when the lock owner did.
+        symlink('pid=1 by=old target=up since=then start=Mon_Jan__1_00:00:00_2001', $this->dir.'/lock');
+
+        $process = $this->guard(['run', 'up', '--', 'true']);
+
+        $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput());
+        $this->assertStringContainsString('stale lock', $process->getErrorOutput());
+    }
+
+    #[Test]
+    public function a_lock_holder_is_recognized_by_its_recorded_start_time(): void
+    {
+        $first = $this->guardProcess(['run', 'build', '--', 'sleep', '3']);
+        $first->start();
+        $this->waitFor(fn (): bool => is_link($this->dir.'/lock'));
+
+        $this->assertMatchesRegularExpression('/ start=\S+/', (string) readlink($this->dir.'/lock'));
+        $this->assertSame(75, $this->guard(['run', 'up', '--', 'true'])->getExitCode());
+
+        $first->stop(0);
+    }
+
+    #[Test]
+    public function changing_only_the_mode_of_an_untracked_file_counts_as_a_change(): void
+    {
+        $build = ['run', 'build', '--', 'sh', '-c', 'echo x >> '.$this->dir.'/builds'];
+        $flags = ['SKIP_IF_UNCHANGED' => '1', 'STAMP_ON_SUCCESS' => '1'];
+        file_put_contents($this->repo.'/tool.sh', "echo hi\n");
+        chmod($this->repo.'/tool.sh', 0644);
+
+        $this->guard($build, $flags);
+        chmod($this->repo.'/tool.sh', 0755);
+        $this->guard($build, $flags);
+
+        $this->assertCount(2, file($this->dir.'/builds'), 'chmod +x changes the image, so it rebuilds');
+    }
+
+    #[Test]
     public function a_lock_owned_by_a_process_we_cannot_signal_counts_as_held(): void
     {
         // PID 1 is alive and, for a non-root user, owned by someone else.
@@ -226,7 +266,7 @@ final class DockerDeployGuardTest extends TestCase
 
         $first = $this->guard($build, $flags);
 
-        $this->assertSame(0, $first->getExitCode());
+        $this->assertSame(76, $first->getExitCode(), 'a stale result must not let the next step run');
         $this->assertFileDoesNotExist($this->dir.'/stamp');
         $this->assertStringContainsString('tree-changed-during-run', (string) file_get_contents($this->dir.'/deploy.log'));
 
