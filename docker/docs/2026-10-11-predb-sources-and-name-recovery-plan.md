@@ -41,7 +41,7 @@ Rejected: predb.dev (its `robots.txt` disallows everything), Skwirll's dump (`/a
 - A per-source health check covers it. No such checker is in the repo yet (the one used while writing this plan was a local scratch script), so the extra-sources work starts by adding it as `docker/bin/predb-health`: container state, IRC scraper processes, and a probe of each feed endpoint. Source activity is judged by successful polls, received messages, or parsed-entry timestamps per source, not by rows attributed to it: `predb.source` is set only on a new insert, so a healthy redundant source (scnlog, opentrackers) often shows zero attributed rows because another source won the race. New sources extend it.
 - Turning it off is a one-line config change.
 
-## Part B: recovering names for hashed and raw releases
+## Recovering names for hashed and raw releases
 
 ### Findings
 
@@ -114,6 +114,6 @@ Record these before Step 1 and after each step (a saved query is enough):
 ## Order of work
 
 1. Merge the deploy guard (#27) so deploys stop restarting the stack mid-run.
-2. Part B step 1 (settings), then measure.
-3. Part B step 2 (code), then the one-off pass.
+2. Name recovery step 1 (settings), then measure.
+3. Name recovery step 2 (code), then the one-off pass.
 4. The extra sources, in any order; each is small and independent.
