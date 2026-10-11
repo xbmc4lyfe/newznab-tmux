@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Tmux;
 
+use App\Enums\TmuxMode;
 use App\Models\Category;
 use App\Models\Collection;
 use App\Models\Release;
@@ -365,12 +366,15 @@ class TmuxMonitorService
     }
 
     /**
-     * Whether backfill runs (TmuxTaskRunner::runBackfill() launches modes 1 and 4) and
-     * decides on the collections count through the kill switch or progressive delay.
+     * Whether backfill runs (the tmux mode schedules it and TmuxTaskRunner::runBackfill()
+     * launches backfill modes 1 and 4) and decides on the collections count through the
+     * kill switch or progressive delay.
      */
     private function collectionCountDrivesBackfill(): bool
     {
-        if (! \in_array((int) ($this->runVar['settings']['backfill'] ?? 0), [1, 4], true)) {
+        $mode = TmuxMode::tryFrom((int) ($this->runVar['settings']['sequential'] ?? 0));
+        if (! isset($mode?->tasks()['backfill'])
+            || ! \in_array((int) ($this->runVar['settings']['backfill'] ?? 0), [1, 4], true)) {
             return false;
         }
 

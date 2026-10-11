@@ -189,7 +189,7 @@ final class TmuxTableCountsTest extends TestCase
         $this->assertTrue($state->getValue($monitor)['killswitch']['coll'], 'Backfill is held until an exact count succeeds.');
     }
 
-    public function test_backfill_controls_need_no_exact_count_while_backfill_is_off(): void
+    public function test_backfill_controls_need_no_exact_count_while_backfill_does_not_run(): void
     {
         DB::table('collections')->insert(['id' => 1]);
         $tmux = $this->getMockBuilder(Tmux::class)
@@ -201,11 +201,13 @@ final class TmuxTableCountsTest extends TestCase
         $monitor = (new ReflectionClass(TmuxMonitorService::class))->newInstanceWithoutConstructor();
         (new ReflectionProperty(TmuxMonitorService::class, 'tmux'))->setValue($monitor, $tmux);
         $state = new ReflectionProperty(TmuxMonitorService::class, 'runVar');
-        $state->setValue($monitor, ['settings' => ['backfill' => 0, 'collections_kill' => 2_000_000, 'progressive' => 1]]);
+        $refresh = new ReflectionMethod(TmuxMonitorService::class, 'getTableCounts');
 
-        (new ReflectionMethod(TmuxMonitorService::class, 'getTableCounts'))->invoke($monitor);
-        (new ReflectionMethod(TmuxMonitorService::class, 'setKillswitches'))->invoke($monitor);
+        foreach ([['backfill' => 0], ['backfill' => 1, 'sequential' => 1], ['backfill' => 1, 'sequential' => 2]] as $settings) {
+            $state->setValue($monitor, ['settings' => $settings + ['collections_kill' => 2_000_000, 'progressive' => 1]]);
+            $refresh->invoke($monitor);
 
-        $this->assertSame(14_100_000, $state->getValue($monitor)['counts']['now']['collections_table']);
+            $this->assertSame(14_100_000, $state->getValue($monitor)['counts']['now']['collections_table'], json_encode($settings));
+        }
     }
 }
