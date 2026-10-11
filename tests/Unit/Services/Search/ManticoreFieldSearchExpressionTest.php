@@ -50,4 +50,28 @@ final class ManticoreFieldSearchExpressionTest extends TestCase
         $this->assertStringNotContainsString('categories_id', $expression);
         $this->assertNull(ManticoreSearchDriver::buildFieldSearchExpression(['categories_id' => 5000], ['searchname']));
     }
+
+    public function test_the_string_zero_is_still_a_searchable_term(): void
+    {
+        $this->assertSame(
+            '@@relaxed @searchname (0)',
+            ManticoreSearchDriver::buildFieldSearchExpression(['searchname' => '0']),
+        );
+    }
+
+    public function test_identical_name_and_searchname_text_is_searched_in_either_field(): void
+    {
+        $title = 'Some.Release.2026-GRP';
+
+        $this->assertSame($title, ManticoreSearchDriver::sharedNameFieldText(['name' => $title, 'searchname' => $title]));
+        $this->assertNull(ManticoreSearchDriver::sharedNameFieldText(['name' => $title, 'searchname' => 'Other']));
+        $this->assertNull(ManticoreSearchDriver::sharedNameFieldText(['searchname' => $title]));
+        $this->assertNull(ManticoreSearchDriver::sharedNameFieldText(['name' => $title, 'searchname' => $title, 'fromname' => 'poster']));
+        $this->assertNull(ManticoreSearchDriver::sharedNameFieldText(['name' => '', 'searchname' => '']));
+
+        // The multi-column selector gets the same separator alternative as a plain @searchname query.
+        $scope = new \ReflectionMethod(ManticoreSearchDriver::class, 'scopeReleaseSearchQuery');
+        $expression = $scope->invoke(null, $title, ManticoreSearchDriver::prepareUserSearchQuery($title), '@(name,searchname)');
+        $this->assertSame('(@(name,searchname) (Some.Release.2026\\-GRP) | @(name,searchname) (Some Release 2026 GRP))', $expression);
+    }
 }

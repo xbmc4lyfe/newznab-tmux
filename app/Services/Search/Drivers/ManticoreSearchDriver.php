@@ -42,6 +42,11 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
     private const AVAILABILITY_CHECK_CACHE_TTL = 30;
 
     /** @var list<string> */
+    /**
+     * Matches a release name in either name field; one selector is an OR across both fields.
+     */
+    private const string RELEASE_NAME_FIELDS_SELECTOR = '@(name,searchname)';
+
     private const RELEASE_FIELD_SEARCH_FIELDS = [
         'searchname',
         'plainsearchname',
@@ -925,10 +930,11 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
             if ($allowedFields !== null && (! is_string($key) || ! in_array($key, $allowedFields, true))) {
                 continue;
             }
-            if (! empty($value)) {
+            // An explicit check: empty() would also drop the legitimate search term "0".
+            if ($value !== null && $value !== '') {
                 $rawValue = (string) $value;
                 $preparedValue = self::prepareUserSearchQuery($rawValue);
-                if (! empty($preparedValue)) {
+                if ($preparedValue !== '') {
                     $terms[] = self::scopeReleaseSearchQuery($rawValue, $preparedValue, '@'.$key);
                 }
             }
@@ -950,7 +956,7 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
     {
         $primary = self::scopePreparedQueryToField($preparedQuery, $fieldSelector);
 
-        if ($fieldSelector !== '@searchname' || self::queryHasNegation($rawQuery)) {
+        if (! in_array($fieldSelector, ['@searchname', self::RELEASE_NAME_FIELDS_SELECTOR], true) || self::queryHasNegation($rawQuery)) {
             return $primary;
         }
 
@@ -1334,9 +1340,30 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
             }
         }
 
-        $result = $this->searchIndexes($this->getReleasesIndex(), '', [], $searchArray, $limit);
+        // The same text for both name fields means "match it in either one" (the PreDB title lookup); a
+        // per-field AND would miss releases whose searchname has not been fixed yet.
+        $nameText = self::sharedNameFieldText($searchArray);
+        $result = $nameText !== null
+            ? $this->searchIndexes($this->getReleasesIndex(), $nameText, ['name', 'searchname'], [], $limit) // @phpstan-ignore argument.type
+            : $this->searchIndexes($this->getReleasesIndex(), '', [], $searchArray, $limit);
 
         return ! empty($result) ? ($result['id'] ?? []) : [];
+    }
+
+    /**
+     * The shared text when a search covers exactly `name` and `searchname` with identical, non-empty values.
+     *
+     * @param  array<string, mixed>  $searchArray
+     */
+    public static function sharedNameFieldText(array $searchArray): ?string
+    {
+        if (count($searchArray) !== 2 || ! array_key_exists('name', $searchArray) || ! array_key_exists('searchname', $searchArray)) {
+            return null;
+        }
+
+        $name = (string) $searchArray['name'];
+
+        return $name !== '' && $name === (string) $searchArray['searchname'] ? $name : null;
     }
 
     /**
