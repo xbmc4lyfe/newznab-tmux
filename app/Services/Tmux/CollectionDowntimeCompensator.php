@@ -27,6 +27,8 @@ final class CollectionDowntimeCompensator
 
     private const int WINDOW_SECONDS = 60;
 
+    private const int NOTE_INTERVAL_SECONDS = 30;
+
     private const int ROW_CHUNK = 5_000;
 
     /**
@@ -53,6 +55,21 @@ final class CollectionDowntimeCompensator
         $this->withLockedMarker(function ($marker): void {
             $this->writeMarker($marker, Carbon::now('UTC')->getTimestamp());
         });
+    }
+
+    /**
+     * Record activity from ingestion workers, at most every NOTE_INTERVAL_SECONDS (by the
+     * marker's mtime) so many workers don't contend for the lock.
+     */
+    public function noteIngestion(): void
+    {
+        clearstatcache(true, $this->markerPath);
+        $modified = @filemtime($this->markerPath);
+        // mtime is filesystem (real) time, so compare against the real clock.
+        if ($modified !== false && time() - $modified < self::NOTE_INTERVAL_SECONDS) {
+            return;
+        }
+        $this->recordActivity();
     }
 
     public function lastActivity(): ?int

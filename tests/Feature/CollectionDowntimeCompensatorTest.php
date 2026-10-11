@@ -227,6 +227,19 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         }
     }
 
+    public function test_ingestion_notes_are_throttled_but_keep_the_marker_current(): void
+    {
+        $this->lastActive(Carbon::now()->subMinutes(10)->getTimestamp());
+        touch($this->marker, time() - 600);
+
+        $this->compensator()->noteIngestion();
+        $this->assertSame(Carbon::now()->getTimestamp(), $this->compensator()->lastActivity(), 'A stale marker is refreshed.');
+
+        file_put_contents($this->marker, '123');
+        $this->compensator()->noteIngestion();
+        $this->assertSame(123, $this->compensator()->lastActivity(), 'Written seconds ago: left alone.');
+    }
+
     private function compensator(): CollectionDowntimeCompensator
     {
         return new CollectionDowntimeCompensator($this->marker);
