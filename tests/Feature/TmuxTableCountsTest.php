@@ -7,6 +7,7 @@ namespace Tests\Feature;
 use App\Services\Tmux\Tmux;
 use App\Services\Tmux\TmuxMonitorService;
 use Illuminate\Support\Facades\DB;
+use PHPUnit\Framework\Attributes\DataProvider;
 use ReflectionClass;
 use ReflectionMethod;
 use ReflectionProperty;
@@ -114,5 +115,43 @@ final class TmuxTableCountsTest extends TestCase
 
         $this->assertSame(14_100_000, $counts['collections_table']);
         $this->assertSame(2, $counts['releases'], 'Releases stay exact: the monitor shows how many were added.');
+    }
+
+    /**
+     * @return iterable<string, array{array<string, int>}>
+     */
+    public static function backfillControls(): iterable
+    {
+        yield 'collections kill switch' => [['collections_kill' => 2_000_000]];
+        yield 'progressive backfill' => [['progressive' => 1]];
+    }
+
+    /**
+     * @param  array<string, int>  $settings
+     */
+    #[DataProvider('backfillControls')]
+    public function test_collections_count_stays_exact_when_it_controls_backfill(array $settings): void
+    {
+        DB::table('collections')->insert([['id' => 1], ['id' => 2], ['id' => 3]]);
+        $tmux = $this->getMockBuilder(Tmux::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['proc_query', 'estimatedRowCount'])
+            ->getMock();
+        $tmux->method('proc_query')->willReturn('SELECT 0 AS active_groups');
+        $estimated = [];
+        $tmux->expects($this->atLeastOnce())->method('estimatedRowCount')->willReturnCallback(static function (string $table) use (&$estimated): ?int {
+            $estimated[] = $table;
+
+            return 14_100_000;
+        });
+        $monitor = (new ReflectionClass(TmuxMonitorService::class))->newInstanceWithoutConstructor();
+        (new ReflectionProperty(TmuxMonitorService::class, 'tmux'))->setValue($monitor, $tmux);
+        $state = new ReflectionProperty(TmuxMonitorService::class, 'runVar');
+        $state->setValue($monitor, ['settings' => $settings]);
+
+        (new ReflectionMethod(TmuxMonitorService::class, 'getTableCounts'))->invoke($monitor);
+
+        $this->assertSame(3, $state->getValue($monitor)['counts']['now']['collections_table']);
+        $this->assertNotContains('collections', $estimated);
     }
 }

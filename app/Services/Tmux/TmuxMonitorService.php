@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Tmux;
 
 use App\Models\Category;
+use App\Models\Collection;
 use App\Models\Release;
 use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
@@ -298,8 +299,12 @@ class TmuxMonitorService
         $timer = microtime(true);
 
         try {
-            // Display-only and often over 10M rows; see Tmux::tableRowCount().
-            $this->runVar['counts']['now']['collections_table'] = $this->tmux->tableRowCount('collections');
+            // The collections kill switch and progressive backfill decide on this count,
+            // so keep it exact when either is on; otherwise it is display-only and can be
+            // over 10M rows, so use the row estimate (see Tmux::tableRowCount()).
+            $this->runVar['counts']['now']['collections_table'] = $this->collectionCountDrivesBackfill()
+                ? Collection::query()->count()
+                : $this->tmux->tableRowCount('collections');
             $this->runVar['counts']['now']['releases'] = Release::query()->count();
 
             foreach ($this->aggregateTableRowCounts($this->tmux->cbpmTableQuery()) as $key => $count) {
@@ -323,6 +328,12 @@ class TmuxMonitorService
         } catch (\Exception $e) {
             logger()->error('Error collecting table counts: '.$e->getMessage());
         }
+    }
+
+    private function collectionCountDrivesBackfill(): bool
+    {
+        return (int) ($this->runVar['settings']['collections_kill'] ?? 0) > 0
+            || (int) ($this->runVar['settings']['progressive'] ?? 0) === 1;
     }
 
     /**
