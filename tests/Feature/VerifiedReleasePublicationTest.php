@@ -97,6 +97,9 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         if ($verifiedBytes !== null) {
             $manifest['verified_bytes'] = $verifiedBytes;
         }
+        $manifest['verified_bytes'] ??= $expectedSize;
+        $manifest['verified_file_names'] = ['movie.mkv'];
+        $manifest['verified_file_count'] = 1;
         if ($duplicateKind !== null) {
             $duplicateGuid = (string) Str::uuid();
             DB::table('releases')->insert([

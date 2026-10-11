@@ -46,8 +46,8 @@ final class PayloadVerifier
         $filenameIdentities = [];
         $available = $manifest;
         $scratchRoot = dirname($directory);
-        $this->initialScratchBytes = $this->directoryBytes($scratchRoot);
-        $allocated = $this->initialScratchBytes - $this->directoryBytes($directory);
+        $this->initialScratchBytes = $this->directoryBytes($scratchRoot, $heartbeat);
+        $allocated = $this->initialScratchBytes - $this->directoryBytes($directory, $heartbeat);
         $networkFailure = false;
         $requiredNames = [];
         $fileChecksums = [];
@@ -295,6 +295,10 @@ final class PayloadVerifier
         }
 
         $available['expected_files'] = $expected;
+        $verifiedNames = array_values(array_unique(array_map('strval', array_merge(array_keys(array_diff_key($files, $partialRecovery)), array_keys($protected)))));
+        sort($verifiedNames, SORT_STRING);
+        $available['verified_file_names'] = $verifiedNames;
+        $available['verified_file_count'] = count($verifiedNames);
 
         $available['identity_hints'] = [];
         foreach (array_keys($files) as $name) {
@@ -343,18 +347,27 @@ final class PayloadVerifier
         }
     }
 
-    private function directoryBytes(string $directory): int
+    private function directoryBytes(string $directory, callable $heartbeat): int
     {
+        $heartbeat();
         if (! is_dir($directory)) {
             return 0;
         }
         $bytes = 0;
-        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS));
+        $entries = 0;
+        $lastHeartbeat = microtime(true);
+        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS), \RecursiveIteratorIterator::SELF_FIRST);
         foreach ($iterator as $file) {
             if ($file->isFile()) {
                 $bytes += $file->getSize();
             }
+            if (++$entries >= 256 || microtime(true) - $lastHeartbeat >= 1.0) {
+                $heartbeat();
+                $entries = 0;
+                $lastHeartbeat = microtime(true);
+            }
         }
+        $heartbeat();
 
         return $bytes;
     }

@@ -24,7 +24,7 @@ final class VerifiedReleasePublisher
             return null;
         }
 
-        return DB::transaction(function () use ($claim, $result): int {
+        return DB::transaction(function () use ($claim, $result): ?int {
             DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
             $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->lockForUpdate()->first();
             if ($candidate === null || $candidate->version !== $claim->version
@@ -36,6 +36,12 @@ final class VerifiedReleasePublisher
                 return (int) $candidate->release_id;
             }
             $manifest = $result->manifest;
+            $filteredReason = app(CollectionReleasePolicy::class)->verifiedRejection($manifest);
+            if ($filteredReason !== null) {
+                app(CandidateRepository::class)->rejectByPolicy($claim, $filteredReason);
+
+                return null;
+            }
             $metadata = $this->metadata->resolve($manifest);
             $size = 0;
             foreach ($manifest['files'] as $file) {
@@ -57,7 +63,8 @@ final class VerifiedReleasePublisher
                 }
             });
             $id = Release::insertRelease($metadata + [
-                'totalpart' => max((int) $manifest['expected_files'], count($manifest['files'])),
+                'totalpart' => ($manifest['metadata_source'] ?? null) !== 'import'
+                    ? count(array_unique($manifest['verified_file_names'])) : max((int) $manifest['expected_files'], count($manifest['files'])),
                 'groups_id' => (int) $manifest['groups_id'], 'guid' => $guid, 'postdate' => $manifest['date'],
                 'size' => $size, 'nzbstatus' => NzbService::NZB_ADDED]);
             if ($id === null) {

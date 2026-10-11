@@ -84,6 +84,8 @@ class ReleaseVerificationPayloadTest extends TestCase
             $result = $verifier->verify(['expected_files' => count($files), 'files' => $files], $scratch, static function (): void {});
             $this->assertSame('repaired', $result->verdict, $result->reason);
             $this->assertContains(['name' => 'movie.mkv', 'source' => 'par2'], $result->manifest['identity_hints']);
+            $this->assertContains('movie.mkv', $result->manifest['verified_file_names']);
+            $this->assertSame(count($result->manifest['verified_file_names']), $result->manifest['verified_file_count']);
             $this->assertSame(str_repeat('movie-data', 64), file_get_contents($scratch.'/data/movie.mkv'));
             $this->assertSame([], $result->manifest['files'][0]['segments']);
         } finally {
@@ -109,6 +111,7 @@ class ReleaseVerificationPayloadTest extends TestCase
             $this->assertContains($partialName, array_column($result->manifest['files'], 'subject'));
             $this->assertSame(count($files), $result->manifest['expected_files']);
             $this->assertNotContains($partialName, array_column($result->manifest['identity_hints'], 'name'));
+            $this->assertNotContains($partialName, $result->manifest['verified_file_names']);
             $this->assertSame(str_repeat('movie-data', 64), file_get_contents($scratch.'/data/movie.mkv'));
         } finally {
             $this->removeDirectory($fixture);
@@ -130,6 +133,8 @@ class ReleaseVerificationPayloadTest extends TestCase
             $result = $verifier->verify(['expected_files' => $expected, 'files' => $files], $scratch, static function (): void {});
             $this->assertSame('repaired', $result->verdict, $result->reason);
             $this->assertContains(['name' => 'movie.mkv', 'source' => 'par2'], $result->manifest['identity_hints']);
+            $this->assertContains('movie.mkv', $result->manifest['verified_file_names']);
+            $this->assertSame(count($result->manifest['verified_file_names']), $result->manifest['verified_file_count']);
             $this->assertCount(count($files), $result->manifest['files']);
             $this->assertSame(str_repeat('movie-data', 64), file_get_contents($scratch.'/data/movie.mkv'));
             $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', str_repeat('movie-data', 64));
@@ -203,6 +208,124 @@ class ReleaseVerificationPayloadTest extends TestCase
             $result = $verifier->verify($parsed, $scratch, static function (): void {});
             $this->assertTrue($result->passed(), 'Published NZB must independently reproduce repair: '.$result->reason);
             $this->assertSame($sourceBytes, file_get_contents($scratch.'/data/'.$sourceName));
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_verified_full_inventory_preserves_numeric_filenames_as_strings(): void
+    {
+        [$verifier, $scratch] = $this->verifier(['a@b' => (new YencService)->encode('hello', '1234')]);
+        try {
+            $result = $verifier->verify($this->manifest(1), $scratch, static function (): void {});
+            $this->assertTrue($result->passed(), $result->reason);
+            $this->assertSame(['1234'], $result->manifest['verified_file_names']);
+            $this->assertSame(1, $result->manifest['verified_file_count']);
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_scratch_size_walk_renews_lease_periodically_without_per_entry_callbacks(): void
+    {
+        [$verifier, $scratch] = $this->verifier([]);
+        for ($group = 0; $group < 3; $group++) {
+            mkdir($scratch.'/group-'.$group);
+            for ($entry = 0; $entry < 200; $entry++) {
+                file_put_contents($scratch.'/group-'.$group.'/item-'.$entry, 'abc');
+            }
+        }
+        $beats = 0;
+        try {
+            $bytes = (new \ReflectionMethod($verifier, 'directoryBytes'))->invoke($verifier, $scratch, static function () use (&$beats): void {
+                $beats++;
+            });
+            $this->assertSame(1800, $bytes);
+            $this->assertGreaterThanOrEqual(4, $beats);
+            $this->assertLessThan(20, $beats, 'Directory walks must not renew the DB lease once per entry.');
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_scratch_size_walk_propagates_a_lost_lease_mid_scan(): void
+    {
+        [$verifier, $scratch] = $this->verifier([]);
+        for ($entry = 0; $entry < 600; $entry++) {
+            file_put_contents($scratch.'/item-'.$entry, 'abc');
+        }
+        $beats = 0;
+        try {
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('Lease lost during scratch scan.');
+            (new \ReflectionMethod($verifier, 'directoryBytes'))->invoke($verifier, $scratch, static function () use (&$beats): void {
+                if (++$beats === 2) {
+                    throw new \RuntimeException('Lease lost during scratch scan.');
+                }
+            });
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_both_scratch_size_walks_renew_before_first_article_fetch(): void
+    {
+        [$unused, $scratch] = $this->verifier([]);
+        $beats = 0;
+        $source = new class(static function () use (&$beats): int {
+            return $beats;
+        }) implements ArticleSource {
+
+            public int $beatsBeforeFetch = 0;
+
+            public function __construct(private \Closure $counter) {}
+
+            public function fetch(string $messageId): string
+            {
+                $this->beatsBeforeFetch = ($this->counter)();
+
+                return (new YencService)->encode('hello', 'movie.mkv');
+            }
+        };
+        $verifier = new PayloadVerifier($source, ['scratch_bytes' => 1048576, 'free_bytes' => 0, 'article_bytes' => 16777216,
+            'bytes_per_second' => 0, 'par2_binary' => 'par2']);
+        try {
+            $result = $verifier->verify($this->manifest(1), $scratch, static function () use (&$beats): void {
+                $beats++;
+            });
+            $this->assertTrue($result->passed(), $result->reason);
+            $this->assertGreaterThanOrEqual(5, $source->beatsBeforeFetch);
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_lost_lease_in_own_scratch_walk_stops_before_article_fetch(): void
+    {
+        [$unused, $scratch] = $this->verifier([]);
+        $source = new class implements ArticleSource
+        {
+            public int $fetches = 0;
+
+            public function fetch(string $messageId): string
+            {
+                $this->fetches++;
+
+                return (new YencService)->encode('hello', 'movie.mkv');
+            }
+        };
+        $verifier = new PayloadVerifier($source, ['scratch_bytes' => 1048576, 'free_bytes' => 0, 'article_bytes' => 16777216,
+            'bytes_per_second' => 0, 'par2_binary' => 'par2']);
+        $beats = 0;
+        try {
+            $result = $verifier->verify($this->manifest(1), $scratch, static function () use (&$beats): void {
+                if (++$beats === 3) {
+                    throw new \RuntimeException('Lease lost in own scratch walk.');
+                }
+            });
+            $this->assertFalse($result->passed());
+            $this->assertSame('Lease lost in own scratch walk.', $result->reason);
+            $this->assertSame(0, $source->fetches);
         } finally {
             $this->removeDirectory($scratch);
         }

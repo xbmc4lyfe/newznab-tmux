@@ -21,6 +21,7 @@ use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseManagementService;
+use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Search\SearchService;
 use App\Services\Tmux\CollectionReconciliationBarrier;
 use App\Support\Data\NzbCreationResult;
@@ -640,6 +641,14 @@ final class ReleaseProcessingService
     public function deleteUnwantedCollections(int|string|null $groupID): void
     {
         if (config('release_verification.required', true)) {
+            $normalizedGroupId = $this->normalizeGroupId($groupID);
+            foreach ($this->collectionCleanupService->verificationEligibleCollections()
+                ->where('filecheck', CollectionFileCheckStatus::Sized->value)
+                ->when($normalizedGroupId !== null, static fn ($query) => $query->where('groups_id', $normalizedGroupId))
+                ->orderBy('id')->limit(self::BATCH_SIZE)->pluck('id') as $id) {
+                app(CandidateRepository::class)->archive((int) $id, onlyIfFiltered: true);
+            }
+
             return;
         }
         $startTime = now()->toImmutable();

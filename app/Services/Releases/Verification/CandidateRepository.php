@@ -16,9 +16,9 @@ final class CandidateRepository
 {
     public function __construct(private readonly ManifestStore $store, private readonly CollectionCleanupService $cleanup) {}
 
-    public function archive(int $collectionId): void
+    public function archive(int $collectionId, bool $onlyIfFiltered = false): void
     {
-        DB::transaction(function () use ($collectionId): void {
+        DB::transaction(function () use ($collectionId, $onlyIfFiltered): void {
             $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
             $collection = DB::table('collections')->where('id', $collectionId)->lockForUpdate()->first();
             if ($collection === null || (int) $collection->filecheck === 4) {
@@ -42,6 +42,10 @@ final class CandidateRepository
                 $manifest = $this->merge($oldManifest, $manifest);
                 $newArticles = $this->articleIdentity($oldManifest) !== $this->articleIdentity($manifest);
             }
+            $filteredReason = app(CollectionReleasePolicy::class)->headerRejection($manifest);
+            if ($onlyIfFiltered && $filteredReason === null) {
+                return;
+            }
             $path = $this->store->write($manifest);
             $size = filesize($this->store->path($path));
             if ($size === false) {
@@ -50,7 +54,8 @@ final class CandidateRepository
             $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
             $lastUniqueAt = $existing === null ? $arrivalAt : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
             $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
-            $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + ($expired ? 0 : $size);
+            $discarded = $expired || $filteredReason !== null;
+            $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + ($discarded ? 0 : $size);
             if ($pending > (int) config('release_verification.pending_bytes')) {
                 if ($existing === null || $existing->manifest_path !== $path) {
                     unlink($this->store->path($path));
@@ -65,8 +70,9 @@ final class CandidateRepository
                 $values += ['version' => (int) ($existing->version ?? 0) + 1, 'last_unique_at' => $lastUniqueAt,
                     'next_attempt_at' => now(), 'status' => 'pending', 'lease_token' => null, 'lease_until' => null, 'reason' => null];
             }
-            if ($expired) {
-                $values = array_replace($values, ['status' => 'expired', 'last_unique_at' => $lastUniqueAt,
+            if ($discarded) {
+                $values = array_replace($values, ['status' => $expired ? 'expired' : 'filtered', 'reason' => $filteredReason,
+                    'last_unique_at' => $lastUniqueAt,
                     'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
             }
             if ($existing === null) {
@@ -77,7 +83,7 @@ final class CandidateRepository
             }
             DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
             $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false);
-            if ($expired) {
+            if ($discarded) {
                 DB::afterCommit(function () use ($path, $candidateId): void {
                     @unlink($this->store->path($path));
                     foreach (glob((string) config('release_verification.storage_path').'/scratch/'.$candidateId.'-*', GLOB_ONLYDIR) ?: [] as $directory) {
@@ -326,5 +332,29 @@ final class CandidateRepository
         DB::table('release_verification_candidates')->where('id', $claim->id)->where('lease_token', $claim->lease_token)
             ->where('version', $claim->version)->update(['status' => $result->verdict === 'unrepairable' ? 'unrepairable' : 'unknown', 'reason' => mb_strcut($result->reason, 0, 2000, 'UTF-8'),
                 'lease_token' => null, 'lease_until' => null, 'next_attempt_at' => now()->addSeconds((int) config('release_verification.retry_seconds'))]);
+    }
+
+    public function rejectByPolicy(object $claim, string $reason): void
+    {
+        DB::transaction(function () use ($claim, $reason): void {
+            DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+            $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)
+                ->where('lease_token', $claim->lease_token)->where('version', $claim->version)->whereNull('release_id')->lockForUpdate()->first();
+            if ($candidate === null) {
+                throw new RuntimeException('Stale verification result cannot filter a candidate.');
+            }
+            DB::table('release_verification_state')->where('id', 1)->decrement('pending_bytes', (int) $candidate->manifest_bytes);
+            DB::table('release_verification_candidates')->where('id', $claim->id)->update(['status' => 'filtered',
+                'reason' => mb_strcut($reason, 0, 2000, 'UTF-8'), 'lease_token' => null, 'lease_until' => null,
+                'manifest_path' => '', 'manifest_bytes' => 0]);
+            DB::afterCommit(function () use ($candidate): void {
+                if ($candidate->manifest_path !== '') {
+                    @unlink($this->store->path($candidate->manifest_path));
+                }
+                foreach (glob((string) config('release_verification.storage_path').'/scratch/'.$candidate->id.'-*', GLOB_ONLYDIR) ?: [] as $directory) {
+                    File::deleteDirectory($directory);
+                }
+            });
+        }, 5);
     }
 }

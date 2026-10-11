@@ -14,6 +14,7 @@ use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
+use RuntimeException;
 use Throwable;
 
 class VerifyReleaseCandidates extends Command
@@ -52,7 +53,9 @@ class VerifyReleaseCandidates extends Command
                     $started = microtime(true);
                     $result = $verifier->verify($manifest, $directory, $heartbeat);
                     if ($result->passed()) {
-                        $publisher->publish($claim, $result);
+                        if ($publisher->publish($claim, $result) === null) {
+                            $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
+                        }
                         File::deleteDirectory($directory);
                     } else {
                         $repository->finish($claim, $result);
@@ -74,8 +77,13 @@ class VerifyReleaseCandidates extends Command
                     }
                     $this->line($claim->id.': '.$result->verdict.' — '.$result->reason);
                 } catch (Throwable $error) {
-                    $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
-                    $this->warn($claim->id.': retry pending — '.$error->getMessage());
+                    $filtered = $this->filteredResult($claim);
+                    if ($filtered !== null) {
+                        $this->line($claim->id.': filtered — '.$filtered->reason);
+                    } else {
+                        $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
+                        $this->warn($claim->id.': retry pending — '.$error->getMessage());
+                    }
                 }
             }
             $counts = DB::table('release_verification_candidates')->selectRaw('status, COUNT(*) AS count')->groupBy('status')->get();
@@ -88,5 +96,13 @@ class VerifyReleaseCandidates extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    private function filteredResult(object $claim): ?VerificationResult
+    {
+        $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->where('version', $claim->version)
+            ->where('manifest_hash', $claim->manifest_hash)->where('status', 'filtered')->whereNull('release_id')->first();
+
+        return $candidate === null ? null : new VerificationResult('filtered', (string) $candidate->reason);
     }
 }
