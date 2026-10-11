@@ -1,0 +1,4 @@
+{"status":"success","message":"","data":{"rowCount":3,"rows":[
+{"id":1,"pretime":1791513593,"release":"WAR.2026.S01E02.FRENCH.WEB.H264-BAWLS","section":"TV-WEB-X264","files":32,"size":457,"status":0,"reason":"","group":"BAWLS","genre":""},
+{"id":2,"pretime":1791513524,"release":"Nybble_and_Nibble_CD32_AMIGA-bADkARMA","section":"GAMES","files":0,"size":0,"status":0,"reason":"","group":"bADkARMA","genre":""},
+{"id":3,"pretime":1791510000,"release":"Some.Movie.2026.1080p.WEB.H264-NUKED","section":"X264-1080","files":46,"size":2150.5,"status":1,"reason":"dupe.2026-10-01","group":"NUKED","genre":""}]}}

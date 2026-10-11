@@ -77,6 +77,19 @@ class PredbImportFeedCommandTest extends TestCase
     }
 
     #[Test]
+    public function the_factory_builds_the_new_opt_in_sources_without_enabling_them_by_default(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+
+        foreach (['scnsrc_me', 'eztv', 'predb_ovh', 'apibay'] as $key) {
+            $this->assertContains($key, $factory->availableKeys());
+            $this->assertSame($key, $factory->makeOne($key)->key());
+            $this->assertNotContains($key, (array) config('predb_feeds.sources'));
+            $this->assertNotSame('', (string) config("predb_feeds.endpoints.{$key}"));
+        }
+    }
+
+    #[Test]
     public function it_inserts_new_pres_from_every_source_and_indexes_them(): void
     {
         $this->fakeFeeds();
