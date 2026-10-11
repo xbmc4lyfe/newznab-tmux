@@ -11,6 +11,8 @@ use App\Services\TvProcessing\Providers\TmdbProvider;
 use App\Services\TvProcessing\Providers\TraktProvider;
 use App\Services\TvProcessing\Providers\TvdbProvider;
 use App\Services\TvProcessing\Providers\TvMazeProvider;
+use App\Support\SqlError;
+use Illuminate\Support\Facades\Log;
 
 class TvProcessor
 {
@@ -150,14 +152,31 @@ class TvProcessor
                 $provider['status'] ?? 0
             );
 
-            /** @var object $processor */
-            $processor = ($provider['factory'])();
-            if (property_exists($processor, 'echooutput')) {
-                $processor->echooutput = $this->echooutput;
-            }
-
             $startTime = microtime(true);
-            $processor->processSite($groupID, $guidChar, $processTV);
+            try {
+                /** @var object $processor */
+                $processor = ($provider['factory'])();
+                if (property_exists($processor, 'echooutput')) {
+                    $processor->echooutput = $this->echooutput;
+                }
+
+                $processor->processSite($groupID, $guidChar, $processTV);
+            } catch (\Throwable $e) {
+                // An unreachable or rejecting provider (DNS failure, failed login) must not abort the
+                // run: the other providers still get their turn, and the unmatched releases stay
+                // pending for the next cycle.
+                Log::warning('TV provider failed, continuing with the next one', [
+                    'provider' => $provider['name'],
+                    'exception' => $e::class,
+                    'message' => SqlError::describe($e),
+                ]);
+                $this->stats['providers'][$provider['name']] = [
+                    'status' => 'failed',
+                    'duration' => microtime(true) - $startTime,
+                ];
+
+                continue;
+            }
             $elapsedTime = microtime(true) - $startTime;
             $processedAny = true;
             $this->stats['providers'][$provider['name']] = [
