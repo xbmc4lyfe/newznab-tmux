@@ -569,10 +569,11 @@ class PredbImportFeedCommandTest extends TestCase
         $this->assertSame('*/5 * * * *', $event->expression);
         $this->assertTrue($event->withoutOverlapping);
 
-        // One launcher only: the scheduled run stops when the tmux cycle runs the pass instead.
-        config(['tmux.fix_names.predbft' => false]);
+        // One launcher only: the scheduled run stops when the tmux cycle runs the pass instead, whatever a
+        // legacy TMUX_FIX_NAMES_PREDBFT=true says.
+        config(['tmux.fix_names.predbft' => true, 'tmux.fix_names.predbft_scheduled' => true]);
         $this->assertTrue($event->filtersPass($this->app));
-        config(['tmux.fix_names.predbft' => true]);
+        config(['tmux.fix_names.predbft_scheduled' => false]);
         $this->assertFalse($event->filtersPass($this->app));
     }
 
