@@ -9,6 +9,7 @@ use App\Services\Binaries\BinariesConfig;
 use App\Services\Binaries\BinaryHandler;
 use App\Services\Binaries\CollectionHandler;
 use App\Services\Binaries\HeaderStorageService;
+use App\Services\Binaries\HeaderStorageTransaction;
 use App\Services\CollectionsCleaningService;
 use App\Services\ReleaseProcessingService;
 use Illuminate\Database\Schema\Blueprint;
@@ -207,6 +208,22 @@ class CbpReleaseEligibilityTest extends TestCase
         (new CollectionHandler(new CollectionsCleaningService))->refreshAggregates([$collectionId], 2);
         $this->assertStatus($collectionId, CollectionFileCheckStatus::Sized);
         $this->assertSame(550, (int) DB::table('collections')->where('id', $collectionId)->value('filesize'));
+    }
+
+    public function test_header_storage_transaction_reads_committed_rows(): void
+    {
+        if (! \in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
+            $this->markTestSkipped('Isolation levels apply to MariaDB.');
+        }
+        DB::statement('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+
+        $transaction = new HeaderStorageTransaction(new CollectionHandler(new CollectionsCleaningService), new BinaryHandler);
+        $transaction->begin();
+        DB::table('collections')->count();
+        $isolation = DB::selectOne('SELECT trx_isolation_level AS level FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID()');
+        $transaction->finish();
+
+        $this->assertSame('READ COMMITTED', $isolation->level ?? null);
     }
 
     private function process(?int $groupId): void
