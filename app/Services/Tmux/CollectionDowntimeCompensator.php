@@ -49,7 +49,7 @@ final class CollectionDowntimeCompensator
     public function recordActivity(): void
     {
         $this->withLockedMarker(function ($marker): void {
-            $this->writeMarker($marker, Carbon::now()->getTimestamp());
+            $this->writeMarker($marker, Carbon::now('UTC')->getTimestamp());
         });
     }
 
@@ -75,7 +75,7 @@ final class CollectionDowntimeCompensator
             rewind($marker);
             $value = trim((string) stream_get_contents($marker));
             $lastActive = ctype_digit($value) ? (int) $value : null;
-            $now = Carbon::now()->getTimestamp();
+            $now = Carbon::now('UTC')->getTimestamp();
 
             if ($lastActive !== null && $now - $lastActive < self::MIN_DOWNTIME_SECONDS) {
                 return 0;
@@ -107,9 +107,13 @@ final class CollectionDowntimeCompensator
 
         $lastActiveAt = $this->at($lastActive);
         $nowAt = $this->at($now);
+        // The downtime itself comes from epochs, so a DST change can't make it negative.
+        // Rows written after the last activity get the wall-clock time since they were
+        // added, clamped to between zero and that downtime, so no row ever moves back.
+        $downtime = min($now - $lastActive, $delaySeconds);
         $shifted = DB::getDriverName() === 'sqlite'
-            ? DB::raw("datetime(dateadded, '+' || MIN(strftime('%s', '{$nowAt}') - MAX(strftime('%s', dateadded), strftime('%s', '{$lastActiveAt}')), {$delaySeconds}) || ' seconds')")
-            : DB::raw("dateadded + INTERVAL LEAST(TIMESTAMPDIFF(SECOND, GREATEST(dateadded, '{$lastActiveAt}'), '{$nowAt}'), {$delaySeconds}) SECOND");
+            ? DB::raw("datetime(dateadded, '+' || (CASE WHEN dateadded <= '{$lastActiveAt}' THEN {$downtime} ELSE MAX(0, MIN(strftime('%s', '{$nowAt}') - strftime('%s', dateadded), {$downtime})) END) || ' seconds')")
+            : DB::raw("dateadded + INTERVAL (CASE WHEN dateadded <= '{$lastActiveAt}' THEN {$downtime} ELSE GREATEST(0, LEAST(TIMESTAMPDIFF(SECOND, dateadded, '{$nowAt}'), {$downtime})) END) SECOND");
         $waitingFrom = $lastActive - $delaySeconds;
         $moved = 0;
 
@@ -118,7 +122,9 @@ final class CollectionDowntimeCompensator
         // lands in a later window that is already done (or at now), so nothing is shifted
         // twice, and the work follows the waiting rows rather than the id range or the
         // length of the outage.
-        $windowEnd = $nowAt;
+        // Start from the later wall-clock value: after a DST fall-back, now can read
+        // earlier than the last activity.
+        $windowEnd = max($nowAt, $lastActiveAt);
         $inclusive = true;
         for ($window = 0; $window < self::MAX_WINDOWS; $window++) {
             $newest = $this->newestWaiting($this->at($waitingFrom), $windowEnd, $inclusive);

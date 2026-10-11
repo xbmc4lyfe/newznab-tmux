@@ -166,6 +166,25 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         }
     }
 
+    public function test_a_dst_fall_back_never_moves_rows_backwards(): void
+    {
+        $previous = date_default_timezone_get();
+        date_default_timezone_set('America/New_York');
+        try {
+            // 01:50 EDT to 01:10 EST on 2026-11-01 is 20 minutes, though the clock reads earlier.
+            $lastActive = Carbon::parse('2026-11-01 05:50:00', 'UTC')->getTimestamp();
+            Carbon::setTestNow(Carbon::createFromTimestamp($lastActive + 1200, 'UTC'));
+            $this->lastActive($lastActive);
+            $waiting = $this->collection('2026-11-01 01:30:00');
+
+            $this->compensator()->compensate(2);
+
+            $this->assertSame('2026-11-01 01:50:00', $this->dateAdded($waiting), 'Moved forward by the 20 real minutes.');
+        } finally {
+            date_default_timezone_set($previous);
+        }
+    }
+
     private function compensator(): CollectionDowntimeCompensator
     {
         return new CollectionDowntimeCompensator($this->marker);
