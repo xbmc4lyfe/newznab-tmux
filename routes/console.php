@@ -74,7 +74,9 @@ Schedule::command('predb:import-feed --quiet')->everyFiveMinutes()->withoutOverl
 // Link releases to PreDB titles that arrived after the release was created (feeds, IRC, history imports).
 // Only recent releases are scanned; the old ones are covered by running `predb:check` by hand.
 Schedule::command('predb:check 3 --quiet')->everyTenMinutes()->withoutOverlapping()->runInBackground();
-// Match each new PreDB title against the raw subjects of existing releases (full-text), 100 titles per run.
-// The tmux fix-names chain ends with this pass, but its slow NNTP passes can run for an hour or more, so on
-// its own it reached only about 100 titles a day. A run takes seconds, so it gets its own schedule.
-Schedule::command('multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBackground();
+// Match each new PreDB title against the raw subjects of existing releases (full-text). A run takes up to
+// `fix_names_per_run` titles per worker (a few seconds). The tmux fix-names chain also ends with this pass,
+// but its slow NNTP passes can run for an hour or more, so on its own it reached only about 100 titles a day;
+// it is off there by default (TMUX_FIX_NAMES_PREDBFT) so this is the only launcher.
+Schedule::command('multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBackground()
+    ->when(static fn (): bool => ! (bool) config('tmux.fix_names.predbft'));

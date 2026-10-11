@@ -36,7 +36,9 @@ return [
     'fix_names' => [
         'full_backlog' => (bool) env('TMUX_FIX_NAMES_FULL_BACKLOG', true),
         'full_backlog_interval_minutes' => (int) env('TMUX_FIX_NAMES_FULL_INTERVAL', 60),
-        'predbft' => (bool) env('TMUX_FIX_NAMES_PREDBFT', true),
+        // PreDB full-text matching at the end of each tmux fix-names cycle. Off by default: the scheduler runs it
+        // every five minutes instead (routes/console.php), and it must have only one launcher.
+        'predbft' => (bool) env('TMUX_FIX_NAMES_PREDBFT', false),
         // Cache store for the once-per-interval claim; must be a single backend, not a failover store.
         'cache_store' => (string) env('TMUX_FIX_NAMES_CACHE_STORE', 'redis'),
     ],
