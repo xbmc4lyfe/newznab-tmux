@@ -35,4 +35,19 @@ final class ManticoreFieldSearchExpressionTest extends TestCase
         );
         $this->assertNull(ManticoreSearchDriver::buildFieldSearchExpression(['name' => '', 'searchname' => '']));
     }
+
+    public function test_the_filtered_search_allowlist_drops_other_fields_and_keeps_one_modifier(): void
+    {
+        $expression = ManticoreSearchDriver::buildFieldSearchExpression(
+            ['searchname' => 'Some.Release.2026-GRP', 'fromname' => 'poster', 'categories_id' => 5000, 0 => 'ignored'],
+            ['searchname', 'fromname'],
+        );
+
+        $this->assertNotNull($expression);
+        $this->assertSame(1, substr_count($expression, '@@relaxed'));
+        $this->assertStringContainsString('@searchname', $expression);
+        $this->assertStringContainsString('@fromname', $expression);
+        $this->assertStringNotContainsString('categories_id', $expression);
+        $this->assertNull(ManticoreSearchDriver::buildFieldSearchExpression(['categories_id' => 5000], ['searchname']));
+    }
 }

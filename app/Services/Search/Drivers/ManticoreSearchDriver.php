@@ -916,11 +916,15 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
      * PreDB title match on `name` and `searchname`) a syntax error.
      *
      * @param  array<string, mixed>  $searchArray
+     * @param  list<string>|null  $allowedFields  When given, only these string keys are searched
      */
-    public static function buildFieldSearchExpression(array $searchArray): ?string
+    public static function buildFieldSearchExpression(array $searchArray, ?array $allowedFields = null): ?string
     {
         $terms = [];
         foreach ($searchArray as $key => $value) {
+            if ($allowedFields !== null && (! is_string($key) || ! in_array($key, $allowedFields, true))) {
+                continue;
+            }
             if (! empty($value)) {
                 $rawValue = (string) $value;
                 $preparedValue = self::prepareUserSearchQuery($rawValue);
@@ -2913,22 +2917,15 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
                         ->option('distance', $distance)
                         ->option('field_weights', $profile['fields']);
                 } else {
-                    $searchArray = $this->phrasesToSearchArray($phrases);
-                    $terms = [];
-                    foreach ($searchArray as $key => $value) {
-                        if (! is_string($key) || ! in_array($key, self::RELEASE_FIELD_SEARCH_FIELDS, true) || $value === '' || $value === null) {
-                            continue;
-                        }
-                        $prepared = self::prepareUserSearchQuery((string) $value);
-                        if ($prepared !== '') {
-                            $terms[] = '@@relaxed '.self::scopeReleaseSearchQuery((string) $value, $prepared, '@'.$key);
-                        }
-                    }
-                    if ($terms === []) {
+                    $searchExpression = self::buildFieldSearchExpression(
+                        $this->phrasesToSearchArray($phrases),
+                        self::RELEASE_FIELD_SEARCH_FIELDS,
+                    );
+                    if ($searchExpression === null) {
                         return ['ids' => [], 'total' => 0, 'fuzzy' => false];
                     }
                     $profile = ManticoreIndexRegistry::profile('releases');
-                    $query->search(implode(' ', $terms))
+                    $query->search($searchExpression)
                         ->option('ranker', $profile['ranker'])
                         ->option('field_weights', $profile['fields']);
                 }
