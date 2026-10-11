@@ -28,6 +28,9 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         config(['release_verification.required' => true]);
         $id = DB::table('collections')->insertGetId(['collectionhash' => sha1('pending', true), 'subject' => 'Movie',
             'fromname' => 'poster', 'totalfiles' => 1, 'groups_id' => 1, 'date' => '2026-10-11 12:00:00']);
+        $binary = DB::table('binaries')->insertGetId(['collections_id' => $id, 'binaryhash' => md5('movie', true),
+            'name' => 'movie.mkv', 'totalparts' => 1]);
+        DB::table('parts')->insert(['binaries_id' => $binary, 'partnumber' => 1, 'messageid' => 'source@article', 'size' => 5]);
         Schema::create('releases', function (Blueprint $table): void {
             $table->id();
         });

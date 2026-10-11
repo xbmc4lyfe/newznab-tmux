@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Services\CollectionCleanupService;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
@@ -46,7 +47,10 @@ final class CandidateRepository
             if ($size === false) {
                 throw new RuntimeException('Cannot reserve manifest storage.');
             }
-            $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + $size;
+            $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
+            $lastUniqueAt = $existing === null ? $arrivalAt : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
+            $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
+            $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + ($expired ? 0 : $size);
             if ($pending > (int) config('release_verification.pending_bytes')) {
                 if ($existing === null || $existing->manifest_path !== $path) {
                     unlink($this->store->path($path));
@@ -58,16 +62,29 @@ final class CandidateRepository
             $values = ['identity' => $identity, 'source_identity' => $sourceIdentity, 'groups_id' => (int) $collection->groups_id, 'manifest_path' => $path,
                 'manifest_bytes' => $size, 'manifest_hash' => substr($path, 0, 64)];
             if ($changed || $dirty) {
-                $values += ['version' => (int) ($existing->version ?? 0) + 1, 'last_unique_at' => $newArticles ? now() : $existing->last_unique_at,
+                $values += ['version' => (int) ($existing->version ?? 0) + 1, 'last_unique_at' => $lastUniqueAt,
                     'next_attempt_at' => now(), 'status' => 'pending', 'lease_token' => null, 'lease_until' => null, 'reason' => null];
             }
+            if ($expired) {
+                $values = array_replace($values, ['status' => 'expired', 'last_unique_at' => $lastUniqueAt,
+                    'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
+            }
             if ($existing === null) {
-                DB::table('release_verification_candidates')->insert($values);
+                $candidateId = DB::table('release_verification_candidates')->insertGetId($values);
             } else {
+                $candidateId = (int) $existing->id;
                 DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
             }
             DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
             $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false);
+            if ($expired) {
+                DB::afterCommit(function () use ($path, $candidateId): void {
+                    @unlink($this->store->path($path));
+                    foreach (glob((string) config('release_verification.storage_path').'/scratch/'.$candidateId.'-*', GLOB_ONLYDIR) ?: [] as $directory) {
+                        File::deleteDirectory($directory);
+                    }
+                });
+            }
             if ($existing !== null && $existing->manifest_path !== $path) {
                 DB::afterCommit(function () use ($existing): void {
                     $old = $this->store->path($existing->manifest_path);
@@ -85,19 +102,39 @@ final class CandidateRepository
         DB::transaction(function () use ($manifest): void {
             $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
             $identity = (string) $manifest['identity'];
-            if (DB::table('release_verification_candidates')->where('identity', $identity)->exists()) {
+            $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
+            if ($existing !== null && ($existing->release_id === null
+                || DB::table('releases')->where('id', $existing->release_id)->lockForUpdate()->first(['id']) !== null)) {
                 return;
+            }
+            if ($state === null) {
+                throw new RuntimeException('Verification migration has not initialized capacity state.');
             }
             $path = $this->store->write($manifest);
             $bytes = (int) filesize($this->store->path($path));
-            if ((int) $state->pending_bytes + $bytes > (int) config('release_verification.pending_bytes')) {
-                @unlink($this->store->path($path));
+            $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + $bytes;
+            if ($pending > (int) config('release_verification.pending_bytes')) {
+                if ($existing === null || $existing->manifest_path !== $path) {
+                    @unlink($this->store->path($path));
+                }
                 throw new RuntimeException('Candidate capacity is full; import retained for retry.');
             }
-            DB::table('release_verification_candidates')->insert(['identity' => $identity, 'source_identity' => $identity,
+            $values = ['identity' => $identity, 'source_identity' => $identity,
                 'groups_id' => (int) $manifest['groups_id'], 'manifest_path' => $path, 'manifest_bytes' => $bytes,
-                'manifest_hash' => substr($path, 0, 64), 'last_unique_at' => now(), 'next_attempt_at' => now()]);
-            DB::table('release_verification_state')->where('id', 1)->increment('pending_bytes', $bytes);
+                'manifest_hash' => substr($path, 0, 64), 'last_unique_at' => now(), 'next_attempt_at' => now(),
+                'version' => (int) ($existing->version ?? 0) + 1, 'status' => 'pending', 'reason' => null,
+                'release_id' => null, 'verified_at' => null, 'lease_token' => null, 'lease_until' => null];
+            if ($existing === null) {
+                DB::table('release_verification_candidates')->insert($values);
+            } else {
+                DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
+                if ($existing->manifest_path !== '' && $existing->manifest_path !== $path) {
+                    DB::afterCommit(function () use ($existing): void {
+                        @unlink($this->store->path($existing->manifest_path));
+                    });
+                }
+            }
+            DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
         }, 5);
     }
 
@@ -224,7 +261,7 @@ final class CandidateRepository
     public function expire(): void
     {
         $ids = DB::table('release_verification_candidates')->whereNull('release_id')
-            ->whereIn('status', ['pending', 'unknown', 'verifying', 'dirty'])
+            ->whereIn('status', ['pending', 'unknown', 'unrepairable', 'verifying', 'dirty'])
             ->where('last_unique_at', '<', now()->subHours((int) config('release_verification.expiry_hours')))
             ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
             ->orderBy('id')->limit(100)->pluck('id');
@@ -287,7 +324,7 @@ final class CandidateRepository
     public function finish(object $claim, VerificationResult $result): void
     {
         DB::table('release_verification_candidates')->where('id', $claim->id)->where('lease_token', $claim->lease_token)
-            ->where('version', $claim->version)->update(['status' => 'unknown', 'reason' => substr($result->reason, 0, 2000),
+            ->where('version', $claim->version)->update(['status' => $result->verdict === 'unrepairable' ? 'unrepairable' : 'unknown', 'reason' => mb_strcut($result->reason, 0, 2000, 'UTF-8'),
                 'lease_token' => null, 'lease_until' => null, 'next_attempt_at' => now()->addSeconds((int) config('release_verification.retry_seconds'))]);
     }
 }

@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace Tests\Unit;
 
 use App\Services\Releases\Verification\ArticleSource;
+use App\Services\Releases\Verification\NzbManifestReader;
 use App\Services\Releases\Verification\PayloadVerifier;
 use App\Services\Releases\Verification\VerifiedArticle;
+use App\Services\Releases\Verification\VerifiedNzbWriter;
 use App\Services\YencService;
 use dariusiii\rarinfo\Par2Info;
 use PHPUnit\Framework\TestCase;
@@ -90,7 +92,7 @@ class ReleaseVerificationPayloadTest extends TestCase
         }
     }
 
-    public function test_partial_redundant_recovery_volume_is_omitted_after_source_repair(): void
+    public function test_partial_redundant_recovery_volume_is_retained_as_available_repair_input(): void
     {
         [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', str_repeat('movie-data', 64), 'set');
         $volume = glob($fixture.'/*.vol*.par2')[0];
@@ -104,11 +106,104 @@ class ReleaseVerificationPayloadTest extends TestCase
         try {
             $result = $verifier->verify(['expected_files' => count($files), 'files' => $files], $scratch, static function (): void {});
             $this->assertSame('repaired', $result->verdict, $result->reason);
-            $this->assertNotContains($partialName, array_column($result->manifest['files'], 'subject'));
+            $this->assertContains($partialName, array_column($result->manifest['files'], 'subject'));
+            $this->assertSame(count($files), $result->manifest['expected_files']);
             $this->assertNotContains($partialName, array_column($result->manifest['identity_hints'], 'name'));
             $this->assertSame(str_repeat('movie-data', 64), file_get_contents($scratch.'/data/movie.mkv'));
         } finally {
             $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_par2_inventory_can_prove_a_whole_source_missing_from_observed_headers(): void
+    {
+        [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', str_repeat('movie-data', 64), 'set');
+        $expected = count($files);
+        $files = array_slice($files, 1);
+        foreach ($files as $index => &$file) {
+            $file['subject'] = '['.($index + 2).'/'.$expected.'] - "'.$file['subject'].'"';
+        }
+        unset($file);
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $result = $verifier->verify(['expected_files' => $expected, 'files' => $files], $scratch, static function (): void {});
+            $this->assertSame('repaired', $result->verdict, $result->reason);
+            $this->assertContains(['name' => 'movie.mkv', 'source' => 'par2'], $result->manifest['identity_hints']);
+            $this->assertCount(count($files), $result->manifest['files']);
+            $this->assertSame(str_repeat('movie-data', 64), file_get_contents($scratch.'/data/movie.mkv'));
+            $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', str_repeat('movie-data', 64));
+        } finally {
+            $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_inferred_par2_sources_cannot_cover_a_larger_unproved_declared_inventory(): void
+    {
+        [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', str_repeat('movie-data', 64), 'set');
+        $expected = count($files) + 1;
+        $files = array_slice($files, 1);
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $result = $verifier->verify(['expected_files' => $expected, 'files' => $files], $scratch, static function (): void {});
+            $this->assertFalse($result->passed());
+            $this->assertStringContainsString('inventory', $result->reason);
+        } finally {
+            $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_partial_recovery_articles_required_for_repair_remain_in_published_nzb(): void
+    {
+        [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', str_repeat('movie-data', 64), 'set');
+        $volume = glob($fixture.'/*.vol*.par2')[0];
+        $name = basename($volume);
+        $bytes = file_get_contents($volume);
+        unset($articles[$name.'@article']);
+        $files = array_values(array_filter($files, static fn (array $file): bool => $file['subject'] !== $name));
+        $articles['partial@article'] = YencArticles::part(substr($bytes, 0, -1), $name, strlen($bytes), 1, 1, 2);
+        $files[] = ['key' => 'partial', 'subject' => $name, 'totalparts' => 2,
+            'segments' => [['number' => 1, 'messageid' => 'partial@article', 'bytes' => strlen($bytes) - 1],
+                ['number' => 2, 'messageid' => 'missing-parity@article', 'bytes' => 1]]];
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $result = $verifier->verify(['expected_files' => count($files), 'files' => $files], $scratch, static function (): void {});
+            $this->assertSame('repaired', $result->verdict, $result->reason);
+            $this->assertSame(640 + filesize($fixture.'/set.par2') + strlen($bytes) - 1, $result->manifest['verified_bytes']);
+            $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', str_repeat('movie-data', 64));
+            $this->assertContains('partial@article', array_merge(...array_map(static fn (array $file): array => array_column($file['segments'], 'messageid'), $result->manifest['files'])));
+        } finally {
+            $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @param  array<string, string>  $articles
+     */
+    private function assertPublishedArticlesCanRepair(array $manifest, array $articles, string $sourceName, string $sourceBytes): void
+    {
+        $manifest += ['fromname' => 'fixture', 'date' => '2026-10-11 12:00:00', 'groups' => ['alt.test']];
+        $writer = (new \ReflectionClass(VerifiedNzbWriter::class))->newInstanceWithoutConstructor();
+        $xml = (new \ReflectionMethod($writer, 'document'))->invoke($writer, $manifest);
+        $parsed = (new NzbManifestReader)->read($xml, (object) ['searchname' => 'fixture', 'fromname' => 'fixture',
+            'postdate' => '2026-10-11 12:00:00', 'groups_id' => 1]);
+        $publishedArticles = [];
+        foreach ($parsed['files'] as $file) {
+            foreach ($file['segments'] as $segment) {
+                $this->assertArrayHasKey($segment['messageid'], $articles, 'Publication must never invent article IDs.');
+                $publishedArticles[$segment['messageid']] = $articles[$segment['messageid']];
+            }
+        }
+        [$verifier, $scratch] = $this->verifier($publishedArticles);
+        try {
+            $result = $verifier->verify($parsed, $scratch, static function (): void {});
+            $this->assertTrue($result->passed(), 'Published NZB must independently reproduce repair: '.$result->reason);
+            $this->assertSame($sourceBytes, file_get_contents($scratch.'/data/'.$sourceName));
+        } finally {
             $this->removeDirectory($scratch);
         }
     }
@@ -322,6 +417,7 @@ class ReleaseVerificationPayloadTest extends TestCase
     {
         $source = new class($articles) implements ArticleSource
         {
+            /** @param array<string, string> $articles */
             public function __construct(private array $articles) {}
 
             public function fetch(string $messageId): string

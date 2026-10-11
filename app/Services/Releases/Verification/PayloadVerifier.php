@@ -50,7 +50,6 @@ final class PayloadVerifier
         $allocated = $this->initialScratchBytes - $this->directoryBytes($directory);
         $networkFailure = false;
         $requiredNames = [];
-        $fileNames = [];
         $fileChecksums = [];
         foreach ($manifest['files'] as $index => $file) {
             $ranges = [];
@@ -160,9 +159,10 @@ final class PayloadVerifier
                     }
                     $cursor = $end;
                 }
-                $files[$identity->name] = ['size' => $identity->size, 'complete' => $cursor === $identity->size && count($ranges) === (int) $file['totalparts']];
+                $files[$identity->name] = ['size' => $identity->size,
+                    'available_bytes' => array_sum(array_map(static fn (array $range): int => $range[1] - $range[0], $ranges)),
+                    'complete' => $cursor === $identity->size && count($ranges) === (int) $file['totalparts']];
                 $requiredNames[] = $identity->name;
-                $fileNames[$index] = $identity->name;
             } else {
                 $subject = (string) $file['subject'];
                 $name = preg_match('/"([^"\r\n]+)"/', $subject, $match) ? $match[1] : $subject;
@@ -251,7 +251,7 @@ final class PayloadVerifier
                 $verifiedSetIds += $mainSets;
             }
         }
-        $excludedRecovery = [];
+        $partialRecovery = [];
         foreach ($parity as $name) {
             if ($files[$name]['complete'] || isset($protected[$name])
                 || preg_match('/\.vol\d+\+\d+\.par2\z/i', $name) !== 1) {
@@ -261,18 +261,18 @@ final class PayloadVerifier
             $partial->open($data.'/'.$name);
             foreach ($partial->getPackets(true) ?: [] as $packet) {
                 if ($packet['head_type'] === Par2Info::PACKET_RECOVERY && isset($verifiedSetIds[(string) $packet['head_set_id']])) {
-                    $excludedRecovery[$name] = true;
+                    $partialRecovery[$name] = true;
                     break;
                 }
             }
         }
         foreach ($requiredNames as $name) {
-            if (! isset($excludedRecovery[$name]) && ! isset($files[$name]) && ! isset($protected[$name])) {
+            if (! isset($partialRecovery[$name]) && ! isset($files[$name]) && ! isset($protected[$name])) {
                 return new VerificationResult('unknown', 'Required missing file is not protected by validated PAR2.');
             }
         }
         foreach ($fileChecksums as $name => $checksum) {
-            if (! isset($excludedRecovery[$name]) && $this->checksum($data.'/'.$name, 'crc32b', $heartbeat) !== $checksum) {
+            if (! isset($partialRecovery[$name]) && $this->checksum($data.'/'.$name, 'crc32b', $heartbeat) !== $checksum) {
                 return new VerificationResult('unknown', 'Whole-file checksum verification failed.');
             }
         }
@@ -282,34 +282,34 @@ final class PayloadVerifier
             }
         }
         foreach ($files as $name => $info) {
-            if (! $info['complete'] && ! isset($protected[$name]) && ! isset($excludedRecovery[$name])) {
+            if (! $info['complete'] && ! isset($protected[$name]) && ! isset($partialRecovery[$name])) {
                 return new VerificationResult('unknown', 'Required file is incomplete and unverified by PAR2.');
             }
         }
         $knownFiles = count(array_unique(array_merge(array_keys($files), array_keys($protected))));
-        if (($expected < 1 && $protected === []) || ($expected > count($manifest['files'])) || ($expected > 0 && $knownFiles < $expected)) {
+        if (($expected < 1 && $protected === []) || ($expected > 0 && $knownFiles < $expected)) {
             return new VerificationResult('unknown', 'Declared file inventory cannot be proved complete.');
         }
         if ($networkFailure && $protected === []) {
             return new VerificationResult('unknown', 'Missing articles require a successful PAR2 proof.');
         }
 
-        foreach ($fileNames as $index => $name) {
-            if (isset($excludedRecovery[$name])) {
-                unset($available['files'][$index], $files[$name]);
-            }
-        }
-        $available['files'] = array_values($available['files']);
-        $available['expected_files'] = max(0, $expected - count($excludedRecovery));
+        $available['expected_files'] = $expected;
 
         $available['identity_hints'] = [];
         foreach (array_keys($files) as $name) {
+            if (isset($partialRecovery[$name])) {
+                continue;
+            }
             $available['identity_hints'][] = ['name' => $name, 'source' => 'yenc'];
         }
         foreach (array_keys($protected) as $name) {
             $available['identity_hints'][] = ['name' => $name, 'source' => 'par2'];
         }
-        $available['verified_bytes'] = array_sum(array_column($files, 'size'));
+        $available['verified_bytes'] = 0;
+        foreach ($files as $name => $info) {
+            $available['verified_bytes'] += isset($partialRecovery[$name]) ? $info['available_bytes'] : $info['size'];
+        }
         foreach (array_keys($protected) as $name) {
             if (! isset($files[$name])) {
                 $available['verified_bytes'] += filesize($data.'/'.$name) ?: 0;

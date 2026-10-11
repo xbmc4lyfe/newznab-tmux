@@ -39,7 +39,8 @@ class ReleaseCreationService
     public function createReleases(int|string|null $groupID, int $limit, bool $echoCLI): array
     {
         if (config('release_verification.required', true)) {
-            $ids = Collection::query()->where('filecheck', CollectionFileCheckStatus::Sized->value)
+            $ids = $this->collectionCleanupService->verificationEligibleCollections()
+                ->where('filecheck', CollectionFileCheckStatus::Sized->value)
                 ->when(! empty($groupID), static fn ($q) => $q->where('groups_id', $groupID))
                 ->orderBy('id')->limit(max(1, $limit))->pluck('id');
             foreach ($ids as $id) {

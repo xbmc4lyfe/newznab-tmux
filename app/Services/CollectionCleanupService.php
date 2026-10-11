@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Enums\CollectionFileCheckStatus;
 use App\Services\Binaries\BinariesConfig;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Releases\Verification\CandidateRepository;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -85,6 +87,7 @@ class CollectionCleanupService
         // are not present in the runtime schema.
         $cutoff = now()->subHours(app(ConfigurationProvider::class)->ingestion()->partRetentionHours);
         $batchDeleted = 0;
+        $verificationRequired = (bool) config('release_verification.required', true);
         do {
             $ids = DB::table('collections')
                 ->where('dateadded', '<', $cutoff)
@@ -97,18 +100,16 @@ class CollectionCleanupService
                 break;
             }
 
-            if (config('release_verification.required', true)) {
-                foreach ($ids as $id) {
-                    $row = DB::table('collections')->where('id', $id)->first(['filecheck']);
-                    if ($row !== null && (int) $row->filecheck !== 4) {
-                        app(CandidateRepository::class)->archive((int) $id);
-                    }
+            if ($verificationRequired) {
+                foreach ($this->verificationEligibleCollections()->whereIn('id', $ids)->orderBy('id')->pluck('id') as $id) {
+                    app(CandidateRepository::class)->archive((int) $id);
                 }
             }
             $affected = $this->deleteCollectionsAndDescendants($ids, 'Cleanup', $echoCLI);
 
             $batchDeleted += $affected;
-            if ($affected < $this->sqlChunkSize()) {
+            // A verification handoff persists manifests per collection; limit that work to one page.
+            if ($verificationRequired || $affected < $this->sqlChunkSize()) {
                 break;
             }
             // Brief pause to reduce pressure on the lock manager in busy systems.
@@ -168,6 +169,30 @@ class CollectionCleanupService
         }
 
         return $deletedCount;
+    }
+
+    /**
+     * Preserve retrievable payload even when header counts or aggregate sizes are incomplete.
+     * Terminal/invalid collections and rows without any usable articles do not need a download attempt.
+     */
+    public function verificationEligibleCollections(): Builder
+    {
+        $statuses = array_map(
+            static fn (CollectionFileCheckStatus $status): int => $status->value,
+            [...CollectionFileCheckStatus::inProgress(), ...CollectionFileCheckStatus::readyForRelease()]
+        );
+        // Legacy partially reconciled rows can still carry recoverable payload.
+        $statuses[] = 10;
+
+        return DB::table('collections')
+            ->whereIn('filecheck', $statuses)
+            ->whereExists(function ($query): void {
+                $query->selectRaw('1')->from('binaries as b')
+                    ->join('parts as p', 'p.binaries_id', '=', 'b.id')
+                    ->whereColumn('b.collections_id', 'collections.id')
+                    ->where('p.size', '>', 0)
+                    ->where('p.messageid', '<>', '');
+            });
     }
 
     /**
