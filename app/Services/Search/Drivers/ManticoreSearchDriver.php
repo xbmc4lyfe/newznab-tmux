@@ -911,6 +911,29 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
     }
 
     /**
+     * Combine per-field terms into one query. `@@relaxed` is a query-wide modifier that is only valid
+     * once, at the start; repeating it before each field made every multi-field search (such as the
+     * PreDB title match on `name` and `searchname`) a syntax error.
+     *
+     * @param  array<string, mixed>  $searchArray
+     */
+    public static function buildFieldSearchExpression(array $searchArray): ?string
+    {
+        $terms = [];
+        foreach ($searchArray as $key => $value) {
+            if (! empty($value)) {
+                $rawValue = (string) $value;
+                $preparedValue = self::prepareUserSearchQuery($rawValue);
+                if (! empty($preparedValue)) {
+                    $terms[] = self::scopeReleaseSearchQuery($rawValue, $preparedValue, '@'.$key);
+                }
+            }
+        }
+
+        return $terms === [] ? null : '@@relaxed '.implode(' ', $terms);
+    }
+
+    /**
      * Build a release-name query that also handles punctuation used as token
      * separators in Usenet subjects (for example, WEB-DL.x265).
      *
@@ -1668,19 +1691,8 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
         // Use prepareUserSearchQuery() to preserve search operators (!, -, "", |, *)
         $searchExpr = null;
         if (! empty($searchArray)) {
-            $terms = [];
-            foreach ($searchArray as $key => $value) {
-                if (! empty($value)) {
-                    $rawValue = (string) $value;
-                    $preparedValue = self::prepareUserSearchQuery($rawValue);
-                    if (! empty($preparedValue)) {
-                        $terms[] = '@@relaxed '.self::scopeReleaseSearchQuery($rawValue, $preparedValue, '@'.$key);
-                    }
-                }
-            }
-            if (! empty($terms)) {
-                $searchExpr = implode(' ', $terms);
-            } else {
+            $searchExpr = self::buildFieldSearchExpression($searchArray);
+            if ($searchExpr === null) {
                 if (config('app.debug')) {
                     Log::debug('ManticoreSearch::searchIndexes no terms after escaping searchArray');
                 }
