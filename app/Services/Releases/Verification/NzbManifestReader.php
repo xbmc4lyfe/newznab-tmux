@@ -23,6 +23,13 @@ final class NzbManifestReader
             $files = [];
             $groups = [];
             $expected = 0;
+            foreach ($document->head->meta ?? [] as $metadata) {
+                $value = (string) $metadata;
+                if ((string) $metadata['type'] === 'nntmux:verified-file-count'
+                    && preg_match('/^[1-9][0-9]{0,6}$/D', $value) === 1) {
+                    $expected = max($expected, (int) $value);
+                }
+            }
             foreach ($document->file as $index => $file) {
                 $subject = (string) $file['subject'];
                 $expected = max($expected, self::declaredFileCount($subject));

@@ -11,6 +11,7 @@ use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
+use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -35,6 +36,69 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $this->assertStringContainsString('COVERING INDEX verification_manifest_path', $details);
         $migration->down();
         $this->assertFalse(Schema::hasIndex('release_verification_candidates', 'verification_manifest_path'));
+    }
+
+    public function test_rolled_back_archive_removes_new_manifest_and_restores_original_headers(): void
+    {
+        $id = $this->arrival();
+        DB::beginTransaction();
+        app(CandidateRepository::class)->archive($id);
+        $path = app(ManifestStore::class)->path(DB::table('release_verification_candidates')->value('manifest_path'));
+        $this->assertFileExists($path);
+        DB::rollBack();
+
+        $this->assertFileDoesNotExist($path);
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
+        $this->assertSame(1, DB::table('collections')->where('id', $id)->count());
+    }
+
+    public function test_rolled_back_replacement_preserves_original_manifest_only(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $store = app(ManifestStore::class);
+        $repository->archive($this->arrival());
+        $original = DB::table('release_verification_candidates')->value('manifest_path');
+        DB::beginTransaction();
+        $repository->archive($this->arrival('second@article', 2));
+        $replacement = DB::table('release_verification_candidates')->value('manifest_path');
+        $this->assertNotSame($original, $replacement);
+        DB::rollBack();
+
+        $this->assertFileDoesNotExist($store->path($replacement));
+        $this->assertFileExists($store->path($original));
+        $this->assertSame($original, DB::table('release_verification_candidates')->value('manifest_path'));
+    }
+
+    public function test_nested_rollback_cleanup_retains_manifest_readmitted_before_outer_commit(): void
+    {
+        $store = app(ManifestStore::class);
+        $manifest = ['identity' => sha1('nested-import'), 'groups_id' => 1, 'files' => []];
+        DB::beginTransaction();
+        DB::beginTransaction();
+        app(CandidateRepository::class)->enqueue($manifest);
+        $path = DB::table('release_verification_candidates')->value('manifest_path');
+        DB::rollBack();
+        app(CandidateRepository::class)->enqueue($manifest);
+        DB::commit();
+
+        $this->assertFileExists($store->path($path));
+        $this->assertSame($manifest, $store->read($path));
+    }
+
+    public function test_candidate_insert_failure_removes_manifest_after_automatic_rollback(): void
+    {
+        $id = $this->arrival();
+        DB::unprepared("CREATE TRIGGER reject_candidate BEFORE INSERT ON release_verification_candidates BEGIN SELECT RAISE(ABORT, 'fixture insert failed'); END");
+        try {
+            app(CandidateRepository::class)->archive($id);
+            $this->fail('Candidate insertion must fail.');
+        } catch (QueryException $error) {
+            $this->assertStringContainsString('fixture insert failed', $error->getMessage());
+        }
+
+        $this->assertSame([], glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
+        $this->assertSame(1, DB::table('collections')->where('id', $id)->count());
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
     }
 
     /** @return iterable<string, array{string}> */

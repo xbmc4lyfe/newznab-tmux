@@ -67,6 +67,7 @@ class LegacyVerificationBacklogTest extends ReleaseVerificationCandidatesTest
         $manifest = app(ManifestStore::class)->read($candidate->manifest_path);
         $this->assertSame('article-2@example.test', $manifest['files'][0]['segments'][0]['messageid']);
         $this->assertSame(0, $manifest['expected_files']);
+        $this->assertSame(10, $manifest['legacy_release_id']);
         $this->assertSame([10, 11], DB::table('releases')->orderBy('id')->pluck('id')->all());
         $this->assertSame(NzbService::NZB_NONE, (int) DB::table('releases')->where('id', 10)->value('nzbstatus'));
     }

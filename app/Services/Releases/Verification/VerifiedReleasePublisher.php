@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Facades\Search;
 use App\Models\Release;
 use App\Models\ReleaseRegex;
 use App\Services\Nzb\NzbService;
@@ -48,25 +49,48 @@ final class VerifiedReleasePublisher
                 $size += (int) ($file['decoded_size'] ?? array_sum(array_column($file['segments'], 'bytes')));
             }
             $size = (int) ($manifest['verified_bytes'] ?? $size);
-            [$duplicate] = $this->duplicates->findDuplicate($metadata['name'], $metadata['searchname'], $metadata['predb_id'], $size);
+            $legacy = null;
+            $archived = app(ManifestStore::class)->read($candidate->manifest_path);
+            $legacyId = $archived['legacy_release_id'] ?? null;
+            if ($legacyId !== ($manifest['legacy_release_id'] ?? null)
+                || ($legacyId !== null && ($archived['metadata_source'] ?? null) === 'import')) {
+                throw new RuntimeException('Legacy release identity is not trusted.');
+            }
+            if ($legacyId !== null) {
+                $legacy = DB::table('releases')->where('id', $legacyId)->lockForUpdate()->first();
+                if ($legacy === null || (int) $legacy->nzbstatus !== NzbService::NZB_NONE
+                    || (int) $legacy->groups_id !== (int) $manifest['groups_id']) {
+                    throw new RuntimeException('Legacy release identity changed before publication.');
+                }
+            }
+            [$duplicate] = $legacy === null
+                ? $this->duplicates->findDuplicate($metadata['name'], $metadata['searchname'], $metadata['predb_id'], $size) : [null];
             $duplicateGuid = $duplicate === null ? null : DB::table('releases')->where('id', $duplicate->id)->value('guid');
-            if (is_string($duplicateGuid) && $this->writer->matches($manifest, $duplicateGuid)) {
+            if ($legacy === null && is_string($duplicateGuid) && $this->writer->matches($manifest, $duplicateGuid)) {
                 $this->markPublished($candidate->id, (int) $duplicate->id, $result);
 
                 return (int) $duplicate->id;
             }
-            $guid = (string) Str::uuid();
+            $guid = $legacy === null ? (string) Str::uuid() : (string) $legacy->guid;
             $path = $this->writer->write($manifest, $guid);
             DB::afterRollBack(static function () use ($path): void {
                 if (is_file($path)) {
                     unlink($path);
                 }
             });
-            $id = Release::insertRelease($metadata + [
+            $parameters = $metadata + [
                 'totalpart' => ($manifest['metadata_source'] ?? null) !== 'import'
                     ? count(array_unique($manifest['verified_file_names'])) : max((int) $manifest['expected_files'], count($manifest['files'])),
                 'groups_id' => (int) $manifest['groups_id'], 'guid' => $guid, 'postdate' => $manifest['date'],
-                'size' => $size, 'nzbstatus' => NzbService::NZB_ADDED]);
+                'size' => $size, 'nzbstatus' => NzbService::NZB_ADDED];
+            if ($legacy === null) {
+                $id = Release::insertRelease($parameters);
+            } else {
+                $id = (int) $legacy->id;
+                unset($parameters['naming_regex_id']);
+                DB::table('releases')->where('id', $id)->update($parameters + ['iscategorized' => 1]);
+                DB::afterCommit(static fn () => Search::updateRelease($id));
+            }
             if ($id === null) {
                 throw new RuntimeException('Verified release insertion failed.');
             }

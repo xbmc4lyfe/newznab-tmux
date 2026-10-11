@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Services\CollectionCleanupService;
+use App\Services\Nzb\NzbService;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -80,7 +81,7 @@ final class CandidateRepository
                 DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
             }
             DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
-            $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false);
+            $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false, manifestArchived: true);
             if ($expired) {
                 $expiredVersion = (int) ($values['version'] ?? $existing->version ?? 1);
                 DB::afterCommit(function () use ($path, $candidateId, $expiredVersion): void {
@@ -222,7 +223,14 @@ final class CandidateRepository
             }
         }
 
-        return ['identity' => bin2hex($collection->collectionhash), 'subject' => $collection->subject,
+        $legacyReleaseId = null;
+        if ((int) $collection->filecheck === 4 && isset($collection->releases_id)) {
+            $legacyReleaseId = DB::table('releases')->where('id', $collection->releases_id)
+                ->where('nzbstatus', NzbService::NZB_NONE)->lockForUpdate()->value('id');
+        }
+
+        return ['legacy_release_id' => $legacyReleaseId === null ? null : (int) $legacyReleaseId,
+            'identity' => bin2hex($collection->collectionhash), 'subject' => $collection->subject,
             'fromname' => $collection->fromname, 'date' => $collection->date, 'groups_id' => (int) $collection->groups_id,
             // Legacy insertion could overwrite the declared count with observed
             // files. Recover explicit counters outside quoted filenames only.
@@ -270,6 +278,13 @@ final class CandidateRepository
             $old['conflict'] = true;
         }
         $old['expected_files'] = max(0, $oldExpected, $newExpected);
+        if (($new['legacy_release_id'] ?? null) !== null) {
+            if (($old['legacy_release_id'] ?? null) !== null && $old['legacy_release_id'] !== $new['legacy_release_id']) {
+                $old['conflict'] = true;
+            } else {
+                $old['legacy_release_id'] = $new['legacy_release_id'];
+            }
+        }
 
         return $old;
     }

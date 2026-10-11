@@ -39,6 +39,9 @@ final class ManifestStore
             if (! rename($temporary, $path)) {
                 throw new RuntimeException('Cannot finalize candidate manifest.');
             }
+            if (DB::transactionLevel() > 0) {
+                DB::afterRollBack(fn () => $this->deleteIfUnreferenced($name));
+            }
         }
 
         return $name;

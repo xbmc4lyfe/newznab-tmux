@@ -160,6 +160,25 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
         $this->assertSame(5, DB::table('releases')->count());
     }
 
+    public function test_reclaimable_verifying_candidate_defers_audit_but_active_lease_does_not(): void
+    {
+        $this->release(1);
+        $this->mock(NzbService::class, function ($mock): void {
+            $mock->shouldReceive('readNzbContents')->once()->andReturn(false);
+        });
+        $id = DB::table('release_verification_candidates')->insertGetId([
+            'identity' => sha1('crashed-worker'), 'groups_id' => 1, 'manifest_path' => '',
+            'manifest_hash' => str_repeat('a', 64), 'manifest_bytes' => 0, 'status' => 'verifying',
+            'last_unique_at' => now(), 'next_attempt_at' => now(), 'lease_until' => now()->subSecond(),
+        ]);
+        $this->audit();
+        $this->assertFileDoesNotExist($this->directory.'/audit.jsonl');
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('audit_cursor'));
+        DB::table('release_verification_candidates')->where('id', $id)->update(['lease_until' => now()->addMinute()]);
+        $this->audit();
+        $this->assertSame([1], array_column($this->records(), 'id'));
+    }
+
     private function audit(int $limit = 1): void
     {
         $this->assertSame(0, Artisan::call('releases:verify-repairable', ['--resume' => true, '--dry-run' => true, '--limit' => $limit]));

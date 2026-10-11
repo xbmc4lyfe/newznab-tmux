@@ -94,9 +94,9 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->seedMixedCollections();
         $cleanup = new class extends CollectionCleanupService
         {
-            public function deleteCollectionsAndDescendants(array $collectionIds, string $label = 'CBP cleanup', bool $echoCLI = false): int
+            public function deleteCollectionsAndDescendants(array $collectionIds, string $label = 'CBP cleanup', bool $echoCLI = false, bool $manifestArchived = false): int
             {
-                return parent::deleteCollectionsAndDescendants([reset($collectionIds)], $label, $echoCLI);
+                return parent::deleteCollectionsAndDescendants([reset($collectionIds)], $label, $echoCLI, $manifestArchived);
             }
         };
         $service = $this->service(new WindowTestReleaseCreationService, $cleanup);
@@ -114,7 +114,7 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->seedMixedCollections();
         $cleanup = new class extends CollectionCleanupService
         {
-            public function deleteCollectionsAndDescendants(array $collectionIds, string $label = 'CBP cleanup', bool $echoCLI = false): int
+            public function deleteCollectionsAndDescendants(array $collectionIds, string $label = 'CBP cleanup', bool $echoCLI = false, bool $manifestArchived = false): int
             {
                 return 0;
             }
@@ -373,7 +373,7 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->seedMixedCollections();
         $cleanup = new class extends CollectionCleanupService
         {
-            public function deleteCollectionsAndDescendants(array $collectionIds, string $label = 'CBP cleanup', bool $echoCLI = false): int
+            public function deleteCollectionsAndDescendants(array $collectionIds, string $label = 'CBP cleanup', bool $echoCLI = false, bool $manifestArchived = false): int
             {
                 return 0;
             }

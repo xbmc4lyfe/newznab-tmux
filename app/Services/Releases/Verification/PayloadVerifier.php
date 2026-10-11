@@ -61,13 +61,15 @@ final class PayloadVerifier
                 $path = $cache.'/'.hash('sha256', $id);
                 $article = null;
                 if (is_file($path)) {
-                    $raw = file_get_contents($path);
+                    $raw = file_get_contents($path, false, null, 0, (int) $this->options['article_bytes'] + 1);
                     if ($raw !== false && strlen($raw) <= (int) $this->options['article_bytes']) {
                         try {
                             $article = VerifiedArticle::decode($raw);
                         } catch (RuntimeException) {
                             unlink($path);
                         }
+                    } else {
+                        unlink($path);
                     }
                 }
                 if ($article === null) {
@@ -85,6 +87,8 @@ final class PayloadVerifier
                     try {
                         $article = VerifiedArticle::decode($raw);
                     } catch (ArticleIntegrityFailure) {
+                        $networkFailure = true;
+
                         continue;
                     }
                     $this->reserve($directory, $allocated + strlen($raw));

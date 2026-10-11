@@ -47,6 +47,12 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         return [
             'legacy manifest' => [null, 5, null],
             'including reconstructed file' => [12345, 12345, null],
+            'trusted unpublished legacy row' => [12345, 12345, 'legacy'],
+            'changed legacy publication is not overwritten' => [12345, 12345, 'legacy_changed', 'legacy_changed'],
+            'missing legacy row cannot recreate duplicates' => [12345, 12345, 'legacy_missing', 'legacy_missing'],
+            'forged result legacy identity cannot publish' => [12345, 12345, 'legacy', 'legacy_forged'],
+            'omitted result legacy identity cannot publish' => [12345, 12345, 'legacy', 'legacy_omitted'],
+            'legacy update rollback removes new NZB' => [12345, 12345, 'legacy', 'legacy_update'],
             'metadata duplicate with different articles' => [12345, 12345, 'different'],
             'metadata duplicate with missing NZB' => [12345, 12345, 'missing'],
             'metadata duplicate with corrupt compressed NZB' => [12345, 12345, 'corrupt'],
@@ -80,7 +86,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $table->integer('releases_id');
             $table->integer('groups_id');
         });
-        Search::shouldReceive('updateRelease')->times($duplicateKind === 'exact' || in_array($failure, ['insert', 'after_commit'], true) ? 0 : 1);
+        Search::shouldReceive('updateRelease')->times($duplicateKind === 'exact' || in_array($failure, ['insert', 'after_commit', 'legacy_changed', 'legacy_missing', 'legacy_update', 'legacy_forged', 'legacy_omitted'], true) ? 0 : 1);
         $this->app->instance(ReleaseMetadataResolver::class,
             new class(app(ReleaseCleaningService::class)) extends ReleaseMetadataResolver
             {
@@ -109,7 +115,10 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 'haspreview' => -1, 'categories_id' => 2000, 'nfostatus' => -1, 'nzbstatus' => 1,
                 'isrenamed' => 1, 'iscategorized' => 1, 'predb_id' => 0,
             ]);
-            if ($duplicateKind !== 'missing') {
+            if (str_starts_with($duplicateKind, 'legacy')) {
+                $manifest['legacy_release_id'] = 777;
+                DB::table('releases')->where('id', 777)->update(['nzbstatus' => NzbService::NZB_NONE, 'size' => 1]);
+            } elseif ($duplicateKind !== 'missing') {
                 $oldManifest = $manifest;
                 if ($duplicateKind === 'different') {
                     $oldManifest['files'][0]['segments'][0]['messageid'] = 'unverified-old@article';
@@ -126,6 +135,18 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             'last_unique_at' => now(), 'next_attempt_at' => now()]);
         DB::table('release_verification_state')->update(['pending_bytes' => filesize($store->path($path))]);
         $claim = app(CandidateRepository::class)->claim();
+        if ($failure === 'legacy_forged') {
+            $manifest['legacy_release_id'] = 778;
+        } elseif ($failure === 'legacy_omitted') {
+            unset($manifest['legacy_release_id']);
+        }
+        if ($failure === 'legacy_changed') {
+            DB::table('releases')->where('id', 777)->update(['nzbstatus' => NzbService::NZB_ADDED]);
+        } elseif ($failure === 'legacy_missing') {
+            DB::table('releases')->where('id', 777)->delete();
+        } elseif ($failure === 'legacy_update') {
+            DB::unprepared("CREATE TRIGGER reject_legacy BEFORE UPDATE ON releases BEGIN SELECT RAISE(ABORT, 'forced legacy update failure'); END");
+        }
         if ($failure === 'insert') {
             DB::unprepared("CREATE TRIGGER reject_release BEFORE INSERT ON releases BEGIN SELECT RAISE(ABORT, 'forced insert failure'); END");
         }
@@ -148,8 +169,18 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         }
         try {
             $id = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
-            $this->assertNotContains($failure, ['insert', 'after_commit']);
+            $this->assertNotContains($failure, ['insert', 'after_commit', 'legacy_changed', 'legacy_missing', 'legacy_update', 'legacy_forged', 'legacy_omitted']);
         } catch (\Throwable $error) {
+            if (in_array($failure, ['legacy_changed', 'legacy_missing', 'legacy_update', 'legacy_forged', 'legacy_omitted'], true)) {
+                $this->assertNull(DB::table('release_verification_candidates')->value('release_id'));
+                $this->assertCount(0, app('files')->allFiles(config('nntmux_settings.path_to_nzbs')));
+                $this->assertSame($failure === 'legacy_missing' ? 0 : 1, DB::table('releases')->count());
+                if ($failure === 'legacy_update') {
+                    $this->assertSame(NzbService::NZB_NONE, (int) DB::table('releases')->value('nzbstatus'));
+                }
+
+                return;
+            }
             if ($failure === 'insert') {
                 $this->assertStringContainsString('forced insert failure', $error->getMessage());
                 $this->assertSame(0, DB::table('releases')->count());
@@ -168,8 +199,10 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $this->assertSame(2, $inserts);
             $this->assertCount(1, app('files')->allFiles(config('nntmux_settings.path_to_nzbs')));
         }
-        if ($duplicateKind === 'exact') {
+        if (in_array($duplicateKind, ['exact', 'legacy'], true)) {
             $this->assertSame(777, $id);
+            $this->assertSame(1, DB::table('releases')->count());
+            $this->assertSame($duplicateGuid, DB::table('releases')->value('guid'));
         } elseif ($duplicateKind !== null) {
             $this->assertNotSame(777, $id);
         }

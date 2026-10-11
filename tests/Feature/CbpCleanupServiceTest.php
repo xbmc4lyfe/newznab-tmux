@@ -12,6 +12,7 @@ use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\Verification\ManifestStore;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Tests\Support\ConfigurationTestBuilder;
@@ -220,6 +221,64 @@ class CbpCleanupServiceTest extends TestCase
         DB::table('release_verification_candidates')->insert(['identity' => $identity, 'source_identity' => $identity, 'groups_id' => 1,
             'manifest_path' => 'invalid-reference.json.gz', 'manifest_hash' => str_repeat('a', 64), 'manifest_bytes' => 0,
             'last_unique_at' => now(), 'next_attempt_at' => now()]);
+    }
+
+    public function test_new_usable_part_after_stale_eligibility_selection_is_preserved_before_plain_deletion(): void
+    {
+        $this->enableVerification();
+        $this->insertStalePayload(1, CollectionFileCheckStatus::Default->value, bytes: 0);
+        $injected = false;
+        DB::listen(static function (QueryExecuted $event) use (&$injected): void {
+            if (! $injected && str_starts_with($event->sql, 'select "id" from "collections"')
+                && str_contains($event->sql, '"parts" as "p"')) {
+                $injected = true;
+                DB::table('parts')->where('binaries_id', 1)->update(['size' => 5]);
+            }
+        });
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+        $this->assertTrue($injected);
+        $this->assertSame([1], $this->collectionIds());
+        $this->assertSame(5, (int) DB::table('parts')->value('size'));
+    }
+
+    public function test_new_binary_and_part_after_orphan_selection_are_preserved(): void
+    {
+        $this->enableVerification();
+        $this->insertRecentCollection(1);
+        $injected = false;
+        DB::listen(static function (QueryExecuted $event) use (&$injected): void {
+            if (! $injected && str_starts_with($event->sql, 'select "c"."id" from "collections" as "c"')
+                && str_contains($event->sql, 'not exists') && str_contains($event->sql, '"binaries" as "b"')) {
+                $injected = true;
+                DB::table('binaries')->insert(['id' => 1, 'collections_id' => 1, 'name' => 'new.rar', 'totalparts' => 1, 'binaryhash' => 'new-binary']);
+                DB::table('parts')->insert(['binaries_id' => 1, 'number' => 1, 'messageid' => 'new@example.test', 'partnumber' => 1, 'size' => 5]);
+            }
+        });
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+        $this->assertTrue($injected);
+        $this->assertSame([1], $this->collectionIds());
+        $this->assertSame('new@example.test', DB::table('parts')->value('messageid'));
+    }
+
+    public function test_new_eligible_state_after_missed_nzb_selection_is_preserved(): void
+    {
+        $this->enableVerification();
+        $this->insertStalePayload(1, CollectionFileCheckStatus::Delete->value, bytes: 0);
+        DB::table('collections')->where('id', 1)->update(['dateadded' => now(), 'releases_id' => 7]);
+        DB::table('releases')->insert(['id' => 7, 'name' => 'Published legacy release', 'nzbstatus' => NzbService::NZB_ADDED]);
+        $injected = false;
+        DB::listen(static function (QueryExecuted $event) use (&$injected): void {
+            if (! $injected && str_starts_with($event->sql, 'select "c"."id" from "collections" as "c"')
+                && str_contains($event->sql, '"releases" as "r"')) {
+                $injected = true;
+                DB::table('collections')->where('id', 1)->update(['filecheck' => CollectionFileCheckStatus::Sized->value]);
+                DB::table('parts')->where('binaries_id', 1)->update(['size' => 5]);
+            }
+        });
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+        $this->assertTrue($injected);
+        $this->assertSame([1], $this->collectionIds());
+        $this->assertSame(1, DB::table('parts')->count());
     }
 
     public function test_release_creation_skips_unusable_sized_rows_before_applying_the_batch_limit(): void

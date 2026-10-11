@@ -241,14 +241,8 @@ class CollectionCleanupService
      */
     public function verificationEligibleCollections(): Builder
     {
-        $statuses = array_map(
-            static fn (CollectionFileCheckStatus $status): int => $status->value,
-            [...CollectionFileCheckStatus::inProgress(), ...CollectionFileCheckStatus::readyForRelease()]
-        );
-        // Legacy partially reconciled rows can still carry recoverable payload.
-        $statuses[] = 10;
-        $supportsLegacyBacklog = Schema::hasColumn('collections', 'releases_id') && Schema::hasTable('releases')
-            && Schema::hasColumn('releases', 'nzbstatus');
+        $statuses = $this->verificationStatuses();
+        $supportsLegacyBacklog = $this->supportsLegacyVerification();
 
         return DB::table('collections')
             ->where(function (Builder $query) use ($statuses, $supportsLegacyBacklog): void {
@@ -432,6 +426,7 @@ class CollectionCleanupService
         array $collectionIds,
         string $label = 'CBP cleanup',
         bool $echoCLI = false,
+        bool $manifestArchived = false,
     ): int {
         if ($collectionIds === []) {
             return 0;
@@ -440,10 +435,16 @@ class CollectionCleanupService
         $deletedCollections = 0;
 
         foreach (array_chunk($collectionIds, $this->sqlChunkSize()) as $chunk) {
-            $placeholders = implode(',', array_fill(0, count($chunk), '?'));
             $deletedCollections += $this->retryOnLockError(
                 fn (): int => DB::transaction(
-                    function () use ($chunk, $placeholders): int {
+                    function () use ($chunk, $manifestArchived): int {
+                        if (config('release_verification.required', true) && ! $manifestArchived) {
+                            $chunk = $this->deletableVerificationIds($chunk);
+                        }
+                        if ($chunk === []) {
+                            return 0;
+                        }
+                        $placeholders = implode(',', array_fill(0, count($chunk), '?'));
                         if ($this->cascadeDeleteReady()) {
                             return (int) DB::affectingStatement(
                                 "DELETE FROM collections WHERE id IN ({$placeholders})",
@@ -472,6 +473,53 @@ class CollectionCleanupService
         }
 
         return $deletedCollections;
+    }
+
+    /** @return list<int> */
+    private function verificationStatuses(): array
+    {
+        return [...array_map(static fn (CollectionFileCheckStatus $status): int => $status->value,
+            [...CollectionFileCheckStatus::inProgress(), ...CollectionFileCheckStatus::readyForRelease()]), 10];
+    }
+
+    private function supportsLegacyVerification(): bool
+    {
+        return Schema::hasColumn('collections', 'releases_id') && Schema::hasTable('releases')
+            && Schema::hasColumn('releases', 'nzbstatus');
+    }
+
+    /**
+     * Lock parent rows before checking descendants, matching header storage's lock order.
+     * Explicit locking reads see newly committed parts even within an older repeatable-read snapshot.
+     *
+     * @param  list<int>  $ids
+     * @return list<int>
+     */
+    private function deletableVerificationIds(array $ids): array
+    {
+        $legacySupported = $this->supportsLegacyVerification();
+        $columns = ['id', 'filecheck'];
+        if ($legacySupported) {
+            $columns[] = 'releases_id';
+        }
+        $parents = DB::table('collections')->whereIn('id', $ids)->orderBy('id')->lockForUpdate()->get($columns);
+        $statuses = $this->verificationStatuses();
+        $deletable = [];
+        foreach ($parents as $parent) {
+            $needsVerification = in_array((int) $parent->filecheck, $statuses, true);
+            if (! $needsVerification && $legacySupported && (int) $parent->filecheck === CollectionFileCheckStatus::Inserted->value) {
+                $needsVerification = DB::table('releases')->where('id', $parent->releases_id)
+                    ->where('nzbstatus', NzbService::NZB_NONE)->lockForUpdate()->first(['id']) !== null;
+            }
+            if ($needsVerification && DB::table('binaries as b')->join('parts as p', 'p.binaries_id', '=', 'b.id')
+                ->where('b.collections_id', $parent->id)->where('p.size', '>', 0)->where('p.messageid', '<>', '')
+                ->orderBy('b.id')->lockForUpdate()->first(['b.id']) !== null) {
+                continue;
+            }
+            $deletable[] = (int) $parent->id;
+        }
+
+        return $deletable;
     }
 
     private function sqlChunkSize(): int

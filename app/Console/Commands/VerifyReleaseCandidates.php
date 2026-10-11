@@ -42,14 +42,16 @@ class VerifyReleaseCandidates extends Command
                     break;
                 }
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;
-                foreach (glob($root.'/scratch/'.$claim->id.'-*', GLOB_ONLYDIR) ?: [] as $oldDirectory) {
-                    if ($oldDirectory !== $directory) {
-                        File::deleteDirectory($oldDirectory);
-                    }
-                }
                 try {
-                    $manifest = $store->read($claim->manifest_path);
                     $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
+                    $heartbeat();
+                    foreach (glob($root.'/scratch/'.$claim->id.'-*', GLOB_ONLYDIR) ?: [] as $oldDirectory) {
+                        if (preg_match('/\A'.$claim->id.'-([0-9]+)\z/', basename($oldDirectory), $match) === 1 && (int) $match[1] < (int) $claim->version) {
+                            $this->deleteStaleScratch($oldDirectory, $heartbeat);
+                        }
+                    }
+                    $heartbeat();
+                    $manifest = $store->read($claim->manifest_path);
                     $started = microtime(true);
                     $result = $verifier->verify($manifest, $directory, $heartbeat);
                     if ($result->passed()) {
@@ -96,6 +98,28 @@ class VerifyReleaseCandidates extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    private function deleteStaleScratch(string $directory, callable $heartbeat): void
+    {
+        $heartbeat();
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST,
+        );
+        foreach ($iterator as $entry) {
+            $heartbeat();
+            $removed = $entry->isDir() && ! $entry->isLink()
+                ? rmdir($entry->getPathname())
+                : File::delete($entry->getPathname());
+            if (! $removed) {
+                throw new RuntimeException('Cannot remove stale verification scratch.');
+            }
+        }
+        $heartbeat();
+        if (! rmdir($directory)) {
+            throw new RuntimeException('Cannot remove stale verification scratch.');
+        }
     }
 
     private function filteredResult(object $claim): ?VerificationResult

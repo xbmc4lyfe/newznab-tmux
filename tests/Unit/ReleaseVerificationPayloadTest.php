@@ -62,6 +62,68 @@ class ReleaseVerificationPayloadTest extends TestCase
         }
     }
 
+    public function test_single_file_verified_nzb_without_subject_counters_can_be_verified_again(): void
+    {
+        $articles = ['a@b' => (new YencService)->encode('hello', 'movie.mkv')];
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $result = $verifier->verify($this->manifest(1), $scratch, static function (): void {});
+            $this->assertTrue($result->passed(), $result->reason);
+            $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', 'hello');
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_oversized_cached_article_is_evicted_even_when_provider_is_unavailable(): void
+    {
+        [$verifier, $scratch] = $this->verifier([]);
+        mkdir($scratch.'/articles');
+        $path = $scratch.'/articles/'.hash('sha256', 'a@b');
+        file_put_contents($path, str_repeat('x', 16777217));
+        try {
+            $result = $verifier->verify($this->manifest(1), $scratch, static function (): void {});
+            $this->assertSame('unknown', $result->verdict);
+            $this->assertFileDoesNotExist($path);
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_corrupt_cache_is_evicted_and_replaced_only_after_successful_validation(): void
+    {
+        $good = (new YencService)->encode('hello', 'movie.mkv');
+        $bad = str_replace('crc32=3610a686', 'crc32=00000000', $good);
+        [$verifier, $scratch] = $this->verifier(['a@b' => $good]);
+        mkdir($scratch.'/articles');
+        $path = $scratch.'/articles/'.hash('sha256', 'a@b');
+        file_put_contents($path, $bad);
+        try {
+            $result = $verifier->verify($this->manifest(1), $scratch, static function (): void {});
+            $this->assertTrue($result->passed(), $result->reason);
+            $this->assertSame($good, file_get_contents($path));
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_corrupt_download_with_insufficient_parity_is_unknown_and_never_cached(): void
+    {
+        [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', str_repeat('movie-data', 64), 'set');
+        $files = array_values(array_filter($files, static fn (array $file): bool => ! str_contains($file['subject'], '.vol')));
+        $articles['source@article'] = preg_replace('/crc32=[0-9a-f]+/', 'crc32=00000000', (new YencService)->encode(str_repeat('movie-data', 64), 'movie.mkv'));
+        $this->assertNotSame($articles['source@article'], (new YencService)->encode(str_repeat('movie-data', 64), 'movie.mkv'));
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $result = $verifier->verify(['expected_files' => count($files), 'files' => $files], $scratch, static function (): void {});
+            $this->assertSame('unknown', $result->verdict, $result->reason);
+            $this->assertFileDoesNotExist($scratch.'/articles/'.hash('sha256', 'source@article'));
+        } finally {
+            $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+        }
+    }
+
     public function test_actual_par2_reconstructs_a_missing_file_before_passing(): void
     {
         $dir = sys_get_temp_dir().'/par2-fixture-'.bin2hex(random_bytes(8));

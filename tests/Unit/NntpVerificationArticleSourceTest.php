@@ -135,14 +135,53 @@ final class NntpVerificationArticleSourceTest extends TestCase
         }
     }
 
+    public function test_corrupt_primary_checksum_uses_valid_alternate_without_group_selection(): void
+    {
+        $good = YencArticles::article('payload');
+        $bad = preg_replace('/crc32=[0-9a-f]+/', 'crc32=00000000', $good);
+        $primary = new VerificationNntpHarness($bad."\r\n.\r\n");
+        $alternate = new VerificationNntpHarness($good."\r\n.\r\n");
+        $raw = (new NntpArticleSource($primary, $alternate))->fetch('test@example');
+        $this->assertSame('payload', VerifiedArticle::decode($raw)->bytes);
+        $this->assertSame(['BODY <test@example>'], $primary->commands);
+        $this->assertSame(['BODY <test@example>'], $alternate->commands);
+    }
+
+    public function test_both_corrupt_provider_checksums_remain_retryable_and_never_return_raw(): void
+    {
+        $bad = preg_replace('/crc32=[0-9a-f]+/', 'crc32=00000000', YencArticles::article('payload'));
+        $primary = new VerificationNntpHarness($bad."\r\n.\r\n");
+        $alternate = new VerificationNntpHarness($bad."\r\n.\r\n");
+        try {
+            (new NntpArticleSource($primary, $alternate))->fetch('test@example');
+            $this->fail('Neither corrupt copy can establish article integrity.');
+        } catch (ArticleIntegrityFailure) {
+            $this->assertSame(['BODY <test@example>'], $primary->commands);
+            $this->assertSame(['BODY <test@example>'], $alternate->commands);
+        }
+    }
+
+    public function test_corrupt_primary_checksum_does_not_use_disabled_alternate(): void
+    {
+        config(['nntmux_nntp.alternate_article_fallback' => false]);
+        $bad = preg_replace('/crc32=[0-9a-f]+/', 'crc32=00000000', YencArticles::article('payload'));
+        $alternate = new VerificationNntpHarness(YencArticles::article('payload')."\r\n.\r\n");
+        try {
+            (new NntpArticleSource(new VerificationNntpHarness($bad."\r\n.\r\n"), $alternate))->fetch('test@example');
+            $this->fail('A corrupt primary article must not be returned.');
+        } catch (ArticleIntegrityFailure) {
+            $this->assertSame([], $alternate->connections);
+            $this->assertSame([], $alternate->commands);
+        }
+    }
+
     public function test_corrupt_alternate_checksum_is_still_rejected_by_integrity_decoder(): void
     {
         $raw = preg_replace('/crc32=[0-9a-f]+/', 'crc32=00000000', YencArticles::article('payload'));
         $primary = new VerificationNntpHarness('', [false]);
         $alternate = new VerificationNntpHarness($raw."\r\n.\r\n");
-        $article = (new NntpArticleSource($primary, $alternate))->fetch('test@example');
         $this->expectException(ArticleIntegrityFailure::class);
-        VerifiedArticle::decode($article);
+        (new NntpArticleSource($primary, $alternate))->fetch('test@example');
     }
 
     public function test_successful_alternate_keeps_valid_yenc_framing_for_decoder(): void

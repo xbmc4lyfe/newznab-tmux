@@ -28,7 +28,7 @@ final class NntpArticleSource implements ArticleSource
                 $this->connected = true;
             }
 
-            return $this->nntp->verificationArticle($messageId, $maximumBytes);
+            return $this->checkIntegrity($this->nntp->verificationArticle($messageId, $maximumBytes));
         } catch (Exception $error) {
             if ($this->connected && $error instanceof RuntimeException) {
                 $this->connected = $this->nntp->isConnected();
@@ -50,7 +50,7 @@ final class NntpArticleSource implements ArticleSource
                 $this->alternateConnected = true;
             }
 
-            return $this->alternate->verificationArticle($messageId, $maximumBytes);
+            return $this->checkIntegrity($this->alternate->verificationArticle($messageId, $maximumBytes));
         } catch (Exception $error) {
             if ($this->alternateConnected && $error instanceof RuntimeException) {
                 $this->alternateConnected = $this->alternate->isConnected();
@@ -60,6 +60,19 @@ final class NntpArticleSource implements ArticleSource
             }
             throw $error instanceof RuntimeException ? $error : new RuntimeException('Alternate NNTP is unavailable.', previous: $error);
         }
+    }
+
+    private function checkIntegrity(string $raw): string
+    {
+        try {
+            VerifiedArticle::decode($raw);
+        } catch (ArticleIntegrityFailure $error) {
+            throw $error;
+        } catch (RuntimeException) {
+            // Encoding and identity validation remain the verifier's responsibility.
+        }
+
+        return $raw;
     }
 
     private function disconnect(NNTPService $connection): void

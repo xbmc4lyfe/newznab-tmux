@@ -36,8 +36,9 @@ class VerifyExistingReleases extends Command
             return self::SUCCESS;
         }
         try {
-            if (DB::table('release_verification_candidates')->whereNull('release_id')->whereIn('status', ['pending', 'unknown'])
-                ->where('next_attempt_at', '<=', now())->exists()) {
+            if (DB::table('release_verification_candidates')->whereNull('release_id')->whereIn('status', ['pending', 'unknown', 'verifying'])
+                ->where('next_attempt_at', '<=', now())
+                ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))->exists()) {
                 $this->warn('New candidates are due; audit deferred.');
 
                 return self::SUCCESS;

@@ -13,7 +13,9 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NzbManifestReader;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 
 class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
@@ -21,6 +23,68 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
     public function test_worker_is_discovered_and_does_not_publish_when_queue_is_empty(): void
     {
         $this->artisan('releases:verify-candidates', ['--limit' => 1])->assertSuccessful();
+    }
+
+    public function test_stale_scratch_cleanup_renews_lease_between_slow_file_deletions(): void
+    {
+        [$id, $directory] = $this->staleScratch();
+        $filesystem = new Filesystem;
+        File::partialMock()->shouldReceive('delete')->andReturnUsing(function ($path) use ($filesystem): bool {
+            $deleted = $filesystem->delete($path);
+            $this->travel(4)->seconds();
+
+            return $deleted;
+        });
+        File::shouldReceive('deleteDirectory')->andReturnUsing(function ($path) use ($filesystem): bool {
+            $deleted = $filesystem->deleteDirectory($path);
+            $this->travel(16)->seconds();
+
+            return $deleted;
+        });
+
+        $this->artisan('releases:verify-candidates', ['--limit' => 1])->assertSuccessful();
+
+        $this->assertDirectoryDoesNotExist($directory);
+        $reason = DB::table('release_verification_candidates')->where('id', $id)->value('reason');
+        $this->assertStringNotContainsString('lease was lost', $reason);
+    }
+
+    public function test_stale_scratch_cleanup_stops_immediately_when_lease_is_lost(): void
+    {
+        [$id, $directory] = $this->staleScratch();
+        $filesystem = new Filesystem;
+        $deletedCount = 0;
+        File::partialMock()->shouldReceive('delete')->andReturnUsing(function ($path) use ($filesystem, $id, &$deletedCount): bool {
+            $deletedCount++;
+            DB::table('release_verification_candidates')->where('id', $id)->update(['lease_token' => 'new-owner']);
+
+            return $filesystem->delete($path);
+        });
+        $this->mock(NNTPService::class, function ($mock): void {
+            $mock->shouldNotReceive('doConnect');
+        });
+
+        $this->artisan('releases:verify-candidates', ['--limit' => 1])->assertSuccessful();
+
+        $this->assertSame(1, $deletedCount);
+        $this->assertCount(3, glob($directory.'/*'));
+        $this->assertSame('new-owner', DB::table('release_verification_candidates')->where('id', $id)->value('lease_token'));
+    }
+
+    /** @return array{int, string} */
+    private function staleScratch(): array
+    {
+        config(['release_verification.lease_seconds' => 5]);
+        app(CandidateRepository::class)->enqueue(['identity' => sha1('scratch-cleanup'), 'groups_id' => 1, 'files' => []]);
+        $id = (int) DB::table('release_verification_candidates')->value('id');
+        DB::table('release_verification_candidates')->where('id', $id)->update(['version' => 2]);
+        $directory = config('release_verification.storage_path').'/scratch/'.$id.'-1';
+        mkdir($directory, 0700, true);
+        foreach (range(1, 4) as $number) {
+            file_put_contents($directory.'/'.$number, 'stale bytes');
+        }
+
+        return [$id, $directory];
     }
 
     public function test_expiry_releases_manifest_capacity_but_never_expires_active_lease(): void
@@ -59,6 +123,23 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
         $text = (new TextFormatter)->format($families);
         $this->assertStringContainsString('nntmux_release_verification_scratch_bytes 1234', $text);
         $this->assertStringContainsString('nntmux_release_verification_verified_bytes_per_second 5678', $text);
+    }
+
+    public function test_terminal_filtered_candidates_do_not_age_the_active_backlog(): void
+    {
+        $this->freezeTime();
+        foreach (['filtered' => 100, 'expired' => 200, 'complete' => 300, 'pending' => 20, 'unrepairable' => 40] as $status => $age) {
+            DB::table('release_verification_candidates')->insert([
+                'identity' => sha1($status), 'groups_id' => 1, 'manifest_path' => '',
+                'manifest_hash' => str_repeat('a', 64), 'manifest_bytes' => 0, 'status' => $status,
+                'last_unique_at' => now()->subSeconds($age), 'next_attempt_at' => now(),
+            ]);
+        }
+        $text = (new TextFormatter)->format([...app(ReleaseVerificationCollector::class)->collect()]);
+        $this->assertStringContainsString('nntmux_release_verification_backlog_age_seconds 40', $text);
+        DB::table('release_verification_candidates')->whereIn('status', ['pending', 'unrepairable'])->delete();
+        $text = (new TextFormatter)->format([...app(ReleaseVerificationCollector::class)->collect()]);
+        $this->assertStringContainsString('nntmux_release_verification_backlog_age_seconds 0', $text);
     }
 
     public function test_audit_dry_run_keeps_unknown_release_even_with_delete_option(): void
