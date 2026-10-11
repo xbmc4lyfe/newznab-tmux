@@ -13,18 +13,22 @@ UPDATE ingestion_configurations SET
     -- 0 released (and re-reconciled) every collection immediately, racing header storage (BUGS #37).
     collection_delay_hours = 2,
     max_messages = 20000,
-    -- Only collections of 1 GB or more become releases (large movie and show files). The 2 MB minimum
-    -- this replaces made 1.4M releases under 50 MB (78% of all), almost all raw or hashed names. This also
-    -- drops music, books, apps and small TV episodes.
-    min_size_to_form_release = 1073741824,
+    -- Drop collections under 2 MB before they become releases. Article-obfuscated posts in
+    -- boneless/cores/comp otherwise yield one ~740 KB release per article.
+    -- Do not raise this to "only large files" casually: `releases:process` also DELETES every existing
+    -- release under this size (ReleaseProcessingService::deleteReleasesUnderMinSize).
+    min_size_to_form_release = 2097152,
     backfill_days_mode = 1,
     backfill_quantity = 200000,
     updated_at = NOW();
 
 UPDATE post_processing_configurations SET
     -- Additional post-processing (par2, files, NFO, media info) only for releases of 1 GB or more, so the
-    -- queue holds the large releases instead of 1.2M small ones.
-    min_size_to_post_process = 1073741824,
+    -- queue holds the large releases instead of 1.2M small ones. The candidate query is "size > minimum",
+    -- so the minimum is one byte under 1 GiB to include a release of exactly 1 GiB. The NFO worker has its
+    -- own minimum.
+    min_size_to_post_process = 1073741823,
+    min_size_to_process_nfo = 1073741823,
     post_threads = 16,
     nfo_threads = 4,
     post_threads_non = 3,
