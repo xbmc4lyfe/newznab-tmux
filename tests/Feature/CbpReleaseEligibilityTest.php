@@ -340,6 +340,25 @@ class CbpReleaseEligibilityTest extends TestCase
         }
     }
 
+    public function test_reconcile_writes_changed_collections_in_batches(): void
+    {
+        $stale = [];
+        foreach (range(1, 5) as $i) {
+            $stale[] = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        }
+        $updates = 0;
+        DB::listen(static function ($query) use (&$updates): void {
+            $updates += preg_match('/^\s*update\s+[`"]?collections\b/i', $query->sql);
+        });
+
+        (new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 2, reconcileBatchSize: 500)))->processIncompleteCollections(1);
+
+        foreach ($stale as $id) {
+            $this->assertStatus($id, CollectionFileCheckStatus::CompleteParts);
+        }
+        $this->assertSame(3, $updates, 'Five changed collections in batches of two: three UPDATEs, not five.');
+    }
+
     private function process(?int $groupId): void
     {
         $processor = new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 2, reconcileBatchSize: 2));
