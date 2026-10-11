@@ -144,6 +144,14 @@ final class PredbFeedSourcesTest extends TestCase
         $this->assertCount(1, $entries);
         $this->assertSame(Predb::PRE_NUKED, $entries[0]->nuked);
         $this->assertSame('dupe.Other.Show-GRP', $entries[0]->nukeReason);
+
+        $byStatus = (new PredbOrgSource('https://predb.org/api/search'))->parseRows([
+            ['rlsname' => 'Nuked.Without.Reason-GRP', 'status' => '1', 'nukereason' => ''],
+            ['rlsname' => 'Normal.Release-GRP', 'status' => '0', 'nukereason' => ''],
+        ]);
+        $this->assertSame(Predb::PRE_NUKED, $byStatus[0]->nuked);
+        $this->assertNull($byStatus[0]->nukeReason);
+        $this->assertSame(Predb::PRE_NONUKE, $byStatus[1]->nuked);
         $this->assertNull($entries[0]->size);
         $this->assertNull($entries[0]->files);
     }

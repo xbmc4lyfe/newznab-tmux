@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Models\Predb;
-use App\Services\Predb\Feeds\FeedRateLimitedException;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
 use RuntimeException;
@@ -35,13 +34,7 @@ final class PredbOrgSource extends HttpFeedSource
             'q' => '*',
             'limit' => min($this->pageSize, self::MAX_PAGE_SIZE),
             'page' => max(1, $page),
-        ]);
-
-        if ($response->status() === 429) {
-            throw new FeedRateLimitedException('predb.org rate limited', (int) $response->header('Retry-After'));
-        }
-
-        $response->throw();
+        ])->throw();
 
         $rows = $response->json('values');
         if (! is_array($rows) || ! array_is_list($rows)) {
@@ -65,6 +58,8 @@ final class PredbOrgSource extends HttpFeedSource
             }
 
             $reason = is_string($row['nukereason'] ?? null) && $row['nukereason'] !== '' ? $row['nukereason'] : null;
+            // `status` 1 is a nuke (the reason can be empty); 0 is a normal release.
+            $nuked = (string) ($row['status'] ?? '0') === '1' || $reason !== null;
 
             $entries[] = new PredbFeedEntry(
                 title: trim($row['rlsname']),
@@ -73,7 +68,7 @@ final class PredbOrgSource extends HttpFeedSource
                 size: PredbFeedEntry::sizeFromMegabytes(is_numeric($row['size'] ?? null) ? (float) $row['size'] : null),
                 files: PredbFeedEntry::filesFromCount(is_numeric($row['files'] ?? null) ? (int) $row['files'] : null),
                 predate: is_numeric($row['ctime'] ?? null) ? CarbonImmutable::createFromTimestampUTC((int) $row['ctime']) : null,
-                nuked: $reason !== null ? Predb::PRE_NUKED : Predb::PRE_NONUKE,
+                nuked: $nuked ? Predb::PRE_NUKED : Predb::PRE_NONUKE,
                 nukeReason: $reason,
             );
         }
