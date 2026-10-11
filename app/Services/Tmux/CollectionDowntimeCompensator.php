@@ -388,14 +388,14 @@ final class CollectionDowntimeCompensator
                 throw new \RuntimeException('Unable to replace marker recovery record.');
             }
             // Make recovery evidence durable while the original marker is still intact.
-            if (! fsync($directoryStream)) {
+            if (! $this->syncDirectory($directoryStream)) {
                 throw new \RuntimeException('Unable to sync marker recovery directory.');
             }
             if (! rename($temporary, $this->markerPath)) {
                 throw new \RuntimeException('Unable to replace marker.');
             }
             $published = true;
-            if (! fsync($directoryStream)) {
+            if (! $this->syncDirectory($directoryStream)) {
                 throw new \RuntimeException('Unable to sync marker directory.');
             }
             $checkpoint = fopen($recoveryPath, 'ab');
@@ -469,7 +469,7 @@ final class CollectionDowntimeCompensator
             } elseif (is_file($this->markerPath) && ! unlink($this->markerPath)) {
                 throw new \RuntimeException('Unrecoverable marker publication: unknown timestamp cannot be removed.');
             }
-            if (! fsync($directoryStream)) {
+            if (! $this->syncDirectory($directoryStream)) {
                 throw new \RuntimeException('Unrecoverable marker publication: rollback cannot be synced; recovery evidence retained.');
             }
             @unlink($recoveryPath);
@@ -479,6 +479,16 @@ final class CollectionDowntimeCompensator
                 unlink($temporary);
             }
         }
+    }
+
+    /**
+     * @param  resource  $stream
+     *
+     * @phpstan-impure
+     */
+    private function syncDirectory($stream): bool
+    {
+        return fsync($stream);
     }
 
     /**
