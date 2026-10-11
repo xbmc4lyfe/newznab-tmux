@@ -154,4 +154,22 @@ final class TmuxTableCountsTest extends TestCase
         $this->assertSame(3, $state->getValue($monitor)['counts']['now']['collections_table']);
         $this->assertNotContains('collections', $estimated);
     }
+
+    public function test_an_estimated_collections_count_is_made_exact_when_a_backfill_control_is_turned_on(): void
+    {
+        DB::table('collections')->insert([['id' => 1], ['id' => 2]]);
+        $monitor = (new ReflectionClass(TmuxMonitorService::class))->newInstanceWithoutConstructor();
+        $state = new ReflectionProperty(TmuxMonitorService::class, 'runVar');
+        (new ReflectionProperty(TmuxMonitorService::class, 'collectionsCountIsEstimate'))->setValue($monitor, true);
+        $refresh = new ReflectionMethod(TmuxMonitorService::class, 'refreshCollectionCountForBackfillControls');
+
+        $state->setValue($monitor, ['settings' => [], 'counts' => ['now' => ['collections_table' => 14_100_000]]]);
+        $this->assertFalse($refresh->invoke($monitor), 'Display-only: the estimate stays.');
+        $this->assertSame(14_100_000, $state->getValue($monitor)['counts']['now']['collections_table']);
+
+        $state->setValue($monitor, ['settings' => ['progressive' => 1], 'counts' => ['now' => ['collections_table' => 14_100_000]]]);
+        $this->assertTrue($refresh->invoke($monitor));
+        $this->assertSame(2, $state->getValue($monitor)['counts']['now']['collections_table']);
+        $this->assertFalse($refresh->invoke($monitor), 'Already exact.');
+    }
 }

@@ -34,6 +34,11 @@ class TmuxMonitorService
 
     protected float $lastSlowRefreshAt = 0.0;
 
+    /**
+     * Whether counts.now.collections_table holds a row estimate rather than an exact count.
+     */
+    protected bool $collectionsCountIsEstimate = false;
+
     public function __construct(?ProcessingRuntimeStateRepository $runtimeState = null)
     {
         $this->tmux = new Tmux;
@@ -154,6 +159,10 @@ class TmuxMonitorService
         if ($this->refreshIsDue($this->lastSlowRefreshAt, $slowRefreshDelay, $now)) {
             $this->refreshSlowStatistics();
             $this->lastSlowRefreshAt = $now;
+            $statisticsChanged = true;
+        }
+
+        if ($this->refreshCollectionCountForBackfillControls()) {
             $statisticsChanged = true;
         }
 
@@ -302,9 +311,10 @@ class TmuxMonitorService
             // The collections kill switch and progressive backfill decide on this count,
             // so keep it exact when either is on; otherwise it is display-only and can be
             // over 10M rows, so use the row estimate (see Tmux::tableRowCount()).
-            $this->runVar['counts']['now']['collections_table'] = $this->collectionCountDrivesBackfill()
-                ? Collection::query()->count()
-                : $this->tmux->tableRowCount('collections');
+            $this->collectionsCountIsEstimate = ! $this->collectionCountDrivesBackfill();
+            $this->runVar['counts']['now']['collections_table'] = $this->collectionsCountIsEstimate
+                ? $this->tmux->tableRowCount('collections')
+                : Collection::query()->count();
             $this->runVar['counts']['now']['releases'] = Release::query()->count();
 
             foreach ($this->aggregateTableRowCounts($this->tmux->cbpmTableQuery()) as $key => $count) {
@@ -328,6 +338,22 @@ class TmuxMonitorService
         } catch (\Exception $e) {
             logger()->error('Error collecting table counts: '.$e->getMessage());
         }
+    }
+
+    /**
+     * Replace an estimated collections count with an exact one as soon as a backfill
+     * control that decides on it is turned on, instead of at the next slow refresh.
+     */
+    protected function refreshCollectionCountForBackfillControls(): bool
+    {
+        if (! $this->collectionsCountIsEstimate || ! $this->collectionCountDrivesBackfill()) {
+            return false;
+        }
+
+        $this->runVar['counts']['now']['collections_table'] = Collection::query()->count();
+        $this->collectionsCountIsEstimate = false;
+
+        return true;
     }
 
     private function collectionCountDrivesBackfill(): bool
