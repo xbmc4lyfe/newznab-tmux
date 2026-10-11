@@ -96,10 +96,17 @@ class FileNameCleaner
             '/\.(nfo|sfv|nzb|srr|srs)$/i',
         ];
 
+        $original = $fileName;
         do {
             $previous = $fileName;
             $fileName = preg_replace($wrappers, '', $fileName) ?? $fileName;
         } while ($fileName !== $previous);
+
+        // After a wrapper (`.rar`, `.par2`) came off, a trailing codec word is part of the title, not a file
+        // extension: `Movie.2020.1080p.DTS.rar` is the title `Movie.2020.1080p.DTS`.
+        if ($fileName !== $original && preg_match('/\.(dts|ac3|eac3|truehd|ts|opus)$/i', $fileName) === 1) {
+            return $fileName;
+        }
 
         // Document and playlist files that the shared payload lists do not cover.
         $extraPayload = '/\.(docx?|rtf|xlsx?|pptx?|odt|m3u8?|txt|m4b|aiff?|amr)$/i';
