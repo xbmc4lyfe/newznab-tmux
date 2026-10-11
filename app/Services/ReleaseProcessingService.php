@@ -27,7 +27,6 @@ use App\Support\Data\ProcessReleasesSettings;
 use App\Support\Data\ReleaseCreationResult;
 use App\Support\Data\ReleaseDeleteStats;
 use App\Support\ReleaseSearchIndexSync;
-use App\Support\SqlError;
 use DateTimeInterface;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Carbon;
@@ -602,19 +601,10 @@ final class ReleaseProcessingService
                 ."WHERE id IN ({$placeholders}) AND CASE id ".implode(' ', $guard).' ELSE 0 END';
             $values = [...$bindings['filesize'], ...$bindings['totalfiles'], ...$bindings['filecheck'], ...$bindings['ids'], ...$bindings['guard']];
             // Header storage locks collections in a different order inside its own
-            // transactions, so a batch can lose a deadlock: retry it, and if it still
-            // fails, leave those rows for the next pass rather than abort release creation.
-            try {
-                DB::transaction(static fn (): int => DB::update($sql, $values), self::MAX_RETRIES);
-            } catch (Throwable $e) {
-                if (! SqlError::isTransientLock($e)) {
-                    throw $e;
-                }
-                Log::warning('Collection aggregate batch skipped after lock retries', [
-                    'collections' => \count($chunk),
-                    'error' => $e->getMessage(),
-                ]);
-            }
+            // transactions, so a batch can lose a deadlock: retry it. If retries run out
+            // the error propagates, as before, so later stages never size rows whose
+            // aggregates weren't written.
+            DB::transaction(static fn (): int => DB::update($sql, $values), self::MAX_RETRIES);
         }
     }
 
