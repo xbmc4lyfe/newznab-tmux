@@ -50,26 +50,82 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
     }
 
     #[DataProvider('headerLimits')]
-    public function test_complete_nonparity_headers_proven_below_policy_never_enter_download_queue(int $min, int $max, int $files, int $groupMin, int $groupFiles): void
+    public function test_below_limit_headers_wait_for_download_then_verified_policy_filters_them(int $min, int $max, int $files, int $groupMin, int $groupFiles): void
     {
+        config(['release_verification.free_bytes' => 0, 'release_verification.scratch_bytes' => 2147483648, 'release_verification.bytes_per_second' => 0]);
         $this->limits($min, $max, $files, $groupMin, $groupFiles);
         $id = $this->collectionForPolicy();
         app(ReleaseCreationService::class)->createReleases(1, 10, false);
         $candidate = DB::table('release_verification_candidates')->first();
-        $this->assertSame('filtered', $candidate->status);
+        $this->assertSame('pending', $candidate->status);
         $this->assertFalse(DB::table('collections')->where('id', $id)->exists());
-        $this->assertNull(app(CandidateRepository::class)->claim());
+        $this->assertGreaterThan(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertFileExists(app(ManifestStore::class)->path($candidate->manifest_path));
+        $this->publicationSchema();
+        $this->mock(NNTPService::class, function ($mock): void {
+            $mock->shouldReceive('doConnect')->twice()->with(false)->andReturn(false, true);
+            $mock->shouldReceive('verificationArticle')->once()->with('a@b', 16777216)->andReturn((new YencService)->encode('hello', 'movie.mkv'));
+            $mock->shouldReceive('doQuit')->andReturn(null);
+        });
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->assertSame('unknown', DB::table('release_verification_candidates')->value('status'));
+        $this->travel(16)->minutes();
+        $this->limits($min, $max, $files, $groupMin, $groupFiles);
+        $this->artisan('releases:verify-candidates')->expectsOutputToContain('filtered — Verified')->assertSuccessful();
+        $this->assertSame('filtered', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame(0, DB::table('releases')->count());
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
-        $this->assertCount(0, glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
     }
 
-    public function test_processing_filter_rejects_known_bad_headers_before_release_creation(): void
+    public function test_processing_filter_preserves_unverified_headers_before_release_creation(): void
     {
         $this->limits(files: 2);
         $id = $this->collectionForPolicy();
-        app(ReleaseProcessingService::class)->deleteUnwantedCollections(1);
-        $this->assertFalse(DB::table('collections')->where('id', $id)->exists());
-        $this->assertSame('filtered', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame([], app(ReleaseProcessingService::class)->deleteUnwantedCollections(1));
+        $this->assertTrue(DB::table('collections')->where('id', $id)->exists());
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
+    }
+
+    public function test_verification_creation_scopes_candidate_queueing_to_the_supplied_window(): void
+    {
+        $this->limits(files: 2);
+        $rejected = $this->collectionForPolicy();
+        $partial = $this->collectionForPolicy(totalParts: 2);
+        $tail = $this->collectionForPolicy();
+        $window = [$rejected, $partial];
+        $rejectedIds = app(ReleaseProcessingService::class)->deleteUnwantedCollections(1, $window);
+        $this->assertSame([], $rejectedIds);
+        $this->assertTrue(DB::table('collections')->where('id', $tail)->exists());
+        $allowed = array_values(array_diff($window, $rejectedIds));
+        $result = app(ReleaseCreationService::class)->createReleases(1, 10, false, $allowed);
+        $this->assertSame(0, $result['added']);
+        $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'pending')->count());
+        $this->assertFalse(DB::table('collections')->where('id', $rejected)->exists());
+        $this->assertFalse(DB::table('collections')->where('id', $partial)->exists());
+        $this->assertTrue(DB::table('collections')->where('id', $tail)->exists());
+    }
+
+    public function test_below_policy_windows_do_not_starve_later_partial_candidates(): void
+    {
+        $this->limits(files: 2);
+        $settings = Cache::get('configuration:ingestion');
+        Cache::put('configuration:ingestion', new IngestionConfigurationData(...array_replace($settings->toArray(), ['maxReleasesCreated' => 1])), 300);
+        $first = $this->collectionForPolicy();
+        $partial = $this->collectionForPolicy(totalParts: 2);
+        $tail = $this->collectionForPolicy();
+        $this->publicationSchema();
+        $tailWasPreservedDuringFirstPass = false;
+        $totals = app(ReleaseProcessingService::class)->processReleaseCreationBatches(1, function () use ($first, $partial, $tail, &$tailWasPreservedDuringFirstPass): void {
+            if (DB::table('collections')->where('id', $partial)->exists() && ! DB::table('collections')->where('id', $first)->exists()) {
+                $tailWasPreservedDuringFirstPass = DB::table('collections')->where('id', $tail)->exists();
+            }
+        });
+        $this->assertTrue($tailWasPreservedDuringFirstPass);
+        $this->assertSame(0, $totals['releases']);
+        $this->assertSame(3, $totals['iterations']);
+        $this->assertSame(0, DB::table('releases')->count());
+        $this->assertSame(0, DB::table('release_verification_candidates')->where('status', 'filtered')->count());
+        $this->assertSame(3, DB::table('release_verification_candidates')->where('status', 'pending')->count());
     }
 
     public function test_partial_and_parity_only_inputs_remain_eligible_for_download_proof(): void

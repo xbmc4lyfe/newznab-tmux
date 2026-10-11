@@ -1,6 +1,6 @@
 # Verify downloads before publishing releases
 
-Status: approved October 11, 2026; implementation staged for review. No live deployment.
+Status: approved October 11, 2026. Review and rollout are tracked in fork PR #53.
 
 ## Recovered request and decisions
 
@@ -15,7 +15,8 @@ releases. On October 11 the user clarified: **download and verify before
 publishing**. Headers and advertised recovery-volume names are insufficient proof.
 
 The unused alternate-article-server changes remain staged in their original
-worktree. Preserve them; this design uses the current primary NNTP proxy.
+worktree. Preserve them. Verification uses the configured primary provider and,
+when enabled, the configured alternate provider with the same bounded BODY limit.
 
 ## Current evidence
 
@@ -55,6 +56,8 @@ Neither is the proposed approach.
 2. Snapshot touched candidates in bounded pages to an immutable manifest. Commit
    the manifest reference and version durably before deleting hot-table rows.
    A failed handoff leaves the original rows available for retry.
+   Failed individual handoffs do not abort subsequent collection windows. Stale
+   cleanup uses a bounded, locked cursor and excludes failed handoffs from deletion.
 3. Retain a compact identity record so late articles from other groups attach to
    the same pending candidate. Merge manifests by file and segment identity;
    conflicting bytes, names or message IDs require explicit resolution. A
@@ -68,6 +71,18 @@ Neither is the proposed approach.
    capacity-limited and unrepairable candidates remain unpublished. Expire waiting
    candidates after 48 hours without new unique articles, matching the previous
    decision. Repeated duplicate headers do not reset the clock.
+
+Configured site/group size and file-count limits still apply before publication,
+using decoded verified bytes and the full verified inventory, including recovered
+sources absent from headers. Subject extensions and advertised counts cannot
+justify early rejection: an article labeled `masked.rar` can contain PAR2 data
+that reconstructs otherwise unseen files. A successful payload that violates
+publication policy becomes terminally filtered and releases its reserved capacity.
+
+With verification required, the legacy NZB queue and direct header-only writer
+remain disabled, including pre-existing `NZB_NONE` rows. Verified publication
+writes its exact NZB directly. Native managed installations provision PAR2 and
+check executable availability before activating processing services.
 
 Archive-and-merge handoff must coordinate with ingest transactions and existing
 cleanup. The collection timeout and 72-hour cleanup cannot erase a candidate

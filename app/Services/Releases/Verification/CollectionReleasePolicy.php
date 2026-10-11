@@ -11,45 +11,6 @@ use RuntimeException;
 final class CollectionReleasePolicy
 {
     /** @param array<string, mixed> $manifest */
-    public function headerRejection(array $manifest): ?string
-    {
-        $files = $manifest['files'];
-        $expected = (int) ($manifest['expected_files'] ?? 0);
-        if ($expected < 1 || count($files) !== $expected || ($manifest['conflict'] ?? false)) {
-            return null;
-        }
-        $bytes = 0;
-        foreach ($files as $file) {
-            $subject = (string) $file['subject'];
-            $name = preg_match('/"([^"\r\n]+)"/', $subject, $match) === 1 ? $match[1] : $subject;
-            if (preg_match('/\.[a-z0-9]{2,8}\z/i', $name) !== 1 || preg_match('/\.par2\z/i', $name) === 1) {
-                return null;
-            }
-            $parts = (int) $file['totalparts'];
-            $numbers = array_column($file['segments'], 'number');
-            sort($numbers);
-            if ($parts < 1 || count($numbers) !== $parts || $numbers !== range(1, $parts)) {
-                return null;
-            }
-            foreach ($file['segments'] as $segment) {
-                if ((int) $segment['bytes'] < 1 || (string) $segment['messageid'] === '') {
-                    return null;
-                }
-                $bytes += (int) $segment['bytes'];
-            }
-        }
-        $limits = $this->limits((int) $manifest['groups_id']);
-        if ($bytes < $limits['min_size']) {
-            return 'Complete non-parity header inventory is below the configured minimum size.';
-        }
-        if (count($files) < $limits['min_files']) {
-            return 'Complete non-parity header inventory is below the configured minimum file count.';
-        }
-
-        return null;
-    }
-
-    /** @param array<string, mixed> $manifest */
     public function verifiedRejection(array $manifest): ?string
     {
         if (($manifest['metadata_source'] ?? null) === 'import') {

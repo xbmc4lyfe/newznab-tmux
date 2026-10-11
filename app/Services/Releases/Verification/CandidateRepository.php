@@ -16,12 +16,16 @@ final class CandidateRepository
 {
     public function __construct(private readonly ManifestStore $store, private readonly CollectionCleanupService $cleanup) {}
 
-    public function archive(int $collectionId, bool $onlyIfFiltered = false): void
+    public function archive(int $collectionId): void
     {
-        DB::transaction(function () use ($collectionId, $onlyIfFiltered): void {
+        DB::transaction(function () use ($collectionId): void {
             $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
             $collection = DB::table('collections')->where('id', $collectionId)->lockForUpdate()->first();
-            if ($collection === null || (int) $collection->filecheck === 4) {
+            if ($collection === null) {
+                return;
+            }
+            if ((int) $collection->filecheck === 4
+                && ! $this->cleanup->verificationEligibleCollections()->where('collections.id', $collectionId)->exists()) {
                 return;
             }
             if ($state === null) {
@@ -42,10 +46,6 @@ final class CandidateRepository
                 $manifest = $this->merge($oldManifest, $manifest);
                 $newArticles = $this->articleIdentity($oldManifest) !== $this->articleIdentity($manifest);
             }
-            $filteredReason = app(CollectionReleasePolicy::class)->headerRejection($manifest);
-            if ($onlyIfFiltered && $filteredReason === null) {
-                return;
-            }
             $path = $this->store->write($manifest);
             $size = filesize($this->store->path($path));
             if ($size === false) {
@@ -54,11 +54,10 @@ final class CandidateRepository
             $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
             $lastUniqueAt = $existing === null ? $arrivalAt : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
             $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
-            $discarded = $expired || $filteredReason !== null;
-            $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + ($discarded ? 0 : $size);
+            $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + ($expired ? 0 : $size);
             if ($pending > (int) config('release_verification.pending_bytes')) {
                 if ($existing === null || $existing->manifest_path !== $path) {
-                    unlink($this->store->path($path));
+                    $this->store->deleteIfUnreferenced($path);
                 }
                 throw new RuntimeException('Pending verification capacity is full; original headers retained.');
             }
@@ -70,9 +69,8 @@ final class CandidateRepository
                 $values += ['version' => (int) ($existing->version ?? 0) + 1, 'last_unique_at' => $lastUniqueAt,
                     'next_attempt_at' => now(), 'status' => 'pending', 'lease_token' => null, 'lease_until' => null, 'reason' => null];
             }
-            if ($discarded) {
-                $values = array_replace($values, ['status' => $expired ? 'expired' : 'filtered', 'reason' => $filteredReason,
-                    'last_unique_at' => $lastUniqueAt,
+            if ($expired) {
+                $values = array_replace($values, ['status' => 'expired', 'last_unique_at' => $lastUniqueAt,
                     'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
             }
             if ($existing === null) {
@@ -83,20 +81,16 @@ final class CandidateRepository
             }
             DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
             $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false);
-            if ($discarded) {
-                DB::afterCommit(function () use ($path, $candidateId): void {
-                    @unlink($this->store->path($path));
-                    foreach (glob((string) config('release_verification.storage_path').'/scratch/'.$candidateId.'-*', GLOB_ONLYDIR) ?: [] as $directory) {
-                        File::deleteDirectory($directory);
-                    }
+            if ($expired) {
+                $expiredVersion = (int) ($values['version'] ?? $existing->version ?? 1);
+                DB::afterCommit(function () use ($path, $candidateId, $expiredVersion): void {
+                    $this->store->deleteIfUnreferenced($path);
+                    $this->deleteScratchThroughVersion($candidateId, $expiredVersion);
                 });
             }
             if ($existing !== null && $existing->manifest_path !== $path) {
                 DB::afterCommit(function () use ($existing): void {
-                    $old = $this->store->path($existing->manifest_path);
-                    if (is_file($old)) {
-                        unlink($old);
-                    }
+                    $this->store->deleteIfUnreferenced($existing->manifest_path);
                 });
             }
         }, 5);
@@ -121,7 +115,7 @@ final class CandidateRepository
             $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + $bytes;
             if ($pending > (int) config('release_verification.pending_bytes')) {
                 if ($existing === null || $existing->manifest_path !== $path) {
-                    @unlink($this->store->path($path));
+                    $this->store->deleteIfUnreferenced($path);
                 }
                 throw new RuntimeException('Candidate capacity is full; import retained for retry.');
             }
@@ -136,7 +130,7 @@ final class CandidateRepository
                 DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
                 if ($existing->manifest_path !== '' && $existing->manifest_path !== $path) {
                     DB::afterCommit(function () use ($existing): void {
-                        @unlink($this->store->path($existing->manifest_path));
+                        $this->store->deleteIfUnreferenced($existing->manifest_path);
                     });
                 }
             }
@@ -220,7 +214,10 @@ final class CandidateRepository
 
         return ['identity' => bin2hex($collection->collectionhash), 'subject' => $collection->subject,
             'fromname' => $collection->fromname, 'date' => $collection->date, 'groups_id' => (int) $collection->groups_id,
-            'regex_id' => (int) $collection->collection_regexes_id, 'expected_files' => (int) $collection->totalfiles,
+            // Legacy insertion could overwrite the declared count with observed
+            // files. An unknown inventory needs PAR2 proof or later evidence.
+            'regex_id' => (int) $collection->collection_regexes_id,
+            'expected_files' => (int) $collection->filecheck === 4 ? 0 : (int) $collection->totalfiles,
             'groups' => $groups, 'files' => $files, 'conflict' => false];
     }
 
@@ -257,9 +254,12 @@ final class CandidateRepository
         $old['files'] = array_values($files);
         $old['groups'] = array_values(array_unique(array_merge($old['groups'], $new['groups'])));
         sort($old['groups']);
-        if ($old['fromname'] !== $new['fromname'] || $old['expected_files'] !== $new['expected_files']) {
+        $oldExpected = (int) $old['expected_files'];
+        $newExpected = (int) $new['expected_files'];
+        if ($old['fromname'] !== $new['fromname'] || ($oldExpected > 0 && $newExpected > 0 && $oldExpected !== $newExpected)) {
             $old['conflict'] = true;
         }
+        $old['expected_files'] = max(0, $oldExpected, $newExpected);
 
         return $old;
     }
@@ -284,13 +284,8 @@ final class CandidateRepository
                 DB::table('release_verification_candidates')->where('id', $id)->update(['status' => 'expired',
                     'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
                 DB::afterCommit(function () use ($row): void {
-                    if ($row->manifest_path !== '') {
-                        @unlink($this->store->path($row->manifest_path));
-                    }
-                    $root = (string) config('release_verification.storage_path').'/scratch/';
-                    foreach (glob($root.$row->id.'-*', GLOB_ONLYDIR) ?: [] as $directory) {
-                        File::deleteDirectory($directory);
-                    }
+                    $this->store->deleteIfUnreferenced($row->manifest_path);
+                    $this->deleteScratchThroughVersion((int) $row->id, (int) $row->version);
                 });
             });
         }
@@ -348,13 +343,19 @@ final class CandidateRepository
                 'reason' => mb_strcut($reason, 0, 2000, 'UTF-8'), 'lease_token' => null, 'lease_until' => null,
                 'manifest_path' => '', 'manifest_bytes' => 0]);
             DB::afterCommit(function () use ($candidate): void {
-                if ($candidate->manifest_path !== '') {
-                    @unlink($this->store->path($candidate->manifest_path));
-                }
-                foreach (glob((string) config('release_verification.storage_path').'/scratch/'.$candidate->id.'-*', GLOB_ONLYDIR) ?: [] as $directory) {
-                    File::deleteDirectory($directory);
-                }
+                $this->store->deleteIfUnreferenced($candidate->manifest_path);
+                $this->deleteScratchThroughVersion((int) $candidate->id, (int) $candidate->version);
             });
         }, 5);
+    }
+
+    private function deleteScratchThroughVersion(int $candidateId, int $version): void
+    {
+        $root = (string) config('release_verification.storage_path').'/scratch/';
+        foreach (glob($root.$candidateId.'-*', GLOB_ONLYDIR) ?: [] as $directory) {
+            if (preg_match('/\A'.$candidateId.'-([0-9]+)\z/', basename($directory), $match) === 1 && (int) $match[1] <= $version) {
+                File::deleteDirectory($directory);
+            }
+        }
     }
 }

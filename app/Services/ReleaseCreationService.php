@@ -32,19 +32,32 @@ class ReleaseCreationService
     /**
      * Create releases from complete collections.
      *
+     * @param  list<int>|null  $allowedIds
      * @return array{added:int,dupes:int}
      *
      * @throws \Throwable
      */
-    public function createReleases(int|string|null $groupID, int $limit, bool $echoCLI): array
+    public function createReleases(int|string|null $groupID, int $limit, bool $echoCLI, ?array $allowedIds = null): array
     {
+        if ($allowedIds === []) {
+            return ['added' => 0, 'dupes' => 0];
+        }
         if (config('release_verification.required', true)) {
-            $ids = $this->collectionCleanupService->verificationEligibleCollections()
-                ->where('filecheck', CollectionFileCheckStatus::Sized->value)
+            $ids = $this->collectionCleanupService->verificationReadyCollections()
                 ->when(! empty($groupID), static fn ($q) => $q->where('groups_id', $groupID))
+                ->when($allowedIds !== null, static fn ($q) => $q->whereIn('id', $allowedIds))
                 ->orderBy('id')->limit(max(1, $limit))->pluck('id');
             foreach ($ids as $id) {
-                app(CandidateRepository::class)->archive((int) $id);
+                try {
+                    app(CandidateRepository::class)->archive((int) $id);
+                } catch (\Throwable $error) {
+                    // Keep this collection for retry without starving later
+                    // candidates or preventing the bounded window cursor saving.
+                    Log::warning('Verification archival failed; original headers retained.', [
+                        'collection_id' => (int) $id,
+                        'error_type' => $error::class,
+                    ]);
+                }
             }
 
             return ['added' => 0, 'dupes' => 0];
@@ -64,6 +77,9 @@ class ReleaseCreationService
             ->where('collections.filesize', '>', 0);
         if (! empty($groupID)) {
             $collectionsQuery->where('collections.groups_id', $groupID);
+        }
+        if ($allowedIds !== null) {
+            $collectionsQuery->whereIn('collections.id', $allowedIds);
         }
         $collectionsQuery->select(['collections.*', 'usenet_groups.name as gname'])
             ->join('usenet_groups', 'usenet_groups.id', '=', 'collections.groups_id')

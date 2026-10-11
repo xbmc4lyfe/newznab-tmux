@@ -7,12 +7,17 @@ namespace App\Services;
 use App\Enums\CollectionFileCheckStatus;
 use App\Services\Binaries\BinariesConfig;
 use App\Services\Configuration\ConfigurationProvider;
+use App\Services\Nzb\NzbService;
 use App\Services\Releases\Verification\CandidateRepository;
+use DateTimeInterface;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
+use Throwable;
 
 class CollectionCleanupService
 {
@@ -43,6 +48,12 @@ class CollectionCleanupService
      * Cache key holding the collection id the next orphan sweep starts after.
      */
     public const ORPHAN_SWEEP_CURSOR = 'cbp:orphan-sweep:cursor';
+
+    public const VERIFICATION_OLD_SWEEP_LOCK = 'cbp:verification-old-sweep:lock';
+
+    public const VERIFICATION_OLD_SWEEP_CURSOR = 'cbp:verification-old-sweep:cursor';
+
+    private const VERIFICATION_OLD_SWEEP_MAX_CANDIDATES = 25;
 
     /**
      * Lock lifetime; a crashed sweeper releases the sweep after this long.
@@ -88,33 +99,31 @@ class CollectionCleanupService
         $cutoff = now()->subHours(app(ConfigurationProvider::class)->ingestion()->partRetentionHours);
         $batchDeleted = 0;
         $verificationRequired = (bool) config('release_verification.required', true);
-        do {
-            $ids = DB::table('collections')
-                ->where('dateadded', '<', $cutoff)
-                ->orderBy('id')
-                ->limit($this->sqlChunkSize())
-                ->pluck('id')
-                ->all();
+        if ($verificationRequired) {
+            $batchDeleted = $this->deleteOldVerificationWindow($cutoff, $echoCLI);
+        } else {
+            do {
+                $ids = DB::table('collections')
+                    ->where('dateadded', '<', $cutoff)
+                    ->orderBy('id')
+                    ->limit($this->sqlChunkSize())
+                    ->pluck('id')
+                    ->all();
 
-            if ($ids === []) {
-                break;
-            }
-
-            if ($verificationRequired) {
-                foreach ($this->verificationEligibleCollections()->whereIn('id', $ids)->orderBy('id')->pluck('id') as $id) {
-                    app(CandidateRepository::class)->archive((int) $id);
+                if ($ids === []) {
+                    break;
                 }
-            }
-            $affected = $this->deleteCollectionsAndDescendants($ids, 'Cleanup', $echoCLI);
 
-            $batchDeleted += $affected;
-            // A verification handoff persists manifests per collection; limit that work to one page.
-            if ($verificationRequired || $affected < $this->sqlChunkSize()) {
-                break;
-            }
-            // Brief pause to reduce pressure on the lock manager in busy systems.
-            usleep(10000);
-        } while (true);
+                $affected = $this->deleteCollectionsAndDescendants($ids, 'Cleanup', $echoCLI);
+
+                $batchDeleted += $affected;
+                if ($affected < $this->sqlChunkSize()) {
+                    break;
+                }
+                // Brief pause to reduce pressure on the lock manager in busy systems.
+                usleep(10000);
+            } while (true);
+        }
 
         $deletedCount += $batchDeleted;
 
@@ -171,6 +180,61 @@ class CollectionCleanupService
         return $deletedCount;
     }
 
+    /** Archive one small stale window, retaining failed inputs until the snapshot wraps. */
+    private function deleteOldVerificationWindow(DateTimeInterface $cutoff, bool $echoCLI): int
+    {
+        $lock = Cache::lock(self::VERIFICATION_OLD_SWEEP_LOCK, 600);
+        if (! $lock->get()) {
+            return 0;
+        }
+        try {
+            $saved = Cache::get(self::VERIFICATION_OLD_SWEEP_CURSOR);
+            if (is_array($saved) && isset($saved['last_id'], $saved['max_id'])
+                && is_int($saved['last_id']) && is_int($saved['max_id'])
+                && $saved['last_id'] >= 0 && $saved['max_id'] > $saved['last_id']) {
+                $lastId = $saved['last_id'];
+                $maxId = $saved['max_id'];
+            } else {
+                $lastId = 0;
+                $maxId = (int) DB::table('collections')->max('id');
+            }
+            $limit = min(self::VERIFICATION_OLD_SWEEP_MAX_CANDIDATES, $this->sqlChunkSize());
+            $ids = DB::table('collections')->where('dateadded', '<', $cutoff)
+                ->where('id', '>', $lastId)->where('id', '<=', $maxId)
+                ->orderBy('id')->limit($limit)->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+            if ($ids === []) {
+                Cache::forget(self::VERIFICATION_OLD_SWEEP_CURSOR);
+
+                return 0;
+            }
+            $eligible = array_fill_keys($this->verificationEligibleCollections()->whereIn('id', $ids)
+                ->pluck('id')->map(static fn ($id): int => (int) $id)->all(), true);
+            $failed = [];
+            foreach ($ids as $id) {
+                if (! isset($eligible[$id])) {
+                    continue;
+                }
+                try {
+                    app(CandidateRepository::class)->archive($id);
+                } catch (Throwable $error) {
+                    $failed[] = $id;
+                    Log::warning('Verification archival failed during stale cleanup.', [
+                        'collection_id' => $id, 'error_type' => $error::class]);
+                }
+            }
+            $lastId = $ids[array_key_last($ids)];
+            if ($lastId >= $maxId || count($ids) < $limit) {
+                Cache::forget(self::VERIFICATION_OLD_SWEEP_CURSOR);
+            } else {
+                Cache::forever(self::VERIFICATION_OLD_SWEEP_CURSOR, ['last_id' => $lastId, 'max_id' => $maxId]);
+            }
+
+            return $this->deleteCollectionsAndDescendants(array_values(array_diff($ids, $failed)), 'Cleanup', $echoCLI);
+        } finally {
+            $lock->release();
+        }
+    }
+
     /**
      * Preserve retrievable payload even when header counts or aggregate sizes are incomplete.
      * Terminal/invalid collections and rows without any usable articles do not need a download attempt.
@@ -183,9 +247,23 @@ class CollectionCleanupService
         );
         // Legacy partially reconciled rows can still carry recoverable payload.
         $statuses[] = 10;
+        $supportsLegacyBacklog = Schema::hasColumn('collections', 'releases_id') && Schema::hasTable('releases')
+            && Schema::hasColumn('releases', 'nzbstatus');
 
         return DB::table('collections')
-            ->whereIn('filecheck', $statuses)
+            ->where(function (Builder $query) use ($statuses, $supportsLegacyBacklog): void {
+                $query->whereIn('filecheck', $statuses);
+                if ($supportsLegacyBacklog) {
+                    $query->orWhere(function (Builder $legacy): void {
+                        $legacy->where('filecheck', CollectionFileCheckStatus::Inserted->value)
+                            ->whereExists(function (Builder $release): void {
+                                $release->selectRaw('1')->from('releases as legacy_release')
+                                    ->whereColumn('legacy_release.id', 'collections.releases_id')
+                                    ->where('legacy_release.nzbstatus', NzbService::NZB_NONE);
+                            });
+                    });
+                }
+            })
             ->whereExists(function ($query): void {
                 $query->selectRaw('1')->from('binaries as b')
                     ->join('parts as p', 'p.binaries_id', '=', 'b.id')
@@ -193,6 +271,12 @@ class CollectionCleanupService
                     ->where('p.size', '>', 0)
                     ->where('p.messageid', '<>', '');
             });
+    }
+
+    public function verificationReadyCollections(): Builder
+    {
+        return $this->verificationEligibleCollections()->whereIn('filecheck', [
+            CollectionFileCheckStatus::Sized->value, CollectionFileCheckStatus::Inserted->value]);
     }
 
     /**
@@ -311,6 +395,8 @@ class CollectionCleanupService
             // optimizer start from every nzbstatus = 1 release instead.
             $ids = DB::table('collections as c')
                 ->whereNotNull('c.releases_id')
+                ->when(config('release_verification.required', true), fn ($query) => $query
+                    ->whereNotExists($this->verificationEligibleCollections()->whereColumn('collections.id', 'c.id')->selectRaw('1')))
                 ->whereExists(fn ($q) => $q->select(DB::raw(1))
                     ->from('releases as r')
                     ->whereColumn('r.id', 'c.releases_id')
@@ -422,7 +508,7 @@ class CollectionCleanupService
             }
 
             return $this->cascadeDeleteReady = isset($cascades['binaries'], $cascades['parts']);
-        } catch (\Throwable) {
+        } catch (Throwable) {
             return $this->cascadeDeleteReady = false;
         }
     }
@@ -448,7 +534,7 @@ class CollectionCleanupService
         while (true) {
             try {
                 return (int) $op();
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 if (! $this->isLockError($e)) {
                     throw $e;
                 }
@@ -472,7 +558,7 @@ class CollectionCleanupService
      * Determine whether the given throwable represents a transient InnoDB
      * lock error (deadlock or lock wait timeout) that is safe to retry.
      */
-    private function isLockError(\Throwable $e): bool
+    private function isLockError(Throwable $e): bool
     {
         if ($e instanceof QueryException) {
             $sqlState = (string) $e->getCode();

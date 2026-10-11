@@ -15,11 +15,14 @@
 ## Global Constraints
 
 - Full payload download precedes publication; file size never grants eligibility.
+- Apply configured admission limits to the verified decoded size and inventory before publication; masked headers cannot prove that reconstruction is impossible.
 - Keep declared file counts; age alone cannot make a candidate complete.
 - One verifier, at most four article connections; start with one connection.
 - Retry unknown outcomes; expire after 48 hours without new unique articles.
 - Persist pending manifests and scratch under the existing storage bind mount.
-- No commits, pushes, deploys or live deletions from this feature session.
+- Every new commit is authored and signed as `xbmc4lyfe` and confirmed GitHub Verified. GitHub actions use that account.
+- Complete current-head review and checks before squash-merging into fork/master; deploy under the shared guard and prove real verified publication afterward.
+- Keep existing-release audits read-only unless a separate deletion scope is authorized.
 - Every new env setting appears in both `.env.example` and `docker/config/app.env.example`.
 - Stage only project changes. Keep execution logs in ignored scratch storage.
 

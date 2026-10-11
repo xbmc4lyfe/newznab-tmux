@@ -90,10 +90,7 @@ final class VerifiedReleasePublisher
             'verified_at' => now(), 'lease_token' => null, 'lease_until' => null, 'manifest_bytes' => 0, 'manifest_path' => '',
         ]);
         DB::afterCommit(function () use ($candidate): void {
-            $path = app(ManifestStore::class)->path($candidate->manifest_path);
-            if (is_file($path)) {
-                unlink($path);
-            }
+            app(ManifestStore::class)->deleteIfUnreferenced($candidate->manifest_path);
         });
     }
 }
