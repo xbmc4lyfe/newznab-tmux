@@ -109,7 +109,7 @@ class FileNameCleaner
         }
 
         // Document and playlist files that the shared payload lists do not cover.
-        $extraPayload = '/\.(docx?|rtf|xlsx?|pptx?|odt|m3u8?|txt|m4b|aiff?|amr)$/i';
+        $extraPayload = '/\.(docx?|rtf|xlsx?|pptx?|odt|m3u8?|txt|m4b|aiff?|amr|m2v|m1v|mpv|mpgv|qt|mp2|ra|w64)$/i';
 
         foreach ([self::VIDEO_EXTENSIONS, self::AUDIO_EXTENSIONS, self::IMAGE_EXTENSIONS, self::EBOOK_EXTENSIONS, self::GAMEAPP_EXTENSIONS, self::SUBTITLE_EXTENSIONS, $extraPayload] as $payload) {
             $stripped = preg_replace($payload, '', $fileName) ?? $fileName;
