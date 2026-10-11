@@ -56,6 +56,8 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             'metadata duplicate with different articles' => [12345, 12345, 'different'],
             'metadata duplicate with missing NZB' => [12345, 12345, 'missing'],
             'metadata duplicate with corrupt compressed NZB' => [12345, 12345, 'corrupt'],
+            'unpublished duplicate with exact verified inventory is not reused' => [12345, 12345, 'unpublished_exact'],
+            'duplicate removed after metadata match is not reused' => [12345, 12345, 'deleted_exact'],
             'duplicate with exact verified article inventory' => [12345, 12345, 'exact'],
             'database insert failure removes new NZB' => [12345, 12345, null, 'insert'],
             'database retry removes rolled-back NZB' => [12345, 12345, null, 'retry'],
@@ -129,6 +131,9 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 }
             }
         }
+        if ($duplicateKind === 'unpublished_exact') {
+            DB::table('releases')->where('id', 777)->update(['nzbstatus' => NzbService::NZB_NONE]);
+        }
         $path = $store->write($manifest);
         DB::table('release_verification_candidates')->insert(['identity' => sha1('publish'), 'groups_id' => 1,
             'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => filesize($store->path($path)),
@@ -164,6 +169,16 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                     DB::afterCommit(static function (): void {
                         throw new \RuntimeException('forced after commit failure');
                     });
+                }
+            });
+        }
+        $duplicateDeleted = false;
+        if ($duplicateKind === 'deleted_exact') {
+            DB::listen(function (QueryExecuted $event) use (&$duplicateDeleted): void {
+                if (! $duplicateDeleted && str_starts_with($event->sql, 'select "id", "predb_id"')
+                    && str_contains($event->sql, 'from "releases"')) {
+                    $duplicateDeleted = true;
+                    DB::table('releases')->where('id', 777)->delete();
                 }
             });
         }
@@ -205,6 +220,14 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $this->assertSame($duplicateGuid, DB::table('releases')->value('guid'));
         } elseif ($duplicateKind !== null) {
             $this->assertNotSame(777, $id);
+        }
+        if ($duplicateKind === 'unpublished_exact') {
+            $this->assertSame(NzbService::NZB_NONE, (int) DB::table('releases')->where('id', 777)->value('nzbstatus'));
+            $this->assertSame(2, DB::table('releases')->count());
+        } elseif ($duplicateKind === 'deleted_exact') {
+            $this->assertTrue($duplicateDeleted, 'Fixture must remove the matched row before its publication revalidation.');
+            $this->assertFalse(DB::table('releases')->where('id', 777)->exists());
+            $this->assertSame(1, DB::table('releases')->count());
         }
         $release = DB::table('releases')->where('id', $id)->first();
         $xml = app(NzbService::class)->readNzbContents($release->guid);

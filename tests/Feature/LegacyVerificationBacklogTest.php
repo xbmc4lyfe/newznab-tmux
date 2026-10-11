@@ -11,6 +11,7 @@ use App\Services\Nzb\NzbService;
 use App\Services\ReleaseCreationService;
 use App\Services\ReleaseProcessingService;
 use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Tmux\CollectionReconciliationBarrier;
 use App\Support\Configuration\IngestionConfigurationData;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Cache;
@@ -109,6 +110,48 @@ class LegacyVerificationBacklogTest extends ReleaseVerificationCandidatesTest
         $this->assertSame([1], DB::table('collections')->pluck('id')->all());
         $this->assertSame([10, 11], DB::table('releases')->orderBy('id')->pluck('id')->all());
         $this->assertSame(NzbService::NZB_NONE, (int) DB::table('releases')->where('id', 10)->value('nzbstatus'));
+    }
+
+    public function test_required_legacy_backlog_is_archived_before_preparation_and_fresh_headers_are_reconciled(): void
+    {
+        Schema::table('binaries', function (Blueprint $table): void {
+            $table->integer('currentparts')->default(0);
+            $table->integer('partsize')->default(0);
+            $table->integer('partcheck')->default(0);
+        });
+        $this->legacyCollection(1);
+        $this->legacyCollection(2, status: CollectionFileCheckStatus::Default->value, releaseId: null);
+        DB::table('collections')->where('id', 2)->update(['totalfiles' => 3]);
+        $barrier = new class($this) implements CollectionReconciliationBarrier
+        {
+            public int $calls = 0;
+
+            public function __construct(private LegacyVerificationBacklogTest $test) {}
+
+            public function withReconciliationBarrier(int $delayHours, callable $work): mixed
+            {
+                $this->calls++;
+                $this->test->assertFalse(DB::table('collections')->where('id', 1)->exists(), 'Eligible legacy headers must be archived before preparation begins.');
+                $this->test->assertTrue(DB::table('release_verification_candidates')->where('source_identity', bin2hex(sha1('legacy-1', true)))->exists());
+                $this->test->assertSame(CollectionFileCheckStatus::Default->value, DB::table('collections')->where('id', 2)->value('filecheck'));
+
+                return $work();
+            }
+        };
+        $this->app->instance(CollectionReconciliationBarrier::class, $barrier);
+
+        $totals = app(ReleaseProcessingService::class)->processCollectionsAndReleases(1);
+
+        $this->assertSame(1, $barrier->calls);
+        $this->assertSame(0, $totals['releases']);
+        $this->assertSame(0, DB::table('collections')->count());
+        $this->assertSame(2, DB::table('release_verification_candidates')->count());
+        $fresh = DB::table('release_verification_candidates')->where('source_identity', bin2hex(sha1('legacy-2', true)))->sole();
+        $manifest = app(ManifestStore::class)->read($fresh->manifest_path);
+        $this->assertSame(3, $manifest['expected_files'], 'Reconciliation must preserve the declared inventory for repair verification.');
+        $this->assertSame('article-2@example.test', $manifest['files'][0]['segments'][0]['messageid']);
+        $this->assertNull($manifest['legacy_release_id']);
+        $this->assertSame([10, 11], DB::table('releases')->orderBy('id')->pluck('id')->all());
     }
 
     private function legacyCollection(int $id, int $status = 4, ?int $releaseId = 10, int $bytes = 5): void

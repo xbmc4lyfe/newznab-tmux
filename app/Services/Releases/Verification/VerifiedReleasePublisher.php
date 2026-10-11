@@ -65,11 +65,12 @@ final class VerifiedReleasePublisher
             }
             [$duplicate] = $legacy === null
                 ? $this->duplicates->findDuplicate($metadata['name'], $metadata['searchname'], $metadata['predb_id'], $size) : [null];
-            $duplicateGuid = $duplicate === null ? null : DB::table('releases')->where('id', $duplicate->id)->value('guid');
-            if ($legacy === null && is_string($duplicateGuid) && $this->writer->matches($manifest, $duplicateGuid)) {
-                $this->markPublished($candidate->id, (int) $duplicate->id, $result);
+            $publishedDuplicate = $duplicate === null ? null : DB::table('releases')->where('id', $duplicate->id)
+                ->where('nzbstatus', NzbService::NZB_ADDED)->lockForUpdate()->first(['id', 'guid']);
+            if ($publishedDuplicate !== null && $this->writer->matches($manifest, (string) $publishedDuplicate->guid)) {
+                $this->markPublished($candidate->id, (int) $publishedDuplicate->id, $result);
 
-                return (int) $duplicate->id;
+                return (int) $publishedDuplicate->id;
             }
             $guid = $legacy === null ? (string) Str::uuid() : (string) $legacy->guid;
             $path = $this->writer->write($manifest, $guid);
