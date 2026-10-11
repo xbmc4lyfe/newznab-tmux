@@ -646,11 +646,13 @@ final class CollectionHandler
                 return true;
             }
 
-            // As in BinaryHandler::refreshAggregates(): read the aggregates with a plain
-            // SELECT, which takes no locks on binaries, then write them back by primary key.
+            // As in BinaryHandler::refreshAggregates(): lock the collections rows in id
+            // order, so concurrent writers to the same collection serialize, then read the
+            // binaries totals with a plain SELECT and write them back by primary key.
             sort($collectionIds);
             $statusPlaceholders = implode(',', array_fill(0, \count($inProgressStatuses), '?'));
             foreach (array_chunk($collectionIds, $chunkSize) as $chunk) {
+                DB::table('collections')->whereIn('id', $chunk)->orderBy('id')->lockForUpdate()->pluck('id');
                 $aggregates = DB::table('binaries')
                     ->whereIn('collections_id', $chunk)
                     ->groupBy('collections_id')

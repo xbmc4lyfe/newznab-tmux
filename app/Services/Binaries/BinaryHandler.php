@@ -438,11 +438,13 @@ final class BinaryHandler
 
             // An UPDATE that joins parts locks every parts row it reads, even under
             // READ-COMMITTED, and concurrent header writers on the same group deadlocked
-            // on those locks. A plain SELECT takes none (and sees this transaction's own
-            // parts), so read the aggregates first and write them back by primary key.
+            // on those locks. Instead lock just the binaries rows, in id order, so a
+            // concurrent writer to the same binary commits first; then a plain SELECT
+            // (READ COMMITTED, see HeaderStorageTransaction) sees its parts and ours.
             $chunkSize = max(1, min($chunkSize, $this->sqlChunkSize));
             sort($binaryIds);
             foreach (array_chunk($binaryIds, $chunkSize) as $chunk) {
+                DB::table('binaries')->whereIn('id', $chunk)->orderBy('id')->lockForUpdate()->pluck('id');
                 $aggregates = DB::table('parts')
                     ->whereIn('binaries_id', $chunk)
                     ->groupBy('binaries_id')

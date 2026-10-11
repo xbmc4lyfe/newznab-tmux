@@ -230,6 +230,36 @@ class CbpReleaseEligibilityTest extends TestCase
         $this->assertSame($before + 1, $after, 'Rows other workers commit are visible inside the transaction.');
     }
 
+    public function test_aggregate_refreshes_lock_their_rows_before_reading_totals(): void
+    {
+        if (! \in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
+            $this->markTestSkipped('Row locks apply to MariaDB.');
+        }
+        $collectionId = $this->collection(1, now()->format('Y-m-d H:i:s'));
+        $binaryId = (int) DB::table('binaries')->where('collections_id', $collectionId)->value('id');
+        $queries = [];
+        DB::listen(static function ($query) use (&$queries): void {
+            $queries[] = strtolower($query->sql);
+        });
+
+        (new BinaryHandler)->refreshAggregates([$binaryId]);
+        (new CollectionHandler(new CollectionsCleaningService))->refreshAggregates([$collectionId]);
+
+        // A concurrent writer to the same row must commit before the totals are read,
+        // or its parts are missing from the totals written back.
+        $position = static function (string $pattern) use ($queries): int {
+            foreach ($queries as $index => $sql) {
+                if (preg_match($pattern, $sql) === 1) {
+                    return $index;
+                }
+            }
+
+            return PHP_INT_MAX;
+        };
+        $this->assertLessThan($position('/from `parts`/'), $position('/from `binaries`.*for update/'));
+        $this->assertLessThan($position('/count\(\*\) as currentfiles/'), $position('/from `collections`.*for update/'));
+    }
+
     private function process(?int $groupId): void
     {
         $processor = new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 2, reconcileBatchSize: 2));
