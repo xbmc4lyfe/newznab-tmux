@@ -174,6 +174,21 @@ class TmuxHealthCheckCommandTest extends TestCase
         Process::assertNotRan(fn (PendingProcess $process): bool => $this->isTmuxCommand($process, 'respawn-pane') || $this->isTmuxCommand($process, 'kill-session'));
     }
 
+    public function test_a_slow_monitor_loop_within_the_heartbeat_tolerance_is_healthy(): void
+    {
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true]);
+        $this->fakeExistingMonitor(dead: false, heartbeat: time() - 90);
+        $this->artisan('tmux:health-check --auto-restart --session=custom-session')->assertExitCode(0);
+    }
+
+    public function test_the_heartbeat_tolerance_is_configurable(): void
+    {
+        config(['tmux.monitor.heartbeat_max_age' => 30]);
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true]);
+        $this->fakeExistingMonitor(dead: false, heartbeat: time() - 90);
+        $this->artisan('tmux:health-check --auto-restart --session=custom-session')->assertExitCode(1);
+    }
+
     public function test_session_probe_reports_missing_even_when_stopped(): void
     {
         $this->fakeMissingSession();
