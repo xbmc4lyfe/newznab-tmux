@@ -95,9 +95,9 @@ final class CollectionDowntimeCompensator
 
     /**
      * Each collection that was waiting when ingestion stopped gets back the waiting time
-     * it lost: the downtime for those added before the last recorded activity, and only
-     * the time since they were added for those written in the moments after it, never
-     * more than one full delay.
+     * it lost: the full downtime for those added before the last recorded activity (which
+     * can't move them past the restart), and only the time since they were added for
+     * those written in the moments after it.
      */
     private function shiftDateAdded(int $lastActive, int $now, int $delaySeconds): int
     {
@@ -105,25 +105,25 @@ final class CollectionDowntimeCompensator
             return 0;
         }
 
+        // The downtime comes from epochs, so a DST change can't distort or negate it.
+        $downtime = max(0, $now - $lastActive);
         $lastActiveAt = $this->at($lastActive);
         $nowAt = $this->at($now);
-        // The downtime itself comes from epochs, so a DST change can't make it negative.
-        // Rows written after the last activity get the wall-clock time since they were
-        // added, clamped to between zero and that downtime, so no row ever moves back.
-        $downtime = min($now - $lastActive, $delaySeconds);
+        $waitingFrom = $lastActive - $delaySeconds;
+        // dateadded holds wall-clock time, so adding seconds to it is only right while the
+        // UTC offset stays put; across a DST change, shift each distinct value in PHP.
+        $perValue = $this->crossesOffsetChange($waitingFrom, $lastActive, $now);
         $shifted = DB::getDriverName() === 'sqlite'
             ? DB::raw("datetime(dateadded, '+' || (CASE WHEN dateadded <= '{$lastActiveAt}' THEN {$downtime} ELSE MAX(0, MIN(strftime('%s', '{$nowAt}') - strftime('%s', dateadded), {$downtime})) END) || ' seconds')")
             : DB::raw("dateadded + INTERVAL (CASE WHEN dateadded <= '{$lastActiveAt}' THEN {$downtime} ELSE GREATEST(0, LEAST(TIMESTAMPDIFF(SECOND, dateadded, '{$nowAt}'), {$downtime})) END) SECOND");
-        $waitingFrom = $lastActive - $delaySeconds;
         $moved = 0;
 
         // One dateadded window at a time, newest first, jumping straight to the next
         // occupied window: each UPDATE is a range on the dateadded index, and a moved row
         // lands in a later window that is already done (or at now), so nothing is shifted
         // twice, and the work follows the waiting rows rather than the id range or the
-        // length of the outage.
-        // Start from the later wall-clock value: after a DST fall-back, now can read
-        // earlier than the last activity.
+        // length of the outage. Start from the later wall-clock value: after a DST
+        // fall-back, now can read earlier than the last activity.
         $windowEnd = max($nowAt, $lastActiveAt);
         $inclusive = true;
         for ($window = 0; $window < self::MAX_WINDOWS; $window++) {
@@ -132,15 +132,56 @@ final class CollectionDowntimeCompensator
                 break;
             }
             $windowStartAt = $this->at(max($this->timestamp($newest) - self::WINDOW_SECONDS, $waitingFrom));
-            $moved += DB::table('collections')
-                ->where('dateadded', '>=', $windowStartAt)
-                ->where('dateadded', '<=', $newest)
-                ->update(['dateadded' => $shifted]);
+            $moved += $perValue
+                ? $this->shiftEachValue($windowStartAt, $newest, $lastActive, $now, $downtime)
+                : DB::table('collections')
+                    ->where('dateadded', '>=', $windowStartAt)
+                    ->where('dateadded', '<=', $newest)
+                    ->update(['dateadded' => $shifted]);
             $windowEnd = $windowStartAt;
             $inclusive = false;
         }
 
         return $moved;
+    }
+
+    /**
+     * Shift each distinct dateadded value in the window through real timezone arithmetic,
+     * newest first so a moved value never lands on one still to be processed.
+     */
+    private function shiftEachValue(string $from, string $to, int $lastActive, int $now, int $downtime): int
+    {
+        $moved = 0;
+        $values = DB::table('collections')
+            ->where('dateadded', '>=', $from)
+            ->where('dateadded', '<=', $to)
+            ->distinct()
+            ->orderByDesc('dateadded')
+            ->pluck('dateadded');
+        foreach ($values as $value) {
+            $added = $this->timestamp((string) $value);
+            $shift = $added <= $lastActive ? $downtime : max(0, min($now - $added, $downtime));
+            if ($shift === 0) {
+                continue;
+            }
+            $moved += DB::table('collections')
+                ->where('dateadded', $value)
+                ->update(['dateadded' => $this->at($added + $shift)]);
+        }
+
+        return $moved;
+    }
+
+    /**
+     * Whether the application timezone changes its UTC offset anywhere in the span.
+     */
+    private function crossesOffsetChange(int ...$timestamps): bool
+    {
+        $zone = new \DateTimeZone(date_default_timezone_get());
+        $transitions = $zone->getTransitions(min($timestamps), max($timestamps));
+
+        // The first entry describes the offset at the start; any more are changes.
+        return \is_array($transitions) && \count($transitions) > 1;
     }
 
     /**
@@ -203,9 +244,11 @@ final class CollectionDowntimeCompensator
      */
     private function writeMarker($marker, int $timestamp): void
     {
-        ftruncate($marker, 0);
-        rewind($marker);
-        fwrite($marker, (string) $timestamp);
-        fflush($marker);
+        $value = (string) $timestamp;
+        // Callers rely on the marker being saved before any row moves, so fail loudly.
+        if (! ftruncate($marker, 0) || ! rewind($marker)
+            || fwrite($marker, $value) !== \strlen($value) || ! fflush($marker)) {
+            throw new \RuntimeException("Unable to write {$this->markerPath}.");
+        }
     }
 }

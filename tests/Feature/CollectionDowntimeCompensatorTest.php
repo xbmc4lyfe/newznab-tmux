@@ -63,14 +63,14 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         $this->assertSame('2026-10-11 11:00:00', $this->dateAdded($waiting));
     }
 
-    public function test_the_extension_never_exceeds_one_full_delay(): void
+    public function test_a_long_outage_restores_the_full_downtime(): void
     {
         $this->lastActive(Carbon::parse('2026-10-11 02:00:00')->getTimestamp());
-        $waiting = $this->collection('2026-10-11 01:00:00');
+        $waiting = $this->collection('2026-10-11 01:30:00');
 
         $this->compensator()->compensate(2);
 
-        $this->assertSame('2026-10-11 03:00:00', $this->dateAdded($waiting), 'Ten hours down, but at most two hours added.');
+        $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting), 'Ten hours down: resumes 30 minutes into its wait, not stale.');
     }
 
     public function test_unknown_downtime_changes_nothing_and_starts_recording(): void
@@ -180,6 +180,25 @@ final class CollectionDowntimeCompensatorTest extends TestCase
             $this->compensator()->compensate(2);
 
             $this->assertSame('2026-11-01 01:50:00', $this->dateAdded($waiting), 'Moved forward by the 20 real minutes.');
+        } finally {
+            date_default_timezone_set($previous);
+        }
+    }
+
+    public function test_a_dst_spring_forward_keeps_the_real_elapsed_wait(): void
+    {
+        $previous = date_default_timezone_get();
+        date_default_timezone_set('America/New_York');
+        try {
+            // 01:50 EST to 03:10 EDT on 2026-03-08 is 20 real minutes.
+            $lastActive = Carbon::parse('2026-03-08 06:50:00', 'UTC')->getTimestamp();
+            Carbon::setTestNow(Carbon::createFromTimestamp($lastActive + 1200, 'UTC'));
+            $this->lastActive($lastActive);
+            $waiting = $this->collection('2026-03-08 01:45:00');
+
+            $this->compensator()->compensate(2);
+
+            $this->assertSame('2026-03-08 03:05:00', $this->dateAdded($waiting), '01:45 EST plus 20 minutes is 03:05 EDT.');
         } finally {
             date_default_timezone_set($previous);
         }
