@@ -11,6 +11,7 @@ use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Services\Predb\Feeds\PredbFeedSourceFactory;
 use App\Services\Predb\Feeds\Sources\PredbNetSource;
+use App\Services\Predb\Feeds\Sources\PredbOvhSource;
 use Illuminate\Console\Scheduling\Event;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Database\Schema\Blueprint;
@@ -87,6 +88,17 @@ class PredbImportFeedCommandTest extends TestCase
             $this->assertNotContains($key, (array) config('predb_feeds.sources'));
             $this->assertNotSame('', (string) config("predb_feeds.endpoints.{$key}"));
         }
+    }
+
+    #[Test]
+    public function predb_ovh_sends_the_configured_page_size_and_parses_documented_rows(): void
+    {
+        Http::fake(['predb.ovh/*' => Http::response((string) file_get_contents($this->fixture('predb_ovh.json')), 200, ['Content-Type' => 'application/json'])]);
+
+        $entries = (new PredbOvhSource((string) config('predb_feeds.endpoints.predb_ovh'), 100))->fetch(2);
+
+        $this->assertCount(3, $entries);
+        Http::assertSent(static fn (Request $request): bool => str_contains($request->url(), 'count=100') && str_contains($request->url(), 'page=2'));
     }
 
     #[Test]

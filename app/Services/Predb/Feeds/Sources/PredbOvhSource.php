@@ -13,10 +13,12 @@ use RuntimeException;
 /**
  * predb.ovh JSON API (v1).
  *
- * UNVERIFIED: api.predb.ovh is currently DNS-dead, so this parser is written from the historical shape
- * {status, data: {rows: [{id, pretime (unix), release, section, files, size (MB), status, reason, group, genre}]}}
- * with status 0 ok, 1 nuke, 2 unnuke, 3 delpre, 4 undelpre (as predb.net). The paging parameters are the old
- * `?q=&page=`. Opt-in only: add `predb_ovh` to PREDB_FEED_SOURCES once the service is back and confirmed.
+ * Written from the published v1 documentation (https://github.com/predbdotovh/pre-api/blob/master/docs/index.md):
+ * base URL https://predb.ovh/api/v1/, parameters `count` and `page`, rows
+ * {id, name, team, cat, genre, url, size (kB), files, preAt (unix), nuke: {typeId, type, reason, ...}|null}.
+ * Nuke type ids: 1 nuke, 2 unnuke, 3 modnuke, 4 delpre, 5 undelpre. The service has not been reachable from our
+ * network when this was written, so it is not verified against live responses. Opt-in only: add `predb_ovh`
+ * to PREDB_FEED_SOURCES once the service is confirmed.
  */
 final class PredbOvhSource extends HttpFeedSource
 {
@@ -28,7 +30,7 @@ final class PredbOvhSource extends HttpFeedSource
     public function fetch(int $page = 1): array
     {
         $response = $this->http()->get($this->endpoint, [
-            'q' => '',
+            'count' => $this->pageSize,
             'page' => max(1, $page),
         ])->throw();
 
@@ -57,26 +59,29 @@ final class PredbOvhSource extends HttpFeedSource
         $entries = [];
 
         foreach ($rows as $row) {
-            if (! is_array($row) || ! is_string($row['release'] ?? null) || trim($row['release']) === '') {
+            if (! is_array($row) || ! is_string($row['name'] ?? null) || trim($row['name']) === '') {
                 continue;
             }
 
-            $status = (int) ($row['status'] ?? 0);
-            $reason = is_string($row['reason'] ?? null) && $row['reason'] !== '' ? $row['reason'] : null;
+            $nuke = is_array($row['nuke'] ?? null) ? $row['nuke'] : null;
+            $typeId = $nuke !== null ? (int) ($nuke['typeId'] ?? 0) : 0;
+            $reason = is_string($nuke['reason'] ?? null) && $nuke['reason'] !== '' ? $nuke['reason'] : null;
 
             $entries[] = new PredbFeedEntry(
-                title: trim($row['release']),
+                title: trim($row['name']),
                 source: 'predb.ovh',
-                category: is_string($row['section'] ?? null) && $row['section'] !== '' ? $row['section'] : null,
-                size: PredbFeedEntry::sizeFromMegabytes(is_numeric($row['size'] ?? null) ? (float) $row['size'] : null),
+                category: is_string($row['cat'] ?? null) && $row['cat'] !== '' ? $row['cat'] : null,
+                size: PredbFeedEntry::sizeFromMegabytes(is_numeric($row['size'] ?? null) ? (float) $row['size'] / 1024 : null),
                 files: PredbFeedEntry::filesFromCount(is_numeric($row['files'] ?? null) ? (int) $row['files'] : null),
-                predate: is_numeric($row['pretime'] ?? null) ? CarbonImmutable::createFromTimestampUTC((int) $row['pretime']) : null,
-                nuked: match ($status) {
+                predate: is_numeric($row['preAt'] ?? null) ? CarbonImmutable::createFromTimestampUTC((int) $row['preAt']) : null,
+                nuked: match ($typeId) {
                     0 => Predb::PRE_NONUKE,
-                    2, 4 => Predb::PRE_UNNUKED,
+                    1 => Predb::PRE_NUKED,
+                    2, 5 => Predb::PRE_UNNUKED,
+                    3 => Predb::PRE_MODNUKE,
                     default => Predb::PRE_NUKED,
                 },
-                nukeReason: $status === 0 ? null : $reason,
+                nukeReason: $typeId === 0 ? null : $reason,
             );
         }
 

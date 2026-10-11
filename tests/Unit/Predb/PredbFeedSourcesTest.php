@@ -187,7 +187,7 @@ final class PredbFeedSourcesTest extends TestCase
     #[Test]
     public function predb_ovh_rows_are_normalised_with_status_mapping(): void
     {
-        $entries = (new PredbOvhSource('https://api.predb.ovh/api/v1/'))->parseRows($this->json('predb_ovh.json')['data']['rows']);
+        $entries = (new PredbOvhSource('https://predb.ovh/api/v1/'))->parseRows($this->json('predb_ovh.json')['data']['rows']);
 
         $this->assertCount(3, $entries);
         $this->assertSame('predb.ovh', $entries[0]->source);

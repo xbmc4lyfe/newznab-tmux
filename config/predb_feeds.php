@@ -20,7 +20,7 @@ return [
     //  - srrdb: first page only (terms: "Use but don't scrape").
     //  - scnsrc_me: scnsrc.me RSS; titles use spaces, so names are lossy (dots are guessed).
     //  - eztv: EZTV RSS; P2P TV names, lossy spaced titles; robots.txt unverified (Cloudflare challenge).
-    //  - predb_ovh: predb.ovh JSON API; currently DNS-dead and its schema is unverified.
+    //  - predb_ovh: predb.ovh JSON API; documented v1 API; not yet verified against live responses.
     //  - apibay: The Pirate Bay top-100 recent dump (movies/TV only); P2P names, not scene PREs.
     'sources' => array_values(array_filter(array_map(
         'trim',
@@ -44,7 +44,7 @@ return [
         'xrel_p2p' => 'https://api.xrel.to/v2/p2p/releases.json',
         'scnsrc_me' => 'https://www.scnsrc.me/feed',
         'eztv' => 'https://eztvx.to/ezrss.xml',
-        'predb_ovh' => 'https://api.predb.ovh/api/v1/',
+        'predb_ovh' => 'https://predb.ovh/api/v1/',
         'apibay' => 'https://apibay.org/precompiled/data_top100_recent.json',
     ],
 
