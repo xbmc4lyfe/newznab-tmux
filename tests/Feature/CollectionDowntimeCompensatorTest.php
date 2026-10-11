@@ -289,6 +289,19 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         $this->assertSame(123, $this->compensator()->lastActivity(), 'Written seconds ago: left alone.');
     }
 
+    public function test_resumed_worker_activity_compensates_before_refreshing_the_marker(): void
+    {
+        $this->lastActive(Carbon::now('UTC')->subHour()->getTimestamp());
+        touch($this->marker, time() - 600);
+        $waiting = $this->collection('2026-10-11 10:30:00');
+
+        $this->compensator()->noteIngestion();
+
+        $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting));
+        $this->assertSame(Carbon::now('UTC')->getTimestamp(), $this->compensator()->lastActivity());
+        $this->assertSame(0, $this->compensator()->compensate(2), 'A subsequent tmux start must not compensate twice.');
+    }
+
     public function test_tests_use_a_temporary_marker_not_the_real_one(): void
     {
         $this->app->make(CollectionDowntimeCompensator::class)->recordActivity();

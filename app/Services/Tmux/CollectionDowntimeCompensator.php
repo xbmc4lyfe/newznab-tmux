@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Tmux;
 
+use App\Services\Configuration\ConfigurationProvider;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
@@ -53,7 +54,7 @@ final class CollectionDowntimeCompensator
     public function recordActivity(): void
     {
         $this->withLockedMarker(function (): void {
-            $this->writeMarker(Carbon::now('UTC')->getTimestamp());
+            $this->compensateLocked(null, true);
         });
     }
 
@@ -90,24 +91,33 @@ final class CollectionDowntimeCompensator
      */
     public function compensate(int $delayHours): int
     {
-        return $this->withLockedMarker(function () use ($delayHours): int {
-            $lastActive = $this->lastActivity();
-            $now = Carbon::now('UTC')->getTimestamp();
+        return $this->withLockedMarker(fn (): int => $this->compensateLocked($delayHours, false));
+    }
 
-            if ($lastActive !== null && $now - $lastActive < self::MIN_DOWNTIME_SECONDS) {
-                return 0;
-            }
+    /**
+     * Claim any stale interval before recording resumed activity, including direct
+     * header workers that run before tmux starts. The caller holds the stable lock.
+     */
+    private function compensateLocked(?int $delayHours, bool $refreshRecent): int
+    {
+        $lastActive = $this->lastActivity();
+        $now = Carbon::now('UTC')->getTimestamp();
+        $stale = $lastActive !== null && $now - $lastActive >= self::MIN_DOWNTIME_SECONDS;
+        if (! $stale && ! $refreshRecent && $lastActive !== null) {
+            return 0;
+        }
+        if ($stale) {
+            $delayHours ??= app(ConfigurationProvider::class)->ingestion()->collectionDelayHours;
+        }
 
-            // Record the new start before touching rows: if this run dies partway, the next
-            // start sees a short downtime and skips, so rows can be under-compensated but
-            // never shifted twice. Unknown downtime changes nothing.
-            $this->writeMarker($now);
-            if ($lastActive === null) {
-                return 0;
-            }
+        // Claim before moving rows: an interrupted run can under-compensate rows,
+        // but a retry cannot shift them twice. Failed publication leaves the old claim.
+        $this->writeMarker($now);
+        if (! $stale || $lastActive === null) {
+            return 0;
+        }
 
-            return $this->shiftDateAdded($lastActive, $now, max(0, $delayHours) * 3600);
-        });
+        return $this->shiftDateAdded($lastActive, $now, max(0, $delayHours ?? 0) * 3600);
     }
 
     /**
