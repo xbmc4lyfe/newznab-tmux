@@ -178,7 +178,7 @@ final class CollectionDowntimeCompensator
             $byValue = [];
             foreach ($rows as $row) {
                 $lastId = (int) $row->id;
-                $added = $this->timestamp((string) $row->dateadded);
+                $added = $this->timestampNotAfter((string) $row->dateadded, $lastActive);
                 $shift = $added <= $lastActive ? $downtime : max(0, min($now - $added, $downtime));
                 if ($shift > 0) {
                     $byValue[$this->at($added + $shift)][] = $lastId;
@@ -190,6 +190,26 @@ final class CollectionDowntimeCompensator
         } while ($rows->count() === self::ROW_CHUNK);
 
         return $moved;
+    }
+
+    /**
+     * A wall-clock value from a repeated fall-back hour names two instants; take the
+     * later one unless it is after $notAfter (a row can't predate itself, and rows were
+     * added before ingestion stopped).
+     */
+    private function timestampNotAfter(string $dateTime, int $notAfter): int
+    {
+        $first = $this->timestamp($dateTime);
+        $value = substr($dateTime, 0, 19);
+        $zone = new \DateTimeZone(date_default_timezone_get());
+        foreach ([3600, 1800, 7200] as $fold) {
+            $later = $first + $fold;
+            if ($later <= $notAfter && (new \DateTimeImmutable('@'.$later))->setTimezone($zone)->format('Y-m-d H:i:s') === $value) {
+                return $later;
+            }
+        }
+
+        return $first;
     }
 
     /**

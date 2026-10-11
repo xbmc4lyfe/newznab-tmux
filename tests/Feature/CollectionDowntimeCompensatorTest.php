@@ -216,10 +216,12 @@ final class CollectionDowntimeCompensatorTest extends TestCase
             Carbon::setTestNow(Carbon::createFromTimestamp($lastActive + 1800, 'UTC'));
             $this->lastActive($lastActive);
             $repeatedHour = $this->collection('2026-11-01 01:10:00');
+            $lateInRepeatedHour = $this->collection('2026-11-01 01:45:00');
 
             $this->compensator()->compensate(2);
 
             $this->assertSame('2026-11-01 01:40:00', $this->dateAdded($repeatedHour), 'Gets the 30 minutes back.');
+            $this->assertSame('2026-11-01 02:15:00', $this->dateAdded($lateInRepeatedHour), 'Read as 01:45 EST, the occurrence before the shutdown.');
         } finally {
             date_default_timezone_set($previous);
         }
