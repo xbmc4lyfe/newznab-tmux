@@ -32,6 +32,12 @@ final class TvProviderVideoInsertRaceTest extends TestCase
             }
             $table->unique(['title', 'type', 'started', 'countries_id'], 'ix_videos_title');
         });
+        Schema::create('tv_info', function (Blueprint $table): void {
+            $table->unsignedInteger('videos_id')->primary();
+            $table->text('summary')->nullable();
+            $table->string('publisher')->default('');
+            $table->string('localzone')->default('');
+        });
     }
 
     /**
@@ -58,15 +64,18 @@ final class TvProviderVideoInsertRaceTest extends TestCase
             }
         });
 
-        $id = $provider->add([
+        // The real caller runs inside a transaction (TvShowAdder), where the recovery read must be a locking one.
+        $id = DB::transaction(static fn (): int => $provider->add([
             'type' => 0, 'title' => 'Less Than Evil', 'country' => 'KR', 'started' => '2018-12-03 00:00:00', 'source' => 5,
             'tvdb' => 0, 'trakt' => 0, 'tvrage' => 0, 'tvmaze' => 0, 'imdb' => 0, 'tmdb' => 0,
-            'summary' => '', 'publisher' => '', 'localzone' => '', 'aliases' => '',
-        ]);
+            'summary' => 'A prosecutor and a killer.', 'publisher' => 'OCN', 'localzone' => 'Asia/Seoul', 'aliases' => '',
+        ]));
 
         $this->assertTrue($raced);
         $this->assertSame(1, DB::table('videos')->count());
         $this->assertSame((int) DB::table('videos')->value('id'), $id);
         $this->assertSame($id, $provider->updatedId);
+        // The supplementary row exists even though the winning worker never wrote one.
+        $this->assertSame('OCN', DB::table('tv_info')->where('videos_id', $id)->value('publisher'));
     }
 }

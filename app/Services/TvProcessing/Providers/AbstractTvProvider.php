@@ -233,14 +233,24 @@ abstract class AbstractTvProvider extends BaseVideoProvider
                     ]);
                 } catch (UniqueConstraintViolationException $e) {
                     // Another worker inserted the same show between the lookup above and this insert:
-                    // use its row and update it instead of failing the whole batch.
-                    $racedVideo = Video::query()->where('title', $show['title'])->first(['id']);
+                    // use its row and update it instead of failing the whole batch. A locking read sees
+                    // the other worker's committed row even inside a repeatable-read transaction, where a
+                    // plain SELECT would still return the snapshot taken by the lookup above.
+                    $racedVideo = Video::query()->where('title', $show['title'])->lockForUpdate()->first(['id']);
                     if ($racedVideo === null) {
                         throw $e;
                     }
-                    $this->update((int) $racedVideo->id, $show);
+                    $racedId = (int) $racedVideo->id;
+                    // The winner may not have written its supplementary row yet (or may have written less).
+                    TvInfo::query()->insertOrIgnore([
+                        'videos_id' => $racedId,
+                        'summary' => $show['summary'],
+                        'publisher' => $show['publisher'],
+                        'localzone' => $show['localzone'],
+                    ]);
+                    $this->update($racedId, $show);
 
-                    return (int) $racedVideo->id;
+                    return $racedId;
                 }
                 $videoId = $video->id;
                 // Insert the supplementary show info
