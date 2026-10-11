@@ -30,17 +30,25 @@ hash_stdin() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
 }
 
-# HEAD plus uncommitted changes plus the names and contents of untracked files: the image bakes the
-# working tree.
+# One "hash  path" line per untracked file, so file boundaries and names are part of the fingerprint.
+untracked_hashes() {
+    (
+        cd "$REPO"
+        if command -v sha256sum >/dev/null 2>&1; then
+            git ls-files -o --exclude-standard -z | xargs -0 sha256sum 2>/dev/null || true
+        else
+            git ls-files -o --exclude-standard -z | xargs -0 shasum -a 256 2>/dev/null || true
+        fi
+    )
+}
+
+# HEAD plus uncommitted changes plus every untracked file with its own content hash: the image bakes
+# the working tree.
 fingerprint() {
     head=$(git -C "$REPO" rev-parse HEAD)
     diff=$(git -C "$REPO" diff HEAD | hash_stdin)
-    untracked=$(
-        cd "$REPO"
-        git ls-files -o --exclude-standard -z | xargs -0 cat 2>/dev/null | hash_stdin
-        git ls-files -o --exclude-standard | hash_stdin
-    )
-    echo "$head $diff $(echo "$untracked" | tr '\n' ' ')"
+    untracked=$(untracked_hashes | hash_stdin)
+    echo "$head $diff $untracked"
 }
 
 log() {
@@ -48,21 +56,14 @@ log() {
         "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)" "${2:-}" >>"$LOG"
 }
 
-owner_pid() {
-    sed -n 's/^pid=//p' "$LOCK/owner" 2>/dev/null || true
+# The lock is a symlink whose target text is the owner (pid, who, what, since). Creating a symlink is
+# atomic and carries its content from the first instant, so there is never a lock without an owner.
+lock_info() {
+    readlink "$LOCK" 2>/dev/null || true
 }
 
-# The owner's pid, waiting a moment for a holder that has made the lock directory but not yet written
-# its owner file. An owner that stays empty belongs to a process that died in between.
-settled_owner_pid() {
-    pid=$(owner_pid)
-    waited=0
-    while [ -z "$pid" ] && [ -d "$LOCK" ] && [ "$waited" -lt 3 ]; do
-        sleep 0.4
-        pid=$(owner_pid)
-        waited=$((waited + 1))
-    done
-    echo "$pid"
+info_pid() {
+    printf '%s' "$1" | sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p'
 }
 
 alive() {
@@ -70,35 +71,35 @@ alive() {
 }
 
 release() {
-    rm -rf "$LOCK"
+    rm -f "$LOCK"
 }
 
 busy() {
-    echo "deploy-guard: another deploy is running ($(tr '\n' ' ' <"$LOCK/owner" 2>/dev/null || echo starting)); leaving the stack alone." >&2
+    echo "deploy-guard: another deploy is running ($1); leaving the stack alone." >&2
     exit 75
 }
 
-# Take the lock. A lock whose owner has died is removed under a short-lived claim directory, so two
-# sessions that see the same stale lock cannot both remove it and then both take it.
+# Take the lock. A lock whose owner has died is removed under a short-lived claim directory, and only
+# if it still holds the dead owner's text, so two sessions that see the same stale lock cannot remove
+# each other's fresh one.
 acquire() {
     target=$1
+    info="pid=$$ by=$BY target=$target since=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     attempts=0
     while [ "$attempts" -lt 10 ]; do
         attempts=$((attempts + 1))
-        if mkdir "$LOCK" 2>/dev/null; then
-            printf 'pid=%s\nby=%s\ntarget=%s\nsince=%s\n' "$$" "$BY" "$target" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$LOCK/owner"
+        if ln -sn "$info" "$LOCK" 2>/dev/null; then
             return 0
         fi
 
-        pid=$(settled_owner_pid)
-        if alive "$pid"; then
-            busy
+        seen=$(lock_info)
+        if alive "$(info_pid "$seen")"; then
+            busy "$seen"
         fi
 
         if mkdir "$CLAIM" 2>/dev/null; then
-            # Re-check while holding the claim: the lock may have been replaced by a live one meanwhile.
-            pid=$(settled_owner_pid)
-            if ! alive "$pid"; then
+            now=$(lock_info)
+            if [ -n "$now" ] && [ "$now" = "$seen" ] && ! alive "$(info_pid "$now")"; then
                 echo "deploy-guard: removing a stale lock" >&2
                 rm -rf "$LOCK"
             fi
@@ -112,7 +113,7 @@ acquire() {
             fi
         fi
     done
-    busy
+    busy "$(lock_info)"
 }
 
 unchanged() {
@@ -131,7 +132,7 @@ cmd_run() {
     shift
     [ "$1" = -- ] && shift
 
-    if [ -n "${DEPLOY_GUARD_HELD:-}" ] && [ "$(owner_pid)" = "$DEPLOY_GUARD_HELD" ] && alive "$DEPLOY_GUARD_HELD"; then
+    if [ -n "${DEPLOY_GUARD_HELD:-}" ] && [ "$(info_pid "$(lock_info)")" = "$DEPLOY_GUARD_HELD" ] && alive "$DEPLOY_GUARD_HELD"; then
         : # Our parent guard holds the lock; it also releases it.
     else
         acquire "$target"

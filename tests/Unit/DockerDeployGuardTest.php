@@ -54,7 +54,7 @@ final class DockerDeployGuardTest extends TestCase
         $this->assertStringContainsString('up by=session-a', $log);
         $this->assertStringContainsString('result=started', $log);
         $this->assertStringContainsString('result=finished rc=0', $log);
-        $this->assertDirectoryDoesNotExist($this->dir.'/lock', 'the lock is released afterwards');
+        $this->assertFalse(is_link($this->dir.'/lock'), 'the lock is released afterwards');
     }
 
     #[Test]
@@ -62,7 +62,7 @@ final class DockerDeployGuardTest extends TestCase
     {
         $first = $this->guardProcess(['run', 'build', '--', 'sleep', '5'], ['DEPLOY_BY' => 'session-a']);
         $first->start();
-        $this->waitFor(fn (): bool => is_dir($this->dir.'/lock/'));
+        $this->waitFor(fn (): bool => is_link($this->dir.'/lock'));
 
         $second = $this->guard(['run', 'up', '--', 'sh', '-c', 'touch '.$this->dir.'/second-ran'], ['DEPLOY_BY' => 'session-b']);
 
@@ -76,8 +76,7 @@ final class DockerDeployGuardTest extends TestCase
     #[Test]
     public function a_stale_lock_is_replaced(): void
     {
-        mkdir($this->dir.'/lock');
-        file_put_contents($this->dir.'/lock/owner', "pid=999999\nby=gone\n");
+        symlink('pid=999999 by=gone target=up since=then', $this->dir.'/lock');
 
         $process = $this->guard(['run', 'up', '--', 'true']);
 
@@ -88,8 +87,7 @@ final class DockerDeployGuardTest extends TestCase
     #[Test]
     public function sessions_racing_for_one_stale_lock_never_deploy_at_the_same_time(): void
     {
-        mkdir($this->dir.'/lock');
-        file_put_contents($this->dir.'/lock/owner', "pid=999999\nby=gone\n");
+        symlink('pid=999999 by=gone target=up since=then', $this->dir.'/lock');
 
         // Each deploy enters a critical section; mkdir fails if another one is inside it.
         $critical = $this->dir.'/critical';
@@ -114,7 +112,7 @@ final class DockerDeployGuardTest extends TestCase
     #[Test]
     public function a_guarded_command_can_run_another_under_the_same_lock(): void
     {
-        $inner = 'sh '.dirname(__DIR__, 2).'/docker/bin/deploy-guard run inner -- sh -c "echo inner > '.$this->dir.'/inner; test -d '.$this->dir.'/lock"';
+        $inner = 'sh '.dirname(__DIR__, 2).'/docker/bin/deploy-guard run inner -- sh -c "echo inner > '.$this->dir.'/inner; test -L '.$this->dir.'/lock"';
 
         $process = $this->guard(['run', 'deploy', '--', 'sh', '-c', $inner]);
 
@@ -122,7 +120,24 @@ final class DockerDeployGuardTest extends TestCase
         $this->assertFileExists($this->dir.'/inner');
         $log = (string) file_get_contents($this->dir.'/deploy.log');
         $this->assertStringContainsString('inner by=', $log);
-        $this->assertDirectoryDoesNotExist($this->dir.'/lock', 'the outer guard releases the lock once');
+        $this->assertFalse(is_link($this->dir.'/lock'), 'the outer guard releases the lock once');
+    }
+
+    #[Test]
+    public function moving_bytes_between_untracked_files_counts_as_a_change(): void
+    {
+        $build = ['run', 'build', '--', 'sh', '-c', 'echo x >> '.$this->dir.'/builds'];
+        $flags = ['SKIP_IF_UNCHANGED' => '1', 'STAMP_ON_SUCCESS' => '1'];
+        file_put_contents($this->repo.'/a.txt', 'a');
+        file_put_contents($this->repo.'/b.txt', 'bc');
+
+        $this->guard($build, $flags);
+
+        file_put_contents($this->repo.'/a.txt', 'ab');
+        file_put_contents($this->repo.'/b.txt', 'c');
+        $this->guard($build, $flags);
+
+        $this->assertCount(2, file($this->dir.'/builds'), 'the same bytes split differently is a different tree');
     }
 
     #[Test]
