@@ -122,8 +122,8 @@ final class TmuxTableCountsTest extends TestCase
      */
     public static function backfillControls(): iterable
     {
-        yield 'collections kill switch' => [['collections_kill' => 2_000_000]];
-        yield 'progressive backfill' => [['progressive' => 1]];
+        yield 'collections kill switch' => [['backfill' => 1, 'collections_kill' => 2_000_000]];
+        yield 'progressive backfill' => [['backfill' => 4, 'progressive' => 1]];
     }
 
     /**
@@ -167,7 +167,7 @@ final class TmuxTableCountsTest extends TestCase
         $this->assertFalse($refresh->invoke($monitor), 'Display-only: the estimate stays.');
         $this->assertSame(14_100_000, $state->getValue($monitor)['counts']['now']['collections_table']);
 
-        $state->setValue($monitor, ['settings' => ['progressive' => 1], 'counts' => ['now' => ['collections_table' => 14_100_000]]]);
+        $state->setValue($monitor, ['settings' => ['backfill' => 1, 'progressive' => 1], 'counts' => ['now' => ['collections_table' => 14_100_000]]]);
         $this->assertTrue($refresh->invoke($monitor));
         $this->assertSame(2, $state->getValue($monitor)['counts']['now']['collections_table']);
         $this->assertFalse($refresh->invoke($monitor), 'Already exact.');
@@ -180,9 +180,32 @@ final class TmuxTableCountsTest extends TestCase
         $state = new ReflectionProperty(TmuxMonitorService::class, 'runVar');
         $isEstimate = new ReflectionProperty(TmuxMonitorService::class, 'collectionsCountIsEstimate');
         $isEstimate->setValue($monitor, true);
-        $state->setValue($monitor, ['settings' => ['collections_kill' => 2_000_000], 'counts' => ['now' => ['collections_table' => 14_100_000]]]);
+        $state->setValue($monitor, ['settings' => ['backfill' => 1, 'collections_kill' => 20_000_000], 'counts' => ['now' => ['collections_table' => 14_100_000]]]);
 
         $this->assertFalse((new ReflectionMethod(TmuxMonitorService::class, 'refreshCollectionCountForBackfillControls'))->invoke($monitor));
         $this->assertTrue($isEstimate->getValue($monitor), 'Still marked as an estimate, so the next loop retries.');
+
+        (new ReflectionMethod(TmuxMonitorService::class, 'setKillswitches'))->invoke($monitor);
+        $this->assertTrue($state->getValue($monitor)['killswitch']['coll'], 'Backfill is held until an exact count succeeds.');
+    }
+
+    public function test_backfill_controls_need_no_exact_count_while_backfill_is_off(): void
+    {
+        DB::table('collections')->insert(['id' => 1]);
+        $tmux = $this->getMockBuilder(Tmux::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['proc_query', 'estimatedRowCount'])
+            ->getMock();
+        $tmux->method('proc_query')->willReturn('SELECT 0 AS active_groups');
+        $tmux->expects($this->atLeastOnce())->method('estimatedRowCount')->willReturn(14_100_000);
+        $monitor = (new ReflectionClass(TmuxMonitorService::class))->newInstanceWithoutConstructor();
+        (new ReflectionProperty(TmuxMonitorService::class, 'tmux'))->setValue($monitor, $tmux);
+        $state = new ReflectionProperty(TmuxMonitorService::class, 'runVar');
+        $state->setValue($monitor, ['settings' => ['backfill' => 0, 'collections_kill' => 2_000_000, 'progressive' => 1]]);
+
+        (new ReflectionMethod(TmuxMonitorService::class, 'getTableCounts'))->invoke($monitor);
+        (new ReflectionMethod(TmuxMonitorService::class, 'setKillswitches'))->invoke($monitor);
+
+        $this->assertSame(14_100_000, $state->getValue($monitor)['counts']['now']['collections_table']);
     }
 }

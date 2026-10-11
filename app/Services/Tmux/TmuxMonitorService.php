@@ -364,8 +364,16 @@ class TmuxMonitorService
         return true;
     }
 
+    /**
+     * Whether backfill runs (TmuxTaskRunner::runBackfill() launches modes 1 and 4) and
+     * decides on the collections count through the kill switch or progressive delay.
+     */
     private function collectionCountDrivesBackfill(): bool
     {
+        if (! \in_array((int) ($this->runVar['settings']['backfill'] ?? 0), [1, 4], true)) {
+            return false;
+        }
+
         return (int) ($this->runVar['settings']['collections_kill'] ?? 0) > 0
             || (int) ($this->runVar['settings']['progressive'] ?? 0) === 1;
     }
@@ -578,7 +586,10 @@ class TmuxMonitorService
         $collections = (int) ($this->runVar['counts']['now']['collections_table'] ?? 0);
 
         $this->runVar['killswitch']['pp'] = ($ppKillLimit > 0 && $ppKillLimit < $totalWork);
-        $this->runVar['killswitch']['coll'] = ($collKillLimit > 0 && $collKillLimit < $collections);
+        // Fail closed: while backfill decides on the collections count but only an
+        // estimate is available (the exact count failed), hold backfill.
+        $this->runVar['killswitch']['coll'] = ($collKillLimit > 0 && $collKillLimit < $collections)
+            || ($this->collectionsCountIsEstimate && $this->collectionCountDrivesBackfill());
     }
 
     /**
