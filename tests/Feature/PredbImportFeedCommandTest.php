@@ -575,6 +575,10 @@ class PredbImportFeedCommandTest extends TestCase
         $this->assertTrue($event->filtersPass($this->app));
         config(['tmux.fix_names.predbft_scheduled' => false]);
         $this->assertFalse($event->filtersPass($this->app));
+
+        // An operator who turned the pass off keeps it off.
+        config(['tmux.fix_names.predbft' => false, 'tmux.fix_names.predbft_scheduled' => true]);
+        $this->assertFalse($event->filtersPass($this->app));
     }
 
     #[Test]

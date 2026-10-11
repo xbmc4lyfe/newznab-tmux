@@ -78,5 +78,6 @@ Schedule::command('predb:check 3 --quiet')->everyTenMinutes()->withoutOverlappin
 // `fix_names_per_run` titles per worker (a few seconds). The tmux fix-names chain also ends with this pass,
 // but its slow NNTP passes can run for an hour or more, so on its own it reached only about 100 titles a day;
 // the tmux cycle skips it while this is on (TMUX_FIX_NAMES_PREDBFT_SCHEDULED), so there is one launcher.
+// TMUX_FIX_NAMES_PREDBFT=false still turns the pass off entirely.
 Schedule::command('multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBackground()
-    ->when(static fn (): bool => (bool) config('tmux.fix_names.predbft_scheduled'));
+    ->when(static fn (): bool => (bool) config('tmux.fix_names.predbft') && (bool) config('tmux.fix_names.predbft_scheduled'));
