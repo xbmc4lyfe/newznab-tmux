@@ -4,12 +4,18 @@ declare(strict_types=1);
 
 namespace App\Services\NameFixing;
 
+use App\Enums\Par2RenameOutcome;
 use App\Facades\Search;
 use App\Services\NameFixing\Extractors\FileNameExtractor;
 use App\Services\NameFixing\Extractors\NfoNameExtractor;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
+use Illuminate\Cache\Lock;
+use Illuminate\Contracts\Cache\LockProvider;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
+use Throwable;
 
 /**
  * Main service for name fixing operations.
@@ -762,7 +768,7 @@ class NameFixingService
     /**
      * Process one GUID-partitioned release batch using all standard name sources.
      *
-     * @param  null|callable(object): bool  $par2Processor
+     * @param  null|callable(object): (bool|Par2RenameOutcome)  $par2Processor
      * @return array{checked: int, fixed: int}
      */
     public function processStandardBatch(
@@ -938,10 +944,10 @@ class NameFixingService
 
             if ((int) $release->proc_par2 === self::PROC_PAR2_NONE) {
                 $this->updateService->reset();
-                $matched = $par2Processor !== null && $par2Processor($release);
-                if ($matched) {
+                $result = $par2Processor !== null ? $par2Processor($release) : Par2RenameOutcome::Deferred;
+                if ($result === true || $result === Par2RenameOutcome::Renamed) {
                     $this->updateService->fixed++;
-                } else {
+                } elseif ($result === false || $result === Par2RenameOutcome::NoMatch) {
                     $this->updateService->updateSingleColumn('proc_par2', self::PROC_PAR2_DONE, $releaseId);
                 }
             }
@@ -1027,34 +1033,83 @@ class NameFixingService
     public function fixNamesWithPar2(int $time, bool $echo, int $cats, bool $nameStatus, bool $show, NNTPService $nntp): void
     {
         $this->echoStartMessage($time, 'par2 files');
-
-        if (! $this->startBatch(NameFixingQueryService::SOURCE_PAR2, $time, $cats, ' releases to process.')) {
-            cli()->info('Nothing to fix.');
+        if (! $echo || ! $nameStatus) {
+            cli()->info('PAR2 downloads require --update and --set-status.');
 
             return;
         }
 
-        $nzbContentsService = app(NzbContentsService::class);
-        foreach ($this->candidateBatches(NameFixingQueryService::SOURCE_PAR2, $time, $cats) as $releases) {
-            foreach ($releases as $release) {
-                if ($nzbContentsService->checkPar2(
-                    $release->guid,
-                    $release->releases_id,
-                    $release->groups_id,
-                    (int) ($echo && $nameStatus),
-                    (int) $show
-                )) {
-                    $this->updateService->fixed++;
-                } else {
-                    $this->markProcessed($echo, $nameStatus, 'proc_par2', (int) $release->releases_id);
-                }
+        $lock = null;
+        $claimed = false;
+        $outcomes = array_fill_keys(array_column(Par2RenameOutcome::cases(), 'value'), 0);
+        $probes = $received = 0;
+        $deadline = now()->getTimestampMs() / 1000 + max(1, (int) config('tmux.fix_names.par2_budget_seconds', 60));
+        try {
+            $cache = Cache::store((string) config('tmux.fix_names.cache_store', 'redis'));
+            $store = $cache->getStore();
+            if (! $store instanceof LockProvider) {
+                throw new RuntimeException('The PAR2 rename cache store must support atomic locks.');
+            }
+            $key = "rename:par2:sweep:{$time}:{$cats}";
+            $lock = $store->lock($key.':lock', 1800);
+            if (! $lock instanceof Lock) {
+                throw new RuntimeException('The PAR2 rename cache lock must support renewal.');
+            }
+            $claimed = $lock->get();
+            if (! $claimed) {
+                cli()->info('Another PAR2 sweep is running.');
 
+                return;
+            }
+            $cursor = $cache->get($key);
+            $afterId = is_array($cursor) ? max(0, (int) ($cursor['after_id'] ?? 0)) : 0;
+            $throughId = is_array($cursor) ? max(0, (int) ($cursor['through_id'] ?? 0)) : $this->queries->highWatermark();
+            $limit = max(1, (int) config('tmux.fix_names.par2_max_releases', 100));
+            $releases = $this->queries->candidateBatch(NameFixingQueryService::SOURCE_PAR2, $time, $cats, $afterId, $limit, $throughId);
+            if ($releases === [] && $afterId > 0) {
+                $throughId = $this->queries->highWatermark();
+                $releases = $this->queries->candidateBatch(NameFixingQueryService::SOURCE_PAR2, $time, $cats, 0, $limit, $throughId);
+            }
+            $nzbContentsService = app(NzbContentsService::class);
+            $nzbContentsService->setNntp($nntp);
+            foreach ($releases as $release) {
+                if (now()->getTimestampMs() / 1000 >= $deadline || ! $this->refreshPar2Sweep($lock)) {
+                    break;
+                }
+                $outcome = $nzbContentsService->checkPar2Result($release->guid, (int) $release->releases_id,
+                    (int) $release->groups_id, 1, (int) $show, $deadline);
+                $outcomes[$outcome->value]++;
+                $stats = $nzbContentsService->par2Stats();
+                $probes += $stats['candidates_probed'];
+                $received += $stats['articles_received'];
+                if ($outcome === Par2RenameOutcome::Renamed) {
+                    $this->updateService->fixed++;
+                }
                 $this->updateService->incrementChecked();
-                $this->echoRenamed($show);
+                if (! $this->refreshPar2Sweep($lock)) {
+                    break;
+                }
+                $cache->put($key, ['after_id' => (int) $release->releases_id, 'through_id' => $throughId], 604800);
+            }
+        } catch (Throwable $e) {
+            Log::warning('PAR2 rename sweep stopped with work pending', ['error' => $e->getMessage()]);
+            throw $e;
+        } finally {
+            if ($claimed && $lock !== null) {
+                $lock->release();
             }
         }
+        Log::info('PAR2 rename batch finished', ['time_scope' => $time, 'category_scope' => $cats,
+            'outcomes' => $outcomes, 'candidates_probed' => $probes, 'articles_received' => $received]);
+        cli()->info(sprintf('PAR2 outcomes: renamed=%d no_match=%d retryable=%d deferred=%d',
+            $outcomes['renamed'], $outcomes['no_match'], $outcomes['retryable'], $outcomes['deferred']));
+        $this->echoFoundCount($echo, ' releases attempted');
+    }
 
-        $this->echoFoundCount($echo, ' files');
+    /** @phpstan-impure */
+    private function refreshPar2Sweep(Lock $lock): bool
+    {
+        return $lock->refresh();
     }
 
     /**
@@ -1189,7 +1244,7 @@ class NameFixingService
      *
      * @throws \Exception
      */
-    public function checkName(object $release, bool $echo, string $type, bool $nameStatus, bool $show, bool $preId = false): bool
+    public function checkName(object $release, bool $echo, string $type, bool $nameStatus, bool $show, bool $preId = false, bool $markProcessed = true): bool
     {
         // Check PreDB first
         $preDbMatch = $this->updateService->checkPreDbMatch($release, $release->textstring);
@@ -1248,7 +1303,7 @@ class NameFixingService
         }
 
         // Update processing flags if not matched
-        if ($echo && $nameStatus && ! $this->updateService->matched) {
+        if ($echo && $nameStatus && $markProcessed && ! $this->updateService->matched) {
             $this->updateProcessingFlags($type, $release->releases_id);
         }
 
