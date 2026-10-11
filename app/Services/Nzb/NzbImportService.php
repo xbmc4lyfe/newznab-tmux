@@ -699,9 +699,16 @@ class NzbImportService
             if (! is_string($nzbDetails['verificationXml'] ?? null)) {
                 throw new \RuntimeException('NZB must be queued for download verification before publication.');
             }
+            $subject = $this->normalizeImportedSubject((string) $nzbDetails['subject']);
             $info = (object) ['groups_id' => $nzbDetails['groups_id'],
-                'searchname' => $nzbDetails['useFName'] !== '' ? $nzbDetails['useFName'] : $nzbDetails['subject'],
-                'fromname' => $nzbDetails['from'], 'postdate' => $nzbDetails['postDate']];
+                'searchname' => $nzbDetails['useFName'] !== '' ? $nzbDetails['useFName'] : $subject,
+                'fromname' => $nzbDetails['from'], 'postdate' => $nzbDetails['postDate'], 'metadata_source' => 'import',
+                'import_name_override' => $nzbDetails['useFName'] !== '', 'original_subject' => $subject];
+            $categoryId = $nzbDetails['nzbCategoryId'] ?? null;
+            if (is_int($categoryId) && $categoryId > 0
+                && Category::query()->where('id', $categoryId)->where('status', Category::STATUS_ACTIVE)->exists()) {
+                $info->categories_id = $categoryId;
+            }
             $manifest = app(NzbManifestReader::class)->read($nzbDetails['verificationXml'], $info);
             $manifest['identity'] = sha1('import:'.($nzbDetails['articleFingerprint'] ?? $nzbDetails['verificationXml']));
             app(CandidateRepository::class)->enqueue($manifest);
@@ -714,10 +721,7 @@ class NzbImportService
         // Make up a GUID for the release.
         $this->relGuid = Str::uuid()->toString();
 
-        // Remove part count from subject.
-        $partLess = preg_replace('/(\(\d+\/\d+\))*$/', 'yEnc', $nzbDetails['subject']);
-        // Remove added yEnc from above and anything after.
-        $subject = mb_convert_encoding(trim(preg_replace('/yEnc.*$/i', 'yEnc', $partLess)), 'UTF-8', mb_list_encodings());
+        $subject = $this->normalizeImportedSubject((string) $nzbDetails['subject']);
 
         $renamed = 0;
         $cleanedMeta = null;
@@ -823,6 +827,13 @@ class NzbImportService
         $this->persistArticleFingerprint($this->relId, $nzbDetails['articleFingerprint'] ?? null);
 
         return NzbImportStatus::Inserted;
+    }
+
+    protected function normalizeImportedSubject(string $subject): string
+    {
+        $partLess = preg_replace('/(\(\d+\/\d+\))*$/', 'yEnc', $subject) ?? $subject;
+
+        return mb_convert_encoding(trim(preg_replace('/yEnc.*$/i', 'yEnc', $partLess) ?? $partLess), 'UTF-8', mb_list_encodings());
     }
 
     protected function normalizeGroupName(\SimpleXMLElement|string $group): string

@@ -21,19 +21,30 @@ use DariusIII\NetNntp\Protocol\ResponseCode;
  */
 class NNTPService extends NntpClient
 {
-    /** Read one bounded, undecoded article for integrity verification. */
-    public function verificationArticle(string $messageId, int $maximumBytes): string
+    public static function verificationMessageId(string $messageId, int $maximumBytes): string
     {
         $messageId = trim($messageId, '<>');
         if ($maximumBytes < 1 || preg_match('/\A[^\s<>\x00-\x1f\x7f]+\z/D', $messageId) !== 1) {
             throw new \RuntimeException('Invalid verification article request.');
         }
+
+        return $messageId;
+    }
+
+    /**
+     * Read one bounded, undecoded article for integrity verification.
+     *
+     * @throws \RuntimeException
+     */
+    public function verificationArticle(string $messageId, int $maximumBytes): string
+    {
+        $messageId = self::verificationMessageId($messageId, $maximumBytes);
         $response = $this->_sendCommand('BODY <'.$messageId.'>');
         if ($response !== ResponseCode::BodyFollows->value) {
             throw new \RuntimeException('Article is unavailable; retry verification later.');
         }
         $raw = '';
-        while (($line = fgets($this->_socket, min($maximumBytes + 1, 65536))) !== false) {
+        while (($line = fgets($this->_socket, max(4, min($maximumBytes, 65534) + 2))) !== false) {
             if ($line === ".\r\n" || $line === ".\n") {
                 return $raw;
             }

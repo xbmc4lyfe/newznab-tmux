@@ -5,30 +5,79 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Services\NNTP\NNTPService;
+use Exception;
 use RuntimeException;
 
 final class NntpArticleSource implements ArticleSource
 {
     private bool $connected = false;
 
-    public function __construct(private readonly NNTPService $nntp) {}
+    private bool $alternateConnected = false;
+
+    public function __construct(private readonly NNTPService $nntp, private ?NNTPService $alternate = null) {}
 
     public function fetch(string $messageId): string
     {
-        if (! $this->connected) {
-            if ($this->nntp->doConnect(false) !== true) {
-                throw new RuntimeException('NNTP is unavailable.');
+        $maximumBytes = (int) config('release_verification.article_bytes');
+        $messageId = NNTPService::verificationMessageId($messageId, $maximumBytes);
+        try {
+            if (! $this->connected) {
+                if ($this->nntp->doConnect(false) !== true) {
+                    throw new RuntimeException('NNTP is unavailable.');
+                }
+                $this->connected = true;
             }
-            $this->connected = true;
+
+            return $this->nntp->verificationArticle($messageId, $maximumBytes);
+        } catch (Exception $error) {
+            if ($this->connected && $error instanceof RuntimeException) {
+                $this->connected = $this->nntp->isConnected();
+            } else {
+                $this->disconnect($this->nntp);
+                $this->connected = false;
+            }
+            if (! (bool) config('nntmux_nntp.alternate_article_fallback', false)) {
+                throw $error instanceof RuntimeException ? $error : new RuntimeException('NNTP is unavailable.', previous: $error);
+            }
         }
 
-        return $this->nntp->verificationArticle($messageId, (int) config('release_verification.article_bytes'));
+        $this->alternate ??= new NNTPService;
+        try {
+            if (! $this->alternateConnected) {
+                if ($this->alternate->doConnect(false, true) !== true) {
+                    throw new RuntimeException('Alternate NNTP is unavailable.');
+                }
+                $this->alternateConnected = true;
+            }
+
+            return $this->alternate->verificationArticle($messageId, $maximumBytes);
+        } catch (Exception $error) {
+            if ($this->alternateConnected && $error instanceof RuntimeException) {
+                $this->alternateConnected = $this->alternate->isConnected();
+            } else {
+                $this->disconnect($this->alternate);
+                $this->alternateConnected = false;
+            }
+            throw $error instanceof RuntimeException ? $error : new RuntimeException('Alternate NNTP is unavailable.', previous: $error);
+        }
+    }
+
+    private function disconnect(NNTPService $connection): void
+    {
+        try {
+            $connection->doQuit();
+        } catch (Exception) {
+            // A failed transport cleanup must not prevent trying the alternate provider.
+        }
     }
 
     public function __destruct()
     {
         if ($this->connected) {
-            $this->nntp->doQuit();
+            $this->disconnect($this->nntp);
+        }
+        if ($this->alternateConnected && $this->alternate !== null) {
+            $this->disconnect($this->alternate);
         }
     }
 }

@@ -6,6 +6,7 @@ namespace App\Services\Releases\Verification;
 
 use App\Models\Category;
 use App\Models\Predb;
+use App\Models\UsenetGroup;
 use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\PredbIdentityKey;
 use App\Services\ReleaseCleaningService;
@@ -21,11 +22,19 @@ class ReleaseMetadataResolver
      */
     public function resolve(array $manifest): array
     {
-        $rawName = Utf8::clean((string) $manifest['subject']);
-        $from = Utf8::clean((string) $manifest['fromname']);
-        $group = $manifest['groups'][0];
-        $cleaned = $this->cleaning->releaseCleaner($rawName, $from, $group);
-        $name = is_array($cleaned) ? (string) ($cleaned['cleansubject'] ?? $rawName) : $rawName;
+        $subject = (string) $manifest['subject'];
+        $poster = (string) $manifest['fromname'];
+        $collectionMetadata = ($manifest['metadata_source'] ?? 'collection') === 'collection';
+        $importMetadata = ($manifest['metadata_source'] ?? null) === 'import';
+        $displaySubject = $importMetadata && is_string($manifest['original_subject'] ?? null) ? $manifest['original_subject'] : $subject;
+        $rawName = Utf8::clean($collectionMetadata ? str_replace(['#', '@', '$', '%', '^', '§', '¨', '©', 'Ö'], '', $subject) : $displaySubject);
+        $from = Utf8::clean($collectionMetadata ? trim($poster, "'") : $poster);
+        $groupId = (int) ($manifest['groups_id'] ?? 0);
+        $group = $groupId > 0 ? (string) UsenetGroup::query()->whereKey($groupId)->value('name') : (string) ($manifest['groups'][0] ?? '');
+        $importNameOverride = $importMetadata
+            && ($manifest['import_name_override'] ?? false) === true && $subject !== '';
+        $cleaned = $importNameOverride ? null : $this->cleaning->releaseCleaner($collectionMetadata ? $subject : $rawName, $collectionMetadata ? $poster : $from, $group);
+        $name = $importNameOverride ? Utf8::clean($subject) : (is_array($cleaned) ? (string) ($cleaned['cleansubject'] ?? $rawName) : $rawName);
         $proper = is_array($cleaned) ? (bool) ($cleaned['properlynamed'] ?? false) : true;
         $predb = is_array($cleaned) ? max(0, (int) ($cleaned['predb'] ?? 0)) : 0;
         if ($predb === 0 && $name !== '') {
@@ -53,11 +62,20 @@ class ReleaseMetadataResolver
             }
         }
 
-        $category = ($this->categorization ?? new CategorizationService)->determineCategory((int) $manifest['groups_id'], $name, $from);
+        $explicitCategory = $importMetadata
+            ? filter_var($manifest['categories_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]) : false;
+        $categoryId = $explicitCategory !== false && Category::query()->whereKey($explicitCategory)->where('status', Category::STATUS_ACTIVE)->exists()
+            ? $explicitCategory : null;
+        if ($categoryId === null) {
+            $category = ($this->categorization ?? new CategorizationService)->determineCategory($groupId, $name, $from);
+            $categoryId = $category['categories_id'] ?? Category::OTHER_MISC;
+        }
 
-        return ['name' => $rawName, 'searchname' => Utf8::clean($name), 'fromname' => $from,
+        $searchName = ($importMetadata ? $name !== '' : ! empty($name)) ? Utf8::clean($name) : $rawName;
+
+        return ['name' => $rawName, 'searchname' => $searchName, 'fromname' => $from,
             'predb_id' => $predb, 'isrenamed' => $proper ? 1 : 0,
-            'categories_id' => $category['categories_id'] ?? Category::OTHER_MISC,
+            'categories_id' => $categoryId,
             'naming_regex_id' => is_array($cleaned) ? (int) ($cleaned['id'] ?? 0) : 0];
     }
 }

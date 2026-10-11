@@ -43,9 +43,21 @@ final class NzbManifestReader
                 throw new RuntimeException('NZB contains no files.');
             }
 
-            return ['subject' => $release->searchname, 'fromname' => $release->fromname, 'date' => $release->postdate,
+            $metadataSource = ($release->metadata_source ?? null) === 'import' ? 'import' : 'audit';
+            $manifest = ['subject' => $release->searchname, 'fromname' => $release->fromname, 'date' => $release->postdate,
                 'groups_id' => (int) $release->groups_id, 'regex_id' => 0, 'expected_files' => $expected,
-                'groups' => array_keys($groups), 'files' => $files];
+                'groups' => array_keys($groups), 'files' => $files, 'metadata_source' => $metadataSource];
+            if ($metadataSource === 'import' && is_int($release->categories_id ?? null) && $release->categories_id > 0) {
+                $manifest['categories_id'] = $release->categories_id;
+            }
+            if ($metadataSource === 'import' && ($release->import_name_override ?? false) === true) {
+                $manifest['import_name_override'] = true;
+            }
+            if ($metadataSource === 'import' && is_string($release->original_subject ?? null)) {
+                $manifest['original_subject'] = $release->original_subject;
+            }
+
+            return $manifest;
         } finally {
             libxml_clear_errors();
             libxml_use_internal_errors($previous);
