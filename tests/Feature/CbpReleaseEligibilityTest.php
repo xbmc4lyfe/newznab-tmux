@@ -212,18 +212,22 @@ class CbpReleaseEligibilityTest extends TestCase
 
     public function test_header_storage_transaction_reads_committed_rows(): void
     {
+        $connection = DB::getDefaultConnection();
         if (! \in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
             $this->markTestSkipped('Isolation levels apply to MariaDB.');
         }
         DB::statement('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+        config(["database.connections.{$connection}_other" => config("database.connections.{$connection}")]);
 
         $transaction = new HeaderStorageTransaction(new CollectionHandler(new CollectionsCleaningService), new BinaryHandler);
         $transaction->begin();
-        DB::table('collections')->count();
-        $isolation = DB::selectOne('SELECT trx_isolation_level AS level FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID()');
+        $before = DB::table('collections')->count();
+        DB::connection("{$connection}_other")->table('collections')->insert(['groups_id' => 1]);
+        $after = DB::table('collections')->count();
         $transaction->finish();
+        DB::purge("{$connection}_other");
 
-        $this->assertSame('READ COMMITTED', $isolation->level ?? null);
+        $this->assertSame($before + 1, $after, 'Rows other workers commit are visible inside the transaction.');
     }
 
     private function process(?int $groupId): void
