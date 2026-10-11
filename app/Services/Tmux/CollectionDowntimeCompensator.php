@@ -355,8 +355,18 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
     private function withLockedMarker(callable $work): mixed
     {
         $directory = \dirname($this->markerPath);
-        if (! is_dir($directory)) {
-            @mkdir($directory, 0775, true);
+        $parents = [\dirname($directory)];
+        $missing = $directory;
+        while (! is_dir($missing)) {
+            $parent = \dirname($missing);
+            if ($parent === $missing) {
+                throw new \RuntimeException('Unable to create marker directory.');
+            }
+            $parents[] = $parent;
+            $missing = $parent;
+        }
+        if (! is_dir($directory) && ! @mkdir($directory, 0775, true) && ! is_dir($directory)) {
+            throw new \RuntimeException('Unable to create marker directory.');
         }
         $marker = fopen($this->markerPath.'.lock', 'c+');
         if ($marker === false) {
@@ -368,6 +378,21 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
                 throw new \RuntimeException("Unable to lock {$this->markerPath}.");
             }
 
+            // Always repeat the parent sync: a prior failed creator, or a concurrent
+            // creator, can leave an existing directory with an unsynced parent entry.
+            foreach (array_unique($parents) as $parent) {
+                $parentStream = fopen($parent, 'r');
+                if ($parentStream === false) {
+                    throw new \RuntimeException('Unable to sync marker parent directory.');
+                }
+                try {
+                    if (! $this->syncDirectory($parentStream)) {
+                        throw new \RuntimeException('Unable to sync marker parent directory.');
+                    }
+                } finally {
+                    fclose($parentStream);
+                }
+            }
             $this->recoverPublication();
 
             return $work();
@@ -450,19 +475,30 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
     private function recoverPublication(bool $forceRollback = false): void
     {
         $recoveryPath = $this->markerPath.'.recovery';
-        if (! is_file($recoveryPath)) {
+        $forcedRecord = file_get_contents($this->markerPath.'.lock');
+        if ($forcedRecord === false) {
+            throw new \RuntimeException('Unrecoverable marker publication: pending lock record is unreadable.');
+        }
+        if ($forcedRecord === '' && ! is_file($recoveryPath)) {
             return;
         }
-        $record = file_get_contents($recoveryPath);
+        $record = $forcedRecord !== '' ? $forcedRecord : file_get_contents($recoveryPath);
         if ($record === false) {
             throw new \RuntimeException('Unrecoverable marker publication: recovery record is unreadable.');
         }
-        if (! $forceRollback && str_contains($record, "\nCOMMITTED\n")) {
+        if (! $forceRollback && $forcedRecord === '' && str_contains($record, "\nCOMMITTED\n")) {
             @unlink($recoveryPath);
 
             return;
         }
-        $metadata = json_decode(explode("\n", $record, 2)[0], true, 512, JSON_THROW_ON_ERROR);
+        $pendingRecord = explode("\n", $record, 2)[0]."\n";
+        if ($forceRollback && $forcedRecord === '') {
+            // A failed checkpoint can leave a visible COMMITTED suffix. Persist an
+            // overriding pending record in the already durable, stable lock inode
+            // before attempting any rollback rename that might itself be lost.
+            $this->writeLockRecovery($pendingRecord);
+        }
+        $metadata = json_decode(trim($pendingRecord), true, 512, JSON_THROW_ON_ERROR);
         if (! \is_array($metadata) || ! array_key_exists('previous', $metadata) || ($metadata['previous'] !== null && ! \is_string($metadata['previous']))) {
             throw new \RuntimeException('Unrecoverable marker publication: invalid recovery record.');
         }
@@ -487,12 +523,33 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
             if (! $this->syncDirectory($directoryStream)) {
                 throw new \RuntimeException('Unrecoverable marker publication: rollback cannot be synced; recovery evidence retained.');
             }
+            $this->writeLockRecovery('');
             @unlink($recoveryPath);
         } finally {
             fclose($directoryStream);
             if ($temporary !== null && is_file($temporary)) {
                 unlink($temporary);
             }
+        }
+    }
+
+    /**
+     * Persist pending rollback evidence without changing a directory entry.
+     * Called only while the same stable lock inode is exclusively held.
+     */
+    private function writeLockRecovery(string $record): void
+    {
+        $stream = fopen($this->markerPath.'.lock', 'c+');
+        if ($stream === false) {
+            throw new \RuntimeException('Unrecoverable marker publication: pending lock record cannot be opened.');
+        }
+        try {
+            if (! rewind($stream) || fwrite($stream, $record) !== \strlen($record)
+                || ! ftruncate($stream, \strlen($record)) || ! fflush($stream) || ! fsync($stream)) {
+                throw new \RuntimeException('Unrecoverable marker publication: pending lock record cannot be synced.');
+            }
+        } finally {
+            fclose($stream);
         }
     }
 

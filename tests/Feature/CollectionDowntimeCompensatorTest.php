@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Services\Tmux\CollectionDowntimeCompensator;
+use App\Services\Tmux\CollectionReconciliationBarrier;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
@@ -42,6 +43,7 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         MarkerIoFailures::$directorySyncCalls = 0;
         MarkerIoFailures::$directorySyncFailFromCall = null;
         MarkerIoFailures::$checkpointSyncFails = false;
+        MarkerIoFailures::$syncFailureUri = null;
         Schema::dropIfExists('collections');
         @unlink($this->marker);
         @unlink($this->marker.'.lock');
@@ -338,6 +340,44 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         $this->assertSame(0, $this->compensator()->compensate(2), 'A subsequent tmux start must not compensate twice.');
     }
 
+    public function test_reconciliation_barrier_compensates_before_consuming_collection_dates(): void
+    {
+        $this->lastActive(Carbon::now('UTC')->subHour()->getTimestamp());
+        $waiting = $this->collection('2026-10-11 10:30:00');
+        $service = $this->compensator();
+
+        $observed = $service->withReconciliationBarrier(2, fn (): string => $this->dateAdded($waiting));
+
+        $this->assertSame('2026-10-11 11:30:00', $observed);
+        $this->assertSame(0, $service->compensate(2));
+    }
+
+    public function test_barrier_resolution_uses_the_isolated_concrete_test_marker(): void
+    {
+        $this->assertSame(
+            $this->app->make(CollectionDowntimeCompensator::class),
+            $this->app->make(CollectionReconciliationBarrier::class),
+        );
+    }
+
+    public function test_parent_sync_failure_prevents_first_marker_publication(): void
+    {
+        $parent = \dirname(\dirname($this->marker));
+        MarkerIoFailures::$syncFailureUri = $parent;
+        try {
+            $this->compensator()->recordActivity();
+            $this->fail('A newly created marker directory needs a durable parent entry.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('Unable to sync marker parent', $exception->getMessage());
+        } finally {
+            MarkerIoFailures::$syncFailureUri = null;
+        }
+
+        $this->assertNull($this->compensator()->lastActivity());
+        $this->compensator()->recordActivity();
+        $this->assertSame(Carbon::now('UTC')->getTimestamp(), $this->compensator()->lastActivity());
+    }
+
     #[DataProvider('compensationWindows')]
     public function test_only_delay_waiting_statuses_receive_compensation(string $timezone, string $stopped, string $restarted, string $added, string $shifted): void
     {
@@ -439,7 +479,7 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         $this->lastActive($previous);
         $waiting = $this->collection('2026-10-11 10:30:00');
         MarkerIoFailures::$directorySyncCalls = 0;
-        MarkerIoFailures::$directorySyncFailFromCall = 2;
+        MarkerIoFailures::$directorySyncFailFromCall = 3;
         try {
             $this->compensator()->compensate(2);
             $this->fail('Failed rollback synchronization must be reported as unrecoverable.');
@@ -498,6 +538,30 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         $this->assertSame($previous, $this->compensator()->lastActivity());
         $this->assertSame('2026-10-11 10:30:00', $this->dateAdded($waiting));
         $this->assertSame(1, $this->compensator()->compensate(2));
+    }
+
+    public function test_checkpoint_and_rollback_failure_cannot_discard_the_pending_outage(): void
+    {
+        $previous = Carbon::now('UTC')->subHour()->getTimestamp();
+        $this->lastActive($previous);
+        $waiting = $this->collection('2026-10-11 10:30:00');
+        MarkerIoFailures::$directorySyncCalls = 0;
+        MarkerIoFailures::$checkpointSyncFails = true;
+        MarkerIoFailures::$directorySyncFailFromCall = 4;
+        try {
+            $this->compensator()->compensate(2);
+            $this->fail('The failed rollback must preserve a pending outage.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('Unrecoverable', $exception->getMessage());
+        } finally {
+            MarkerIoFailures::$checkpointSyncFails = false;
+            MarkerIoFailures::$directorySyncFailFromCall = null;
+        }
+
+        // Model a crash losing the unsynced rollback rename, leaving the new marker.
+        file_put_contents($this->marker, (string) Carbon::now('UTC')->getTimestamp());
+        $this->assertSame(1, $this->compensator()->compensate(2));
+        $this->assertSame('2026-10-11 11:30:00', $this->dateAdded($waiting));
     }
 
     public function test_tests_use_a_temporary_marker_not_the_real_one(): void

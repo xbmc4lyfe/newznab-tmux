@@ -54,6 +54,8 @@ final class HeaderStorageService
      * @param  array<string, mixed>  $groupMySQL  Group info from database
      * @param  bool  $addToPartRepair  Caller repair mode; failures are returned in every mode
      * @return array<int, int|string> Article numbers that failed to insert
+     *
+     * @phpstan-impure
      */
     public function store(array $headers, array $groupMySQL, bool $addToPartRepair = true): array
     {

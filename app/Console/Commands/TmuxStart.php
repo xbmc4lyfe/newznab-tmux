@@ -168,14 +168,10 @@ class TmuxStart extends Command
     {
         $delayTime = app(ConfigurationProvider::class)->ingestion()->collectionDelayHours;
 
-        try {
-            $count = app(CollectionDowntimeCompensator::class)->compensate($delayTime);
-            $this->info($count > 0
-                ? "  ✓ Gave {$count} waiting collections back the time lost while the indexer was down"
-                : '  ✓ No collections needed more time');
-        } catch (\Exception $e) {
-            $this->warn('Failed to adjust collection delays: '.$e->getMessage());
-        }
+        $count = app(CollectionDowntimeCompensator::class)->compensate($delayTime);
+        $this->info($count > 0
+            ? "  ✓ Gave {$count} waiting collections back the time lost while the indexer was down"
+            : '  ✓ No collections needed more time');
     }
 
     /**

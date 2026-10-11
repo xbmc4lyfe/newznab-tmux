@@ -16,6 +16,8 @@ namespace Tests\Support {
         public static ?int $directorySyncFailFromCall = null;
 
         public static bool $checkpointSyncFails = false;
+
+        public static ?string $syncFailureUri = null;
     }
 }
 
@@ -45,6 +47,9 @@ namespace App\Services\Tmux {
     function fsync($stream): bool
     {
         $metadata = stream_get_meta_data($stream);
+        if (MarkerIoFailures::$syncFailureUri !== null && ($metadata['uri'] ?? '') === MarkerIoFailures::$syncFailureUri) {
+            return false;
+        }
         if (MarkerIoFailures::$checkpointSyncFails && str_ends_with($metadata['uri'] ?? '', '.recovery')) {
             return false;
         }
