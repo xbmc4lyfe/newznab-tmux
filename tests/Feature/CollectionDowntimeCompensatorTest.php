@@ -253,6 +253,25 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         );
     }
 
+    public function test_rows_from_before_a_fall_back_restart_that_reads_earlier_are_included(): void
+    {
+        $previous = date_default_timezone_get();
+        date_default_timezone_set('America/New_York');
+        try {
+            // Last activity 01:10 EST, restart 01:30 EST; added at 01:59 EDT, 11 minutes before.
+            $lastActive = Carbon::parse('2026-11-01 06:10:00', 'UTC')->getTimestamp();
+            Carbon::setTestNow(Carbon::createFromTimestamp($lastActive + 1200, 'UTC'));
+            $this->lastActive($lastActive);
+            $row = $this->collection('2026-11-01 01:59:00');
+
+            $this->compensator()->compensate(2);
+
+            $this->assertSame('2026-11-01 01:19:00', $this->dateAdded($row), '01:59 EDT plus 20 minutes is 01:19 EST.');
+        } finally {
+            date_default_timezone_set($previous);
+        }
+    }
+
     private function compensator(): CollectionDowntimeCompensator
     {
         return new CollectionDowntimeCompensator($this->marker);

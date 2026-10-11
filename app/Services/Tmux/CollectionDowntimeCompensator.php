@@ -137,10 +137,13 @@ final class CollectionDowntimeCompensator
             : DB::raw("dateadded + INTERVAL (CASE WHEN dateadded <= '{$lastActiveAt}' THEN {$downtime} ELSE GREATEST(0, LEAST(TIMESTAMPDIFF(SECOND, dateadded, '{$nowAt}'), {$downtime})) END) SECOND");
         if ($perValue) {
             // Wall-clock values from a repeated fall-back hour don't say which occurrence
-            // they were, so widen the lower bound by the offset change to include them.
+            // they were, so widen both bounds by the offset change to include them; each
+            // row's real age is then checked after resolving its timestamp.
+            $fold = $this->largestOffsetChange($waitingFrom, $lastActive, $now);
+
             return $this->shiftRowsById(
-                $this->at($waitingFrom - $this->largestOffsetChange($waitingFrom, $lastActive, $now)),
-                max($nowAt, $lastActiveAt),
+                $this->at($waitingFrom - $fold),
+                $this->at(max($now, $lastActive) + $fold),
                 $waitingFrom,
                 $lastActive,
                 $now,
