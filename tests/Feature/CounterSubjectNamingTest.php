@@ -58,6 +58,8 @@ class CounterSubjectNamingTest extends TestCase
         yield 'title ending in a codec token' => ['[1/5] - "Movie.2020.1080p.DTS.mkv" yEnc', 'Movie.2020.1080p.DTS'];
         yield 'codec token before a rar' => ['[1/2] - "Movie.2020.1080p.DTS.rar" yEnc', 'Movie.2020.1080p.DTS'];
         yield 'm2v' => ['[1/2] - "Movie.2020.1080p-GRP.m2v" yEnc', 'Movie.2020.1080p-GRP'];
+        yield 'ifo' => ['[1/2] - "Movie.2020.1080p-GRP.ifo" yEnc', 'Movie.2020.1080p-GRP'];
+        yield 'flac token before a rar' => ['[1/2] - "Movie.2020.1080p.FLAC.rar" yEnc', 'Movie.2020.1080p.FLAC'];
         yield 'audiobook' => ['[1/2] - "Author.Book.2020-GRP.m4b" yEnc', 'Author.Book.2020-GRP'];
         yield 'document' => ['[1/2] - "Book.Title-GRP.docx" yEnc', 'Book.Title-GRP'];
         yield 'vob' => ['[1/5] - "Movie.2020.1080p-GRP.vob" yEnc', 'Movie.2020.1080p-GRP'];
