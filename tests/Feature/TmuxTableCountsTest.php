@@ -203,11 +203,14 @@ final class TmuxTableCountsTest extends TestCase
         $state = new ReflectionProperty(TmuxMonitorService::class, 'runVar');
         $refresh = new ReflectionMethod(TmuxMonitorService::class, 'getTableCounts');
 
-        foreach ([['backfill' => 0], ['backfill' => 1, 'sequential' => 1], ['backfill' => 1, 'sequential' => 2]] as $settings) {
-            $state->setValue($monitor, ['settings' => $settings + ['collections_kill' => 2_000_000, 'progressive' => 1]]);
+        foreach ([[0, 0], [1, 1], [1, 2]] as [$backfill, $sequential]) {
+            $state->setValue($monitor, [
+                'constants' => ['sequential' => $sequential],
+                'settings' => ['backfill' => $backfill, 'collections_kill' => 2_000_000, 'progressive' => 1],
+            ]);
             $refresh->invoke($monitor);
 
-            $this->assertSame(14_100_000, $state->getValue($monitor)['counts']['now']['collections_table'], json_encode($settings));
+            $this->assertSame(14_100_000, $state->getValue($monitor)['counts']['now']['collections_table'], "backfill {$backfill}, sequential {$sequential}");
         }
     }
 }

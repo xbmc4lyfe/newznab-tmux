@@ -372,8 +372,9 @@ class TmuxMonitorService
      */
     private function collectionCountDrivesBackfill(): bool
     {
-        $mode = TmuxMode::tryFrom((int) ($this->runVar['settings']['sequential'] ?? 0));
-        if (! isset($mode?->tasks()['backfill'])
+        // Same mode resolution as TmuxMonitor::runPaneTasks().
+        $mode = TmuxMode::tryFrom((int) ($this->runVar['constants']['sequential'] ?? 0)) ?? TmuxMode::Full;
+        if (! isset($mode->tasks()['backfill'])
             || ! \in_array((int) ($this->runVar['settings']['backfill'] ?? 0), [1, 4], true)) {
             return false;
         }
