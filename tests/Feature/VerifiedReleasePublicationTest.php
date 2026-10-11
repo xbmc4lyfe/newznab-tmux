@@ -12,10 +12,12 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\VerificationResult;
+use App\Services\Releases\Verification\VerifiedNzbWriter;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
 {
@@ -34,9 +36,23 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         $this->assertFalse(DB::table('collections')->where('id', $id)->exists());
     }
 
-    public function test_successful_download_publishes_exact_verified_nzb_once(): void
+    /** @return array<string, array{?int, int, ?string}> */
+    public static function verifiedSizes(): array
     {
-        config(['nntmux.release_dedupe_enabled' => false, 'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
+        return [
+            'legacy manifest' => [null, 5, null],
+            'including reconstructed file' => [12345, 12345, null],
+            'metadata duplicate with different articles' => [12345, 12345, 'different'],
+            'metadata duplicate with missing NZB' => [12345, 12345, 'missing'],
+            'metadata duplicate with corrupt compressed NZB' => [12345, 12345, 'corrupt'],
+            'duplicate with exact verified article inventory' => [12345, 12345, 'exact'],
+        ];
+    }
+
+    #[DataProvider('verifiedSizes')]
+    public function test_successful_download_publishes_exact_verified_nzb_once(?int $verifiedBytes, int $expectedSize, ?string $duplicateKind): void
+    {
+        config(['nntmux.release_dedupe_enabled' => $duplicateKind !== null, 'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
         Schema::create('releases', function (Blueprint $table): void {
             $table->id();
             foreach (['name', 'searchname', 'guid', 'leftguid', 'fromname', 'postdate', 'adddate'] as $column) {
@@ -55,7 +71,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $table->integer('releases_id');
             $table->integer('groups_id');
         });
-        Search::shouldReceive('updateRelease')->once();
+        Search::shouldReceive('updateRelease')->times($duplicateKind === 'exact' ? 0 : 1);
         $this->app->instance(ReleaseMetadataResolver::class,
             new class(app(ReleaseCleaningService::class)) extends ReleaseMetadataResolver
             {
@@ -69,6 +85,29 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         $manifest = ['subject' => 'Movie', 'fromname' => 'poster', 'date' => '2026-10-11 12:00:00', 'groups_id' => 1,
             'groups' => ['alt.test'], 'expected_files' => 1, 'regex_id' => 0,
             'files' => [['key' => 'file', 'subject' => 'movie.mkv', 'totalparts' => 1, 'segments' => [['number' => 1, 'messageid' => 'verified@article', 'bytes' => 5]]]]];
+        if ($verifiedBytes !== null) {
+            $manifest['verified_bytes'] = $verifiedBytes;
+        }
+        if ($duplicateKind !== null) {
+            $duplicateGuid = '11111111111111111111111111111111';
+            DB::table('releases')->insert([
+                'id' => 777, 'name' => 'Movie', 'searchname' => 'Movie', 'guid' => $duplicateGuid,
+                'leftguid' => '1', 'fromname' => 'poster', 'postdate' => $manifest['date'], 'adddate' => $manifest['date'],
+                'totalpart' => 1, 'groups_id' => 1, 'size' => $expectedSize, 'passwordstatus' => -1,
+                'haspreview' => -1, 'categories_id' => 2000, 'nfostatus' => -1, 'nzbstatus' => 1,
+                'isrenamed' => 1, 'iscategorized' => 1, 'predb_id' => 0,
+            ]);
+            if ($duplicateKind !== 'missing') {
+                $oldManifest = $manifest;
+                if ($duplicateKind === 'different') {
+                    $oldManifest['files'][0]['segments'][0]['messageid'] = 'unverified-old@article';
+                }
+                app(VerifiedNzbWriter::class)->write($oldManifest, $duplicateGuid);
+                if ($duplicateKind === 'corrupt') {
+                    file_put_contents(app(NzbService::class)->getNzbPath($duplicateGuid), "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xff\xff\xff\xff");
+                }
+            }
+        }
         $path = $store->write($manifest);
         DB::table('release_verification_candidates')->insert(['identity' => sha1('publish'), 'groups_id' => 1,
             'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => filesize($store->path($path)),
@@ -76,10 +115,16 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         DB::table('release_verification_state')->update(['pending_bytes' => filesize($store->path($path))]);
         $claim = app(CandidateRepository::class)->claim();
         $id = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
+        if ($duplicateKind === 'exact') {
+            $this->assertSame(777, $id);
+        } elseif ($duplicateKind !== null) {
+            $this->assertNotSame(777, $id);
+        }
         $release = DB::table('releases')->where('id', $id)->first();
         $xml = app(NzbService::class)->readNzbContents($release->guid);
         $this->assertStringContainsString('verified@article', $xml);
         $this->assertSame(1, (int) $release->nzbstatus);
+        $this->assertSame($expectedSize, (int) $release->size);
         $this->assertSame($id, (int) DB::table('release_verification_candidates')->value('release_id'));
         $this->expectException(\RuntimeException::class);
         app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Duplicate stale claim', $manifest));

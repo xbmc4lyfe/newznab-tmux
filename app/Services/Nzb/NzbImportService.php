@@ -68,6 +68,8 @@ class NzbImportService
 
     protected ?int $relId = null;
 
+    protected ?string $verificationCandidateIdentity = null;
+
     public mixed $echoCLI;
 
     public NzbService $nzb;
@@ -104,7 +106,7 @@ class NzbImportService
     /**
      * Begin importing NZB files.
      *
-     * @param  null|callable(array{path:string,status:NzbImportStatus,release_id:int|null,release_guid:string|null}):void  $resultCallback
+     * @param  null|callable(array{path:string,status:NzbImportStatus,release_id:int|null,release_guid:string|null,candidate_identity:string|null}):void  $resultCallback
      *
      * @throws FileNotFoundException
      */
@@ -157,6 +159,7 @@ class NzbImportService
             NzbImportStatus $status,
             ?int $releaseId = null,
             ?string $releaseGuid = null,
+            ?string $candidateIdentity = null,
         ) use ($resultCallback): void {
             if ($resultCallback === null) {
                 return;
@@ -167,6 +170,7 @@ class NzbImportService
                 'status' => $status,
                 'release_id' => $status === NzbImportStatus::Inserted ? $releaseId : null,
                 'release_guid' => $status === NzbImportStatus::Inserted ? $releaseGuid : null,
+                'candidate_identity' => $status === NzbImportStatus::Queued ? $candidateIdentity : null,
             ]);
         };
 
@@ -176,6 +180,7 @@ class NzbImportService
             if (File::isFile($nzbFilePath)) {
                 $this->relGuid = '';
                 $this->relId = null;
+                $this->verificationCandidateIdentity = null;
 
                 // Get the contents of the NZB file as a string.
                 if (Str::endsWith(strtolower($nzbFilePath), '.nzb.gz')) {
@@ -249,7 +254,7 @@ class NzbImportService
                 }
 
                 if ($importStatus === NzbImportStatus::Queued) {
-                    $reportResult($nzbFilePath, $importStatus);
+                    $reportResult($nzbFilePath, $importStatus, candidateIdentity: $this->verificationCandidateIdentity);
                     $nzbsImported++;
                     if ($delete) {
                         File::delete($nzbFilePath);
@@ -700,6 +705,7 @@ class NzbImportService
             $manifest = app(NzbManifestReader::class)->read($nzbDetails['verificationXml'], $info);
             $manifest['identity'] = sha1('import:'.($nzbDetails['articleFingerprint'] ?? $nzbDetails['verificationXml']));
             app(CandidateRepository::class)->enqueue($manifest);
+            $this->verificationCandidateIdentity = $manifest['identity'];
             $this->echoOut('NZB queued for download verification.');
 
             return NzbImportStatus::Queued;

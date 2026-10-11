@@ -15,6 +15,38 @@ final class VerifiedNzbWriter
     /** @param array<string, mixed> $manifest */
     public function write(array $manifest, string $guid): string
     {
+        $path = $this->nzb->getNzbPath($guid, createIfNotExist: true);
+        $body = gzencode($this->document($manifest));
+        $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
+        $handle = fopen($temporary, 'xb');
+        if ($body === false || $handle === false) {
+            throw new RuntimeException('Cannot write verified NZB.');
+        }
+        try {
+            if (fwrite($handle, $body) !== strlen($body) || ! fflush($handle) || ! fsync($handle)) {
+                throw new RuntimeException('Cannot persist verified NZB.');
+            }
+        } finally {
+            fclose($handle);
+        }
+        if (! rename($temporary, $path)) {
+            throw new RuntimeException('Cannot finalize verified NZB.');
+        }
+
+        return $path;
+    }
+
+    /** @param array<string, mixed> $manifest */
+    public function matches(array $manifest, string $guid): bool
+    {
+        $contents = $this->nzb->readNzbContents($guid);
+
+        return is_string($contents) && hash_equals($this->document($manifest), $contents);
+    }
+
+    /** @param array<string, mixed> $manifest */
+    private function document(array $manifest): string
+    {
         $xml = new XMLWriter;
         $xml->openMemory();
         $xml->startDocument('1.0', 'UTF-8');
@@ -46,24 +78,7 @@ final class VerifiedNzbWriter
         }
         $xml->endElement();
         $xml->endDocument();
-        $path = $this->nzb->getNzbPath($guid, createIfNotExist: true);
-        $body = gzencode($xml->outputMemory());
-        $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
-        $handle = fopen($temporary, 'xb');
-        if ($body === false || $handle === false) {
-            throw new RuntimeException('Cannot write verified NZB.');
-        }
-        try {
-            if (fwrite($handle, $body) !== strlen($body) || ! fflush($handle) || ! fsync($handle)) {
-                throw new RuntimeException('Cannot persist verified NZB.');
-            }
-        } finally {
-            fclose($handle);
-        }
-        if (! rename($temporary, $path)) {
-            throw new RuntimeException('Cannot finalize verified NZB.');
-        }
 
-        return $path;
+        return $xml->outputMemory();
     }
 }

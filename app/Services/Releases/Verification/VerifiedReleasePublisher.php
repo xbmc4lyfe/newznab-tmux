@@ -41,8 +41,10 @@ final class VerifiedReleasePublisher
             foreach ($manifest['files'] as $file) {
                 $size += (int) ($file['decoded_size'] ?? array_sum(array_column($file['segments'], 'bytes')));
             }
+            $size = (int) ($manifest['verified_bytes'] ?? $size);
             [$duplicate] = $this->duplicates->findDuplicate($metadata['name'], $metadata['searchname'], $metadata['predb_id'], $size);
-            if ($duplicate !== null) {
+            $duplicateGuid = $duplicate === null ? null : DB::table('releases')->where('id', $duplicate->id)->value('guid');
+            if (is_string($duplicateGuid) && $this->writer->matches($manifest, $duplicateGuid)) {
                 $this->markPublished($candidate->id, (int) $duplicate->id, $result);
 
                 return (int) $duplicate->id;
