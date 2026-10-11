@@ -206,6 +206,25 @@ final class CollectionDowntimeCompensatorTest extends TestCase
         }
     }
 
+    public function test_collections_from_the_repeated_fall_back_hour_are_included(): void
+    {
+        $previous = date_default_timezone_get();
+        date_default_timezone_set('America/New_York');
+        try {
+            // Shut down 02:50 EST, restart 03:20 EST on 2026-11-01; added at 01:10 EST.
+            $lastActive = Carbon::parse('2026-11-01 07:50:00', 'UTC')->getTimestamp();
+            Carbon::setTestNow(Carbon::createFromTimestamp($lastActive + 1800, 'UTC'));
+            $this->lastActive($lastActive);
+            $repeatedHour = $this->collection('2026-11-01 01:10:00');
+
+            $this->compensator()->compensate(2);
+
+            $this->assertSame('2026-11-01 01:40:00', $this->dateAdded($repeatedHour), 'Gets the 30 minutes back.');
+        } finally {
+            date_default_timezone_set($previous);
+        }
+    }
+
     private function compensator(): CollectionDowntimeCompensator
     {
         return new CollectionDowntimeCompensator($this->marker);

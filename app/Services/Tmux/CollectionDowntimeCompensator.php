@@ -119,7 +119,15 @@ final class CollectionDowntimeCompensator
             ? DB::raw("datetime(dateadded, '+' || (CASE WHEN dateadded <= '{$lastActiveAt}' THEN {$downtime} ELSE MAX(0, MIN(strftime('%s', '{$nowAt}') - strftime('%s', dateadded), {$downtime})) END) || ' seconds')")
             : DB::raw("dateadded + INTERVAL (CASE WHEN dateadded <= '{$lastActiveAt}' THEN {$downtime} ELSE GREATEST(0, LEAST(TIMESTAMPDIFF(SECOND, dateadded, '{$nowAt}'), {$downtime})) END) SECOND");
         if ($perValue) {
-            return $this->shiftRowsById($this->at($waitingFrom), max($nowAt, $lastActiveAt), $lastActive, $now, $downtime);
+            // Wall-clock values from a repeated fall-back hour don't say which occurrence
+            // they were, so widen the lower bound by the offset change to include them.
+            return $this->shiftRowsById(
+                $this->at($waitingFrom - $this->largestOffsetChange($waitingFrom, $lastActive, $now)),
+                max($nowAt, $lastActiveAt),
+                $lastActive,
+                $now,
+                $downtime,
+            );
         }
         $moved = 0;
 
@@ -182,6 +190,17 @@ final class CollectionDowntimeCompensator
         } while ($rows->count() === self::ROW_CHUNK);
 
         return $moved;
+    }
+
+    /**
+     * The largest UTC-offset change, in seconds, in the span.
+     */
+    private function largestOffsetChange(int ...$timestamps): int
+    {
+        $zone = new \DateTimeZone(date_default_timezone_get());
+        $offsets = array_column($zone->getTransitions(min($timestamps), max($timestamps)) ?: [], 'offset');
+
+        return $offsets === [] ? 0 : max($offsets) - min($offsets);
     }
 
     /**
