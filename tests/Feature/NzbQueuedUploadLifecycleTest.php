@@ -136,6 +136,50 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->assertFileExists(dirname($path).'/info.nfo');
     }
 
+    public function test_unrepairable_candidate_is_rejected_before_expiry_and_paired_nfo_only_deletes_on_explicit_failure_cleanup(): void
+    {
+        $identity = sha1('import:unrepairable');
+        $this->candidate($identity, 'unrepairable');
+        [$path, $manifests] = $this->upload('unrepairable');
+        $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
+        $nfoPath = dirname($path).'/info.nfo';
+        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        unlink($path);
+        $this->assertSame(0, Artisan::call('nntmux:import-nzbs', ['--folder' => dirname($path)]));
+        $manifest = $manifests->read($manifestPath);
+        $this->assertSame(NzbUploadManifestService::STATE_NZB_REJECTED, $manifest['state']);
+        $this->assertStringContainsString('unrepairable', $manifest['last_error']);
+        $this->assertNull($manifest['release_id']);
+        $this->assertNull($manifest['release_guid']);
+        $this->assertFalse($manifests->shouldImportNzb($path));
+        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->assertSame(NzbUploadManifestService::STATE_NZB_REJECTED, $manifests->read($manifestPath)['state']);
+        $importer = new NfoImportService(new Filesystem, $manifests, new NfoService);
+        $this->assertSame('skipped', $importer->importManifest($manifestPath, delete: true)['status']);
+        $this->assertFileExists($nfoPath);
+        $this->assertSame(0, DB::table('release_nfos')->count());
+        $this->assertSame('unrepairable', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame('skipped', $importer->importManifest($manifestPath, deleteFailed: true)['status']);
+        $this->assertFileDoesNotExist($nfoPath);
+    }
+
+    public function test_unrepairable_status_cannot_assign_a_stale_published_release_identity_to_uploaded_nfo(): void
+    {
+        $identity = sha1('import:unrepairable-stale');
+        $this->candidate($identity, 'unrepairable', 7);
+        DB::table('release_verification_candidates')->update(['verified_at' => now()]);
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'stale-publication']);
+        [$path, $manifests] = $this->upload('unrepairable-stale');
+        $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
+        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->assertSame(NzbUploadManifestService::STATE_NZB_REJECTED, $manifests->reconcilePending($manifestPath)['state']);
+        $this->assertNull($manifests->read($manifestPath)['release_id']);
+        $this->assertNull($manifests->read($manifestPath)['release_guid']);
+        $this->assertSame('skipped', (new NfoImportService(new Filesystem, $manifests, new NfoService))->importManifest($manifestPath)['status']);
+        $this->assertSame(0, DB::table('release_nfos')->count());
+        $this->assertFileExists(dirname($path).'/info.nfo');
+    }
+
     public function test_unpublished_or_missing_release_is_never_given_to_nfo_importer(): void
     {
         foreach (['pending', 'unknown', 'verifying', 'complete'] as $status) {

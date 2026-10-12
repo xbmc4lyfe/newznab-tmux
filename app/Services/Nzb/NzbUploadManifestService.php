@@ -243,10 +243,10 @@ final class NzbUploadManifestService
             ->leftJoin('releases as published', 'published.id', '=', 'candidates.release_id')
             ->where('candidates.identity', $identity)->lockForUpdate()
             ->first(['candidates.status', 'candidates.release_id', 'candidates.verified_at', 'published.guid']);
-        if ($candidate !== null && ! in_array($candidate->status, ['complete', 'repaired', 'expired'], true)) {
+        if ($candidate !== null && ! in_array($candidate->status, ['complete', 'repaired', 'expired', 'unrepairable'], true)) {
             return $manifest;
         }
-        if ($candidate !== null && $candidate->status !== 'expired' && $candidate->verified_at !== null
+        if ($candidate !== null && in_array($candidate->status, ['complete', 'repaired'], true) && $candidate->verified_at !== null
             && (int) $candidate->release_id > 0 && is_string($candidate->guid) && $candidate->guid !== '') {
             $manifest['state'] = self::STATE_NZB_IMPORTED;
             $manifest['release_id'] = (int) $candidate->release_id;
@@ -256,9 +256,12 @@ final class NzbUploadManifestService
             $manifest['state'] = self::STATE_NZB_REJECTED;
             $manifest['release_id'] = null;
             $manifest['release_guid'] = null;
-            $manifest['last_error'] = $candidate === null ? 'Download verification candidate no longer exists.'
-                : ($candidate->status === 'expired' ? 'Download verification expired before publication.'
-                    : 'Verified publication has no current release identity.');
+            $manifest['last_error'] = match ($candidate->status ?? null) {
+                null => 'Download verification candidate no longer exists.',
+                'expired' => 'Download verification expired before publication.',
+                'unrepairable' => 'Download verification found the payload unrepairable.',
+                default => 'Verified publication has no current release identity.',
+            };
         }
         $manifest['updated_at'] = now()->toIso8601String();
 

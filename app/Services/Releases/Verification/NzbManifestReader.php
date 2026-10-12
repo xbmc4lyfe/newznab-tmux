@@ -33,16 +33,22 @@ final class NzbManifestReader
             foreach ($document->file as $index => $file) {
                 $subject = (string) $file['subject'];
                 $expected = max($expected, self::declaredFileCount($subject));
-                $parts = preg_match('/\(\d+\/(\d+)\)\s*$/', $subject, $count) ? (int) $count[1] : 0;
+                $parts = preg_match('/\(\d+\/(\d+)\)\s*$/', $subject, $count) ? (int) $count[1] : null;
                 $segments = [];
+                $observedParts = 0;
                 foreach ($file->segments->segment as $segment) {
-                    $segments[] = ['number' => (int) $segment['number'], 'bytes' => (int) $segment['bytes'], 'messageid' => trim((string) $segment)];
+                    $number = (int) $segment['number'];
+                    $messageId = trim((string) $segment);
+                    $segments[] = ['number' => $number, 'bytes' => (int) $segment['bytes'], 'messageid' => $messageId];
+                    if ($number > 0 && $messageId !== '') {
+                        $observedParts = max($observedParts, $number);
+                    }
                 }
                 foreach ($file->groups->group as $group) {
                     $groups[(string) $group] = true;
                 }
                 $files[] = ['key' => hash('sha256', $subject), 'subject' => preg_replace('/\s*\(\d+\/\d+\)\s*$/', '', $subject),
-                    'totalparts' => $parts, 'segments' => $segments];
+                    'totalparts' => $parts ?? $observedParts, 'segments' => $segments];
             }
             if ($files === []) {
                 throw new RuntimeException('NZB contains no files.');

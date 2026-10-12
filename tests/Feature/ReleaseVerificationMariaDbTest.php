@@ -15,34 +15,88 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
 {
+    private string $fixtureDatabase = '';
+
+    private bool $fixtureCreated = false;
+
+    protected function setUp(): void
+    {
+        try {
+            parent::setUp();
+        } catch (Throwable $error) {
+            $this->dropOwnedFixture();
+
+            throw $error;
+        }
+    }
+
     protected function configureVerificationDatabase(): void
     {
         if (getenv('VERIFICATION_MARIADB_TEST') !== '1') {
             $this->markTestSkipped('Requires the isolated verification MariaDB test database.');
         }
-        config(['database.default' => 'mysql', 'database.connections.mysql.host' => 'nntmux-verify-db',
-            'database.connections.mysql.database' => 'verification', 'database.connections.mysql.username' => 'root',
-            'database.connections.mysql.password' => '']);
-        DB::purge();
-        $this->assertSame('verification', DB::selectOne('SELECT DATABASE() AS name')->name);
-        $this->dropVerificationTables();
+        $endpoint = [
+            'driver' => 'mysql', 'url' => null, 'host' => 'nntmux-verify-db', 'port' => 3306,
+            'database' => 'mysql', 'username' => 'root', 'password' => '', 'unix_socket' => '',
+            'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci', 'prefix' => '',
+            'strict' => false, 'engine' => 'InnoDB ROW_FORMAT=DYNAMIC', 'options' => [],
+        ];
+        config(['database.connections.verification_fixture_admin' => $endpoint]);
+        DB::purge('verification_fixture_admin');
+        $this->fixtureDatabase = 'verification_fixture_'.bin2hex(random_bytes(12));
+        DB::connection('verification_fixture_admin')->statement(
+            'CREATE DATABASE `'.$this->fixtureDatabase.'` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'
+        );
+        $this->fixtureCreated = true;
+        $endpoint['database'] = $this->fixtureDatabase;
+        config(['database.default' => 'mysql', 'database.connections.mysql' => $endpoint]);
+        DB::purge('mysql');
+        $this->assertSame($this->fixtureDatabase, DB::selectOne('SELECT DATABASE() AS name')->name);
     }
 
     protected function tearDown(): void
     {
-        if (getenv('VERIFICATION_MARIADB_TEST') === '1') {
-            $this->dropVerificationTables();
+        try {
+            $this->dropOwnedFixture();
+        } finally {
+            parent::tearDown();
         }
-        parent::tearDown();
     }
 
-    private function dropVerificationTables(): void
+    private function dropOwnedFixture(): void
     {
-        foreach (['parts', 'binaries', 'collections', 'usenet_groups', 'releases', 'release_verification_audit_retries', 'release_verification_candidates', 'release_verification_state'] as $table) {
-            Schema::dropIfExists($table);
+        if (! $this->fixtureCreated) {
+            DB::purge('verification_fixture_admin');
+
+            return;
+        }
+        $rollbackError = null;
+        foreach (DB::getConnections() as $name => $connection) {
+            if ($connection->getConfig('database') !== $this->fixtureDatabase) {
+                continue;
+            }
+            try {
+                if ($connection->transactionLevel() > 0) {
+                    $connection->rollBack(0);
+                }
+            } catch (Throwable $error) {
+                $rollbackError ??= $error;
+            } finally {
+                DB::purge($name);
+            }
+        }
+        try {
+            DB::connection('verification_fixture_admin')->statement('DROP DATABASE `'.$this->fixtureDatabase.'`');
+            $this->fixtureCreated = false;
+        } finally {
+            DB::purge('verification_fixture_admin');
+        }
+        if ($rollbackError !== null) {
+            throw $rollbackError;
         }
     }
 

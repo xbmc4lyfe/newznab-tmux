@@ -76,6 +76,53 @@ class ReleaseVerificationPayloadTest extends TestCase
         }
     }
 
+    /** @return iterable<string, array{string, list<int>, list<string>, list<int>, int, bool}> */
+    public static function nzbSegmentInventories(): iterable
+    {
+        yield 'single complete article without part suffix' => ['[1/1] movie.mkv', [1], ['hello'], [1], 1, true];
+        yield 'multipart complete bytes without part suffix' => ['[1/1] movie.mkv', [1, 2], ['hell', 'tail'], [1, 5], 2, true];
+        yield 'gap in numbered parts despite complete byte ranges' => ['[1/1] movie.mkv', [1, 3], ['hell', 'tail'], [1, 5], 3, false];
+        yield 'missing byte range despite consecutive part numbers' => ['[1/1] movie.mkv', [1, 2], ['he', 'tail'], [1, 5], 2, false];
+        yield 'explicit larger total must not be inferred down' => ['[1/1] movie.mkv (1/3)', [1, 2], ['hell', 'tail'], [1, 5], 3, false];
+        yield 'explicit zero total remains invalid' => ['[1/1] movie.mkv (1/0)', [1], ['hello'], [1], 0, false];
+        yield 'stronger overall file count remains unresolved' => ['[1/2] movie.mkv', [1], ['hello'], [1], 1, false];
+        yield 'absent overall file inventory remains unknown' => ['movie.mkv', [1], ['hello'], [1], 1, false];
+    }
+
+    /**
+     * @param  list<int>  $numbers
+     * @param  list<string>  $pieces
+     * @param  list<int>  $begins
+     */
+    #[DataProvider('nzbSegmentInventories')]
+    public function test_nzb_without_part_suffix_derives_only_part_inventory_and_requires_actual_complete_bytes(string $subject, array $numbers, array $pieces, array $begins, int $expectedParts, bool $passes): void
+    {
+        $size = count($numbers) === 1 ? strlen($pieces[0]) : 8;
+        $articles = [];
+        $segments = '';
+        foreach ($numbers as $index => $number) {
+            $id = 'part-'.$number.'@article';
+            $articles[$id] = count($numbers) === 1 ? (new YencService)->encode($pieces[$index], 'movie.mkv')
+                : YencArticles::part($pieces[$index], 'movie.mkv', $size, $number, $begins[$index], max($numbers));
+            $segments .= '<segment bytes="'.strlen($pieces[$index]).'" number="'.$number.'">'.$id.'</segment>';
+        }
+        $xml = '<nzb><file subject="'.$subject.'"><groups><group>alt.test</group></groups><segments>'.$segments.'</segments></file></nzb>';
+        $manifest = (new NzbManifestReader)->read($xml, (object) ['searchname' => 'fixture', 'fromname' => 'fixture',
+            'postdate' => '2026-10-11 12:00:00', 'groups_id' => 1]);
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $this->assertSame($expectedParts, $manifest['files'][0]['totalparts']);
+            $result = $verifier->verify($manifest, $scratch, static function (): void {});
+            $this->assertSame($passes, $result->passed(), $result->reason);
+            if ($passes) {
+                $this->assertSame(implode('', $pieces), file_get_contents($scratch.'/data/movie.mkv'));
+                $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', implode('', $pieces));
+            }
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
     public function test_oversized_cached_article_is_evicted_even_when_provider_is_unavailable(): void
     {
         [$verifier, $scratch] = $this->verifier([]);
