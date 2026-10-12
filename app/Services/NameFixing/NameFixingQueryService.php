@@ -83,7 +83,10 @@ final class NameFixingQueryService
             .' AND ('.implode(' OR ', $sources).')';
 
         if (! (bool) config('tmux.fix_names.full_backlog', true)) {
-            $condition .= " AND r.adddate > '".CarbonImmutable::now()->subHours(6)->toDateTimeString()."'";
+            $cutoff = DB::getDriverName() === 'sqlite'
+                ? "datetime(CURRENT_TIMESTAMP, '-6 hours')"
+                : 'CURRENT_TIMESTAMP - INTERVAL 6 HOUR';
+            $condition .= ' AND r.adddate > '.$cutoff;
         }
 
         return $condition;

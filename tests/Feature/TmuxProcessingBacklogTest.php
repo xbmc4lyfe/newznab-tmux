@@ -8,6 +8,7 @@ use App\Enums\ConfigurationDomain;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\Tmux\Tmux;
 use App\Services\Tmux\TmuxMonitorService;
+use Carbon\CarbonImmutable;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -79,6 +80,7 @@ class TmuxProcessingBacklogTest extends TestCase
             $table->increments('id');
             $table->string('name')->nullable();
             $table->integer('active')->default(0);
+            $table->integer('backfill')->default(0);
         });
         /** @var PDO $pdo */
         $pdo = DB::connection()->getPdo();
@@ -155,6 +157,17 @@ class TmuxProcessingBacklogTest extends TestCase
         $this->assertSame(0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
     }
 
+    public function test_renamed_only_music_lookup_excludes_unrenamed_releases(): void
+    {
+        ConfigurationTestBuilder::update(ConfigurationDomain::Metadata, ['music_lookup' => 2]);
+        DB::table('releases')->insert([
+            ['categories_id' => 3010, 'isrenamed' => 0],
+            ['categories_id' => 3010, 'isrenamed' => 1],
+        ]);
+
+        $this->assertSame(1, (int) $this->counts()->processmusic);
+    }
+
     public function test_all_scheduled_rename_sources_are_counted_once_per_release(): void
     {
         $sources = [
@@ -213,13 +226,64 @@ class TmuxProcessingBacklogTest extends TestCase
             DB::table('releases')->insert(['categories_id' => $category]);
         }
         DB::table('releases')->insert(['nfostatus' => -1]);
+        DB::table('usenet_groups')->insert(['id' => 1, 'active' => 1]);
 
         $counts = $this->counts();
 
-        foreach (['anime', 'tv', 'movies', 'nfo'] as $type) {
+        foreach (['anime', 'tv', 'movies'] as $type) {
             $this->assertSame(0, (int) $counts->{'process'.$type}, $type);
         }
         $this->assertSame(1, (int) $counts->processmusic);
+        $this->assertSame(1, (int) $counts->processnfo);
+    }
+
+    public function test_stripped_mode_counts_sequential_additional_and_nfo_work_for_active_or_backfill_groups(): void
+    {
+        ConfigurationTestBuilder::update(ConfigurationDomain::Tmux, [
+            'sequential_mode' => 2, 'post_mode' => 0, 'post_non_mode' => 0, 'post_amazon_mode' => 0,
+        ]);
+        ConfigurationTestBuilder::update(ConfigurationDomain::PostProcessing, ['lookup_nfo' => 0]);
+        DB::table('categories')->insert(['id' => 10]);
+        DB::table('usenet_groups')->insert([
+            ['id' => 1, 'active' => 1, 'backfill' => 0],
+            ['id' => 2, 'active' => 0, 'backfill' => 0],
+            ['id' => 3, 'active' => 0, 'backfill' => 1],
+        ]);
+        foreach ([1, 2, 3] as $groupId) {
+            DB::table('releases')->insert(['groups_id' => $groupId, 'passwordstatus' => -1]);
+        }
+        DB::table('releases')->insert(['groups_id' => 3, 'nfostatus' => -1]);
+        DB::table('releases')->insert(['groups_id' => 2, 'nfostatus' => -1]);
+
+        $counts = $this->monitorCounts(postMode: 0, sequentialMode: 2);
+
+        $this->assertSame(2, $counts['work']);
+        $this->assertSame(2, $counts['work_available']);
+        $this->assertSame(1, (int) $counts['processnfo']);
+        $this->assertSame(3, $counts['total_work']);
+    }
+
+    public function test_recent_rename_count_keeps_a_stable_cache_key_and_the_six_hour_cutoff(): void
+    {
+        $this->freezeTime();
+        config(['tmux.fix_names.full_backlog' => false]);
+        $databaseTime = CarbonImmutable::parse(DB::selectOne('SELECT CURRENT_TIMESTAMP AS clock')->clock);
+        DB::table('releases')->insert([
+            ['proc_par2' => 0, 'adddate' => $databaseTime->subHours(5)],
+            ['proc_par2' => 0, 'adddate' => $databaseTime->subHours(7)],
+        ]);
+        $tmux = new Tmux;
+        $firstSql = $tmux->proc_query(1, '', '');
+        $monitor = (new ReflectionClass(TmuxMonitorService::class))->newInstanceWithoutConstructor();
+        $readCached = new ReflectionMethod(TmuxMonitorService::class, 'getCachedProc1Result');
+        $firstResult = $readCached->invoke($monitor, $firstSql);
+        $this->travel(2)->seconds();
+
+        $secondSql = $tmux->proc_query(1, '', '');
+
+        $this->assertSame($firstSql, $secondSql);
+        $this->assertSame(1, (int) $firstResult->processrenames);
+        $this->assertSame($firstResult, $readCached->invoke($monitor, $secondSql));
     }
 
     public function test_total_includes_ready_and_in_progress_additional_work_but_excludes_deferred_work(): void
@@ -252,12 +316,12 @@ class TmuxProcessingBacklogTest extends TestCase
     }
 
     /** @return array<string, int> */
-    private function monitorCounts(int $postMode): array
+    private function monitorCounts(int $postMode, int $sequentialMode = 0): array
     {
         $monitor = (new ReflectionClass(TmuxMonitorService::class))->newInstanceWithoutConstructor();
         (new ReflectionProperty(TmuxMonitorService::class, 'tmux'))->setValue($monitor, new Tmux);
         $state = new ReflectionProperty(TmuxMonitorService::class, 'runVar');
-        $state->setValue($monitor, ['settings' => ['post' => $postMode]]);
+        $state->setValue($monitor, ['settings' => ['post' => $postMode], 'constants' => ['sequential' => $sequentialMode]]);
         (new ReflectionMethod(TmuxMonitorService::class, 'getProcessCounts'))->invoke($monitor);
         (new ReflectionMethod(TmuxMonitorService::class, 'calculateStatistics'))->invoke($monitor);
 

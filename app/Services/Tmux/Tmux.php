@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Tmux;
 
 use App\Models\Category;
+use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\BookProcessingCandidateQuery;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
@@ -302,7 +303,7 @@ class Tmux
                     ),
                     'processmusic' => $this->readyLookupCondition(
                         'categories_id IN ('.Category::MUSIC_MP3.', '.Category::MUSIC_LOSSLESS.', '.Category::MUSIC_OTHER.') AND musicinfo_id IS NULL',
-                        $metadata->musicLookup->value, $amazonEnabled, renamedOnly: false,
+                        $metadata->musicLookup->value, $amazonEnabled,
                     ),
                     'processconsole' => $this->readyLookupCondition(
                         'categories_id BETWEEN '.Category::GAME_ROOT.' AND '.Category::GAME_OTHER.' AND consoleinfo_id IS NULL',
@@ -313,8 +314,10 @@ class Tmux
                         'categories_id = '.Category::PC_GAMES.' AND gamesinfo_id = 0',
                         $metadata->gameLookup->value, $amazonEnabled,
                     ),
-                    'processnfo' => $hasPostPanes && in_array($tmux->postMode, [2, 3], true) && $postProcessing->lookupNfo
-                        ? '1=1 '.NfoService::NfoQueryString() : '0 = 1',
+                    'processnfo' => ! $hasPostPanes
+                        ? '1=1 '.NfoService::NfoQueryString().' AND '.AdditionalCandidateQuery::sequentialGroupCondition()
+                        : (in_array($tmux->postMode, [2, 3], true) && $postProcessing->lookupNfo
+                            ? '1=1 '.NfoService::NfoQueryString() : '0 = 1'),
                     'processrenames' => $tmux->fixNamesEnabled ? NameFixingQueryService::pendingWorkCondition() : '0 = 1',
                     'renamed' => 'isrenamed = 1',
                     'nfo' => 'nfostatus = 1',
