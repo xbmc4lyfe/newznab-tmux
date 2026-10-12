@@ -16,6 +16,73 @@ pub struct SignatureMatch {
     pub basis: &'static str,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ZipExtraField {
+    pub record_index: usize,
+    pub header_id: Option<u16>,
+    pub header_id_hex: Option<String>,
+    pub offset_in_extra_area: usize,
+    pub declared_payload_length: Option<usize>,
+    pub observed_payload_length: usize,
+    pub payload_sha256: Option<String>,
+    pub payload_prefix_hex: Option<String>,
+    pub payload_prefix_truncated: Option<bool>,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ZipAesExtra {
+    pub record_index: usize,
+    pub payload_length: usize,
+    pub vendor_version: Option<u16>,
+    pub vendor_id: Option<String>,
+    pub encryption_strength: Option<u8>,
+    pub key_bits: Option<u16>,
+    pub actual_compression_method: Option<u16>,
+    pub vendor_id_is_ae: Option<bool>,
+    pub local_encryption_flag_set: Option<bool>,
+    pub local_compression_method_is_99: Option<bool>,
+    pub local_indicators_match_aes_record: Option<bool>,
+    pub ae2_local_header_crc32_is_zero: Option<bool>,
+    pub expected_payload_length: usize,
+    pub payload_has_required_fields: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ZipUnicodePathExtra {
+    pub record_index: usize,
+    pub payload_length: usize,
+    pub version: Option<u8>,
+    pub saved_filename_crc32: Option<u32>,
+    pub observed_filename_crc32: Option<u32>,
+    pub filename_crc32_matches: Option<bool>,
+    pub unicode_filename_bytes_length: Option<usize>,
+    pub unicode_filename_bytes_sha256: Option<String>,
+    pub unicode_filename_prefix_hex: Option<String>,
+    pub unicode_filename_prefix_truncated: Option<bool>,
+    pub unicode_filename_utf8_valid: Option<bool>,
+    pub unicode_filename_bom_present: Option<bool>,
+    pub unicode_filename_matches_efs_filename: Option<bool>,
+    pub usable_as_filename_override: bool,
+    pub payload_has_required_fields: bool,
+}
+
+#[derive(Debug)]
+struct ZipExtraInspection<'a> {
+    records: Vec<ZipExtraField>,
+    record_count: usize,
+    records_truncated: bool,
+    records_complete: bool,
+    zip64_payload: Option<&'a [u8]>,
+    zip64_present: bool,
+    zip64_record_count: usize,
+    zip64_duplicate: bool,
+    aes_records: Vec<ZipAesExtra>,
+    aes_record_count: usize,
+    unicode_path_records: Vec<ZipUnicodePathExtra>,
+    unicode_path_record_count: usize,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "format", rename_all = "snake_case")]
 pub enum FormatHeader {
@@ -134,6 +201,12 @@ pub enum FormatHeader {
         crc32: Option<u32>,
         compressed_size: Option<u32>,
         uncompressed_size: Option<u32>,
+        zip64_uncompressed_size: Option<u64>,
+        zip64_compressed_size: Option<u64>,
+        resolved_uncompressed_size: Option<u64>,
+        resolved_uncompressed_size_source: Option<&'static str>,
+        resolved_compressed_size: Option<u64>,
+        resolved_compressed_size_source: Option<&'static str>,
         filename_bytes_hex: Option<String>,
         filename_bytes_sha256: Option<String>,
         filename_hex_truncated: Option<bool>,
@@ -145,11 +218,24 @@ pub enum FormatHeader {
         extra_field_bytes_sha256: Option<String>,
         extra_field_prefix_hex: Option<String>,
         extra_field_hex_truncated: Option<bool>,
+        extra_field_records: Option<Vec<ZipExtraField>>,
+        extra_field_record_count: Option<usize>,
+        extra_field_records_truncated: Option<bool>,
+        extra_field_records_complete: Option<bool>,
         zip64_extra_payload_length: Option<usize>,
         data_descriptor_follows: Option<bool>,
         zip64_extra_present: Option<bool>,
+        zip64_extra_record_count: Option<usize>,
+        zip64_extra_duplicate: Option<bool>,
         zip64_extra_valid: Option<bool>,
         zip64_size_sentinel_present: Option<bool>,
+        zip_aes_records: Option<Vec<ZipAesExtra>>,
+        zip_aes_record_count: Option<usize>,
+        zip_aes_records_truncated: Option<bool>,
+        zip_aes_record_count_matches_encryption_indicators: Option<bool>,
+        zip_unicode_path_records: Option<Vec<ZipUnicodePathExtra>>,
+        zip_unicode_path_record_count: Option<usize>,
+        zip_unicode_path_records_truncated: Option<bool>,
     },
     Gzip {
         offset: usize,
@@ -896,30 +982,74 @@ fn parse_zip(data: &[u8], offset: usize) -> FormatHeader {
         });
     let filename = variable_fields.map(|(name, _)| name);
     let extra = variable_fields.map(|(_, extra)| extra);
-    let zip64_payload = extra.and_then(inspect_zip_extra_fields);
-    let zip64_extra_present = zip64_payload.as_ref().map(Option::is_some);
-    let zip64_extra_payload_length = zip64_payload
-        .as_ref()
-        .and_then(|payload| payload.map(<[u8]>::len));
+    let extra_inspection = extra
+        .map(|bytes| inspect_zip_extra_fields(bytes, filename, flags, compression_method, crc32));
+    let zip64_extra_present = extra_inspection.as_ref().and_then(|inspection| {
+        if inspection.zip64_present {
+            Some(true)
+        } else {
+            inspection.records_complete.then_some(false)
+        }
+    });
+    let zip64_extra_payload_length = extra_inspection.as_ref().and_then(|inspection| {
+        (inspection.records_complete && !inspection.zip64_duplicate)
+            .then_some(inspection.zip64_payload)
+            .flatten()
+            .map(<[u8]>::len)
+    });
+    let zip64_payload = extra_inspection.as_ref().and_then(|inspection| {
+        (inspection.records_complete && !inspection.zip64_duplicate)
+            .then_some(inspection.zip64_payload)
+            .flatten()
+            .filter(|payload| payload.len() >= 16)
+    });
+    let zip64_uncompressed_size = zip64_payload
+        .and_then(|payload| payload.get(..8))
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("bounded 8-byte slice")));
+    let zip64_compressed_size = zip64_payload
+        .and_then(|payload| payload.get(8..16))
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("bounded 8-byte slice")));
     let zip64_size_sentinel_present = compressed_size
         .zip(uncompressed_size)
         .map(|(compressed, uncompressed)| compressed == u32::MAX || uncompressed == u32::MAX);
-    let zip64_extra_valid = zip64_size_sentinel_present.zip(zip64_payload.as_ref()).map(
-        |(has_size_sentinel, payload)| {
-            if !has_size_sentinel {
-                return true;
+    let zip64_extra_valid = zip64_size_sentinel_present
+        .zip(extra_inspection.as_ref())
+        .and_then(|(has_size_sentinel, inspection)| {
+            if !inspection.records_complete {
+                return None;
             }
-            let Some(payload) = payload else {
-                return false;
-            };
-            let required_size_bytes = usize::from(uncompressed_size == Some(u32::MAX)) * 8
-                + usize::from(compressed_size == Some(u32::MAX)) * 8;
-            payload.len() >= required_size_bytes
-        },
+            if inspection.zip64_duplicate {
+                return Some(false);
+            }
+            if !inspection.zip64_present {
+                return Some(!has_size_sentinel);
+            }
+            Some(
+                inspection
+                    .zip64_payload
+                    .is_some_and(|payload| payload.len() >= 16),
+            )
+        });
+    let data_descriptor_follows = flags.map(|value| value & 0x0008 != 0);
+    let uncompressed_size_is_masked = flags.map(|value| value & 0x2000 != 0);
+    let (resolved_uncompressed_size, resolved_uncompressed_size_source) = resolve_zip_local_size(
+        uncompressed_size,
+        zip64_uncompressed_size,
+        data_descriptor_follows,
+        uncompressed_size_is_masked,
+    );
+    let (resolved_compressed_size, resolved_compressed_size_source) = resolve_zip_local_size(
+        compressed_size,
+        zip64_compressed_size,
+        data_descriptor_follows,
+        Some(false),
     );
     let local_header_available = fixed_header.is_some();
     let structure_valid = local_header_available
         && variable_fields.is_some()
+        && extra_inspection
+            .as_ref()
+            .is_some_and(|inspection| inspection.records_complete)
         && zip64_extra_present.is_some()
         && zip64_extra_valid == Some(true);
 
@@ -936,6 +1066,12 @@ fn parse_zip(data: &[u8], offset: usize) -> FormatHeader {
         crc32,
         compressed_size,
         uncompressed_size,
+        zip64_uncompressed_size,
+        zip64_compressed_size,
+        resolved_uncompressed_size,
+        resolved_uncompressed_size_source,
+        resolved_compressed_size,
+        resolved_compressed_size_source,
         filename_bytes_hex: filename.map(|bytes| hex(&bytes[..bytes.len().min(256)])),
         filename_bytes_sha256: filename.map(sha256_hex),
         filename_hex_truncated: filename.map(|bytes| bytes.len() > 256),
@@ -953,31 +1089,323 @@ fn parse_zip(data: &[u8], offset: usize) -> FormatHeader {
         extra_field_bytes_sha256: extra.map(sha256_hex),
         extra_field_prefix_hex: extra.map(|bytes| hex(&bytes[..bytes.len().min(128)])),
         extra_field_hex_truncated: extra.map(|bytes| bytes.len() > 128),
+        extra_field_records: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.records.clone()),
+        extra_field_record_count: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.record_count),
+        extra_field_records_truncated: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.records_truncated),
+        extra_field_records_complete: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.records_complete),
         zip64_extra_payload_length,
-        data_descriptor_follows: flags.map(|value| value & 0x0008 != 0),
+        data_descriptor_follows,
         zip64_extra_present,
+        zip64_extra_record_count: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.zip64_record_count),
+        zip64_extra_duplicate: extra_inspection.as_ref().and_then(|inspection| {
+            if inspection.zip64_duplicate {
+                Some(true)
+            } else {
+                inspection.records_complete.then_some(false)
+            }
+        }),
         zip64_extra_valid,
         zip64_size_sentinel_present,
+        zip_aes_record_count: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.aes_record_count),
+        zip_aes_record_count_matches_encryption_indicators: extra_inspection.as_ref().and_then(
+            |inspection| {
+                if !inspection.records_complete {
+                    return None;
+                }
+                compression_method.zip(flags).map(|(method, flags)| {
+                    if method == 99 {
+                        inspection.aes_record_count == 1 && flags & 0x0001 != 0
+                    } else {
+                        inspection.aes_record_count == 0
+                    }
+                })
+            },
+        ),
+        zip_aes_records: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.aes_records.clone()),
+        zip_aes_records_truncated: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.aes_record_count > inspection.aes_records.len()),
+        zip_unicode_path_record_count: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.unicode_path_record_count),
+        zip_unicode_path_records: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.unicode_path_records.clone()),
+        zip_unicode_path_records_truncated: extra_inspection.as_ref().map(|inspection| {
+            inspection.unicode_path_record_count > inspection.unicode_path_records.len()
+        }),
     }
 }
 
-fn inspect_zip_extra_fields(mut extra: &[u8]) -> Option<Option<&[u8]>> {
-    let mut zip64_payload = None;
+fn inspect_zip_extra_fields<'a>(
+    mut extra: &'a [u8],
+    filename: Option<&[u8]>,
+    flags: Option<u16>,
+    compression_method: Option<u16>,
+    crc32: Option<u32>,
+) -> ZipExtraInspection<'a> {
+    const MAX_EXTRA_RECORDS: usize = 256;
+    const MAX_EXTRA_PAYLOAD_PREFIX_BYTES: usize = 32;
+
+    let mut inspection = ZipExtraInspection {
+        records: Vec::new(),
+        record_count: 0,
+        records_truncated: false,
+        records_complete: true,
+        zip64_payload: None,
+        zip64_present: false,
+        zip64_record_count: 0,
+        zip64_duplicate: false,
+        aes_records: Vec::new(),
+        aes_record_count: 0,
+        unicode_path_records: Vec::new(),
+        unicode_path_record_count: 0,
+    };
+    let mut offset = 0usize;
+
     while !extra.is_empty() {
-        let header = extra.get(..4)?;
+        let record_index = inspection.record_count;
+        inspection.record_count = inspection.record_count.saturating_add(1);
+        if record_index >= MAX_EXTRA_RECORDS {
+            inspection.records_truncated = true;
+        }
+
+        let Some(header) = extra.get(..4) else {
+            if record_index < MAX_EXTRA_RECORDS {
+                inspection.records.push(ZipExtraField {
+                    record_index,
+                    header_id: None,
+                    header_id_hex: None,
+                    offset_in_extra_area: offset,
+                    declared_payload_length: None,
+                    observed_payload_length: extra.len(),
+                    payload_sha256: (!extra.is_empty()).then(|| sha256_hex(extra)),
+                    payload_prefix_hex: Some(hex(
+                        &extra[..extra.len().min(MAX_EXTRA_PAYLOAD_PREFIX_BYTES)]
+                    )),
+                    payload_prefix_truncated: Some(extra.len() > MAX_EXTRA_PAYLOAD_PREFIX_BYTES),
+                    complete: false,
+                });
+            }
+            inspection.records_complete = false;
+            break;
+        };
         let header_id = u16::from_le_bytes([header[0], header[1]]);
         let data_size = u16::from_le_bytes([header[2], header[3]]) as usize;
-        let record_end = 4usize.checked_add(data_size)?;
-        let payload = extra.get(4..record_end)?;
-        if header_id == 0x0001 {
-            if zip64_payload.is_some() {
-                return None;
-            }
-            zip64_payload = Some(payload);
+        let payload_available = extra.len().saturating_sub(4);
+        let observed_payload_length = data_size.min(payload_available);
+        let payload = &extra[4..4 + observed_payload_length];
+        let complete = observed_payload_length == data_size;
+        let mut id_hex = String::with_capacity(4);
+        id_hex.push_str(&hex(&header_id.to_le_bytes()));
+        if record_index < MAX_EXTRA_RECORDS {
+            inspection.records.push(ZipExtraField {
+                record_index,
+                header_id: Some(header_id),
+                header_id_hex: Some(id_hex),
+                offset_in_extra_area: offset,
+                declared_payload_length: Some(data_size),
+                observed_payload_length,
+                payload_sha256: Some(sha256_hex(payload)),
+                payload_prefix_hex: Some(hex(
+                    &payload[..payload.len().min(MAX_EXTRA_PAYLOAD_PREFIX_BYTES)]
+                )),
+                payload_prefix_truncated: Some(payload.len() > MAX_EXTRA_PAYLOAD_PREFIX_BYTES),
+                complete,
+            });
         }
-        extra = extra.get(record_end..)?;
+
+        if !complete {
+            inspection.records_complete = false;
+        }
+        if header_id == 0x0001 {
+            inspection.zip64_present = true;
+            inspection.zip64_record_count = inspection.zip64_record_count.saturating_add(1);
+        }
+        match header_id {
+            0x0001 if complete => {
+                if inspection.zip64_record_count > 1 {
+                    inspection.zip64_duplicate = true;
+                    inspection.zip64_payload = None;
+                } else {
+                    inspection.zip64_payload = Some(payload);
+                }
+            }
+            0x9901 if complete => {
+                inspection.aes_record_count = inspection.aes_record_count.saturating_add(1);
+                if inspection.aes_records.len() < MAX_EXTRA_RECORDS {
+                    inspection.aes_records.push(parse_zip_aes_record(
+                        record_index,
+                        payload,
+                        flags,
+                        compression_method,
+                        crc32,
+                    ));
+                }
+            }
+            0x7075 if complete => {
+                inspection.unicode_path_record_count =
+                    inspection.unicode_path_record_count.saturating_add(1);
+                if inspection.unicode_path_records.len() < MAX_EXTRA_RECORDS {
+                    inspection
+                        .unicode_path_records
+                        .push(parse_zip_unicode_path_record(
+                            record_index,
+                            payload,
+                            filename,
+                            flags,
+                        ));
+                }
+            }
+            _ => {}
+        }
+
+        let consumed = 4usize.saturating_add(observed_payload_length);
+        offset = offset.saturating_add(consumed);
+        extra = &extra[consumed..];
+        if !complete {
+            break;
+        }
     }
-    Some(zip64_payload)
+
+    inspection
+}
+
+fn resolve_zip_local_size(
+    local_size: Option<u32>,
+    zip64_size: Option<u64>,
+    data_descriptor_follows: Option<bool>,
+    size_is_masked: Option<bool>,
+) -> (Option<u64>, Option<&'static str>) {
+    if data_descriptor_follows == Some(true) {
+        return (None, Some("data_descriptor_expected"));
+    }
+    if size_is_masked == Some(true) {
+        return (None, Some("encrypted_central_directory_masked"));
+    }
+
+    match local_size {
+        Some(u32::MAX) => match zip64_size {
+            Some(size) => (Some(size), Some("zip64_local_extra")),
+            None => (None, Some("zip64_local_extra_unavailable")),
+        },
+        Some(size) => (Some(u64::from(size)), Some("local_header")),
+        None => (None, None),
+    }
+}
+
+fn parse_zip_aes_record(
+    record_index: usize,
+    payload: &[u8],
+    flags: Option<u16>,
+    compression_method: Option<u16>,
+    crc32: Option<u32>,
+) -> ZipAesExtra {
+    let vendor_version = payload
+        .get(..2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+    let vendor_id = payload
+        .get(2..4)
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+    let encryption_strength = payload.get(4).copied();
+    let key_bits = encryption_strength.and_then(|strength| match strength {
+        1 => Some(128),
+        2 => Some(192),
+        3 => Some(256),
+        _ => None,
+    });
+    let actual_compression_method = payload
+        .get(5..7)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+    let vendor_id_is_ae = vendor_id.as_deref().map(|vendor| vendor == "AE");
+    let local_encryption_flag_set = flags.map(|value| value & 0x0001 != 0);
+    let local_compression_method_is_99 = compression_method.map(|method| method == 99);
+    let local_indicators_match_aes_record = local_encryption_flag_set
+        .zip(local_compression_method_is_99)
+        .map(|(encrypted, aes_method)| encrypted && aes_method);
+    let ae2_local_header_crc32_is_zero = vendor_version
+        .filter(|version| *version == 2)
+        .and(crc32.map(|value| value == 0));
+
+    ZipAesExtra {
+        record_index,
+        payload_length: payload.len(),
+        vendor_version,
+        vendor_id,
+        encryption_strength,
+        key_bits,
+        actual_compression_method,
+        vendor_id_is_ae,
+        local_encryption_flag_set,
+        local_compression_method_is_99,
+        local_indicators_match_aes_record,
+        ae2_local_header_crc32_is_zero,
+        expected_payload_length: 7,
+        payload_has_required_fields: payload.len() >= 7,
+    }
+}
+
+fn parse_zip_unicode_path_record(
+    record_index: usize,
+    payload: &[u8],
+    filename: Option<&[u8]>,
+    flags: Option<u16>,
+) -> ZipUnicodePathExtra {
+    let version = payload.first().copied();
+    let saved_filename_crc32 = payload
+        .get(1..5)
+        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+    let observed_filename_crc32 = filename.map(crc32fast::hash);
+    let filename_crc32_matches = saved_filename_crc32
+        .zip(observed_filename_crc32)
+        .map(|(saved, observed)| saved == observed);
+    let unicode_filename = payload.get(5..);
+    let unicode_filename_utf8_valid =
+        unicode_filename.map(|bytes| std::str::from_utf8(bytes).is_ok());
+    let unicode_filename_bom_present =
+        unicode_filename.map(|bytes| bytes.starts_with(&[0xef, 0xbb, 0xbf]));
+    let efs_flag_set = flags.map(|value| value & 0x0800 != 0);
+    let unicode_filename_matches_efs_filename = efs_flag_set
+        .zip(unicode_filename)
+        .and_then(|(efs_set, unicode_name)| efs_set.then(|| filename == Some(unicode_name)));
+    let usable_as_filename_override = version == Some(1)
+        && filename_crc32_matches == Some(true)
+        && unicode_filename_utf8_valid == Some(true)
+        && unicode_filename_bom_present == Some(false)
+        && unicode_filename_matches_efs_filename != Some(false);
+
+    ZipUnicodePathExtra {
+        record_index,
+        payload_length: payload.len(),
+        version,
+        saved_filename_crc32,
+        observed_filename_crc32,
+        filename_crc32_matches,
+        unicode_filename_bytes_length: unicode_filename.map(<[u8]>::len),
+        unicode_filename_bytes_sha256: unicode_filename.map(sha256_hex),
+        unicode_filename_prefix_hex: unicode_filename
+            .map(|bytes| hex(&bytes[..bytes.len().min(128)])),
+        unicode_filename_prefix_truncated: unicode_filename.map(|bytes| bytes.len() > 128),
+        unicode_filename_utf8_valid,
+        unicode_filename_bom_present,
+        unicode_filename_matches_efs_filename,
+        usable_as_filename_override,
+        payload_has_required_fields: payload.len() >= 5,
+    }
 }
 
 fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
