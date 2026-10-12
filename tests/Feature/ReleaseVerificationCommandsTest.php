@@ -12,6 +12,7 @@ use App\Services\Releases\ReleaseManagementService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NzbManifestReader;
+use App\Services\Releases\Verification\ScratchInventory;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
@@ -71,6 +72,68 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('new-owner', DB::table('release_verification_candidates')->where('id', $id)->value('lease_token'));
     }
 
+    public function test_stale_version_root_symlink_never_deletes_its_target(): void
+    {
+        [$id, $directory] = $this->staleScratch();
+        File::deleteDirectory($directory);
+        $outside = config('release_verification.storage_path').'/outside';
+        mkdir($outside);
+        file_put_contents($outside.'/sentinel', 'keep');
+        symlink($outside, $directory);
+        $this->mock(NNTPService::class, static function ($mock): void {
+            $mock->shouldNotReceive('doConnect');
+        });
+
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+
+        $this->assertFileExists($outside.'/sentinel');
+        $this->assertTrue(is_link($directory));
+        $this->assertStringContainsString('symlink', DB::table('release_verification_candidates')->where('id', $id)->value('reason'));
+    }
+
+    public function test_linked_scratch_parent_stops_before_claim_or_stale_version_deletion(): void
+    {
+        [$id, $directory] = $this->staleScratch();
+        $root = config('release_verification.storage_path');
+        rename($root.'/scratch', $root.'/outside');
+        symlink($root.'/outside', $root.'/scratch');
+        $this->mock(NNTPService::class, static function ($mock): void {
+            $mock->shouldNotReceive('doConnect');
+        });
+
+        $this->artisan('releases:verify-candidates')->assertFailed();
+
+        $this->assertCount(4, glob($directory.'/*'));
+        $this->assertSame('pending', DB::table('release_verification_candidates')->where('id', $id)->value('status'));
+        $this->assertSame(1, DB::table('release_verification_scratch')->count());
+    }
+
+    public function test_old_version_cleanup_uses_bounded_index_pages_and_keeps_current_version(): void
+    {
+        app(CandidateRepository::class)->enqueue(['identity' => sha1('many-old-versions'), 'groups_id' => 1, 'files' => []]);
+        $id = (int) DB::table('release_verification_candidates')->value('id');
+        DB::table('release_verification_candidates')->where('id', $id)->update(['version' => 103]);
+        $root = config('release_verification.storage_path').'/scratch';
+        foreach (range(1, 102) as $version) {
+            app(ScratchInventory::class)->register($id, $version);
+            mkdir($root.'/'.$id.'-'.$version, 0700, true);
+        }
+
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+
+        $this->assertDirectoryDoesNotExist($root.'/'.$id.'-100');
+        $this->assertDirectoryExists($root.'/'.$id.'-101');
+        $this->assertDirectoryExists($root.'/'.$id.'-102');
+        $this->assertDirectoryExists($root.'/'.$id.'-103');
+        $this->assertSame(3, DB::table('release_verification_scratch')->count());
+        DB::table('release_verification_candidates')->where('id', $id)->update(['next_attempt_at' => now()]);
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->assertDirectoryDoesNotExist($root.'/'.$id.'-101');
+        $this->assertDirectoryDoesNotExist($root.'/'.$id.'-102');
+        $this->assertDirectoryExists($root.'/'.$id.'-103');
+        $this->assertSame(1, DB::table('release_verification_scratch')->count());
+    }
+
     /** @return array{int, string} */
     private function staleScratch(): array
     {
@@ -78,6 +141,7 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
         app(CandidateRepository::class)->enqueue(['identity' => sha1('scratch-cleanup'), 'groups_id' => 1, 'files' => []]);
         $id = (int) DB::table('release_verification_candidates')->value('id');
         DB::table('release_verification_candidates')->where('id', $id)->update(['version' => 2]);
+        app(ScratchInventory::class)->register($id, 1);
         $directory = config('release_verification.storage_path').'/scratch/'.$id.'-1';
         mkdir($directory, 0700, true);
         foreach (range(1, 4) as $number) {

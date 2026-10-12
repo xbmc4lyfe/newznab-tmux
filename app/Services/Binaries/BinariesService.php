@@ -279,6 +279,12 @@ class BinariesService
      */
     public function scan(array $groupMySQL, int $first, int $last, string $type = 'update', ?array $missingParts = null): array
     {
+        if (! app(CandidateRepository::class)->capacityAvailable()) {
+            if ($type !== 'partrepair') {
+                $this->missedPartHandler->addMissingRange($first, $last, (int) $groupMySQL['id']);
+            }
+            throw new \RuntimeException('Verification backlog is full; scan paused before downloading headers.');
+        }
         $this->startLoop = Carbon::now();
         $this->groupMySQL = $groupMySQL;
         $this->last = $last;

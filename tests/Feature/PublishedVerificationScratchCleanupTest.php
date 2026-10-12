@@ -4,14 +4,23 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Console\Commands\VerifyReleaseCandidates;
+use App\Facades\Search;
 use App\Services\NNTP\NNTPService;
+use App\Services\ReleaseCleaningService;
 use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\ReleaseMetadataResolver;
+use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\YencService;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
+use Symfony\Component\Process\Process;
 
 class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandidatesTest
 {
@@ -154,6 +163,23 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
         $this->assertDirectoryDoesNotExist($directory);
     }
 
+    public function test_large_low_id_directory_does_not_starve_later_terminal_cleanup(): void
+    {
+        $large = $this->candidateScratch(1);
+        foreach (range(1, 2500) as $entry) {
+            file_put_contents($large.'/'.$entry, 'x');
+        }
+        $later = $this->candidateScratch(2);
+
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->assertDirectoryExists($large);
+        $this->assertDirectoryExists($later);
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->assertDirectoryExists($large);
+        $this->assertDirectoryDoesNotExist($later);
+        $this->assertTrue(DB::table('release_verification_scratch')->where('candidate_id', 1)->exists());
+    }
+
     public function test_sweep_advances_past_one_hundred_actual_directories(): void
     {
         foreach (range(1, 101) as $id) {
@@ -174,6 +200,7 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
         foreach (range(1, 101) as $id) {
             $directory = $this->candidateScratch($id);
             File::deleteDirectory($directory);
+            DB::table('release_verification_scratch')->where('candidate_id', $id)->delete();
         }
         $directory = $this->candidateScratch(102);
 
@@ -186,6 +213,7 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
     {
         $directory = $this->candidateScratch(1, 'expired');
         DB::table('release_verification_candidates')->where('id', 1)->update(['version' => 2]);
+        app(ScratchInventory::class)->register(1, 3);
         $future = dirname($directory).'/1-3';
         mkdir($future);
         file_put_contents($future.'/payload', 'future');
@@ -201,9 +229,8 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
         foreach (range(1, 101) as $id) {
             $this->candidateScratch($id, 'pending');
         }
-        $entries = iterator_to_array(new \FilesystemIterator(config('release_verification.storage_path').'/scratch'));
-        $last = end($entries)->getPathname();
-        $id = (int) explode('-', basename($last))[0];
+        $last = config('release_verification.storage_path').'/scratch/101-1';
+        $id = 101;
         $this->artisan('releases:verify-candidates')->assertSuccessful();
         DB::table('release_verification_candidates')->where('id', $id)->update(['status' => 'filtered']);
 
@@ -219,9 +246,8 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
             $this->candidateScratch($id, 'pending');
         }
         $root = config('release_verification.storage_path').'/scratch';
-        $entries = new \FilesystemIterator($root);
-        $failed = $entries->current()->getPathname();
-        $id = (int) explode('-', basename($failed))[0];
+        $failed = $root.'/1-1';
+        $id = 1;
         DB::table('release_verification_candidates')->where('id', $id)->update(['status' => 'filtered']);
         $filesystem = new Filesystem;
         $attempts = 0;
@@ -268,10 +294,148 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
         rename($root.'/scratch', $root.'/outside');
         symlink($root.'/outside', $root.'/scratch');
 
-        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->artisan('releases:verify-candidates')->assertFailed();
 
         $this->assertFileExists($directory.'/payload');
         $this->assertFileExists($root.'/outside/1-1/payload');
+    }
+
+    public function test_cleanup_never_enumerates_the_top_level_scratch_directory(): void
+    {
+        stream_wrapper_register('scratch-enumeration', ScratchEnumerationProbe::class);
+        ScratchEnumerationProbe::$reads = 0;
+        try {
+            $command = app(VerifyReleaseCandidates::class);
+            (new \ReflectionMethod($command, 'cleanupTerminalScratch'))->invoke($command, 'scratch-enumeration://root');
+            $this->assertSame(0, ScratchEnumerationProbe::$reads);
+        } finally {
+            stream_wrapper_unregister('scratch-enumeration');
+        }
+    }
+
+    public function test_external_unregistered_scratch_and_missing_candidate_metadata_are_preserved(): void
+    {
+        $missing = $this->candidateScratch(1);
+        DB::table('release_verification_candidates')->where('id', 1)->delete();
+        $unregistered = $this->candidateScratch(2);
+        DB::table('release_verification_scratch')->where('candidate_id', 2)->delete();
+
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+
+        $this->assertFileExists($missing.'/payload');
+        $this->assertFileExists($unregistered.'/payload');
+        $this->assertSame(1, DB::table('release_verification_scratch')->count());
+    }
+
+    public function test_worker_registers_scratch_before_any_payload_directory_is_created(): void
+    {
+        app(CandidateRepository::class)->enqueue(['identity' => sha1('register-first'), 'groups_id' => 1, 'files' => []]);
+        $id = (int) DB::table('release_verification_candidates')->value('id');
+        $directory = config('release_verification.storage_path').'/scratch/'.$id.'-1';
+        $registered = false;
+        DB::listen(function ($query) use ($directory, &$registered): void {
+            if (str_starts_with($query->sql, 'insert or ignore into "release_verification_scratch"')) {
+                $this->assertDirectoryDoesNotExist($directory);
+                $registered = true;
+            }
+        });
+        $reference = DB::table('release_verification_candidates')->value('manifest_path');
+        unlink(app(ManifestStore::class)->path($reference));
+
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->assertTrue($registered);
+        $this->assertDirectoryDoesNotExist($directory);
+        $this->assertSame(1, DB::table('release_verification_scratch')->count());
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->assertSame(0, DB::table('release_verification_scratch')->count());
+    }
+
+    public function test_failed_immediate_publication_cleanup_retains_index_for_next_worker(): void
+    {
+        config(['nntmux.release_dedupe_enabled' => false, 'release_verification.bytes_per_second' => 0, 'release_verification.free_bytes' => 0,
+            'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
+        File::ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->id();
+            foreach (['name', 'searchname', 'guid', 'leftguid', 'fromname', 'postdate', 'adddate'] as $column) {
+                $table->string($column);
+            }
+            foreach (['totalpart', 'groups_id', 'size', 'passwordstatus', 'haspreview', 'categories_id', 'nfostatus', 'nzbstatus', 'isrenamed', 'iscategorized', 'predb_id'] as $column) {
+                $table->integer($column);
+            }
+        });
+        Schema::create('release_regexes', static function (Blueprint $table): void {
+            $table->integer('releases_id');
+            $table->integer('collection_regex_id');
+            $table->integer('naming_regex_id');
+        });
+        Schema::create('releases_groups', static function (Blueprint $table): void {
+            $table->integer('releases_id');
+            $table->integer('groups_id');
+        });
+        $this->app->instance(ReleaseMetadataResolver::class, new class(app(ReleaseCleaningService::class)) extends ReleaseMetadataResolver
+        {
+            public function resolve(array $manifest): array
+            {
+                return ['name' => 'Movie', 'searchname' => 'Movie', 'fromname' => 'poster', 'predb_id' => 0,
+                    'isrenamed' => 1, 'categories_id' => 2000, 'naming_regex_id' => 0];
+            }
+        });
+        Search::shouldReceive('updateRelease')->once();
+        app(CandidateRepository::class)->enqueue(['identity' => sha1('publish-cleanup'), 'subject' => 'Movie', 'fromname' => 'poster',
+            'date' => '2026-10-11 12:00:00', 'groups_id' => 1, 'groups' => ['alt.test'], 'expected_files' => 1, 'regex_id' => 0,
+            'files' => [['key' => 'file', 'subject' => 'movie.mkv', 'totalparts' => 1,
+                'segments' => [['number' => 1, 'messageid' => 'publish@article', 'bytes' => 5]]]]]);
+        $id = (int) DB::table('release_verification_candidates')->value('id');
+        $directory = config('release_verification.storage_path').'/scratch/'.$id.'-1';
+        $filesystem = new Filesystem;
+        File::partialMock()->shouldReceive('deleteDirectory')->andReturnUsing(static fn ($path): bool => $path === $directory ? false : $filesystem->deleteDirectory($path));
+        $this->mock(NNTPService::class, static function ($mock): void {
+            $mock->shouldReceive('doConnect')->once()->andReturn(true);
+            $mock->shouldReceive('verificationArticle')->once()->andReturn((new YencService)->encode('hello', 'movie.mkv'));
+            $mock->shouldReceive('doQuit')->andReturn(null);
+        });
+
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->assertSame('complete', DB::table('release_verification_candidates')->value('status'), (string) DB::table('release_verification_candidates')->value('reason'));
+        $this->assertSame(1, DB::table('releases')->count());
+        $this->assertDirectoryExists($directory);
+        $this->assertSame(1, DB::table('release_verification_scratch')->count());
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->assertDirectoryDoesNotExist($directory);
+        $this->assertSame(0, DB::table('release_verification_scratch')->count());
+        $this->assertSame(1, DB::table('releases')->count());
+    }
+
+    public function test_unsearchable_scratch_parent_is_not_mistaken_for_absent_inventory(): void
+    {
+        $directory = $this->candidateScratch(1);
+        $root = (string) config('release_verification.storage_path');
+        chmod($root, 0755);
+        chmod($root.'/scratch', 0000);
+        $script = <<<'PHP'
+require 'vendor/autoload.php';
+if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
+    posix_setgid(65534);
+    posix_setuid(65534);
+}
+try {
+    $command = new App\Console\Commands\VerifyReleaseCandidates;
+    (new ReflectionMethod($command, 'cleanupTerminalScratch'))->invoke($command, $argv[1]);
+    echo 'Cleanup was not blocked.';
+} catch (RuntimeException $error) {
+    echo $error->getMessage();
+}
+PHP;
+        try {
+            $process = new Process([PHP_BINARY, '-r', $script, $root], base_path());
+            $process->mustRun();
+            $this->assertSame('Verification scratch root is inaccessible or linked; inventory retained.', $process->getOutput());
+            $this->assertSame(1, DB::table('release_verification_scratch')->count());
+        } finally {
+            chmod($root.'/scratch', 0700);
+        }
+        $this->assertFileExists($directory.'/payload');
     }
 
     private function candidateScratch(int $id, string $status = 'complete'): string
@@ -280,10 +444,44 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
             'version' => 1, 'status' => $status, 'release_id' => in_array($status, ['complete', 'repaired'], true) ? 77 : null,
             'manifest_path' => '', 'manifest_hash' => str_repeat('a', 64), 'manifest_bytes' => 0,
             'last_unique_at' => now(), 'next_attempt_at' => now()->addHour()]);
+        app(ScratchInventory::class)->register($id, 1);
         $directory = config('release_verification.storage_path').'/scratch/'.$id.'-1';
         mkdir($directory, 0700, true);
         file_put_contents($directory.'/payload', 'old payload');
 
         return $directory;
+    }
+}
+
+/** A directory whose oversized listing exposes unbounded pre-claim enumeration. */
+final class ScratchEnumerationProbe
+{
+    public mixed $context;
+
+    public static int $reads = 0;
+
+    /** @return array<string, int> */
+    public function url_stat(string $path, int $flags): array
+    {
+        return ['mode' => 0040000 | 0700];
+    }
+
+    public function dir_opendir(string $path, int $options): bool
+    {
+        return true;
+    }
+
+    public function dir_readdir(): string
+    {
+        if (++self::$reads > 102) {
+            throw new RuntimeException('Pre-claim sweep exceeded its top-level metadata budget.');
+        }
+
+        return self::$reads.'-1';
+    }
+
+    public function dir_closedir(): bool
+    {
+        return true;
     }
 }

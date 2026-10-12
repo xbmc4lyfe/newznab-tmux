@@ -2,6 +2,8 @@
 
 namespace Tests\Feature;
 
+use App\Services\Backfill\BackfillConfig;
+use App\Services\Backfill\BackfillService;
 use App\Services\Binaries\BinariesConfig;
 use App\Services\Binaries\BinariesService;
 use App\Services\Binaries\BinaryHandler;
@@ -554,6 +556,230 @@ class BinariesStorageInternalsTest extends TestCase
 
         $this->assertSame([1101], DB::table('parts')->pluck('number')->all());
         $this->assertSame([1104, 1105], DB::table('missed_parts')->orderBy('numberid')->pluck('numberid')->all());
+    }
+
+    public function test_backfill_group_pauses_before_nntp_selection_when_verification_capacity_is_full(): void
+    {
+        $this->backfillTables(100);
+        $nntp = $this->backfillNntp();
+        $service = $this->backfillService($nntp);
+
+        $service->backfillGroup($this->backfillGroup(), 0, 200);
+
+        $this->assertBackfillPosition(501, 0);
+        $this->assertSame(0, $nntp->selections);
+        $this->assertSame([], $nntp->ranges);
+        $this->assertNull(DB::table('processing_runtime_states')->value('last_binary_run_at'));
+    }
+
+    public function test_direct_backfill_chunk_pauses_without_fetching_or_inventing_repair_work(): void
+    {
+        $this->backfillTables(100);
+        $nntp = $this->backfillNntp();
+
+        (new \ReflectionMethod(BackfillService::class, 'processBackfillChunks'))
+            ->invoke($this->backfillService($nntp), $this->backfillGroup(), 301, 0, 'alt.test');
+
+        $this->assertBackfillPosition(501, 0);
+        $this->assertSame(0, DB::table('missed_parts')->count());
+        $this->assertSame([], $nntp->ranges);
+        $this->assertSame(0, $nntp->selections);
+    }
+
+    public function test_backfill_rechecks_capacity_between_committed_chunks_and_resumes_the_same_frontier(): void
+    {
+        $this->backfillTables(0);
+        $nntp = $this->backfillNntp();
+        $filled = false;
+        DB::listen(static function (QueryExecuted $event) use (&$filled): void {
+            if (! $filled && str_starts_with($event->sql, 'UPDATE usenet_groups SET first_record_postdate')) {
+                $filled = true;
+                DB::table('release_verification_state')->update(['pending_bytes' => 100]);
+            }
+        });
+        $this->backfillService($nntp)->backfillGroup($this->backfillGroup(), 0, 200);
+
+        $this->assertTrue($filled);
+        $this->assertBackfillPosition(401, 1);
+        $this->assertSame(['401-500'], $nntp->ranges);
+        $this->assertSame(0, DB::table('missed_parts')->count());
+        DB::table('release_verification_state')->update(['pending_bytes' => 0]);
+        $nntp = $this->backfillNntp();
+        $this->backfillService($nntp)->backfillGroup($this->backfillGroup(), 0, 100);
+        $this->assertBackfillPosition(301, 2);
+        $this->assertSame(['301-400'], $nntp->ranges);
+    }
+
+    public function test_backfill_preserves_legacy_progress_when_verification_is_disabled(): void
+    {
+        $this->backfillTables(100);
+        config(['release_verification.required' => false]);
+        $nntp = $this->backfillNntp();
+
+        $this->backfillService($nntp)->backfillGroup($this->backfillGroup(), 0, 200);
+
+        $this->assertBackfillPosition(301, 2);
+        $this->assertSame(['401-500', '301-400'], $nntp->ranges);
+    }
+
+    public function test_scan_level_capacity_race_queues_launched_range_without_advancing_backfill(): void
+    {
+        $this->backfillTables(0);
+        $nntp = $this->backfillNntp();
+        $capacityReads = 0;
+        DB::listen(static function (QueryExecuted $event) use (&$capacityReads): void {
+            if (str_starts_with($event->sql, 'select "pending_bytes" from "release_verification_state"')) {
+                if (++$capacityReads === 2) {
+                    DB::table('release_verification_state')->update(['pending_bytes' => 100]);
+                }
+            }
+        });
+        $this->assertCapacityPaused(fn () => $this->backfillService($nntp)->backfillGroup($this->backfillGroup(), 0, 200));
+        $this->assertBackfillPosition(501, 0);
+        $this->assertSame([], $nntp->ranges);
+        $this->assertSame(100, DB::table('missed_parts')->count());
+        $this->assertSame(401, (int) DB::table('missed_parts')->min('numberid'));
+        $this->assertSame(500, (int) DB::table('missed_parts')->max('numberid'));
+    }
+
+    public function test_direct_scan_capacity_pause_preserves_sibling_range_repair(): void
+    {
+        $this->backfillTables(100);
+        $nntp = $this->backfillNntp();
+        $this->assertCapacityPaused(fn () => $this->backfillBinaries($nntp)->scan($this->backfillGroup(), 401, 500, 'backfill'));
+        $this->assertBackfillPosition(501, 0);
+        $this->assertSame([], $nntp->ranges);
+        $this->assertSame(100, DB::table('missed_parts')->count());
+        $this->assertSame(1, (int) DB::table('missed_parts')->value('attempts'));
+    }
+
+    public function test_partrepair_capacity_pause_preserves_existing_attempts_and_queue(): void
+    {
+        $this->backfillTables(100);
+        DB::table('missed_parts')->insert(['groups_id' => 1, 'numberid' => 401, 'attempts' => 1]);
+        $nntp = $this->backfillNntp();
+        $this->assertCapacityPaused(fn () => $this->backfillBinaries($nntp)->scan($this->backfillGroup(), 401, 500, 'partrepair', [401]));
+        $this->assertBackfillPosition(501, 0);
+        $this->assertSame([], $nntp->ranges);
+        $this->assertSame([401], DB::table('missed_parts')->pluck('numberid')->all());
+        $this->assertSame(1, (int) DB::table('missed_parts')->value('attempts'));
+    }
+
+    public function test_direct_scan_capacity_pause_propagates_repair_persistence_failure(): void
+    {
+        $this->backfillTables(100);
+        DB::statement("CREATE TRIGGER reject_repair BEFORE INSERT ON missed_parts BEGIN SELECT RAISE(ABORT, 'repair storage unavailable'); END");
+        $nntp = $this->backfillNntp();
+        try {
+            $this->backfillBinaries($nntp)->scan($this->backfillGroup(), 401, 500, 'backfill');
+            $this->fail('Repair persistence failure must propagate.');
+        } catch (QueryException $error) {
+            $this->assertStringContainsString('repair storage unavailable', $error->getMessage());
+        }
+        $this->assertBackfillPosition(501, 0);
+        $this->assertSame([], $nntp->ranges);
+        $this->assertSame(0, DB::table('missed_parts')->count());
+    }
+
+    private function assertCapacityPaused(callable $operation): void
+    {
+        try {
+            $operation();
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString('Verification backlog', $error->getMessage());
+
+            return;
+        }
+        $this->fail('Full verification capacity must not report successful empty work.');
+    }
+
+    private function backfillTables(int $pendingBytes): void
+    {
+        $this->createHeaderStorageTables();
+        $this->createMissedPartsTable();
+        DB::statement('ALTER TABLE missed_parts ADD updated_at TEXT');
+        config(['release_verification.required' => true, 'release_verification.pending_bytes' => 100]);
+        DB::statement('CREATE TABLE release_verification_state (id INTEGER PRIMARY KEY, pending_bytes INT)');
+        DB::table('release_verification_state')->insert(['id' => 1, 'pending_bytes' => $pendingBytes]);
+        DB::statement('CREATE TABLE usenet_groups (id INTEGER PRIMARY KEY, name TEXT, first_record INT, first_record_postdate TEXT, last_updated TEXT)');
+        DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.test', 'first_record' => 501, 'first_record_postdate' => '2026-10-11 00:00:00']);
+        DB::statement('CREATE TABLE processing_runtime_states (id INTEGER PRIMARY KEY, last_binary_run_at TEXT, created_at TEXT, updated_at TEXT)');
+        DB::table('processing_runtime_states')->insert(['id' => 1]);
+        $pdo = DB::connection()->getPdo();
+        $pdo->sqliteCreateFunction('FROM_UNIXTIME', static fn ($time): string => date('Y-m-d H:i:s', (int) $time));
+        $pdo->sqliteCreateFunction('NOW', static fn (): string => date('Y-m-d H:i:s'));
+    }
+
+    /** @return array<string, mixed> */
+    private function backfillGroup(): array
+    {
+        return (array) DB::table('usenet_groups')->where('id', 1)->first();
+    }
+
+    /** @return array<string, mixed> */
+    private function backfillHeader(int $number): array
+    {
+        $header = $this->rawHeader($number, 'Backfill.Release'.$number.' (1/1)');
+        $header['Date'] = 'Sun, 11 Oct 2026 12:00:00 +0000';
+
+        return $header;
+    }
+
+    private function backfillNntp(): NNTPService
+    {
+        return new class(fn (int $number): array => $this->backfillHeader($number)) extends NNTPService
+        {
+            public array $ranges = [];
+
+            public int $selections = 0;
+
+            public function __construct(private readonly \Closure $header) {}
+
+            public function selectGroup(string $group, mixed $articles = false, bool $force = false): mixed
+            {
+                $this->selections++;
+
+                return ['first' => 1, 'last' => 1000];
+            }
+
+            public function getXOVER(string $range): mixed
+            {
+                $this->ranges[] = $range;
+
+                return [($this->header)((int) explode('-', $range)[0])];
+            }
+
+            public function getOverview(mixed $range = null, bool $names = true, bool $forceNames = true): mixed
+            {
+                return $this->getXOVER((string) $range);
+            }
+        };
+    }
+
+    private function backfillService(NNTPService $nntp): BackfillService
+    {
+        return new BackfillService(new BackfillConfig(compressedHeaders: false), $this->backfillBinaries($nntp), $nntp);
+    }
+
+    private function backfillBinaries(NNTPService $nntp): BinariesService
+    {
+        $config = new BinariesConfig(messageBuffer: 100, compressedHeaders: false, headerChunkSize: 100, sqlChunkSize: 100);
+
+        return new BinariesService($config, new HeaderParser(new class extends BlacklistService
+        {
+            public function isBlackListed(array $msg, string $groupName): bool
+            {
+                return false;
+            }
+        }), new HeaderStorageService($this->deterministicCollectionHandler(), config: $config), nntp: $nntp);
+    }
+
+    private function assertBackfillPosition(int $firstRecord, int $hotArticles): void
+    {
+        $this->assertSame($firstRecord, (int) DB::table('usenet_groups')->value('first_record'));
+        $this->assertSame($hotArticles, DB::table('parts')->count());
+        $this->assertSame($hotArticles, DB::table('binaries')->count());
+        $this->assertSame($hotArticles, DB::table('collections')->count());
     }
 
     /** @param list<array<string, mixed>> $headers */

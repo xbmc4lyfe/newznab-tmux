@@ -9,6 +9,7 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
 use App\Services\Releases\Verification\PayloadVerifier;
+use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Console\Command;
@@ -23,7 +24,7 @@ class VerifyReleaseCandidates extends Command
 
     protected $description = 'Download and verify pending candidates before publishing their NZBs';
 
-    public function handle(CandidateRepository $repository, ManifestStore $store, VerifiedReleasePublisher $publisher): int
+    public function handle(CandidateRepository $repository, ManifestStore $store, VerifiedReleasePublisher $publisher, ScratchInventory $scratchInventory): int
     {
         $root = (string) config('release_verification.storage_path');
         File::ensureDirectoryExists($root, 0700);
@@ -34,6 +35,11 @@ class VerifyReleaseCandidates extends Command
             return self::SUCCESS;
         }
         try {
+            if (! $this->scratchRootIsSafe($root.'/scratch')) {
+                $this->error('Verification scratch root must be an accessible directory, not a symlink.');
+
+                return self::FAILURE;
+            }
             $this->cleanupTerminalScratch($root);
             $repository->expire();
             $verifier = new PayloadVerifier(new NntpArticleSource(app(NNTPService::class)), (array) config('release_verification'));
@@ -46,10 +52,16 @@ class VerifyReleaseCandidates extends Command
                 try {
                     $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
                     $heartbeat();
-                    foreach (glob($root.'/scratch/'.$claim->id.'-*', GLOB_ONLYDIR) ?: [] as $oldDirectory) {
-                        if (preg_match('/\A'.$claim->id.'-([0-9]+)\z/', basename($oldDirectory), $match) === 1 && (int) $match[1] < (int) $claim->version) {
+                    $scratchInventory->register((int) $claim->id, (int) $claim->version);
+                    foreach ($scratchInventory->olderVersions((int) $claim->id, (int) $claim->version) as $old) {
+                        $oldDirectory = $root.'/scratch/'.$old->candidate_id.'-'.$old->version;
+                        $heartbeat();
+                        if (is_dir($oldDirectory) || is_link($oldDirectory)) {
                             $this->deleteStaleScratch($oldDirectory, $heartbeat);
+                        } elseif (file_exists($oldDirectory)) {
+                            throw new RuntimeException('Stale verification scratch is not a directory.');
                         }
+                        $scratchInventory->forget((int) $old->id);
                     }
                     $heartbeat();
                     $manifest = $store->read($claim->manifest_path);
@@ -105,63 +117,30 @@ class VerifyReleaseCandidates extends Command
     private function cleanupTerminalScratch(string $root): void
     {
         $scratch = $root.'/scratch';
-        if (! is_dir($scratch) || is_link($scratch)) {
-            return;
+        if (! $this->scratchRootIsSafe($scratch)) {
+            throw new RuntimeException('Verification scratch root is inaccessible or linked; inventory retained.');
         }
-        $cursorPath = $root.'/terminal-scratch.cursor';
+        $cursorPath = $root.'/indexed-scratch.cursor';
         $cursor = is_file($cursorPath) ? json_decode((string) file_get_contents($cursorPath), true) : null;
-        $offset = max(0, (int) ($cursor['offset'] ?? 0));
+        $after = max(0, (int) ($cursor['after'] ?? 0));
         $ceiling = max(0, (int) ($cursor['ceiling'] ?? 0));
-        $handle = opendir($scratch);
-        if ($handle === false) {
-            throw new RuntimeException('Cannot scan verification scratch.');
+        if ($ceiling === 0) {
+            $ceiling = (int) DB::table('release_verification_scratch')->max('id');
         }
-        $entries = [];
-        $atEnd = false;
-        try {
-            if ($ceiling === 0) {
-                while (($name = readdir($handle)) !== false) {
-                    if ($name !== '.' && $name !== '..') {
-                        $ceiling++;
-                    }
-                }
-                rewinddir($handle);
-                $offset = 0;
-            }
-            $skipped = 0;
-            while ($skipped < $offset && ($name = readdir($handle)) !== false) {
-                if ($name !== '.' && $name !== '..') {
-                    $skipped++;
-                }
-            }
-            while (count($entries) < min(100, max(0, $ceiling - $offset))) {
-                $name = readdir($handle);
-                if ($name === false) {
-                    if ($entries === [] && $offset > 0) {
-                        rewinddir($handle);
-                        $offset = 0;
-
-                        continue;
-                    }
-                    $atEnd = true;
-                    break;
-                }
-                if ($name !== '.' && $name !== '..') {
-                    $entries[] = $name;
-                }
-            }
-        } finally {
-            closedir($handle);
+        $entries = DB::table('release_verification_scratch')->where('id', '>', $after)->where('id', '<=', $ceiling)
+            ->orderBy('id')->limit(100)->get();
+        if ($entries->isEmpty() && $ceiling === 0) {
+            return;
         }
         $remaining = 1000;
         $exhausted = false;
-        $processed = 0;
-        $removed = 0;
-        foreach ($entries as $name) {
-            $directory = $scratch.'/'.$name;
-            if (preg_match('/\A([1-9][0-9]*)-([1-9][0-9]*)\z/', $name, $match) === 1 && is_dir($directory) && ! is_link($directory)) {
-                $candidate = DB::table('release_verification_candidates')->where('id', $match[1])
-                    ->where('version', '>=', $match[2])
+        foreach ($entries as $entry) {
+            $directory = $scratch.'/'.$entry->candidate_id.'-'.$entry->version;
+            if (! file_exists($directory) && ! is_link($directory)) {
+                app(ScratchInventory::class)->forget((int) $entry->id);
+            } elseif (is_dir($directory) && ! is_link($directory)) {
+                $candidate = DB::table('release_verification_candidates')->where('id', $entry->candidate_id)
+                    ->where('version', '>=', $entry->version)
                     ->where(function ($query): void {
                         $query->whereIn('status', ['expired', 'filtered'])
                             ->orWhere(fn ($published) => $published->whereNotNull('release_id')->whereIn('status', ['complete', 'repaired']));
@@ -176,33 +155,40 @@ class VerifyReleaseCandidates extends Command
                                 throw new RuntimeException('Terminal scratch cleanup will resume on the next run.');
                             }
                         });
-                        $removed++;
+                        app(ScratchInventory::class)->forget((int) $entry->id);
                     } catch (Throwable $error) {
                         if ($exhausted) {
+                            $after = (int) $entry->id;
                             break;
                         }
                         $this->warn('Terminal scratch cleanup will retry: '.$error->getMessage());
                     }
                 }
             }
-            $processed++;
+            $after = (int) $entry->id;
         }
-        // Directory positions move when entries disappear; a full pass always wraps.
-        $offset = max(0, $offset + $processed - $removed);
-        $ceiling = max(0, $ceiling - $removed);
-        if (! $exhausted && ($atEnd || $offset >= $ceiling)) {
-            $offset = 0;
+        if ((! $exhausted && $entries->count() < 100) || $after >= $ceiling) {
+            $after = 0;
             $ceiling = 0;
         }
-        $checkpoint = json_encode(['offset' => $offset, 'ceiling' => $ceiling], JSON_THROW_ON_ERROR);
+        $checkpoint = json_encode(['after' => $after, 'ceiling' => $ceiling], JSON_THROW_ON_ERROR);
         if (file_put_contents($cursorPath.'.tmp', $checkpoint, LOCK_EX) === false || ! rename($cursorPath.'.tmp', $cursorPath)) {
             throw new RuntimeException('Cannot checkpoint terminal scratch cleanup.');
         }
     }
 
+    private function scratchRootIsSafe(string $directory): bool
+    {
+        return ! is_link($directory) && (! file_exists($directory)
+            || (is_dir($directory) && is_readable($directory) && is_executable($directory)));
+    }
+
     private function deleteStaleScratch(string $directory, callable $heartbeat): void
     {
         $heartbeat();
+        if (is_link($directory)) {
+            throw new RuntimeException('Stale verification scratch cannot be a symlink.');
+        }
         $iterator = new \RecursiveIteratorIterator(
             new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS),
             \RecursiveIteratorIterator::CHILD_FIRST,

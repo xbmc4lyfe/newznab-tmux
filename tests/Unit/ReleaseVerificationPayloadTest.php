@@ -81,6 +81,8 @@ class ReleaseVerificationPayloadTest extends TestCase
     {
         yield 'single complete article without part suffix' => ['[1/1] movie.mkv', [1], ['hello'], [1], 1, true];
         yield 'multipart complete bytes without part suffix' => ['[1/1] movie.mkv', [1, 2], ['hell', 'tail'], [1, 5], 2, true];
+        yield 'duplicate suffix-free numbers cannot replace missing part two' => ['[1/1] movie.mkv', [1, 1, 3], ['aa', 'bb', 'cccc'], [1, 3, 5], 3, false];
+        yield 'duplicate explicitly declared numbers cannot replace missing part two' => ['[1/1] movie.mkv (1/3)', [1, 1, 3], ['aa', 'bb', 'cccc'], [1, 3, 5], 3, false];
         yield 'gap in numbered parts despite complete byte ranges' => ['[1/1] movie.mkv', [1, 3], ['hell', 'tail'], [1, 5], 3, false];
         yield 'missing byte range despite consecutive part numbers' => ['[1/1] movie.mkv', [1, 2], ['he', 'tail'], [1, 5], 2, false];
         yield 'explicit larger total must not be inferred down' => ['[1/1] movie.mkv (1/3)', [1, 2], ['hell', 'tail'], [1, 5], 3, false];
@@ -101,7 +103,7 @@ class ReleaseVerificationPayloadTest extends TestCase
         $articles = [];
         $segments = '';
         foreach ($numbers as $index => $number) {
-            $id = 'part-'.$number.'@article';
+            $id = 'part-'.$number.'-'.$index.'@article';
             $articles[$id] = count($numbers) === 1 ? (new YencService)->encode($pieces[$index], 'movie.mkv')
                 : YencArticles::part($pieces[$index], 'movie.mkv', $size, $number, $begins[$index], max($numbers));
             $segments .= '<segment bytes="'.strlen($pieces[$index]).'" number="'.$number.'">'.$id.'</segment>';
@@ -113,12 +115,159 @@ class ReleaseVerificationPayloadTest extends TestCase
         try {
             $this->assertSame($expectedParts, $manifest['files'][0]['totalparts']);
             $result = $verifier->verify($manifest, $scratch, static function (): void {});
+            if ($result->passed() && count(array_unique($numbers)) !== count($numbers)) {
+                $this->assertSame(implode('', $pieces), file_get_contents($scratch.'/data/movie.mkv'));
+                $writer = (new \ReflectionClass(VerifiedNzbWriter::class))->newInstanceWithoutConstructor();
+                $emitted = (new \ReflectionMethod($writer, 'document'))->invoke($writer, $result->manifest);
+                $decoded = simplexml_load_string($emitted);
+                $emittedNumbers = [];
+                foreach ($decoded->file[0]->segments->segment as $segment) {
+                    $emittedNumbers[] = (int) $segment['number'];
+                }
+                $this->assertSame($numbers, $emittedNumbers, 'The false pass emitted duplicated segment numbers despite correct contiguous decoded bytes.');
+            }
             $this->assertSame($passes, $result->passed(), $result->reason);
+            if (count(array_unique($numbers)) !== count($numbers)) {
+                unset($manifest['conflict']);
+                $direct = $verifier->verify($manifest, $scratch, static function (): void {});
+                $this->assertFalse($direct->passed(), 'Verifier must independently reject duplicate ordinals without reader metadata.');
+                $this->assertSame('Invalid or duplicate article part number.', $direct->reason);
+            }
             if ($passes) {
                 $this->assertSame(implode('', $pieces), file_get_contents($scratch.'/data/movie.mkv'));
                 $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', implode('', $pieces));
             }
         } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    /** @return iterable<string, array{int, bool, bool, 3?: int, 4?: bool, 5?: bool}> */
+    public static function retainedCacheBudgets(): iterable
+    {
+        yield 'cached first projection preserves free reserve one byte short' => [0, true, false, -1];
+        yield 'cached exact free reserve does not charge visits again' => [0, true, true, 0];
+        yield 'new checkpoint exact live free reserve charged only once' => [0, false, true, 0];
+        yield 'successful corrupt cache eviction refunds baseline before replacement' => [0, true, true, 0, true];
+        yield 'stale checkpoint temporary is refunded before replacement' => [0, false, true, 0, false, true];
+        yield 'all cached exceeds projected scratch by one byte' => [-1, true, false];
+        yield 'all cached fits exact projection without double counting visits' => [0, true, true];
+        yield 'new first checkpoint and retained tail fits exact projection' => [0, false, true];
+        yield 'new first checkpoint and retained tail exceeds by one byte' => [-1, false, false];
+    }
+
+    #[DataProvider('retainedCacheBudgets')]
+    public function test_retained_raw_cache_is_counted_before_derived_allocation_and_new_checkpoints_only_once(int $extraBudget, bool $firstCached, bool $passes, ?int $extraFree = null, bool $corruptFirst = false, bool $staleTemporary = false): void
+    {
+        $raw = ['first@article' => YencArticles::part('a', 'movie.mkv', 1000, 1, 1, 2),
+            'tail@article' => YencArticles::part(str_repeat('b', 999), 'movie.mkv', 1000, 2, 2, 2)];
+        $source = new class($raw) implements ArticleSource
+        {
+            /** @var list<string> */
+            public array $requested = [];
+
+            /** @param array<string, string> $raw */
+            public function __construct(private readonly array $raw) {}
+
+            public function fetch(string $messageId): string
+            {
+                $this->requested[] = $messageId;
+
+                return $this->raw[$messageId];
+            }
+        };
+        [$unused, $scratch] = $this->verifier([]);
+        mkdir($scratch.'/articles');
+        foreach ($raw as $id => $body) {
+            if ($firstCached || $id === 'tail@article') {
+                $stored = $corruptFirst && $id === 'first@article' ? preg_replace('/pcrc32=[0-9a-f]+/', 'pcrc32=00000000', $body) : $body;
+                file_put_contents($scratch.'/articles/'.hash('sha256', $id), $stored);
+            }
+        }
+        if ($staleTemporary) {
+            file_put_contents($scratch.'/articles/'.hash('sha256', 'first@article').'.tmp', str_repeat('x', 500));
+        }
+        $rawBytes = array_sum(array_map(strlen(...), $raw));
+        $budget = $rawBytes + 3000 + $extraBudget;
+        $reserve = $extraFree === null ? 0 : 1234;
+        $probe = null;
+        if ($extraFree !== null) {
+            $initialCache = array_sum(array_map(filesize(...), glob($scratch.'/articles/*')));
+            $initialFree = $reserve + 3000 + max(0, $rawBytes - $initialCache) + $extraFree;
+            $probe = static function (string $directory) use ($initialCache, $initialFree): float {
+                $currentCache = array_sum(array_map(filesize(...), glob($directory.'/articles/*')));
+
+                return (float) ($initialFree + $initialCache - $currentCache);
+            };
+        }
+        $verifier = new PayloadVerifier($source, ['scratch_bytes' => $budget, 'free_bytes' => $reserve,
+            'article_bytes' => 16777216, 'bytes_per_second' => 0, 'par2_binary' => 'par2'], $probe);
+        $manifest = ['expected_files' => 1, 'files' => [['key' => 'source', 'subject' => 'movie.mkv', 'totalparts' => 2,
+            'segments' => [['number' => 1, 'messageid' => 'first@article', 'bytes' => 1],
+                ['number' => 2, 'messageid' => 'tail@article', 'bytes' => 999]]]]];
+        try {
+            $result = $verifier->verify($manifest, $scratch, static function (): void {});
+            $this->assertSame($passes, $result->passed(), $result->reason);
+            $this->assertSame($firstCached && ! $corruptFirst ? [] : ['first@article'], $source->requested);
+            if ($passes) {
+                $this->assertSame('a'.str_repeat('b', 999), file_get_contents($scratch.'/data/movie.mkv'));
+            } else {
+                $this->assertSame('Verification is waiting for scratch capacity.', $result->reason);
+                $this->assertFileDoesNotExist($scratch.'/data/movie.mkv', 'Full retained cache must be charged before the first decoded file allocation.');
+            }
+            foreach ($raw as $id => $body) {
+                $this->assertSame($body, file_get_contents($scratch.'/articles/'.hash('sha256', $id)));
+            }
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function linkedScratchDirectories(): iterable
+    {
+        yield 'candidate directory symlink' => [true];
+        yield 'article cache directory symlink' => [false];
+    }
+
+    #[DataProvider('linkedScratchDirectories')]
+    public function test_symlinked_candidate_or_cache_root_cannot_touch_outside_sentinels_or_fetch_articles(bool $candidateLinked): void
+    {
+        [$unused, $scratch] = $this->verifier([]);
+        $source = new class implements ArticleSource
+        {
+            public int $fetches = 0;
+
+            public function fetch(string $messageId): string
+            {
+                $this->fetches++;
+
+                return (new YencService)->encode('hello', 'movie.mkv');
+            }
+        };
+        mkdir($scratch.'/outside');
+        if ($candidateLinked) {
+            mkdir($scratch.'/outside/data');
+            $sentinel = $scratch.'/outside/data/sentinel';
+            $directory = $scratch.'/current-link';
+            $link = $directory;
+        } else {
+            $sentinel = $scratch.'/outside/sentinel';
+            $directory = $scratch;
+            $link = $scratch.'/articles';
+        }
+        file_put_contents($sentinel, 'preserve outside data');
+        symlink($scratch.'/outside', $link);
+        $verifier = new PayloadVerifier($source, ['scratch_bytes' => 1048576, 'free_bytes' => 0, 'article_bytes' => 16777216,
+            'bytes_per_second' => 0, 'par2_binary' => 'par2']);
+        try {
+            $result = $verifier->verify($this->manifest(1), $directory, static function (): void {});
+            $this->assertSame('unknown', $result->verdict);
+            $this->assertSame(0, $source->fetches);
+            $this->assertSame('preserve outside data', file_get_contents($sentinel));
+            $this->assertFileDoesNotExist($directory.'/data/movie.mkv');
+        } finally {
+            unlink($link);
             $this->removeDirectory($scratch);
         }
     }
@@ -542,7 +691,7 @@ class ReleaseVerificationPayloadTest extends TestCase
         }
     }
 
-    public function test_both_scratch_size_walks_renew_before_first_article_fetch(): void
+    public function test_initial_scratch_size_walk_renews_before_first_article_fetch(): void
     {
         [$unused, $scratch] = $this->verifier([]);
         $beats = 0;
@@ -574,7 +723,7 @@ class ReleaseVerificationPayloadTest extends TestCase
         }
     }
 
-    public function test_lost_lease_in_own_scratch_walk_stops_before_article_fetch(): void
+    public function test_lost_lease_in_initial_scratch_walk_stops_before_article_fetch(): void
     {
         [$unused, $scratch] = $this->verifier([]);
         $source = new class implements ArticleSource
@@ -593,7 +742,7 @@ class ReleaseVerificationPayloadTest extends TestCase
         $beats = 0;
         try {
             $result = $verifier->verify($this->manifest(1), $scratch, static function () use (&$beats): void {
-                if (++$beats === 5) {
+                if (++$beats === 3) {
                     throw new \RuntimeException('Lease lost in own scratch walk.');
                 }
             });

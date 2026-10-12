@@ -13,8 +13,14 @@ final class PayloadVerifier
 {
     private int $initialScratchBytes = 0;
 
-    /** @param array<string, mixed> $options */
-    public function __construct(private readonly ArticleSource $source, private readonly array $options) {}
+    private int $materializedCacheBytes = 0;
+
+    /**
+     * @param  array<string, mixed>  $options
+     * @param  (\Closure(string): (float|false))|null  $diskFreeSpace
+     */
+    public function __construct(private readonly ArticleSource $source, private readonly array $options,
+        private readonly ?\Closure $diskFreeSpace = null) {}
 
     /** @param array<string, mixed> $manifest */
     public function verify(array $manifest, string $directory, callable $heartbeat): VerificationResult
@@ -32,11 +38,17 @@ final class PayloadVerifier
         if ($manifest['conflict'] ?? false) {
             return new VerificationResult('unknown', 'Conflicting header identities require resolution.');
         }
+        if (is_link(rtrim($directory, '/\\'))) {
+            throw new RuntimeException('Scratch candidate directory cannot be a symlink.');
+        }
         if (! is_dir($directory) && ! mkdir($directory, 0700, true) && ! is_dir($directory)) {
             throw new RuntimeException('Scratch directory is unavailable.');
         }
         $cache = $directory.'/articles';
         $data = $directory.'/data';
+        if (is_link($cache)) {
+            throw new RuntimeException('Article cache directory cannot be a symlink.');
+        }
         foreach ([$cache, $data] as $path) {
             if (! is_dir($path) && ! mkdir($path, 0700)) {
                 throw new RuntimeException('Cannot allocate scratch storage.');
@@ -48,16 +60,24 @@ final class PayloadVerifier
         $available = $manifest;
         $scratchRoot = dirname($directory);
         $this->initialScratchBytes = $this->directoryBytes($scratchRoot, $heartbeat);
-        $allocated = $this->initialScratchBytes - $this->directoryBytes($directory, $heartbeat);
+        $allocated = $this->initialScratchBytes;
+        $this->materializedCacheBytes = 0;
         $networkFailure = false;
         $requiredNames = [];
         $fileChecksums = [];
         foreach ($manifest['files'] as $index => $file) {
             $ranges = [];
+            $partNumbers = [];
+            $validatedParts = [];
             $identity = null;
             $available['files'][$index]['segments'] = [];
             foreach ($file['segments'] as $segment) {
                 $heartbeat();
+                $number = (int) $segment['number'];
+                if ($number < 1 || isset($partNumbers[$number])) {
+                    throw new RuntimeException('Invalid or duplicate article part number.');
+                }
+                $partNumbers[$number] = true;
                 $id = (string) $segment['messageid'];
                 $path = $cache.'/'.hash('sha256', $id);
                 $article = null;
@@ -67,10 +87,10 @@ final class PayloadVerifier
                         try {
                             $article = VerifiedArticle::decode($raw);
                         } catch (RuntimeException) {
-                            unlink($path);
+                            $this->discardCheckpoint($path, $allocated);
                         }
                     } else {
-                        unlink($path);
+                        $this->discardCheckpoint($path, $allocated);
                     }
                 }
                 if ($article === null) {
@@ -92,10 +112,13 @@ final class PayloadVerifier
 
                         continue;
                     }
+                    $this->discardCheckpoint($path.'.tmp', $allocated);
                     $this->reserve($directory, $allocated + strlen($raw));
                     if (file_put_contents($path.'.tmp', $raw, LOCK_EX) !== strlen($raw) || ! rename($path.'.tmp', $path)) {
                         throw new RuntimeException('Cannot checkpoint downloaded article.');
                     }
+                    $allocated += strlen($raw);
+                    $this->materializedCacheBytes += strlen($raw);
                     $rate = (int) $this->options['bytes_per_second'];
                     if ($rate > 0) {
                         $wait = strlen($raw) / $rate - (microtime(true) - $start);
@@ -107,7 +130,6 @@ final class PayloadVerifier
                         }
                     }
                 }
-                $allocated += filesize($path) ?: 0;
                 $this->reserve($directory, $allocated);
                 if ($article->part !== (int) $segment['number']) {
                     throw new RuntimeException('Article part number differs from the manifest.');
@@ -152,6 +174,7 @@ final class PayloadVerifier
                 }
                 fclose($handle);
                 $ranges[] = [$article->offset, $end];
+                $validatedParts[$number] = true;
                 $available['files'][$index]['segments'][] = $segment;
                 $available['files'][$index]['decoded_size'] = $article->size;
             }
@@ -166,7 +189,8 @@ final class PayloadVerifier
                 }
                 $files[$identity->name] = ['size' => $identity->size,
                     'available_bytes' => array_sum(array_map(static fn (array $range): int => $range[1] - $range[0], $ranges)),
-                    'complete' => $cursor === $identity->size && count($ranges) === (int) $file['totalparts']];
+                    'complete' => $cursor === $identity->size && count($validatedParts) === (int) $file['totalparts']
+                        && isset($validatedParts[1]) && max(array_keys($validatedParts)) === (int) $file['totalparts']];
                 $requiredNames[] = $identity->name;
             } else {
                 $subject = (string) $file['subject'];
@@ -400,11 +424,25 @@ final class PayloadVerifier
         return $bytes;
     }
 
+    private function discardCheckpoint(string $path, int &$allocated): void
+    {
+        if (! file_exists($path) && ! is_link($path)) {
+            return;
+        }
+        $bytes = filesize($path);
+        if ($bytes === false || ! unlink($path)) {
+            throw new RuntimeException('Cannot discard invalid article checkpoint.');
+        }
+        clearstatcache(true, $path);
+        $allocated -= $bytes;
+        $this->initialScratchBytes -= $bytes;
+    }
+
     private function reserve(string $directory, int $bytes): void
     {
-        $free = disk_free_space($directory);
+        $free = $this->diskFreeSpace === null ? disk_free_space($directory) : ($this->diskFreeSpace)($directory);
         if ($bytes > (int) $this->options['scratch_bytes'] || $free === false
-            || $free < (int) $this->options['free_bytes'] + max(0, $bytes - $this->initialScratchBytes)) {
+            || $free < (int) $this->options['free_bytes'] + max(0, $bytes - $this->initialScratchBytes - $this->materializedCacheBytes)) {
             throw new RuntimeException('Verification is waiting for scratch capacity.');
         }
     }

@@ -22,6 +22,7 @@ class ReleaseVerificationCandidatesTest extends TestCase
         $this->configureVerificationDatabase();
         $migration = require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php');
         $migration->up();
+        (require database_path('migrations/2026_10_12_004819_create_release_verification_scratch_table.php'))->up();
         (require database_path('migrations/2026_10_11_175742_create_release_verification_audit_retries_table.php'))->up();
         Schema::create('collections', function (Blueprint $table): void {
             $table->id();

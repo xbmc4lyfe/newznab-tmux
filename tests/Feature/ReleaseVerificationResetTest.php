@@ -7,6 +7,7 @@ namespace Tests\Feature;
 use App\Facades\Search;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\VerificationResetService;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
@@ -232,6 +233,7 @@ class ReleaseVerificationResetTest extends ReleaseVerificationCandidatesTest
         DB::table('release_verification_audit_retries')->insert(['release_id' => 999, 'next_attempt_at' => now(), 'reason' => 'NNTP unavailable']);
         DB::table('release_verification_state')->update(['audit_cursor' => 999, 'audit_retry_turn' => true]);
         $root = (string) config('release_verification.storage_path');
+        app(ScratchInventory::class)->register(1, 1);
         mkdir($root.'/scratch/1-1', 0700, true);
         file_put_contents($root.'/scratch/1-1/payload', 'old downloaded bytes');
         file_put_contents($root.'/status.json', 'old status');
@@ -239,6 +241,7 @@ class ReleaseVerificationResetTest extends ReleaseVerificationCandidatesTest
 
     private function assertResetState(): void
     {
+        $this->assertSame(0, DB::table('release_verification_scratch')->count());
         $this->assertSame(0, DB::table('release_verification_candidates')->count());
         $this->assertSame(0, DB::table('release_verification_audit_retries')->count());
         $state = DB::table('release_verification_state')->where('id', 1)->first();

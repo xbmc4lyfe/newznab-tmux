@@ -23,6 +23,7 @@ final class NzbManifestReader
             $files = [];
             $groups = [];
             $expected = 0;
+            $conflict = false;
             foreach ($document->head->meta ?? [] as $metadata) {
                 $value = (string) $metadata;
                 if ((string) $metadata['type'] === 'nntmux:verified-file-count'
@@ -36,10 +37,15 @@ final class NzbManifestReader
                 $parts = preg_match('/\(\d+\/(\d+)\)\s*$/', $subject, $count) ? (int) $count[1] : null;
                 $segments = [];
                 $observedParts = 0;
+                $partNumbers = [];
                 foreach ($file->segments->segment as $segment) {
                     $number = (int) $segment['number'];
                     $messageId = trim((string) $segment);
                     $segments[] = ['number' => $number, 'bytes' => (int) $segment['bytes'], 'messageid' => $messageId];
+                    if ($number < 1 || isset($partNumbers[$number])) {
+                        $conflict = true;
+                    }
+                    $partNumbers[$number] = true;
                     if ($number > 0 && $messageId !== '') {
                         $observedParts = max($observedParts, $number);
                     }
@@ -58,6 +64,9 @@ final class NzbManifestReader
             $manifest = ['subject' => $release->searchname, 'fromname' => $release->fromname, 'date' => $release->postdate,
                 'groups_id' => (int) $release->groups_id, 'regex_id' => 0, 'expected_files' => $expected,
                 'groups' => array_keys($groups), 'files' => $files, 'metadata_source' => $metadataSource];
+            if ($conflict) {
+                $manifest['conflict'] = true;
+            }
             if ($metadataSource === 'import' && is_int($release->categories_id ?? null) && $release->categories_id > 0) {
                 $manifest['categories_id'] = $release->categories_id;
             }
