@@ -2,6 +2,8 @@
 
 This is the historical first screen. The subsequent [fixed-sample validation](hot-workload-validation.md) resolves its hot-workload nonregression concern; retain these initial failures and limitations when interpreting the later result.
 
+Storage and replay pass counts below refer to the archived oracle's recorded checks. As described in the final validation's coverage limits, total cross-post row counts and canonical replay do not establish exact cross-post membership or replay-only metadata updates.
+
 The isolated screen completed on October 11, 2026, 19:03:57–19:07:31 America/Chicago. [Summary evidence](performance/evidence/2026-10-11-collection-primary-screen.json) records hashes, counts and pair-level ratios. Full private raw reports, plans, logs, source manifests and measured protocol are retained in `paired-evidence.tar.gz` under the existing benchmark scratch pointer; its hash is in the summary.
 
 For durable review, the [published raw screen](performance/evidence/raw/2026-10-11-initial-screen.tar.gz) and [complete report supplement](performance/evidence/raw/2026-10-11-initial-screen-reports.json.gz) are committed alongside the [follow-up artifacts](performance/evidence/raw/2026-10-11-followups.tar.gz) and [follow-up reports](performance/evidence/raw/2026-10-11-followups-reports.json.gz). The [publication manifest](performance/evidence/raw/2026-10-11-publication-manifest.json) records original and published hashes and path-only redactions; no observations or failures were removed.

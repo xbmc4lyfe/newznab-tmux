@@ -43196,5 +43196,19 @@
         "path_redacted": true
       }
     }
+  },
+  "exact_final_report": {
+    "file": "2026-10-11-fixed-study-exact-report.json.gz",
+    "gzip_sha256": "d5254841042d2fa904c38d881a0807fe2417473c912b3a3abb92e72700322c93",
+    "uncompressed_sha256": "338c98ff2a355d33e3b7dc995827ac62d27c51bc56fc47a930e6c76a4599a66c",
+    "uncompressed_bytes": 12353563,
+    "redacted": false
+  },
+  "candidate_source": {
+    "patch": "2026-10-11-collection-primary-source.patch",
+    "patch_sha256": "b90a3e9f2a2e966e7125aeabcf8f6e9ad25fed293360d157b093be8500e59973",
+    "baseline_revision": "54c140d7dc4c2500bf69115047b3aabfac6942f0",
+    "published_revision": "6a2555d57cca071f64d3d5315e3da82fde40c04f",
+    "handler_sha256": "7d58bf1cd097be7c22a3ecaec175b35166bd4ee7109dab76d1117f4b52768474"
   }
 }

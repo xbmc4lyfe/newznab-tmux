@@ -4,17 +4,21 @@ The fixed-sample isolated study completed October 11, 2026, 20:05:17–20:17:46 
 
 Durable [raw study artifacts](performance/evidence/raw/2026-10-11-fixed-study.tar.gz) retain all epochs, worker outcomes, plans and logs. The [complete report supplement](performance/evidence/raw/2026-10-11-fixed-study-reports.json.gz) includes the final report, handoff, randomized order, analysis and topology supplement. The [publication manifest](performance/evidence/raw/2026-10-11-publication-manifest.json) records original and published hashes. Only machine-specific absolute path strings were replaced; measured numbers, failures and observation order are unchanged. Archived scripts are provenance copies, not supported repository commands.
 
-The safe PRIMARY-access candidate passes the declared 10% hot-workload nonregression budget in this controlled profile. No additional source change, unhinted fallback, weakened lock or runtime tuning was needed.
+The [exact final report](performance/evidence/raw/2026-10-11-fixed-study-exact-report.json.gz), after gzip decompression, has the advertised SHA-256 `338c98ff2a355d33e3b7dc995827ac62d27c51bc56fc47a930e6c76a4599a66c`. This preserves the actual analyzed bytes separately from the equivalent parsed report supplement. The [tested source patch](performance/evidence/raw/2026-10-11-collection-primary-source.patch) reconstructs the candidate from source revision `54c140d7dc4c2500bf69115047b3aabfac6942f0`; the candidate CollectionHandler is also published in [squash commit 6a2555d57](https://github.com/xbmc4lyfe/newznab-tmux/blob/6a2555d57cca071f64d3d5315e3da82fde40c04f/app/Services/Binaries/CollectionHandler.php) with SHA-256 `7d58bf1cd097be7c22a3ecaec175b35166bd4ee7109dab76d1117f4b52768474`.
+
+The PRIMARY-access candidate passes the declared 10% hot-workload nonregression budget in this controlled profile. No additional source change, unhinted fallback, weakened lock or runtime tuning was needed.
 
 | Primary hot-workload metric | Candidate/baseline effect | 95% interval | Gate |
 |---|---:|---:|---|
 | Successful new-part throughput | 1.0018 | 0.9864–1.0174 | Lower bound ≥ 0.90: pass |
 | Full-service batch p95 latency | 0.9897 | 0.9680–1.0119 | Upper bound ≤ 1.10: pass |
 
-## Design and correctness
+## Design and recorded checks
+
+The archived epoch checks prove their recorded parts, aggregates, readiness and total cross-post row counts. They do not prove exact `(collections_id, group_name)` membership or replay-only membership/timestamp updates: canonical replay supplies no new membership and its verifier ignores `last_seen_at`. Treat the stored `correctness.passed` and `replay_passed` flags within that scope; they are not complete metadata-correctness claims. A supplemental semantic check is distinct from these immutable timing observations and cannot retroactively expand their checks.
 
 - Fixed 20 independent hot paired blocks, eight independently restored 10,240-part fixture epochs per source arm; four spread paired blocks with four epochs per arm as a secondary safeguard.
-- One warmup per arm retained separately: 352 measured epochs plus 48 warmups, all 400 initially correct. Replay, conflicting first-write checks and normal worker exits also passed throughout.
+- One warmup per arm retained separately: 352 measured epochs plus 48 warmups, all 400 passed the recorded initial storage checks. Canonical replay, conflicting first-write checks and normal worker exits also passed throughout.
 - Source order counterbalanced 10/10 for hot blocks and 2/2 for spread blocks with a fixed randomized schedule. No interim budget evaluations, optional stopping, outlier deletion or treating nested epochs as independent samples.
 - Primary effects are matched epoch-log throughput and p95 ratios averaged within each block; two-sided Student-t intervals use the 20 outer hot blocks. Aggregate work/time and pooled batch p95 are secondary diagnostics, not replacements for the preregistered primary metrics.
 - App and database used distinct physical cores through logical CPUs 11 and 10, without CFS quota throttling; memory stayed 512 MiB each and buffer pool 128 MiB. Source, runtime, schema, input, retry and correctness identities remained frozen.
@@ -27,7 +31,7 @@ The actual hot-table baseline and candidate both choose PRIMARY range access. Th
 
 ## Deadlock gains retained
 
-Across measured epochs, baseline deadlocks totaled 147 and candidate deadlocks zero, with all candidate storage correct. The spread safeguard's geometric throughput ratio was about 2.05 and p95 ratio about 0.146. It is secondary evidence with four outer blocks, not a general production speed claim.
+Across measured epochs, baseline deadlocks totaled 147 and candidate deadlocks zero, with all candidate epochs passing the recorded storage checks. The spread safeguard's geometric throughput ratio was about 2.05 and p95 ratio about 0.146. It is secondary evidence with four outer blocks, not a general production speed claim.
 
 Cumulative row-lock waiting still rose from 173,072 ms to 197,071 ms. Successful serialization and failed deadlock attempts have different costs. Do not describe the result as lower total waiting or universal deadlock elimination.
 

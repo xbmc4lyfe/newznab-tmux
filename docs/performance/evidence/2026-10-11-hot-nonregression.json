@@ -264,5 +264,13 @@
   "decision": "Declared10%hot nonregression budget passed; original12%screen penalty not persistent in controlled fixed study; safePRIMARYlocking retained. No unhinted fallback or weakenedlocks.",
   "report_sha256": "338c98ff2a355d33e3b7dc995827ac62d27c51bc56fc47a930e6c76a4599a66c",
   "analysis_sha256": "6f44d76fa373bcc9d3870a870531e414afd1a42610321f2cd48e62b303cca262",
-  "superseding_validation_sha256": "035d0b297321f862b4fff180be7ff7a7bef0a19d2b331487d2689e4c6591ab14"
+  "superseding_validation_sha256": "035d0b297321f862b4fff180be7ff7a7bef0a19d2b331487d2689e4c6591ab14",
+  "recorded_correctness_scope": {
+    "storage_and_aggregate_checks": true,
+    "crosspost_total_row_count": true,
+    "exact_crosspost_membership_checked": false,
+    "canonical_replay_checked": true,
+    "replay_only_membership_or_timestamp_update_checked": false,
+    "interpretation": "Historical passed flags apply to the recorded checks only; supplemental semantic checks do not expand the original epoch coverage."
+  }
 }
