@@ -2,7 +2,7 @@
 
 ## Retest verification and throughput PRs after the expedited rollout
 
-The 2026-10-12 throughput rollout was explicitly requested with minimal targeted checks and no PR review. Complete the deferred review and testing for PR #53, upstream PR #68 integration, and the follow-up article-concurrency/pipelining, candidate-worker, and native-decoder PR before treating the expedited changes as fully qualified.
+The 2026-10-12 throughput rollout was explicitly requested with minimal targeted checks and no PR review. Complete the deferred review and testing for PR #53, upstream PR #68 integration, and [PR #70](https://github.com/xbmc4lyfe/newznab-tmux/pull/70) (article concurrency/pipelining, candidate workers, and native decoding) before treating the expedited changes as fully qualified.
 
 - [ ] Review the final merged diffs and run the complete PHPUnit and native suites.
 - [ ] Retest pipelined BODY response ordering, missing/truncated/oversized articles, dot-stuffing, disconnects, cancellation, and alternate-provider retries.
