@@ -149,6 +149,27 @@ class ReleasesRunnerEligibilityTest extends TestCase
     }
 
     #[DataProvider('groupProcessingModes')]
+    public function test_ready_failure_recovered_by_full_processing_returns_for_maintenance(string $method): void
+    {
+        foreach ([1, 2, 109] as $id) {
+            DB::table('usenet_groups')->insert(['id' => $id, 'name' => 'alt.test.'.$id, 'active' => 1, 'backfill' => 0]);
+            DB::table('collections')->insert(['groups_id' => $id]);
+        }
+        $runner = new class extends CapturingEligibilityReleasesRunner
+        {
+            protected function runParallelCommandsWithCompletion(array $commands, int $maxProcesses, callable $onComplete): void
+            {
+                if (in_array('--ready-only', reset($commands), true)) {
+                    throw new RuntimeException('ready pass temporarily failed');
+                }
+                parent::runParallelCommandsWithCompletion($commands, $maxProcesses, $onComplete);
+            }
+        };
+        $runner->{$method}();
+        $this->assertCount(3, $runner->commands);
+    }
+
+    #[DataProvider('groupProcessingModes')]
     public function test_cancelling_the_ready_pass_does_not_launch_full_preparation(string $method): void
     {
         if (! function_exists('pcntl_signal') || ! function_exists('posix_kill')) {

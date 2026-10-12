@@ -70,6 +70,8 @@ final class ReleaseProcessingService
 
     private const string COLLECTION_WINDOW_CURSOR_PREFIX = 'cbp:release-window:cursor:';
 
+    private const string READY_WINDOW_CURSOR_PREFIX = 'cbp:release-ready-window:cursor:';
+
     private const string PRIORITY_WINDOW_CURSOR_PREFIX = 'cbp:release-priority-window:cursor:';
 
     private const int PRIORITY_GROUP_PROBES_PER_PASS = 20;
@@ -403,13 +405,21 @@ final class ReleaseProcessingService
             throw new \InvalidArgumentException('Ready release processing requires a positive group ID.');
         }
         $limit = min(self::READY_WINDOW_SIZE, max(1, $this->settings->releaseCreationLimit));
-        $state = ['max_id' => (int) Collection::query()->max('id'), 'group_ids' => [$groupId], 'position' => 0, 'cursors' => [], 'exhausted' => []];
+        $cursorKey = self::READY_WINDOW_CURSOR_PREFIX.$groupId;
+        $savedState = Cache::get($cursorKey);
+        $state = $this->isValidPriorityWindowState($savedState, $groupId) ? $savedState : ['max_id' => (int) Collection::query()->max('id'), 'group_ids' => [$groupId], 'position' => 0, 'cursors' => [], 'exhausted' => []];
         $probes = 0;
         $window = $this->nextPriorityCollectionWindow($groupId, $state, $limit, $probes, []);
         if ($window['ids'] === [] && ! NzbCreationCandidateQuery::baseBuilder($groupId)->exists()) {
+            $this->persistCollectionWindowState($cursorKey, $state, $window['more']);
+
             return ['releases' => 0, 'nzbs' => 0, 'dupes' => 0, 'iterations' => 0];
         }
-        [$result, $nzbs] = $this->processReleaseCollectionWindow($groupId, $window['ids'], null, null, $limit);
+        try {
+            [$result, $nzbs] = $this->processReleaseCollectionWindow($groupId, $window['ids'], null, null, $limit);
+        } finally {
+            $this->persistCollectionWindowState($cursorKey, $state, $window['more']);
+        }
 
         return ['releases' => $result->added, 'nzbs' => $nzbs, 'dupes' => $result->dupes, 'iterations' => 1];
     }
@@ -1114,18 +1124,26 @@ final class ReleaseProcessingService
      */
     public function createReleasesAndNzbs(int|string|null $groupID, ?array $allowedIds = null, ?int $nzbLimit = null): array
     {
-        return app(SearchService::class)->deferReleaseUpdates(fn (): array => [
-            $this->createReleases($groupID, $allowedIds),
-            $nzbLimit === null ? $this->createNZBs($groupID) : $this->createNZBs($groupID, $nzbLimit),
-        ]);
+        return app(SearchService::class)->deferReleaseUpdates(function () use ($groupID, $allowedIds, $nzbLimit): array {
+            $result = $this->createReleases($groupID, $allowedIds);
+            if ($nzbLimit === null) {
+                return [$result, $this->createNZBs($groupID)];
+            }
+            $preferredIds = Collection::query()->whereIn('id', $allowedIds ?? [])
+                ->whereNotNull('releases_id')->pluck('releases_id')->map(static fn ($id): int => (int) $id)->all();
+
+            return [$result, $this->createNZBs($groupID, $nzbLimit, $preferredIds)];
+        });
     }
 
     /**
      * Create NZB files from releases that don't have them yet.
      *
+     * @param  list<int>  $preferredIds
+     *
      * @throws Throwable
      */
-    public function createNZBs(int|string|null $groupID, ?int $maxReleases = null): int
+    public function createNZBs(int|string|null $groupID, ?int $maxReleases = null, array $preferredIds = []): int
     {
         $startTime = now()->toImmutable();
         $this->outputSubHeader('Creating NZB Files');
@@ -1148,7 +1166,7 @@ final class ReleaseProcessingService
             'nzbstatus',
             NzbCreationCandidateQuery::CLAIM_TOKEN_COLUMN,
         ];
-        $releases = $maxReleases === null ? null : NzbCreationCandidateQuery::claimBatch($groupID, $limit, $claimToken, $columns);
+        $releases = $maxReleases === null ? null : NzbCreationCandidateQuery::claimBatch($groupID, $limit, $claimToken, $columns, $preferredIds);
         $total = $releases === null ? min(NzbCreationCandidateQuery::baseBuilder($groupID)->count(), $limit) : $releases->count();
 
         if ($total > 0) {

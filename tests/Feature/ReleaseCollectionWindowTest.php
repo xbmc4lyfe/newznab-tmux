@@ -725,6 +725,47 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->assertSame(10, $full['nzbs']);
     }
 
+    public function test_ready_window_publishes_new_releases_before_newer_nzb_backlog(): void
+    {
+        $this->insertCollection(100);
+        foreach (range(1, 3) as $id) {
+            DB::table('releases')->insert(['id' => $id, 'guid' => 'backlog-'.$id, 'name' => 'Backlog', 'groups_id' => 1, 'postdate' => now()->addDay()]);
+        }
+        $result = $this->service(new WindowTestReleaseCreationService)->processReadyReleaseWindow(1);
+        $this->assertSame(1, $result['releases']);
+        $this->assertSame(1, (int) DB::table('releases')->where('id', 100)->value('nzbstatus'));
+        $this->assertSame(3, $result['nzbs']);
+    }
+
+    public function test_ready_snapshot_advances_past_failed_rows_and_new_smaller_arrivals(): void
+    {
+        foreach (range(1, 4) as $id) {
+            $this->insertCollection($id);
+        }
+        $this->service(new WindowTestReleaseCreationService(failAll: true))->processReadyReleaseWindow(1);
+        foreach (range(100, 102) as $id) {
+            $this->insertCollection($id, size: 2000);
+        }
+        $next = $this->service(new WindowTestReleaseCreationService)->processReadyReleaseWindow(1);
+        $this->assertSame(1, $next['releases']);
+        $this->assertSame([4], DB::table('releases')->pluck('id')->all());
+        $retry = $this->service(new WindowTestReleaseCreationService)->processReadyReleaseWindow(1);
+        $this->assertSame(3, $retry['releases']);
+        $this->assertSame(3, DB::table('releases')->whereIn('id', [100, 101, 102])->count());
+    }
+
+    public function test_empty_saved_snapshot_clears_before_processing_new_arrivals(): void
+    {
+        foreach (range(1, 4) as $id) {
+            $this->insertCollection($id);
+        }
+        $this->service(new WindowTestReleaseCreationService(failAll: true))->processReadyReleaseWindow(1);
+        DB::table('collections')->delete();
+        $this->assertSame(0, $this->service(new WindowTestReleaseCreationService)->processReadyReleaseWindow(1)['releases']);
+        $this->insertCollection(100, size: 2000);
+        $this->assertSame(1, $this->service(new WindowTestReleaseCreationService)->processReadyReleaseWindow(1)['releases']);
+    }
+
     private function service(WindowTestReleaseCreationService $creation, ?CollectionCleanupService $cleanup = null, ?BinariesConfig $binariesConfig = null): ReleaseProcessingService
     {
         return (new ReleaseProcessingService(

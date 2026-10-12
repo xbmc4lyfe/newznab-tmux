@@ -61,7 +61,7 @@ class ReleasesRunner extends BaseRunner
         }
 
         $streaming = (bool) config('nntmux.stream_fork_output', false);
-        $readyFailure = $this->runReadyReleasePass(array_map(static fn (array $group): int => (int) $group['id'], $uGroups), $maxProcesses, $streaming);
+        $this->runReadyReleasePass(array_map(static fn (array $group): int => (int) $group['id'], $uGroups), $maxProcesses, $streaming);
 
         // Streaming mode
         if ((bool) config('nntmux.stream_fork_output', false) === true) {
@@ -70,9 +70,6 @@ class ReleasesRunner extends BaseRunner
                 $commands[] = $this->buildDnrCommand('releases  '.$group['id']);
             }
             $this->runStreamingCommands($commands, $maxProcesses, 'releases');
-            if ($readyFailure !== null) {
-                throw new RuntimeException('Ready release pass failed.', 0, $readyFailure);
-            }
 
             return;
         }
@@ -89,9 +86,6 @@ class ReleasesRunner extends BaseRunner
                 echo $output;
                 cli()->primary('Finished performing release processing for group ID: '.$groupId);
             });
-            if ($readyFailure !== null) {
-                throw new RuntimeException('Ready release pass failed.', 0, $readyFailure);
-            }
         } catch (\Throwable $e) {
             Log::error('Release processing batch failed: '.$e->getMessage());
             cli()->error('Release processing failed: '.$e->getMessage());
@@ -112,7 +106,7 @@ class ReleasesRunner extends BaseRunner
         }
 
         $streaming = (bool) config('nntmux.stream_fork_output', false);
-        $readyFailure = $this->runReadyReleasePass(array_map(static fn (object $group): int => (int) $group->id, $groups), $maxProcesses, $streaming);
+        $this->runReadyReleasePass(array_map(static fn (object $group): int => (int) $group->id, $groups), $maxProcesses, $streaming);
 
         // Streaming mode
         if ((bool) config('nntmux.stream_fork_output', false) === true) {
@@ -121,9 +115,6 @@ class ReleasesRunner extends BaseRunner
                 $commands[] = $this->buildDnrCommand('update_per_group  '.$group->id);
             }
             $this->runStreamingCommands($commands, $maxProcesses, 'update_per_group');
-            if ($readyFailure !== null) {
-                throw new RuntimeException('Ready release pass failed.', 0, $readyFailure);
-            }
 
             return;
         }
@@ -141,9 +132,6 @@ class ReleasesRunner extends BaseRunner
                 $name = UsenetGroup::getNameByID($groupId);
                 cli()->primary('Finished updating binaries, processing releases and additional postprocessing for group: '.$name);
             });
-            if ($readyFailure !== null) {
-                throw new RuntimeException('Ready release pass failed.', 0, $readyFailure);
-            }
         } catch (\Throwable $e) {
             Log::error('Update per group batch failed: '.$e->getMessage());
             cli()->error('Update per group failed: '.$e->getMessage());
@@ -152,7 +140,7 @@ class ReleasesRunner extends BaseRunner
     }
 
     /** @param list<int> $groupIds */
-    private function runReadyReleasePass(array $groupIds, int $maxProcesses, bool $streaming): ?\Throwable
+    private function runReadyReleasePass(array $groupIds, int $maxProcesses, bool $streaming): void
     {
         $commands = [];
         foreach ($groupIds as $groupId) {
@@ -178,10 +166,8 @@ class ReleasesRunner extends BaseRunner
             }
             Log::error('Ready release pass failed: '.$exception->getMessage());
 
-            return $exception;
+            return;
         }
-
-        return null;
     }
 
     public function fixRelNames(string $mode, int $maxPerRun, int $maxThreads): void
