@@ -37,6 +37,7 @@ pub struct Par2Metadata {
     pub packed_layout_present: bool,
     pub recovery_percentage_basis: &'static str,
     pub optional_packet_summaries: BTreeMap<String, Vec<OptionalPacketSummary>>,
+    pub unicode_filename_packets: Vec<UnicodeFilenamePacket>,
     pub packet_summaries: Vec<PacketSummary>,
     pub packet_type_counts: BTreeMap<String, usize>,
 }
@@ -130,6 +131,21 @@ pub struct OptionalPacketSummary {
 }
 
 #[derive(Debug, Serialize)]
+pub struct UnicodeFilenamePacket {
+    pub packet_offset: usize,
+    pub recovery_set_id: String,
+    pub file_id: Option<String>,
+    pub filename_field_bytes_length: Option<usize>,
+    pub filename_field_sha256: Option<String>,
+    pub filename_field_prefix_hex: Option<String>,
+    pub filename_field_prefix_truncated: Option<bool>,
+    pub source_file_present: Option<bool>,
+    pub main_packet_membership: Option<bool>,
+    pub duplicate_occurrence_count: Option<usize>,
+    pub duplicate_name_conflict: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct PacketSummary {
     pub offset: usize,
     pub packet_bytes: usize,
@@ -143,6 +159,8 @@ pub struct PacketSummary {
     pub payload_prefix_truncated: bool,
     pub recovery_exponent: Option<u32>,
     pub recovery_data_sha256: Option<String>,
+    pub main_body_md5: Option<String>,
+    pub main_body_md5_matches_declared_set_id: Option<bool>,
 }
 
 #[derive(Default)]
@@ -160,6 +178,7 @@ struct Parsed {
     recovery_exponents_observed_by_set: BTreeMap<String, BTreeSet<u32>>,
     packet_definitions: BTreeMap<String, String>,
     optional_packets: BTreeMap<String, Vec<OptionalPacketSummary>>,
+    unicode_filename_packets: Vec<UnicodeFilenamePacket>,
     packet_summaries: Vec<PacketSummary>,
     packet_type_counts: BTreeMap<String, usize>,
     packet_count: usize,
@@ -218,6 +237,9 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
             .flatten();
         let recovery_data_sha256 = (packet_type == "PAR 2.0\\0RecvSlic" && payload.len() >= 4)
             .then(|| sha256_hex(&payload[4..]));
+        let main_body_md5 = (packet_type == "PAR 2.0\\0Main").then(|| hex(&md5(payload)));
+        let main_body_md5_matches_declared_set_id =
+            main_body_md5.as_ref().map(|body_md5| body_md5 == &set_id);
 
         parsed.packet_count += 1;
         *parsed
@@ -238,6 +260,8 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
             payload_prefix_truncated: payload.len() > MAX_OPTIONAL_HEX_BYTES,
             recovery_exponent,
             recovery_data_sha256: recovery_data_sha256.clone(),
+            main_body_md5,
+            main_body_md5_matches_declared_set_id,
         });
 
         if !checksum_valid {
@@ -406,6 +430,25 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
             "PAR 2.0\\0UniFileN" | "PAR 2.0\\0CommASCI" | "PAR 2.0\\0CommUni"
             | "PAR 2.0\\0FileSlic" | "PAR 2.0\\0PkdMain" | "PAR 2.0\\0PkdRecvS"
             | "PAR 2.0\\0RFSC" => {
+                if packet_type == "PAR 2.0\\0UniFileN" {
+                    let file_id = payload.get(..16).map(hex);
+                    let filename_field = payload.get(16..);
+                    parsed.unicode_filename_packets.push(UnicodeFilenamePacket {
+                        packet_offset: offset,
+                        recovery_set_id: set_id.clone(),
+                        file_id,
+                        filename_field_bytes_length: filename_field.map(<[u8]>::len),
+                        filename_field_sha256: filename_field.map(sha256_hex),
+                        filename_field_prefix_hex: filename_field
+                            .map(|field| hex(&field[..field.len().min(MAX_OPTIONAL_HEX_BYTES)])),
+                        filename_field_prefix_truncated: filename_field
+                            .map(|field| field.len() > MAX_OPTIONAL_HEX_BYTES),
+                        source_file_present: None,
+                        main_packet_membership: None,
+                        duplicate_occurrence_count: None,
+                        duplicate_name_conflict: None,
+                    });
+                }
                 let type_key = packet_type.clone();
                 let prefix = &payload[..payload.len().min(MAX_OPTIONAL_HEX_BYTES)];
                 parsed
@@ -423,6 +466,37 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
         }
 
         offset += packet_len;
+    }
+
+    let mut unicode_filename_groups: BTreeMap<(String, String), (usize, BTreeSet<String>)> =
+        BTreeMap::new();
+    for unicode_filename in &parsed.unicode_filename_packets {
+        if let (Some(file_id), Some(filename_hash)) = (
+            unicode_filename.file_id.as_ref(),
+            unicode_filename.filename_field_sha256.as_ref(),
+        ) {
+            let entry = unicode_filename_groups
+                .entry((unicode_filename.recovery_set_id.clone(), file_id.clone()))
+                .or_default();
+            entry.0 = entry.0.saturating_add(1);
+            entry.1.insert(filename_hash.clone());
+        }
+    }
+    for unicode_filename in &mut parsed.unicode_filename_packets {
+        let Some(file_id) = unicode_filename.file_id.as_ref() else {
+            continue;
+        };
+        let key = (unicode_filename.recovery_set_id.clone(), file_id.clone());
+        unicode_filename.source_file_present = Some(parsed.sources_by_set.contains_key(&key));
+        unicode_filename.main_packet_membership = parsed.mains_by_set.get(&key.0).map(|main| {
+            main.all_file_ids
+                .iter()
+                .any(|main_file_id| main_file_id == file_id)
+        });
+        if let Some((count, name_hashes)) = unicode_filename_groups.get(&key) {
+            unicode_filename.duplicate_occurrence_count = Some(*count);
+            unicode_filename.duplicate_name_conflict = Some(name_hashes.len() > 1);
+        }
     }
 
     let recovery_set_ids = parsed
@@ -712,6 +786,7 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
             "unique-valid-recovery-exponents-over-recoverable-source-blocks"
         },
         optional_packet_summaries: parsed.optional_packets,
+        unicode_filename_packets: parsed.unicode_filename_packets,
         packet_summaries: parsed.packet_summaries,
         packet_type_counts: parsed.packet_type_counts,
     }
