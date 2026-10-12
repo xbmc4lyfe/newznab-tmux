@@ -8,7 +8,6 @@ use App\Services\CollectionCleanupService;
 use App\Services\Nzb\NzbService;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use RuntimeException;
@@ -76,18 +75,15 @@ final class CandidateRepository
                         'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
                 }
                 if ($existing === null) {
-                    $candidateId = DB::table('release_verification_candidates')->insertGetId($values);
+                    DB::table('release_verification_candidates')->insert($values);
                 } else {
-                    $candidateId = (int) $existing->id;
                     DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
                 }
                 DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
                 $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false, manifestArchived: true);
                 if ($expired) {
-                    $expiredVersion = (int) ($values['version'] ?? $existing->version ?? 1);
-                    DB::afterCommit(function () use ($path, $candidateId, $expiredVersion): void {
+                    DB::afterCommit(function () use ($path): void {
                         $this->store->deleteIfUnreferenced($path);
-                        $this->deleteScratchThroughVersion($candidateId, $expiredVersion);
                     });
                 }
                 if ($existing !== null && $existing->manifest_path !== $path) {
@@ -314,7 +310,6 @@ final class CandidateRepository
                     'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
                 DB::afterCommit(function () use ($row): void {
                     $this->store->deleteIfUnreferenced($row->manifest_path);
-                    $this->deleteScratchThroughVersion((int) $row->id, (int) $row->version);
                 });
             });
         }
@@ -373,18 +368,7 @@ final class CandidateRepository
                 'manifest_path' => '', 'manifest_bytes' => 0]);
             DB::afterCommit(function () use ($candidate): void {
                 $this->store->deleteIfUnreferenced($candidate->manifest_path);
-                $this->deleteScratchThroughVersion((int) $candidate->id, (int) $candidate->version);
             });
         }, 5);
-    }
-
-    private function deleteScratchThroughVersion(int $candidateId, int $version): void
-    {
-        $root = (string) config('release_verification.storage_path').'/scratch/';
-        foreach (glob($root.$candidateId.'-*', GLOB_ONLYDIR) ?: [] as $directory) {
-            if (preg_match('/\A'.$candidateId.'-([0-9]+)\z/', basename($directory), $match) === 1 && (int) $match[1] <= $version) {
-                File::deleteDirectory($directory);
-            }
-        }
     }
 }

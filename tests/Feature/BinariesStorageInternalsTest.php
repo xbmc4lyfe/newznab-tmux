@@ -14,6 +14,7 @@ use App\Services\Binaries\HeaderStorageTransaction;
 use App\Services\Binaries\PartHandler;
 use App\Services\BlacklistService;
 use App\Services\CollectionsCleaningService;
+use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
@@ -21,6 +22,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Mockery;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Tests\Support\ConfigurationTestBuilder;
 use Tests\TestCase;
 
 class BinariesStorageInternalsTest extends TestCase
@@ -620,6 +622,14 @@ class BinariesStorageInternalsTest extends TestCase
 
         $this->assertBackfillPosition(301, 2);
         $this->assertSame(['401-500', '301-400'], $nntp->ranges);
+
+        $runtime = app(ProcessingRuntimeStateRepository::class);
+        $runtime->setTmuxRunning(true);
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $runtime->requestStop();
+        $runtime->setTmuxRunning(false);
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('stop_requested'));
     }
 
     public function test_scan_level_capacity_race_queues_launched_range_without_advancing_backfill(): void
@@ -703,8 +713,7 @@ class BinariesStorageInternalsTest extends TestCase
         DB::table('release_verification_state')->insert(['id' => 1, 'pending_bytes' => $pendingBytes]);
         DB::statement('CREATE TABLE usenet_groups (id INTEGER PRIMARY KEY, name TEXT, first_record INT, first_record_postdate TEXT, last_updated TEXT)');
         DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.test', 'first_record' => 501, 'first_record_postdate' => '2026-10-11 00:00:00']);
-        DB::statement('CREATE TABLE processing_runtime_states (id INTEGER PRIMARY KEY, last_binary_run_at TEXT, created_at TEXT, updated_at TEXT)');
-        DB::table('processing_runtime_states')->insert(['id' => 1]);
+        ConfigurationTestBuilder::installDefaults();
         $pdo = DB::connection()->getPdo();
         $pdo->sqliteCreateFunction('FROM_UNIXTIME', static fn ($time): string => date('Y-m-d H:i:s', (int) $time));
         $pdo->sqliteCreateFunction('NOW', static fn (): string => date('Y-m-d H:i:s'));

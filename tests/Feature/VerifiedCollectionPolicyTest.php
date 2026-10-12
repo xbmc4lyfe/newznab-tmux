@@ -12,6 +12,7 @@ use App\Services\ReleaseProcessingService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
+use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use App\Services\YencService;
@@ -170,6 +171,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $manifest['verified_file_count'] = count($names);
         $this->limits($min, $max, $files, $groupMin, $groupFiles);
         $this->publicationSchema();
+        app(ScratchInventory::class)->register((int) $claim->id, (int) $claim->version);
         $scratch = config('release_verification.storage_path').'/scratch/'.$claim->id.'-'.$claim->version;
         app('files')->ensureDirectoryExists($scratch);
         file_put_contents($scratch.'/payload', 'verified bytes');
@@ -179,6 +181,8 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('filtered', DB::table('release_verification_candidates')->value('status'));
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
         $this->assertFileDoesNotExist(app(ManifestStore::class)->path($claim->manifest_path));
+        $this->assertFileExists($scratch.'/payload');
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
         $this->assertDirectoryDoesNotExist($scratch);
         $this->travel(16)->minutes();
         $this->assertNull($repository->claim());

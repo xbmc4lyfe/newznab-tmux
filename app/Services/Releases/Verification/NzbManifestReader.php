@@ -54,7 +54,7 @@ final class NzbManifestReader
                     $groups[(string) $group] = true;
                 }
                 $files[] = ['key' => hash('sha256', $subject), 'subject' => preg_replace('/\s*\(\d+\/\d+\)\s*$/', '', $subject),
-                    'totalparts' => $parts ?? $observedParts, 'segments' => $segments];
+                    'totalparts' => $parts ?? $observedParts, 'totalparts_inferred' => $parts === null, 'segments' => $segments];
             }
             if ($files === []) {
                 throw new RuntimeException('NZB contains no files.');

@@ -13,6 +13,7 @@ use App\Services\ReleaseCleaningService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
+use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Database\Schema\Blueprint;
@@ -63,6 +64,7 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
         $repository->archive($this->arrival());
         $claim = $repository->claim();
         $repository->finish($claim, new VerificationResult('unrepairable', 'Insufficient validated recovery data.'));
+        app(ScratchInventory::class)->register((int) $claim->id, (int) $claim->version);
         $scratch = config('release_verification.storage_path').'/scratch/'.$claim->id.'-'.$claim->version;
         app('files')->ensureDirectoryExists($scratch);
         file_put_contents($scratch.'/payload', 'retained bytes');
@@ -71,6 +73,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
         $this->assertSame('expired', DB::table('release_verification_candidates')->value('status'));
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
         $this->assertFileDoesNotExist(app(ManifestStore::class)->path($claim->manifest_path));
+        $this->assertFileExists($scratch.'/payload');
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
         $this->assertDirectoryDoesNotExist($scratch);
     }
 

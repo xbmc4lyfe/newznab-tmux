@@ -15,6 +15,7 @@ final readonly class VerifiedArticle
         public int $size,
         public int $offset,
         public int $part,
+        public ?int $totalParts,
         public string $bytes,
         public ?string $fileChecksum,
     ) {}
@@ -30,10 +31,18 @@ final readonly class VerifiedArticle
             || preg_match('/[\x00-\x1f\x7f\/\\\\]/', $name)) {
             throw new RuntimeException('Unsafe article filename.');
         }
-        foreach ([$frame->header['size'], $frame->header['part'] ?? '1', $frame->part['begin'] ?? '1'] as $number) {
+        $numbers = [$frame->header['size'], $frame->header['part'] ?? '1', $frame->part['begin'] ?? '1'];
+        if (isset($frame->header['total'])) {
+            $numbers[] = $frame->header['total'];
+        }
+        foreach ($numbers as $number) {
             if (! ctype_digit($number) || strlen($number) > 18 || (int) $number < 1) {
                 throw new RuntimeException('Invalid article dimensions.');
             }
+        }
+        $totalParts = isset($frame->header['total']) ? (int) $frame->header['total'] : null;
+        if ($totalParts !== null && (int) ($frame->header['part'] ?? 1) > $totalParts) {
+            throw new RuntimeException('Article part number exceeds its declared total.');
         }
         if (! isset($frame->trailer[$frame->part === null ? 'crc32' : 'pcrc32'])) {
             throw new RuntimeException('Article checksum is required.');
@@ -51,6 +60,6 @@ final readonly class VerifiedArticle
         }
 
         return new self($name, (int) $frame->header['size'], (int) ($frame->part['begin'] ?? 1) - 1,
-            (int) ($frame->header['part'] ?? 1), $decoded, isset($frame->trailer['crc32']) ? strtolower(str_pad($frame->trailer['crc32'], 8, '0', STR_PAD_LEFT)) : null);
+            (int) ($frame->header['part'] ?? 1), $totalParts, $decoded, isset($frame->trailer['crc32']) ? strtolower(str_pad($frame->trailer['crc32'], 8, '0', STR_PAD_LEFT)) : null);
     }
 }

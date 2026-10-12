@@ -305,6 +305,8 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
         stream_wrapper_register('scratch-enumeration', ScratchEnumerationProbe::class);
         ScratchEnumerationProbe::$reads = 0;
         try {
+            $this->assertTrue(is_readable('scratch-enumeration://root/scratch'));
+            $this->assertTrue(is_executable('scratch-enumeration://root/scratch'));
             $command = app(VerifyReleaseCandidates::class);
             (new \ReflectionMethod($command, 'cleanupTerminalScratch'))->invoke($command, 'scratch-enumeration://root');
             $this->assertSame(0, ScratchEnumerationProbe::$reads);
@@ -463,7 +465,7 @@ final class ScratchEnumerationProbe
     /** @return array<string, int> */
     public function url_stat(string $path, int $flags): array
     {
-        return ['mode' => 0040000 | 0700];
+        return ['mode' => 0040000 | 0755];
     }
 
     public function dir_opendir(string $path, int $options): bool

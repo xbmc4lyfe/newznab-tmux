@@ -272,6 +272,109 @@ class ReleaseVerificationPayloadTest extends TestCase
         }
     }
 
+    /** @return iterable<string, array{int, int, int, bool}> */
+    public static function yencFileTotals(): iterable
+    {
+        yield 'body three contradicts explicit two' => [2, 3, 3, false];
+        yield 'frame totals disagree' => [2, 2, 3, false];
+        yield 'consistent explicit two passes' => [2, 2, 2, true];
+        yield 'missing third part remains incomplete without parity' => [3, 3, 3, false];
+    }
+
+    #[DataProvider('yencFileTotals')]
+    public function test_yenc_part_totals_must_agree_with_frames_and_explicit_nzb_inventory(int $manifestParts, int $firstTotal, int $secondTotal, bool $passes): void
+    {
+        $articles = ['first@article' => YencArticles::part('hell', 'movie.mkv', 8, 1, 1, $firstTotal),
+            'tail@article' => YencArticles::part('tail', 'movie.mkv', 8, 2, 5, $secondTotal)];
+        $xml = '<nzb><file subject="[1/1] movie.mkv (1/'.$manifestParts.')"><groups><group>alt.test</group></groups><segments>'
+            .'<segment number="1" bytes="4">first@article</segment><segment number="2" bytes="4">tail@article</segment></segments></file></nzb>';
+        $manifest = (new NzbManifestReader)->read($xml, (object) ['searchname' => 'fixture', 'fromname' => 'fixture',
+            'postdate' => '2026-10-11 12:00:00', 'groups_id' => 1]);
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $result = $verifier->verify($manifest, $scratch, static function (): void {});
+            if ($result->passed()) {
+                $this->assertSame('helltail', file_get_contents($scratch.'/data/movie.mkv'));
+            }
+            $this->assertSame($passes, $result->passed(), $result->reason);
+            if ($passes) {
+                $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', 'helltail');
+            }
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function invalidYencTotals(): iterable
+    {
+        yield 'zero' => ['0'];
+        yield 'negative' => ['-1'];
+        yield 'not decimal' => ['two'];
+        yield 'empty' => [''];
+        yield 'numeric overflow' => [str_repeat('9', 19)];
+        yield 'part exceeds total' => ['1'];
+    }
+
+    #[DataProvider('invalidYencTotals')]
+    public function test_yenc_optional_total_must_be_positive_bounded_and_cover_its_part(string $total): void
+    {
+        $raw = str_replace('total=2', 'total='.$total, YencArticles::part('tail', 'movie.mkv', 8, 2, 5, 2));
+        $this->expectException(\RuntimeException::class);
+        VerifiedArticle::decode($raw);
+    }
+
+    public function test_inferred_nzb_part_count_can_expand_from_consistent_yenc_totals_for_real_partial_par2_repair_and_replay(): void
+    {
+        $bytes = str_repeat('movie-data', 64);
+        [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', $bytes, 'set');
+        $piece = intdiv(strlen($bytes), 3);
+        $articles['source-1@article'] = YencArticles::part(substr($bytes, 0, $piece), 'movie.mkv', strlen($bytes), 1, 1, 3);
+        $articles['source-2@article'] = YencArticles::part(substr($bytes, $piece, $piece), 'movie.mkv', strlen($bytes), 2, $piece + 1, 3);
+        $files[0]['segments'] = [['number' => 1, 'messageid' => 'source-1@article', 'bytes' => $piece],
+            ['number' => 2, 'messageid' => 'source-2@article', 'bytes' => $piece]];
+        $xml = '<nzb>';
+        foreach ($files as $index => $file) {
+            $xml .= '<file subject="['.($index + 1).'/'.count($files).'] '.$file['subject'].'"><groups><group>alt.test</group></groups><segments>';
+            foreach ($file['segments'] as $segment) {
+                $xml .= '<segment number="'.$segment['number'].'" bytes="'.$segment['bytes'].'">'.$segment['messageid'].'</segment>';
+            }
+            $xml .= '</segments></file>';
+        }
+        $xml .= '</nzb>';
+        $manifest = (new NzbManifestReader)->read($xml, (object) ['searchname' => 'fixture', 'fromname' => 'fixture',
+            'postdate' => '2026-10-11 12:00:00', 'groups_id' => 1]);
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $this->assertSame(2, $manifest['files'][0]['totalparts']);
+            $result = $verifier->verify($manifest, $scratch, static function (): void {});
+            $this->assertSame('repaired', $result->verdict, $result->reason);
+            $this->assertSame(3, $result->manifest['files'][0]['totalparts'], 'Published subject total must agree with the available bodies without inventing missing article IDs.');
+            $this->assertSame([1, 2], array_column($result->manifest['files'][0]['segments'], 'number'));
+            $this->assertSame($bytes, file_get_contents($scratch.'/data/movie.mkv'));
+            $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', $bytes);
+        } finally {
+            $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_filename_total_text_is_not_header_inventory_and_absent_total_singlepart_remains_valid(): void
+    {
+        $raw = (new YencService)->encode('hello', 'movie total=0.mkv');
+        $article = VerifiedArticle::decode($raw);
+        $this->assertNull($article->totalParts);
+        $this->assertSame('movie total=0.mkv', $article->name);
+        $this->assertSame('hello', $article->bytes);
+    }
+
+    public function test_singlepart_frame_with_explicit_zero_total_is_invalid_even_without_multipart_range(): void
+    {
+        $raw = str_replace('=ybegin ', '=ybegin total=0 ', (new YencService)->encode('hello', 'movie.mkv'));
+        $this->expectException(\RuntimeException::class);
+        VerifiedArticle::decode($raw);
+    }
+
     public function test_oversized_cached_article_is_evicted_even_when_provider_is_unavailable(): void
     {
         [$verifier, $scratch] = $this->verifier([]);

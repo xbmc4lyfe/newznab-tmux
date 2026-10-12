@@ -9,6 +9,7 @@ use App\Services\ReleaseCleaningService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
+use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Database\QueryException;
@@ -110,6 +111,68 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
     }
 
     #[DataProvider('terminalTransitions')]
+    public function test_terminal_callbacks_leave_registered_cleanup_to_the_worker(string $transition): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->arrival());
+        $claim = $repository->claim();
+        $scratch = $this->scratch((int) $claim->id, (int) $claim->version);
+        $external = dirname($scratch).'/'.$claim->id.'-0';
+        mkdir($external);
+        file_put_contents($external.'/payload', 'unregistered inventory');
+
+        $this->terminateCandidate($claim, $transition);
+
+        $this->assertFileExists($scratch.'/payload');
+        $this->assertFileExists($external.'/payload');
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertFileDoesNotExist(app(ManifestStore::class)->path($claim->manifest_path));
+        $this->assertSame(1, DB::table('release_verification_scratch')->count());
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->assertDirectoryDoesNotExist($scratch);
+        $this->assertFileExists($external.'/payload');
+        $this->assertSame(0, DB::table('release_verification_scratch')->count());
+    }
+
+    #[DataProvider('terminalTransitions')]
+    public function test_terminal_callbacks_never_follow_a_linked_scratch_parent(string $transition): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->arrival());
+        $claim = $repository->claim();
+        $scratch = $this->scratch((int) $claim->id, (int) $claim->version);
+        $root = (string) config('release_verification.storage_path');
+        rename($root.'/scratch', $root.'/outside');
+        symlink($root.'/outside', $root.'/scratch');
+
+        $this->terminateCandidate($claim, $transition);
+
+        $this->assertFileExists($scratch.'/payload');
+        $this->assertSame(1, DB::table('release_verification_scratch')->count());
+        $this->artisan('releases:verify-candidates')->assertFailed();
+        $this->assertFileExists($root.'/outside/'.$claim->id.'-'.$claim->version.'/payload');
+    }
+
+    private function terminateCandidate(object $claim, string $transition): void
+    {
+        $repository = app(CandidateRepository::class);
+        if ($transition === 'reject') {
+            $repository->rejectByPolicy($claim, 'Filtered fixture.');
+
+            return;
+        }
+        $repository->finish($claim, new VerificationResult('unknown', 'Retry later.'));
+        $this->travel(49)->hours();
+        if ($transition === 'expire') {
+            $repository->expire();
+        } else {
+            $id = $this->arrival();
+            DB::table('collections')->where('id', $id)->update(['last_seen_at' => now()->subHours(49)]);
+            $repository->archive($id);
+        }
+    }
+
+    #[DataProvider('terminalTransitions')]
     public function test_deferred_terminal_cleanup_preserves_readmitted_manifest_and_newer_scratch(string $transition): void
     {
         $repository = app(CandidateRepository::class);
@@ -142,7 +205,7 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $this->assertSame('pending', $current->status);
         $this->assertFileExists($store->path($current->manifest_path));
         $this->assertSame('first@article', $store->read($current->manifest_path)['files'][0]['segments'][0]['messageid']);
-        $this->assertDirectoryDoesNotExist($oldScratch);
+        $this->assertFileExists($oldScratch.'/payload');
         $this->assertFileExists($newScratch.'/payload');
     }
 
@@ -307,6 +370,7 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
 
     private function scratch(int $candidateId, int $version): string
     {
+        app(ScratchInventory::class)->register($candidateId, $version);
         $directory = config('release_verification.storage_path').'/scratch/'.$candidateId.'-'.$version;
         app('files')->ensureDirectoryExists($directory);
         file_put_contents($directory.'/payload', 'retained bytes');

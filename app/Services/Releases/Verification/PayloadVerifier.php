@@ -70,6 +70,9 @@ final class PayloadVerifier
             $partNumbers = [];
             $validatedParts = [];
             $identity = null;
+            $bodyTotalParts = null;
+            $totalParts = (int) $file['totalparts'];
+            $inferredParts = ($file['totalparts_inferred'] ?? false) === true;
             $available['files'][$index]['segments'] = [];
             foreach ($file['segments'] as $segment) {
                 $heartbeat();
@@ -134,6 +137,23 @@ final class PayloadVerifier
                 if ($article->part !== (int) $segment['number']) {
                     throw new RuntimeException('Article part number differs from the manifest.');
                 }
+                if ($article->totalParts !== null) {
+                    if ($bodyTotalParts !== null && $article->totalParts !== $bodyTotalParts) {
+                        throw new RuntimeException('Conflicting article part totals.');
+                    }
+                    if (! $inferredParts && $article->totalParts !== $totalParts) {
+                        throw new RuntimeException('Article part total differs from declared manifest inventory.');
+                    }
+                    if ($inferredParts && $article->totalParts < (int) $file['totalparts']) {
+                        throw new RuntimeException('Article part total contradicts observed segment inventory.');
+                    }
+                    $bodyTotalParts = $article->totalParts;
+                    $totalParts = $bodyTotalParts;
+                    $available['files'][$index]['totalparts'] = $totalParts;
+                }
+                if ($article->part > $totalParts) {
+                    throw new RuntimeException('Article part number exceeds manifest inventory.');
+                }
                 if ($identity !== null && [$article->name, $article->size] !== [$identity->name, $identity->size]) {
                     throw new RuntimeException('Conflicting file identities.');
                 }
@@ -189,8 +209,8 @@ final class PayloadVerifier
                 }
                 $files[$identity->name] = ['size' => $identity->size,
                     'available_bytes' => array_sum(array_map(static fn (array $range): int => $range[1] - $range[0], $ranges)),
-                    'complete' => $cursor === $identity->size && count($validatedParts) === (int) $file['totalparts']
-                        && isset($validatedParts[1]) && max(array_keys($validatedParts)) === (int) $file['totalparts']];
+                    'complete' => $cursor === $identity->size && count($validatedParts) === $totalParts
+                        && isset($validatedParts[1]) && max(array_keys($validatedParts)) === $totalParts];
                 $requiredNames[] = $identity->name;
             } else {
                 $subject = (string) $file['subject'];
