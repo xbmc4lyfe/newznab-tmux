@@ -16,13 +16,177 @@ use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandidatesTest
 {
+    /** @return iterable<string, array{bool}> */
+    public static function filteredReplays(): iterable
+    {
+        yield 'late partial headers' => [false];
+        yield 'complete replay' => [true];
+    }
+
+    #[DataProvider('filteredReplays')]
+    public function test_policy_filtered_identity_remains_terminal_on_recreated_headers(bool $completeReplay): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->arrival());
+        $repository->archive($this->arrival('second@article', 2));
+        $claim = $repository->claim();
+        $repository->rejectByPolicy($claim, 'Verified payload below minimum size.');
+        $before = DB::table('release_verification_candidates')->sole();
+        $replay = $this->arrival($completeReplay ? 'first@article' : 'late@article', $completeReplay ? 1 : 2);
+        if ($completeReplay) {
+            $binary = DB::table('binaries')->where('collections_id', $replay)->value('id');
+            DB::table('parts')->insert(['binaries_id' => $binary, 'partnumber' => 2, 'messageid' => 'second@article', 'size' => 5]);
+        }
+        $repository->archive($replay);
+
+        $this->assertEquals($before, DB::table('release_verification_candidates')->sole());
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame(0, DB::table('collections')->count());
+        $this->assertSame(0, DB::table('binaries')->count());
+        $this->assertSame(0, DB::table('parts')->count());
+        $this->assertSame([], glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
+        $this->assertNull($repository->claim());
+        $this->mock(NNTPService::class, function ($mock): void {
+            $mock->shouldNotReceive('doConnect');
+            $mock->shouldNotReceive('verificationArticle');
+        });
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+    }
+
+    public function test_filtered_replay_uses_no_capacity_and_preserves_another_identity_for_admission(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->arrival());
+        $repository->rejectByPolicy($repository->claim(), 'Verified policy rejection.');
+        config(['release_verification.pending_bytes' => 0]);
+        $repository->archive($this->arrival('late@article', 2));
+        $this->assertSame(0, DB::table('collections')->count());
+        $other = $this->arrival('other@article');
+        DB::table('collections')->where('id', $other)->update(['collectionhash' => sha1('other-identity', true)]);
+        try {
+            $repository->archive($other);
+            $this->fail('An unrelated identity must retain its headers when capacity is full.');
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString('capacity is full', $error->getMessage());
+        }
+        $this->assertSame(1, DB::table('collections')->where('id', $other)->count());
+        $this->assertSame('other@article', DB::table('parts')->value('messageid'));
+        config(['release_verification.pending_bytes' => 1048576]);
+        $repository->archive($other);
+        $next = $repository->claim();
+        $this->assertNotNull($next);
+        $this->assertSame(sha1('other-identity'), $next->source_identity);
+        $this->assertSame(1, DB::table('release_verification_candidates')->where('status', 'filtered')->count());
+        $this->assertSame(0, DB::table('collections')->count());
+    }
+
+    /** @return iterable<string, array{array<string, int|string>, bool}> */
+    public static function unsafeFilteredReplays(): iterable
+    {
+        yield 'different group' => [['groups_id' => 2], true];
+        yield 'retained manifest ownership' => [['manifest_path' => str_repeat('a', 64).'.json.gz'], true];
+        yield 'retained capacity ownership' => [['manifest_bytes' => 1], true];
+        yield 'publication reference' => [['release_id' => 7], true];
+        yield 'no usable articles' => [[], false];
+    }
+
+    /** @param array<string, int|string> $changes */
+    #[DataProvider('unsafeFilteredReplays')]
+    public function test_filtered_replay_retains_headers_without_safe_terminal_ownership(array $changes, bool $usable): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->arrival());
+        $repository->rejectByPolicy($repository->claim(), 'Verified policy rejection.');
+        if ($changes !== []) {
+            DB::table('release_verification_candidates')->update($changes);
+        }
+        $before = DB::table('release_verification_candidates')->sole();
+        $replay = $this->arrival('late@article', 2);
+        if (! $usable) {
+            DB::table('parts')->update(['size' => 0, 'messageid' => '']);
+        }
+        $repository->archive($replay);
+
+        $this->assertEquals($before, DB::table('release_verification_candidates')->sole());
+        $this->assertSame(1, DB::table('collections')->where('id', $replay)->count());
+        $this->assertSame(1, DB::table('binaries')->count());
+        $this->assertSame(1, DB::table('parts')->count());
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    public function test_filtered_replay_retirement_rolls_back_with_the_callers_transaction(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->arrival());
+        $repository->rejectByPolicy($repository->claim(), 'Verified policy rejection.');
+        $replay = $this->arrival('late@article', 2);
+        DB::beginTransaction();
+        $repository->archive($replay);
+        $this->assertSame(0, DB::table('collections')->count());
+        DB::rollBack();
+
+        $this->assertSame(1, DB::table('collections')->where('id', $replay)->count());
+        $this->assertSame('late@article', DB::table('parts')->value('messageid'));
+        $this->assertSame('filtered', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function expiryTerminalTransitions(): iterable
+    {
+        yield 'filtered after expiry selection' => [false];
+        yield 'published after expiry selection' => [true];
+    }
+
+    #[DataProvider('expiryTerminalTransitions')]
+    public function test_expiry_current_read_preserves_a_terminal_transition_after_selection(bool $published): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->arrival());
+        $claim = $repository->claim();
+        DB::table('release_verification_candidates')->where('id', $claim->id)->update([
+            'last_unique_at' => now()->subHours(49), 'lease_until' => now()->subSecond(),
+        ]);
+        $transitioned = false;
+        $terminal = null;
+        DB::listen(function (QueryExecuted $query) use ($repository, $claim, $published, &$transitioned, &$terminal): void {
+            if ($transitioned || ! str_starts_with($query->sql, 'select "id"')
+                || ! str_contains($query->sql, 'release_verification_candidates') || ! str_contains($query->sql, 'last_unique_at')) {
+                return;
+            }
+            $transitioned = true;
+            if ($published) {
+                DB::transaction(function () use ($claim): void {
+                    DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                    $row = DB::table('release_verification_candidates')->where('id', $claim->id)->lockForUpdate()->sole();
+                    DB::table('release_verification_state')->where('id', 1)->decrement('pending_bytes', (int) $row->manifest_bytes);
+                    DB::table('release_verification_candidates')->where('id', $claim->id)->update([
+                        'status' => 'complete', 'release_id' => 7, 'verified_at' => now(), 'manifest_path' => '',
+                        'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null,
+                    ]);
+                });
+            } else {
+                $repository->rejectByPolicy($claim, 'Verified policy rejection during expiry selection.');
+            }
+            $terminal = DB::table('release_verification_candidates')->sole();
+        });
+        $repository->expire();
+
+        $this->assertTrue($transitioned);
+        $this->assertEquals($terminal, DB::table('release_verification_candidates')->sole());
+        $this->assertSame($published ? 'complete' : 'filtered', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
     public function test_proven_unrepairable_manifest_waits_for_new_headers_without_refetching(): void
     {
         $repository = app(CandidateRepository::class);

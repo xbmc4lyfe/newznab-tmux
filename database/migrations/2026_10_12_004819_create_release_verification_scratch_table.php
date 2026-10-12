@@ -12,8 +12,11 @@ return new class extends Migration
     {
         Schema::create('release_verification_scratch', function (Blueprint $table): void {
             $table->id();
-            $table->unsignedBigInteger('candidate_id');
-            $table->unsignedInteger('version');
+            $table->unsignedBigInteger('candidate_id')->nullable();
+            $table->unsignedBigInteger('audit_release_id')->nullable();
+            $table->boolean('terminal')->default(false);
+            $table->index(['audit_release_id', 'terminal'], 'verification_scratch_audit_terminal');
+            $table->unsignedInteger('version')->default(0);
             $table->unique(['candidate_id', 'version'], 'verification_scratch_candidate_version');
         });
     }

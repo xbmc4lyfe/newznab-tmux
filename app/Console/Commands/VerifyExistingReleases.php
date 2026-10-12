@@ -12,6 +12,7 @@ use App\Services\Releases\ReleaseManagementService;
 use App\Services\Releases\Verification\NntpArticleSource;
 use App\Services\Releases\Verification\NzbManifestReader;
 use App\Services\Releases\Verification\PayloadVerifier;
+use App\Services\Releases\Verification\ScratchInventory;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -25,7 +26,7 @@ class VerifyExistingReleases extends Command
 
     protected $description = 'Download and audit existing NZBs with resumable progress; unknown results are retained';
 
-    public function handle(NzbService $nzb, NzbManifestReader $reader, ReleaseManagementService $management, ReleaseImageService $images): int
+    public function handle(NzbService $nzb, NzbManifestReader $reader, ReleaseManagementService $management, ReleaseImageService $images, ScratchInventory $scratchInventory): int
     {
         $root = (string) config('release_verification.storage_path');
         File::ensureDirectoryExists($root, 0700);
@@ -36,9 +37,11 @@ class VerifyExistingReleases extends Command
             return self::SUCCESS;
         }
         try {
-            if (DB::table('release_verification_candidates')->whereNull('release_id')->whereIn('status', ['pending', 'unknown', 'verifying'])
-                ->where('next_attempt_at', '<=', now())
-                ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))->exists()) {
+            $scratch = $root.'/scratch';
+            if (is_link($scratch) || (file_exists($scratch) && (! is_dir($scratch) || ! is_readable($scratch) || ! is_executable($scratch)))) {
+                throw new \RuntimeException('Audit scratch root is inaccessible or linked.');
+            }
+            if ($this->newCandidatesAreDue()) {
                 $this->warn('New candidates are due; audit deferred.');
 
                 return self::SUCCESS;
@@ -57,16 +60,25 @@ class VerifyExistingReleases extends Command
             $verifier = new PayloadVerifier(new NntpArticleSource(app(NNTPService::class)), (array) config('release_verification'));
             $attempted = 0;
             while ($attempted < $limit && ($freshIds !== [] || $retryIds !== [])) {
+                if ($this->newCandidatesAreDue()) {
+                    $this->warn('New candidates are due; audit deferred.');
+
+                    break;
+                }
                 $isRetry = $retryIds !== [] && ($retryTurn || $freshIds === []);
                 $id = (int) ($isRetry ? array_shift($retryIds) : array_shift($freshIds));
                 $release = Release::query()->find($id);
                 if ($release === null) {
-                    DB::table('release_verification_audit_retries')->where('release_id', $id)->delete();
+                    DB::transaction(static function () use ($id): void {
+                        DB::table('release_verification_audit_retries')->where('release_id', $id)->delete();
+                        DB::table('release_verification_scratch')->where('audit_release_id', $id)->update(['terminal' => true]);
+                    });
 
                     continue;
                 }
                 $attempted++;
-                $directory = $root.'/scratch/audit-'.$release->id;
+                $scratchEntry = $scratchInventory->registerAudit((int) $release->id);
+                $directory = $root.'/scratch/'.$scratchInventory->directoryName($scratchEntry);
                 try {
                     $xml = $nzb->readNzbContents($release->guid);
                     if ($xml === false) {
@@ -85,7 +97,7 @@ class VerifyExistingReleases extends Command
                 if (file_put_contents($root.'/audit.jsonl', $line."\n", FILE_APPEND | LOCK_EX) === false) {
                     throw new \RuntimeException('Cannot persist audit report.');
                 }
-                DB::transaction(function () use ($id, $isRetry, $record): void {
+                DB::transaction(function () use ($id, $isRetry, $record, $scratchEntry, $scratchInventory): void {
                     $current = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                     if ($current === null) {
                         throw new \RuntimeException('Audit state is unavailable.');
@@ -97,6 +109,7 @@ class VerifyExistingReleases extends Command
                         ]);
                     } else {
                         DB::table('release_verification_audit_retries')->where('release_id', $id)->delete();
+                        $scratchInventory->finishAudit((int) $scratchEntry->id);
                     }
                     DB::table('release_verification_state')->where('id', 1)->update([
                         'audit_cursor' => max((int) $current->audit_cursor, $id), 'audit_retry_turn' => ! $isRetry,
@@ -104,7 +117,6 @@ class VerifyExistingReleases extends Command
                 }, 5);
                 $retryTurn = ! $isRetry;
                 $this->line($line);
-                File::deleteDirectory($directory);
             }
         } finally {
             flock($lock, LOCK_UN);
@@ -112,5 +124,12 @@ class VerifyExistingReleases extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    private function newCandidatesAreDue(): bool
+    {
+        return DB::table('release_verification_candidates')->whereNull('release_id')->whereIn('status', ['pending', 'unknown', 'verifying'])
+            ->where('next_attempt_at', '<=', now())
+            ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))->exists();
     }
 }

@@ -76,17 +76,8 @@ class VerifyReleaseCandidates extends Command
                         $repository->finish($claim, $result);
                     }
                     $bytes = $result->passed() ? (int) ($result->manifest['verified_bytes'] ?? 0) : 0;
-                    $scratchBytes = 0;
-                    if (is_dir($root.'/scratch')) {
-                        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($root.'/scratch', \FilesystemIterator::SKIP_DOTS));
-                        foreach ($iterator as $file) {
-                            if ($file->isFile()) {
-                                $scratchBytes += $file->getSize();
-                            }
-                        }
-                    }
                     $snapshot = json_encode(['verified_bytes_per_second' => $bytes / max(0.001, microtime(true) - $started),
-                        'scratch_bytes' => $scratchBytes], JSON_THROW_ON_ERROR);
+                        'scratch_bytes' => null, 'scratch_bytes_status' => 'unknown'], JSON_THROW_ON_ERROR);
                     if (file_put_contents($root.'/status.json.tmp', $snapshot, LOCK_EX) !== false) {
                         rename($root.'/status.json.tmp', $root.'/status.json');
                     }
@@ -135,19 +126,20 @@ class VerifyReleaseCandidates extends Command
         $remaining = 1000;
         $exhausted = false;
         foreach ($entries as $entry) {
-            $directory = $scratch.'/'.$entry->candidate_id.'-'.$entry->version;
+            $directory = $scratch.'/'.app(ScratchInventory::class)->directoryName($entry);
             if (! file_exists($directory) && ! is_link($directory)) {
                 app(ScratchInventory::class)->forget((int) $entry->id);
             } elseif (is_dir($directory) && ! is_link($directory)) {
-                $candidate = DB::table('release_verification_candidates')->where('id', $entry->candidate_id)
-                    ->where('version', '>=', $entry->version)
-                    ->where(function ($query): void {
-                        $query->whereIn('status', ['expired', 'filtered'])
-                            ->orWhere(fn ($published) => $published->whereNotNull('release_id')->whereIn('status', ['complete', 'repaired']));
-                    })
-                    ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))
-                    ->first(['id', 'version']);
-                if ($candidate !== null) {
+                $terminal = $entry->audit_release_id !== null ? (bool) $entry->terminal
+                    : DB::table('release_verification_candidates')->where('id', $entry->candidate_id)
+                        ->where('version', '>=', $entry->version)
+                        ->where(function ($query): void {
+                            $query->whereIn('status', ['expired', 'filtered'])
+                                ->orWhere(fn ($published) => $published->whereNotNull('release_id')->whereIn('status', ['complete', 'repaired']));
+                        })
+                        ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))
+                        ->exists();
+                if ($terminal) {
                     try {
                         $this->deleteStaleScratch($directory, static function () use (&$remaining, &$exhausted): void {
                             if ($remaining-- <= 0) {

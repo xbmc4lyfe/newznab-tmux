@@ -110,6 +110,13 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         yield 'already expired hot archive' => ['archive-expired'];
     }
 
+    /** @return iterable<string, array{string}> */
+    public static function reopenableTransitions(): iterable
+    {
+        yield 'candidate expiry' => ['expire'];
+        yield 'already expired hot archive' => ['archive-expired'];
+    }
+
     #[DataProvider('terminalTransitions')]
     public function test_terminal_callbacks_leave_registered_cleanup_to_the_worker(string $transition): void
     {
@@ -172,7 +179,7 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         }
     }
 
-    #[DataProvider('terminalTransitions')]
+    #[DataProvider('reopenableTransitions')]
     public function test_deferred_terminal_cleanup_preserves_readmitted_manifest_and_newer_scratch(string $transition): void
     {
         $repository = app(CandidateRepository::class);
@@ -180,15 +187,11 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $repository->archive($this->arrival());
         $claim = $repository->claim();
         $oldScratch = $this->scratch((int) $claim->id, (int) $claim->version);
-        if ($transition !== 'reject') {
-            $repository->finish($claim, new VerificationResult('unknown', 'Retry later.'));
-            $this->travel(49)->hours();
-        }
+        $repository->finish($claim, new VerificationResult('unknown', 'Retry later.'));
+        $this->travel(49)->hours();
 
         DB::beginTransaction();
-        if ($transition === 'reject') {
-            $repository->rejectByPolicy($claim, 'Filtered fixture.');
-        } elseif ($transition === 'expire') {
+        if ($transition === 'expire') {
             $repository->expire();
         } else {
             $id = $this->arrival();
@@ -220,7 +223,9 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $repository->archive($this->arrival('second@article', 2));
         $replacement = $repository->claim();
         $this->assertNotSame($old->manifest_path, $replacement->manifest_path);
-        $repository->rejectByPolicy($replacement, 'Reset fixture.');
+        $repository->finish($replacement, new VerificationResult('unknown', 'Retry later.'));
+        $this->travel(49)->hours();
+        $repository->expire();
         $repository->archive($this->arrival());
         DB::commit();
 

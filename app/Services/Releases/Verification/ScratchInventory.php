@@ -8,14 +8,36 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 /**
- * Candidate scratch is registered under the worker lock before directory creation.
- * Unregistered external directories and audit scratch are never discovered or deleted here.
+ * Candidate and audit scratch are registered under the worker lock before creation.
+ * Unregistered external directories are never discovered or deleted here.
  */
 final class ScratchInventory
 {
     public function register(int $candidateId, int $version): void
     {
         DB::table('release_verification_scratch')->insertOrIgnore(['candidate_id' => $candidateId, 'version' => $version]);
+    }
+
+    public function registerAudit(int $releaseId): \stdClass
+    {
+        $active = DB::table('release_verification_scratch')->where('audit_release_id', $releaseId)
+            ->where('terminal', false)->first();
+        if ($active !== null) {
+            return $active;
+        }
+        $id = DB::table('release_verification_scratch')->insertGetId(['audit_release_id' => $releaseId]);
+
+        return DB::table('release_verification_scratch')->where('id', $id)->sole();
+    }
+
+    public function finishAudit(int $id): void
+    {
+        DB::table('release_verification_scratch')->where('id', $id)->whereNotNull('audit_release_id')->update(['terminal' => true]);
+    }
+
+    public function directoryName(object $entry): string
+    {
+        return $entry->audit_release_id === null ? $entry->candidate_id.'-'.$entry->version : 'audit-'.$entry->audit_release_id.'-'.$entry->id;
     }
 
     /** @return Collection<int, \stdClass> */

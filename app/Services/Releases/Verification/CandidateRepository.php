@@ -35,6 +35,20 @@ final class CandidateRepository
                 $sourceIdentity = bin2hex($collection->collectionhash);
                 $existing = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
                     ->orderByDesc('id')->lockForUpdate()->first();
+                if ($existing !== null && $existing->status === 'filtered') {
+                    if ($existing->release_id !== null || (int) $existing->groups_id !== (int) $collection->groups_id
+                        || $existing->manifest_path !== '' || (int) $existing->manifest_bytes !== 0) {
+                        return;
+                    }
+                    $usablePart = DB::table('binaries as b')->join('parts as p', 'p.binaries_id', '=', 'b.id')
+                        ->where('b.collections_id', $collectionId)->where('p.size', '>', 0)->where('p.messageid', '<>', '')
+                        ->lockForUpdate()->first(['p.binaries_id']);
+                    if ($usablePart !== null) {
+                        $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Policy-filtered replay', false, manifestArchived: true);
+                    }
+
+                    return;
+                }
                 $identity = $existing->identity ?? $sourceIdentity;
                 if ($existing !== null && $existing->release_id !== null) {
                     $identity = sha1($sourceIdentity.':generation:'.$existing->id);
@@ -301,6 +315,7 @@ final class CandidateRepository
                 DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                 $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
                 if ($row === null || $row->release_id !== null
+                    || ! in_array($row->status, ['pending', 'unknown', 'unrepairable', 'verifying', 'dirty'], true)
                     || $row->last_unique_at >= now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s')
                     || ($row->lease_until !== null && $row->lease_until >= now()->format('Y-m-d H:i:s'))) {
                     return;
