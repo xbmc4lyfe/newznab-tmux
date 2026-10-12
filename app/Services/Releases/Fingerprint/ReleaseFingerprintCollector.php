@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 8;
+    public const SCHEMA_VERSION = 9;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 
@@ -234,6 +234,10 @@ final class ReleaseFingerprintCollector
                         $article['overview_raw'],
                         $article['overview_response_code'],
                         $article['overview_attempted'],
+                        $article['head_response']['response_text'],
+                        $article['body_response']['response_text'],
+                        $article['head_response']['response_code'],
+                        $article['body_response']['response_code'],
                     );
                     $metadata['article_identity'] = $articleIdentity ?? [
                         'parser_engine' => null,
@@ -264,6 +268,8 @@ final class ReleaseFingerprintCollector
                         'overview_row_count' => $article['overview_row_count'],
                         'overview_row_protocol_status' => $this->overviewRowProtocolStatus($article),
                         'overview_rows_basis' => 'NNTP multiline data rows after client dot-unstuffing and CRLF removal',
+                        'head_response' => $article['head_response'],
+                        'body_response' => $article['body_response'],
                         'overview_fields' => $overviewFields,
                         'overview_nzb_segment_bytes_difference' => isset($overviewFields[':bytes']) && is_numeric($overviewFields[':bytes'])
                             ? (int) $overviewFields[':bytes'] - (int) $sample['segment_bytes'] : null,
@@ -916,7 +922,9 @@ final class ReleaseFingerprintCollector
         $identityParserCoverageComplete = $observations !== [] && count(array_filter(
             $observations,
             static fn (array $observation): bool => ($observation['metadata']['article_identity']['parser_engine'] ?? null)
-                === 'nntmux-rust-article-identity',
+                === 'nntmux-rust-article-identity'
+                && ($observation['metadata']['article_identity']['schema_version'] ?? null) === 2
+                && ($observation['metadata']['article_identity']['request']['syntax_status'] ?? null) === 'valid',
         )) === count($observations);
         $status = $allSamplesAvailable && $par2Complete && $providerCoverageComplete && $profileCoverageComplete && $identityParserCoverageComplete ? 'complete' : 'partial';
 
