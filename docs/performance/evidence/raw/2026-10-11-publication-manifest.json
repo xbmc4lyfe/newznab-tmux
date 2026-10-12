@@ -43210,5 +43210,42 @@
     "baseline_revision": "54c140d7dc4c2500bf69115047b3aabfac6942f0",
     "published_revision": "6a2555d57cca071f64d3d5315e3da82fde40c04f",
     "handler_sha256": "7d58bf1cd097be7c22a3ecaec175b35166bd4ee7109dab76d1117f4b52768474"
+  },
+  "semantic_supplement": {
+    "file": "2026-10-11-metadata-semantic-supplement.tar.gz",
+    "sha256": "9eeb0e671b742f67a6736635dd2a7dd3a64c2ef9e9c3f587bccc516346ed1730",
+    "members": [
+      {
+        "member": "fixture.php",
+        "original_sha256": "481a9e06d3f8d20918d70b77b895ab3d646022a536981ce7e63ac1e30f2090eb",
+        "published_sha256": "159e6ff73f55eb55faacfcf9057b6233ec169640c578c94e351e943dae0f8a9d",
+        "path_redacted": true
+      },
+      {
+        "member": "schema.sql",
+        "original_sha256": "940179ec775e9c13e765d56aaee47db1d3a82f250d1696b12ef32bac1a74cada",
+        "published_sha256": "940179ec775e9c13e765d56aaee47db1d3a82f250d1696b12ef32bac1a74cada",
+        "path_redacted": false
+      },
+      {
+        "member": "baseline.stdout",
+        "original_sha256": "e727a51bd11169fc15d9e046854c49e949ecb6898fe69fc22e734eb2874c574c",
+        "published_sha256": "e727a51bd11169fc15d9e046854c49e949ecb6898fe69fc22e734eb2874c574c",
+        "path_redacted": false
+      },
+      {
+        "member": "candidate.stdout",
+        "original_sha256": "7231dbfba996542f285de4dbdacafe15e7e5d21e40b22dfbff53513fc605ce07",
+        "published_sha256": "7231dbfba996542f285de4dbdacafe15e7e5d21e40b22dfbff53513fc605ce07",
+        "path_redacted": false
+      },
+      {
+        "member": "supplemental-results.json",
+        "original_sha256": "bb7d83ec9825f5cc259ed3676c341e060d6ff974a1796cd421a1a794c3ba5392",
+        "published_sha256": "bb7d83ec9825f5cc259ed3676c341e060d6ff974a1796cd421a1a794c3ba5392",
+        "path_redacted": false
+      }
+    ],
+    "scope": "Separate non-timing fixture; does not retroactively expand the old 400-epoch oracle."
   }
 }
