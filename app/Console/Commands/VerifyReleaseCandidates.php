@@ -34,6 +34,7 @@ class VerifyReleaseCandidates extends Command
             return self::SUCCESS;
         }
         try {
+            $this->cleanupTerminalScratch($root);
             $repository->expire();
             $verifier = new PayloadVerifier(new NntpArticleSource(app(NNTPService::class)), (array) config('release_verification'));
             for ($index = 0; $index < max(1, (int) $this->option('limit')); $index++) {
@@ -98,6 +99,105 @@ class VerifyReleaseCandidates extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    /** Recover interrupted terminal cleanup without delaying claims indefinitely. */
+    private function cleanupTerminalScratch(string $root): void
+    {
+        $scratch = $root.'/scratch';
+        if (! is_dir($scratch) || is_link($scratch)) {
+            return;
+        }
+        $cursorPath = $root.'/terminal-scratch.cursor';
+        $cursor = is_file($cursorPath) ? json_decode((string) file_get_contents($cursorPath), true) : null;
+        $offset = max(0, (int) ($cursor['offset'] ?? 0));
+        $ceiling = max(0, (int) ($cursor['ceiling'] ?? 0));
+        $handle = opendir($scratch);
+        if ($handle === false) {
+            throw new RuntimeException('Cannot scan verification scratch.');
+        }
+        $entries = [];
+        $atEnd = false;
+        try {
+            if ($ceiling === 0) {
+                while (($name = readdir($handle)) !== false) {
+                    if ($name !== '.' && $name !== '..') {
+                        $ceiling++;
+                    }
+                }
+                rewinddir($handle);
+                $offset = 0;
+            }
+            $skipped = 0;
+            while ($skipped < $offset && ($name = readdir($handle)) !== false) {
+                if ($name !== '.' && $name !== '..') {
+                    $skipped++;
+                }
+            }
+            while (count($entries) < min(100, max(0, $ceiling - $offset))) {
+                $name = readdir($handle);
+                if ($name === false) {
+                    if ($entries === [] && $offset > 0) {
+                        rewinddir($handle);
+                        $offset = 0;
+
+                        continue;
+                    }
+                    $atEnd = true;
+                    break;
+                }
+                if ($name !== '.' && $name !== '..') {
+                    $entries[] = $name;
+                }
+            }
+        } finally {
+            closedir($handle);
+        }
+        $remaining = 1000;
+        $exhausted = false;
+        $processed = 0;
+        $removed = 0;
+        foreach ($entries as $name) {
+            $directory = $scratch.'/'.$name;
+            if (preg_match('/\A([1-9][0-9]*)-([1-9][0-9]*)\z/', $name, $match) === 1 && is_dir($directory) && ! is_link($directory)) {
+                $candidate = DB::table('release_verification_candidates')->where('id', $match[1])
+                    ->where('version', '>=', $match[2])
+                    ->where(function ($query): void {
+                        $query->whereIn('status', ['expired', 'filtered'])
+                            ->orWhere(fn ($published) => $published->whereNotNull('release_id')->whereIn('status', ['complete', 'repaired']));
+                    })
+                    ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))
+                    ->first(['id', 'version']);
+                if ($candidate !== null) {
+                    try {
+                        $this->deleteStaleScratch($directory, static function () use (&$remaining, &$exhausted): void {
+                            if ($remaining-- <= 0) {
+                                $exhausted = true;
+                                throw new RuntimeException('Terminal scratch cleanup will resume on the next run.');
+                            }
+                        });
+                        $removed++;
+                    } catch (Throwable $error) {
+                        if ($exhausted) {
+                            break;
+                        }
+                        $this->warn('Terminal scratch cleanup will retry: '.$error->getMessage());
+                    }
+                }
+            }
+            $processed++;
+        }
+        // Directory positions move when entries disappear; a full pass always wraps.
+        $offset = max(0, $offset + $processed - $removed);
+        $ceiling = max(0, $ceiling - $removed);
+        if (! $exhausted && ($atEnd || $offset >= $ceiling)) {
+            $offset = 0;
+            $ceiling = 0;
+        }
+        $checkpoint = json_encode(['offset' => $offset, 'ceiling' => $ceiling], JSON_THROW_ON_ERROR);
+        if (file_put_contents($cursorPath.'.tmp', $checkpoint, LOCK_EX) === false || ! rename($cursorPath.'.tmp', $cursorPath)) {
+            throw new RuntimeException('Cannot checkpoint terminal scratch cleanup.');
+        }
     }
 
     private function deleteStaleScratch(string $directory, callable $heartbeat): void

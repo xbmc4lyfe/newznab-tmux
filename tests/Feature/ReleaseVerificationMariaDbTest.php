@@ -4,11 +4,15 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Enums\NzbImportStatus;
 use App\Services\CollectionCleanupService;
+use App\Services\Nzb\NzbUploadManifestService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\VerificationResetService;
 use Illuminate\Database\QueryException;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
@@ -40,6 +44,101 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
         foreach (['parts', 'binaries', 'collections', 'usenet_groups', 'releases', 'release_verification_audit_retries', 'release_verification_candidates', 'release_verification_state'] as $table) {
             Schema::dropIfExists($table);
         }
+    }
+
+    public function test_upload_reconciliation_uses_current_admission_reads_inside_an_older_snapshot(): void
+    {
+        $identity = sha1('import:current-upload');
+        [$manifests, $manifestPath] = $this->pendingUploadManifest($identity);
+        config(['database.connections.verification_upload_other' => config('database.connections.mysql')]);
+        DB::purge('verification_upload_other');
+        $other = DB::connection('verification_upload_other');
+        DB::statement('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+        DB::beginTransaction();
+        try {
+            $this->assertNull(DB::table('release_verification_candidates')->where('identity', $identity)->value('id'));
+            $other->transaction(function () use ($other, $identity): void {
+                $other->table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                $other->table('releases')->insert(['id' => 7, 'guid' => 'committed-upload']);
+                $other->table('release_verification_candidates')->insert($this->pendingUploadCandidate($identity) + [
+                    'status' => 'complete', 'release_id' => 7, 'verified_at' => now(),
+                ]);
+            });
+            $this->assertNull(DB::table('release_verification_candidates')->where('identity', $identity)->value('id'), 'The consistent read retains its pre-admission snapshot.');
+            $resolved = (new \ReflectionMethod($manifests, 'resolveCandidate'))->invoke($manifests, $manifests->read($manifestPath));
+            $this->assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $resolved['state']);
+            $this->assertSame(7, $resolved['release_id']);
+            $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $manifests->read($manifestPath)['state']);
+            $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $manifests->reconcilePending($manifestPath)['state']);
+            DB::commit();
+            $manifest = $manifests->read($manifestPath);
+            $this->assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $manifest['state']);
+            $this->assertSame(7, $manifest['release_id']);
+            $this->assertSame('committed-upload', $manifest['release_guid']);
+        } finally {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+            DB::purge('verification_upload_other');
+        }
+    }
+
+    public function test_uncommitted_upload_admission_defers_absence_rejection_until_ledger_is_available(): void
+    {
+        $identity = sha1('import:uncommitted-upload');
+        [$manifests, $manifestPath] = $this->pendingUploadManifest($identity);
+        config(['database.connections.verification_upload_other' => config('database.connections.mysql')]);
+        DB::purge('verification_upload_other');
+        $other = DB::connection('verification_upload_other');
+        DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
+        $other->beginTransaction();
+        try {
+            $other->table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+            $other->table('release_verification_candidates')->insert($this->pendingUploadCandidate($identity) + ['status' => 'pending']);
+            $this->assertNull(DB::table('release_verification_candidates')->where('identity', $identity)->value('id'));
+            try {
+                $manifests->reconcilePending($manifestPath);
+                $this->fail('An in-progress admission must hold the reconciliation ledger until commit.');
+            } catch (QueryException $error) {
+                $this->assertSame(1205, (int) $error->errorInfo[1]);
+            }
+            $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $manifests->read($manifestPath)['state']);
+            $this->assertNull($manifests->read($manifestPath)['last_error']);
+            $other->commit();
+            $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $manifests->reconcilePending($manifestPath)['state']);
+            $this->assertTrue(DB::table('release_verification_candidates')->where('identity', $identity)->exists());
+            $this->assertFileExists(dirname($manifestPath).'/info.nfo');
+        } finally {
+            if ($other->transactionLevel() > 0) {
+                $other->rollBack();
+            }
+            DB::purge('verification_upload_other');
+        }
+    }
+
+    /** @return array{NzbUploadManifestService, string} */
+    private function pendingUploadManifest(string $identity): array
+    {
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->id();
+            $table->string('guid');
+        });
+        $directory = config('release_verification.storage_path').'/upload';
+        app('files')->ensureDirectoryExists($directory);
+        file_put_contents($directory.'/Release.nzb', '<nzb/>');
+        file_put_contents($directory.'/info.nfo', 'paired NFO');
+        $manifests = new NzbUploadManifestService(new Filesystem);
+        $manifests->create($directory, 'upload-fixture', 'Release.nzb', 'info.nfo');
+        $manifests->recordNzbOutcome($directory.'/Release.nzb', NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+
+        return [$manifests, $directory.'/'.NzbUploadManifestService::FILENAME];
+    }
+
+    /** @return array<string, mixed> */
+    private function pendingUploadCandidate(string $identity): array
+    {
+        return ['identity' => $identity, 'source_identity' => $identity, 'groups_id' => 1, 'manifest_path' => '',
+            'manifest_hash' => str_repeat('a', 64), 'manifest_bytes' => 0, 'last_unique_at' => now(), 'next_attempt_at' => now()];
     }
 
     public function test_second_connection_cannot_claim_or_publish_while_lease_is_active(): void

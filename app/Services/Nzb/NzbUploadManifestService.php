@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Nzb;
 
 use App\Enums\NzbImportStatus;
+use App\Services\Releases\Verification\VerificationResetService;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
@@ -59,6 +60,8 @@ final class NzbUploadManifestService
 
     /**
      * @return array<string, mixed>
+     *
+     * @phpstan-impure
      */
     public function read(string $manifestPath): array
     {
@@ -203,35 +206,63 @@ final class NzbUploadManifestService
             if ($manifest['state'] !== self::STATE_NZB_PENDING) {
                 return $manifest;
             }
-            $identity = $manifest['candidate_identity'] ?? null;
-            if (! is_string($identity) || preg_match('/\A[0-9a-f]{40}\z/', $identity) !== 1) {
-                throw new RuntimeException('Pending upload has no valid verification candidate identity.');
-            }
-            $candidate = DB::table('release_verification_candidates as candidates')
-                ->leftJoin('releases as published', 'published.id', '=', 'candidates.release_id')
-                ->where('candidates.identity', $identity)
-                ->first(['candidates.status', 'candidates.release_id', 'candidates.verified_at', 'published.guid']);
-            if ($candidate === null || ! in_array($candidate->status, ['complete', 'repaired', 'expired'], true)) {
-                return $manifest;
-            }
-            if ($candidate->status !== 'expired' && $candidate->verified_at !== null
-                && (int) $candidate->release_id > 0 && is_string($candidate->guid) && $candidate->guid !== '') {
-                $manifest['state'] = self::STATE_NZB_IMPORTED;
-                $manifest['release_id'] = (int) $candidate->release_id;
-                $manifest['release_guid'] = $candidate->guid;
-                $manifest['last_error'] = null;
-            } else {
-                $manifest['state'] = self::STATE_NZB_REJECTED;
-                $manifest['release_id'] = null;
-                $manifest['release_guid'] = null;
-                $manifest['last_error'] = $candidate->status === 'expired'
-                    ? 'Download verification expired before publication.' : 'Verified publication has no current release identity.';
-            }
-            $manifest['updated_at'] = now()->toIso8601String();
-            $this->write($manifestPath, $manifest);
+            app(VerificationResetService::class)->withAdmission(function () use (&$manifest, $manifestPath): void {
+                $resolved = DB::transaction(fn (): array => $this->resolveCandidate($manifest), 5);
+                if (DB::transactionLevel() > 0) {
+                    DB::afterCommit(fn () => $this->reconcilePending($manifestPath));
+
+                    return;
+                }
+                if ($resolved !== $manifest) {
+                    $this->write($manifestPath, $resolved);
+                    $manifest = $resolved;
+                }
+            });
 
             return $manifest;
         });
+    }
+
+    /**
+     * Resolve current admission state while holding the capacity ledger lock.
+     *
+     * @param  array<string, mixed>  $manifest
+     * @return array<string, mixed>
+     */
+    private function resolveCandidate(array $manifest): array
+    {
+        $identity = $manifest['candidate_identity'] ?? null;
+        if (! is_string($identity) || preg_match('/\A[0-9a-f]{40}\z/', $identity) !== 1) {
+            throw new RuntimeException('Pending upload has no valid verification candidate identity.');
+        }
+        $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+        if ($state === null) {
+            throw new RuntimeException('Verification capacity state is unavailable; upload reconciliation deferred.');
+        }
+        $candidate = DB::table('release_verification_candidates as candidates')
+            ->leftJoin('releases as published', 'published.id', '=', 'candidates.release_id')
+            ->where('candidates.identity', $identity)->lockForUpdate()
+            ->first(['candidates.status', 'candidates.release_id', 'candidates.verified_at', 'published.guid']);
+        if ($candidate !== null && ! in_array($candidate->status, ['complete', 'repaired', 'expired'], true)) {
+            return $manifest;
+        }
+        if ($candidate !== null && $candidate->status !== 'expired' && $candidate->verified_at !== null
+            && (int) $candidate->release_id > 0 && is_string($candidate->guid) && $candidate->guid !== '') {
+            $manifest['state'] = self::STATE_NZB_IMPORTED;
+            $manifest['release_id'] = (int) $candidate->release_id;
+            $manifest['release_guid'] = $candidate->guid;
+            $manifest['last_error'] = null;
+        } else {
+            $manifest['state'] = self::STATE_NZB_REJECTED;
+            $manifest['release_id'] = null;
+            $manifest['release_guid'] = null;
+            $manifest['last_error'] = $candidate === null ? 'Download verification candidate no longer exists.'
+                : ($candidate->status === 'expired' ? 'Download verification expired before publication.'
+                    : 'Verified publication has no current release identity.');
+        }
+        $manifest['updated_at'] = now()->toIso8601String();
+
+        return $manifest;
     }
 
     public function recordNfoOutcome(string $manifestPath, bool $imported, ?string $error = null): void

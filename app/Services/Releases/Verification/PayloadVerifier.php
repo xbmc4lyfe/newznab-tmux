@@ -42,6 +42,7 @@ final class PayloadVerifier
                 throw new RuntimeException('Cannot allocate scratch storage.');
             }
         }
+        $this->resetData($data, $heartbeat);
         $files = [];
         $filenameIdentities = [];
         $available = $manifest;
@@ -325,6 +326,29 @@ final class PayloadVerifier
         }
 
         return new VerificationResult($repaired ? 'repaired' : 'complete', 'Downloaded payload verified.', $available);
+    }
+
+    private function resetData(string $directory, callable $heartbeat): void
+    {
+        $heartbeat();
+        if (is_link($directory)) {
+            throw new RuntimeException('Derived payload directory cannot be a symlink.');
+        }
+        $entries = 0;
+        $lastHeartbeat = microtime(true);
+        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS), \RecursiveIteratorIterator::CHILD_FIRST);
+        foreach ($iterator as $file) {
+            if (++$entries >= 256 || microtime(true) - $lastHeartbeat >= 1.0) {
+                $heartbeat();
+                $entries = 0;
+                $lastHeartbeat = microtime(true);
+            }
+            $removed = $file->isDir() && ! $file->isLink() ? rmdir($file->getPathname()) : unlink($file->getPathname());
+            if (! $removed) {
+                throw new RuntimeException('Cannot rebuild derived payload storage.');
+            }
+        }
+        $heartbeat();
     }
 
     private function checksum(string $path, string $algorithm, callable $heartbeat): string

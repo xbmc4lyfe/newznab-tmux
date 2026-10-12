@@ -11,6 +11,7 @@ use App\Services\Releases\Verification\VerifiedArticle;
 use App\Services\Releases\Verification\VerifiedNzbWriter;
 use App\Services\YencService;
 use dariusiii\rarinfo\Par2Info;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Process\Process;
 use Tests\Fixtures\YencArticles;
@@ -120,6 +121,170 @@ class ReleaseVerificationPayloadTest extends TestCase
             $this->assertFileDoesNotExist($scratch.'/articles/'.hash('sha256', 'source@article'));
         } finally {
             $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function staleProtectedSources(): iterable
+    {
+        yield 'index-only manifest with unknown declared count' => [false];
+        yield 'source headers remain but source raw cache was lost' => [true];
+    }
+
+    #[DataProvider('staleProtectedSources')]
+    public function test_stale_derived_source_cannot_make_index_only_articles_pass_fresh_nzb_replay(bool $sourceDeclared): void
+    {
+        $bytes = str_repeat('movie-data', 64);
+        [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', $bytes, 'set');
+        $indexFiles = array_values(array_filter($files, static fn (array $file): bool => $file['subject'] === 'set.par2'));
+        $indexId = $indexFiles[0]['segments'][0]['messageid'];
+        $articles = [$indexId => $articles[$indexId]];
+        [$verifier, $scratch] = $this->verifier($articles);
+        mkdir($scratch.'/data');
+        file_put_contents($scratch.'/data/movie.mkv', $bytes);
+        $manifest = ['expected_files' => 0, 'files' => $sourceDeclared ? array_merge([$files[0]], $indexFiles) : $indexFiles];
+        $fresh = null;
+        try {
+            $resumed = $verifier->verify($manifest, $scratch, static function (): void {});
+            $available = $resumed->passed() ? $resumed->manifest : ['expected_files' => 0, 'files' => $indexFiles];
+            $available += ['fromname' => 'fixture', 'date' => '2026-10-11 12:00:00', 'groups' => ['alt.test']];
+            $writer = (new \ReflectionClass(VerifiedNzbWriter::class))->newInstanceWithoutConstructor();
+            $xml = (new \ReflectionMethod($writer, 'document'))->invoke($writer, $available);
+            $parsed = (new NzbManifestReader)->read($xml, (object) ['searchname' => 'fixture', 'fromname' => 'fixture',
+                'postdate' => '2026-10-11 12:00:00', 'groups_id' => 1]);
+            $this->assertSame([$indexId], array_merge(...array_map(static fn (array $file): array => array_column($file['segments'], 'messageid'), $parsed['files'])));
+            [$replay, $fresh] = $this->verifier($articles);
+            $freshResult = $replay->verify($parsed, $fresh, static function (): void {});
+            $this->assertFalse($freshResult->passed(), 'An index alone cannot reconstruct its absent protected source.');
+            $this->assertFalse($resumed->passed(), 'Resumed scratch passed although its emitted article inventory fails fresh replay.');
+        } finally {
+            $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+            if ($fresh !== null) {
+                $this->removeDirectory($fresh);
+            }
+        }
+    }
+
+    public function test_actual_par2_repair_rebuilds_derived_files_from_preserved_valid_raw_cache_and_replays(): void
+    {
+        $bytes = str_repeat('movie-data', 64);
+        [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', $bytes, 'set');
+        $manifest = ['expected_files' => 0, 'files' => array_slice($files, 1)];
+        [$verifier, $scratch] = $this->verifier($articles);
+        $unused = null;
+        try {
+            $this->assertTrue($verifier->verify($manifest, $scratch, static function (): void {})->passed());
+            $indexCache = $scratch.'/articles/'.hash('sha256', 'set.par2@article');
+            $indexChecksum = hash_file('sha256', $indexCache);
+            file_put_contents($scratch.'/data/movie.mkv', str_repeat('wrong-data', 64));
+            [$offline, $unused] = $this->verifier([]);
+            $result = $offline->verify($manifest, $scratch, static function (): void {});
+            $this->assertSame('repaired', $result->verdict, $result->reason);
+            $this->assertSame($bytes, file_get_contents($scratch.'/data/movie.mkv'));
+            $this->assertSame($indexChecksum, hash_file('sha256', $indexCache));
+            $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', $bytes);
+        } finally {
+            $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+            if ($unused !== null) {
+                $this->removeDirectory($unused);
+            }
+        }
+    }
+
+    public function test_derived_cleanup_is_batched_preserves_raw_cache_and_does_not_follow_symlinks(): void
+    {
+        [$verifier, $scratch] = $this->verifier([]);
+        mkdir($scratch.'/articles');
+        $cachePath = $scratch.'/articles/'.hash('sha256', 'a@b');
+        $raw = (new YencService)->encode('hello', 'movie.mkv');
+        file_put_contents($cachePath, $raw);
+        mkdir($scratch.'/data');
+        mkdir($scratch.'/data/old');
+        for ($entry = 0; $entry < 600; $entry++) {
+            file_put_contents($scratch.'/data/old/item-'.$entry, 'old bytes');
+        }
+        mkdir($scratch.'/outside');
+        file_put_contents($scratch.'/outside/retained', 'preserve outside');
+        symlink($scratch.'/outside', $scratch.'/data/stale-link');
+        $beats = 0;
+        try {
+            $result = $verifier->verify($this->manifest(1), $scratch, static function () use (&$beats): void {
+                $beats++;
+            });
+            $this->assertTrue($result->passed(), $result->reason);
+            $this->assertDirectoryDoesNotExist($scratch.'/data/old');
+            $this->assertFileDoesNotExist($scratch.'/data/stale-link');
+            $this->assertSame('preserve outside', file_get_contents($scratch.'/outside/retained'));
+            $this->assertSame($raw, file_get_contents($cachePath));
+            $this->assertGreaterThanOrEqual(4, $beats);
+            $this->assertLessThan(30, $beats, 'Derived cleanup must not renew the DB lease once per entry.');
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_lost_lease_during_derived_cleanup_preserves_cache_and_stops_proof_until_retry(): void
+    {
+        [$verifier, $scratch] = $this->verifier([]);
+        mkdir($scratch.'/articles');
+        $cachePath = $scratch.'/articles/'.hash('sha256', 'a@b');
+        $raw = (new YencService)->encode('hello', 'movie.mkv');
+        file_put_contents($cachePath, $raw);
+        mkdir($scratch.'/data');
+        for ($entry = 0; $entry < 600; $entry++) {
+            file_put_contents($scratch.'/data/item-'.$entry, 'old bytes');
+        }
+        $beats = 0;
+        try {
+            $result = $verifier->verify($this->manifest(1), $scratch, static function () use (&$beats): void {
+                if (++$beats === 2) {
+                    throw new \RuntimeException('Lease lost during derived cleanup.');
+                }
+            });
+            $this->assertSame('unknown', $result->verdict);
+            $this->assertSame('Lease lost during derived cleanup.', $result->reason);
+            $this->assertSame($raw, file_get_contents($cachePath));
+            $this->assertFileDoesNotExist($scratch.'/data/movie.mkv');
+            $this->assertTrue($verifier->verify($this->manifest(1), $scratch, static function (): void {})->passed());
+            $this->assertSame(['movie.mkv'], array_values(array_diff(scandir($scratch.'/data'), ['.', '..'])));
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_symlinked_derived_directory_cannot_delete_raw_article_cache(): void
+    {
+        [$verifier, $scratch] = $this->verifier([]);
+        mkdir($scratch.'/articles');
+        $path = $scratch.'/articles/'.hash('sha256', 'a@b');
+        file_put_contents($path, (new YencService)->encode('hello', 'movie.mkv'));
+        symlink($scratch.'/articles', $scratch.'/data');
+        try {
+            $result = $verifier->verify($this->manifest(1), $scratch, static function (): void {});
+            $this->assertSame('unknown', $result->verdict);
+            $this->assertSame('Derived payload directory cannot be a symlink.', $result->reason);
+            $this->assertFileExists($path);
+        } finally {
+            unlink($scratch.'/data');
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_partial_source_ranges_do_not_reuse_uncovered_old_bytes(): void
+    {
+        [$verifier, $scratch] = $this->verifier(['tail@article' => YencArticles::part('tail', 'movie.mkv', 8, 2, 5, 2)]);
+        mkdir($scratch.'/data');
+        file_put_contents($scratch.'/data/movie.mkv', 'old-tail');
+        try {
+            $manifest = ['expected_files' => 1, 'files' => [['key' => 'source', 'subject' => 'movie.mkv', 'totalparts' => 2,
+                'segments' => [['number' => 2, 'messageid' => 'tail@article', 'bytes' => 4]]]]];
+            $result = $verifier->verify($manifest, $scratch, static function (): void {});
+            $this->assertFalse($result->passed());
+            $this->assertSame("\0\0\0\0tail", file_get_contents($scratch.'/data/movie.mkv'));
+        } finally {
             $this->removeDirectory($scratch);
         }
     }
@@ -381,7 +546,7 @@ class ReleaseVerificationPayloadTest extends TestCase
         $beats = 0;
         try {
             $result = $verifier->verify($this->manifest(1), $scratch, static function () use (&$beats): void {
-                if (++$beats === 3) {
+                if (++$beats === 5) {
                     throw new \RuntimeException('Lease lost in own scratch walk.');
                 }
             });
