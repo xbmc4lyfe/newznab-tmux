@@ -15,6 +15,8 @@ use RuntimeException;
 
 final class CandidateRepository
 {
+    private const array CLAIMABLE_STATUSES = ['pending', 'unknown', 'verifying'];
+
     public function __construct(private readonly ManifestStore $store, private readonly CollectionCleanupService $cleanup) {}
 
     public function archive(int $collectionId): void
@@ -371,7 +373,7 @@ final class CandidateRepository
      */
     public function claim(?callable $acquireCandidate = null): ?object
     {
-        $ids = $this->claimableCandidates()->orderBy('next_attempt_at')->orderBy('id')->limit(100)->pluck('id');
+        $ids = $this->claimQueueIds();
         foreach ($ids as $id) {
             $acquired = false;
             $claimed = DB::transaction(function () use ($id, $acquireCandidate, &$acquired): ?object {
@@ -409,11 +411,37 @@ final class CandidateRepository
         return null;
     }
 
-    private function claimableCandidates(): Builder
+    /** @return list<int> */
+    private function claimQueueIds(): array
     {
-        return DB::table('release_verification_candidates')->whereNull('release_id')
-            ->whereIn('status', ['pending', 'unknown', 'verifying'])->where('next_attempt_at', '<=', now())
-            ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()));
+        $cutoff = now();
+        $rows = [];
+        // Fixing the leading status key lets verification_due serve each ORDER BY / LIMIT.
+        foreach (self::CLAIMABLE_STATUSES as $status) {
+            foreach ($this->claimableCandidates($status, $cutoff)->orderBy('next_attempt_at')->orderBy('id')
+                ->limit(100)->get(['id', 'next_attempt_at']) as $row) {
+                // A status change between reads must not consume two slots in the claim window.
+                $rows[(int) $row->id] ??= $row;
+            }
+        }
+        usort($rows, static fn (object $a, object $b): int => [$a->next_attempt_at, (int) $a->id]
+            <=> [$b->next_attempt_at, (int) $b->id]);
+
+        return array_map(static fn (object $row): int => (int) $row->id, array_slice($rows, 0, 100));
+    }
+
+    private function claimableCandidates(?string $status = null, ?Carbon $cutoff = null): Builder
+    {
+        $cutoff ??= now();
+        $query = DB::table('release_verification_candidates')->whereNull('release_id');
+        if ($status === null) {
+            $query->whereIn('status', self::CLAIMABLE_STATUSES);
+        } else {
+            $query->where('status', $status);
+        }
+
+        return $query->where('next_attempt_at', '<=', $cutoff)
+            ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', $cutoff));
     }
 
     public function heartbeat(int $id, string $token): void
