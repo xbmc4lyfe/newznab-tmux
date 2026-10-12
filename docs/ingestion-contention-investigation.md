@@ -15,7 +15,7 @@ This is a causal SQL reproduction, not a full PHP-service fix. It used a simplif
 | Artifact | Purpose | Limits |
 |---|---|---|
 | [24-case baseline](performance/evidence/2026-10-11-ingestion-baseline.json) | Real storage code, initial correctness, throughput, retries, replay | Tiny cache-fit dataset; strict CPU caps; two repeats |
-| [Baseline runtime](performance/evidence/2026-10-11-ingestion-environment.json) | Runtime images, architecture, isolation and limits | Native PHP differs from production mode/architecture |
+| [Baseline runtime](performance/evidence/2026-10-11-ingestion-environment.json) | Runtime images, architecture and resource limits | Native PHP differs from production mode/architecture; transaction isolation, durability and binlog settings were not captured in this inventory |
 | [Case 8 snapshot](performance/evidence/2026-10-11-deadlock-case-8.txt) | Physical record and transaction edges | Latest deadlock after workers joined, not exception-time capture |
 | [Case 21 snapshot](performance/evidence/2026-10-11-deadlock-case-21.txt) | Independent repeat of the same edge pattern | Same capture limitation |
 | [Causal SQL probe](performance/evidence/2026-10-11-lock-causal-probe.json) | Submitted statements, barriers, first observed wait, plans, errors, final rows | Simplified schema, no service-level accounting tests |

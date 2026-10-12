@@ -1,6 +1,6 @@
 # CollectionHandler candidate benchmark protocol
 
-Status: prepared offline on October 11, 2026. No private runtime preparation, transfer, or benchmark was launched for this document. Lightweight local Docker PHP syntax checks were performed without a database. The designated coordinating-session agent owns private baseline red validation and current green/quality checks. PERF waits for an explicit frozen-green source and execution handoff.
+Status: historical pre-execution protocol prepared offline on October 11, 2026. Its pending-work statements describe that preparation checkpoint, not current status. The handoff, semantic/plan gates and paired execution subsequently completed; see the [initial screen](collection-primary-screen-results.md), [final fixed-sample validation](hot-workload-validation.md), and [durable raw evidence](performance/evidence/raw/2026-10-11-publication-manifest.json). The final study's grouped epochs and pinned CPU profile supersede the initial screening schedule for the nonregression decision.
 
 ## Executable preparation completed
 

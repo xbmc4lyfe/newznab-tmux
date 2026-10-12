@@ -2,6 +2,8 @@
 
 The fixed-sample isolated study completed October 11, 2026, 20:05:17–20:17:46 America/Chicago. [Evidence summary](performance/evidence/2026-10-11-hot-nonregression.json) records the design, effects, hashes and scope.
 
+Durable [raw study artifacts](performance/evidence/raw/2026-10-11-fixed-study.tar.gz) retain all epochs, worker outcomes, plans and logs. The [complete report supplement](performance/evidence/raw/2026-10-11-fixed-study-reports.json.gz) includes the final report, handoff, randomized order, analysis and topology supplement. The [publication manifest](performance/evidence/raw/2026-10-11-publication-manifest.json) records original and published hashes. Only machine-specific absolute path strings were replaced; measured numbers, failures and observation order are unchanged. Archived scripts are provenance copies, not supported repository commands.
+
 The safe PRIMARY-access candidate passes the declared 10% hot-workload nonregression budget in this controlled profile. No additional source change, unhinted fallback, weakened lock or runtime tuning was needed.
 
 | Primary hot-workload metric | Candidate/baseline effect | 95% interval | Gate |

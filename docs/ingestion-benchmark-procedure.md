@@ -1,5 +1,7 @@
 # Ingestion benchmark and experiment procedure
 
+Historical investigation procedure: the pending-stage statements below describe the initial planning checkpoint. The subsequent [screen](collection-primary-screen-results.md) and [fixed-sample validation](hot-workload-validation.md) record completed execution and its limits; use those results when deciding what remains to validate.
+
 This procedure records the October 11 research and provides acceptance rules for future isolated experiments. It is an experimental procedure, not a standing instruction to change production concurrency or database settings.
 
 Read the [detailed investigation](ingestion-contention-investigation.md) for decoded records and the later reduced SQL causal probe. It narrows the next candidate to collection-lock query access before broad parent ownership. Its unhinted preflight plan is a secondary-index scan/filesort, not `ALL`; its exact original full-service plan remains unavailable.
