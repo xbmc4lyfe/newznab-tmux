@@ -1,9 +1,10 @@
 use serde::Serialize;
 
-const MAGIC: &[u8; 4] = b"AI01";
+const MAGIC: &[u8; 4] = b"AI02";
 const MAX_REQUEST_BYTES: usize = 8_192;
 const MAX_HEADER_BYTES: usize = 65_536;
 const MAX_OVERVIEW_BYTES: usize = 32_768;
+const MAX_RESPONSE_TEXT_BYTES: usize = 4_096;
 const MAX_OCCURRENCES: usize = 4_096;
 
 #[derive(Debug, Serialize)]
@@ -12,6 +13,8 @@ pub struct ArticleIdentity {
     pub schema_version: u8,
     pub comparison_basis: &'static str,
     pub request: IdentityValue,
+    pub head_response: ProtocolResponseIdentity,
+    pub body_response: ProtocolResponseIdentity,
     pub head_message_id: IdentitySource,
     pub overview_message_id: IdentitySource,
     pub overview_attempted: bool,
@@ -51,22 +54,50 @@ pub struct IdentityOccurrence {
 
 #[derive(Debug, Serialize)]
 pub struct IdentityRelations {
+    pub head_response_matches_request: Option<bool>,
+    pub body_response_matches_request: Option<bool>,
+    pub head_response_matches_body_response: Option<bool>,
+    pub head_response_matches_head_field: Option<bool>,
+    pub body_response_matches_head_field: Option<bool>,
+    pub head_response_matches_overview: Option<bool>,
+    pub body_response_matches_overview: Option<bool>,
     pub head_matches_overview: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProtocolResponseIdentity {
+    pub response_code: Option<i32>,
+    pub availability: &'static str,
+    pub response_text_hex: String,
+    pub response_text_basis: &'static str,
+    pub article_number: Option<String>,
+    pub message_id: Option<String>,
+    pub message_id_hex: Option<String>,
+    pub parse_status: &'static str,
 }
 
 struct PackedFields<'a> {
     request: &'a [u8],
     headers: &'a [u8],
     overview: Option<&'a [u8]>,
+    head_response: Option<&'a [u8]>,
+    body_response: Option<&'a [u8]>,
 }
 
 pub fn parse(
     packed: &[u8],
     overview_response_code: i32,
     overview_attempted: bool,
+    head_response_code: i32,
+    body_response_code: i32,
 ) -> ArticleIdentity {
     let Some(fields) = unpack(packed) else {
-        return invalid_input(overview_response_code, overview_attempted);
+        return invalid_input(
+            overview_response_code,
+            overview_attempted,
+            head_response_code,
+            body_response_code,
+        );
     };
 
     let request_status = if fields.request.len() > MAX_REQUEST_BYTES {
@@ -81,6 +112,8 @@ pub fn parse(
             .flatten(),
         syntax_status: request_status,
     };
+    let head_response = parse_protocol_response(fields.head_response, head_response_code, 221);
+    let body_response = parse_protocol_response(fields.body_response, body_response_code, 222);
 
     let head_candidates = parse_header_message_ids(fields.headers);
     let head_status =
@@ -134,23 +167,74 @@ pub fn parse(
         matches_request: overview_matches_request,
     };
 
-    let head_overview_match = (overview_row_structure_status == "valid")
+    let head_overview_match = (overview_availability == "available"
+        && overview_row_structure_status == "valid")
         .then(|| unique_valid_token(&head_message_id.candidates))
         .flatten()
         .zip(unique_valid_token(&overview_message_id.candidates))
         .map(|(head, overview)| head == overview);
 
+    let request_token_hex = (request_status == "valid").then(|| hex(fields.request));
+    let head_response_matches_request = relation(
+        head_response.message_id_hex.as_deref(),
+        request_token_hex.as_deref(),
+        head_response.availability == "available",
+    );
+    let body_response_matches_request = relation(
+        body_response.message_id_hex.as_deref(),
+        request_token_hex.as_deref(),
+        body_response.availability == "available",
+    );
+    let head_response_matches_head_field = relation(
+        head_response.message_id_hex.as_deref(),
+        unique_valid_token(&head_message_id.candidates),
+        head_response.availability == "available" && head_message_id.availability == "available",
+    );
+    let body_response_matches_head_field = relation(
+        body_response.message_id_hex.as_deref(),
+        unique_valid_token(&head_message_id.candidates),
+        body_response.availability == "available" && head_message_id.availability == "available",
+    );
+    let overview_token = (overview_availability == "available"
+        && overview_row_structure_status == "valid")
+        .then(|| unique_valid_token(&overview_message_id.candidates))
+        .flatten();
+    let head_response_matches_body_response = relation(
+        head_response.message_id_hex.as_deref(),
+        body_response.message_id_hex.as_deref(),
+        head_response.availability == "available" && body_response.availability == "available",
+    );
+    let head_response_matches_overview = relation(
+        head_response.message_id_hex.as_deref(),
+        overview_token,
+        head_response.availability == "available" && overview_token.is_some(),
+    );
+    let body_response_matches_overview = relation(
+        body_response.message_id_hex.as_deref(),
+        overview_token,
+        body_response.availability == "available" && overview_token.is_some(),
+    );
+
     ArticleIdentity {
         parser_engine: "nntmux-rust-article-identity",
-        schema_version: 1,
+        schema_version: 2,
         comparison_basis: "exact_message_id_octets_case_sensitive",
         request,
+        head_response,
+        body_response,
         head_message_id,
         overview_message_id,
         overview_attempted,
         overview_row_structure_status,
         overview_article_number,
         relations: IdentityRelations {
+            head_response_matches_request,
+            body_response_matches_request,
+            head_response_matches_body_response,
+            head_response_matches_head_field,
+            body_response_matches_head_field,
+            head_response_matches_overview,
+            body_response_matches_overview,
             head_matches_overview: head_overview_match,
         },
         overview_response_code: (overview_response_code >= 0).then_some(overview_response_code),
@@ -166,6 +250,8 @@ fn unpack(data: &[u8]) -> Option<PackedFields<'_>> {
     let request = next_field(data, &mut cursor)?;
     let headers = next_field(data, &mut cursor)?;
     let overview = next_field(data, &mut cursor)?;
+    let head_response = next_field(data, &mut cursor)?;
+    let body_response = next_field(data, &mut cursor)?;
     if cursor != data.len() || request.is_none() || headers.is_none() {
         return None;
     }
@@ -175,6 +261,8 @@ fn unpack(data: &[u8]) -> Option<PackedFields<'_>> {
         request,
         headers,
         overview,
+        head_response,
+        body_response,
     })
 }
 
@@ -192,27 +280,105 @@ fn next_field<'a>(data: &'a [u8], cursor: &mut usize) -> Option<Option<&'a [u8]>
     Some(Some(value))
 }
 
-fn invalid_input(overview_response_code: i32, overview_attempted: bool) -> ArticleIdentity {
+fn invalid_input(
+    overview_response_code: i32,
+    overview_attempted: bool,
+    head_response_code: i32,
+    body_response_code: i32,
+) -> ArticleIdentity {
     ArticleIdentity {
         parser_engine: "nntmux-rust-article-identity",
-        schema_version: 1,
+        schema_version: 2,
         comparison_basis: "exact_message_id_octets_case_sensitive",
         request: IdentityValue {
             raw_hex: String::new(),
             token: None,
             syntax_status: "invalid_input",
         },
+        head_response: parse_protocol_response(None, head_response_code, 221),
+        body_response: parse_protocol_response(None, body_response_code, 222),
         head_message_id: empty_source("invalid_input", "unavailable"),
         overview_message_id: empty_source("invalid_input", "unavailable"),
         overview_attempted,
         overview_row_structure_status: "invalid_input",
         overview_article_number: None,
         relations: IdentityRelations {
+            head_response_matches_request: None,
+            body_response_matches_request: None,
+            head_response_matches_body_response: None,
+            head_response_matches_head_field: None,
+            body_response_matches_head_field: None,
+            head_response_matches_overview: None,
+            body_response_matches_overview: None,
             head_matches_overview: None,
         },
         overview_response_code: (overview_response_code >= 0).then_some(overview_response_code),
         interpretation: "mismatches are descriptive only; RFC 3977 permits the lookup Message-ID to differ from the article Message-ID header",
     }
+}
+
+fn parse_protocol_response(
+    response_text: Option<&[u8]>,
+    response_code: i32,
+    expected_code: i32,
+) -> ProtocolResponseIdentity {
+    let mut result = ProtocolResponseIdentity {
+        response_code: (response_code >= 0).then_some(response_code),
+        availability: if response_code < 0 {
+            "failed"
+        } else if response_code == expected_code {
+            "available"
+        } else {
+            "unavailable"
+        },
+        response_text_hex: response_text.map(hex).unwrap_or_default(),
+        response_text_basis: "net_nntp_current_status_response_trimmed_remainder",
+        article_number: None,
+        message_id: None,
+        message_id_hex: None,
+        parse_status: "unavailable",
+    };
+    if result.availability != "available" {
+        return result;
+    }
+    let Some(text) = response_text else {
+        result.parse_status = "missing_response_text";
+        return result;
+    };
+    if text.len() > MAX_RESPONSE_TEXT_BYTES {
+        result.parse_status = "budget_exceeded";
+        result.availability = "budget_exceeded";
+        return result;
+    }
+    let fields = text
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let Some(article_number) = fields.first() else {
+        result.parse_status = "malformed";
+        return result;
+    };
+    if !article_number.iter().all(u8::is_ascii_digit) {
+        result.parse_status = "malformed_article_number";
+        return result;
+    }
+    result.article_number = Some(String::from_utf8_lossy(article_number).into_owned());
+    let Some(message_id) = fields.get(1) else {
+        result.parse_status = "missing_message_id";
+        return result;
+    };
+    result.parse_status = message_id_status(message_id);
+    if result.parse_status == "valid" {
+        result.message_id = String::from_utf8(message_id.to_vec()).ok();
+        result.message_id_hex = Some(hex(message_id));
+    }
+    result
+}
+
+fn relation(left: Option<&str>, right: Option<&str>, available: bool) -> Option<bool> {
+    available
+        .then(|| left.zip(right).map(|(left, right)| left == right))
+        .flatten()
 }
 
 fn empty_source(parse_status: &'static str, availability: &'static str) -> IdentitySource {

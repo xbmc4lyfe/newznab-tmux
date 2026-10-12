@@ -186,17 +186,23 @@ pub unsafe extern "C" fn nntmux_par2_source_ranges_json(
     }
 }
 
-/// Parse the relationship between a requested Message-ID, a HEAD field, and
-/// the Message-ID column in an OVER response.
+/// Parse a v2 relationship between a requested Message-ID, protocol response
+/// lines, a HEAD field, and the mandatory Message-ID column in an OVER response.
+/// `data` is AI02 followed by five little-endian length-prefixed byte strings;
+/// u32::MAX means absent. The v2 symbol keeps this ABI separate from the legacy
+/// four-argument function below.
+/// The caller must release the result with `nntmux_metadata_string_free`.
 ///
 /// # Safety
 /// `data` must be readable for `length` bytes. Oversized inputs are rejected.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nntmux_article_identity_json(
+pub unsafe extern "C" fn nntmux_article_identity_v2_json(
     data: *const u8,
     length: usize,
     overview_response_code: i32,
     overview_attempted: i32,
+    head_response_code: i32,
+    body_response_code: i32,
 ) -> *mut c_char {
     if length > MAX_ARTICLE_IDENTITY_INPUT_BYTES || (length > 0 && data.is_null()) {
         return ptr::null_mut();
@@ -207,14 +213,68 @@ pub unsafe extern "C" fn nntmux_article_identity_json(
         // SAFETY: the caller guarantees `data` is readable for `length` bytes.
         unsafe { slice::from_raw_parts(data, length) }
     };
-    let encoded = catch_unwind(|| {
+    article_identity_json(
+        input,
+        overview_response_code,
+        overview_attempted != 0,
+        head_response_code,
+        body_response_code,
+    )
+}
+
+/// Parse legacy AI01 input while preserving the original four-argument ABI.
+/// The added response fields are marked absent in the v2 output.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Oversized inputs are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_article_identity_json(
+    data: *const u8,
+    length: usize,
+    overview_response_code: i32,
+    overview_attempted: i32,
+) -> *mut c_char {
+    if length > MAX_ARTICLE_IDENTITY_INPUT_BYTES || length < 4 || data.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+    let input = unsafe { slice::from_raw_parts(data, length) };
+    if input.get(..4) != Some(b"AI01")
+        || length
+            .checked_add(8)
+            .is_none_or(|size| size > MAX_ARTICLE_IDENTITY_INPUT_BYTES)
+    {
+        return ptr::null_mut();
+    }
+    let mut upgraded = Vec::with_capacity(length + 8);
+    upgraded.extend_from_slice(b"AI02");
+    upgraded.extend_from_slice(&input[4..]);
+    upgraded.extend_from_slice(&[0xff; 8]);
+    article_identity_json(
+        &upgraded,
+        overview_response_code,
+        overview_attempted != 0,
+        -1,
+        -1,
+    )
+}
+
+fn article_identity_json(
+    input: &[u8],
+    overview_response_code: i32,
+    overview_attempted: bool,
+    head_response_code: i32,
+    body_response_code: i32,
+) -> *mut c_char {
+    match catch_unwind(|| {
         serde_json::to_string(&article_identity::parse(
             input,
             overview_response_code,
-            overview_attempted != 0,
+            overview_attempted,
+            head_response_code,
+            body_response_code,
         ))
-    });
-    match encoded {
+    }) {
         Ok(Ok(json)) => CString::new(json)
             .map(CString::into_raw)
             .unwrap_or(ptr::null_mut()),

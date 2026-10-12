@@ -36,10 +36,16 @@ class NNTPService extends NntpClient
      *
      * @throws \RuntimeException
      */
-    public function verificationArticle(string $messageId, int $maximumBytes): string
+    public function verificationArticle(string $messageId, int $maximumBytes, ?array &$responseMetadata = null): string
     {
         $messageId = self::verificationMessageId($messageId, $maximumBytes);
         $response = $this->_sendCommand('BODY <'.$messageId.'>');
+        $responseMetadata = [
+            'response_code' => is_numeric($response) ? (int) $response : null,
+            'response_text' => is_numeric($response) ? $this->_currentStatusResponse() : null,
+            'response_text_basis' => 'net_nntp_current_status_response_trimmed_remainder',
+            'error_type' => is_numeric($response) ? null : class_basename($response),
+        ];
         if ($response !== ResponseCode::BodyFollows->value) {
             throw new \RuntimeException('Article is unavailable; retry verification later.');
         }
@@ -1054,7 +1060,7 @@ class NNTPService extends NntpClient
      * Read raw HEAD fields and a bounded raw BODY for a known article ID.
      * The alternate provider is queried directly instead of only as a fallback.
      *
-     * @return array{headers: list<string>, body: string, overview_response_code: int|null, overview_raw: string|null, overview_rows: list<string>, overview_row_count: int, overview_attempted: bool, command_results: list<array<string, mixed>>}
+     * @return array{headers: list<string>, body: string, head_response: array{response_code: int|null, response_text: string|null, response_text_basis: string, error_type: string|null}, body_response: array{response_code: int|null, response_text: string|null, response_text_basis: string, error_type: string|null}, overview_response_code: int|null, overview_raw: string|null, overview_rows: list<string>, overview_row_count: int, overview_attempted: bool, command_results: list<array<string, mixed>>}
      */
     public function getFingerprintArticleByMessageID(string $identifier, int $maximumBodyBytes = 2_000_000,
         int $maximumHeaderBytes = 65_536, bool $alternate = false, bool $includeOverview = false): array
@@ -1084,12 +1090,16 @@ class NNTPService extends NntpClient
                     $overviewRaw = $overviewLines[0] ?? null;
                 }
             }
-            $headers = $connection->readFingerprintArticleHeaders($identifier, $maximumHeaderBytes);
-            $body = $connection->verificationArticle($identifier, $maximumBodyBytes);
+            $headResponse = [];
+            $headers = $connection->readFingerprintArticleHeaders($identifier, $maximumHeaderBytes, $headResponse);
+            $bodyResponse = [];
+            $body = $connection->verificationArticle($identifier, $maximumBodyBytes, $bodyResponse);
 
             return [
                 'headers' => $headers,
                 'body' => $body,
+                'head_response' => $headResponse,
+                'body_response' => $bodyResponse,
                 'overview_response_code' => is_numeric($overviewCode) ? (int) $overviewCode : null,
                 'overview_raw' => $overviewRaw,
                 'overview_rows' => $overviewLines,
@@ -1103,8 +1113,8 @@ class NNTPService extends NntpClient
                         'available' => $overviewCode === 224,
                         'error_type' => is_numeric($overviewCode) ? null : class_basename($overviewCode),
                     ]] : []),
-                    ['command' => 'HEAD', 'attempted' => true, 'response_code' => 221, 'available' => true],
-                    ['command' => 'BODY', 'attempted' => true, 'response_code' => 222, 'available' => true],
+                    ['command' => 'HEAD', 'attempted' => true, ...$headResponse, 'available' => $headResponse['response_code'] === 221],
+                    ['command' => 'BODY', 'attempted' => true, ...$bodyResponse, 'available' => $bodyResponse['response_code'] === 222],
                 ],
             ];
         } finally {
@@ -1196,9 +1206,15 @@ class NNTPService extends NntpClient
     }
 
     /** @return list<string> */
-    private function readFingerprintArticleHeaders(string $identifier, int $maximumBytes): array
+    private function readFingerprintArticleHeaders(string $identifier, int $maximumBytes, ?array &$responseMetadata = null): array
     {
         $response = $this->_sendCommand('HEAD <'.$identifier.'>');
+        $responseMetadata = [
+            'response_code' => is_numeric($response) ? (int) $response : null,
+            'response_text' => is_numeric($response) ? $this->_currentStatusResponse() : null,
+            'response_text_basis' => 'net_nntp_current_status_response_trimmed_remainder',
+            'error_type' => is_numeric($response) ? null : class_basename($response),
+        ];
         if ($response !== 221) {
             throw new \RuntimeException('Article headers are unavailable.');
         }

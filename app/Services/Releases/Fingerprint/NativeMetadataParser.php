@@ -42,24 +42,43 @@ final class NativeMetadataParser
     /** @param list<string> $rawHeaders
      *  @return array<string, mixed>|null
      */
-    public function parseArticleIdentity(string $requestedMessageId, array $rawHeaders, ?string $overviewRow, ?int $overviewResponseCode, bool $overviewAttempted): ?array
-    {
+    public function parseArticleIdentity(
+        string $requestedMessageId,
+        array $rawHeaders,
+        ?string $overviewRow,
+        ?int $overviewResponseCode,
+        bool $overviewAttempted,
+        ?string $headResponseText,
+        ?string $bodyResponseText,
+        ?int $headResponseCode,
+        ?int $bodyResponseCode,
+    ): ?array {
         $headerBlock = implode('', $rawHeaders);
-        $packed = 'AI01'.self::packMetadataField($requestedMessageId)
+        $packed = 'AI02'.self::packMetadataField($requestedMessageId)
             .self::packMetadataField($headerBlock)
-            .($overviewRow === null ? "\xff\xff\xff\xff" : self::packMetadataField($overviewRow));
+            .($overviewRow === null ? "\xff\xff\xff\xff" : self::packMetadataField($overviewRow))
+            .($headResponseText === null ? "\xff\xff\xff\xff" : self::packMetadataField($headResponseText))
+            .($bodyResponseText === null ? "\xff\xff\xff\xff" : self::packMetadataField($bodyResponseText));
 
         if (strlen($packed) > 131_072) {
             return null;
         }
 
-        return $this->parseJson('nntmux_article_identity_json', $packed, $overviewResponseCode ?? -1, (int) $overviewAttempted);
+        return $this->parseJson('nntmux_article_identity_v2_json', $packed, [
+            $overviewResponseCode ?? -1,
+            (int) $overviewAttempted,
+            $headResponseCode ?? -1,
+            $bodyResponseCode ?? -1,
+        ]);
     }
 
-    /** @return array<string, mixed>|null */
-    private function parseJson(string $function, string $bytes, ?int $integerArgument = null, ?int $secondIntegerArgument = null): ?array
+    /**
+     * @param  list<int>  $integerArguments
+     * @return array<string, mixed>|null
+     */
+    private function parseJson(string $function, string $bytes, array $integerArguments = []): ?array
     {
-        $identityParser = $function === 'nntmux_article_identity_json';
+        $identityParser = str_starts_with($function, 'nntmux_article_identity_');
         $library = $this->library($identityParser);
         if ($library === null || strlen($bytes) > 67_108_864) {
             return null;
@@ -72,11 +91,7 @@ final class NativeMetadataParser
             if ($length > 0) {
                 FFI::memcpy($buffer, $bytes, $length);
             }
-            $pointer = match (true) {
-                $secondIntegerArgument !== null => $library->{$function}($buffer, $length, $integerArgument, $secondIntegerArgument), // @phpstan-ignore method.notFound
-                $integerArgument !== null => $library->{$function}($buffer, $length, $integerArgument), // @phpstan-ignore method.notFound
-                default => $library->{$function}($buffer, $length), // @phpstan-ignore method.notFound
-            };
+            $pointer = $library->{$function}($buffer, $length, ...$integerArguments); // @phpstan-ignore method.notFound
             if (FFI::isNull($pointer)) {
                 return null;
             }
@@ -119,7 +134,7 @@ final class NativeMetadataParser
         try {
             if ($articleIdentity) {
                 $definitions = <<<'C'
-                char* nntmux_article_identity_json(const unsigned char* data, size_t length, int overview_response_code, int overview_attempted);
+                char* nntmux_article_identity_v2_json(const unsigned char* data, size_t length, int overview_response_code, int overview_attempted, int head_response_code, int body_response_code);
                 void nntmux_metadata_string_free(char* value);
                 C;
             } else {
