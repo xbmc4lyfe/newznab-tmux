@@ -74,7 +74,7 @@ For a reliability-focused lock fix, first require the controlled cycle to disapp
 
 ## Verification, cleanup, and sharing
 
-For future PHP changes, run affected PHPUnit tests, Pint until clean, PHPStan, and changed-file syntax checks in Docker. Record exact commands, versions, and results in that implementation's report; this documentation-only change runs no PHP validation.
+For future PHP changes, run affected PHPUnit tests, Pint until clean, PHPStan, and changed-file syntax checks using the execution precedence in AGENTS.md. This investigation has explicit user authorization for Docker PHP validation; unrelated work retains the host default unless separately authorized for container execution. Record exact commands, versions, and results in that implementation's report; this documentation-only change runs no PHP validation.
 
 Archive fixture-only reports, metadata, protocol/source hashes, failure snapshots, and comparison summaries. Remove only the run's own containers, network, and scratch after collecting evidence. Do not prune shared Docker resources.
 

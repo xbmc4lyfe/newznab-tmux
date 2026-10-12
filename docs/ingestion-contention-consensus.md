@@ -28,7 +28,7 @@ All five consulted sessions explicitly approve the narrowed isolated experiment 
 - Validate both clients' explicit statement and transaction outcomes, not just marker receipt or process exit zero.
 - Independently verify stored parts, count/sum, readiness, crossposts, first-write duplicates, replay, rollback, missing-parent and deletion races.
 - Capture and examine actual plan/access evidence across small, dense, sparse, and maximum bounded ID sets and varying statistics. A hint or ORDER BY is not a universal physical-lock-order guarantee.
-- Run affected Docker tests, Pint, PHPStan, and changed-file syntax checks for implementation changes.
+- Run affected tests, Pint, PHPStan, and changed-file syntax checks for implementation changes, following AGENTS.md execution precedence. Docker PHP validation is explicitly authorized for this investigation.
 - Before a performance acceptance claim, run source-matched paired real-service comparisons; retain every initial correctness failure and exhausted chunk; record CPU throttling and compare successful unique work.
 - Preserve the historical-plan absence, simplified control/single-observation limits, and victim-label/client-outcome discrepancy. Do not assign the cycle's cause using the victim number alone.
 
