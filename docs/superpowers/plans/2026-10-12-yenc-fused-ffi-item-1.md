@@ -144,6 +144,10 @@ Define the `#[repr(C)]` enum with explicit discriminants. Validate
 `output_length`, null/length pointer pairs, and capacity before constructing
 slices. Initialize no output bytes on non-success. Return `NotYenc` for a
 well-formed plain byte slice; leave framed behavior for Task 2.
+Add Rustdoc above the new function documenting input ownership, non-aliasing
+preconditions, status semantics, unchanged `output_length` on non-success,
+and the no-partial-output guarantee. Do not rename, remove, or alter the
+compatibility exports.
 
 - [ ] **Step 4: Run the focused tests and verify GREEN**
 
@@ -183,6 +187,16 @@ fn leaves_false_yend_control_in_the_payload() {
     let body = b"=ybegin line=128 size=6 name=a\r\n=yendx\r\n=yend size=6\r\n";
     let frame = find_complete_frame(body).expect("complete frame");
     assert_eq!(frame.payload, b"=yendx\r\n");
+}
+
+#[test]
+fn returns_fallback_without_writing_for_an_immediate_ypart_line() {
+    let body = b"=ybegin part=1 total=2 line=128 size=3 name=a\r\n=ypart begin=1 end=3\r\nklm\r\n=yend size=3\r\n";
+    let mut output = [0xa5; 3];
+    let mut written = 0xfeed_beef;
+    assert_eq!(call_body(body, &mut output, &mut written), NntmuxYencBodyStatus::Fallback);
+    assert_eq!(output, [0xa5; 3]);
+    assert_eq!(written, 0xfeed_beef);
 }
 
 #[test]
@@ -267,7 +281,7 @@ Run: `cd docker/app/nzb-yenc-ffi && cargo test --release --locked`
 
 Expected: PASS.
 
-### Task 4: Lock compatibility with the existing library ABI
+### Task 4: Validate coexistence and the release-library ABI surface
 
 **Files:**
 - Modify: `docker/app/nzb-yenc-ffi/src/lib.rs`
@@ -275,39 +289,34 @@ Expected: PASS.
 
 **Interfaces:**
 - Consumes: the new body ABI and pre-existing `rapidyenc_*` exports.
-- Produces: a release-mode test suite that proves both ABI families remain callable.
+- Produces: a release-mode test suite and exact exported-symbol assertion that
+  prove both ABI families remain callable.
 
-- [ ] **Step 1: Write a failing coexistence test**
+- [ ] **Step 1: Add a coexistence test after Tasks 1 through 3 are green**
 
 Add a test that calls `rapidyenc_decode_ex` for its existing known answer and
 then calls `nntmux_yenc_decode_body` for a valid framed body, asserting the
 literal byte results from both.
 
-- [ ] **Step 2: Run it and verify the intended RED failure**
+- [ ] **Step 2: Run it and verify compatibility**
 
 Run: `cd docker/app/nzb-yenc-ffi && cargo test --release --locked body_abi_coexists_with_rapidyenc_compatibility_exports`
 
-Expected: FAIL until the new symbol and helper are available together.
+Expected: PASS. Task 1 and Task 3 already supplied the red-to-green tests for
+the new ABI; this is a compatibility check over the completed symbols.
 
-- [ ] **Step 3: Keep public symbols isolated and document the ABI invariant**
-
-Add Rustdoc above the new function documenting input ownership, non-aliasing
-preconditions, status semantics, unchanged `output_length` on non-success,
-and the no-partial-output guarantee. Do not rename, remove, or alter the
-compatibility exports.
-
-- [ ] **Step 4: Run all Rust library tests**
+- [ ] **Step 3: Run all Rust library tests**
 
 Run: `cd docker/app/nzb-yenc-ffi && cargo test --release --locked`
 
 Expected: PASS with the old and new ABI tests.
 
-- [ ] **Step 5: Verify dynamic symbols from the release cdylib**
+- [ ] **Step 4: Verify every required dynamic symbol from the release cdylib**
 
-Run: `cd docker/app/nzb-yenc-ffi && cargo build --release --locked && nm -D target/release/libnzbyenc.so | grep -E ' (rapidyenc_decode_ex|rapidyenc_decode_init|rapidyenc_version|rapidyenc_crc|rapidyenc_crc_init|nntmux_yenc_decode_body)$'`
+Run: `cd docker/app/nzb-yenc-ffi && cargo build --release --locked && expected_symbols=$(printf '%s\\n' nntmux_yenc_decode_body rapidyenc_crc rapidyenc_crc_init rapidyenc_decode_ex rapidyenc_decode_init rapidyenc_version | sort) && actual_symbols=$(nm -D --defined-only target/release/libnzbyenc.so | awk '{print $3}' | grep -E '^(nntmux_yenc_decode_body|rapidyenc_.*)$' | sort) && test "$actual_symbols" = "$expected_symbols"`
 
-Expected: all six symbols are present in the release artifact. Run this in the
-Linux build runtime because `nm -D` is an ELF check.
+Expected: the exact six-symbol set is present in the release artifact. Run
+this in the Linux build runtime because `nm -D` is an ELF check.
 
 ### Task 5: Validate the item-1 source in the supported build path
 
@@ -324,20 +333,28 @@ Run: `cd docker/app/nzb-yenc-ffi && cargo build --release --locked`
 
 Expected: exit 0 and `target/release/libnzbyenc.so` exists.
 
-- [ ] **Step 2: Run focused PHP regression tests without native selection**
+- [ ] **Step 2: Load the built cdylib through the existing PHP FFI declaration**
+
+Run: `YENC_NATIVE_LIBRARY="$(git rev-parse --show-toplevel)/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped tests/Unit/YencNativeDecoderTest.php`
+
+Expected: PASS on Linux CLI PHP with FFI. This validates that the release
+artifact retains the existing PHP FFI-compatible `rapidyenc_*` ABI; a skipped
+test fails the command. Do not add the new whole-body PHP declaration in Item 1.
+
+- [ ] **Step 3: Run focused PHP regression tests without native selection**
 
 Run: `php artisan test --compact tests/Unit/YencServiceTest.php tests/Unit/YencDecoderTest.php tests/Unit/NNTPBodyDecodingTest.php`
 
 Expected: PASS; this item must not change PHP behavior.
 
-- [ ] **Step 3: Run repository-required project validation**
+- [ ] **Step 4: Run repository-required project validation**
 
 Run: `./vendor/bin/pint --dirty && ./vendor/bin/phpstan analyse --memory-limit=2G && find app -name '*.php' -print0 | xargs -0 -n1 php -l && php artisan test --compact`
 
 Expected: all commands exit 0. If host PHP is unavailable, run the equivalent
 approved indexer CLI runtime and report that environmental substitution.
 
-- [ ] **Step 4: Record the evidence boundary**
+- [ ] **Step 5: Record the evidence boundary**
 
 Record the exact commit, Rust toolchain, Cargo lockfile hash, command output,
 and all test counts in the PR. State explicitly that item 1 has no PHP caller

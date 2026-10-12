@@ -17,10 +17,11 @@ malformed-input fixtures. The ABI has no PHP caller in this item.
 
 ## 2. Integrate the ABI into lenient BODY decoding with safe fallback
 
-Allow `YencService::decodeIgnore()` to use the new ABI only from the existing
-Linux CLI native decoder. Preserve the existing PHP path for server SAPIs,
-unavailable FFI, unframed input, malformed frames, and every uncertain ABI
-result. Do not move strict decoding or metadata extraction in this item.
+Wire `YencService::decodeIgnore()` to the new ABI only behind a disabled
+qualification switch in the existing Linux CLI native decoder. Preserve the
+existing PHP path for normal operation, server SAPIs, unavailable FFI,
+unframed input, malformed frames, and every uncertain ABI result. Do not move
+strict decoding or metadata extraction in this item.
 
 **Exit gate:** PHP tests prove the native and PHP results match and that all
 fallback conditions retain the current observable behavior.
@@ -47,11 +48,23 @@ slower and noisy rows rather than filtering them.
 artifacts for 4 KiB through 8 MiB ordinary and escape-heavy fixtures, and
 reports wall time, PHP peak memory, Linux peak RSS, and output correctness.
 
+**Predeclared qualification protocol:** Item 5 runs three independent
+fresh-process repetitions of randomized PHP/current-native/fused-native pairs,
+after three warmups and with eleven measured pairs per variant. It retains all
+rows, uses the same pinned cloud-indexer-equivalent runtime and resource limits,
+and records bootstrap source, fixtures, commits, image digests, and tool
+versions. A caller is eligible only if every decode is correct, each 1 MiB and
+8 MiB escape-heavy full-body fixture has at least a 3x median wall-time
+speedup in at least two of the three repetitions, and no other gated fixture
+has more than a 10% p95 wall-time regression. A 5x or 20x result is reported
+when measured, not assumed. Any failed criterion keeps the PHP selection.
+
 ## 5. Qualify, integrate, and deploy only an evidence-backed improvement
 
 Run the approved benchmark matrix on the cloud-indexer-equivalent CLI runtime,
-review the immutable implementation and measurement artifacts, and merge only
-if the fused complete-body caller is faster without a correctness regression.
+review the immutable implementation and measurement artifacts, and enable the
+previously disabled fused complete-body caller only if it meets the
+predeclared qualification protocol without a correctness regression.
 Deployment remains a separate operation owned by the designated deployer.
 
 **Exit gate:** the selected implementation has a reviewed, reproducible,
