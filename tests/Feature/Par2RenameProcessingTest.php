@@ -240,6 +240,22 @@ class Par2RenameProcessingTest extends TestCase
         $this->assertSame(['index', 'volume'], $this->downloaded);
     }
 
+    public function test_multipart_recovery_volume_is_skipped_and_marked_complete(): void
+    {
+        $release = $this->release();
+        $nzb = $this->nzb([['"release.vol001+002.par2" yEnc', 'volume']]);
+        $file = $nzb->file[0];
+        $segment = $file->segments->addChild('segment', 'volume-second');
+        $segment->addAttribute('bytes', '1000');
+        $segment->addAttribute('number', '2');
+
+        $service = $this->service($nzb);
+
+        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame([], $this->downloaded);
+        $this->assertSame(1, (int) $release->fresh()->proc_par2);
+    }
+
     public function test_probe_progress_survives_a_sweep_longer_than_seven_days(): void
     {
         $this->freezeTime();

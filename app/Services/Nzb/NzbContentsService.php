@@ -430,6 +430,11 @@ class NzbContentsService
 
             if (preg_match('/\.par2(?:["\s]|$)/i', $subject)) {
                 if (preg_match('/\.vol\d+\+\d+\.par2(?:["\s]|$)/i', $subject)) {
+                    // Only the first article is probed. A multipart recovery volume cannot be
+                    // parsed from that fragment and otherwise remains retryable on every sweep.
+                    if (count($file->segments->segment) > 1) {
+                        continue;
+                    }
                     $volumes[$id] = ['id' => $id, 'explicit' => true];
                 } else {
                     $explicit[$id] = ['id' => $id, 'explicit' => true];
