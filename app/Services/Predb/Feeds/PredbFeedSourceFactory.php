@@ -6,13 +6,24 @@ namespace App\Services\Predb\Feeds;
 
 use App\Services\Predb\Feeds\Contracts\PredbFeedSource;
 use App\Services\Predb\Feeds\Sources\ApibaySource;
+use App\Services\Predb\Feeds\Sources\CrowdnfoSource;
+use App\Services\Predb\Feeds\Sources\DatsPcIsoSource;
+use App\Services\Predb\Feeds\Sources\G4uSource;
+use App\Services\Predb\Feeds\Sources\GabberSource;
+use App\Services\Predb\Feeds\Sources\KnabenSource;
+use App\Services\Predb\Feeds\Sources\Nima4kSource;
+use App\Services\Predb\Feeds\Sources\NswdbSource;
+use App\Services\Predb\Feeds\Sources\NzedbArchiveSource;
 use App\Services\Predb\Feeds\Sources\PredatabaseSource;
 use App\Services\Predb\Feeds\Sources\PredbClubSource;
 use App\Services\Predb\Feeds\Sources\PredbNetSource;
 use App\Services\Predb\Feeds\Sources\PredbOrgSource;
 use App\Services\Predb\Feeds\Sources\PredbOvhSource;
 use App\Services\Predb\Feeds\Sources\RssFeedSource;
+use App\Services\Predb\Feeds\Sources\SceneArchiveSqlSource;
+use App\Services\Predb\Feeds\Sources\SeriousAboutSoundSource;
 use App\Services\Predb\Feeds\Sources\SrrdbSource;
+use App\Services\Predb\Feeds\Sources\ThreeDsDbSource;
 use App\Services\Predb\Feeds\Sources\XrelSource;
 use InvalidArgumentException;
 
@@ -26,7 +37,7 @@ class PredbFeedSourceFactory
      */
     public function availableKeys(): array
     {
-        return ['predb_club', 'predb_net', 'predb_me', 'predb_org', 'predatabase', 'srrdb', 'xrel', 'xrel_p2p', 'scnsrc_me', 'eztv', 'predb_ovh', 'apibay'];
+        return ['predb_club', 'predb_net', 'predb_me', 'predb_org', 'predatabase', 'srrdb', 'xrel', 'xrel_p2p', 'scnsrc_me', 'eztv', 'predb_ovh', 'apibay', 'nfodb', 'one_techno', 'one_gabba', 'ddlvalley', 'hdencode', 'hdencode_tv', 'mp3scene', 'nima4k', 'gload', 'hdworld', 'g4u', 'nswdb', '3dsdb', 'gabber', 'movieblog', 'scnlog', 'knaben', 'crowdnfo', 'seriousaboutsound', 'dats_pciso_1998', 'nzedb_archive', 'scene_archive_sql'];
     }
 
     /**
@@ -60,6 +71,28 @@ class PredbFeedSourceFactory
             'eztv' => new RssFeedSource('eztv', 'eztv', $endpoint, $pageSize, $timeout, $userAgent, spacedTitles: true),
             'predb_ovh' => new PredbOvhSource($endpoint, $pageSize, $timeout, $userAgent),
             'apibay' => new ApibaySource($endpoint, $pageSize, $timeout, $userAgent),
+            'nfodb' => new RssFeedSource('nfodb', 'nfodb.net.ru', $endpoint, $pageSize, $timeout, $userAgent, mapCategory: true, publicationDatesOnly: true),
+            'one_techno' => new RssFeedSource('one_techno', '1techno.org', $endpoint, $pageSize, $timeout, $userAgent, mapCategory: true, publicationDatesOnly: true),
+            'one_gabba' => new RssFeedSource('one_gabba', '1gabba.pw', $endpoint, $pageSize, $timeout, $userAgent, mapCategory: true, publicationDatesOnly: true),
+            'ddlvalley' => new RssFeedSource('ddlvalley', 'ddlvalley.me', $endpoint, $pageSize, $timeout, $userAgent, publicationDatesOnly: true),
+            'hdencode' => new RssFeedSource('hdencode', 'hdencode.org', $endpoint, $pageSize, $timeout, $userAgent, publicationDatesOnly: true, stripDisplaySizeSuffix: true),
+            'hdencode_tv' => new RssFeedSource('hdencode_tv', 'hdencode.org', $endpoint, $pageSize, $timeout, $userAgent, publicationDatesOnly: true, stripDisplaySizeSuffix: true),
+            'mp3scene' => new RssFeedSource('mp3scene', 'mp3scene.info', $endpoint, $pageSize, $timeout, $userAgent, publicationDatesOnly: true),
+            'nima4k' => new Nima4kSource($endpoint, $pageSize, $timeout, $userAgent),
+            'gload' => new RssFeedSource('gload', 'gload.to', $endpoint, $pageSize, $timeout, $userAgent, publicationDatesOnly: true),
+            'movieblog' => new RssFeedSource('movieblog', 'movieblog.to', $endpoint, $pageSize, $timeout, $userAgent, publicationDatesOnly: true),
+            'hdworld' => new RssFeedSource('hdworld', 'hd-world.cc', $endpoint, $pageSize, $timeout, $userAgent, publicationDatesOnly: true),
+            'scnlog' => new RssFeedSource('scnlog', 'scnlog.me', $endpoint, $pageSize, $timeout, $userAgent, mapCategory: true, publicationDatesOnly: true),
+            'knaben' => new KnabenSource($endpoint, $pageSize, $timeout, $userAgent),
+            'crowdnfo' => new CrowdnfoSource($endpoint, $pageSize, $timeout, $userAgent),
+            'seriousaboutsound' => new SeriousAboutSoundSource($endpoint, $pageSize, $timeout, $userAgent),
+            'g4u' => new G4uSource($endpoint, $pageSize, $timeout, $userAgent),
+            'gabber' => new GabberSource($endpoint, $pageSize, $timeout, $userAgent),
+            'nzedb_archive' => new NzedbArchiveSource($endpoint, $pageSize, $timeout, $userAgent),
+            'dats_pciso_1998' => new DatsPcIsoSource($endpoint, $pageSize, $timeout, $userAgent),
+            'scene_archive_sql' => new SceneArchiveSqlSource((string) config('predb_feeds.scene_archive_sql_file', ''), $pageSize),
+            'nswdb' => new NswdbSource($endpoint, $pageSize, $timeout, $userAgent),
+            '3dsdb' => new ThreeDsDbSource($endpoint, $pageSize, $timeout, $userAgent),
             default => throw new InvalidArgumentException("Unknown PreDB feed source [{$key}]. Available: ".implode(', ', $this->availableKeys())),
         };
     }

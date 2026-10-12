@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Services\Predb\Feeds\Contracts\CompleteCatalogueSource;
 use App\Services\Predb\Feeds\Contracts\PredbFeedSource;
 use App\Services\Predb\Feeds\FeedRateLimitedException;
 use App\Services\Predb\Feeds\PredbFeedEntry;
@@ -32,7 +33,7 @@ class PredbImportFeed extends Command
     /**
      * @var string
      */
-    protected $description = 'Import PREs from public PreDB JSON/RSS feeds into the predb table';
+    protected $description = 'Import release-title metadata from public PreDB feeds and catalogues';
 
     public function handle(PredbFeedSourceFactory $factory, PredbFeedImporter $importer): int
     {
@@ -49,9 +50,20 @@ class PredbImportFeed extends Command
         $dryRun = (bool) $this->option('dry-run');
         /** @var list<string> $requested */
         $requested = array_values(array_filter((array) $this->option('source')));
+        $keys = $requested === [] ? (array) config('predb_feeds.sources', []) : $requested;
+        if ($requested === []) {
+            $manualOnly = (array) config('predb_feeds.manual_only_sources', []);
+            foreach ($keys as $key) {
+                if (in_array($key, $manualOnly, true)) {
+                    $this->warn('Skipping manual-only catalogue '.$key.'; select it explicitly with --source.');
+                    Log::warning('Manual-only catalogue excluded from automatic polling', ['source' => $key]);
+                }
+            }
+            $keys = array_values(array_diff($keys, $manualOnly));
+        }
 
         try {
-            $sources = $factory->make($requested === [] ? null : $requested);
+            $sources = $factory->make($keys);
         } catch (InvalidArgumentException $e) {
             $this->error($e->getMessage());
 
@@ -72,6 +84,7 @@ class PredbImportFeed extends Command
             $status = 'ok';
 
             $reachedCutoff = false;
+            $visited = 0;
             $singlePage = in_array($source->key(), (array) config('predb_feeds.single_page_sources', []), true);
             $sourcePages = $singlePage ? 1 : $pages;
 
@@ -86,6 +99,7 @@ class PredbImportFeed extends Command
                     if ($entries === []) {
                         break;
                     }
+                    $visited += count($entries);
 
                     foreach ($importer->import($entries, $dryRun) as $key => $count) {
                         $totals[$key] += $count;
@@ -106,11 +120,18 @@ class PredbImportFeed extends Command
 
                 $succeeded++;
 
-                if ($since !== null && ! $reachedCutoff) {
-                    // The source ran out of history, hit --max-pages, or may not be paged (single-page).
-                    $status = $singlePage
-                        ? 'incomplete: history paging is disabled for this source'
-                        : 'incomplete: history ended before '.$since->toDateString();
+                if ($source instanceof CompleteCatalogueSource && $visited < $source->acceptedCount()) {
+                    $status = 'incomplete: processed '.$visited.' of '.$source->acceptedCount().' catalogue entries; increase --pages';
+                }
+
+                if ($since !== null && ($singlePage || ! $reachedCutoff)) {
+                    // Latest-only listings cannot verify historical coverage, even when a listing date crosses the cutoff.
+                    // Other sources may have run out of history or hit --max-pages.
+                    $status = $source instanceof CompleteCatalogueSource
+                        ? 'incomplete: catalogue dates are unknown; --since cannot verify coverage'
+                        : ($singlePage
+                            ? 'incomplete: history paging is disabled for this source'
+                            : 'incomplete: history ended before '.$since->toDateString());
                     Log::warning('PreDB history import incomplete', ['source' => $source->key(), 'since' => $since->toDateTimeString()]);
                 }
             } catch (Throwable $e) {

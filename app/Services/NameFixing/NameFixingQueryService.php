@@ -5,10 +5,15 @@ declare(strict_types=1);
 namespace App\Services\NameFixing;
 
 use App\Models\Category;
+use App\Support\Par2FileHashEvidence;
 use Carbon\CarbonImmutable;
+use Illuminate\Cache\DatabaseLock;
+use Illuminate\Cache\DatabaseStore;
 use Illuminate\Database\ConnectionInterface;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
+use RuntimeException;
 
 final class NameFixingQueryService
 {
@@ -120,7 +125,7 @@ final class NameFixingQueryService
             "SELECT r.id AS releases_id, r.id, r.name, r.searchname, r.fromname, r.groups_id,
                     r.categories_id, r.size AS relsize, r.guid, r.predb_id, r.nfostatus,
                     r.proc_nfo, r.proc_files, r.proc_par2, r.proc_uid, r.proc_srr,
-                    r.proc_hash16k, r.proc_crc32
+                    r.proc_hash16k, r.proc_crc32, r.isrenamed
              FROM releases r
              WHERE {$where}
              AND r.id > ?{$ceiling}
@@ -154,7 +159,7 @@ final class NameFixingQueryService
     public function standardCandidateBatch(string $leftGuid, int $limit, ?int $beforeId = null): array
     {
         $cursor = $beforeId === null ? '' : ' AND r.id < ?';
-        $bindings = [$leftGuid];
+        $bindings = [$leftGuid, CarbonImmutable::now()->toDateTimeString()];
         if ($beforeId !== null) {
             $bindings[] = $beforeId;
         }
@@ -164,7 +169,7 @@ final class NameFixingQueryService
             'SELECT r.id AS releases_id, r.id, r.name, r.searchname, r.fromname, r.guid,
                     r.groups_id, r.categories_id, r.size AS relsize, r.predb_id, r.nfostatus,
                     r.proc_nfo, r.proc_uid, r.proc_files, r.proc_par2, r.proc_hash16k,
-                    r.proc_srr, r.proc_crc32
+                    r.proc_srr, r.proc_crc32, r.isrenamed
              FROM releases r
              WHERE r.leftguid = ?
              AND r.isrenamed = 0
@@ -177,7 +182,8 @@ final class NameFixingQueryService
                 OR r.proc_uid = 0
                 OR r.proc_par2 = 0
                 OR r.proc_srr = 0
-                OR r.proc_hash16k = 0
+                OR (r.proc_hash16k = 0 AND NOT EXISTS (SELECT 1 FROM par2_hash_retry hr
+                    WHERE hr.releases_id = r.id AND HEX(hr.release_guid) = HEX(r.guid) AND hr.retry_at > ?))
                 OR r.proc_crc32 = 0
              )
              AND r.categories_id IN ('.implode(',', Category::OTHERS_GROUP).')'.$cursor.'
@@ -255,6 +261,23 @@ final class NameFixingQueryService
         );
     }
 
+    /** @param list<int> $releaseIds
+     * @return list<object>
+     */
+    public function legacyHashRows(array $releaseIds): array
+    {
+        return $this->selectForReleaseIds('SELECT ph.releases_id, ph.hash FROM par_hashes ph
+            WHERE ph.releases_id IN (%s) AND NOT EXISTS
+                (SELECT 1 FROM par_file_hashes strong WHERE strong.releases_id = ph.releases_id)
+            ORDER BY ph.releases_id, ph.hash', $releaseIds);
+    }
+
+    public function hashRetryDue(int $releaseId, string $guid): bool
+    {
+        return ! $this->database->table('par2_hash_retry')->where('releases_id', $releaseId)
+            ->whereRaw('HEX(release_guid) = ?', [strtoupper(bin2hex($guid))])->where('retry_at', '>', CarbonImmutable::now()->toDateTimeString())->exists();
+    }
+
     /**
      * @param  list<string>  $uniqueIds
      * @return array<string, list<object>>
@@ -298,6 +321,62 @@ final class NameFixingQueryService
     }
 
     /**
+     * All target keys participate in one catalogue snapshot. The 257th distinct donor
+     * is a flood sentinel; SQL work remains dependent on the indexed input cardinality.
+     * Target tuple validation uses bounded pages and never truncates descriptor coverage.
+     *
+     * @return array{known: bool, usable: bool, overflow: bool, donors: list<object>, generation: string}
+     */
+    public function fullHashDonorsForRelease(int $releaseId, string $expectedGuid): array
+    {
+        $known = $usable = false;
+        $cursor = 0;
+        $count = 0;
+        do {
+            $rows = $this->database->table('par_file_hashes')->select(['id', 'release_guid', 'hash16k', 'full_md5', 'file_size'])
+                ->where('releases_id', $releaseId)->where('id', '>', $cursor)->orderBy('id')->limit(128)->lockForUpdate()->get()->all();
+            foreach ($rows as $row) {
+                $known = true;
+                $count++;
+                $cursor = (int) $row->id;
+                if ($row->release_guid !== $expectedGuid
+                    || preg_match('/^[0-9a-f]{32}$/D', (string) $row->hash16k) !== 1
+                    || preg_match('/^[0-9a-f]{32}$/D', (string) $row->full_md5) !== 1
+                    || Par2FileHashEvidence::sizeDecimal($row->file_size) === null) {
+                    $generation = $this->hashEvidenceGeneration($releaseId);
+
+                    return ['known' => true, 'usable' => false, 'overflow' => false, 'donors' => [], 'generation' => $generation];
+                }
+                $usable = $usable || ($row->file_size !== '' && $row->file_size !== '0');
+            }
+        } while (count($rows) === 128);
+        if (! $usable) {
+            return ['known' => $known, 'usable' => false, 'overflow' => false, 'donors' => [], 'generation' => $cursor.':'.$count];
+        }
+        $donors = $this->database->select('SELECT DISTINCT r.id AS releases_id, r.guid AS donor_guid,
+                r.searchname, r.fromname, r.predb_id, p.title AS canonical_title
+            FROM par_file_hashes t
+            INNER JOIN releases target ON target.id = t.releases_id AND HEX(target.guid) = HEX(t.release_guid)
+            INNER JOIN par_file_hashes d ON d.full_md5 = t.full_md5 AND d.file_size = t.file_size
+                AND HEX(d.full_md5) = HEX(t.full_md5) AND HEX(d.file_size) = HEX(t.file_size)
+            INNER JOIN releases r ON r.id = d.releases_id AND HEX(r.guid) = HEX(d.release_guid)
+            INNER JOIN predb p ON p.id = r.predb_id
+            WHERE t.releases_id = ? AND HEX(t.release_guid) = ? AND r.id <> ?
+                AND t.file_size NOT IN (?, ?)
+            LIMIT 257', [$releaseId, strtoupper(bin2hex($expectedGuid)), $releaseId, '', '0']);
+
+        return ['known' => true, 'usable' => true, 'overflow' => count($donors) === 257, 'donors' => $donors, 'generation' => $cursor.':'.$count];
+    }
+
+    public function hashEvidenceGeneration(int $releaseId): string
+    {
+        $row = $this->database->table('par_file_hashes')->where('releases_id', $releaseId)
+            ->selectRaw('MAX(id) AS last_id, COUNT(*) AS total')->first();
+
+        return (int) ($row->last_id ?? 0).':'.(int) ($row->total ?? 0);
+    }
+
+    /**
      * @param  list<string>  $crcs
      * @return array<string, list<object>>
      */
@@ -315,9 +394,62 @@ final class NameFixingQueryService
     }
 
     /**
+     * Reserve a bounded ID window before matching. Unfinished titles stay eligible and are
+     * revisited when the snapshot wraps, including after a worker crashes or its backend fails.
+     *
      * @return list<object>
      */
-    public function predbBatch(int $worker, int $workers, int $limit): array
+    public function reservePredbBatch(int $worker, int $workers, int $limit): array
+    {
+        $workerCount = max(1, min(16, $workers));
+        $workerSlot = max(1, min($workerCount, $worker)) - 1;
+        $key = "predb:fulltext:v1:{$workerCount}:{$workerSlot}";
+        $cache = Cache::store('database');
+        $store = $cache->getStore();
+        if (! $store instanceof DatabaseStore) {
+            throw new RuntimeException('PreDB fulltext retries require the persistent database cache store.');
+        }
+        /** @var DatabaseLock $lock */
+        $lock = $store->lock($key.':lock', 60);
+
+        if (! $lock->get()) {
+            throw new RuntimeException('Another worker is reserving this PreDB fulltext shard; retry later.');
+        }
+
+        try {
+            $saved = $cache->get($key);
+            $valid = is_array($saved) && isset($saved['last_id'], $saved['max_id'])
+                && is_int($saved['last_id']) && is_int($saved['max_id'])
+                && $saved['last_id'] >= 0 && $saved['last_id'] <= $saved['max_id'];
+            $lastId = $valid ? $saved['last_id'] : 0;
+            $maxId = $valid ? $saved['max_id'] : (int) $this->database->table('predb')->max('id');
+            $rows = $this->predbBatch($worker, $workers, $limit, $lastId, $maxId);
+
+            if ($rows === [] && $lastId > 0) {
+                $maxId = (int) $this->database->table('predb')->max('id');
+                $rows = $this->predbBatch($worker, $workers, $limit, 0, $maxId);
+            }
+
+            if (! $lock->isOwnedByCurrentProcess()) {
+                throw new RuntimeException('PreDB fulltext reservation lock expired; retry later.');
+            }
+
+            if ($rows === []) {
+                $cache->forget($key);
+            } elseif (! $cache->forever($key, ['last_id' => (int) $rows[array_key_last($rows)]->predb_id, 'max_id' => $maxId])) {
+                throw new RuntimeException('Unable to persist the PreDB fulltext retry cursor.');
+            }
+
+            return $rows;
+        } finally {
+            $lock->release();
+        }
+    }
+
+    /**
+     * @return list<object>
+     */
+    public function predbBatch(int $worker, int $workers, int $limit, int $afterId = 0, int $maxId = PHP_INT_MAX): array
     {
         $workerCount = max(1, min(16, $workers));
         $workerSlot = max(1, min($workerCount, $worker)) - 1;
@@ -330,13 +462,16 @@ final class NameFixingQueryService
              AND p.searched = 0
              AND (p.predate < ? OR (p.predate IS NULL AND p.imported_at < ?))
              AND MOD(p.id, ?) = ?
-             ORDER BY p.predate ASC, p.id ASC
+             AND p.id > ? AND p.id <= ?
+             ORDER BY p.id ASC
              LIMIT ?',
             [
                 CarbonImmutable::now()->subDay()->toDateTimeString(),
                 CarbonImmutable::now()->subDay()->toDateTimeString(),
                 $workerCount,
                 $workerSlot,
+                max(0, $afterId),
+                max(0, $maxId),
                 max(1, $limit),
             ]
         );
@@ -355,7 +490,7 @@ final class NameFixingQueryService
         $like = '%'.$this->escapeLike($title).'%';
 
         return $this->database->select(
-            'SELECT r.id AS releases_id, r.name, r.fromname, r.searchname,
+            'SELECT r.id AS releases_id, r.guid, r.name, r.fromname, r.searchname,
                     r.groups_id, r.categories_id
              FROM releases r
              WHERE r.id IN ('.$this->placeholders(count($candidateIds)).')
@@ -364,6 +499,44 @@ final class NameFixingQueryService
              ORDER BY r.id ASC
              LIMIT 21',
             array_merge($candidateIds, [$like, $like])
+        );
+    }
+
+    /**
+     * Check only enumerated candidates for a concurrent attachment to the intended PreDB row.
+     *
+     * @param  list<int>  $candidateIds
+     * @return list<object>
+     */
+    public function linkedPredbCandidates(array $candidateIds, int $predbId): array
+    {
+        if ($candidateIds === [] || $predbId <= 0) {
+            return [];
+        }
+
+        return $this->database->select(
+            'SELECT r.searchname FROM releases r
+             WHERE r.id IN ('.$this->placeholders(count($candidateIds)).') AND r.predb_id = ?',
+            array_merge($candidateIds, [$predbId]),
+            false
+        );
+    }
+
+    /**
+     * Read a strictly capped indexed PreDB-ID range when discovery omitted an existing link.
+     *
+     * @return list<object>
+     */
+    public function existingPredbLinks(int $predbId): array
+    {
+        if ($predbId <= 0) {
+            return [];
+        }
+
+        return $this->database->select(
+            'SELECT r.searchname FROM releases r WHERE r.predb_id = ? ORDER BY r.id ASC LIMIT 17',
+            [$predbId],
+            false
         );
     }
 
@@ -394,7 +567,7 @@ final class NameFixingQueryService
         $direction = $descending ? 'DESC' : 'ASC';
 
         return $this->database->select(
-            'SELECT r.id AS releases_id, r.name, r.searchname, r.fromname,
+            'SELECT r.id AS releases_id, r.guid, r.name, r.searchname, r.fromname,
                     r.groups_id, r.categories_id
              FROM releases r
              WHERE r.predb_id = 0
@@ -448,6 +621,12 @@ final class NameFixingQueryService
 
         if ($categories === 1) {
             $where[] = 'r.categories_id IN ('.implode(',', Category::OTHERS_GROUP).')';
+        }
+
+        if ($source === self::SOURCE_HASH) {
+            $where[] = 'NOT EXISTS (SELECT 1 FROM par2_hash_retry hr WHERE hr.releases_id = r.id
+                AND HEX(hr.release_guid) = HEX(r.guid) AND hr.retry_at > ?)';
+            $bindings[] = CarbonImmutable::now()->toDateTimeString();
         }
 
         return [implode(' AND ', $where), $bindings];

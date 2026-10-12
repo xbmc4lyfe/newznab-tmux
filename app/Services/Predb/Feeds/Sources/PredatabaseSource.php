@@ -7,7 +7,10 @@ namespace App\Services\Predb\Feeds\Sources;
 use App\Services\Predb\Feeds\FeedRateLimitedException;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\RequestException;
 use RuntimeException;
+use Throwable;
 
 /**
  * predataba.se search API (newest first).
@@ -25,11 +28,28 @@ final class PredatabaseSource extends HttpFeedSource
 
     public const ANONYMOUS_REQUEST_LIMIT = 5;
 
+    private const MAX_EMPTY_CONTINUATION_REQUESTS = 5;
+
     private ?string $cursor = null;
 
     private int $lastPage = 0;
 
     private int $requests = 0;
+
+    private ?int $pendingPage = null;
+
+    private int $pendingRequests = 0;
+
+    /** @var array<string, true> */
+    private array $visitedCursors = [];
+
+    private ?int $oldestTimestamp = null;
+
+    /** @var list<PredbFeedEntry> */
+    private array $pendingEntries = [];
+
+    /** @var list<PredbFeedEntry> */
+    private array $completedEntries = [];
 
     public function __construct(
         string $endpoint,
@@ -50,37 +70,62 @@ final class PredatabaseSource extends HttpFeedSource
     {
         $page = max(1, $page);
 
-        if ($page === 1) {
-            $this->cursor = null;
-            $this->requests = 0;
-        } elseif ($page !== $this->lastPage && $page !== $this->lastPage + 1) {
-            // The same page again is a retry after throttling; it resumes from the saved cursor.
-            throw new RuntimeException('predataba.se pages through a cursor; fetch pages in order starting at 1.');
-        } elseif ($this->cursor === null) {
-            return [];
+        if ($this->pendingPage !== null) {
+            if ($page !== $this->pendingPage) {
+                throw new RuntimeException('predataba.se has an unfinished page; retry it before fetching the next page.');
+            }
+        } else {
+            if ($page === $this->lastPage) {
+                return $this->completedEntries;
+            }
+            if ($page !== $this->lastPage + 1) {
+                throw new RuntimeException('predataba.se pages through a cursor; fetch pages in order starting at 1.');
+            }
+            if ($this->lastPage > 0 && $this->cursor === null) {
+                return [];
+            }
+            $this->pendingPage = $page;
+            $this->pendingRequests = 0;
+            $this->pendingEntries = [];
         }
 
-        $this->lastPage = $page;
-        $entries = [];
         $requestsPerPage = max(1, intdiv($this->pageSize + self::ROWS_PER_REQUEST - 1, self::ROWS_PER_REQUEST));
 
-        for ($i = 0; $i < $requestsPerPage; $i++) {
+        while ($this->pendingRequests < $requestsPerPage || ($this->pendingEntries === [] && $this->cursor !== null)) {
+            if ($this->pendingRequests >= $requestsPerPage + self::MAX_EMPTY_CONTINUATION_REQUESTS) {
+                throw new RuntimeException('predataba.se returned too many nonterminal pages without eligible titles; history coverage is incomplete.');
+            }
             if ($this->apiKey === '' && $this->requests >= self::ANONYMOUS_REQUEST_LIMIT) {
                 $this->cursor = null;
                 break;
             }
 
-            [$rows, $this->cursor] = $this->request($this->cursor);
-            $this->requests++;
-            array_push($entries, ...$this->parseRows($rows));
+            [$rows, $nextCursor] = $this->request($this->cursor);
+            $entries = $this->parseRows($rows);
+            if ($nextCursor !== null && ($nextCursor === $this->cursor || isset($this->visitedCursors[':'.$nextCursor]))) {
+                throw new RuntimeException('predataba.se returned a repeated history cursor.');
+            }
+            $oldestTimestamp = $this->validateChronology($rows);
+            if ($this->cursor !== null) {
+                $this->visitedCursors[':'.$this->cursor] = true;
+            }
+            array_push($this->pendingEntries, ...$entries);
+            $this->oldestTimestamp = $oldestTimestamp;
+            $this->cursor = $nextCursor;
+            $this->pendingRequests++;
 
-            if ($this->cursor === null || count($rows) < self::ROWS_PER_REQUEST) {
+            if ($this->cursor === null) {
                 $this->cursor = null;
                 break;
             }
         }
 
-        return $entries;
+        $this->lastPage = $page;
+        $this->completedEntries = $this->pendingEntries;
+        $this->pendingPage = null;
+        $this->pendingEntries = [];
+
+        return $this->completedEntries;
     }
 
     /**
@@ -88,7 +133,16 @@ final class PredatabaseSource extends HttpFeedSource
      */
     private function request(?string $cursor): array
     {
-        $request = $this->http();
+        $attempts = $this->apiKey === '' ? min(2, self::ANONYMOUS_REQUEST_LIMIT - $this->requests) : 2;
+        $request = $this->http()
+            ->retry($attempts, 500, static fn (Throwable $exception): bool => $exception instanceof ConnectionException
+                || ($exception instanceof RequestException && $exception->response->serverError()), throw: false)
+            ->beforeSending(function (): void {
+                if ($this->apiKey === '' && $this->requests >= self::ANONYMOUS_REQUEST_LIMIT) {
+                    throw new RuntimeException('predataba.se anonymous wire request allowance is exhausted.');
+                }
+                $this->requests++;
+            });
         if ($this->apiKey !== '') {
             $request = $request->withToken($this->apiKey);
         }
@@ -108,8 +162,34 @@ final class PredatabaseSource extends HttpFeedSource
         }
 
         $next = $response->json('next_page_id');
+        if ($next !== null && ! is_string($next)) {
+            throw new RuntimeException('predataba.se returned a malformed history cursor.');
+        }
 
-        return [$rows, is_string($next) && $next !== '' ? $next : null];
+        return [$rows, $next !== '' ? $next : null];
+    }
+
+    /**
+     * Validate received dates before committing chunk state or allowing a CLI history cutoff.
+     * Unknown dates stay unknown; only an explicit reversal of known dates is rejected.
+     *
+     * @param  array<int, mixed>  $rows
+     */
+    private function validateChronology(array $rows): ?int
+    {
+        $oldest = $this->oldestTimestamp;
+        foreach ($rows as $row) {
+            $timestamp = is_array($row) && is_numeric($row['ctime'] ?? null) ? (int) $row['ctime'] : 0;
+            if ($timestamp <= 0) {
+                continue;
+            }
+            if ($oldest !== null && $timestamp > $oldest) {
+                throw new RuntimeException('predataba.se returned reversed chronological history.');
+            }
+            $oldest = $timestamp;
+        }
+
+        return $oldest;
     }
 
     /**

@@ -148,6 +148,29 @@ class ReleaseProcessingContext
      */
     public array $pendingParHashes = [];
 
+    /** @var array<string, array{full_md5: string, hash16k: string, size: ?string}> */
+    public array $pendingFullParHashes = [];
+
+    /** @var array{id: int, guid: string, name: ?string, searchname: ?string, additional_pp_claim_token: ?string} */
+    public readonly array $par2EvidenceSnapshot;
+
+    public bool $fullPar2EvidenceDeferred = false;
+
+    /** @var array{token: ?string, claimed_at: ?string}|null */
+    public readonly ?array $producerNamingClaim;
+
+    /** Naming admission requires claim checks for the lifetime of this context. */
+    public bool $producerNamingAttempted = false;
+
+    public int $producerNamingGeneration = 0;
+
+    public bool $audioMetadataCommitted = false;
+
+    public int $audioMetadataAdmissionGeneration = 0;
+
+    /** @var array{id: int, guid: string, name: ?string, searchname: ?string, additional_pp_claim_token: ?string} */
+    private array $currentPar2EvidenceSnapshot;
+
     /**
      * @var array<string, true>|null
      */
@@ -164,7 +187,53 @@ class ReleaseProcessingContext
     public function __construct(Release $release)
     {
         $this->release = $release;
+        $attributes = $release->getAttributes();
+        $this->producerNamingClaim = array_key_exists('additional_pp_claim_token', $attributes)
+            && array_key_exists('additional_pp_claimed_at', $attributes)
+            ? ['token' => is_string($attributes['additional_pp_claim_token']) ? $attributes['additional_pp_claim_token'] : null,
+                'claimed_at' => is_string($attributes['additional_pp_claimed_at']) ? $attributes['additional_pp_claimed_at'] : null]
+            : null;
+        $this->par2EvidenceSnapshot = [
+            'id' => (int) $release->id,
+            'guid' => (string) $release->guid,
+            'name' => is_string($attributes['name'] ?? null) ? $attributes['name'] : null,
+            'searchname' => is_string($attributes['searchname'] ?? null) ? $attributes['searchname'] : null,
+            'additional_pp_claim_token' => is_string($attributes['additional_pp_claim_token'] ?? null) ? $attributes['additional_pp_claim_token'] : null,
+        ];
+        $this->currentPar2EvidenceSnapshot = $this->par2EvidenceSnapshot;
         $this->startTime = hrtime(true);
+    }
+
+    /** @return array{id: int, guid: string, name: ?string, searchname: ?string, additional_pp_claim_token: ?string} */
+    public function fullPar2EvidenceSnapshot(): array
+    {
+        return $this->currentPar2EvidenceSnapshot;
+    }
+
+    /**
+     * Advance only through an identity transition attested by the guarded writer.
+     *
+     * @param  array{before: array{id: int, guid: string, name: ?string, searchname: ?string}, after: array{id: int, guid: string, name: ?string, searchname: ?string}}|null  $proof
+     */
+    public function advanceFullPar2EvidenceIdentity(?array $proof): bool
+    {
+        if ($proof === null || (int) $this->release->id !== $this->par2EvidenceSnapshot['id']
+            || (string) $this->release->guid !== $this->par2EvidenceSnapshot['guid']) {
+            return false;
+        }
+        foreach (['id', 'guid', 'name', 'searchname'] as $column) {
+            if ($proof['before'][$column] !== $this->currentPar2EvidenceSnapshot[$column]) {
+                return false;
+            }
+        }
+        if ($proof['after']['id'] !== $this->par2EvidenceSnapshot['id'] || $proof['after']['guid'] !== $this->par2EvidenceSnapshot['guid']) {
+            return false;
+        }
+        $this->currentPar2EvidenceSnapshot = [...$proof['after'], 'additional_pp_claim_token' => $this->par2EvidenceSnapshot['additional_pp_claim_token']];
+        $this->release->name = $proof['after']['name'];
+        $this->release->searchname = $proof['after']['searchname'];
+
+        return true;
     }
 
     /**
@@ -211,6 +280,11 @@ class ReleaseProcessingContext
         $this->compressedFilesChecked = 0;
         $this->pendingReleaseFiles = [];
         $this->pendingParHashes = [];
+        $this->pendingFullParHashes = [];
+        $this->fullPar2EvidenceDeferred = false;
+        $this->producerNamingGeneration++;
+        $this->audioMetadataCommitted = false;
+        $this->audioMetadataAdmissionGeneration++;
         $this->existingReleaseFileNames = null;
         $this->releaseFilesChanged = false;
     }

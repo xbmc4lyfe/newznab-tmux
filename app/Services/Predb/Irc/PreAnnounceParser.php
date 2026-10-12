@@ -23,11 +23,14 @@ use InvalidArgumentException;
  *                                                 `p2p | #1 | BTN | Name-GRP, WIN!`
  *  - ngp         (ngp.re #ngpre):                 `.::: PRE ::: TV-X264-HD ::: Name-GRP :::.`,
  *                                                 `[INFO] FOR Name-GRP with 5F 158.3MB added.`
+ *  - opentrackers (public #pre-all/#p2p-pre relay): mixed captured grammars, unknown PRE time.
  *  - rizon       (Rizon #pre):                    `[PRE]  [TV-HD]  Name-GRP`
  */
 final class PreAnnounceParser
 {
-    public const FORMATS = ['corruptnet', 'zenet', 'predatabase', 'ngp', 'rizon'];
+    public const FORMATS = ['corruptnet', 'zenet', 'predatabase', 'ngp', 'rizon', 'opentrackers'];
+
+    private const RELAY_FORMATS = ['corruptnet', 'zenet', 'predatabase', 'rizon'];
 
     /**
      * Announce type keyword => predb nuke status.
@@ -81,13 +84,17 @@ final class PreAnnounceParser
         private readonly string $format,
         private readonly string $source,
     ) {
-        if (! isset(self::PATTERNS[$format])) {
+        if ($format !== 'opentrackers' && ! isset(self::PATTERNS[$format])) {
             throw new InvalidArgumentException("Unknown IRC pre announce format [{$format}]. Available: ".implode(', ', self::FORMATS));
         }
     }
 
     public function parse(string $message, ?CarbonImmutable $receivedAt = null): ?PredbFeedEntry
     {
+        if ($this->format === 'opentrackers') {
+            return $this->parseRelay($message, $receivedAt);
+        }
+
         $message = trim($message);
 
         foreach (self::PATTERNS[$this->format] as $pattern) {
@@ -97,6 +104,54 @@ final class PreAnnounceParser
         }
 
         return null;
+    }
+
+    /**
+     * The public relay carries several existing grammars. Its receipt is an observation, not PRE time.
+     */
+    private function parseRelay(string $message, ?CarbonImmutable $receivedAt): ?PredbFeedEntry
+    {
+        if (str_contains($message, "\r") || str_contains($message, "\n")) {
+            return null;
+        }
+
+        $message = trim($message);
+        $matches = [];
+        foreach (self::RELAY_FORMATS as $format) {
+            foreach (self::PATTERNS[$format] as $pattern) {
+                $delimiter = strrpos($pattern, '/');
+                $completePattern = substr($pattern, 0, $delimiter).'\\z'.substr($pattern, $delimiter);
+                if (preg_match($completePattern, $message, $groups) !== 1) {
+                    continue;
+                }
+                if (strtoupper($groups['type']) === 'PRE' && ! isset($groups['section'])) {
+                    continue;
+                }
+                $entry = $this->entry($groups, $receivedAt);
+                if ($entry !== null) {
+                    $matches[] = $entry;
+                }
+            }
+        }
+
+        if (count($matches) !== 1) {
+            return null;
+        }
+
+        $entry = $matches[0];
+
+        return new PredbFeedEntry(
+            title: $entry->title,
+            source: 'opentrackers-relay',
+            category: $entry->category,
+            size: $entry->size,
+            files: $entry->files,
+            predate: null,
+            nuked: $entry->nuked,
+            nukeReason: $entry->nukeReason,
+            listedAt: $entry->predate !== null ? ($receivedAt ?? CarbonImmutable::now('UTC')) : null,
+            enrichOnly: $entry->enrichOnly,
+        );
     }
 
     /**

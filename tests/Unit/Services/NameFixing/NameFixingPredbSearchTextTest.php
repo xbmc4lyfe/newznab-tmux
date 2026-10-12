@@ -4,10 +4,16 @@ declare(strict_types=1);
 
 namespace Tests\Unit\Services\NameFixing;
 
+use App\Services\NameFixing\DonorMatchSelector;
+use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\NameFixingService;
+use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use ReflectionClass;
+use ReflectionMethod;
+use ReflectionProperty;
 
 final class NameFixingPredbSearchTextTest extends TestCase
 {
@@ -38,5 +44,83 @@ final class NameFixingPredbSearchTextTest extends TestCase
             'negation and OR operators' => ['-excluded | other !not', 'excluded other not'],
             'only punctuation' => ['())(|', ''],
         ];
+    }
+
+    #[DataProvider('updateModes')]
+    public function test_same_title_predb_match_attaches_only_when_updates_are_enabled(bool $update): void
+    {
+        $updates = $this->getMockBuilder(ReleaseUpdateService::class)->disableOriginalConstructor()
+            ->onlyMethods(['attachPredbSnapshot', 'updateRelease', 'updateSingleColumn', 'currentPredbTitle'])->getMock();
+        $updates->expects($this->exactly($update ? 0 : 1))->method('currentPredbTitle')
+            ->with(7, 'Canonical.Scene-GROUP', 'Canonical.Scene-GROUP')->willReturn('Canonical.Scene-GROUP');
+        $updates->expects($this->never())->method('updateRelease');
+        $updates->expects($this->never())->method('updateSingleColumn');
+        $updates->expects($this->exactly($update ? 1 : 0))->method('attachPredbSnapshot')->with($this->callback(static fn (object $release): bool => (int) $release->releases_id === 42), 7)
+            ->willReturnCallback(static function (object $release, int $predbId) use ($updates): bool {
+                $updates->matched = true;
+                $updates->done = true;
+
+                return true;
+            });
+
+        $service = $this->getMockBuilder(NameFixingService::class)->disableOriginalConstructor()
+            ->onlyMethods(['findBestPredbMatch'])->getMock();
+        $service->expects($this->once())->method('findBestPredbMatch')->with('Canonical.Scene-GROUP')
+            ->willReturn(['id' => 7, 'title' => 'Canonical.Scene-GROUP']);
+        (new ReflectionProperty(NameFixingService::class, 'fileNameCleaner'))->setValue($service, new FileNameCleaner);
+        (new ReflectionProperty(NameFixingService::class, 'updateService'))->setValue($service, $updates);
+        $release = (object) [
+            'releases_id' => 42, 'searchname' => 'canonical.scene-group',
+            'textstring' => 'Canonical.Scene-GROUP.mkv',
+        ];
+
+        $matched = (new ReflectionMethod(NameFixingService::class, 'preDbFileCheck'))
+            ->invoke($service, $release, $update, 'Filenames, ', true, false);
+
+        $this->assertSame($update, $matched);
+        $this->assertSame(0, $updates->fixed);
+        $this->assertSame('canonical.scene-group', $release->searchname);
+    }
+
+    #[DataProvider('updateModes')]
+    public function test_same_title_donor_match_attaches_only_when_updates_are_enabled(bool $update): void
+    {
+        $updates = $this->getMockBuilder(ReleaseUpdateService::class)->disableOriginalConstructor()
+            ->onlyMethods(['attachPredbSnapshot', 'updateRelease', 'updateSingleColumn'])->getMock();
+        $updates->expects($this->never())->method('updateRelease');
+        $updates->expects($this->never())->method('updateSingleColumn');
+        $updates->expects($this->exactly($update ? 1 : 0))->method('attachPredbSnapshot')->with($this->callback(static fn (object $release): bool => (int) $release->releases_id === 42), 7)
+            ->willReturnCallback(static function (object $release, int $predbId) use ($updates): bool {
+                $updates->matched = true;
+                $updates->done = true;
+
+                return true;
+            });
+
+        $service = (new ReflectionClass(NameFixingService::class))->newInstanceWithoutConstructor();
+        (new ReflectionProperty(NameFixingService::class, 'donorMatchSelector'))->setValue($service, new DonorMatchSelector);
+        (new ReflectionProperty(NameFixingService::class, 'updateService'))->setValue($service, $updates);
+        $release = (object) [
+            'releases_id' => 42, 'searchname' => 'canonical.scene-group', 'relsize' => 5000,
+        ];
+        $donor = (object) [
+            'releases_id' => 99, 'searchname' => 'Canonical.Scene-GROUP', 'relsize' => 5000,
+            'fromname' => 'poster@example.test', 'predb_id' => 7,
+        ];
+
+        $matched = (new ReflectionMethod(NameFixingService::class, 'applyDonorMatch'))
+            ->invoke($service, $release, [$donor], 5, 'hashCheck: 16K Hash', 'PAR2 hash, ', $update, true, false);
+
+        $this->assertSame($update, $matched);
+        $this->assertSame(0, $updates->fixed);
+        $this->assertSame('canonical.scene-group', $release->searchname);
+    }
+
+    /**
+     * @return array<string, array{bool}>
+     */
+    public static function updateModes(): array
+    {
+        return ['preview' => [false], 'update' => [true]];
     }
 }

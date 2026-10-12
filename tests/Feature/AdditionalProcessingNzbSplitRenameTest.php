@@ -49,6 +49,9 @@ class AdditionalProcessingNzbSplitRenameTest extends TestCase
                 true
             );
 
+        $before = ['id' => 123, 'guid' => str_repeat('a', 40), 'name' => $wrapped, 'searchname' => $wrapped];
+        $updateService->method('lastCommittedIdentity')->willReturn(['before' => $before, 'after' => [...$before, 'searchname' => $expected]]);
+
         $manager = $this->makeReleaseFileManager($updateService);
 
         $renamed = $manager->processReleaseNameFromNzbContents([

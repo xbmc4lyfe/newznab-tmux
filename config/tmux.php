@@ -47,6 +47,7 @@ return [
         'par2_budget_seconds' => (int) env('TMUX_FIX_NAMES_PAR2_BUDGET_SECONDS', 60),
         'par2_max_probes' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_PROBES', 4),
         'par2_max_probe_bytes' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_PROBE_BYTES', 2097152),
+        'par2_max_state_bytes' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_STATE_BYTES', 8388608),
     ],
 
     'terminal' => [

@@ -7,6 +7,8 @@ namespace App\Services\Releases\Verification;
 use App\Facades\Search;
 use App\Models\Release;
 use App\Models\ReleaseRegex;
+use App\Services\Nzb\NzbArticleCoverage;
+use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
@@ -64,7 +66,7 @@ final class VerifiedReleasePublisher
                     throw new RuntimeException('Legacy release identity changed before publication.');
                 }
             }
-            $duplicateId = $legacy === null ? $this->findExactDuplicate($claim, $manifest, $metadata, $size) : null;
+            $duplicateId = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size) : null;
             if ($duplicateId !== null) {
                 $this->recordGroups($duplicateId, $manifest['groups']);
                 app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
@@ -109,21 +111,24 @@ final class VerifiedReleasePublisher
      * @param  array<string, mixed>  $manifest
      * @param  array<string, mixed>  $metadata
      */
-    private function findExactDuplicate(object $claim, array $manifest, array $metadata, int $size): ?int
+    private function findCoveredDuplicate(object $claim, array $manifest, array $metadata, int $size): ?int
     {
         $lastHeartbeat = 0.0;
         $repository = app(CandidateRepository::class);
-        foreach ($this->duplicates->publishedCandidates($metadata['name'], $metadata['searchname'], $metadata['predb_id'], $size) as $duplicate) {
+        $heartbeat = function () use ($repository, $claim, &$lastHeartbeat): void {
             if (microtime(true) - $lastHeartbeat >= 1) {
                 $repository->heartbeat((int) $claim->id, $claim->lease_token);
                 $lastHeartbeat = microtime(true);
             }
-            if (! $this->writer->matches($manifest, (string) $duplicate->guid)) {
-                continue;
-            }
+        };
+        $coverage = new NzbArticleCoverage(app(NzbService::class), $this->duplicates);
+        $xml = $coverage->parseXml($this->writer->document($manifest));
+        $duplicate = $xml === null ? null : $coverage->findCoveredUpload($size, NzbArticleFingerprint::fromXml($xml), $xml,
+            $metadata['name'], $metadata['searchname'], $metadata['predb_id'], publishedOnly: true, onCandidate: $heartbeat);
+        if ($duplicate !== null && $xml !== null) {
             $current = DB::table('releases')->where('id', $duplicate->id)->where('nzbstatus', NzbService::NZB_ADDED)
                 ->lockForUpdate()->first(['id', 'guid']);
-            if ($current !== null && $this->writer->matches($manifest, (string) $current->guid)) {
+            if ($current !== null && $current->guid === (string) $duplicate->guid && $coverage->coversXml($xml, (string) $current->guid)) {
                 $repository->heartbeat((int) $claim->id, $claim->lease_token);
 
                 return (int) $current->id;

@@ -11,13 +11,13 @@ use Illuminate\Database\Eloquent\Builder;
 /**
  * Finds an existing release that should be treated as a duplicate of an incoming import.
  *
- * Uses (predb_id OR searchname) within a configurable size band. Falls back to raw {@see Release::$name}
- * when {@see Release::$searchname} is empty and there is no predb id. Disabled entirely when
- * `nntmux.release_dedupe_enabled` is false (NZB import then checks article identity itself).
+ * Metadata equality only nominates candidates. A caller must prove actual article coverage
+ * before a release can be treated as a duplicate. Metadata-only callers retain uploads.
  */
 final class ReleaseDuplicateFinder
 {
     /**
+     * @param  (callable(Release): bool)|null  $coversArticles
      * @return array{0: ?Release, 1: ?string} Tuple of matched release (if any) and dedupe reason for logging.
      */
     public function findDuplicate(
@@ -26,25 +26,62 @@ final class ReleaseDuplicateFinder
         int $predbId,
         int $filesize,
         bool $publishedOnly = false,
+        ?callable $coversArticles = null,
     ): array {
         if (! (bool) config('nntmux.release_dedupe_enabled', true)) {
             return [null, null];
         }
 
-        $query = $this->matchingQuery($cleanRelName, $searchName, $predbId, $filesize);
-        if ($publishedOnly) {
-            $query->where('nzbstatus', NzbService::NZB_ADDED);
-        }
-
-        $dup = $query->first(['id', 'predb_id', 'searchname', 'fromname', 'size', 'name']);
-
-        if ($dup === null) {
+        if ($coversArticles === null) {
             return [null, null];
         }
 
-        $reason = $this->resolveReason($dup, $searchName, $predbId);
+        foreach ($this->candidates($cleanRelName, $searchName, $predbId, 128, $publishedOnly) as $candidate) {
+            if ($coversArticles($candidate)) {
+                return [$candidate, $this->resolveReason($candidate, $searchName, $predbId).'_articles'];
+            }
+        }
 
-        return [$dup, $reason];
+        return [null, null];
+    }
+
+    /**
+     * Size annotations do not define article identity. The bounded list may miss a
+     * covering upload; exhaustion retains the incoming upload instead of guessing.
+     *
+     * @return list<Release>
+     */
+    public function candidates(string $cleanRelName, string $searchName, int $predbId, int $limit = 128, bool $publishedOnly = false): array
+    {
+        $limit = max(0, min(128, $limit));
+        $candidates = [];
+        $nominations = [];
+        if ($predbId > 0) {
+            $nominations['predb_id'] = $predbId;
+        }
+        if ($searchName !== '') {
+            $nominations['searchname'] = $searchName;
+        }
+        if ($cleanRelName !== '') {
+            $nominations['name'] = $cleanRelName;
+        }
+        foreach ($nominations as $column => $value) {
+            if (count($candidates) >= $limit) {
+                break;
+            }
+            $rows = Release::query()->where($column, $value)
+                ->when($publishedOnly, static fn (Builder $query) => $query->where('nzbstatus', NzbService::NZB_ADDED))
+                ->orderBy('id')->limit($limit)
+                ->get(['id', 'guid', 'predb_id', 'searchname', 'fromname', 'size', 'name']);
+            foreach ($rows as $row) {
+                $candidates[$row->id] = $row;
+                if (count($candidates) >= $limit) {
+                    break;
+                }
+            }
+        }
+
+        return array_values($candidates);
     }
 
     /**

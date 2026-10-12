@@ -480,6 +480,56 @@ class NzbService
     }
 
     /**
+     * Comparison-only read ceiling. Failed or over-limit reads consume their whole
+     * decoded allowance, so repeated corrupt candidates cannot bypass the budget.
+     */
+    public function readNzbContentsBounded(string $releaseGuid, int $maxCompressedBytes, int $maxDecodedBytes, ?int &$decodedBytes = null): string|false
+    {
+        $decodedBytes = 0;
+        if ($maxCompressedBytes <= 0 || $maxDecodedBytes <= 0) {
+            return false;
+        }
+        $path = $this->nzbPath($releaseGuid);
+        if (! is_string($path)) {
+            return false;
+        }
+        $compressed = @file_get_contents($path, false, null, 0, $maxCompressedBytes + 1);
+        if ($compressed === false || strlen($compressed) > $maxCompressedBytes || ! str_starts_with($compressed, "\x1f\x8b")) {
+            $decodedBytes = $maxDecodedBytes;
+
+            return false;
+        }
+        $inflater = @inflate_init(ZLIB_ENCODING_GZIP);
+        if ($inflater === false) {
+            $decodedBytes = $maxDecodedBytes;
+
+            return false;
+        }
+        $contents = '';
+        $length = strlen($compressed);
+        for ($offset = 0; $offset < $length; $offset += 256) {
+            $chunk = @inflate_add($inflater, substr($compressed, $offset, 256), $offset + 256 >= $length ? ZLIB_FINISH : ZLIB_SYNC_FLUSH);
+            if ($chunk === false || strlen($contents) + strlen($chunk) > $maxDecodedBytes) {
+                $decodedBytes = $maxDecodedBytes;
+
+                return false;
+            }
+            $contents .= $chunk;
+            if (inflate_get_status($inflater) === ZLIB_STREAM_END) {
+                break;
+            }
+        }
+        $decodedBytes = strlen($contents);
+        if (inflate_get_status($inflater) !== ZLIB_STREAM_END || inflate_get_read_len($inflater) !== $length) {
+            $decodedBytes = $maxDecodedBytes;
+
+            return false;
+        }
+
+        return $contents === '' ? false : $contents;
+    }
+
+    /**
      * Delete an NZB file.
      *
      * @param  string  $releaseGuid  The release GUID

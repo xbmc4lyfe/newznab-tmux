@@ -23,6 +23,8 @@ use Illuminate\Support\Facades\Facade;
  * @method static void updatePreDb(array $parameters)
  * @method static void deletePreDb(int $id)
  * @method static array searchReleases(array|string $phrases, int $limit = 1000)
+ * @method static bool supportsReleaseCandidatePaging()
+ * @method static array{ids: list<int>, available: bool, has_more: bool} searchReleaseCandidatesPage(string $title, int $limit = 21, int $afterId = 0)
  * @method static array searchReleasesWithFuzzy(array|string $phrases, int $limit = 1000, bool $forceFuzzy = false)
  * @method static array fuzzySearchReleases(array|string $phrases, int $limit = 1000)
  * @method static bool isFuzzyEnabled()

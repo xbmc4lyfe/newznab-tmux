@@ -252,7 +252,7 @@ class ReleaseExtraService
             }
         }
 
-        ReleaseSearchIndexSync::forIds([$releaseID]);
+        DB::afterCommit(static fn () => ReleaseSearchIndexSync::forIds([$releaseID]));
     }
 
     /**

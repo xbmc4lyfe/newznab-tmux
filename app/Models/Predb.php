@@ -108,7 +108,7 @@ class Predb extends Model
         $query = self::query()
             ->where('releases.predb_id', '<', 1)
             ->join('releases', 'predb.title', '=', 'releases.searchname')
-            ->select(['predb.id as predb_id', 'releases.id as releases_id']);
+            ->select(['predb.id as predb_id', 'releases.id as releases_id', 'predb.title as predb_title', 'releases.searchname as release_searchname']);
         if ($dateLimit !== false && (int) $dateLimit > 0) {
             $query->where('adddate', '>', now()->subDays((int) $dateLimit));
         }
@@ -120,11 +120,19 @@ class Predb extends Model
             cli()->primary(number_format($total).' releases to match.');
 
             foreach ($res as $row) {
-                Release::query()->where('id', $row['releases_id'])->update(['predb_id' => $row['predb_id']]);
+                if (PredbSearchDocument::exactValue((string) $row['predb_title']) !== PredbSearchDocument::exactValue((string) $row['release_searchname'])) {
+                    continue;
+                }
+
+                $updated += Release::query()
+                    ->where('id', $row['releases_id'])
+                    ->where('predb_id', '<', 1)
+                    ->whereRaw('HEX(searchname) = ?', [strtoupper(bin2hex((string) $row['release_searchname']))])
+                    ->update(['predb_id' => $row['predb_id']]);
 
                 if (config('nntmux.echocli')) {
                     cli()->overWritePrimary(
-                        'Matching up preDB titles with release searchnames: '.cli()->percentString(++$updated, $total)
+                        'Matching up preDB titles with release searchnames: '.cli()->percentString($updated, $total)
                     );
                 }
             }

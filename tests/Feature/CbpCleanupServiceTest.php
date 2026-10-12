@@ -7,14 +7,19 @@ use App\Enums\ConfigurationDomain;
 use App\Models\Release;
 use App\Services\Binaries\BinariesConfig;
 use App\Services\CollectionCleanupService;
+use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
+use App\Services\ReleaseProcessingService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Services\Releases\ReleaseManagementService;
 use App\Services\Releases\Verification\ManifestStore;
+use App\Support\Data\ReleaseDeleteStats;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use ReflectionMethod;
 use Tests\Support\ConfigurationTestBuilder;
 use Tests\TestCase;
 
@@ -477,7 +482,7 @@ class CbpCleanupServiceTest extends TestCase
         $this->assertSame(1, (int) DB::table('releases')->where('id', 1)->value('nzbstatus'));
     }
 
-    public function test_duplicate_release_path_cleans_up_collection_binary_and_parts(): void
+    public function test_metadata_only_duplicate_candidate_preserves_new_collection_articles(): void
     {
         DB::table('releases')->insert([
             'id' => 2,
@@ -540,13 +545,16 @@ class CbpCleanupServiceTest extends TestCase
         );
         $result = $service->createReleases(null, 10, false);
 
-        $this->assertSame(['added' => 0, 'dupes' => 1], $result);
-        $this->assertSame(0, DB::table('parts')->count());
-        $this->assertSame(0, DB::table('binaries')->count());
-        $this->assertSame(0, DB::table('collections')->count());
+        $this->assertSame(['added' => 1, 'dupes' => 0], $result);
+        $this->assertSame(2, DB::table('releases')->count());
+        $this->assertSame(1, DB::table('parts')->count());
+        $this->assertSame('<duplicate-1@example.com>', DB::table('parts')->value('messageid'));
+        $this->assertSame(1, DB::table('binaries')->count());
+        $this->assertSame(1, DB::table('collections')->count());
+        $this->assertSame(CollectionFileCheckStatus::Inserted->value, (int) DB::table('collections')->where('id', 300)->value('filecheck'));
     }
 
-    public function test_release_duplicate_finder_matches_searchname_within_size_band(): void
+    public function test_release_duplicate_finder_nominates_searchname_without_suppressing_articles(): void
     {
         DB::table('releases')->insert([
             'id' => 20,
@@ -579,11 +587,12 @@ class CbpCleanupServiceTest extends TestCase
             1_020_000
         );
 
-        $this->assertNotNull($dup);
-        $this->assertSame('searchname_match', $reason);
+        $this->assertNull($dup);
+        $this->assertNull($reason);
+        $this->assertSame(20, $finder->candidates('raw-obfuscated-b', 'Unified.Scene.S01E01.1080p', 0)[0]->id);
     }
 
-    public function test_release_duplicate_finder_matches_predb_id_when_searchname_differs(): void
+    public function test_release_duplicate_finder_nominates_predb_without_suppressing_articles(): void
     {
         DB::table('releases')->insert([
             'id' => 21,
@@ -616,11 +625,12 @@ class CbpCleanupServiceTest extends TestCase
             2_050_000
         );
 
-        $this->assertNotNull($dup);
-        $this->assertSame('predb_id_match', $reason);
+        $this->assertNull($dup);
+        $this->assertNull($reason);
+        $this->assertSame(21, $finder->candidates('new', 'New Style Name', 9001)[0]->id);
     }
 
-    public function test_release_duplicate_finder_does_not_match_outside_size_tolerance(): void
+    public function test_release_duplicate_finder_nominations_ignore_byte_annotation_difference(): void
     {
         config(['nntmux.release_dedupe_size_tolerance' => 0.05]);
 
@@ -651,9 +661,10 @@ class CbpCleanupServiceTest extends TestCase
         [$dup] = $finder->findDuplicate('x', 'Same.Search', 0, 1_200_000);
 
         $this->assertNull($dup);
+        $this->assertSame(22, $finder->candidates('x', 'Same.Search', 0)[0]->id);
     }
 
-    public function test_release_duplicate_finder_falls_back_to_name_when_searchname_empty(): void
+    public function test_release_duplicate_finder_nominates_raw_name_without_article_proof(): void
     {
         DB::table('releases')->insert([
             'id' => 23,
@@ -681,8 +692,35 @@ class CbpCleanupServiceTest extends TestCase
         $finder = app(ReleaseDuplicateFinder::class);
         [$dup, $reason] = $finder->findDuplicate('fallback.unique', '', 0, 500);
 
-        $this->assertNotNull($dup);
-        $this->assertSame('name_match_fallback', $reason);
+        $this->assertNull($dup);
+        $this->assertNull($reason);
+        $this->assertSame(23, $finder->candidates('fallback.unique', '', 0)[0]->id);
+    }
+
+    public function test_crosspost_cleanup_retains_same_metadata_with_distinct_article_sets(): void
+    {
+        config(['nntmux.release_dedupe_enabled' => true]);
+        DB::statement('ALTER TABLE releases ADD COLUMN article_fingerprint VARCHAR(40) NULL');
+        foreach ([['a1@x', 'a2@x'], ['b1@y', 'b2@y']] as $index => $ids) {
+            DB::table('releases')->insert([
+                'id' => 100 + $index,
+                'guid' => 'article-set-'.$index,
+                'name' => 'Same.Scene.Release-GRP',
+                'searchname' => 'Same.Scene.Release-GRP',
+                'fromname' => 'same-poster',
+                'adddate' => now(),
+                'article_fingerprint' => NzbArticleFingerprint::fromMessageIds($ids),
+            ]);
+        }
+        $this->assertNotSame(DB::table('releases')->where('id', 100)->value('article_fingerprint'), DB::table('releases')->where('id', 101)->value('article_fingerprint'));
+        $management = $this->createMock(ReleaseManagementService::class);
+        $management->method('deleteSingle')->willReturnCallback(static function (array $release): void {
+            DB::table('releases')->where('id', $release['i'])->delete();
+        });
+        $service = new ReleaseProcessingService(nzb: $this->createMock(NzbService::class), releaseManagement: $management);
+        $stats = (new ReflectionMethod($service, 'deleteCrossPostedReleases'))->invoke($service, new ReleaseDeleteStats);
+        $this->assertSame(0, $stats->duplicate);
+        $this->assertSame(2, DB::table('releases')->whereIn('id', [100, 101])->count());
     }
 
     private function insertRecentCollection(int $id, ?int $releasesId = null): void
@@ -781,6 +819,8 @@ class CbpCleanupServiceTest extends TestCase
             partnumber INTEGER,
             size INTEGER
         )');
+        DB::statement('CREATE TABLE release_regexes (releases_id INTEGER, collection_regex_id INTEGER, naming_regex_id INTEGER)');
+        DB::statement('CREATE TABLE releases_groups (releases_id INTEGER, groups_id INTEGER)');
         DB::statement('CREATE TABLE release_naming_regexes (
             id INTEGER PRIMARY KEY,
             group_regex VARCHAR(255),

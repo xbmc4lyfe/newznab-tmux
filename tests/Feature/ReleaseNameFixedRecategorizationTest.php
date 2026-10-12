@@ -291,6 +291,11 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
         ]);
 
         app(ReleaseUpdateService::class)->updateSingleColumn('proc_nfo', 1, $release->id);
+        Schema::create('predb', function (Blueprint $table): void {
+            $table->id();
+            $table->string('title');
+        });
+        DB::table('predb')->insert(['id' => 123, 'title' => $release->searchname]);
         app(ReleaseUpdateService::class)->attachPredbId($release->id, 123);
 
         $this->assertSame(1, (int) $release->fresh()->proc_nfo);

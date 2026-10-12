@@ -15,6 +15,7 @@ use App\Models\Release;
 use App\Models\SteamApp;
 use App\Models\Video;
 use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
+use App\Services\Search\Contracts\ReleaseCandidatePager;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
@@ -37,7 +38,7 @@ use Manticoresearch\Search;
 /**
  * ManticoreSearch driver for full-text search functionality.
  */
-class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInterface
+class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidatePager, SearchDriverInterface
 {
     private const AVAILABILITY_CHECK_CACHE_TTL = 30;
 
@@ -1348,6 +1349,70 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
             : $this->searchIndexes($this->getReleasesIndex(), '', [], $searchArray, $limit);
 
         return ! empty($result) ? ($result['id'] ?? []) : [];
+    }
+
+    /** @return array{ids: list<int>, available: bool, has_more: bool} */
+    public function searchReleaseCandidatesPage(string $title, int $limit = 21, int $afterId = 0): array
+    {
+        if ($limit < 1 || $limit > 1000 || $afterId < 0) {
+            throw new \InvalidArgumentException('Release candidate pages require a limit from 1 to 1000 and a nonnegative cursor.');
+        }
+        $unavailable = ['ids' => [], 'available' => false, 'has_more' => false];
+        if (! $this->isAvailable()) {
+            $this->recordSearchFailure();
+
+            return $unavailable;
+        }
+
+        // Titles are data rather than search syntax; literal confirmation belongs to the caller.
+        $tokens = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $title);
+        if ($tokens === null || trim($tokens) === '') {
+            $this->recordSearchFailure();
+
+            return $unavailable;
+        }
+        $prepared = self::prepareUserSearchQuery(trim($tokens));
+        $expression = '@@relaxed ('.self::scopePreparedQueryToField($prepared, '@name').' | '.self::scopePreparedQueryToField($prepared, '@searchname').')';
+        $profile = ManticoreIndexRegistry::profile('releases');
+
+        try {
+            $results = (new Search($this->manticoreSearch))
+                ->setTable($this->getReleasesIndex())
+                ->stripBadUtf8(true)
+                ->search($expression)
+                ->filter('id', 'gt', $afterId)
+                ->sort('id', 'asc')
+                ->option('ranker', $profile['ranker'])
+                ->option('field_weights', $profile['fields'])
+                ->maxMatches($limit + 1)
+                ->limit($limit + 1)
+                ->get();
+            $response = $results->getResponse()->getResponse();
+            if ($results->hasTimedout() || ! is_array($response['hits']['hits'] ?? null)) {
+                throw new \RuntimeException('The release candidate response was partial or malformed.');
+            }
+            $ids = [];
+            $previousId = $afterId;
+            foreach ($results as $hit) {
+                $rawId = $hit->getId();
+                if (! is_int($rawId) && (! is_string($rawId) || preg_match('/^[0-9]+$/D', $rawId) !== 1)) {
+                    throw new \RuntimeException('The release candidate response contained an invalid ID type.');
+                }
+                $id = filter_var($rawId, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+                if ($id === false || $id <= $previousId || count($ids) >= $limit + 1) {
+                    throw new \RuntimeException('The release candidate response did not preserve its cursor order.');
+                }
+                $ids[] = $id;
+                $previousId = $id;
+            }
+
+            return ['ids' => array_slice($ids, 0, $limit), 'available' => true, 'has_more' => count($ids) > $limit];
+        } catch (\Throwable $exception) {
+            $this->recordSearchFailure();
+            Log::error('ManticoreSearch release candidate page failed: '.$exception->getMessage());
+
+            return $unavailable;
+        }
     }
 
     /**

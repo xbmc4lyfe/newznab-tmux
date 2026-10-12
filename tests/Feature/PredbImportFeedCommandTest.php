@@ -7,6 +7,7 @@ namespace Tests\Feature;
 use App\Console\Commands\PredbImportFeed;
 use App\Facades\Search;
 use App\Models\Predb;
+use App\Services\Predb\Feeds\Contracts\PredbFeedSource;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Services\Predb\Feeds\PredbFeedSourceFactory;
@@ -21,6 +22,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 use Mockery;
 use Mockery\MockInterface;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use ReflectionMethod;
 use Tests\TestCase;
@@ -29,9 +31,14 @@ class PredbImportFeedCommandTest extends TestCase
 {
     private MockInterface $search;
 
+    /** @var list<string> */
+    private array $defaultSources;
+
     protected function setUp(): void
     {
         parent::setUp();
+
+        $this->defaultSources = (array) config('predb_feeds.sources');
 
         config([
             'database.default' => 'sqlite',
@@ -69,6 +76,139 @@ class PredbImportFeedCommandTest extends TestCase
     }
 
     #[Test]
+    public function local_scene_sql_archive_is_manual_only_and_never_requests_http(): void
+    {
+        config(['predb_feeds.scene_archive_sql_file' => $this->fixture('scene-archive-sql-subset.sql')]);
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('scene_archive_sql', $factory->availableKeys());
+        $this->assertNotContains('scene_archive_sql', $this->defaultSources);
+        $this->assertContains('scene_archive_sql', (array) config('predb_feeds.manual_only_sources'));
+        $this->assertNotContains('scene_archive_sql', (array) config('predb_feeds.single_page_sources'));
+        $this->assertSame('scene_archive_sql', $factory->makeOne('scene_archive_sql')->key());
+        Http::assertNothingSent();
+    }
+
+    #[Test]
+    public function local_scene_sql_import_preserves_literal_music_and_unknown_archive_metadata(): void
+    {
+        config(['predb_feeds.scene_archive_sql_file' => $this->fixture('scene-archive-sql-subset.sql'), 'predb_feeds.page_size' => 2]);
+        $this->artisan('predb:import-feed', ['--source' => ['scene_archive_sql'], '--pages' => 10])->assertSuccessful();
+        $this->assertSame(6, Predb::query()->count());
+        $this->assertTrue(Predb::query()->where('title', 'ER.S12E13.iTALiAN.LD.HDTV.XviD-TRiBECA')->exists());
+        $this->assertTrue(Predb::query()->where('title', 'Alcatraz-Give_Me_Love-(CATRAZ001)-Bootleg-Vinyl-2007-MPX')->exists());
+        $this->assertSame(6, Predb::query()->where('source', 'scene-archive-sql')->count());
+        foreach (['predate', 'size', 'files', 'category', 'nukereason'] as $column) {
+            $this->assertSame(0, Predb::query()->whereNotNull($column)->count());
+        }
+        Http::assertNothingSent();
+    }
+
+    #[Test]
+    public function local_scene_sql_preview_does_not_execute_sql_or_claim_known_pre_history(): void
+    {
+        config(['predb_feeds.scene_archive_sql_file' => $this->fixture('scene-archive-sql-subset.sql')]);
+        $this->artisan('predb:import-feed', ['--source' => ['scene_archive_sql'], '--dry-run' => true, '--since' => '2020-01-01'])
+            ->expectsOutputToContain('Dry run: nothing was written.')
+            ->expectsOutputToContain('incomplete')
+            ->assertSuccessful();
+        $this->assertSame(0, Predb::query()->count());
+        $this->search->shouldNotHaveReceived('insertPredb');
+        Http::assertNothingSent();
+    }
+
+    #[Test]
+    public function historical_dats_catalogue_requires_explicit_manual_selection(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('dats_pciso_1998', $factory->availableKeys());
+        $this->assertNotContains('dats_pciso_1998', $this->defaultSources);
+        $this->assertContains('dats_pciso_1998', (array) config('predb_feeds.manual_only_sources'));
+        $this->assertNotContains('dats_pciso_1998', (array) config('predb_feeds.single_page_sources'));
+        $this->assertSame('https://dats.site/exports/dat-sets/267', config('predb_feeds.endpoints.dats_pciso_1998'));
+        $this->assertSame('dats_pciso_1998', $factory->makeOne('dats_pciso_1998')->key());
+    }
+
+    #[Test]
+    public function historical_dats_import_keeps_independent_literal_names_and_unknown_metadata(): void
+    {
+        config(['predb_feeds.page_size' => 2]);
+        $url = (string) config('predb_feeds.endpoints.dats_pciso_1998');
+        Http::fake([$url => Http::response((string) file_get_contents($this->fixture('dats-pciso-1998-subset.xml')), 200)]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['dats_pciso_1998'], '--pages' => 10])->assertSuccessful();
+
+        $this->assertSame(3, Predb::query()->count());
+        foreach (['F22.Air.Dominance.Fighter-GOBBLE', 'Alien.Earth-RAZORISO', 'Bundesliga_Manager_98_GERMAN_ISO_FF'] as $title) {
+            $this->assertTrue(Predb::query()->where('title', $title)->exists());
+        }
+        $this->assertSame(3, Predb::query()->where('source', 'dats.site')->count());
+        foreach (['predate', 'size', 'files', 'category'] as $column) {
+            $this->assertSame(0, Predb::query()->whereNotNull($column)->count());
+        }
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function historical_dats_preview_does_not_claim_known_pre_history_or_write_rows(): void
+    {
+        $url = (string) config('predb_feeds.endpoints.dats_pciso_1998');
+        Http::fake([$url => Http::response((string) file_get_contents($this->fixture('dats-pciso-1998-subset.xml')), 200)]);
+        $this->artisan('predb:import-feed', ['--source' => ['dats_pciso_1998'], '--dry-run' => true, '--since' => '2000-01-01'])
+            ->expectsOutputToContain('Dry run: nothing was written.')
+            ->expectsOutputToContain('incomplete')
+            ->assertSuccessful();
+        $this->assertSame(0, Predb::query()->count());
+        $this->search->shouldNotHaveReceived('insertPredb');
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function historical_nzedb_archive_requires_explicit_manual_selection(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('nzedb_archive', $factory->availableKeys());
+        $this->assertNotContains('nzedb_archive', $this->defaultSources);
+        $this->assertContains('nzedb_archive', (array) config('predb_feeds.manual_only_sources'));
+        $this->assertNotContains('nzedb_archive', (array) config('predb_feeds.single_page_sources'));
+        $this->assertSame('https://raw.githubusercontent.com/nZEDb/nZEDbPre_Dumps/ae51410b04bb3c59749b68582fbc4cc1e1f02d68/dumps/1689156393/1714642832_predb_dump.csv.gz', config('predb_feeds.endpoints.nzedb_archive'));
+        $this->assertSame('nzedb_archive', $factory->makeOne('nzedb_archive')->key());
+    }
+
+    #[Test]
+    public function historical_nzedb_archive_import_preserves_literal_titles_with_unknown_dates(): void
+    {
+        config(['predb_feeds.page_size' => 2]);
+        $url = (string) config('predb_feeds.endpoints.nzedb_archive');
+        Http::fake([$url => Http::response(gzencode((string) file_get_contents($this->fixture('nzedb-2024-05-02-subset.csv'))), 200)]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['nzedb_archive'], '--pages' => 10])->assertSuccessful();
+
+        $this->assertSame(5, Predb::query()->count());
+        $this->assertSame('X264', Predb::query()->where('title', 'FC.Bayern.Generation.Wembley.S01E05.720p.BluRay.x264-GUACAMOLE')->value('category'));
+        $this->assertSame('Movie HD-1080p', Predb::query()->where('title', 'Ueberall.nur.nicht.hier.1999.German.DL.1080p.DSNP.H264-Oergel')->value('category'));
+        $this->assertSame(5, Predb::query()->where('source', 'nzedb-pre-dumps')->count());
+        foreach (['predate', 'size', 'files'] as $column) {
+            $this->assertSame(0, Predb::query()->whereNotNull($column)->count());
+        }
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function historical_archive_preview_does_not_write_or_claim_date_coverage(): void
+    {
+        $url = (string) config('predb_feeds.endpoints.nzedb_archive');
+        Http::fake([$url => Http::response(gzencode((string) file_get_contents($this->fixture('nzedb-2024-05-02-subset.csv'))), 200)]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['nzedb_archive'], '--dry-run' => true, '--since' => '2020-01-01'])
+            ->expectsOutputToContain('incomplete: catalogue dates are unknown; --since cannot verify coverage')
+            ->expectsOutputToContain('Dry run: nothing was written.')
+            ->assertSuccessful();
+        $this->assertSame(0, Predb::query()->count());
+        $this->search->shouldNotHaveReceived('insertPredb');
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
     public function the_factory_builds_the_opt_in_predb_org_source(): void
     {
         $factory = new PredbFeedSourceFactory;
@@ -88,6 +228,218 @@ class PredbImportFeedCommandTest extends TestCase
             $this->assertNotContains($key, (array) config('predb_feeds.sources'));
             $this->assertNotSame('', (string) config("predb_feeds.endpoints.{$key}"));
         }
+    }
+
+    #[Test]
+    public function nima4k_import_is_opt_in_and_reports_latest_only_coverage(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('nima4k', $factory->availableKeys());
+        $this->assertNotContains('nima4k', $this->defaultSources);
+        $this->assertNotContains('nima4k', array_map(static fn (PredbFeedSource $source): string => $source->key(), $factory->make()));
+        $this->assertContains('nima4k', (array) config('predb_feeds.single_page_sources'));
+        $endpoint = 'https://nima4k.org/';
+        $this->assertSame($endpoint, config('predb_feeds.endpoints.nima4k'));
+        Http::fake([$endpoint => Http::response((string) file_get_contents($this->fixture('nima4k.html')), 200, ['Content-Type' => 'text/html'])]);
+        $this->assertSame([], $factory->makeOne('nima4k')->fetch(2));
+        Http::assertNothingSent();
+
+        $this->artisan('predb:import-feed', ['--source' => ['nima4k'], '--pages' => 5, '--since' => '2020-01-01'])
+            ->expectsOutputToContain('incomplete: history paging is disabled for this source')
+            ->assertSuccessful();
+
+        $this->assertSame(10, Predb::query()->count());
+        $first = Predb::query()->where('title', 'Formel.1.2026.GP.Singapur.Rennen.German.2160p.UHDTV.HDR.HEVC-NIMA4K')->firstOrFail();
+        $this->assertSame('nima4k.org', $first->source);
+        $this->assertNull($first->predate);
+        $this->assertNull($first->category);
+        $this->assertNull($first->size);
+        $this->assertNull($first->files);
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function nfodb_is_opt_in_and_never_fetches_a_second_rss_page(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('nfodb', $factory->availableKeys());
+        $this->assertNotContains('nfodb', $this->defaultSources);
+        $this->assertSame('https://nfodb.net.ru/rss.xml', config('predb_feeds.endpoints.nfodb'));
+        $this->assertContains('nfodb', (array) config('predb_feeds.single_page_sources'));
+        $this->assertNotContains('nfodb', array_map(static fn (PredbFeedSource $source): string => $source->key(), $factory->make()));
+
+        Http::fake(['https://nfodb.net.ru/rss.xml' => Http::response((string) file_get_contents($this->fixture('nfodb.xml')), 200, ['Content-Type' => 'application/rss+xml'])]);
+        $source = $factory->makeOne('nfodb');
+        $this->assertSame('nfodb', $source->key());
+        $this->assertSame([], $source->fetch(2));
+        Http::assertNothingSent();
+        $entries = $source->fetch();
+        $this->assertCount(3, $entries);
+        $this->assertSame('nfodb.net.ru', $entries[0]->source);
+        $this->assertNull($entries[0]->predate);
+        $this->assertSame('2026-10-11 12:26:12', $entries[0]->listedAt?->format('Y-m-d H:i:s'));
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function nfodb_history_import_keeps_true_pre_dates_and_reports_incomplete_coverage(): void
+    {
+        $title = 'DJ_Trike-Berlin_EP-(SYNCRO75)-24BIT-WEB-FLAC-2026-AGITB';
+        DB::table('predb')->insert(['title' => $title, 'source' => '#PreNNTmux', 'predate' => '2026-10-10 01:02:03']);
+        Http::fake(['https://nfodb.net.ru/rss.xml' => Http::response((string) file_get_contents($this->fixture('nfodb.xml')), 200, ['Content-Type' => 'application/rss+xml'])]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['nfodb'], '--since' => '2026-10-01'])
+            ->expectsOutputToContain('incomplete: history paging is disabled for this source')
+            ->assertSuccessful();
+
+        $this->assertSame(3, Predb::query()->count());
+        $this->assertSame('2026-10-10 01:02:03', DB::table('predb')->where('title', $title)->value('predate'));
+        $this->assertSame('#PreNNTmux', Predb::query()->where('title', $title)->value('source'));
+        $chart = Predb::query()->where('title', 'VA_-_Beatport_Cuprite_-_Badaman_Chart-WEB-2026')->firstOrFail();
+        $this->assertSame('nfodb.net.ru', $chart->source);
+        $this->assertSame('Dance', $chart->category);
+        $this->assertNull($chart->predate);
+        $this->assertNull(Predb::query()->where('title', 'VA_-_Beatport_Sofian_-_D.Y.F.I.T_Chart-WEB-2026')->value('predate'));
+        $this->assertFalse(Predb::query()->where('title', 'Music catalogue news and updates')->exists());
+        $this->search->shouldHaveReceived('insertPredb')->times(2);
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    #[DataProvider('specialistCatalogueSources')]
+    public function specialist_catalogues_are_opt_in_and_fetch_only_their_public_rss_endpoint(string $key, string $label, int $count, ?string $listedAt, string $endpoint, ?string $category): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains($key, $factory->availableKeys());
+        $this->assertNotContains($key, $this->defaultSources);
+        $this->assertNotContains($key, array_map(static fn (PredbFeedSource $source): string => $source->key(), $factory->make()));
+        $this->assertSame($endpoint, config('predb_feeds.endpoints.'.$key));
+        $this->assertContains($key, (array) config('predb_feeds.single_page_sources'));
+        config(['predb_feeds.user_agent' => 'Catalogue-Test/1.0']);
+        Http::fake([$endpoint => Http::response((string) file_get_contents($this->fixture($key.'.xml')), 200, ['Content-Type' => 'application/rss+xml'])]);
+
+        $source = $factory->makeOne($key);
+        $this->assertSame($key, $source->key());
+        $this->assertSame([], $source->fetch(2));
+        Http::assertNothingSent();
+        $entries = $source->fetch();
+        $this->assertCount($count, $entries);
+        $this->assertSame($label, $entries[0]->source);
+        $this->assertSame($category, $entries[0]->category);
+        $this->assertNull($entries[0]->predate);
+        $this->assertSame($listedAt, $entries[0]->listedAt?->toDateTimeString());
+        Http::assertSent(static fn (Request $request): bool => $request->method() === 'GET'
+            && $request->url() === $endpoint
+            && $request->hasHeader('User-Agent', 'Catalogue-Test/1.0'));
+        Http::assertSentCount(1);
+    }
+
+    /** @return array<string, array{string, string, int, ?string, string, ?string}> */
+    public static function specialistCatalogueSources(): array
+    {
+        return [
+            'techno dates are unknown' => ['one_techno', '1techno.org', 2, null, 'https://1techno.org/rss.xml', null],
+            'gabba dates include a timezone' => ['one_gabba', '1gabba.pw', 1, '2026-10-11 02:14:20', 'https://1gabba.pw/rss.xml', 'Web'],
+            'ddlvalley categories are not mapped' => ['ddlvalley', 'ddlvalley.me', 1, '2026-10-09 23:37:19', 'https://www.ddlvalley.me/feed/', null],
+            'hdencode display sizes are not metadata' => ['hdencode', 'hdencode.org', 8, '2026-10-11 14:56:46', 'https://hdencode.org/tag/movies/feed/', null],
+            'hdencode TV keeps listing metadata separate' => ['hdencode_tv', 'hdencode.org', 1, '2026-10-11 15:24:20', 'https://hdencode.org/tag/tv-shows/feed/', null],
+            'mp3scene historical release days are not PRE times' => ['mp3scene', 'mp3scene.info', 2, '2026-10-10 22:19:13', 'https://www.mp3scene.info/feeds/releases/', null],
+        ];
+    }
+
+    #[Test]
+    public function hdencode_import_links_the_observed_exact_release_names_without_renaming(): void
+    {
+        config(['nntmux.echocli' => false]);
+        Schema::create('releases', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('searchname');
+            $table->unsignedInteger('predb_id')->default(0);
+            $table->boolean('isrenamed')->default(false);
+            $table->dateTime('adddate')->nullable();
+            $table->timestamps();
+        });
+        $titles = [
+            'Jackass.Best.and.Last.2026.2160p.iT.WEB-DL.DTS-HD.MA.5.1.DV.HDR10P.H.265-BTBN',
+            'Little.Fockers.2010.UHD.BluRay.1080p.DDP.5.1.Atmos.DV.HDR.x265-faBR',
+            'Almost.Dead.1994.1080p.WEB.h264-NoRBiT',
+            'Bird.vs.Plane.Miracle.on.the.Hudson.2018.1080p.AMZN.WEB-DL.DDP2.0.H.264-Kitsune',
+            'The.Fix.2026.720p.NOW.WEB-DL.DD+5.1.H.264-playWEB',
+            'The.Revenant.2015.BluRay.1080p.DDP.5.1.x264-hallowed',
+            'Cursed.Waters.2026.1080p.AMZN.WEB-DL.DD+2.0.H.264-BobDobbs',
+            'Deep.Dive.2026.1080p.AMZN.WEB-DL.DD+2.0.H.264-BobDobbs',
+        ];
+        foreach ($titles as $title) {
+            DB::table('releases')->insert(['searchname' => $title, 'adddate' => now()->subHours(12)]);
+        }
+        DB::table('predb')->insert(['id' => 900, 'title' => $titles[0], 'source' => '#PreNNTmux']);
+        $linkedId = DB::table('releases')->insertGetId(['searchname' => $titles[0], 'predb_id' => 900, 'adddate' => now()->subHours(12)]);
+        $mismatchId = DB::table('releases')->insertGetId(['searchname' => str_replace('1994', '1995', $titles[2]), 'adddate' => now()->subHours(12)]);
+        $oldId = DB::table('releases')->insertGetId(['searchname' => $titles[0], 'adddate' => now()->subDays(4)]);
+        Http::fake(['https://hdencode.org/tag/movies/feed/' => Http::response((string) file_get_contents($this->fixture('hdencode.xml')), 200, ['Content-Type' => 'application/rss+xml'])]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['hdencode'], '--pages' => 5])->assertSuccessful();
+        $this->artisan('predb:check', ['limit' => 3])->assertSuccessful();
+
+        foreach ($titles as $index => $title) {
+            $release = DB::table('releases')->where('id', $index + 1)->first();
+            $this->assertNotNull($release);
+            $this->assertSame($title, $release->searchname);
+            $this->assertSame((int) Predb::query()->where('title', $title)->value('id'), (int) $release->predb_id);
+            $this->assertSame(0, (int) $release->isrenamed);
+        }
+        $this->assertSame(900, (int) DB::table('releases')->where('id', $linkedId)->value('predb_id'));
+        $this->assertSame(0, (int) DB::table('releases')->where('id', $mismatchId)->value('predb_id'));
+        $this->assertSame(0, (int) DB::table('releases')->where('id', $oldId)->value('predb_id'));
+        $this->assertSame(8, Predb::query()->count());
+        $this->assertSame(0, Predb::query()->whereNotNull('predate')->count());
+        $this->assertSame(0, Predb::query()->whereNotNull('size')->count());
+        $this->assertSame(0, Predb::query()->whereNotNull('category')->count());
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function hdencode_tv_import_links_an_already_renamed_release_without_changing_processing_flags(): void
+    {
+        config(['nntmux.echocli' => false]);
+        Schema::create('releases', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('searchname');
+            $table->unsignedInteger('predb_id')->default(0);
+            $table->boolean('isrenamed')->default(false);
+            $table->boolean('proc_files')->default(false);
+            $table->boolean('proc_nfo')->default(false);
+            $table->boolean('proc_par2')->default(false);
+            $table->dateTime('adddate')->nullable();
+            $table->timestamps();
+        });
+        $title = 'Formula1.2026.Round17.Singapore.Race.F1TV.WEB-DL.2160p.HLG.H265.Multi-MWR';
+        $releaseId = DB::table('releases')->insertGetId([
+            'searchname' => $title,
+            'isrenamed' => 1,
+            'proc_files' => 1,
+            'adddate' => now()->subHours(12),
+        ]);
+        Http::fake(['https://hdencode.org/tag/tv-shows/feed/' => Http::response((string) file_get_contents($this->fixture('hdencode_tv.xml')), 200, ['Content-Type' => 'application/rss+xml'])]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['hdencode_tv'], '--pages' => 5])->assertSuccessful();
+        $this->artisan('predb:check', ['limit' => 3])->assertSuccessful();
+
+        $release = DB::table('releases')->where('id', $releaseId)->first();
+        $this->assertNotNull($release);
+        $predb = Predb::query()->where('title', $title)->firstOrFail();
+        $this->assertSame((int) $predb->id, (int) $release->predb_id);
+        $this->assertSame($title, $release->searchname);
+        $this->assertSame(1, (int) $release->isrenamed);
+        $this->assertSame(1, (int) $release->proc_files);
+        $this->assertSame(0, (int) $release->proc_nfo);
+        $this->assertSame(0, (int) $release->proc_par2);
+        $this->assertSame('hdencode.org', $predb->source);
+        $this->assertNull($predb->category);
+        $this->assertNull($predb->size);
+        $this->assertNull($predb->files);
+        $this->assertNull($predb->predate);
+        Http::assertSentCount(1);
     }
 
     #[Test]
@@ -185,6 +537,407 @@ class PredbImportFeedCommandTest extends TestCase
         Http::fake(['*' => Http::response('down', 503)]);
 
         $this->artisan('predb:import-feed')->assertFailed();
+    }
+
+    #[Test]
+    public function nswdb_requires_explicit_selection_and_pages_one_complete_snapshot(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('nswdb', $factory->availableKeys());
+        $this->assertNotContains('nswdb', $this->defaultSources);
+        $this->assertContains('nswdb', (array) config('predb_feeds.manual_only_sources'));
+        $this->assertNotContains('nswdb', (array) config('predb_feeds.single_page_sources'));
+        config(['predb_feeds.page_size' => 2, 'predb_feeds.request_delay_ms' => 0]);
+        Http::fake(['https://nswdb.com/xml.php' => Http::response((string) file_get_contents($this->fixture('nswdb.xml')), 200, ['Content-Type' => 'application/xml'])]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['nswdb'], '--pages' => 10])->assertSuccessful();
+
+        $this->assertSame(6, Predb::query()->count());
+        $this->assertTrue(Predb::query()->where('title', 'MARIO_Plus_RABBIDS_SPARKS_OF_HOPE_NSW')->exists());
+        $this->assertTrue(Predb::query()->where('title', 'Mega_Man_11_NSW-VENOM')->exists());
+        $this->assertSame(0, Predb::query()->whereNotNull('predate')->count());
+        $this->assertSame(0, Predb::query()->whereNotNull('size')->count());
+        $this->assertSame(0, Predb::query()->whereNotNull('category')->count());
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function nswdb_page_limit_reports_remaining_cached_catalogue_entries(): void
+    {
+        config(['predb_feeds.page_size' => 2]);
+        Http::fake(['https://nswdb.com/xml.php' => Http::response((string) file_get_contents($this->fixture('nswdb.xml')), 200)]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['nswdb']])
+            ->expectsOutputToContain('incomplete: processed 2 of 6 catalogue entries; increase --pages')
+            ->assertSuccessful();
+
+        $this->assertSame(2, Predb::query()->count());
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function nswdb_configured_automatic_polling_skips_the_export_and_keeps_other_feeds(): void
+    {
+        config(['predb_feeds.sources' => ['nswdb', 'predb_me']]);
+        Http::fake(['https://predb.me/?rss=1' => Http::response((string) file_get_contents($this->fixture('predb_me.xml')))]);
+
+        $this->artisan('predb:import-feed')
+            ->expectsOutputToContain('Skipping manual-only catalogue nswdb; select it explicitly with --source.')
+            ->assertSuccessful();
+
+        Http::assertSentCount(1);
+        Http::assertNotSent(static fn (Request $request): bool => $request->url() === 'https://nswdb.com/xml.php');
+        $this->assertGreaterThan(0, Predb::query()->count());
+    }
+
+    #[Test]
+    public function nswdb_partial_dry_run_reports_coverage_without_database_or_search_writes(): void
+    {
+        config(['predb_feeds.page_size' => 2]);
+        Http::fake(['https://nswdb.com/xml.php' => Http::response((string) file_get_contents($this->fixture('nswdb.xml')), 200)]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['nswdb'], '--dry-run' => true])
+            ->expectsOutputToContain('incomplete: processed 2 of 6 catalogue entries; increase --pages')
+            ->expectsOutputToContain('Dry run: nothing was written.')
+            ->assertSuccessful();
+
+        $this->assertSame(0, Predb::query()->count());
+        $this->search->shouldNotHaveReceived('insertPredb');
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function nswdb_undated_export_cannot_claim_a_history_cutoff(): void
+    {
+        config(['predb_feeds.page_size' => 2]);
+        Http::fake(['https://nswdb.com/xml.php' => Http::response((string) file_get_contents($this->fixture('nswdb.xml')), 200)]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['nswdb'], '--since' => '2020-01-01'])
+            ->expectsOutputToContain('incomplete: catalogue dates are unknown; --since cannot verify coverage')
+            ->assertSuccessful();
+
+        $this->assertSame(2, Predb::query()->count());
+        $this->assertSame(0, Predb::query()->whereNotNull('predate')->count());
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function three_ds_db_requires_explicit_selection_and_pages_one_complete_snapshot(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('3dsdb', $factory->availableKeys());
+        $this->assertNotContains('3dsdb', $this->defaultSources);
+        $this->assertContains('3dsdb', (array) config('predb_feeds.manual_only_sources'));
+        $this->assertNotContains('3dsdb', (array) config('predb_feeds.single_page_sources'));
+        config(['predb_feeds.page_size' => 2, 'predb_feeds.request_delay_ms' => 0]);
+        Http::fake(['https://3dsdb.com/xml.php' => Http::response((string) file_get_contents($this->fixture('3dsdb.xml')), 200, ['Content-Type' => 'application/xml'])]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['3dsdb'], '--pages' => 10])->assertSuccessful();
+
+        $this->assertSame(7, Predb::query()->count());
+        $this->assertTrue(Predb::query()->where('title', 'Atooi.Collection_3DS-JRP')->exists());
+        $this->assertTrue(Predb::query()->where('title', 'Fire_Emblem_Musou_JPN_New3DS-HR')->exists());
+        $this->assertSame(0, Predb::query()->whereNotNull('predate')->count());
+        $this->assertSame(0, Predb::query()->whereNotNull('size')->count());
+        $this->assertSame(0, Predb::query()->whereNotNull('category')->count());
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function three_ds_db_page_limit_reports_remaining_cached_catalogue_entries(): void
+    {
+        config(['predb_feeds.page_size' => 2]);
+        Http::fake(['https://3dsdb.com/xml.php' => Http::response((string) file_get_contents($this->fixture('3dsdb.xml')), 200)]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['3dsdb']])
+            ->expectsOutputToContain('incomplete: processed 2 of 7 catalogue entries; increase --pages')
+            ->assertSuccessful();
+
+        $this->assertSame(2, Predb::query()->count());
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function three_ds_db_configured_automatic_polling_skips_the_export_and_keeps_other_feeds(): void
+    {
+        config(['predb_feeds.sources' => ['3dsdb', 'predb_me']]);
+        Http::fake(['https://predb.me/?rss=1' => Http::response((string) file_get_contents($this->fixture('predb_me.xml')))]);
+
+        $this->artisan('predb:import-feed')
+            ->expectsOutputToContain('Skipping manual-only catalogue 3dsdb; select it explicitly with --source.')
+            ->assertSuccessful();
+
+        Http::assertSentCount(1);
+        Http::assertNotSent(static fn (Request $request): bool => $request->url() === 'https://3dsdb.com/xml.php');
+        $this->assertGreaterThan(0, Predb::query()->count());
+    }
+
+    #[Test]
+    public function three_ds_db_partial_dry_run_reports_coverage_without_database_or_search_writes(): void
+    {
+        config(['predb_feeds.page_size' => 2]);
+        Http::fake(['https://3dsdb.com/xml.php' => Http::response((string) file_get_contents($this->fixture('3dsdb.xml')), 200)]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['3dsdb'], '--dry-run' => true])
+            ->expectsOutputToContain('incomplete: processed 2 of 7 catalogue entries; increase --pages')
+            ->expectsOutputToContain('Dry run: nothing was written.')
+            ->assertSuccessful();
+
+        $this->assertSame(0, Predb::query()->count());
+        $this->search->shouldNotHaveReceived('insertPredb');
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function three_ds_db_undated_export_cannot_claim_a_history_cutoff(): void
+    {
+        config(['predb_feeds.page_size' => 2]);
+        Http::fake(['https://3dsdb.com/xml.php' => Http::response((string) file_get_contents($this->fixture('3dsdb.xml')), 200)]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['3dsdb'], '--since' => '2020-01-01'])
+            ->expectsOutputToContain('incomplete: catalogue dates are unknown; --since cannot verify coverage')
+            ->assertSuccessful();
+
+        $this->assertSame(2, Predb::query()->count());
+        $this->assertSame(0, Predb::query()->whereNotNull('predate')->count());
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function g4u_import_keeps_only_literal_today_names_and_unknown_metadata(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('g4u', $factory->availableKeys());
+        $this->assertNotContains('g4u', $this->defaultSources);
+        $this->assertContains('g4u', (array) config('predb_feeds.single_page_sources'));
+        config(['predb_feeds.page_size' => 3]);
+        Http::fake(['https://g4u.to/' => Http::response((string) file_get_contents($this->fixture('g4u.html')), 200, ['Content-Type' => 'text/html'])]);
+        $this->assertSame([], $factory->makeOne('g4u')->fetch(2));
+        Http::assertNothingSent();
+
+        $this->artisan('predb:import-feed', ['--source' => ['g4u'], '--pages' => 5])->assertSuccessful();
+
+        $this->assertSame(3, Predb::query()->count());
+        $this->assertTrue(Predb::query()->where('title', 'Granblue.Fantasy.Versus.Rising.Deluxe.Edition.v2.61.MULTi9-ElAmigos')->exists());
+        $this->assertSame(0, Predb::query()->whereNotNull('predate')->count());
+        $this->assertSame(0, Predb::query()->whereNotNull('size')->count());
+        $this->assertSame(0, Predb::query()->whereNotNull('category')->count());
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function gabber_import_keeps_only_literal_latest_names_and_unknown_metadata(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('gabber', $factory->availableKeys());
+        $this->assertNotContains('gabber', $this->defaultSources);
+        $this->assertContains('gabber', (array) config('predb_feeds.single_page_sources'));
+        config(['predb_feeds.page_size' => 3]);
+        Http::fake(['https://gabber.od.ua/0day' => Http::response((string) file_get_contents($this->fixture('gabber.html')), 200)]);
+        $this->assertSame([], $factory->makeOne('gabber')->fetch(2));
+        Http::assertNothingSent();
+
+        $this->artisan('predb:import-feed', ['--source' => ['gabber'], '--pages' => 5])->assertSuccessful();
+
+        $this->assertSame(3, Predb::query()->count());
+        $this->assertTrue(Predb::query()->where('title', 'A-Kriv_-_Concentrate_2-(TWS61)-WEB-FLAC-2026')->exists());
+        foreach (['predate', 'size', 'category', 'files'] as $column) {
+            $this->assertSame(0, Predb::query()->whereNotNull($column)->count());
+        }
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function gabber_throttling_does_not_trigger_a_command_level_fast_retry(): void
+    {
+        config(['predb_feeds.rate_limit_retries' => 5]);
+        Http::fake(['https://gabber.od.ua/0day' => Http::sequence()
+            ->push('rate limited', 429, ['Retry-After' => '0'])
+            ->push((string) file_get_contents($this->fixture('gabber.html')), 200)]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['gabber']])->assertFailed();
+
+        Http::assertSentCount(1);
+        $this->assertSame(0, Predb::query()->count());
+        $this->search->shouldNotHaveReceived('insertPredb');
+    }
+
+    #[Test]
+    public function movieblog_import_preserves_literal_titles_and_listing_only_dates(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('movieblog', $factory->availableKeys());
+        $this->assertNotContains('movieblog', $this->defaultSources);
+        $this->assertContains('movieblog', (array) config('predb_feeds.single_page_sources'));
+        Http::fake(['https://movieblog.to/feed/' => Http::response((string) file_get_contents($this->fixture('movieblog.xml')), 200)]);
+        $this->assertSame([], $factory->makeOne('movieblog')->fetch(2));
+        Http::assertNothingSent();
+
+        $this->artisan('predb:import-feed', ['--source' => ['movieblog'], '--pages' => 5])->assertSuccessful();
+
+        $this->assertSame(3, Predb::query()->count());
+        $this->assertTrue(Predb::query()->where('title', 'Wildauge.The.Midwife.2015.German.720p.BluRay.x264-TiG')->exists());
+        $this->assertTrue(Predb::query()->where('title', 'Wildauge.The.Midwife.2015.German.BDRip.x264-TiG')->exists());
+        $this->assertTrue(Predb::query()->where('title', 'Camp.Rock.3.2026.German.DL.1080p.DV.HDR.WEBRip.AV1-WOTT')->exists());
+        foreach (['predate', 'size', 'category', 'files'] as $column) {
+            $this->assertSame(0, Predb::query()->whereNotNull($column)->count());
+        }
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function movieblog_dry_run_previews_titles_without_database_or_index_writes(): void
+    {
+        Http::fake(['https://movieblog.to/feed/' => Http::response((string) file_get_contents($this->fixture('movieblog.xml')), 200)]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['movieblog'], '--dry-run' => true])
+            ->expectsOutputToContain('Dry run: nothing was written.')
+            ->assertSuccessful();
+
+        $this->assertSame(0, Predb::query()->count());
+        $this->search->shouldNotHaveReceived('insertPredb');
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function scnlog_import_preserves_literal_names_and_published_categories(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('scnlog', $factory->availableKeys());
+        $this->assertNotContains('scnlog', $this->defaultSources);
+        $this->assertContains('scnlog', (array) config('predb_feeds.single_page_sources'));
+        Http::fake(['https://scnlog.me/feed/' => Http::response((string) file_get_contents($this->fixture('scnlog.xml')), 200)]);
+        $this->assertSame([], $factory->makeOne('scnlog')->fetch(2));
+        Http::assertNothingSent();
+
+        $this->artisan('predb:import-feed', ['--source' => ['scnlog'], '--pages' => 5])->assertSuccessful();
+
+        $this->assertSame(5, Predb::query()->count());
+        $this->assertSame('Music', Predb::query()->where('title', 'Naza_x_JUL-Pas_Dproblemes-SINGLE-WEB-FR-2026-OND')->value('category'));
+        $this->assertSame('HDTV', Predb::query()->where('title', 'Lanterns.S01E03.1080p.AMZN.WEBRip.HEVC.10bit.AAC5.1-LuCY')->value('category'));
+        $this->assertSame('FLAC', Predb::query()->where('title', 'Boo_Williams-Tribulation-(BMM90)-24BIT-WEB-FLAC-2020-BABAS')->value('category'));
+        foreach (['predate', 'size', 'files'] as $column) {
+            $this->assertSame(0, Predb::query()->whereNotNull($column)->count());
+        }
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function knaben_import_keeps_literal_movie_names_and_unknown_metadata(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('knaben', $factory->availableKeys());
+        $this->assertNotContains('knaben', $this->defaultSources);
+        $this->assertContains('knaben', (array) config('predb_feeds.single_page_sources'));
+        Http::fake(['https://api.knaben.org/v2/browse?*' => Http::response((string) file_get_contents($this->fixture('knaben-movies.json')), 200)]);
+        $this->assertSame([], $factory->makeOne('knaben')->fetch(2));
+        Http::assertNothingSent();
+
+        $this->artisan('predb:import-feed', ['--source' => ['knaben'], '--pages' => 5])->assertSuccessful();
+
+        $this->assertSame(8, Predb::query()->count());
+        $this->assertSame('Movies / HD', Predb::query()->where('title', 'Novocaine.2025.1080p.BluRay.x264-playHD_EniaHD')->value('category'));
+        $this->assertSame(0, Predb::query()->where('title', 'Novocaine.2025.1080p.BluRay.x264-playHD')->count());
+        foreach (['predate', 'size', 'files'] as $column) {
+            $this->assertSame(0, Predb::query()->whereNotNull($column)->count());
+        }
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function crowdnfo_import_preserves_canonical_headings_without_inferred_metadata(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('crowdnfo', $factory->availableKeys());
+        $this->assertNotContains('crowdnfo', $this->defaultSources);
+        $this->assertContains('crowdnfo', (array) config('predb_feeds.single_page_sources'));
+        Http::fake(['https://crowdnfo.net/' => Http::response((string) file_get_contents($this->fixture('crowdnfo-home.html')), 200)]);
+        $this->assertSame([], $factory->makeOne('crowdnfo')->fetch(2));
+        Http::assertNothingSent();
+
+        $this->artisan('predb:import-feed', ['--source' => ['crowdnfo'], '--pages' => 5])->assertSuccessful();
+
+        $this->assertSame(20, Predb::query()->count());
+        $this->assertTrue(Predb::query()->where('title', 'American.Pickers.S02E06.Im.Bickerhimmel.GERMAN.DOKU.WS.HDTVRiP.XviD-TVP')->exists());
+        foreach (['predate', 'size', 'files', 'category'] as $column) {
+            $this->assertSame(0, Predb::query()->whereNotNull($column)->count());
+        }
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function seriousaboutsound_import_preserves_literal_music_titles_and_unknown_metadata(): void
+    {
+        $factory = new PredbFeedSourceFactory;
+        $this->assertContains('seriousaboutsound', $factory->availableKeys());
+        $this->assertNotContains('seriousaboutsound', $this->defaultSources);
+        $this->assertContains('seriousaboutsound', (array) config('predb_feeds.single_page_sources'));
+        $url = 'https://seriousaboutsound.net/forum/48-releases/?sortby=start_date&sortdirection=desc';
+        Http::fake([$url => Http::response((string) file_get_contents($this->fixture('seriousaboutsound-releases.html')), 200)]);
+        $this->assertSame([], $factory->makeOne('seriousaboutsound')->fetch(2));
+        Http::assertNothingSent();
+
+        $this->artisan('predb:import-feed', ['--source' => ['seriousaboutsound'], '--pages' => 5])->assertSuccessful();
+
+        $this->assertSame(3, Predb::query()->count());
+        $this->assertTrue(Predb::query()->where('title', 'Nerutto_-_Elements-(DP26)-SINGLE-WEB-2022-iDC')->exists());
+        $this->assertFalse(Predb::query()->where('title', "Renegade's Corner")->exists());
+        $this->assertSame(3, Predb::query()->where('source', 'seriousaboutsound.net')->count());
+        foreach (['predate', 'size', 'files', 'category'] as $column) {
+            $this->assertSame(0, Predb::query()->whereNotNull($column)->count());
+        }
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
+    public function new_catalogue_sources_preview_without_writes_or_history_completion_claims(): void
+    {
+        $fixtures = [
+            'scnlog' => ['https://scnlog.me/feed/', 'scnlog.xml'],
+            'knaben' => ['https://api.knaben.org/v2/browse?*', 'knaben-movies.json'],
+            'crowdnfo' => ['https://crowdnfo.net/', 'crowdnfo-home.html'],
+            'seriousaboutsound' => ['https://seriousaboutsound.net/forum/48-releases/?sortby=start_date&sortdirection=desc', 'seriousaboutsound-releases.html'],
+        ];
+        foreach ($fixtures as $key => [$url, $fixture]) {
+            Http::fake([$url => Http::response((string) file_get_contents($this->fixture($fixture)), 200)]);
+            $this->artisan('predb:import-feed', ['--source' => [$key], '--dry-run' => true, '--since' => '2020-01-01'])
+                ->expectsOutputToContain('Dry run: nothing was written.')
+                ->expectsOutputToContain('incomplete: history paging is disabled for this source')
+                ->assertSuccessful();
+            $this->assertSame(0, Predb::query()->count());
+            Http::assertSentCount(1);
+        }
+        $this->search->shouldNotHaveReceived('insertPredb');
+    }
+
+    #[Test]
+    public function configured_manual_catalogues_do_not_block_automatic_feed_polling(): void
+    {
+        config(['predb_feeds.sources' => ['predb_club', 'predb_me'], 'predb_feeds.manual_only_sources' => ['predb_club']]);
+        Http::fake([
+            'https://predb.club/api/v1/*' => Http::response((string) file_get_contents($this->fixture('predb_club.json'))),
+            'https://predb.me/?rss=1' => Http::response((string) file_get_contents($this->fixture('predb_me.xml'))),
+        ]);
+
+        $this->artisan('predb:import-feed')
+            ->expectsOutputToContain('Skipping manual-only catalogue predb_club; select it explicitly with --source.')
+            ->assertSuccessful();
+
+        Http::assertSentCount(1);
+        Http::assertNotSent(static fn (Request $request): bool => str_starts_with($request->url(), 'https://predb.club/api/v1/'));
+        $this->assertGreaterThan(0, Predb::query()->count());
+    }
+
+    #[Test]
+    public function manual_catalogues_can_be_selected_explicitly(): void
+    {
+        config(['predb_feeds.manual_only_sources' => ['predb_club']]);
+        Http::fake(['https://predb.club/api/v1/*' => Http::response((string) file_get_contents($this->fixture('predb_club.json')))]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_club']])->assertSuccessful();
+
+        Http::assertSentCount(1);
+        $this->assertGreaterThan(0, Predb::query()->count());
     }
 
     #[Test]

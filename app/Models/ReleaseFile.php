@@ -6,6 +6,7 @@ namespace App\Models;
 
 use App\Facades\Search;
 use App\Models\Concerns\HasCompositePrimaryKey;
+use App\Support\Par2FileHashEvidence;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -121,10 +122,46 @@ class ReleaseFile extends Model
      *
      *
      *
+     * @param  array<string, mixed>|null  $expectedSnapshot
+     * @param  null|callable(): bool  $guard
+     *
      * @throws \Exception
      */
-    public static function addReleaseFiles(mixed $id, mixed $name, mixed $size, mixed $createdTime, mixed $hasPassword, string $hash = '', string $crc = ''): int
+    public static function addReleaseFiles(mixed $id, mixed $name, mixed $size, mixed $createdTime, mixed $hasPassword, string $hash = '', string $crc = '', string $fullMd5 = '', mixed $exactSize = null, ?array $expectedSnapshot = null, ?callable $guard = null): int
     {
+        if ($fullMd5 !== '') {
+            if ($expectedSnapshot === null) {
+                return 0;
+            }
+            $aborted = new \RuntimeException('PAR2 file metadata ownership changed.');
+            try {
+                return DB::transaction(function () use ($id, $name, $size, $createdTime, $hasPassword, $hash, $crc, $fullMd5, $exactSize, $expectedSnapshot, $guard, $aborted): int {
+                    $current = DB::table('releases')->where('id', $id)->lockForUpdate()->first();
+                    if (! Par2FileHashEvidence::snapshotMatches($current, $expectedSnapshot)) {
+                        throw $aborted;
+                    }
+                    if (! Par2FileHashEvidence::remember((int) $id, $fullMd5, $hash, $exactSize ?? $size, $expectedSnapshot, $guard)) {
+                        throw $aborted;
+                    }
+                    $afterSnapshot = $expectedSnapshot;
+                    if (array_key_exists('proc_hash16k', $afterSnapshot) && (int) ($current->predb_id ?? 0) === 0 && in_array((int) ($current->isrenamed ?? 0), [0, 1], true)) {
+                        $afterSnapshot['proc_hash16k'] = (int) DB::table('releases')->where('id', $id)->value('proc_hash16k');
+                    }
+                    $inserted = self::addReleaseFiles($id, $name, $size, $createdTime, $hasPassword, $hash, $crc);
+                    if (($guard !== null && ! $guard())
+                        || ! Par2FileHashEvidence::snapshotMatches(DB::table('releases')->where('id', $id)->lockForUpdate()->first(), $afterSnapshot)) {
+                        throw $aborted;
+                    }
+
+                    return $inserted;
+                });
+            } catch (\RuntimeException $exception) {
+                if ($exception === $aborted) {
+                    return 0;
+                }
+                throw $exception;
+            }
+        }
         // Check if we already have this data in table
         $duplicateCheck = self::query()->where('releases_id', $id)->where('name', $name)->first();
 
@@ -156,12 +193,15 @@ class ReleaseFile extends Model
                 Log::alert($e->getMessage());
             }
 
-            if (\strlen($hash) === 32) {
-                ParHash::insertOrIgnore(['releases_id' => $id, 'hash' => $hash]);
-            }
             DB::afterCommit(function () use ($id): void {
                 Search::updateRelease($id);
             });
+        }
+
+        if ($releaseCheck !== null && strlen($hash) === 32 && ctype_xdigit($hash)
+            && ($duplicateCheck !== null || ($insert ?? 0) > 0 || self::query()->where('releases_id', $id)->where('name', $name)->exists())
+        ) {
+            ParHash::insertOrIgnore(['releases_id' => $id, 'hash' => strtolower($hash)]);
         }
 
         return $insert ?? 0;

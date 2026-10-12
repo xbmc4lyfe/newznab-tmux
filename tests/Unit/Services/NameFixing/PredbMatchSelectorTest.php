@@ -60,7 +60,7 @@ class PredbMatchSelectorTest extends TestCase
         $this->assertNull($bestMatch);
     }
 
-    public function test_it_can_match_cover_style_queries_when_the_title_tokens_line_up(): void
+    public function test_it_rejects_cover_style_queries_missing_the_literal_release_identity(): void
     {
         $selector = new PredbMatchSelector;
 
@@ -77,8 +77,7 @@ class PredbMatchSelectorTest extends TestCase
             ],
         ]);
 
-        $this->assertNotNull($bestMatch);
-        $this->assertSame(2, $bestMatch['id']);
+        $this->assertNull($bestMatch);
     }
 
     public function test_it_rejects_unrelated_release_sharing_only_date_and_resolution(): void

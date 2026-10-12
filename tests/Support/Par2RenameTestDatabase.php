@@ -36,6 +36,16 @@ trait Par2RenameTestDatabase
         });
         $migration = require base_path('database/migrations/2026_10_11_215821_create_par2_rename_progress_table.php');
         $migration->up();
+        $paths = glob(base_path('database/migrations/*_create_par2_rename_candidate_progress_table.php'));
+        if (count($paths) !== 1) {
+            throw new \RuntimeException('Expected the real PAR2 candidate progress migration');
+        }
+        (require $paths[0])->up();
+        $hashPaths = glob(base_path('database/migrations/*_create_par_file_hash_evidence_tables.php'));
+        if (count($hashPaths) !== 1) {
+            throw new \RuntimeException('Expected the real PAR2 hash evidence migration');
+        }
+        (require $hashPaths[0])->up();
         Schema::create('release_nfos', function (Blueprint $table): void {
             $table->integer('releases_id');
             $table->binary('nfo')->nullable();
@@ -65,9 +75,14 @@ trait Par2RenameTestDatabase
     /** @param array<string, mixed> $attributes */
     private function pendingPar2Release(array $attributes = []): Release
     {
-        return Release::withoutEvents(fn (): Release => Release::factory()->create(array_merge([
-            'groups_id' => 1, 'categories_id' => Category::OTHER_HASHED, 'isrenamed' => 0,
-            'adddate' => now()->toDateTimeString(),
-        ], $attributes)));
+        return Release::withoutEvents(function () use ($attributes): Release {
+            $release = Release::factory()->createOne(array_merge([
+                'groups_id' => 1, 'categories_id' => Category::OTHER_HASHED, 'isrenamed' => 0,
+                'adddate' => now()->toDateTimeString(),
+            ], $attributes));
+            assert($release instanceof Release);
+
+            return $release;
+        });
     }
 }

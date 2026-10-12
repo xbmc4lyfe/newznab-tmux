@@ -21,6 +21,7 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\ReleaseExtraService;
 use App\Services\ReleaseImageService;
+use App\Support\Par2FileHashEvidence;
 use FFMpeg\Coordinate\Dimension;
 use FFMpeg\Coordinate\TimeCode;
 use FFMpeg\FFMpeg;
@@ -28,6 +29,7 @@ use FFMpeg\FFProbe;
 use FFMpeg\Filters\Video\ResizeFilter;
 use FFMpeg\Format\Video\Ogg;
 use FFMpeg\Media\Video;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Mhor\MediaInfo\MediaInfo;
@@ -48,6 +50,8 @@ class MediaExtractionService
 
     private readonly ReleaseSearchSyncCoordinator $searchSyncCoordinator;
 
+    private ?ReleaseUpdateService $releaseUpdater;
+
     public function __construct(
         private readonly ProcessingConfiguration $config,
         private readonly ReleaseImageService $releaseImage,
@@ -56,11 +60,13 @@ class MediaExtractionService
         ?ReleaseSearchSyncCoordinator $searchSyncCoordinator = null,
         ?MediaToolFactory $tools = null,
         ?ThumbnailFrameSelector $frameSelector = null,
+        ?ReleaseUpdateService $releaseUpdater = null,
     ) {
         $this->searchSyncCoordinator = $searchSyncCoordinator
             ?? new ReleaseSearchSyncCoordinator(
                 new PersistenceMetricsCollector,
             );
+        $this->releaseUpdater = $releaseUpdater;
         $this->tools = $tools ?? new MediaToolFactory($config);
         $scorer = new FrameQualityScorer($config->thumbnailMinStddev, $config->thumbnailMinLuma, $config->thumbnailMaxLuma);
         $this->frameSelector = $frameSelector ?? new ThumbnailFrameSelector(
@@ -253,11 +259,18 @@ class MediaExtractionService
             $result['audioInfo'] = true;
         }
 
-        $rQuery = Release::query()
-            ->where('proc_pp', '=', 0)
-            ->where('id', $context->release->id)
-            ->select(['searchname', 'fromname', 'categories_id', 'groups_id'])
-            ->first();
+        $snapshot = $context->fullPar2EvidenceSnapshot();
+        $rQuery = DB::table('releases')->where('id', $snapshot['id'])->first();
+        if (! Par2FileHashEvidence::snapshotMatches($rQuery, $snapshot)
+            || ! $this->ownsAudioClaim($context, $snapshot)) {
+            $context->fullPar2EvidenceDeferred = true;
+
+            return $result;
+        }
+        if ((int) ($rQuery->proc_pp ?? 0) !== 0) {
+            return $result;
+        }
+        $snapshot['additional_pp_claimed_at'] = $rQuery->additional_pp_claimed_at ?? null;
 
         $musicParent = (string) Category::MUSIC_ROOT;
         if ($rQuery === null || ! preg_match(
@@ -279,59 +292,85 @@ class MediaExtractionService
 
         // Get media info
         if (! $result['audioInfo']) {
+            $aborted = new \RuntimeException('Audio metadata ownership changed.');
+            $audioAdmissionGeneration = $context->audioMetadataAdmissionGeneration;
             try {
                 $xmlArray = $this->mediaInfo()->getInfo($fileLocation, false);
+                $this->releaseUpdater ??= new ReleaseUpdateService($this->categorize, searchSyncCoordinator: $this->searchSyncCoordinator);
                 foreach ($xmlArray->getAudios() as $track) {
-                    if ($track->get('album') !== null && $track->get('performer') !== null) {
-                        if ((int) $context->release->predb_id === 0 && $this->config->renameMusicMediaInfo) {
+                    $album = $this->audioTagText($track->get('album'));
+                    $performer = $this->audioTagText($track->get('performer'));
+                    if ($album === null || $performer === null) {
+                        continue;
+                    }
+                    $renamed = DB::transaction(function () use ($context, $snapshot, $xmlArray, $track, $album, $performer, $fileExtension, $aborted, $audioAdmissionGeneration): bool {
+                        $current = DB::table('releases')->where('id', $snapshot['id'])->lockForUpdate()->first();
+                        if (! Par2FileHashEvidence::snapshotMatches($current, $snapshot)
+                            || ! $this->ownsAudioClaim($context, $snapshot)
+                            || (int) ($current->proc_pp ?? 0) !== 0) {
+                            throw $aborted;
+                        }
+                        DB::afterCommit(static function () use ($context, $audioAdmissionGeneration): void {
+                            if ($context->audioMetadataAdmissionGeneration === $audioAdmissionGeneration) {
+                                $context->audioMetadataCommitted = true;
+                            }
+                        });
+                        $expected = [...$snapshot, 'predb_id' => (int) $current->predb_id, 'proc_pp' => 0];
+                        $renamed = false;
+                        if ((int) $current->predb_id === 0 && $this->config->renameMusicMediaInfo) {
                             $ext = strtoupper($fileExtension);
-
-                            $newName = $track->get('performer')->getFullName().' - '.$track->get('album')->getFullName();
-                            if (! empty($track->get('recorded_date'))
-                                && preg_match('/(?:19|20)\d\d/', $track->get('recorded_date')->getFullname, $Year)
-                            ) {
-                                $newName .= ' ('.$Year[0].') '.$ext;
-                            } else {
-                                $newName .= ' '.$ext;
+                            $title = $performer.' - '.$album;
+                            $date = $this->audioTagText($track->get('recorded_date'));
+                            if ($date !== null && preg_match('/(?:19|20)\d\d/', $date, $year)) {
+                                $title .= ' ('.$year[0].')';
+                            }
+                            $title .= ' '.$ext;
+                            if (mb_check_encoding($title, 'UTF-8') && mb_strlen($title, 'UTF-8') <= 255
+                                && preg_match('/\p{C}/u', $title) === 0) {
+                                $category = match ($ext) {
+                                    'MP3' => Category::MUSIC_MP3,
+                                    'FLAC' => Category::MUSIC_LOSSLESS,
+                                    default => $this->categorize->determineCategory((int) $current->groups_id, $title, $current->fromname),
+                                };
+                                $categoryId = is_array($category) ? (int) $category['categories_id'] : $category;
+                                if (! $this->releaseUpdater->updateMediaSnapshot(
+                                    (object) [...$snapshot, 'releases_id' => $snapshot['id']], $title, $categoryId,
+                                    fn (): bool => $this->ownsAudioClaim($context, $snapshot),
+                                )) {
+                                    throw $aborted;
+                                }
+                                $expected['searchname'] = $title;
+                                $expected['proc_pp'] = 1;
+                                $renamed = true;
                             }
 
-                            $newCat = match ($ext) {
-                                'MP3' => Category::MUSIC_MP3,
-                                'FLAC' => Category::MUSIC_LOSSLESS,
-                                default => $this->categorize->determineCategory($rQuery->groups_id, $newName, $rQuery->fromname),
-                            };
-
-                            $newTitle = escapeString(substr($newName, 0, 255));
-                            Release::whereId($context->release->id)->update([
-                                'searchname' => $newTitle,
-                                'categories_id' => is_array($newCat) ? $newCat['categories_id'] : $newCat,
-                                'iscategorized' => 1,
-                                'isrenamed' => 1,
-                                'proc_pp' => 1,
-                            ]);
-
-                            $this->searchSyncCoordinator->request((int) $context->release->id);
-
-                            if ($this->config->echoCLI) {
-                                $releaseInfo = (object) [
-                                    'groups_id' => $rQuery->groups_id, 'categories_id' => $rQuery->categories_id,
-                                    'searchname' => $rQuery->searchname, 'name' => $rQuery->searchname,
-                                    'releases_id' => $context->release->id, 'filename' => '',
-                                ];
-                                (new ReleaseUpdateService)->echoReleaseInfo($releaseInfo, $newTitle,
-                                    is_array($newCat) ? $newCat : ['categories_id' => $newCat], '',
-                                    'MediaExtractionService->getAudioInfo');
-                            }
+                        }
+                        $this->releaseExtra->addFromXml($snapshot['id'], $xmlArray);
+                        if (! Par2FileHashEvidence::snapshotMatches(DB::table('releases')->where('id', $snapshot['id'])->first(), $expected)
+                            || ! $this->ownsAudioClaim($context, $snapshot)) {
+                            throw $aborted;
                         }
 
-                        $this->releaseExtra->addFromXml($context->release->id, $xmlArray);
-                        $result['audioInfo'] = true;
-                        $context->foundAudioInfo = true;
-                        break;
+                        return $renamed;
+                    });
+                    if ($renamed && ! $context->advanceFullPar2EvidenceIdentity($this->releaseUpdater->lastCommittedIdentity())) {
+                        $context->fullPar2EvidenceDeferred = true;
+
+                        return $result;
                     }
+                    $result['audioInfo'] = true;
+                    $context->foundAudioInfo = true;
+                    break;
                 }
             } catch (\Throwable $e) {
+                if ($e === $aborted || ! Par2FileHashEvidence::snapshotMatches(DB::table('releases')->where('id', $snapshot['id'])->first(), $snapshot)
+                    || ! $this->ownsAudioClaim($context, $snapshot)) {
+                    $context->fullPar2EvidenceDeferred = true;
+                }
                 Log::debug($e->getMessage());
+                if ($context->fullPar2EvidenceDeferred) {
+                    return $result;
+                }
             }
         }
 
@@ -366,6 +405,47 @@ class MediaExtractionService
         }
 
         return $result;
+    }
+
+    private function audioTagText(mixed $value): ?string
+    {
+        if (! is_string($value) && ! is_int($value) && ! is_float($value) && ! $value instanceof \Stringable) {
+            return null;
+        }
+        $text = trim((string) $value);
+
+        return $text !== '' && mb_check_encoding($text, 'UTF-8') && ! preg_match('/[\x00-\x1f\x7f]/', $text) ? $text : null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $snapshot
+     *
+     * @phpstan-impure
+     */
+    private function ownsAudioClaim(ReleaseProcessingContext $context, array $snapshot): bool
+    {
+        if ((int) $context->release->id !== $snapshot['id'] || (string) $context->release->guid !== $snapshot['guid']) {
+            return false;
+        }
+        $current = DB::table('releases')->where('id', $snapshot['id'])->first();
+        if ($current === null || $current->guid !== $snapshot['guid']
+            || ($current->additional_pp_claim_token ?? null) !== $snapshot['additional_pp_claim_token']) {
+            return false;
+        }
+        $claimedAt = $current->additional_pp_claimed_at ?? null;
+        if (array_key_exists('additional_pp_claimed_at', $snapshot) && $claimedAt !== $snapshot['additional_pp_claimed_at']) {
+            return false;
+        }
+        if ($snapshot['additional_pp_claim_token'] === null) {
+            return $claimedAt === null;
+        }
+        if (! is_string($claimedAt)) {
+            return false;
+        }
+        $parsed = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $claimedAt);
+
+        return $parsed !== false && $parsed->format('Y-m-d H:i:s') === $claimedAt
+            && $claimedAt >= AdditionalCandidateQuery::claimStaleBefore()->format('Y-m-d H:i:s');
     }
 
     /**
