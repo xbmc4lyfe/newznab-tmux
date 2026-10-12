@@ -43247,5 +43247,15 @@
       }
     ],
     "scope": "Separate non-timing fixture; does not retroactively expand the old 400-epoch oracle."
+  },
+  "semantic_application_source": {
+    "file": "2026-10-11-metadata-semantic-source.tar.gz",
+    "sha256": "26c399a83019bf73cb3177e77a9fce0a4c6f0d10bc659784c0f7072ebb00db59",
+    "git_tree_oid": "b86e26bad77203cf07be3cc08eb2b9b02879b100",
+    "tracked_files_compared": 2563,
+    "mismatches": 0,
+    "exact_original_archive": true,
+    "redacted": false,
+    "scope": "Published tracked repository source only; no production configuration or vendor bundle."
   }
 }

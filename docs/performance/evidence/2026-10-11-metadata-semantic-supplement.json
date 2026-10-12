@@ -10,7 +10,14 @@
     "full_source_archive_sha256": "26c399a83019bf73cb3177e77a9fce0a4c6f0d10bc659784c0f7072ebb00db59",
     "fixture_script_sha256": "481a9e06d3f8d20918d70b77b895ab3d646022a536981ce7e63ac1e30f2090eb",
     "schema_sha256": "940179ec775e9c13e765d56aaee47db1d3a82f250d1696b12ef32bac1a74cada",
-    "vendor_manifest_sha256": "c6e66d8d0a3b0b68b9a1a27fc24b6c4693279a7af70dc8e65e10246ebefb66fd"
+    "vendor_manifest_sha256": "c6e66d8d0a3b0b68b9a1a27fc24b6c4693279a7af70dc8e65e10246ebefb66fd",
+    "durable_source_archive": "raw/2026-10-11-metadata-semantic-source.tar.gz",
+    "git_tree_oid": "b86e26bad77203cf07be3cc08eb2b9b02879b100",
+    "source_archive_tracked_file_verification": {
+      "compared_files": 2563,
+      "mismatches": 0,
+      "against_revision": "a282ca24990fb11c586cb9544ae4bf2833e73c18"
+    }
   },
   "runtime": {
     "host": "192.168.1.93 Linux",
