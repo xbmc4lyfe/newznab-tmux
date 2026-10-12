@@ -60,6 +60,9 @@ class ReleasesRunner extends BaseRunner
             return;
         }
 
+        $streaming = (bool) config('nntmux.stream_fork_output', false);
+        $readyFailure = $this->runReadyReleasePass(array_map(static fn (array $group): int => (int) $group['id'], $uGroups), $maxProcesses, $streaming);
+
         // Streaming mode
         if ((bool) config('nntmux.stream_fork_output', false) === true) {
             $commands = [];
@@ -67,6 +70,9 @@ class ReleasesRunner extends BaseRunner
                 $commands[] = $this->buildDnrCommand('releases  '.$group['id']);
             }
             $this->runStreamingCommands($commands, $maxProcesses, 'releases');
+            if ($readyFailure !== null) {
+                throw new RuntimeException('Ready release pass failed.', 0, $readyFailure);
+            }
 
             return;
         }
@@ -83,6 +89,9 @@ class ReleasesRunner extends BaseRunner
                 echo $output;
                 cli()->primary('Finished performing release processing for group ID: '.$groupId);
             });
+            if ($readyFailure !== null) {
+                throw new RuntimeException('Ready release pass failed.', 0, $readyFailure);
+            }
         } catch (\Throwable $e) {
             Log::error('Release processing batch failed: '.$e->getMessage());
             cli()->error('Release processing failed: '.$e->getMessage());
@@ -102,6 +111,9 @@ class ReleasesRunner extends BaseRunner
             return;
         }
 
+        $streaming = (bool) config('nntmux.stream_fork_output', false);
+        $readyFailure = $this->runReadyReleasePass(array_map(static fn (object $group): int => (int) $group->id, $groups), $maxProcesses, $streaming);
+
         // Streaming mode
         if ((bool) config('nntmux.stream_fork_output', false) === true) {
             $commands = [];
@@ -109,6 +121,9 @@ class ReleasesRunner extends BaseRunner
                 $commands[] = $this->buildDnrCommand('update_per_group  '.$group->id);
             }
             $this->runStreamingCommands($commands, $maxProcesses, 'update_per_group');
+            if ($readyFailure !== null) {
+                throw new RuntimeException('Ready release pass failed.', 0, $readyFailure);
+            }
 
             return;
         }
@@ -126,11 +141,47 @@ class ReleasesRunner extends BaseRunner
                 $name = UsenetGroup::getNameByID($groupId);
                 cli()->primary('Finished updating binaries, processing releases and additional postprocessing for group: '.$name);
             });
+            if ($readyFailure !== null) {
+                throw new RuntimeException('Ready release pass failed.', 0, $readyFailure);
+            }
         } catch (\Throwable $e) {
             Log::error('Update per group batch failed: '.$e->getMessage());
             cli()->error('Update per group failed: '.$e->getMessage());
             throw new RuntimeException('Worker batch failed.', 0, $e);
         }
+    }
+
+    /** @param list<int> $groupIds */
+    private function runReadyReleasePass(array $groupIds, int $maxProcesses, bool $streaming): ?\Throwable
+    {
+        $commands = [];
+        foreach ($groupIds as $groupId) {
+            $commands[$groupId] = [...$this->buildDnrCommand('releases  '.$groupId), '--ready-only'];
+        }
+        try {
+            if ($streaming) {
+                $this->runStreamingCommands($commands, $maxProcesses, 'ready_releases');
+            } else {
+                $this->headerStart('ready releases', count($commands), $maxProcesses);
+                $this->runParallelCommandsWithCompletion($commands, $maxProcesses, static function (int|string $groupId, string $output): void {
+                    echo $output;
+                    cli()->primary('Finished ready release processing for group ID: '.$groupId);
+                });
+            }
+            if ($this->hasCancellationRequest()) {
+                throw new RuntimeException('Ready release pass stopped by cancellation.');
+            }
+        } catch (\Throwable $exception) {
+            if ($this->hasCancellationRequest()
+                || array_filter($this->workerOutcomes, static fn (array $outcome): bool => $outcome['status'] === 'cancellation') !== []) {
+                throw $exception;
+            }
+            Log::error('Ready release pass failed: '.$exception->getMessage());
+
+            return $exception;
+        }
+
+        return null;
     }
 
     public function fixRelNames(string $mode, int $maxPerRun, int $maxThreads): void

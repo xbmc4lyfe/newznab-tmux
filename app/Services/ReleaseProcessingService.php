@@ -54,6 +54,8 @@ final class ReleaseProcessingService
 {
     private const int BATCH_SIZE = 500;
 
+    private const int READY_WINDOW_SIZE = 50;
+
     private const int MAX_RETRIES = 5;
 
     private const int RETRY_BASE_DELAY_US = 20000;
@@ -394,6 +396,24 @@ final class ReleaseProcessingService
         return $totals;
     }
 
+    /** @return array{releases: int, nzbs: int, dupes: int, iterations: int} */
+    public function processReadyReleaseWindow(int $groupId): array
+    {
+        if ($groupId <= 0) {
+            throw new \InvalidArgumentException('Ready release processing requires a positive group ID.');
+        }
+        $limit = min(self::READY_WINDOW_SIZE, max(1, $this->settings->releaseCreationLimit));
+        $state = ['max_id' => (int) Collection::query()->max('id'), 'group_ids' => [$groupId], 'position' => 0, 'cursors' => [], 'exhausted' => []];
+        $probes = 0;
+        $window = $this->nextPriorityCollectionWindow($groupId, $state, $limit, $probes, []);
+        if ($window['ids'] === [] && ! NzbCreationCandidateQuery::baseBuilder($groupId)->exists()) {
+            return ['releases' => 0, 'nzbs' => 0, 'dupes' => 0, 'iterations' => 0];
+        }
+        [$result, $nzbs] = $this->processReleaseCollectionWindow($groupId, $window['ids'], null, null, $limit);
+
+        return ['releases' => $result->added, 'nzbs' => $nzbs, 'dupes' => $result->dupes, 'iterations' => 1];
+    }
+
     /**
      * Drain ready collections before preparation, then consume each freshly reconciled
      * page outside the downtime barrier. Sized rows never participate in downtime
@@ -468,12 +488,13 @@ final class ReleaseProcessingService
      * @param  callable(): void|null  $afterPass
      * @return array{ReleaseCreationResult, int}
      */
-    private function processReleaseCollectionWindow(?int $groupId, array $windowIds, ?callable $afterCreation, ?callable $afterPass): array
+    private function processReleaseCollectionWindow(?int $groupId, array $windowIds, ?callable $afterCreation, ?callable $afterPass, ?int $nzbLimit = null): array
     {
         $rejectedIds = $this->deleteUnwantedCollections($groupId, $windowIds);
         $allowedIds = array_values(array_diff($windowIds, $rejectedIds));
-        $pass = app(SearchService::class)->deferReleaseUpdates(function () use ($groupId, $allowedIds, $afterCreation): array {
-            $result = $this->createReleasesAndNzbs($groupId, $allowedIds);
+        $pass = app(SearchService::class)->deferReleaseUpdates(function () use ($groupId, $allowedIds, $afterCreation, $nzbLimit): array {
+            $result = $nzbLimit === null ? $this->createReleasesAndNzbs($groupId, $allowedIds)
+                : $this->createReleasesAndNzbs($groupId, $allowedIds, $nzbLimit);
             if ($afterCreation !== null) {
                 $afterCreation();
             }
@@ -1091,11 +1112,11 @@ final class ReleaseProcessingService
      *
      * @throws Throwable
      */
-    public function createReleasesAndNzbs(int|string|null $groupID, ?array $allowedIds = null): array
+    public function createReleasesAndNzbs(int|string|null $groupID, ?array $allowedIds = null, ?int $nzbLimit = null): array
     {
         return app(SearchService::class)->deferReleaseUpdates(fn (): array => [
             $this->createReleases($groupID, $allowedIds),
-            $this->createNZBs($groupID),
+            $nzbLimit === null ? $this->createNZBs($groupID) : $this->createNZBs($groupID, $nzbLimit),
         ]);
     }
 
@@ -1104,7 +1125,7 @@ final class ReleaseProcessingService
      *
      * @throws Throwable
      */
-    public function createNZBs(int|string|null $groupID): int
+    public function createNZBs(int|string|null $groupID, ?int $maxReleases = null): int
     {
         $startTime = now()->toImmutable();
         $this->outputSubHeader('Creating NZB Files');
@@ -1114,22 +1135,25 @@ final class ReleaseProcessingService
         $deletedCount = 0;
         $claimToken = bin2hex(random_bytes(16));
         $limit = max(1, $this->settings->releaseCreationLimit);
-        $total = min(NzbCreationCandidateQuery::baseBuilder($groupID)->count(), $limit);
+        if ($maxReleases !== null) {
+            $limit = min($limit, max(1, $maxReleases));
+        }
+        $columns = [
+            'id',
+            'guid',
+            'name',
+            'categories_id',
+            'groups_id',
+            'postdate',
+            'nzbstatus',
+            NzbCreationCandidateQuery::CLAIM_TOKEN_COLUMN,
+        ];
+        $releases = $maxReleases === null ? null : NzbCreationCandidateQuery::claimBatch($groupID, $limit, $claimToken, $columns);
+        $total = $releases === null ? min(NzbCreationCandidateQuery::baseBuilder($groupID)->count(), $limit) : $releases->count();
 
         if ($total > 0) {
-            $columns = [
-                'id',
-                'guid',
-                'name',
-                'categories_id',
-                'groups_id',
-                'postdate',
-                'nzbstatus',
-                NzbCreationCandidateQuery::CLAIM_TOKEN_COLUMN,
-            ];
-
             $processed = 0;
-            $releases = NzbCreationCandidateQuery::claimBatch($groupID, $limit, $claimToken, $columns);
+            $releases ??= NzbCreationCandidateQuery::claimBatch($groupID, $limit, $claimToken, $columns);
             foreach ($releases as $release) {
                 try {
                     $result = $this->nzb->createNzbForRelease($release);
