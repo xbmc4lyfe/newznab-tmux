@@ -34,13 +34,14 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
         }
         $this->username = (string) (getenv('VERIFICATION_LOCK_TEST_USERNAME') ?: 'root');
         $this->password = (string) getenv('VERIFICATION_LOCK_TEST_PASSWORD');
-        $this->administrator = new PDO('mysql:host='.$this->host.';charset=utf8mb4', $this->username, $this->password);
+        $this->administrator = new PDO('mysql:host='.$this->host.';port=3306;charset=utf8mb4', $this->username, $this->password);
         $this->database = 'nntmux_archive_lock_test_'.bin2hex(random_bytes(8));
         $this->administrator->exec('CREATE DATABASE `'.$this->database.'`');
         config(['database.default' => 'mariadb', 'database.connections.mariadb.host' => $this->host,
             'database.connections.mariadb.port' => 3306, 'database.connections.mariadb.database' => $this->database,
             'database.connections.mariadb.username' => $this->username, 'database.connections.mariadb.password' => $this->password,
-            'database.connections.mariadb.url' => null, 'database.connections.mariadb.prefix' => '',
+            'database.connections.mariadb.url' => null, 'database.connections.mariadb.unix_socket' => '',
+            'database.connections.mariadb.prefix' => '',
             'release_verification.required' => true, 'nntmux.echocli' => false,
             'release_verification.storage_path' => storage_path('framework/testing/lock-'.bin2hex(random_bytes(8)))]);
         DB::purge();
@@ -249,6 +250,41 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
         $this->assertSame($bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
     }
 
+    public function test_claim_queue_lookup_uses_due_index_without_sorting_all_statuses(): void
+    {
+        $this->freezeTime();
+        $rows = [];
+        for ($number = 1; $number <= 3000; $number++) {
+            $rows[] = ['identity' => sha1('plan-'.$number), 'groups_id' => 1, 'manifest_path' => '',
+                'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64),
+                'status' => ['pending', 'unknown', 'verifying'][$number % 3],
+                'last_unique_at' => now(), 'next_attempt_at' => now()->subHour()];
+        }
+        foreach (array_chunk($rows, 100) as $chunk) {
+            DB::table('release_verification_candidates')->insert($chunk);
+        }
+        $lookups = [];
+        DB::listen(static function (QueryExecuted $query) use (&$lookups): void {
+            if (str_starts_with($query->sql, 'select') && str_contains($query->sql, '`release_verification_candidates`')
+                && str_contains($query->sql, 'order by') && ! str_contains($query->sql, 'for update')) {
+                $lookups[] = [$query->sql, $query->bindings];
+            }
+        });
+        $attempts = [];
+        $this->assertNull(app(CandidateRepository::class)->claim(static function (int $id) use (&$attempts): bool {
+            $attempts[] = $id;
+
+            return false;
+        }));
+        $this->assertSame(range(1, 100), $attempts);
+        $this->assertNotEmpty($lookups);
+        foreach ($lookups as [$sql, $bindings]) {
+            $plan = DB::select('EXPLAIN '.$sql, $bindings)[0];
+            $this->assertSame('verification_due', $plan->key);
+            $this->assertStringNotContainsString('filesort', strtolower((string) $plan->Extra));
+        }
+    }
+
     public function test_refused_claim_releases_its_row_before_trying_another_candidate(): void
     {
         $repository = app(CandidateRepository::class);
@@ -282,7 +318,8 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
         $changed = false;
         $keys = [];
         DB::listen(static function (QueryExecuted $query) use ($ids, $other, &$changed, &$keys): void {
-            if (! $changed && str_starts_with($query->sql, 'select `id` from `release_verification_candidates`')) {
+            if (! $changed && str_starts_with($query->sql, 'select')
+                && str_contains($query->sql, '`release_verification_candidates`') && str_contains($query->sql, 'order by')) {
                 $changed = true;
                 $statement = $other->prepare('UPDATE release_verification_candidates SET lease_until = ? WHERE id = ?');
                 $statement->execute([now()->addHour()->format('Y-m-d H:i:s'), $ids[0]]);
@@ -305,7 +342,7 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
 
     private function connection(): PDO
     {
-        $pdo = new PDO('mysql:host='.$this->host.';dbname='.$this->database.';charset=utf8mb4', $this->username, $this->password);
+        $pdo = new PDO('mysql:host='.$this->host.';port=3306;dbname='.$this->database.';charset=utf8mb4', $this->username, $this->password);
         $pdo->exec('SET SESSION innodb_lock_wait_timeout = 1');
 
         return $pdo;
