@@ -35,6 +35,13 @@ final class ScratchInventory
         DB::table('release_verification_scratch')->where('id', $id)->whereNotNull('audit_release_id')->update(['terminal' => true]);
     }
 
+    public function recordAudit(int $id, string $verdict, string $reason): void
+    {
+        DB::table('release_verification_scratch')->where('id', $id)->whereNotNull('audit_release_id')->update([
+            'audit_verdict' => $verdict, 'audit_reason' => mb_strcut($reason, 0, 2000, 'UTF-8'),
+        ]);
+    }
+
     public function directoryName(object $entry): string
     {
         return $entry->audit_release_id === null ? $entry->candidate_id.'-'.$entry->version : 'audit-'.$entry->audit_release_id.'-'.$entry->id;

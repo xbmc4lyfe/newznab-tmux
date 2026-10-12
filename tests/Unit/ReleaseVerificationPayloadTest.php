@@ -407,6 +407,49 @@ class ReleaseVerificationPayloadTest extends TestCase
         }
     }
 
+    /** @return iterable<string, array{bool, bool}> */
+    public static function semanticCheckpoints(): iterable
+    {
+        yield 'wrong part from provider' => [false, false];
+        yield 'wrong declared total from provider' => [true, false];
+        yield 'persisted wrong part from earlier verifier' => [false, true];
+        yield 'persisted wrong declared total from earlier verifier' => [true, true];
+    }
+
+    #[DataProvider('semanticCheckpoints')]
+    public function test_semantically_invalid_articles_never_persist_and_old_checkpoints_can_refetch(bool $wrongTotal, bool $persisted): void
+    {
+        $first = YencArticles::part('hell', 'movie.mkv', 8, 1, 1, 2);
+        $good = YencArticles::part('tail', 'movie.mkv', 8, 2, 5, 2);
+        $bad = YencArticles::part('tail', 'movie.mkv', 8, $wrongTotal ? 2 : 1, 5, $wrongTotal ? 3 : 2);
+        $this->assertSame('tail', VerifiedArticle::decode($bad)->bytes, 'Fixture has a valid checksum despite the wrong semantic identity.');
+        $manifest = ['expected_files' => 1, 'files' => [['key' => 'source', 'subject' => 'movie.mkv', 'totalparts' => 2,
+            'segments' => [['number' => 1, 'messageid' => 'first@article', 'bytes' => 4],
+                ['number' => 2, 'messageid' => 'tail@article', 'bytes' => 4]]]]];
+        $articles = ['first@article' => $first, 'tail@article' => $persisted ? $good : $bad];
+        [$verifier, $scratch] = $this->verifier($articles);
+        $path = $scratch.'/articles/'.hash('sha256', 'tail@article');
+        if ($persisted) {
+            mkdir($scratch.'/articles');
+            file_put_contents($path, $bad);
+        }
+        try {
+            $result = $verifier->verify($manifest, $scratch, static function (): void {});
+            if (! $persisted) {
+                $this->assertSame('unknown', $result->verdict);
+                $this->assertFileDoesNotExist($path);
+                [$corrected] = $this->verifier(['tail@article' => $good]);
+                $result = $corrected->verify($manifest, $scratch, static function (): void {});
+            }
+            $this->assertTrue($result->passed(), $result->reason);
+            $this->assertSame($good, file_get_contents($path));
+            $this->assertSame('helltail', file_get_contents($scratch.'/data/movie.mkv'));
+            $this->assertPublishedArticlesCanRepair($result->manifest, ['first@article' => $first, 'tail@article' => $good], 'movie.mkv', 'helltail');
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
     public function test_corrupt_download_with_insufficient_parity_is_unknown_and_never_cached(): void
     {
         [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', str_repeat('movie-data', 64), 'set');

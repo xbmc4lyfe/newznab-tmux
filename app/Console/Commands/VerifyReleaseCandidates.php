@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Services\NNTP\NNTPService;
+use App\Services\Releases\Verification\AuditReleaseDeletion;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
@@ -127,6 +128,16 @@ class VerifyReleaseCandidates extends Command
         $exhausted = false;
         foreach ($entries as $entry) {
             $directory = $scratch.'/'.app(ScratchInventory::class)->directoryName($entry);
+            if ($entry->delete_guid !== null) {
+                try {
+                    app(AuditReleaseDeletion::class)->cleanup($entry);
+                } catch (Throwable $error) {
+                    $this->warn('Terminal audit cleanup will retry: '.$error->getMessage());
+                    $after = (int) $entry->id;
+
+                    continue;
+                }
+            }
             if (! file_exists($directory) && ! is_link($directory)) {
                 app(ScratchInventory::class)->forget((int) $entry->id);
             } elseif (is_dir($directory) && ! is_link($directory)) {

@@ -18,6 +18,18 @@ final class NntpArticleSource implements ArticleSource
 
     public function fetch(string $messageId): string
     {
+        return $this->fetchFromProviders($messageId);
+    }
+
+    /** @param callable(VerifiedArticle): void $validate */
+    public function fetchValidated(string $messageId, callable $validate): string
+    {
+        return $this->fetchFromProviders($messageId, $validate);
+    }
+
+    /** @param (callable(VerifiedArticle): void)|null $validate */
+    private function fetchFromProviders(string $messageId, ?callable $validate = null): string
+    {
         $maximumBytes = (int) config('release_verification.article_bytes');
         $messageId = NNTPService::verificationMessageId($messageId, $maximumBytes);
         try {
@@ -28,7 +40,7 @@ final class NntpArticleSource implements ArticleSource
                 $this->connected = true;
             }
 
-            return $this->checkIntegrity($this->nntp->verificationArticle($messageId, $maximumBytes));
+            return $this->checkIntegrity($this->nntp->verificationArticle($messageId, $maximumBytes), $validate);
         } catch (Exception $error) {
             if ($this->connected && $error instanceof RuntimeException) {
                 $this->connected = $this->nntp->isConnected();
@@ -50,7 +62,7 @@ final class NntpArticleSource implements ArticleSource
                 $this->alternateConnected = true;
             }
 
-            return $this->checkIntegrity($this->alternate->verificationArticle($messageId, $maximumBytes));
+            return $this->checkIntegrity($this->alternate->verificationArticle($messageId, $maximumBytes), $validate);
         } catch (Exception $error) {
             if ($this->alternateConnected && $error instanceof RuntimeException) {
                 $this->alternateConnected = $this->alternate->isConnected();
@@ -62,13 +74,20 @@ final class NntpArticleSource implements ArticleSource
         }
     }
 
-    private function checkIntegrity(string $raw): string
+    /** @param (callable(VerifiedArticle): void)|null $validate */
+    private function checkIntegrity(string $raw, ?callable $validate = null): string
     {
         try {
-            VerifiedArticle::decode($raw);
+            $article = VerifiedArticle::decode($raw);
+            if ($validate !== null) {
+                $validate($article);
+            }
         } catch (ArticleIntegrityFailure $error) {
             throw $error;
-        } catch (RuntimeException) {
+        } catch (RuntimeException $error) {
+            if ($validate !== null) {
+                throw $error;
+            }
             // Encoding and identity validation remain the verifier's responsibility.
         }
 

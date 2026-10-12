@@ -7,8 +7,7 @@ namespace App\Console\Commands;
 use App\Models\Release;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
-use App\Services\ReleaseImageService;
-use App\Services\Releases\ReleaseManagementService;
+use App\Services\Releases\Verification\AuditReleaseDeletion;
 use App\Services\Releases\Verification\NntpArticleSource;
 use App\Services\Releases\Verification\NzbManifestReader;
 use App\Services\Releases\Verification\PayloadVerifier;
@@ -26,7 +25,7 @@ class VerifyExistingReleases extends Command
 
     protected $description = 'Download and audit existing NZBs with resumable progress; unknown results are retained';
 
-    public function handle(NzbService $nzb, NzbManifestReader $reader, ReleaseManagementService $management, ReleaseImageService $images, ScratchInventory $scratchInventory): int
+    public function handle(NzbService $nzb, NzbManifestReader $reader, ScratchInventory $scratchInventory, AuditReleaseDeletion $deletion): int
     {
         $root = (string) config('release_verification.storage_path');
         File::ensureDirectoryExists($root, 0700);
@@ -86,18 +85,12 @@ class VerifyExistingReleases extends Command
                     }
                     $result = $verifier->verify($reader->read($xml, $release), $directory, static function (): void {});
                     $record = ['id' => $release->id, 'verdict' => $result->verdict, 'reason' => $result->reason];
-                    if (! $this->option('dry-run') && $this->option('delete') && $result->verdict === 'unrepairable') {
-                        $management->deleteSingle(['g' => $release->guid, 'i' => $release->id], $nzb, $images);
-                        $record['deleted'] = true;
-                    }
                 } catch (Throwable $error) {
                     $record = ['id' => $release->id, 'verdict' => 'unknown', 'reason' => $error->getMessage()];
                 }
-                $line = json_encode($record, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
-                if (file_put_contents($root.'/audit.jsonl', $line."\n", FILE_APPEND | LOCK_EX) === false) {
-                    throw new \RuntimeException('Cannot persist audit report.');
-                }
-                DB::transaction(function () use ($id, $isRetry, $record, $scratchEntry, $scratchInventory): void {
+                $scratchInventory->recordAudit((int) $scratchEntry->id, $record['verdict'], $record['reason']);
+                $delete = ! $this->option('dry-run') && $this->option('delete') && $record['verdict'] === 'unrepairable';
+                DB::transaction(function () use ($id, $isRetry, $record, $scratchEntry, $scratchInventory, $delete, $release, $deletion): void {
                     $current = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                     if ($current === null) {
                         throw new \RuntimeException('Audit state is unavailable.');
@@ -108,6 +101,9 @@ class VerifyExistingReleases extends Command
                             'reason' => mb_strcut($record['reason'], 0, 2000, 'UTF-8'),
                         ]);
                     } else {
+                        if ($delete) {
+                            $deletion->commit($release, (int) $scratchEntry->id);
+                        }
                         DB::table('release_verification_audit_retries')->where('release_id', $id)->delete();
                         $scratchInventory->finishAudit((int) $scratchEntry->id);
                     }
@@ -115,6 +111,13 @@ class VerifyExistingReleases extends Command
                         'audit_cursor' => max((int) $current->audit_cursor, $id), 'audit_retry_turn' => ! $isRetry,
                     ]);
                 }, 5);
+                if ($delete) {
+                    $record['deleted'] = true;
+                }
+                $line = json_encode($record, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
+                if (file_put_contents($root.'/audit.jsonl', $line."\n", FILE_APPEND | LOCK_EX) === false) {
+                    throw new \RuntimeException('Cannot persist audit report.');
+                }
                 $retryTurn = ! $isRetry;
                 $this->line($line);
             }

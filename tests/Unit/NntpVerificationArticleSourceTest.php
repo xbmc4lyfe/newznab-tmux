@@ -7,6 +7,7 @@ namespace Tests\Unit;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\ArticleIntegrityFailure;
 use App\Services\Releases\Verification\NntpArticleSource;
+use App\Services\Releases\Verification\PayloadVerifier;
 use App\Services\Releases\Verification\VerifiedArticle;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
@@ -145,6 +146,57 @@ final class NntpVerificationArticleSourceTest extends TestCase
         $this->assertSame('payload', VerifiedArticle::decode($raw)->bytes);
         $this->assertSame(['BODY <test@example>'], $primary->commands);
         $this->assertSame(['BODY <test@example>'], $alternate->commands);
+    }
+
+    /** @return iterable<string, array{bool, bool, bool}> */
+    public static function semanticProviderCopies(): iterable
+    {
+        yield 'wrong part then corrected alternate' => [false, true, true];
+        yield 'wrong total then corrected alternate' => [true, true, true];
+        yield 'wrong part with disabled alternate' => [false, false, true];
+        yield 'wrong total with disabled alternate' => [true, false, true];
+        yield 'both providers have wrong part' => [false, true, false];
+        yield 'both providers have wrong total' => [true, true, false];
+    }
+
+    #[DataProvider('semanticProviderCopies')]
+    public function test_checksum_valid_wrong_identity_can_use_only_a_semantically_valid_configured_alternate(bool $wrongTotal, bool $enabled, bool $corrected): void
+    {
+        config(['nntmux_nntp.alternate_article_fallback' => $enabled]);
+        $first = YencArticles::part('hell', 'movie.mkv', 8, 1, 1, 2);
+        $good = YencArticles::part('tail', 'movie.mkv', 8, 2, 5, 2);
+        $bad = YencArticles::part('tail', 'movie.mkv', 8, $wrongTotal ? 2 : 1, 5, $wrongTotal ? 3 : 2);
+        $this->assertSame('tail', VerifiedArticle::decode($bad)->bytes);
+        $primary = new VerificationNntpHarness($first."\r\n.\r\n".$bad."\r\n.\r\n");
+        $alternate = new VerificationNntpHarness(($corrected ? $good : $bad)."\r\n.\r\n");
+        $verifier = new PayloadVerifier(new NntpArticleSource($primary, $alternate),
+            ['scratch_bytes' => 1048576, 'free_bytes' => 0, 'article_bytes' => 1048576, 'bytes_per_second' => 0, 'par2_binary' => 'par2']);
+        $scratch = sys_get_temp_dir().'/semantic-copy-'.bin2hex(random_bytes(8)).'/candidate';
+        $manifest = ['expected_files' => 1, 'files' => [['key' => 'source', 'subject' => 'movie.mkv', 'totalparts' => 2,
+            'segments' => [['number' => 1, 'messageid' => 'first@example', 'bytes' => 4],
+                ['number' => 2, 'messageid' => 'tail@example', 'bytes' => 4]]]]];
+        try {
+            $result = $verifier->verify($manifest, $scratch, static function (): void {});
+            $this->assertSame($enabled && $corrected, $result->passed(), $result->reason);
+            $this->assertSame(['BODY <first@example>', 'BODY <tail@example>'], $primary->commands);
+            $this->assertSame($enabled ? ['BODY <tail@example>'] : [], $alternate->commands);
+            $cachePath = $scratch.'/articles/'.hash('sha256', 'tail@example');
+            if ($result->passed()) {
+                $this->assertSame('helltail', file_get_contents($scratch.'/data/movie.mkv'));
+                $this->assertSame(2, VerifiedArticle::decode(file_get_contents($cachePath))->part);
+                $this->assertSame(2, VerifiedArticle::decode(file_get_contents($cachePath))->totalParts);
+            } else {
+                $this->assertSame('unknown', $result->verdict);
+                $this->assertFileDoesNotExist($cachePath);
+            }
+        } finally {
+            $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($scratch, \FilesystemIterator::SKIP_DOTS), \RecursiveIteratorIterator::CHILD_FIRST);
+            foreach ($iterator as $entry) {
+                $entry->isDir() ? rmdir($entry->getPathname()) : unlink($entry->getPathname());
+            }
+            rmdir($scratch);
+            rmdir(dirname($scratch));
+        }
     }
 
     public function test_both_corrupt_provider_checksums_remain_retryable_and_never_return_raw(): void

@@ -502,7 +502,9 @@ class CollectionCleanupService
         if ($legacySupported) {
             $columns[] = 'releases_id';
         }
-        $parents = DB::table('collections')->whereIn('id', $ids)->orderBy('id')->lockForUpdate()->get($columns);
+        $parents = DB::table('collections')
+            ->when(in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
+            ->whereIn('id', $ids)->orderBy('id')->lockForUpdate()->get($columns);
         $statuses = $this->verificationStatuses();
         $deletable = [];
         foreach ($parents as $parent) {

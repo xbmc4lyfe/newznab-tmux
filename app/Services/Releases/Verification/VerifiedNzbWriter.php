@@ -17,20 +17,29 @@ final class VerifiedNzbWriter
     {
         $path = $this->nzb->getNzbPath($guid, createIfNotExist: true);
         $body = gzencode($this->document($manifest));
+        if ($body === false) {
+            throw new RuntimeException('Cannot compress verified NZB.');
+        }
         $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
         $handle = fopen($temporary, 'xb');
-        if ($body === false || $handle === false) {
+        if ($handle === false) {
             throw new RuntimeException('Cannot write verified NZB.');
         }
         try {
-            if (fwrite($handle, $body) !== strlen($body) || ! fflush($handle) || ! fsync($handle)) {
-                throw new RuntimeException('Cannot persist verified NZB.');
+            try {
+                if (fwrite($handle, $body) !== strlen($body) || ! fflush($handle) || ! fsync($handle)) {
+                    throw new RuntimeException('Cannot persist verified NZB.');
+                }
+            } finally {
+                fclose($handle);
+            }
+            if (! rename($temporary, $path)) {
+                throw new RuntimeException('Cannot finalize verified NZB.');
             }
         } finally {
-            fclose($handle);
-        }
-        if (! rename($temporary, $path)) {
-            throw new RuntimeException('Cannot finalize verified NZB.');
+            if (is_file($temporary)) {
+                unlink($temporary);
+            }
         }
 
         return $path;

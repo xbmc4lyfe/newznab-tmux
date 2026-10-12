@@ -310,7 +310,9 @@ final class HeaderStorageService
         if (config('release_verification.required', true)) {
             $ids = array_values(array_unique($collectionIds));
             sort($ids);
-            $locked = DB::table('collections')->whereIn('id', $ids)->orderBy('id')->lockForUpdate()->pluck('id')->all();
+            $locked = DB::table('collections')
+                ->when(in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
+                ->whereIn('id', $ids)->orderBy('id')->lockForUpdate()->pluck('id')->all();
             if (Schema::hasTable('release_verification_candidates')) {
                 $hashes = DB::table('collections')->whereIn('id', $ids)->pluck('collectionhash', 'id');
                 $identities = $hashes->map(static fn ($hash): string => bin2hex($hash))->all();

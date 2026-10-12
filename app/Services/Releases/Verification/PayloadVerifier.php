@@ -32,6 +32,32 @@ final class PayloadVerifier
         }
     }
 
+    private function validateArticleIdentity(VerifiedArticle $article, int $number, int $totalParts, int $observedParts,
+        bool $inferredParts, ?int $bodyTotalParts, ?VerifiedArticle $identity): void
+    {
+        if ($article->part !== $number) {
+            throw new RuntimeException('Article part number differs from the manifest.');
+        }
+        if ($article->totalParts !== null) {
+            if ($bodyTotalParts !== null && $article->totalParts !== $bodyTotalParts) {
+                throw new RuntimeException('Conflicting article part totals.');
+            }
+            if (! $inferredParts && $article->totalParts !== $totalParts) {
+                throw new RuntimeException('Article part total differs from declared manifest inventory.');
+            }
+            if ($inferredParts && $article->totalParts < $observedParts) {
+                throw new RuntimeException('Article part total contradicts observed segment inventory.');
+            }
+            $totalParts = $article->totalParts;
+        }
+        if ($article->part > $totalParts) {
+            throw new RuntimeException('Article part number exceeds manifest inventory.');
+        }
+        if ($identity !== null && [$article->name, $article->size] !== [$identity->name, $identity->size]) {
+            throw new RuntimeException('Conflicting file identities.');
+        }
+    }
+
     /** @param array<string, mixed> $manifest */
     private function downloadAndVerify(array $manifest, string $directory, callable $heartbeat): VerificationResult
     {
@@ -84,11 +110,15 @@ final class PayloadVerifier
                 $id = (string) $segment['messageid'];
                 $path = $cache.'/'.hash('sha256', $id);
                 $article = null;
+                $validate = fn (VerifiedArticle $decoded) => $this->validateArticleIdentity($decoded, $number, $totalParts,
+                    (int) $file['totalparts'], $inferredParts, $bodyTotalParts, $identity);
                 if (is_file($path)) {
                     $raw = file_get_contents($path, false, null, 0, (int) $this->options['article_bytes'] + 1);
                     if ($raw !== false && strlen($raw) <= (int) $this->options['article_bytes']) {
                         try {
-                            $article = VerifiedArticle::decode($raw);
+                            $decoded = VerifiedArticle::decode($raw);
+                            $validate($decoded);
+                            $article = $decoded;
                         } catch (RuntimeException) {
                             $this->discardCheckpoint($path, $allocated);
                         }
@@ -99,7 +129,8 @@ final class PayloadVerifier
                 if ($article === null) {
                     try {
                         $start = microtime(true);
-                        $raw = $this->source->fetch($id);
+                        $raw = $this->source instanceof NntpArticleSource
+                            ? $this->source->fetchValidated($id, $validate) : $this->source->fetch($id);
                     } catch (RuntimeException) {
                         $networkFailure = true;
 
@@ -111,6 +142,13 @@ final class PayloadVerifier
                     try {
                         $article = VerifiedArticle::decode($raw);
                     } catch (ArticleIntegrityFailure) {
+                        $networkFailure = true;
+
+                        continue;
+                    }
+                    try {
+                        $validate($article);
+                    } catch (RuntimeException) {
                         $networkFailure = true;
 
                         continue;
@@ -134,28 +172,10 @@ final class PayloadVerifier
                     }
                 }
                 $this->reserve($directory, $allocated);
-                if ($article->part !== (int) $segment['number']) {
-                    throw new RuntimeException('Article part number differs from the manifest.');
-                }
                 if ($article->totalParts !== null) {
-                    if ($bodyTotalParts !== null && $article->totalParts !== $bodyTotalParts) {
-                        throw new RuntimeException('Conflicting article part totals.');
-                    }
-                    if (! $inferredParts && $article->totalParts !== $totalParts) {
-                        throw new RuntimeException('Article part total differs from declared manifest inventory.');
-                    }
-                    if ($inferredParts && $article->totalParts < (int) $file['totalparts']) {
-                        throw new RuntimeException('Article part total contradicts observed segment inventory.');
-                    }
                     $bodyTotalParts = $article->totalParts;
                     $totalParts = $bodyTotalParts;
                     $available['files'][$index]['totalparts'] = $totalParts;
-                }
-                if ($article->part > $totalParts) {
-                    throw new RuntimeException('Article part number exceeds manifest inventory.');
-                }
-                if ($identity !== null && [$article->name, $article->size] !== [$identity->name, $identity->size]) {
-                    throw new RuntimeException('Conflicting file identities.');
                 }
                 if ($identity === null) {
                     $normalizedName = mb_strtolower(\Normalizer::normalize($article->name) ?: $article->name);

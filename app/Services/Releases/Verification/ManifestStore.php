@@ -30,14 +30,20 @@ final class ManifestStore
                 throw new RuntimeException('Cannot write candidate manifest.');
             }
             try {
-                if (fwrite($handle, $compressed) !== strlen($compressed) || ! fflush($handle) || ! fsync($handle)) {
-                    throw new RuntimeException('Cannot persist candidate manifest.');
+                try {
+                    if (fwrite($handle, $compressed) !== strlen($compressed) || ! fflush($handle) || ! fsync($handle)) {
+                        throw new RuntimeException('Cannot persist candidate manifest.');
+                    }
+                } finally {
+                    fclose($handle);
+                }
+                if (! rename($temporary, $path)) {
+                    throw new RuntimeException('Cannot finalize candidate manifest.');
                 }
             } finally {
-                fclose($handle);
-            }
-            if (! rename($temporary, $path)) {
-                throw new RuntimeException('Cannot finalize candidate manifest.');
+                if (is_file($temporary)) {
+                    unlink($temporary);
+                }
             }
             if (DB::transactionLevel() > 0) {
                 DB::afterRollBack(fn () => $this->deleteIfUnreferenced($name));

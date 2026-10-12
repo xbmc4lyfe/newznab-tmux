@@ -15,6 +15,10 @@ return new class extends Migration
             $table->unsignedBigInteger('candidate_id')->nullable();
             $table->unsignedBigInteger('audit_release_id')->nullable();
             $table->boolean('terminal')->default(false);
+            $table->string('audit_verdict', 32)->nullable();
+            $table->text('audit_reason')->nullable();
+            $table->string('delete_guid')->nullable();
+            $table->text('delete_paths')->nullable();
             $table->index(['audit_release_id', 'terminal'], 'verification_scratch_audit_terminal');
             $table->unsignedInteger('version')->default(0);
             $table->unique(['candidate_id', 'version'], 'verification_scratch_candidate_version');
