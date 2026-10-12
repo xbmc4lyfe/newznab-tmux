@@ -106,6 +106,13 @@ These procedures apply to ingestion/storage concurrency changes and performance 
 - Retain every failure. A performance pair is eligible only when both observations satisfy initial correctness; report invalidity/reliability separately rather than ranking surviving runs as universally safe. Normalize retry/lock costs by successful unique work and distinguish retry events, distinct failed articles, and missing unique parts. Small paired screens select further experiments; they do not establish statistically supported production throughput claims.
 - Keep barrier-controlled causal tests separate from natural-schedule throughput tests. Separate CPU throttling, cache fit, storage, and lock contention before recommending concurrency, buffer-pool, or redo changes. Broad ownership refactors, index hints on other writers, insert-delta arithmetic, retry-policy changes, and database tuning each need their own evidence.
 
+### Release lifecycle and cleanup checks
+
+- Check source, runtime image, schema, and live publication separately. A successful build is not image/source parity or proof that deployed handlers executed; compare the relevant runtime source hashes with the reviewed source.
+- For release admission/reset changes, exercise the real coordinator and transaction boundaries: rollback, after-commit failures, expired claims, implicit commits, concurrent admission, and skipped sibling ranges where applicable. Distinguish simulated durable interruption from an actual process-kill test. Preserve ownership until the outer transaction commits or rolls back, and preserve filesystem terminal state on database lookup/commit failure.
+- Verify newly emitted NZBs in fresh scratch by reconstructing from their actual article IDs. Retained reconstructed files alone do not prove the emitted NZB is sufficient; validate cached article integrity before using it as evidence.
+- Cleanup must preserve active/newer versions and stable lock inodes, handle symlinks safely, and retry interrupted/failed work fairly under new arrivals. State the work bound precisely: deletion/database budgets do not bound a linear top-level metadata enumeration. Cover older direct command callers when changing dependencies or exit contracts.
+
 ## Production monitoring and session coordination
 
 - Discover the live Compose working directory from container labels and storage from bind mounts; a feature worktree or validation runtime is not production. Discover actual database tables/columns before querying runtime settings. Bound indexed reads and redact credentials, article subjects, and raw sensitive logs.
