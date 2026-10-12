@@ -109,14 +109,14 @@ class MovieServiceTest extends ImdbScraperTestCase
     public function it_negatively_caches_missing_trakt_movie_metadata(): void
     {
         $service = $this->makeMovieServiceForTraktResponse(null);
-        Log::spy();
+        $log = Log::spy();
 
         $result = $service->fetchTraktTVProperties('0137523');
 
         $this->assertFalse($result);
         $this->assertFalse(Cache::get('trakt_movie_'.md5('0137523')));
         $this->assertFalse($service->fetchTraktTVProperties('0137523'));
-        Log::shouldNotHaveReceived('warning');
+        $log->shouldNotHaveReceived('warning');
     }
 
     #[Test]
