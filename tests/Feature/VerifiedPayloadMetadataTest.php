@@ -11,6 +11,7 @@ use App\Services\ReleaseCleaningService;
 use App\Services\Releases\Verification\PayloadIdentityResolver;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Support\Utf8;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -272,6 +273,84 @@ class VerifiedPayloadMetadataTest extends TestCase
         Search::shouldReceive('matchPredbExact')->once()->with('Already.Named.2026.1080p-GRP')->andReturnNull();
         $metadata = (new ReleaseMetadataResolver($cleaning, new PayloadIdentityResolver($cleaning), $category))->resolve($this->manifest());
         $this->assertSame('Already.Named.2026.1080p-GRP', $metadata['searchname']);
+    }
+
+    public function test_actual_cleaner_predb_association_is_rechecked_after_its_stored_title_changes(): void
+    {
+        $title = 'Known.Movie.2026.1080p.WEB-DL-GRP';
+        $changed = false;
+        DB::listen(function (QueryExecuted $query) use ($title, &$changed): void {
+            if ($changed || ! str_starts_with($query->sql, 'select') || ! str_contains($query->sql, 'predb')
+                || ! in_array($title, $query->bindings, true)) {
+                return;
+            }
+            $changed = true;
+            DB::table('predb')->where('id', 7)->update(['title' => 'Different.Movie.2026.1080p.WEB-DL-GRP']);
+        });
+        Search::shouldReceive('matchPredbExact')->once()->with($title)->andReturnNull();
+        $category = $this->createMock(CategorizationService::class);
+        $category->expects($this->once())->method('determineCategory')->with(1, $title, 'poster')->willReturn(['categories_id' => 2000]);
+
+        $metadata = (new ReleaseMetadataResolver(new ReleaseCleaningService, categorization: $category))
+            ->resolve(array_replace($this->manifest(), ['subject' => $title]));
+
+        $this->assertTrue($changed, 'Fixture changes the stored row after the actual cleaner SELECT returned its old identity.');
+        $this->assertSame($title, $metadata['searchname']);
+        $this->assertSame(0, $metadata['predb_id']);
+        $this->assertSame(1, $metadata['isrenamed']);
+    }
+
+    public function test_missing_cleaner_predb_reference_is_not_published_as_an_association(): void
+    {
+        DB::table('predb')->where('id', 7)->delete();
+        $title = 'Known.Movie.2026.1080p.WEB-DL-GRP';
+        $cleaning = $this->createPartialMock(ReleaseCleaningService::class, ['releaseCleaner']);
+        $cleaning->expects($this->once())->method('releaseCleaner')->willReturn([
+            'cleansubject' => $title, 'properlynamed' => true, 'predb' => 7,
+        ]);
+        Search::shouldReceive('matchPredbExact')->once()->with($title)->andReturnNull();
+        $category = $this->createMock(CategorizationService::class);
+        $category->expects($this->once())->method('determineCategory')->willReturn(['categories_id' => 2000]);
+
+        $metadata = (new ReleaseMetadataResolver($cleaning, categorization: $category))->resolve($this->manifest());
+
+        $this->assertSame($title, $metadata['searchname']);
+        $this->assertSame(0, $metadata['predb_id']);
+    }
+
+    public function test_current_cleaner_predb_title_keeps_its_id_and_established_spelling(): void
+    {
+        $title = 'KNOWN.Movie.2026.1080p.WEB-DL-GRP';
+        $cleaning = $this->createPartialMock(ReleaseCleaningService::class, ['releaseCleaner']);
+        $cleaning->expects($this->once())->method('releaseCleaner')->willReturn([
+            'cleansubject' => $title, 'properlynamed' => true, 'predb' => 7,
+        ]);
+        Search::shouldReceive('matchPredbExact')->never();
+        $category = $this->createMock(CategorizationService::class);
+        $category->expects($this->once())->method('determineCategory')->willReturn(['categories_id' => 2000]);
+
+        $metadata = (new ReleaseMetadataResolver($cleaning, categorization: $category))->resolve($this->manifest());
+
+        $this->assertSame($title, $metadata['searchname']);
+        $this->assertSame(7, $metadata['predb_id']);
+    }
+
+    public function test_cleaner_string_result_is_the_established_name_instead_of_its_decorated_subject(): void
+    {
+        $title = 'Unlisted.Movie.2025.1080p.BluRay-GRP';
+        $manifest = array_replace($this->manifest(), ['subject' => '<TOWN> wrapper [01/12] "'.$title.'.part01.rar" yEnc']);
+        $cleaning = $this->createPartialMock(ReleaseCleaningService::class, ['releaseCleaner']);
+        $cleaning->expects($this->once())->method('releaseCleaner')->willReturn($title);
+        Search::shouldReceive('matchPredbExact')->once()->with($title)->andReturnNull();
+        $category = $this->createMock(CategorizationService::class);
+        $category->expects($this->once())->method('determineCategory')->with(1, $title, 'poster')->willReturn(['categories_id' => 2000]);
+
+        $metadata = (new ReleaseMetadataResolver($cleaning, categorization: $category))->resolve($manifest);
+
+        $this->assertSame($manifest['subject'], $metadata['name']);
+        $this->assertSame($title, $metadata['searchname']);
+        $this->assertSame(1, $metadata['isrenamed']);
+        $this->assertSame(0, $metadata['predb_id']);
     }
 
     public function test_filename_alias_for_a_different_stored_title_cannot_assign_predb_id(): void

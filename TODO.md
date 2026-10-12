@@ -1,5 +1,12 @@
 # To do
 
+## Release identification follow-up (implemented, not deployed)
+
+- [x] Prioritize one recovery volume per filename family and hidden PAR2 candidates before repeated volumes, retaining every volume for fallback and durable resume.
+- [x] Preserve string results from the release name cleaner and recheck cleaner-supplied PreDB references against their current stored title. Missing or changed references no longer attach an unrelated identity.
+- [x] Run the affected PAR2, payload metadata, and PreDB matching regressions: 95 tests, 469 assertions (11 PHPUnit notices).
+- [ ] Deploy through the single deployment owner and measure historical rename yield versus arrivals. The regression checks prove the repaired mechanisms, not sustained throughput or a shrinking production backlog.
+
 ## Retest verification and throughput PRs after the expedited rollout
 
 The 2026-10-12 throughput rollout was explicitly requested with minimal targeted checks and no PR review. Complete the deferred review and testing for PR #53, upstream PR #68 integration, and [PR #70](https://github.com/xbmc4lyfe/newznab-tmux/pull/70) (article concurrency/pipelining, candidate workers, and native decoding) before treating the expedited changes as fully qualified.
@@ -95,7 +102,7 @@ Work proceeds from small contract corrections to broader operational decisions. 
 
 Live rename observation at this inventory: 17 completed bounded passes (nine recent, eight historical) report 22 recovered names and 2,433 received articles. Historical passes report two recovered names, one completed miss, five retryable outcomes, and 330 deferrals. These are reported outcomes, not evidence that the net backlog is shrinking. Continue distinguishing real recovered names from completed checks.
 
-Next operational priority: inspect a bounded sample of existing historical NZBs and durable checkpoints before changing probe selection. The sampled historical runs deferred 330 of 338 attempts (97.6%) and averaged 3.92 received articles per attempt, close to the four-probe cap. Current logs combine probe-budget, deadline, and claim-loss deferrals, so the cause is not yet proven. Indexes precede all recovery volumes, then hidden candidates; repeated volume metadata may waste probes, but partial metadata and missing indexes still require fallback. Prefer evidence-led candidate prioritization before excluding volumes or adding workers. Regression gates must retain missing/corrupt-index volume recovery, partial/multiple recovery sets, obfuscated indexes, transient retries, restart/resume, changed NZBs, and worker overlap.
+Next operational priority: inspect a bounded sample of existing historical NZBs and durable checkpoints and measure the candidate-priority repair after deployment. The sampled historical runs deferred 330 of 338 attempts (97.6%) and averaged 3.92 received articles per attempt, close to the four-probe cap. Current logs combine probe-budget, deadline, and claim-loss deferrals, so the live cause is not yet proven. The follow-up prioritizes explicit indexes, one recovery volume per filename family, hidden candidates, then remaining volumes. Regression fixtures reproduce repeated volumes crowding out useful candidates and retain later-volume fallback and durable resume. No volumes are excluded. Existing regression gates retain missing/corrupt-index volume recovery, partial/multiple recovery sets, obfuscated indexes, transient retries, restart/resume, changed NZBs, and worker overlap.
 
 Monitor baseline for the next comparison (2026-10-11 22:46:54 UTC): the Renames row reports 465,835 unmatched and 24,317 matched. These monitor counts span all rename methods and must be assessed alongside actual changed-name/download outcomes.
 
