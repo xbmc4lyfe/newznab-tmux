@@ -18,8 +18,12 @@ use App\Services\Search\Contracts\SearchServiceInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
 use App\Services\Search\Support\SearchFailureTracker;
+use Dom\HTMLDocument;
 use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Database\ConnectionResolver;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Database\SQLiteConnection;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
@@ -33,6 +37,7 @@ use Mockery;
 use PDO;
 use PHPUnit\Framework\Attributes\DataProvider;
 use ReflectionClass;
+use Spatie\Permission\PermissionRegistrar;
 use Tests\TestCase;
 
 class ApiRequestMatrixTest extends TestCase
@@ -131,6 +136,85 @@ class ApiRequestMatrixTest extends TestCase
             ->get(route('search', ['searchadvposter' => $poster, 'search_type' => 'adv']));
 
         $response->assertOk();
+    }
+
+    public function test_exact_poster_detail_link_preserves_whitespace_through_http_and_returns_its_own_release(): void
+    {
+        $poster = ' alice+usenet@example.test ';
+        $source = (array) DB::table('releases')->first();
+        $source['fromname'] = $poster;
+        $source['searchname'] = 'Whitespace anchor release';
+        $source['passwordstatus'] = 0;
+        DB::table('releases')->where('id', $source['id'])->update($source);
+        $lookalike = $source;
+        $lookalike['id'] = DB::table('releases')->max('id') + 1;
+        $lookalike['guid'] = str_repeat('b', 40);
+        $lookalike['fromname'] = trim($poster);
+        $lookalike['searchname'] = 'Different normalized poster release';
+        DB::table('releases')->insert($lookalike);
+
+        $user = User::query()->where('username', 'matrix_user')->firstOrFail();
+        $permissionId = DB::table('permissions')->insertGetId(['name' => 'view tv', 'guard_name' => 'web']);
+        DB::table('model_has_permissions')->insert(['permission_id' => $permissionId, 'model_type' => $user->getMorphClass(), 'model_id' => $user->getKey()]);
+        app(PermissionRegistrar::class)->forgetCachedPermissions();
+
+        $release = (object) array_merge($source, ['category_name' => 'TV', 'group_name' => 'alt.binaries.example']);
+        $html = view('details.partials.info-sidebar', compact('release'))->render();
+        $document = HTMLDocument::createFromString('<!doctype html><html><head><title>Release</title></head><body>'.$html.'</body></html>');
+        $link = $document->querySelector('a[aria-label^="View releases with the exact same poster field"]');
+        $this->assertNotNull($link);
+        $url = $link->getAttribute('href');
+        parse_str((string) parse_url($url, PHP_URL_QUERY), $query);
+        $this->assertSame($poster, $query['poster']);
+
+        $database = DB::connection();
+        // SQLite cannot render the MySQL report-badge projection. Keep the real
+        // public service predicates, bindings, order, and page window intact.
+        $fixture = new class($database->getPdo(), $database->getDatabaseName(), $database->getTablePrefix(), $database->getConfig()) extends SQLiteConnection
+        {
+            /** @var list<array{sql: string, bindings: array}> */
+            public array $posterQueries = [];
+
+            public function select($query, $bindings = [], $useReadPdo = true, array $fetchUsing = [])
+            {
+                if (str_starts_with($query, 'SELECT * FROM (')) {
+                    if (! preg_match('/(WHERE .*)\n\s*GROUP BY r.id/s', $query, $where)
+                        || ! preg_match('/\) r (ORDER BY .*)$/s', $query, $order)) {
+                        throw new \RuntimeException('Unable to isolate the public search predicates.');
+                    }
+                    $query = 'SELECT r.* FROM releases r '.$where[1].' '.$order[1];
+                }
+                if (str_contains($query, 'r.fromname')) {
+                    $this->posterQueries[] = ['sql' => $query, 'bindings' => $bindings];
+                }
+
+                return parent::select($query, $bindings, $useReadPdo, $fetchUsing);
+            }
+        };
+        $originalResolver = Model::getConnectionResolver();
+        $resolver = new ConnectionResolver(['sqlite' => $fixture]);
+        $resolver->setDefaultConnection('sqlite');
+        Model::setConnectionResolver($resolver);
+        $this->app->instance(ReleaseSearchService::class, new ReleaseSearchService);
+        $searchService = Mockery::mock(SearchServiceInterface::class);
+        $searchService->shouldReceive('isSuggestEnabled')->andReturnFalse();
+        $searchService->shouldReceive('isAutocompleteEnabled')->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $searchService);
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        try {
+            $response = $this->actingAs($user)->get($url);
+            $response->assertOk();
+            $response->assertViewHas('listQuery', fn (array $query): bool => ($query['poster'] ?? null) === $poster);
+            $this->assertFalse($response->viewData('results')->isEmpty(), 'Exact poster queries: '.json_encode($fixture->posterQueries, JSON_THROW_ON_ERROR));
+            $response->assertSeeText('Whitespace anchor release');
+            $response->assertDontSeeText('Different normalized poster release');
+        } finally {
+            if ($originalResolver === null) {
+                Model::unsetConnectionResolver();
+            } else {
+                Model::setConnectionResolver($originalResolver);
+            }
+        }
     }
 
     public function test_v1_invalid_sort_returns_xml_201_error(): void

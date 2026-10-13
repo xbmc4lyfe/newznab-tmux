@@ -19,9 +19,11 @@ use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\ConnectionResolver;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Database\SQLiteConnection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Facade;
+use Illuminate\Support\Facades\Schema;
 use Manticoresearch\Client;
 use Manticoresearch\Search as ManticoreQuery;
 use PHPUnit\Framework\Attributes\Test;
@@ -315,6 +317,123 @@ final class ReleaseSearchFiltersTest extends TestCase
             } else {
                 Model::setConnectionResolver($originalResolver);
             }
+        }
+    }
+
+    #[Test]
+    public function exact_poster_browse_matches_bytes_and_filters_before_pagination_without_search_fallback(): void
+    {
+        $pdo = new \PDO('sqlite::memory:');
+        $pdo->exec("CREATE TABLE releases (id INTEGER PRIMARY KEY, searchname TEXT, fromname TEXT COLLATE NOCASE, categories_id INTEGER, size INTEGER, comments INTEGER, passwordstatus INTEGER, postdate TEXT DEFAULT '2026-10-12 12:00:00')");
+        $pdo->exec('CREATE TABLE root_categories (id INTEGER PRIMARY KEY)');
+        $poster = "-Alice O'Reilly- <alice+usenet@example.test>";
+        $insert = $pdo->prepare('INSERT INTO releases (id, searchname, fromname, categories_id, size, comments, passwordstatus) VALUES (?, ?, ?, ?, ?, ?, ?)');
+        foreach ([
+            [1, 'Alpha', $poster, 2040, 20, 0, 0],
+            [2, 'Beta', $poster, 2040, 30, 0, 0],
+            [3, 'Case variant', strtolower($poster), 2040, 25, 0, 0],
+            [4, 'Extra byte', $poster.' ', 2040, 25, 0, 0],
+            [5, 'Excluded category', $poster, 2050, 25, 0, 0],
+            [6, 'Passworded', $poster, 2040, 25, 0, 1],
+            [7, 'Too large', $poster, 2040, 31, 0, 0],
+            [8, 'Comments', $poster, 2040, 25, 1, 0],
+            [9, 'Wrong category', $poster, 2060, 25, 0, 0],
+            [10, 'Gamma', $poster, 2040, 25, 0, 0],
+        ] as $row) {
+            $insert->execute($row);
+        }
+        $connection = new WebSearchSqliteFixtureConnection($pdo);
+        $originalApp = Facade::getFacadeApplication();
+        $originalContainer = Container::getInstance();
+        $originalResolver = Model::getConnectionResolver();
+        $container = new Container;
+        $container->instance('config', new Repository(['app' => ['debug' => false], 'nntmux' => ['mysql_search_fallback' => false, 'cache_expiry_medium' => 5]]));
+        $container->instance('cache', new \Illuminate\Cache\Repository(new ArrayStore));
+        $container->instance('db.schema', new class
+        {
+            public function hasTable(string $table): bool
+            {
+                return false;
+            }
+        });
+        Container::setInstance($container);
+        Facade::setFacadeApplication($container);
+        DB::swap($connection);
+        $resolver = new ConnectionResolver(['testing' => $connection]);
+        $resolver->setDefaultConnection('testing');
+        Model::setConnectionResolver($resolver);
+        Search::swap(new class
+        {
+            public function isAvailable(): bool
+            {
+                throw new \LogicException('Exact poster browsing must not depend on the search backend.');
+            }
+        });
+        try {
+            $service = new ReleaseSearchService;
+            $filters = ['filter_only' => true, 'poster_release_id' => 1, 'ranges' => ['size' => ['min' => 20, 'max' => 30], 'comments' => ['max' => 0]]];
+            $page = $service->search([], -1, -1, -1, -1, -1, 1, 1, 'name_asc', excludedCats: [2050], cat: [2040, 2050], filters: $filters);
+            $this->assertSame([2], $page->modelKeys());
+            $this->assertSame(3, $page[0]->_totalrows);
+            $all = $service->search([], -1, -1, -1, -1, -1, 0, 10, 'name_asc', excludedCats: [2050], cat: [2040, 2050], filters: $filters);
+            $this->assertSame([1, 2, 10], $all->modelKeys());
+            $this->assertSame(3, $all[0]->_totalrows);
+            $missing = $service->search([], -1, -1, -1, -1, -1, filters: ['filter_only' => true, 'poster_release_id' => 999]);
+            $this->assertTrue($missing->isEmpty());
+        } finally {
+            Facade::clearResolvedInstances();
+            Facade::setFacadeApplication($originalApp);
+            Container::setInstance($originalContainer);
+            if ($originalResolver === null) {
+                Model::unsetConnectionResolver();
+            } else {
+                Model::setConnectionResolver($originalResolver);
+            }
+        }
+    }
+
+    #[Test]
+    public function poster_index_migration_supports_full_field_lookup_and_is_idempotent_and_reversible(): void
+    {
+        $connection = new SQLiteConnection(new \PDO('sqlite::memory:'), ':memory:');
+        $schema = $connection->getSchemaBuilder();
+        $schema->create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('fromname', 255)->nullable();
+        });
+        $poster = str_repeat('a', 254).'X';
+        $connection->table('releases')->insert([
+            ['id' => 1, 'fromname' => $poster],
+            ['id' => 2, 'fromname' => str_repeat('a', 254).'Y'],
+        ]);
+        $originalApp = Facade::getFacadeApplication();
+        $originalContainer = Container::getInstance();
+        $container = new Container;
+        $container->instance('db.schema', $schema);
+        Container::setInstance($container);
+        Facade::setFacadeApplication($container);
+        DB::swap($connection);
+        try {
+            $migrationPath = __DIR__.'/../../database/migrations/2026_10_12_120000_add_releases_poster_index.php';
+            $this->assertFileExists($migrationPath, 'Exact poster browsing needs its supporting index migration.');
+            $migration = require $migrationPath;
+            $migration->up();
+            $migration->up();
+            $index = collect(Schema::getIndexes('releases'))->firstWhere('name', 'ix_releases_fromname');
+            $this->assertNotNull($index);
+            $this->assertSame(['fromname'], $index['columns']);
+            $this->assertFalse($index['unique']);
+            $plan = $connection->select('EXPLAIN QUERY PLAN SELECT id FROM releases WHERE fromname = ?', [$poster]);
+            $this->assertStringContainsString('INDEX ix_releases_fromname', implode(' ', array_map(static fn (object $row): string => $row->detail, $plan)));
+            $this->assertSame([1], $connection->table('releases')->where('fromname', $poster)->pluck('id')->all());
+            $migration->down();
+            $migration->down();
+            $this->assertFalse(Schema::hasIndex('releases', 'ix_releases_fromname'));
+            $this->assertSame(2, $connection->table('releases')->count());
+        } finally {
+            Facade::clearResolvedInstances();
+            Facade::setFacadeApplication($originalApp);
+            Container::setInstance($originalContainer);
         }
     }
 
