@@ -293,33 +293,25 @@ final class BinaryHandler
         $driver = DB::getDriverName();
         $hashExpression = $driver === 'sqlite' ? 'binaryhash' : 'LOWER(HEX(binaryhash))';
 
-        // Group lookups by collections_id and run small `binaryhash IN (...)`
-        // queries per collection. This avoids producing a single
-        // `WHERE (... AND ...) OR (... AND ...) OR ...` expression with
-        // thousands of clauses and bindings, which both bloats the SQL
-        // string in PHP and can force MySQL into pathological plans.
-        $rowsByCollection = [];
-        foreach ($rows as $row) {
-            $rowsByCollection[(int) $row['collections_id']][] = (string) $row['hash'];
-        }
-
+        // Resolve bounded composite keys together: per-collection lookups add round trips
+        // while the header transaction holds parent locks across cross-posted collections.
         $results = [];
-        foreach ($rowsByCollection as $collectionId => $hashes) {
-            $hashes = array_values(array_unique($hashes));
-            foreach (array_chunk($hashes, $this->sqlChunkSize) as $chunk) {
-                $placeholders = implode(',', array_fill(0, \count($chunk), $driver === 'sqlite' ? '?' : 'UNHEX(?)'));
-                $bindings = $chunk;
-                $bindings[] = $collectionId;
+        foreach (array_chunk($rows, $this->sqlChunkSize) as $chunk) {
+            $tuples = implode(',', array_fill(0, \count($chunk), $driver === 'sqlite' ? '(?, ?)' : '(?, UNHEX(?))'));
+            $bindings = [];
+            foreach ($chunk as $row) {
+                $bindings[] = (int) $row['collections_id'];
+                $bindings[] = (string) $row['hash'];
+            }
 
-                $rowsResult = DB::select(
-                    "SELECT id, {$hashExpression} AS hashvalue, collections_id FROM binaries "
-                    ."WHERE binaryhash IN ({$placeholders}) AND collections_id = ?",
-                    $bindings
-                );
+            $rowsResult = DB::select(
+                "SELECT id, {$hashExpression} AS hashvalue, collections_id FROM binaries "
+                ."WHERE (collections_id, binaryhash) IN ({$tuples})",
+                $bindings
+            );
 
-                foreach ($rowsResult as $r) {
-                    $results[] = $r;
-                }
+            foreach ($rowsResult as $row) {
+                $results[] = $row;
             }
         }
 

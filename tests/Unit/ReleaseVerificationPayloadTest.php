@@ -631,6 +631,56 @@ class ReleaseVerificationPayloadTest extends TestCase
         }
     }
 
+    public function test_redundant_volumes_verify_the_same_recovery_set_only_once(): void
+    {
+        [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', str_repeat('movie-data', 64), 'set');
+        $articles['source@article'] = (new YencService)->encode(str_repeat('movie-data', 64), 'movie.mkv');
+        $log = $fixture.'/operations';
+        $wrapper = $fixture.'/par2-wrapper';
+        file_put_contents($wrapper, "#!/bin/sh\nprintf '%s\\n' \"$".'1" >> '.escapeshellarg($log)."\nexec par2 \"$"."@\"\n");
+        chmod($wrapper, 0700);
+        [$unused, $scratch] = $this->verifier([]);
+        $source = new class($articles) implements ArticleSource
+        {
+            public function __construct(private array $articles) {}
+
+            public function fetch(string $messageId): string
+            {
+                return $this->articles[$messageId];
+            }
+        };
+        $verifier = new PayloadVerifier($source, ['scratch_bytes' => 104857600, 'free_bytes' => 0,
+            'article_bytes' => 16777216, 'bytes_per_second' => 0, 'par2_binary' => $wrapper]);
+        try {
+            $result = $verifier->verify(['expected_files' => count($files), 'files' => $files], $scratch, static function (): void {});
+            $this->assertTrue($result->passed(), $result->reason);
+            $this->assertSame(['v'], file($log, FILE_IGNORE_NEW_LINES));
+            $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', str_repeat('movie-data', 64));
+        } finally {
+            $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_corrupt_redundant_volume_is_rejected_after_its_set_was_verified(): void
+    {
+        [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', str_repeat('movie-data', 64), 'set');
+        $articles['source@article'] = (new YencService)->encode(str_repeat('movie-data', 64), 'movie.mkv');
+        $volume = glob($fixture.'/*.vol*.par2')[0];
+        $bytes = file_get_contents($volume);
+        $bytes[strlen($bytes) - 1] = chr(ord($bytes[strlen($bytes) - 1]) ^ 1);
+        $articles[basename($volume).'@article'] = (new YencService)->encode($bytes, basename($volume));
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $result = $verifier->verify(['expected_files' => count($files), 'files' => $files], $scratch, static function (): void {});
+            $this->assertFalse($result->passed());
+            $this->assertStringContainsString('Invalid PAR2 metadata', $result->reason);
+        } finally {
+            $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+        }
+    }
+
     public function test_actual_par2_reconstructs_a_missing_file_before_passing(): void
     {
         $dir = sys_get_temp_dir().'/par2-fixture-'.bin2hex(random_bytes(8));
