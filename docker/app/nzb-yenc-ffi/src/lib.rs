@@ -24,6 +24,7 @@ mod article_xref;
 mod formats;
 mod par2;
 mod par2_source_ranges;
+mod sample_plan;
 mod seven_zip_ranges;
 
 /// nzb-decode 0.1.3, packed as RapidYenc packs its version (major << 16 | minor << 8 | patch).
@@ -370,6 +371,45 @@ pub unsafe extern "C" fn nntmux_metadata_string_free(value: *mut c_char) {
     }
 }
 
+/// Versioned bounded sampling-planner ABI; unsupported inputs request PHP fallback.
+/// Null requests PHP fallback for unsupported input. Free a result using
+/// `nntmux_metadata_string_free` from this same library.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes when length is nonzero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_spot_check_sample_v1_json(
+    data: *const u8,
+    length: usize,
+    maximum_articles: i64,
+    maximum_header_bytes: i64,
+    maximum_article_bytes: i64,
+    has_maximum_article_bytes: c_int,
+) -> *mut c_char {
+    if length > MAX_METADATA_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: caller supplies readable input of the checked length.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    match catch_unwind(|| {
+        sample_plan::select_json(
+            input,
+            maximum_articles,
+            maximum_header_bytes,
+            (has_maximum_article_bytes != 0).then_some(maximum_article_bytes),
+        )
+    }) {
+        Ok(Some(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
 /// Decode `src_length` bytes from `src` into `dest` and return the decoded length.
 ///
 /// `is_raw` and `state` exist for RapidYenc compatibility; NNTmux always passes
@@ -535,5 +575,30 @@ mod tests {
     #[test]
     fn reports_the_nzb_decode_version() {
         assert_eq!(rapidyenc_version(), 0x0103);
+    }
+    #[test]
+    fn sampling_abi_checks_input_bounds_and_result_ownership() {
+        unsafe {
+            assert!(nntmux_spot_check_sample_v1_json(ptr::null(), 1, 1, 2, 0, 0).is_null());
+            assert!(nntmux_spot_check_sample_v1_json(ptr::null(), 0, 1, 2, 0, 0).is_null());
+            assert!(
+                nntmux_spot_check_sample_v1_json(
+                    ptr::null(),
+                    MAX_METADATA_INPUT_BYTES + 1,
+                    1,
+                    2,
+                    0,
+                    0
+                )
+                .is_null()
+            );
+            nntmux_metadata_string_free(ptr::null_mut());
+            let input =
+                br#"{"files":[{"key":"f","segments":[{"number":1,"messageid":"m","bytes":2}]}]}"#;
+            let result = nntmux_spot_check_sample_v1_json(input.as_ptr(), input.len(), 1, 2, 0, 0);
+            assert!(!result.is_null());
+            assert_eq!(std::ffi::CStr::from_ptr(result).to_bytes(), br#"[{"file_key":"f","totalparts":0,"totalparts_inferred":false,"number":1,"messageid":"m","bytes":2}]"#);
+            nntmux_metadata_string_free(result);
+        }
     }
 }

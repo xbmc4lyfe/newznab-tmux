@@ -6,6 +6,8 @@ namespace App\Services\Releases\Verification;
 
 final class SpotCheckPlanner
 {
+    public function __construct(private ?NativeSpotCheckPlanner $native = null) {}
+
     /**
      * Select a stable, bounded sample and spread first across different files.
      * A stable candidate identity keeps retries from repeatedly sampling a new set.
@@ -17,6 +19,13 @@ final class SpotCheckPlanner
     {
         if ($maximumArticles < 1 || $maximumHeaderBytes < 1 || ! is_array($manifest['files'] ?? null)) {
             return [];
+        }
+
+        if ($maximumArticles <= 16 && NativeSpotCheckPlanner::supportsInventory($manifest)) {
+            $sample = ($this->native ??= new NativeSpotCheckPlanner)->select($manifest, $maximumArticles, $maximumHeaderBytes, $maximumArticleBytes);
+            if ($sample !== null) {
+                return $sample;
+            }
         }
 
         $identity = null;
