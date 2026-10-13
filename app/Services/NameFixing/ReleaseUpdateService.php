@@ -685,6 +685,7 @@ class ReleaseUpdateService
 
                 $affected = $query->update($updateColumns);
             } else {
+
                 $affected = $query->update([
                     ...TvProcessingCandidateQuery::resetColumns(),
                     'imdbid' => null,

@@ -1189,6 +1189,7 @@ class ReleaseProcessorTest extends TestCase
 
         $downloadService = Mockery::mock(UsenetDownloadService::class);
         $this->expectDownloadScope($downloadService);
+
         $downloadService->shouldReceive('downloadBounded')->once()->ordered()->with(DownloadKind::Jpg, ['<s1>', '<s2>'], 8388608, '', 1)
             ->andReturn(['success' => true, 'data' => 'BROKEN', 'groupUnavailable' => false, 'error' => null, 'bytesDownloaded' => 6]);
         $downloadService->shouldReceive('downloadBounded')->once()->ordered()->with(DownloadKind::Jpg, ['<cover>'], 8388608, '', 1)
@@ -1226,6 +1227,7 @@ class ReleaseProcessorTest extends TestCase
     }
 
     #[Test]
+
     #[DataProvider('imageByteBudgets')]
     public function failed_ranked_images_share_the_preview_budget_and_report_every_consumed_byte(int $limit): void
     {
