@@ -277,6 +277,7 @@ final class PayloadVerifier
         $sourceHashes = [];
         $reservedSources = [];
         $verifiedSetIds = [];
+        $verifiedRecoverySets = [];
         foreach ($parity as $name) {
             $heartbeat();
             if (! $files[$name]['complete']) {
@@ -312,6 +313,30 @@ final class PayloadVerifier
                 }
                 $this->reserve($directory, $allocated);
             }
+            $setId = null;
+            $mainSets = [];
+            $mainHashes = [];
+            $descriptorSets = [];
+            foreach ($par2->getPackets(true) ?: [] as $packet) {
+                if ($packet['head_type'] === Par2Info::PACKET_MAIN) {
+                    $mainSets[(string) $packet['head_set_id']] = true;
+                    $mainHashes[(string) $packet['head_hash']] = true;
+                } elseif ($packet['head_type'] === Par2Info::PACKET_FILEDESC) {
+                    $descriptorSets[(string) $packet['head_set_id']] = true;
+                }
+            }
+            if (count($mainSets) === 1 && count($mainHashes) === 1 && count($descriptorSets) === 1 && array_keys($mainSets) === array_keys($descriptorSets)) {
+                $setId = array_key_first($mainSets);
+            }
+            $inventory = array_map(static fn (array $descriptor): array => [
+                'name' => $descriptor['name'], 'size' => $descriptor['size'],
+                'hash' => $descriptor['hash'], 'hash_16K' => $descriptor['hash_16K'],
+            ], $descriptors);
+            ksort($inventory, SORT_STRING);
+            $recoveryKey = $setId === null ? null : $setId.':'.array_key_first($mainHashes).':'.hash('sha256', serialize($inventory));
+            if ($recoveryKey !== null && isset($verifiedRecoverySets[$recoveryKey])) {
+                continue;
+            }
             $exit = $this->par2('v', $name, $data, $heartbeat);
             if ($exit === 2 && ! $networkFailure) {
                 return new VerificationResult('unrepairable', 'Downloaded payload has insufficient validated PAR2 recovery data.');
@@ -331,16 +356,9 @@ final class PayloadVerifier
                 }
                 $protected[$filename] = true;
             }
-            $mainSets = [];
-            $descriptorSets = [];
-            foreach ($par2->getPackets(true) ?: [] as $packet) {
-                if ($packet['head_type'] === Par2Info::PACKET_MAIN) {
-                    $mainSets[(string) $packet['head_set_id']] = true;
-                } elseif ($packet['head_type'] === Par2Info::PACKET_FILEDESC) {
-                    $descriptorSets[(string) $packet['head_set_id']] = true;
-                }
-            }
-            if (count($mainSets) === 1 && count($descriptorSets) === 1 && array_keys($mainSets) === array_keys($descriptorSets)) {
+
+            if ($recoveryKey !== null) {
+                $verifiedRecoverySets[$recoveryKey] = true;
                 $verifiedSetIds += $mainSets;
             }
         }

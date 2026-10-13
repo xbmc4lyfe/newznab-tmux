@@ -7,6 +7,7 @@ namespace App\Console\Commands;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\AuditReleaseDeletion;
 use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\LeaseHeartbeat;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
 use App\Services\Releases\Verification\PayloadVerifier;
@@ -24,7 +25,7 @@ use Throwable;
 
 class VerifyReleaseCandidates extends Command
 {
-    protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot}';
+    protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the active candidate}';
 
     protected $description = 'Download and verify pending candidates before publishing their NZBs';
 
@@ -64,7 +65,12 @@ class VerifyReleaseCandidates extends Command
                 }
             }
             $decoder = app(YencService::class);
+            $runStarted = hrtime(true);
+            $maxSeconds = max(0, (int) $this->option('max-seconds'));
             for ($index = 0; $index < max(1, (int) $this->option('limit')); $index++) {
+                if ($index > 0 && $maxSeconds > 0 && (hrtime(true) - $runStarted) / 1e9 >= $maxSeconds) {
+                    break;
+                }
                 $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id));
                 if ($claim === null) {
                     break;
@@ -73,10 +79,11 @@ class VerifyReleaseCandidates extends Command
                 try {
                     $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
                     $heartbeat();
+                    $progressHeartbeat = new LeaseHeartbeat($heartbeat, max(0.1, min(30, (int) config('release_verification.lease_seconds') / 3)));
                     $scratchInventory->register((int) $claim->id, (int) $claim->version);
                     $scratchEntryId = (int) DB::table('release_verification_scratch')->where('candidate_id', $claim->id)
                         ->where('version', $claim->version)->value('id');
-                    $scratchBudget->reconcile($scratchEntryId, $locks, $heartbeat);
+                    $scratchBudget->reconcile($scratchEntryId, $locks, $progressHeartbeat);
                     $verifier = new PayloadVerifier(new NntpArticleSource(app(NNTPService::class), decoder: $decoder),
                         (array) config('release_verification'), decoder: $decoder, scratchBudget: $scratchBudget->forEntry($scratchEntryId));
                     foreach ($scratchInventory->olderVersions((int) $claim->id, (int) $claim->version) as $old) {
@@ -92,7 +99,7 @@ class VerifyReleaseCandidates extends Command
                     $heartbeat();
                     $manifest = $store->read($claim->manifest_path);
                     $started = microtime(true);
-                    $result = $verifier->verify($manifest, $directory, $heartbeat);
+                    $result = $verifier->verify($manifest, $directory, $progressHeartbeat);
                     if ($result->passed()) {
                         if ($publisher->publish($claim, $result) === null) {
                             $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
