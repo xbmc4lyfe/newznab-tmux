@@ -55,6 +55,9 @@ class SearchController extends BasePageController
         } elseif (! $request->exists('poster')) {
             $exactPoster = '';
         }
+        if ($exactPoster !== '' && ! array_key_exists('searchadvposter', $listQuery)) {
+            $listQuery['searchadvposter'] = $exactPoster;
+        }
         $group = $this->scalarInput($request, 'group');
         $ranges = $request->ranges();
         $searchFields = [

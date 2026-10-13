@@ -140,6 +140,37 @@ class ApiRequestMatrixTest extends TestCase
         $response->assertOk();
     }
 
+    public function test_legacy_exact_poster_url_prefills_advanced_poster_field(): void
+    {
+        $poster = 'legacy@example.test';
+        $releaseSearch = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearch->shouldReceive('search')
+            ->once()
+            ->withArgs(fn (...$arguments): bool => ($arguments[0]['fromname'] ?? null) === ''
+                && ($arguments[14]['poster'] ?? null) === $poster
+                && ($arguments[14]['filter_only'] ?? false) === true)
+            ->andReturn(collect());
+        $this->app->instance(ReleaseSearchService::class, $releaseSearch);
+
+        $releaseBrowse = Mockery::mock(ReleaseBrowseService::class);
+        $releaseBrowse->shouldReceive('getBrowseOrdering')->once()->andReturn(['posted_desc']);
+        $this->app->instance(ReleaseBrowseService::class, $releaseBrowse);
+
+        $searchService = Mockery::mock(SearchServiceInterface::class);
+        $searchService->shouldReceive('isSuggestEnabled')->once()->andReturnFalse();
+        $searchService->shouldReceive('isAutocompleteEnabled')->once()->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $searchService);
+
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        $response = $this->actingAs(User::query()->where('username', 'matrix_user')->firstOrFail())
+            ->get(route('search', ['poster' => $poster, 'search_type' => 'adv']));
+
+        $response->assertOk();
+        $response->assertViewHas('listQuery', fn (array $query): bool => ($query['searchadvposter'] ?? null) === $poster);
+        $document = HTMLDocument::createFromString($response->getContent());
+        $this->assertSame($poster, $document->querySelector('input[name="searchadvposter"]')?->getAttribute('value'));
+    }
+
     public function test_edited_advanced_poster_overrides_hidden_exact_poster(): void
     {
         $searchRelease = Mockery::mock(ReleaseSearchService::class);
