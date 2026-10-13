@@ -55,6 +55,7 @@ class MediaSourceResolver
     private function readIndex(ReleaseProcessingContext $context, array $candidates, MediaByteBudget $budget): array
     {
         foreach ($candidates as $candidate) {
+
             if ($context->groupUnavailable || $budget->exhausted() || ! $budget->allows($this->estimatedBytes($context, $candidate->sourceIndex, count($candidate->messageIds)))) {
                 return [];
             }
@@ -125,6 +126,7 @@ class MediaSourceResolver
                 }
 
                 $messageId = (string) ($context->nzbContents[$sourceIndex]['segments'][0] ?? '');
+
                 if ($messageId === '' || $budget->exhausted() || ! $budget->allows($this->estimatedBytes($context, $sourceIndex, 1))) {
                     break 2;
                 }

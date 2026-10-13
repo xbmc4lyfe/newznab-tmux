@@ -282,6 +282,7 @@ class Tmux
 
         switch ((int) $qry) {
             case 1:
+
                 $metadata = $this->configuration->metadata();
                 $tmux = $this->configuration->tmux();
                 $postProcessing = $this->configuration->postProcessing();

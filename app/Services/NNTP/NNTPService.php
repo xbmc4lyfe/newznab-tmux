@@ -1233,6 +1233,7 @@ class NNTPService extends NntpClient
         [$data, $part] = $this->_yencService->decodeWithFrame($raw);
 
         return ['data' => $data, 'part' => $part];
+
     }
 
     /**
