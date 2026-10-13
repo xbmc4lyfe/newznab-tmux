@@ -125,13 +125,13 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
         $this->assertDirectoryDoesNotExist($root.'/'.$id.'-100');
         $this->assertDirectoryExists($root.'/'.$id.'-101');
         $this->assertDirectoryExists($root.'/'.$id.'-102');
-        $this->assertDirectoryExists($root.'/'.$id.'-103');
+        $this->assertDirectoryDoesNotExist($root.'/'.$id.'-103');
         $this->assertSame(3, DB::table('release_verification_scratch')->count());
         DB::table('release_verification_candidates')->where('id', $id)->update(['next_attempt_at' => now()]);
         $this->artisan('releases:verify-candidates')->assertSuccessful();
         $this->assertDirectoryDoesNotExist($root.'/'.$id.'-101');
         $this->assertDirectoryDoesNotExist($root.'/'.$id.'-102');
-        $this->assertDirectoryExists($root.'/'.$id.'-103');
+        $this->assertDirectoryDoesNotExist($root.'/'.$id.'-103');
         $this->assertSame(1, DB::table('release_verification_scratch')->count());
     }
 

@@ -42,7 +42,7 @@ class ReleaseVerificationSchedulerRecoveryTest extends TestCase
         });
         DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.test']);
         app(CandidateRepository::class)->enqueue(['identity' => sha1('scheduler-recovery'), 'groups_id' => 1,
-            'expected_files' => 2, 'files' => [['key' => 'movie', 'subject' => 'movie.mkv', 'totalparts' => 1,
+            'expected_files' => 1, 'files' => [['key' => 'movie', 'subject' => 'movie.mkv', 'totalparts' => 1,
                 'segments' => [['number' => 1, 'messageid' => 'scheduled@article', 'bytes' => 5]]]]]);
     }
 
@@ -69,8 +69,8 @@ class ReleaseVerificationSchedulerRecoveryTest extends TestCase
             throw new SchedulerDispatchIntercept;
         });
         $this->mock(NNTPService::class, static function ($mock): void {
-            $mock->shouldReceive('doConnect')->once()->with(false)->andReturn(true);
-            $mock->shouldReceive('verificationArticle')->once()->andReturn((new YencService)->encode('hello', 'movie.mkv'));
+            $mock->shouldReceive('doConnect')->once()->with(false)->andReturn(false);
+            $mock->shouldNotReceive('verificationArticle');
             $mock->shouldReceive('doQuit')->andReturn(null);
         });
         $this->travel(1)->minutes();
@@ -85,7 +85,7 @@ class ReleaseVerificationSchedulerRecoveryTest extends TestCase
         $candidate = DB::table('release_verification_candidates')->sole();
         $this->assertSame('unknown', $candidate->status);
         $this->assertNull($candidate->lease_token);
-        $this->assertSame('Declared file inventory cannot be proved complete.', $candidate->reason);
+        $this->assertSame('NNTP is unavailable.', $candidate->reason);
         $this->assertTrue($event->mutex->exists($event), 'The retained legacy scheduler mutex is ignored without needing a cache flush.');
     }
 
@@ -104,7 +104,7 @@ class ReleaseVerificationSchedulerRecoveryTest extends TestCase
                 $token = DB::table('release_verification_candidates')->value('lease_token');
                 $this->assertSame('verifying', DB::table('release_verification_candidates')->value('status'));
                 $this->assertTrue($this->dispatchMinute($event));
-                $this->assertStringContainsString('Verification worker is already running.', Artisan::output());
+                $this->assertStringContainsString('Verification worker slots are occupied or exclusive maintenance is running.', Artisan::output());
                 $this->assertSame($token, DB::table('release_verification_candidates')->value('lease_token'));
 
                 return (new YencService)->encode('hello', 'movie.mkv');
