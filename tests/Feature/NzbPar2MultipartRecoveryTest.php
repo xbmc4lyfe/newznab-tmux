@@ -200,20 +200,20 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
         return ['GUID' => ['guid', 'replacement-guid'], 'name' => ['name', 'replacement-name'], 'searchname' => ['searchname', 'replacement-title'], 'linked' => ['predb_id', 9], 'renamed' => ['isrenamed', 1], 'processed' => ['proc_par2', 1]];
     }
 
-    public function test_partial_index_rotates_so_a_complete_volume_can_win_the_next_article_budget(): void
+    public function test_partial_index_rotates_so_a_hidden_index_can_win_the_next_article_budget(): void
     {
         $release = $this->release();
         [$main, $rest] = $this->metadata();
         $xml = $this->nzb([$main, $rest]);
-        $volume = $xml->addChild('file');
-        $volume->addAttribute('subject', '"release.vol001+002.par2" yEnc');
-        $segment = $volume->addChild('segments')->addChild('segment', 'volume');
+        $hidden = $xml->addChild('file');
+        $hidden->addAttribute('subject', '"hidden-index" yEnc');
+        $segment = $hidden->addChild('segments')->addChild('segment', 'hidden');
         $segment->addAttribute('number', '1');
         $segment->addAttribute('bytes', (string) strlen($main.$rest));
 
         self::assertSame(Par2RenameOutcome::Deferred, $this->service($xml, ['one' => BoundedArticleResult::success($main)])->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        self::assertSame(Par2RenameOutcome::Renamed, $this->service($xml, ['volume' => BoundedArticleResult::success($main.$rest)])->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        self::assertSame(['one', 'volume'], $this->fetched);
+        self::assertSame(Par2RenameOutcome::Renamed, $this->service($xml, ['hidden' => BoundedArticleResult::success($main.$rest)])->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        self::assertSame(['one', 'hidden'], $this->fetched);
     }
 
     #[DataProvider('malformedSegments')]

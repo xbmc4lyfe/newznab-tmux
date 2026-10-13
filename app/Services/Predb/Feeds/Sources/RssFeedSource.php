@@ -19,8 +19,10 @@ use Throwable;
  * first RSS <category> element into the entry category. Catalogues can set $publicationDatesOnly
  * so listing timestamps are never treated as PRE times.
  */
-final class RssFeedSource extends HttpFeedSource
+final class RssFeedSource extends BoundedHttpFeedSource
 {
+    private const MAXIMUM_ITEMS = 5000;
+
     public function __construct(
         private readonly string $sourceKey,
         private readonly string $sourceLabel,
@@ -50,7 +52,7 @@ final class RssFeedSource extends HttpFeedSource
             return [];
         }
 
-        return $this->parseXml($this->http()->get($this->endpoint)->throw()->body());
+        return $this->parseXml($this->downloadBody());
     }
 
     /**
@@ -60,6 +62,12 @@ final class RssFeedSource extends HttpFeedSource
      */
     public function parseXml(string $xml): array
     {
+        if (strlen($xml) > $this->maximumBodyBytes) {
+            throw $this->bodyLimitException();
+        }
+        if (preg_match('/<!(?:DOCTYPE|ENTITY)\b/i', $xml) === 1) {
+            throw new RuntimeException($this->sourceLabel.' returned an invalid RSS document.');
+        }
         $xml = preg_replace('/\A[ \t\r\n]+(?=<\?xml[ \t\r\n])/', '', $xml) ?? $xml;
         $previous = libxml_use_internal_errors(true);
 
@@ -78,6 +86,9 @@ final class RssFeedSource extends HttpFeedSource
             return [];
         }
 
+        if (count($document->channel->item) > self::MAXIMUM_ITEMS) {
+            throw new RuntimeException($this->sourceLabel.' RSS document exceeds the item limit.');
+        }
         $entries = [];
 
         foreach ($document->channel->item as $item) {

@@ -1432,7 +1432,7 @@ class NameFixingService
             $cursor = $cache->get($key);
             $afterId = is_array($cursor) ? max(0, (int) ($cursor['after_id'] ?? 0)) : 0;
             $throughId = is_array($cursor) ? max(0, (int) ($cursor['through_id'] ?? 0)) : $this->queries->highWatermark();
-            $limit = max(1, (int) config('tmux.fix_names.par2_max_releases', 100));
+            $limit = max(1, (int) config('tmux.fix_names.par2_max_releases', 300));
             $releases = $this->queries->candidateBatch(NameFixingQueryService::SOURCE_PAR2, $time, $cats, $afterId, $limit, $throughId);
             if ($releases === [] && $afterId > 0) {
                 $throughId = $this->queries->highWatermark();

@@ -54,6 +54,25 @@ class Par2RenameBatchTest extends TestCase
         $this->assertSame(5, Release::query()->where('proc_par2', 1)->count());
     }
 
+    public function test_historical_sweep_processes_three_hundred_releases_before_resuming(): void
+    {
+        config(['tmux.fix_names.par2_max_releases' => 300]);
+        for ($i = 1; $i <= 301; $i++) {
+            $this->pendingPar2Release(['guid' => 'guid-'.$i]);
+        }
+        $this->bindNzb();
+
+        $this->runBatch();
+
+        $this->assertCount(300, $this->visited);
+        $this->assertSame(300, Release::query()->where('proc_par2', 1)->count());
+
+        $this->runBatch();
+
+        $this->assertCount(301, $this->visited);
+        $this->assertSame(301, Release::query()->where('proc_par2', 1)->count());
+    }
+
     public function test_retryable_old_releases_do_not_starve_later_work_and_are_revisited(): void
     {
         for ($i = 1; $i <= 3; $i++) {

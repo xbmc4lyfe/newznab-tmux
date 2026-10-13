@@ -1,5 +1,17 @@
 # To do
 
+## Release identification follow-up (implemented, not deployed)
+
+- [x] Exclude explicitly named recovery-volume subjects from naming probes, preserving explicit indexes, legacy candidates, bounded hidden candidates and durable resume (PR #83 supersedes the earlier volume-priority policy).
+- [x] Preserve string results from the release name cleaner and recheck cleaner-supplied PreDB references against their current stored title. Missing or changed references no longer attach an unrelated identity.
+- [x] Run the affected PAR2, payload metadata, and PreDB matching regressions: 95 tests, 469 assertions (11 PHPUnit notices).
+- [ ] Deploy through the single deployment owner and measure historical rename yield versus arrivals. The regression checks prove the repaired mechanisms, not sustained throughput or a shrinking production backlog.
+
+## Qualify PAR2 donor inventory matching
+
+- [ ] Validate the symmetric full-MD5/size donor inventory query on isolated MariaDB fixtures with sparse, dense and maximum descriptor inventories. The two-distinct-tuple threshold and symmetric coverage prevent a lone shared file or partial inventory from attaching a donor; they do not establish production throughput.
+- [ ] Decide whether filename or payload classification should be persisted independently of optional file collection. Identical inventories made entirely of shared support files remain indistinguishable without that evidence; inventory agreement alone does not prove a scene release identity.
+
 ## Retest verification and throughput PRs after the expedited rollout
 
 The 2026-10-12 throughput rollout was explicitly requested with minimal targeted checks and no PR review. Complete the deferred review and testing for PR #53, upstream PR #68 integration, and [PR #70](https://github.com/xbmc4lyfe/newznab-tmux/pull/70) (article concurrency/pipelining, candidate workers, and native decoding) before treating the expedited changes as fully qualified.
@@ -95,7 +107,7 @@ Work proceeds from small contract corrections to broader operational decisions. 
 
 Live rename observation at this inventory: 17 completed bounded passes (nine recent, eight historical) report 22 recovered names and 2,433 received articles. Historical passes report two recovered names, one completed miss, five retryable outcomes, and 330 deferrals. These are reported outcomes, not evidence that the net backlog is shrinking. Continue distinguishing real recovered names from completed checks.
 
-Next operational priority: inspect a bounded sample of existing historical NZBs and durable checkpoints before changing probe selection. The sampled historical runs deferred 330 of 338 attempts (97.6%) and averaged 3.92 received articles per attempt, close to the four-probe cap. Current logs combine probe-budget, deadline, and claim-loss deferrals, so the cause is not yet proven. Indexes precede all recovery volumes, then hidden candidates; repeated volume metadata may waste probes, but partial metadata and missing indexes still require fallback. Prefer evidence-led candidate prioritization before excluding volumes or adding workers. Regression gates must retain missing/corrupt-index volume recovery, partial/multiple recovery sets, obfuscated indexes, transient retries, restart/resume, changed NZBs, and worker overlap.
+Next operational priority: inspect a bounded sample of existing historical NZBs and durable checkpoints and measure the candidate-priority repair after deployment. The sampled historical runs deferred 330 of 338 attempts (97.6%) and averaged 3.92 received articles per attempt, close to the four-probe cap. Current logs combine probe-budget, deadline, and claim-loss deferrals, so the live cause is not yet proven. The follow-up prioritizes explicit indexes, one recovery volume per filename family, hidden candidates, then remaining volumes. Regression fixtures reproduce repeated volumes crowding out useful candidates and retain later-volume fallback and durable resume. That earlier policy was superseded by PR #83: explicitly named recovery volumes are now excluded from naming probes. Historical regression gates retained missing/corrupt-index volume recovery, partial/multiple recovery sets, obfuscated indexes, transient retries, restart/resume, changed NZBs, and worker overlap.
 
 Monitor baseline for the next comparison (2026-10-11 22:46:54 UTC): the Renames row reports 465,835 unmatched and 24,317 matched. These monitor counts span all rename methods and must be assessed alongside actual changed-name/download outcomes.
 
@@ -111,3 +123,41 @@ Expedited shipping was requested with GitHub CI/CD skipped. Run the full regress
 - [ ] Recheck rename-count equality across PAR2, metadata-only, missing-source, NZB-less, already renamed, and recent-only releases. The PAR2 fast path must skip metadata probes while preserving eligibility and counting a release once.
 - [ ] Compare monitor query durations and scheduling gaps under the same workload, plus net rename backlog, actual recovered names, arrivals, and DB row-lock wait rates over an hour. The bounded SQL probe is not a sustained throughput benchmark.
 - [ ] Retest verification snapshot batching with large multi-file collections, empty files, unordered segments, late arrivals/replays, expiry, capacity rejection, manifest rollback and concurrent ingestion. Compare archive transaction duration and capacity-lock waits before/after; batching retains the existing lock order and metadata budget.
+- [ ] Retest processing-only Pulse suppression, the `PULSE_PROCESSING_ENABLED=true` opt-in, web/Horizon recording, config caching, file logs and Prometheus snapshots. Measure Pulse aggregate lock waits/deadlocks separately from collection/capacity-state waits; disabling processing telemetry does not resolve those other locks.
+- [ ] Investigate remaining collection/capacity-state serialization under live ingestion; retain capacity accounting, manifest GC, parent locking and retry/header retention when shortening transactions.
+
+## Retest collection archive lock order (expedited, 2026-10-12)
+
+GitHub CI/CD and the full regression/deployment qualification were deferred at the user's request. The repair locks the exact collection through `ix_collection_collectionhash` before capacity state, skips busy rows without reserving bytes or deleting headers, and preserves candidate/manifest accounting and cleanup in the same transaction.
+
+- [ ] Run the full PHPUnit suite, native parity and required CI checks. Rerun the affected verification, ingestion, cleanup, publication/import, rollback, expiry, filtered-replay, legacy-release and reset suites.
+- [ ] Run `tests/Integration/ReleaseVerificationArchiveLockMariaDbTest.php` with `VERIFICATION_LOCK_TEST_HOST` pointing to an isolated MariaDB/MySQL server (optional username/password variables). It creates and removes only randomly named test databases. Cover primary/unique-hash contention, a locked capacity row, physical index choice, repeatable-read late arrivals (standalone and caller-owned transactions), skipped-header retention and successful retry with exact capacity totals.
+- [ ] Stress concurrent header inserts, archive/delete, publication, GC, reset and legacy reconciliation. Confirm no new lock-order cycles, stale/recreated collection IDs are retained safely, busy collections retry after cursor wrap, and persistently busy collections do not starve indefinitely.
+- [ ] Compare collection and capacity-row wait graphs, deadlocks, archive throughput, admitted/verified bytes and net backlog over at least an hour under comparable load. The global capacity lock still protects manifest reservation/cleanup; this repair removes collection waits while holding it, not every source of serialization.
+
+## Retest candidate claim lock order (expedited, 2026-10-12)
+
+GitHub CI/CD and full qualification are deferred at the user's request. Candidate claiming now selects up to 100 due IDs without locks, then revalidates and locks one primary row at a time with `SKIP LOCKED`. Refused/busy rows release their transaction immediately. A mutex acquired before a rolled-back lease stops the claim attempt if retry loses eligibility, allowing the caller to release it safely.
+
+- [ ] Run full PHPUnit, native parity and required CI checks; rerun candidate/parallel-worker, archival, publication, expiration, reset, GC and rollback suites.
+- [ ] Run the isolated MariaDB integration tests for a locked due head, concurrent primary-row updates, physical PRIMARY plan, stale eligibility and release of callback-refused rows. Stress concurrent claim/publish/archive/finish/expire under both read-committed and repeatable-read isolation.
+- [ ] Retest file-mutex acquisition followed by deadlock/retry, lease loss, process interruption and restart. Ensure a worker never advances with a previous candidate's mutex held, and two workers cannot process the same candidate.
+- [ ] Measure candidate/capacity-row wait chains, deadlocks, claim latency and admitted/verified throughput over an hour. The 100-ID window has best-effort fairness; test persistently busy/refused early candidates and cursor/progress behavior before assuming starvation is solved.
+
+## Retest indexed candidate queue selection (expedited, 2026-10-12)
+
+GitHub CI/CD and full qualification remain deferred at the user's request. Claim selection reads at most 100 eligible rows per status through the existing `(status, next_attempt_at, id)` index, merges due-time/ID order, removes duplicate IDs after concurrent status changes, and retains the same 100-ID claim window. Primary-row claim transactions and eligibility revalidation remain unchanged. Returned rows are bounded; filtered active leases can still require examining more index entries.
+
+- [ ] Run full PHPUnit, native parity, frontend build and required CI checks on the final synchronized upstream/fork head. Rerun candidate/parallel-worker, archival, publication, expiration, reset, GC, rollback and the upstream API/RAR/movie changes included in this branch.
+- [ ] Run the isolated MariaDB integration suite with production-equivalent schema, collation and isolation. Check real queue plans for all three statuses, empty/sparse/dense queues, large active-lease cohorts, global due-time/ID ties, status transitions, expired leases, refused/busy rows and the 100-ID window.
+- [ ] Compare frozen baseline/candidate revisions on a separate validation host with identical fixtures and randomized paired order. Record executed rows examined, sort work, claim latency, retries and correctness; preserve failed observations. Preflight EXPLAIN and one production read-only index probe do not establish production throughput.
+- [ ] After explicit writer-resume authorization, verify deployed source/image parity and observe an hour of claim latency, collection/capacity lock waits, admitted/verified work and net backlog under comparable load. Queue selection does not remove the remaining shared capacity-row serialization or manifest/filesystem work inside its transaction.
+
+## Retest archival snapshot capacity lock scope (expedited, 2026-10-12)
+
+GitHub CI/CD and full qualification are deferred at the user's request; deployment remains on hold. Archival builds header snapshots while holding the collection parent, before acquiring the global capacity row. An advisory filtered-status read preserves the cheap terminal-replay path; locked candidate validation remains authoritative, with a fallback snapshot if the status changed. Metadata-budget failures wait for that locked validation so a stale repeatable-read view cannot block terminal replay cleanup. Legacy release locks retain capacity-before-release order. Manifest merge/persistence, accounting, deletion and transaction/rollback boundaries remain inside their existing protected section. A caller that already owns capacity cannot have that inherited lock shortened by this change.
+
+- [ ] Run full PHPUnit, native parity and CI qualification on the final upstream-synchronized fork head, including the integrated TV pipeline/retry migration, exact duplicate-show recovery, scheduled TV lookup-mode guards and actionable backlog/pane gating. Migrate against a private full-schema MariaDB clone and verify source/image/schema parity separately before any authorized rollout.
+- [ ] Run the isolated MariaDB snapshot tests for new/legacy collections, standalone/caller-owned transactions, multi-batch headers and competing capacity/parent locks. Reproduce actual archive/ingestion/publication/delete/reset lock graphs under read-committed and repeatable-read isolation; preserve late arrivals, first-write duplicates, crossposts, replay, missing/recreated parents and rollback/after-commit failures. Retest filtered-to-pending and pending-to-filtered races and oversized filtered replays.
+- [ ] Freeze source/vendor/runtime/schema/index/collation/durability identities and compare baseline/candidate on a separate validation host, using randomized paired order, independent processes, identical restored fixtures and predeclared correctness/regression gates. Record snapshot/capacity lock duration, executed query work, CPU/throttling, retries and failed observations; the deterministic lock test alone does not establish production throughput.
+- [ ] After explicit deployment authorization, verify runtime parity and observe an hour of collection/capacity waits, admitted/verified work and net backlog under comparable load. Manifest compression/fsync, merges and collection deletion still hold capacity; investigate them separately if they remain dominant. Validate newly emitted NZBs in fresh scratch from their actual article IDs, preserving active files and stable lock inodes during cleanup.

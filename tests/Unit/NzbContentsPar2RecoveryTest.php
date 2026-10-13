@@ -56,7 +56,7 @@ final class NzbContentsPar2RecoveryTest extends TestCase
             $this->isInstanceOf(Par2PacketAccumulator::class), 123, 1, 0
         )->willReturnCallback(fn (): Par2RenameOutcome => $this->renamed());
         $service = $this->service([
-            ['subject' => '"hashed.vol000+01.par2" yEnc (1/20)', 'id' => 'par2@example', 'second_id' => 'second@example'],
+            ['subject' => '"hashed.par2" yEnc (1/20)', 'id' => 'par2@example', 'second_id' => 'second@example'],
         ], $processor);
 
         $this->assertTrue($service->checkPar2('guid', 123, 1, 1, 0));
@@ -71,16 +71,16 @@ final class NzbContentsPar2RecoveryTest extends TestCase
                 $message = array_values(array_values($inventory->filesBySet())[0])[0]['name'];
                 $messages[] = $message;
 
-                return $message === 'volume@example' ? $this->renamed() : Par2RenameOutcome::NoMatch;
+                return $message === 'second-index@example' ? $this->renamed() : Par2RenameOutcome::NoMatch;
             });
         $service = $this->service([
             ['subject' => '"hashed.par2" yEnc (1/1)', 'id' => 'index@example'],
             ['subject' => '"hashed.part01.rar" yEnc (1/800)', 'id' => 'archive@example'],
-            ['subject' => '"hashed.vol000+01.par2" yEnc (1/20)', 'id' => 'volume@example'],
+            ['subject' => '"second-index.par2" yEnc (1/20)', 'id' => 'second-index@example'],
         ], $processor);
 
         $this->assertTrue($service->checkPar2('guid', 123, 1, 1, 0));
-        $this->assertSame(['index@example', 'volume@example'], $messages);
+        $this->assertSame(['index@example', 'second-index@example'], $messages);
     }
 
     public function test_it_skips_files_with_no_segments(): void
@@ -146,7 +146,7 @@ final class NzbContentsPar2RecoveryTest extends TestCase
         $processor->expects($this->exactly(2))->method('applyInventoryForRename')->willReturn(Par2RenameOutcome::NoMatch);
         $service = $this->service([
             ['subject' => '"hashed.par2" yEnc (1/1)', 'id' => 'index@example'],
-            ['subject' => '"hashed.vol000+01.par2" yEnc (1/20)', 'id' => 'volume@example'],
+            ['subject' => '"second-index.par2" yEnc (1/20)', 'id' => 'second-index@example'],
         ], $processor);
 
         $this->assertFalse($service->checkPar2('guid', 123, 1, 1, 0));
@@ -159,7 +159,7 @@ final class NzbContentsPar2RecoveryTest extends TestCase
         $processor->expects($this->once())->method('applyInventoryForRename')->willReturnCallback(fn (): Par2RenameOutcome => $this->renamed());
         $service = $this->service([
             ['subject' => '"hashed.par2" yEnc (1/1)', 'id' => 'index@example'],
-            ['subject' => '"hashed.vol000+01.par2" yEnc (1/20)', 'id' => 'volume@example'],
+            ['subject' => '"second-index.par2" yEnc (1/20)', 'id' => 'second-index@example'],
         ], $processor);
 
         $this->assertTrue($service->checkPar2('guid', 123, 1, 1, 0));

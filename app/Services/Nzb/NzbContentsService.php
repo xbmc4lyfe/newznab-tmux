@@ -508,7 +508,7 @@ class NzbContentsService
     /** @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> */
     private function par2Candidates(SimpleXMLElement $nzb): array
     {
-        $explicit = $volumes = $legacy = $hidden = [];
+        $explicit = $legacy = $hidden = [];
         $this->par2Manifest = [];
         $this->par2StructureValid = count($nzb->file) > 0;
         $maxBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
@@ -543,7 +543,7 @@ class NzbContentsService
             if (! $valid) {
                 $this->par2StructureValid = false;
             }
-            if ($classification === 'excluded' || $segments === []) {
+            if (in_array($classification, ['excluded', 'volume'], true) || $segments === []) {
                 continue;
             }
             if (! $valid) {
@@ -553,14 +553,14 @@ class NzbContentsService
             $key = hash('sha256', json_encode($candidate, JSON_THROW_ON_ERROR));
             match ($classification) {
                 'index' => $explicit[$key] = $candidate,
-                'volume' => $volumes[$key] = $candidate,
                 'legacy' => $legacy[$key] = $candidate,
                 default => $hidden[$key] = $candidate,
             };
         }
         uasort($hidden, static fn (array $left, array $right): int => $left['segments'][0]['bytes'] <=> $right['segments'][0]['bytes']);
 
-        return array_values($explicit + $volumes + $legacy + $hidden);
+        // Recovery volumes stay outside bounded naming retries.
+        return array_values($explicit + $legacy + $hidden);
     }
 
     /**

@@ -34,9 +34,15 @@ class ReleaseMetadataResolver
         $importNameOverride = $importMetadata
             && ($manifest['import_name_override'] ?? false) === true && $subject !== '';
         $cleaned = $importNameOverride ? null : $this->cleaning->releaseCleaner($collectionMetadata ? $subject : $rawName, $collectionMetadata ? $poster : $from, $group);
-        $name = $importNameOverride ? Utf8::clean($subject) : (is_array($cleaned) ? (string) ($cleaned['cleansubject'] ?? $rawName) : $rawName);
+        $name = $importNameOverride ? Utf8::clean($subject) : (is_array($cleaned) ? (string) ($cleaned['cleansubject'] ?? $rawName) : (is_string($cleaned) && $cleaned !== '' ? $cleaned : $rawName));
         $proper = is_array($cleaned) ? (bool) ($cleaned['properlynamed'] ?? false) : true;
         $predb = is_array($cleaned) ? max(0, (int) ($cleaned['predb'] ?? 0)) : 0;
+        if ($predb > 0) {
+            $storedTitle = Predb::query()->whereKey($predb)->value('title');
+            if (! is_string($storedTitle) || PredbSearchDocument::exactValue($storedTitle) !== PredbSearchDocument::exactValue($name)) {
+                $predb = 0;
+            }
+        }
         if ($predb === 0 && $name !== '') {
             $match = Predb::matchPre($name);
             if ($match !== false) {
