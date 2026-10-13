@@ -19,7 +19,7 @@ class SearchReleaseListRequest extends FormRequest
     protected function prepareForValidation(): void
     {
         foreach ($this->all() as $field => $value) {
-            if (is_string($value)) {
+            if ($field !== 'poster' && is_string($value)) {
                 $this->merge([$field => trim($value) === '' ? null : trim($value)]);
             }
         }
