@@ -2936,7 +2936,10 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
 
         $phrases = $criteria['phrases'] ?? null;
         $hasText = $phrases !== null && $phrases !== '' && $phrases !== -1;
-        $tryFuzzy = (bool) ($criteria['try_fuzzy'] ?? true) && ! self::hasMediaInfoFieldQuery($phrases);
+        $hasPosterFieldQuery = self::hasPosterFieldQuery($phrases);
+        $tryFuzzy = (bool) ($criteria['try_fuzzy'] ?? true)
+            && ! self::hasMediaInfoFieldQuery($phrases)
+            && ! $hasPosterFieldQuery;
 
         $execute = function (bool $useFuzzy) use ($criteria, $limit, $offset, $hasText, $phrases): array {
             $query = (new Search($this->manticoreSearch))
@@ -3044,7 +3047,7 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
         };
 
         if ($hasText && (bool) ($criteria['fuzzy_only'] ?? false)) {
-            return $execute(true);
+            return $execute(! $hasPosterFieldQuery);
         }
 
         if ($hasText) {
@@ -3109,6 +3112,14 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
         }
 
         return false;
+    }
+
+    private static function hasPosterFieldQuery(mixed $phrases): bool
+    {
+        return is_array($phrases)
+            && isset($phrases['fromname'])
+            && $phrases['fromname'] !== ''
+            && $phrases['fromname'] !== -1;
     }
 
     /**
