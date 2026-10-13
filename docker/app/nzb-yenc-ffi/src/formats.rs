@@ -597,6 +597,7 @@ fn parse_rar5(data: &[u8], offset: usize) -> FormatHeader {
                     main_extra_records_complete,
                 ) = parse_rar5_main_extra_records(data, typed_header_end, header_end, block_start);
             }
+            main_extra_records_complete &= typed_header_complete;
         }
         4 => {
             algorithm_version = read_vint_bounded(data, &mut cursor, typed_header_end);
@@ -2097,5 +2098,32 @@ mod tests {
         assert!(!first_block_header_available);
         assert_eq!(*main_archive_flags, None);
         assert!(!main_extra_records_complete);
+    }
+
+    #[test]
+    fn complete_rar5_main_header_retains_complete_extra_records() {
+        let mut rar = RAR5.to_vec();
+        rar.extend_from_slice(&[0; 4]);
+        // MAIN type, extra-area flag, extra size, archive flags, locator record.
+        rar.push(7);
+        rar.extend_from_slice(&[1, 1, 3, 0, 2, 1, 0]);
+        let header_crc = crc32fast::hash(&rar[12..]);
+        rar[8..12].copy_from_slice(&header_crc.to_le_bytes());
+
+        let metadata = parse(&rar);
+        let FormatHeader::Rar5 {
+            first_block_header_available,
+            main_archive_flags,
+            main_extra_records_complete,
+            main_extra_record_types,
+            ..
+        } = &metadata.headers[0]
+        else {
+            panic!("expected RAR5 metadata");
+        };
+        assert!(*first_block_header_available);
+        assert_eq!(*main_archive_flags, Some(0));
+        assert!(*main_extra_records_complete);
+        assert_eq!(main_extra_record_types, &[1]);
     }
 }

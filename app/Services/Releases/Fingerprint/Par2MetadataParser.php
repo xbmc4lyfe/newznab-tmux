@@ -239,7 +239,7 @@ final class Par2MetadataParser
 
         $recoverySetIds = array_values(array_unique(array_column(array_filter(
             $packetSummaries,
-            static fn (array $packet): bool => ($packet['checksum_valid'] ?? false) === true,
+            static fn (array $packet): bool => $packet['checksum_valid'] === true,
         ), 'set_id')));
         $inputFileSliceChecksums = [];
         foreach ($ifscBySetAndFile as $setId => $fileChecksums) {
@@ -247,7 +247,7 @@ final class Par2MetadataParser
                 $source = $sourcesBySet[$setId][$fileId] ?? null;
                 $setBlockSize = $blockSizesBySet[$setId] ?? null;
                 $expectedSliceCount = is_array($source) && is_int($source['file_length'] ?? null)
-                    && is_int($setBlockSize) && $setBlockSize > 0
+                    && is_int($setBlockSize)
                     ? intdiv($source['file_length'], $setBlockSize) + (($source['file_length'] % $setBlockSize) === 0 ? 0 : 1) : null;
                 $inputFileSliceChecksums[] = $ifsc + [
                     'recovery_set_id' => $setId,
@@ -276,7 +276,7 @@ final class Par2MetadataParser
             }
             $exponentIdentity = $exponent === 65535 ? 0 : $exponent;
             $setBlockSize = $blockSizesBySet[$setId] ?? null;
-            if (! is_int($setBlockSize) || $setBlockSize < 1) {
+            if (! is_int($setBlockSize)) {
                 $recoverySliceLengthsUnvalidatedBySet[$setId] = ($recoverySliceLengthsUnvalidatedBySet[$setId] ?? 0) + 1;
             } elseif ($setBlockSize > PHP_INT_MAX - 4) {
                 $unsupportedIntegerRangeCount++;
@@ -323,7 +323,7 @@ final class Par2MetadataParser
                     $invalidPacketCount++;
                 }
                 $setIntegerRangeValid = $setIntegerRangeValid && $fileLength !== null && $setSourceBytes !== null;
-                if (in_array($fileId, $setRecoverableIds, true) && is_int($setBlockSize) && $setBlockSize > 0) {
+                if (in_array($fileId, $setRecoverableIds, true) && is_int($setBlockSize)) {
                     $fileBlocks = $fileLength === null ? null
                         : intdiv($fileLength, $setBlockSize) + (($fileLength % $setBlockSize) === 0 ? 0 : 1);
                     $previousBlocks = $setSourceBlockCount;

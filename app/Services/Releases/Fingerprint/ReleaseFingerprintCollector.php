@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 14;
+    public const SCHEMA_VERSION = 15;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 
@@ -50,7 +50,8 @@ final class ReleaseFingerprintCollector
         }
 
         $manifest = $this->analyzer->analyzeManifest($xml);
-        $samples = $this->analyzer->selectArticleSamples($manifest['files']);
+        $omittedSampleCount = 0;
+        $samples = $this->analyzer->selectArticleSamples($manifest['files'], NzbFingerprintAnalyzer::MAX_ARTICLE_SAMPLES, $omittedSampleCount);
         $servers = $this->configuredServers();
         $nntp = new NNTPService;
         $observations = [];
@@ -60,6 +61,7 @@ final class ReleaseFingerprintCollector
         $decodedPar2 = [];
         $decodedPar2Bytes = 0;
         $par2BudgetExceeded = false;
+        $par2ProviderAttemptsSkipped = 0;
         $sevenZipCandidates = [];
         $sevenZipRetainedBytes = 0;
         $sevenZipOmittedSamples = 0;
@@ -80,6 +82,11 @@ final class ReleaseFingerprintCollector
         }
         foreach ($samples as $sample) {
             foreach ($servers as $server) {
+                if ($sample['kind'] === 'par2' && $par2BudgetExceeded) {
+                    $par2ProviderAttemptsSkipped++;
+
+                    continue;
+                }
                 try {
                     $queryStart = hrtime(true);
                     $serverKey = ($server['alternate'] ? 'alternate ' : 'primary ').$server['name'];
@@ -298,7 +305,7 @@ final class ReleaseFingerprintCollector
                         'head_response' => $article['head_response'],
                         'body_response' => $article['body_response'],
                         'overview_fields' => $overviewFields,
-                        'overview_nzb_segment_bytes_difference' => isset($overviewFields[':bytes']) && is_numeric($overviewFields[':bytes'])
+                        'overview_nzb_segment_bytes_difference' => is_int($sample['segment_bytes']) && isset($overviewFields[':bytes']) && is_numeric($overviewFields[':bytes'])
                             ? (int) $overviewFields[':bytes'] - (int) $sample['segment_bytes'] : null,
                         'command_results' => $article['command_results'],
                         'metadata' => $metadata,
@@ -428,9 +435,9 @@ final class ReleaseFingerprintCollector
             $rangesCoverFile = ! $allSegmentsSampled ? null : ($singlePartCoversFile || ($allMultipartNumbersMatch && $rangesContiguous
                 && $declaredFileSize !== null
                 && $ranges[count($ranges) - 1]['end'] === $declaredFileSize));
-            if (($yencConsistency['file_size']['sample_count'] ?? 0) > 0 && ! $yencConsistency['file_size']['consistent']) {
+            if ($yencConsistency['file_size']['sample_count'] > 0 && ! $yencConsistency['file_size']['consistent']) {
                 $yencSizeConflictCounts[$file['kind']]++;
-            } elseif (($yencConsistency['file_size']['consistent'] ?? false)
+            } elseif ($yencConsistency['file_size']['consistent']
                 && is_array($yenc) && is_int($yenc['file_size'] ?? null)) {
                 $yencSizes[$file['kind']] = $this->checkedNonNegativeIntegerAdd($yencSizes[$file['kind']], $yenc['file_size']);
                 $yencSizeCounts[$file['kind']]++;
@@ -751,7 +758,7 @@ final class ReleaseFingerprintCollector
                     $par2SetSources[$setId][$fileId] = $sourceFile;
                 }
             }
-            if (($par2File['metadata_valid'] ?? false) !== true) {
+            if ($par2File['metadata_valid'] !== true) {
                 continue;
             }
             foreach ($par2File['metadata']['packet_summaries'] ?? [] as $packet) {
@@ -953,7 +960,7 @@ final class ReleaseFingerprintCollector
             $manifest['files'],
             static fn (array $file): bool => ($file['segments'] ?? []) !== [],
         )) === count($manifest['files']);
-        $manifestIntegrityValid = count(array_filter(
+        $manifestIntegrityValid = ($manifest['advertised_byte_totals_valid'] ?? false) === true && count(array_filter(
             $manifest['files'],
             static fn (array $file): bool => ($file['segment_number_sequence_valid'] ?? false) === true
                 && ($file['invalid_segment_record_count'] ?? 0) === 0
@@ -999,9 +1006,15 @@ final class ReleaseFingerprintCollector
             $observations,
             static fn (array $observation): bool => ($observation['metadata']['yenc']['payload_escape_state_valid'] ?? null) === false,
         )) === 0;
+        $yencNumericFieldsValid = count(array_filter(
+            $observations,
+            static fn (array $observation): bool => ($observation['metadata']['yenc']['header_numeric_fields_valid'] ?? null) === false
+                || ($observation['metadata']['yenc']['trailer_numeric_fields_valid'] ?? null) === false
+                || ($observation['metadata']['yenc']['ypart_range_valid'] ?? null) === false,
+        )) === 0;
         $status = $allSamplesAvailable && $par2Complete && $providerCoverageComplete && $profileCoverageComplete
             && $identityParserCoverageComplete && $xrefParserCoverageComplete && $dateParserCoverageComplete
-            && $yencEscapeStateValid ? 'complete' : 'partial';
+            && $yencEscapeStateValid && $yencNumericFieldsValid && $omittedSampleCount === 0 && ! $par2BudgetExceeded ? 'complete' : 'partial';
 
         return [
             'status' => $status,
@@ -1013,17 +1026,25 @@ final class ReleaseFingerprintCollector
                 'collection_policy' => [
                     'all_nzb_files_listed' => true,
                     'non_par2_article_samples_per_file' => 'first, middle, and last segment; repeated Message-IDs are deduplicated within each NZB file',
-                    'par2_segments_requested' => 'all',
+                    'par2_segments_requested' => $omittedSampleCount === 0 && ! $par2BudgetExceeded ? 'all' : 'bounded',
+                    'article_sample_limit' => NzbFingerprintAnalyzer::MAX_ARTICLE_SAMPLES,
+                    'article_samples_selected' => count($samples),
+                    'article_samples_omitted_due_to_limit' => $omittedSampleCount,
+                    'maximum_provider_article_attempts' => NzbFingerprintAnalyzer::MAX_ARTICLE_SAMPLES * count($servers),
+                    'par2_retained_byte_limit' => self::MAX_PAR2_SET_BYTES,
+                    'par2_retained_byte_limit_exceeded' => $par2BudgetExceeded,
+                    'par2_provider_attempts_skipped_due_to_byte_limit' => $par2ProviderAttemptsSkipped,
                     'article_body_limit_bytes' => self::MAX_ARTICLE_BODY_BYTES,
                     'providers' => array_column($servers, 'name'),
                     'queried_server_endpoints' => $servers,
                     'server_profiles' => $serverProfiles,
-                    'coverage_note' => 'First, middle, and last RAR/other article bodies are sampled per NZB file; all PAR2 segments are requested. Provider-specific raw headers are retained for every collected article.',
+                    'coverage_note' => 'First, middle, and last RAR/other article bodies and PAR2 segments are requested within the release article budget. Further PAR2 requests stop when retained bytes exceed their budget. Omitted samples force partial coverage. Provider-specific raw headers are retained for every collected article.',
                 ],
                 'nzb' => [
                     'file_count' => $manifest['file_count'],
                     'meta' => $manifest['nzb_meta_values'],
                     'totals' => $manifest['totals'],
+                    'advertised_byte_totals_valid' => $manifest['advertised_byte_totals_valid'],
                     'par2_to_rar_advertised_percent' => $manifest['par2_to_rar_advertised_percent'],
                     'par2_to_rar_percent_basis' => $manifest['par2_to_rar_percent_basis'],
                 ],
@@ -1226,7 +1247,7 @@ final class ReleaseFingerprintCollector
             if (count($declaredSizes) !== 1 || ! is_int($declaredSizes[0])) {
                 $relationships[] = $base + [
                     'resolution_status' => 'inconsistent_or_unavailable_declared_file_size',
-                    'declared_file_sizes' => array_values($declaredSizes),
+                    'declared_file_sizes' => $declaredSizes,
                     'omitted_ranges' => $candidate['budget_omitted_ranges'],
                 ];
 
@@ -1344,6 +1365,13 @@ final class ReleaseFingerprintCollector
         return false;
     }
 
+    /**
+     * @param  list<array<string, mixed>>  $sourceFiles
+     * @param  list<array<string, mixed>>  $ifscFiles
+     * @param  array<string, array<string, mixed>>  $sampledFiles
+     * @param  list<array<string, mixed>>  $observations
+     * @return array<string, mixed>
+     */
     private function resolvePar2SourceSliceRelationships(
         array $sourceFiles,
         array $ifscFiles,
@@ -1753,6 +1781,13 @@ final class ReleaseFingerprintCollector
      * Repeated packets describe the same complete checksum sequence; they are
      * never concatenated.
      *
+     * @param  array<string, array<string, list<array<string, mixed>>>>  $observations
+     * @param  array<string, array<string, mixed>>  $mainPackets
+     * @param  array<string, bool>  $mainPacketConflicts
+     * @param  array<string, array<string, array<string, mixed>>>  $sourceFiles
+     * @param  array<string, array<string, bool>>  $sourceFileConflicts
+     * @param  array<string, int>  $blockSizes
+     * @param  array<string, bool>  $blockSizeConflicts
      * @return array{files: list<array<string, mixed>>, conflicts: list<array<string, mixed>>, slice_count_mismatches: list<array<string, mixed>>, unvalidated_file_ids: list<array{recovery_set_id: string, file_id: string}>, missing_recoverable_file_ids: list<array{recovery_set_id: string, file_id: string}>, coverage_complete: bool, preview_records_omitted: int, preview_variants_truncated: int}
      */
     private function mergeInputFileSliceChecksums(
@@ -1992,7 +2027,9 @@ final class ReleaseFingerprintCollector
         return $slices;
     }
 
-    /** @param list<array<string, mixed>> $observations */
+    /** @param list<array<string, mixed>> $observations
+     * @return array<string, mixed>|null
+     */
     private function primaryObservation(int $fileIndex, array $observations, ?string $messageId = null): ?array
     {
         $fallback = null;
@@ -2068,6 +2105,8 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param list<array<string, mixed>> $files
+     * @param  list<array<string, mixed>>  $observations
+     * @param  list<array{name: string, alternate: bool, port: string, tls: bool, provider_label: string, provider_label_basis: string}>  $servers
      * @return array<string, mixed>
      */
     private function estimatePostingTimeline(array $files, array $observations, array $servers, int $expectedSamples): array
@@ -2081,7 +2120,9 @@ final class ReleaseFingerprintCollector
             }
             $dates[] = $timestamp;
             $minute = intdiv($timestamp, 60) * 60;
-            $bytesByMinute[$minute] = ($bytesByMinute[$minute] ?? 0) + (int) ($file['advertised_bytes'] ?? 0);
+            $previousBytes = array_key_exists($minute, $bytesByMinute) ? $bytesByMinute[$minute] : 0;
+            $fileBytes = is_int($file['advertised_bytes'] ?? null) ? $file['advertised_bytes'] : null;
+            $bytesByMinute[$minute] = $this->checkedNonNegativeIntegerAdd($previousBytes, $fileBytes);
         }
         if ($dates === []) {
             $nzbTimestampSpan = [
@@ -2096,8 +2137,12 @@ final class ReleaseFingerprintCollector
             $end = $dates[count($dates) - 1];
             $duration = max(0, $end - $start);
             $datedFiles = array_values(array_filter($files, static fn (array $file): bool => is_int($file['date'] ?? null) && $file['date'] > 0));
-            $advertisedBytes = array_sum(array_map(static fn (array $file): int => (int) ($file['advertised_bytes'] ?? 0), $datedFiles));
-            $minuteRates = array_map(static fn (int $bytes): float => round($bytes / 60, 3), array_values($bytesByMinute));
+            $advertisedBytes = 0;
+            foreach ($datedFiles as $file) {
+                $fileBytes = is_int($file['advertised_bytes'] ?? null) ? $file['advertised_bytes'] : null;
+                $advertisedBytes = $this->checkedNonNegativeIntegerAdd($advertisedBytes, $fileBytes);
+            }
+            $minuteRates = $advertisedBytes === null ? [] : array_map(static fn (int $bytes): float => round($bytes / 60, 3), array_values($bytesByMinute));
             $nzbTimestampSpan = [
                 'available' => true,
                 'source' => 'NZB file-level date attributes and advertised segment bytes',
@@ -2105,13 +2150,14 @@ final class ReleaseFingerprintCollector
                 'end_utc' => gmdate(DATE_ATOM, $end),
                 'timestamp_span_seconds' => $duration,
                 'advertised_bytes' => $advertisedBytes,
+                'advertised_byte_rates_available' => $advertisedBytes !== null,
                 'dated_file_count' => count($datedFiles),
                 'undated_file_count_excluded' => count($files) - count($datedFiles),
-                'whole_span_average_advertised_bytes_per_second' => $duration > 0 ? round($advertisedBytes / $duration, 3) : null,
+                'whole_span_average_advertised_bytes_per_second' => $duration > 0 && $advertisedBytes !== null ? round($advertisedBytes / $duration, 3) : null,
                 'observed_nonempty_minute_bucket_rates_bytes_per_second' => [
                     'minimum_nonempty_bucket' => $minuteRates === [] ? null : min($minuteRates),
                     'maximum_nonempty_bucket' => $minuteRates === [] ? null : max($minuteRates),
-                    'bucket_count' => count($minuteRates),
+                    'bucket_count' => count($bytesByMinute),
                     'bucket_seconds' => 60,
                     'empty_buckets_included' => false,
                     'basis' => 'NZB advertised bytes grouped by file-level timestamps; bucket rates are not measured transfer rates.',
