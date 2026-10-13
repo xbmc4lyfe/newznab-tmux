@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Exceptions\CandidateMetadataBudgetExceeded;
 use App\Services\CollectionCleanupService;
 use App\Services\Nzb\NzbService;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -14,14 +16,20 @@ use RuntimeException;
 
 final class CandidateRepository
 {
+    private const array CLAIMABLE_STATUSES = ['pending', 'unknown', 'verifying'];
+
     public function __construct(private readonly ManifestStore $store, private readonly CollectionCleanupService $cleanup) {}
 
     public function archive(int $collectionId): void
     {
         app(VerificationResetService::class)->withAdmission(function () use ($collectionId): void {
-            DB::transaction(function () use ($collectionId): void {
-                $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
-                $collection = DB::table('collections')->where('id', $collectionId)->lockForUpdate()->first();
+            $currentReads = DB::transactionLevel() > 0;
+            $hash = DB::table('collections')->where('id', $collectionId)->value('collectionhash');
+            if (! is_string($hash)) {
+                return;
+            }
+            DB::transaction(function () use ($collectionId, $hash, $currentReads): void {
+                $collection = $this->lockArchiveCollection($collectionId, $hash);
                 if ($collection === null) {
                     return;
                 }
@@ -29,10 +37,25 @@ final class CandidateRepository
                     && ! $this->cleanup->verificationEligibleCollections()->where('collections.id', $collectionId)->exists()) {
                     return;
                 }
+                $sourceIdentity = bin2hex($collection->collectionhash);
+                // The parent lock protects the header snapshot; unrelated admissions need no lock yet.
+                // Keep terminal replays on their existing cheap, locked validation path.
+                $filtered = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
+                    ->orderByDesc('id')->value('status') === 'filtered';
+                $manifest = null;
+                $snapshotFailure = null;
+                if (! $filtered) {
+                    try {
+                        $manifest = $this->snapshotHeaders($collection, $currentReads);
+                    } catch (CandidateMetadataBudgetExceeded $error) {
+                        // A stale read view can hide a committed filtered replay; validate it first.
+                        $snapshotFailure = $error;
+                    }
+                }
+                $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                 if ($state === null) {
                     throw new RuntimeException('Verification migration has not initialized capacity state.');
                 }
-                $sourceIdentity = bin2hex($collection->collectionhash);
                 $existing = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
                     ->orderByDesc('id')->lockForUpdate()->first();
                 if ($existing !== null && $existing->status === 'filtered') {
@@ -49,12 +72,16 @@ final class CandidateRepository
 
                     return;
                 }
+                if ($snapshotFailure !== null) {
+                    throw $snapshotFailure;
+                }
                 $identity = $existing->identity ?? $sourceIdentity;
                 if ($existing !== null && $existing->release_id !== null) {
                     $identity = sha1($sourceIdentity.':generation:'.$existing->id);
                     $existing = null;
                 }
-                $manifest = $this->snapshot($collection);
+                $manifest ??= $this->snapshotHeaders($collection, $currentReads);
+                $manifest['legacy_release_id'] = $this->legacyReleaseId($collection);
                 $newArticles = true;
                 if ($existing !== null && $existing->manifest_path !== '') {
                     $oldManifest = $this->store->read($existing->manifest_path);
@@ -107,6 +134,19 @@ final class CandidateRepository
                 }
             }, 5);
         });
+    }
+
+    /** Lock through ingestion's unique hash index before taking the shared capacity row. */
+    private function lockArchiveCollection(int $collectionId, string $hash): ?object
+    {
+        $query = DB::table('collections')->where('collectionhash', $hash)->where('id', $collectionId);
+        if (in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
+            $query->forceIndex('ix_collection_collectionhash')->lock('for update skip locked');
+        } else {
+            $query->lockForUpdate();
+        }
+
+        return $query->first();
     }
 
     /** @param array<string, mixed> $manifest */
@@ -204,27 +244,43 @@ final class CandidateRepository
     }
 
     /** @return array<string, mixed> */
-    private function snapshot(object $collection): array
+    private function snapshot(object $collection, bool $currentReads = false): array
+    {
+        $manifest = $this->snapshotHeaders($collection, $currentReads);
+        $manifest['legacy_release_id'] = $this->legacyReleaseId($collection);
+
+        return $manifest;
+    }
+
+    /** @return array<string, mixed> */
+    private function snapshotHeaders(object $collection, bool $currentReads): array
     {
         $groups = Schema::hasTable('collection_groups')
-            ? DB::table('collection_groups')->where('collections_id', $collection->id)->pluck('group_name')->all() : [];
+            ? $this->snapshotQuery('collection_groups', $currentReads)->where('collections_id', $collection->id)->pluck('group_name')->all() : [];
         if ($groups === []) {
-            $groups = [(string) DB::table('usenet_groups')->where('id', $collection->groups_id)->value('name')];
+            $groups = [(string) $this->snapshotQuery('usenet_groups', $currentReads)->where('id', $collection->groups_id)->value('name')];
         }
         sort($groups);
         $files = [];
         $metadataBytes = 0;
-        foreach (DB::table('binaries')->where('collections_id', $collection->id)->orderBy('binaryhash')->cursor() as $binary) {
-            $segments = [];
-            foreach (DB::table('parts')->where('binaries_id', $binary->id)->orderBy('partnumber')->cursor() as $part) {
+        $binaries = $this->snapshotQuery('binaries', $currentReads)->where('collections_id', $collection->id)->orderBy('binaryhash')
+            ->select(['id', 'binaryhash', 'name', 'totalparts'])->cursor();
+        foreach ($binaries->chunk(100) as $batch) {
+            $segmentsByBinary = [];
+            foreach ($this->snapshotQuery('parts', $currentReads)->whereIn('binaries_id', $batch->pluck('id')->all())
+                ->orderBy('binaries_id')->orderBy('partnumber')
+                ->select(['binaries_id', 'partnumber', 'messageid', 'size'])->cursor() as $part) {
                 $metadataBytes += 128 + strlen($part->messageid);
                 if ($metadataBytes > 16777216) {
-                    throw new RuntimeException('Candidate exceeds metadata budget; headers retained.');
+                    throw new CandidateMetadataBudgetExceeded('Candidate exceeds metadata budget; headers retained.');
                 }
-                $segments[] = ['number' => (int) $part->partnumber, 'messageid' => $part->messageid, 'bytes' => (int) $part->size];
+                $segmentsByBinary[$part->binaries_id][] = ['number' => (int) $part->partnumber,
+                    'messageid' => $part->messageid, 'bytes' => (int) $part->size];
             }
-            $files[] = ['key' => bin2hex($binary->binaryhash), 'subject' => $binary->name,
-                'totalparts' => (int) $binary->totalparts, 'segments' => $segments];
+            foreach ($batch as $binary) {
+                $files[] = ['key' => bin2hex($binary->binaryhash), 'subject' => $binary->name,
+                    'totalparts' => (int) $binary->totalparts, 'segments' => $segmentsByBinary[$binary->id] ?? []];
+            }
         }
 
         $expected = (int) $collection->totalfiles;
@@ -237,13 +293,7 @@ final class CandidateRepository
             }
         }
 
-        $legacyReleaseId = null;
-        if ((int) $collection->filecheck === 4 && isset($collection->releases_id)) {
-            $legacyReleaseId = DB::table('releases')->where('id', $collection->releases_id)
-                ->where('nzbstatus', NzbService::NZB_NONE)->lockForUpdate()->value('id');
-        }
-
-        return ['legacy_release_id' => $legacyReleaseId === null ? null : (int) $legacyReleaseId,
+        return ['legacy_release_id' => null,
             'identity' => bin2hex($collection->collectionhash), 'subject' => $collection->subject,
             'fromname' => $collection->fromname, 'date' => $collection->date, 'groups_id' => (int) $collection->groups_id,
             // Legacy insertion could overwrite the declared count with observed
@@ -251,6 +301,26 @@ final class CandidateRepository
             'regex_id' => (int) $collection->collection_regexes_id,
             'expected_files' => $expected,
             'groups' => $groups, 'files' => $files, 'conflict' => false];
+    }
+
+    /** Legacy publication takes capacity before its release row; retain that lock order. */
+    private function legacyReleaseId(object $collection): ?int
+    {
+        if ((int) $collection->filecheck !== 4 || ! isset($collection->releases_id)) {
+            return null;
+        }
+        $id = DB::table('releases')->where('id', $collection->releases_id)
+            ->where('nzbstatus', NzbService::NZB_NONE)->lockForUpdate()->value('id');
+
+        return $id === null ? null : (int) $id;
+    }
+
+    /** Current reads avoid a caller-owned repeatable-read snapshot omitting committed headers. */
+    private function snapshotQuery(string $table, bool $currentReads): Builder
+    {
+        $query = DB::table($table);
+
+        return $currentReads ? $query->sharedLock() : $query;
     }
 
     /** @param array<string, mixed> $old
@@ -330,26 +400,82 @@ final class CandidateRepository
         }
     }
 
-    public function claim(): ?object
+    /**
+     * @param  (callable(int): bool)|null  $acquireCandidate
+     *
+     * @phpstan-impure
+     */
+    public function claim(?callable $acquireCandidate = null): ?object
     {
-        return DB::transaction(function (): ?object {
-            $query = DB::table('release_verification_candidates')->whereNull('release_id')
-                ->whereIn('status', ['pending', 'unknown', 'verifying'])->where('next_attempt_at', '<=', now())
-                ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
-                ->orderBy('next_attempt_at')->orderBy('id')->lockForUpdate();
-            $row = $query->first();
-            if ($row === null) {
-                return null;
-            }
-            $token = (string) Str::uuid();
-            DB::table('release_verification_candidates')->where('id', $row->id)->update([
-                'status' => 'verifying', 'lease_token' => $token,
-                'lease_until' => now()->addSeconds((int) config('release_verification.lease_seconds')),
-            ]);
-            $row->lease_token = $token;
+        $ids = $this->claimQueueIds();
+        foreach ($ids as $id) {
+            $acquired = false;
+            $claimed = DB::transaction(function () use ($id, $acquireCandidate, &$acquired): ?object {
+                $query = $this->claimableCandidates()->where('id', $id);
+                if (in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
+                    $query->forceIndex('PRIMARY')->lock('for update skip locked');
+                } else {
+                    $query->lockForUpdate();
+                }
+                $row = $query->first();
+                if ($row === null) {
+                    return null;
+                }
+                if ($acquireCandidate !== null) {
+                    if (! $acquireCandidate((int) $row->id)) {
+                        return null;
+                    }
+                    $acquired = true;
+                }
+                $token = (string) Str::uuid();
+                DB::table('release_verification_candidates')->where('id', $row->id)->update([
+                    'status' => 'verifying', 'lease_token' => $token,
+                    'lease_until' => now()->addSeconds((int) config('release_verification.lease_seconds')),
+                ]);
+                $row->lease_token = $token;
 
-            return $row;
-        }, 5);
+                return $row;
+            }, 5);
+            // A rolled-back lease may still own its file mutex; let the caller release it.
+            if ($claimed !== null || $acquired) {
+                return $claimed;
+            }
+        }
+
+        return null;
+    }
+
+    /** @return list<int> */
+    private function claimQueueIds(): array
+    {
+        $cutoff = now();
+        $rows = [];
+        // Fixing the leading status key lets verification_due serve each ORDER BY / LIMIT.
+        foreach (self::CLAIMABLE_STATUSES as $status) {
+            foreach ($this->claimableCandidates($status, $cutoff)->orderBy('next_attempt_at')->orderBy('id')
+                ->limit(100)->get(['id', 'next_attempt_at']) as $row) {
+                // A status change between reads must not consume two slots in the claim window.
+                $rows[(int) $row->id] ??= $row;
+            }
+        }
+        usort($rows, static fn (object $a, object $b): int => [$a->next_attempt_at, (int) $a->id]
+            <=> [$b->next_attempt_at, (int) $b->id]);
+
+        return array_map(static fn (object $row): int => (int) $row->id, array_slice($rows, 0, 100));
+    }
+
+    private function claimableCandidates(?string $status = null, ?Carbon $cutoff = null): Builder
+    {
+        $cutoff ??= now();
+        $query = DB::table('release_verification_candidates')->whereNull('release_id');
+        if ($status === null) {
+            $query->whereIn('status', self::CLAIMABLE_STATUSES);
+        } else {
+            $query->where('status', $status);
+        }
+
+        return $query->where('next_attempt_at', '<=', $cutoff)
+            ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', $cutoff));
     }
 
     public function heartbeat(int $id, string $token): void

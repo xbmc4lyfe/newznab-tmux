@@ -64,6 +64,10 @@ Schedule::call(function () {
 Schedule::command('tmux:health-check --auto-restart')->everyThirtyMinutes()->withoutOverlapping()->when(static fn (): bool => (bool) config('tmux.scheduled_health_check'));
 Schedule::command('nntmux:check-service-health')->everyMinute()->withoutOverlapping();
 Schedule::command('nntmux:search-repair --limit=100')->everyMinute()->withoutOverlapping();
+// TV: retry episode lookups for shows whose episode wasn't available yet, and normalize
+// any release still carrying a legacy TV processor status.
+Schedule::command('tv:reprocess-missing-episodes --scheduled --limit=500')->everyThirtyMinutes()->withoutOverlapping()->runInBackground();
+Schedule::command('tv:repair-links --legacy --stuck --orphans --limit=50000')->dailyAt('05:15')->withoutOverlapping();
 // Tail storage/logs into the Manticore log index used by the admin log viewer search
 Schedule::command('nntmux:index-logs')->everyMinute()->withoutOverlapping()->runInBackground()->when(static fn (): bool => (bool) config('nntmux.log_viewer.index.enabled'));
 // Keep the admin dashboard snapshot (Cache::flexible) hot so admins never pay
@@ -82,6 +86,10 @@ Schedule::command('predb:check 3 --quiet')->everyTenMinutes()->withoutOverlappin
 Schedule::command('multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBackground()
     ->when(static fn (): bool => (bool) config('tmux.fix_names.predbft') && (bool) config('tmux.fix_names.predbft_scheduled'));
 
-// The verifier's worker.lock guards concurrency; a stale scheduler cache mutex must not suppress crash recovery.
-Schedule::command('releases:verify-candidates --limit=1')->everyMinute()->runInBackground()
-    ->when(static fn (): bool => (bool) config('release_verification.scheduled'));
+// Stable worker slots cap concurrency without a stale scheduler overlap mutex.
+for ($slot = 1; $slot <= max(1, min(8, (int) config('release_verification.candidate_workers', 2))); $slot++) {
+    $verificationCommand = escapeshellarg(PHP_BINARY).' -d ffi.enable=true -d memory_limit=256M '
+        .escapeshellarg(base_path('artisan')).' releases:verify-candidates --limit=1 --slot='.$slot;
+    Schedule::exec($verificationCommand)->everyMinute()->runInBackground()
+        ->when(static fn (): bool => (bool) config('release_verification.scheduled'));
+}

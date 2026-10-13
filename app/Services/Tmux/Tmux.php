@@ -11,6 +11,7 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NfoService;
+use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
@@ -289,10 +290,7 @@ class Tmux
                 $amazonEnabled = $tmux->postAmazonMode > 0;
 
                 $conditions = [
-                    'processtv' => $this->readyLookupCondition(
-                        'categories_id BETWEEN '.Category::TV_ROOT.' AND '.Category::TV_OTHER.' AND categories_id != '.Category::TV_ANIME.' AND videos_id = 0 AND tv_episodes_id BETWEEN -3 AND 0 AND size > 1048576',
-                        $metadata->tvLookup->value, $nonAmazonEnabled,
-                    ),
+                    'processtv' => $nonAmazonEnabled ? TvProcessingCandidateQuery::workCondition($metadata->tvLookup->value) : '0 = 1',
                     'processanime' => $this->readyLookupCondition(
                         'categories_id = '.Category::TV_ANIME.' AND anidbid IS NULL',
                         $metadata->animeLookup->value, $nonAmazonEnabled, renamedOnly: false,
