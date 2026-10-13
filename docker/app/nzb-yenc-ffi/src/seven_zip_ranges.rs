@@ -8,6 +8,10 @@ const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NEXT_HEADER_BYTES: usize = 1024 * 1024;
 const MAX_PACK_STREAM_COUNT: usize = 32;
 const MAX_PACKED_HEADER_BYTES: usize = 1024 * 1024;
+const MAX_FOLDER_COUNT: usize = 32;
+const MAX_CODER_COUNT: usize = 64;
+const MAX_FOLDER_STREAM_COUNT: usize = 64;
+const MAX_CODER_PROPERTIES_BYTES: usize = 4096;
 
 #[derive(Debug, Serialize)]
 pub struct SevenZipNextHeaderResolution {
@@ -36,6 +40,71 @@ pub struct EncodedHeaderPackInfo {
     pub pack_position: Option<u64>,
     pub declared_pack_stream_count: Option<u64>,
     pub streams: Vec<EncodedHeaderPackedStream>,
+    pub unpack_info: EncodedHeaderUnpackInfo,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EncodedHeaderUnpackInfo {
+    pub parse_status: &'static str,
+    pub declared_folder_count: Option<u64>,
+    pub external_folder_data: Option<bool>,
+    pub folders: Vec<EncodedHeaderFolder>,
+    pub total_input_streams: Option<u64>,
+    pub total_output_streams: Option<u64>,
+    pub packed_stream_index_count: Option<u64>,
+    pub packed_stream_count_matches_pack_info: Option<bool>,
+    pub coder_output_stream_size_total: Option<u64>,
+    pub folder_crc32: Vec<Option<u32>>,
+    pub end_marker_present: bool,
+    pub following_stream_info_property_id: Option<u8>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EncodedHeaderFolder {
+    pub folder_index: usize,
+    pub declared_coder_count: Option<u64>,
+    pub coders: Vec<EncodedHeaderCoder>,
+    pub total_input_streams: Option<u64>,
+    pub total_output_streams: Option<u64>,
+    pub bind_pairs: Vec<EncodedHeaderBindPair>,
+    pub packed_input_stream_indexes: Vec<u64>,
+    pub output_stream_unpack_sizes: Vec<u64>,
+    pub crc32: Option<u32>,
+    pub parse_status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EncodedHeaderCoder {
+    pub coder_index: usize,
+    pub flags: u8,
+    pub method_id_hex: String,
+    pub method_name: Option<&'static str>,
+    pub input_stream_count: Option<u64>,
+    pub output_stream_count: Option<u64>,
+    pub properties_length: Option<usize>,
+    pub properties_sha256: Option<String>,
+    pub properties_prefix_hex: Option<String>,
+    pub properties_prefix_truncated: Option<bool>,
+    pub properties_parse_status: &'static str,
+    pub seven_zip_aes: Option<SevenZipAesProperties>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SevenZipAesProperties {
+    pub cycles_power: Option<u8>,
+    pub derivation_mode: Option<&'static str>,
+    pub key_derivation_iteration_count: Option<u64>,
+    pub salt_length: Option<usize>,
+    pub initialization_vector_length: Option<usize>,
+    pub expected_properties_length: Option<usize>,
+    pub properties_length_valid: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EncodedHeaderBindPair {
+    pub input_stream_index: u64,
+    pub output_stream_index: u64,
+    pub indexes_unique_and_in_range: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -473,6 +542,7 @@ fn parse_encoded_header_pack_info(
     }
 
     let packed_byte_budget_exceeded = total_packed_bytes > MAX_PACKED_HEADER_BYTES as u64;
+    let unpack_info = parse_encoded_header_unpack_info(header, cursor, stream_count);
     let mut streams = Vec::with_capacity(stream_count_usize);
     let mut range_offset = 0u64;
     for (stream_index, size) in sizes.into_iter().enumerate() {
@@ -533,6 +603,7 @@ fn parse_encoded_header_pack_info(
         pack_position: Some(pack_position),
         declared_pack_stream_count: Some(stream_count),
         streams,
+        unpack_info,
     }
 }
 
@@ -673,6 +744,374 @@ fn resolve_packed_stream(
     }
 }
 
+fn parse_encoded_header_unpack_info(
+    data: &[u8],
+    mut cursor: usize,
+    declared_pack_stream_count: u64,
+) -> EncodedHeaderUnpackInfo {
+    if read_byte(data, &mut cursor) != Some(0x07) {
+        return empty_unpack_info("unpack_info_not_present");
+    }
+    if read_byte(data, &mut cursor) != Some(0x0b) {
+        return empty_unpack_info("folder_marker_missing");
+    }
+    let Some(folder_count) = read_7z_uint64(data, &mut cursor) else {
+        return empty_unpack_info("truncated_folder_count");
+    };
+    let Ok(folder_count_usize) = usize::try_from(folder_count) else {
+        return empty_unpack_info("folder_count_exceeds_supported_range");
+    };
+    if folder_count_usize > MAX_FOLDER_COUNT {
+        return empty_unpack_info("folder_count_budget_exceeded");
+    }
+    let Some(external) = read_byte(data, &mut cursor) else {
+        return empty_unpack_info("truncated_external_folder_flag");
+    };
+    if external > 1 {
+        return empty_unpack_info("invalid_external_folder_flag");
+    }
+    if external != 0 {
+        return EncodedHeaderUnpackInfo {
+            parse_status: "external_folder_data_unsupported",
+            declared_folder_count: Some(folder_count),
+            external_folder_data: Some(true),
+            ..empty_unpack_info("external_folder_data_unsupported")
+        };
+    }
+
+    let mut folders = Vec::with_capacity(folder_count_usize);
+    let mut total_input_streams = 0u64;
+    let mut total_output_streams = 0u64;
+    let mut packed_stream_index_count = 0u64;
+    let mut coder_output_stream_size_total = 0u64;
+    for folder_index in 0..folder_count_usize {
+        let Some(folder) = parse_encoded_header_folder(data, &mut cursor, folder_index) else {
+            return empty_unpack_info("malformed_or_unsupported_folder");
+        };
+        total_input_streams =
+            total_input_streams.saturating_add(folder.total_input_streams.unwrap_or_default());
+        total_output_streams =
+            total_output_streams.saturating_add(folder.total_output_streams.unwrap_or_default());
+        packed_stream_index_count = packed_stream_index_count
+            .saturating_add(folder.packed_input_stream_indexes.len() as u64);
+        folders.push(folder);
+    }
+
+    if read_byte(data, &mut cursor) != Some(0x0c) {
+        return empty_unpack_info("coders_unpack_size_marker_missing");
+    }
+    for folder in &mut folders {
+        for _ in 0..folder.total_output_streams.unwrap_or_default() {
+            let Some(size) = read_7z_uint64(data, &mut cursor) else {
+                return empty_unpack_info("truncated_output_stream_unpack_sizes");
+            };
+            folder.output_stream_unpack_sizes.push(size);
+            let Some(total) = coder_output_stream_size_total.checked_add(size) else {
+                return empty_unpack_info("unpack_size_sum_overflow");
+            };
+            coder_output_stream_size_total = total;
+        }
+    }
+
+    let mut folder_crc32 = vec![None; folder_count_usize];
+    let mut property = read_byte(data, &mut cursor);
+    if property == Some(0x0a) {
+        match read_7z_digests(data, &mut cursor, folder_count_usize) {
+            Ok(crcs) => folder_crc32 = crcs,
+            Err(_) => {
+                return EncodedHeaderUnpackInfo {
+                    parse_status: "malformed_folder_crc_data",
+                    declared_folder_count: Some(folder_count),
+                    external_folder_data: Some(false),
+                    folders,
+                    total_input_streams: Some(total_input_streams),
+                    total_output_streams: Some(total_output_streams),
+                    packed_stream_index_count: Some(packed_stream_index_count),
+                    packed_stream_count_matches_pack_info: Some(
+                        packed_stream_index_count == declared_pack_stream_count,
+                    ),
+                    coder_output_stream_size_total: Some(coder_output_stream_size_total),
+                    folder_crc32,
+                    end_marker_present: false,
+                    following_stream_info_property_id: None,
+                };
+            }
+        }
+        property = read_byte(data, &mut cursor);
+    }
+    let ended = property == Some(0x00);
+    let following_property = ended.then(|| data.get(cursor).copied()).flatten();
+    for (folder, crc) in folders.iter_mut().zip(folder_crc32.iter().copied()) {
+        folder.crc32 = crc;
+    }
+    let stream_count_matches = packed_stream_index_count == declared_pack_stream_count;
+    let parse_status = if !ended {
+        "unpack_info_end_marker_missing"
+    } else if !stream_count_matches {
+        "pack_stream_count_mismatch"
+    } else {
+        "unpack_info_parsed"
+    };
+    EncodedHeaderUnpackInfo {
+        parse_status,
+        declared_folder_count: Some(folder_count),
+        external_folder_data: Some(false),
+        folders,
+        total_input_streams: Some(total_input_streams),
+        total_output_streams: Some(total_output_streams),
+        packed_stream_index_count: Some(packed_stream_index_count),
+        packed_stream_count_matches_pack_info: Some(stream_count_matches),
+        coder_output_stream_size_total: Some(coder_output_stream_size_total),
+        folder_crc32,
+        end_marker_present: ended,
+        following_stream_info_property_id: following_property,
+    }
+}
+
+fn parse_encoded_header_folder(
+    data: &[u8],
+    cursor: &mut usize,
+    folder_index: usize,
+) -> Option<EncodedHeaderFolder> {
+    let coder_count = read_7z_uint64(data, cursor)?;
+    let coder_count_usize = usize::try_from(coder_count).ok()?;
+    if coder_count_usize == 0 || coder_count_usize > MAX_CODER_COUNT {
+        return None;
+    }
+    let mut coders = Vec::with_capacity(coder_count_usize);
+    let mut total_input_streams = 0u64;
+    let mut total_output_streams = 0u64;
+    for coder_index in 0..coder_count_usize {
+        let flags = read_byte(data, cursor)?;
+        if flags & 0xc0 != 0 {
+            return None;
+        }
+        let method_length = usize::from(flags & 0x0f);
+        if method_length > 8 {
+            return None;
+        }
+        let method_end = cursor.checked_add(method_length)?;
+        let method_id = data.get(*cursor..method_end)?;
+        *cursor = method_end;
+        let (input_stream_count, output_stream_count) = if flags & 0x10 != 0 {
+            (read_7z_uint64(data, cursor)?, read_7z_uint64(data, cursor)?)
+        } else {
+            (1, 1)
+        };
+        if input_stream_count == 0 || output_stream_count == 0 {
+            return None;
+        }
+        total_input_streams = total_input_streams.checked_add(input_stream_count)?;
+        total_output_streams = total_output_streams.checked_add(output_stream_count)?;
+        if total_input_streams > MAX_FOLDER_STREAM_COUNT as u64
+            || total_output_streams > MAX_FOLDER_STREAM_COUNT as u64
+        {
+            return None;
+        }
+        let (
+            properties_length,
+            properties_sha256,
+            properties_prefix_hex,
+            properties_prefix_truncated,
+            properties_parse_status,
+            seven_zip_aes,
+        ) = if flags & 0x20 != 0 {
+            let Some(length) = read_7z_uint64(data, cursor) else {
+                return None;
+            };
+            let Ok(length_usize) = usize::try_from(length) else {
+                return None;
+            };
+            if length_usize > MAX_CODER_PROPERTIES_BYTES {
+                return None;
+            }
+            let end = cursor.checked_add(length_usize)?;
+            let properties = data.get(*cursor..end)?;
+            *cursor = end;
+            let aes = (seven_zip_method_id(method_id) == 0x06f1_0701)
+                .then(|| parse_seven_zip_aes_properties(properties));
+            (
+                Some(length_usize),
+                Some(sha256_hex(properties)),
+                Some(hex(&properties[..properties.len().min(256)])),
+                Some(properties.len() > 256),
+                if aes
+                    .as_ref()
+                    .is_none_or(|value| value.properties_length_valid)
+                {
+                    "properties_parsed"
+                } else {
+                    "malformed_aes_properties"
+                },
+                aes,
+            )
+        } else {
+            let aes = (seven_zip_method_id(method_id) == 0x06f1_0701)
+                .then(|| parse_seven_zip_aes_properties(&[]));
+            (None, None, None, None, "properties_not_present", aes)
+        };
+        coders.push(EncodedHeaderCoder {
+            coder_index,
+            flags,
+            method_id_hex: hex(method_id),
+            method_name: seven_zip_method_name(method_id),
+            input_stream_count: Some(input_stream_count),
+            output_stream_count: Some(output_stream_count),
+            properties_length,
+            properties_sha256,
+            properties_prefix_hex,
+            properties_prefix_truncated,
+            properties_parse_status,
+            seven_zip_aes,
+        });
+    }
+    let bind_count = total_output_streams.checked_sub(1)?;
+    if bind_count > MAX_FOLDER_STREAM_COUNT as u64 {
+        return None;
+    }
+    let mut bind_pairs = Vec::with_capacity(usize::try_from(bind_count).ok()?);
+    let mut bound_inputs = BTreeSet::new();
+    let mut bound_outputs = BTreeSet::new();
+    for _ in 0..bind_count {
+        let input_stream_index = read_7z_uint64(data, cursor)?;
+        let output_stream_index = read_7z_uint64(data, cursor)?;
+        let valid = input_stream_index < total_input_streams
+            && output_stream_index < total_output_streams
+            && bound_inputs.insert(input_stream_index)
+            && bound_outputs.insert(output_stream_index);
+        if !valid {
+            return None;
+        }
+        bind_pairs.push(EncodedHeaderBindPair {
+            input_stream_index,
+            output_stream_index,
+            indexes_unique_and_in_range: valid,
+        });
+    }
+    let packed_count = total_input_streams.checked_sub(bind_count)?;
+    if packed_count == 0 || packed_count > MAX_FOLDER_STREAM_COUNT as u64 {
+        return None;
+    }
+    let unbound_inputs = (0..total_input_streams)
+        .filter(|index| !bound_inputs.contains(index))
+        .collect::<Vec<_>>();
+    let packed_input_stream_indexes = if packed_count == 1 {
+        unbound_inputs
+    } else {
+        let mut indexes = Vec::with_capacity(usize::try_from(packed_count).ok()?);
+        let mut unique = BTreeSet::new();
+        for _ in 0..packed_count {
+            let index = read_7z_uint64(data, cursor)?;
+            if index >= total_input_streams
+                || bound_inputs.contains(&index)
+                || !unique.insert(index)
+            {
+                return None;
+            }
+            indexes.push(index);
+        }
+        indexes
+    };
+    if packed_input_stream_indexes.len() as u64 != packed_count {
+        return None;
+    }
+    Some(EncodedHeaderFolder {
+        folder_index,
+        declared_coder_count: Some(coder_count),
+        coders,
+        total_input_streams: Some(total_input_streams),
+        total_output_streams: Some(total_output_streams),
+        bind_pairs,
+        packed_input_stream_indexes,
+        output_stream_unpack_sizes: Vec::with_capacity(usize::try_from(total_output_streams).ok()?),
+        crc32: None,
+        parse_status: "folder_parsed",
+    })
+}
+
+fn seven_zip_method_name(method_id: &[u8]) -> Option<&'static str> {
+    match seven_zip_method_id(method_id) {
+        0x00 => Some("Copy"),
+        0x03 => Some("Delta"),
+        0x21 => Some("LZMA2"),
+        0x03_01_01 => Some("LZMA"),
+        0x06f1_0701 => Some("7zAES"),
+        _ => None,
+    }
+}
+
+fn seven_zip_method_id(method_id: &[u8]) -> u64 {
+    method_id
+        .iter()
+        .fold(0u64, |value, byte| (value << 8) | u64::from(*byte))
+}
+
+fn parse_seven_zip_aes_properties(properties: &[u8]) -> SevenZipAesProperties {
+    if properties.is_empty() {
+        return SevenZipAesProperties {
+            cycles_power: Some(0),
+            derivation_mode: Some("default_properties"),
+            key_derivation_iteration_count: Some(1),
+            salt_length: Some(0),
+            initialization_vector_length: Some(0),
+            expected_properties_length: Some(0),
+            properties_length_valid: true,
+        };
+    }
+    let first = properties[0];
+    let cycles_power = first & 0x3f;
+    if first & 0xc0 == 0 {
+        return SevenZipAesProperties {
+            cycles_power: Some(cycles_power),
+            derivation_mode: Some(if cycles_power == 63 {
+                "special_cycle_power_63"
+            } else {
+                "2_to_cycles_power"
+            }),
+            key_derivation_iteration_count: derivation_iterations(cycles_power),
+            salt_length: Some(0),
+            initialization_vector_length: Some(0),
+            expected_properties_length: Some(1),
+            properties_length_valid: properties.len() == 1,
+        };
+    }
+    let Some(second) = properties.get(1).copied() else {
+        return SevenZipAesProperties {
+            cycles_power: Some(cycles_power),
+            derivation_mode: Some("malformed_properties"),
+            key_derivation_iteration_count: derivation_iterations(cycles_power),
+            salt_length: None,
+            initialization_vector_length: None,
+            expected_properties_length: None,
+            properties_length_valid: false,
+        };
+    };
+    let salt_length = usize::from((first >> 7) & 1) + usize::from(second >> 4);
+    let iv_length = usize::from((first >> 6) & 1) + usize::from(second & 0x0f);
+    let expected_length = 2usize
+        .checked_add(salt_length)
+        .and_then(|value| value.checked_add(iv_length));
+    SevenZipAesProperties {
+        cycles_power: Some(cycles_power),
+        derivation_mode: Some(if cycles_power == 63 {
+            "special_cycle_power_63"
+        } else {
+            "2_to_cycles_power"
+        }),
+        key_derivation_iteration_count: derivation_iterations(cycles_power),
+        salt_length: Some(salt_length),
+        initialization_vector_length: Some(iv_length),
+        expected_properties_length: expected_length,
+        properties_length_valid: expected_length == Some(properties.len()),
+    }
+}
+
+fn derivation_iterations(cycles_power: u8) -> Option<u64> {
+    (cycles_power < 63)
+        .then(|| 1u64.checked_shl(u32::from(cycles_power)))
+        .flatten()
+}
+
 fn empty_packed_stream(
     stream_index: usize,
     declared_size: u64,
@@ -709,6 +1148,24 @@ fn empty_pack_info(
         pack_position,
         declared_pack_stream_count,
         streams: Vec::new(),
+        unpack_info: empty_unpack_info("pack_info_not_parsed"),
+    }
+}
+
+fn empty_unpack_info(parse_status: &'static str) -> EncodedHeaderUnpackInfo {
+    EncodedHeaderUnpackInfo {
+        parse_status,
+        declared_folder_count: None,
+        external_folder_data: None,
+        folders: Vec::new(),
+        total_input_streams: None,
+        total_output_streams: None,
+        packed_stream_index_count: None,
+        packed_stream_count_matches_pack_info: None,
+        coder_output_stream_size_total: None,
+        folder_crc32: Vec::new(),
+        end_marker_present: false,
+        following_stream_info_property_id: None,
     }
 }
 
@@ -809,4 +1266,15 @@ fn le_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_le_bytes(
         bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
     ))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
