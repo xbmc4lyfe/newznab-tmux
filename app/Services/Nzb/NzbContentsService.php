@@ -259,7 +259,7 @@ class NzbContentsService
         return $this->checkPar2Result($guid, $relID, $groupID, $nameStatus, $show) === Par2RenameOutcome::Renamed;
     }
 
-    public function checkPar2Result(string $guid, int $relID, int $groupID, int $nameStatus, int $show, ?float $deadline = null): Par2RenameOutcome
+    public function checkPar2Result(string $guid, int $relID, int $groupID, int $nameStatus, int $show, ?float $deadline = null, ?callable $onArticleReceived = null): Par2RenameOutcome
     {
         $this->par2Stats = ['candidates_probed' => 0, 'articles_received' => 0];
         if ($nameStatus !== 1) {
@@ -337,10 +337,11 @@ class NzbContentsService
                 try {
                     $outcome = $this->postProcessService->parsePAR2ForRename(
                         $candidates[$index]['id'], $relID, $groupID, $this->nntp, $show,
-                        function () use ($lock): bool {
+                        function () use ($lock, $onArticleReceived): bool {
                             $this->par2Stats['articles_received']++;
 
-                            return $this->refreshPar2Claim($lock);
+                            return ($onArticleReceived === null || $onArticleReceived())
+                                && $this->refreshPar2Claim($lock);
                         }, $candidates[$index]['explicit']
                     );
                 } catch (Throwable $e) {

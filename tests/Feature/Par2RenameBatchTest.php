@@ -10,6 +10,7 @@ use App\Services\NameFixing\NameFixingService;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
 use App\Services\Nzb\NzbParserService;
+use Carbon\CarbonImmutable;
 use DariusIII\NetNntp\Error;
 use Illuminate\Cache\ArrayStore;
 use Illuminate\Support\Facades\Artisan;
@@ -94,7 +95,8 @@ class Par2RenameBatchTest extends TestCase
                 int $groupID,
                 int $nameStatus,
                 int $show,
-                ?float $deadline = null
+                ?float $deadline = null,
+                ?callable $onArticleReceived = null
             ): Par2RenameOutcome {
                 $expiresAt = $this->store->locks['rename:par2:sweep:2:1:lock']['expiresAt'];
                 $this->sweepLeaseSeconds = $expiresAt->getTimestamp() - now()->getTimestamp();
@@ -107,6 +109,70 @@ class Par2RenameBatchTest extends TestCase
         $this->runBatch();
 
         $this->assertSame(300, $service->sweepLeaseSeconds);
+    }
+
+    public function test_abandoned_historical_sweep_lock_can_be_reacquired_after_five_minutes(): void
+    {
+        $this->freezeTime();
+        config([
+            'nntmux_nntp.socket_timeout' => 120,
+            'nntmux_nntp.alternate_server_socket_timeout' => 120,
+        ]);
+        $store = Cache::store('array')->getStore();
+        $this->assertInstanceOf(ArrayStore::class, $store);
+        $abandonedLock = $store->lock('rename:par2:sweep:2:1:lock', 300);
+        $this->assertTrue($abandonedLock->get());
+
+        CarbonImmutable::setTestNow(now()->addSeconds(301));
+
+        $replacementLock = $store->lock('rename:par2:sweep:2:1:lock', 300);
+        $this->assertTrue($replacementLock->get());
+        $replacementLock->release();
+    }
+
+    public function test_active_sweep_refreshes_its_lease_during_an_article_read(): void
+    {
+        $this->freezeTime();
+        config([
+            'nntmux_nntp.socket_timeout' => 120,
+            'nntmux_nntp.alternate_server_socket_timeout' => 120,
+        ]);
+        $this->pendingPar2Release();
+        $store = Cache::store('array')->getStore();
+        $this->assertInstanceOf(ArrayStore::class, $store);
+        $service = new class($store) extends NzbContentsService
+        {
+            public ?int $leaseBeforeArticleRead = null;
+
+            public ?int $leaseAfterArticleRead = null;
+
+            public function __construct(private ArrayStore $store) {}
+
+            public function checkPar2Result(
+                string $guid,
+                int $relID,
+                int $groupID,
+                int $nameStatus,
+                int $show,
+                ?float $deadline = null,
+                ?callable $onArticleReceived = null
+            ): Par2RenameOutcome {
+                $expiresAt = $this->store->locks['rename:par2:sweep:2:1:lock']['expiresAt'];
+                $this->leaseBeforeArticleRead = $expiresAt->getTimestamp() - now()->getTimestamp();
+                CarbonImmutable::setTestNow(now()->addSeconds(250));
+                $onArticleReceived?->__invoke();
+                $expiresAt = $this->store->locks['rename:par2:sweep:2:1:lock']['expiresAt'];
+                $this->leaseAfterArticleRead = $expiresAt->getTimestamp() - now()->getTimestamp();
+
+                return Par2RenameOutcome::NoMatch;
+            }
+        };
+        $this->app->instance(NzbContentsService::class, $service);
+
+        $this->runBatch();
+
+        $this->assertSame(300, $service->leaseBeforeArticleRead);
+        $this->assertSame(300, $service->leaseAfterArticleRead);
     }
 
     public function test_retryable_old_releases_do_not_starve_later_work_and_are_revisited(): void

@@ -1118,7 +1118,8 @@ class NameFixingService
                     break;
                 }
                 $outcome = $nzbContentsService->checkPar2Result($release->guid, (int) $release->releases_id,
-                    (int) $release->groups_id, 1, (int) $show, $deadline);
+                    (int) $release->groups_id, 1, (int) $show, $deadline,
+                    fn (): bool => $this->refreshPar2Sweep($lock));
                 $outcomes[$outcome->value]++;
                 $stats = $nzbContentsService->par2Stats();
                 $probes += $stats['candidates_probed'];
