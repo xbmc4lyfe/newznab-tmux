@@ -12,17 +12,24 @@ final class ManifestStore
     /** @param array<string, mixed> $manifest */
     public function write(array $manifest): string
     {
+        return $this->writePrepared($this->prepare($manifest));
+    }
+
+    /** @param array<string, mixed> $manifest */
+    public function prepare(array $manifest): PreparedManifest
+    {
+        return new PreparedManifest($manifest);
+    }
+
+    public function writePrepared(PreparedManifest $prepared): string
+    {
         $directory = (string) config('release_verification.storage_path').'/manifests';
         if (! is_dir($directory) && ! mkdir($directory, 0700, true) && ! is_dir($directory)) {
             throw new RuntimeException('Candidate storage is unavailable.');
         }
-        $body = json_encode($manifest, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
-        $name = hash('sha256', $body).'.json.gz';
+        $name = $prepared->name;
         $path = $directory.'/'.$name;
-        $compressed = gzencode($body);
-        if ($compressed === false) {
-            throw new RuntimeException('Cannot compress candidate manifest.');
-        }
+        $compressed = $prepared->compressed;
         if (! is_file($path)) {
             $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
             $handle = fopen($temporary, 'xb');

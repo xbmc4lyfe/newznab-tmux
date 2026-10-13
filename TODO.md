@@ -1,5 +1,14 @@
 # To do
 
+## Qualify manifest preparation outside shared capacity (2026-10-13)
+
+New ordinary archives and enqueue admissions prepare JSON/gzip bytes before requesting the shared capacity row. File persistence/fsync, authoritative candidate validation, accounting and hot-header deletion remain in the existing protected transaction. Known replays avoid unused preparation; existing-manifest merges and legacy release reconciliation retain their locked paths. A candidate committed during preparation requires a fresh locked merge. A caller that already owns capacity retains that lock.
+
+- [ ] Run the full PHPUnit/native suites and required CI on the final integrated master; targeted lock and lifecycle regressions do not establish full regression qualification.
+- [ ] Retest full-schema MariaDB admissions under both isolation levels, including fresh/caller transactions, filtered and expired replays, late candidates, legacy releases, capacity failures, publication, reset, rollback and after-commit failures. Check exact stored/emitted article sets independently.
+- [ ] Measure preparation and capacity-lock duration on a separate validation host with frozen source/vendor/schema/runtime identities, identical restored fixtures, paired randomized order and declared correctness/regression gates. Preserve every failed observation; synthetic compression time and deterministic lock availability are not production-throughput evidence.
+- [ ] The user authorized guarded master catch-up deployment on 2026-10-13. After each authorized rollout verify reviewed source/image/schema parity, app health and M4 TLS connectivity; observe admitted/verified work and net backlog under comparable load. Compression moved outside an admission's own lock does not shorten inherited capacity locks, existing merges, legacy reconciliation or filesystem persistence.
+
 ## Fingerprint review follow-up (not deployed)
 
 - [ ] Re-run the complete PHPUnit and Rust native suites on the final reviewed follow-up head, including malformed RAR5 typed-header boundaries, collection budgets, terminal queue failure, and numeric overflow.

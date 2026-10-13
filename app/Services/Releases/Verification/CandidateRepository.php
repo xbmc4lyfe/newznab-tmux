@@ -40,13 +40,21 @@ final class CandidateRepository
                 $sourceIdentity = bin2hex($collection->collectionhash);
                 // The parent lock protects the header snapshot; unrelated admissions need no lock yet.
                 // Keep terminal replays on their existing cheap, locked validation path.
-                $filtered = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
-                    ->orderByDesc('id')->value('status') === 'filtered';
+                $observed = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
+                    ->orderByDesc('id')->first(['status', 'manifest_path', 'release_id']);
+                $filtered = $observed?->status === 'filtered';
                 $manifest = null;
+                $prepared = null;
                 $snapshotFailure = null;
                 if (! $filtered) {
                     try {
                         $manifest = $this->snapshotHeaders($collection, $currentReads);
+                        // Prepare new, non-legacy admissions while only the parent is held.
+                        // Existing manifests and legacy rows still require locked reconciliation.
+                        if ((int) $collection->filecheck !== 4
+                            && ($observed === null || $observed->manifest_path === '' || $observed->release_id !== null)) {
+                            $prepared = $this->store->prepare($manifest);
+                        }
                     } catch (CandidateMetadataBudgetExceeded $error) {
                         // A stale read view can hide a committed filtered replay; validate it first.
                         $snapshotFailure = $error;
@@ -87,8 +95,10 @@ final class CandidateRepository
                     $oldManifest = $this->store->read($existing->manifest_path);
                     $manifest = $this->merge($oldManifest, $manifest);
                     $newArticles = $this->articleIdentity($oldManifest) !== $this->articleIdentity($manifest);
+                    // A candidate may have appeared since the advisory read; persist its merge.
+                    $prepared = null;
                 }
-                $path = $this->store->write($manifest);
+                $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
                 $size = filesize($this->store->path($path));
                 if ($size === false) {
                     throw new RuntimeException('Cannot reserve manifest storage.');
@@ -153,7 +163,10 @@ final class CandidateRepository
     public function enqueue(array $manifest): void
     {
         app(VerificationResetService::class)->withAdmission(function () use ($manifest): void {
-            DB::transaction(function () use ($manifest): void {
+            // Avoid preparing known replays; the locked read remains authoritative below.
+            $prepared = DB::table('release_verification_candidates')->where('identity', (string) $manifest['identity'])->exists()
+                ? null : $this->store->prepare($manifest);
+            DB::transaction(function () use ($manifest, $prepared): void {
                 $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                 $identity = (string) $manifest['identity'];
                 $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
@@ -164,7 +177,7 @@ final class CandidateRepository
                 if ($state === null) {
                     throw new RuntimeException('Verification migration has not initialized capacity state.');
                 }
-                $path = $this->store->write($manifest);
+                $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
                 $bytes = (int) filesize($this->store->path($path));
                 $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + $bytes;
                 if ($pending > (int) config('release_verification.pending_bytes')) {

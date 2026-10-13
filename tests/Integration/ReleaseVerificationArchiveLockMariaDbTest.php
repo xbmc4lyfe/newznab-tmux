@@ -12,6 +12,7 @@ use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use PDO;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Tests\Fixtures\ManifestCompressionProbe;
 use Tests\TestCase;
 
 final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
@@ -29,6 +30,7 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        require_once __DIR__.'/../Fixtures/ManifestCompressionProbe.php';
         $this->host = (string) getenv('VERIFICATION_LOCK_TEST_HOST');
         if ($this->host === '') {
             $this->markTestSkipped('Set VERIFICATION_LOCK_TEST_HOST to an isolated MariaDB test server.');
@@ -66,6 +68,7 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
 
     protected function tearDown(): void
     {
+        ManifestCompressionProbe::$onCompress = null;
         try {
             if ($this->administrator !== null && preg_match('/^nntmux_archive_lock_test_[a-f0-9]{16}$/', $this->database) === 1) {
                 app('files')->deleteDirectory((string) config('release_verification.storage_path'));
@@ -75,6 +78,156 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
         } finally {
             parent::tearDown();
         }
+    }
+
+    public static function preparationModes(): iterable
+    {
+        yield 'archive standalone' => [false, false];
+        yield 'archive caller transaction' => [true, false];
+        yield 'enqueue standalone' => [false, true];
+        yield 'enqueue caller transaction' => [true, true];
+    }
+
+    #[DataProvider('preparationModes')]
+    public function test_real_compression_keeps_capacity_available_until_manifest_publication(bool $outerTransaction, bool $enqueue): void
+    {
+        require_once __DIR__.'/../Fixtures/ManifestCompressionProbe.php';
+        $id = $enqueue ? null : $this->arrival('compression');
+        $other = $this->connection();
+        $compressions = 0;
+        ManifestCompressionProbe::$onCompress = function () use ($id, $other, &$compressions): void {
+            $compressions++;
+            $other->beginTransaction();
+            try {
+                try {
+                    $other->query('SELECT id FROM release_verification_state WHERE id = 1 FOR UPDATE NOWAIT')->fetchAll();
+                } catch (\PDOException $error) {
+                    $this->assertSame(1205, (int) $error->errorInfo[1]);
+                    $this->fail('JSON/gzip preparation must not own shared capacity.');
+                }
+                $this->assertSame(0, (int) $other->query('SELECT pending_bytes FROM release_verification_state WHERE id = 1')->fetchColumn());
+                $this->assertSame([], glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
+                if ($id !== null) {
+                    try {
+                        $lock = $other->prepare('SELECT id FROM collections WHERE id = ? FOR UPDATE NOWAIT');
+                        $lock->execute([$id]);
+                        $this->fail('Preparation must retain its collection parent.');
+                    } catch (\PDOException $error) {
+                        $this->assertSame(1205, (int) $error->errorInfo[1]);
+                    }
+                }
+            } finally {
+                $other->rollBack();
+            }
+        };
+        if ($outerTransaction) {
+            DB::beginTransaction();
+        }
+        try {
+            if ($enqueue) {
+                app(CandidateRepository::class)->enqueue(['identity' => sha1('compression-import'), 'groups_id' => 1, 'files' => []]);
+            } else {
+                app(CandidateRepository::class)->archive($id);
+            }
+            if ($outerTransaction) {
+                DB::commit();
+            }
+        } finally {
+            ManifestCompressionProbe::$onCompress = null;
+            if ($outerTransaction && DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+        }
+        $this->assertSame(1, $compressions);
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertFileExists(app(ManifestStore::class)->path($candidate->manifest_path));
+        $this->assertSame((int) $candidate->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        if (! $enqueue) {
+            $manifest = app(ManifestStore::class)->read($candidate->manifest_path);
+            $this->assertSame('compression@article', $manifest['files'][0]['segments'][0]['messageid']);
+            $this->assertSame(0, DB::table('collections')->count());
+            $this->assertSame(0, DB::table('parts')->count());
+        }
+    }
+
+    public function test_candidate_created_during_preparation_keeps_its_committed_articles(): void
+    {
+        $id = $this->arrival('prepared-race');
+        DB::table('binaries')->where('collections_id', $id)->update(['totalparts' => 2]);
+        $otherManifest = ['legacy_release_id' => null, 'identity' => sha1('prepared-race'), 'subject' => 'Movie',
+            'fromname' => 'poster', 'date' => now()->format('Y-m-d H:i:s'), 'groups_id' => 1,
+            'regex_id' => 0, 'expected_files' => 1, 'groups' => ['alt.test'],
+            'files' => [['key' => md5('prepared-race'), 'subject' => 'movie.mkv', 'totalparts' => 2,
+                'segments' => [['number' => 2, 'messageid' => 'later@article', 'bytes' => 5]]]], 'conflict' => false];
+        config(['database.connections.interleaved_admission' => config('database.connections.mariadb')]);
+        $interleaved = false;
+        $compressions = 0;
+        ManifestCompressionProbe::$onCompress = function () use ($otherManifest, &$interleaved, &$compressions): void {
+            $compressions++;
+            if ($interleaved) {
+                return;
+            }
+            $interleaved = true;
+            $probe = ManifestCompressionProbe::$onCompress;
+            ManifestCompressionProbe::$onCompress = null;
+            DB::setDefaultConnection('interleaved_admission');
+            try {
+                app(CandidateRepository::class)->enqueue($otherManifest);
+            } finally {
+                DB::setDefaultConnection('mariadb');
+                ManifestCompressionProbe::$onCompress = $probe;
+            }
+        };
+        try {
+            app(CandidateRepository::class)->archive($id);
+        } finally {
+            ManifestCompressionProbe::$onCompress = null;
+            DB::setDefaultConnection('mariadb');
+            DB::purge('interleaved_admission');
+        }
+        $this->assertTrue($interleaved);
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $manifest = app(ManifestStore::class)->read($candidate->manifest_path);
+        $this->assertSame(['prepared-race@article', 'later@article'], array_column($manifest['files'][0]['segments'], 'messageid'));
+        $this->assertSame(2, $compressions, 'A late candidate needs a fresh, locked merge.');
+        $this->assertSame(2, (int) $candidate->version);
+        $this->assertSame((int) $candidate->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame(0, DB::table('collections')->count());
+        $this->assertSame(0, DB::table('parts')->count());
+    }
+
+    public function test_preparation_retains_capacity_already_owned_by_an_outer_transaction(): void
+    {
+        $id = $this->arrival('inherited-capacity');
+        $other = $this->connection();
+        $compressions = 0;
+        DB::beginTransaction();
+        DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+        ManifestCompressionProbe::$onCompress = function () use ($other, &$compressions): void {
+            $compressions++;
+            $other->beginTransaction();
+            try {
+                try {
+                    $other->query('SELECT id FROM release_verification_state WHERE id = 1 FOR UPDATE NOWAIT')->fetchAll();
+                    $this->fail('Admission must not release its caller\'s capacity ownership.');
+                } catch (\PDOException $error) {
+                    $this->assertSame(1205, (int) $error->errorInfo[1]);
+                }
+            } finally {
+                $other->rollBack();
+            }
+        };
+        try {
+            app(CandidateRepository::class)->archive($id);
+        } finally {
+            ManifestCompressionProbe::$onCompress = null;
+            DB::rollBack();
+        }
+        $this->assertSame(1, $compressions);
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
+        $this->assertSame(1, DB::table('collections')->count());
+        $this->assertSame(1, DB::table('parts')->count());
+        $this->assertSame([], glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
     }
 
     /** @return iterable<string, array{bool}> */
