@@ -406,7 +406,7 @@ class NzbContentsService
     /** @return list<array{id: string, explicit: bool}> */
     private function par2Candidates(SimpleXMLElement $nzb): array
     {
-        $explicit = $volumes = $firstVolumes = $volumeFamilies = $hidden = [];
+        $explicit = $hidden = [];
         $this->par2StructureValid = count($nzb->file) > 0;
         foreach ($nzb->file as $file) {
             if (count($file->segments->segment) === 0) {
@@ -430,14 +430,7 @@ class NzbContentsService
 
             if (preg_match('/\.par2(?:["\s]|$)/i', $subject)) {
                 if (preg_match('/\.vol\d+\+\d+\.par2(?:["\s]|$)/i', $subject)) {
-                    $volumes[$id] = ['id' => $id, 'explicit' => true];
-                    $family = preg_match('/"([^"\r\n]+)\.vol\d+\+\d+\.par2"/i', $subject, $match)
-                        || preg_match('/(?:^|\s)([^\s"]+)\.vol\d+\+\d+\.par2(?:\s|$)/i', $subject, $match)
-                        ? mb_strtolower($match[1]) : $id;
-                    if (! isset($volumeFamilies[$family])) {
-                        $volumeFamilies[$family] = true;
-                        $firstVolumes[$id] = $volumes[$id];
-                    }
+                    continue;
                 } else {
                     $explicit[$id] = ['id' => $id, 'explicit' => true];
                 }
@@ -460,8 +453,8 @@ class NzbContentsService
 
         uasort($hidden, static fn (array $first, array $second): int => $first['bytes'] <=> $second['bytes']);
 
-        // Filename families only prioritize probes; later volumes may contain unique metadata and must remain resumable.
-        return array_values($explicit + $firstVolumes + $hidden + $volumes);
+        // Exclude recovery-volume subjects so they cannot dominate bounded retry batches.
+        return array_values($explicit + $hidden);
     }
 
     /**
