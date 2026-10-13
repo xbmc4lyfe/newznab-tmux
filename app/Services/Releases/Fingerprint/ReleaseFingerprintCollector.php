@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 15;
+    public const SCHEMA_VERSION = 16;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 
@@ -106,6 +106,23 @@ final class ReleaseFingerprintCollector
                     $analysis = $this->analyzer->analyzeArticleAndDecodedBytes($article['headers'], $article['body']);
                     $metadata = $analysis['metadata'];
                     $decodedBytes = $analysis['decoded_bytes'];
+                    $articleIdentity = (new NativeMetadataParser)->parseArticleIdentity(
+                        '<'.$sample['messageid'].'>',
+                        $article['headers'],
+                        $article['overview_raw'],
+                        $article['overview_response_code'],
+                        $article['overview_attempted'],
+                        $article['head_response']['response_text'],
+                        $article['body_response']['response_text'],
+                        $article['head_response']['response_code'],
+                        $article['body_response']['response_code'],
+                    );
+                    $metadata['article_identity'] = $articleIdentity ?? [
+                        'parser_engine' => null,
+                        'schema_version' => self::SCHEMA_VERSION,
+                        'collection_status' => 'unavailable',
+                        'reason' => 'native_parser_unavailable_or_input_exceeded_budget',
+                    ];
                     $yenc = $metadata['yenc'] ?? null;
                     $metadata['yenc_nzb_part_number_matches'] = is_array($yenc) && is_int($yenc['part'] ?? null)
                         ? $yenc['part'] === $sample['segment_number'] : null;
@@ -239,23 +256,13 @@ final class ReleaseFingerprintCollector
                     $overviewFormatCodeRaw = $serverProfileMap[$serverKey]['overview_format_response_code'] ?? null;
                     $overviewFormatResponseCode = is_int($overviewFormatCodeRaw) ? $overviewFormatCodeRaw : null;
                     $overviewFields = $this->parseOverview($article['overview_raw'], $overviewFormat);
-                    $articleIdentity = (new NativeMetadataParser)->parseArticleIdentity(
-                        '<'.$sample['messageid'].'>',
-                        $article['headers'],
-                        $article['overview_raw'],
-                        $article['overview_response_code'],
-                        $article['overview_attempted'],
-                        $article['head_response']['response_text'],
-                        $article['body_response']['response_text'],
-                        $article['head_response']['response_code'],
-                        $article['body_response']['response_code'],
-                    );
-                    $metadata['article_identity'] = $articleIdentity ?? [
-                        'parser_engine' => null,
-                        'schema_version' => self::SCHEMA_VERSION,
-                        'collection_status' => 'unavailable',
-                        'reason' => 'native_parser_unavailable_or_input_exceeded_budget',
-                    ];
+                    $linesBodyRelationship = $metadata['nntp_lines_body_relationship'] ?? null;
+                    if (is_array($linesBodyRelationship)) {
+                        $metadata['nntp_lines_body_relationship'] = $this->relateLinesBodyToRequestedArticle(
+                            $linesBodyRelationship,
+                            $articleIdentity,
+                        );
+                    }
                     $articleXref = (new NativeMetadataParser)->parseArticleXref(
                         $article['headers'],
                         $article['overview_rows'],
@@ -301,6 +308,7 @@ final class ReleaseFingerprintCollector
                         'overview_rows' => $article['overview_rows'],
                         'overview_row_count' => $article['overview_row_count'],
                         'overview_row_protocol_status' => $this->overviewRowProtocolStatus($article),
+                        'overview_response_row_observation_status' => $this->overviewResponseRowStatus($article),
                         'overview_rows_basis' => 'NNTP multiline data rows after client dot-unstuffing and CRLF removal',
                         'head_response' => $article['head_response'],
                         'body_response' => $article['body_response'],
@@ -314,6 +322,7 @@ final class ReleaseFingerprintCollector
                     if ($sample['kind'] === 'par2' && ! $server['alternate']) {
                         $decoded = $this->yenc->decodeWithFrame($article['body']);
                         $yencIntegrity = $metadata['yenc'] ?? null;
+                        $bodyResponseIdentityValid = Par2MetadataParser::bodyResponseIdentityVerified($metadata);
                         $sizeValid = is_array($yencIntegrity)
                             && ($yencIntegrity['payload_escape_state_valid'] ?? false) === true
                             && ($yencIntegrity['header_numeric_fields_valid'] ?? false) === true
@@ -335,10 +344,8 @@ final class ReleaseFingerprintCollector
                                 ? ($yencIntegrity['pcrc32'] ?? null) !== null
                                     && ($yencIntegrity['declared_crc32_is_hex'] ?? false) === true
                                     && ($yencIntegrity['declared_crc32_matches'] ?? false) === true
-                                : (($yencIntegrity['crc32'] ?? null) === null
-                                    || (($yencIntegrity['declared_crc32_is_hex'] ?? false) === true
-                                        && ($yencIntegrity['declared_crc32_matches'] ?? false) === true)));
-                        if ($decoded[1] !== null && $sizeValid && $crcValid) {
+                                : Par2MetadataParser::declaredYencCrc32Valid($yencIntegrity));
+                        if ($decoded[1] !== null && $bodyResponseIdentityValid && $sizeValid && $crcValid) {
                             $decodedSize = strlen($decoded[0]);
                             if ($decodedPar2Bytes + $decodedSize <= self::MAX_PAR2_SET_BYTES) {
                                 $decodedPar2[$sample['file_index']][$sample['segment_number']] = $decoded[0];
@@ -357,7 +364,9 @@ final class ReleaseFingerprintCollector
                                 'file_index' => $sample['file_index'],
                                 'message_id' => $sample['messageid'],
                                 'server' => $server['name'],
-                                'error_type' => 'Par2YencIntegrityCheckFailed',
+                                'error_type' => $bodyResponseIdentityValid
+                                    ? 'Par2YencIntegrityCheckFailed'
+                                    : 'Par2BodyResponseIdentityUnverified',
                             ];
                         }
                     }
@@ -452,13 +461,17 @@ final class ReleaseFingerprintCollector
                 'subject' => $file['subject'],
                 'poster' => $file['poster'],
                 'date' => $file['date'],
+                'source_date' => $file['source_date'] ?? null,
                 'groups' => $file['groups'],
                 'segment_count' => $file['segment_count'],
                 'nzb_advertised_bytes' => $file['advertised_bytes'],
+                'nzb_advertised_bytes_overflow' => $file['advertised_bytes_overflow'] ?? false,
                 'segments' => array_map(static fn (array $segment): array => [
                     'number' => $segment['number'],
+                    'source_number' => $segment['source_number'] ?? null,
                     'message_id' => $segment['messageid'],
                     'advertised_bytes' => $segment['bytes'],
+                    'source_bytes' => $segment['source_bytes'] ?? null,
                 ], $file['segments']),
                 'sampled_article_count' => count($fileObservations),
                 'sampled_segment_number' => $primary['segment_number'] ?? null,
@@ -526,6 +539,105 @@ final class ReleaseFingerprintCollector
             $assembled = implode('', $parts);
             $metadata = $this->par2->parse($assembled);
             $fileObservations = array_values(array_filter($observations, static fn (array $observation): bool => $observation['file_index'] === (int) $file['index'] && $observation['server_role'] === 'primary'));
+            $articleSegmentRanges = [];
+            $segmentOffset = 0;
+            foreach ($parts as $segmentNumber => $segmentBytes) {
+                $segmentObservation = null;
+                foreach ($fileObservations as $observation) {
+                    if ($observation['segment_number'] === (int) $segmentNumber) {
+                        $segmentObservation = $observation;
+                        break;
+                    }
+                }
+                if ($segmentObservation !== null) {
+                    $yencMetadata = $segmentObservation['metadata']['yenc'] ?? [];
+                    $declaredRangeStart = is_int($yencMetadata['begin'] ?? null) ? $yencMetadata['begin'] : null;
+                    $declaredRangeEnd = is_int($yencMetadata['end'] ?? null) ? $yencMetadata['end'] : null;
+                    $expectedRangeStart = $segmentOffset + 1;
+                    $expectedRangeEnd = $segmentOffset + strlen($segmentBytes);
+                    $articleSegmentRanges[] = [
+                        'segment_number' => (int) $segmentNumber,
+                        'message_id' => $segmentObservation['message_id'],
+                        'offset' => $segmentOffset,
+                        'byte_length' => strlen($segmentBytes),
+                        'declared_file_byte_start' => $declaredRangeStart,
+                        'declared_file_byte_end_inclusive' => $declaredRangeEnd,
+                        'declared_range_matches_assembled_position' => $declaredRangeStart === $expectedRangeStart
+                            && $declaredRangeEnd === $expectedRangeEnd,
+                        'server' => $segmentObservation['server'],
+                        'provider_label' => $segmentObservation['provider_label'],
+                        'server_role' => $segmentObservation['server_role'],
+                    ];
+                }
+                $segmentOffset += strlen($segmentBytes);
+            }
+            $metadata['packet_summaries'] = Par2MetadataParser::mapPacketArticleSpans(
+                $metadata['packet_summaries'] ?? [],
+                $articleSegmentRanges,
+            );
+            $packetArticleSegmentsByOffset = [];
+            foreach ($metadata['packet_summaries'] as $packetSummary) {
+                $packetArticleSegmentsByOffset[$packetSummary['offset']] = $packetSummary['article_segments'] ?? [];
+            }
+            $metadata['recovery_packets'] = $metadata['recovery_packets'] ?? [];
+            foreach ($metadata['recovery_packets'] as &$recoveryPacket) {
+                $packetOffset = $recoveryPacket['packet_offset'] ?? null;
+                $recoveryPacket['article_segments'] = is_int($packetOffset)
+                    ? ($packetArticleSegmentsByOffset[$packetOffset] ?? []) : [];
+            }
+            unset($recoveryPacket);
+            $physicalRegionCount = 0;
+            $unmappedPhysicalRegionCount = 0;
+            foreach ($metadata['packet_summaries'] as &$packet) {
+                $regions = $packet['physical_regions'] ?? [];
+                foreach ($regions as &$region) {
+                    $regionMappings = Par2MetadataParser::mapPacketArticleSpans([[
+                        'offset' => $region['offset'] ?? null,
+                        'packet_bytes' => $region['byte_length'] ?? null,
+                    ]], $articleSegmentRanges);
+                    $mappedRegion = $regionMappings[0] ?? [];
+                    $region['article_segments'] = $mappedRegion['article_segments'] ?? [];
+                    $region['article_span_mapped_bytes'] = $mappedRegion['article_span_mapped_bytes'] ?? 0;
+                    $region['article_span_mapping_complete'] = $mappedRegion['article_span_mapping_complete'] ?? false;
+                    $physicalRegionCount++;
+                    if (($region['article_span_mapping_complete'] ?? false) !== true) {
+                        $unmappedPhysicalRegionCount++;
+                    }
+                }
+                unset($region);
+                $packet['physical_regions'] = $regions;
+            }
+            unset($packet);
+            $metadata['article_span_mapping'] = [
+                'basis' => 'PAR2 packet offsets in assembled segment-number order mapped to decoded article bytes and primary-provider Message-IDs; yEnc-declared file positions are compared separately.',
+                'decoded_segment_count' => count($articleSegmentRanges),
+                'decoded_segment_bytes' => $segmentOffset,
+                'yenc_segment_position_claims_match_assembled_order' => $articleSegmentRanges !== []
+                    && count(array_filter(
+                        $articleSegmentRanges,
+                        static fn (array $segment): bool => $segment['declared_range_matches_assembled_position'] === true,
+                    )) === count($articleSegmentRanges),
+                'yenc_segment_position_mismatches' => array_values(array_map(
+                    static fn (array $segment): int => $segment['segment_number'],
+                    array_filter(
+                        $articleSegmentRanges,
+                        static fn (array $segment): bool => $segment['declared_range_matches_assembled_position'] !== true,
+                    ),
+                )),
+                'packet_count' => count($metadata['packet_summaries']),
+                'unmapped_packet_count' => count(array_filter(
+                    $metadata['packet_summaries'],
+                    static fn (array $packet): bool => ($packet['article_span_mapping_complete'] ?? false) !== true,
+                )),
+                'physical_region_count' => $physicalRegionCount,
+                'unmapped_physical_region_count' => $unmappedPhysicalRegionCount,
+                'complete' => $metadata['packet_summaries'] !== []
+                    && count(array_filter(
+                        $metadata['packet_summaries'],
+                        static fn (array $packet): bool => ($packet['article_span_mapping_complete'] ?? false) !== true,
+                    )) === 0
+                    && $unmappedPhysicalRegionCount === 0,
+            ];
             $yencNames = array_values(array_unique(array_filter(array_map(
                 static fn (array $observation): ?string => $observation['metadata']['yenc']['name'] ?? null,
                 $fileObservations,
@@ -544,6 +656,7 @@ final class ReleaseFingerprintCollector
                     && ($observation['metadata']['yenc_nzb_total_parts_matches'] ?? null) !== false
                     && ($observation['metadata']['yenc']['decoded_size_matches_header_size'] ?? false) === true
                     && ($observation['metadata']['yenc']['decoded_size_matches_yend_size'] ?? false) === true
+                    && ($observation['metadata']['yenc']['integrity_checks_ambiguous'] ?? false) !== true
                     && (($observation['metadata']['yenc']['multipart'] ?? false) === true
                         ? ($observation['metadata']['yenc']['ypart_range_valid'] ?? false) === true
                             && ($observation['metadata']['yenc']['pcrc32'] ?? null) !== null
@@ -553,13 +666,12 @@ final class ReleaseFingerprintCollector
                         : true),
                 )) === count($fileObservations);
             if ($yencStructureValid && $hasMultipartYenc) {
-                $ranges = array_map(static fn (array $observation): array => [
-                    (int) ($observation['metadata']['yenc']['begin'] ?? 0),
-                    (int) ($observation['metadata']['yenc']['end'] ?? 0),
-                ], $fileObservations);
-                usort($ranges, static fn (array $left, array $right): int => $left[0] <=> $right[0]);
+                $orderedObservations = $fileObservations;
+                usort($orderedObservations, static fn (array $left, array $right): int => $left['segment_number'] <=> $right['segment_number']);
                 $nextByte = 1;
-                foreach ($ranges as [$begin, $end]) {
+                foreach ($orderedObservations as $observation) {
+                    $begin = (int) ($observation['metadata']['yenc']['begin'] ?? 0);
+                    $end = (int) ($observation['metadata']['yenc']['end'] ?? 0);
                     if ($begin !== $nextByte || $end < $begin) {
                         $yencStructureValid = false;
                         break;
@@ -582,7 +694,7 @@ final class ReleaseFingerprintCollector
                 : (count($wholeFileCrcValues) === 1
                     && preg_match('/\A[0-9A-F]{1,8}\z/', $wholeFileCrcValues[0]) === 1
                     && str_pad($wholeFileCrcValues[0], 8, '0', STR_PAD_LEFT) === $observedWholeFileCrc);
-            $packets = $metadata['packet_summaries'] ?? [];
+            $packets = $metadata['packet_summaries'];
             $packetChecksumsValid = $packets !== []
                 && (int) ($metadata['invalid_packet_count'] ?? 0) === 0
                 && count(array_filter($packets, static fn (array $packet): bool => ($packet['checksum_valid'] ?? false) !== true)) === 0;
@@ -603,6 +715,8 @@ final class ReleaseFingerprintCollector
                 && trim($metadata['creator']) !== ''
                 && $yencStructureValid
                 && $packetSetConsistent
+                && ($metadata['source_descriptions_valid'] ?? true) === true
+                && ($metadata['ifsc_relationships_valid'] ?? true) === true
                 && $wholeFileCrcMatches !== false
                 && (int) ($metadata['packet_count'] ?? 0) > 0;
             if (! $metadataValid) {
@@ -633,6 +747,7 @@ final class ReleaseFingerprintCollector
         $par2SetMainDefinitionHashes = [];
         $par2SetSources = [];
         $par2SetSourceConflicts = [];
+        $par2SourceDefinitionConflictKeys = [];
         $par2SetSourceDefinitionHashes = [];
         $par2SetBlockSizes = [];
         $par2SetBlockSizeConflicts = [];
@@ -644,12 +759,16 @@ final class ReleaseFingerprintCollector
         $par2PackedLayout = false;
         $par2FileCount = count(array_filter($manifest['files'], static fn (array $file): bool => $file['kind'] === 'par2'));
         foreach ($assembledPar2 as $par2File) {
+            $packetMetadata = is_array($par2File['metadata'] ?? null) ? $par2File['metadata'] : [];
+            foreach (Par2MetadataParser::sourceDefinitionConflictKeys($packetMetadata) as $conflictKey) {
+                $par2SourceDefinitionConflictKeys[$conflictKey] = true;
+            }
             if (! is_array($par2File['metadata'] ?? null)) {
                 continue;
             }
             $metadata = $par2File['metadata'];
             $validIfscPacketKeys = [];
-            foreach ($metadata['packet_summaries'] ?? [] as $packet) {
+            foreach ($metadata['packet_summaries'] as $packet) {
                 $setId = $packet['set_id'] ?? null;
                 $payloadPrefix = $packet['payload_prefix_hex'] ?? null;
                 if (($packet['checksum_valid'] ?? false) !== true
@@ -702,7 +821,7 @@ final class ReleaseFingerprintCollector
                 ];
             }
             $fileSetIds = array_values(array_unique(array_column(array_filter(
-                $metadata['packet_summaries'] ?? [],
+                $metadata['packet_summaries'],
                 static fn (array $packet): bool => ($packet['checksum_valid'] ?? false) === true,
             ), 'set_id')));
             if (count($fileSetIds) !== 1) {
@@ -712,7 +831,7 @@ final class ReleaseFingerprintCollector
             }
             $setId = $fileSetIds[0];
             $par2SetIds[$setId] = true;
-            foreach ($metadata['packet_summaries'] ?? [] as $packet) {
+            foreach ($metadata['packet_summaries'] as $packet) {
                 if (($packet['checksum_valid'] ?? false) !== true
                     || ($packet['set_id'] ?? null) !== $setId
                     || ! is_string($packet['payload_sha256'] ?? null)) {
@@ -754,6 +873,7 @@ final class ReleaseFingerprintCollector
                 if (isset($par2SetSources[$setId][$fileId]) && $par2SetSources[$setId][$fileId] !== $sourceFile) {
                     $par2SetSourceConflicts[$setId][$fileId] = true;
                     $par2Complete = false;
+                    $par2SourceDefinitionConflictKeys[$setId.':'.$fileId] = true;
                 } else {
                     $par2SetSources[$setId][$fileId] = $sourceFile;
                 }
@@ -761,7 +881,7 @@ final class ReleaseFingerprintCollector
             if ($par2File['metadata_valid'] !== true) {
                 continue;
             }
-            foreach ($par2File['metadata']['packet_summaries'] ?? [] as $packet) {
+            foreach ($par2File['metadata']['packet_summaries'] as $packet) {
                 if (($packet['checksum_valid'] ?? false) === true && is_string($packet['set_id'] ?? null)) {
                     $par2SetIds[$packet['set_id']] = true;
                 }
@@ -784,9 +904,6 @@ final class ReleaseFingerprintCollector
                 } else {
                     $par2RecoverySlicePayloadHashesBySet[$setId][$exponent] = $packet['recovery_data_sha256'];
                 }
-            }
-            foreach ($par2File['metadata']['recovery_exponents'] ?? [] as $exponent) {
-                $par2RecoveryExponentsBySet[$setId][$exponent] = true;
             }
             $par2PackedLayout = $par2PackedLayout || (bool) ($par2File['metadata']['packed_layout_present'] ?? false);
         }
@@ -817,6 +934,7 @@ final class ReleaseFingerprintCollector
         $par2SourceDefinitionConflicts = [];
         foreach ($par2SetSourceConflicts as $setId => $filesWithConflicts) {
             foreach (array_keys($filesWithConflicts) as $fileId) {
+                $par2SourceDefinitionConflictKeys[$setId.':'.$fileId] = true;
                 $par2SourceDefinitionConflicts[] = [
                     'recovery_set_id' => $setId,
                     'file_id' => $fileId,
@@ -840,6 +958,23 @@ final class ReleaseFingerprintCollector
                 $par2Complete = false;
             }
             $blockSize = (int) ($par2SetBlockSizes[$setId] ?? 0);
+            $validatedRecoveryPackets = [];
+            foreach ($assembledPar2 as $par2File) {
+                foreach ($par2File['metadata']['recovery_packets'] ?? [] as $recoveryPacket) {
+                    if (($recoveryPacket['recovery_set_id'] ?? null) !== $setId) {
+                        continue;
+                    }
+                    $validatedRecoveryPackets[] = $recoveryPacket;
+                    $payloadBytes = $recoveryPacket['payload_bytes'] ?? null;
+                    if (! is_int($payloadBytes) || $blockSize < 1 || $payloadBytes !== $blockSize + 4) {
+                        $par2Complete = false;
+                    }
+                }
+            }
+            $par2RecoveryExponentsBySet[$setId] = array_fill_keys(
+                Par2MetadataParser::validatedRecoveryExponents($validatedRecoveryPackets, $blockSize),
+                true,
+            );
             foreach ($assembledPar2 as $par2File) {
                 foreach ($par2File['metadata']['packet_summaries'] ?? [] as $packet) {
                     if (($packet['set_id'] ?? null) === $setId
@@ -881,11 +1016,33 @@ final class ReleaseFingerprintCollector
             }
         }
         unset($par2File);
+        $crossVolumeFiles = [];
+        foreach ($assembledPar2 as $par2File) {
+            $recoveryPackets = array_values(array_filter(
+                $par2File['metadata']['recovery_packets'] ?? [],
+                static function (array $packet) use ($par2SetBlockSizes): bool {
+                    $setId = $packet['recovery_set_id'] ?? null;
+                    $blockSize = is_string($setId) ? ($par2SetBlockSizes[$setId] ?? null) : null;
+
+                    return ! is_int($blockSize) || (int) ($packet['payload_bytes'] ?? 0) === $blockSize + 4;
+                },
+            ));
+            $crossVolumeFiles[] = [
+                'file_index' => $par2File['file_index'],
+                'subject' => $par2File['subject'],
+                'recovery_packets' => $recoveryPackets,
+            ];
+        }
+        $crossVolumeRecoveryConflicts = Par2MetadataParser::findCrossVolumeRecoveryConflicts($crossVolumeFiles);
+        if ($crossVolumeRecoveryConflicts !== []) {
+            $par2Complete = false;
+        }
         $multiplePar2Sets = count($par2SetIds) > 1;
         $par2RecoveryExponents = $multiplePar2Sets ? [] : ($par2RecoveryExponentsBySet[array_key_first($par2SetIds)] ?? []);
         $recoveryCount = count($par2RecoveryExponents);
         $parsedRecoveryAcrossSets = array_sum(array_map('count', $par2RecoveryExponentsBySet));
         $par2SourceBlocks = null;
+        $par2SourceBlocksOverflow = false;
         if (! $multiplePar2Sets && $par2SetIds !== []) {
             $singleSetId = array_key_first($par2SetIds);
             $main = $par2SetMainPackets[$singleSetId] ?? null;
@@ -908,6 +1065,7 @@ final class ReleaseFingerprintCollector
                     $fileBlockCount = intdiv($fileSize, $blockSize) + (($fileSize % $blockSize) === 0 ? 0 : 1);
                     $sourceBlockCount = $this->checkedNonNegativeIntegerAdd($sourceBlockCount, $fileBlockCount);
                     if ($sourceBlockCount === null) {
+                        $par2SourceBlocksOverflow = true;
                         $denominatorIsDefined = false;
                         break;
                     }
@@ -920,6 +1078,12 @@ final class ReleaseFingerprintCollector
             }
         }
         $par2SourceFiles = array_values($par2Sources);
+        $par2SourcePrefixRelationships = Par2MetadataParser::relateNzbFilePrefixesToSources(
+            $manifest['files'],
+            $observations,
+            $par2SourceFiles,
+            array_keys($par2SourceDefinitionConflictKeys),
+        );
         $par2SourceRarFiles = array_values(array_filter($par2SourceFiles, static fn (array $sourceFile): bool => preg_match(
             '/(?:\.part\d+\.rar|\.rar|\.r\d{2,})\z/i',
             (string) ($sourceFile['filename'] ?? ''),
@@ -974,6 +1138,16 @@ final class ReleaseFingerprintCollector
             && $allFilesHaveSegments
             && $manifestIntegrityValid;
         $providerCoverageComplete = count($servers) < 2 || count($comparisons) >= count(array_unique(array_column($samples, 'messageid')));
+        $providerHeaderComparisonRows = [];
+        foreach ($comparisons as $comparison) {
+            array_push($providerHeaderComparisonRows, ...($comparison['ordered_occurrence_comparisons'] ?? []));
+        }
+        $providerHeaderComparisonCoverageComplete = count($servers) < 2
+            || ($providerCoverageComplete && $providerHeaderComparisonRows !== []
+                && count(array_filter(
+                    $providerHeaderComparisonRows,
+                    static fn (array $comparison): bool => ($comparison['comparison_status'] ?? null) !== 'available',
+                )) === 0);
         $profileCoverageComplete = count($serverProfiles) === count($servers)
             && count(array_filter($serverProfiles, static fn (array $profile): bool => ! isset($profile['profile_error_type'])
                 && ! isset($profile['profile']['capabilities_error_type'])
@@ -987,8 +1161,14 @@ final class ReleaseFingerprintCollector
             $observations,
             static fn (array $observation): bool => ($observation['metadata']['article_identity']['parser_engine'] ?? null)
                 === 'nntmux-rust-article-identity'
-                && ($observation['metadata']['article_identity']['schema_version'] ?? null) === 2
+                && ($observation['metadata']['article_identity']['schema_version'] ?? null) === 3
                 && ($observation['metadata']['article_identity']['request']['syntax_status'] ?? null) === 'valid',
+        )) === count($observations);
+        $headerParserCoverageComplete = $observations !== [] && count(array_filter(
+            $observations,
+            static fn (array $observation): bool => NativeMetadataParser::hasCurrentNntpHeaderSchema(
+                $observation['metadata']['nntp_header_metadata'] ?? null,
+            ),
         )) === count($observations);
         $xrefParserCoverageComplete = $observations !== [] && count(array_filter(
             $observations,
@@ -1012,8 +1192,8 @@ final class ReleaseFingerprintCollector
                 || ($observation['metadata']['yenc']['trailer_numeric_fields_valid'] ?? null) === false
                 || ($observation['metadata']['yenc']['ypart_range_valid'] ?? null) === false,
         )) === 0;
-        $status = $allSamplesAvailable && $par2Complete && $providerCoverageComplete && $profileCoverageComplete
-            && $identityParserCoverageComplete && $xrefParserCoverageComplete && $dateParserCoverageComplete
+        $status = $allSamplesAvailable && $par2Complete && $providerCoverageComplete && $providerHeaderComparisonCoverageComplete && $profileCoverageComplete
+            && $identityParserCoverageComplete && $headerParserCoverageComplete && $xrefParserCoverageComplete && $dateParserCoverageComplete
             && $yencEscapeStateValid && $yencNumericFieldsValid && $omittedSampleCount === 0 && ! $par2BudgetExceeded ? 'complete' : 'partial';
 
         return [
@@ -1061,7 +1241,9 @@ final class ReleaseFingerprintCollector
                     ],
                 ],
                 'provider_comparisons' => $comparisons,
+                'provider_header_occurrence_comparison_coverage_complete' => $providerHeaderComparisonCoverageComplete,
                 'posting_timeline_estimate' => $timing,
+                'nntp_header_parser_coverage_complete' => $headerParserCoverageComplete,
                 'par2' => [
                     'present' => $par2FileCount > 0,
                     'files' => $assembledPar2,
@@ -1102,14 +1284,19 @@ final class ReleaseFingerprintCollector
                     'parsed_recovery_exponents_across_sets' => $multiplePar2Sets ? $parsedRecoveryAcrossSets : null,
                     'recovery_slice_conflicts' => array_values($par2RecoverySliceConflicts),
                     'source_block_count' => $par2SourceBlocks ?: null,
+                    'source_block_count_overflow' => $par2SourceBlocksOverflow,
+                    'nzb_file_prefix_relationships' => $par2SourcePrefixRelationships,
                     'recovery_percent' => $par2RecoveryPercent,
+                    'cross_volume_recovery_conflicts' => $crossVolumeRecoveryConflicts,
                     'packed_layout_present' => $par2PackedLayout,
                     'complete' => $par2FileCount > 0 ? $par2Complete : null,
                     'warning' => $par2FileCount === 0
                         ? 'The NZB lists no PAR2 files.'
                         : ($multiplePar2Sets
                             ? 'Multiple PAR2 recovery sets were found; a single aggregate recovery percentage is unavailable.'
-                            : ($par2Complete ? null : 'PAR2 packets are incomplete; recovery percentage is unavailable.')),
+                        : ($crossVolumeRecoveryConflicts !== []
+                            ? 'Conflicting copies of the same recovery exponent were found across PAR2 volumes; recovery percentage is unavailable.'
+                            : ($par2Complete ? null : 'PAR2 packets are incomplete; recovery percentage is unavailable.'))),
                 ],
                 'yenc_file_lengths' => [
                     'rar_bytes' => $yencSizeCounts['rar'] > 0 ? $yencSizes['rar'] : null,
@@ -1130,11 +1317,44 @@ final class ReleaseFingerprintCollector
         ];
     }
 
+    /**
+     * @param  array<string, mixed>  $relationship
+     * @param  array<string, mixed>|null  $identity
+     * @return array<string, mixed>
+     */
+    private function relateLinesBodyToRequestedArticle(array $relationship, ?array $identity): array
+    {
+        $headBodyMatches = $identity['relations']['head_response_matches_body_response'] ?? null;
+        $bodyRequestMatches = $identity['relations']['body_response_matches_request'] ?? null;
+        $bodyRequestVerified = Par2MetadataParser::bodyResponseIdentityVerified(['article_identity' => $identity]);
+        if ($headBodyMatches === true && $bodyRequestVerified) {
+            $relationship['response_identity_status'] = 'head_body_and_requested_message_ids_match';
+
+            return $relationship;
+        }
+
+        $mismatch = $headBodyMatches === false || $bodyRequestMatches === false;
+        $relationship['status'] = $mismatch ? 'article_identity_mismatch' : 'article_identity_unconfirmed';
+        $relationship['matches'] = null;
+        $relationship['absolute_difference'] = null;
+        $relationship['response_identity_status'] = match (true) {
+            $headBodyMatches === false => 'head_body_message_ids_differ',
+            $bodyRequestMatches === false => 'body_message_id_differs_from_request',
+            ! $bodyRequestVerified => 'body_request_message_id_match_unavailable',
+            default => 'head_body_message_id_match_unavailable',
+        };
+
+        return $relationship;
+    }
+
     /** @param array<string, mixed> $metadata
      * @return array<string, mixed>
      */
     private function decodedFileRange(array $metadata, ?string $decodedBytes): array
     {
+        if (! Par2MetadataParser::bodyResponseIdentityVerified($metadata)) {
+            return ['mapping_status' => 'invalid', 'integrity_status' => 'article_response_identity_unverified'];
+        }
         $yenc = $metadata['yenc'] ?? null;
         if (is_array($yenc) && ($yenc['payload_escape_state_valid'] ?? null) === false) {
             return ['mapping_status' => 'invalid', 'integrity_status' => 'invalid_unmatched_escape'];
@@ -1639,6 +1859,9 @@ final class ReleaseFingerprintCollector
             ));
             $yenc = $observation['metadata']['yenc'] ?? null;
             $integrityConflicts = [];
+            if (! Par2MetadataParser::bodyResponseIdentityVerified($observation['metadata'] ?? [])) {
+                $integrityConflicts[] = 'article_response_identity_unverified';
+            }
             if (is_array($yenc)) {
                 foreach ([
                     'payload_escape_state_valid' => 'unmatched_yenc_escape',
@@ -2318,7 +2541,8 @@ final class ReleaseFingerprintCollector
                     'end' => $multipart ? (is_int($yenc['end'] ?? null) ? $yenc['end'] : null) : $fileSize,
                     'file_size' => $fileSize,
                 ];
-                $decodedSegmentIntegrity[$server] = ($yenc['payload_escape_state_valid'] ?? null) === true
+                $decodedSegmentIntegrity[$server] = Par2MetadataParser::bodyResponseIdentityVerified($observation['metadata'])
+                    && ($yenc['payload_escape_state_valid'] ?? null) === true
                     && ($yenc['header_numeric_fields_valid'] ?? null) === true
                     && ($yenc['trailer_numeric_fields_valid'] ?? null) === true
                     && ($yenc['decoded_size_matches_yenc'] ?? null) === true
@@ -2373,10 +2597,92 @@ final class ReleaseFingerprintCollector
                     return hash('sha256', serialize(array_keys($value)));
                 }, $headers))) === 1,
                 'header_order_comparison_basis' => 'Original field-name occurrence sequence with duplicates and capitalization preserved; normalized_header_order_match separately compares case-folded unique map keys.',
+                'header_comparison_basis' => 'legacy collapsed PHP projection; duplicate occurrences are comma-joined',
+                'ordered_occurrence_comparisons' => $this->compareProviderHeaderOccurrences($perServer),
             ];
         }
 
         return $comparisons;
+    }
+
+    /** @param array<string, array<string, mixed>> $perServer
+     * @return list<array<string, mixed>>
+     */
+    private function compareProviderHeaderOccurrences(array $perServer): array
+    {
+        $providers = array_values($perServer);
+        $comparisons = [];
+        $parser = new NativeMetadataParser;
+        for ($leftIndex = 0; $leftIndex < count($providers); $leftIndex++) {
+            for ($rightIndex = $leftIndex + 1; $rightIndex < count($providers); $rightIndex++) {
+                $left = $providers[$leftIndex];
+                $right = $providers[$rightIndex];
+                $leftHeaders = $left['metadata']['raw_headers'] ?? null;
+                $rightHeaders = $right['metadata']['raw_headers'] ?? null;
+                if (! is_array($leftHeaders) || ! is_array($rightHeaders)) {
+                    $comparison = null;
+                } else {
+                    $leftIdentity = self::providerArticleIdentityMatch($left['metadata']['article_identity'] ?? null);
+                    $rightIdentity = self::providerArticleIdentityMatch($right['metadata']['article_identity'] ?? null);
+                    $identityMatch = $leftIdentity === false || $rightIdentity === false
+                        ? false : ($leftIdentity === true && $rightIdentity === true ? true : null);
+                    $comparison = $parser->compareNntpHeaders(
+                        implode('', array_map('strval', $leftHeaders)),
+                        implode('', array_map('strval', $rightHeaders)),
+                        $identityMatch,
+                    );
+                }
+                $comparisons[] = [
+                    'left_server' => $left['server_role'].' '.$left['server'].':'.$left['server_port'],
+                    'right_server' => $right['server_role'].' '.$right['server'].':'.$right['server_port'],
+                    'comparison_status' => $comparison === null ? 'native_comparison_unavailable' : 'available',
+                    'comparison' => $comparison,
+                ];
+            }
+        }
+
+        return $comparisons;
+    }
+
+    /** @param array<string, mixed>|null $identity */
+    private static function providerArticleIdentityMatch(?array $identity): ?bool
+    {
+        $relations = $identity['relations'] ?? null;
+        if (! is_array($relations)) {
+            return null;
+        }
+        $matches = [
+            $relations['head_response_matches_request'] ?? null,
+            $relations['body_response_matches_request'] ?? null,
+            $relations['head_response_matches_body_response'] ?? null,
+        ];
+        if (in_array(false, $matches, true)) {
+            return false;
+        }
+
+        return count(array_filter($matches, static fn (mixed $match): bool => $match === true)) === count($matches)
+            ? true : null;
+    }
+
+    /** @param array<string, mixed> $article */
+    private function overviewResponseRowStatus(array $article): string
+    {
+        if (($article['overview_attempted'] ?? false) !== true) {
+            return 'not_attempted';
+        }
+        $rowCount = (int) ($article['overview_row_count'] ?? 0);
+        if (($article['overview_response_code'] ?? null) !== 224) {
+            if ($rowCount > 0) {
+                return 'rows_without_success_response';
+            }
+
+            return ($article['overview_response_code'] ?? null) === null ? 'attempt_failed' : 'no_row';
+        }
+        if ($rowCount === 0) {
+            return 'success_without_row';
+        }
+
+        return $rowCount === 1 ? 'single_row' : 'unexpected_multiple_rows';
     }
 
     /** @param list<string> $format

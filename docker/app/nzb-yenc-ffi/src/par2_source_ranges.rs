@@ -284,7 +284,7 @@ fn resolve_slice(
         result.status = "conflicting_overlaps";
         return result;
     }
-    if result.missing_ranges.len() > 0 {
+    if !result.missing_ranges.is_empty() {
         result.status = if result.covered_ranges.is_empty() {
             "unobserved"
         } else {
@@ -341,15 +341,14 @@ fn ranges_for_presence(present: &[bool], base: u64, wanted: bool) -> Vec<ByteRan
         while index < present.len() && present[index] == wanted {
             index += 1;
         }
-        if let (Ok(start_offset), Ok(end_offset)) = (u64::try_from(start), u64::try_from(index)) {
-            if let (Some(start), Some(end_exclusive)) =
+        if let (Ok(start_offset), Ok(end_offset)) = (u64::try_from(start), u64::try_from(index))
+            && let (Some(start), Some(end_exclusive)) =
                 (base.checked_add(start_offset), base.checked_add(end_offset))
-            {
-                ranges.push(ByteRange {
-                    start,
-                    end_exclusive,
-                });
-            }
+        {
+            ranges.push(ByteRange {
+                start,
+                end_exclusive,
+            });
         }
     }
     ranges

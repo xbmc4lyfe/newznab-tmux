@@ -950,9 +950,7 @@ fn parse_encoded_header_folder(
             properties_parse_status,
             seven_zip_aes,
         ) = if flags & 0x20 != 0 {
-            let Some(length) = read_7z_uint64(data, cursor) else {
-                return None;
-            };
+            let length = read_7z_uint64(data, cursor)?;
             let Ok(length_usize) = usize::try_from(length) else {
                 return None;
             };

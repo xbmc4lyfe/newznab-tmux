@@ -1,17 +1,6 @@
-//! C ABI shim that exposes nzb-decode's yEnc decoder under RapidYenc's symbol
-//! names, so `App\Services\Yenc\NativePayloadDecoder` loads it through FFI
-//! unchanged (`YENC_NATIVE_LIBRARY=/path/to/libnzbyenc.so`).
-//!
-//! NNTmux hands the decoder only the encoded payload between `=ybegin`/`=ypart`
-//! and `=yend`, while nzb-decode decodes whole articles. The payload is
-//! therefore wrapped in a minimal header and footer.
-//!
-//! nzb-decode reads `=yend` and `=ypart` wherever a line starts with them, but
-//! inside a payload `=y` is just an escaped byte (encoders never emit it, yet
-//! NNTmux must decode it). Line endings carry no data, so they are removed
-//! first; that leaves the payload's first bytes as its only line start, and any
-//! leading `=y` escapes there are decoded before handing over the rest. Removing
-//! them first also joins escapes split across a line break, as the PHP decoder does.
+//! RapidYenc-compatible C ABI for NNTmux. Payload decoding writes directly
+//! into the caller's buffer; metadata parsers expose separate JSON exports.
+//! Framing and CRC validation remain at the PHP caller boundary.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::panic::catch_unwind;
@@ -22,52 +11,37 @@ mod article_dates;
 mod article_identity;
 mod article_xref;
 mod formats;
+mod nntp_body;
+mod nntp_headers;
 mod par2;
 mod par2_source_ranges;
+mod payload_decoder;
 mod seven_zip_ranges;
+mod yenc_framing;
 
-/// nzb-decode 0.1.3, packed as RapidYenc packs its version (major << 16 | minor << 8 | patch).
+/// Historical shim version retained for callers, packed as major << 16 | minor << 8 | patch.
 const VERSION: c_int = 3 | (1 << 8);
 
 /// Returned instead of a length when decoding fails; NativePayloadDecoder rejects
 /// any length larger than its input.
 const DECODE_FAILED: usize = usize::MAX;
 
-const HEADER: &[u8] = b"=ybegin line=128 name=payload\r\n";
-const FOOTER: &[u8] = b"\r\n=yend\r\n";
 const MAX_METADATA_INPUT_BYTES: usize = 67_108_864;
 const MAX_SEVEN_ZIP_RANGE_INPUT_BYTES: usize = 16 * 1024 * 1024 + 4096;
 const MAX_PAR2_SOURCE_RANGE_INPUT_BYTES: usize = 16 * 1024 * 1024 + 16 * 1024;
 const MAX_ARTICLE_IDENTITY_INPUT_BYTES: usize = 131_072;
 const MAX_ARTICLE_XREF_INPUT_BYTES: usize = 196_608;
+const MAX_NNTP_HEADER_INPUT_BYTES: usize = 131_072;
 
 /// Decode a yEnc payload (CR/LF line endings are skipped, `=X` escapes resolved).
 pub fn decode_payload(payload: &[u8]) -> Option<Vec<u8>> {
-    let mut article = Vec::with_capacity(HEADER.len() + payload.len() + FOOTER.len());
-    article.extend_from_slice(HEADER);
-    let body_start = article.len();
-    article.extend(
-        payload
-            .iter()
-            .copied()
-            .filter(|&b| b != b'\r' && b != b'\n'),
-    );
-
-    let mut decoded = Vec::new();
-    let mut skip = body_start;
-    while article.len() >= skip + 2 && article[skip] == b'=' && article[skip + 1] == b'y' {
-        decoded.push(b'y'.wrapping_sub(106));
-        skip += 2;
-    }
-    article.drain(body_start..skip);
-    article.extend_from_slice(FOOTER);
-
-    let result = nzb_decode::decode_yenc(&article).ok()?;
-    if decoded.is_empty() {
-        return Some(result.data);
-    }
-    decoded.extend_from_slice(&result.data);
-
+    let mut decoded = Vec::with_capacity(payload.len());
+    // SAFETY: the destination has payload.len() bytes of capacity, and the
+    // decoder initializes exactly the returned number of bytes (never more).
+    let written = unsafe {
+        payload_decoder::decode_into(payload.as_ptr(), decoded.as_mut_ptr(), payload.len())
+    };
+    unsafe { decoded.set_len(written) };
     Some(decoded)
 }
 
@@ -216,6 +190,200 @@ pub unsafe extern "C" fn nntmux_par2_source_ranges_json(
     }
 }
 
+/// Return bounded, ordered yEnc control-field occurrences as UTF-8 JSON.
+/// The caller must release it with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs over the bounded parser
+/// budget are rejected by returning a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_yenc_framing_metadata_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > MAX_METADATA_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let encoded = catch_unwind(|| serde_json::to_string(&yenc_framing::parse(input)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Return bounded, ordered NNTP header-field occurrences as UTF-8 JSON.
+/// The caller must release it with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Header blocks over the parser
+/// budget are rejected by returning a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nntp_header_metadata_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > MAX_NNTP_HEADER_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let encoded = catch_unwind(|| serde_json::to_string(&nntp_headers::parse(input)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Compare two length-prefixed NNTP header blocks without collapsing
+/// duplicate field occurrences. The identity flag is -1 when unavailable,
+/// zero when response identities disagree, and one when they agree.
+///
+/// # Safety
+/// data must contain two little-endian u32-length-prefixed header blocks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nntp_header_pair_comparison_json(
+    data: *const u8,
+    length: usize,
+    identity_match: c_int,
+) -> *mut c_char {
+    if length > MAX_NNTP_HEADER_INPUT_BYTES * 2 + 8 || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees data is readable for length bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let Some((left, right)) = unpack_header_pair(input) else {
+        return ptr::null_mut();
+    };
+    let identity_match = match identity_match {
+        0 => Some(false),
+        1 => Some(true),
+        -1 => None,
+        _ => return ptr::null_mut(),
+    };
+    let encoded =
+        catch_unwind(|| serde_json::to_string(&nntp_headers::compare(left, right, identity_match)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+fn unpack_header_pair(input: &[u8]) -> Option<(&[u8], &[u8])> {
+    let left_length = usize::try_from(u32::from_le_bytes(input.get(..4)?.try_into().ok()?)).ok()?;
+    let left_end = 4usize.checked_add(left_length)?;
+    let right_length = usize::try_from(u32::from_le_bytes(
+        input
+            .get(left_end..left_end.checked_add(4)?)?
+            .try_into()
+            .ok()?,
+    ))
+    .ok()?;
+    let right_start = left_end.checked_add(4)?;
+    let right_end = right_start.checked_add(right_length)?;
+    (right_end == input.len()).then(|| (&input[4..left_end], &input[right_start..right_end]))
+}
+
+/// Return body-line framing measurements for post-dot-unstuffing NNTP BODY bytes.
+/// The caller must release the result with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs over the bounded parser
+/// budget are rejected by returning a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nntp_body_measurement_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > MAX_METADATA_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let encoded = catch_unwind(|| serde_json::to_string(&nntp_body::parse(input)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Compare a unique RFC 5536 Lines header occurrence with observed BODY framing.
+/// `data` is a little-endian u32 header length, header bytes, then body bytes.
+/// The caller must release the result with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs over the bounded parser
+/// budget are rejected by returning a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nntp_lines_body_relationship_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > MAX_NNTP_HEADER_INPUT_BYTES + 2_000_004 || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let Some(header_length) = input
+        .get(..4)
+        .and_then(|bytes| usize::try_from(u32::from_le_bytes(bytes.try_into().ok()?)).ok())
+    else {
+        return ptr::null_mut();
+    };
+    let Some(header_end) = 4usize.checked_add(header_length) else {
+        return ptr::null_mut();
+    };
+    let Some(headers) = input.get(4..header_end) else {
+        return ptr::null_mut();
+    };
+    if headers.len() > MAX_NNTP_HEADER_INPUT_BYTES {
+        return ptr::null_mut();
+    }
+    let Some(body) = input.get(header_end..) else {
+        return ptr::null_mut();
+    };
+    if body.len() > 2_000_000 {
+        return ptr::null_mut();
+    }
+    let encoded =
+        catch_unwind(|| serde_json::to_string(&nntp_body::compare_lines_to_body(headers, body)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
 /// Parse a v2 relationship between a requested Message-ID, protocol response
 /// lines, a HEAD field, and the mandatory Message-ID column in an OVER response.
 /// `data` is AI02 followed by five little-endian length-prefixed byte strings;
@@ -310,7 +478,7 @@ pub unsafe extern "C" fn nntmux_article_identity_json(
     overview_response_code: i32,
     overview_attempted: i32,
 ) -> *mut c_char {
-    if length > MAX_ARTICLE_IDENTITY_INPUT_BYTES || length < 4 || data.is_null() {
+    if !(4..=MAX_ARTICLE_IDENTITY_INPUT_BYTES).contains(&length) || data.is_null() {
         return ptr::null_mut();
     }
     // SAFETY: the caller guarantees `data` is readable for `length` bytes.
@@ -393,16 +561,12 @@ pub unsafe extern "C" fn rapidyenc_decode_ex(
     if src.is_null() || dest.is_null() {
         return DECODE_FAILED;
     }
-    // SAFETY: the caller guarantees `src` is readable for `src_length` bytes.
-    let input = unsafe { slice::from_raw_parts(src.cast::<u8>(), src_length) };
-
-    match catch_unwind(|| decode_payload(input)) {
-        Ok(Some(decoded)) if decoded.len() <= src_length => {
-            // SAFETY: `dest` is writable for `src_length` bytes and `decoded` fits.
-            unsafe { ptr::copy_nonoverlapping(decoded.as_ptr(), dest.cast::<u8>(), decoded.len()) };
-            decoded.len()
-        }
-        _ => DECODE_FAILED,
+    match catch_unwind(|| {
+        // SAFETY: the caller supplies readable/writable buffers of src_length.
+        unsafe { payload_decoder::decode_into(src.cast(), dest.cast(), src_length) }
+    }) {
+        Ok(written) => written,
+        Err(_) => DECODE_FAILED,
     }
 }
 
@@ -434,6 +598,72 @@ pub unsafe extern "C" fn rapidyenc_crc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::ffi::CStr;
+
+    thread_local! {
+        static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct ObservedAllocator;
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: ObservedAllocator = ObservedAllocator;
+
+    unsafe impl GlobalAlloc for ObservedAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count_allocation();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            count_allocation();
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            count_allocation();
+            unsafe { System.realloc(pointer, layout, size) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    fn count_allocation() {
+        let _ = COUNT_ALLOCATIONS.try_with(|enabled| {
+            if enabled.get() {
+                let _ = ALLOCATION_COUNT.try_with(|count| count.set(count.get() + 1));
+            }
+        });
+    }
+
+    #[test]
+    fn abi_decodes_without_heap_allocation() {
+        let payload = b"klm=@=J=M=}..\x0b==";
+        let mut output = [0xcc; 32];
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
+        let written = unsafe {
+            rapidyenc_decode_ex(
+                0,
+                payload.as_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                payload.len(),
+                ptr::null_mut(),
+            )
+        };
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+        let allocations = ALLOCATION_COUNT.with(Cell::get);
+        assert_eq!(&output[..written], b"ABC\xd6\xe0\xe3\x13\x04\x04\xe1\xd3");
+        assert_eq!(
+            allocations, 0,
+            "the caller already supplies the destination buffer"
+        );
+    }
 
     fn decode_via_abi(payload: &[u8]) -> Result<Vec<u8>, usize> {
         let mut output = vec![0u8; payload.len()];
@@ -452,6 +682,67 @@ mod tests {
         output.truncate(written);
 
         Ok(output)
+    }
+
+    #[test]
+    fn exposes_ordered_provider_header_comparison_through_ffi() {
+        let left = b"X-Test: a\r\nX-Test: b\r\n\r\n";
+        let right = b"X-Test: a, b\r\n\r\n";
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&(left.len() as u32).to_le_bytes());
+        packed.extend_from_slice(left);
+        packed.extend_from_slice(&(right.len() as u32).to_le_bytes());
+        packed.extend_from_slice(right);
+        let pointer =
+            unsafe { nntmux_nntp_header_pair_comparison_json(packed.as_ptr(), packed.len(), 1) };
+        assert!(!pointer.is_null());
+        let json = unsafe { CStr::from_ptr(pointer) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { nntmux_metadata_string_free(pointer) };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["same_article_comparison_status"],
+            "eligible_same_article"
+        );
+        assert_eq!(parsed["fields"][0]["left_occurrence_count"], 2);
+        assert_eq!(parsed["fields"][0]["right_occurrence_count"], 1);
+        assert_eq!(parsed["fields"][0]["unfolded_value_hashes_match"], false);
+    }
+
+    #[test]
+    fn exposes_lines_body_relationship_through_ffi() {
+        let headers = b"Lines: 2\r\n\r\n";
+        let body = b"a\r\n\r\n";
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+        packed.extend_from_slice(headers);
+        packed.extend_from_slice(body);
+        let pointer =
+            unsafe { nntmux_nntp_lines_body_relationship_json(packed.as_ptr(), packed.len()) };
+        assert!(!pointer.is_null());
+        let json = unsafe { CStr::from_ptr(pointer) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { nntmux_metadata_string_free(pointer) };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["status"], "match");
+        assert_eq!(parsed["declared_body_line_count"], 2);
+        assert_eq!(parsed["observed_body_line_count"], 2);
+    }
+
+    #[test]
+    fn rejects_over_budget_lines_body_headers_at_the_ffi_boundary() {
+        let headers = vec![b'x'; MAX_NNTP_HEADER_INPUT_BYTES + 1];
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+        packed.extend_from_slice(&headers);
+        packed.extend_from_slice(b"body\r\n");
+        let pointer =
+            unsafe { nntmux_nntp_lines_body_relationship_json(packed.as_ptr(), packed.len()) };
+        assert!(pointer.is_null());
     }
 
     #[test]
@@ -533,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_the_nzb_decode_version() {
+    fn reports_the_compatible_shim_version() {
         assert_eq!(rapidyenc_version(), 0x0103);
     }
 }

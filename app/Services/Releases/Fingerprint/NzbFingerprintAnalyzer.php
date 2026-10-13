@@ -53,9 +53,9 @@ final class NzbFingerprintAnalyzer
 
             $files = [];
             $totals = [
-                'rar' => ['file_count' => 0, 'segment_count' => 0, 'advertised_bytes' => 0],
-                'par2' => ['file_count' => 0, 'segment_count' => 0, 'advertised_bytes' => 0],
-                'other' => ['file_count' => 0, 'segment_count' => 0, 'advertised_bytes' => 0],
+                'rar' => ['file_count' => 0, 'segment_count' => 0, 'advertised_bytes' => 0, 'advertised_bytes_overflow' => false],
+                'par2' => ['file_count' => 0, 'segment_count' => 0, 'advertised_bytes' => 0, 'advertised_bytes_overflow' => false],
+                'other' => ['file_count' => 0, 'segment_count' => 0, 'advertised_bytes' => 0, 'advertised_bytes_overflow' => false],
             ];
             $fileElements = $document->xpath('/*[local-name()="nzb"]/*[local-name()="file"]') ?: [];
             foreach ($fileElements as $fileIndex => $element) {
@@ -66,6 +66,7 @@ final class NzbFingerprintAnalyzer
                 $invalidSegmentCount = 0;
                 $invalidSegmentMetadataCount = 0;
                 $advertisedBytes = 0;
+                $advertisedBytesOverflow = false;
                 foreach ($segmentElements as $segment) {
                     $messageId = trim((string) $segment);
                     if ($messageId === '' || preg_match('/\A[^\s<>\x00-\x1f\x7f]+\z/D', trim($messageId, '<>')) !== 1) {
@@ -80,10 +81,15 @@ final class NzbFingerprintAnalyzer
                     if ($parsedNumber === null || $parsedNumber < 1 || $parsedBytes === null) {
                         $invalidSegmentMetadataCount++;
                     }
+                    if (is_int($advertisedBytes) && is_int($parsedBytes) && $parsedBytes > PHP_INT_MAX - $advertisedBytes) {
+                        $advertisedBytesOverflow = true;
+                    }
                     $advertisedBytes = self::checkedAdd($advertisedBytes, $parsedBytes);
                     $segments[] = [
                         'number' => $parsedNumber ?? 0,
                         'bytes' => $parsedBytes,
+                        'source_number' => $segmentNumber,
+                        'source_bytes' => $segmentBytes,
                         'messageid' => trim($messageId, '<>'),
                     ];
                 }
@@ -102,7 +108,8 @@ final class NzbFingerprintAnalyzer
                     'format_hint' => self::formatHint($subject),
                     'subject' => $subject,
                     'poster' => (string) $element['poster'],
-                    'date' => (int) $element['date'] ?: null,
+                    'date' => self::boundedDecimalInt(trim((string) $element['date'])),
+                    'source_date' => (string) $element['date'],
                     'groups' => $groups,
                     'segment_count' => count($segments),
                     'source_segment_record_count' => count($segmentElements),
@@ -112,10 +119,15 @@ final class NzbFingerprintAnalyzer
                     'duplicate_segment_number_count' => count($segmentNumbers) - count(array_unique($segmentNumbers)),
                     'segment_number_sequence_valid' => $numberSequenceValid,
                     'advertised_bytes' => $advertisedBytes,
+                    'advertised_bytes_overflow' => $advertisedBytesOverflow,
                     'segments' => $segments,
                 ];
                 $totals[$kind]['file_count']++;
                 $totals[$kind]['segment_count'] += count($segments);
+                if ($advertisedBytesOverflow || (is_int($totals[$kind]['advertised_bytes']) && is_int($advertisedBytes)
+                    && $advertisedBytes > PHP_INT_MAX - $totals[$kind]['advertised_bytes'])) {
+                    $totals[$kind]['advertised_bytes_overflow'] = true;
+                }
                 $totals[$kind]['advertised_bytes'] = self::checkedAdd($totals[$kind]['advertised_bytes'], $advertisedBytes);
             }
             if ($files === []) {
@@ -237,6 +249,29 @@ final class NzbFingerprintAnalyzer
         }
 
         $frame = ArticleFrame::parse($rawBody);
+        $yencFramingMetadata = (new NativeMetadataParser)->parseYencFraming($rawBody);
+        $nntpHeaderMetadata = (new NativeMetadataParser)->parseNntpHeaders(implode('', $rawHeaders));
+        $nntpBodyMetadata = (new NativeMetadataParser)->parseNntpBody($rawBody)
+            ?? self::fallbackNntpBodyMetadata($rawBody);
+        $nntpLinesBodyRelationship = (new NativeMetadataParser)->compareNntpLinesToBody(
+            implode('', $rawHeaders),
+            $rawBody,
+        );
+        $conflictingYencFields = [];
+        $framingLines = is_array($yencFramingMetadata['lines'] ?? null) ? $yencFramingMetadata['lines'] : [];
+        foreach ($framingLines as $controlLine) {
+            if (! is_array($controlLine) || ! is_string($controlLine['kind'] ?? null)) {
+                continue;
+            }
+            $duplicateFieldNames = is_array($controlLine['conflicting_duplicate_field_names'] ?? null)
+                ? $controlLine['conflicting_duplicate_field_names'] : [];
+            foreach ($duplicateFieldNames as $fieldName) {
+                if (is_string($fieldName)) {
+                    $conflictingYencFields[] = $controlLine['kind'].'.'.$fieldName;
+                }
+            }
+        }
+        $conflictingYencFields = array_values(array_unique($conflictingYencFields));
         $rawHeaderBytes = array_sum(array_map(static fn (string $line): int => str_ends_with($line, "\n") ? strlen($line) : strlen($line) + 2, $rawHeaders));
         $yenc = null;
         $decodedHash = null;
@@ -269,20 +304,29 @@ final class NzbFingerprintAnalyzer
             foreach (preg_split('/\r?\n/', rtrim($payload, "\r\n")) ?: [] as $line) {
                 $payloadLineLengths[] = strlen($line);
             }
-            $rangeStart = isset($frame->part['begin']) ? self::metadataNumber($frame->part['begin']) : null;
-            $rangeEnd = isset($frame->part['end']) ? self::metadataNumber($frame->part['end']) : null;
-            $headerExpectedDecodedSize = isset($frame->header['size'])
+            $rangeFieldsConflict = in_array('ypart.begin', $conflictingYencFields, true)
+                || in_array('ypart.end', $conflictingYencFields, true);
+            $headerSizeConflict = in_array('ybegin.size', $conflictingYencFields, true);
+            $trailerSizeConflict = in_array('yend.size', $conflictingYencFields, true);
+            $rangeStart = ! in_array('ypart.begin', $conflictingYencFields, true) && isset($frame->part['begin'])
+                ? self::metadataNumber($frame->part['begin']) : null;
+            $rangeEnd = ! in_array('ypart.end', $conflictingYencFields, true) && isset($frame->part['end'])
+                ? self::metadataNumber($frame->part['end']) : null;
+            $headerExpectedDecodedSize = ! $headerSizeConflict && isset($frame->header['size'])
                 ? self::metadataNumber($frame->header['size']) : null;
             $hasRangeField = isset($frame->part['begin']) || isset($frame->part['end']);
-            $rangeIsValid = ! $hasRangeField ? null : ($rangeStart !== null && $rangeEnd !== null
+            $rangeIsValid = ! $hasRangeField || $rangeFieldsConflict || $headerSizeConflict ? null : ($rangeStart !== null && $rangeEnd !== null
                 && $rangeStart >= 1 && $rangeEnd >= $rangeStart
                 && (! isset($frame->header['size']) || ($headerExpectedDecodedSize !== null
                     && $rangeEnd <= $headerExpectedDecodedSize)));
             $ypartExpectedDecodedSize = $rangeIsValid === true ? $rangeEnd - $rangeStart + 1 : null;
-            $trailerExpectedDecodedSize = isset($frame->trailer['size'])
+            $trailerExpectedDecodedSize = ! $trailerSizeConflict && isset($frame->trailer['size'])
                 ? self::metadataNumber($frame->trailer['size']) : null;
-            $trailerSizeIsDecimal = ! isset($frame->trailer['size']) || ctype_digit($frame->trailer['size']);
-            $trailerNumericFieldsValid = true;
+            $trailerSizeIsDecimal = $trailerSizeConflict ? null : (! isset($frame->trailer['size']) || ctype_digit($frame->trailer['size']));
+            $trailerNumericFieldsValid = array_intersect(
+                ['yend.size', 'yend.part', 'yend.total'],
+                $conflictingYencFields,
+            ) === [];
             $trailerNumericFieldsRangeValid = true;
             foreach (['size', 'part', 'total'] as $numericField) {
                 if (! isset($frame->trailer[$numericField])) {
@@ -305,16 +349,23 @@ final class NzbFingerprintAnalyzer
             $headerTotalNumber = isset($frame->header['total'])
                 ? self::metadataNumber($frame->header['total']) : null;
             $trailerPartMatchesHeader = null;
-            if (isset($frame->trailer['part'], $frame->header['part'])) {
+            if (isset($frame->trailer['part'], $frame->header['part'])
+                && ! in_array('yend.part', $conflictingYencFields, true)
+                && ! in_array('ybegin.part', $conflictingYencFields, true)) {
                 $trailerPartMatchesHeader = $trailerPartNumber !== null && $headerPartNumber !== null
                     ? $trailerPartNumber === $headerPartNumber : false;
             }
             $trailerTotalMatchesHeader = null;
-            if (isset($frame->trailer['total'], $frame->header['total'])) {
+            if (isset($frame->trailer['total'], $frame->header['total'])
+                && ! in_array('yend.total', $conflictingYencFields, true)
+                && ! in_array('ybegin.total', $conflictingYencFields, true)) {
                 $trailerTotalMatchesHeader = $trailerTotalNumber !== null && $headerTotalNumber !== null
                     ? $trailerTotalNumber === $headerTotalNumber : false;
             }
-            $headerNumericFieldsValid = true;
+            $headerNumericFieldsValid = array_intersect(
+                ['ybegin.line', 'ybegin.size', 'ybegin.part', 'ybegin.total'],
+                $conflictingYencFields,
+            ) === [];
             $headerNumericFieldsRangeValid = true;
             foreach (['line', 'size', 'part', 'total'] as $numericField) {
                 if (! isset($frame->header[$numericField])) {
@@ -336,14 +387,19 @@ final class NzbFingerprintAnalyzer
             }
             $multipart = $frame->part !== null;
             $expectedDecodedSize = $multipart ? $ypartExpectedDecodedSize : $headerExpectedDecodedSize;
-            $expectedCrc = $multipart
-                ? ($frame->trailer['pcrc32'] ?? null)
-                : ($frame->trailer['crc32'] ?? $frame->trailer['pcrc32'] ?? null);
+            $crcField = $multipart ? 'pcrc32' : (isset($frame->trailer['crc32']) ? 'crc32' : 'pcrc32');
+            $crcFieldConflict = in_array('yend.'.$crcField, $conflictingYencFields, true);
+            $expectedCrc = $crcFieldConflict ? null : ($frame->trailer[$crcField] ?? null);
+            $criticalYencFields = [
+                'ybegin.name', 'ybegin.line', 'ybegin.size', 'ybegin.part', 'ybegin.total',
+                'ypart.begin', 'ypart.end', 'yend.size', 'yend.part', 'yend.total', 'yend.pcrc32', 'yend.crc32',
+            ];
+            $integrityChecksAmbiguous = array_intersect($criticalYencFields, $conflictingYencFields) !== [];
             $allDeclaredCrc32FieldsAreHex = true;
-            foreach (['pcrc32', 'crc32'] as $crcField) {
-                if (isset($frame->trailer[$crcField])
-                    && (! is_string($frame->trailer[$crcField])
-                        || preg_match('/\A[0-9a-f]{1,8}\z/i', $frame->trailer[$crcField]) !== 1)) {
+            foreach (['pcrc32', 'crc32'] as $declaredCrcField) {
+                if (isset($frame->trailer[$declaredCrcField])
+                    && (! is_string($frame->trailer[$declaredCrcField])
+                        || preg_match('/\A[0-9a-f]{1,8}\z/i', $frame->trailer[$declaredCrcField]) !== 1)) {
                     $allDeclaredCrc32FieldsAreHex = false;
                 }
             }
@@ -355,7 +411,7 @@ final class NzbFingerprintAnalyzer
             preg_match_all('/^(?:=ybegin|=ypart|=yend)[^\r\n]*/mi', $rawBody, $controlMatches);
             $controlLines = $controlMatches[0] ?? [];
             $par2PrefixLength = min($headerExpectedDecodedSize ?? 16_384, 16_384);
-            $prefixCoverageIsValid = $payloadEscapeStateValid && $par2PrefixLength > 0
+            $prefixCoverageIsValid = ! $integrityChecksAmbiguous && $payloadEscapeStateValid && $par2PrefixLength > 0
                 && $decodedSize >= $par2PrefixLength
                 && (! $multipart
                     ? $headerExpectedDecodedSize === null || $decodedSize === $headerExpectedDecodedSize
@@ -373,6 +429,8 @@ final class NzbFingerprintAnalyzer
                 'multipart' => $multipart,
                 'total_parts' => $headerTotalNumber,
                 'header_numeric_fields_valid' => $headerNumericFieldsValid,
+                'conflicting_control_fields' => $conflictingYencFields,
+                'integrity_checks_ambiguous' => $integrityChecksAmbiguous,
                 'header_numeric_fields_representable' => $headerNumericFieldsRangeValid,
                 'begin' => $rangeStart,
                 'end' => $rangeEnd,
@@ -412,7 +470,8 @@ final class NzbFingerprintAnalyzer
                 'decoded_size_matches_ypart_range' => $ypartExpectedDecodedSize === null ? null : $ypartExpectedDecodedSize === $decodedSize,
                 'decoded_size_matches_yend_size' => $trailerExpectedDecodedSize === null ? null : $trailerExpectedDecodedSize === $decodedSize,
                 'observed_decoded_crc32' => strtoupper($observedCrc),
-                'segment_crc32_basis' => $multipart ? ($expectedCrc === null ? 'missing-pcrc32' : 'pcrc32') : ($expectedCrc === null ? 'missing-crc32' : 'crc32'),
+                'segment_crc32_basis' => $crcFieldConflict ? 'unavailable-conflicting-yenc-field'
+                    : ($multipart ? ($expectedCrc === null ? 'missing-pcrc32' : 'pcrc32') : ($expectedCrc === null ? 'missing-crc32' : $crcField)),
                 'declared_crc32_is_hex' => is_string($expectedCrc) ? preg_match('/\A[0-9a-f]{1,8}\z/i', $expectedCrc) === 1 : null,
                 'all_declared_crc32_fields_are_hex' => $allDeclaredCrc32FieldsAreHex,
                 'declared_crc32_matches' => is_string($expectedCrc) && preg_match('/\A[0-9a-f]{1,8}\z/i', $expectedCrc) === 1
@@ -436,21 +495,56 @@ final class NzbFingerprintAnalyzer
                 'raw_headers' => array_values($rawHeaders),
                 'headers' => $values,
                 'header_profile' => ['ordered_names' => $orderedNames, 'ordered_names_sha256' => hash('sha256', implode("\n", $orderedNames))],
+                'nntp_header_metadata' => $nntpHeaderMetadata ?? [
+                    'parser_engine' => null,
+                    'schema_version' => NativeMetadataParser::NNTP_HEADER_SCHEMA_VERSION,
+                    'status' => 'native_parser_unavailable_or_input_over_budget',
+                    'field_count' => null,
+                    'fields' => [],
+                ],
+                'nntp_body_metadata' => $nntpBodyMetadata,
+                'nntp_lines_body_relationship' => $nntpLinesBodyRelationship ?? [
+                    'parser_engine' => null,
+                    'schema_version' => 1,
+                    'status' => 'native_parser_unavailable_or_input_over_budget',
+                    'matches' => null,
+                ],
                 'retrieval_measurements' => [
                     'raw_header_line_count' => count($rawHeaders),
                     'raw_header_bytes_including_crlf' => $rawHeaderBytes,
                     'body_bytes_after_nntp_dot_unstuffing' => strlen($rawBody),
-                    'body_line_count' => substr_count(rtrim($rawBody, "\r\n"), "\n") + ($rawBody === '' ? 0 : 1),
+                    'body_line_count' => $nntpBodyMetadata['body_line_count'] ?? null,
+                    'body_line_framing_status' => $nntpBodyMetadata['status'] ?? 'unavailable',
                     'article_bytes_after_dot_unstuffing' => $rawHeaderBytes + 2 + strlen($rawBody),
                     'measurement_basis' => 'Collector-side bytes after NNTP dot-unstuffing; excludes TCP/TLS, NNTP status lines, and any wire-level compression.',
                 ],
                 'yenc' => $yenc,
+                'yenc_framing_metadata' => $yencFramingMetadata,
                 'decoded_format_metadata' => $formatMetadata,
                 'article_body_sha256' => hash('sha256', $rawBody),
                 'uploader_software_candidates' => $software,
             ],
             'decoded_bytes' => $decodedBytes,
         ];
+    }
+
+    private static function boundedDecimalInt(string $value): ?int
+    {
+        if (preg_match('/\A[0-9]+\z/D', $value) !== 1) {
+            return null;
+        }
+
+        $normalized = ltrim($value, '0');
+        if ($normalized === '') {
+            return 0;
+        }
+        $maximum = (string) PHP_INT_MAX;
+        if (strlen($normalized) > strlen($maximum)
+            || (strlen($normalized) === strlen($maximum) && strcmp($normalized, $maximum) > 0)) {
+            return null;
+        }
+
+        return (int) $normalized;
     }
 
     private static function payloadEscapeStateValid(string $payload): bool
@@ -509,6 +603,41 @@ final class NzbFingerprintAnalyzer
         }
 
         return strtolower($matches[1]);
+    }
+
+    /** @return array<string, mixed> */
+    private static function fallbackNntpBodyMetadata(string $body): array
+    {
+        $crlfLineBreakCount = substr_count($body, "\r\n");
+        $lfLineBreakCount = substr_count($body, "\n");
+        preg_match_all('/(?<!\r)\n/', $body, $bareLfMatches);
+        preg_match_all('/\r(?!\n)/', $body, $bareCrMatches);
+        $bareLfCount = count($bareLfMatches[0]);
+        $bareCrCount = count($bareCrMatches[0]);
+        $finalLineTerminated = $body === '' || str_ends_with($body, "\r\n");
+        $lastLf = strrpos($body, "\n");
+        $unterminatedTailByteCount = $lastLf === false ? strlen($body) : strlen($body) - $lastLf - 1;
+        $completeCrlfFraming = $bareLfCount === 0 && $bareCrCount === 0 && $finalLineTerminated;
+        $status = $body === '' ? 'empty'
+            : (($bareLfCount > 0 || $bareCrCount > 0) ? 'non_crlf_line_endings'
+                : (! $finalLineTerminated ? 'unterminated_final_line' : 'complete_crlf'));
+
+        return [
+            'parser_engine' => 'php-fallback',
+            'schema_version' => 1,
+            'status' => $status,
+            'body_octets_after_dot_unstuffing' => strlen($body),
+            'crlf_line_break_count' => $crlfLineBreakCount,
+            'lf_line_break_count' => $lfLineBreakCount,
+            'bare_lf_count' => $bareLfCount,
+            'bare_cr_count' => $bareCrCount,
+            'nul_byte_count' => substr_count($body, "\0"),
+            'body_line_count' => $completeCrlfFraming ? $crlfLineBreakCount : null,
+            'observed_lf_delimited_line_count' => $lfLineBreakCount + (int) ($body !== '' && ! str_ends_with($body, "\n")),
+            'unterminated_tail_byte_count' => $unterminatedTailByteCount,
+            'final_line_terminated' => $finalLineTerminated,
+            'measurement_basis' => 'Raw NNTP BODY octets after one dot-unstuffing pass; excludes the NNTP dot terminator.',
+        ];
     }
 
     /** @return list<array{name: string, offset: int, basis: string}> */

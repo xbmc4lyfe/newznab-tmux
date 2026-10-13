@@ -6,6 +6,7 @@ namespace Tests\Feature;
 
 use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\ReleaseFingerprintMetadata;
+use App\Services\Releases\Fingerprint\NativeMetadataParser;
 use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
 use App\Services\Releases\Fingerprint\Par2MetadataParser;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
@@ -134,6 +135,27 @@ final class ReleaseFingerprintMetadataTest extends TestCase
     }
 
     #[Test]
+    public function it_requires_the_current_native_nntp_header_parser_before_marking_coverage_complete(): void
+    {
+        self::assertTrue(NativeMetadataParser::hasCurrentNntpHeaderSchema([
+            'parser_engine' => 'nntmux-rust-nntp-headers',
+            'schema_version' => NativeMetadataParser::NNTP_HEADER_SCHEMA_VERSION,
+            'status' => 'complete',
+        ]));
+        self::assertFalse(NativeMetadataParser::hasCurrentNntpHeaderSchema([
+            'parser_engine' => 'nntmux-rust-nntp-headers',
+            'schema_version' => 1,
+            'status' => 'complete',
+        ]));
+        self::assertFalse(NativeMetadataParser::hasCurrentNntpHeaderSchema([
+            'parser_engine' => null,
+            'schema_version' => NativeMetadataParser::NNTP_HEADER_SCHEMA_VERSION,
+            'status' => 'native_parser_unavailable_or_input_over_budget',
+        ]));
+        self::assertFalse(NativeMetadataParser::hasCurrentNntpHeaderSchema(null));
+    }
+
+    #[Test]
     public function it_lists_every_nzb_file_and_calculates_advertised_parity_ratio(): void
     {
         $xml = <<<'XML'
@@ -154,6 +176,35 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertSame(50, $report['totals']['par2']['advertised_bytes']);
         self::assertSame(12.5, $report['par2_to_rar_advertised_percent']);
         self::assertSame(['Movies'], $report['nzb_meta_values']['category']);
+    }
+
+    #[Test]
+    public function it_preserves_oversized_manifest_numbers_and_withholds_overflowed_totals(): void
+    {
+        $xml = <<<'XML'
+        <nzb>
+          <file subject="archive.rar" poster="poster@example.net" date="9223372036854775808">
+            <segments>
+              <segment bytes="9223372036854775807" number="1">one@example.net</segment>
+              <segment bytes="9223372036854775807" number="9223372036854775808">two@example.net</segment>
+            </segments>
+          </file>
+        </nzb>
+        XML;
+
+        $report = (new NzbFingerprintAnalyzer(new YencService))->analyzeManifest($xml);
+
+        self::assertSame(1, $report['files'][0]['invalid_segment_metadata_count']);
+        $oversizedSegment = collect($report['files'][0]['segments'])->firstWhere('messageid', 'two@example.net');
+        self::assertNotNull($oversizedSegment);
+        self::assertSame('9223372036854775808', $oversizedSegment['source_number']);
+        self::assertNull($report['files'][0]['date']);
+        self::assertSame('9223372036854775808', $report['files'][0]['source_date']);
+        self::assertTrue($report['files'][0]['advertised_bytes_overflow']);
+        self::assertNull($report['files'][0]['advertised_bytes']);
+        self::assertTrue($report['totals']['rar']['advertised_bytes_overflow']);
+        self::assertNull($report['totals']['rar']['advertised_bytes']);
+        self::assertNull($report['par2_to_rar_advertised_percent']);
     }
 
     #[Test]
@@ -182,19 +233,841 @@ final class ReleaseFingerprintMetadataTest extends TestCase
     {
         $fileId = str_repeat('F', 16);
         $main = pack('V2', 4096, 0).pack('V', 1).$fileId;
-        $fileDescription = $fileId.str_repeat('M', 16).str_repeat('N', 16).pack('V2', 5000, 0).'payload.rar'."\0";
+        $fileDescription = $fileId.str_repeat('M', 16).str_repeat('M', 16).pack('V2', 5000, 0).'payload.rar'."\0";
+        $ifsc = $fileId.str_repeat('C', 40);
         $recovery = pack('V', 0).str_repeat('R', 4096);
         $binary = $this->par2Packet("PAR 2.0\0Main", $main)
             .$this->par2Packet("PAR 2.0\0FileDesc", $fileDescription)
+            .$this->par2Packet("PAR 2.0\0IFSC", $ifsc)
             .$this->par2Packet("PAR 2.0\0RecvSlic", $recovery);
 
+        config(['yenc.native_library' => '']);
         $metadata = (new Par2MetadataParser)->parse($binary);
 
+        self::assertSame('php-fallback', $metadata['parser_engine']);
         self::assertSame(5000, $metadata['source_files'][0]['file_length']);
         self::assertSame('payload.rar', $metadata['source_files'][0]['filename']);
         self::assertSame(2, $metadata['source_block_count']);
         self::assertSame(1, $metadata['unique_recovery_slice_count']);
         self::assertSame(50.0, $metadata['recovery_to_source_percent']);
+        $ifscPacket = array_values(array_filter(
+            $metadata['packet_summaries'],
+            static fn (array $packet): bool => $packet['packet_type'] === 'PAR 2.0\\0IFSC',
+        ))[0];
+        self::assertSame(64, $ifscPacket['physical_regions'][0]['byte_length']);
+        self::assertSame(16, $ifscPacket['physical_regions'][2]['byte_length']);
+        self::assertSame(40, $ifscPacket['physical_regions'][3]['byte_length']);
+        self::assertSame(2, $ifscPacket['physical_regions'][3]['record_count']);
+        $recoveryPacket = array_values(array_filter(
+            $metadata['packet_summaries'],
+            static fn (array $packet): bool => $packet['packet_type'] === 'PAR 2.0\\0RecvSlic',
+        ))[0];
+        self::assertSame('recovery_exponent', $recoveryPacket['physical_regions'][2]['kind']);
+        self::assertSame('recovery_data', $recoveryPacket['physical_regions'][3]['kind']);
+    }
+
+    #[Test]
+    public function it_withholds_fallback_par2_percentage_for_inconsistent_small_file_hashes(): void
+    {
+        $filename = 'bad.rar';
+        $length = pack('V2', 5000, 0);
+        $first16k = str_repeat('N', 16);
+        $fileId = md5($first16k.$length.$filename, true);
+        $main = pack('V2', 4096, 0).pack('V', 1).$fileId;
+        $fileDescription = $fileId.str_repeat('M', 16).$first16k.$length.$filename."\0";
+        $binary = $this->par2Packet("PAR 2.0\0Main", $main)
+            .$this->par2Packet("PAR 2.0\0FileDesc", $fileDescription)
+            .$this->par2Packet("PAR 2.0\0RecvSlic", pack('V', 0).str_repeat('R', 4096));
+
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($binary);
+
+        self::assertSame('php-fallback', $metadata['parser_engine']);
+        self::assertFalse($metadata['source_files'][0]['short_file_hashes_consistent']);
+        self::assertFalse($metadata['source_descriptions_valid']);
+        self::assertFalse($metadata['recovery_sets'][0]['source_descriptions_valid']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+    }
+
+    #[Test]
+    public function it_bounds_fallback_main_inventory_before_expanding_file_ids(): void
+    {
+        $main = pack('V2', 4096, 0).pack('V', 0);
+        for ($index = 0; $index < 32769; $index++) {
+            $main .= pack('V4', $index, 0, 0, 0);
+        }
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($this->par2Packet("PAR 2.0\0Main", $main));
+
+        self::assertSame(32768, $metadata['main_file_id_limit']);
+        self::assertTrue($metadata['main_file_id_limit_reached']);
+        self::assertSame(32769, $metadata['main_file_id_limit_observations'][0]['observed_file_id_count']);
+        self::assertNull($metadata['main_packet']);
+        self::assertNull($metadata['source_block_count']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+    }
+
+    #[Test]
+    public function it_validates_par2_input_slice_checksums_after_cross_volume_file_description_merge(): void
+    {
+        $fileId = str_repeat('f', 32);
+        $main = ['all_file_ids' => [$fileId]];
+        $sources = [$fileId => ['file_id' => $fileId, 'file_length' => 5000]];
+        $oneSlice = [[
+            'file_id' => $fileId,
+            'slice_count' => 1,
+            'checksum_records_sha256' => str_repeat('a', 64),
+            'duplicate_conflict' => false,
+        ]];
+        $twoSlices = [[
+            'file_id' => $fileId,
+            'slice_count' => 2,
+            'checksum_records_sha256' => str_repeat('b', 64),
+            'duplicate_conflict' => false,
+        ]];
+
+        $short = Par2MetadataParser::validateCrossVolumeIfscRelationships($main, $sources, 4096, $oneSlice);
+        $matchingCopies = Par2MetadataParser::validateCrossVolumeIfscRelationships(
+            $main,
+            $sources,
+            4096,
+            [$twoSlices[0], $twoSlices[0]],
+        );
+        $conflictingCopies = Par2MetadataParser::validateCrossVolumeIfscRelationships(
+            $main,
+            $sources,
+            4096,
+            [$twoSlices[0], array_merge($twoSlices[0], ['checksum_records_sha256' => str_repeat('c', 64)])],
+        );
+
+        self::assertFalse($short['valid']);
+        self::assertSame([$fileId], $short['slice_count_mismatch_file_ids']);
+        self::assertTrue($matchingCopies['valid']);
+        self::assertSame([$fileId], $conflictingCopies['conflicting_checksum_file_ids']);
+        $pending = Par2MetadataParser::validateCrossVolumeIfscRelationships(
+            $main,
+            [],
+            4096,
+            [$twoSlices[0]],
+        );
+        self::assertTrue($pending['valid']);
+        self::assertSame('pending_source_metadata', $pending['status']);
+        self::assertSame([$fileId], $pending['unresolved_file_ids']);
+    }
+
+    #[Test]
+    public function it_withholds_fallback_par2_percentage_for_an_ifsc_count_mismatch(): void
+    {
+        $fileId = str_repeat('F', 16);
+        $main = pack('V2', 4096, 0).pack('V', 1).$fileId;
+        $fileDescription = $fileId.str_repeat('M', 16).str_repeat('M', 16).pack('V2', 5000, 0).'payload.rar'."\0";
+        $ifsc = $fileId.str_repeat('C', 20);
+        $recovery = pack('V', 0).str_repeat('R', 4096);
+        $binary = $this->par2Packet("PAR 2.0\0Main", $main)
+            .$this->par2Packet("PAR 2.0\0FileDesc", $fileDescription)
+            .$this->par2Packet("PAR 2.0\0IFSC", $ifsc)
+            .$this->par2Packet("PAR 2.0\0RecvSlic", $recovery);
+
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($binary);
+
+        self::assertSame('php-fallback', $metadata['parser_engine']);
+        self::assertTrue($metadata['source_inventory_complete']);
+        self::assertFalse($metadata['ifsc_relationships_valid']);
+        self::assertSame('unavailable-invalid-input-file-slice-checksums', $metadata['recovery_percentage_basis']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+    }
+
+    #[Test]
+    public function it_reports_conflicting_par2_source_definitions_per_recovery_set(): void
+    {
+        $fileId = str_repeat('F', 16);
+        $main = pack('V2', 4096, 0).pack('V', 1).$fileId;
+        $fileDescription = $fileId.str_repeat('M', 16).str_repeat('M', 16).pack('V2', 5000, 0).'one.rar'."\0";
+        $conflictingMain = pack('V2', 8192, 0).pack('V', 1).$fileId;
+        $conflictingFileDescription = $fileId.str_repeat('M', 16).str_repeat('M', 16).pack('V2', 5001, 0).'one.rar'."\0";
+        $binary = $this->par2Packet("PAR 2.0\0Main", $main)
+            .$this->par2Packet("PAR 2.0\0FileDesc", $fileDescription)
+            .$this->par2Packet("PAR 2.0\0Main", $conflictingMain)
+            .$this->par2Packet("PAR 2.0\0FileDesc", $conflictingFileDescription);
+
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($binary);
+
+        self::assertSame('php-fallback', $metadata['parser_engine']);
+        self::assertFalse($metadata['source_inventory_complete']);
+        self::assertTrue($metadata['main_definition_conflict']);
+        self::assertSame([bin2hex($fileId)], $metadata['conflicting_file_description_ids']);
+        self::assertSame('unavailable-conflicting-source-definition-packets', $metadata['recovery_percentage_basis']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertCount(2, $metadata['source_definition_conflicts']);
+        self::assertSame($metadata['packet_summaries'][0]['offset'], $metadata['source_definition_conflicts'][0]['first_packet_offset']);
+        self::assertSame($metadata['packet_summaries'][2]['offset'], $metadata['source_definition_conflicts'][0]['conflicting_packet_offset']);
+        self::assertSame(2, count($metadata['recovery_sets'][0]['source_definition_conflicts']));
+    }
+
+    #[Test]
+    public function it_links_only_trusted_yenc_prefixes_to_unique_or_ambiguous_par2_sources(): void
+    {
+        $hash = '1d64dce239c4437b7736041db089e1b9';
+        $files = [[
+            'index' => 0,
+            'kind' => 'rar',
+            'subject' => 'renamed.part01.rar',
+            'segment_number_sequence_valid' => true,
+            'invalid_segment_record_count' => 0,
+            'invalid_segment_metadata_count' => 0,
+            'duplicate_message_id_count' => 0,
+            'duplicate_segment_number_count' => 0,
+        ]];
+        $observations = [[
+            'file_index' => 0,
+            'segment_number' => 1,
+            'sample_role' => 'first',
+            'server_role' => 'primary',
+            'server' => 'news.example.test',
+            'provider_label' => 'Example provider',
+            'server_port' => 563,
+            'server_tls' => true,
+            'queried_at_utc' => '2026-10-13T12:00:00Z',
+            'message_id' => '<first@example.test>',
+            'metadata' => [
+                'yenc' => [
+                    'file_size' => 20_000,
+                    'multipart' => true,
+                    'begin' => 1,
+                    'end' => 20_000,
+                    'part' => 1,
+                    'total_parts' => 1,
+                    'decoded_segment_size' => 20_000,
+                    'header_numeric_fields_valid' => true,
+                    'integrity_checks_ambiguous' => false,
+                    'ypart_range_valid' => true,
+                    'decoded_size_matches_ypart_range' => true,
+                    'decoded_size_matches_yenc' => true,
+                    'decoded_size_matches_yend_size' => true,
+                    'pcrc32' => 'aabbccdd',
+                    'declared_crc32_is_hex' => true,
+                    'declared_crc32_matches' => true,
+                    'trailer_fields' => ['part' => '1'],
+                ],
+                'yenc_nzb_part_number_matches' => true,
+                'yenc_nzb_total_parts_matches' => true,
+                'article_identity' => [
+                    'parser_engine' => 'nntmux-rust-article-identity',
+                    'schema_version' => 3,
+                    'relations' => ['body_response_matches_request' => true],
+                ],
+                'decoded_format_metadata' => [
+                    'sample_prefix_identity' => [
+                        'bytes_hashed' => 16_384,
+                        'md5' => $hash,
+                        'parser_input_offset_zero' => true,
+                        'file_offset_known' => false,
+                    ],
+                ],
+            ],
+        ]];
+        $sources = [[
+            'recovery_set_id' => str_repeat('a', 32),
+            'file_id' => str_repeat('b', 32),
+            'filename' => 'original.rar',
+            'file_length' => 20_000,
+            'md5_first_16k' => $hash,
+        ]];
+
+        $unique = Par2MetadataParser::relateNzbFilePrefixesToSources($files, $observations, $sources);
+        self::assertSame('candidate_match', $unique['files'][0]['status']);
+        self::assertSame('<first@example.test>', $unique['files'][0]['sample']['message_id']);
+        self::assertSame('Example provider', $unique['files'][0]['sample']['provider_label']);
+        self::assertSame(563, $unique['files'][0]['sample']['server_port']);
+        self::assertTrue($unique['files'][0]['sample']['server_tls']);
+        self::assertSame('2026-10-13T12:00:00Z', $unique['files'][0]['sample']['queried_at_utc']);
+        self::assertSame('original.rar', $unique['files'][0]['matches'][0]['par2_filename']);
+        self::assertFalse($unique['files'][0]['matches'][0]['whole_file_identity_established']);
+
+        $mainDefinitionConflict = Par2MetadataParser::relateNzbFilePrefixesToSources(
+            $files,
+            $observations,
+            $sources,
+            [str_repeat('a', 32).':*'],
+        );
+        self::assertSame('conflicting_source_definition', $mainDefinitionConflict['files'][0]['status']);
+        self::assertSame([], $mainDefinitionConflict['files'][0]['matches']);
+
+        $secondSource = $sources[0];
+        $secondSource['recovery_set_id'] = str_repeat('c', 32);
+        $secondSource['file_id'] = str_repeat('d', 32);
+        $ambiguous = Par2MetadataParser::relateNzbFilePrefixesToSources(
+            $files,
+            $observations,
+            [$sources[0], $secondSource],
+        );
+        self::assertSame('ambiguous', $ambiguous['files'][0]['status']);
+        self::assertCount(2, $ambiguous['files'][0]['matches']);
+    }
+
+    #[Test]
+    public function it_does_not_count_par2_carriers_as_unmatched_source_files(): void
+    {
+        $hash = '1d64dce239c4437b7736041db089e1b9';
+        $files = [
+            [
+                'index' => 0,
+                'kind' => 'rar',
+                'subject' => 'renamed.part01.rar',
+                'segment_number_sequence_valid' => true,
+                'invalid_segment_record_count' => 0,
+                'invalid_segment_metadata_count' => 0,
+                'duplicate_message_id_count' => 0,
+                'duplicate_segment_number_count' => 0,
+            ],
+            ['index' => 1, 'kind' => 'par2', 'subject' => 'set.vol00+01.par2'],
+        ];
+        $observation = [
+            'file_index' => 0,
+            'segment_number' => 1,
+            'sample_role' => 'first',
+            'server_role' => 'primary',
+            'message_id' => '<first@example.test>',
+            'metadata' => [
+                'yenc' => [
+                    'file_size' => 20_000,
+                    'multipart' => true,
+                    'begin' => 1,
+                    'end' => 20_000,
+                    'part' => 1,
+                    'total_parts' => 1,
+                    'decoded_segment_size' => 20_000,
+                    'header_numeric_fields_valid' => true,
+                    'integrity_checks_ambiguous' => false,
+                    'ypart_range_valid' => true,
+                    'decoded_size_matches_ypart_range' => true,
+                    'decoded_size_matches_yenc' => true,
+                    'decoded_size_matches_yend_size' => true,
+                    'pcrc32' => 'aabbccdd',
+                    'declared_crc32_is_hex' => true,
+                    'declared_crc32_matches' => true,
+                    'trailer_fields' => ['part' => '1'],
+                ],
+                'yenc_nzb_part_number_matches' => true,
+                'yenc_nzb_total_parts_matches' => true,
+                'article_identity' => [
+                    'parser_engine' => 'nntmux-rust-article-identity',
+                    'schema_version' => 3,
+                    'relations' => ['body_response_matches_request' => true],
+                ],
+                'decoded_format_metadata' => [
+                    'sample_prefix_identity' => [
+                        'bytes_hashed' => 16_384,
+                        'md5' => $hash,
+                        'parser_input_offset_zero' => true,
+                        'file_offset_known' => false,
+                    ],
+                ],
+            ],
+        ];
+        $result = Par2MetadataParser::relateNzbFilePrefixesToSources(
+            $files,
+            [$observation, ['file_index' => 1, 'sample_role' => 'all_par2_segments']],
+            [[
+                'recovery_set_id' => str_repeat('a', 32),
+                'file_id' => str_repeat('b', 32),
+                'filename' => 'original.rar',
+                'file_length' => 20_000,
+                'md5_first_16k' => $hash,
+            ]],
+        );
+
+        self::assertSame('complete', $result['status']);
+        self::assertSame(2, $result['nzb_file_count']);
+        self::assertSame(1, $result['source_file_count']);
+        self::assertSame(1, $result['par2_carrier_file_count']);
+        self::assertSame('candidate_match', $result['files'][0]['status']);
+    }
+
+    #[Test]
+    public function it_rejects_prefix_matches_when_yenc_trailer_numbers_disagree(): void
+    {
+        $hash = '1d64dce239c4437b7736041db089e1b9';
+        $file = [
+            'index' => 0,
+            'kind' => 'rar',
+            'subject' => 'one.rar',
+            'segment_number_sequence_valid' => true,
+            'invalid_segment_record_count' => 0,
+            'invalid_segment_metadata_count' => 0,
+            'duplicate_message_id_count' => 0,
+            'duplicate_segment_number_count' => 0,
+        ];
+        $observation = [
+            'file_index' => 0,
+            'segment_number' => 1,
+            'sample_role' => 'first',
+            'server_role' => 'primary',
+            'message_id' => '<first@example.test>',
+            'metadata' => [
+                'yenc' => [
+                    'file_size' => 20_000,
+                    'multipart' => true,
+                    'begin' => 1,
+                    'end' => 20_000,
+                    'part' => 1,
+                    'total_parts' => 1,
+                    'decoded_segment_size' => 20_000,
+                    'header_numeric_fields_valid' => true,
+                    'integrity_checks_ambiguous' => false,
+                    'ypart_range_valid' => true,
+                    'decoded_size_matches_ypart_range' => true,
+                    'decoded_size_matches_yenc' => true,
+                    'decoded_size_matches_yend_size' => true,
+                    'pcrc32' => 'aabbccdd',
+                    'declared_crc32_is_hex' => true,
+                    'declared_crc32_matches' => true,
+                    'trailer_fields' => ['part' => '2'],
+                ],
+                'yenc_nzb_part_number_matches' => true,
+                'yenc_nzb_total_parts_matches' => true,
+                'article_identity' => [
+                    'parser_engine' => 'nntmux-rust-article-identity',
+                    'schema_version' => 3,
+                    'relations' => ['body_response_matches_request' => true],
+                ],
+                'decoded_format_metadata' => [
+                    'sample_prefix_identity' => [
+                        'bytes_hashed' => 16_384,
+                        'md5' => $hash,
+                        'parser_input_offset_zero' => true,
+                        'file_offset_known' => false,
+                    ],
+                ],
+            ],
+        ];
+        $result = Par2MetadataParser::relateNzbFilePrefixesToSources(
+            [$file],
+            [$observation],
+            [[
+                'recovery_set_id' => str_repeat('a', 32),
+                'file_id' => str_repeat('b', 32),
+                'filename' => 'one.rar',
+                'file_length' => 20_000,
+                'md5_first_16k' => $hash,
+            ]],
+        );
+
+        self::assertSame('insufficient_evidence', $result['files'][0]['status']);
+        self::assertSame('yenc_integrity_failed', $result['files'][0]['evidence_status']);
+        self::assertSame([], $result['files'][0]['matches']);
+
+        $validTrailerObservation = $observation;
+        $validTrailerObservation['metadata']['yenc']['begin'] = 1;
+        $validTrailerObservation['metadata']['yenc']['end'] = 20_000;
+        $validTrailerObservation['metadata']['yenc']['declared_crc32_matches'] = true;
+        $validTrailerObservation['metadata']['yenc']['trailer_fields'] = ['part' => '1'];
+        $validTrailerObservation['metadata']['yenc_framing_metadata'] = [
+            'parser_engine' => 'nntmux-rust-ffi',
+            'frame_count' => 1,
+            'frames_truncated' => false,
+            'frames' => [['part_number_matches' => false, 'total_parts_match' => true]],
+        ];
+        $nativeMismatch = Par2MetadataParser::relateNzbFilePrefixesToSources(
+            [$file],
+            [$validTrailerObservation],
+            [[
+                'recovery_set_id' => str_repeat('a', 32),
+                'file_id' => str_repeat('b', 32),
+                'filename' => 'one.rar',
+                'file_length' => 100,
+                'md5_first_16k' => str_repeat('1', 32),
+            ]],
+        );
+        self::assertSame('yenc_integrity_failed', $nativeMismatch['files'][0]['evidence_status']);
+        self::assertSame([], $nativeMismatch['files'][0]['matches']);
+    }
+
+    #[Test]
+    public function it_validates_the_selected_single_part_yenc_crc_field(): void
+    {
+        self::assertFalse(Par2MetadataParser::declaredYencCrc32Valid([
+            'crc32' => null,
+            'pcrc32' => 'aabbccdd',
+            'segment_crc32_basis' => 'pcrc32',
+            'declared_crc32_is_hex' => true,
+            'declared_crc32_matches' => false,
+        ]));
+        self::assertFalse(Par2MetadataParser::declaredYencCrc32Valid([
+            'crc32' => null,
+            'pcrc32' => 'not-hex',
+            'segment_crc32_basis' => 'pcrc32',
+            'declared_crc32_is_hex' => false,
+            'declared_crc32_matches' => null,
+        ]));
+        self::assertTrue(Par2MetadataParser::declaredYencCrc32Valid([
+            'crc32' => 'aabbccdd',
+            'pcrc32' => null,
+            'segment_crc32_basis' => 'crc32',
+            'declared_crc32_is_hex' => true,
+            'declared_crc32_matches' => true,
+        ]));
+        self::assertTrue(Par2MetadataParser::declaredYencCrc32Valid([
+            'crc32' => null,
+            'pcrc32' => null,
+            'segment_crc32_basis' => 'missing-crc32',
+            'declared_crc32_is_hex' => null,
+            'declared_crc32_matches' => null,
+        ]));
+    }
+
+    #[Test]
+    public function it_requires_the_requested_body_message_id_before_trusting_par2_bytes(): void
+    {
+        $metadata = [
+            'article_identity' => [
+                'parser_engine' => 'nntmux-rust-article-identity',
+                'schema_version' => 3,
+                'relations' => ['body_response_matches_request' => true],
+            ],
+        ];
+
+        self::assertTrue(Par2MetadataParser::bodyResponseIdentityVerified($metadata));
+
+        $metadata['article_identity']['relations']['body_response_matches_request'] = false;
+        self::assertFalse(Par2MetadataParser::bodyResponseIdentityVerified($metadata));
+
+        unset($metadata['article_identity']['relations']['body_response_matches_request']);
+        self::assertFalse(Par2MetadataParser::bodyResponseIdentityVerified($metadata));
+    }
+
+    #[Test]
+    public function it_requires_body_identity_before_admitting_source_or_seven_zip_ranges(): void
+    {
+        $collector = (new \ReflectionClass(ReleaseFingerprintCollector::class))->newInstanceWithoutConstructor();
+        $rangeMethod = new \ReflectionMethod($collector, 'decodedFileRange');
+        $body = "=ybegin line=128 size=3 name=one.7z\r\nklm\r\n=yend size=3 crc32=a3830348\r\n";
+        $metadata = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $body);
+        $metadata['article_identity'] = [
+            'parser_engine' => 'nntmux-rust-article-identity',
+            'schema_version' => 3,
+            'relations' => ['body_response_matches_request' => true],
+        ];
+
+        self::assertSame('valid', $rangeMethod->invoke($collector, $metadata, 'ABC')['mapping_status']);
+
+        foreach ([false, null] as $identityMatches) {
+            $metadata['article_identity']['relations']['body_response_matches_request'] = $identityMatches;
+            $range = $rangeMethod->invoke($collector, $metadata, 'ABC');
+
+            self::assertNotSame('valid', $range['mapping_status']);
+            self::assertArrayNotHasKey('start_offset', $range);
+            self::assertArrayNotHasKey('end_offset_exclusive', $range);
+        }
+
+        unset($metadata['article_identity']);
+        self::assertNotSame('valid', $rangeMethod->invoke($collector, $metadata, 'ABC')['mapping_status']);
+    }
+
+    #[Test]
+    public function it_requires_requested_identity_for_lines_body_relationships(): void
+    {
+        $collector = (new \ReflectionClass(ReleaseFingerprintCollector::class))->newInstanceWithoutConstructor();
+        $method = new \ReflectionMethod($collector, 'relateLinesBodyToRequestedArticle');
+        $relationship = ['status' => 'match', 'matches' => true, 'absolute_difference' => 0];
+        $identity = [
+            'parser_engine' => 'nntmux-rust-article-identity',
+            'schema_version' => 3,
+            'relations' => [
+                'head_response_matches_body_response' => true,
+                'body_response_matches_request' => false,
+            ],
+        ];
+
+        $mismatched = $method->invoke($collector, $relationship, $identity);
+        self::assertSame('article_identity_mismatch', $mismatched['status']);
+        self::assertNull($mismatched['matches']);
+        self::assertNull($mismatched['absolute_difference']);
+        self::assertSame('body_message_id_differs_from_request', $mismatched['response_identity_status']);
+
+        $identity['relations']['body_response_matches_request'] = true;
+        self::assertTrue($method->invoke($collector, $relationship, $identity)['matches']);
+        self::assertNull($method->invoke($collector, $relationship, null)['matches']);
+
+        $identity['relations']['head_response_matches_body_response'] = false;
+        self::assertNull($method->invoke($collector, $relationship, $identity)['matches']);
+    }
+
+    #[Test]
+    public function it_preserves_source_conflict_keys_even_when_a_par2_volume_is_not_admissible(): void
+    {
+        $conflictedKeys = Par2MetadataParser::sourceDefinitionConflictKeys([
+            'source_definition_conflicts' => [
+                ['recovery_set_id' => str_repeat('A', 32), 'file_id' => str_repeat('B', 32)],
+                ['recovery_set_id' => str_repeat('C', 32), 'file_id' => null],
+            ],
+        ]);
+
+        self::assertSame([
+            strtolower(str_repeat('A', 32).':'.str_repeat('B', 32)),
+            strtolower(str_repeat('C', 32).':*'),
+        ], $conflictedKeys);
+    }
+
+    #[Test]
+    public function it_withholds_prefix_relationships_without_trusted_start_offset_and_integrity(): void
+    {
+        $observation = [
+            'file_index' => 0,
+            'segment_number' => 1,
+            'sample_role' => 'first',
+            'server_role' => 'primary',
+            'message_id' => '<first@example.test>',
+            'metadata' => [
+                'yenc' => [
+                    'file_size' => 100,
+                    'multipart' => true,
+                    'begin' => 2,
+                    'end' => 101,
+                    'part' => 1,
+                    'total_parts' => 1,
+                    'header_numeric_fields_valid' => true,
+                    'integrity_checks_ambiguous' => false,
+                    'ypart_range_valid' => true,
+                    'decoded_size_matches_ypart_range' => true,
+                    'decoded_size_matches_yenc' => true,
+                    'decoded_size_matches_yend_size' => true,
+                    'decoded_segment_size' => 100,
+                    'pcrc32' => 'aabbccdd',
+                    'declared_crc32_is_hex' => true,
+                    'declared_crc32_matches' => false,
+                    'trailer_fields' => ['part' => '1'],
+                ],
+                'yenc_nzb_part_number_matches' => true,
+                'yenc_nzb_total_parts_matches' => true,
+                'article_identity' => [
+                    'parser_engine' => 'nntmux-rust-article-identity',
+                    'schema_version' => 3,
+                    'relations' => ['body_response_matches_request' => true],
+                ],
+                'decoded_format_metadata' => [
+                    'sample_prefix_identity' => [
+                        'bytes_hashed' => 100,
+                        'md5' => str_repeat('1', 32),
+                        'parser_input_offset_zero' => true,
+                        'file_offset_known' => false,
+                    ],
+                ],
+            ],
+        ];
+        $result = Par2MetadataParser::relateNzbFilePrefixesToSources(
+            [[
+                'index' => 0,
+                'kind' => 'rar',
+                'subject' => 'one.rar',
+                'segment_number_sequence_valid' => true,
+                'invalid_segment_record_count' => 0,
+                'invalid_segment_metadata_count' => 0,
+                'duplicate_message_id_count' => 0,
+                'duplicate_segment_number_count' => 0,
+            ]],
+            [$observation],
+            [[
+                'recovery_set_id' => str_repeat('a', 32),
+                'file_id' => str_repeat('b', 32),
+                'filename' => 'one.rar',
+                'file_length' => 100,
+                'md5_first_16k' => str_repeat('1', 32),
+            ]],
+        );
+
+        self::assertSame('insufficient_evidence', $result['files'][0]['status']);
+        self::assertSame('yenc_start_offset_not_zero', $result['files'][0]['evidence_status']);
+        self::assertSame([], $result['files'][0]['matches']);
+
+        $failedIntegrityObservation = $observation;
+        $failedIntegrityObservation['metadata']['yenc']['begin'] = 1;
+        $failedIntegrityObservation['metadata']['yenc']['end'] = 100;
+        $failedIntegrity = Par2MetadataParser::relateNzbFilePrefixesToSources(
+            [[
+                'index' => 0,
+                'kind' => 'rar',
+                'subject' => 'one.rar',
+                'segment_number_sequence_valid' => true,
+                'invalid_segment_record_count' => 0,
+                'invalid_segment_metadata_count' => 0,
+                'duplicate_message_id_count' => 0,
+                'duplicate_segment_number_count' => 0,
+            ]],
+            [$failedIntegrityObservation],
+            [[
+                'recovery_set_id' => str_repeat('a', 32),
+                'file_id' => str_repeat('b', 32),
+                'filename' => 'one.rar',
+                'file_length' => 100,
+                'md5_first_16k' => str_repeat('1', 32),
+            ]],
+        );
+        self::assertSame('insufficient_evidence', $failedIntegrity['files'][0]['status']);
+        self::assertSame('yenc_integrity_failed', $failedIntegrity['files'][0]['evidence_status']);
+    }
+
+    #[Test]
+    public function it_maps_par2_packet_ranges_to_the_exact_nntp_segments_that_carried_them(): void
+    {
+        $packets = [
+            ['offset' => 8, 'packet_bytes' => 12],
+        ];
+        $segments = [
+            ['segment_number' => 1, 'message_id' => 'one@example.net', 'offset' => 0, 'byte_length' => 10,
+                'declared_file_byte_start' => 1, 'declared_file_byte_end_inclusive' => 10,
+                'declared_range_matches_assembled_position' => true],
+            ['segment_number' => 2, 'message_id' => 'two@example.net', 'offset' => 10, 'byte_length' => 10,
+                'declared_file_byte_start' => 1, 'declared_file_byte_end_inclusive' => 10,
+                'declared_range_matches_assembled_position' => false],
+        ];
+
+        $mapped = Par2MetadataParser::mapPacketArticleSpans($packets, $segments);
+
+        self::assertSame([
+            ['segment_number' => 1, 'message_id' => 'one@example.net', 'assembled_file_byte_start' => 8, 'assembled_file_byte_end_exclusive' => 10, 'segment_byte_start' => 8, 'segment_byte_end_exclusive' => 10, 'overlap_bytes' => 2,
+                'declared_file_byte_start' => 1, 'declared_file_byte_end_inclusive' => 10,
+                'declared_range_matches_assembled_position' => true],
+            ['segment_number' => 2, 'message_id' => 'two@example.net', 'assembled_file_byte_start' => 10, 'assembled_file_byte_end_exclusive' => 20, 'segment_byte_start' => 0, 'segment_byte_end_exclusive' => 10, 'overlap_bytes' => 10,
+                'declared_file_byte_start' => 1, 'declared_file_byte_end_inclusive' => 10,
+                'declared_range_matches_assembled_position' => false],
+        ], $mapped[0]['article_segments']);
+        self::assertTrue($mapped[0]['article_span_mapping_complete']);
+        self::assertSame(12, $mapped[0]['article_span_mapped_bytes']);
+    }
+
+    #[Test]
+    public function it_treats_zero_length_par2_regions_as_vacuously_mapped(): void
+    {
+        $mapped = Par2MetadataParser::mapPacketArticleSpans(
+            [['offset' => 10, 'packet_bytes' => 0], ['offset' => 21, 'packet_bytes' => 0]],
+            [['segment_number' => 1, 'message_id' => 'one@example.net', 'offset' => 0, 'byte_length' => 10]],
+        );
+
+        self::assertSame([], $mapped[0]['article_segments']);
+        self::assertSame(0, $mapped[0]['article_span_mapped_bytes']);
+        self::assertTrue($mapped[0]['article_span_mapping_complete']);
+        self::assertFalse($mapped[1]['article_span_mapping_complete']);
+    }
+
+    #[Test]
+    public function it_detects_conflicting_recovery_slices_across_par2_volumes(): void
+    {
+        $volumes = [
+            ['file_index' => 4, 'subject' => 'set.vol00+01.par2', 'recovery_packets' => [[
+                'recovery_set_id' => 'set-id', 'exponent' => 7, 'slice_sha256' => str_repeat('a', 64), 'packet_offset' => 64,
+                'article_segments' => [['segment_number' => 1, 'message_id' => 'first@example.net']],
+            ]]],
+            ['file_index' => 5, 'subject' => 'set.vol01+01.par2', 'recovery_packets' => [[
+                'recovery_set_id' => 'set-id', 'exponent' => 7, 'slice_sha256' => str_repeat('b', 64), 'packet_offset' => 128,
+                'article_segments' => [['segment_number' => 2, 'message_id' => 'second@example.net']],
+            ]]],
+        ];
+
+        $conflicts = Par2MetadataParser::findCrossVolumeRecoveryConflicts($volumes);
+
+        self::assertCount(1, $conflicts);
+        self::assertSame('set-id', $conflicts[0]['recovery_set_id']);
+        self::assertSame(7, $conflicts[0]['exponent']);
+        self::assertSame('first@example.net', $conflicts[0]['first_article_segments'][0]['message_id']);
+        self::assertSame('second@example.net', $conflicts[0]['conflicting_article_segments'][0]['message_id']);
+        self::assertSame([], Par2MetadataParser::findCrossVolumeRecoveryConflicts([
+            ['file_index' => 4, 'recovery_packets' => [
+                ['recovery_set_id' => 'set-id', 'exponent' => 7, 'slice_sha256' => str_repeat('a', 64), 'packet_offset' => 64],
+                ['recovery_set_id' => 'set-id', 'exponent' => 7, 'slice_sha256' => str_repeat('b', 64), 'packet_offset' => 128],
+            ]],
+        ]));
+    }
+
+    #[Test]
+    public function it_excludes_wrong_sized_recovery_slices_from_set_level_counts(): void
+    {
+        $packets = [
+            ['exponent' => 2, 'payload_bytes' => 4100],
+            ['exponent' => 3, 'payload_bytes' => 8],
+            ['exponent' => 2, 'payload_bytes' => 4100],
+        ];
+
+        self::assertSame([2], Par2MetadataParser::validatedRecoveryExponents($packets, 4096));
+        self::assertSame([], Par2MetadataParser::validatedRecoveryExponents($packets, PHP_INT_MAX));
+    }
+
+    #[Test]
+    public function it_withholds_par2_recovery_percentage_for_conflicting_exponent_packets(): void
+    {
+        $fileId = str_repeat('F', 16);
+        $main = pack('V2', 4096, 0).pack('V', 1).$fileId;
+        $fileDescription = $fileId.str_repeat('M', 16).str_repeat('M', 16).pack('V2', 5000, 0).'payload.rar'."\0";
+        $firstRecovery = pack('V', 3).str_repeat('R', 4096);
+        $identicalRecovery = $firstRecovery;
+        $conflictingRecovery = pack('V', 3).str_repeat('X', 4096);
+        $binary = $this->par2Packet("PAR 2.0\0Main", $main)
+            .$this->par2Packet("PAR 2.0\0FileDesc", $fileDescription)
+            .$this->par2Packet("PAR 2.0\0RecvSlic", $firstRecovery)
+            .$this->par2Packet("PAR 2.0\0RecvSlic", $identicalRecovery)
+            .$this->par2Packet("PAR 2.0\0RecvSlic", $conflictingRecovery);
+
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($binary);
+
+        self::assertSame('php-fallback', $metadata['parser_engine']);
+        self::assertSame(1, $metadata['invalid_packet_count']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertSame('unavailable-conflicting-recovery-exponent-packets', $metadata['recovery_percentage_basis']);
+        self::assertCount(1, $metadata['conflicting_recovery_exponents']);
+        self::assertSame(3, $metadata['conflicting_recovery_exponents'][0]['exponent']);
+        self::assertSame($metadata['packet_summaries'][2]['offset'], $metadata['conflicting_recovery_exponents'][0]['first_packet_offset']);
+        self::assertSame($metadata['packet_summaries'][4]['offset'], $metadata['conflicting_recovery_exponents'][0]['conflicting_packet_offset']);
+        self::assertSame([3], $metadata['recovery_sets'][0]['conflicting_recovery_exponents']);
+    }
+
+    #[Test]
+    public function it_keeps_recovery_only_par2_volume_slices_pending_set_level_validation(): void
+    {
+        $recovery = pack('V', 7).str_repeat('R', 4096);
+        $binary = $this->par2Packet("PAR 2.0\0Creator", str_pad('par2j v1.3.3', 16, "\0"))
+            .$this->par2Packet("PAR 2.0\0RecvSlic", $recovery);
+
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($binary);
+
+        self::assertSame(0, $metadata['invalid_packet_count']);
+        self::assertSame([7], $metadata['recovery_exponents']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertSame('unavailable-source-block-size-not-in-this-volume', $metadata['recovery_percentage_basis']);
+    }
+
+    #[Test]
+    public function it_excludes_wrong_sized_recovery_packets_from_cross_volume_evidence(): void
+    {
+        $fileId = str_repeat('F', 16);
+        $main = pack('V2', 4096, 0).pack('V', 1).$fileId;
+        $binary = $this->par2Packet("PAR 2.0\0Main", $main)
+            .$this->par2Packet("PAR 2.0\0RecvSlic", str_pad(pack('V', 7).'R', 8, "\0"));
+
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($binary);
+
+        self::assertSame(1, $metadata['invalid_packet_count']);
+        self::assertSame([], $metadata['recovery_packets']);
+    }
+
+    #[Test]
+    public function it_reports_unrepresentable_par2_u64_values_without_crashing_the_fallback(): void
+    {
+        $fileId = str_repeat('F', 16);
+        $main = pack('V2', 0xFFFF_FFFC, 0xFFFF_FFFF).pack('V', 1).$fileId;
+        $binary = $this->par2Packet("PAR 2.0\0Main", $main);
+
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($binary);
+
+        self::assertSame('php-fallback', $metadata['parser_engine']);
+        self::assertSame(1, $metadata['invalid_packet_count']);
+        self::assertNull($metadata['source_block_size']);
+        self::assertNull($metadata['main_packet']);
     }
 
     #[Test]
@@ -215,6 +1088,22 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertSame('archive.part01.rar', $article['yenc']['name']);
         self::assertSame(14, $article['yenc']['decoded_segment_size']);
         self::assertNotEmpty($article['article_body_sha256']);
+    }
+
+    #[Test]
+    public function it_counts_trailing_blank_nntp_body_lines_without_trimming_them_away(): void
+    {
+        $analyzer = new NzbFingerprintAnalyzer(new YencService);
+
+        $article = $analyzer->analyzeArticle([], "a\r\n\r\n");
+        $blankLines = $analyzer->analyzeArticle([], "\r\n\r\n");
+        $bareLf = $analyzer->analyzeArticle([], "a\n\n");
+
+        self::assertSame(2, $article['retrieval_measurements']['body_line_count']);
+        self::assertSame(2, $blankLines['retrieval_measurements']['body_line_count']);
+        self::assertSame('complete_crlf', $article['nntp_body_metadata']['status']);
+        self::assertNull($bareLf['retrieval_measurements']['body_line_count']);
+        self::assertSame('non_crlf_line_endings', $bareLf['retrieval_measurements']['body_line_framing_status']);
     }
 
     private function par2Packet(string $type, string $payload): string

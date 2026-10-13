@@ -9,11 +9,19 @@ use Throwable;
 
 final class NativeMetadataParser
 {
+    public const NNTP_HEADER_SCHEMA_VERSION = 3;
+
     /** @var array<string, FFI> */
     private static array $libraries = [];
 
     /** @var array<string, FFI> */
     private static array $identityLibraries = [];
+
+    /** @var array<string, FFI> */
+    private static array $headerLibraries = [];
+
+    /** @var array<string, FFI> */
+    private static array $bodyLibraries = [];
 
     /** @var array<string, FFI> */
     private static array $xrefLibraries = [];
@@ -56,6 +64,63 @@ final class NativeMetadataParser
     public function resolvePar2SourceRanges(string $packedRanges): ?array
     {
         return $this->parseJson('nntmux_par2_source_ranges_json', $packedRanges);
+    }
+
+    /** @return array<string, mixed>|null */
+    public function parseYencFraming(string $bytes): ?array
+    {
+        return $this->parseJson('nntmux_yenc_framing_metadata_json', $bytes);
+    }
+
+    /** @return array<string, mixed>|null */
+    public function parseNntpHeaders(string $bytes): ?array
+    {
+        if (strlen($bytes) > 131_072) {
+            return null;
+        }
+
+        return $this->parseJson('nntmux_nntp_header_metadata_json', $bytes);
+    }
+
+    /** @return array<string, mixed>|null */
+    public function compareNntpHeaders(string $left, string $right, ?bool $identityMatch): ?array
+    {
+        if (strlen($left) > 131_072 || strlen($right) > 131_072) {
+            return null;
+        }
+        $identityFlag = $identityMatch === null ? -1 : (int) $identityMatch;
+        $packed = pack('V', strlen($left)).$left.pack('V', strlen($right)).$right;
+
+        return $this->parseJson('nntmux_nntp_header_pair_comparison_json', $packed, [$identityFlag]);
+    }
+
+    /** @return array<string, mixed>|null */
+    public function parseNntpBody(string $bytes): ?array
+    {
+        if (strlen($bytes) > 2_000_000) {
+            return null;
+        }
+
+        return $this->parseJson('nntmux_nntp_body_measurement_json', $bytes);
+    }
+
+    /** @return array<string, mixed>|null */
+    public function compareNntpLinesToBody(string $headers, string $body): ?array
+    {
+        if (strlen($headers) > 131_072 || strlen($body) > 2_000_000) {
+            return null;
+        }
+        $packed = pack('V', strlen($headers)).$headers.$body;
+
+        return $this->parseJson('nntmux_nntp_lines_body_relationship_json', $packed);
+    }
+
+    /** @param array<string, mixed>|null $metadata */
+    public static function hasCurrentNntpHeaderSchema(?array $metadata): bool
+    {
+        return ($metadata['parser_engine'] ?? null) === 'nntmux-rust-nntp-headers'
+            && ($metadata['schema_version'] ?? null) === self::NNTP_HEADER_SCHEMA_VERSION
+            && ($metadata['status'] ?? null) === 'complete';
     }
 
     /** @param list<string> $rawHeaders
@@ -133,7 +198,12 @@ final class NativeMetadataParser
         $identityParser = $function === 'nntmux_article_identity_v2_json';
         $xrefParser = $function === 'nntmux_article_identity_xref_v1_json';
         $dateParser = $function === 'nntmux_article_dates_v1_json';
-        $library = $this->library($identityParser, $xrefParser, $dateParser);
+        $library = match ($function) {
+            'nntmux_nntp_header_metadata_json', 'nntmux_nntp_header_pair_comparison_json',
+            'nntmux_nntp_lines_body_relationship_json' => $this->headerLibrary(),
+            'nntmux_nntp_body_measurement_json' => $this->bodyLibrary(),
+            default => $this->library($identityParser, $xrefParser, $dateParser),
+        };
         if ($library === null || strlen($bytes) > 67_108_864) {
             return null;
         }
@@ -221,6 +291,7 @@ final class NativeMetadataParser
                 $definitions = <<<'C'
                 char* nntmux_par2_metadata_json(const unsigned char* data, size_t length);
                 char* nntmux_format_metadata_json(const unsigned char* data, size_t length);
+                char* nntmux_yenc_framing_metadata_json(const unsigned char* data, size_t length);
                 char* nntmux_seven_zip_ranges_json(const unsigned char* data, size_t length);
                 char* nntmux_par2_source_ranges_json(const unsigned char* data, size_t length);
                 void nntmux_metadata_string_free(char* value);
@@ -236,6 +307,66 @@ final class NativeMetadataParser
             } else {
                 self::$libraries[$key] = $library;
             }
+
+            return $library;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private function headerLibrary(): ?FFI
+    {
+        if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || ! extension_loaded('FFI')) {
+            return null;
+        }
+        $path = (string) config('yenc.native_library', '');
+        $resolved = realpath($path);
+        if ($resolved === false || ! is_file($resolved) || ! is_readable($resolved)) {
+            return null;
+        }
+        $key = getmypid().':'.$resolved;
+        if (isset(self::$headerLibraries[$key])) {
+            return self::$headerLibraries[$key];
+        }
+
+        try {
+            $definitions = <<<'C'
+            char* nntmux_nntp_header_metadata_json(const unsigned char* data, size_t length);
+            char* nntmux_nntp_header_pair_comparison_json(const unsigned char* data, size_t length, int identity_match);
+            char* nntmux_nntp_lines_body_relationship_json(const unsigned char* data, size_t length);
+            void nntmux_metadata_string_free(char* value);
+            C;
+            $library = FFI::cdef($definitions, $resolved);
+            self::$headerLibraries[$key] = $library;
+
+            return $library;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private function bodyLibrary(): ?FFI
+    {
+        if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || ! extension_loaded('FFI')) {
+            return null;
+        }
+        $path = (string) config('yenc.native_library', '');
+        $resolved = realpath($path);
+        if ($resolved === false || ! is_file($resolved) || ! is_readable($resolved)) {
+            return null;
+        }
+        $key = getmypid().':'.$resolved;
+        if (isset(self::$bodyLibraries[$key])) {
+            return self::$bodyLibraries[$key];
+        }
+
+        try {
+            $definitions = <<<'C'
+            char* nntmux_nntp_body_measurement_json(const unsigned char* data, size_t length);
+            void nntmux_metadata_string_free(char* value);
+            C;
+            $library = FFI::cdef($definitions, $resolved);
+            self::$bodyLibraries[$key] = $library;
 
             return $library;
         } catch (Throwable) {
