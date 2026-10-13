@@ -51,6 +51,9 @@ return [
 
     'page_size' => (int) env('PREDB_FEED_PAGE_SIZE', 100),
 
+    // Maximum wire and decoded response size for RSS feeds.
+    'max_body_bytes' => (int) env('PREDB_FEED_MAX_BODY_BYTES', 1048576),
+
     'timeout' => (int) env('PREDB_FEED_TIMEOUT', 15),
 
     'user_agent' => (string) env('PREDB_FEED_USER_AGENT', 'NNTmux-PreDB-Importer/1.0'),

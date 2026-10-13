@@ -1057,6 +1057,18 @@ class PredbImportFeedCommandTest extends TestCase
     }
 
     #[Test]
+    public function rss_response_over_the_configured_wire_or_decoded_limit_fails_without_importing(): void
+    {
+        config(['predb_feeds.max_body_bytes' => 64]);
+        Http::fake(['https://predb.me/?rss=1' => Http::response(str_repeat('x', 65), 200, ['Content-Type' => 'application/rss+xml'])]);
+
+        $this->artisan('predb:import-feed', ['--source' => ['predb_me']])->assertFailed();
+
+        $this->assertSame(0, Predb::query()->count());
+        Http::assertSentCount(1);
+    }
+
+    #[Test]
     public function an_unknown_predate_is_stored_as_null_and_filled_later(): void
     {
         Http::fake(['predb.me/*' => Http::response((string) file_get_contents($this->fixture('predb_me.xml')), 200, ['Content-Type' => 'application/xml'])]);

@@ -65,16 +65,76 @@ final class Par2FullHashMatchingTest extends TestCase
         $different = $prefix.str_repeat('B', 4096);
         $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
         $this->remember(42, md5($body), md5($prefix), strlen($body));
+        $this->rememberCorroboratingTuple(42);
         foreach ([10 => [$different, 'Different.Scene.Release.2026-GRPB'], 20 => [$body, 'Correct.Scene.Release.2026-GRPA']] as $id => [$content, $title]) {
             $this->donor($id, $id, $title);
             DB::table('releases')->where('id', $id)->update(['size' => strlen($content) * 2]);
             $this->remember($id, md5($content), md5($prefix), strlen($content));
+            $this->rememberCorroboratingTuple($id);
         }
         $result = $this->lookup();
         self::assertTrue($result['known']);
         self::assertFalse($result['overflow']);
         self::assertCount(1, $result['donors']);
         self::assertSame(20, (int) $result['donors'][0]->releases_id);
+    }
+
+    public function test_shared_file_does_not_link_when_release_inventories_differ(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Scene.Release.2026-GRPA');
+        $shared = ['full' => md5('shared readme'), 'prefix' => md5('shared readme prefix'), 'size' => 100];
+        $unique = ['full' => md5('target payload'), 'prefix' => md5('target payload prefix'), 'size' => 200];
+        $this->remember(42, $shared['full'], $shared['prefix'], $shared['size']);
+        $this->remember(42, $unique['full'], $unique['prefix'], $unique['size']);
+        $this->remember(20, $shared['full'], $shared['prefix'], $shared['size']);
+
+        self::assertSame([], $this->lookup()['donors']);
+
+        $this->remember(20, $unique['full'], $unique['prefix'], $unique['size']);
+        $result = $this->lookup();
+        self::assertCount(1, $result['donors']);
+        self::assertSame(20, (int) $result['donors'][0]->releases_id);
+    }
+
+    public function test_one_shared_support_file_is_not_enough_evidence_to_link_releases(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Unrelated.Scene.Release.2026-GRP');
+        foreach ([42, 20] as $id) {
+            $this->remember($id, md5('shared readme'), md5('shared readme'), 128);
+        }
+
+        self::assertSame([], $this->lookup()['donors']);
+    }
+
+    public function test_duplicate_tuple_with_different_prefixes_is_not_independent_evidence(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Scene.Release.2026-GRP');
+        foreach ([42, 20] as $id) {
+            $this->remember($id, md5('one payload'), md5('prefix one'), 20000);
+            $this->remember($id, md5('one payload'), md5('prefix two'), 20000);
+        }
+
+        self::assertSame([], $this->lookup()['donors']);
+    }
+
+    public function test_matching_requires_symmetric_complete_inventory_coverage(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Scene.Release.2026-GRP');
+        foreach ([42, 20] as $id) {
+            $this->remember($id, md5('payload one'), md5('prefix one'), 20000);
+            $this->remember($id, md5('payload two'), md5('prefix two'), 30000);
+        }
+        self::assertCount(1, $this->lookup()['donors']);
+
+        $this->remember(42, md5('target-only payload'), md5('target-only prefix'), 40000);
+        self::assertSame([], $this->lookup()['donors']);
+        DB::table('par_file_hashes')->where('releases_id', 42)->where('full_md5', md5('target-only payload'))->delete();
+        $this->remember(20, md5('donor-only payload'), md5('donor-only prefix'), 50000);
+        self::assertSame([], $this->lookup()['donors']);
     }
 
     public function test_all_130_target_keys_are_considered_before_canonical_identity_selection(): void
@@ -84,13 +144,12 @@ final class Par2FullHashMatchingTest extends TestCase
         $this->donor(30, 2, 'Scene.Release.2026-GRPB');
         foreach (range(1, 130) as $key) {
             $this->remember(42, md5('full-'.$key), md5('prefix-'.$key), 12900000000 + $key);
-            $id = $key === 130 ? 30 : 20;
-            $this->remember($id, md5('full-'.$key), md5('prefix-'.$key), 12900000000 + $key);
+            $this->remember($key === 130 ? 30 : 20, md5('full-'.$key), md5('prefix-'.$key), 12900000000 + $key);
         }
         $result = $this->lookup();
-        self::assertCount(2, $result['donors']);
-        self::assertNull((new DonorMatchSelector)->selectCanonical($result['donors']));
+        self::assertSame([], $result['donors']);
         DB::table('par_file_hashes')->where('releases_id', 30)->delete();
+        $this->remember(20, md5('full-130'), md5('prefix-130'), 12900000130);
         $result = $this->lookup();
         self::assertSame(20, (int) (new DonorMatchSelector)->selectCanonical($result['donors'])->releases_id);
     }
@@ -99,9 +158,11 @@ final class Par2FullHashMatchingTest extends TestCase
     {
         $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
         $this->remember(42, md5('full'), md5('prefix'), 12900000000);
+        $this->rememberCorroboratingTuple(42);
         foreach (range(100, 356) as $id) {
             $this->donor($id, 1, 'Scene.Release.2026-GRPA');
             $this->remember($id, md5('full'), md5('prefix'), 12900000000);
+            $this->rememberCorroboratingTuple($id);
         }
         $result = $this->lookup();
         self::assertTrue($result['overflow']);
@@ -120,6 +181,7 @@ final class Par2FullHashMatchingTest extends TestCase
         $this->donor(20, 1, 'Scene.Release.2026-GRPA');
         $this->remember(42, md5('positive'), md5('positive prefix'), 12900000000);
         $this->remember(20, md5('positive'), md5('positive prefix'), 12900000000);
+        $this->rememberCorroboratingTuple(42, 20);
         self::assertFalse($this->lookup()['usable']);
         DB::table('par_file_hashes')->where('releases_id', 42)->where('file_size', '')->delete();
         self::assertTrue($this->lookup()['usable']);
@@ -156,6 +218,7 @@ final class Par2FullHashMatchingTest extends TestCase
         $this->donor(20, 1, 'Scene.Release.2026-GRPA');
         $this->remember(42, md5('full'), md5('prefix'), 12);
         $this->remember(20, md5('full'), md5('prefix'), 12);
+        $this->rememberCorroboratingTuple(42, 20);
         DB::table('releases')->where('id', 20)->update(['predb_id' => 0]);
         self::assertCount(0, $this->lookup()['donors']);
         DB::table('releases')->where('id', 20)->update(['predb_id' => 1]);
@@ -174,6 +237,7 @@ final class Par2FullHashMatchingTest extends TestCase
         $this->donor(20, 1, 'Scene.Release.2026-GRPA');
         $this->remember(42, md5('target'), md5('shared prefix'), 20000);
         $this->remember(20, md5('different'), md5('shared prefix'), 20000);
+        $this->rememberCorroboratingTuple(42, 20);
         DB::table('releases')->where('id', 20)->update(['size' => 20000]);
         $input = (object) array_merge($release->getAttributes(), ['releases_id' => 42, 'relsize' => 20000]);
         $service = new NameFixingService;
@@ -183,6 +247,7 @@ final class Par2FullHashMatchingTest extends TestCase
         self::assertSame(0, DB::table('releases')->where('id', 42)->value('predb_id'));
         self::assertSame(0, DB::table('releases')->where('id', 42)->value('proc_hash16k'));
         self::assertSame(1, DB::table('par2_hash_retry')->where('releases_id', 42)->count());
+        DB::table('par_file_hashes')->where('releases_id', 20)->where('full_md5', md5('different'))->delete();
         $this->remember(20, md5('target'), md5('shared prefix'), 20000);
         self::assertFalse($method->invoke($service, $input, [], [], true, true, false));
         DB::table('par2_hash_retry')->where('releases_id', 42)->update(['retry_at' => now()->subSecond()]);
@@ -225,6 +290,7 @@ final class Par2FullHashMatchingTest extends TestCase
         $this->donor(20, 1, 'Scene.Release.2026-GRPA');
         $this->remember(42, md5('full'), md5('prefix'), 12);
         $this->remember(20, md5('full'), md5('prefix'), 12);
+        $this->rememberCorroboratingTuple(42, 20);
         DB::table('par2_hash_retry')->insert(['releases_id' => 42, 'release_guid' => 'target', 'retry_at' => now()->subSecond()->toDateTimeString()]);
         $before = DB::table('par2_hash_retry')->first();
         $input = (object) array_merge($release->getAttributes(), ['releases_id' => 42, 'relsize' => 12]);
@@ -242,6 +308,7 @@ final class Par2FullHashMatchingTest extends TestCase
         $this->donor(20, 1, 'Scene.Release.2026-GRPA');
         $this->remember(42, md5('full'), md5('prefix'), 12);
         $this->remember(20, md5('full'), md5('prefix'), 12);
+        $this->rememberCorroboratingTuple(42, 20);
         $input = (object) array_merge($release->getAttributes(), ['releases_id' => 42, 'relsize' => 12]);
         $fired = false;
         DB::connection()->beforeExecuting(static function (string $query) use ($input, $other, &$fired): void {
@@ -368,6 +435,7 @@ final class Par2FullHashMatchingTest extends TestCase
         $processor = new Par2Processor(new NameFixingService, new Par2Info, false, false);
         self::assertSame(Par2RenameOutcome::NoMatch, $processor->applyInventoryForRename($inventory, 42, 1, 0, null, true, $this->snapshot(42)));
         $this->remember(20, $file['hash'], $file['hash_16K'], $file['size_decimal']);
+        $this->rememberCorroboratingTuple(42, 20);
         DB::table('releases')->where('id', 20)->update(['size' => 1000]);
         $input = (object) array_merge($release->getAttributes(), ['releases_id' => 42, 'relsize' => 1]);
         $service = new NameFixingService;
@@ -395,11 +463,13 @@ final class Par2FullHashMatchingTest extends TestCase
     {
         $this->donor(20, 7, 'Scene.Release.2026-GRPA');
         $this->remember(20, md5('full'), md5('prefix'), 12);
+        $this->rememberCorroboratingTuple(20);
         foreach ([0, 1] as $status) {
             foreach ([2, 3] as $categories) {
                 $id = 100 + $status * 10 + $categories;
                 $release = $this->pendingPar2Release(['id' => $id, 'guid' => 'target-'.$id, 'isrenamed' => $status, 'searchname' => 'obfuscated', 'proc_hash16k' => 1]);
                 $this->remember($id, md5('full'), md5('prefix'), 12);
+                $this->rememberCorroboratingTuple($id);
                 self::assertSame(0, DB::table('releases')->where('id', $id)->value('proc_hash16k'));
                 $queries = new NameFixingQueryService;
                 self::assertContains($id, array_map(static fn (object $row): int => (int) $row->releases_id, $queries->candidateBatch(NameFixingQueryService::SOURCE_HASH, 2, $categories)));
@@ -426,6 +496,7 @@ final class Par2FullHashMatchingTest extends TestCase
         $this->donor(20, 7, 'Scene.Release.2026-GRPA');
         $this->remember(42, md5('full'), md5('prefix'), 12);
         $this->remember(20, md5('full'), md5('prefix'), 12);
+        $this->rememberCorroboratingTuple(42, 20);
         $input = (object) array_merge($release->getAttributes(), ['releases_id' => 42, 'relsize' => 12]);
         $fired = false;
         DB::connection()->beforeExecuting(static function (string $query) use (&$fired): void {
@@ -459,6 +530,7 @@ final class Par2FullHashMatchingTest extends TestCase
         $this->donor(20, 7, 'Scene.Release.2026-GRPA');
         $this->remember(42, md5('full'), md5('prefix'), 12);
         $this->remember(20, md5('full'), md5('prefix'), 12);
+        $this->rememberCorroboratingTuple(42, 20);
         $fired = false;
         DB::connection()->beforeExecuting(function (string $query) use (&$fired): void {
             if (! $fired && preg_match('/^update\b.*releases.*searchname/i', $query) === 1) {
@@ -479,7 +551,7 @@ final class Par2FullHashMatchingTest extends TestCase
         self::assertSame(0, (int) $target->predb_id);
         self::assertSame('obfuscated', $target->searchname);
         self::assertSame(0, (int) $target->proc_hash16k);
-        self::assertSame(2, DB::table('par_file_hashes')->where('releases_id', 42)->count());
+        self::assertSame(3, DB::table('par_file_hashes')->where('releases_id', 42)->count());
         self::assertFalse($this->lookup()['usable']);
         self::assertSame(0, DB::table('par2_hash_retry')->count());
     }
@@ -534,6 +606,13 @@ final class Par2FullHashMatchingTest extends TestCase
     private function remember(int $id, string $full, string $prefix, mixed $size, ?array $snapshot = null, ?callable $guard = null): bool
     {
         return Par2FileHashEvidence::remember($id, $full, $prefix, $size, $snapshot ?? $this->snapshot($id), $guard);
+    }
+
+    private function rememberCorroboratingTuple(int ...$releaseIds): void
+    {
+        foreach ($releaseIds as $releaseId) {
+            $this->remember($releaseId, md5('independent archive volume'), md5('archive prefix'), 40960);
+        }
     }
 
     private function donor(int $id, int $predb, string $title): void

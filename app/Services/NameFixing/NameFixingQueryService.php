@@ -329,7 +329,8 @@ final class NameFixingQueryService
      */
     public function fullHashDonorsForRelease(int $releaseId, string $expectedGuid): array
     {
-        $known = $usable = false;
+        $known = $usable = $multipleTuples = false;
+        $firstTuple = null;
         $cursor = 0;
         $count = 0;
         do {
@@ -348,11 +349,23 @@ final class NameFixingQueryService
                     return ['known' => true, 'usable' => false, 'overflow' => false, 'donors' => [], 'generation' => $generation];
                 }
                 $usable = $usable || ($row->file_size !== '' && $row->file_size !== '0');
+                if ($row->file_size !== '' && $row->file_size !== '0') {
+                    $tuple = $row->full_md5.':'.$row->file_size;
+                    $multipleTuples = $multipleTuples || ($firstTuple !== null && $firstTuple !== $tuple);
+                    $firstTuple ??= $tuple;
+                }
             }
         } while (count($rows) === 128);
         if (! $usable) {
             return ['known' => $known, 'usable' => false, 'overflow' => false, 'donors' => [], 'generation' => $cursor.':'.$count];
         }
+        if (! $multipleTuples) {
+            return ['known' => true, 'usable' => true, 'overflow' => false, 'donors' => [], 'generation' => $cursor.':'.$count];
+        }
+
+        // One matching PAR2 file may be a shared readme or other support file. Only
+        // nominate donors when at least two distinct files cover the complete target
+        // inventory and the donor has no additional unmatched files.
         $donors = $this->database->select('SELECT DISTINCT r.id AS releases_id, r.guid AS donor_guid,
                 r.searchname, r.fromname, r.predb_id, p.title AS canonical_title
             FROM par_file_hashes t
@@ -363,7 +376,32 @@ final class NameFixingQueryService
             INNER JOIN predb p ON p.id = r.predb_id
             WHERE t.releases_id = ? AND HEX(t.release_guid) = ? AND r.id <> ?
                 AND t.file_size NOT IN (?, ?)
-            LIMIT 257', [$releaseId, strtoupper(bin2hex($expectedGuid)), $releaseId, '', '0']);
+                AND NOT EXISTS (
+                    SELECT 1 FROM par_file_hashes wanted
+                    WHERE wanted.releases_id = t.releases_id AND HEX(wanted.release_guid) = HEX(t.release_guid)
+                        AND wanted.file_size <> ?
+                        AND NOT EXISTS (
+                            SELECT 1 FROM par_file_hashes provided
+                            WHERE provided.releases_id = r.id AND HEX(provided.release_guid) = HEX(r.guid)
+                                AND provided.full_md5 = wanted.full_md5 AND provided.file_size = wanted.file_size
+                                AND HEX(provided.full_md5) = HEX(wanted.full_md5)
+                                AND HEX(provided.file_size) = HEX(wanted.file_size)
+                        )
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM par_file_hashes extra
+                    WHERE extra.releases_id = r.id AND (
+                        HEX(extra.release_guid) <> HEX(r.guid) OR extra.file_size = ?
+                        OR (extra.file_size <> ? AND NOT EXISTS (
+                            SELECT 1 FROM par_file_hashes present
+                            WHERE present.releases_id = t.releases_id AND HEX(present.release_guid) = HEX(t.release_guid)
+                                AND present.full_md5 = extra.full_md5 AND present.file_size = extra.file_size
+                                AND HEX(present.full_md5) = HEX(extra.full_md5)
+                                AND HEX(present.file_size) = HEX(extra.file_size)
+                        ))
+                    )
+                )
+            LIMIT 257', [$releaseId, strtoupper(bin2hex($expectedGuid)), $releaseId, '', '0', '0', '', '0']);
 
         return ['known' => true, 'usable' => true, 'overflow' => count($donors) === 257, 'donors' => $donors, 'generation' => $cursor.':'.$count];
     }
