@@ -49,6 +49,17 @@ return [
     ],
 
     /*
+     * Keep hand-maintained AGENTS.md and CLAUDE.md outside Boost generation.
+     * These keys are supported by the locked Boost agent guideline writers.
+     * Use the existing mirror, outside .ai/guidelines (custom generator input).
+     */
+    'agents' => array_fill_keys([
+        'amp', 'antigravity', 'claude_code', 'codex', 'copilot', 'cursor',
+        'factory', 'grok_build', 'junie', 'kiro', 'opencode', 'pi', 'zed',
+        'phpstorm_copilot',
+    ], ['guidelines_path' => '.github/instructions/laravel-boost.instructions.md']),
+
+    /*
     |--------------------------------------------------------------------------
     | Excluded Skills
     |--------------------------------------------------------------------------

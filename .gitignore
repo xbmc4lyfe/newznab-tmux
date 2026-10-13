@@ -73,8 +73,14 @@ yarn.lock
 pnpm-lock.yaml
 
 # Agent skills are installed globally by scripts/install-global-skills.sh
-/.agents/skills/
-/.claude/skills/
+/.agents/skills/*
+!/.agents/skills/nntmux-development
+!/.agents/skills/performance-validation
+!/.agents/skills/production-operations
+/.claude/skills/*
+!/.claude/skills/nntmux-development
+!/.claude/skills/performance-validation
+!/.claude/skills/production-operations
 /.cursor/skills/
 
 # Terraform providers, local configuration, plans, and state
