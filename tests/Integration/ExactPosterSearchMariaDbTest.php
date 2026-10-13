@@ -10,6 +10,7 @@ use Database\Seeders\ConfigurationSeeder;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use PDO;
+use PDOException;
 use Tests\TestCase;
 
 final class ExactPosterSearchMariaDbTest extends TestCase
@@ -17,6 +18,8 @@ final class ExactPosterSearchMariaDbTest extends TestCase
     private ?PDO $administrator = null;
 
     private string $database = '';
+
+    private bool $databaseCreated = false;
 
     /** @var array<string, mixed> */
     private array $originalConfig = [];
@@ -31,40 +34,78 @@ final class ExactPosterSearchMariaDbTest extends TestCase
         if ($host === '') {
             $this->markTestSkipped('Set POSTER_SEARCH_TEST_HOST to an isolated MariaDB test server.');
         }
+        $this->initializeDatabase($this->app->make('files')->get(database_path('schema/mariadb-schema.sql')));
+    }
+
+    private function initializeDatabase(string $schema): void
+    {
+        $host = (string) getenv('POSTER_SEARCH_TEST_HOST');
         $port = (int) (getenv('POSTER_SEARCH_TEST_PORT') ?: 3306);
         $username = (string) (getenv('POSTER_SEARCH_TEST_USERNAME') ?: 'root');
         $password = (string) getenv('POSTER_SEARCH_TEST_PASSWORD');
-        $this->administrator = new PDO("mysql:host={$host};port={$port};charset=utf8mb4", $username, $password);
-        $this->database = 'nntmux_poster_test_'.bin2hex(random_bytes(8));
-        $this->administrator->exec('CREATE DATABASE `'.$this->database.'`');
-        $this->administrator->exec('USE `'.$this->database.'`');
-        // Exercise the complete release schema, foreign keys and joined tables.
-        $this->administrator->exec(file_get_contents(database_path('schema/mariadb-schema.sql')));
-        config([
-            'database.default' => 'poster_qualification',
-            'database.connections.poster_qualification' => [
-                'driver' => 'mysql', 'host' => $host, 'port' => $port,
-                'database' => $this->database, 'username' => $username, 'password' => $password,
-                'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci', 'prefix' => '', 'strict' => false,
-            ],
-            'cache.default' => 'array', 'nntmux.mysql_search_fallback' => false,
-        ]);
-        DB::purge('poster_qualification');
-        Cache::flush();
-        (new ConfigurationSeeder)->run();
-        Search::shouldReceive('isAvailable')->never();
+        try {
+            $this->administrator = new PDO("mysql:host={$host};port={$port};charset=utf8mb4", $username, $password);
+            $this->database = 'nntmux_poster_test_'.bin2hex(random_bytes(8));
+            $this->administrator->exec('CREATE DATABASE `'.$this->database.'`');
+            $this->databaseCreated = true;
+            $this->administrator->exec('USE `'.$this->database.'`');
+            // Exercise the complete release schema, foreign keys and joined tables.
+            $this->administrator->exec($schema);
+            config([
+                'database.default' => 'poster_qualification',
+                'database.connections.poster_qualification' => [
+                    'driver' => 'mysql', 'host' => $host, 'port' => $port,
+                    'database' => $this->database, 'username' => $username, 'password' => $password,
+                    'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci', 'prefix' => '', 'strict' => false,
+                ],
+                'cache.default' => 'array', 'nntmux.mysql_search_fallback' => false,
+            ]);
+            DB::purge('poster_qualification');
+            Cache::flush();
+            (new ConfigurationSeeder)->run();
+            Search::shouldReceive('isAvailable')->never();
+        } catch (\Throwable $exception) {
+            $this->cleanupDatabase();
+            throw $exception;
+        }
     }
 
     protected function tearDown(): void
     {
         try {
-            if ($this->administrator !== null && preg_match('/^nntmux_poster_test_[a-f0-9]{16}$/', $this->database) === 1) {
+            $this->cleanupDatabase();
+        } finally {
+            parent::tearDown();
+        }
+    }
+
+    private function cleanupDatabase(): void
+    {
+        try {
+            if ($this->databaseCreated && $this->administrator !== null && preg_match('/^nntmux_poster_test_[a-f0-9]{16}$/', $this->database) === 1) {
                 DB::purge('poster_qualification');
                 $this->administrator->exec('DROP DATABASE `'.$this->database.'`');
+                $this->databaseCreated = false;
             }
         } finally {
             config($this->originalConfig);
-            parent::tearDown();
+        }
+    }
+
+    public function test_setup_failure_removes_its_database_and_restores_configuration(): void
+    {
+        $this->cleanupDatabase();
+        try {
+            $this->initializeDatabase('INVALID POSTER QUALIFICATION DDL');
+            $this->fail('Invalid schema import must fail setup.');
+        } catch (PDOException) {
+            $this->assertNotNull($this->administrator);
+            $statement = $this->administrator->prepare('SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = ?');
+            $statement->execute([$this->database]);
+            $this->assertSame(0, (int) $statement->fetchColumn());
+            foreach ($this->originalConfig as $key => $value) {
+                $this->assertSame($value, config($key), $key);
+            }
         }
     }
 
