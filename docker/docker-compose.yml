@@ -99,6 +99,8 @@ services:
       PULSE_ENABLED: "false"
       TERM: xterm-256color
       TMUX_SESSION_NAME: nntmux
+      # Native decoding/planning belongs to CLI processing; web retains ffi.enable=false.
+      PHP_INI_SCAN_DIR: /usr/local/etc/php/conf.d:/usr/local/etc/php/indexer-conf.d
       INDEXER_MAX_FAILURES: ${INDEXER_MAX_FAILURES:-10}
     healthcheck:
       test: ["CMD", "php", "artisan", "tmux:health-check", "--session=nntmux", "--require-session", "--quiet"]
