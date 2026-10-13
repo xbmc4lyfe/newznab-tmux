@@ -259,7 +259,7 @@ class NzbContentsService
         return $this->checkPar2Result($guid, $relID, $groupID, $nameStatus, $show) === Par2RenameOutcome::Renamed;
     }
 
-    public function checkPar2Result(string $guid, int $relID, int $groupID, int $nameStatus, int $show, ?float $deadline = null): Par2RenameOutcome
+    public function checkPar2Result(string $guid, int $relID, int $groupID, int $nameStatus, int $show, ?float $deadline = null, ?callable $onArticleReceived = null): Par2RenameOutcome
     {
         $this->par2Stats = ['candidates_probed' => 0, 'articles_received' => 0];
         if ($nameStatus !== 1) {
@@ -327,6 +327,17 @@ class NzbContentsService
             $pending = array_values(array_unique(array_merge($pending, array_keys($retry))));
             $budget = max(1, (int) config('tmux.fix_names.par2_max_probes', 4));
             $outcome = Par2RenameOutcome::NoMatch;
+            $lastHeartbeat = 0;
+            $onArticleRead = function () use ($lock, $onArticleReceived, &$lastHeartbeat): bool {
+                $now = now()->getTimestamp();
+                if ($now - $lastHeartbeat < 30) {
+                    return true;
+                }
+                $lastHeartbeat = $now;
+
+                return ($onArticleReceived === null || $onArticleReceived())
+                    && $this->refreshPar2Claim($lock);
+            };
 
             foreach ($pending as $index) {
                 if ($this->par2Stats['candidates_probed'] >= $budget || ($deadline !== null && now()->getTimestampMs() / 1000 >= $deadline) || ! $this->refreshPar2Claim($lock)) {
@@ -337,11 +348,12 @@ class NzbContentsService
                 try {
                     $outcome = $this->postProcessService->parsePAR2ForRename(
                         $candidates[$index]['id'], $relID, $groupID, $this->nntp, $show,
-                        function () use ($lock): bool {
+                        function () use ($lock, $onArticleReceived): bool {
                             $this->par2Stats['articles_received']++;
 
-                            return $this->refreshPar2Claim($lock);
-                        }, $candidates[$index]['explicit']
+                            return ($onArticleReceived === null || $onArticleReceived())
+                                && $this->refreshPar2Claim($lock);
+                        }, $candidates[$index]['explicit'], $onArticleRead
                     );
                 } catch (Throwable $e) {
                     Log::warning('PAR2 probe remains pending', ['release_id' => $relID, 'candidate_index' => $index, 'error' => $e->getMessage()]);
