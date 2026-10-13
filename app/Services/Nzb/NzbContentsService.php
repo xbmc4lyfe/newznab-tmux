@@ -491,6 +491,8 @@ class NzbContentsService
         $subject = preg_replace('/^\s*\[\d+\/\d+\]\s*/', '', $subject) ?? $subject;
         if (preg_match('/"([^"]+\.par2)"/i', $subject, $match) === 1) {
             $name = $match[1];
+        } elseif (preg_match('/(?:^|\s)([^\s"]+\.par2)(?=\s|$)/i', $subject, $match) === 1) {
+            $name = $match[1];
         } else {
             $name = trim($subject, " \t\"'");
         }
