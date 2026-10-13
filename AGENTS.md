@@ -47,7 +47,7 @@ Laravel 13 Usenet indexer. Use this file for repo-wide defaults; load a project 
 - Follow existing sibling conventions and reuse existing components. Keep dependencies and new base directories subject to user approval.
 - Create documentation only when requested. Keep replies concise.
 
-## Commands
+## Command execution precedence
 
 - Run Artisan, Composer, npm, Pint, PHPStan, and tests. Sail/`make` is for Compose lifecycle or an explicit containerized request. See `.ai/guidelines/sail/core.blade.php`.
 - Examples: `php artisan test --compact --filter=TestName`, `./vendor/bin/pint --dirty`, `./vendor/bin/phpstan analyse --memory-limit=2G`, `npm run build` after frontend edits.
