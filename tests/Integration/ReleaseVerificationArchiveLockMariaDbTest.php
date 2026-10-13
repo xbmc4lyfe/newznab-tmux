@@ -157,6 +157,54 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
         yield 'caller-owned transaction' => [true];
     }
 
+    public function test_filtered_oversized_replay_uses_locked_status_despite_an_older_repeatable_read_view(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->enqueue(['identity' => sha1('oversized-replay'), 'groups_id' => 1, 'files' => []]);
+        $claim = $repository->claim();
+        $this->assertNotNull($claim);
+        $id = $this->arrival('oversized-replay');
+        $binary = (int) DB::table('binaries')->where('collections_id', $id)->value('id');
+        for ($start = 2; $start <= 44001; $start += 500) {
+            $parts = [];
+            for ($number = $start; $number < $start + 500; $number++) {
+                $parts[] = ['binaries_id' => $binary, 'partnumber' => $number,
+                    'messageid' => str_repeat('x', 255), 'size' => 5];
+            }
+            DB::table('parts')->insert($parts);
+        }
+        $this->assertGreaterThan(16777216, 44000 * (128 + 255));
+        config(['database.connections.policy_filter' => config('database.connections.mariadb')]);
+        DB::statement('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+        DB::beginTransaction();
+        try {
+            $this->assertSame('verifying', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
+            DB::setDefaultConnection('policy_filter');
+            try {
+                $repository->rejectByPolicy($claim, 'Test policy');
+                $this->assertSame('filtered', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
+            } finally {
+                DB::setDefaultConnection('mariadb');
+            }
+            $this->assertSame('verifying', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
+
+            $repository->archive($id);
+            DB::commit();
+        } finally {
+            DB::setDefaultConnection('mariadb');
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+            DB::purge('policy_filter');
+        }
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame('filtered', $candidate->status);
+        $this->assertSame('', $candidate->manifest_path);
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame(0, DB::table('collections')->count());
+        $this->assertSame(0, DB::table('parts')->count());
+    }
+
     /** @return iterable<string, array{bool, bool}> */
     public static function capacitySnapshotModes(): iterable
     {

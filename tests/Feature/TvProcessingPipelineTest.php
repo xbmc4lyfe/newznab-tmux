@@ -14,6 +14,8 @@ use App\Services\TvProcessing\Pipes\TvdbPipe;
 use App\Services\TvProcessing\Pipes\TvMazePipe;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Services\TvProcessing\TvProcessingPipeline;
+use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Tests\Support\ConfigurationTestBuilder;
@@ -118,6 +120,56 @@ class TvProcessingPipelineTest extends TestCase
 
         $this->assertSame(1, (int) DB::table('releases')->where('id', $new)->value('tv_lookup_attempts'));
         $this->assertSame(0, (int) DB::table('releases')->where('id', $old)->value('tv_lookup_attempts'));
+    }
+
+    public function test_scheduled_episode_retries_respect_disabled_lookup_and_preserve_manual_repairs(): void
+    {
+        ConfigurationTestBuilder::update(ConfigurationDomain::Metadata, ['tv_lookup' => 0]);
+        $videoId = $this->insertVideo('Severance', ['tvdb' => 371980]);
+        $releaseId = $this->insertTvRelease('Severance.S03E01', ['videos_id' => $videoId,
+            'tv_episodes_id' => TvLookupStatus::EpisodeMissing->value]);
+        $before = DB::table('releases')->find($releaseId);
+        $releaseReads = 0;
+        DB::listen(static function (QueryExecuted $query) use (&$releaseReads): void {
+            if (str_starts_with($query->sql, 'select') && str_contains($query->sql, 'from "releases"')) {
+                $releaseReads++;
+            }
+        });
+
+        $this->artisan($this->scheduledEpisodeRetryCommand())->assertSuccessful();
+
+        $this->assertSame(0, $releaseReads);
+        $this->assertEquals($before, DB::table('releases')->find($releaseId));
+        $this->assertSame(0, array_sum($this->tvdb->calls) + array_sum($this->tvmaze->calls));
+
+        $this->artisan('tv:reprocess-missing-episodes')->assertSuccessful();
+        $this->assertRelease($releaseId, $videoId, TvLookupStatus::EpisodeMissing->value, attempts: 1);
+    }
+
+    public function test_scheduled_episode_retries_only_process_renamed_releases_in_mode_two(): void
+    {
+        ConfigurationTestBuilder::update(ConfigurationDomain::Metadata, ['tv_lookup' => 2]);
+        $videoId = $this->insertVideo('Severance', ['tvdb' => 371980]);
+        $due = ['videos_id' => $videoId, 'tv_episodes_id' => TvLookupStatus::EpisodeMissing->value];
+        $unrenamed = $this->insertTvRelease('Severance.S03E01', ['isrenamed' => 0, ...$due]);
+        $renamed = $this->insertTvRelease('Severance.S03E02', ['isrenamed' => 1, ...$due]);
+        $before = DB::table('releases')->find($unrenamed);
+
+        $this->artisan($this->scheduledEpisodeRetryCommand())->assertSuccessful();
+
+        $this->assertEquals($before, DB::table('releases')->find($unrenamed));
+        $this->assertRelease($renamed, $videoId, TvLookupStatus::EpisodeMissing->value, attempts: 1);
+        $this->assertSame(1, $this->tvdb->calls['episode']);
+    }
+
+    private function scheduledEpisodeRetryCommand(): string
+    {
+        foreach (app(Schedule::class)->events() as $event) {
+            if (is_string($event->command) && str_contains($event->command, 'tv:reprocess-missing-episodes')) {
+                return substr($event->command, (int) strpos($event->command, 'tv:reprocess-missing-episodes'));
+            }
+        }
+        $this->fail('The scheduled TV episode retry command must exist.');
     }
 
     public function test_show_no_provider_knows_is_given_up_without_retries(): void

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Models\Release;
+use App\Services\Configuration\ConfigurationProvider;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Services\TvProcessing\TvProcessingPipeline;
 use Illuminate\Console\Command;
@@ -26,6 +27,7 @@ class ReprocessMissingEpisodes extends Command
                             {--limit=0 : Limit the number of releases to process (0 = no limit)}
                             {--video-id= : Process only releases for a specific video ID}
                             {--all : Ignore the retry schedule and attempt cap}
+                            {--scheduled : Respect the configured TV lookup mode}
                             {--dry-run : Show how many releases would be processed without making changes}
                             {--debug : Show detailed debug information for each release}
                             {--sleep=0 : Sleep time in milliseconds between processing each release}';
@@ -42,6 +44,12 @@ class ReprocessMissingEpisodes extends Command
      */
     public function handle(): int
     {
+        $lookupMode = $this->option('scheduled')
+            ? (int) app(ConfigurationProvider::class)->metadata()->tvLookup->value : 1;
+        if ($lookupMode <= 0) {
+            return self::SUCCESS;
+        }
+
         $limit = (int) $this->option('limit');
         $videoId = $this->option('video-id');
         $dryRun = (bool) $this->option('dry-run');
@@ -55,6 +63,10 @@ class ReprocessMissingEpisodes extends Command
             ->whereRaw(TvProcessingCandidateQuery::episodeRetryCondition((bool) $this->option('all')))
             ->orderByDesc('postdate')
             ->orderByDesc('id');
+
+        if ($lookupMode === 2) {
+            $query->where('isrenamed', 1);
+        }
 
         if ($videoId !== null) {
             $query->where('videos_id', (int) $videoId);

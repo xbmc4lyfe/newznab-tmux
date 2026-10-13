@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Exceptions\CandidateMetadataBudgetExceeded;
 use App\Services\CollectionCleanupService;
 use App\Services\Nzb\NzbService;
 use Illuminate\Database\Query\Builder;
@@ -41,7 +42,16 @@ final class CandidateRepository
                 // Keep terminal replays on their existing cheap, locked validation path.
                 $filtered = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
                     ->orderByDesc('id')->value('status') === 'filtered';
-                $manifest = $filtered ? null : $this->snapshotHeaders($collection, $currentReads);
+                $manifest = null;
+                $snapshotFailure = null;
+                if (! $filtered) {
+                    try {
+                        $manifest = $this->snapshotHeaders($collection, $currentReads);
+                    } catch (CandidateMetadataBudgetExceeded $error) {
+                        // A stale read view can hide a committed filtered replay; validate it first.
+                        $snapshotFailure = $error;
+                    }
+                }
                 $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                 if ($state === null) {
                     throw new RuntimeException('Verification migration has not initialized capacity state.');
@@ -61,6 +71,9 @@ final class CandidateRepository
                     }
 
                     return;
+                }
+                if ($snapshotFailure !== null) {
+                    throw $snapshotFailure;
                 }
                 $identity = $existing->identity ?? $sourceIdentity;
                 if ($existing !== null && $existing->release_id !== null) {
@@ -259,7 +272,7 @@ final class CandidateRepository
                 ->select(['binaries_id', 'partnumber', 'messageid', 'size'])->cursor() as $part) {
                 $metadataBytes += 128 + strlen($part->messageid);
                 if ($metadataBytes > 16777216) {
-                    throw new RuntimeException('Candidate exceeds metadata budget; headers retained.');
+                    throw new CandidateMetadataBudgetExceeded('Candidate exceeds metadata budget; headers retained.');
                 }
                 $segmentsByBinary[$part->binaries_id][] = ['number' => (int) $part->partnumber,
                     'messageid' => $part->messageid, 'bytes' => (int) $part->size];
