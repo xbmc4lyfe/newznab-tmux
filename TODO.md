@@ -1,5 +1,13 @@
 # To do
 
+## Qualify equivalent PAR2 source-proof reuse (2026-10-13)
+
+Equivalent complete volumes reuse a successful source proof only within one verification invocation. Every volume still receives packet checksum, filename, alias, conflict and scratch checks. Mixed, incomplete or inconsistent metadata retains the original proof path. Any repair invalidates all earlier cached proofs; final source MD5 and whole-file CRC checks remain authoritative.
+
+- [ ] Run the full PHPUnit/native suites on final integrated master, including real PAR2 repair, partial recovery, conflicting metadata, replay, lease loss and fresh reconstruction from emitted NZB article IDs. Focused regressions do not establish full qualification.
+- [ ] Measure large multi-volume candidates on a separate validation host with frozen source/vendor/runtime and restored fixtures, paired randomized runs and correctness gates. Reduced proof invocation counts establish avoided work, not production throughput.
+- [ ] After an authorized guarded rollout, verify source/image parity, app health and M4 TLS connectivity; measure verification yield, net backlog and candidate time under comparable load. Preserve the local database shutdown and shared deploy ownership.
+
 ## Qualify manifest preparation outside shared capacity (2026-10-13)
 
 New ordinary archives and enqueue admissions prepare JSON/gzip bytes before requesting the shared capacity row. File persistence/fsync, authoritative candidate validation, accounting and hot-header deletion remain in the existing protected transaction. Known replays avoid unused preparation; existing-manifest merges and legacy release reconciliation retain their locked paths. A candidate committed during preparation requires a fresh locked merge. A caller that already owns capacity retains that lock.
