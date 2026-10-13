@@ -728,9 +728,12 @@ PHP;
         {
             public function __construct(private \Closure $fetch) {}
 
-            public function getMessages(string $groupName, mixed $identifiers, bool $alternate = false): mixed
+            public function getMessages(string $groupName, mixed $identifiers, bool $alternate = false, ?callable $onRead = null): mixed
             {
-                return ($this->fetch)($groupName, $identifiers);
+                $response = ($this->fetch)($groupName, $identifiers);
+                $onRead?->__invoke();
+
+                return $response;
             }
 
             public function doQuit(bool $force = false): mixed

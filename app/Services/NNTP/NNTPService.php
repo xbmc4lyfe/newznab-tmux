@@ -819,7 +819,7 @@ class NNTPService extends NntpClient
      * @throws \Exception
      *                    On failure : (object) DariusIII\NetNntp\Error.
      */
-    public function getMessages(string $groupName, mixed $identifiers, bool $alternate = false): mixed
+    public function getMessages(string $groupName, mixed $identifiers, bool $alternate = false, ?callable $onRead = null): mixed
     {
         $connected = $this->_checkConnection();
         if ($connected !== true) {
@@ -850,7 +850,7 @@ class NNTPService extends NntpClient
                 }
 
                 // Download the body.
-                $message = $this->_getMessage($groupName, $wanted);
+                $message = $this->_getMessage($groupName, $wanted, $onRead);
 
                 // Append the body to $body.
                 if (! self::isError($message)) {
@@ -870,7 +870,7 @@ class NNTPService extends NntpClient
                     }
                     // If we connected successfully to usenet try to download the article body.
                     if ($aConnected === true) {
-                        $newBody = $nntp->_getMessage($groupName, $wanted);
+                        $newBody = $nntp->_getMessage($groupName, $wanted, $onRead);
                         // Check if we got an error.
                         if ($nntp->isError($newBody)) {
                             $nntp->doQuit();
@@ -1365,7 +1365,7 @@ class NNTPService extends NntpClient
      *
      * @throws \Exception
      */
-    protected function _getMessage(string $groupName, mixed $identifier): mixed
+    protected function _getMessage(string $groupName, mixed $identifier, ?callable $onRead = null): mixed
     {
         // Make sure the requested group is already selected, if not select it.
         if ($this->group() !== $groupName) {
@@ -1390,16 +1390,16 @@ class NNTPService extends NntpClient
         }
 
         if ($response === ResponseCode::BodyFollows->value) {
-            return $this->readBody();
+            return $this->readBody($onRead);
         }
 
         return $this->_handleErrorResponse($response);
     }
 
     /** Read one dot-terminated BODY response and yEnc decode it. */
-    protected function readBody(): mixed
+    protected function readBody(?callable $onRead = null): mixed
     {
-        $body = $this->readRawBody();
+        $body = $this->readRawBody($onRead);
         if (! is_string($body)) {
             return $body;
         }
@@ -1410,7 +1410,7 @@ class NNTPService extends NntpClient
     }
 
     /** Read one dot-terminated BODY response, removing NNTP dot stuffing exactly once. */
-    protected function readRawBody(): mixed
+    protected function readRawBody(?callable $onRead = null): mixed
     {
         $body = '';
         $line = '';
@@ -1419,6 +1419,11 @@ class NNTPService extends NntpClient
             $fragment = fgets($socket, 8192);
             if ($fragment === false) {
                 return $this->throwError('Failed to read line from socket.', null);
+            }
+            if ($onRead !== null && ! $onRead()) {
+                $this->doQuit();
+
+                return $this->throwError('NNTP article read stopped after processing lock ownership was lost.', null);
             }
             $line .= $fragment;
             if (! str_ends_with($line, "\n")) {

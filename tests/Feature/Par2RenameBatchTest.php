@@ -130,7 +130,7 @@ class Par2RenameBatchTest extends TestCase
         $replacementLock->release();
     }
 
-    public function test_active_sweep_refreshes_its_lease_during_an_article_read(): void
+    public function test_active_sweep_refreshes_its_lease_when_the_article_reader_heartbeats(): void
     {
         $this->freezeTime();
         config([
@@ -142,9 +142,7 @@ class Par2RenameBatchTest extends TestCase
         $this->assertInstanceOf(ArrayStore::class, $store);
         $service = new class($store) extends NzbContentsService
         {
-            public ?int $leaseBeforeArticleRead = null;
-
-            public ?int $leaseAfterArticleRead = null;
+            public ?int $leaseAfterHeartbeat = null;
 
             public function __construct(private ArrayStore $store) {}
 
@@ -157,12 +155,10 @@ class Par2RenameBatchTest extends TestCase
                 ?float $deadline = null,
                 ?callable $onArticleReceived = null
             ): Par2RenameOutcome {
-                $expiresAt = $this->store->locks['rename:par2:sweep:2:1:lock']['expiresAt'];
-                $this->leaseBeforeArticleRead = $expiresAt->getTimestamp() - now()->getTimestamp();
                 CarbonImmutable::setTestNow(now()->addSeconds(250));
                 $onArticleReceived?->__invoke();
                 $expiresAt = $this->store->locks['rename:par2:sweep:2:1:lock']['expiresAt'];
-                $this->leaseAfterArticleRead = $expiresAt->getTimestamp() - now()->getTimestamp();
+                $this->leaseAfterHeartbeat = $expiresAt->getTimestamp() - now()->getTimestamp();
 
                 return Par2RenameOutcome::NoMatch;
             }
@@ -171,8 +167,7 @@ class Par2RenameBatchTest extends TestCase
 
         $this->runBatch();
 
-        $this->assertSame(300, $service->leaseBeforeArticleRead);
-        $this->assertSame(300, $service->leaseAfterArticleRead);
+        $this->assertSame(300, $service->leaseAfterHeartbeat);
     }
 
     public function test_retryable_old_releases_do_not_starve_later_work_and_are_revisited(): void

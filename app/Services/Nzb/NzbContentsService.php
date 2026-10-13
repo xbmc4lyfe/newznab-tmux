@@ -327,6 +327,17 @@ class NzbContentsService
             $pending = array_values(array_unique(array_merge($pending, array_keys($retry))));
             $budget = max(1, (int) config('tmux.fix_names.par2_max_probes', 4));
             $outcome = Par2RenameOutcome::NoMatch;
+            $lastHeartbeat = 0;
+            $onArticleRead = function () use ($lock, $onArticleReceived, &$lastHeartbeat): bool {
+                $now = now()->getTimestamp();
+                if ($now - $lastHeartbeat < 30) {
+                    return true;
+                }
+                $lastHeartbeat = $now;
+
+                return ($onArticleReceived === null || $onArticleReceived())
+                    && $this->refreshPar2Claim($lock);
+            };
 
             foreach ($pending as $index) {
                 if ($this->par2Stats['candidates_probed'] >= $budget || ($deadline !== null && now()->getTimestampMs() / 1000 >= $deadline) || ! $this->refreshPar2Claim($lock)) {
@@ -342,7 +353,7 @@ class NzbContentsService
 
                             return ($onArticleReceived === null || $onArticleReceived())
                                 && $this->refreshPar2Claim($lock);
-                        }, $candidates[$index]['explicit']
+                        }, $candidates[$index]['explicit'], $onArticleRead
                     );
                 } catch (Throwable $e) {
                     Log::warning('PAR2 probe remains pending', ['release_id' => $relID, 'candidate_index' => $index, 'error' => $e->getMessage()]);
