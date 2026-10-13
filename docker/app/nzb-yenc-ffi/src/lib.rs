@@ -13,10 +13,18 @@
 //! leading `=y` escapes there are decoded before handing over the rest. Removing
 //! them first also joins escapes split across a line break, as the PHP decoder does.
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::panic::catch_unwind;
 use std::ptr;
 use std::slice;
+
+mod article_dates;
+mod article_identity;
+mod article_xref;
+mod formats;
+mod par2;
+mod par2_source_ranges;
+mod seven_zip_ranges;
 
 /// nzb-decode 0.1.3, packed as RapidYenc packs its version (major << 16 | minor << 8 | patch).
 const VERSION: c_int = 3 | (1 << 8);
@@ -27,6 +35,11 @@ const DECODE_FAILED: usize = usize::MAX;
 
 const HEADER: &[u8] = b"=ybegin line=128 name=payload\r\n";
 const FOOTER: &[u8] = b"\r\n=yend\r\n";
+const MAX_METADATA_INPUT_BYTES: usize = 67_108_864;
+const MAX_SEVEN_ZIP_RANGE_INPUT_BYTES: usize = 16 * 1024 * 1024 + 4096;
+const MAX_PAR2_SOURCE_RANGE_INPUT_BYTES: usize = 16 * 1024 * 1024 + 16 * 1024;
+const MAX_ARTICLE_IDENTITY_INPUT_BYTES: usize = 131_072;
+const MAX_ARTICLE_XREF_INPUT_BYTES: usize = 196_608;
 
 /// Decode a yEnc payload (CR/LF line endings are skipped, `=X` escapes resolved).
 pub fn decode_payload(payload: &[u8]) -> Option<Vec<u8>> {
@@ -64,6 +77,297 @@ pub extern "C" fn rapidyenc_decode_init() {}
 #[unsafe(no_mangle)]
 pub extern "C" fn rapidyenc_version() -> c_int {
     VERSION
+}
+
+/// Return PAR2 packet metadata as a newly allocated UTF-8 JSON C string.
+/// The caller must release it with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs over the bounded parser
+/// budget are rejected by returning a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_metadata_json(data: *const u8, length: usize) -> *mut c_char {
+    if length > MAX_METADATA_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let encoded = catch_unwind(|| serde_json::to_string(&par2::parse(input)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Return bounded format-signature and header metadata as UTF-8 JSON.
+/// The caller must release it with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs over the bounded parser
+/// budget are rejected by returning a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_format_metadata_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > MAX_METADATA_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let encoded = catch_unwind(|| serde_json::to_string(&formats::parse(input)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Parse bounded raw HEAD fields into occurrence-aware absolute date metadata.
+/// The caller must release the returned JSON with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs above 65536 bytes are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_article_dates_v1_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > 65_536 || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    match catch_unwind(|| serde_json::to_string(&article_dates::parse(input))) {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Resolve one 7-Zip next-header range and any encoded-header PackInfo ranges
+/// from a compact list of sampled file ranges. Input is: fragment count (u32 LE),
+/// declared file size (u64 LE), then repeated file offset (u64 LE), byte length
+/// (u32 LE), and raw decoded bytes.
+/// The caller must release the returned UTF-8 JSON with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs over the range budget are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_seven_zip_ranges_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > MAX_SEVEN_ZIP_RANGE_INPUT_BYTES || data.is_null() || length == 0 {
+        return ptr::null_mut();
+    }
+    // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+    let input = unsafe { slice::from_raw_parts(data, length) };
+    let encoded = catch_unwind(|| {
+        seven_zip_ranges::parse(input).and_then(|metadata| serde_json::to_string(&metadata).ok())
+    });
+    match encoded {
+        Ok(Some(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Verify bounded PAR2 IFSC slices against decoded yEnc article fragments.
+/// The input is a packed P2SR record; the caller must free the returned JSON.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs over the range budget are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_source_ranges_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > MAX_PAR2_SOURCE_RANGE_INPUT_BYTES || data.is_null() || length == 0 {
+        return ptr::null_mut();
+    }
+    // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+    let input = unsafe { slice::from_raw_parts(data, length) };
+    let encoded = catch_unwind(|| {
+        par2_source_ranges::parse(input).and_then(|metadata| serde_json::to_string(&metadata).ok())
+    });
+    match encoded {
+        Ok(Some(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Parse a v2 relationship between a requested Message-ID, protocol response
+/// lines, a HEAD field, and the mandatory Message-ID column in an OVER response.
+/// `data` is AI02 followed by five little-endian length-prefixed byte strings;
+/// u32::MAX means absent. The v2 symbol keeps this ABI separate from the legacy
+/// four-argument function below.
+/// The caller must release the result with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Oversized inputs are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_article_identity_v2_json(
+    data: *const u8,
+    length: usize,
+    overview_response_code: i32,
+    overview_attempted: i32,
+    head_response_code: i32,
+    body_response_code: i32,
+) -> *mut c_char {
+    if length > MAX_ARTICLE_IDENTITY_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    article_identity_json(
+        input,
+        overview_response_code,
+        overview_attempted != 0,
+        head_response_code,
+        body_response_code,
+    )
+}
+
+/// Parse the Xref fields in a HEAD response and an OVER response using the
+/// server's advertised LIST OVERVIEW.FMT layout. `data` is XR01 followed by
+/// three little-endian length-prefixed fields: raw HEAD bytes, packed overview
+/// rows, and packed overview-format lines. Each line list is a u32 count then
+/// repeated length-prefixed byte strings; u32::MAX marks an absent outer field.
+/// The caller must release the returned JSON with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Oversized inputs are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_article_identity_xref_v1_json(
+    data: *const u8,
+    length: usize,
+    head_response_code: i32,
+    overview_response_code: i32,
+    overview_attempted: i32,
+    overview_row_count: i32,
+    overview_format_response_code: i32,
+) -> *mut c_char {
+    if length > MAX_ARTICLE_XREF_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let encoded = catch_unwind(|| {
+        serde_json::to_string(&article_xref::parse(
+            input,
+            head_response_code,
+            overview_response_code,
+            overview_attempted != 0,
+            overview_row_count,
+            overview_format_response_code,
+        ))
+    });
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Parse legacy AI01 input while preserving the original four-argument ABI.
+/// The added response fields are marked absent in the v2 output.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Oversized inputs are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_article_identity_json(
+    data: *const u8,
+    length: usize,
+    overview_response_code: i32,
+    overview_attempted: i32,
+) -> *mut c_char {
+    if length > MAX_ARTICLE_IDENTITY_INPUT_BYTES || length < 4 || data.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+    let input = unsafe { slice::from_raw_parts(data, length) };
+    if input.get(..4) != Some(b"AI01")
+        || length
+            .checked_add(8)
+            .is_none_or(|size| size > MAX_ARTICLE_IDENTITY_INPUT_BYTES)
+    {
+        return ptr::null_mut();
+    }
+    let mut upgraded = Vec::with_capacity(length + 8);
+    upgraded.extend_from_slice(b"AI02");
+    upgraded.extend_from_slice(&input[4..]);
+    upgraded.extend_from_slice(&[0xff; 8]);
+    article_identity_json(
+        &upgraded,
+        overview_response_code,
+        overview_attempted != 0,
+        -1,
+        -1,
+    )
+}
+
+fn article_identity_json(
+    input: &[u8],
+    overview_response_code: i32,
+    overview_attempted: bool,
+    head_response_code: i32,
+    body_response_code: i32,
+) -> *mut c_char {
+    match catch_unwind(|| {
+        serde_json::to_string(&article_identity::parse(
+            input,
+            overview_response_code,
+            overview_attempted,
+            head_response_code,
+            body_response_code,
+        ))
+    }) {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Release a metadata JSON string returned by this library.
+///
+/// # Safety
+/// `value` must be null or a pointer returned by one of the metadata functions.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_metadata_string_free(value: *mut c_char) {
+    if !value.is_null() {
+        // SAFETY: the pointer was produced by `CString::into_raw` in this library.
+        unsafe { drop(CString::from_raw(value)) };
+    }
 }
 
 /// Decode `src_length` bytes from `src` into `dest` and return the decoded length.
