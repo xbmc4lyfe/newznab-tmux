@@ -27,6 +27,7 @@ class ReprocessMissingEpisodes extends Command
                             {--limit=0 : Limit the number of releases to process (0 = no limit)}
                             {--video-id= : Process only releases for a specific video ID}
                             {--all : Ignore the retry schedule and attempt cap}
+
                             {--scheduled : Respect the configured TV lookup mode}
                             {--dry-run : Show how many releases would be processed without making changes}
                             {--debug : Show detailed debug information for each release}

@@ -179,6 +179,7 @@ abstract class AbstractTvProvider extends BaseVideoProvider
             return $lock->block(10, fn (): int => $this->addOrUpdate($show));
         } catch (LockTimeoutException) {
             return $this->addOrUpdate($show);
+
         }
     }
 
@@ -212,6 +213,7 @@ abstract class AbstractTvProvider extends BaseVideoProvider
                 'imdb' => $this->normalizeImdbValue($show['imdb'] ?? '') ?: '0',
                 'tmdb' => (int) ($show['tmdb'] ?? 0),
             ]);
+
         } catch (UniqueConstraintViolationException $e) {
             // Use a current locking read of the full unique key, even inside a repeatable-read transaction.
             $racedVideo = Video::query()
