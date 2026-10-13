@@ -658,6 +658,7 @@ class ReleaseProcessor
      */
     private function processImageDownloads(ReleaseProcessingContext $context): void
     {
+
         $budget = $context->mediaBudget ??= new MediaByteBudget($this->config->mediaMaxBytes);
         $candidates = $context->workPlan->imageCandidates ?? [];
         $messageIdLists = $candidates !== []
@@ -665,6 +666,7 @@ class ReleaseProcessor
             : [$context->jpgMessageIDs];
 
         foreach ($messageIdLists as $messageIds) {
+
             if ($context->foundJPGSample || $context->groupUnavailable || $budget->exhausted()) {
                 return;
             }

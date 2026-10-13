@@ -66,6 +66,7 @@ Schedule::command('nntmux:check-service-health')->everyMinute()->withoutOverlapp
 Schedule::command('nntmux:search-repair --limit=100')->everyMinute()->withoutOverlapping();
 // TV: retry episode lookups for shows whose episode wasn't available yet, and normalize
 // any release still carrying a legacy TV processor status.
+
 Schedule::command('tv:reprocess-missing-episodes --scheduled --limit=500')->everyThirtyMinutes()->withoutOverlapping()->runInBackground();
 Schedule::command('tv:repair-links --legacy --stuck --orphans --limit=50000')->dailyAt('05:15')->withoutOverlapping();
 // Tail storage/logs into the Manticore log index used by the admin log viewer search

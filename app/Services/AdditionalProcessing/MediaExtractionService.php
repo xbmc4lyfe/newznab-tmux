@@ -60,12 +60,14 @@ class MediaExtractionService
         ?ReleaseSearchSyncCoordinator $searchSyncCoordinator = null,
         ?MediaToolFactory $tools = null,
         ?ThumbnailFrameSelector $frameSelector = null,
+
         ?ReleaseUpdateService $releaseUpdater = null,
     ) {
         $this->searchSyncCoordinator = $searchSyncCoordinator
             ?? new ReleaseSearchSyncCoordinator(
                 new PersistenceMetricsCollector,
             );
+
         $this->releaseUpdater = $releaseUpdater;
         $this->tools = $tools ?? new MediaToolFactory($config);
         $scorer = new FrameQualityScorer($config->thumbnailMinStddev, $config->thumbnailMinLuma, $config->thumbnailMaxLuma);
