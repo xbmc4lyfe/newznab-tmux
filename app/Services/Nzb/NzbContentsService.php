@@ -336,7 +336,7 @@ class NzbContentsService
                 if ($candidates[$index]['classification'] === 'volume') {
                     $family = $this->par2FamilyKey($candidates[$index]['subject']);
                     if ($family === null || (! isset($allowRecoveryVolumes[$family])
-                        && ! $this->hasIncompleteExplicitPar2Progress($relID, $candidates, $family))) {
+                        && ! $this->hasIncompleteExplicitPar2Progress($relID, $candidates))) {
                         continue;
                     }
                 }
@@ -455,11 +455,10 @@ class NzbContentsService
      *
      * @param  list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}>  $candidates
      */
-    private function hasIncompleteExplicitPar2Progress(int $releaseId, array $candidates, ?string $familyKey = null): bool
+    private function hasIncompleteExplicitPar2Progress(int $releaseId, array $candidates): bool
     {
         foreach ($candidates as $candidate) {
-            if ($candidate['classification'] !== 'index'
-                || ($familyKey !== null && $this->par2FamilyKey($candidate['subject']) !== $familyKey)) {
+            if ($candidate['classification'] !== 'index') {
                 continue;
             }
             $signature = hash('sha256', json_encode([
