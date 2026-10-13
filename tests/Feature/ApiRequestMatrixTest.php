@@ -169,6 +169,7 @@ class ApiRequestMatrixTest extends TestCase
             ]));
 
         $response->assertOk();
+        $response->assertViewHas('listQuery', fn (array $query): bool => ($query['poster'] ?? null) === 'edited@example.test');
     }
 
     public function test_clearing_advanced_poster_clears_hidden_exact_poster(): void
@@ -202,6 +203,7 @@ class ApiRequestMatrixTest extends TestCase
             ]));
 
         $response->assertOk();
+        $response->assertViewHas('listQuery', fn (array $query): bool => ! array_key_exists('poster', $query));
     }
 
     public function test_exact_poster_detail_link_preserves_whitespace_through_http_and_returns_its_own_release(): void
