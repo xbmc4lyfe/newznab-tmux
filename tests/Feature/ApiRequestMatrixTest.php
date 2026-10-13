@@ -304,12 +304,34 @@ class ApiRequestMatrixTest extends TestCase
         try {
             $response = $this->actingAs($user)->get($url);
             $response->assertOk();
-            $response->assertViewHas('listQuery', fn (array $listQuery): bool => ($listQuery['searchadvposter'] ?? null) === trim($poster));
+            $response->assertViewHas('listQuery', fn (array $listQuery): bool => ($listQuery['searchadvposter'] ?? null) === $poster);
             $response->assertViewHas('exactPoster', $poster);
             $this->assertFalse($response->viewData('results')->isEmpty(), 'Exact poster queries: '.json_encode($fixture->posterQueries, JSON_THROW_ON_ERROR));
             $this->assertCount(1, $response->viewData('results'));
             $this->assertSame([$poster, $poster], $fixture->posterQueries[0]['bindings']);
             $response->assertSee('name="searchadvposter"', false);
+            $form = HTMLDocument::createFromString($response->getContent());
+            $visiblePoster = $form->querySelector('input[name="searchadvposter"]')?->getAttribute('value');
+            $this->assertSame($poster, $visiblePoster);
+            $resubmitted = $this->actingAs($user)->get(route('search', [
+                'poster' => $poster,
+                'searchadvposter' => $visiblePoster,
+                'search_type' => 'adv',
+            ]));
+            $resubmitted->assertOk();
+            $resubmitted->assertViewHas('exactPoster', $poster);
+            $this->assertSame((int) $source['id'], (int) $resubmitted->viewData('results')->first()->id);
+
+            $edited = $this->actingAs($user)->get(route('search', [
+                'poster' => $poster,
+                'searchadvposter' => trim($visiblePoster),
+                'search_type' => 'adv',
+            ]));
+            $edited->assertOk();
+            $edited->assertViewHas('exactPoster', trim($poster));
+            $this->assertCount(1, $edited->viewData('results'));
+            $this->assertSame((int) $lookalike['id'], (int) $edited->viewData('results')->first()->id);
+            $edited->assertViewHas('listQuery', fn (array $listQuery): bool => ($listQuery['poster'] ?? null) === trim($poster));
         } finally {
             if ($originalResolver === null) {
                 Model::unsetConnectionResolver();
