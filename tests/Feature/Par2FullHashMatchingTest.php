@@ -160,6 +160,37 @@ final class Par2FullHashMatchingTest extends TestCase
         self::assertSame([], $this->lookup()['donors']);
     }
 
+    public function test_upgrade_requires_recertification_of_both_legacy_completeness_markers(): void
+    {
+        Schema::dropIfExists('par_file_hash_inventories');
+        Schema::create('par_file_hash_inventories', static function (Blueprint $table): void {
+            $table->unsignedInteger('releases_id')->primary();
+            $table->string('release_guid', 40);
+            $table->unsignedBigInteger('evidence_last_id');
+            $table->unsignedBigInteger('evidence_count');
+        });
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Unrelated.Scene.Release-GRP');
+        foreach ([42, 20] as $id) {
+            self::assertTrue($this->rememberUnmarked($id, md5('shared payload one'), md5('prefix one'), 20000));
+            self::assertTrue($this->rememberUnmarked($id, md5('shared payload two'), md5('prefix two'), 30000));
+            $evidence = DB::table('par_file_hashes')->where('releases_id', $id);
+            DB::table('par_file_hash_inventories')->insert([
+                'releases_id' => $id, 'release_guid' => $this->snapshot($id)['guid'],
+                'evidence_last_id' => (clone $evidence)->max('id'), 'evidence_count' => $evidence->count(),
+            ]);
+        }
+        (require database_path('migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->up();
+
+        self::assertSame(2, DB::table('par_file_hash_inventories')->count());
+        self::assertSame([], $this->lookup()['donors']);
+        self::assertSame([0, 0], DB::table('par_file_hash_inventories')->orderBy('releases_id')->pluck('proof_version')->all());
+        self::assertTrue(Par2FileHashEvidence::markInventoryComplete(42, $this->snapshot(42)));
+        self::assertSame([], $this->lookup()['donors']);
+        self::assertTrue(Par2FileHashEvidence::markInventoryComplete(20, $this->snapshot(20)));
+        self::assertCount(1, $this->lookup()['donors']);
+    }
+
     public function test_descriptor_only_packet_stream_cannot_mark_a_complete_inventory(): void
     {
         $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
@@ -342,6 +373,7 @@ final class Par2FullHashMatchingTest extends TestCase
         self::assertSame(Par2RenameOutcome::NoMatch, $processor->applyInventoryForRename($inventory, 42, 1, 0, null, true, $this->snapshot(42)));
         self::assertSame(10, DB::table('par_file_hashes')->where('releases_id', 42)->count());
         self::assertSame(1, DB::table('par_file_hash_inventories')->where('releases_id', 42)->count());
+        self::assertSame(Par2FileHashEvidence::INVENTORY_PROOF_VERSION, DB::table('par_file_hash_inventories')->where('releases_id', 42)->value('proof_version'));
         self::assertSame(0, DB::table('release_files')->count());
         self::assertSame(10, DB::table('releases')->where('id', 42)->value('rarinnerfilecount'));
         DB::table('releases')->where('id', 42)->update(['proc_hash16k' => 1]);

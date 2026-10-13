@@ -29,6 +29,13 @@ return new class extends Migration
             $table->timestamp('retry_at');
             $table->foreign('releases_id')->references('id')->on('releases')->cascadeOnDelete();
         });
+        Schema::create('par_file_hash_inventories', function (Blueprint $table): void {
+            $table->unsignedInteger('releases_id')->primary();
+            $table->string('release_guid', 40);
+            $table->unsignedBigInteger('evidence_last_id');
+            $table->unsignedBigInteger('evidence_count');
+            $table->foreign('releases_id')->references('id')->on('releases')->cascadeOnDelete();
+        });
     }
 
     /**
@@ -37,6 +44,7 @@ return new class extends Migration
     public function down(): void
     {
         Schema::dropIfExists('par2_hash_retry');
+        Schema::dropIfExists('par_file_hash_inventories');
         Schema::dropIfExists('par_file_hashes');
     }
 };

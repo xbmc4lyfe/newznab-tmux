@@ -365,6 +365,7 @@ final class NameFixingQueryService
             return ['known' => true, 'usable' => true, 'overflow' => false, 'donors' => [], 'generation' => $cursor.':'.$count];
         }
         $inventory = $this->database->table('par_file_hash_inventories')->where('releases_id', $releaseId)
+            ->where('proof_version', Par2FileHashEvidence::INVENTORY_PROOF_VERSION)
             ->whereRaw('HEX(release_guid) = ?', [strtoupper(bin2hex($expectedGuid))])->first();
         if ($inventory === null || (int) $inventory->evidence_last_id !== $cursor || (int) $inventory->evidence_count !== $count) {
             return ['known' => true, 'usable' => true, 'overflow' => false, 'donors' => [], 'generation' => $cursor.':'.$count];
@@ -378,6 +379,7 @@ final class NameFixingQueryService
             FROM par_file_hashes t
             INNER JOIN releases target ON target.id = t.releases_id AND HEX(target.guid) = HEX(t.release_guid)
             INNER JOIN par_file_hash_inventories target_inventory ON target_inventory.releases_id = target.id
+                AND target_inventory.proof_version = ?
                 AND HEX(target_inventory.release_guid) = HEX(target.guid)
                 AND target_inventory.evidence_last_id = (SELECT COALESCE(MAX(target_generation.id), 0) FROM par_file_hashes target_generation
                     WHERE target_generation.releases_id = target.id AND HEX(target_generation.release_guid) = HEX(target.guid))
@@ -387,6 +389,7 @@ final class NameFixingQueryService
                 AND HEX(d.full_md5) = HEX(t.full_md5) AND HEX(d.file_size) = HEX(t.file_size)
             INNER JOIN releases r ON r.id = d.releases_id AND HEX(r.guid) = HEX(d.release_guid)
             INNER JOIN par_file_hash_inventories donor_inventory ON donor_inventory.releases_id = r.id
+                AND donor_inventory.proof_version = ?
                 AND HEX(donor_inventory.release_guid) = HEX(r.guid)
                 AND donor_inventory.evidence_last_id = (SELECT COALESCE(MAX(donor_generation.id), 0) FROM par_file_hashes donor_generation
                     WHERE donor_generation.releases_id = r.id AND HEX(donor_generation.release_guid) = HEX(r.guid))
@@ -420,7 +423,8 @@ final class NameFixingQueryService
                         ))
                     )
                 )
-            LIMIT 257', [$releaseId, strtoupper(bin2hex($expectedGuid)), $releaseId, '', '0', '0', '', '0']);
+            LIMIT 257', [Par2FileHashEvidence::INVENTORY_PROOF_VERSION, Par2FileHashEvidence::INVENTORY_PROOF_VERSION,
+            $releaseId, strtoupper(bin2hex($expectedGuid)), $releaseId, '', '0', '0', '', '0']);
 
         return ['known' => true, 'usable' => true, 'overflow' => count($donors) === 257, 'donors' => $donors, 'generation' => $cursor.':'.$count];
     }

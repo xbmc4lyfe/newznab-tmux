@@ -8,6 +8,7 @@ use App\Console\Commands\NntmuxResetDb;
 use App\Services\Par2PacketAccumulator;
 use App\Services\Releases\Verification\VerificationResetService;
 use App\Support\Par2CandidateProgress;
+use App\Support\Par2FileHashEvidence;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -42,6 +43,7 @@ final class Par2HashResetTest extends TestCase
         DB::table('par_file_hash_inventories')->insert([
             'releases_id' => $release->id, 'release_guid' => $release->guid,
             'evidence_last_id' => DB::table('par_file_hashes')->max('id'), 'evidence_count' => 1,
+            'proof_version' => Par2FileHashEvidence::INVENTORY_PROOF_VERSION,
         ]);
         DB::table('par2_hash_retry')->insert(['releases_id' => $release->id, 'release_guid' => $release->guid, 'retry_at' => now()]);
         $tables = ['par_hashes', 'par_file_hashes', 'par_file_hash_inventories', 'par2_hash_retry', 'par2_rename_candidate_progress', 'par2_rename_progress', 'releases'];

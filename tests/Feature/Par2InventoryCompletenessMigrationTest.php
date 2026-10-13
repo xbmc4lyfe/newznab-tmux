@@ -11,7 +11,7 @@ use Tests\TestCase;
 
 final class Par2InventoryCompletenessMigrationTest extends TestCase
 {
-    public function test_fresh_chain_gives_the_additive_migration_sole_marker_table_ownership(): void
+    public function test_fresh_chain_preserves_the_historical_marker_table_until_its_creator_is_rolled_back(): void
     {
         config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
         DB::purge();
@@ -21,19 +21,44 @@ final class Par2InventoryCompletenessMigrationTest extends TestCase
         });
         $evidenceMigration = require database_path('migrations/2026_10_12_010315_create_par_file_hash_evidence_tables.php');
         $evidenceMigration->up();
-        self::assertFalse(Schema::hasTable('par_file_hash_inventories'));
+        self::assertTrue(Schema::hasTable('par_file_hash_inventories'));
 
         $inventoryMigration = require database_path('migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php');
         $inventoryMigration->up();
+        self::assertTrue(Schema::hasColumn('par_file_hash_inventories', 'proof_version'));
+        (require database_path('migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->down();
         self::assertTrue(Schema::hasTable('par_file_hash_inventories'));
-        $inventoryMigration->down();
-        self::assertFalse(Schema::hasTable('par_file_hash_inventories'));
+        self::assertFalse(Schema::hasColumn('par_file_hash_inventories', 'proof_version'));
         self::assertTrue(Schema::hasTable('par_file_hashes'));
         $inventoryMigration->up();
-        self::assertTrue(Schema::hasTable('par_file_hash_inventories'));
-        $inventoryMigration->down();
+        self::assertTrue(Schema::hasColumn('par_file_hash_inventories', 'proof_version'));
+        (require database_path('migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->down();
         $evidenceMigration->down();
         self::assertFalse(Schema::hasTable('par_file_hashes'));
+        self::assertFalse(Schema::hasTable('par_file_hash_inventories'));
+    }
+
+    public function test_existing_marker_table_survives_rollback_from_a_separate_migration_instance(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('par_file_hash_inventories', static function (Blueprint $table): void {
+            $table->unsignedInteger('releases_id')->primary();
+            $table->string('release_guid', 40);
+            $table->unsignedBigInteger('evidence_last_id');
+            $table->unsignedBigInteger('evidence_count');
+        });
+        DB::table('par_file_hash_inventories')->insert([
+            'releases_id' => 42, 'release_guid' => 'target', 'evidence_last_id' => 2, 'evidence_count' => 2,
+        ]);
+        (require database_path('migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->up();
+        (require database_path('migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->down();
+
+        self::assertTrue(Schema::hasTable('par_file_hash_inventories'));
+        self::assertFalse(Schema::hasColumn('par_file_hash_inventories', 'proof_version'));
+        self::assertSame(1, DB::table('par_file_hash_inventories')->count());
+        self::assertSame('target', DB::table('par_file_hash_inventories')->value('release_guid'));
     }
 
     public function test_upgrade_adds_inventory_markers_without_recreating_existing_evidence(): void
@@ -60,7 +85,7 @@ final class Par2InventoryCompletenessMigrationTest extends TestCase
         self::assertTrue(Schema::hasTable('par_file_hash_inventories'));
         self::assertSame(0, DB::table('par_file_hash_inventories')->count());
         self::assertSame(1, DB::table('par_file_hashes')->count());
-        $migration->down();
+        (require $paths[0])->down();
         self::assertFalse(Schema::hasTable('par_file_hash_inventories'));
         self::assertSame(1, DB::table('par_file_hashes')->count());
     }

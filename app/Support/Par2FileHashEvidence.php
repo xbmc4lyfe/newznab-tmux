@@ -11,6 +11,8 @@ final class Par2FileHashEvidence
 {
     public const RETRY_DELAY_SECONDS = 60;
 
+    public const INVENTORY_PROOF_VERSION = 1;
+
     public static function sizeDecimal(mixed $size): ?string
     {
         if (is_int($size)) {
@@ -203,7 +205,8 @@ final class Par2FileHashEvidence
                 $lastId = (int) (clone $evidence)->max('id');
                 DB::table('par_file_hash_inventories')->updateOrInsert(
                     ['releases_id' => $releaseId],
-                    ['release_guid' => $current->guid, 'evidence_last_id' => $lastId, 'evidence_count' => $count],
+                    ['release_guid' => $current->guid, 'evidence_last_id' => $lastId, 'evidence_count' => $count,
+                        'proof_version' => self::INVENTORY_PROOF_VERSION],
                 );
                 if (($guard !== null && ! $guard())
                     || ! self::snapshotMatches(DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first(), $expectedSnapshot)) {
