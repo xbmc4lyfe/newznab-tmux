@@ -139,7 +139,8 @@ class ManticoreSearchQueryTest extends TestCase
         $this->assertSame('\\-VIP\\- \\<poster\\@example.test\\>', $method->invoke(null, 'fromname', '-VIP- <poster@example.test>'));
         $this->assertSame('\\!poster', $method->invoke(null, 'fromname', '!poster'));
         $this->assertSame('poster \\(VIP\\)', $method->invoke(null, 'fromname', 'poster (VIP)'));
-        $this->assertSame('alice', $method->invoke(null, 'fromname', 'alice*'));
+        $this->assertSame('alice\\*', $method->invoke(null, 'fromname', 'alice*'));
+        $this->assertSame('alice\\?bob\\%', $method->invoke(null, 'fromname', 'alice?bob%'));
         $this->assertSame('alice \\| bob', $method->invoke(null, 'fromname', 'alice | bob'));
         $this->assertSame('-VIP\\-', $method->invoke(null, 'searchname', '-VIP-'));
     }

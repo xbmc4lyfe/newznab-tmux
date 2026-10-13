@@ -156,7 +156,7 @@ class ReleaseResultsViewTest extends TestCase
         $submitterLink = $document->querySelector('a[aria-label="View releases with the exact same poster field as '.$submitter.'"]');
 
         $this->assertNotNull($submitterLink);
-        $this->assertSame(route('search', ['poster_release_id' => $release->id, 'search_type' => 'adv']), $submitterLink->getAttribute('href'));
+        $this->assertSame(route('search', ['poster' => $submitter, 'search_type' => 'adv']), $submitterLink->getAttribute('href'));
         $this->assertSame($submitter, trim($submitterLink->textContent));
     }
 }
