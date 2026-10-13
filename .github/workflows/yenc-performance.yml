@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/yenc-performance.yml'
       - 'scripts/benchmark-yenc.php'
+      - 'scripts/benchmark-yenc-abi.py'
       - 'scripts/build-rapidyenc.sh'
       - 'app/Services/Yenc/**'
       - 'app/Services/YencService.php'
@@ -137,6 +138,24 @@ jobs:
             --runtime-manifest="$GITHUB_WORKSPACE/benchmark-evidence/build/runtime.json" \
             --output-dir="$GITHUB_WORKSPACE/benchmark-evidence/paired" \
             2>&1 | tee benchmark-evidence/build/paired-console.log
+
+      - name: Explain native decode and CRC costs without changing the caller gate
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [[ -f benchmark-evidence/paired/cpp.so && -f benchmark-evidence/paired/rust.so ]]; then
+            python3 scripts/benchmark-yenc-abi.py \
+              --fixture-dir="$GITHUB_WORKSPACE/benchmark-evidence/paired" \
+              --output-dir="$GITHUB_WORKSPACE/benchmark-evidence/abi-diagnostic" \
+              --runtime-manifest="$GITHUB_WORKSPACE/benchmark-evidence/build/runtime.json" \
+              --samples=11 --iterations=8 --seed=20261013 --timeout=30 \
+              2>&1 | tee benchmark-evidence/build/abi-diagnostic-console.log
+          else
+            echo 'ABI diagnostic skipped: paired native libraries/fixtures unavailable.'
+            mkdir -p benchmark-evidence/abi-diagnostic
+            echo '{"type":"run_summary","status":"skipped","reason":"paired native libraries/fixtures unavailable","claim":"no ABI performance conclusion"}' > benchmark-evidence/abi-diagnostic/observations.jsonl
+          fi
 
       - name: Summarize every measured stratum
         if: always()

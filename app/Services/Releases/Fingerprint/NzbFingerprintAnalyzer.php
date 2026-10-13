@@ -258,6 +258,7 @@ final class NzbFingerprintAnalyzer
             $rawBody,
         );
         $conflictingYencFields = [];
+        $framingEvidenceIncomplete = self::yencFramingEvidenceIncomplete($yencFramingMetadata);
         $framingLines = is_array($yencFramingMetadata['lines'] ?? null) ? $yencFramingMetadata['lines'] : [];
         foreach ($framingLines as $controlLine) {
             if (! is_array($controlLine) || ! is_string($controlLine['kind'] ?? null)) {
@@ -304,13 +305,13 @@ final class NzbFingerprintAnalyzer
             foreach (preg_split('/\r?\n/', rtrim($payload, "\r\n")) ?: [] as $line) {
                 $payloadLineLengths[] = strlen($line);
             }
-            $rangeFieldsConflict = in_array('ypart.begin', $conflictingYencFields, true)
+            $rangeFieldsConflict = $framingEvidenceIncomplete || in_array('ypart.begin', $conflictingYencFields, true)
                 || in_array('ypart.end', $conflictingYencFields, true);
-            $headerSizeConflict = in_array('ybegin.size', $conflictingYencFields, true);
-            $trailerSizeConflict = in_array('yend.size', $conflictingYencFields, true);
-            $rangeStart = ! in_array('ypart.begin', $conflictingYencFields, true) && isset($frame->part['begin'])
+            $headerSizeConflict = $framingEvidenceIncomplete || in_array('ybegin.size', $conflictingYencFields, true);
+            $trailerSizeConflict = $framingEvidenceIncomplete || in_array('yend.size', $conflictingYencFields, true);
+            $rangeStart = ! $framingEvidenceIncomplete && ! in_array('ypart.begin', $conflictingYencFields, true) && isset($frame->part['begin'])
                 ? self::metadataNumber($frame->part['begin']) : null;
-            $rangeEnd = ! in_array('ypart.end', $conflictingYencFields, true) && isset($frame->part['end'])
+            $rangeEnd = ! $framingEvidenceIncomplete && ! in_array('ypart.end', $conflictingYencFields, true) && isset($frame->part['end'])
                 ? self::metadataNumber($frame->part['end']) : null;
             $headerExpectedDecodedSize = ! $headerSizeConflict && isset($frame->header['size'])
                 ? self::metadataNumber($frame->header['size']) : null;
@@ -350,6 +351,7 @@ final class NzbFingerprintAnalyzer
                 ? self::metadataNumber($frame->header['total']) : null;
             $trailerPartMatchesHeader = null;
             if (isset($frame->trailer['part'], $frame->header['part'])
+                && ! $framingEvidenceIncomplete
                 && ! in_array('yend.part', $conflictingYencFields, true)
                 && ! in_array('ybegin.part', $conflictingYencFields, true)) {
                 $trailerPartMatchesHeader = $trailerPartNumber !== null && $headerPartNumber !== null
@@ -357,6 +359,7 @@ final class NzbFingerprintAnalyzer
             }
             $trailerTotalMatchesHeader = null;
             if (isset($frame->trailer['total'], $frame->header['total'])
+                && ! $framingEvidenceIncomplete
                 && ! in_array('yend.total', $conflictingYencFields, true)
                 && ! in_array('ybegin.total', $conflictingYencFields, true)) {
                 $trailerTotalMatchesHeader = $trailerTotalNumber !== null && $headerTotalNumber !== null
@@ -388,13 +391,13 @@ final class NzbFingerprintAnalyzer
             $multipart = $frame->part !== null;
             $expectedDecodedSize = $multipart ? $ypartExpectedDecodedSize : $headerExpectedDecodedSize;
             $crcField = $multipart ? 'pcrc32' : (isset($frame->trailer['crc32']) ? 'crc32' : 'pcrc32');
-            $crcFieldConflict = in_array('yend.'.$crcField, $conflictingYencFields, true);
+            $crcFieldConflict = $framingEvidenceIncomplete || in_array('yend.'.$crcField, $conflictingYencFields, true);
             $expectedCrc = $crcFieldConflict ? null : ($frame->trailer[$crcField] ?? null);
             $criticalYencFields = [
                 'ybegin.name', 'ybegin.line', 'ybegin.size', 'ybegin.part', 'ybegin.total',
                 'ypart.begin', 'ypart.end', 'yend.size', 'yend.part', 'yend.total', 'yend.pcrc32', 'yend.crc32',
             ];
-            $integrityChecksAmbiguous = array_intersect($criticalYencFields, $conflictingYencFields) !== [];
+            $integrityChecksAmbiguous = $framingEvidenceIncomplete || array_intersect($criticalYencFields, $conflictingYencFields) !== [];
             $allDeclaredCrc32FieldsAreHex = true;
             foreach (['pcrc32', 'crc32'] as $declaredCrcField) {
                 if (isset($frame->trailer[$declaredCrcField])
@@ -431,6 +434,8 @@ final class NzbFingerprintAnalyzer
                 'header_numeric_fields_valid' => $headerNumericFieldsValid,
                 'conflicting_control_fields' => $conflictingYencFields,
                 'integrity_checks_ambiguous' => $integrityChecksAmbiguous,
+                'native_framing_evidence_status' => $yencFramingMetadata === null ? 'unavailable'
+                    : ($framingEvidenceIncomplete ? 'incomplete_or_ambiguous' : 'occurrence_scan_complete'),
                 'header_numeric_fields_representable' => $headerNumericFieldsRangeValid,
                 'begin' => $rangeStart,
                 'end' => $rangeEnd,
@@ -638,6 +643,32 @@ final class NzbFingerprintAnalyzer
             'final_line_terminated' => $finalLineTerminated,
             'measurement_basis' => 'Raw NNTP BODY octets after one dot-unstuffing pass; excludes the NNTP dot terminator.',
         ];
+    }
+
+    /** @param array<string, mixed>|null $metadata */
+    private static function yencFramingEvidenceIncomplete(?array $metadata): bool
+    {
+        if ($metadata === null) {
+            return false; // No native claim; the public status explicitly says unavailable.
+        }
+        if (($metadata['frames_truncated'] ?? false) === true
+            || ($metadata['control_lines_truncated'] ?? false) === true
+            || ! is_array($metadata['lines'] ?? null)
+            || ! is_array($metadata['frames'] ?? null)) {
+            return true;
+        }
+        foreach ($metadata['lines'] as $line) {
+            if (! is_array($line) || ($line['field_occurrences_truncated'] ?? false) === true) {
+                return true;
+            }
+        }
+        foreach ($metadata['frames'] as $frame) {
+            if (! is_array($frame) || ($frame['size_relationship_status'] ?? null) === 'ambiguous') {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /** @return list<array{name: string, offset: int, basis: string}> */

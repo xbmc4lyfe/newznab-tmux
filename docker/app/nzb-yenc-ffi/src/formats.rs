@@ -616,6 +616,7 @@ pub struct Rar5FileHeaderObservation {
     pub solid: Option<bool>,
     pub compression_method: Option<u8>,
     pub dictionary_size_exponent: Option<u8>,
+    pub compression_metadata: Option<Rar5CompressionMetadata>,
     pub host_os: Option<u64>,
     pub name_byte_length: Option<usize>,
     pub name_utf8_valid: Option<bool>,
@@ -623,6 +624,79 @@ pub struct Rar5FileHeaderObservation {
     pub name_sha256: Option<String>,
     pub name_preview_hex: Option<String>,
     pub name_preview_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Rar5CompressionMetadata {
+    pub status: &'static str,
+    pub interpretation_status: &'static str,
+    pub evidence_basis: &'static str,
+    pub encoding_version: u8,
+    pub dictionary_exponent_observed: u8,
+    pub dictionary_fraction_bits_observed: u8,
+    pub algorithm_zero_compatibility_bit_observed: bool,
+    pub actual_algorithm_version: Option<u8>,
+    pub minimum_decoder_generation: Option<&'static str>,
+    pub declared_dictionary_bytes: Option<u64>,
+    pub effective_dictionary_bytes: Option<u64>,
+}
+
+fn rar5_compression_metadata(info: u64, header_trusted: bool) -> Rar5CompressionMetadata {
+    let version = (info & 0x3f) as u8;
+    let method = ((info >> 7) & 7) as u8;
+    let exponent = ((info >> 10) & 31) as u8;
+    let fraction = ((info >> 15) & 31) as u8;
+    let compatibility = info & 0x100000 != 0;
+    let known_encoding = match version {
+        0 => info & !0x7fff == 0,
+        1 => info & !0x1fffff == 0,
+        _ => false,
+    };
+    let interpretation_status = if version > 1 {
+        "compression_version_unsupported"
+    } else if !known_encoding {
+        "compression_flags_unsupported"
+    } else if exponent > if version == 0 { 15 } else { 23 } {
+        "dictionary_exponent_unsupported"
+    } else if method > 5 {
+        "compression_method_unsupported"
+    } else {
+        "supported"
+    };
+    let declared_dictionary_bytes = (interpretation_status == "supported")
+        .then(|| {
+            let base = 131_072u64.checked_shl(u32::from(exponent))?;
+            let addition = (base / 32).checked_mul(u64::from(fraction))?;
+            base.checked_add(addition)
+        })
+        .flatten();
+    Rar5CompressionMetadata {
+        status: if header_trusted {
+            interpretation_status
+        } else {
+            "header_untrusted"
+        },
+        interpretation_status,
+        evidence_basis: "RAR5 file/service compression-info vint; RAR technote dictionary encoding, not measured memory allocation, writer version, or uploader identity",
+        encoding_version: version,
+        dictionary_exponent_observed: exponent,
+        dictionary_fraction_bits_observed: fraction,
+        algorithm_zero_compatibility_bit_observed: compatibility,
+        actual_algorithm_version: known_encoding.then_some(if version == 1 && !compatibility {
+            1
+        } else {
+            0
+        }),
+        minimum_decoder_generation: known_encoding.then_some(if version == 0 {
+            "RAR 5.0"
+        } else {
+            "RAR 7.0"
+        }),
+        declared_dictionary_bytes,
+        effective_dictionary_bytes: header_trusted
+            .then_some(declared_dictionary_bytes)
+            .flatten(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1653,6 +1727,11 @@ fn read_rar5_visible_block_walk(
     if !main_header_trusted {
         walk.status = "main_header_untrusted";
         walk.stopped_offset = Some(main_header_start);
+        for locator in [&mut walk.quick_open, &mut walk.recovery_record] {
+            locator.status = "main_header_untrusted";
+            locator.relative_offset = None;
+            locator.target_sample_offset = None;
+        }
         return walk;
     }
 
@@ -2035,6 +2114,7 @@ fn parse_rar5_file_header(
         solid: None,
         compression_method: None,
         dictionary_size_exponent: None,
+        compression_metadata: None,
         host_os: None,
         name_byte_length: None,
         name_utf8_valid: None,
@@ -2103,6 +2183,10 @@ fn parse_rar5_file_header(
     result.solid = Some(compression_info & 0x40 != 0);
     result.compression_method = Some(((compression_info >> 7) & 0x07) as u8);
     result.dictionary_size_exponent = Some(((compression_info >> 10) & 0x1f) as u8);
+    result.compression_metadata = Some(rar5_compression_metadata(
+        compression_info,
+        header_crc32_valid == Some(true),
+    ));
 
     let Some(host_os) = read_rar5_vint_bounded(data, &mut cursor, fields_end) else {
         return result;
@@ -6961,6 +7045,96 @@ mod tests {
     }
 
     #[test]
+    fn rar5_dictionary_encoding_and_actual_algorithm_are_separate_evidence() {
+        let cases = [
+            (
+                15 << 10,
+                "supported",
+                Some(4_294_967_296u64),
+                Some(0),
+                Some("RAR 5.0"),
+            ),
+            (
+                1 | (19 << 10) | (16 << 15),
+                "supported",
+                Some(103_079_215_104),
+                Some(1),
+                Some("RAR 7.0"),
+            ),
+            (
+                1 | (23 << 10) | (31 << 15) | 0x100000,
+                "supported",
+                Some(2_164_663_517_184),
+                Some(0),
+                Some("RAR 7.0"),
+            ),
+            (
+                16 << 10,
+                "dictionary_exponent_unsupported",
+                None,
+                Some(0),
+                Some("RAR 5.0"),
+            ),
+            (
+                1 | (24 << 10),
+                "dictionary_exponent_unsupported",
+                None,
+                Some(1),
+                Some("RAR 7.0"),
+            ),
+            (2, "compression_version_unsupported", None, None, None),
+            (1 << 15, "compression_flags_unsupported", None, None, None),
+            (
+                1 | (1 << 21),
+                "compression_flags_unsupported",
+                None,
+                None,
+                None,
+            ),
+            (
+                6 << 7,
+                "compression_method_unsupported",
+                None,
+                Some(0),
+                Some("RAR 5.0"),
+            ),
+        ];
+        for (info, status, dictionary, algorithm, minimum_generation) in cases {
+            let block = rar5_test_file_block(0, 0, 0, 0, None, None, info, 0, b"x", &[], &[]);
+            let mut archive = RAR5.to_vec();
+            archive.extend_from_slice(&rar5_test_block(&[1, 0, 0], &[]));
+            let file_start = archive.len();
+            archive.extend_from_slice(&block);
+            let metadata = serde_json::to_value(parse(&archive)).unwrap();
+            let compression = &metadata["headers"][0]["visible_block_walk"]["blocks"][1]["file_header"]
+                ["compression_metadata"];
+            assert_eq!(compression["status"], status, "info={info}");
+            assert_eq!(
+                compression["declared_dictionary_bytes"],
+                serde_json::json!(dictionary)
+            );
+            assert_eq!(
+                compression["effective_dictionary_bytes"],
+                serde_json::json!(dictionary)
+            );
+            assert_eq!(
+                compression["actual_algorithm_version"],
+                serde_json::json!(algorithm)
+            );
+            assert_eq!(
+                compression["minimum_decoder_generation"],
+                serde_json::json!(minimum_generation)
+            );
+            archive[file_start] ^= 1;
+            let metadata = serde_json::to_value(parse(&archive)).unwrap();
+            let compression = &metadata["headers"][0]["visible_block_walk"]["blocks"][1]["file_header"]
+                ["compression_metadata"];
+            assert_eq!(compression["status"], "header_untrusted");
+            assert!(compression["effective_dictionary_bytes"].is_null());
+        }
+    }
+
+    #[test]
     fn rar5_unknown_unpacked_size_is_observed_but_not_effective() {
         let file_block = rar5_test_file_block(
             0x02,
@@ -7317,6 +7491,23 @@ mod tests {
                 .map(|observation| observation.status),
             Some("filename_range_invalid")
         );
+    }
+
+    #[test]
+    fn untrusted_rar5_main_header_withholds_locator_targets() {
+        let mut archive = rar5_archive_with_quick_open_locator(false);
+        archive[RAR5.len()] ^= 1;
+        let metadata = serde_json::to_value(parse(&archive)).unwrap();
+        let walk = &metadata["headers"][0]["visible_block_walk"];
+        assert_eq!(walk["status"], "main_header_untrusted");
+        for kind in ["quick_open", "recovery_record"] {
+            assert_eq!(walk[kind]["status"], "main_header_untrusted");
+            assert!(walk[kind]["relative_offset"].is_null());
+            assert!(walk[kind]["target_sample_offset"].is_null());
+            assert!(walk[kind]["matched_block_index"].is_null());
+        }
+        // The raw locator observations remain attached to the rejected header.
+        assert!(metadata["headers"][0]["main_extra_records"]["quick_open_offset"].is_number());
     }
 
     #[test]
@@ -8081,6 +8272,29 @@ mod tests {
         let header = &metadata["headers"][0];
         assert_eq!(header["resolved_uncompressed_size"], 1234);
         assert_eq!(header["resolved_compressed_size"], 567);
+    }
+
+    #[test]
+    fn zip64_local_extra_requires_both_sizes_even_with_one_sentinel() {
+        // APPNOTE 4.5.3 requires BOTH sizes in a local header. Conditional
+        // omission in central-directory entries does not apply here.
+        for (compressed, uncompressed) in [(u32::MAX, 7), (7, u32::MAX)] {
+            let mut extra = vec![1, 0, 8, 0];
+            extra.extend_from_slice(&1234u64.to_le_bytes());
+            let mut zip = zip_local_header(0, 0, 0, &extra);
+            zip[4..6].copy_from_slice(&45u16.to_le_bytes());
+            zip[18..22].copy_from_slice(&compressed.to_le_bytes());
+            zip[22..26].copy_from_slice(&uncompressed.to_le_bytes());
+            let metadata = serde_json::to_value(parse(&zip)).unwrap();
+            let header = &metadata["headers"][0];
+            assert_eq!(
+                header["zip64_size_metadata"]["status"],
+                "malformed-local-zip64-sizes"
+            );
+            assert!(header["resolved_uncompressed_size"].is_null());
+            assert!(header["resolved_compressed_size"].is_null());
+            assert_eq!(header["structure_valid"], false);
+        }
     }
 
     #[test]

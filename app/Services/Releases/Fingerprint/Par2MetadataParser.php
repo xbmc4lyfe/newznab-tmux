@@ -890,6 +890,9 @@ final class Par2MetadataParser
             } elseif ($type === "PAR 2.0\0Creator") {
                 $creator = trim(strtok($payload, "\0") ?: $payload);
             } elseif (in_array($type, ["PAR 2.0\0UniFileN", "PAR 2.0\0CommASCI", "PAR 2.0\0CommUni", "PAR 2.0\0FileSlic", "PAR 2.0\0RFSC", "PAR 2.0\0PkdMain", "PAR 2.0\0PkdRecvS"], true)) {
+                if ($type === "PAR 2.0\0UniFileN" && strlen($payload) < 20) {
+                    $invalidPacketCount++;
+                }
                 $optionalPackets[$type][] = [
                     'payload_bytes' => strlen($payload),
                     'payload_sha256' => hash('sha256', $payload),
@@ -1230,6 +1233,7 @@ final class Par2MetadataParser
             $metadata['invalid_packet_count'] = (int) ($metadata['invalid_packet_count'] ?? 0) + $unsupportedRangeCount;
             $metadata['integer_range_valid'] = false;
             $metadata['recovery_to_source_percent'] = null;
+            $metadata['recovery_percentage_basis'] = 'unavailable-unsupported-integer-range';
         }
 
         return $metadata;
@@ -1242,18 +1246,26 @@ final class Par2MetadataParser
             'source_block_size', 'source_block_count', 'source_file_bytes', 'file_length',
             'expected_slice_count_from_file_length', 'source_byte_start', 'source_byte_end_exclusive',
             'source_bytes_in_slice', 'zero_padding_bytes',
-            'input_slice_index', 'logical_file_offset', 'logical_byte_length',
+            'logical_file_offset', 'logical_byte_length',
             'ifsc_record_index', 'source_slice_checksum_bytes',
         ];
         $initialUnsupportedRangeCount = $unsupportedRangeCount;
         foreach ($values as $key => &$value) {
             if (is_array($value)) {
                 self::normalizeIntegerRangeValues($value, $unsupportedRangeCount);
+            } elseif ($key === 'input_slice_index' && $value !== null) {
+                // This optional unsigned observation is not a global validity constraint.
+                // Keep JSON_BIGINT_AS_STRING's exact decimal value for public evidence.
+                $values['input_slice_index_integer_range_valid'] = is_int($value);
             } elseif (in_array($key, $integerFields, true) && $value !== null && ! is_int($value)) {
                 $value = null;
                 $unsupportedRangeCount++;
                 if ($key === 'file_length') {
                     $values['file_length_integer_range_valid'] = false;
+                } elseif ($key === 'source_file_bytes') {
+                    $values['source_file_bytes_overflow'] = true;
+                } elseif ($key === 'source_block_count') {
+                    $values['source_block_count_overflow'] = true;
                 }
             }
         }
@@ -1334,7 +1346,7 @@ final class Par2MetadataParser
                     'byte_length' => $trailingBytes,
                 ];
             }
-        } elseif ($type === "PAR 2.0\0RecvSlic" && strlen($payload) > 4) {
+        } elseif ($type === "PAR 2.0\0RecvSlic" && strlen($payload) >= 4) {
             $regions[] = [
                 'kind' => 'recovery_exponent',
                 'offset' => $payloadOffset,
@@ -1345,6 +1357,30 @@ final class Par2MetadataParser
                 'offset' => $payloadOffset + 4,
                 'byte_length' => strlen($payload) - 4,
             ];
+        } elseif ($type === "PAR 2.0\0FileSlic") {
+            $fileIdBytes = min(strlen($payload), 16);
+            if ($fileIdBytes > 0) {
+                $regions[] = [
+                    'kind' => $fileIdBytes === 16 ? 'fileslic_file_id' : 'fileslic_truncated_file_id',
+                    'offset' => $payloadOffset,
+                    'byte_length' => $fileIdBytes,
+                ];
+            }
+            $indexBytes = min(max(strlen($payload) - 16, 0), 8);
+            if ($indexBytes > 0) {
+                $regions[] = [
+                    'kind' => $indexBytes === 8 ? 'fileslic_input_slice_index' : 'fileslic_truncated_input_slice_index',
+                    'offset' => $payloadOffset + 16,
+                    'byte_length' => $indexBytes,
+                ];
+            }
+            if (strlen($payload) > 24) {
+                $regions[] = [
+                    'kind' => 'fileslic_physical_slice_field',
+                    'offset' => $payloadOffset + 24,
+                    'byte_length' => strlen($payload) - 24,
+                ];
+            }
         }
 
         return $regions;

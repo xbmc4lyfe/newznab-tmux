@@ -1,8 +1,8 @@
 //! Payload-only yEnc decoding into the caller's storage. Framing and CRC checks
 //! belong to the caller; CR/LF is discarded even inside an escape sequence.
 
-static COMPACT: [[u8; 8]; 256] = compact_table();
-static ESCAPE_OFFSETS: [[u8; 8]; 256] = escape_offset_table();
+pub(crate) static COMPACT: [[u8; 8]; 256] = compact_table();
+pub(crate) static ESCAPE_OFFSETS: [[u8; 8]; 256] = escape_offset_table();
 
 const fn compact_table() -> [[u8; 8]; 256] {
     let mut table = [[0x80; 8]; 256];
@@ -59,15 +59,17 @@ unsafe fn decode_forward(source: *const u8, destination: *mut u8, length: usize)
     #[cfg(target_arch = "aarch64")]
     {
         // AArch64 requires Advanced SIMD; no optional ISA is assumed here.
-        return unsafe { decode_neon(source, destination, length) };
+        return unsafe { crate::payload_decoder_arm::decode_neon(source, destination, length) };
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
-            return unsafe { decode_avx2(source, destination, length) };
+            return unsafe { crate::payload_decoder_x86::decode_avx2(source, destination, length) };
         }
         if is_x86_feature_detected!("ssse3") {
-            return unsafe { decode_ssse3(source, destination, length) };
+            return unsafe {
+                crate::payload_decoder_x86::decode_ssse3(source, destination, length)
+            };
         }
     }
     #[allow(unreachable_code)]
@@ -78,7 +80,7 @@ unsafe fn decode_forward(source: *const u8, destination: *mut u8, length: usize)
 
 /// Return removal and escaped-value masks for one sixteen-byte block.
 #[inline]
-fn block_masks(mut equals: u16, newlines: u16, escaped: &mut bool) -> (u16, u16) {
+pub(crate) fn block_masks(mut equals: u16, newlines: u16, escaped: &mut bool) -> (u16, u16) {
     let mut adjustments = 0u16;
     if *escaped {
         let available = !newlines;
@@ -123,7 +125,7 @@ fn block_masks(mut equals: u16, newlines: u16, escaped: &mut bool) -> (u16, u16)
 
 /// Store only selected output bytes, preserving storage beyond the returned length.
 #[inline]
-unsafe fn store_word(mut word: u64, mut destination: *mut u8, count: usize) {
+pub(crate) unsafe fn store_word(mut word: u64, mut destination: *mut u8, count: usize) {
     unsafe {
         if count == 8 {
             destination.cast::<u64>().write_unaligned(word.to_le());
@@ -150,7 +152,7 @@ unsafe fn store_word(mut word: u64, mut destination: *mut u8, count: usize) {
 }
 
 #[inline]
-unsafe fn scalar_tail(
+pub(crate) unsafe fn scalar_tail(
     source: *const u8,
     destination: *mut u8,
     length: usize,
@@ -183,189 +185,6 @@ unsafe fn scalar_tail(
         }
     }
     written
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn decode_neon(source: *const u8, destination: *mut u8, length: usize) -> usize {
-    use std::arch::aarch64::*;
-    let mut read = 0;
-    let mut written = 0;
-    let mut escaped = false;
-    unsafe {
-        let offset = vdupq_n_u8(42);
-        let weights = vld1_u8([1u8, 2, 4, 8, 16, 32, 64, 128].as_ptr());
-        while length - read >= 16 {
-            let bytes = vld1q_u8(source.add(read));
-            let equals = vceqq_u8(bytes, vdupq_n_u8(b'='));
-            let newlines = vorrq_u8(
-                vceqq_u8(bytes, vdupq_n_u8(b'\r')),
-                vceqq_u8(bytes, vdupq_n_u8(b'\n')),
-            );
-            if !escaped && vmaxvq_u8(vorrq_u8(equals, newlines)) == 0 {
-                vst1q_u8(destination.add(written), vsubq_u8(bytes, offset));
-                written += 16;
-            } else {
-                let equals_mask = u16::from(vaddv_u8(vand_u8(vget_low_u8(equals), weights)))
-                    | (u16::from(vaddv_u8(vand_u8(vget_high_u8(equals), weights))) << 8);
-                let newline_mask = u16::from(vaddv_u8(vand_u8(vget_low_u8(newlines), weights)))
-                    | (u16::from(vaddv_u8(vand_u8(vget_high_u8(newlines), weights))) << 8);
-                let (remove, adjust) = block_masks(equals_mask, newline_mask, &mut escaped);
-                let low = vsub_u8(
-                    vsub_u8(vget_low_u8(bytes), vdup_n_u8(42)),
-                    vld1_u8(ESCAPE_OFFSETS[(adjust & 255) as usize].as_ptr()),
-                );
-                let high = vsub_u8(
-                    vsub_u8(vget_high_u8(bytes), vdup_n_u8(42)),
-                    vld1_u8(ESCAPE_OFFSETS[(adjust >> 8) as usize].as_ptr()),
-                );
-                let low_count = 8 - (remove & 255).count_ones() as usize;
-                let high_count = 8 - (remove >> 8).count_ones() as usize;
-                let low = vtbl1_u8(low, vld1_u8(COMPACT[(remove & 255) as usize].as_ptr()));
-                let high = vtbl1_u8(high, vld1_u8(COMPACT[(remove >> 8) as usize].as_ptr()));
-                store_word(
-                    vget_lane_u64(vreinterpret_u64_u8(low), 0),
-                    destination.add(written),
-                    low_count,
-                );
-                store_word(
-                    vget_lane_u64(vreinterpret_u64_u8(high), 0),
-                    destination.add(written + low_count),
-                    high_count,
-                );
-                written += low_count + high_count;
-            }
-            read += 16;
-        }
-        scalar_tail(source, destination, length, read, written, escaped)
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-mod x86 {
-    #[cfg(target_arch = "x86")]
-    pub use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    pub use std::arch::x86_64::*;
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "ssse3")]
-unsafe fn compact_ssse3(
-    bytes: x86::__m128i,
-    equals: u16,
-    newlines: u16,
-    escaped: &mut bool,
-    destination: *mut u8,
-) -> usize {
-    use x86::*;
-    unsafe {
-        let (remove, adjust) = block_masks(equals, newlines, escaped);
-        let low_offsets = _mm_loadl_epi64(ESCAPE_OFFSETS[(adjust & 255) as usize].as_ptr().cast());
-        let high_offsets = _mm_loadl_epi64(ESCAPE_OFFSETS[(adjust >> 8) as usize].as_ptr().cast());
-        let offsets = _mm_add_epi8(
-            _mm_set1_epi8(42),
-            _mm_unpacklo_epi64(low_offsets, high_offsets),
-        );
-        let decoded = _mm_sub_epi8(bytes, offsets);
-        let low = _mm_shuffle_epi8(
-            decoded,
-            _mm_loadl_epi64(COMPACT[(remove & 255) as usize].as_ptr().cast()),
-        );
-        let high = _mm_shuffle_epi8(
-            _mm_srli_si128::<8>(decoded),
-            _mm_loadl_epi64(COMPACT[(remove >> 8) as usize].as_ptr().cast()),
-        );
-        let low_count = 8 - (remove & 255).count_ones() as usize;
-        let high_count = 8 - (remove >> 8).count_ones() as usize;
-        let mut low_word = 0u64;
-        let mut high_word = 0u64;
-        _mm_storel_epi64(std::ptr::addr_of_mut!(low_word).cast(), low);
-        _mm_storel_epi64(std::ptr::addr_of_mut!(high_word).cast(), high);
-        store_word(low_word, destination, low_count);
-        store_word(high_word, destination.add(low_count), high_count);
-        low_count + high_count
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "ssse3")]
-unsafe fn decode_ssse3(source: *const u8, destination: *mut u8, length: usize) -> usize {
-    use x86::*;
-    let mut read = 0;
-    let mut written = 0;
-    let mut escaped = false;
-    unsafe {
-        while length - read >= 16 {
-            let bytes = _mm_loadu_si128(source.add(read).cast());
-            let equals = _mm_movemask_epi8(_mm_cmpeq_epi8(bytes, _mm_set1_epi8(b'=' as i8))) as u16;
-            let newlines = _mm_movemask_epi8(_mm_or_si128(
-                _mm_cmpeq_epi8(bytes, _mm_set1_epi8(b'\r' as i8)),
-                _mm_cmpeq_epi8(bytes, _mm_set1_epi8(b'\n' as i8)),
-            )) as u16;
-            if !escaped && equals | newlines == 0 {
-                _mm_storeu_si128(
-                    destination.add(written).cast(),
-                    _mm_sub_epi8(bytes, _mm_set1_epi8(42)),
-                );
-                written += 16;
-            } else {
-                written += compact_ssse3(
-                    bytes,
-                    equals,
-                    newlines,
-                    &mut escaped,
-                    destination.add(written),
-                );
-            }
-            read += 16;
-        }
-        scalar_tail(source, destination, length, read, written, escaped)
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn decode_avx2(source: *const u8, destination: *mut u8, length: usize) -> usize {
-    use x86::*;
-    let mut read = 0;
-    let mut written = 0;
-    let mut escaped = false;
-    unsafe {
-        while length - read >= 32 {
-            let bytes = _mm256_loadu_si256(source.add(read).cast());
-            let equals =
-                _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'=' as i8))) as u32;
-            let newlines = _mm256_movemask_epi8(_mm256_or_si256(
-                _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'\r' as i8)),
-                _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'\n' as i8)),
-            )) as u32;
-            if !escaped && equals | newlines == 0 {
-                _mm256_storeu_si256(
-                    destination.add(written).cast(),
-                    _mm256_sub_epi8(bytes, _mm256_set1_epi8(42)),
-                );
-                written += 32;
-            } else {
-                written += compact_ssse3(
-                    _mm256_castsi256_si128(bytes),
-                    equals as u16,
-                    newlines as u16,
-                    &mut escaped,
-                    destination.add(written),
-                );
-                written += compact_ssse3(
-                    _mm256_extracti128_si256::<1>(bytes),
-                    (equals >> 16) as u16,
-                    (newlines >> 16) as u16,
-                    &mut escaped,
-                    destination.add(written),
-                );
-            }
-            read += 32;
-        }
-        scalar_tail(source, destination, length, read, written, escaped)
-    }
 }
 
 #[cfg(test)]
@@ -478,6 +297,7 @@ mod tests {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn each_available_x86_kernel_matches_scalar_at_boundaries() {
+        use crate::payload_decoder_x86::{decode_avx2, decode_ssse3};
         for prefix_length in 0..65 {
             let mut payload = vec![b'k'; prefix_length];
             payload.extend_from_slice(&b"=y=@\r\n===\r\n=\r\n@=J=M=}..\x0b==".repeat(65));

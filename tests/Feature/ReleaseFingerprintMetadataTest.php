@@ -79,6 +79,44 @@ final class ReleaseFingerprintMetadataTest extends TestCase
     }
 
     #[Test]
+    public function it_treats_incomplete_native_framing_evidence_as_ambiguous(): void
+    {
+        $method = new \ReflectionMethod(NzbFingerprintAnalyzer::class, 'yencFramingEvidenceIncomplete');
+        $complete = ['frames' => [['size_relationship_status' => 'consistent']], 'lines' => [['field_occurrences_truncated' => false]]];
+        self::assertFalse($method->invoke(null, $complete));
+        foreach (['frames_truncated', 'control_lines_truncated'] as $flag) {
+            self::assertTrue($method->invoke(null, $complete + [$flag => true]));
+        }
+        $truncated = $complete;
+        $truncated['lines'][0]['field_occurrences_truncated'] = true;
+        self::assertTrue($method->invoke(null, $truncated));
+        $ambiguous = $complete;
+        $ambiguous['frames'][0]['size_relationship_status'] = 'ambiguous';
+        self::assertTrue($method->invoke(null, $ambiguous));
+    }
+
+    #[Test]
+    public function it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated(): void
+    {
+        $filler = implode(' ', array_map(static fn (int $i): string => 'x'.$i.'=v', range(1, 62)));
+        $bodies = [
+            '=ybegin size=0 line=128 '.$filler." size=3 name=x.rar\r\nklm\r\n=yend size=3 crc32=a3830348\r\n",
+            "=ybegin size=3 line=128 name=x.rar\r\nklm\r\n=yend size=0 crc32=a3830348 ".$filler." size=3\r\n",
+        ];
+        foreach ($bodies as $body) {
+            $native = (new NativeMetadataParser)->parseYencFraming($body);
+            if ($native === null) {
+                self::markTestSkipped('Native yEnc framing library is required for scan-budget integration.');
+            }
+            self::assertContains(true, array_column($native['lines'], 'field_occurrences_truncated'));
+            $article = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $body);
+            self::assertTrue($article['yenc']['integrity_checks_ambiguous']);
+            self::assertNull($article['yenc']['par2_first_16k_md5_candidate']);
+            self::assertFalse(Par2MetadataParser::declaredYencCrc32Valid($article['yenc']));
+        }
+    }
+
+    #[Test]
     public function it_preserves_raw_yenc_sizes_without_claiming_an_out_of_range_integer_is_valid(): void
     {
         $body = "=ybegin line=128 size=18446744073709551615 name=one.rar\r\nklm\r\n=yend size=3 crc32=a3830348\r\n";
@@ -1052,6 +1090,72 @@ final class ReleaseFingerprintMetadataTest extends TestCase
 
         self::assertSame(1, $metadata['invalid_packet_count']);
         self::assertSame([], $metadata['recovery_packets']);
+    }
+
+    #[Test]
+    public function it_rejects_short_unicode_filename_packets_in_the_fallback(): void
+    {
+        config(['yenc.native_library' => '']);
+        foreach ([0, 4, 12, 16] as $length) {
+            $metadata = (new Par2MetadataParser)->parse($this->par2Packet("PAR 2.0\0UniFileN", str_repeat('U', $length)));
+            self::assertSame(1, $metadata['invalid_packet_count']);
+        }
+    }
+
+    #[Test]
+    public function it_preserves_fileslic_and_empty_recovery_physical_regions_in_the_fallback(): void
+    {
+        config(['yenc.native_library' => '']);
+        $cases = [
+            ["PAR 2.0\0FileSlic", str_repeat('F', 12), ['fileslic_truncated_file_id' => [64, 12]]],
+            ["PAR 2.0\0FileSlic", str_repeat('F', 16).'1234', ['fileslic_file_id' => [64, 16], 'fileslic_truncated_input_slice_index' => [80, 4]]],
+            ["PAR 2.0\0FileSlic", str_repeat('F', 16).pack('V2', 1, 0).'data', ['fileslic_file_id' => [64, 16], 'fileslic_input_slice_index' => [80, 8], 'fileslic_physical_slice_field' => [88, 4]]],
+            ["PAR 2.0\0RecvSlic", pack('V', 1), ['recovery_exponent' => [64, 4], 'recovery_data' => [68, 0]]],
+        ];
+        foreach ($cases as [$type, $payload, $expected]) {
+            $metadata = (new Par2MetadataParser)->parse($this->par2Packet($type, $payload));
+            $regions = array_column($metadata['packet_summaries'][0]['physical_regions'], null, 'kind');
+            foreach ($expected as $kind => [$offset, $length]) {
+                self::assertArrayHasKey($kind, $regions);
+                self::assertSame($offset, $regions[$kind]['offset']);
+                self::assertSame($length, $regions[$kind]['byte_length']);
+            }
+        }
+    }
+
+    #[Test]
+    public function it_keeps_optional_unsigned_slice_indexes_out_of_global_par2_validity(): void
+    {
+        $method = new \ReflectionMethod(Par2MetadataParser::class, 'normalizeNativeIntegerRanges');
+        $metadata = $method->invoke(null, [
+            'invalid_packet_count' => 0,
+            'integer_range_valid' => true,
+            'optional_packet_summaries' => [['input_slice_index' => '9223372036854775808']],
+        ]);
+        self::assertSame(0, $metadata['invalid_packet_count']);
+        self::assertTrue($metadata['integer_range_valid']);
+        self::assertSame('9223372036854775808', $metadata['optional_packet_summaries'][0]['input_slice_index']);
+        self::assertFalse($metadata['optional_packet_summaries'][0]['input_slice_index_integer_range_valid']);
+    }
+
+    #[Test]
+    public function it_updates_native_aggregate_overflow_flags_at_the_php_integer_boundary(): void
+    {
+        $method = new \ReflectionMethod(Par2MetadataParser::class, 'normalizeNativeIntegerRanges');
+        $aggregate = ['source_file_bytes' => '9223372036854775808', 'source_file_bytes_overflow' => false];
+        $metadata = $method->invoke(null, $aggregate + [
+            'source_block_count' => '9223372036854775808',
+            'source_block_count_overflow' => false,
+            'recovery_to_source_percent' => 10.0,
+            'recovery_percentage_basis' => 'unique-valid-recovery-exponents-over-recoverable-source-blocks',
+            'recovery_sets' => [$aggregate],
+        ]);
+        self::assertNull($metadata['source_file_bytes']);
+        self::assertTrue($metadata['source_file_bytes_overflow']);
+        self::assertTrue($metadata['source_block_count_overflow']);
+        self::assertTrue($metadata['recovery_sets'][0]['source_file_bytes_overflow']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertSame('unavailable-unsupported-integer-range', $metadata['recovery_percentage_basis']);
     }
 
     #[Test]

@@ -16,6 +16,10 @@ mod nntp_headers;
 mod par2;
 mod par2_source_ranges;
 mod payload_decoder;
+#[cfg(target_arch = "aarch64")]
+mod payload_decoder_arm;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod payload_decoder_x86;
 mod seven_zip_ranges;
 mod yenc_framing;
 
