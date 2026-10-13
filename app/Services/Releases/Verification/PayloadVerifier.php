@@ -277,7 +277,7 @@ final class PayloadVerifier
         $sourceHashes = [];
         $reservedSources = [];
         $verifiedSetIds = [];
-        $verifiedRecoverySets = [];
+        $sourceProofs = [];
         foreach ($parity as $name) {
             $heartbeat();
             if (! $files[$name]['complete']) {
@@ -313,52 +313,46 @@ final class PayloadVerifier
                 }
                 $this->reserve($directory, $allocated);
             }
-            $setId = null;
+            $packets = $par2->getPackets(true) ?: [];
+            $proofKey = Par2ProofIdentity::fromPackets($packets);
+            if ($proofKey === null || ! isset($sourceProofs[$proofKey])) {
+                $exit = $this->par2('v', $name, $data, $heartbeat);
+                if ($exit === 2 && ! $networkFailure) {
+                    return new VerificationResult('unrepairable', 'Downloaded payload has insufficient validated PAR2 recovery data.');
+                }
+                if ($exit !== 0) {
+                    // Repair may modify sources shared with any earlier set.
+                    $sourceProofs = [];
+                    if ($exit !== 1 || $this->par2('r', $name, $data, $heartbeat) !== 0
+                        || $this->par2('v', $name, $data, $heartbeat) !== 0) {
+                        return new VerificationResult('unknown', 'PAR2 has not proved this candidate repairable.');
+                    }
+                    $repaired = true;
+                }
+                foreach ($descriptors as $descriptor) {
+                    $filename = (string) $descriptor['name'];
+                    if (! is_file($data.'/'.$filename) || filesize($data.'/'.$filename) !== (int) $descriptor['size']
+                        || $this->checksum($data.'/'.$filename, 'md5', $heartbeat) !== $descriptor['hash']) {
+                        throw new RuntimeException('PAR2 source-file integrity verification failed.');
+                    }
+                }
+                if ($proofKey !== null) {
+                    $sourceProofs[$proofKey] = true;
+                }
+            }
+            foreach ($descriptors as $descriptor) {
+                $protected[(string) $descriptor['name']] = true;
+            }
             $mainSets = [];
-            $mainHashes = [];
             $descriptorSets = [];
-            foreach ($par2->getPackets(true) ?: [] as $packet) {
+            foreach ($packets as $packet) {
                 if ($packet['head_type'] === Par2Info::PACKET_MAIN) {
                     $mainSets[(string) $packet['head_set_id']] = true;
-                    $mainHashes[(string) $packet['head_hash']] = true;
                 } elseif ($packet['head_type'] === Par2Info::PACKET_FILEDESC) {
                     $descriptorSets[(string) $packet['head_set_id']] = true;
                 }
             }
-            if (count($mainSets) === 1 && count($mainHashes) === 1 && count($descriptorSets) === 1 && array_keys($mainSets) === array_keys($descriptorSets)) {
-                $setId = array_key_first($mainSets);
-            }
-            $inventory = array_map(static fn (array $descriptor): array => [
-                'name' => $descriptor['name'], 'size' => $descriptor['size'],
-                'hash' => $descriptor['hash'], 'hash_16K' => $descriptor['hash_16K'],
-            ], $descriptors);
-            ksort($inventory, SORT_STRING);
-            $recoveryKey = $setId === null ? null : $setId.':'.array_key_first($mainHashes).':'.hash('sha256', serialize($inventory));
-            if ($recoveryKey !== null && isset($verifiedRecoverySets[$recoveryKey])) {
-                continue;
-            }
-            $exit = $this->par2('v', $name, $data, $heartbeat);
-            if ($exit === 2 && ! $networkFailure) {
-                return new VerificationResult('unrepairable', 'Downloaded payload has insufficient validated PAR2 recovery data.');
-            }
-            if ($exit !== 0) {
-                if ($exit !== 1 || $this->par2('r', $name, $data, $heartbeat) !== 0
-                    || $this->par2('v', $name, $data, $heartbeat) !== 0) {
-                    return new VerificationResult('unknown', 'PAR2 has not proved this candidate repairable.');
-                }
-                $repaired = true;
-            }
-            foreach ($descriptors as $descriptor) {
-                $filename = (string) $descriptor['name'];
-                if (! is_file($data.'/'.$filename) || filesize($data.'/'.$filename) !== (int) $descriptor['size']
-                    || $this->checksum($data.'/'.$filename, 'md5', $heartbeat) !== $descriptor['hash']) {
-                    throw new RuntimeException('PAR2 source-file integrity verification failed.');
-                }
-                $protected[$filename] = true;
-            }
-
-            if ($recoveryKey !== null) {
-                $verifiedRecoverySets[$recoveryKey] = true;
+            if (count($mainSets) === 1 && count($descriptorSets) === 1 && array_keys($mainSets) === array_keys($descriptorSets)) {
                 $verifiedSetIds += $mainSets;
             }
         }
