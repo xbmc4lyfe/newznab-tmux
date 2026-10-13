@@ -53,7 +53,7 @@ return Application::configure(basePath: dirname(__DIR__))
         );
 
         // Exact poster searches compare the stored field byte for byte.
-        $middleware->trimStrings(except: ['poster']);
+        $middleware->trimStrings(except: ['poster', 'searchadvposter']);
 
         $middleware->validateCsrfTokens(except: [
             'btcpay/webhook',
