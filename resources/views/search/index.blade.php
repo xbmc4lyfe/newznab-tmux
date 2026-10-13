@@ -52,6 +52,9 @@
 
     <!-- Search Form -->
     <form method="GET" action="{{ route('search') }}" class="px-6 pb-6" id="searchForm">
+        @if(!empty($posterReleaseId))
+            <input type="hidden" name="poster_release_id" value="{{ $posterReleaseId }}">
+        @endif
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-4">
             <!-- Search Query with Autocomplete -->
             <div class="lg:col-span-2 relative">
