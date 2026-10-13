@@ -23,10 +23,10 @@ trait Par2RenameTestDatabase
             foreach (['groups_id', 'categories_id', 'nzbstatus', 'passwordstatus', 'isrenamed', 'proc_par2', 'rarinnerfilecount', 'predb_id', 'nfostatus', 'proc_nfo', 'proc_files', 'proc_uid', 'proc_srr', 'proc_crc32', 'proc_hash16k', 'size'] as $column) {
                 $table->integer($column)->default(0);
             }
-            foreach (['videos_id', 'tv_episodes_id', 'book_lookup_attempts', 'iscategorized'] as $column) {
+            foreach (['videos_id', 'tv_episodes_id', 'tv_lookup_attempts', 'book_lookup_attempts', 'iscategorized'] as $column) {
                 $table->integer($column)->default(0);
             }
-            foreach (['imdbid', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'book_lookup_retry_at', 'book_name_normalized_at', 'anidbid'] as $column) {
+            foreach (['imdbid', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'tv_lookup_retry_at', 'book_lookup_retry_at', 'book_name_normalized_at', 'anidbid'] as $column) {
                 $table->string($column)->nullable();
             }
         });

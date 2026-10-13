@@ -11,6 +11,7 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
 use App\Services\Nzb\NzbParserService;
 use DariusIII\NetNntp\Error;
+use Illuminate\Cache\ArrayStore;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use RuntimeException;
@@ -69,6 +70,43 @@ class Par2RenameBatchTest extends TestCase
 
         $this->assertCount(301, $this->visited);
         $this->assertSame(301, Release::query()->where('proc_par2', 1)->count());
+    }
+
+    public function test_abandoned_historical_sweep_lock_expires_within_five_minutes(): void
+    {
+        $this->freezeTime();
+        config([
+            'nntmux_nntp.socket_timeout' => 120,
+            'nntmux_nntp.alternate_server_socket_timeout' => 120,
+        ]);
+        $this->pendingPar2Release();
+        $store = Cache::store('array')->getStore();
+        $this->assertInstanceOf(ArrayStore::class, $store);
+        $service = new class($store) extends NzbContentsService
+        {
+            public ?int $sweepLeaseSeconds = null;
+
+            public function __construct(private ArrayStore $store) {}
+
+            public function checkPar2Result(
+                string $guid,
+                int $relID,
+                int $groupID,
+                int $nameStatus,
+                int $show,
+                ?float $deadline = null
+            ): Par2RenameOutcome {
+                $expiresAt = $this->store->locks['rename:par2:sweep:2:1:lock']['expiresAt'];
+                $this->sweepLeaseSeconds = $expiresAt->getTimestamp() - now()->getTimestamp();
+
+                return Par2RenameOutcome::NoMatch;
+            }
+        };
+        $this->app->instance(NzbContentsService::class, $service);
+
+        $this->runBatch();
+
+        $this->assertSame(300, $service->sweepLeaseSeconds);
     }
 
     public function test_retryable_old_releases_do_not_starve_later_work_and_are_revisited(): void
