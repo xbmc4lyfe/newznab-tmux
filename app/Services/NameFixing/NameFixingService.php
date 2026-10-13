@@ -1088,7 +1088,11 @@ class NameFixingService
                 throw new RuntimeException('The PAR2 rename cache store must support atomic locks.');
             }
             $key = "rename:par2:sweep:{$time}:{$cats}";
-            $lock = $store->lock($key.':lock', 1800);
+            $socketTimeout = max(
+                (int) config('nntmux_nntp.socket_timeout', 120),
+                (int) config('nntmux_nntp.alternate_server_socket_timeout', 120)
+            );
+            $lock = $store->lock($key.':lock', max(300, 2 * $socketTimeout));
             if (! $lock instanceof Lock) {
                 throw new RuntimeException('The PAR2 rename cache lock must support renewal.');
             }
@@ -1114,7 +1118,8 @@ class NameFixingService
                     break;
                 }
                 $outcome = $nzbContentsService->checkPar2Result($release->guid, (int) $release->releases_id,
-                    (int) $release->groups_id, 1, (int) $show, $deadline);
+                    (int) $release->groups_id, 1, (int) $show, $deadline,
+                    fn (): bool => $this->refreshPar2Sweep($lock));
                 $outcomes[$outcome->value]++;
                 $stats = $nzbContentsService->par2Stats();
                 $probes += $stats['candidates_probed'];
