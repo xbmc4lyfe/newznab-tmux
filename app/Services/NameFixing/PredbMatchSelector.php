@@ -277,6 +277,10 @@ class PredbMatchSelector
 
     protected function similarityPercent(string $left, string $right): float
     {
+        if ($left !== '' && $left === $right) {
+            return 100.0;
+        }
+
         $percent = 0.0;
         similar_text($left, $right, $percent);
 
