@@ -106,6 +106,19 @@ class SearchReleasesControllerTest extends TestCase
         $this->assertSame(['min' => 3], $this->searchCalls[0][14]['ranges']['totalpart']);
     }
 
+    public function test_exact_poster_browse_preserves_submitter_value_and_pagination(): void
+    {
+        $poster = 'alice+usenet@example.test';
+        $view = $this->searchView(['poster' => $poster, 'search_type' => 'adv', 'page' => '2']);
+        $call = $this->searchCalls[0];
+
+        $this->assertSame([], array_filter($call[0]));
+        $this->assertSame($poster, $call[14]['poster']);
+        $this->assertTrue($call[14]['filter_only']);
+        $this->assertSame($poster, $view->getData()['listQuery']['poster']);
+        $this->assertSame(20, $call[6]);
+    }
+
     public function test_advanced_search_keeps_text_category_sort_and_aliases(): void
     {
         $view = $this->searchView([

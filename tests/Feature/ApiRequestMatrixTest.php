@@ -7,11 +7,14 @@ namespace Tests\Feature;
 use App\Facades\Search;
 use App\Http\Controllers\Api\ApiController;
 use App\Http\Controllers\Api\ApiV2Controller;
+use App\Http\Middleware\Google2FAMiddleware;
 use App\Models\Category;
+use App\Models\User;
 use App\Services\Api\ApiUsageService;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
+use App\Services\Search\Contracts\SearchServiceInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
 use App\Services\Search\Support\SearchFailureTracker;
@@ -102,6 +105,32 @@ class ApiRequestMatrixTest extends TestCase
         foreach ($this->originalEnvironment as $key => $value) {
             $this->setEnvironmentValue($key, $value === false ? null : $value);
         }
+    }
+
+    public function test_submitter_search_request_preserves_operator_bearing_poster_as_field_value(): void
+    {
+        $poster = '-VIP- <poster@example.test>';
+        $releaseSearch = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearch->shouldReceive('search')
+            ->once()
+            ->withArgs(fn (array $searchArr): bool => ($searchArr['fromname'] ?? null) === $poster)
+            ->andReturn(collect());
+        $this->app->instance(ReleaseSearchService::class, $releaseSearch);
+
+        $releaseBrowse = Mockery::mock(ReleaseBrowseService::class);
+        $releaseBrowse->shouldReceive('getBrowseOrdering')->once()->andReturn(['posted_desc']);
+        $this->app->instance(ReleaseBrowseService::class, $releaseBrowse);
+
+        $searchService = Mockery::mock(SearchServiceInterface::class);
+        $searchService->shouldReceive('isSuggestEnabled')->once()->andReturnFalse();
+        $searchService->shouldReceive('isAutocompleteEnabled')->once()->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $searchService);
+
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        $response = $this->actingAs(User::query()->where('username', 'matrix_user')->firstOrFail())
+            ->get(route('search', ['searchadvposter' => $poster, 'search_type' => 'adv']));
+
+        $response->assertOk();
     }
 
     public function test_v1_invalid_sort_returns_xml_201_error(): void
@@ -1524,6 +1553,7 @@ class ApiRequestMatrixTest extends TestCase
             $table->string('api_token')->nullable()->index();
             $table->string('host')->nullable();
             $table->timestamp('apiaccess')->nullable();
+            $table->timestamp('lastlogin')->nullable();
             $table->boolean('verified')->default(true);
             $table->timestamp('email_verified_at')->nullable();
             $table->integer('rate_limit')->default(60);
@@ -1673,6 +1703,14 @@ class ApiRequestMatrixTest extends TestCase
             $table->unsignedInteger('created_by')->nullable();
             $table->unsignedInteger('updated_by')->nullable();
             $table->timestamps();
+        });
+
+        Schema::create('content', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->integer('contenttype');
+            $table->integer('status');
+            $table->integer('ordinal')->nullable();
+            $table->integer('role')->default(0);
         });
     }
 

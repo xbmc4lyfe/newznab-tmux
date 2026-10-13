@@ -516,7 +516,7 @@ final class Par2CandidateRecoveryTest extends TestCase
     {
         $nntp = Mockery::mock(NNTPService::class);
         foreach ($articles as $id => $result) {
-            $nntp->shouldReceive('getMessageBounded')->once()->with('alt.binaries.test', $id, $maxArticleBytes, false)->andReturn($result);
+            $nntp->shouldReceive('getMessageBounded')->once()->with('alt.binaries.test', $id, $maxArticleBytes, false, null)->andReturn($result);
         }
         if ($articles === []) {
             $nntp->shouldNotReceive('getMessageBounded');

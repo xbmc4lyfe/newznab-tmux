@@ -810,9 +810,12 @@ PHP;
         {
             public function __construct(private \Closure $fetch) {}
 
-            public function getMessageBounded(string $groupName, string $messageId, int $maxDecodedBytes, bool $alternate = false): BoundedArticleResult
+            public function getMessageBounded(string $groupName, string $messageId, int $maxDecodedBytes, bool $alternate = false, ?callable $onRead = null): BoundedArticleResult
             {
                 $response = ($this->fetch)($groupName, $messageId);
+                if ($onRead !== null && ! $onRead()) {
+                    return BoundedArticleResult::failure('Fixture processing lock ownership was lost.');
+                }
 
                 return is_string($response) ? BoundedArticleResult::success($response) : BoundedArticleResult::failure('Fixture provider failure');
             }

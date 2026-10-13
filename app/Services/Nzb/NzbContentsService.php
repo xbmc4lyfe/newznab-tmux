@@ -264,7 +264,7 @@ class NzbContentsService
         return $this->checkPar2Result($guid, $relID, $groupID, $nameStatus, $show) === Par2RenameOutcome::Renamed;
     }
 
-    public function checkPar2Result(string $guid, int $relID, int $groupID, int $nameStatus, int $show, ?float $deadline = null): Par2RenameOutcome
+    public function checkPar2Result(string $guid, int $relID, int $groupID, int $nameStatus, int $show, ?float $deadline = null, ?callable $onArticleReceived = null): Par2RenameOutcome
     {
         $this->par2Stats = ['candidates_probed' => 0, 'articles_received' => 0];
         if ($nameStatus !== 1) {
@@ -297,8 +297,27 @@ class NzbContentsService
                 return Par2RenameOutcome::Deferred;
             }
             $snapshot = ['id' => $relID, 'guid' => $guid, 'name' => $release->name, 'searchname' => $release->searchname];
-            $guard = function () use ($lock, $deadline): bool {
-                return ($deadline === null || now()->getTimestampMs() / 1000 < $deadline) && $this->refreshPar2Claim($lock);
+            $readerOwnsClaims = true;
+            $refreshOwnership = function () use ($lock, $onArticleReceived, &$readerOwnsClaims): bool {
+                return $readerOwnsClaims && ($onArticleReceived === null || $onArticleReceived())
+                    && $this->refreshPar2Claim($lock);
+            };
+            $guard = function () use ($deadline, $refreshOwnership): bool {
+                return ($deadline === null || now()->getTimestampMs() / 1000 < $deadline) && $refreshOwnership();
+            };
+            $lastHeartbeat = 0;
+            $onArticleRead = function () use ($refreshOwnership, &$lastHeartbeat, &$readerOwnsClaims): bool {
+                if (! $readerOwnsClaims) {
+                    return false;
+                }
+                $now = now()->getTimestamp();
+                if ($now - $lastHeartbeat < 30) {
+                    return true;
+                }
+                $lastHeartbeat = $now;
+                $readerOwnsClaims = $refreshOwnership();
+
+                return $readerOwnsClaims;
             };
             if (! $this->canContinuePar2($guard)) {
                 return Par2RenameOutcome::Deferred;
@@ -336,7 +355,7 @@ class NzbContentsService
                     return Par2RenameOutcome::Deferred;
                 }
                 $result = $recovery->recover($candidates[$index], $snapshot, $signature, $groupID, $show,
-                    $budget - $this->par2Stats['candidates_probed'], $maxArticleBytes, $maxStateBytes, $guard);
+                    $budget - $this->par2Stats['candidates_probed'], $maxArticleBytes, $maxStateBytes, $guard, $onArticleRead);
                 $this->par2Stats['candidates_probed'] += $result->probes;
                 $this->par2Stats['articles_received'] += $result->articles;
                 $outcome = $result->outcome;

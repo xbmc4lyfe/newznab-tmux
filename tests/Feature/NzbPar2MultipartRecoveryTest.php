@@ -65,6 +65,35 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
         Search::shouldReceive('updateRelease')->andReturnNull();
     }
 
+    public function test_multipart_recovery_respects_the_outer_sweep_ownership_callback(): void
+    {
+        $release = $this->release();
+        $xml = $this->nzb(['ordinary payload']);
+        $xml->file[0]->attributes()->subject = 'hidden unknown file';
+        $reading = $renewedBeforeRead = $lostDuringRead = false;
+        $service = $this->service($xml, ['one' => BoundedArticleResult::success('ordinary payload')], beforeRead: static function () use (&$reading): void {
+            $reading = true;
+        });
+        $outcome = $service->checkPar2Result(
+            $release->guid, $release->id, 1, 1, 0, onArticleReceived: static function () use (&$reading, &$renewedBeforeRead, &$lostDuringRead): bool {
+                if (! $reading) {
+                    $renewedBeforeRead = true;
+
+                    return true;
+                }
+                $lostDuringRead = true;
+
+                return false;
+            }
+        );
+
+        self::assertSame(Par2RenameOutcome::Deferred, $outcome);
+        self::assertTrue($renewedBeforeRead);
+        self::assertTrue($lostDuringRead);
+        self::assertSame(['one'], $this->fetched);
+        self::assertSame(0, $release->fresh()->proc_par2);
+    }
+
     public function test_full_controller_resumes_main_first_fixture_across_objects_and_recovers_exact_large_title(): void
     {
         $release = $this->release();
@@ -446,13 +475,17 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
     }
 
     /** @param array<string,BoundedArticleResult|\Closure> $responses */
-    private function service(SimpleXMLElement $xml, array $responses, bool $failLoad = false): NzbContentsService
+    private function service(SimpleXMLElement $xml, array $responses, bool $failLoad = false, ?callable $beforeRead = null): NzbContentsService
     {
         $nntp = Mockery::mock(NNTPService::class);
         $nntp->shouldNotReceive('getMessages');
         foreach ($responses as $id => $response) {
-            $nntp->shouldReceive('getMessageBounded')->once()->with('alt.binaries.test', $id, 2097152, false)->andReturnUsing(function () use ($id, $response): BoundedArticleResult {
+            $nntp->shouldReceive('getMessageBounded')->once()->with('alt.binaries.test', $id, 2097152, false, Mockery::type('callable'))->andReturnUsing(function (string $group, string $messageId, int $maximumBytes, bool $alternate, callable $onRead) use ($id, $response, $beforeRead): BoundedArticleResult {
                 $this->fetched[] = $id;
+                $beforeRead?->__invoke();
+                if (! $onRead()) {
+                    return BoundedArticleResult::failure('Fixture processing lock ownership was lost.');
+                }
 
                 return $response instanceof \Closure ? $response() : $response;
             });

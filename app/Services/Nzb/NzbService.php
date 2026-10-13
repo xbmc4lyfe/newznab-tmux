@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
+use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Collection;
 use App\Models\Release;
 use App\Models\ReleaseNzbCreationFailure;
@@ -280,6 +281,14 @@ class NzbService
                     $release->unsetRelation('nzbCreationFailure');
                 }
             });
+            try {
+                CollectReleaseFingerprintMetadata::dispatch((int) $release->id);
+            } catch (Throwable $dispatchException) {
+                Log::warning('Could not queue release fingerprint metadata collection.', [
+                    'release_id' => $release->id,
+                    'exception' => $dispatchException::class,
+                ]);
+            }
         } catch (Throwable $e) {
             return NzbCreationResult::transient('Failed to write NZB file: '.$e->getMessage(), $collectionIds, $path);
         } finally {

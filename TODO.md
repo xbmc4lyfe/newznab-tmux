@@ -7,6 +7,15 @@
 - [x] Run the affected PAR2, payload metadata, and PreDB matching regressions: 95 tests, 469 assertions (11 PHPUnit notices).
 - [ ] Deploy through the single deployment owner and measure historical rename yield versus arrivals. The regression checks prove the repaired mechanisms, not sustained throughput or a shrinking production backlog.
 
+## Retest the final synchronized PreDB/publication integration
+
+PR #73 is reconciled with fork master through PR #88, including fingerprint metadata (#84), native workflow checks (#86), renewable PAR2 sweep leases (#87), and poster-search/verification repairs (#88). Targeted checks qualify their reproduced cases; complete integrated qualification remains deferred.
+
+- [ ] Run the complete PHPUnit suite with an explicit 2 GiB PHP memory limit, native tests/parity, frontend build and required CI on the final synchronized PR head. A combined run aborted at the host default 128 MiB limit; that runtime failure is not a failing application assertion.
+- [ ] Retest donor inventory/canonical identity, bounded RSS wire/decoded/item limits, multipart checkpoint resume and primary/alternate bounded-read ownership renewal together. Retain processing claims, exact release snapshots and recovery-volume exclusion.
+- [ ] Retest article-set coverage against independently reconstructed stored/emitted NZBs, publication transaction/row-lock rechecks, fingerprint after-commit dispatch, queue isolation, rollback and cleanup/reset behavior in private runtimes.
+- [ ] Validate source/image/schema and live release/NZB/search evidence only through the single deployment owner after explicit deployment and writer-resume authorization. No deployment or production qualification is included in this audit.
+
 ## Qualify PAR2 donor inventory matching
 
 - [ ] Validate the symmetric full-MD5/size donor inventory query on isolated MariaDB fixtures with sparse, dense and maximum descriptor inventories. The two-distinct-tuple threshold and symmetric coverage prevent a lone shared file or partial inventory from attaching a donor; they do not establish production throughput.

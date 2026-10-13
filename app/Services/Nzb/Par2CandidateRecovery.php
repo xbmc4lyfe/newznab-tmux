@@ -27,8 +27,9 @@ final class Par2CandidateRecovery
      * @param  array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>}  $candidate
      * @param  array{id:int,guid:string,name:?string,searchname:?string}  $snapshot
      * @param  callable():bool  $guard
+     * @param  null|callable():bool  $onRead
      */
-    public function recover(array $candidate, array $snapshot, string $manifestSignature, int $groupId, int $show, int $articleBudget, int $maxArticleBytes, int $maxReleaseStateBytes, callable $guard): Par2CandidateRecoveryResult
+    public function recover(array $candidate, array $snapshot, string $manifestSignature, int $groupId, int $show, int $articleBudget, int $maxArticleBytes, int $maxReleaseStateBytes, callable $guard, ?callable $onRead = null): Par2CandidateRecoveryResult
     {
         $probes = $articles = 0;
         $result = static fn (Par2RenameOutcome $outcome): Par2CandidateRecoveryResult => new Par2CandidateRecoveryResult($outcome, $probes, $articles);
@@ -147,7 +148,7 @@ final class Par2CandidateRecovery
                     return new Par2CandidateRecoveryResult(Par2RenameOutcome::Deferred, $probes, $articles);
                 }
                 $probes++;
-                $article = $this->nntp->getMessageBounded($group, $segment['id'], $maxArticleBytes, $this->alternate);
+                $article = $this->nntp->getMessageBounded($group, $segment['id'], $maxArticleBytes, $this->alternate, $onRead);
                 if ($article->body !== null) {
                     $articles++;
                 }

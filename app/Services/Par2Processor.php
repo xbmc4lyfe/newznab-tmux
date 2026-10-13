@@ -60,7 +60,7 @@ class Par2Processor
     /**
      * @param  null|callable(): bool  $canPersist  Checked after receipt and before writes; side effects must be idempotent.
      */
-    public function parseForRename(string $messageID, int $relID, int $groupID, NNTPService $nntp, int $show, ?callable $canPersist = null, bool $expectedPar2 = false): Par2RenameOutcome
+    public function parseForRename(string $messageID, int $relID, int $groupID, NNTPService $nntp, int $show, ?callable $canPersist = null, bool $expectedPar2 = false, ?callable $onRead = null): Par2RenameOutcome
     {
         $this->existingNameConfirmed = false;
         $this->nameFixingService->reset();
@@ -78,7 +78,7 @@ class Par2Processor
         }
 
         // Get the PAR2 file.
-        $par2 = $nntp->getMessages(UsenetGroup::getNameByID($groupID), $messageID, $this->alternateNNTP);
+        $par2 = $nntp->getMessages(UsenetGroup::getNameByID($groupID), $messageID, $this->alternateNNTP, $onRead);
         if (NNTPService::isError($par2) || ! is_string($par2) || $par2 === '') {
             return Par2RenameOutcome::Retryable;
         }

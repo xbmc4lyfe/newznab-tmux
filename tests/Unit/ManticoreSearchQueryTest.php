@@ -131,6 +131,21 @@ class ManticoreSearchQueryTest extends TestCase
     }
 
     #[Test]
+    public function it_treats_poster_search_values_as_literals(): void
+    {
+        $reflection = new ReflectionClass(ManticoreSearchDriver::class);
+        $method = $reflection->getMethod('prepareReleaseFieldSearchQuery');
+
+        $this->assertSame('\\-VIP\\- \\<poster\\@example.test\\>', $method->invoke(null, 'fromname', '-VIP- <poster@example.test>'));
+        $this->assertSame('\\!poster', $method->invoke(null, 'fromname', '!poster'));
+        $this->assertSame('poster \\(VIP\\)', $method->invoke(null, 'fromname', 'poster (VIP)'));
+        $this->assertSame('alice\\*', $method->invoke(null, 'fromname', 'alice*'));
+        $this->assertSame('alice\\?bob\\%', $method->invoke(null, 'fromname', 'alice?bob%'));
+        $this->assertSame('alice \\| bob', $method->invoke(null, 'fromname', 'alice | bob'));
+        $this->assertSame('-VIP\\-', $method->invoke(null, 'searchname', '-VIP-'));
+    }
+
+    #[Test]
     public function it_scopes_multi_word_queries_to_the_requested_field(): void
     {
         $reflection = new ReflectionClass(ManticoreSearchDriver::class);
@@ -313,7 +328,11 @@ class ManticoreSearchQueryTest extends TestCase
         $this->assertIsString($driverSource);
         // Field terms are scoped with grouping parentheses, and `@@relaxed` is prefixed once for the whole query.
         $this->assertStringContainsString(
-            "\$terms[] = self::scopeReleaseSearchQuery(\$rawValue, \$preparedValue, '@'.\$key);",
+            '$prepared = self::prepareReleaseFieldSearchQuery($key, $rawValue);',
+            $driverSource
+        );
+        $this->assertStringContainsString(
+            "\$terms[] = self::scopeReleaseSearchQuery(\$rawValue, \$prepared, '@'.\$key);",
             $driverSource
         );
         $this->assertStringContainsString("'@@relaxed '.implode(' ', \$terms)", $driverSource);
