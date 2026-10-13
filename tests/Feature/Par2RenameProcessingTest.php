@@ -227,7 +227,7 @@ class Par2RenameProcessingTest extends TestCase
         $this->assertSame(0, (int) $release->fresh()->proc_par2);
     }
 
-    public function test_throwing_index_remains_retryable_without_probing_recovery_volumes(): void
+    public function test_throwing_index_rotates_to_recovery_volume_on_resume(): void
     {
         $release = $this->release();
         config(['tmux.fix_names.par2_max_probes' => 1]);
@@ -237,8 +237,8 @@ class Par2RenameProcessingTest extends TestCase
             'volume' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
         $this->assertSame(Par2RenameOutcome::Retryable, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
         $this->assertSame(0, (int) $release->fresh()->proc_par2);
-        $this->assertSame(Par2RenameOutcome::Retryable, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame(['index', 'index'], $this->downloaded);
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['index', 'volume'], $this->downloaded);
     }
 
     public function test_probe_progress_survives_a_sweep_longer_than_seven_days(): void
@@ -401,7 +401,7 @@ class Par2RenameProcessingTest extends TestCase
         ]), ['index' => $body, 'volume' => $body]);
 
         $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame(['index', 'legacy', 'hidden'], $this->downloaded);
+        $this->assertSame(['index', 'volume', 'legacy', 'hidden'], $this->downloaded);
         $this->assertSame(1, (int) $release->fresh()->proc_par2);
     }
 
@@ -510,11 +510,11 @@ PHP;
             'hidden' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
 
         $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame(['index', 'hidden'], $this->downloaded);
+        $this->assertSame(['index', 'volume-one', 'hidden'], $this->downloaded);
         $this->assertSame(1, (int) $release->fresh()->isrenamed);
     }
 
-    public function test_multi_part_recovery_volumes_are_skipped_when_the_index_is_unavailable(): void
+    public function test_recovery_volume_metadata_recovers_when_the_index_is_unavailable(): void
     {
         $release = $this->release();
         config(['tmux.fix_names.par2_max_probes' => 3]);
@@ -529,11 +529,54 @@ PHP;
             'hidden' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
 
         $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame(['index', 'hidden'], $this->downloaded);
+        $this->assertSame(['index', 'volume-one'], $this->downloaded);
         $this->assertSame(1, (int) $release->fresh()->isrenamed);
     }
 
-    public function test_volume_only_nzb_is_completed_without_downloading_recovery_volumes(): void
+    public function test_later_volume_remains_available_after_first_volume_and_hidden_misses(): void
+    {
+        $release = $this->release();
+        config(['tmux.fix_names.par2_max_probes' => 2]);
+        $service = $this->service($this->nzb([
+            ['"set.vol000+01.par2" yEnc', 'first-volume'],
+            ['"set.vol001+02.par2" yEnc', 'later-volume'],
+            ['"obfuscated" yEnc', 'hidden'],
+        ]), ['later-volume' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
+
+        $this->assertSame(Par2RenameOutcome::Retryable, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(0, (int) $release->fresh()->proc_par2);
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['first-volume', 'hidden', 'later-volume'], $this->downloaded);
+    }
+
+    public function test_volume_fallback_recovers_without_an_index(): void
+    {
+        $release = $this->release();
+        $service = $this->service($this->nzb([
+            ['"set.vol000+01.par2" yEnc', 'volume'],
+        ]), ['volume' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
+
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['volume'], $this->downloaded);
+        $this->assertSame(1, (int) $release->fresh()->isrenamed);
+    }
+
+    public function test_multipart_volume_fallback_resumes_after_the_article_budget(): void
+    {
+        $release = $this->release();
+        config(['tmux.fix_names.par2_max_probes' => 1]);
+        $body = file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'));
+        $xml = new SimpleXMLElement('<nzb><file subject="&quot;set.vol000+01.par2&quot; yEnc (1/2)"><segments><segment number="1" bytes="32">first</segment><segment number="2" bytes="1000">second</segment></segments></file></nzb>');
+        $service = $this->service($xml, ['first' => substr($body, 0, 32), 'second' => substr($body, 32)], rename: true);
+
+        $this->assertSame(Par2RenameOutcome::Deferred, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(0, (int) $release->fresh()->proc_par2);
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['first', 'second'], $this->downloaded);
+        $this->assertSame(1, (int) $release->fresh()->isrenamed);
+    }
+
+    public function test_volume_only_nzb_recovers_from_its_first_volume(): void
     {
         $release = $this->release();
         $service = $this->service($this->nzb([
@@ -542,25 +585,25 @@ PHP;
         ]), ['volume-one' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2')),
             'volume-two' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
 
-        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame([], $this->downloaded);
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['volume-one'], $this->downloaded);
         $this->assertSame(1, (int) $release->fresh()->proc_par2);
     }
 
-    public function test_first_single_block_volume_alone_does_not_bypass_the_partial_index_guard(): void
+    public function test_single_block_volume_recovers_without_partial_index_progress(): void
     {
         $release = $this->release();
         $service = $this->service($this->nzb([
             ['"set.vol000+01.par2" yEnc', 'first-volume'],
         ]), ['first-volume' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
 
-        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame([], $this->downloaded);
-        $this->assertSame(0, (int) $release->fresh()->isrenamed);
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['first-volume'], $this->downloaded);
+        $this->assertSame(1, (int) $release->fresh()->isrenamed);
         $this->assertSame(1, (int) $release->fresh()->proc_par2);
     }
 
-    public function test_recovery_volumes_from_multiple_families_are_not_probed(): void
+    public function test_first_volume_from_another_family_precedes_repeated_volumes(): void
     {
         $release = $this->release();
         $service = $this->service($this->nzb([
@@ -570,12 +613,12 @@ PHP;
             ['[4/4] "another set.vol001+002.par2" yEnc', 'another'],
         ]), ['another' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
 
-        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame([], $this->downloaded);
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['first-one', 'another'], $this->downloaded);
         $this->assertSame(1, (int) $release->fresh()->proc_par2);
     }
 
-    public function test_hidden_par2_candidate_can_recover_without_recovery_volume_probes(): void
+    public function test_hidden_candidate_precedes_repeated_volumes(): void
     {
         $release = $this->release();
         $data = file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'));
@@ -586,10 +629,10 @@ PHP;
         ]);
         $service = $this->service($nzb, ['hidden' => $data], rename: true);
         $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame(['hidden'], $this->downloaded);
+        $this->assertSame(['partial-volume', 'hidden'], $this->downloaded);
     }
 
-    public function test_failed_index_does_not_trigger_a_recovery_volume_probe(): void
+    public function test_failed_index_does_not_prevent_recovery_volume_fallback(): void
     {
         $release = $this->release();
         $service = $this->service($this->nzb([
@@ -597,10 +640,10 @@ PHP;
         ]), ['index' => new Error('Article unavailable', 430),
             'volume' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
 
-        $this->assertSame(Par2RenameOutcome::Retryable, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame(['index'], $this->downloaded);
-        $this->assertSame(0, (int) $release->fresh()->isrenamed);
-        $this->assertSame(0, (int) $release->fresh()->proc_par2);
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['index', 'volume'], $this->downloaded);
+        $this->assertSame(1, (int) $release->fresh()->isrenamed);
+        $this->assertSame(1, (int) $release->fresh()->proc_par2);
     }
 
     public function test_missing_segment_structure_remains_pending(): void
@@ -636,13 +679,14 @@ PHP;
         ]), ['index' => $index, 'volume' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], names: new NameFixingService);
 
         $this->assertSame(Par2RenameOutcome::Retryable, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(Par2RenameOutcome::Retryable, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
         $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
         $this->assertSame(0, (int) $release->fresh()->isrenamed);
         $this->assertSame(1, (int) $release->fresh()->proc_par2);
-        $this->assertSame(['index', 'index'], $this->downloaded);
+        $this->assertSame(['index', 'volume', 'index'], $this->downloaded);
     }
 
-    public function test_permanently_failed_index_retries_without_recovery_volume_probes(): void
+    public function test_permanently_failed_index_does_not_starve_a_retryable_volume(): void
     {
         $release = $this->release();
         config(['tmux.fix_names.par2_max_probes' => 1]);
@@ -654,11 +698,12 @@ PHP;
         $service = $this->service($this->nzb([
             ['"release.par2" yEnc', 'index'], ['"release.vol001+002.par2" yEnc', 'volume'],
         ]), ['index' => new Error('Permanently missing', 430), 'volume' => $volume], rename: true);
-        for ($i = 0; $i < 4; $i++) {
+        for ($i = 0; $i < 3; $i++) {
             $this->assertSame(Par2RenameOutcome::Retryable, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
         }
-        $this->assertSame(['index', 'index', 'index', 'index'], $this->downloaded);
-        $this->assertSame(0, (int) $release->fresh()->proc_par2);
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['index', 'volume', 'index', 'volume'], $this->downloaded);
+        $this->assertSame(1, (int) $release->fresh()->proc_par2);
     }
 
     public function test_truncated_hidden_par2_data_remains_retryable(): void
