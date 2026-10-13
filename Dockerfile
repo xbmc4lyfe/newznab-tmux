@@ -13,7 +13,8 @@ FROM dunglas/frankenphp:1-php8.5-bookworm AS build
 WORKDIR /app
 COPY --from=composer /usr/bin/composer /usr/local/bin/composer
 COPY --from=node /usr/local/ /usr/local/
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates git unzip curl tmux par2 unrar-free lame ffmpeg mediainfo \
     jpegoptim webp optipng pngquant libavif-bin python3 time procps \
     mariadb-client libmagic1 \
@@ -34,7 +35,8 @@ RUN composer dump-autoload --no-dev --no-scripts --optimize \
 FROM dunglas/frankenphp:1-php8.5-bookworm AS production
 ENV LANG=C.UTF-8
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl unzip tmux par2 unrar-free lame ffmpeg mediainfo jpegoptim webp \
     optipng pngquant libavif-bin python3 time procps mariadb-client libmagic1 \
     && rm -rf /var/lib/apt/lists/*
