@@ -23,11 +23,13 @@ New ordinary archives and enqueue admissions prepare JSON/gzip bytes before requ
 - [ ] Validate Linux CLI PHP FFI against the rebuilt native library and check native/PHP metadata parity; host PHP fallback tests do not establish Linux FFI behavior.
 - [ ] Keep deployment on hold until these checks and independent review pass; the single deployment owner must verify image/source/schema parity and collected public metadata before reporting live validation.
 
-## Exact poster lookup qualification (not deployed)
+## Exact poster lookup qualification (deployment verification pending)
 
-- [ ] Run the complete PHPUnit suite against the final merged poster-search and index changes; focused checks are not full regression qualification.
-- [ ] Retest exact poster page/count queries with the complete release schema and joins in an isolated MariaDB runtime, including byte identity and active filters. The reduced fixture shows selective index access, not production capacity.
+- [x] Run the complete PHPUnit suite against the merged poster-search and index changes. PR #105 Linux CI passed 5,323 tests and 33,716 assertions, plus 85 native yEnc parity tests and 4,604 assertions; the squash merge source tree matches the reviewed CI head. The isolated macOS run retains two platform-specific failures (setgid and the Linux-only yEnc fallback warning).
+- [x] Retest exact poster page/count queries with the complete release schema and joins in an isolated MariaDB runtime, including byte identity and active filters. `ExactPosterSearchMariaDbTest` restores the complete MariaDB schema into a randomly named disposable database and passes 18 assertions: paged IDs and totals, report/NFO/video/failure joins, case/whitespace/token lookalikes, group/category exclusions, size/files/grabs/comments/added-date filters, and lookup after deleting the original release. The small fixture proves query correctness, not production capacity. Run with `POSTER_SEARCH_TEST_HOST` (and optional `POSTER_SEARCH_TEST_PORT`, `POSTER_SEARCH_TEST_USERNAME`, `POSTER_SEARCH_TEST_PASSWORD`) pointing to an isolated server.
 - [ ] Hold deployment until the designated deployment owner applies the migration and verifies reviewed source, runtime, schema, and live poster-search behavior together.
+
+Submitter links and the editable advanced Poster field are merged in PRs #102 and #105, including exact matching and deliberate whitespace edits. The shared deployment is being recovered separately; do not mark live verification complete from CI or container health alone.
 
 ## Release identification follow-up (implemented, not deployed)
 
