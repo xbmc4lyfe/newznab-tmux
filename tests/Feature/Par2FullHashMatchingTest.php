@@ -149,6 +149,21 @@ final class Par2FullHashMatchingTest extends TestCase
         self::assertSame([], $this->lookup()['donors']);
     }
 
+    public function test_new_partial_evidence_invalidates_a_previously_complete_inventory(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Scene.Release.2026-GRP');
+        foreach ([42, 20] as $id) {
+            $this->remember($id, md5('payload one'), md5('prefix one'), 20000);
+            $this->remember($id, md5('payload two'), md5('prefix two'), 30000);
+        }
+        self::assertCount(1, $this->lookup()['donors']);
+
+        $this->rememberUnmarked(42, md5('new partial payload'), md5('new partial prefix'), 40000);
+
+        self::assertSame([], $this->lookup()['donors']);
+    }
+
     public function test_all_130_target_keys_are_considered_before_canonical_identity_selection(): void
     {
         $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
@@ -196,6 +211,7 @@ final class Par2FullHashMatchingTest extends TestCase
         $this->rememberCorroboratingTuple(42, 20);
         self::assertFalse($this->lookup()['usable']);
         DB::table('par_file_hashes')->where('releases_id', 42)->where('file_size', '')->delete();
+        self::assertTrue(Par2FileHashEvidence::markInventoryComplete(42, $this->snapshot(42)));
         self::assertTrue($this->lookup()['usable']);
         self::assertCount(1, $this->lookup()['donors']);
     }
@@ -287,6 +303,7 @@ final class Par2FullHashMatchingTest extends TestCase
         $processor = new Par2Processor(new NameFixingService, new Par2Info, false, false);
         self::assertSame(Par2RenameOutcome::NoMatch, $processor->applyInventoryForRename($inventory, 42, 1, 0, null, true, $this->snapshot(42)));
         self::assertSame(10, DB::table('par_file_hashes')->where('releases_id', 42)->count());
+        self::assertSame(1, DB::table('par_file_hash_inventories')->where('releases_id', 42)->count());
         self::assertSame(0, DB::table('release_files')->count());
         self::assertSame(10, DB::table('releases')->where('id', 42)->value('rarinnerfilecount'));
         DB::table('releases')->where('id', 42)->update(['proc_hash16k' => 1]);
