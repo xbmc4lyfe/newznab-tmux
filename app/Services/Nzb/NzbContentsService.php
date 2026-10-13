@@ -577,7 +577,7 @@ class NzbContentsService
     /** @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> */
     private function par2Candidates(SimpleXMLElement $nzb): array
     {
-        $explicit = $volumes = $firstVolumes = $families = $legacy = $hidden = [];
+        $explicit = $volumes = $firstVolumes = $matchingVolumes = $indexFamilies = $families = $legacy = $hidden = [];
         $this->par2Manifest = [];
         $this->par2StructureValid = count($nzb->file) > 0;
         $maxBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
@@ -626,6 +626,9 @@ class NzbContentsService
                 'legacy' => $legacy[$key] = $candidate,
                 default => $hidden[$key] = $candidate,
             };
+            if ($classification === 'index') {
+                $indexFamilies[mb_strtolower($this->par2FamilyKey($subject) ?? $key)] = true;
+            }
             if ($classification === 'volume') {
                 $family = mb_strtolower($this->par2FamilyKey($subject) ?? $key);
                 if (! isset($families[$family])) {
@@ -636,8 +639,15 @@ class NzbContentsService
         }
         uasort($hidden, static fn (array $left, array $right): int => $left['segments'][0]['bytes'] <=> $right['segments'][0]['bytes']);
 
-        // Families prioritize probes only; later volumes retain their own resumable metadata.
-        return array_values($explicit + $firstVolumes + $legacy + $hidden + $volumes);
+        foreach ($firstVolumes as $key => $candidate) {
+            $family = mb_strtolower($this->par2FamilyKey($candidate['subject']) ?? $key);
+            if (isset($indexFamilies[$family])) {
+                $matchingVolumes[$key] = $candidate;
+            }
+        }
+
+        // Family matches affect priority only; standalone and later volumes remain resumable.
+        return array_values($explicit + $matchingVolumes + $legacy + $hidden + $firstVolumes + $volumes);
     }
 
     /**
