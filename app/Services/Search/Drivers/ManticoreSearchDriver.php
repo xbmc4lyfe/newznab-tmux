@@ -791,14 +791,13 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, SearchDriverInte
             return self::prepareUserSearchQuery($query);
         }
 
-        $query = str_replace(['*', '?', '%'], ' ', trim($query));
-        $query = trim(preg_replace('/\s+/', ' ', $query) ?? $query);
+        $query = trim($query);
         if ($query === '') {
             return '';
         }
 
-        $escapeFrom = ['\\', '@', '~', '&', '/', '$', '=', "'", '[', ']', '(', ')', '"', '!', '-', '|', '^', '<', '>'];
-        $escapeTo = ['\\\\', '\\@', '\\~', '\\&', '\\/', '\\$', '\\=', "\\'", '\\[', '\\]', '\\(', '\\)', '\\"', '\\!', '\\-', '\\|', '\\^', '\\<', '\\>'];
+        $escapeFrom = ['\\', '@', '~', '&', '/', '$', '=', "'", '[', ']', '(', ')', '"', '!', '-', '|', '^', '<', '>', '*', '?', '%'];
+        $escapeTo = ['\\\\', '\\@', '\\~', '\\&', '\\/', '\\$', '\\=', "\\'", '\\[', '\\]', '\\(', '\\)', '\\"', '\\!', '\\-', '\\|', '\\^', '\\<', '\\>', '\\*', '\\?', '\\%'];
 
         return str_replace($escapeFrom, $escapeTo, $query);
     }

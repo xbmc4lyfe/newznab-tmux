@@ -254,7 +254,7 @@ final class ReleaseSearchFiltersTest extends TestCase
         $pdo = new \PDO('sqlite::memory:');
         $pdo->exec('CREATE TABLE releases (id INTEGER PRIMARY KEY, searchname TEXT, fromname TEXT, size INTEGER, comments INTEGER, passwordstatus INTEGER)');
         $pdo->exec('CREATE TABLE release_files (releases_id INTEGER, name TEXT)');
-        $pdo->exec("INSERT INTO releases VALUES (1,'First','Poster',20,0,0), (2,'Second','Poster',20,0,0), (3,'Episode 1080p','Poster',20,0,0), (4,'Fourth','Poster',20,1,0), (5,'Fifth','Poster',20,0,0), (6,'Sixth','Poster',20,0,2)");
+        $pdo->exec("INSERT INTO releases VALUES (1,'First','Poster',20,0,0), (2,'Second','Poster',20,0,0), (3,'Episode 1080p','Poster',20,0,0), (4,'Fourth','Poster',20,1,0), (5,'Fifth','Poster',20,0,0), (6,'Sixth','Poster',20,0,2), (7,'Different','Poster Extra',20,0,0)");
         $insert = $pdo->prepare('INSERT INTO release_files VALUES (?, ?)');
         foreach ([[1, 'Episode.1080p.mkv'], [2, 'Episode.mkv'], [2, '1080p.mkv'], [4, 'Episode.1080p.mkv'], [5, "O'Reilly.Episode.1080p.mkv"], [6, 'Episode.1080p.mkv']] as $file) {
             $insert->execute($file);
@@ -302,6 +302,10 @@ final class ReleaseSearchFiltersTest extends TestCase
             $quoted = $service->search(['filename' => "O'Reilly 1080p"], -1, -1, -1, -1, -1, 0, 10, 'name_asc');
             $this->assertSame([5], $quoted->modelKeys());
             $this->assertSame(1, $quoted[0]->_totalrows);
+
+            $container->make('config')->set('nntmux.mysql_search_fallback', false);
+            $exactPoster = $service->search([], -1, -1, -1, -1, -1, 0, 10, 'name_asc', filters: ['filter_only' => true, 'poster' => 'Poster']);
+            $this->assertEqualsCanonicalizing([1, 2, 3, 4, 5], $exactPoster->modelKeys());
         } finally {
             Facade::clearResolvedInstances();
             Facade::setFacadeApplication($originalApp);
