@@ -5,10 +5,44 @@ declare(strict_types=1);
 namespace Tests\Unit\Services\NameFixing;
 
 use App\Services\NameFixing\PredbMatchSelector;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 class PredbMatchSelectorTest extends TestCase
 {
+    #[DataProvider('similarityInputs')]
+    public function test_similarity_preserves_native_percentages(string $left, string $right): void
+    {
+        $selector = new class extends PredbMatchSelector
+        {
+            public function compare(string $left, string $right): float
+            {
+                return $this->similarityPercent($left, $right);
+            }
+        };
+        $expected = 0.0;
+        similar_text($left, $right, $expected);
+        $this->assertSame($expected, $selector->compare($left, $right));
+    }
+
+    /** @return array<string, array{string, string}> */
+    public static function similarityInputs(): array
+    {
+        return [
+            'empty' => ['', ''],
+            'empty left' => ['', 'fixture'],
+            'empty right' => ['fixture', ''],
+            'zero' => ['0', '0'],
+            'equal ASCII' => ['Fixture.Release-GRP', 'Fixture.Release-GRP'],
+            'equal Unicode' => ['é界🚀', 'é界🚀'],
+            'equal binary' => ["fixture\0\xFF", "fixture\0\xFF"],
+            'long equality' => [str_repeat('x', 256), str_repeat('x', 256)],
+            'case difference' => ['Fixture', 'fixture'],
+            'unequal' => ['abcXYZ', 'XYZabc'],
+            'numeric difference' => ['0', '00'],
+        ];
+    }
+
     public function test_it_prefers_the_best_matching_predb_hit_over_the_first_hit(): void
     {
         $selector = new PredbMatchSelector;
