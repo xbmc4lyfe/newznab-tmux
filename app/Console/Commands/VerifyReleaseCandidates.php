@@ -133,6 +133,7 @@ class VerifyReleaseCandidates extends Command
                         $this->warn($claim->id.': retry pending — '.$error->getMessage());
                     }
                 } finally {
+                    unset($verifier, $manifest, $result, $progressHeartbeat, $heartbeat);
                     $locks->releaseCandidate();
                 }
             }

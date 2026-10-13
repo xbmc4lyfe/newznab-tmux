@@ -12,6 +12,7 @@ use App\Services\Releases\Verification\VerificationResetService;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\YencService;
 use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -77,6 +78,35 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(3, DB::table('release_verification_candidates')->where('status', 'unknown')->count());
         $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('release_id')->count());
         $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('lease_token')->count());
+    }
+
+    public function test_completed_candidate_releases_its_article_source_before_the_next_claim(): void
+    {
+        config(['release_verification.bytes_per_second' => 0]);
+        foreach (['one', 'two'] as $name) {
+            app(CandidateRepository::class)->enqueue(['identity' => sha1($name), 'groups_id' => 1, 'expected_files' => 2,
+                'files' => [['key' => 'movie', 'subject' => 'movie.mkv', 'totalparts' => 1,
+                    'segments' => [['number' => 1, 'messageid' => $name.'@article', 'bytes' => 5]]]]]);
+        }
+        $closed = 0;
+        $this->mock(NNTPService::class, static function ($mock) use (&$closed): void {
+            $mock->shouldReceive('doConnect')->twice()->with(false)->andReturn(true);
+            $mock->shouldReceive('verificationArticle')->twice()->andReturn((new YencService)->encode('hello', 'movie.mkv'));
+            $mock->shouldReceive('doQuit')->twice()->andReturnUsing(static function () use (&$closed): void {
+                $closed++;
+            });
+        });
+        $claims = 0;
+        DB::listen(function (QueryExecuted $query) use (&$claims, &$closed): void {
+            if (str_starts_with($query->sql, 'update "release_verification_candidates"') && in_array('verifying', $query->bindings, true)) {
+                if (++$claims === 2) {
+                    $this->assertSame(1, $closed, 'Previous payload/source state must be released before another candidate is claimed.');
+                }
+            }
+        });
+        $this->artisan('releases:verify-candidates', ['--limit' => 2])->assertSuccessful();
+        $this->assertSame(2, $claims);
+        $this->assertSame(2, $closed);
     }
 
     public function test_run_duration_stops_new_claims_but_finishes_active_verification(): void
