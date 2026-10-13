@@ -18,9 +18,15 @@ final class ExactPosterSearchMariaDbTest extends TestCase
 
     private string $database = '';
 
+    /** @var array<string, mixed> */
+    private array $originalConfig = [];
+
     protected function setUp(): void
     {
         parent::setUp();
+        foreach (['database.default', 'database.connections.poster_qualification', 'cache.default', 'nntmux.mysql_search_fallback'] as $key) {
+            $this->originalConfig[$key] = config($key);
+        }
         $host = (string) getenv('POSTER_SEARCH_TEST_HOST');
         if ($host === '') {
             $this->markTestSkipped('Set POSTER_SEARCH_TEST_HOST to an isolated MariaDB test server.');
@@ -53,10 +59,11 @@ final class ExactPosterSearchMariaDbTest extends TestCase
     {
         try {
             if ($this->administrator !== null && preg_match('/^nntmux_poster_test_[a-f0-9]{16}$/', $this->database) === 1) {
-                DB::disconnect('poster_qualification');
+                DB::purge('poster_qualification');
                 $this->administrator->exec('DROP DATABASE `'.$this->database.'`');
             }
         } finally {
+            config($this->originalConfig);
             parent::tearDown();
         }
     }
