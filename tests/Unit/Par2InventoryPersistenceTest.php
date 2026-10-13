@@ -69,10 +69,10 @@ final class Par2InventoryPersistenceTest extends TestCase
         });
         $schema->create('releases', function (Blueprint $table): void {
             $table->integer('id')->primary();
-            foreach (['groups_id', 'categories_id', 'isrenamed', 'iscategorized', 'predb_id', 'proc_par2', 'proc_hash16k', 'rarinnerfilecount', 'videos_id', 'tv_episodes_id', 'book_lookup_attempts'] as $column) {
+            foreach (['groups_id', 'categories_id', 'isrenamed', 'iscategorized', 'predb_id', 'proc_par2', 'proc_hash16k', 'rarinnerfilecount', 'videos_id', 'tv_episodes_id', 'tv_lookup_attempts', 'book_lookup_attempts'] as $column) {
                 $table->integer($column)->default(0);
             }
-            foreach (['guid', 'name', 'searchname', 'imdbid', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'anidbid', 'book_lookup_retry_at', 'book_name_normalized_at'] as $column) {
+            foreach (['guid', 'name', 'searchname', 'imdbid', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'anidbid', 'tv_lookup_retry_at', 'book_lookup_retry_at', 'book_name_normalized_at'] as $column) {
                 $table->string($column)->nullable();
             }
             $table->dateTime('postdate')->nullable();

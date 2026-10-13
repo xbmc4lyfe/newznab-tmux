@@ -332,7 +332,10 @@ class NzbContentsService
             $recovery = new Par2CandidateRecovery($this->nntp, $this->postProcessService, $alternate);
             $outcome = Par2RenameOutcome::NoMatch;
             foreach ($pending as $index) {
-                if ($this->par2Stats['candidates_probed'] >= $budget || ! $this->canContinuePar2($guard)) {
+                if ($this->par2Stats['candidates_probed'] >= $budget) {
+                    return Par2RenameOutcome::Retryable;
+                }
+                if (! $this->canContinuePar2($guard)) {
                     return Par2RenameOutcome::Deferred;
                 }
                 $result = $recovery->recover($candidates[$index], $snapshot, $signature, $groupID, $show,
@@ -508,7 +511,7 @@ class NzbContentsService
     /** @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> */
     private function par2Candidates(SimpleXMLElement $nzb): array
     {
-        $explicit = $volumes = $legacy = $hidden = [];
+        $explicit = $legacy = $hidden = [];
         $this->par2Manifest = [];
         $this->par2StructureValid = count($nzb->file) > 0;
         $maxBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
@@ -546,6 +549,9 @@ class NzbContentsService
             if ($classification === 'excluded' || $segments === []) {
                 continue;
             }
+            if ($classification === 'volume') {
+                continue;
+            }
             if (! $valid) {
                 $segments[0]['number'] = 0;
             }
@@ -553,14 +559,13 @@ class NzbContentsService
             $key = hash('sha256', json_encode($candidate, JSON_THROW_ON_ERROR));
             match ($classification) {
                 'index' => $explicit[$key] = $candidate,
-                'volume' => $volumes[$key] = $candidate,
                 'legacy' => $legacy[$key] = $candidate,
                 default => $hidden[$key] = $candidate,
             };
         }
         uasort($hidden, static fn (array $left, array $right): int => $left['segments'][0]['bytes'] <=> $right['segments'][0]['bytes']);
 
-        return array_values($explicit + $volumes + $legacy + $hidden);
+        return array_values($explicit + $legacy + $hidden);
     }
 
     /**
