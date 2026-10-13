@@ -19,6 +19,7 @@ use std::ptr;
 use std::slice;
 
 mod article_identity;
+mod article_xref;
 mod formats;
 mod par2;
 mod par2_source_ranges;
@@ -37,6 +38,7 @@ const MAX_METADATA_INPUT_BYTES: usize = 67_108_864;
 const MAX_SEVEN_ZIP_RANGE_INPUT_BYTES: usize = 16 * 1024 * 1024 + 4096;
 const MAX_PAR2_SOURCE_RANGE_INPUT_BYTES: usize = 16 * 1024 * 1024 + 16 * 1024;
 const MAX_ARTICLE_IDENTITY_INPUT_BYTES: usize = 131_072;
+const MAX_ARTICLE_XREF_INPUT_BYTES: usize = 196_608;
 
 /// Decode a yEnc payload (CR/LF line endings are skipped, `=X` escapes resolved).
 pub fn decode_payload(payload: &[u8]) -> Option<Vec<u8>> {
@@ -220,6 +222,52 @@ pub unsafe extern "C" fn nntmux_article_identity_v2_json(
         head_response_code,
         body_response_code,
     )
+}
+
+/// Parse the Xref fields in a HEAD response and an OVER response using the
+/// server's advertised LIST OVERVIEW.FMT layout. `data` is XR01 followed by
+/// three little-endian length-prefixed fields: raw HEAD bytes, packed overview
+/// rows, and packed overview-format lines. Each line list is a u32 count then
+/// repeated length-prefixed byte strings; u32::MAX marks an absent outer field.
+/// The caller must release the returned JSON with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Oversized inputs are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_article_identity_xref_v1_json(
+    data: *const u8,
+    length: usize,
+    head_response_code: i32,
+    overview_response_code: i32,
+    overview_attempted: i32,
+    overview_row_count: i32,
+    overview_format_response_code: i32,
+) -> *mut c_char {
+    if length > MAX_ARTICLE_XREF_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let encoded = catch_unwind(|| {
+        serde_json::to_string(&article_xref::parse(
+            input,
+            head_response_code,
+            overview_response_code,
+            overview_attempted != 0,
+            overview_row_count,
+            overview_format_response_code,
+        ))
+    });
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
 }
 
 /// Parse legacy AI01 input while preserving the original four-argument ABI.

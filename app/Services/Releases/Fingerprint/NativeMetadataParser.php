@@ -15,6 +15,9 @@ final class NativeMetadataParser
     /** @var array<string, FFI> */
     private static array $identityLibraries = [];
 
+    /** @var array<string, FFI> */
+    private static array $xrefLibraries = [];
+
     /** @return array<string, mixed>|null */
     public function parsePar2(string $bytes): ?array
     {
@@ -73,13 +76,47 @@ final class NativeMetadataParser
     }
 
     /**
+     * @param  list<string>  $rawHeaders
+     * @param  list<string>  $overviewRows
+     * @param  list<string>  $overviewFormat
+     * @return array<string, mixed>|null
+     */
+    public function parseArticleXref(
+        array $rawHeaders,
+        array $overviewRows,
+        array $overviewFormat,
+        ?int $headResponseCode,
+        ?int $overviewResponseCode,
+        bool $overviewAttempted,
+        int $overviewRowCount,
+        ?int $overviewFormatResponseCode,
+    ): ?array {
+        $packed = 'XR01'.self::packMetadataField(implode('', $rawHeaders))
+            .self::packMetadataField(self::packMetadataLines($overviewRows))
+            .self::packMetadataField(self::packMetadataLines($overviewFormat));
+
+        if (strlen($packed) > 196_608) {
+            return null;
+        }
+
+        return $this->parseJson('nntmux_article_identity_xref_v1_json', $packed, [
+            $headResponseCode ?? -1,
+            $overviewResponseCode ?? -1,
+            (int) $overviewAttempted,
+            $overviewRowCount,
+            $overviewFormatResponseCode ?? -1,
+        ]);
+    }
+
+    /**
      * @param  list<int>  $integerArguments
      * @return array<string, mixed>|null
      */
     private function parseJson(string $function, string $bytes, array $integerArguments = []): ?array
     {
-        $identityParser = str_starts_with($function, 'nntmux_article_identity_');
-        $library = $this->library($identityParser);
+        $identityParser = $function === 'nntmux_article_identity_v2_json';
+        $xrefParser = $function === 'nntmux_article_identity_xref_v1_json';
+        $library = $this->library($identityParser, $xrefParser);
         if ($library === null || strlen($bytes) > 67_108_864) {
             return null;
         }
@@ -115,7 +152,18 @@ final class NativeMetadataParser
         return pack('V', strlen($value)).$value;
     }
 
-    private function library(bool $articleIdentity = false): ?FFI
+    /** @param list<string> $lines */
+    private static function packMetadataLines(array $lines): string
+    {
+        $packed = pack('V', count($lines));
+        foreach ($lines as $line) {
+            $packed .= self::packMetadataField($line);
+        }
+
+        return $packed;
+    }
+
+    private function library(bool $articleIdentity = false, bool $articleXref = false): ?FFI
     {
         if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || ! extension_loaded('FFI')) {
             return null;
@@ -126,7 +174,11 @@ final class NativeMetadataParser
             return null;
         }
         $key = getmypid().':'.$resolved;
-        $libraries = $articleIdentity ? self::$identityLibraries : self::$libraries;
+        $libraries = match (true) {
+            $articleIdentity => self::$identityLibraries,
+            $articleXref => self::$xrefLibraries,
+            default => self::$libraries,
+        };
         if (isset($libraries[$key])) {
             return $libraries[$key];
         }
@@ -135,6 +187,11 @@ final class NativeMetadataParser
             if ($articleIdentity) {
                 $definitions = <<<'C'
                 char* nntmux_article_identity_v2_json(const unsigned char* data, size_t length, int overview_response_code, int overview_attempted, int head_response_code, int body_response_code);
+                void nntmux_metadata_string_free(char* value);
+                C;
+            } elseif ($articleXref) {
+                $definitions = <<<'C'
+                char* nntmux_article_identity_xref_v1_json(const unsigned char* data, size_t length, int head_response_code, int overview_response_code, int overview_attempted, int overview_row_count, int overview_format_response_code);
                 void nntmux_metadata_string_free(char* value);
                 C;
             } else {
@@ -149,6 +206,8 @@ final class NativeMetadataParser
             $library = FFI::cdef($definitions, $resolved);
             if ($articleIdentity) {
                 self::$identityLibraries[$key] = $library;
+            } elseif ($articleXref) {
+                self::$xrefLibraries[$key] = $library;
             } else {
                 self::$libraries[$key] = $library;
             }
