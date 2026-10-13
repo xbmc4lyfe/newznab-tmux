@@ -43,6 +43,14 @@ final class VerifiedReleasePublisher
                 return (int) $candidate->release_id;
             }
             $manifest = $result->manifest;
+            if ($result->verdict === 'sampled') {
+                if (($manifest['verification_mode'] ?? null) !== 'spot_check') {
+                    throw new RuntimeException('Sampled verdict has no spot-check evidence.');
+                }
+                if (($rejection = (new CandidateHeaderInventory)->rejection($manifest)) !== null) {
+                    throw new RuntimeException($rejection);
+                }
+            }
             $filteredReason = app(CollectionReleasePolicy::class)->verifiedRejection($manifest);
             if ($filteredReason !== null) {
                 app(CandidateRepository::class)->rejectByPolicy($claim, $filteredReason);
@@ -50,11 +58,18 @@ final class VerifiedReleasePublisher
                 return null;
             }
             $metadata = $this->metadata->resolve($manifest);
-            $size = 0;
-            foreach ($manifest['files'] as $file) {
-                $size += (int) ($file['decoded_size'] ?? array_sum(array_column($file['segments'], 'bytes')));
+            if (($manifest['verification_mode'] ?? null) === 'spot_check') {
+                $size = (new CandidateHeaderInventory)->bytes($manifest);
+                if ($size < 1) {
+                    throw new RuntimeException('Spot-checked release has no positive declared size.');
+                }
+            } else {
+                $size = 0;
+                foreach ($manifest['files'] as $file) {
+                    $size += (int) ($file['decoded_size'] ?? array_sum(array_column($file['segments'], 'bytes')));
+                }
+                $size = (int) ($manifest['verified_bytes'] ?? $size);
             }
-            $size = (int) ($manifest['verified_bytes'] ?? $size);
             $legacy = null;
             $archived = app(ManifestStore::class)->read($candidate->manifest_path);
             $legacyId = $archived['legacy_release_id'] ?? null;
@@ -85,8 +100,10 @@ final class VerifiedReleasePublisher
                 }
             });
             $parameters = $metadata + [
-                'totalpart' => ($manifest['metadata_source'] ?? null) !== 'import'
-                    ? count(array_unique($manifest['verified_file_names'])) : max((int) $manifest['expected_files'], count($manifest['files'])),
+                'totalpart' => ($manifest['verification_mode'] ?? null) === 'spot_check'
+                    ? max(0, (int) ($manifest['publication_file_count'] ?? $manifest['expected_files'] ?? count($manifest['files'])))
+                    : (($manifest['metadata_source'] ?? null) !== 'import'
+                        ? count(array_unique($manifest['verified_file_names'])) : max((int) $manifest['expected_files'], count($manifest['files']))),
                 'groups_id' => (int) $manifest['groups_id'], 'guid' => $guid, 'postdate' => $manifest['date'],
                 'size' => $size, 'nzbstatus' => NzbService::NZB_ADDED];
             if ($legacy === null) {

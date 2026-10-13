@@ -10,9 +10,9 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\LeaseHeartbeat;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
-use App\Services\Releases\Verification\PayloadVerifier;
 use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
+use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
@@ -27,7 +27,7 @@ class VerifyReleaseCandidates extends Command
 {
     protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the active candidate}';
 
-    protected $description = 'Download and verify pending candidates before publishing their NZBs';
+    protected $description = 'Spot check bounded articles before publishing complete candidate NZBs';
 
     public function handle(CandidateRepository $repository, ManifestStore $store, VerifiedReleasePublisher $publisher, ScratchInventory $scratchInventory, ScratchBudget $scratchBudget): int
     {
@@ -84,8 +84,11 @@ class VerifyReleaseCandidates extends Command
                     $scratchEntryId = (int) DB::table('release_verification_scratch')->where('candidate_id', $claim->id)
                         ->where('version', $claim->version)->value('id');
                     $scratchBudget->reconcile($scratchEntryId, $locks, $progressHeartbeat);
-                    $verifier = new PayloadVerifier(new NntpArticleSource(app(NNTPService::class), decoder: $decoder),
-                        (array) config('release_verification'), decoder: $decoder, scratchBudget: $scratchBudget->forEntry($scratchEntryId));
+                    $verificationOptions = (array) config('release_verification');
+                    $source = new NntpArticleSource(app(NNTPService::class), decoder: $decoder,
+                        maximumBytes: min((int) $verificationOptions['spot_check_bytes'], (int) $verificationOptions['spot_check_article_bytes']),
+                        allowAlternateFallback: false);
+                    $verifier = new SpotCheckVerifier($source, $verificationOptions, $decoder);
                     foreach ($scratchInventory->olderVersions((int) $claim->id, (int) $claim->version) as $old) {
                         $oldDirectory = $root.'/scratch/'.$old->candidate_id.'-'.$old->version;
                         $heartbeat();
@@ -99,7 +102,7 @@ class VerifyReleaseCandidates extends Command
                     $heartbeat();
                     $manifest = $store->read($claim->manifest_path);
                     $started = microtime(true);
-                    $result = $verifier->verify($manifest, $directory, $progressHeartbeat);
+                    $result = $verifier->verify($manifest, $progressHeartbeat);
                     if ($result->passed()) {
                         if ($publisher->publish($claim, $result) === null) {
                             $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
@@ -110,7 +113,8 @@ class VerifyReleaseCandidates extends Command
                     } else {
                         $repository->finish($claim, $result);
                     }
-                    $bytes = $result->passed() ? (int) ($result->manifest['verified_bytes'] ?? 0) : 0;
+                    $bytes = $result->passed()
+                        ? (int) ($result->manifest['spot_check']['bytes'] ?? $result->manifest['verified_bytes'] ?? 0) : 0;
                     $snapshot = json_encode(['verified_bytes_per_second' => $bytes / max(0.001, microtime(true) - $started),
                         'scratch_bytes' => null, 'scratch_bytes_status' => 'unknown'], JSON_THROW_ON_ERROR);
                     $statusTemporary = $root.'/status-'.bin2hex(random_bytes(8)).'.tmp';
@@ -133,7 +137,7 @@ class VerifyReleaseCandidates extends Command
                         $this->warn($claim->id.': retry pending — '.$error->getMessage());
                     }
                 } finally {
-                    unset($verifier, $manifest, $result, $progressHeartbeat, $heartbeat);
+                    unset($source, $verifier, $manifest, $result, $progressHeartbeat, $heartbeat);
                     $locks->releaseCandidate();
                 }
             }
@@ -195,7 +199,7 @@ class VerifyReleaseCandidates extends Command
                             ->where('version', '>=', $entry->version)
                             ->where(function ($query): void {
                                 $query->whereIn('status', ['expired', 'filtered'])
-                                    ->orWhere(fn ($published) => $published->whereNotNull('release_id')->whereIn('status', ['complete', 'repaired']));
+                                    ->orWhere(fn ($published) => $published->whereNotNull('release_id')->whereIn('status', ['complete', 'repaired', 'sampled']));
                             })
                             ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))
                             ->exists();

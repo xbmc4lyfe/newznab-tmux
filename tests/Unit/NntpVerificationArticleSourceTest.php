@@ -22,6 +22,23 @@ use Tests\Fixtures\YencArticles;
 
 final class NntpVerificationArticleSourceTest extends TestCase
 {
+    public function test_bounded_sample_fetch_honours_remaining_budget_and_never_retries_another_provider(): void
+    {
+        $primary = new VerificationNntpHarness("too-large-body\r\n.\r\n");
+        $alternate = new VerificationNntpHarness("alternate-body\r\n.\r\n");
+        $source = new NntpArticleSource($primary, $alternate, maximumBytes: 1048576, allowAlternateFallback: false);
+        try {
+            $source->fetchBounded('sample@example', 4);
+            $this->fail('A sample cannot exceed its remaining transfer budget.');
+        } catch (RuntimeException) {
+            $this->assertSame(['BODY <sample@example>'], $primary->commands);
+            $this->assertSame([], $alternate->commands);
+            $this->assertSame([], $alternate->connections);
+        }
+        $this->expectException(RuntimeException::class);
+        $source->fetchBounded('second@example', 0);
+    }
+
     private Container $previousContainer;
 
     protected function setUp(): void

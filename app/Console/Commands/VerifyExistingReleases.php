@@ -10,9 +10,9 @@ use App\Services\Nzb\NzbService;
 use App\Services\Releases\Verification\AuditReleaseDeletion;
 use App\Services\Releases\Verification\NntpArticleSource;
 use App\Services\Releases\Verification\NzbManifestReader;
-use App\Services\Releases\Verification\PayloadVerifier;
 use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
+use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\YencService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -25,7 +25,7 @@ class VerifyExistingReleases extends Command
         {--delete : Delete only proven unrepairable releases} {--limit=100 : Maximum releases}
         {--since-id=0 : Start after this release ID} {--resume : Use persisted audit cursor}';
 
-    protected $description = 'Download and audit existing NZBs with resumable progress; unknown results are retained';
+    protected $description = 'Spot check existing NZBs with bounded article reads; inconclusive results are retained';
 
     public function handle(NzbService $nzb, NzbManifestReader $reader, ScratchInventory $scratchInventory,
         AuditReleaseDeletion $deletion, ScratchBudget $scratchBudget, YencService $decoder): int
@@ -68,7 +68,10 @@ class VerifyExistingReleases extends Command
             $retryIds = $resume ? DB::table('release_verification_audit_retries')->where('next_attempt_at', '<=', now())
                 ->orderBy('next_attempt_at')->orderBy('release_id')->limit($limit)->pluck('release_id')->all() : [];
             $retryTurn = (bool) $state->audit_retry_turn;
-            $source = new NntpArticleSource(app(NNTPService::class), decoder: $decoder);
+            $verificationOptions = (array) config('release_verification');
+            $source = new NntpArticleSource(app(NNTPService::class), decoder: $decoder,
+                maximumBytes: min((int) $verificationOptions['spot_check_bytes'], (int) $verificationOptions['spot_check_article_bytes']),
+                allowAlternateFallback: false);
             $attempted = 0;
             while ($attempted < $limit && ($freshIds !== [] || $retryIds !== [])) {
                 if ($this->newCandidatesAreDue()) {
@@ -90,14 +93,14 @@ class VerifyExistingReleases extends Command
                 $attempted++;
                 $scratchEntry = $scratchInventory->registerAudit((int) $release->id);
                 $directory = $root.'/scratch/'.$scratchInventory->directoryName($scratchEntry);
-                $verifier = new PayloadVerifier($source, (array) config('release_verification'),
-                    decoder: $decoder, scratchBudget: $scratchBudget->forEntry((int) $scratchEntry->id));
+                File::ensureDirectoryExists($directory, 0700);
+                $verifier = new SpotCheckVerifier($source, $verificationOptions, $decoder);
                 try {
                     $xml = $nzb->readNzbContents($release->guid);
                     if ($xml === false) {
                         throw new \RuntimeException('Release NZB is unavailable.');
                     }
-                    $result = $verifier->verify($reader->read($xml, $release), $directory, static function (): void {});
+                    $result = $verifier->verify($reader->read($xml, $release), static function (): void {});
                     $record = ['id' => $release->id, 'verdict' => $result->verdict, 'reason' => $result->reason];
                 } catch (Throwable $error) {
                     $record = ['id' => $release->id, 'verdict' => 'unknown', 'reason' => $error->getMessage()];
