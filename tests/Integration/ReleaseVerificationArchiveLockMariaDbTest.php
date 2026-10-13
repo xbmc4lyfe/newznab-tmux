@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Integration;
 
 use App\Services\CollectionCleanupService;
+use App\Services\Nzb\NzbService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use Illuminate\Database\Events\QueryExecuted;
@@ -154,6 +155,138 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
     {
         yield 'standalone archival' => [false];
         yield 'caller-owned transaction' => [true];
+    }
+
+    public function test_filtered_oversized_replay_uses_locked_status_despite_an_older_repeatable_read_view(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->enqueue(['identity' => sha1('oversized-replay'), 'groups_id' => 1, 'files' => []]);
+        $claim = $repository->claim();
+        $this->assertNotNull($claim);
+        $id = $this->arrival('oversized-replay');
+        $binary = (int) DB::table('binaries')->where('collections_id', $id)->value('id');
+        for ($start = 2; $start <= 44001; $start += 500) {
+            $parts = [];
+            for ($number = $start; $number < $start + 500; $number++) {
+                $parts[] = ['binaries_id' => $binary, 'partnumber' => $number,
+                    'messageid' => str_repeat('x', 255), 'size' => 5];
+            }
+            DB::table('parts')->insert($parts);
+        }
+        $this->assertGreaterThan(16777216, 44000 * (128 + 255));
+        config(['database.connections.policy_filter' => config('database.connections.mariadb')]);
+        DB::statement('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+        DB::beginTransaction();
+        try {
+            $this->assertSame('verifying', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
+            DB::setDefaultConnection('policy_filter');
+            try {
+                $repository->rejectByPolicy($claim, 'Test policy');
+                $this->assertSame('filtered', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
+            } finally {
+                DB::setDefaultConnection('mariadb');
+            }
+            $this->assertSame('verifying', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
+
+            $repository->archive($id);
+            DB::commit();
+        } finally {
+            DB::setDefaultConnection('mariadb');
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+            DB::purge('policy_filter');
+        }
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame('filtered', $candidate->status);
+        $this->assertSame('', $candidate->manifest_path);
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame(0, DB::table('collections')->count());
+        $this->assertSame(0, DB::table('parts')->count());
+    }
+
+    /** @return iterable<string, array{bool, bool}> */
+    public static function capacitySnapshotModes(): iterable
+    {
+        yield 'new standalone' => [false, false];
+        yield 'new outer transaction' => [true, false];
+        yield 'legacy standalone' => [false, true];
+        yield 'legacy outer transaction' => [true, true];
+    }
+
+    #[DataProvider('capacitySnapshotModes')]
+    public function test_header_snapshot_keeps_capacity_available_and_parent_locked(bool $outerTransaction, bool $legacy): void
+    {
+        $id = $this->arrival('snapshot');
+        if ($legacy) {
+            DB::statement('ALTER TABLE collections ADD releases_id BIGINT UNSIGNED NULL');
+            DB::statement('CREATE TABLE releases (id BIGINT UNSIGNED PRIMARY KEY, nzbstatus INT NOT NULL) ENGINE=InnoDB');
+            DB::table('releases')->insert(['id' => 7, 'nzbstatus' => NzbService::NZB_NONE]);
+            DB::table('collections')->where('id', $id)->update(['filecheck' => 4, 'releases_id' => 7]);
+        }
+        for ($number = 1; $number <= 200; $number++) {
+            $binary = DB::table('binaries')->insertGetId(['collections_id' => $id,
+                'binaryhash' => md5('batch-'.$number, true), 'name' => 'file-'.$number, 'totalparts' => 1]);
+            DB::table('parts')->insert(['binaries_id' => $binary, 'partnumber' => 1,
+                'messageid' => 'batch-'.$number.'@article', 'size' => 5]);
+        }
+        $other = $this->connection();
+        $snapshots = 0;
+        $parentProtected = false;
+        $archiving = true;
+        DB::listen(function (QueryExecuted $query) use ($id, $other, &$snapshots, &$parentProtected, &$archiving): void {
+            if (! $archiving || ! str_starts_with($query->sql, 'select') || ! str_contains($query->sql, 'from `parts`')) {
+                return;
+            }
+            $snapshots++;
+            $other->beginTransaction();
+            try {
+                try {
+                    $other->query('SELECT id FROM release_verification_state WHERE id = 1 FOR UPDATE NOWAIT')->fetchAll();
+                } catch (\PDOException $error) {
+                    $this->assertSame(1205, (int) $error->errorInfo[1]);
+                    $this->fail('The header snapshot must not hold the shared capacity lock.');
+                }
+                $this->assertSame(0, (int) $other->query('SELECT pending_bytes FROM release_verification_state WHERE id = 1')->fetchColumn());
+                try {
+                    $lock = $other->prepare('SELECT id FROM collections WHERE id = ? FOR UPDATE NOWAIT');
+                    $lock->execute([$id]);
+                    $this->fail('The header snapshot must retain its collection parent lock.');
+                } catch (\PDOException $error) {
+                    $this->assertSame(1205, (int) $error->errorInfo[1]);
+                    $parentProtected = true;
+                }
+            } finally {
+                $other->rollBack();
+            }
+        });
+        if ($outerTransaction) {
+            DB::beginTransaction();
+        }
+        try {
+            app(CandidateRepository::class)->archive($id);
+            if ($outerTransaction) {
+                DB::commit();
+            }
+        } finally {
+            $archiving = false;
+            if ($outerTransaction && DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+        }
+        $this->assertSame(3, $snapshots);
+        $this->assertTrue($parentProtected);
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $manifest = app(ManifestStore::class)->read($candidate->manifest_path);
+        $this->assertCount(201, $manifest['files']);
+        $articles = array_merge(...array_column($manifest['files'], 'segments'));
+        $this->assertCount(201, $articles);
+        $this->assertContains('snapshot@article', array_column($articles, 'messageid'));
+        $this->assertSame(1005, array_sum(array_column($articles, 'bytes')));
+        $this->assertSame($legacy ? 7 : null, $manifest['legacy_release_id']);
+        $this->assertSame((int) $candidate->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame(0, DB::table('collections')->count());
+        $this->assertSame(0, DB::table('parts')->count());
     }
 
     #[DataProvider('snapshotTransactionModes')]

@@ -58,6 +58,8 @@ class TmuxProcessingBacklogTest extends TestCase
             }
             $table->integer('videos_id')->default(0);
             $table->integer('tv_episodes_id')->default(0);
+            $table->integer('tv_lookup_attempts')->default(0);
+            $table->dateTime('tv_lookup_retry_at')->nullable();
             $table->integer('gamesinfo_id')->default(0);
             $table->integer('book_lookup_attempts')->default(0);
             $table->dateTime('book_lookup_retry_at')->nullable();
@@ -155,6 +157,25 @@ class TmuxProcessingBacklogTest extends TestCase
 
         $this->assertSame(0, (int) $this->counts()->processrenames);
         $this->assertSame(0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+    }
+
+    public function test_tv_backlog_counts_only_pending_lookups_that_are_due(): void
+    {
+        ConfigurationTestBuilder::update(ConfigurationDomain::Metadata, ['tv_lookup' => 1]);
+        foreach ([
+            ['tv_episodes_id' => 0, 'tv_lookup_retry_at' => null],
+            ['tv_episodes_id' => 0, 'tv_lookup_retry_at' => now()->subHour()],
+            ['tv_episodes_id' => 0, 'tv_lookup_retry_at' => now()->addHour()],
+            ['tv_episodes_id' => -1, 'tv_lookup_retry_at' => null],
+            ['tv_episodes_id' => -2, 'tv_lookup_retry_at' => null],
+            ['tv_episodes_id' => -3, 'tv_lookup_retry_at' => null],
+            ['tv_episodes_id' => -4, 'tv_lookup_retry_at' => null],
+            ['tv_episodes_id' => 42, 'tv_lookup_retry_at' => null],
+        ] as $attributes) {
+            DB::table('releases')->insert(['categories_id' => 5030, ...$attributes]);
+        }
+
+        $this->assertSame(2, (int) $this->counts()->processtv);
     }
 
     public function test_renamed_only_music_lookup_excludes_unrenamed_releases(): void

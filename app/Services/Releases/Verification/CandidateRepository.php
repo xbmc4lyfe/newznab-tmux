@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Exceptions\CandidateMetadataBudgetExceeded;
 use App\Services\CollectionCleanupService;
 use App\Services\Nzb\NzbService;
 use Illuminate\Database\Query\Builder;
@@ -36,11 +37,25 @@ final class CandidateRepository
                     && ! $this->cleanup->verificationEligibleCollections()->where('collections.id', $collectionId)->exists()) {
                     return;
                 }
+                $sourceIdentity = bin2hex($collection->collectionhash);
+                // The parent lock protects the header snapshot; unrelated admissions need no lock yet.
+                // Keep terminal replays on their existing cheap, locked validation path.
+                $filtered = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
+                    ->orderByDesc('id')->value('status') === 'filtered';
+                $manifest = null;
+                $snapshotFailure = null;
+                if (! $filtered) {
+                    try {
+                        $manifest = $this->snapshotHeaders($collection, $currentReads);
+                    } catch (CandidateMetadataBudgetExceeded $error) {
+                        // A stale read view can hide a committed filtered replay; validate it first.
+                        $snapshotFailure = $error;
+                    }
+                }
                 $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                 if ($state === null) {
                     throw new RuntimeException('Verification migration has not initialized capacity state.');
                 }
-                $sourceIdentity = bin2hex($collection->collectionhash);
                 $existing = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
                     ->orderByDesc('id')->lockForUpdate()->first();
                 if ($existing !== null && $existing->status === 'filtered') {
@@ -57,12 +72,16 @@ final class CandidateRepository
 
                     return;
                 }
+                if ($snapshotFailure !== null) {
+                    throw $snapshotFailure;
+                }
                 $identity = $existing->identity ?? $sourceIdentity;
                 if ($existing !== null && $existing->release_id !== null) {
                     $identity = sha1($sourceIdentity.':generation:'.$existing->id);
                     $existing = null;
                 }
-                $manifest = $this->snapshot($collection, $currentReads);
+                $manifest ??= $this->snapshotHeaders($collection, $currentReads);
+                $manifest['legacy_release_id'] = $this->legacyReleaseId($collection);
                 $newArticles = true;
                 if ($existing !== null && $existing->manifest_path !== '') {
                     $oldManifest = $this->store->read($existing->manifest_path);
@@ -227,6 +246,15 @@ final class CandidateRepository
     /** @return array<string, mixed> */
     private function snapshot(object $collection, bool $currentReads = false): array
     {
+        $manifest = $this->snapshotHeaders($collection, $currentReads);
+        $manifest['legacy_release_id'] = $this->legacyReleaseId($collection);
+
+        return $manifest;
+    }
+
+    /** @return array<string, mixed> */
+    private function snapshotHeaders(object $collection, bool $currentReads): array
+    {
         $groups = Schema::hasTable('collection_groups')
             ? $this->snapshotQuery('collection_groups', $currentReads)->where('collections_id', $collection->id)->pluck('group_name')->all() : [];
         if ($groups === []) {
@@ -244,7 +272,7 @@ final class CandidateRepository
                 ->select(['binaries_id', 'partnumber', 'messageid', 'size'])->cursor() as $part) {
                 $metadataBytes += 128 + strlen($part->messageid);
                 if ($metadataBytes > 16777216) {
-                    throw new RuntimeException('Candidate exceeds metadata budget; headers retained.');
+                    throw new CandidateMetadataBudgetExceeded('Candidate exceeds metadata budget; headers retained.');
                 }
                 $segmentsByBinary[$part->binaries_id][] = ['number' => (int) $part->partnumber,
                     'messageid' => $part->messageid, 'bytes' => (int) $part->size];
@@ -265,13 +293,7 @@ final class CandidateRepository
             }
         }
 
-        $legacyReleaseId = null;
-        if ((int) $collection->filecheck === 4 && isset($collection->releases_id)) {
-            $legacyReleaseId = DB::table('releases')->where('id', $collection->releases_id)
-                ->where('nzbstatus', NzbService::NZB_NONE)->lockForUpdate()->value('id');
-        }
-
-        return ['legacy_release_id' => $legacyReleaseId === null ? null : (int) $legacyReleaseId,
+        return ['legacy_release_id' => null,
             'identity' => bin2hex($collection->collectionhash), 'subject' => $collection->subject,
             'fromname' => $collection->fromname, 'date' => $collection->date, 'groups_id' => (int) $collection->groups_id,
             // Legacy insertion could overwrite the declared count with observed
@@ -279,6 +301,18 @@ final class CandidateRepository
             'regex_id' => (int) $collection->collection_regexes_id,
             'expected_files' => $expected,
             'groups' => $groups, 'files' => $files, 'conflict' => false];
+    }
+
+    /** Legacy publication takes capacity before its release row; retain that lock order. */
+    private function legacyReleaseId(object $collection): ?int
+    {
+        if ((int) $collection->filecheck !== 4 || ! isset($collection->releases_id)) {
+            return null;
+        }
+        $id = DB::table('releases')->where('id', $collection->releases_id)
+            ->where('nzbstatus', NzbService::NZB_NONE)->lockForUpdate()->value('id');
+
+        return $id === null ? null : (int) $id;
     }
 
     /** Current reads avoid a caller-owned repeatable-read snapshot omitting committed headers. */
