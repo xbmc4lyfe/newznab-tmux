@@ -21,7 +21,8 @@ COPY --from=yenc /out/libnzbyenc.so /usr/local/lib/nntmux/libnzbyenc.so
 # - unrar (non-free): unrar-free cannot open RAR5 archives used by most current posts.
 # - iproute2: NNTmux counts live NNTP sockets with `ss`.
 # - file, htop, git: helpers used by post-processing, the tmux htop pane and the monitor header.
-RUN sed -i 's/^Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources \
+RUN sed -i -e 's/^Components: main$/Components: main non-free/' \
+    -e 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get purge -y unrar-free \
     && apt-get install -y --no-install-recommends unrar iproute2 file htop git \
