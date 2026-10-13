@@ -106,6 +106,41 @@ fn rejects_null_output_length_without_writing() {
 }
 
 #[test]
+fn rejects_null_input_with_nonzero_length_without_writing() {
+    let mut output = [0xa5; 8];
+    let mut written = 0xfeed_beef;
+    let status = unsafe {
+        nntmux_yenc_decode_body(
+            std::ptr::null(),
+            1,
+            output.as_mut_ptr().cast(),
+            output.len(),
+            &mut written,
+        )
+    };
+    assert_eq!(status, NntmuxYencBodyStatus::InvalidArgument);
+    assert_eq!(output, [0xa5; 8]);
+    assert_eq!(written, 0xfeed_beef);
+}
+
+#[test]
+fn rejects_null_output_with_nonzero_capacity_without_writing() {
+    let input = b"=ybegin line=128 size=3 name=x\r\nklm\r\n=yend size=3\r\n";
+    let mut written = 0xfeed_beef;
+    let status = unsafe {
+        nntmux_yenc_decode_body(
+            input.as_ptr().cast(),
+            input.len(),
+            std::ptr::null_mut(),
+            input.len(),
+            &mut written,
+        )
+    };
+    assert_eq!(status, NntmuxYencBodyStatus::InvalidArgument);
+    assert_eq!(written, 0xfeed_beef);
+}
+
+#[test]
 fn returns_not_yenc_and_preserves_output_for_plain_body() {
     let mut output = [0xa5; 8];
     let mut written = 0xfeed_beef;
@@ -217,7 +252,8 @@ Expected: FAIL because the ABI shell cannot classify a framed body.
 - [ ] **Step 3: Implement conservative frame detection**
 
 Scan only body-start or `\n` control boundaries, using PHP-compatible,
-case-insensitive control delimiters. Parse enough `=ybegin` fields to require
+case-insensitive control names and field names with the existing delimiter
+rules. Parse enough `=ybegin` fields to require
 `line=`, `size=`, and `name=`. Return `Fallback` for every immediate `=ypart`
 line rather than parsing multipart values in this item. Find a bounded valid
 `=yend` control; a line-leading `=yendx` remains payload. If another valid
@@ -250,6 +286,22 @@ fn decodes_escaped_payload_and_split_escape() {
     let (status, output) = call_body_bytes(body);
     assert_eq!(status, NntmuxYencBodyStatus::Decoded);
     assert_eq!(output, b"ABC\xd6");
+}
+
+#[test]
+fn decodes_repeated_and_adjacent_escapes_in_a_complete_body() {
+    let body = b"=ybegin line=128 size=8 name=x\r\n=@=J=M=}=@=J=M=}\r\n=yend size=8\r\n";
+    let (status, output) = call_body_bytes(body);
+    assert_eq!(status, NntmuxYencBodyStatus::Decoded);
+    assert_eq!(output, b"\xd6\xe0\xe3\x13\xd6\xe0\xe3\x13");
+}
+
+#[test]
+fn decodes_mixed_case_controls_and_field_names() {
+    let body = b"=YBEGIN LiNe=128 SIZE=3 NaMe=x\r\nklm\r\n=YeNd SiZe=3\r\n";
+    let (status, output) = call_body_bytes(body);
+    assert_eq!(status, NntmuxYencBodyStatus::Decoded);
+    assert_eq!(output, b"ABC");
 }
 
 #[test]
@@ -313,7 +365,7 @@ Expected: PASS with the old and new ABI tests.
 
 - [ ] **Step 4: Verify every required dynamic symbol from the release cdylib**
 
-Run: `cd docker/app/nzb-yenc-ffi && cargo build --release --locked && expected_symbols=$(printf '%s\\n' nntmux_yenc_decode_body rapidyenc_crc rapidyenc_crc_init rapidyenc_decode_ex rapidyenc_decode_init rapidyenc_version | sort) && actual_symbols=$(nm -D --defined-only target/release/libnzbyenc.so | awk '{print $3}' | grep -E '^(nntmux_yenc_decode_body|rapidyenc_.*)$' | sort) && test "$actual_symbols" = "$expected_symbols"`
+Run: `cd docker/app/nzb-yenc-ffi && cargo build --release --locked && expected_symbols=$(printf '%s\n' nntmux_yenc_decode_body rapidyenc_crc rapidyenc_crc_init rapidyenc_decode_ex rapidyenc_decode_init rapidyenc_version | sort) && actual_symbols=$(nm -D --defined-only target/release/libnzbyenc.so | awk '{print $3}' | grep -E '^(nntmux_yenc_decode_body|rapidyenc_.*)$' | sort) && test "$actual_symbols" = "$expected_symbols"`
 
 Expected: the exact six-symbol set is present in the release artifact. Run
 this in the Linux build runtime because `nm -D` is an ELF check.
