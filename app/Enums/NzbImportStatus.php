@@ -13,6 +13,8 @@ enum NzbImportStatus: string
 
     case Queued = 'queued';
 
+    case MetadataIgnored = 'metadata_ignored';
+
     case Duplicate = 'duplicate';
 
     case Blacklisted = 'blacklisted';

@@ -13,11 +13,13 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NzbManifestReader;
 use App\Services\Releases\Verification\ScratchInventory;
+use App\Services\Releases\Verification\VerifiedNzbWriter;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
 {
@@ -244,5 +246,174 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(2, $manifest['expected_files']);
         $this->assertSame(10, $manifest['files'][0]['totalparts']);
         $this->assertCount(1, $manifest['files'][0]['segments']);
+    }
+
+    public function test_password_reader_preserves_spaces_between_cdata_sections(): void
+    {
+        $xml = '<nzb><head><meta type="password">  <![CDATA[synthetic]]>  <![CDATA[synthetic]]>  </meta></head></nzb>';
+        $xml = str_replace('</nzb>', '<file subject="fixture.rar (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">fixture@example.test</segment></segments></file></nzb>', $xml);
+        $manifest = app(NzbManifestReader::class)->read($xml, (object) ['groups_id' => 1, 'searchname' => 'Fixture', 'fromname' => 'poster', 'postdate' => '2026-10-13 12:00:00']);
+        $this->assertSame(['  synthetic  synthetic  '], $manifest['passwords']);
+    }
+
+    #[DataProvider('ambiguousPasswordXml')]
+    public function test_password_reader_rejects_ambiguous_structure(string $xml): void
+    {
+        $xml = str_replace('</nzb>', '<file subject="fixture.rar (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">fixture@example.test</segment></segments></file></nzb>', $xml);
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Invalid NZB password metadata structure.');
+        app(NzbManifestReader::class)->read($xml, (object) ['groups_id' => 1, 'searchname' => 'Fixture', 'fromname' => 'poster', 'postdate' => '2026-10-13 12:00:00']);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function ambiguousPasswordXml(): array
+    {
+        return [
+            'child' => ['<nzb><head><meta type="password"><value>fixture</value></meta></head></nzb>'],
+            'foreign child' => ['<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><head><meta type="password"><x:value xmlns:x="urn:fixture">fixture</x:value></meta></head></nzb>'],
+            'mixed child' => ['<nzb><head><meta type="password">prefix<value>fixture</value>suffix</meta></head></nzb>'],
+            'duplicate head' => ['<nzb><head></head><head><meta type="password">fixture</meta></head></nzb>'],
+        ];
+    }
+
+    public function test_verified_nzb_round_trips_ordered_uploader_password_metadata(): void
+    {
+        $firstPassword = '  uploader <tag> & value  ';
+        $secondPassword = 'second password';
+        $xml = '<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><head>'
+            .'<meta type="password">'.htmlspecialchars($firstPassword, ENT_XML1).'</meta>'
+            .'<meta type="password">'.htmlspecialchars($secondPassword, ENT_XML1).'</meta>'
+            .'</head><file subject="release.rar (1/1)"><groups><group>alt.test</group></groups>'
+            .'<segments><segment bytes="5" number="1">kept-article@example</segment></segments></file></nzb>';
+        $release = (object) ['groups_id' => 1, 'searchname' => 'Release', 'fromname' => 'poster', 'postdate' => '2026-10-11 12:00:00'];
+        $manifest = app(NzbManifestReader::class)->read($xml, $release);
+        $writer = new VerifiedNzbWriter(app(NzbService::class));
+        $verifiedXml = $writer->document($manifest);
+        $roundTrip = app(NzbManifestReader::class)->read($verifiedXml, $release);
+
+        $this->assertSame([$firstPassword, $secondPassword], $roundTrip['passwords']);
+        $this->assertSame('kept-article@example', $roundTrip['files'][0]['segments'][0]['messageid']);
+        $this->assertSame(1, $roundTrip['expected_files']);
+    }
+
+    #[DataProvider('passwordVerificationModes')]
+    public function test_password_metadata_preserves_full_and_sampled_inventory_labels(string $mode): void
+    {
+        $release = (object) ['groups_id' => 1, 'searchname' => 'Fixture', 'fromname' => 'poster', 'postdate' => '2026-10-13 12:00:00'];
+        $manifest = app(NzbManifestReader::class)->read('<nzb><file subject="fixture.rar [1/2] (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">fixture@example.test</segment></segments></file></nzb>', $release);
+        $manifest['passwords'] = ['  synthetic &lt;fixture&gt;  ', '', 'repeated fixture', 'repeated fixture'];
+        if ($mode === 'spot_check') {
+            $manifest['verification_mode'] = $mode;
+        }
+        $xml = (new VerifiedNzbWriter(app(NzbService::class)))->document($manifest);
+        $roundTrip = app(NzbManifestReader::class)->read($xml, $release);
+        $this->assertSame($manifest['passwords'], $roundTrip['passwords']);
+        $this->assertSame($manifest['expected_files'], $roundTrip['expected_files']);
+        $this->assertSame($manifest['files'][0]['segments'], $roundTrip['files'][0]['segments']);
+        $document = simplexml_load_string($xml);
+        $this->assertCount(1, $document->head);
+        $labels = [];
+        foreach ($document->head->meta as $entry) {
+            $labels[] = (string) $entry['type'];
+        }
+        if ($mode === 'spot_check') {
+            $this->assertSame('spot_check', $roundTrip['verification_mode']);
+            $this->assertContains('nntmux:declared-file-count', $labels);
+            $this->assertContains('nntmux:verification-mode', $labels);
+            $this->assertNotContains('nntmux:verified-file-count', $labels);
+        } else {
+            $this->assertArrayNotHasKey('verification_mode', $roundTrip);
+            $this->assertContains('nntmux:verified-file-count', $labels);
+            $this->assertNotContains('nntmux:declared-file-count', $labels);
+        }
+    }
+
+    /** @return array<string, array{string}> */
+    public static function passwordVerificationModes(): array
+    {
+        return ['full' => ['full'], 'sampled' => ['spot_check']];
+    }
+
+    public function test_verified_nzb_omits_password_metadata_when_none_was_supplied(): void
+    {
+        $xml = '<nzb><file subject="release.rar (1/1)"><groups><group>alt.test</group></groups>'
+            .'<segments><segment bytes="5" number="1">kept-article@example</segment></segments></file></nzb>';
+        $release = (object) ['groups_id' => 1, 'searchname' => 'Release', 'fromname' => 'poster', 'postdate' => '2026-10-11 12:00:00'];
+        $manifest = app(NzbManifestReader::class)->read($xml, $release);
+        $verifiedXml = (new VerifiedNzbWriter(app(NzbService::class)))->document($manifest);
+        $parsed = simplexml_load_string($verifiedXml);
+        $passwordMetadata = [];
+        foreach ($parsed->head->meta as $metadata) {
+            if ((string) $metadata['type'] === 'password') {
+                $passwordMetadata[] = (string) $metadata;
+            }
+        }
+
+        $this->assertArrayNotHasKey('passwords', $manifest);
+        $this->assertSame([], $passwordMetadata);
+    }
+
+    #[DataProvider('invalidWriterPasswordMetadata')]
+    public function test_writer_rejects_invalid_password_metadata_before_serializing(mixed $values): void
+    {
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Invalid verified NZB password metadata.');
+        (new VerifiedNzbWriter(app(NzbService::class)))->document(['files' => [], 'passwords' => $values]);
+    }
+
+    /** @return array<string, array{mixed}> */
+    public static function invalidWriterPasswordMetadata(): array
+    {
+        return [
+            'null' => [null],
+            'nul' => [["fixture\0value"]],
+            'control' => [["fixture\x01value"]],
+            'invalid utf8' => [["fixture\xFFvalue"]],
+            'xml noncharacter' => [["fixture\u{FFFF}value"]],
+            'invalid list' => [['named' => 'fixture']],
+            'nonstring' => [[42]],
+            'too many' => [array_fill(0, 65, 'fixture')],
+            'too large' => [[str_repeat('x', 4097)]],
+        ];
+    }
+
+    public function test_writer_preserves_exact_password_metadata_at_supported_boundaries(): void
+    {
+        $values = ['', " \t\n\r ", '<fixture & value>', "fixture\u{10000}", str_repeat('x', 4096)];
+        $values = array_pad($values, 64, 'repeated fixture');
+        $xml = (new VerifiedNzbWriter(app(NzbService::class)))->document(['files' => [], 'passwords' => $values]);
+        $document = simplexml_load_string($xml);
+        $this->assertNotFalse($document);
+        $actual = [];
+        foreach ($document->head->meta as $metadata) {
+            if ((string) $metadata['type'] === 'password') {
+                $actual[] = (string) $metadata;
+            }
+        }
+        $this->assertSame($values, $actual);
+    }
+
+    public function test_verified_nzb_rejects_over_budget_password_metadata(): void
+    {
+        $xml = '<nzb><head><meta type="password">'.str_repeat('x', 4097).'</meta></head>'
+            .'<file subject="release.rar"><groups><group>alt.test</group></groups>'
+            .'<segments><segment bytes="5" number="1">kept-article@example</segment></segments></file></nzb>';
+
+        $this->expectException(\RuntimeException::class);
+        app(NzbManifestReader::class)->read($xml, (object) [
+            'groups_id' => 1, 'searchname' => 'Release', 'fromname' => 'poster', 'postdate' => '2026-10-11 12:00:00',
+        ]);
+    }
+
+    public function test_verified_nzb_rejects_too_many_password_metadata_values(): void
+    {
+        $metadata = str_repeat('<meta type="password">value</meta>', 65);
+        $xml = '<nzb><head>'.$metadata.'</head><file subject="release.rar"><groups><group>alt.test</group></groups>'
+            .'<segments><segment bytes="5" number="1">kept-article@example</segment></segments></file></nzb>';
+
+        $this->expectException(\RuntimeException::class);
+        app(NzbManifestReader::class)->read($xml, (object) [
+            'groups_id' => 1, 'searchname' => 'Release', 'fromname' => 'poster', 'postdate' => '2026-10-11 12:00:00',
+        ]);
     }
 }

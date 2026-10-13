@@ -8,6 +8,10 @@ use RuntimeException;
 
 final class NzbManifestReader
 {
+    private const int MAX_PASSWORD_METADATA_COUNT = 64;
+
+    private const int MAX_PASSWORD_METADATA_BYTES = 4096;
+
     /** @return array<string, mixed> */
     public function read(string $xml, object $release): array
     {
@@ -16,17 +20,30 @@ final class NzbManifestReader
         }
         $previous = libxml_use_internal_errors(true);
         try {
-            $document = simplexml_load_string($xml, options: LIBXML_NONET | LIBXML_NOBLANKS);
+            $document = simplexml_load_string($xml, options: LIBXML_NONET);
             if ($document === false || $document->getName() !== 'nzb') {
                 throw new RuntimeException('Invalid NZB.');
+            }
+            if (count($document->head) > 1) {
+                throw new RuntimeException('Invalid NZB password metadata structure.');
             }
             $files = [];
             $groups = [];
             $expected = 0;
             $verificationMode = null;
             $conflict = false;
+            $passwords = [];
             foreach ($document->head->meta ?? [] as $metadata) {
+                if ((string) $metadata['type'] === 'password' && $metadata->xpath('./*') !== []) {
+                    throw new RuntimeException('Invalid NZB password metadata structure.');
+                }
                 $value = (string) $metadata;
+                if ((string) $metadata['type'] === 'password') {
+                    if (strlen($value) > self::MAX_PASSWORD_METADATA_BYTES || count($passwords) >= self::MAX_PASSWORD_METADATA_COUNT) {
+                        throw new RuntimeException('NZB password metadata exceeds the supported limit.');
+                    }
+                    $passwords[] = $value;
+                }
                 if ((string) $metadata['type'] === 'nntmux:verification-mode' && $value === 'spot-check') {
                     $verificationMode = 'spot_check';
                 }
@@ -68,6 +85,9 @@ final class NzbManifestReader
             $manifest = ['subject' => $release->searchname, 'fromname' => $release->fromname, 'date' => $release->postdate,
                 'groups_id' => (int) $release->groups_id, 'regex_id' => 0, 'expected_files' => $expected,
                 'groups' => array_keys($groups), 'files' => $files, 'metadata_source' => $metadataSource];
+            if ($passwords !== []) {
+                $manifest['passwords'] = $passwords;
+            }
             if ($conflict) {
                 $manifest['conflict'] = true;
             }

@@ -6,11 +6,15 @@ namespace Tests\Unit;
 
 use App\Enums\NzbImportStatus;
 use App\Models\Category;
+use App\Services\NfoService;
+use App\Services\Nzb\NfoImportService;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbUploadManifestService;
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -445,5 +449,64 @@ final class NzbImportServiceTest extends TestCase
         putenv("{$key}={$value}");
         $_ENV[$key] = $value;
         $_SERVER[$key] = $value;
+    }
+
+    #[DataProvider('metadataRetentionDeletionFlags')]
+    public function test_ignored_metadata_retains_nzb_and_paired_nfo_under_all_deletion_flags(bool $delete, bool $deleteFailed): void
+    {
+        $directory = sys_get_temp_dir().'/metadata-retained-'.bin2hex(random_bytes(6));
+        mkdir($directory);
+        $file = $directory.'/fixture.nzb';
+        $nfo = $directory.'/fixture.nfo';
+        file_put_contents($file, '<nzb></nzb>');
+        file_put_contents($nfo, 'synthetic companion');
+        $filesystem = new Filesystem;
+        $manifests = new NzbUploadManifestService($filesystem);
+        $manifests->create($directory, 'fixture', 'fixture.nzb', 'fixture.nfo');
+        $reports = [];
+        $service = new class(['Browser' => true]) extends NzbImportService
+        {
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function scanNZBFile(mixed &$nzbXML, mixed $nzbFileName = '', mixed $source = ''): NzbImportStatus
+            {
+                return NzbImportStatus::MetadataIgnored;
+            }
+        };
+        try {
+            $output = $service->beginImport([$file], delete: $delete, deleteFailed: $deleteFailed,
+                resultCallback: static function (array $report) use (&$reports, $manifests): void {
+                    $reports[] = $report;
+                    $manifests->recordNzbOutcome($report['path'], $report['status'], $report['release_id'], $report['release_guid'], candidateIdentity: $report['candidate_identity']);
+                });
+            $this->assertFileExists($file);
+            $this->assertCount(1, $reports);
+            $this->assertSame(NzbImportStatus::MetadataIgnored, $reports[0]['status']);
+            $this->assertNull($reports[0]['candidate_identity']);
+            $this->assertNull($reports[0]['release_id']);
+            $this->assertStringContainsString('Processed 0 NZBs', $output);
+            $this->assertStringContainsString('1 NZBs were skipped', $output);
+            $manifestPath = $directory.'/'.NzbUploadManifestService::FILENAME;
+            $retained = $manifests->read($manifestPath);
+            $this->assertSame(NzbUploadManifestService::STATE_NZB_RETAINED, $retained['state']);
+            $this->assertSame($retained, $manifests->reconcilePending($manifestPath));
+            $this->assertTrue($manifests->shouldImportNzb($file));
+            $nfoResult = (new NfoImportService($filesystem, $manifests, new NfoService))
+                ->importManifest($manifestPath, $delete, $deleteFailed);
+            $this->assertSame('skipped', $nfoResult['status']);
+            $this->assertFileExists($nfo);
+            $this->assertFileExists($file);
+        } finally {
+            $filesystem->deleteDirectory($directory);
+        }
+    }
+
+    /** @return array<string, array{bool, bool}> */
+    public static function metadataRetentionDeletionFlags(): array
+    {
+        return ['neither' => [false, false], 'delete' => [true, false], 'delete failed' => [false, true], 'both' => [true, true]];
     }
 }

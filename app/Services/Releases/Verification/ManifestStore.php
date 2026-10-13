@@ -27,6 +27,9 @@ final class ManifestStore
         if (! is_dir($directory) && ! mkdir($directory, 0700, true) && ! is_dir($directory)) {
             throw new RuntimeException('Candidate storage is unavailable.');
         }
+        if (! chmod($directory, 0700)) {
+            throw new RuntimeException('Candidate storage is unavailable.');
+        }
         $name = $prepared->name;
         $path = $directory.'/'.$name;
         $compressed = $prepared->compressed;
@@ -38,6 +41,9 @@ final class ManifestStore
             }
             try {
                 try {
+                    if (! chmod($temporary, 0600)) {
+                        throw new RuntimeException('Cannot write candidate manifest.');
+                    }
                     if (fwrite($handle, $compressed) !== strlen($compressed) || ! fflush($handle) || ! fsync($handle)) {
                         throw new RuntimeException('Cannot persist candidate manifest.');
                     }
@@ -55,6 +61,8 @@ final class ManifestStore
             if (DB::transactionLevel() > 0) {
                 DB::afterRollBack(fn () => $this->deleteIfUnreferenced($name));
             }
+        } elseif (! chmod($path, 0600)) {
+            throw new RuntimeException('Cannot secure candidate manifest.');
         }
 
         return $name;

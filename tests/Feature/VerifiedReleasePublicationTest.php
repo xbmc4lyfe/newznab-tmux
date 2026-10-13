@@ -42,7 +42,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         $this->assertFalse(DB::table('collections')->where('id', $id)->exists());
     }
 
-    /** @return array<string, array{0: ?int, 1: int, 2: ?string, 3?: ?string, 4?: list<string>}> */
+    /** @return array<string, array{0: ?int, 1: int, 2: ?string, 3?: ?string, 4?: list<string>, 5?: list<string>}> */
     public static function verifiedSizes(): array
     {
         return [
@@ -72,12 +72,15 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             'database insert failure removes new NZB' => [12345, 12345, null, 'insert'],
             'database retry removes rolled-back NZB' => [12345, 12345, null, 'retry'],
             'after commit failure preserves published NZB' => [12345, 12345, null, 'after_commit'],
+            'uploader password metadata survives verified publication' => [12345, 12345, null, null, ['alt.test'], ['  upload <tag> & pass  ', 'second value']],
         ];
     }
 
-    /** @param list<string> $groupNames */
+    /** @param list<string> $groupNames
+     * @param  list<string>|null  $passwords
+     */
     #[DataProvider('verifiedSizes')]
-    public function test_successful_download_publishes_exact_verified_nzb_once(?int $verifiedBytes, int $expectedSize, ?string $duplicateKind, ?string $failure = null, array $groupNames = ['alt.test']): void
+    public function test_successful_download_publishes_exact_verified_nzb_once(?int $verifiedBytes, int $expectedSize, ?string $duplicateKind, ?string $failure = null, array $groupNames = ['alt.test'], ?array $passwords = null): void
     {
         config(['nntmux.release_dedupe_enabled' => $duplicateKind !== null, 'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
         app('files')->ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
@@ -123,6 +126,9 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             'files' => [['key' => 'file', 'subject' => 'movie.mkv', 'totalparts' => 1, 'segments' => [['number' => 1, 'messageid' => 'verified@article', 'bytes' => 5]]]]];
         if ($verifiedBytes !== null) {
             $manifest['verified_bytes'] = $verifiedBytes;
+        }
+        if ($passwords !== null) {
+            $manifest['passwords'] = $passwords;
         }
         $manifest['verified_bytes'] ??= $expectedSize;
         $manifest['verified_file_names'] = ['movie.mkv'];
@@ -336,6 +342,17 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         $release = DB::table('releases')->where('id', $id)->first();
         $xml = app(NzbService::class)->readNzbContents($release->guid);
         $this->assertStringContainsString('verified@article', $xml);
+        if ($passwords !== null) {
+            $document = new \DOMDocument;
+            $this->assertTrue($document->loadXML($xml, LIBXML_NONET));
+            $metadata = (new \DOMXPath($document))->query('//*[local-name()="meta" and @type="password"]');
+            $this->assertNotFalse($metadata);
+            $actualPasswords = [];
+            foreach ($metadata as $entry) {
+                $actualPasswords[] = (string) $entry->textContent;
+            }
+            $this->assertSame($passwords, $actualPasswords);
+        }
         $this->assertSame(1, (int) $release->nzbstatus);
         $this->assertSame($expectedSize, (int) $release->size);
         $this->assertSame($id, (int) DB::table('release_verification_candidates')->value('release_id'));

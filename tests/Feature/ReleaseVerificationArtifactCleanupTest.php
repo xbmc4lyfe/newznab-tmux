@@ -28,6 +28,32 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         });
     }
 
+    public function test_manifest_storage_enforces_private_permissions_for_directory_and_file(): void
+    {
+        $directory = config('release_verification.storage_path').'/manifests';
+        mkdir($directory, 0755, true);
+        chmod($directory, 0755);
+
+        $mask = umask(0022);
+        try {
+            $name = app(ManifestStore::class)->write(['passwords' => ['synthetic uploader metadata']]);
+        } finally {
+            umask($mask);
+        }
+
+        clearstatcache(true, $directory);
+        $this->assertSame(0700, fileperms($directory) & 0777);
+        $path = app(ManifestStore::class)->path($name);
+        clearstatcache(true, $path);
+        $this->assertSame(0600, fileperms($path) & 0777);
+        $this->assertSame(['synthetic uploader metadata'], app(ManifestStore::class)->read($name)['passwords']);
+
+        chmod($path, 0644);
+        app(ManifestStore::class)->write(['passwords' => ['synthetic uploader metadata']]);
+        clearstatcache(true, $path);
+        $this->assertSame(0600, fileperms($path) & 0777);
+    }
+
     public function test_manifest_reference_lookup_uses_an_index_and_migration_is_reversible(): void
     {
         $migration = require database_path('migrations/2026_10_11_205937_add_manifest_path_index_to_release_verification_candidates_table.php');

@@ -25,6 +25,8 @@ final class NzbUploadManifestService
 
     public const STATE_NZB_PENDING = 'nzb_pending';
 
+    public const STATE_NZB_RETAINED = 'nzb_retained';
+
     public const STATE_NZB_REJECTED = 'nzb_rejected';
 
     public const STATE_NFO_IMPORTED = 'nfo_imported';
@@ -155,6 +157,12 @@ final class NzbUploadManifestService
                 $manifest['release_id'] = null;
                 $manifest['release_guid'] = null;
                 $manifest['last_error'] = null;
+            } elseif ($status === NzbImportStatus::MetadataIgnored) {
+                $manifest['state'] = self::STATE_NZB_RETAINED;
+                $manifest['release_id'] = null;
+                $manifest['release_guid'] = null;
+                $manifest['candidate_identity'] = null;
+                $manifest['last_error'] = 'Supplied NZB metadata was not retained; source kept for review.';
             } elseif ($status === NzbImportStatus::Duplicate) {
                 $manifest['state'] = self::STATE_NZB_DUPLICATE;
                 $manifest['release_id'] = null;
@@ -186,7 +194,7 @@ final class NzbUploadManifestService
 
         $manifest = $this->reconcilePending($manifestPath);
 
-        return in_array($manifest['state'], [self::STATE_STAGED, self::STATE_NZB_FAILED], true);
+        return in_array($manifest['state'], [self::STATE_STAGED, self::STATE_NZB_FAILED, self::STATE_NZB_RETAINED], true);
     }
 
     /**

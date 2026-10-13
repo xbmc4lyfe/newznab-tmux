@@ -15,6 +15,7 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\ReleaseCleaningService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Services\Releases\Verification\CandidateCapacityException;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\NzbManifestReader;
 use App\Support\Utf8;
@@ -254,7 +255,11 @@ class NzbImportService
                     $importStatus = NzbImportStatus::Failed;
                 }
 
-                if ($importStatus === NzbImportStatus::Queued) {
+                if ($importStatus === NzbImportStatus::MetadataIgnored) {
+                    $reportResult($nzbFilePath, $importStatus);
+                    $this->echoOut('Supplied NZB metadata was not retained; keeping the source for review.');
+                    $nzbsSkipped++;
+                } elseif ($importStatus === NzbImportStatus::Queued) {
                     $reportResult($nzbFilePath, $importStatus, candidateIdentity: $this->verificationCandidateIdentity);
                     $nzbsImported++;
                     if ($delete) {
@@ -691,7 +696,16 @@ class NzbImportService
             }
             $manifest = app(NzbManifestReader::class)->read($nzbDetails['verificationXml'], $info);
             $manifest['identity'] = sha1('import:'.($nzbDetails['articleFingerprint'] ?? $nzbDetails['verificationXml']));
-            app(CandidateRepository::class)->enqueue($manifest);
+            try {
+                $admitted = app(CandidateRepository::class)->enqueue($manifest);
+            } catch (CandidateCapacityException) {
+                $admitted = false;
+            }
+            if (! $admitted) {
+                $this->verificationCandidateIdentity = null;
+
+                return NzbImportStatus::MetadataIgnored;
+            }
             $this->verificationCandidateIdentity = $manifest['identity'];
             $this->echoOut('NZB queued for download verification.');
 
