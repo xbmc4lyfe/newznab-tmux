@@ -105,6 +105,10 @@ After updating the checkout, back up the database and use `make -C docker deploy
 
 Persistent data lives in `docker/data/`, logs in `docker/logs/`, and database dumps in `docker/backups/`. The backup command covers MariaDB; preserve application configuration and NZB/storage files separately. If initialization fails, inspect `make -C docker logs` before retrying; a partially initialized database needs recovery rather than a reset.
 
+## Cloud and bare-metal deployments
+
+For existing AWS, Hetzner, OVHcloud, and physical-server installations, use the [deployment runbooks](docs/deployment.md). They cover initialization, releases, rollback, encrypted storage, backups, and recovery.
+
 ## Credits and license
 
 Full credit to the **NNTmux team**, [DariusIII](https://github.com/DariusIII), and [all upstream contributors](https://github.com/NNTmux/newznab-tmux/graphs/contributors) for building and maintaining the project this fork is based on. Their work provides the foundation for these improvements. You can [support upstream development](https://github.com/sponsors/DariusIII).
