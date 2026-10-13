@@ -137,6 +137,18 @@ final class Par2FullHashMatchingTest extends TestCase
         self::assertSame([], $this->lookup()['donors']);
     }
 
+    public function test_partial_par2_descriptor_inventories_cannot_nominate_a_donor(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Unrelated.Scene.Release-GRP');
+        foreach ([42, 20] as $id) {
+            $this->rememberUnmarked($id, md5('shared payload one'), md5('prefix one'), 20000);
+            $this->rememberUnmarked($id, md5('shared payload two'), md5('prefix two'), 30000);
+        }
+
+        self::assertSame([], $this->lookup()['donors']);
+    }
+
     public function test_all_130_target_keys_are_considered_before_canonical_identity_selection(): void
     {
         $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
@@ -605,7 +617,18 @@ final class Par2FullHashMatchingTest extends TestCase
      */
     private function remember(int $id, string $full, string $prefix, mixed $size, ?array $snapshot = null, ?callable $guard = null): bool
     {
-        return Par2FileHashEvidence::remember($id, $full, $prefix, $size, $snapshot ?? $this->snapshot($id), $guard);
+        $expectedSnapshot = $snapshot ?? $this->snapshot($id);
+        $remembered = Par2FileHashEvidence::remember($id, $full, $prefix, $size, $expectedSnapshot, $guard);
+        if ($remembered) {
+            Par2FileHashEvidence::markInventoryComplete($id, $expectedSnapshot, $guard);
+        }
+
+        return $remembered;
+    }
+
+    private function rememberUnmarked(int $id, string $full, string $prefix, mixed $size): bool
+    {
+        return Par2FileHashEvidence::remember($id, $full, $prefix, $size, $this->snapshot($id));
     }
 
     private function rememberCorroboratingTuple(int ...$releaseIds): void

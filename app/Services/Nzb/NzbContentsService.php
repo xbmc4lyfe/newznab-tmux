@@ -605,7 +605,7 @@ class NzbContentsService
                 }
             }
             $this->par2Manifest[] = ['subject' => $subject, 'classification' => $classification, 'segments' => $raw];
-            if (! $valid) {
+            if (! $valid && $classification !== 'excluded') {
                 $this->par2StructureValid = false;
             }
             if ($classification === 'excluded' || $segments === []) {

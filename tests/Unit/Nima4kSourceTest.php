@@ -83,6 +83,7 @@ final class Nima4kSourceTest extends TestCase
             'tab title' => [str_replace('Exact.Release-GRP', "Exact\tRelease-GRP", $card)],
             'empty title' => [str_replace('Exact.Release-GRP', '', $card)],
             'control character' => [str_replace('Exact.Release-GRP', 'Exact.&#x7f;Release-GRP', $card)],
+            'nul numeric reference repaired before comparison' => [str_replace('Exact.Release-GRP</span>', 'Exact.&#0;Release-GRP</span>', $card)],
             'nested markup' => [str_replace('>Exact.Release-GRP</span>', '><b>Exact.Release-GRP</b></span>', $card)],
         ];
     }

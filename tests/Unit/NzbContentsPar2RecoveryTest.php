@@ -153,6 +153,20 @@ final class NzbContentsPar2RecoveryTest extends TestCase
         $this->assertSame(1, DB::table('releases')->value('proc_par2'));
     }
 
+    public function test_malformed_excluded_archive_segments_do_not_block_par2_completion(): void
+    {
+        $processor = $this->createMock(Par2Processor::class);
+        $processor->expects($this->once())->method('applyInventoryForRename')
+            ->willReturn(Par2RenameOutcome::NoMatch);
+        $service = $this->service([
+            ['subject' => '"hashed.part01.rar" yEnc (1/800)', 'id' => 'archive@example', 'second_id' => 'archive-gap@example', 'second_number' => 3],
+            ['subject' => '"hashed.par2" yEnc (1/1)', 'id' => 'par2@example'],
+        ], $processor);
+
+        $this->assertFalse($service->checkPar2('guid', 123, 1, 1, 0));
+        $this->assertSame(1, DB::table('releases')->value('proc_par2'));
+    }
+
     public function test_it_stops_after_a_successful_candidate(): void
     {
         $processor = $this->createMock(Par2Processor::class);
@@ -182,7 +196,7 @@ final class NzbContentsPar2RecoveryTest extends TestCase
     }
 
     /**
-     * @param  list<array{subject: string, id: string}>  $files
+     * @param  list<array{subject: string, id: string, second_id?: string, second_number?: int}>  $files
      */
     private function service(array $files, Par2Processor $processor, bool $loadsNzb = true): NzbContentsService
     {
@@ -197,7 +211,7 @@ final class NzbContentsPar2RecoveryTest extends TestCase
                 $segment->addAttribute('bytes', '4096');
                 if (isset($file['second_id'])) {
                     $second = $segments->addChild('segment', $file['second_id']);
-                    $second->addAttribute('number', '2');
+                    $second->addAttribute('number', (string) ($file['second_number'] ?? 2));
                     $second->addAttribute('bytes', '4096');
                 }
             }

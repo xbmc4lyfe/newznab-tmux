@@ -166,6 +166,21 @@ class Par2Processor
                     }
                     $this->assertInventorySnapshot($query, $canPersist, $aborted);
                 }
+                $hashEvidenceComplete = $complete && $evidence !== [];
+                foreach ($evidence as $file) {
+                    if (! isset($file['hash'], $file['hash_16K'])) {
+                        $hashEvidenceComplete = false;
+                        break;
+                    }
+                }
+                if ($hashEvidenceComplete && ! Par2FileHashEvidence::markInventoryComplete(
+                    (int) $query->id,
+                    ['id' => (int) $query->id, 'guid' => (string) $query->guid, 'name' => $query->name,
+                        'searchname' => $query->searchname, 'predb_id' => 0, 'isrenamed' => 0],
+                    $canPersist,
+                )) {
+                    throw $aborted;
+                }
                 if ($this->addPar2) {
                     $createdTime = $query['postdate'] !== null ? Carbon::createFromFormat('Y-m-d H:i:s', $query['postdate']) : now();
                     foreach (array_slice($files, 0, 21) as $file) {
