@@ -6,6 +6,12 @@
 - [ ] Validate Linux CLI PHP FFI against the rebuilt native library and check native/PHP metadata parity; host PHP fallback tests do not establish Linux FFI behavior.
 - [ ] Keep deployment on hold until these checks and independent review pass; the single deployment owner must verify image/source/schema parity and collected public metadata before reporting live validation.
 
+## Exact poster lookup qualification (not deployed)
+
+- [ ] Run the complete PHPUnit suite against the final merged poster-search and index changes; focused checks are not full regression qualification.
+- [ ] Retest exact poster page/count queries with the complete release schema and joins in an isolated MariaDB runtime, including byte identity and active filters. The reduced fixture shows selective index access, not production capacity.
+- [ ] Hold deployment until the designated deployment owner applies the migration and verifies reviewed source, runtime, schema, and live poster-search behavior together.
+
 ## Release identification follow-up (implemented, not deployed)
 
 - [x] Prioritize one recovery volume per filename family and hidden PAR2 candidates before repeated volumes, retaining every volume for fallback and durable resume.
