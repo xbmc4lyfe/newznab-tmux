@@ -171,6 +171,39 @@ class ApiRequestMatrixTest extends TestCase
         $response->assertOk();
     }
 
+    public function test_clearing_advanced_poster_clears_hidden_exact_poster(): void
+    {
+        $releaseSearch = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearch->shouldReceive('search')
+            ->once()
+            ->withArgs(fn (...$arguments): bool => ($arguments[1] ?? null) === 'alt.binaries.example'
+                && ($arguments[0]['fromname'] ?? null) === ''
+                && ($arguments[14]['poster'] ?? null) === ''
+                && ($arguments[14]['filter_only'] ?? false) === true)
+            ->andReturn(collect());
+        $this->app->instance(ReleaseSearchService::class, $releaseSearch);
+
+        $browse = Mockery::mock(ReleaseBrowseService::class);
+        $browse->shouldReceive('getBrowseOrdering')->once()->andReturn(['posted_desc']);
+        $this->app->instance(ReleaseBrowseService::class, $browse);
+
+        $search = Mockery::mock(SearchServiceInterface::class);
+        $search->shouldReceive('isSuggestEnabled')->once()->andReturnFalse();
+        $search->shouldReceive('isAutocompleteEnabled')->once()->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $search);
+
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        $response = $this->actingAs(User::query()->where('username', 'matrix_user')->firstOrFail())
+            ->get(route('search', [
+                'poster' => 'original@example.test',
+                'searchadvposter' => '',
+                'group' => 'alt.binaries.example',
+                'search_type' => 'adv',
+            ]));
+
+        $response->assertOk();
+    }
+
     public function test_exact_poster_detail_link_preserves_whitespace_through_http_and_returns_its_own_release(): void
     {
         $poster = ' alice+usenet@example.test ';

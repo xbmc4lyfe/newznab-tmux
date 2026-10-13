@@ -45,7 +45,7 @@ class SearchController extends BasePageController
         $posterReleaseId = $request->integer('poster_release_id') ?: null;
         $exactPoster = $this->scalarInput($request, 'poster');
         $advancedPoster = $this->scalarInput($request, 'searchadvposter');
-        if ($request->exists('poster') && $advancedPoster !== '' && $advancedPoster !== trim($exactPoster)) {
+        if ($request->exists('poster') && $request->exists('searchadvposter') && $advancedPoster !== trim($exactPoster)) {
             $exactPoster = $advancedPoster;
         } elseif (! $request->exists('poster')) {
             $exactPoster = '';
