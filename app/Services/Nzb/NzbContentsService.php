@@ -331,9 +331,19 @@ class NzbContentsService
             $pending = array_values(array_unique(array_merge($pending, array_keys($retry))));
             $recovery = new Par2CandidateRecovery($this->nntp, $this->postProcessService, $alternate);
             $outcome = Par2RenameOutcome::NoMatch;
+            $allowRecoveryVolumes = [];
             foreach ($pending as $index) {
+                if ($candidates[$index]['classification'] === 'volume') {
+                    $family = $this->par2FamilyKey($candidates[$index]['subject']);
+                    if ($family === null || (! isset($allowRecoveryVolumes[$family])
+                        && ! $this->hasIncompleteExplicitPar2Progress($relID, $candidates, $family))) {
+                        continue;
+                    }
+                }
                 if ($this->par2Stats['candidates_probed'] >= $budget) {
-                    return Par2RenameOutcome::Retryable;
+                    $incompleteIndex = $this->hasIncompleteExplicitPar2Progress($relID, $candidates);
+
+                    return $retry !== [] && ! $incompleteIndex ? Par2RenameOutcome::Retryable : Par2RenameOutcome::Deferred;
                 }
                 if (! $this->canContinuePar2($guard)) {
                     return Par2RenameOutcome::Deferred;
@@ -343,6 +353,12 @@ class NzbContentsService
                 $this->par2Stats['candidates_probed'] += $result->probes;
                 $this->par2Stats['articles_received'] += $result->articles;
                 $outcome = $result->outcome;
+                if ($candidates[$index]['classification'] === 'index' && $outcome === Par2RenameOutcome::NoMatch) {
+                    $family = $this->par2FamilyKey($candidates[$index]['subject']);
+                    if ($family !== null) {
+                        $allowRecoveryVolumes[$family] = true;
+                    }
+                }
                 if ($outcome === Par2RenameOutcome::Renamed) {
                     return $outcome;
                 }
@@ -434,6 +450,48 @@ class NzbContentsService
     }
 
     /**
+     * Recovery volumes can resume a previously partial index, but an unavailable or malformed
+     * index must not let unrelated recovery volumes consume the bounded probe budget.
+     *
+     * @param  list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}>  $candidates
+     */
+    private function hasIncompleteExplicitPar2Progress(int $releaseId, array $candidates, ?string $familyKey = null): bool
+    {
+        foreach ($candidates as $candidate) {
+            if ($candidate['classification'] !== 'index'
+                || ($familyKey !== null && $this->par2FamilyKey($candidate['subject']) !== $familyKey)) {
+                continue;
+            }
+            $signature = hash('sha256', json_encode([
+                'subject' => $candidate['subject'],
+                'explicit' => $candidate['explicit'],
+                'segments' => array_map(static fn (array $segment): array => [
+                    'number' => $segment['number'], 'id' => $segment['id'], 'bytes' => $segment['bytes'],
+                ], $candidate['segments']),
+            ], JSON_THROW_ON_ERROR));
+            if (DB::table('par2_rename_candidate_progress')->where('releases_id', $releaseId)
+                ->where('candidate_signature', $signature)->where('next_segment', '>', 0)->exists()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function par2FamilyKey(string $subject): ?string
+    {
+        $subject = preg_replace('/^\s*\[\d+\/\d+\]\s*/', '', $subject) ?? $subject;
+        if (preg_match('/"([^"]+\.par2)"/i', $subject, $match) === 1) {
+            $name = $match[1];
+        } else {
+            $name = trim($subject, " \t\"'");
+        }
+        $name = preg_replace('/\.vol\d+\+\d+\.par2$/i', '.par2', $name) ?? $name;
+
+        return preg_match('/\.par2$/i', $name) === 1 ? $name : null;
+    }
+
+    /**
      * @param  array{id:int,guid:string,name:?string,searchname:?string}  $snapshot
      *
      * @phpstan-impure
@@ -511,7 +569,7 @@ class NzbContentsService
     /** @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> */
     private function par2Candidates(SimpleXMLElement $nzb): array
     {
-        $explicit = $legacy = $hidden = [];
+        $explicit = $volumes = $legacy = $hidden = [];
         $this->par2Manifest = [];
         $this->par2StructureValid = count($nzb->file) > 0;
         $maxBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
@@ -534,7 +592,11 @@ class NzbContentsService
                 }
             }
             $isExplicit = preg_match('/\.par2(?:["\s]|$)/i', $subject) === 1;
-            $classification = $isExplicit ? (preg_match('/\.vol\d+\+\d+\.par2(?:["\s]|$)/i', $subject) === 1 ? 'volume' : 'index') : 'excluded';
+            $classification = $isExplicit
+                ? (preg_match('/\.vol0{3}\+0*1\.par2(?:["\s]|$)/i', $subject) === 1
+                    ? 'index'
+                    : (preg_match('/\.vol\d+\+\d+\.par2(?:["\s]|$)/i', $subject) === 1 ? 'volume' : 'index'))
+                : 'excluded';
             $singlePart = count($segments) === 1 && $this->parserService->extractPartsTotal($subject) <= 1;
             $knownContent = preg_match('/\.(?:rar|r\d{2,4}|\d{3}|7z|zip|mkv|mp4|avi|m2ts|ts|iso|nfo|sfv|srr|srs|jpg|png|mp3|flac)(?:["\s]|$)/i', $subject) === 1;
             if (! $isExplicit && (! $knownContent || $singlePart) && $segments !== []) {
@@ -549,9 +611,6 @@ class NzbContentsService
             if ($classification === 'excluded' || $segments === []) {
                 continue;
             }
-            if ($classification === 'volume') {
-                continue;
-            }
             if (! $valid) {
                 $segments[0]['number'] = 0;
             }
@@ -559,13 +618,14 @@ class NzbContentsService
             $key = hash('sha256', json_encode($candidate, JSON_THROW_ON_ERROR));
             match ($classification) {
                 'index' => $explicit[$key] = $candidate,
+                'volume' => $volumes[$key] = $candidate,
                 'legacy' => $legacy[$key] = $candidate,
                 default => $hidden[$key] = $candidate,
             };
         }
         uasort($hidden, static fn (array $left, array $right): int => $left['segments'][0]['bytes'] <=> $right['segments'][0]['bytes']);
 
-        return array_values($explicit + $legacy + $hidden);
+        return array_values($explicit + $volumes + $legacy + $hidden);
     }
 
     /**
