@@ -354,7 +354,10 @@ class NzbContentsService
             $recovery = new Par2CandidateRecovery($this->nntp, $this->postProcessService, $alternate);
             $outcome = Par2RenameOutcome::NoMatch;
             foreach ($pending as $index) {
-                if ($this->par2Stats['candidates_probed'] >= $budget || ! $this->canContinuePar2($guard)) {
+                if ($this->par2Stats['candidates_probed'] >= $budget) {
+                    return Par2RenameOutcome::Deferred;
+                }
+                if (! $this->canContinuePar2($guard)) {
                     return Par2RenameOutcome::Deferred;
                 }
                 $result = $recovery->recover($candidates[$index], $snapshot, $signature, $groupID, $show,

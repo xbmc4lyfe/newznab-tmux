@@ -1494,9 +1494,11 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $table->integer('nzbstatus')->default(1);
             $table->integer('rarinnerfilecount')->default(0);
             $table->integer('pp_timeout_count')->default(0);
+            $table->integer('tv_lookup_attempts')->default(0);
             $table->timestamp('additional_pp_claimed_at')->nullable();
             $table->string('additional_pp_claim_token', 64)->nullable();
             $table->timestamp('archive_retry_at')->nullable();
+            $table->timestamp('tv_lookup_retry_at')->nullable();
         });
 
         Schema::create('release_files', function (Blueprint $table): void {

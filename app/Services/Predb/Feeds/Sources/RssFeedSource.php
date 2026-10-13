@@ -41,7 +41,7 @@ final class RssFeedSource extends BoundedHttpFeedSource
             $pageSize,
             $timeout,
             $userAgent,
-            $maximumBodyBytes ?? (int) config('predb_feeds.max_body_bytes', 1048576),
+            $maximumBodyBytes ?? 1048576,
         );
     }
 
