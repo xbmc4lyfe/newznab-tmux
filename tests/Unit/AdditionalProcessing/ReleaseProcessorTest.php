@@ -32,6 +32,7 @@ use Illuminate\Filesystem\Filesystem;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Facade;
 use Mockery;
+use Mockery\MockInterface;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
@@ -51,6 +52,34 @@ class ReleaseProcessorTest extends TestCase
         }
         Mockery::close();
         parent::tearDown();
+    }
+
+    #[Test]
+    public function it_does_not_report_deferred_full_hash_metadata_as_successful(): void
+    {
+        /** @var ReleaseFileManager&MockInterface $manager */
+        $manager = Mockery::mock(ReleaseFileManager::class);
+        $manager->shouldReceive('processReleaseNameFromNzbContents')->once()->andReturnFalse();
+        $manager->shouldReceive('finalizeRelease')->once()->andReturnUsing(static function (ReleaseProcessingContext $context): void {
+            $context->fullPar2EvidenceDeferred = true;
+        });
+        /** @var NzbContentParser&MockInterface $parser */
+        $parser = Mockery::mock(NzbContentParser::class);
+        $parser->shouldReceive('parseNzb')->once()->andReturn(['error' => null, 'contents' => [['title' => 'file.nzb', 'segments' => []]]]);
+        /** @var ConsoleOutputService&MockInterface $output */
+        $output = Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing();
+        $processor = $this->makeProcessor(
+            nzbParser: $parser,
+            releaseManager: $manager,
+            tempWorkspace: $this->successfulTempWorkspace(),
+            output: $output,
+        );
+
+        $result = $processor->process($this->makeContext(), sys_get_temp_dir());
+
+        $this->assertSame(ProcessingOutcome::Failed, $result->outcome);
+        $this->assertFalse($result->isSuccessful());
+        $this->assertStringContainsString('before metadata commit', $result->reason);
     }
 
     #[Test]

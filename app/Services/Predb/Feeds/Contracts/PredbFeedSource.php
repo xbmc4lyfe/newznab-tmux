@@ -18,7 +18,7 @@ interface PredbFeedSource
     public function key(): string;
 
     /**
-     * Fetch one page (1-based, newest first) of PREs.
+     * Fetch one page (1-based, newest first) of PRE or catalogue release-name metadata.
      *
      * @return list<PredbFeedEntry>
      *

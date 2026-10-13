@@ -6,11 +6,13 @@ namespace App\Services\Predb\Feeds;
 
 use App\Facades\Search;
 use App\Models\Predb;
+use App\Support\PredbSearchDocument;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\UniqueConstraintViolationException;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Str;
+use RuntimeException;
 
 /**
  * Upserts feed entries into the predb table by title, mirroring the IRC scraper:
@@ -27,12 +29,18 @@ class PredbFeedImporter
      */
     private array $dryRunRows = [];
 
+    /** @var array<string, string> */
+    private array $dryRunKeys = [];
+
     /**
      * @param  iterable<PredbFeedEntry>  $entries
      * @return array{inserted: int, updated: int, skipped: int}
      */
     public function import(iterable $entries, bool $dryRun = false): array
     {
+        if ($dryRun && in_array(DB::connection()->getDriverName(), ['mysql', 'mariadb'], true)) {
+            $entries = $this->prepareDryRunEntries($entries);
+        }
         $result = ['inserted' => 0, 'updated' => 0, 'skipped' => 0];
 
         foreach ($entries as $entry) {
@@ -60,13 +68,13 @@ class PredbFeedImporter
      */
     private function importEntry(PredbFeedEntry $entry, bool $dryRun): string
     {
-        $title = mb_substr(trim($entry->title), 0, 255);
+        $title = trim($entry->title);
 
-        if ($title === '') {
+        if ($title === '' || mb_strlen($title) > 255) {
             return 'skipped';
         }
 
-        $existing = ($dryRun ? ($this->dryRunRows[$this->shadowKey($title)] ?? null) : null) ?? Predb::query()->where('title', $title)->first();
+        $existing = ($dryRun ? $this->findDryRunRow($title) : null) ?? Predb::query()->where('title', $title)->first();
 
         if ($existing === null) {
             if ($entry->enrichOnly) {
@@ -100,13 +108,17 @@ class PredbFeedImporter
             }
         }
 
+        if (PredbSearchDocument::exactValue((string) $existing->title) !== PredbSearchDocument::exactValue($title)) {
+            return 'skipped';
+        }
+
         $changes = $this->changesFor($existing, $entry);
 
         if ($changes === []) {
             if (! $dryRun && $existing->exists) {
                 // Idempotent re-index from the current row (another ingester may have changed the
                 // indexed fields), so a document dropped by an earlier failed index write recovers.
-                $this->reindex((int) $existing->id, Predb::query()->find($existing->id, ['id', 'title', 'filename', 'source']) ?? $existing);
+                $this->reindex((int) $existing->id, Predb::query()->find($existing->id, ['id', 'title', 'filename', 'source']), $title);
             }
 
             return 'skipped';
@@ -122,32 +134,125 @@ class PredbFeedImporter
             return 'updated';
         }
 
+        $changes['_observed_title'] = (string) $existing->title;
         if (! $this->applyChanges((int) $existing->id, $changes)) {
             return 'skipped';
         }
 
         // Re-read the indexed fields: another ingester may have changed them since $existing was read.
-        $this->reindex((int) $existing->id, Predb::query()->find($existing->id, ['id', 'title', 'filename', 'source']) ?? $existing);
-
-        return 'updated';
+        return $this->reindex((int) $existing->id, Predb::query()->find($existing->id, ['id', 'title', 'filename', 'source']), $title) ? 'updated' : 'skipped';
     }
 
-    private function reindex(int $id, Predb $row): void
+    private function reindex(int $id, ?Predb $row, string $expectedTitle): bool
     {
+        if ($row === null || PredbSearchDocument::exactValue((string) $row->title) !== PredbSearchDocument::exactValue($expectedTitle)) {
+            return false;
+        }
         Search::updatePreDb([
             'id' => $id,
             'title' => $row->title,
             'filename' => $row->filename,
             'source' => $row->source,
         ]);
+
+        return true;
     }
 
     /**
-     * Shadow key matching predb.title's case- and accent-insensitive collation.
+     * MySQL keys follow the real title-column collation; other drivers retain literal keys.
      */
     private function shadowKey(string $title): string
     {
-        return mb_strtolower(Str::ascii($title));
+        $literal = 'literal:'.PredbSearchDocument::exactValue($title);
+
+        return in_array(DB::connection()->getDriverName(), ['mysql', 'mariadb'], true) ? $this->dryRunKeys[$literal] : $literal;
+    }
+
+    private function findDryRunRow(string $title): ?Predb
+    {
+        $key = $this->shadowKey($title);
+        if (isset($this->dryRunRows[$key])) {
+            return $this->dryRunRows[$key];
+        }
+        if (in_array(DB::connection()->getDriverName(), ['mysql', 'mariadb'], true)) {
+            return null;
+        }
+
+        foreach (array_chunk($this->dryRunRows, 100) as $rows) {
+            $comparison = DB::table('predb')->select('title')->whereRaw('1 = 0');
+            foreach ($rows as $row) {
+                $comparison->unionAll(DB::query()->selectRaw('? AS title', [(string) $row->title]));
+            }
+            $match = DB::query()->fromSub($comparison, 'shadow_titles')->where('title', $title)->value('title');
+            if (is_string($match)) {
+                return $this->dryRunRows[$this->shadowKey($match)];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  iterable<PredbFeedEntry>  $entries
+     * @return \Generator<int, PredbFeedEntry>
+     */
+    private function prepareDryRunEntries(iterable $entries): \Generator
+    {
+        $chunk = [];
+        foreach ($entries as $entry) {
+            $chunk[] = $entry;
+            if (count($chunk) === 100) {
+                $this->cacheShadowKeys($chunk);
+                yield from $chunk;
+                $chunk = [];
+            }
+        }
+        if ($chunk !== []) {
+            $this->cacheShadowKeys($chunk);
+            yield from $chunk;
+        }
+    }
+
+    /** @param array<array-key, PredbFeedEntry> $entries */
+    private function cacheShadowKeys(array $entries): void
+    {
+        $missing = [];
+        foreach ($entries as $entry) {
+            $title = trim($entry->title);
+            $literal = 'literal:'.PredbSearchDocument::exactValue($title);
+            if ($title !== '' && mb_strlen($title) <= 255 && ! isset($this->dryRunKeys[$literal])) {
+                $missing[$literal] = $title;
+            }
+        }
+
+        foreach (array_chunk($missing, 100) as $titles) {
+            $comparison = DB::table('predb')->select('title')->whereRaw('1 = 0')
+                ->unionAll(DB::query()->selectRaw('? AS title', [' ']));
+            foreach ($titles as $title) {
+                $comparison->unionAll(DB::query()->selectRaw('? AS title', [$title]));
+            }
+            /** @var Collection<int, object{title: string, weight_key: string, title_collation: string}> $rows */
+            $rows = DB::query()->fromSub($comparison, 'shadow_titles')
+                ->selectRaw('title, HEX(WEIGHT_STRING(title)) AS weight_key, COLLATION(title) AS title_collation')->get();
+            $space = $rows->first(static fn (object $row): bool => $row->title === ' ');
+            if ($space === null || $space->weight_key === '') {
+                throw new RuntimeException('Unable to verify the PreDB dry-run title collation.');
+            }
+            foreach ($rows as $row) {
+                if ($row->title_collation !== 'utf8mb4_unicode_ci') {
+                    throw new RuntimeException('PreDB dry-run title weights require the verified utf8mb4_unicode_ci collation.');
+                }
+                if ($row->title === ' ') {
+                    continue;
+                }
+                $weight = $row->weight_key;
+                // PAD SPACE ignores trailing space weights; full weights must never be truncated.
+                while (str_ends_with($weight, $space->weight_key)) {
+                    $weight = substr($weight, 0, -strlen($space->weight_key));
+                }
+                $this->dryRunKeys['literal:'.PredbSearchDocument::exactValue($row->title)] = 'weight:'.$weight;
+            }
+        }
     }
 
     /**
@@ -159,32 +264,34 @@ class PredbFeedImporter
      */
     protected function applyChanges(int $id, array $changes): bool
     {
+        $observedTitle = $changes['_observed_title'] ?? DB::table('predb')->where('id', $id)->value('title');
+        if (! is_string($observedTitle)) {
+            return false;
+        }
+        $identity = DB::table('predb')->where('id', $id)->whereRaw('HEX(title) = HEX(?)', [$observedTitle]);
         $changed = false;
 
         foreach (['category', 'size', 'files'] as $column) {
             if (array_key_exists($column, $changes)) {
-                $changed = DB::table('predb')
-                    ->where('id', $id)
+                $changed = (clone $identity)
                     ->where(static fn ($query) => $query->whereNull($column)->orWhere($column, ''))
                     ->update([$column => $changes[$column]]) > 0 || $changed;
             }
         }
 
         if (array_key_exists('predate', $changes)) {
-            $changed = DB::table('predb')->where('id', $id)->whereNull('predate')->update(['predate' => $changes['predate']]) > 0 || $changed;
+            $changed = (clone $identity)->whereNull('predate')->update(['predate' => $changes['predate']]) > 0 || $changed;
         }
 
         if (array_key_exists('nuked', $changes)) {
             // Transition from the status that was read; if another ingester changed it since, keep theirs.
-            $changed = DB::table('predb')
-                ->where('id', $id)
+            $changed = (clone $identity)
                 ->where('nuked', $changes['nuked_from'] ?? $changes['nuked'])
                 ->update(['nuked' => $changes['nuked'], 'nukereason' => $changes['nukereason'] ?? null]) > 0 || $changed;
         } elseif (array_key_exists('nukereason', $changes)) {
             // Same status: fill or correct the reason while the status still matches.
             $observed = $changes['nukereason_from'] ?? null;
-            $changed = DB::table('predb')
-                ->where('id', $id)
+            $changed = (clone $identity)
                 ->where('nuked', $changes['nuked_status'])
                 ->where(static fn ($query) => $observed === null || $observed === ''
                     ? $query->whereNull('nukereason')->orWhere('nukereason', '')
@@ -229,15 +336,15 @@ class PredbFeedImporter
     {
         $changes = [];
 
-        if (empty($existing->category) && $entry->category !== null) {
+        if (($existing->category === null || $existing->category === '') && $entry->category !== null) {
             $changes['category'] = mb_substr($entry->category, 0, 255);
         }
 
-        if (empty($existing->size) && $entry->size !== null) {
+        if (($existing->size === null || $existing->size === '') && $entry->size !== null) {
             $changes['size'] = mb_substr($entry->size, 0, 50);
         }
 
-        if (empty($existing->files) && $entry->files !== null) {
+        if (($existing->files === null || $existing->files === '') && $entry->files !== null) {
             $changes['files'] = mb_substr($entry->files, 0, 50);
         }
 

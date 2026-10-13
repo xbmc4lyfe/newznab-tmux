@@ -8,7 +8,7 @@ use App\Models\Predb;
 use Carbon\CarbonImmutable;
 
 /**
- * One PRE announced by a remote PreDB feed, normalised to predb table semantics.
+ * Release-name metadata from a remote PRE feed or catalogue, normalised to predb table semantics.
  */
 final readonly class PredbFeedEntry
 {

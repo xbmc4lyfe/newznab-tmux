@@ -38,7 +38,7 @@ class PredbFulltextNameFixingTest extends TestCase
             ]);
 
         $updates = $this->createMock(ReleaseUpdateService::class);
-        $updates->expects($this->once())->method('attachPredbId')->with(42, 7);
+        $updates->expects($this->once())->method('updatePredbCandidate')->with($this->callback(static fn (object $release): bool => (int) $release->releases_id === 42), $title, 7, 'srrdb', false)->willReturn(true);
         $service = new NameFixingService(
             updateService: $updates,
             queries: new NameFixingQueryService($database)

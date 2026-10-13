@@ -74,6 +74,7 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
 
     public function test_stale_version_root_symlink_never_deletes_its_target(): void
     {
+        DB::table('release_verification_scratch_budget')->where('id', 1)->update(['initialized' => true]);
         [$id, $directory] = $this->staleScratch();
         File::deleteDirectory($directory);
         $outside = config('release_verification.storage_path').'/outside';

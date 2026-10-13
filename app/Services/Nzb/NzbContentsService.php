@@ -14,10 +14,12 @@ use App\Support\Par2RenameProgress;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use SimpleXMLElement;
 use Throwable;
+use UnexpectedValueException;
 
 /**
  * Service for processing NZB contents - extracting NFO files, PAR2 information,
@@ -39,12 +41,15 @@ class NzbContentsService
 
     protected bool $echoOutput;
 
-    protected bool $alternateNntp;
+    protected bool $alternateNntp = false;
 
     /** @var array{candidates_probed: int, articles_received: int} */
     private array $par2Stats = ['candidates_probed' => 0, 'articles_received' => 0];
 
     private bool $par2StructureValid = true;
+
+    /** @var list<array<string, mixed>> */
+    private array $par2Manifest = [];
 
     public function __construct(
         ?NzbService $nzbService = null,
@@ -287,107 +292,93 @@ class NzbContentsService
                 return Par2RenameOutcome::Deferred;
             }
 
-            $release = Release::query()->where('id', $relID)->first(['proc_par2', 'isrenamed']);
-            if ($release === null || (int) $release->proc_par2 === 1) {
-                Par2RenameProgress::forget($relID);
-
-                return Par2RenameOutcome::NoMatch;
+            $release = Release::query()->where('id', $relID)->first(['id', 'guid', 'name', 'searchname', 'groups_id', 'proc_par2', 'isrenamed', 'predb_id']);
+            if ($release === null || $release->guid !== $guid || (int) $release->groups_id !== $groupID) {
+                return Par2RenameOutcome::Deferred;
             }
-            if ((int) $release->isrenamed === 1) {
-                if (! $this->refreshPar2Claim($lock)) {
-                    return Par2RenameOutcome::Deferred;
-                }
-                Release::query()->where('id', $relID)->update(['proc_par2' => 1]);
-                Par2RenameProgress::forget($relID);
-
-                return Par2RenameOutcome::NoMatch;
+            $snapshot = ['id' => $relID, 'guid' => $guid, 'name' => $release->name, 'searchname' => $release->searchname];
+            $guard = function () use ($lock, $deadline): bool {
+                return ($deadline === null || now()->getTimestampMs() / 1000 < $deadline) && $this->refreshPar2Claim($lock);
+            };
+            if (! $this->canContinuePar2($guard)) {
+                return Par2RenameOutcome::Deferred;
+            }
+            if ((int) $release->proc_par2 === 1 || (int) $release->isrenamed === 1 || (int) $release->predb_id > 0) {
+                return $this->completePar2Snapshot($snapshot, $groupID, $guard, true) ? Par2RenameOutcome::NoMatch : Par2RenameOutcome::Deferred;
             }
 
             $nzbFile = $this->loadNzb($guid);
+            if (! $this->canContinuePar2($guard)) {
+                return Par2RenameOutcome::Deferred;
+            }
             if ($nzbFile === false) {
                 return Par2RenameOutcome::Retryable;
             }
-
             $candidates = $this->par2Candidates($nzbFile);
-            $signature = hash('sha256', serialize($candidates));
-            $progress = Par2RenameProgress::get($relID);
-            $offset = is_array($progress) && ($progress['signature'] ?? '') === $signature
-                ? max(0, (int) ($progress['offset'] ?? 0)) : 0;
+            $budget = max(1, (int) config('tmux.fix_names.par2_max_probes', 4));
+            $maxArticleBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
+            $maxStateBytes = max(1, (int) config('tmux.fix_names.par2_max_state_bytes', 8388608));
+            $alternate = $this->alternateNntp;
+            $signature = hash('sha256', json_encode(['guid' => $guid, 'group' => $groupID, 'article_limit' => $maxArticleBytes,
+                'state_limit' => $maxStateBytes, 'alternate' => $alternate, 'manifest' => $this->par2Manifest, 'candidates' => $candidates], JSON_THROW_ON_ERROR));
+            $progress = $this->strictPar2Progress($relID, $signature, count($candidates));
+            $offset = $progress['offset'] ?? 0;
             $retry = [];
-            $savedRetries = is_array($progress) && ($progress['signature'] ?? '') === $signature
-                ? ($progress['retry_indexes'] ?? []) : [];
-            if (is_array($savedRetries)) {
-                foreach ($savedRetries as $index) {
-                    if (is_int($index) && $index >= 0 && $index < count($candidates)) {
-                        $retry[$index] = true;
-                    }
-                }
+            foreach ($progress['retry_indexes'] ?? [] as $index) {
+                $retry[$index] = true;
             }
             $pending = $offset < count($candidates) ? range($offset, count($candidates) - 1) : [];
             $pending = array_values(array_unique(array_merge($pending, array_keys($retry))));
-            $budget = max(1, (int) config('tmux.fix_names.par2_max_probes', 4));
+            $recovery = new Par2CandidateRecovery($this->nntp, $this->postProcessService, $alternate);
             $outcome = Par2RenameOutcome::NoMatch;
-            $lastHeartbeat = 0;
-            $onArticleRead = function () use ($lock, $onArticleReceived, &$lastHeartbeat): bool {
-                $now = now()->getTimestamp();
-                if ($now - $lastHeartbeat < 30) {
-                    return true;
-                }
-                $lastHeartbeat = $now;
-
-                return ($onArticleReceived === null || $onArticleReceived())
-                    && $this->refreshPar2Claim($lock);
-            };
-
+            $allowRecoveryVolumes = [];
             foreach ($pending as $index) {
-                if ($this->par2Stats['candidates_probed'] >= $budget || ($deadline !== null && now()->getTimestampMs() / 1000 >= $deadline) || ! $this->refreshPar2Claim($lock)) {
+                if ($candidates[$index]['classification'] === 'volume') {
+                    $family = $this->par2FamilyKey($candidates[$index]['subject']);
+                    if ($family === null || (! isset($allowRecoveryVolumes[$family])
+                        && ! $this->hasIncompleteExplicitPar2Progress($relID, $candidates))) {
+                        continue;
+                    }
+                }
+                if ($this->par2Stats['candidates_probed'] >= $budget) {
+                    $incompleteIndex = $this->hasIncompleteExplicitPar2Progress($relID, $candidates);
+
+                    return $retry !== [] && ! $incompleteIndex ? Par2RenameOutcome::Retryable : Par2RenameOutcome::Deferred;
+                }
+                if (! $this->canContinuePar2($guard)) {
                     return Par2RenameOutcome::Deferred;
                 }
-
-                $this->par2Stats['candidates_probed']++;
-                try {
-                    $outcome = $this->postProcessService->parsePAR2ForRename(
-                        $candidates[$index]['id'], $relID, $groupID, $this->nntp, $show,
-                        function () use ($lock, $onArticleReceived): bool {
-                            $this->par2Stats['articles_received']++;
-
-                            return ($onArticleReceived === null || $onArticleReceived())
-                                && $this->refreshPar2Claim($lock);
-                        }, $candidates[$index]['explicit'], $onArticleRead
-                    );
-                } catch (Throwable $e) {
-                    Log::warning('PAR2 probe remains pending', ['release_id' => $relID, 'candidate_index' => $index, 'error' => $e->getMessage()]);
-                    $outcome = Par2RenameOutcome::Retryable;
-                }
-                if ($outcome === Par2RenameOutcome::Deferred || ! $this->refreshPar2Claim($lock)) {
-                    return Par2RenameOutcome::Deferred;
+                $result = $recovery->recover($candidates[$index], $snapshot, $signature, $groupID, $show,
+                    $budget - $this->par2Stats['candidates_probed'], $maxArticleBytes, $maxStateBytes, $guard, $onArticleReceived);
+                $this->par2Stats['candidates_probed'] += $result->probes;
+                $this->par2Stats['articles_received'] += $result->articles;
+                $outcome = $result->outcome;
+                if ($candidates[$index]['classification'] === 'index' && $outcome === Par2RenameOutcome::NoMatch) {
+                    $family = $this->par2FamilyKey($candidates[$index]['subject']);
+                    if ($family !== null) {
+                        $allowRecoveryVolumes[$family] = true;
+                    }
                 }
                 if ($outcome === Par2RenameOutcome::Renamed) {
-                    break;
+                    return $outcome;
                 }
-                if ($outcome === Par2RenameOutcome::Retryable) {
-                    unset($retry[$index]);
+                if (! $this->canContinuePar2($guard)) {
+                    return Par2RenameOutcome::Deferred;
+                }
+                unset($retry[$index]);
+                if ($outcome === Par2RenameOutcome::Retryable || $outcome === Par2RenameOutcome::Deferred) {
                     $retry[$index] = true;
-                } else {
-                    unset($retry[$index]);
                 }
                 $offset = max($offset, $index + 1);
-                if (! Par2RenameProgress::save($relID, $signature, $offset, array_keys($retry))) {
-                    return Par2RenameOutcome::NoMatch;
+                if (! $this->savePar2Snapshot($snapshot, $groupID, $signature, $offset, array_keys($retry), $guard)) {
+                    return Par2RenameOutcome::Deferred;
                 }
             }
-
-            if ($outcome !== Par2RenameOutcome::Renamed && ($retry !== [] || ! $this->par2StructureValid)) {
-                return Par2RenameOutcome::Retryable;
+            if ($retry !== [] || ! $this->par2StructureValid || $this->hasPendingPar2Candidates($relID, $signature)) {
+                return $outcome === Par2RenameOutcome::Deferred ? $outcome : Par2RenameOutcome::Retryable;
             }
 
-            if (! $this->refreshPar2Claim($lock)) {
-                return Par2RenameOutcome::Deferred;
-            }
-            Release::query()->where('id', $relID)->update(['proc_par2' => 1]);
-            Par2RenameProgress::forget($relID);
-
-            return $outcome;
+            return $this->completePar2Snapshot($snapshot, $groupID, $guard, manifestSignature: $signature) ? Par2RenameOutcome::NoMatch : Par2RenameOutcome::Deferred;
         } catch (Throwable $e) {
             Log::warning('PAR2 rename attempt remains pending', ['release_id' => $relID, 'error' => $e->getMessage()]);
 
@@ -415,58 +406,225 @@ class NzbContentsService
         return $lock->refresh();
     }
 
-    /** @return list<array{id: string, explicit: bool}> */
-    private function par2Candidates(SimpleXMLElement $nzb): array
+    /**
+     * @param  callable():bool  $guard
+     *
+     * @phpstan-impure
+     */
+    private function canContinuePar2(callable $guard): bool
     {
-        $explicit = $hidden = [];
-        $this->par2StructureValid = count($nzb->file) > 0;
-        foreach ($nzb->file as $file) {
-            if (count($file->segments->segment) === 0) {
-                $this->par2StructureValid = false;
+        return $guard();
+    }
 
+    /** @return array{offset:int,retry_indexes:list<int>}|null */
+    private function strictPar2Progress(int $releaseId, string $signature, int $candidateCount): ?array
+    {
+        $row = DB::table('par2_rename_progress')->where('releases_id', $releaseId)->first();
+        if ($row === null || $row->signature !== $signature) {
+            return null;
+        }
+        $offset = filter_var($row->offset, FILTER_VALIDATE_INT, ['options' => ['min_range' => 0, 'max_range' => $candidateCount]]);
+        $retries = json_decode($row->retry_indexes, flags: JSON_THROW_ON_ERROR);
+        if ($offset === false || ! is_array($retries) || ! array_is_list($retries)) {
+            throw new UnexpectedValueException('Malformed PAR2 parent cursor or retry list');
+        }
+        $seen = [];
+        $validRetries = [];
+        foreach ($retries as $retry) {
+            if (! is_int($retry) || $retry < 0 || $retry >= $candidateCount || isset($seen[$retry])) {
+                throw new UnexpectedValueException('Malformed PAR2 parent retry identity');
+            }
+            $seen[$retry] = true;
+            $validRetries[] = $retry;
+        }
+
+        return ['offset' => $offset, 'retry_indexes' => $validRetries];
+    }
+
+    /** @phpstan-impure */
+    private function hasPendingPar2Candidates(int $releaseId, string $signature): bool
+    {
+        return DB::table('par2_rename_candidate_progress as candidate')
+            ->join('par2_rename_progress as parent', 'parent.releases_id', '=', 'candidate.releases_id')
+            ->where('candidate.releases_id', $releaseId)->where('parent.signature', $signature)->exists();
+    }
+
+    /**
+     * Recovery volumes can resume a previously partial index, but an unavailable or malformed
+     * index must not let unrelated recovery volumes consume the bounded probe budget.
+     *
+     * @param  list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}>  $candidates
+     */
+    private function hasIncompleteExplicitPar2Progress(int $releaseId, array $candidates): bool
+    {
+        foreach ($candidates as $candidate) {
+            if ($candidate['classification'] !== 'index') {
                 continue;
             }
-            foreach ($file->segments->segment as $entry) {
-                if (trim((string) $entry) === '') {
-                    $this->par2StructureValid = false;
-                }
-            }
-            $subject = (string) $file->attributes()->subject;
-            $segment = $file->segments->segment[0];
-            $id = trim((string) $segment);
-            if ($id === '') {
-                $this->par2StructureValid = false;
-
-                continue;
-            }
-
-            if (preg_match('/\.par2(?:["\s]|$)/i', $subject)) {
-                if (preg_match('/\.vol\d+\+\d+\.par2(?:["\s]|$)/i', $subject)) {
-                    continue;
-                } else {
-                    $explicit[$id] = ['id' => $id, 'explicit' => true];
-                }
-            } else {
-                $knownContent = preg_match('/\.(?:rar|r\d{2,3}|\d{3}|7z|zip|mkv|mp4|avi|m2ts|ts|iso|nfo|sfv|srr|srs|jpg|png|mp3|flac)(?:["\s]|$)/i', $subject);
-                $singlePart = count($file->segments->segment) === 1 && $this->parserService->extractPartsTotal($subject) <= 1;
-                if (! $knownContent || $singlePart) {
-                    $bytes = filter_var((string) $segment->attributes()->bytes, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
-                    if ($bytes === false) {
-                        $this->par2StructureValid = false;
-
-                        continue;
-                    }
-                    if ($bytes <= max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152))) {
-                        $hidden[$id] = ['id' => $id, 'explicit' => false, 'bytes' => $bytes];
-                    }
-                }
+            $signature = hash('sha256', json_encode([
+                'subject' => $candidate['subject'],
+                'explicit' => $candidate['explicit'],
+                'segments' => array_map(static fn (array $segment): array => [
+                    'number' => $segment['number'], 'id' => $segment['id'], 'bytes' => $segment['bytes'],
+                ], $candidate['segments']),
+            ], JSON_THROW_ON_ERROR));
+            if (DB::table('par2_rename_candidate_progress')->where('releases_id', $releaseId)
+                ->where('candidate_signature', $signature)->where('next_segment', '>', 0)->exists()) {
+                return true;
             }
         }
 
-        uasort($hidden, static fn (array $first, array $second): int => $first['bytes'] <=> $second['bytes']);
+        return false;
+    }
 
-        // Exclude recovery-volume subjects so they cannot dominate bounded retry batches.
-        return array_values($explicit + $hidden);
+    private function par2FamilyKey(string $subject): ?string
+    {
+        $subject = preg_replace('/^\s*\[\d+\/\d+\]\s*/', '', $subject) ?? $subject;
+        if (preg_match('/"([^"]+\.par2)"/i', $subject, $match) === 1) {
+            $name = $match[1];
+        } else {
+            $name = trim($subject, " \t\"'");
+        }
+        $name = preg_replace('/\.vol\d+\+\d+\.par2$/i', '.par2', $name) ?? $name;
+
+        return preg_match('/\.par2$/i', $name) === 1 ? $name : null;
+    }
+
+    /**
+     * @param  array{id:int,guid:string,name:?string,searchname:?string}  $snapshot
+     *
+     * @phpstan-impure
+     */
+    private function matchingPar2Snapshot(array $snapshot, int $groupId, bool $terminal = false): bool
+    {
+        $release = DB::table('releases')->where('id', $snapshot['id'])->lockForUpdate()->first(['guid', 'name', 'searchname', 'groups_id', 'isrenamed', 'proc_par2', 'predb_id']);
+        if ($release === null || $release->guid !== $snapshot['guid'] || $release->name !== $snapshot['name'] || $release->searchname !== $snapshot['searchname'] || (int) $release->groups_id !== $groupId) {
+            return false;
+        }
+        $completed = (int) $release->isrenamed === 1 || (int) $release->proc_par2 === 1 || (int) $release->predb_id > 0;
+
+        return $terminal ? $completed : ((int) $release->isrenamed === 0 && (int) $release->predb_id === 0 && (int) $release->proc_par2 !== 1);
+    }
+
+    /**
+     * @param  array{id:int,guid:string,name:?string,searchname:?string}  $snapshot
+     * @param  list<int>  $retry
+     * @param  callable():bool  $guard
+     */
+    private function savePar2Snapshot(array $snapshot, int $groupId, string $signature, int $offset, array $retry, callable $guard): bool
+    {
+        $aborted = new RuntimeException('PAR2 outer cursor lost its claim or release snapshot');
+        try {
+            return DB::transaction(function () use ($snapshot, $groupId, $signature, $offset, $retry, $guard, $aborted): bool {
+                if (! $this->canContinuePar2($guard) || ! $this->matchingPar2Snapshot($snapshot, $groupId)
+                    || ! Par2RenameProgress::save($snapshot['id'], $signature, $offset, $retry)
+                    || ! $this->canContinuePar2($guard) || ! $this->matchingPar2Snapshot($snapshot, $groupId)) {
+                    throw $aborted;
+                }
+
+                return true;
+            });
+        } catch (Throwable $exception) {
+            if ($exception === $aborted) {
+                return false;
+            }
+            throw $exception;
+        }
+    }
+
+    /**
+     * @param  array{id:int,guid:string,name:?string,searchname:?string}  $snapshot
+     * @param  callable():bool  $guard
+     */
+    private function completePar2Snapshot(array $snapshot, int $groupId, callable $guard, bool $terminal = false, ?string $manifestSignature = null): bool
+    {
+        $aborted = new RuntimeException('PAR2 completion lost its claim or release snapshot');
+        try {
+            return DB::transaction(function () use ($snapshot, $groupId, $guard, $terminal, $manifestSignature, $aborted): bool {
+                if (! $this->canContinuePar2($guard) || ! $this->matchingPar2Snapshot($snapshot, $groupId, $terminal)
+                    || ($manifestSignature !== null && $this->hasPendingPar2Candidates($snapshot['id'], $manifestSignature))) {
+                    throw $aborted;
+                }
+                DB::table('releases')->where('id', $snapshot['id'])->update(['proc_par2' => 1]);
+                if ($manifestSignature !== null && $this->hasPendingPar2Candidates($snapshot['id'], $manifestSignature)) {
+                    throw $aborted;
+                }
+                DB::table('par2_rename_candidate_progress')->where('releases_id', $snapshot['id'])->delete();
+                DB::table('par2_rename_progress')->where('releases_id', $snapshot['id'])->delete();
+                if (! $this->canContinuePar2($guard) || ! $this->matchingPar2Snapshot($snapshot, $groupId, true)) {
+                    throw $aborted;
+                }
+
+                return true;
+            });
+        } catch (Throwable $exception) {
+            if ($exception === $aborted) {
+                return false;
+            }
+            throw $exception;
+        }
+    }
+
+    /** @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> */
+    private function par2Candidates(SimpleXMLElement $nzb): array
+    {
+        $explicit = $volumes = $legacy = $hidden = [];
+        $this->par2Manifest = [];
+        $this->par2StructureValid = count($nzb->file) > 0;
+        $maxBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
+        foreach ($nzb->file as $file) {
+            $subject = (string) $file->attributes()->subject;
+            $segments = $raw = [];
+            $valid = count($file->segments->segment) > 0;
+            foreach ($file->segments->segment as $entry) {
+                $raw[] = ['number' => (string) $entry->attributes()->number, 'id' => (string) $entry, 'bytes' => (string) $entry->attributes()->bytes];
+                $number = filter_var((string) $entry->attributes()->number, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+                $bytes = filter_var((string) $entry->attributes()->bytes, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+                $id = trim((string) $entry);
+                $valid = $valid && $number !== false && $bytes !== false && $id !== '';
+                $segments[] = ['number' => $number === false ? 0 : $number, 'id' => $id, 'bytes' => $bytes === false ? 0 : $bytes];
+            }
+            usort($segments, static fn (array $left, array $right): int => $left['number'] <=> $right['number']);
+            foreach ($segments as $index => $segment) {
+                if ($segment['number'] !== $index + 1) {
+                    $valid = false;
+                }
+            }
+            $isExplicit = preg_match('/\.par2(?:["\s]|$)/i', $subject) === 1;
+            $classification = $isExplicit
+                ? (preg_match('/\.vol0{3}\+0*1\.par2(?:["\s]|$)/i', $subject) === 1
+                    ? 'index'
+                    : (preg_match('/\.vol\d+\+\d+\.par2(?:["\s]|$)/i', $subject) === 1 ? 'volume' : 'index'))
+                : 'excluded';
+            $singlePart = count($segments) === 1 && $this->parserService->extractPartsTotal($subject) <= 1;
+            $knownContent = preg_match('/\.(?:rar|r\d{2,4}|\d{3}|7z|zip|mkv|mp4|avi|m2ts|ts|iso|nfo|sfv|srr|srs|jpg|png|mp3|flac)(?:["\s]|$)/i', $subject) === 1;
+            if (! $isExplicit && (! $knownContent || $singlePart) && $segments !== []) {
+                if (! $valid || $segments[0]['bytes'] <= $maxBytes) {
+                    $classification = $singlePart && preg_match('/\.(par[" ]|\d{2,3}").+\(1\/1\)/i', $subject) === 1 ? 'legacy' : 'hidden';
+                }
+            }
+            $this->par2Manifest[] = ['subject' => $subject, 'classification' => $classification, 'segments' => $raw];
+            if (! $valid && $classification !== 'excluded') {
+                $this->par2StructureValid = false;
+            }
+            if ($classification === 'excluded' || $segments === []) {
+                continue;
+            }
+            if (! $valid) {
+                $segments[0]['number'] = 0;
+            }
+            $candidate = ['subject' => $subject, 'explicit' => $isExplicit, 'segments' => $segments, 'classification' => $classification];
+            $key = hash('sha256', json_encode($candidate, JSON_THROW_ON_ERROR));
+            match ($classification) {
+                'index' => $explicit[$key] = $candidate,
+                'volume' => $volumes[$key] = $candidate,
+                'legacy' => $legacy[$key] = $candidate,
+                default => $hidden[$key] = $candidate,
+            };
+        }
+        uasort($hidden, static fn (array $left, array $right): int => $left['segments'][0]['bytes'] <=> $right['segments'][0]['bytes']);
+
+        return array_values($explicit + $volumes + $legacy + $hidden);
     }
 
     /**

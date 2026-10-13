@@ -60,6 +60,9 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             'forged result legacy identity cannot publish' => [12345, 12345, 'legacy', 'legacy_forged'],
             'omitted result legacy identity cannot publish' => [12345, 12345, 'legacy', 'legacy_omitted'],
             'legacy update rollback removes new NZB' => [12345, 12345, 'legacy', 'legacy_update'],
+            'covered article subset is reused after verification' => [12345, 12345, 'covered_subset'],
+            'covered article subset ignores metadata dedupe switch' => [12345, 12345, 'covered_subset_disabled'],
+            'case-distinct article remains independently published' => [12345, 12345, 'case_distinct'],
             'metadata duplicate with different articles' => [12345, 12345, 'different'],
             'metadata duplicate with missing NZB' => [12345, 12345, 'missing'],
             'metadata duplicate with corrupt compressed NZB' => [12345, 12345, 'corrupt'],
@@ -104,7 +107,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $table->string('minfilestoformrelease')->default('');
             $table->string('minsizetoformrelease')->default('');
         });
-        Search::shouldReceive('updateRelease')->times(in_array($duplicateKind, ['exact', 'shadow_exact', 'published_shadow_exact', 'paged_exact'], true) || in_array($failure, ['insert', 'after_commit', 'legacy_changed', 'legacy_missing', 'legacy_update', 'legacy_forged', 'legacy_omitted'], true) ? 0 : 1);
+        Search::shouldReceive('updateRelease')->times(in_array($duplicateKind, ['exact', 'shadow_exact', 'published_shadow_exact', 'paged_exact', 'covered_subset', 'covered_subset_disabled'], true) || in_array($failure, ['insert', 'after_commit', 'legacy_changed', 'legacy_missing', 'legacy_update', 'legacy_forged', 'legacy_omitted'], true) ? 0 : 1);
         $this->app->instance(ReleaseMetadataResolver::class,
             new class(app(ReleaseCleaningService::class)) extends ReleaseMetadataResolver
             {
@@ -138,6 +141,16 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 DB::table('releases')->where('id', 777)->update(['nzbstatus' => NzbService::NZB_NONE, 'size' => 1]);
             } elseif ($duplicateKind !== 'missing') {
                 $oldManifest = $manifest;
+                if (in_array($duplicateKind, ['covered_subset', 'covered_subset_disabled'], true)) {
+                    $oldManifest['files'][0]['segments'][] = ['number' => 2, 'messageid' => 'extra@article', 'bytes' => 9];
+                    $oldManifest['files'][0]['totalparts'] = 2;
+                    if ($duplicateKind === 'covered_subset_disabled') {
+                        config(['nntmux.release_dedupe_enabled' => false]);
+                    }
+                }
+                if ($duplicateKind === 'case_distinct') {
+                    $oldManifest['files'][0]['segments'][0]['messageid'] = 'Verified@article';
+                }
                 if ($duplicateKind === 'different') {
                     $oldManifest['files'][0]['segments'][0]['messageid'] = 'unverified-old@article';
                 }
@@ -172,8 +185,8 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             DB::table('releases')->insert($stub);
             $finder = app(ReleaseDuplicateFinder::class);
             [$legacyMatch] = $finder->findDuplicate('Movie', 'Movie', 0, $expectedSize);
-            $this->assertSame(776, $legacyMatch->id);
-            [$publishedMatch] = $finder->findDuplicate('Movie', 'Movie', 0, $expectedSize, publishedOnly: true);
+            $this->assertNull($legacyMatch);
+            [$publishedMatch] = $finder->findDuplicate('Movie', 'Movie', 0, $expectedSize, publishedOnly: true, coversArticles: fn ($release): bool => app(VerifiedNzbWriter::class)->matches($manifest, (string) $release->guid));
             $this->assertSame(777, $publishedMatch->id);
             config(['nntmux.release_dedupe_enabled' => false]);
             $this->assertSame([null, null], $finder->findDuplicate('Movie', 'Movie', 0, $expectedSize, publishedOnly: true));
@@ -223,7 +236,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         }
         $pages = 0;
         DB::listen(function (QueryExecuted $event) use (&$pages): void {
-            if (str_starts_with($event->sql, 'select "id", "guid"') && str_contains($event->sql, 'limit 100')) {
+            if (str_starts_with($event->sql, 'select "id", "guid"') && str_contains($event->sql, 'limit 128')) {
                 $pages++;
             }
         });
@@ -288,7 +301,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $this->assertSame(2, $inserts);
             $this->assertCount(1, app('files')->allFiles(config('nntmux_settings.path_to_nzbs')));
         }
-        if (in_array($duplicateKind, ['exact', 'legacy', 'shadow_exact', 'published_shadow_exact', 'paged_exact'], true)) {
+        if (in_array($duplicateKind, ['exact', 'legacy', 'shadow_exact', 'published_shadow_exact', 'paged_exact', 'covered_subset', 'covered_subset_disabled'], true)) {
             $this->assertSame(777, $id);
             $this->assertSame($duplicateKind === 'paged_exact' ? 102 : (in_array($duplicateKind, ['shadow_exact', 'published_shadow_exact'], true) ? 2 : 1), DB::table('releases')->count());
             $this->assertSame($duplicateGuid, DB::table('releases')->where('id', 777)->value('guid'));
@@ -304,7 +317,8 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $this->assertSame(1, DB::table('releases')->count());
         }
         if ($duplicateKind === 'paged_exact') {
-            $this->assertSame(2, $pages, 'Exact inventory beyond the first bounded page must be considered.');
+            $this->assertGreaterThan(0, $pages, 'The later matching inventory must be considered within the bounded nominations.');
+            $this->assertLessThanOrEqual(3, $pages, 'Metadata nominations use at most one bounded query per indexed identity.');
         }
         if ($groupNames !== ['alt.test']) {
             $group = DB::table('usenet_groups')->where('name', 'alt.crosspost')->first();

@@ -104,7 +104,9 @@ class NameFixingQueryServiceTest extends TestCase
                     && ! str_contains($sql, 'OFFSET')),
                 $this->callback(static fn (array $bindings): bool => $bindings[2] === 4
                     && $bindings[3] === 2
-                    && $bindings[4] === 250)
+                    && $bindings[4] === 0
+                    && $bindings[5] === PHP_INT_MAX
+                    && $bindings[6] === 250)
             )
             ->willReturn([]);
 

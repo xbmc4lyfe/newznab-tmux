@@ -67,6 +67,7 @@ class ReleaseCollectionWindowTest extends TestCase
         return ['one group' => [1, [5, 9]], 'all groups' => [null, [5, 7, 9]]];
     }
 
+    /** @param list<int> $expected */
     #[DataProvider('groupScopes')]
     public function test_invalid_only_windows_do_not_stop_later_valid_releases_or_drain_every_invalid_row_first(?int $groupId, array $expected): void
     {
@@ -417,6 +418,11 @@ class ReleaseCollectionWindowTest extends TestCase
 
     public function test_creation_allowlist_and_explicit_empty_list_never_fall_back_to_other_collections(): void
     {
+        foreach (['adddate DATETIME', 'leftguid TEXT', 'totalpart INTEGER DEFAULT 0', 'passwordstatus INTEGER DEFAULT 0', 'haspreview INTEGER DEFAULT -1', 'nfostatus INTEGER DEFAULT -1', 'isrenamed INTEGER DEFAULT 0', 'iscategorized INTEGER DEFAULT 0'] as $column) {
+            DB::statement('ALTER TABLE releases ADD COLUMN '.$column);
+        }
+        DB::statement('CREATE TABLE release_regexes (releases_id INTEGER, collection_regex_id INTEGER, naming_regex_id INTEGER)');
+        DB::statement('CREATE TABLE releases_groups (releases_id INTEGER, groups_id INTEGER)');
         $this->insertCollection(1);
         $this->insertCollection(2);
         DB::table('releases')->insert(['id' => 50, 'guid' => 'duplicate', 'name' => 'Duplicate', 'searchname' => 'Duplicate', 'predb_id' => 1]);
@@ -426,8 +432,12 @@ class ReleaseCollectionWindowTest extends TestCase
 
         $this->assertSame(['added' => 0, 'dupes' => 0], $creation->createReleases(1, 3, false, []));
         $this->assertSame(2, DB::table('collections')->count());
-        $this->assertSame(['added' => 0, 'dupes' => 1], $creation->createReleases(1, 3, false, [2]));
-        $this->assertSame([1], DB::table('collections')->pluck('id')->all());
+        $this->assertSame(['added' => 1, 'dupes' => 0], $creation->createReleases(1, 3, false, [2]));
+        $this->assertSame([1, 2], DB::table('collections')->orderBy('id')->pluck('id')->all());
+        $this->assertNull(DB::table('collections')->where('id', 1)->value('releases_id'));
+        $this->assertSame(51, (int) DB::table('collections')->where('id', 2)->value('releases_id'));
+        $this->assertSame(CollectionFileCheckStatus::Inserted->value, (int) DB::table('collections')->where('id', 2)->value('filecheck'));
+        $this->assertSame([50, 51], DB::table('releases')->orderBy('id')->pluck('id')->all());
     }
 
     /** @return array<string, array{class-string}> */

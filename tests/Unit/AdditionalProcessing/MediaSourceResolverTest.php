@@ -13,6 +13,7 @@ use App\Services\AdditionalProcessing\State\MediaByteBudget;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\AdditionalProcessing\UsenetDownloadService;
 use App\Services\Yenc\YencPart;
+use dariusiii\rarinfo\Par2Info;
 use Mockery;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
@@ -26,6 +27,62 @@ class MediaSourceResolverTest extends TestCase
     {
         Mockery::close();
         parent::tearDown();
+    }
+
+    #[Test]
+    public function it_maps_real_media_names_when_verification_packets_precede_descriptions(): void
+    {
+        $name = 'Example.Movie.2020.1080p.WEB-DL.x264-GRP.mkv';
+        $data = str_repeat('fixture payload ', 1200);
+        $context = $this->contextFor([
+            array_replace($this->entry('<index>', 600), ['title' => '"Movie.par2" yEnc (1/1)']),
+            $this->entry('<movie>', 20000),
+        ], ['par2VerifyFiles' => 0]);
+        $download = Mockery::mock(UsenetDownloadService::class);
+        $download->shouldReceive('download')->once()
+            ->with(DownloadKind::Par2Index, ['<index>'], 'alt.binaries.test', 1, Mockery::any(), false)
+            ->andReturn($this->ok($this->indexWithVerificationBeforeDescription($name, $data)));
+        $download->shouldNotReceive('downloadArticle');
+
+        $plan = $this->resolver($context, $download, ['par2VerifyFiles' => 0])->resolve($context);
+
+        $this->assertNotNull($plan);
+        $this->assertSame([1], array_keys($plan->mappedFiles));
+        $this->assertSame($name, $plan->mappedFiles[1]->file->name);
+        $this->assertSame(19200, $plan->mappedFiles[1]->file->size);
+        $this->assertSame('54ab0d46c0318ac3e0687e39973c5c2c', $plan->mappedFiles[1]->file->hash16k);
+        $this->assertTrue($plan->mappedFiles[1]->file->matchesStartOf($data));
+        $this->assertSame(MappingConfidence::UniqueSize, $plan->mappedFiles[1]->confidence);
+    }
+
+    #[Test]
+    public function it_rejects_a_corrupt_descriptor_after_verification_packets(): void
+    {
+        $bytes = $this->indexWithVerificationBeforeDescription('Movie.mkv', str_repeat('fixture payload ', 1200));
+        $bytes[strlen($bytes) - 1] = chr(ord($bytes[strlen($bytes) - 1]) ^ 1);
+        $context = $this->contextFor([
+            array_replace($this->entry('<index>', 600), ['title' => '"Movie.par2" yEnc (1/1)']),
+            $this->entry('<movie>', 20000),
+        ]);
+        $download = Mockery::mock(UsenetDownloadService::class);
+        $download->shouldReceive('download')->once()->andReturn($this->ok($bytes));
+        $download->shouldNotReceive('downloadArticle');
+
+        $this->assertNull($this->resolver($context, $download)->resolve($context));
+    }
+
+    private function indexWithVerificationBeforeDescription(string $name, string $data): string
+    {
+        $index = $this->par2Index([[$name, strlen($data), $data]]);
+        $mainLength = unpack('Vlength', substr($index, 8, 4))['length'];
+        $description = substr($index, $mainLength);
+        $fileId = substr($description, 64, 16);
+        $slice = str_pad($data, 768000, "\0");
+        $body = $fileId.md5($slice, true).pack('V', crc32($slice));
+        $hashed = str_repeat("\x5A", 16).Par2Info::PACKET_FILEVER.$body;
+        $verification = Par2Info::PACKET_MARKER.pack('V2', 64 + strlen($body), 0).md5($hashed, true).$hashed;
+
+        return substr($index, 0, $mainLength).$verification.$description;
     }
 
     #[Test]

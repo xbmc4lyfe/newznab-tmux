@@ -47,6 +47,15 @@ class FileNameExtractor
             return null;
         }
 
+        $basename = $this->cleaner->extractFilenameFromPath($filename);
+        $literalTitle = $this->cleaner->stripFileSuffixes($basename);
+        if ($literalTitle !== $basename
+            && preg_match('/\.(?:mkv|avi|mp4|m4v|wmv|mpg|mpeg|mov|ts|m2ts|vob|divx|flv|webm|ogv|3gp|asf|rm|rmvb|f4v|mp3|flac|m4a|aac|ogg|wav|wma|ape|opus|mka|ac3|dts|eac3|truehd|mpc|shn|tak|tta|wv|rar|r\d{2,4}|zip|z\d{2}|7z|par2?|tar|gz|bz2|xz|lz|lzma|zst|tgz|lz4|rev|enc|\d{3})$/iD', $basename)
+            && $this->cleaner->isLiteralTechnicalSceneTitle($literalTitle)
+        ) {
+            return NameFixResult::fromMatch($literalTitle, 'Complete literal basename', 'File');
+        }
+
         // Scene TV release with group suffix
         if (preg_match('/^(.+?(x264|x265|HEVC|XviD|H\.?264|H\.?265)\-[A-Za-z0-9]+)\\\\/i', $filename, $result)) {
             return NameFixResult::fromMatch($result[1], 'Scene release with group', 'File');
@@ -127,12 +136,12 @@ class FileNameExtractor
         }
 
         // RAR file contents - look for release name in RAR path
-        if (preg_match('/^([A-Za-z0-9][\w.\-]+(?:[\.\-_ ][\w.\-]+)+)[\\\\\\/](?:CD\d|Disc\d|DVD\d|Subs?)?[\\\\\\/]?.+\.(rar|r\d{2,3}|zip|7z)$/i', $filename, $result)) {
+        if (preg_match('/^([A-Za-z0-9][\w.\-]+(?:[\.\-_ ][\w.\-]+)+)[\\\\\\/](?:CD\d|Disc\d|DVD\d|Subs?)?[\\\\\\/]?.+\.(rar|r\d{2,4}|zip|7z)$/i', $filename, $result)) {
             return NameFixResult::fromMatch($result[1], 'RAR archive path', 'File');
         }
 
         // Scene release in RAR
-        if (preg_match('/^([A-Za-z0-9][\w.\-]+\-[A-Za-z0-9]+)[\\\\\\/].+\.(rar|r\d{2,3})$/i', $filename, $result)) {
+        if (preg_match('/^([A-Za-z0-9][\w.\-]+\-[A-Za-z0-9]+)[\\\\\\/].+\.(rar|r\d{2,4})$/i', $filename, $result)) {
             return NameFixResult::fromMatch($result[1], 'Scene RAR release', 'File');
         }
 
@@ -222,6 +231,34 @@ class FileNameExtractor
         // Scene release from cleaned filename
         if (preg_match('/^([A-Za-z0-9][\w.\-]+\-[A-Za-z0-9]{2,15})$/i', $cleanedFilename, $result) && preg_match(self::PREDB_REGEX, $cleanedFilename)) {
             return NameFixResult::fromMatch($result[1], 'Cleaned scene name', 'File');
+        }
+
+        $basename = basename(str_replace('\\', '/', $filename));
+        $candidate = $this->cleaner->stripFileSuffixes($basename);
+
+        if ($candidate !== $basename
+            && preg_match('/\.(?:mkv|avi|mp4|m4v|ts|m2ts|rar|r\d{2,4}|7z|par2|nfo|sfv|md5|sha1)$/i', $basename)
+            && preg_match('/^[A-Za-z0-9 ._()\[\]@+,!\'&-]+$/', $candidate)
+            && preg_match('/^(.+?)[ ._(\[](?:19|20)\d{2}(?=$|[ ._)\]-])/u', $candidate, $result)
+            && preg_match('/[A-Za-z]{3}/', (string) preg_replace('/^(?:\[[^\]]+\]\s*)+/', '', $result[1]))
+            && preg_match('/(?<![a-z0-9])(?:720p|1080p|2160p)(?![a-z0-9])/i', $candidate)
+            && preg_match('/(?<![a-z0-9])(?:HDTV(?:Light)?|BluRay|BDRip|WEB[- .]?DL|WEBRip|BD)(?![a-z0-9])/i', $candidate)
+            && preg_match('/(?<![a-z0-9])(?:x264|x265|HEVC|H[ .]?264|H[ .]?265|XviD)(?![a-z0-9])/i', $candidate)
+            && $this->cleaner->isPlausibleReleaseTitle($this->cleaner->normalizeCandidateTitle($candidate))
+        ) {
+            return NameFixResult::fromMatch($candidate, 'Technical video basename', 'File');
+        }
+
+        $parent = basename(dirname(str_replace('\\', '/', $filename)));
+        if ($parent === $candidate
+            && preg_match('/\.(?:mkv|avi|mp4|m4v)$/i', $basename)
+            && preg_match('/^[A-Za-z0-9 ._()\[\]@+,!\'&-]+$/', $candidate)
+            && preg_match('/^(.+?)[ ._(\[](?:19|20)\d{2}(?=$|[ ._)\]-])/u', $candidate, $result)
+            && preg_match('/[A-Za-z]{3}/', (string) preg_replace('/^(?:\[[^\]]+\]\s*)+/', '', $result[1]))
+            && preg_match('/(?<![a-z0-9])(?:720p|1080p|2160p)(?![a-z0-9])/i', $candidate)
+            && $this->cleaner->isPlausibleReleaseTitle($this->cleaner->normalizeCandidateTitle($candidate))
+        ) {
+            return NameFixResult::fromMatch($candidate, 'Matching video parent basename', 'File');
         }
 
         // Folder name fallback

@@ -16,6 +16,7 @@ class ReleaseVerificationMetricsTest extends ReleaseVerificationCandidatesTest
 {
     public function test_per_claim_metrics_do_not_walk_retained_audit_scratch_before_the_next_claim(): void
     {
+        DB::table('release_verification_scratch_budget')->where('id', 1)->update(['initialized' => true]);
         $nativeRoot = (string) config('release_verification.storage_path');
         File::ensureDirectoryExists($nativeRoot.'/scratch', 0700);
         $this->assertTrue(app(ScratchBudget::class)->initialize());
@@ -117,6 +118,7 @@ final class VerificationMetricTreeProbe
         return self::$nativeRoot.substr($path, strlen('verification-metric-probe://root'));
     }
 
+    /** @return array<int|string, int>|false */
     public function url_stat(string $path, int $flags): array|false
     {
         if (str_contains($path, '/scratch/unregistered-audit')) {
@@ -219,6 +221,7 @@ final class VerificationMetricTreeProbe
         return $operation === 0 || flock($this->handle, $operation);
     }
 
+    /** @return array<int|string, int>|false */
     public function stream_stat(): array|false
     {
         return fstat($this->handle);

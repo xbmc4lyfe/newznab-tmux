@@ -4,12 +4,11 @@ declare(strict_types=1);
 
 namespace App\Services\NameFixing;
 
+use App\Support\PredbSearchDocument;
+
 /**
- * Selects the most plausible PreDB hit for a filename-derived query.
- *
- * Search backends can return broad fuzzy matches for low-information filenames
- * like "1" or "VTS_01_1". This selector scores the top hits and only accepts
- * a candidate when the overlap with the cleaned filename is strong enough.
+ * Selects a PreDB hit whose title or cleaned filename has the query's literal UTF-8 identity.
+ * Backend discovery and ranking may be fuzzy; acceptance permits only letter case differences.
  */
 class PredbMatchSelector
 {
@@ -53,6 +52,10 @@ class PredbMatchSelector
      */
     public function selectBestMatch(string $query, array $hits): ?array
     {
+        if (! mb_check_encoding($query, 'UTF-8')) {
+            return null;
+        }
+        $queryIdentity = PredbSearchDocument::exactValue($query);
         $normalizedQuery = $this->normalizeForComparison($query);
         if (! $this->isSearchableQuery($normalizedQuery)) {
             return null;
@@ -63,11 +66,29 @@ class PredbMatchSelector
             return null;
         }
 
-        $bestMatch = null;
-        $bestScore = 0.0;
-
+        $literalTitles = $literalFilenames = [];
+        $filenameTitles = [];
         foreach (array_slice($hits, 0, self::MAX_RESULTS_TO_SCORE) as $hit) {
             $hitData = is_array($hit) ? $hit : (array) $hit;
+            $title = (string) ($hitData['title'] ?? '');
+            if ($title === '' || ! mb_check_encoding($title, 'UTF-8')) {
+                continue;
+            }
+            $titleIdentity = PredbSearchDocument::exactValue($title);
+            if ($titleIdentity === $queryIdentity) {
+                $literalTitles[] = $hitData;
+            } elseif ($this->hasLiteralFilename($queryIdentity, $hitData)) {
+                $literalFilenames[] = $hitData;
+                $filenameTitles[$titleIdentity] = true;
+            }
+        }
+        if ($literalTitles === [] && count($filenameTitles) !== 1) {
+            return null;
+        }
+
+        $bestMatch = null;
+        $bestScore = 0.0;
+        foreach ($literalTitles !== [] ? $literalTitles : $literalFilenames as $hitData) {
             $score = $this->scoreHit($normalizedQuery, $queryTokens, $hitData);
 
             if ($score > $bestScore) {
@@ -81,6 +102,14 @@ class PredbMatchSelector
         }
 
         return $bestMatch;
+    }
+
+    /** @param array<string, mixed> $hit */
+    private function hasLiteralFilename(string $queryIdentity, array $hit): bool
+    {
+        $filename = $this->fileNameCleaner->cleanForMatching((string) ($hit['filename'] ?? ''));
+
+        return $filename !== false && PredbSearchDocument::exactValue($filename) === $queryIdentity;
     }
 
     /**

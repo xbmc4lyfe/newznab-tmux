@@ -15,6 +15,7 @@ use App\Services\Predb\Feeds\Sources\RssFeedSource;
 use App\Services\Predb\Feeds\Sources\SrrdbSource;
 use App\Services\Predb\Feeds\Sources\XrelSource;
 use App\Support\IrcChannelList;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
@@ -72,6 +73,222 @@ final class PredbFeedSourcesTest extends TestCase
         $this->assertNull($entries[0]->predate);
         $this->assertSame('2026-10-09 02:37:37', $entries[1]->predate?->format('Y-m-d H:i:s'));
         $this->assertSame('predb.me', $entries[1]->source);
+    }
+
+    #[Test]
+    #[DataProvider('cataloguePublicationDates')]
+    public function publication_only_dates_require_an_explicit_timezone(string $publishedAt, ?string $expectedUtc): void
+    {
+        $previousTimezone = date_default_timezone_get();
+        date_default_timezone_set('America/New_York');
+
+        try {
+            $source = new RssFeedSource('catalogue', 'catalogue.example', 'https://catalogue.example/rss.xml', publicationDatesOnly: true);
+            $xml = '<rss version="2.0"><channel><item><title>Example_Album-WEB-2026</title><pubDate>'.htmlspecialchars($publishedAt, ENT_XML1).'</pubDate></item></channel></rss>';
+            $entries = $source->parseXml($xml);
+
+            $this->assertCount(1, $entries);
+            $this->assertNull($entries[0]->predate);
+            $this->assertSame($expectedUtc, $entries[0]->listedAt?->toDateTimeString());
+            $this->assertSame($entries[0]->listedAt, $entries[0]->pagingTime());
+        } finally {
+            date_default_timezone_set($previousTimezone);
+        }
+    }
+
+    /** @return array<string, array{string, ?string}> */
+    public static function cataloguePublicationDates(): array
+    {
+        return [
+            'timezone-free SQL timestamp' => ['2026-10-11 04:14:20', null],
+            'timezone-free ISO timestamp' => ['2026-10-11T04:14:20', null],
+            'timezone-free RFC date' => ['Sun, 11 Oct 2026 04:14:20', null],
+            'RFC numeric offset' => ['Sun, 11 Oct 2026 04:14:20 +0200', '2026-10-11 02:14:20'],
+            'ISO numeric offset' => ['2026-10-11T04:14:20+02:00', '2026-10-11 02:14:20'],
+            'ISO UTC designator' => ['2026-10-11T04:14:20Z', '2026-10-11 04:14:20'],
+            'explicit UTC' => ['Sun, 11 Oct 2026 04:14:20 UTC', '2026-10-11 04:14:20'],
+            'explicit GMT' => ['Sun, 11 Oct 2026 04:14:20 GMT', '2026-10-11 04:14:20'],
+        ];
+    }
+
+    #[Test]
+    public function existing_predb_rss_keeps_its_timezone_free_date_behavior(): void
+    {
+        $previousTimezone = date_default_timezone_get();
+        date_default_timezone_set('America/New_York');
+
+        try {
+            $source = new RssFeedSource('predb_me', 'predb.me', 'https://predb.me/?rss=1');
+            $entries = $source->parseXml('<rss version="2.0"><channel><item><title>Example.Release-GRP</title><pubDate>2026-10-11 04:14:20</pubDate></item></channel></rss>');
+
+            $this->assertSame('2026-10-11 08:14:20', $entries[0]->predate?->toDateTimeString());
+            $this->assertNull($entries[0]->listedAt);
+        } finally {
+            date_default_timezone_set($previousTimezone);
+        }
+    }
+
+    #[Test]
+    public function nfodb_catalogue_titles_keep_exact_spelling_and_publication_dates_only(): void
+    {
+        $source = new RssFeedSource('nfodb', 'nfodb.net.ru', 'https://nfodb.net.ru/rss.xml', mapCategory: true, publicationDatesOnly: true);
+        $entries = $source->parseXml((string) file_get_contents($this->fixture('nfodb.xml')));
+
+        $this->assertSame([
+            'DJ_Trike-Berlin_EP-(SYNCRO75)-24BIT-WEB-FLAC-2026-AGITB',
+            'VA_-_Beatport_Cuprite_-_Badaman_Chart-WEB-2026',
+            'VA_-_Beatport_Sofian_-_D.Y.F.I.T_Chart-WEB-2026',
+        ], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+        $this->assertSame('nfodb.net.ru', $entries[0]->source);
+        $this->assertSame('Techno', $entries[0]->category);
+        $this->assertSame('Dance', $entries[1]->category);
+        $this->assertSame('2026-10-11 12:26:12', $entries[0]->listedAt?->format('Y-m-d H:i:s'));
+        $this->assertSame('2026-10-11 03:00:25', $entries[1]->pagingTime()?->format('Y-m-d H:i:s'));
+        foreach ($entries as $entry) {
+            $this->assertNull($entry->predate);
+            $this->assertNull($entry->size);
+            $this->assertNull($entry->files);
+        }
+        $this->assertNull($entries[2]->listedAt);
+        $this->assertNull($entries[2]->pagingTime());
+    }
+
+    #[Test]
+    public function one_techno_preserves_catalogue_titles_without_guessing_groups_or_dates(): void
+    {
+        $source = new RssFeedSource('one_techno', '1techno.org', 'https://1techno.org/rss.xml', mapCategory: true, publicationDatesOnly: true);
+        $entries = $source->parseXml((string) file_get_contents($this->fixture('one_techno.xml')));
+
+        $this->assertSame([
+            'Oxy_-_Space_Runner_EP-(SR2607)-WEB-FLAC-2026',
+            'Jil_Tanner_-_Return_To_The_Now-(UIII072)-WEB-FLAC-2026',
+        ], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+        foreach ($entries as $entry) {
+            $this->assertSame('1techno.org', $entry->source);
+            $this->assertNull($entry->category);
+            $this->assertNull($entry->predate);
+            $this->assertNull($entry->listedAt);
+            $this->assertNull($entry->pagingTime());
+        }
+    }
+
+    #[Test]
+    #[DataProvider('hdencodeDisplayTitles')]
+    public function hdencode_strips_only_the_terminal_display_size(string $rawTitle, ?string $expectedTitle): void
+    {
+        $source = new RssFeedSource('hdencode', 'hdencode.org', 'https://hdencode.org/tag/movies/feed/', publicationDatesOnly: true, stripDisplaySizeSuffix: true);
+        $xml = '<rss><channel><item><title>'.htmlspecialchars($rawTitle, ENT_XML1).'</title><pubDate>Sun, 11 Oct 2026 14:56:46 +0000</pubDate><category>REMUX</category></item></channel></rss>';
+        $entries = $source->parseXml($xml);
+
+        if ($expectedTitle === null) {
+            $this->assertSame([], $entries);
+
+            return;
+        }
+
+        $this->assertCount(1, $entries);
+        $this->assertSame($expectedTitle, $entries[0]->title);
+        $this->assertNull($entries[0]->size);
+        $this->assertNull($entries[0]->files);
+        $this->assertNull($entries[0]->category);
+        $this->assertNull($entries[0]->predate);
+        $this->assertSame('2026-10-11 14:56:46', $entries[0]->listedAt?->toDateTimeString());
+    }
+
+    /** @return array<string, array{string, ?string}> */
+    public static function hdencodeDisplayTitles(): array
+    {
+        $title = 'Example_Film.1994.1080p.WEB-DL.DD+5.1.H.264-MixedGroup';
+
+        return [
+            'synthetic literal technical tokens' => [$title.' – 3.1 GB', $title],
+            'synthetic megabyte display' => [$title.' – 700 MB', $title],
+            'synthetic UTF-8 prefix' => ['Léon_天空.1994.1080p-GRP – 3.1 GB', 'Léon_天空.1994.1080p-GRP'],
+            'wrong separator' => [$title.' - 3.1 GB', null],
+            'wrong unit' => [$title.' – 3.1 TB', null],
+            'wrong unit casing' => [$title.' – 3.1 gb', null],
+            'malformed decimal' => [$title.' – 3..1 GB', null],
+            'not terminal' => [$title.' – 3.1 GB extra', null],
+            'missing observed separator space' => [$title.' –3.1 GB', null],
+            'editorial prefix' => ['Movie catalogue news – 3.1 GB', null],
+            'internal spaced en-dash' => [$title.' – commentary – 3.1 GB', null],
+        ];
+    }
+
+    #[Test]
+    public function hdencode_tv_preserves_the_observed_title_and_publication_date_without_inferring_metadata(): void
+    {
+        $source = new RssFeedSource('hdencode_tv', 'hdencode.org', 'https://hdencode.org/tag/tv-shows/feed/', publicationDatesOnly: true, stripDisplaySizeSuffix: true);
+        $entries = $source->parseXml((string) file_get_contents($this->fixture('hdencode_tv.xml')));
+
+        $this->assertCount(1, $entries);
+        $this->assertSame('Formula1.2026.Round17.Singapore.Race.F1TV.WEB-DL.2160p.HLG.H265.Multi-MWR', $entries[0]->title);
+        $this->assertSame('hdencode.org', $entries[0]->source);
+        $this->assertNull($entries[0]->category);
+        $this->assertNull($entries[0]->size);
+        $this->assertNull($entries[0]->files);
+        $this->assertNull($entries[0]->predate);
+        $this->assertSame('2026-10-11 15:24:20', $entries[0]->listedAt?->toDateTimeString());
+    }
+
+    #[Test]
+    public function rss_display_suffix_removal_is_disabled_by_default(): void
+    {
+        $source = new RssFeedSource('predb_me', 'predb.me', 'https://predb.me/?rss=1');
+        $entries = $source->parseXml('<rss><channel><item><title>Example.Film-GRP – 3.1 GB</title></item><item><title>Unchanged_Release-GRP</title></item></channel></rss>');
+
+        $this->assertCount(1, $entries);
+        $this->assertSame('Unchanged_Release-GRP', $entries[0]->title);
+    }
+
+    #[Test]
+    public function mp3scene_preserves_historical_names_without_guessing_pre_times(): void
+    {
+        $source = new RssFeedSource('mp3scene', 'mp3scene.info', 'https://www.mp3scene.info/feeds/releases/', publicationDatesOnly: true);
+        $entries = $source->parseXml((string) file_get_contents($this->fixture('mp3scene.xml')));
+
+        $this->assertSame([
+            'Offspring-The_Year_That_Punk_Broke-UMA',
+            'James_Taylor_-_Sweet_Baby_James_-_(1970)_-_ATM',
+        ], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+        $this->assertSame('2026-10-10 22:19:13', $entries[0]->listedAt?->toDateTimeString());
+        $this->assertSame('2026-09-13 17:26:09', $entries[1]->listedAt?->toDateTimeString());
+        foreach ($entries as $entry) {
+            $this->assertSame('mp3scene.info', $entry->source);
+            $this->assertNull($entry->predate);
+            $this->assertNull($entry->category);
+            $this->assertNull($entry->size);
+            $this->assertNull($entry->files);
+        }
+    }
+
+    #[Test]
+    public function ddlvalley_keeps_exact_catalogue_titles_without_mapping_delivery_categories(): void
+    {
+        $source = new RssFeedSource('ddlvalley', 'ddlvalley.me', 'https://www.ddlvalley.me/feed/', publicationDatesOnly: true);
+        $entries = $source->parseXml((string) file_get_contents($this->fixture('ddlvalley.xml')));
+
+        $this->assertCount(1, $entries);
+        $this->assertSame('The.Florist.2026.1080p.AMZN.WEB-DL.DD_5.1.H.264-playWEB', $entries[0]->title);
+        $this->assertSame('ddlvalley.me', $entries[0]->source);
+        $this->assertNull($entries[0]->category);
+        $this->assertNull($entries[0]->predate);
+        $this->assertSame('2026-10-09 23:37:19', $entries[0]->listedAt?->toDateTimeString());
+    }
+
+    #[Test]
+    public function one_gabba_preserves_ungrouped_catalogue_titles_and_publication_dates(): void
+    {
+        $source = new RssFeedSource('one_gabba', '1gabba.pw', 'https://1gabba.pw/rss.xml', mapCategory: true, publicationDatesOnly: true);
+        $entries = $source->parseXml((string) file_get_contents($this->fixture('one_gabba.xml')));
+
+        $this->assertCount(1, $entries);
+        $this->assertSame('Alto_-_A_New_Day-(ALTO003)-WEB-2026', $entries[0]->title);
+        $this->assertSame('1gabba.pw', $entries[0]->source);
+        $this->assertSame('Web', $entries[0]->category);
+        $this->assertNull($entries[0]->predate);
+        $this->assertSame('2026-10-11 02:14:20', $entries[0]->listedAt?->toDateTimeString());
+        $this->assertSame($entries[0]->listedAt, $entries[0]->pagingTime());
     }
 
     #[Test]
@@ -203,7 +420,9 @@ final class PredbFeedSourcesTest extends TestCase
     #[Test]
     public function apibay_keeps_only_movie_and_tv_categories_and_converts_bytes(): void
     {
-        $entries = (new ApibaySource('https://apibay.org/precompiled/data_top100_recent.json'))->parseRows($this->json('apibay.json'));
+        /** @var array<int, mixed> $rows */
+        $rows = $this->json('apibay.json');
+        $entries = (new ApibaySource('https://apibay.org/precompiled/data_top100_recent.json'))->parseRows($rows);
 
         $this->assertSame(['Some.Show.S01E01.1080p.WEB.h264-GRP', 'Some.Movie.2026.720p.BluRay.x264-GRP'], array_map(static fn (PredbFeedEntry $e): string => $e->title, $entries));
         $this->assertSame('apibay', $entries[0]->source);
@@ -212,7 +431,8 @@ final class PredbFeedSourcesTest extends TestCase
         $this->assertSame('1024MB', $entries[0]->size);
         $this->assertSame('3', $entries[0]->files);
         $this->assertNull($entries[1]->files);
-        $this->assertSame(1791513593, $entries[0]->predate?->getTimestamp());
+        $this->assertNull($entries[0]->predate);
+        $this->assertSame(1791513593, $entries[0]->listedAt?->getTimestamp());
     }
 
     #[Test]

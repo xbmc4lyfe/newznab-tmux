@@ -271,6 +271,10 @@ class ReleaseProcessor
                 fn () => $this->releaseManager->finalizeRelease($context, $this->config->processPasswords),
             );
 
+            if ($context->fullPar2EvidenceDeferred) {
+                return $this->result($context, ProcessingOutcome::Failed, reason: 'Release identity or additional-processing claim changed before metadata commit.');
+            }
+
             $artifactsCreated = $releaseNameChanged || $this->createdArtifacts($context, $releaseNeededNfo);
             $outcome = match (true) {
                 $context->releaseHasPassword => ProcessingOutcome::Passworded,

@@ -12,6 +12,7 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
+use App\Services\NNTP\BoundedArticleResult;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
 use App\Services\Nzb\NzbParserService;
@@ -302,7 +303,7 @@ class Par2RenameProcessingTest extends TestCase
         $service = $this->service($this->nzb([
             ['"hidden-one" yEnc', 'one'], ['"hidden-two" yEnc', 'two'],
         ]), ['one' => $response]);
-        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(Par2RenameOutcome::Deferred, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
         $this->assertNull(Par2RenameProgress::get($release->id));
         $this->assertSame(['one'], $this->downloaded);
     }
@@ -355,6 +356,87 @@ class Par2RenameProcessingTest extends TestCase
         ]), ['index' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
         $this->assertTrue($service->checkPar2($release->guid, $release->id, 1, 1, 0));
         $this->assertSame(['index'], $this->downloaded);
+    }
+
+    #[DataProvider('multiDigitArchiveVolumes')]
+    public function test_multipart_archive_volume_does_not_consume_a_hidden_par2_probe(string $suffix): void
+    {
+        $release = $this->release();
+        $service = $this->service($this->nzb([['"obfuscated'.$suffix.'" yEnc (1/10)', 'archive', 750000]]));
+
+        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame([], $this->downloaded);
+        $this->assertSame(['candidates_probed' => 0, 'articles_received' => 0], $service->par2Stats());
+        $this->assertSame(1, (int) $release->fresh()->proc_par2);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function multiDigitArchiveVolumes(): array
+    {
+        return ['three digits' => ['.r999'], 'four digits' => ['.r1000']];
+    }
+
+    public function test_bounded_single_part_four_digit_archive_can_still_contain_par2(): void
+    {
+        $release = $this->release();
+        $service = $this->service($this->nzb([['"obfuscated.r1000" yEnc (1/1)', 'hidden', 1000]]),
+            ['hidden' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
+
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['hidden'], $this->downloaded);
+        $this->assertSame('Recovered.Title.2026-GROUP', $release->fresh()->searchname);
+    }
+
+    #[DataProvider('legacyPar2Suffixes')]
+    public function test_bounded_legacy_candidates_follow_explicit_par2_before_other_hidden_articles(string $suffix): void
+    {
+        $release = $this->release();
+        config(['tmux.fix_names.par2_max_probes' => 4]);
+        $body = file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'));
+        $service = $this->service($this->nzb([
+            ['"unknown" yEnc (1/1)', 'hidden', 100],
+            ['"legacy'.$suffix.'" yEnc (1/1)', 'legacy', 1000],
+            ['"release.vol001+002.par2" yEnc (1/10)', 'volume'],
+            ['"release.par2" yEnc (1/1)', 'index'],
+        ]), ['index' => $body, 'volume' => $body]);
+
+        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['index', 'volume', 'legacy', 'hidden'], $this->downloaded);
+        $this->assertSame(1, (int) $release->fresh()->proc_par2);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function legacyPar2Suffixes(): array
+    {
+        return ['legacy PAR' => ['.par'], 'two-digit numbered file' => ['.01'], 'three-digit numbered file' => ['.001']];
+    }
+
+    public function test_legacy_candidate_priority_preserves_the_hidden_probe_byte_cap(): void
+    {
+        $release = $this->release();
+        config(['tmux.fix_names.par2_max_probe_bytes' => 1000, 'tmux.fix_names.par2_max_probes' => 3]);
+        $service = $this->service($this->nzb([
+            ['"unknown" yEnc (1/1)', 'hidden', 100],
+            ['"oversized.par" yEnc (1/1)', 'oversized', 1001],
+            ['"bounded.par" yEnc (1/1)', 'bounded', 1000],
+        ]));
+
+        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['bounded', 'hidden'], $this->downloaded);
+        $this->assertSame(['candidates_probed' => 2, 'articles_received' => 2], $service->par2Stats());
+        $this->assertSame(1, (int) $release->fresh()->proc_par2);
+    }
+
+    public function test_multipart_legacy_extension_does_not_gain_single_part_priority(): void
+    {
+        $release = $this->release();
+        $service = $this->service($this->nzb([
+            ['"legacy.par" yEnc (1/10)', 'multipart', 1000],
+            ['"unknown" yEnc (1/1)', 'hidden', 100],
+        ]));
+
+        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['hidden', 'multipart'], $this->downloaded);
     }
 
     public function test_a_separate_php_worker_respects_the_shared_release_claim(): void
@@ -728,6 +810,13 @@ PHP;
         {
             public function __construct(private \Closure $fetch) {}
 
+            public function getMessageBounded(string $groupName, string $messageId, int $maxDecodedBytes, bool $alternate = false): BoundedArticleResult
+            {
+                $response = ($this->fetch)($groupName, $messageId);
+
+                return is_string($response) ? BoundedArticleResult::success($response) : BoundedArticleResult::failure('Fixture provider failure');
+            }
+
             public function getMessages(string $groupName, mixed $identifiers, bool $alternate = false, ?callable $onRead = null): mixed
             {
                 $response = ($this->fetch)($groupName, $identifiers);
@@ -746,7 +835,7 @@ PHP;
             $names->method('checkName')->willReturnCallback(static function (object $release) use ($rename): bool {
                 if ($rename) {
                     Release::query()->where('id', $release->releases_id)->update([
-                        'searchname' => 'Recovered.Title.2026-GROUP', 'isrenamed' => 1,
+                        'searchname' => 'Recovered.Title.2026-GROUP', 'isrenamed' => 1, 'proc_par2' => 1,
                     ]);
                 }
 

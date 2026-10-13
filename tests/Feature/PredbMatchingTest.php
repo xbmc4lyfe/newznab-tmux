@@ -77,6 +77,8 @@ final class PredbMatchingTest extends TestCase
         DB::statement('CREATE TABLE predb (id INTEGER PRIMARY KEY, title TEXT, filename TEXT, source TEXT, size TEXT, category TEXT, nuked INTEGER DEFAULT 0)');
         DB::table('predb')->insert(['id' => 7, 'title' => 'Canonical.Scene-GROUP', 'filename' => 'File.Name-GROUP', 'source' => 'srrdb']);
         DB::statement('CREATE TABLE releases (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, searchname TEXT, totalpart INTEGER, groups_id INTEGER, adddate TEXT, guid TEXT, leftguid TEXT, postdate TEXT, fromname TEXT, size INTEGER, passwordstatus INTEGER, haspreview INTEGER, categories_id INTEGER, nfostatus INTEGER, nzbstatus INTEGER, isrenamed INTEGER, iscategorized INTEGER, predb_id INTEGER)');
+        DB::statement('PRAGMA foreign_keys = ON');
+        (require base_path('database/migrations/2026_10_11_215821_create_par2_rename_progress_table.php'))->up();
         DB::statement('CREATE TABLE usenet_groups (id INTEGER PRIMARY KEY, name TEXT)');
         DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.binaries.test']);
     }
@@ -151,10 +153,13 @@ final class PredbMatchingTest extends TestCase
         config(['nntmux.echocli' => $output]);
         $updates = $this->createMock(ReleaseUpdateService::class);
         if ($rename) {
-            $updates->expects(self::once())->method('updateRelease')->with(self::anything(), 'Canonical.Scene-GROUP', 'file matched source: srrdb', true, 'PreDB file match, ', true, false, 7);
-            $updates->expects(self::never())->method('attachPredbId');
+            $updates->expects(self::once())->method('updateRelease')->with(self::anything(), 'Canonical.Scene-GROUP', 'file matched source: srrdb', true, 'PreDB file match, ', true, false, 7)
+                ->willReturnCallback(static function () use ($updates): void {
+                    $updates->matched = true;
+                });
+            $updates->expects(self::never())->method('attachPredbSnapshot');
         } else {
-            $updates->expects(self::once())->method('attachPredbId')->with(42, 7);
+            $updates->expects(self::once())->method('attachPredbSnapshot')->with(self::callback(static fn (object $release): bool => (int) $release->releases_id === 42), 7)->willReturn(true);
             $updates->expects(self::never())->method('updateRelease');
         }
         Search::shouldReceive('searchPredb')->once()->andReturn([$this->hit()]);
@@ -165,8 +170,9 @@ final class PredbMatchingTest extends TestCase
     public function test_filename_match_does_not_attach_id_when_writes_are_disabled(): void
     {
         $updates = $this->createMock(ReleaseUpdateService::class);
+        $updates->expects(self::once())->method('currentPredbTitle')->with(7, 'Canonical.Scene-GROUP', 'File.Name-GROUP')->willReturn('Canonical.Scene-GROUP');
         $updates->expects(self::never())->method('updateRelease');
-        $updates->expects(self::never())->method('attachPredbId');
+        $updates->expects(self::never())->method('attachPredbSnapshot');
         Search::shouldReceive('searchPredb')->once()->andReturn([$this->hit()]);
 
         self::assertSame(1, (new NameFixingService(updateService: $updates))->matchPreDbFiles((object) ['releases_id' => 42, 'filename' => 'File.Name-GROUP.mkv', 'searchname' => 'Canonical.Scene-GROUP'], false, true, false));
@@ -179,7 +185,7 @@ final class PredbMatchingTest extends TestCase
         foreach (['videos_id', 'tv_episodes_id', 'imdbid', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'book_lookup_attempts', 'book_lookup_retry_at', 'book_name_normalized_at', 'tv_lookup_attempts', 'tv_lookup_retry_at', 'anidbid'] as $column) {
             DB::statement('ALTER TABLE releases ADD COLUMN '.$column.' TEXT');
         }
-        DB::table('releases')->insert(['id' => 42, 'searchname' => $rename ? 'Old.Title' : 'Canonical.Scene-GROUP', 'predb_id' => 0, 'categories_id' => 7010, 'groups_id' => 1]);
+        DB::table('releases')->insert(['id' => 42, 'guid' => 'synthetic-release-42', 'name' => 'posted-subject', 'searchname' => $rename ? 'Old.Title' : 'Canonical.Scene-GROUP', 'predb_id' => 0, 'categories_id' => 7010, 'groups_id' => 1]);
         Event::fake([ReleaseNameFixed::class]);
         Search::shouldReceive('searchPredb')->once()->andReturn([$this->hit()]);
         Search::shouldReceive('updateRelease')->times($rename ? 1 : 0)->with(42);
@@ -196,7 +202,7 @@ final class PredbMatchingTest extends TestCase
     {
         $updates = $this->createMock(ReleaseUpdateService::class);
         $updates->expects(self::never())->method('updateRelease');
-        $updates->expects(self::never())->method('attachPredbId');
+        $updates->expects(self::never())->method('attachPredbSnapshot');
         Search::shouldReceive('searchPredb')->once()->andReturn([array_replace($this->hit(), ['id' => 0])]);
         self::assertSame(0, (new NameFixingService(updateService: $updates))->matchPreDbFiles((object) ['releases_id' => 42, 'filename' => 'File.Name-GROUP.mkv', 'searchname' => 'Old.Title'], false, true, false));
     }
@@ -283,7 +289,7 @@ final class PredbMatchingTest extends TestCase
             public function __construct()
             {
                 $this->_curPre = ['title' => 'Canonical.Scene-GROUP', 'nuked' => 2];
-                $this->_oldPre = ['category' => ''];
+                $this->_oldPre = Predb::query()->find(7, ['id', 'title', 'category', 'size', 'source']);
                 $this->_debug = false;
                 $this->_silent = true;
             }

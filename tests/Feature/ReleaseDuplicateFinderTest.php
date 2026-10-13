@@ -61,12 +61,12 @@ class ReleaseDuplicateFinderTest extends TestCase
     }
 
     #[Test]
-    public function an_existing_release_with_the_same_searchname_and_size_is_a_duplicate_by_default(): void
+    public function metadata_alone_cannot_suppress_an_existing_release(): void
     {
         [$duplicate, $reason] = (new ReleaseDuplicateFinder)->findDuplicate('Show.S01E01.1080p.WEB.h264-GRP', 'Show.S01E01.1080p.WEB.h264-GRP', 42, 1_000_000_000);
 
-        $this->assertNotNull($duplicate);
-        $this->assertSame('predb_id_match', $reason);
+        $this->assertNull($duplicate);
+        $this->assertNull($reason);
     }
 
     #[Test]
@@ -98,7 +98,7 @@ class ReleaseDuplicateFinderTest extends TestCase
         $stored = NzbArticleFingerprintTest::nzb([['a1@x', 'a2@x']]);
 
         $nzb = $this->createMock(NzbService::class);
-        $nzb->method('readNzbContents')->willReturnCallback(static fn (string $guid): string|false => $guid === 'stored-guid' ? $stored : false);
+        $nzb->method('readNzbContentsBounded')->willReturnCallback(static fn (string $guid): string|false => $guid === 'stored-guid' ? $stored : false);
         $this->app->instance(NzbService::class, $nzb);
         $import = new NzbImportService(['Browser' => true]);
         $find = new ReflectionMethod($import, 'findIdenticalArticleUpload');
@@ -106,9 +106,9 @@ class ReleaseDuplicateFinderTest extends TestCase
         $same = NzbArticleFingerprint::fromContents(NzbArticleFingerprintTest::nzb([['a2@x', 'a1@x']]));
         $repost = NzbArticleFingerprint::fromContents(NzbArticleFingerprintTest::nzb([['b1@y', 'b2@y']]));
 
-        $this->assertSame(1, $find->invoke($import, 1_000_000_000, $same)?->id);
-        $this->assertNull($find->invoke($import, 1_000_000_000, $repost));
-        $this->assertNull($find->invoke($import, 999, $same));
+        $this->assertSame(1, $find->invoke($import, 1_000_000_000, $same, simplexml_load_string($stored))?->id);
+        $this->assertNull($find->invoke($import, 1_000_000_000, $repost, simplexml_load_string(NzbArticleFingerprintTest::nzb([['b1@y', 'b2@y']]))));
+        $this->assertNull($find->invoke($import, 999, $same, simplexml_load_string($stored)));
     }
 
     #[Test]
@@ -121,11 +121,11 @@ class ReleaseDuplicateFinderTest extends TestCase
         $other = NzbArticleFingerprintTest::nzb([['o1@z']]);
 
         $nzb = $this->createMock(NzbService::class);
-        $nzb->method('readNzbContents')->willReturnCallback(static fn (string $guid): string => $guid === 'stored-guid' ? $stored : $other);
+        $nzb->method('readNzbContentsBounded')->willReturnCallback(static fn (string $guid): string => $guid === 'stored-guid' ? $stored : $other);
         $this->app->instance(NzbService::class, $nzb);
         $import = new NzbImportService(['Browser' => true]);
 
-        $match = (new ReflectionMethod($import, 'findIdenticalArticleUpload'))->invoke($import, 1_000_000_000, NzbArticleFingerprint::fromContents($stored));
+        $match = (new ReflectionMethod($import, 'findIdenticalArticleUpload'))->invoke($import, 1_000_000_000, NzbArticleFingerprint::fromContents($stored), simplexml_load_string($stored));
 
         $this->assertSame('stored-guid', $match?->guid);
     }
@@ -138,14 +138,14 @@ class ReleaseDuplicateFinderTest extends TestCase
         DB::table('releases')->insert(['guid' => 'fp-guid', 'name' => 'x', 'size' => 5, 'article_fingerprint' => $fingerprint]);
 
         $nzb = $this->createMock(NzbService::class);
-        $nzb->expects($this->never())->method('readNzbContents');
+        $nzb->method('readNzbContentsBounded')->willReturn(NzbArticleFingerprintTest::nzb([['a1@x', 'a2@x']]));
         $nzb->method('nzbPath')->willReturn('/stored/fp-guid.nzb.gz');
         $this->app->instance(NzbService::class, $nzb);
         $import = new NzbImportService(['Browser' => true]);
         $find = new ReflectionMethod($import, 'findIdenticalArticleUpload');
 
-        $this->assertSame('fp-guid', $find->invoke($import, 1_000_000_000, $fingerprint)?->guid);
-        $this->assertSame('fp-guid', $find->invoke($import, 0, $fingerprint)?->guid);
+        $this->assertSame('fp-guid', $find->invoke($import, 1_000_000_000, $fingerprint, simplexml_load_string(NzbArticleFingerprintTest::nzb([['a1@x', 'a2@x']])))?->guid);
+        $this->assertSame('fp-guid', $find->invoke($import, 0, $fingerprint, simplexml_load_string(NzbArticleFingerprintTest::nzb([['a1@x', 'a2@x']])))?->guid);
     }
 
     #[Test]

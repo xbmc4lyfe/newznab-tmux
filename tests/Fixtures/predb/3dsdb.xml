@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Reduced public 3DSDB XML metadata observed 2026-10-11; literal fields retained, including two trailing tabs and one duplicate title. -->
+<releases>
+  <release>
+    <id>1</id>
+    <name>Tom Clancys Ghost Recon: Shadow Wars</name>
+    <publisher>Ubisoft</publisher>
+    <region>EUR</region>
+    <languages>en,fr,de,it,es</languages>
+    <group>Legacy</group>
+    <imagesize>2048</imagesize>
+    <serial>CTR-AGRP</serial>
+    <titleid>0004000000037500</titleid>
+    <imgcrc>5BD0B123</imgcrc>
+    <filename>lgc-grsw</filename>
+    <releasename>Tom_Clancys_Ghost_Recon_Shadow_Wars_EUR_3DS-LGC</releasename>
+    <trimmedsize>229750272</trimmedsize>
+    <firmware>1.0.0E</firmware>
+    <type>1</type>
+    <card>1</card>
+  </release>
+  <release>
+    <id>2</id>
+    <name>Super Monkey Ball 3D</name>
+    <publisher>SEGA</publisher>
+    <region>EUR</region>
+    <languages>en,fr,de,it,es</languages>
+    <group>Legacy</group>
+    <imagesize>2048</imagesize>
+    <serial>CTR-ASMP</serial>
+    <titleid>0004000000038900</titleid>
+    <imgcrc>ABD37EE3</imgcrc>
+    <filename>lgc-mb3d</filename>
+    <releasename>Super_Monkey_Ball_3D_EUR_3DS-LGC</releasename>
+    <trimmedsize>232271360</trimmedsize>
+    <firmware>1.0.0E</firmware>
+    <type>1</type>
+    <card>1</card>
+  </release>
+  <release>
+    <id>2122</id>
+    <name>The Misshitsukara no Dasshutsu Archives 1 (Simple Series for Nintendo 3DS Vol. 2)</name>
+    <publisher>D3 Publisher</publisher>
+    <region>JPN</region>
+    <languages>ja</languages>
+    <group>HR</group>
+    <imagesize>2048</imagesize>
+    <serial>CTR-BYEJ</serial>
+    <titleid>000400000018E200</titleid>
+    <imgcrc>7209C703</imgcrc>
+    <filename>hr-ssvol2</filename>
+    <releasename>Simple_Series_for_Nintendo_3DS_Vol_2_The_Misshitsu_kara_no_Dasshutsu_Archives_1_JPN_3DS-HR</releasename>
+    <trimmedsize>235380736</trimmedsize>
+    <firmware>10.1.0J</firmware>
+    <type>1</type>
+    <card>1</card>
+  </release>
+  <release>
+    <id>2123</id>
+    <name>The Misshitsukara no Dasshutsu Archives 2 (Simple Series for Nintendo 3DS Vol. 3)</name>
+    <publisher>D3 Publisher</publisher>
+    <region>JPN</region>
+    <languages>ja</languages>
+    <group>HR</group>
+    <imagesize>2048</imagesize>
+    <serial>CTR-BP3J</serial>
+    <titleid>000400000018FE00</titleid>
+    <imgcrc>D789E7BC</imgcrc>
+    <filename>hr-ssvol3</filename>
+    <releasename>Simple_Series_for_Nintendo_3DS_Vol_2_The_Misshitsu_kara_no_Dasshutsu_Archives_1_JPN_3DS-HR</releasename>
+    <trimmedsize>247664640</trimmedsize>
+    <firmware>10.1.0J</firmware>
+    <type>1</type>
+    <card>1</card>
+  </release>
+  <release>
+    <id>2418</id>
+    <name>Fire Emblem Musou (N3DS Only)</name>
+    <publisher>Koei Tecmo Games</publisher>
+    <region>JPN</region>
+    <languages>ja</languages>
+    <group>HR</group>
+    <imagesize>32768</imagesize>
+    <serial>KTR-CFMJ</serial>
+    <titleid>000400000F70C100</titleid>
+    <imgcrc>6145B1DE</imgcrc>
+    <filename>hr-fem</filename>
+    <releasename>Fire_Emblem_Musou_JPN_New3DS-HR	</releasename>
+    <trimmedsize>2240401408</trimmedsize>
+    <firmware>11.4.0J</firmware>
+    <type>1</type>
+    <card>1</card>
+  </release>
+  <release>
+    <id>2419</id>
+    <name>Mario &amp; Luigi: Superstar Saga + Bowsers Minions</name>
+    <publisher>Nintendo</publisher>
+    <region>EUR</region>
+    <languages>en,fr,de,it,es,nl</languages>
+    <group>LiGHTFORCE</group>
+    <imagesize>8192</imagesize>
+    <serial>CTR-BRMP</serial>
+    <titleid>00040000001B9000</titleid>
+    <imgcrc>86F1505B</imgcrc>
+    <filename>lfc-brmp</filename>
+    <releasename>Mario_and_Luigi-Super_Star_Saga_and_Bowsers_Minions_EUR_MULTI6_3DS-LiGHTFORCE	</releasename>
+    <trimmedsize>664670208</trimmedsize>
+    <firmware>11.4.0E</firmware>
+    <type>1</type>
+    <card>1</card>
+  </release>
+  <release>
+    <id>2533</id>
+    <name>Persona Q2 - New Cinema Labyrinth</name>
+    <publisher>Deep Silver</publisher>
+    <region>EUR</region>
+    <languages>en</languages>
+    <group>TiNGO</group>
+    <imagesize>32768</imagesize>
+    <serial>CTR-AQ2P</serial>
+    <titleid>00040000001D7600</titleid>
+    <imgcrc>2e2a7227</imgcrc>
+    <filename>tin-aq2p</filename>
+    <releasename>Persona.Q2.New.Cinema.Labyrinth.3DS-TiNGO</releasename>
+    <trimmedsize>2899566592</trimmedsize>
+    <firmware>11.8.0E</firmware>
+    <type>1</type>
+    <card>1</card>
+  </release>
+  <release>
+    <id>2535</id>
+    <name>Atooi Collection</name>
+    <publisher>Limited Run Games</publisher>
+    <region>USA</region>
+    <languages>en</languages>
+    <group>JRP</group>
+    <imagesize>8192</imagesize>
+    <serial>CTR-AUTE</serial>
+    <titleid>00040000001D9300</titleid>
+    <imgcrc>3bc5af55</imgcrc>
+    <filename>jrp-ac3ds</filename>
+    <releasename>Atooi.Collection_3DS-JRP</releasename>
+    <trimmedsize>537051136</trimmedsize>
+    <firmware>11.9.0U</firmware>
+    <type>1</type>
+    <card>1</card>
+  </release>
+</releases>

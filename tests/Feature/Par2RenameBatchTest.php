@@ -10,9 +10,11 @@ use App\Services\NameFixing\NameFixingService;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
 use App\Services\Nzb\NzbParserService;
+use App\Services\PostProcessService;
 use Carbon\CarbonImmutable;
 use DariusIII\NetNntp\Error;
 use Illuminate\Cache\ArrayStore;
+use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use RuntimeException;
@@ -246,7 +248,9 @@ class Par2RenameBatchTest extends TestCase
     public function test_grouped_reservation_claim_defers_an_overlapping_selector(): void
     {
         $release = $this->pendingPar2Release(['leftguid' => 'a']);
-        $lock = Cache::store('array')->lock('rename:standard:cursor:a:lock', 120);
+        $store = Cache::store('array')->getStore();
+        self::assertInstanceOf(LockProvider::class, $store);
+        $lock = $store->lock('rename:standard:cursor:a:lock', 120);
         $this->assertTrue($lock->get());
         try {
             $result = (new NameFixingService)->processStandardBatch('a', 1, false,
@@ -358,6 +362,7 @@ class Par2RenameBatchTest extends TestCase
             public function __construct(private \Closure $load)
             {
                 $this->parserService = new NzbParserService;
+                $this->postProcessService = app(PostProcessService::class);
             }
 
             public function loadNzb(string $guid): SimpleXMLElement|false
@@ -369,7 +374,9 @@ class Par2RenameBatchTest extends TestCase
 
     private function runBatch(): void
     {
-        (new NameFixingService)->fixNamesWithPar2(2, true, 1, true, false,
-            $this->createStub(NNTPService::class));
+        $nntp = $this->createMock(NNTPService::class);
+        $nntp->expects($this->never())->method('getMessageBounded');
+        $nntp->expects($this->never())->method('getMessages');
+        (new NameFixingService)->fixNamesWithPar2(2, true, 1, true, false, $nntp);
     }
 }
