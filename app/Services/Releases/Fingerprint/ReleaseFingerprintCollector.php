@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 9;
+    public const SCHEMA_VERSION = 10;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 
@@ -226,7 +226,11 @@ final class ReleaseFingerprintCollector
                             }
                         }
                     }
-                    $overviewFormat = $serverProfileMap[$serverKey]['overview_format_raw'] ?? [];
+                    $overviewFormatRaw = $serverProfileMap[$serverKey]['overview_format_raw'] ?? [];
+                    $overviewFormat = is_array($overviewFormatRaw)
+                        ? array_values(array_filter($overviewFormatRaw, 'is_string')) : [];
+                    $overviewFormatCodeRaw = $serverProfileMap[$serverKey]['overview_format_response_code'] ?? null;
+                    $overviewFormatResponseCode = is_int($overviewFormatCodeRaw) ? $overviewFormatCodeRaw : null;
                     $overviewFields = $this->parseOverview($article['overview_raw'], $overviewFormat);
                     $articleIdentity = (new NativeMetadataParser)->parseArticleIdentity(
                         '<'.$sample['messageid'].'>',
@@ -242,6 +246,22 @@ final class ReleaseFingerprintCollector
                     $metadata['article_identity'] = $articleIdentity ?? [
                         'parser_engine' => null,
                         'schema_version' => self::SCHEMA_VERSION,
+                        'collection_status' => 'unavailable',
+                        'reason' => 'native_parser_unavailable_or_input_exceeded_budget',
+                    ];
+                    $articleXref = (new NativeMetadataParser)->parseArticleXref(
+                        $article['headers'],
+                        $article['overview_rows'],
+                        $overviewFormat,
+                        $article['head_response']['response_code'],
+                        $article['overview_response_code'],
+                        $article['overview_attempted'],
+                        $article['overview_row_count'],
+                        $overviewFormatResponseCode,
+                    );
+                    $metadata['article_xref'] = $articleXref ?? [
+                        'parser_engine' => null,
+                        'schema_version' => 1,
                         'collection_status' => 'unavailable',
                         'reason' => 'native_parser_unavailable_or_input_exceeded_budget',
                     ];
@@ -926,13 +946,21 @@ final class ReleaseFingerprintCollector
                 && ($observation['metadata']['article_identity']['schema_version'] ?? null) === 2
                 && ($observation['metadata']['article_identity']['request']['syntax_status'] ?? null) === 'valid',
         )) === count($observations);
-        $status = $allSamplesAvailable && $par2Complete && $providerCoverageComplete && $profileCoverageComplete && $identityParserCoverageComplete ? 'complete' : 'partial';
+        $xrefParserCoverageComplete = $observations !== [] && count(array_filter(
+            $observations,
+            static fn (array $observation): bool => ($observation['metadata']['article_xref']['parser_engine'] ?? null)
+                === 'nntmux-rust-article-xref'
+                && ($observation['metadata']['article_xref']['schema_version'] ?? null) === 1,
+        )) === count($observations);
+        $status = $allSamplesAvailable && $par2Complete && $providerCoverageComplete && $profileCoverageComplete
+            && $identityParserCoverageComplete && $xrefParserCoverageComplete ? 'complete' : 'partial';
 
         return [
             'status' => $status,
             'data' => [
                 'schema_version' => self::SCHEMA_VERSION,
                 'article_identity_parser_coverage_complete' => $identityParserCoverageComplete,
+                'article_xref_parser_coverage_complete' => $xrefParserCoverageComplete,
                 'collection_policy' => [
                     'all_nzb_files_listed' => true,
                     'non_par2_article_samples_per_file' => 'first, middle, and last segment; repeated Message-IDs are deduplicated within each NZB file',
