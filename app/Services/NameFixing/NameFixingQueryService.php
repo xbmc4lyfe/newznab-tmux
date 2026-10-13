@@ -364,6 +364,10 @@ final class NameFixingQueryService
         if (! $multipleTuples) {
             return ['known' => true, 'usable' => true, 'overflow' => false, 'donors' => [], 'generation' => $cursor.':'.$count];
         }
+
+        // One matching PAR2 file may be a shared readme or other support file. Only
+        // nominate donors when at least two distinct files cover the complete target
+        // inventory and the donor has no additional unmatched files.
         $donors = $this->database->select('SELECT DISTINCT r.id AS releases_id, r.guid AS donor_guid,
                 r.searchname, r.fromname, r.predb_id, p.title AS canonical_title
             FROM par_file_hashes t

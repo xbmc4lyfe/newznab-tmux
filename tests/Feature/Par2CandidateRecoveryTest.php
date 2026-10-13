@@ -500,6 +500,30 @@ final class Par2CandidateRecoveryTest extends TestCase
         self::assertSame(9, $release->fresh()->predb_id);
     }
 
+    public function test_named_article_receipt_hook_can_defer_without_committing_metadata(): void
+    {
+        $release = $this->pendingPar2Release();
+        [$main, $rest] = $this->largeMetadata();
+        $applications = [];
+        $received = 0;
+        $result = $this->runRecovery($this->candidate([$main, $rest]), $release,
+            ['article-1' => BoundedArticleResult::success($main)], $this->postprocessor($applications),
+            onArticleReceived: static function () use (&$received): bool {
+                $received++;
+
+                return false;
+            }
+        );
+
+        self::assertSame(Par2RenameOutcome::Deferred, $result->outcome);
+        self::assertSame(1, $result->probes);
+        self::assertSame(1, $result->articles);
+        self::assertSame(1, $received);
+        self::assertSame([], $applications);
+        self::assertSame(0, DB::table('par2_rename_candidate_progress')->count());
+        self::assertSame(0, $release->fresh()->proc_par2);
+    }
+
     /** @param list<string> $parts @return array{subject:string, explicit:bool, segments:list<array{number:int,id:string,bytes:int}>} */
     private function candidate(array $parts): array
     {
@@ -512,7 +536,7 @@ final class Par2CandidateRecoveryTest extends TestCase
     }
 
     /** @param array<string,mixed> $candidate @param array<string,BoundedArticleResult> $articles */
-    private function runRecovery(array $candidate, Release $release, array $articles, PostProcessService $post, int $budget = 1, int $maxArticleBytes = 10000, int $maxStateBytes = 10000, string $manifest = self::MANIFEST): Par2CandidateRecoveryResult
+    private function runRecovery(array $candidate, Release $release, array $articles, PostProcessService $post, int $budget = 1, int $maxArticleBytes = 10000, int $maxStateBytes = 10000, string $manifest = self::MANIFEST, ?callable $onArticleReceived = null): Par2CandidateRecoveryResult
     {
         $nntp = Mockery::mock(NNTPService::class);
         foreach ($articles as $id => $result) {
@@ -522,7 +546,7 @@ final class Par2CandidateRecoveryTest extends TestCase
             $nntp->shouldNotReceive('getMessageBounded');
         }
 
-        return (new Par2CandidateRecovery($nntp, $post))->recover($candidate, $this->snapshot($release), $manifest, 1, 0, $budget, $maxArticleBytes, $maxStateBytes, static fn (): bool => true);
+        return (new Par2CandidateRecovery($nntp, $post))->recover($candidate, $this->snapshot($release), $manifest, 1, 0, $budget, $maxArticleBytes, $maxStateBytes, static fn (): bool => true, onArticleReceived: $onArticleReceived);
     }
 
     /** @param list<array{files:array,terminal:bool}> $applications */

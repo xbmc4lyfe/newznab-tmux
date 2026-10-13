@@ -34,8 +34,15 @@ final class RssFeedSource extends BoundedHttpFeedSource
         private readonly bool $mapCategory = false,
         private readonly bool $publicationDatesOnly = false,
         private readonly bool $stripDisplaySizeSuffix = false,
+        ?int $maximumBodyBytes = null,
     ) {
-        parent::__construct($endpoint, $pageSize, $timeout, $userAgent);
+        parent::__construct(
+            $endpoint,
+            $pageSize,
+            $timeout,
+            $userAgent,
+            $maximumBodyBytes ?? (int) config('predb_feeds.max_body_bytes', 1048576),
+        );
     }
 
     public function key(): string
@@ -89,6 +96,7 @@ final class RssFeedSource extends BoundedHttpFeedSource
         if (count($document->channel->item) > self::MAXIMUM_ITEMS) {
             throw new RuntimeException($this->sourceLabel.' RSS document exceeds the item limit.');
         }
+
         $entries = [];
 
         foreach ($document->channel->item as $item) {

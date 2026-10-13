@@ -130,6 +130,24 @@ final class Par2FullHashMatchingTest extends TestCase
         self::assertSame(20, (int) $result['donors'][0]->releases_id);
     }
 
+    public function test_shared_file_does_not_link_when_release_inventories_differ(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Scene.Release.2026-GRPA');
+        $shared = ['full' => md5('shared readme'), 'prefix' => md5('shared readme prefix'), 'size' => 100];
+        $unique = ['full' => md5('target payload'), 'prefix' => md5('target payload prefix'), 'size' => 200];
+        $this->remember(42, $shared['full'], $shared['prefix'], $shared['size']);
+        $this->remember(42, $unique['full'], $unique['prefix'], $unique['size']);
+        $this->remember(20, $shared['full'], $shared['prefix'], $shared['size']);
+
+        self::assertSame([], $this->lookup()['donors']);
+
+        $this->remember(20, $unique['full'], $unique['prefix'], $unique['size']);
+        $result = $this->lookup();
+        self::assertCount(1, $result['donors']);
+        self::assertSame(20, (int) $result['donors'][0]->releases_id);
+    }
+
     public function test_all_130_target_keys_are_considered_before_canonical_identity_selection(): void
     {
         $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
@@ -137,8 +155,7 @@ final class Par2FullHashMatchingTest extends TestCase
         $this->donor(30, 2, 'Scene.Release.2026-GRPB');
         foreach (range(1, 130) as $key) {
             $this->remember(42, md5('full-'.$key), md5('prefix-'.$key), 12900000000 + $key);
-            $id = $key === 130 ? 30 : 20;
-            $this->remember($id, md5('full-'.$key), md5('prefix-'.$key), 12900000000 + $key);
+            $this->remember($key === 130 ? 30 : 20, md5('full-'.$key), md5('prefix-'.$key), 12900000000 + $key);
         }
         $result = $this->lookup();
         self::assertSame([], $result['donors']);

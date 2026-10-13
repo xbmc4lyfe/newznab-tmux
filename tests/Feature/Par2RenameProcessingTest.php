@@ -820,6 +820,14 @@ PHP;
                 return is_string($response) ? BoundedArticleResult::success($response) : BoundedArticleResult::failure('Fixture provider failure');
             }
 
+            public function getMessages(string $groupName, mixed $identifiers, bool $alternate = false, ?callable $onRead = null): mixed
+            {
+                $response = ($this->fetch)($groupName, $identifiers);
+                $onRead?->__invoke();
+
+                return $response;
+            }
+
             public function doQuit(bool $force = false): mixed
             {
                 return true;

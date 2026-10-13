@@ -358,7 +358,7 @@ class NzbContentsService
                     return Par2RenameOutcome::Deferred;
                 }
                 $result = $recovery->recover($candidates[$index], $snapshot, $signature, $groupID, $show,
-                    $budget - $this->par2Stats['candidates_probed'], $maxArticleBytes, $maxStateBytes, $guard, $onArticleRead);
+                    $budget - $this->par2Stats['candidates_probed'], $maxArticleBytes, $maxStateBytes, $guard, onArticleReceived: $onArticleRead, onRead: $onArticleRead);
                 $this->par2Stats['candidates_probed'] += $result->probes;
                 $this->par2Stats['articles_received'] += $result->articles;
                 $outcome = $result->outcome;
