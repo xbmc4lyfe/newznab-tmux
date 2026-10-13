@@ -1144,7 +1144,7 @@ class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterfac
             return [];
         }
 
-        $cacheKey = $this->buildCacheKey('predb_search_v2', [$keywords]); // @phpstan-ignore argument.type
+        $cacheKey = $this->buildCacheKey('predb_search_v3', [$keywords]); // @phpstan-ignore argument.type
         $cached = Cache::get($cacheKey);
         if ($cached !== null) {
             return $cached;
@@ -1161,6 +1161,8 @@ class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterfac
                 ],
                 includeDateSort: false
             );
+
+            $search['body']['_source'] = ['title', 'filename', 'source'];
 
             $result = $this->executeSearch($search, fullResults: true);
             Cache::put($cacheKey, $result, now()->addMinutes($this->config['cache_minutes'] ?? self::CACHE_TTL_MINUTES));
