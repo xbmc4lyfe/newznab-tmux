@@ -14,17 +14,17 @@
 
 ## Release identification follow-up (implemented, not deployed)
 
-- [x] Exclude explicitly named recovery-volume subjects from naming probes, preserving explicit indexes, legacy candidates, bounded hidden candidates and durable resume (PR #83 supersedes the earlier volume-priority policy).
+- [x] Exclude explicitly named recovery-volume subjects from ordinary naming probes, preserving explicit indexes, legacy candidates, bounded hidden candidates and durable resume. The follow-up permits only same-family recovery volumes backed by an unblocked saved partial index; standalone first-block volumes remain excluded.
 - [x] Preserve string results from the release name cleaner and recheck cleaner-supplied PreDB references against their current stored title. Missing or changed references no longer attach an unrelated identity.
 - [x] Run the affected PAR2, payload metadata, and PreDB matching regressions: 95 tests, 469 assertions (11 PHPUnit notices).
 - [ ] Deploy through the single deployment owner and measure historical rename yield versus arrivals. The regression checks prove the repaired mechanisms, not sustained throughput or a shrinking production backlog.
 
 ## Retest the final synchronized PreDB/publication integration
 
-PR #73 is reconciled with fork master through PR #90, including fingerprint metadata (#84), native workflow checks (#86), renewable PAR2 sweep leases (#87), poster-search/verification repairs (#88), fingerprint parser/typing corrections (#89), and exact poster query/index repairs (#90). Concurrent source updates retain the configurable RSS body cap and post-article callback alongside bounded-read ownership renewal. Targeted checks qualify their reproduced cases; complete integrated qualification remains deferred.
+The PR #73 review follow-up incorporates the merged PreDB/publication changes and fork master through PR #90, including fingerprint metadata (#84), native workflow checks (#86), renewable PAR2 sweep leases (#87), poster-search/verification repairs (#88), fingerprint parser/typing corrections (#89), and exact poster query/index repairs (#90). It retains the configurable RSS body cap and post-article callback alongside bounded-read ownership renewal. Completeness markers require a complete Main inventory with exact current evidence coverage; the additive marker migration supports earlier PR database snapshots without certifying their existing evidence. Targeted checks qualify their reproduced cases; complete integrated qualification remains deferred.
 
 - [ ] Run the complete PHPUnit suite with an explicit 2 GiB PHP memory limit, native tests/parity, frontend build and required CI on the final synchronized PR head. A combined run aborted at the host default 128 MiB limit; that runtime failure is not a failing application assertion.
-- [ ] Retest donor inventory/canonical identity, bounded RSS wire/decoded/item limits, multipart checkpoint resume and primary/alternate bounded-read ownership renewal together. Retain processing claims, exact release snapshots and recovery-volume exclusion.
+- [ ] Retest donor inventory/canonical identity, completeness generation/invalidation and reset, fresh/upgrade migration ownership, bounded RSS wire/decoded/item limits, multipart checkpoint resume and primary/alternate bounded-read ownership renewal together. Retain processing claims, exact release snapshots and the same-family partial-index guard for recovery volumes.
 - [ ] Retest article-set coverage against independently reconstructed stored/emitted NZBs, publication transaction/row-lock rechecks, fingerprint after-commit dispatch, queue isolation, rollback and cleanup/reset behavior in private runtimes.
 - [ ] Validate source/image/schema and live release/NZB/search evidence only through the single deployment owner after explicit deployment and writer-resume authorization. No deployment or production qualification is included in this audit.
 

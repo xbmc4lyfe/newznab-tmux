@@ -252,6 +252,25 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
         self::assertSame(['one', 'hidden'], $this->fetched);
     }
 
+    public function test_same_family_volume_can_recover_a_saved_partial_index_on_the_next_sweep(): void
+    {
+        $release = $this->release();
+        [$main, $rest] = $this->metadata();
+        $xml = $this->nzb([$main, $rest]);
+        $xml->file[0]['subject'] = '"release.par2" yEnc';
+        $volume = $xml->addChild('file');
+        $volume->addAttribute('subject', '"release.vol001+002.par2" yEnc');
+        $segment = $volume->addChild('segments')->addChild('segment', 'volume');
+        $segment->addAttribute('number', '1');
+        $segment->addAttribute('bytes', (string) strlen($main.$rest));
+
+        self::assertSame(Par2RenameOutcome::Deferred, $this->service($xml, ['one' => BoundedArticleResult::success($main)])->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        self::assertSame(1, DB::table('par2_rename_candidate_progress')->value('next_segment'));
+        self::assertSame(Par2RenameOutcome::Renamed, $this->service($xml, ['volume' => BoundedArticleResult::success($main.$rest)])->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        self::assertSame(['one', 'volume'], $this->fetched);
+        self::assertSame(1, (int) $release->fresh()->isrenamed);
+    }
+
     #[DataProvider('malformedSegments')]
     public function test_malformed_advertised_bytes_or_number_sequences_remain_pending_without_fetch(string $number, string $bytes): void
     {

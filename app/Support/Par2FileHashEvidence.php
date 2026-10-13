@@ -93,7 +93,7 @@ final class Par2FileHashEvidence
                     $captured[$column] = $current->{$column} ?? null;
                 }
                 $captured = array_merge($captured, $expectedSnapshot);
-                DB::table('par_file_hashes')->where('releases_id', $releaseId)
+                $staleRowsRemoved = DB::table('par_file_hashes')->where('releases_id', $releaseId)
                     ->whereRaw('HEX(release_guid) <> ?', [strtoupper(bin2hex($current->guid))])->delete();
                 $exactSize = self::sizeDecimal($size) ?? '';
                 $repaired = 0;
@@ -109,6 +109,9 @@ final class Par2FileHashEvidence
                     'hash16k' => strtolower($hash16k), 'full_md5' => strtolower($fullMd5),
                     'file_size' => $exactSize,
                 ]) > 0;
+                if ($staleRowsRemoved > 0 || $repaired > 0 || $inserted) {
+                    DB::table('par_file_hash_inventories')->where('releases_id', $releaseId)->delete();
+                }
                 if (! DB::table('par_hashes')->where('releases_id', $releaseId)->where('hash', strtolower($hash16k))->exists()) {
                     DB::table('par_hashes')->insertOrIgnore(['releases_id' => $releaseId, 'hash' => strtolower($hash16k)]);
                 }
@@ -132,6 +135,79 @@ final class Par2FileHashEvidence
                     if ($actual !== $value) {
                         throw $aborted;
                     }
+                }
+
+                return true;
+            });
+        } catch (RuntimeException $exception) {
+            if ($exception === $aborted) {
+                return false;
+            }
+            throw $exception;
+        }
+    }
+
+    /**
+     * Compare under the caller's release row lock. A complete current set must not
+     * certify descriptors retained from a different, still partial recovery set.
+     *
+     * @param  list<array{name?: string, size?: int|float, size_decimal?: string, hash?: string, hash_16K?: string, blocks?: int, next_offset?: int}>  $files
+     */
+    public static function inventoryEvidenceMatches(int $releaseId, string $guid, array $files): bool
+    {
+        $expected = [];
+        foreach ($files as $file) {
+            $size = self::sizeDecimal($file['size_decimal'] ?? $file['size'] ?? null);
+            if (! isset($file['hash'], $file['hash_16K']) || $size === null) {
+                return false;
+            }
+            $expected[strtolower($file['hash_16K']).':'.strtolower($file['hash']).':'.$size] = true;
+        }
+        if ($expected === []) {
+            return false;
+        }
+        $stored = DB::table('par_file_hashes')->where('releases_id', $releaseId)
+            ->whereRaw('HEX(release_guid) = ?', [strtoupper(bin2hex($guid))]);
+        if ((clone $stored)->count() !== count($expected)) {
+            return false;
+        }
+        foreach ($stored->select(['hash16k', 'full_md5', 'file_size'])->cursor() as $row) {
+            $key = $row->hash16k.':'.$row->full_md5.':'.$row->file_size;
+            if (! isset($expected[$key])) {
+                return false;
+            }
+            unset($expected[$key]);
+        }
+
+        return $expected === [];
+    }
+
+    /** @param array<string, mixed> $expectedSnapshot
+     * @param  null|callable(): bool  $guard
+     */
+    public static function markInventoryComplete(int $releaseId, array $expectedSnapshot, ?callable $guard = null): bool
+    {
+        $aborted = new RuntimeException('PAR2 inventory completeness ownership changed.');
+        try {
+            return DB::transaction(function () use ($releaseId, $expectedSnapshot, $guard, $aborted): bool {
+                $current = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
+                if (! self::snapshotMatches($current, $expectedSnapshot) || ($guard !== null && ! $guard())) {
+                    throw $aborted;
+                }
+                $evidence = DB::table('par_file_hashes')->where('releases_id', $releaseId)
+                    ->whereRaw('HEX(release_guid) = ?', [strtoupper(bin2hex($current->guid))]);
+                $count = (int) (clone $evidence)->count();
+                if ($count === 0) {
+                    return false;
+                }
+                $lastId = (int) (clone $evidence)->max('id');
+                DB::table('par_file_hash_inventories')->updateOrInsert(
+                    ['releases_id' => $releaseId],
+                    ['release_guid' => $current->guid, 'evidence_last_id' => $lastId, 'evidence_count' => $count],
+                );
+                if (($guard !== null && ! $guard())
+                    || ! self::snapshotMatches(DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first(), $expectedSnapshot)) {
+                    throw $aborted;
                 }
 
                 return true;

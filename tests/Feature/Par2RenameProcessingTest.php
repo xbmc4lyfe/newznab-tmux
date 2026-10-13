@@ -547,6 +547,19 @@ PHP;
         $this->assertSame(1, (int) $release->fresh()->proc_par2);
     }
 
+    public function test_first_single_block_volume_alone_does_not_bypass_the_partial_index_guard(): void
+    {
+        $release = $this->release();
+        $service = $this->service($this->nzb([
+            ['"set.vol000+01.par2" yEnc', 'first-volume'],
+        ]), ['first-volume' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
+
+        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame([], $this->downloaded);
+        $this->assertSame(0, (int) $release->fresh()->isrenamed);
+        $this->assertSame(1, (int) $release->fresh()->proc_par2);
+    }
+
     public function test_recovery_volumes_from_multiple_families_are_not_probed(): void
     {
         $release = $this->release();

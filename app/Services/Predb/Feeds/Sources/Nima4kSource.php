@@ -62,6 +62,25 @@ final class Nima4kSource extends BoundedHttpFeedSource
         if ($html === '' || preg_match('//u', $html) !== 1) {
             throw new RuntimeException('NIMA4K returned invalid HTML.');
         }
+        $invalidNumericReference = false;
+        preg_replace_callback('/&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));?/', static function (array $match) use (&$invalidNumericReference): string {
+            $hexadecimal = $match[1] !== '';
+            $digits = $hexadecimal ? $match[1] : $match[2];
+            $limit = $hexadecimal ? '10ffff' : '1114111';
+            $normalized = ltrim(strtolower($digits), '0');
+            $normalized = $normalized === '' ? '0' : $normalized;
+            $tooLarge = strlen($normalized) > strlen($limit)
+                || (strlen($normalized) === strlen($limit) && strcmp($normalized, $limit) > 0);
+            $codepoint = $tooLarge ? 0 : (int) ($hexadecimal ? hexdec($normalized) : $normalized);
+            if ($tooLarge || $codepoint === 0 || ($codepoint >= 0xD800 && $codepoint <= 0xDFFF)) {
+                $invalidNumericReference = true;
+            }
+
+            return $match[0];
+        }, $html);
+        if ($invalidNumericReference) {
+            throw new RuntimeException('NIMA4K returned an invalid numeric character reference.');
+        }
 
         $document = new DOMDocument;
         $previous = libxml_use_internal_errors(true);

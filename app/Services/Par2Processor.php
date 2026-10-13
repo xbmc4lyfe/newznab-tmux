@@ -151,7 +151,7 @@ class Par2Processor
         }
         $aborted = new RuntimeException('PAR2 inventory ownership or release snapshot changed.');
         try {
-            return DB::transaction(function () use ($query, $files, $evidence, $complete, $show, $canPersist, $aborted): Par2RenameOutcome {
+            return DB::transaction(function () use ($query, $files, $evidence, $inventory, $complete, $show, $canPersist, $aborted): Par2RenameOutcome {
                 $this->assertInventorySnapshot($query, $canPersist, $aborted);
                 foreach ($evidence as $file) {
                     if (! isset($file['hash'], $file['hash_16K'])) {
@@ -165,6 +165,24 @@ class Par2Processor
                         throw $aborted;
                     }
                     $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                }
+                $hashEvidenceComplete = $complete && $inventory->hasCompleteMainInventory() && $evidence !== [];
+                foreach ($evidence as $file) {
+                    if (! isset($file['hash'], $file['hash_16K'])) {
+                        $hashEvidenceComplete = false;
+                        break;
+                    }
+                }
+                $hashEvidenceComplete = $hashEvidenceComplete && Par2FileHashEvidence::inventoryEvidenceMatches(
+                    (int) $query->id, (string) $query->guid, $evidence,
+                );
+                if ($hashEvidenceComplete && ! Par2FileHashEvidence::markInventoryComplete(
+                    (int) $query->id,
+                    ['id' => (int) $query->id, 'guid' => (string) $query->guid, 'name' => $query->name,
+                        'searchname' => $query->searchname, 'predb_id' => 0, 'isrenamed' => 0],
+                    $canPersist,
+                )) {
+                    throw $aborted;
                 }
                 if ($this->addPar2) {
                     $createdTime = $query['postdate'] !== null ? Carbon::createFromFormat('Y-m-d H:i:s', $query['postdate']) : now();

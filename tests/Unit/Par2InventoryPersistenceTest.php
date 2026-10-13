@@ -95,6 +95,7 @@ final class Par2InventoryPersistenceTest extends TestCase
         });
         $container->instance('db.schema', $schema);
         (require base_path('database/migrations/2026_10_12_010315_create_par_file_hash_evidence_tables.php'))->up();
+        (require base_path('database/migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->up();
         Search::swap(new class
         {
             public function updateRelease(int $id): void {}
