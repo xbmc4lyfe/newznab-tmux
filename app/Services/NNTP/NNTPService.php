@@ -6,6 +6,7 @@ namespace App\Services\NNTP;
 
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Tmux\Tmux;
+use App\Services\Yenc\ArticleFrame;
 use App\Services\Yenc\YencPart;
 use App\Services\YencService;
 use DariusIII\NetNntp\Client as NntpClient;
@@ -811,6 +812,172 @@ class NNTPService extends NntpClient
         $this->_enableCompression();
 
         return parent::getGroups($wildMat);
+    }
+
+    /**
+     * Fetch exactly one complete article, with a decoded byte ceiling independent of yEnc file size.
+     * Failures never expose a prefix. The alternate provider is tried once, except for oversize input.
+     */
+    public function getMessageBounded(string $groupName, string $messageId, int $maxDecodedBytes, bool $alternate = false): BoundedArticleResult
+    {
+        if ($maxDecodedBytes < 1 || $maxDecodedBytes > intdiv(PHP_INT_MAX - 65538, 5)) {
+            throw new \InvalidArgumentException('The decoded article ceiling must be positive and permit a bounded wire ceiling.');
+        }
+        $identifier = $this->_formatMessageID($messageId);
+        if ($identifier === false || strlen($identifier) > 505 || preg_match('/[\x00-\x20\x7f]/', $identifier)) {
+            return BoundedArticleResult::failure('Invalid article Message-ID.');
+        }
+
+        $result = $this->fetchBoundedArticle($groupName, $identifier, $maxDecodedBytes);
+        if ($result->body !== null || $result->oversized || ! $alternate) {
+            return $result;
+        }
+
+        $client = $this->createBoundedArticleClient();
+        try {
+            $connected = $client->doConnect(false, $this->_currentServer === $this->_configServer);
+            if ($connected !== true) {
+                return BoundedArticleResult::failure('The alternate article provider could not connect.');
+            }
+
+            return $client->fetchBoundedArticle($groupName, $identifier, $maxDecodedBytes);
+        } catch (\Exception $exception) {
+            return BoundedArticleResult::failure('The alternate article provider failed: '.$exception->getMessage());
+        } finally {
+            $client->discardBoundedArticleConnection();
+        }
+    }
+
+    protected function createBoundedArticleClient(): self
+    {
+        return new self(yencService: $this->_yencService);
+    }
+
+    /** Abort without QUIT: an unread BODY must never be reused as a command response. */
+    protected function discardBoundedArticleConnection(): void
+    {
+        if (is_resource($this->_socket)) {
+            fclose($this->_socket);
+        }
+        $this->_resetProperties();
+    }
+
+    private function fetchBoundedArticle(string $groupName, string $identifier, int $maxDecodedBytes): BoundedArticleResult
+    {
+        try {
+            if ($this->_checkConnection(false) !== true) {
+                $this->discardBoundedArticleConnection();
+
+                return BoundedArticleResult::failure('The article provider could not connect.');
+            }
+            $group = $this->selectGroup($groupName);
+            if (self::isError($group) || $group === false) {
+                $this->discardBoundedArticleConnection();
+
+                return BoundedArticleResult::failure('The article group could not be selected.');
+            }
+            $response = $this->_sendCommand('BODY '.$identifier);
+            if ($response !== ResponseCode::BodyFollows->value) {
+                $this->discardBoundedArticleConnection();
+
+                return BoundedArticleResult::failure('The article provider did not return a BODY.');
+            }
+
+            return $this->readBoundedArticle($maxDecodedBytes);
+        } catch (\Exception $exception) {
+            $this->discardBoundedArticleConnection();
+
+            return BoundedArticleResult::failure('The article could not be read: '.$exception->getMessage());
+        }
+    }
+
+    /**
+     * Wire ceiling includes framing, line endings, stuffing and the terminator. Five bytes per
+     * decoded byte covers escaped one-byte lines; 64 KiB allows control lines and other framing.
+     * Each fgets reads at most 8191 bytes and is tightened at the ceiling: at most one excess byte
+     * is consumed, never appended. Body plus unfinished line therefore stays within the ceiling.
+     */
+    private function readBoundedArticle(int $maxDecodedBytes): BoundedArticleResult
+    {
+        $maxWireBytes = 5 * $maxDecodedBytes + 65536;
+        $received = 0;
+        $body = '';
+        $line = '';
+        while (is_resource($this->_socket) && ! feof($this->_socket)) {
+            $fragment = @fgets($this->_socket, min(8192, $maxWireBytes - $received + 2));
+            if ($fragment === false || $fragment === '') {
+                break;
+            }
+            $received += strlen($fragment);
+            if ($received > $maxWireBytes) {
+                $this->discardBoundedArticleConnection();
+
+                return BoundedArticleResult::failure('Article wire byte ceiling exceeded.', true);
+            }
+            $line .= $fragment;
+            if (! str_ends_with($line, "\n")) {
+                continue;
+            }
+            if ($line === ".\r\n") {
+                return $this->decodeBoundedArticle($body, $maxDecodedBytes);
+            }
+            $body .= str_starts_with($line, '..') ? substr($line, 1) : $line;
+            $line = '';
+        }
+        $this->discardBoundedArticleConnection();
+
+        return BoundedArticleResult::failure('Article ended before the BODY terminator.');
+    }
+
+    private function decodeBoundedArticle(string $body, int $maxDecodedBytes): BoundedArticleResult
+    {
+        $frame = ArticleFrame::parse($body);
+        if ($frame === null) {
+            if (preg_match('/(?:^|\n)=y(?:begin|part|end)(?:[ \t\r\n]|$)/i', $body)) {
+                return BoundedArticleResult::failure('Incomplete or invalid yEnc article framing.');
+            }
+            if (strlen($body) > $maxDecodedBytes) {
+                return BoundedArticleResult::failure('Article decoded byte ceiling exceeded.', true);
+            }
+
+            return BoundedArticleResult::success($body);
+        }
+        if (preg_match_all('/(?:^|\n)=ybegin(?:[ \t\r\n]|$)/i', $body) !== 1) {
+            return BoundedArticleResult::failure('Multiple yEnc frames in one article.');
+        }
+
+        // Count actual decoded bytes before the decoder allocates output, ignoring claimed sizes.
+        $decodedBytes = 0;
+        $escaped = false;
+        $end = $frame->payloadOffset + $frame->payloadLength;
+        for ($offset = $frame->payloadOffset; $offset < $end; $offset++) {
+            $byte = $body[$offset];
+            if ($byte === "\r" || $byte === "\n") {
+                continue;
+            }
+            if (! $escaped && $byte === '=') {
+                $escaped = true;
+
+                continue;
+            }
+            $escaped = false;
+            if (++$decodedBytes > $maxDecodedBytes) {
+                return BoundedArticleResult::failure('Article decoded byte ceiling exceeded.', true);
+            }
+        }
+        $this->_yencService ??= app(YencService::class);
+        $decoded = $this->_yencService->decode($body);
+        if ($decoded === false || strlen($decoded) !== $decodedBytes) {
+            return BoundedArticleResult::failure('Article yEnc decoding failed.');
+        }
+
+        return BoundedArticleResult::success($decoded, new YencPart(
+            name: $frame->header['name'],
+            size: (int) $frame->header['size'],
+            part: isset($frame->header['part']) ? (int) $frame->header['part'] : null,
+            begin: isset($frame->part['begin']) ? (int) $frame->part['begin'] : null,
+            end: isset($frame->part['end']) ? (int) $frame->part['end'] : null,
+        ));
     }
 
     /**

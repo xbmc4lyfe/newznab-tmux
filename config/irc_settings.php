@@ -158,6 +158,16 @@ return [
             'tls' => true,
             'channels' => ['#pre' => null],
         ],
+        // Public mixed-format relay: receipt is only an observation; upstream PRE time stays unknown.
+        'opentrackers' => [
+            'enabled' => (bool) env('SCRAPE_IRC_OPENTRACKERS_ENABLED', false),
+            'format' => 'opentrackers',
+            'source' => 'opentrackers-relay',
+            'server' => env('SCRAPE_IRC_OPENTRACKERS_SERVER', 'irc.opentrackers.org'),
+            'port' => (int) env('SCRAPE_IRC_OPENTRACKERS_PORT', 6697),
+            'tls' => true,
+            'channels' => ['#pre-all' => null, '#p2p-pre' => null],
+        ],
         // WebSocket push feeds (not IRC): the same rows as the predb.club and predb.net JSON APIs, about
         // a second after the pre. The scheduled feed import still backfills anything missed while disconnected.
         'predbclub_ws' => [

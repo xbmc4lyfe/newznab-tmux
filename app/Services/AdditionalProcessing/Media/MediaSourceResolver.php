@@ -12,6 +12,7 @@ use App\Services\AdditionalProcessing\Enums\DownloadKind;
 use App\Services\AdditionalProcessing\State\MediaByteBudget;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\AdditionalProcessing\UsenetDownloadService;
+use App\Services\Par2FileList;
 use dariusiii\rarinfo\Par2Info;
 
 /**
@@ -86,7 +87,7 @@ class MediaSourceResolver
                 continue;
             }
 
-            $files = Par2FileEntry::listFromPar2Info($par2Info->getFileList());
+            $files = Par2FileEntry::listFromPar2Info((new Par2FileList)->getFiles($par2Info));
             if ($files !== []) {
                 return $files;
             }

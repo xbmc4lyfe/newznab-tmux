@@ -25,6 +25,12 @@ use Symfony\Component\Process\Process;
 
 class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandidatesTest
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        DB::table('release_verification_scratch_budget')->where('id', 1)->update(['initialized' => true]);
+    }
+
     /** @return iterable<string, array{bool}> */
     public static function publicationInterruptions(): iterable
     {

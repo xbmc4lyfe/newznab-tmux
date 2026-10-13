@@ -10,6 +10,7 @@ use App\Models\UsenetGroup;
 use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Services\Predb\Irc\IrcNetworks;
 use App\Services\Predb\Irc\PreAnnounceParser;
+use App\Support\PredbSearchDocument;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -330,7 +331,7 @@ class IRCScraper extends IRCClient
      */
     protected function _checkForDupe(): void
     {
-        $this->_oldPre = Predb::query()->where('title', $this->_curPre['title'])->select(['category', 'size', 'source'])->first();
+        $this->_oldPre = Predb::query()->where('title', $this->_curPre['title'])->select(['id', 'title', 'category', 'size', 'source'])->first();
         if ($this->_oldPre === null) {
             if ($this->_debug && ! $this->_silent) {
                 echo '[DEBUG] New PRE found, inserting: '.$this->_curPre['title'].PHP_EOL;
@@ -446,7 +447,9 @@ class IRCScraper extends IRCClient
      */
     protected function _updatePre(): void
     {
-        if (empty($this->_curPre['title'])) {
+        if (empty($this->_curPre['title']) || $this->_oldPre === null
+            || PredbSearchDocument::exactValue((string) ($this->_oldPre['title'] ?? '')) !== PredbSearchDocument::exactValue((string) $this->_curPre['title'])
+        ) {
             return;
         }
 
@@ -473,15 +476,17 @@ class IRCScraper extends IRCClient
         }
 
         $query .= 'title = '.escapeString($this->_curPre['title']);
-        $query .= ' WHERE title = '.escapeString($this->_curPre['title']);
+        $query .= ' WHERE id = '.(int) $this->_oldPre['id'];
+        $query .= ' AND HEX(title) = '.escapeString(strtoupper(bin2hex((string) $this->_oldPre['title'])));
 
-        // Execute the update and then fetch the affected row ID by title.
-        DB::update($query);
+        $updated = DB::update($query);
 
-        // Look up the predb row ID by title for indexing backends.
-        $pre = Predb::query()->where('title', $this->_curPre['title'])->first(['id', 'title', 'filename', 'source']);
+        $pre = Predb::query()->find((int) $this->_oldPre['id'], ['id', 'title', 'filename', 'source']);
 
-        if ($pre !== null) {
+        if ($pre !== null
+            && PredbSearchDocument::exactValue((string) $pre->title) === PredbSearchDocument::exactValue((string) $this->_curPre['title'])
+            && ($updated > 0 || (string) $pre->title === (string) $this->_oldPre['title'])
+        ) {
             $parameters = [
                 'id' => (int) $pre->id,
                 'title' => $pre->title,

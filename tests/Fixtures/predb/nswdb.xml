@@ -1,0 +1,52 @@
+<?xml version='1.0' encoding='utf-8'?>
+<releases>
+  <!--Factual metadata subset of the public NSWDB XML export observed 2026-10-11; no game payloads.-->
+  <release>
+    <id>1</id>
+    <filename>bbb-h-aaaaap</filename>
+    <releasename>The.Legend.of.Zelda.Breath.of.the.Wild.PROPER.NSW-BigBlueBox</releasename>
+    <imagesize>16</imagesize>
+    <trimmedsize>14880118272</trimmedsize>
+    <imgcrc>5DD119C1</imgcrc>
+  </release>
+  <release>
+    <id>2</id>
+    <filename>bbb-h-aabpap</filename>
+    <releasename>Mario.Kart.8.Deluxe.PROPER.NSW-BigBlueBox</releasename>
+    <imagesize>8</imagesize>
+    <trimmedsize>7672369152</trimmedsize>
+    <imgcrc>1912A1DF</imgcrc>
+  </release>
+  <release>
+    <id>3</id>
+    <filename>bbb-h-aabqap</filename>
+    <releasename>ARMS.PROPER.NSW-BigBlueBox</releasename>
+    <imagesize>4</imagesize>
+    <trimmedsize>2787529728</trimmedsize>
+    <imgcrc>11E06E5E</imgcrc>
+  </release>
+  <release>
+    <id>1038</id>
+    <filename>v-mm11</filename>
+    <releasename>Mega_Man_11_NSW-VENOM	</releasename>
+    <imagesize>4</imagesize>
+    <trimmedsize>2681391104</trimmedsize>
+    <imgcrc>5155FFA6</imgcrc>
+  </release>
+  <release>
+    <id>2622</id>
+    <filename>v-mario_plus_rabbids_sparks_of_hope</filename>
+    <releasename>MARIO_Plus_RABBIDS_SPARKS_OF_HOPE_NSW</releasename>
+    <imagesize>8</imagesize>
+    <trimmedsize>6505238016</trimmedsize>
+    <imgcrc>8C52BB25</imgcrc>
+  </release>
+  <release>
+    <id>4086</id>
+    <filename>hr-bua6a</filename>
+    <releasename>Ayakashi_Gohan_Okawari_for_S_JPN_NSW-HR</releasename>
+    <imagesize>4</imagesize>
+    <trimmedsize>3200046080</trimmedsize>
+    <imgcrc>5DACDAFE</imgcrc>
+  </release>
+</releases>

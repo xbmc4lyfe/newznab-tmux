@@ -16,10 +16,13 @@ use Throwable;
  * Opt-in feeds that publish human-readable titles ("Show S01E01 720p WEB h264-GROUP", scnsrc.me, EZTV) set
  * $spacedTitles: whitespace becomes dots and a trailing " EZTV" tag is dropped. That is lossy (the original
  * dots, underscores and casing are unrecoverable), so those sources must stay opt-in. $mapCategory copies the
- * first RSS <category> element into the entry category.
+ * first RSS <category> element into the entry category. Catalogues can set $publicationDatesOnly
+ * so listing timestamps are never treated as PRE times.
  */
-final class RssFeedSource extends HttpFeedSource
+final class RssFeedSource extends BoundedHttpFeedSource
 {
+    private const MAXIMUM_ITEMS = 5000;
+
     public function __construct(
         private readonly string $sourceKey,
         private readonly string $sourceLabel,
@@ -29,8 +32,17 @@ final class RssFeedSource extends HttpFeedSource
         string $userAgent = 'NNTmux-PreDB-Importer/1.0',
         private readonly bool $spacedTitles = false,
         private readonly bool $mapCategory = false,
+        private readonly bool $publicationDatesOnly = false,
+        private readonly bool $stripDisplaySizeSuffix = false,
+        ?int $maximumBodyBytes = null,
     ) {
-        parent::__construct($endpoint, $pageSize, $timeout, $userAgent);
+        parent::__construct(
+            $endpoint,
+            $pageSize,
+            $timeout,
+            $userAgent,
+            $maximumBodyBytes ?? 1048576,
+        );
     }
 
     public function key(): string
@@ -47,7 +59,7 @@ final class RssFeedSource extends HttpFeedSource
             return [];
         }
 
-        return $this->parseXml($this->http()->get($this->endpoint)->throw()->body());
+        return $this->parseXml($this->downloadBody());
     }
 
     /**
@@ -57,6 +69,13 @@ final class RssFeedSource extends HttpFeedSource
      */
     public function parseXml(string $xml): array
     {
+        if (strlen($xml) > $this->maximumBodyBytes) {
+            throw $this->bodyLimitException();
+        }
+        if (preg_match('/<!(?:DOCTYPE|ENTITY)\b/i', $xml) === 1) {
+            throw new RuntimeException($this->sourceLabel.' returned an invalid RSS document.');
+        }
+        $xml = preg_replace('/\A[ \t\r\n]+(?=<\?xml[ \t\r\n])/', '', $xml) ?? $xml;
         $previous = libxml_use_internal_errors(true);
 
         try {
@@ -74,10 +93,18 @@ final class RssFeedSource extends HttpFeedSource
             return [];
         }
 
+        if (count($document->channel->item) > self::MAXIMUM_ITEMS) {
+            throw new RuntimeException($this->sourceLabel.' RSS document exceeds the item limit.');
+        }
+
         $entries = [];
 
         foreach ($document->channel->item as $item) {
             $title = trim((string) $item->title);
+
+            if ($this->stripDisplaySizeSuffix) {
+                $title = preg_replace('/ \x{2013} [0-9]+(?:\.[0-9]+)? (?:MB|GB)$/u', '', $title) ?? $title;
+            }
 
             if ($this->spacedTitles) {
                 $title = $this->dotted($title);
@@ -88,12 +115,14 @@ final class RssFeedSource extends HttpFeedSource
             }
 
             $category = $this->mapCategory ? trim((string) $item->category) : '';
+            $publishedAt = $this->parseDate((string) $item->pubDate);
 
             $entries[] = new PredbFeedEntry(
                 title: $title,
                 source: $this->sourceLabel,
                 category: $category !== '' ? $category : null,
-                predate: $this->parseDate((string) $item->pubDate),
+                predate: $this->publicationDatesOnly ? null : $publishedAt,
+                listedAt: $this->publicationDatesOnly ? $publishedAt : null,
             );
 
             if (count($entries) >= $this->pageSize) {
@@ -114,6 +143,10 @@ final class RssFeedSource extends HttpFeedSource
     private function parseDate(string $value): ?CarbonImmutable
     {
         if (trim($value) === '') {
+            return null;
+        }
+
+        if ($this->publicationDatesOnly && ! isset(date_parse($value)['zone_type'])) {
             return null;
         }
 

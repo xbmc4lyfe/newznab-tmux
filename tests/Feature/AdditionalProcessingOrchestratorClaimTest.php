@@ -87,6 +87,54 @@ class AdditionalProcessingOrchestratorClaimTest extends TestCase
         }
     }
 
+    public function test_mutated_processor_alias_cannot_redirect_batch_claim_cleanup(): void
+    {
+        Log::spy();
+        DB::table('categories')->insert(['id' => 1, 'disablepreview' => 0]);
+        foreach ([1, 2] as $id) {
+            DB::table('releases')->insert([
+                'id' => $id, 'guid' => 'a-guid-'.$id, 'leftguid' => 'a', 'name' => 'Example', 'searchname' => 'Example',
+                'size' => 2097152, 'groups_id' => 1, 'nfostatus' => -1, 'fromname' => 'poster@example.test',
+                'completion' => 100, 'categories_id' => 1, 'predb_id' => 0, 'pp_timeout_count' => 0,
+                'passwordstatus' => -1, 'haspreview' => -1, 'nzbstatus' => 1, 'postdate' => '2026-07-12 10:00:00',
+            ]);
+        }
+        $processor = new class extends ReleaseProcessor
+        {
+            public bool $secondClaimPresent = false;
+
+            public function __construct() {}
+
+            public function process(ReleaseProcessingContext $context, string $mainTmpPath): ReleaseProcessingResult
+            {
+                if ((int) $context->release->id === 1) {
+                    $context->release->id = 2;
+                    $context->release->guid = 'a-guid-2';
+                    throw new \RuntimeException('Guarded processing rejected mutated alias');
+                }
+                $this->secondClaimPresent = DB::table('releases')->where('id', 2)->value('additional_pp_claim_token') !== null;
+
+                return new ReleaseProcessingResult(2, 'a-guid-2', ProcessingOutcome::Failed, reason: 'fixture');
+            }
+        };
+        $orchestrator = new AdditionalProcessingOrchestrator($this->makeConfig(['queryLimit' => 25, 'minSizeBytes' => 0, 'maxSizeBytes' => 107374182400]), $processor, new RecordingTempWorkspaceService, new RecordingConsoleOutputService);
+        $result = $orchestrator->start('', 'a');
+        self::assertSame([1, 2], $result->claimedIds);
+        self::assertSame([true, null], [$processor->secondClaimPresent, DB::table('releases')->where('id', 1)->value('additional_pp_claim_token')]);
+        self::assertNull(DB::table('releases')->where('id', 1)->value('additional_pp_claimed_at'));
+        self::assertNull(DB::table('releases')->where('id', 2)->value('additional_pp_claim_token'));
+        self::assertSame(1, $result->results[0]->releaseId);
+        self::assertSame('a-guid-1', $result->results[0]->guid);
+        self::assertSame(ProcessingOutcome::Failed, $result->results[0]->outcome);
+        self::assertSame(2, $result->results[1]->releaseId);
+        self::assertSame('a-guid-2', $result->results[1]->guid);
+        self::assertSame('fixture', $result->results[1]->reason);
+        Log::shouldHaveReceived('error')->once()->with(
+            'Additional postprocessing failed for release 1: Guarded processing rejected mutated alias',
+            Mockery::on(static fn (array $context): bool => $context['release_id'] === 1 && $context['guid'] === 'a-guid-1'),
+        );
+    }
+
     public function test_handled_release_exception_clears_claim(): void
     {
         Log::spy();

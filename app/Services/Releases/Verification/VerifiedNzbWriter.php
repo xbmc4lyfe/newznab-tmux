@@ -54,7 +54,7 @@ final class VerifiedNzbWriter
     }
 
     /** @param array<string, mixed> $manifest */
-    private function document(array $manifest): string
+    public function document(array $manifest): string
     {
         $xml = new XMLWriter;
         $xml->openMemory();

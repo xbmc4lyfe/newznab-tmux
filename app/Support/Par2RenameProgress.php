@@ -34,8 +34,37 @@ final class Par2RenameProgress
 
                 return false;
             }
+            $previous = DB::table('par2_rename_progress')->where('releases_id', $releaseId)->first(['signature']);
+            if ($previous !== null && $previous->signature !== $signature) {
+                DB::table('par2_rename_progress')->where('releases_id', $releaseId)->delete();
+            }
             DB::table('par2_rename_progress')->updateOrInsert(['releases_id' => $releaseId],
                 ['signature' => $signature, 'offset' => $offset, 'retry_indexes' => json_encode($retryIndexes, JSON_THROW_ON_ERROR), 'updated_at' => now()]);
+
+            return true;
+        });
+    }
+
+    /**
+     * Clear completed work only while the committed identity is still terminal. A reset or
+     * replacement release may already have new candidate buffers by the time callbacks run.
+     *
+     * @param  array{id:int,guid:string,name:?string,searchname:?string}  $snapshot
+     */
+    public static function forgetCompletedSnapshot(array $snapshot): bool
+    {
+        return DB::transaction(function () use ($snapshot): bool {
+            $release = DB::table('releases')->where('id', $snapshot['id'])->lockForUpdate()
+                ->first();
+            if ($release === null || ! isset($release->id, $release->guid)
+                || ! property_exists($release, 'name') || ! property_exists($release, 'searchname')
+                || (int) $release->id !== $snapshot['id']
+                || $release->guid !== $snapshot['guid'] || $release->name !== $snapshot['name']
+                || $release->searchname !== $snapshot['searchname']
+                || ((int) ($release->predb_id ?? 0) <= 0 && (int) ($release->isrenamed ?? 0) !== 1 && (int) ($release->proc_par2 ?? 0) !== 1)) {
+                return false;
+            }
+            DB::table('par2_rename_progress')->where('releases_id', $snapshot['id'])->delete();
 
             return true;
         });

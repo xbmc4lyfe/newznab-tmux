@@ -12,6 +12,7 @@ class ReleaseNameFixed
     use Dispatchable;
     use SerializesModels;
 
+    /** @param array{id:int,guid:string,name:?string,searchname:?string}|null $expectedSnapshot */
     public function __construct(
         public readonly int $releaseId,
         public readonly string $oldName,
@@ -19,5 +20,6 @@ class ReleaseNameFixed
         public readonly int $oldCategoryId,
         public readonly int|string $groupId,
         public readonly string $poster = '',
+        public readonly ?array $expectedSnapshot = null,
     ) {}
 }

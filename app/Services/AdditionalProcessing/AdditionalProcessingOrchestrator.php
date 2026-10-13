@@ -222,21 +222,23 @@ class AdditionalProcessingOrchestrator
         $results = [];
 
         foreach ($this->releases as $release) {
+            $releaseId = (int) ($release->id ?? 0);
+            $releaseGuid = (string) ($release->guid ?? '');
             $releaseStartedAt = hrtime(true);
 
             try {
                 $results[] = $this->processor->process(new ReleaseProcessingContext($release), $this->mainTmpPath);
             } catch (\Throwable $e) {
                 $results[] = new ReleaseProcessingResult(
-                    releaseId: (int) ($release->id ?? 0),
-                    guid: (string) ($release->guid ?? ''),
+                    releaseId: $releaseId,
+                    guid: $releaseGuid,
                     outcome: ProcessingOutcome::Failed,
                     reason: $e->getMessage(),
                     elapsedSeconds: $this->elapsedSecondsSince($releaseStartedAt),
                 );
-                Log::error('Additional postprocessing failed for release '.($release->id ?? '?').': '.$e->getMessage(), [
-                    'release_id' => $release->id ?? null,
-                    'guid' => $release->guid ?? null,
+                Log::error('Additional postprocessing failed for release '.$releaseId.': '.$e->getMessage(), [
+                    'release_id' => $releaseId,
+                    'guid' => $releaseGuid,
                     'guid_char' => $guidChar,
                     'exception' => $e,
                 ]);
@@ -244,8 +246,8 @@ class AdditionalProcessingOrchestrator
                 // re-selected on the next cycle, and the pp_timeout_count /
                 // maxpptimeoutcount machinery will eventually drop it.
             } finally {
-                if ($this->claimToken !== '' && ! empty($release->id)) {
-                    AdditionalCandidateQuery::clearClaim((int) $release->id, $this->claimToken);
+                if ($this->claimToken !== '' && $releaseId > 0) {
+                    AdditionalCandidateQuery::clearClaim($releaseId, $this->claimToken);
                 }
             }
         }

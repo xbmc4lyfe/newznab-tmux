@@ -76,7 +76,7 @@ class NzbImportService
     public NzbService $nzb;
 
     /**
-     * Seconds to wait for another import of the same articles to finish (dedupe disabled).
+     * Seconds to wait for another import of the same articles to finish (all metadata settings).
      */
     protected int $identityLockWaitSeconds = 30;
 
@@ -216,10 +216,10 @@ class NzbImportService
                     continue;
                 }
 
-                // Try to insert the NZB details into the DB and store the compressed NZB. With release
-                // dedupe disabled both run under a per-article lock (see withArticleIdentityLock()).
+                // Legacy publication serializes identity checks and NZB writes under every metadata setting.
+                // Queued verification uses its own transactional candidate-admission protections.
                 $nzbFileName = $useNzbName === true ? $this->deriveReleaseNameFromNzbPath($nzbFilePath) : '';
-                $lockFingerprint = ! (bool) config('nntmux.release_dedupe_enabled', true) ? NzbArticleFingerprint::fromXml($nzbXML) : null;
+                $lockFingerprint = config('release_verification.required', true) ? null : NzbArticleFingerprint::fromXml($nzbXML);
                 $stored = false;
                 $path = null;
                 try {
@@ -532,6 +532,7 @@ class NzbImportService
                 'nzbCategoryId' => $this->resolveNzbCategoryId($nzbXML),
                 'articleFingerprint' => NzbArticleFingerprint::fromXml($nzbXML),
                 'verificationXml' => config('release_verification.required', true) ? $nzbXML->asXML() : null,
+                'articleXml' => $nzbXML,
             ]
         );
     }
@@ -583,42 +584,10 @@ class NzbImportService
         return [$stored, $path];
     }
 
-    /**
-     * With release dedupe disabled, an NZB is still a duplicate when an existing release references
-     * exactly the same articles (e.g. the same file imported twice), matched by article_fingerprint.
-     */
-    protected function findIdenticalArticleUpload(int $totalSize, ?string $fingerprint): ?Release
+    /** Compare complete article sets; metadata only nominates existing releases. */
+    protected function findIdenticalArticleUpload(int $totalSize, ?string $fingerprint, ?\SimpleXMLElement $incoming = null, string $name = '', string $searchName = '', int $predbId = 0): ?Release
     {
-        if ($fingerprint === null) {
-            return null;
-        }
-
-        foreach (ReleaseArticleFingerprintStore::candidates($fingerprint) as $persisted) {
-            // A fingerprint without its stored NZB (e.g. an import that crashed mid-write) is ignored.
-            if ($this->nzb->nzbPath((string) $persisted->guid) !== false) {
-                return $persisted;
-            }
-        }
-
-        if ($totalSize <= 0) {
-            return null;
-        }
-
-        // Releases written before article_fingerprint existed: compare stored NZBs of the same size.
-        $candidates = Release::query()
-            ->where('size', $totalSize)
-            ->when(ReleaseArticleFingerprintStore::columnExists(), static fn ($query) => $query->whereNull(ReleaseArticleFingerprintStore::COLUMN))
-            ->select(['id', 'guid', 'name', 'searchname', 'fromname', 'size'])
-            ->lazyById(200);
-
-        foreach ($candidates as $candidate) {
-            $contents = $this->nzb->readNzbContents((string) $candidate->guid);
-            if ($contents !== false && NzbArticleFingerprint::fromContents($contents) === $fingerprint) {
-                return $candidate;
-            }
-        }
-
-        return null;
+        return (new NzbArticleCoverage($this->nzb, $this->releaseDuplicateFinder))->findCoveredUpload($totalSize, $fingerprint, $incoming, $name, $searchName, $predbId);
     }
 
     protected function resolveNzbCategoryId(mixed $nzbXML): ?int
@@ -675,7 +644,7 @@ class NzbImportService
     /**
      * Serialise the identity check, insert and NZB file write for one set of articles, so two
      * concurrent imports of the same NZB cannot both pass {@see findIdenticalArticleUpload()}
-     * and a fingerprint is never visible without its stored NZB (dedupe disabled).
+     * and a fingerprint is never visible without its stored NZB (all metadata settings).
      *
      * @template TResult
      *
@@ -775,17 +744,15 @@ class NzbImportService
             $escapedSearchName = $escapedSubject;
         }
 
-        [$dupeCheck, $dupeReason] = $this->releaseDuplicateFinder->findDuplicate(
+        $dupeCheck = $this->findIdenticalArticleUpload(
+            (int) $nzbDetails['totalSize'],
+            $nzbDetails['articleFingerprint'] ?? null,
+            $nzbDetails['articleXml'] ?? null,
             $escapedSubject,
             $escapedSearchName,
-            $predbIdInt,
-            (int) $nzbDetails['totalSize']
+            $predbIdInt
         );
-
-        if ($dupeCheck === null && ! (bool) config('nntmux.release_dedupe_enabled', true)) {
-            $dupeCheck = $this->findIdenticalArticleUpload((int) $nzbDetails['totalSize'], $nzbDetails['articleFingerprint'] ?? null);
-            $dupeReason = $dupeCheck !== null ? 'identical_articles' : null;
-        }
+        $dupeReason = $dupeCheck !== null ? 'covered_articles' : null;
 
         if ($dupeCheck !== null) {
             Log::info('NZB import skipped as duplicate', [

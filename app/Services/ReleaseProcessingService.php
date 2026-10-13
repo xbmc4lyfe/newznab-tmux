@@ -1751,22 +1751,8 @@ final class ReleaseProcessingService
 
     private function deleteCrossPostedReleases(ReleaseDeleteStats $stats): ReleaseDeleteStats
     {
-        if (! $this->settings->hasCrossPostDetection()) {
-            return $stats;
-        }
-
-        $releases = Release::query()
-            ->where('adddate', '>', now()->subHours($this->settings->crossPostTime))
-            ->groupBy(['name', 'fromname'])
-            ->havingRaw('COUNT(name) > 1 AND COUNT(fromname) > 1')
-            ->select(['id', 'guid'])
-            ->get();
-
-        foreach ($releases as $release) {
-            $this->deleteSingleRelease($release);
-            $stats = $stats->increment('duplicate');
-        }
-
+        // A name/poster group is not proof that its uploads share articles. Until
+        // cleanup has verified coverage and a retained survivor, keep every row.
         return $stats;
     }
 

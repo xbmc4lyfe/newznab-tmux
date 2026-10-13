@@ -88,6 +88,20 @@ class FileNameCleaner
      */
     public function stripFileSuffixes(string $fileName): string
     {
+        return $this->stripKnownFileSuffixes($fileName, preserveCodecAfterWrapper: true);
+    }
+
+    /**
+     * Validate only bytes appended after an already confirmed complete canonical title.
+     * Codec words here are payload extensions, so title-preservation heuristics do not apply.
+     */
+    public function isKnownFileSuffix(string $suffix): bool
+    {
+        return $suffix === '' || $this->stripKnownFileSuffixes('Title'.$suffix, preserveCodecAfterWrapper: false) === 'Title';
+    }
+
+    private function stripKnownFileSuffixes(string $fileName, bool $preserveCodecAfterWrapper): string
+    {
         $wrappers = [
             ...self::ARCHIVE_PATTERNS,
             '/\.(zst|tgz|lz4|enc|rev)$/i',
@@ -104,7 +118,7 @@ class FileNameCleaner
 
         // After a wrapper (`.rar`, `.par2`) came off, a trailing codec word is part of the title, not a file
         // extension: `Movie.2020.1080p.DTS.rar` is the title `Movie.2020.1080p.DTS`.
-        if ($fileName !== $original && preg_match('/\.(dts|ac3|eac3|truehd|ts|opus|flac|aac|mp3|ogg|wav|m4a|mka|wma)$/i', $fileName) === 1) {
+        if ($preserveCodecAfterWrapper && $fileName !== $original && preg_match('/\.(dts|ac3|eac3|truehd|ts|opus|flac|aac|mp3|ogg|wav|m4a|mka|wma)$/i', $fileName) === 1) {
             return $fileName;
         }
 
@@ -129,8 +143,13 @@ class FileNameCleaner
      */
     public function cleanForMatching(string $fileName): string|false
     {
-        // Strip non-printing characters
-        $fileName = preg_replace('/[[:^print:]]/', '', $fileName);
+        if (! mb_check_encoding($fileName, 'UTF-8')
+            || preg_match('/(?![\x00-\x7F])\p{C}/u', $fileName) !== 0) {
+            return false;
+        }
+
+        // Keep ASCII control cleanup without erasing valid Unicode spelling into another title.
+        $fileName = preg_replace('/[\x00-\x1F\x7F]/', '', $fileName);
 
         if ($fileName === '' || str_starts_with($fileName, '.')) {
             return false;
@@ -408,6 +427,23 @@ class FileNameCleaner
         }
 
         return false;
+    }
+
+    /** Keep only complete technical scene titles eligible for literal byte preservation. */
+    public function isLiteralTechnicalSceneTitle(string $title): bool
+    {
+        if (! mb_check_encoding($title, 'UTF-8') || mb_strlen($title, 'UTF-8') > 255
+            || preg_match('/\p{C}/u', $title) !== 0
+            || preg_match('/\A(?<stem>[\p{L}\p{N}][\p{L}\p{N}\p{M}._-]*)-[A-Za-z0-9]{2,15}\z/u', $title, $parts) !== 1
+            || preg_match('/[._-](?:sample|proof|thumbs?|part\d+|vol\d+(?:[+-]\d+)?)\z/i', $title) === 1) {
+            return false;
+        }
+
+        $technicalToken = '/(?:^|[._-])(?:480p|576p|720p|1080[pi]|2160p|4320p|[48]k|web[._-]?dl|webrip|bluray|bdrip|brrip|dvdrip|hdtv|sdtv|x264|x265|h[._]?26[45]|hevc|avc|xvid|divx|aac|ac3|eac3|ddp?[0-9](?:[._][0-9])?|dts(?:[._-]?hd)?|flac|mp3|truehd|pal|ntsc)(?=$|[._-])/i';
+
+        return preg_match($technicalToken, $parts['stem']) === 1
+            && $this->looksLikeSceneRelease($title)
+            && $this->isPlausibleReleaseTitle($title);
     }
 
     public function extractNzbSplitName(string $value): ?string

@@ -15,6 +15,7 @@ use RuntimeException;
  *
  * These are P2P names, not scene PREs. Only movie (201, 207) and TV (205, 208) categories are kept; every
  * other category, including adult, is dropped. The dump is a single file, so pages past the first are empty.
+ * The added Unix timestamp is the catalogue upload time, not a verified PRE time.
  * Opt-in only.
  */
 final class ApibaySource extends HttpFeedSource
@@ -70,7 +71,7 @@ final class ApibaySource extends HttpFeedSource
                 category: $category,
                 size: PredbFeedEntry::sizeFromMegabytes(is_numeric($row['size'] ?? null) ? (float) $row['size'] / 1048576 : null),
                 files: PredbFeedEntry::filesFromCount(is_numeric($row['num_files'] ?? null) ? (int) $row['num_files'] : null),
-                predate: is_numeric($row['added'] ?? null) ? CarbonImmutable::createFromTimestampUTC((int) $row['added']) : null,
+                listedAt: is_numeric($row['added'] ?? null) ? CarbonImmutable::createFromTimestampUTC((int) $row['added']) : null,
             );
 
             if (count($entries) >= $this->pageSize) {

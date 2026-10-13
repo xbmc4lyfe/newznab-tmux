@@ -6,6 +6,7 @@ namespace App\Services\Search;
 
 use App\Enums\SecondarySearchIndex;
 use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
+use App\Services\Search\Contracts\ReleaseCandidatePager;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\Contracts\SearchServiceInterface;
 use App\Services\Search\Drivers\ElasticSearchDriver;
@@ -418,6 +419,22 @@ class SearchService extends Manager implements SearchServiceInterface
     public function searchReleases(array|string $phrases, int $limit = 1000): array
     {
         return $this->driver()->searchReleases($phrases, $limit);
+    }
+
+    public function supportsReleaseCandidatePaging(): bool
+    {
+        return $this->driver() instanceof ReleaseCandidatePager;
+    }
+
+    /** @return array{ids: list<int>, available: bool, has_more: bool} */
+    public function searchReleaseCandidatesPage(string $title, int $limit = 21, int $afterId = 0): array
+    {
+        $driver = $this->driver();
+        if (! $driver instanceof ReleaseCandidatePager) {
+            return ['ids' => [], 'available' => false, 'has_more' => false];
+        }
+
+        return $driver->searchReleaseCandidatesPage($title, $limit, $afterId);
     }
 
     /**
