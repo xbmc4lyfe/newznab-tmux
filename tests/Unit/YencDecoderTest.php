@@ -53,6 +53,32 @@ class YencDecoderTest extends TestCase
         ], $this->service()->extractMetadata($article));
     }
 
+    public function test_multipart_accepts_a_missing_trailer_part_with_valid_header_range_and_checksum(): void
+    {
+        $raw = YencArticles::part('abc', 'movie.mkv', 6, 1, 1, 2);
+        $raw = str_replace('=yend size=3 part=1 ', '=yend size=3 ', $raw);
+        $this->assertSame('abc', $this->service()->decode($raw));
+    }
+
+    public function test_missing_trailer_part_does_not_skip_the_part_checksum(): void
+    {
+        $raw = YencArticles::part('abc', 'movie.mkv', 6, 1, 1, 2);
+        $raw = str_replace('=yend size=3 part=1 ', '=yend size=3 ', $raw);
+        $raw = preg_replace('/pcrc32=[0-9a-f]+/', 'pcrc32=00000000', $raw);
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('CRC32 checksums do not match.');
+        $this->service()->decode($raw);
+    }
+
+    public function test_present_trailer_part_must_still_match_the_header(): void
+    {
+        $raw = YencArticles::part('abc', 'movie.mkv', 6, 1, 1, 2);
+        $raw = str_replace('=yend size=3 part=1 ', '=yend size=3 part=2 ', $raw);
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Invalid yEnc multipart range or part number.');
+        $this->service()->decode($raw);
+    }
+
     public function test_multipart_uses_part_size_and_part_checksum(): void
     {
         $article = "=ybegin part=2 total=3 line=128 size=9 name=multi.bin\r\n=ypart begin=4 end=6\r\nklm\r\n=yend size=3 part=2 pcrc32=a3830348 crc32=deadbeef";
