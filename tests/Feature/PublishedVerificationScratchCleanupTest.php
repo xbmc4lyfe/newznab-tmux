@@ -12,6 +12,7 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\ScratchInventory;
+use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\YencService;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
@@ -308,7 +309,7 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
             $this->assertTrue(is_readable('scratch-enumeration://root/scratch'));
             $this->assertTrue(is_executable('scratch-enumeration://root/scratch'));
             $command = app(VerifyReleaseCandidates::class);
-            (new \ReflectionMethod($command, 'cleanupTerminalScratch'))->invoke($command, 'scratch-enumeration://root');
+            (new \ReflectionMethod($command, 'cleanupTerminalScratch'))->invoke($command, 'scratch-enumeration://root', new VerificationWorkerLocks);
             $this->assertSame(0, ScratchEnumerationProbe::$reads);
         } finally {
             stream_wrapper_unregister('scratch-enumeration');
@@ -423,7 +424,7 @@ if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
 }
 try {
     $command = new App\Console\Commands\VerifyReleaseCandidates;
-    (new ReflectionMethod($command, 'cleanupTerminalScratch'))->invoke($command, $argv[1]);
+    (new ReflectionMethod($command, 'cleanupTerminalScratch'))->invoke($command, $argv[1], new App\Services\Releases\Verification\VerificationWorkerLocks);
     echo 'Cleanup was not blocked.';
 } catch (RuntimeException $error) {
     echo $error->getMessage();

@@ -81,6 +81,7 @@ class ReleaseSearchService
         });
         $exactPosterReleaseId = filter_var($filters['poster_release_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
         $exactPosterReleaseId = $exactPosterReleaseId === false ? null : $exactPosterReleaseId;
+        $exactPoster = is_string($filters['poster'] ?? null) && $filters['poster'] !== '' ? $filters['poster'] : null;
 
         if ($searchFields === [] && ($filters['filter_only'] ?? false) !== true) {
             return collect();
@@ -104,7 +105,7 @@ class ReleaseSearchService
             $groupId = (int) $resolved;
         }
 
-        if ($exactPosterReleaseId === null && Search::isAvailable()) {
+        if ($exactPosterReleaseId === null && $exactPoster === null && Search::isAvailable()) {
             [$sizeMinFromRange, $sizeMaxFromRange] = $this->resolveSizeRangeBounds($sizeFrom, $sizeTo);
             $minSizeCriteria = max((int) $minSize, $sizeMinFromRange);
             $maxSizeCriteria = $sizeMaxFromRange;
@@ -167,7 +168,7 @@ class ReleaseSearchService
             }
         }
 
-        if ($exactPosterReleaseId === null && config('nntmux.mysql_search_fallback', false) !== true) {
+        if ($exactPosterReleaseId === null && $exactPoster === null && config('nntmux.mysql_search_fallback', false) !== true) {
             return collect();
         }
 
@@ -187,7 +188,11 @@ class ReleaseSearchService
         );
 
         $bindings = [];
-        if ($exactPosterReleaseId !== null) {
+        if ($exactPoster !== null) {
+            $whereSql .= ' AND r.fromname = ? AND HEX(r.fromname) = HEX(?)';
+            $bindings[] = $exactPoster;
+            $bindings[] = $exactPoster;
+        } elseif ($exactPosterReleaseId !== null) {
             $whereSql .= ' AND EXISTS (SELECT 1 FROM releases poster_source WHERE poster_source.id = ? AND r.fromname = poster_source.fromname AND HEX(r.fromname) = HEX(poster_source.fromname))';
             $bindings[] = $exactPosterReleaseId;
         }
