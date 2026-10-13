@@ -1357,6 +1357,7 @@ CREATE TABLE `releases` (
   KEY `ix_releases_videos_categories` (`videos_id`,`categories_id`),
   KEY `ix_releases_imdbid_password_cat_postdate` (`imdbid`,`passwordstatus`,`categories_id`,`postdate` DESC),
   KEY `ix_releases_searchname` (`searchname`),
+  KEY `ix_releases_fromname` (`fromname`),
   KEY `ix_releases_categories_postdate_admin` (`categories_id`,`postdate`),
   KEY `ix_releases_postdate_admin` (`postdate`),
   KEY `ix_releases_adddate_id` (`adddate`,`id`),

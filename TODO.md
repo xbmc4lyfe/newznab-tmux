@@ -6,6 +6,12 @@
 - [ ] Validate Linux CLI PHP FFI against the rebuilt native library and check native/PHP metadata parity; host PHP fallback tests do not establish Linux FFI behavior.
 - [ ] Keep deployment on hold until these checks and independent review pass; the single deployment owner must verify image/source/schema parity and collected public metadata before reporting live validation.
 
+## Exact poster lookup qualification (not deployed)
+
+- [ ] Run the complete PHPUnit suite against the final merged poster-search and index changes; focused checks are not full regression qualification.
+- [ ] Retest exact poster page/count queries with the complete release schema and joins in an isolated MariaDB runtime, including byte identity and active filters. The reduced fixture shows selective index access, not production capacity.
+- [ ] Hold deployment until the designated deployment owner applies the migration and verifies reviewed source, runtime, schema, and live poster-search behavior together.
+
 ## Release identification follow-up (implemented, not deployed)
 
 - [x] Exclude explicitly named recovery-volume subjects from naming probes, preserving explicit indexes, legacy candidates, bounded hidden candidates and durable resume (PR #83 supersedes the earlier volume-priority policy).
@@ -15,7 +21,7 @@
 
 ## Retest the final synchronized PreDB/publication integration
 
-PR #73 is reconciled with fork master through PR #89, including fingerprint metadata (#84), native workflow checks (#86), renewable PAR2 sweep leases (#87), poster-search/verification repairs (#88), and fingerprint parser/typing corrections (#89). Targeted checks qualify their reproduced cases; complete integrated qualification remains deferred.
+PR #73 is reconciled with fork master through PR #90, including fingerprint metadata (#84), native workflow checks (#86), renewable PAR2 sweep leases (#87), poster-search/verification repairs (#88), fingerprint parser/typing corrections (#89), and exact poster query/index repairs (#90). Concurrent source updates retain the configurable RSS body cap and post-article callback alongside bounded-read ownership renewal. Targeted checks qualify their reproduced cases; complete integrated qualification remains deferred.
 
 - [ ] Run the complete PHPUnit suite with an explicit 2 GiB PHP memory limit, native tests/parity, frontend build and required CI on the final synchronized PR head. A combined run aborted at the host default 128 MiB limit; that runtime failure is not a failing application assertion.
 - [ ] Retest donor inventory/canonical identity, bounded RSS wire/decoded/item limits, multipart checkpoint resume and primary/alternate bounded-read ownership renewal together. Retain processing claims, exact release snapshots and recovery-volume exclusion.
