@@ -820,6 +820,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $table->integer('isrenamed')->default(0);
         });
         (require database_path('migrations/2026_10_12_010315_create_par_file_hash_evidence_tables.php'))->up();
+        (require database_path('migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->up();
         DB::table('releases')->insert(array_replace($this->releaseRow(), [
             'postdate' => '2026-10-11 00:00:00', 'predb_id' => 7, 'isrenamed' => 1,
         ]));

@@ -818,7 +818,7 @@ class NNTPService extends NntpClient
      * Fetch exactly one complete article, with a decoded byte ceiling independent of yEnc file size.
      * Failures never expose a prefix. The alternate provider is tried once, except for oversize input.
      */
-    public function getMessageBounded(string $groupName, string $messageId, int $maxDecodedBytes, bool $alternate = false): BoundedArticleResult
+    public function getMessageBounded(string $groupName, string $messageId, int $maxDecodedBytes, bool $alternate = false, ?callable $onRead = null): BoundedArticleResult
     {
         if ($maxDecodedBytes < 1 || $maxDecodedBytes > intdiv(PHP_INT_MAX - 65538, 5)) {
             throw new \InvalidArgumentException('The decoded article ceiling must be positive and permit a bounded wire ceiling.');
@@ -828,8 +828,14 @@ class NNTPService extends NntpClient
             return BoundedArticleResult::failure('Invalid article Message-ID.');
         }
 
-        $result = $this->fetchBoundedArticle($groupName, $identifier, $maxDecodedBytes);
-        if ($result->body !== null || $result->oversized || ! $alternate) {
+        $ownershipLost = false;
+        $heartbeat = $onRead === null ? null : static function () use ($onRead, &$ownershipLost): bool {
+            $ownershipLost = $ownershipLost || ! $onRead();
+
+            return ! $ownershipLost;
+        };
+        $result = $this->fetchBoundedArticle($groupName, $identifier, $maxDecodedBytes, $heartbeat);
+        if ($result->body !== null || $result->oversized || $ownershipLost || ! $alternate) {
             return $result;
         }
 
@@ -840,7 +846,7 @@ class NNTPService extends NntpClient
                 return BoundedArticleResult::failure('The alternate article provider could not connect.');
             }
 
-            return $client->fetchBoundedArticle($groupName, $identifier, $maxDecodedBytes);
+            return $client->fetchBoundedArticle($groupName, $identifier, $maxDecodedBytes, $heartbeat);
         } catch (\Exception $exception) {
             return BoundedArticleResult::failure('The alternate article provider failed: '.$exception->getMessage());
         } finally {
@@ -862,7 +868,7 @@ class NNTPService extends NntpClient
         $this->_resetProperties();
     }
 
-    private function fetchBoundedArticle(string $groupName, string $identifier, int $maxDecodedBytes): BoundedArticleResult
+    private function fetchBoundedArticle(string $groupName, string $identifier, int $maxDecodedBytes, ?callable $onRead): BoundedArticleResult
     {
         try {
             if ($this->_checkConnection(false) !== true) {
@@ -883,7 +889,7 @@ class NNTPService extends NntpClient
                 return BoundedArticleResult::failure('The article provider did not return a BODY.');
             }
 
-            return $this->readBoundedArticle($maxDecodedBytes);
+            return $this->readBoundedArticle($maxDecodedBytes, $onRead);
         } catch (\Exception $exception) {
             $this->discardBoundedArticleConnection();
 
@@ -897,7 +903,7 @@ class NNTPService extends NntpClient
      * Each fgets reads at most 8191 bytes and is tightened at the ceiling: at most one excess byte
      * is consumed, never appended. Body plus unfinished line therefore stays within the ceiling.
      */
-    private function readBoundedArticle(int $maxDecodedBytes): BoundedArticleResult
+    private function readBoundedArticle(int $maxDecodedBytes, ?callable $onRead): BoundedArticleResult
     {
         $maxWireBytes = 5 * $maxDecodedBytes + 65536;
         $received = 0;
@@ -907,6 +913,11 @@ class NNTPService extends NntpClient
             $fragment = @fgets($this->_socket, min(8192, $maxWireBytes - $received + 2));
             if ($fragment === false || $fragment === '') {
                 break;
+            }
+            if ($onRead !== null && ! $onRead()) {
+                $this->discardBoundedArticleConnection();
+
+                return BoundedArticleResult::failure('Article read stopped after processing lock ownership was lost.');
             }
             $received += strlen($fragment);
             if ($received > $maxWireBytes) {

@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
-use App\Models\Collection;
 use App\Jobs\CollectReleaseFingerprintMetadata;
+use App\Models\Collection;
 use App\Models\Release;
 use App\Models\ReleaseNzbCreationFailure;
 use App\Services\Binaries\BinariesConfig;

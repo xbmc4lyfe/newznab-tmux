@@ -13,6 +13,47 @@ use Tests\Fixtures\YencArticles;
 
 final class NNTPBoundedArticleTest extends TestCase
 {
+    public function test_bounded_article_read_refreshes_ownership_across_socket_fragments(): void
+    {
+        $data = str_repeat('x', 20000)."\r\n";
+        $client = $this->client($data.".\r\n");
+        $heartbeats = 0;
+        $result = $client->getMessageBounded('alt.test', 'test@example', strlen($data), false, static function () use (&$heartbeats): bool {
+            $heartbeats++;
+
+            return true;
+        });
+        self::assertSame($data, $result->body);
+        self::assertGreaterThanOrEqual(3, $heartbeats);
+    }
+
+    public function test_bounded_article_ownership_loss_discards_prefix_and_never_tries_alternate(): void
+    {
+        $client = $this->client("prefix\r\nsecond line\r\n.\r\n");
+        $client->alternate = $this->client("alternate\r\n.\r\n");
+        $result = $client->getMessageBounded('alt.test', 'test@example', 100, true, static fn (): bool => false);
+
+        self::assertNull($result->body);
+        self::assertFalse($client->isConnected());
+        self::assertSame([], $client->alternate->alternateConnections);
+    }
+
+    public function test_bounded_alternate_article_read_keeps_the_ownership_heartbeat(): void
+    {
+        $client = $this->client('');
+        $client->response = 430;
+        $client->alternate = $this->client("alternate\r\n.\r\n");
+        $heartbeats = 0;
+        $result = $client->getMessageBounded('alt.test', 'test@example', 100, true, static function () use (&$heartbeats): bool {
+            $heartbeats++;
+
+            return true;
+        });
+
+        self::assertSame("alternate\r\n", $result->body);
+        self::assertGreaterThanOrEqual(2, $heartbeats);
+    }
+
     public function test_returns_complete_plain_par2_bytes_and_preserves_next_response(): void
     {
         $data = "PAR2\0PKT".str_repeat('x', 8183)."..continued\r\n.leading dot\r\n";
