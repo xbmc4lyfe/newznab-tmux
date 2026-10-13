@@ -339,6 +339,7 @@ final class ReleaseSearchFiltersTest extends TestCase
             [8, 'Comments', $poster, 2040, 25, 1, 0],
             [9, 'Wrong category', $poster, 2060, 25, 0, 0],
             [10, 'Gamma', $poster, 2040, 25, 0, 0],
+            [11, 'Token overlap', $poster.'.invalid', 2040, 25, 0, 0],
         ] as $row) {
             $insert->execute($row);
         }
@@ -371,14 +372,14 @@ final class ReleaseSearchFiltersTest extends TestCase
         });
         try {
             $service = new ReleaseSearchService;
-            $filters = ['filter_only' => true, 'poster_release_id' => 1, 'ranges' => ['size' => ['min' => 20, 'max' => 30], 'comments' => ['max' => 0]]];
+            $filters = ['filter_only' => true, 'poster' => $poster, 'ranges' => ['size' => ['min' => 20, 'max' => 30], 'comments' => ['max' => 0]]];
             $page = $service->search([], -1, -1, -1, -1, -1, 1, 1, 'name_asc', excludedCats: [2050], cat: [2040, 2050], filters: $filters);
             $this->assertSame([2], $page->modelKeys());
             $this->assertSame(3, $page[0]->_totalrows);
             $all = $service->search([], -1, -1, -1, -1, -1, 0, 10, 'name_asc', excludedCats: [2050], cat: [2040, 2050], filters: $filters);
             $this->assertSame([1, 2, 10], $all->modelKeys());
             $this->assertSame(3, $all[0]->_totalrows);
-            $missing = $service->search([], -1, -1, -1, -1, -1, filters: ['filter_only' => true, 'poster_release_id' => 999]);
+            $missing = $service->search([], -1, -1, -1, -1, -1, filters: ['filter_only' => true, 'poster' => 'missing@example.test']);
             $this->assertTrue($missing->isEmpty());
         } finally {
             Facade::clearResolvedInstances();
