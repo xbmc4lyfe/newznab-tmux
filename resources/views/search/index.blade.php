@@ -44,6 +44,12 @@
 
     <x-page-header title="Search Releases" description="Find exactly what you're looking for" icon="fas fa-search" />
 
+    @if(!empty($posterReleaseId))
+        <p class="px-6 text-sm text-gray-600 dark:text-gray-400" role="status">
+            Showing releases with the same exact poster field as release #{{ $posterReleaseId }}.
+        </p>
+    @endif
+
     <!-- Search Form -->
     <form method="GET" action="{{ route('search') }}" class="px-6 pb-6" id="searchForm">
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-4">

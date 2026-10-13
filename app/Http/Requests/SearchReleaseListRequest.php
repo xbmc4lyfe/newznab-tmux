@@ -42,7 +42,7 @@ class SearchReleaseListRequest extends FormRequest
         }
         $mode = $this->input('search_type', 'basic');
         if ($mode === null || $mode === 'basic') {
-            $mode = $this->anyFilled(['group', 'searchadvposter', 'searchadvsubject', 'searchadvfilename', 'minage', 'maxage', 'minsize', 'maxsize', 'added_from', 'added_to', 'minfiles', 'maxfiles', 'mingrabs', 'maxgrabs', 'mincomments', 'maxcomments']) ? 'adv' : 'basic';
+            $mode = $this->anyFilled(['group', 'searchadvposter', 'searchadvsubject', 'searchadvfilename', 'poster_release_id', 'minage', 'maxage', 'minsize', 'maxsize', 'added_from', 'added_to', 'minfiles', 'maxfiles', 'mingrabs', 'maxgrabs', 'mincomments', 'maxcomments']) ? 'adv' : 'basic';
         }
         $this->merge(['search_type' => $mode, 'ob' => $this->input('ob') ?? 'posted_desc']);
     }
@@ -57,6 +57,7 @@ class SearchReleaseListRequest extends FormRequest
             'search_type' => ['nullable', 'string', 'in:basic,adv'],
             'ob' => ['nullable', 'string', 'in:'.implode(',', (new ReleaseBrowseService)->getBrowseOrdering())],
             'page' => ['nullable', 'integer', 'min:1', 'max:1000000'],
+            'poster_release_id' => ['nullable', 'integer', 'min:1', 'max:4294967295'],
             'added_from' => ['nullable', 'date_format:Y-m-d', 'after_or_equal:1970-01-01'],
             'added_to' => ['nullable', 'date_format:Y-m-d', 'after_or_equal:1970-01-01'],
         ];

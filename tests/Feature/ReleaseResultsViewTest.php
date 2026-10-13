@@ -140,6 +140,7 @@ class ReleaseResultsViewTest extends TestCase
     {
         $submitter = 'alice+usenet@example.test';
         $release = (object) [
+            'id' => 47,
             'category_name' => 'TV',
             'size' => 1073741824,
             'totalpart' => 42,
@@ -152,10 +153,10 @@ class ReleaseResultsViewTest extends TestCase
 
         $html = view('details.partials.info-sidebar', compact('release'))->render();
         $document = HTMLDocument::createFromString('<!doctype html><html><head><title>Release</title></head><body>'.$html.'</body></html>');
-        $submitterLink = $document->querySelector('a[aria-label="View all posts by '.$submitter.'"]');
+        $submitterLink = $document->querySelector('a[aria-label="View releases with the exact same poster field as '.$submitter.'"]');
 
         $this->assertNotNull($submitterLink);
-        $this->assertSame(route('search', ['searchadvposter' => $submitter, 'search_type' => 'adv']), $submitterLink->getAttribute('href'));
+        $this->assertSame(route('search', ['poster_release_id' => $release->id, 'search_type' => 'adv']), $submitterLink->getAttribute('href'));
         $this->assertSame($submitter, trim($submitterLink->textContent));
     }
 }
