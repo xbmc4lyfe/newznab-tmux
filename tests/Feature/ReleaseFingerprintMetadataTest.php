@@ -4,14 +4,135 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Jobs\CollectReleaseFingerprintMetadata;
+use App\Models\ReleaseFingerprintMetadata;
 use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
 use App\Services\Releases\Fingerprint\Par2MetadataParser;
+use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use App\Services\YencService;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
 
 final class ReleaseFingerprintMetadataTest extends TestCase
 {
+    #[Test]
+    public function it_keeps_timestamp_evidence_when_advertised_byte_rates_overflow(): void
+    {
+        // This pure estimator does not use the collector's storage or NNTP dependencies.
+        $collector = (new \ReflectionClass(ReleaseFingerprintCollector::class))->newInstanceWithoutConstructor();
+        $files = [
+            ['date' => 120, 'advertised_bytes' => PHP_INT_MAX, 'segments' => []],
+            ['date' => 120, 'advertised_bytes' => 1, 'segments' => []],
+            ['date' => 180, 'advertised_bytes' => 1, 'segments' => []],
+        ];
+
+        $report = (new \ReflectionMethod($collector, 'estimatePostingTimeline'))->invoke($collector, $files, [], [], 0);
+        $span = $report['nzb_file_timestamp_span'];
+
+        self::assertTrue($span['available']);
+        self::assertSame(60, $span['timestamp_span_seconds']);
+        self::assertNull($span['advertised_bytes']);
+        self::assertNull($span['whole_span_average_advertised_bytes_per_second']);
+        self::assertNull($span['observed_nonempty_minute_bucket_rates_bytes_per_second']['maximum_nonempty_bucket']);
+    }
+
+    #[Test]
+    public function it_does_not_clamp_unsupported_nzb_sizes(): void
+    {
+        $analyzer = new NzbFingerprintAnalyzer(new YencService);
+        $unsupported = '<nzb><file subject="one.rar"><segments><segment bytes="18446744073709551615" number="1">one@example.net</segment></segments></file></nzb>';
+        $report = $analyzer->analyzeManifest($unsupported);
+        self::assertSame(1, $report['files'][0]['invalid_segment_metadata_count']);
+        self::assertNull($report['files'][0]['advertised_bytes']);
+        self::assertNull($report['totals']['rar']['advertised_bytes']);
+        self::assertNull($report['par2_to_rar_advertised_percent']);
+        self::assertFalse($report['advertised_byte_totals_valid']);
+    }
+
+    #[Test]
+    public function it_does_not_round_overflowing_nzb_totals_across_files(): void
+    {
+        $analyzer = new NzbFingerprintAnalyzer(new YencService);
+        $maximum = (string) PHP_INT_MAX;
+        $overflow = '<nzb><file subject="one.rar"><segments><segment bytes="'.$maximum.'" number="1">one@example.net</segment></segments></file><file subject="two.rar"><segments><segment bytes="1" number="1">two@example.net</segment></segments></file></nzb>';
+        $report = $analyzer->analyzeManifest($overflow);
+        self::assertSame(PHP_INT_MAX, $report['files'][0]['advertised_bytes']);
+        self::assertSame(1, $report['files'][1]['advertised_bytes']);
+        self::assertNull($report['totals']['rar']['advertised_bytes']);
+        self::assertFalse($report['advertised_byte_totals_valid']);
+    }
+
+    #[Test]
+    public function it_does_not_round_overflowing_nzb_totals_within_one_file(): void
+    {
+        $maximum = (string) PHP_INT_MAX;
+        $xml = '<nzb><file subject="one.rar"><segments><segment bytes="'.$maximum.'" number="1">one@example.net</segment><segment bytes="1" number="2">two@example.net</segment></segments></file></nzb>';
+        $report = (new NzbFingerprintAnalyzer(new YencService))->analyzeManifest($xml);
+
+        self::assertNull($report['files'][0]['advertised_bytes']);
+        self::assertNull($report['totals']['rar']['advertised_bytes']);
+        self::assertFalse($report['advertised_byte_totals_valid']);
+    }
+
+    #[Test]
+    public function it_preserves_raw_yenc_sizes_without_claiming_an_out_of_range_integer_is_valid(): void
+    {
+        $body = "=ybegin line=128 size=18446744073709551615 name=one.rar\r\nklm\r\n=yend size=3 crc32=a3830348\r\n";
+        $report = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $body);
+
+        self::assertSame('18446744073709551615', $report['yenc']['header_fields']['size']);
+        self::assertNull($report['yenc']['file_size']);
+        self::assertFalse($report['yenc']['header_numeric_fields_valid']);
+    }
+
+    #[Test]
+    public function it_marks_terminal_worker_failures_without_recreating_deleted_release_records(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+        });
+        $migration = require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php');
+        $migration->up();
+        DB::table('releases')->insert(['id' => 1]);
+        ReleaseFingerprintMetadata::query()->create(['releases_id' => 1, 'status' => 'processing']);
+
+        (new CollectReleaseFingerprintMetadata(1))->failed(new \RuntimeException('private provider details'));
+
+        $record = ReleaseFingerprintMetadata::query()->findOrFail(1);
+        self::assertSame('failed', $record->status);
+        self::assertSame('RuntimeException', $record->last_error);
+        self::assertNotNull($record->collected_at);
+        (new CollectReleaseFingerprintMetadata(2))->failed(new \RuntimeException('deleted release'));
+        self::assertSame(1, ReleaseFingerprintMetadata::query()->count());
+        $record->update(['status' => 'complete']);
+        (new CollectReleaseFingerprintMetadata(1))->failed(new \RuntimeException('older expired attempt'));
+        self::assertSame('complete', $record->fresh()->status);
+    }
+
+    #[Test]
+    public function it_bounds_par2_network_samples_and_counts_omitted_unique_articles(): void
+    {
+        $segments = [];
+        for ($number = 1; $number <= 140; $number++) {
+            $segments[] = ['number' => $number, 'messageid' => 'par-'.$number.'@example.net'];
+        }
+        $segments[] = $segments[0];
+        $files = [['index' => 0, 'kind' => 'par2', 'subject' => 'set.par2', 'segments' => $segments]];
+        $omitted = 0;
+
+        $samples = (new NzbFingerprintAnalyzer(new YencService))->selectArticleSamples($files, 128, $omitted);
+
+        self::assertCount(128, $samples);
+        self::assertSame(12, $omitted);
+        self::assertSame('par-128@example.net', $samples[127]['messageid']);
+    }
+
     #[Test]
     public function it_lists_every_nzb_file_and_calculates_advertised_parity_ratio(): void
     {
