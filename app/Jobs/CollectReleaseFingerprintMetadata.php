@@ -65,13 +65,14 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         ]);
     }
 
-    public function failed(Throwable $exception): void
+    public function failed(?Throwable $exception): void
     {
         ReleaseFingerprintMetadata::query()
             ->where('releases_id', $this->releaseId)
+            ->where('status', 'processing')
             ->update([
                 'status' => 'failed',
-                'last_error' => class_basename($exception),
+                'last_error' => $exception === null ? 'QueueJobFailed' : class_basename($exception),
                 'collected_at' => now(),
             ]);
     }

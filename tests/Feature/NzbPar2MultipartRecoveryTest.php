@@ -71,13 +71,19 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
         $xml = $this->nzb(['ordinary payload']);
         $xml->file[0]->attributes()->subject = 'hidden unknown file';
         $reading = $renewedBeforeRead = $lostDuringRead = false;
+        $postLossRechecks = 0;
         $service = $this->service($xml, ['one' => BoundedArticleResult::success('ordinary payload')], beforeRead: static function () use (&$reading): void {
             $reading = true;
         });
         $outcome = $service->checkPar2Result(
-            $release->guid, $release->id, 1, 1, 0, onArticleReceived: static function () use (&$reading, &$renewedBeforeRead, &$lostDuringRead): bool {
+            $release->guid, $release->id, 1, 1, 0, onArticleReceived: static function () use (&$reading, &$renewedBeforeRead, &$lostDuringRead, &$postLossRechecks): bool {
                 if (! $reading) {
                     $renewedBeforeRead = true;
+
+                    return true;
+                }
+                if ($lostDuringRead) {
+                    $postLossRechecks++;
 
                     return true;
                 }
@@ -90,6 +96,7 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
         self::assertSame(Par2RenameOutcome::Deferred, $outcome);
         self::assertTrue($renewedBeforeRead);
         self::assertTrue($lostDuringRead);
+        self::assertSame(0, $postLossRechecks);
         self::assertSame(['one'], $this->fetched);
         self::assertSame(0, $release->fresh()->proc_par2);
     }

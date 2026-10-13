@@ -1,5 +1,11 @@
 # To do
 
+## Fingerprint review follow-up (not deployed)
+
+- [ ] Re-run the complete PHPUnit and Rust native suites on the final reviewed follow-up head, including malformed RAR5 typed-header boundaries, collection budgets, terminal queue failure, and numeric overflow.
+- [ ] Validate Linux CLI PHP FFI against the rebuilt native library and check native/PHP metadata parity; host PHP fallback tests do not establish Linux FFI behavior.
+- [ ] Keep deployment on hold until these checks and independent review pass; the single deployment owner must verify image/source/schema parity and collected public metadata before reporting live validation.
+
 ## Release identification follow-up (implemented, not deployed)
 
 - [x] Exclude explicitly named recovery-volume subjects from naming probes, preserving explicit indexes, legacy candidates, bounded hidden candidates and durable resume (PR #83 supersedes the earlier volume-priority policy).
@@ -9,7 +15,7 @@
 
 ## Retest the final synchronized PreDB/publication integration
 
-PR #73 is reconciled with fork master through PR #88, including fingerprint metadata (#84), native workflow checks (#86), renewable PAR2 sweep leases (#87), and poster-search/verification repairs (#88). Targeted checks qualify their reproduced cases; complete integrated qualification remains deferred.
+PR #73 is reconciled with fork master through PR #89, including fingerprint metadata (#84), native workflow checks (#86), renewable PAR2 sweep leases (#87), poster-search/verification repairs (#88), and fingerprint parser/typing corrections (#89). Targeted checks qualify their reproduced cases; complete integrated qualification remains deferred.
 
 - [ ] Run the complete PHPUnit suite with an explicit 2 GiB PHP memory limit, native tests/parity, frontend build and required CI on the final synchronized PR head. A combined run aborted at the host default 128 MiB limit; that runtime failure is not a failing application assertion.
 - [ ] Retest donor inventory/canonical identity, bounded RSS wire/decoded/item limits, multipart checkpoint resume and primary/alternate bounded-read ownership renewal together. Retain processing claims, exact release snapshots and recovery-volume exclusion.

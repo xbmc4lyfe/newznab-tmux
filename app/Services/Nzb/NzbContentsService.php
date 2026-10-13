@@ -297,17 +297,20 @@ class NzbContentsService
                 return Par2RenameOutcome::Deferred;
             }
             $snapshot = ['id' => $relID, 'guid' => $guid, 'name' => $release->name, 'searchname' => $release->searchname];
-            $readerOwnsClaims = true;
-            $refreshOwnership = function () use ($lock, $onArticleReceived, &$readerOwnsClaims): bool {
-                return $readerOwnsClaims && ($onArticleReceived === null || $onArticleReceived())
+            $readerOwnership = new class
+            {
+                public bool $held = true;
+            };
+            $refreshOwnership = function () use ($lock, $onArticleReceived, $readerOwnership): bool {
+                return $readerOwnership->held && ($onArticleReceived === null || $onArticleReceived())
                     && $this->refreshPar2Claim($lock);
             };
             $guard = function () use ($deadline, $refreshOwnership): bool {
                 return ($deadline === null || now()->getTimestampMs() / 1000 < $deadline) && $refreshOwnership();
             };
             $lastHeartbeat = 0;
-            $onArticleRead = function () use ($refreshOwnership, &$lastHeartbeat, &$readerOwnsClaims): bool {
-                if (! $readerOwnsClaims) {
+            $onArticleRead = function () use ($refreshOwnership, &$lastHeartbeat, $readerOwnership): bool {
+                if (! $readerOwnership->held) {
                     return false;
                 }
                 $now = now()->getTimestamp();
@@ -315,9 +318,9 @@ class NzbContentsService
                     return true;
                 }
                 $lastHeartbeat = $now;
-                $readerOwnsClaims = $refreshOwnership();
+                $readerOwnership->held = $refreshOwnership();
 
-                return $readerOwnsClaims;
+                return $readerOwnership->held;
             };
             if (! $this->canContinuePar2($guard)) {
                 return Par2RenameOutcome::Deferred;

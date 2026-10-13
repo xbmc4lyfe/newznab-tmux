@@ -3,7 +3,7 @@
 
 The tool parses local NZB files and, when explicitly configured, fetches only
 the listed article IDs using NNTP ARTICLE. It does not post, modify, or probe
-servers. Output is JSON and deliberately omits credentials and raw subjects.
+servers. JSON omits credentials but includes release subjects and raw article headers.
 """
 
 from __future__ import annotations
@@ -139,7 +139,7 @@ class Nntp:
         self.poisoned = False
         raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
         self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=self.host) if self.tls else raw
-        self.file = self.sock.makefile("rwb", buffering=0)
+        self.file = self.sock.makefile("rb")
         code, greeting = self._response()
         self.greeting = greeting
         if code not in (200, 201):
@@ -166,7 +166,7 @@ class Nntp:
         if self.poisoned:
             raise RuntimeError("NNTP connection is unusable after a write failure")
         try:
-            self.file.write(data)
+            self.sock.sendall(data)
         except OSError:
             self.poisoned = True
             self._close_transport()
