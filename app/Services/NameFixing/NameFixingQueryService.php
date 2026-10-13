@@ -377,13 +377,19 @@ final class NameFixingQueryService
             INNER JOIN releases target ON target.id = t.releases_id AND HEX(target.guid) = HEX(t.release_guid)
             INNER JOIN par_file_hash_inventories target_inventory ON target_inventory.releases_id = target.id
                 AND HEX(target_inventory.release_guid) = HEX(target.guid)
+                AND target_inventory.evidence_last_id = (SELECT COALESCE(MAX(target_generation.id), 0) FROM par_file_hashes target_generation
+                    WHERE target_generation.releases_id = target.id AND HEX(target_generation.release_guid) = HEX(target.guid))
+                AND target_inventory.evidence_count = (SELECT COUNT(*) FROM par_file_hashes target_generation
+                    WHERE target_generation.releases_id = target.id AND HEX(target_generation.release_guid) = HEX(target.guid))
             INNER JOIN par_file_hashes d ON d.full_md5 = t.full_md5 AND d.file_size = t.file_size
                 AND HEX(d.full_md5) = HEX(t.full_md5) AND HEX(d.file_size) = HEX(t.file_size)
             INNER JOIN releases r ON r.id = d.releases_id AND HEX(r.guid) = HEX(d.release_guid)
             INNER JOIN par_file_hash_inventories donor_inventory ON donor_inventory.releases_id = r.id
                 AND HEX(donor_inventory.release_guid) = HEX(r.guid)
-                AND donor_inventory.evidence_last_id = (SELECT COALESCE(MAX(donor_generation.id), 0) FROM par_file_hashes donor_generation WHERE donor_generation.releases_id = r.id)
-                AND donor_inventory.evidence_count = (SELECT COUNT(*) FROM par_file_hashes donor_generation WHERE donor_generation.releases_id = r.id)
+                AND donor_inventory.evidence_last_id = (SELECT COALESCE(MAX(donor_generation.id), 0) FROM par_file_hashes donor_generation
+                    WHERE donor_generation.releases_id = r.id AND HEX(donor_generation.release_guid) = HEX(r.guid))
+                AND donor_inventory.evidence_count = (SELECT COUNT(*) FROM par_file_hashes donor_generation
+                    WHERE donor_generation.releases_id = r.id AND HEX(donor_generation.release_guid) = HEX(r.guid))
             INNER JOIN predb p ON p.id = r.predb_id
             WHERE t.releases_id = ? AND HEX(t.release_guid) = ? AND r.id <> ?
                 AND t.file_size NOT IN (?, ?)
