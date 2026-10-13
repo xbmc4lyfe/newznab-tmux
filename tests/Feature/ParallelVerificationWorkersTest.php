@@ -4,12 +4,15 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\VerificationResetService;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
+use App\Services\YencService;
 use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -28,6 +31,7 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
         $events = array_values(array_filter(app(Schedule::class)->events(),
             static fn ($event): bool => str_contains($event->command ?? '', 'releases:verify-candidates')));
         $this->assertCount(2, $events);
+        $this->assertStringContainsString('--limit=1000 --max-seconds=300', $events[0]->command);
         $this->assertStringContainsString('-d ffi.enable=true -d memory_limit=256M', $events[0]->command);
         $this->assertStringContainsString('--slot=1', $events[0]->command);
         $this->assertStringContainsString('--slot=2', $events[1]->command);
@@ -63,6 +67,68 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
             $second->close();
             $third->close();
         }
+    }
+
+    public function test_worker_drains_multiple_candidates_in_one_run_without_republishing_failures(): void
+    {
+        foreach (['one', 'two', 'three'] as $name) {
+            app(CandidateRepository::class)->enqueue(['identity' => sha1($name), 'groups_id' => 1, 'files' => []]);
+        }
+        $this->artisan('releases:verify-candidates', ['--limit' => 1000, '--max-seconds' => 300])->assertSuccessful();
+        $this->assertSame(3, DB::table('release_verification_candidates')->where('status', 'unknown')->count());
+        $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('release_id')->count());
+        $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('lease_token')->count());
+    }
+
+    public function test_completed_candidate_releases_its_article_source_before_the_next_claim(): void
+    {
+        config(['release_verification.bytes_per_second' => 0]);
+        foreach (['one', 'two'] as $name) {
+            app(CandidateRepository::class)->enqueue(['identity' => sha1($name), 'groups_id' => 1, 'expected_files' => 2,
+                'files' => [['key' => 'movie', 'subject' => 'movie.mkv', 'totalparts' => 1,
+                    'segments' => [['number' => 1, 'messageid' => $name.'@article', 'bytes' => 5]]]]]);
+        }
+        $closed = 0;
+        $this->mock(NNTPService::class, static function ($mock) use (&$closed): void {
+            $mock->shouldReceive('doConnect')->twice()->with(false)->andReturn(true);
+            $mock->shouldReceive('verificationArticle')->twice()->andReturn((new YencService)->encode('hello', 'movie.mkv'));
+            $mock->shouldReceive('doQuit')->twice()->andReturnUsing(static function () use (&$closed): void {
+                $closed++;
+            });
+        });
+        $claims = 0;
+        DB::listen(function (QueryExecuted $query) use (&$claims, &$closed): void {
+            if (str_starts_with($query->sql, 'update "release_verification_candidates"') && in_array('verifying', $query->bindings, true)) {
+                if (++$claims === 2) {
+                    $this->assertSame(1, $closed, 'Previous payload/source state must be released before another candidate is claimed.');
+                }
+            }
+        });
+        $this->artisan('releases:verify-candidates', ['--limit' => 2])->assertSuccessful();
+        $this->assertSame(2, $claims);
+        $this->assertSame(2, $closed);
+    }
+
+    public function test_run_duration_stops_new_claims_but_finishes_active_verification(): void
+    {
+        config(['release_verification.bytes_per_second' => 0]);
+        foreach (['one', 'two'] as $name) {
+            app(CandidateRepository::class)->enqueue(['identity' => sha1($name), 'groups_id' => 1, 'expected_files' => 2,
+                'files' => [['key' => 'movie', 'subject' => 'movie.mkv', 'totalparts' => 1,
+                    'segments' => [['number' => 1, 'messageid' => $name.'@article', 'bytes' => 5]]]]]);
+        }
+        $this->mock(NNTPService::class, static function ($mock): void {
+            $mock->shouldReceive('doConnect')->once()->with(false)->andReturn(true);
+            $mock->shouldReceive('verificationArticle')->once()->andReturnUsing(static function (): string {
+                usleep(1100000);
+
+                return (new YencService)->encode('hello', 'movie.mkv');
+            });
+            $mock->shouldReceive('doQuit')->andReturn(null);
+        });
+        $this->artisan('releases:verify-candidates', ['--limit' => 1000, '--max-seconds' => 1])->assertSuccessful();
+        $this->assertSame(['unknown', 'pending'], DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+        $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('lease_token')->count());
     }
 
     public function test_candidate_workers_exclude_audit_and_reset_and_keep_lock_inodes(): void
