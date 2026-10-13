@@ -1,481 +1,87 @@
-# AGENTS.md
+# Codex routing
 
-> AI coding agent guidelines for NNTmux - a Laravel 13 Usenet indexer.
+These model rules apply to Codex subagents only; Claude uses `CLAUDE.md`. Keep the human-selected main-session model unchanged. Delegate bounded independent work when useful; do small coupled work directly.
 
-## Command execution precedence (overrules Boost Sail)
+| Delegated task | Model | Effort |
+| --- | --- | --- |
+| File/symbol inventory, source lookup, log summarization, mechanical edits | `gpt-6-luna` | `high` |
+| Bounded Laravel implementation or focused correctness review | `gpt-6.1-sol` | `medium` |
+| Cross-service debugging, transaction reasoning, concurrency fixes | `gpt-6.1-sol` | `high` |
+| Ambiguous architecture, security boundaries, release/storage safety review | `gpt-6-astra` | `high` |
 
-**This section and `.ai/guidelines/sail/core.blade.php` overrule Laravel Boost's built-in Sail rules** (including any text below that says you MUST run all commands through Sail).
+- Choose complexity by uncertainty, interacting state, and failure impact; a short diff can require the strongest route.
+- Set both `model` and `reasoning_effort` explicitly on native `spawn_agent`; use `fork_turns="none"` with a self-contained brief when overrides require it. CLI children use `--model` and `-c model_reasoning_effort=...`.
+- Include goal, relevant paths/skills, constraints, file ownership, validation, and completion evidence. Give independent reviewers the contract and diff without the implementer's conclusions.
+- Escalate when evidence shows the task exceeds its route; give a concrete reason. Reserve `xhigh`/`max` for unresolved difficult reasoning. Check advertised model/effort support; report unavailable overrides rather than silently inheriting or bypassing permissions.
+- Parallelize independent reads; give each writer exclusive files or an isolated worktree. Keep the source/experiment/deployment ownership rules below.
 
-1. **Default:** run Artisan, Composer, npm, Pint, PHPStan, and tests on the **WSL host** using the Quick Reference below.
-2. **Sail / `make`:** only for Compose lifecycle (`make up` / `make down`) or when the user explicitly asks for containerized commands.
-3. **Docker missing in WSL:** usually means Windows Docker Desktop is stopped or WSL integration is off — do not apt-install Docker inside WSL by default. Host tooling still works when Docker is down.
+# PR Review and merging
 
-Canonical Boost override: `.ai/guidelines/sail/core.blade.php`. Host binaries for generated guidelines: `config/boost.php` → `executable_paths`. Copilot mirror: `.github/instructions/nntmux-command-execution.instructions.md`.
+When asked to review and merge a PR, follow the below set of strict guidance to ensure proper testing and validation is done before you merge the PR.
 
-## Quick Reference
+## Fork repository
+Fork's main branch: `master`
+Git repository: `https://github.com/xbmc4lyfe/newznab-tmux.git`
 
-```bash
-php artisan test --compact --filter=TestName  # Run single test (PHPUnit only)
-./vendor/bin/pint --dirty                     # Format changed files
-php artisan tmux:start                        # Start processing engine
-npm run build                                 # Required after frontend changes
-php artisan route:cache                       # Refresh cached routes if new routes seem missing
-```
+## Upstream repository
+Upstream main branch: `master`
+Git repository: `https://github.com/NNTmux/newznab-tmux.git`
 
-## Architecture
 
-NNTmux scans Usenet servers, collects headers, organizes releases, and enriches with metadata. Data flow:
+- Update the PR against the intended destination branch before submitting
+- Create the PR and then wait for Codex to review
+- Check each finding against the code and reproduce it where practical. Fix real bugs, run relevant tests, and push the fixes when authorized. Reply with the evidence that it is not an issue or if its real. Then create a fix commit, and reply to the review comment that you fixed it through reproduction and how you fixed it then resolve the commet. Do this for all unresolved comments in the PR.
+- Once updates are pushed, comment `@codex re-review`. Repeat as needed until Codex approves the current head and required checks pass. New commits need another review before merging.
+- When Codex finally gives a g2g then squash and merge feature branches into your own repository; use a merge commit for upstream synchronization into your fork. If the repository disallows that method, flag it before merging.
 
-```
-NNTP → NNTPService → BinariesRunner → ReleaseCreationService → ReleaseProcessingService → SearchService → API/Web
-```
+**Wait for Codex's go-ahead before merging.**
 
-### Key Patterns
+# NNTmux agent guide
 
-| Pattern | Location | Example |
-|---------|----------|---------|
-| **Service Layer** | `app/Services/` | 50+ services with facades (`Search::`, `Categorization::`, `TvProcessing::`, `Yenc::`, `Elasticsearch::`) |
-| **Pipeline** | `*/Pipes/` | `TvProcessingPipeline` (Parse→Local DB→TVDB→TVMaze→TMDB→Trakt; pipes only record findings, `TvLookupOutcomeWriter` persists them; lookup states in `App\Enums\TvLookupStatus`, due-work SQL in `TvProcessingCandidateQuery`), `CategorizationPipeline` (priority-driven; `Music` runs before `Book` for audiobook detection) |
-| **Driver** | `Search/Drivers/` | Manticore/Elasticsearch via `SEARCH_DRIVER` env var |
-| **Runners** | `Runners/` | `BinariesRunner`, `ReleasesRunner`, `BackfillRunner`, `PostProcessRunner` |
-| **DTO** | `*/DTO/`, `app/Support/DTOs/`, `app/Data/` | Internal: `NameFixResult`, `ReleaseProcessingContext`, `ReleaseCreationResult`. API responses use Spatie Laravel Data in `app/Data/Api/` (`ReleaseData`, `CategoryData`, `DetailsData`) |
-| **Enum** | `app/Enums/` | `UserRole`, `QueueType`, `FileCompletionStatus`, `SecondarySearchIndex`, `NzbImportStatus` |
-| **Observer** | `app/Observers/`, `AppServiceProvider` | `ReleaseObserver`, `MovieInfoObserver`, `RolePromotionObserver` |
-| **View Composer** | `app/View/Composers/`, `AppServiceProvider` | `GlobalDataComposer` shared across `layouts.*` and `admin.*` |
-| **Status Probe** | `app/Services/StatusProbes/` | `ServiceProbeRegistry` aggregates `DatabaseProbe`, `DiskProbe`, `NntpProbe`, `QueueProbe`, `RedisProbe`, `SearchProbe` for `StatusPageController` (`/status`) and `DegradeWhenRedisUnreachable` middleware; tune via `config/status-probes.php` |
-| **Monitoring** | `app/Services/Monitoring/`, `config/monitoring.php`, `docker/monitoring/`, `scripts/install-monitoring.sh` | Prometheus + Grafana. `monitoring:export-metrics` (every minute) runs tagged `MetricsCollector`s and PUTs to the Pushgateway; processing counts come from `TmuxMetricsSnapshot`, published by the tmux monitor loop. Grafana is proxied at `/grafana/` and trusts RS256 JWTs from `GrafanaJwtIssuer`, which only ever arrive as the `X-JWT-Assertion` header and never in a URL. With `GRAFANA_AUTH=proxy`, nginx `auth_request` calls `AdminMonitoringController::authorizeGrafana` on every request; with `cookie` (Apache), the web server copies the HttpOnly `nntmux_grafana_jwt` cookie into the header. See `docker/monitoring/README.md`. Alpine `adminMonitoring`/`grafanaPanels` render the embeds (Alpine's CSP build forbids directives on `<iframe>`). Dashboard UIDs/panel ids are a contract with `config/monitoring.php` (`GrafanaDashboardDefinitionsTest`). The Ubuntu installer reuses exporters it didn't install and never modifies them; Sail uses the `docker-compose.monitoring.yml` overlay, which the Makefile adds to every compose call (`make up`/`down`) while `MONITORING_ENABLED=true` and the Grafana key exists |
-| **Passkey** | `app/Actions/Passkeys/`, `app/Http/Controllers/Auth/Passkey*` | Spatie Laravel Passkeys; ceremony actions (`GeneratePasskeyRegisterOptionsAction`, `FindPasskeyToAuthenticateAction`) wire into routes `passkeys.*` in `routes/web.php`. `GeneratePasskeyRegisterOptionsAction` overrides `authenticatorSelection()` (defaults: attachment=null, `residentKey=preferred`, `userVerification=preferred`) and injects WebAuthn L3 `hints` + `credProps` extension so Windows Hello / Touch ID / phone-via-QR / FIDO2 keys all appear in the browser picker on Windows domain machines. Tunable via `PASSKEY_AUTHENTICATOR_ATTACHMENT`, `PASSKEY_RESIDENT_KEY`, `PASSKEY_USER_VERIFICATION`, `PASSKEY_RELYING_PARTY_ID` (see `config/passkeys.php`) |
+Laravel 13 Usenet indexer. Use this file for repo-wide defaults; load a project skill below when its domain applies.
 
-## Tmux Processing Engine
+## Before planning or editing
 
-Multi-pane terminal orchestrator at `app/Services/Tmux/`. Components: `TmuxSessionManager`, `TmuxLayoutBuilder`, `TmuxPaneManager`, `TmuxTaskRunner`, `TmuxMonitorService`.
+- Read [.ai/rules/index.md](.ai/rules/index.md), every rule matching the target paths, and search `.ai/rules` for task keywords.
+- Record durable shared rules with Boost's `record-rule`; do not substitute personal memory.
+- Follow existing sibling conventions and reuse existing components. Keep dependencies and new base directories subject to user approval.
+- Create documentation only when requested. Keep replies concise.
 
-**Sequential Modes** (`Settings::settingValue('sequential')`):
-- Mode 0: Full (3 windows, parallel panes)
-- Mode 1: Basic (reduced)
-- Mode 2: Stripped (minimal)
+## Command execution precedence
 
-**Commands**: `tmux:start`, `tmux:stop`, `tmux:attach`, `tmux:monitor`, `tmux:health-check`
+- Run Artisan, Composer, npm, Pint, PHPStan, and tests. Sail/`make` is for Compose lifecycle or an explicit containerized request. See `.ai/guidelines/sail/core.blade.php`.
+- Examples: `php artisan test --compact --filter=TestName`, `./vendor/bin/pint --dirty`, `./vendor/bin/phpstan analyse --memory-limit=2G`, `npm run build` after frontend edits.
 
-**Config**: `config/tmux.php` + database `settings` table
+## Changes and verification
 
-**Post-process panes** (window 2: panes 2.0–2.3) run `php artisan multiprocessing:postprocess <type>`, which fans out work as multiple `postprocess:guid <type> <char>` child processes via `App\Services\Runners\PostProcessRunner`. Types: `add`/`nfo` (pane 2.0), `tv`/`ani` (2.1), `ama` (2.2 — books+music+console+games), `mov` (2.3). Per-type aliases: `boo`, `mus`, `con`, `gam`.
+- Follow Laravel/package versions in the lockfiles and existing sibling conventions. Never change dependencies without approval.
+- Add every new or renamed `env()` key to `.env.example` with a default and short comment; use `config()` outside config files.
+- After code changes, run Pint, PHPStan, and PHP syntax lint on changed PHP files. Run focused PHPUnit tests for behavior changes; PHPUnit only, no Pest.
+- Run `npm run build` after frontend changes. Refresh route cache after route changes when needed.
+- Do not commit or push unless the user explicitly authorizes that request in this conversation. Stage every created/modified project file by explicit path; exclude temporary and unrelated files.
+- If Pint changes PHP files, retain the fixes and rerun until clean. Fix new PHPStan errors; document any baseline addition.
+- CaptainHook runs lint, Composer lock validation, and Pint. Commit limits are a 200-character subject and 72-character body.
 
-- **Live tmux output**: set `STREAM_FORK_OUTPUT=true` in `.env` (`config('nntmux.stream_fork_output')`). When false (default), child output is buffered per batch and the pane may look idle until a batch completes.
-- **Parallelism settings** (all default to `1` in `database/seeders/SettingsTableSeeder.php`; raise via Admin UI or DB): `postthreads` (additional), `nfothreads` (NFO when `post=3`), `postthreadsnon` (TV/anime/movies), `postthreadsamazon` (books/music/console/games and `ama` fan-out). Raising `nfothreads` opens that many parallel NNTP sessions for NFO children.
-- **Batch sizing**: up to 16 distinct first-character GUID buckets per type per cycle (`LIMIT 16` in `PostProcessRunner`); each bucket processes its slice sequentially inside `postprocess:guid`. Additional processing also respects `maxaddprocessed` (default 25) per bucket.
-- **Direct CLI**: `update:postprocess <type>` remains available for single-process runs outside tmux; tmux panes use the multiprocessing command only.
+## Shared runtime
 
-## Testing
+- Feature sessions do not deploy or restart the shared stack. The deployment owner uses `make -C docker deploy DEPLOY_BY=<session name>` and the deploy guard.
+- Treat production monitoring as read-only unless the user authorizes a specific operational change. Do not launch jobs, change NNTP/concurrency settings, restart, or deploy while observing.
 
-PHPUnit only (no Pest). Create tests: `php artisan make:test --phpunit {name}`
+## Project skills
 
-- In-memory SQLite (`DB_CONNECTION=testing`)
-- App boot can hit `Settings::settingValue()` via `CategorizationPipeline` (`app/Providers/CategorizationServiceProvider.php` → `app/Services/Categorization/CategorizationPipeline.php`), even in focused controller tests
-- For isolated tests that bypass the normal app test DB setup, seed a minimal `settings` table before app bootstrap; `categorizeforeign` and `catwebdl` are the minimum keys needed for this path, and `tests/Feature/AdminContentControllerTest.php` shows the file-backed SQLite workaround when `php artisan test` would otherwise fail during startup
-- Feature tests that render shared layouts or admin pages may need to clear `App\View\Composers\GlobalDataComposer::$resolvedData`; see `resetGlobalComposerState()` helpers in `tests/Feature/AdminContentControllerTest.php`, `AdminGroupControllerTest.php`, and `NzbAndRssAccessTest.php`
-- All HTTP mocked - no real API calls
-- Suites: `Install`, `Unit`, `Feature` (also `tests/Integration/` for live API tests, not in CI)
-- Use model factories; check for custom states first
-- Mocks in `tests/Fixtures/`, `tests/mock_data/`
-- Test harnesses in `tests/Support/` (e.g., `DatabaseTestCase`, `TestBinariesHarness`)
-- PHPUnit 12 — use `#[Test]` attributes or `test` prefix naming
+- Read applicable skills before starting work; these links provide explicit routing from this guide.
+- `.ai/skills/` owns the skill sources; tracked relative links in `.agents/skills/` and `.claude/skills/` provide native discovery.
 
-## Performance investigation and validation
+- For performance, ingestion/storage concurrency, release admission/reset, NZB sufficiency, or cleanup correctness, read `.ai/skills/performance-validation/SKILL.md`.
+- For production monitoring, queue diagnosis, or deployment coordination, read `.ai/skills/production-operations/SKILL.md`.
+- For application architecture, tmux processing, API/config, testing, Manticore, or frontend work, read `.ai/skills/nntmux-development/SKILL.md`.
+- These skills preserve detailed project guidance without loading every domain into every task. Laravel Boost guidance remains in `.github/instructions/laravel-boost.instructions.md` and `.ai/guidelines/`.
 
-These procedures apply to ingestion/storage concurrency changes and performance claims. They supplement the command-execution and deployment rules above; they do not authorize containerized commands, dependency installation, production tuning, or deployment.
+## Generated guidance
 
-### Tools and isolated test environments
+Laravel Boost and IDE instructions are generated or mirrored under `.github/instructions/` and `.ai/guidelines/`. Follow the relevant file for framework guidance; do not duplicate generated text here. Confirm installed package versions before relying on APIs, preserve sibling conventions, and use available Boost tools when they fit.
 
-- Start with existing PHPUnit tests, the real storage handlers, MariaDB `EXPLAIN`/lock-wait metadata, and OS/container resource counters. A temporary benchmark harness is experimental until committed, reviewed, and documented; do not advertise private scratch commands as supported tooling. Consider Sysbench for a reproduced SQL transaction or PHPBench for pure PHP work only when existing tools cannot answer the question, and follow the dependency-approval rule.
-- Give each experiment one executor and a uniquely named disposable database/runtime. Concurrency or capacity benchmarks run on a separate host: container CPU/memory caps on the production host do not eliminate shared-resource interference. Keep production endpoints, credentials, bind mounts, `.env` files, and cached application configuration out of validation runtimes.
-- Before creating a MariaDB fixture, clear Laravel's connection `url` and `unix_socket` and explicitly set the private host and port. Pass the same endpoint to every child PDO/client connection. Use random fixture database names; roll back transactions, reap child processes, and drop owned fixtures in `finally`. Cleanup must target only resources created by the experiment.
-- A full-suite runtime needs the extensions and tools used by the locked application and tests, including GD/EXIF, Node, Git, make, and procps where required. Copy the complete tracked test inputs, including Docker, frontend, and monitoring fixtures, without production data or configuration. Classify missing-runtime/fixture failures before changing application code; rerun affected checks after repairing the environment.
-
-### Reproducing contention and preserving correctness
-
-- Freeze the baseline and candidate source revisions/hashes, lockfile/vendor identity, runtime image IDs, PHP/MariaDB versions, schema/indexes/collations, transaction isolation, durability settings, resource caps, storage type, and protocol/order hashes. Record differences from the deployed environment. A reduced fixture proves only its reproduced mechanism; it does not establish full-schema behavior or production capacity.
-- Reproduce a deadlock through the actual handler with deterministic synchronization and an observed competing lock wait. Record both clients' statement and transaction outcomes and the matched wait graph. Demonstrate baseline failure and candidate success; an unrelated artificial deadlock or a victim label alone is insufficient.
-- Preserve transaction boundaries, upserts, aggregate COUNT/SUM/CASE calculations, retry policy, lifecycle/deletion guards, and SQLite behavior unless a separate change explicitly covers them. Capture access-plan evidence for dense, sparse, small, and actual maximum chunk sizes. An index hint or logical ID ordering does not guarantee bounded access or physical lock order; label preflight plans separately from executed-plan evidence.
-- Independently check initial committed unique parts and bytes, binary aggregates, collection readiness, crosspost membership, and orphans. Cover conflicting duplicates/first-write behavior, replay, rollback, missing parents, and deletion races. Returned insert IDs remain provisional until commit. Replay recovery does not turn an initially exhausted batch into success.
-
-### Comparing performance
-
-- Predeclare fixture, source pair, randomized paired order, warmup, timeouts, correctness gates, and useful-effect/regression criteria. Restore identical fixture state for each observation and use independent connections/processes. Freeze the protocol before execution; protocol changes require a new comparison.
-- Measure from the start barrier through all worker joins, including retries. Capture CPU usage/throttling and database counter intervals around that measured window; keep replay and verification outside it. Record missing artifacts, setup failures, child crashes, timeouts, skips, and exhausted batches as invalid observations with their causes.
-- Retain every failure. A performance pair is eligible only when both observations satisfy initial correctness; report invalidity/reliability separately rather than ranking surviving runs as universally safe. Normalize retry/lock costs by successful unique work and distinguish retry events, distinct failed articles, and missing unique parts. Small paired screens select further experiments; they do not establish statistically supported production throughput claims.
-- Keep barrier-controlled causal tests separate from natural-schedule throughput tests. Separate CPU throttling, cache fit, storage, and lock contention before recommending concurrency, buffer-pool, or redo changes. Broad ownership refactors, index hints on other writers, insert-delta arithmetic, retry-policy changes, and database tuning each need their own evidence.
-
-### Release lifecycle and cleanup checks
-
-- Check source, runtime image, schema, and live publication separately. A successful build is not image/source parity or proof that deployed handlers executed; compare the relevant runtime source hashes with the reviewed source.
-- For release admission/reset changes, exercise the real coordinator and transaction boundaries: rollback, after-commit failures, expired claims, implicit commits, concurrent admission, and skipped sibling ranges where applicable. Distinguish simulated durable interruption from an actual process-kill test. Preserve ownership until the outer transaction commits or rolls back, and preserve filesystem terminal state on database lookup/commit failure.
-- Verify newly emitted NZBs in fresh scratch by reconstructing from their actual article IDs. Retained reconstructed files alone do not prove the emitted NZB is sufficient; validate cached article integrity before using it as evidence.
-- Cleanup must preserve active/newer versions and stable lock inodes, handle symlinks safely, and retry interrupted/failed work fairly under new arrivals. State the work bound precisely: deletion/database budgets do not bound a linear top-level metadata enumeration. Cover older direct command callers when changing dependencies or exit contracts.
-
-## Production monitoring and session coordination
-
-- Discover the live Compose working directory from container labels and storage from bind mounts; a feature worktree or validation runtime is not production. Discover actual database tables/columns before querying runtime settings. Bound indexed reads and redact credentials, article subjects, and raw sensitive logs.
-- Keep monitoring read-only unless the human authorizes a specific operational change. Do not launch processing/import jobs, change NNTP settings or concurrency, restart, or deploy as a side effect of observation. Preserve one source owner, one experiment executor, and the existing single deployment owner; communicate handoffs and frozen source identities before transferring execution.
-- Compare interval deltas of deadlocks, row-lock waits/time, log waits, and physical/logical reads where relevant; cumulative totals alone are not current incidents. `Innodb_log_waits` describes log-buffer flush waits and alone does not prove insufficient redo-file capacity. Verify service impact before alerting and distinguish retry events from unique failures.
-- Exclude documented authorized restart/cancellation cohorts, test containers, and standalone diagnostics from production failure rates; investigate repeated service failures. A queued natural cycle or a group with no eligible input is not a release stall. Verify creation with persisted release/NZB evidence and search visibility when relevant; collection deletion alone is not creation. Notify on verified actionable changes and deduplicate unchanged observations.
-- Keep experiments, passing tests, review, merge, deployment, and live verification distinct. Review the final PR head, address findings, and preserve unrelated dirty checkout/runtime settings. Existing Git authorization and deployment-guard requirements still apply.
-
-## Project Conventions
-
-### Models (`app/Models/`)
-- Casts in `casts()` method, not `$casts` property
-- Foreign keys: `{table}_id` (e.g., `groups_id`)
-- Key: `Release`, `Video`, `TvEpisode`, `MovieInfo`, `UsenetGroup`
-
-### API (`app/Http/Controllers/Api/`)
-- v1: XML (newznab compat) - `ApiController.php`
-- v2: JSON REST - `ApiV2Controller.php`
-- HTTP `QUERY` (RFC 10008) is accepted on v1 `/api/v1/api` and the v2 read endpoints (`search`, `tv`, `movies`, `audio`, `books`, `anime`, `details`); never on `getnzb`/`nzbadd`. Route middleware `acceptQuery:v1|v2` (`ValidateHttpQueryInput`) enforces the JSON body contract and normalizes input via `App\Services\Api\ApiInputCanonicalizer`, which the v2 cursor hash and `ApiUsageService` audit also use. The global outermost `DecorateHttpQueryResponses` sets `Cache-Control: private, no-store` and `Accept-Query`. v1 limits QUERY to `ApiController::QUERY_SAFE_FUNCTIONS`. QUERY body size is bounded in `docker/8.5/nginx.conf`. Client docs: `docs/nntmux_api_v2.md`. Run `php artisan route:cache` after deploy
-- RSS feeds are separate from `/api`: edit `routes/rss.php` + `App\Http\Controllers\RssController`; `/rss/*` is mounted from `bootstrap/app.php` and `RssController::userCheck()` validates `api_token`
-
-### Config
-- App configs: `config/nntmux*.php`, `config/tmux.php`, `config/search.php`
-- Never `env()` outside config - use `config('key')`
-- **Whenever you add or rename an `env()` key — in any file, whether under `config/*.php` or anywhere else in the codebase — you MUST also add it (with a sensible default and a short comment) to `.env.example`.** Treat any new env setting without the matching `.env.example` entry as an incomplete task.
-- Runtime settings: `Settings::settingValue()`
-- Laravel 13 route/middleware wiring lives in `bootstrap/app.php`; use that file when adding route groups, aliases, or middleware (for example the `/rss` mount)
-- Custom global middleware in `app/Http/Middleware/`: `DegradeWhenRedisUnreachable` (prepended; short-circuits requests when Redis is down via `StatusProbes`), `BlockAbusiveServices` (blocks AIOStreams, Oracle Cloud, UsenetStreamer, Cloudflare WARP), `NoCacheForAuthenticatedUsers` (CDN cache busting), `ContentSecurityPolicy`, `EnforceSessionToken`, `TrustedDevice2FAMiddleware`
-- In Docker/Sail, `Makefile` exports `.env` `SEARCH_DRIVER` as `COMPOSE_PROFILES`, so only the matching Manticore/Elasticsearch service starts
-
-### Manticore `releases_rt` signed columns
-
-- In Manticore, `integer` is **unsigned 32-bit**; negative DB values (e.g. `passwordstatus = -1`, `haspreview = -1`) are stored as large positives (e.g. `4294967295`), so `passwordstatus <= 1` filters never match. The `releases_rt` schema uses **`bigint`** for `passwordstatus` and `haspreview` so values stay signed.
-- Changing column types requires dropping and recreating the RT table(s); Manticore cannot `ALTER` attribute types in place. **`php artisan manticore:create-indexes --drop`** drops and recreates **every** index defined in [`app/Console/Commands/CreateManticoreIndexes.php`](app/Console/Commands/CreateManticoreIndexes.php) (releases, predb, movies, tvshows, secondaries, etc.) as empty shells. Then repopulate what you use, e.g. **`php artisan nntmux:populate --manticore --all`** or at minimum **`--releases`** (and other index flags as needed). Prefer a maintenance window: run **`php artisan tmux:stop`** (and pause queue workers that touch search) during drop/repopulate, then **`php artisan tmux:start`**. The scheduler also runs `multiprocessing:fixrelnames predbft` every five minutes; against an empty releases index it marks every PreDB title it tries as searched with no match (`predb.searched = -1`), so stop the scheduler too (`docker compose --project-directory docker -f docker/docker-compose.yml stop scheduler`, from the repository root) and, after repopulating, reset them: `UPDATE predb SET searched = 0 WHERE searched = -1`, then start the scheduler again (same command with `start`). Optionally enable MySQL search fallback via `nntmux.mysql_search_fallback` while indexes are empty.
-
-### Commands
-- 80+ auto-registered in `app/Console/Commands/`
-- Create with `php artisan make:` + `--no-interaction`
-- Prefer host `php artisan …` / `./vendor/bin/…` (see Command execution precedence). Use `Makefile` / Sail only for Compose lifecycle or when the user asks for containerized runs (`make artisan cmd="..."`, `make test filter=TestName`, etc.)
-- On WSL2, Docker may come from **Windows Docker Desktop** (not a Linux Docker package in the distro). If `docker` is missing or the daemon is unreachable, start Desktop / enable WSL integration before installing Docker inside WSL
-- This workspace may have cached routes under `bootstrap/cache/routes-*.php`; after adding/changing routes, refresh with `php artisan route:cache` if a route appears missing
-
-### Admin Content
-- Admin content ordering is scoped by `contenttype`, not global: Homepage rows only reorder Homepage rows, Useful Links only reorder Useful Links
-- The admin list at `resources/views/admin/content/index.blade.php` renders one draggable table per content group and uses Alpine component `contentToggle`
-- `resources/js/alpine/components/content-toggle.js` is the integration point for admin content interactions: grouped drag ordering, enable/disable toggles, and delete confirmations all live there
-- Reorder requests go to `AdminContentController::reorder()` and must include the exact ID set for one `contenttype`; mixed-type or partial payloads are rejected
-- The ordinal field is intentionally hidden on `resources/views/admin/content/add.blade.php`; the server assigns new items to the bottom of their own group in `AdminContentController::nextBottomOrdinal()`
-- Deleting content does not renumber remaining items; gaps in per-group ordinals are expected
-
-## Code Formatting & Quality
-
-**After every code change, run all of the following before considering a task done:**
-
-### 1. Apply style fixes to changed PHP files
-```bash
-./vendor/bin/pint --dirty  # Format only changed files
-```
-
-> If Pint changes files, keep those changes and rerun Pint until it reports clean output.
-
-### 2. Check for static analysis errors
-```bash
-./vendor/bin/phpstan analyse --memory-limit=2G  # Run PHPStan static analysis
-```
-
-### 3. Check for syntax / lint errors
-```bash
-find app -name "*.php" | xargs php -l  # PHP syntax lint on all changed files
-```
-
-> **These steps are mandatory.** Run them before considering any task done. Do not wait for the pre-commit hook to catch formatting or type errors. If PHPStan reports new errors introduced by your changes, fix them before finishing. If you add a PHPStan baseline entry, document why.
-
-## Pre-commit (CaptainHook)
-
-Auto-runs: PHP lint, Composer lock validation, Pint formatting. Commit limits: 200 char subject, 72 char body.
-
-## Docker deploys (shared stack)
-
-Every session that works in this repo shares one checkout and one `docker/` compose project, and `make build` followed by `make up` recreates `web`, `horizon`, `scheduler` and `indexer` together, which also restarts the tmux engine and every IRC scraper.
-
-- **Only one session deploys.** Feature sessions run tests and open PRs; they do not run `make build`, `make up`, `make deploy` or `make restart`. The deploying session batches merged PRs, then deploys once.
-- Deploy with `make -C docker deploy DEPLOY_BY=<session name>`. `bin/deploy-guard` allows one deploy at a time (`docker/.deploy.lock`; the second one exits with status 75), appends who deployed what to `docker/.deploy.log`, and skips the rebuild while nothing changed since the last deploy (`FORCE=1` overrides).
-- If a deploy is refused because another is running, wait for it to finish; never delete the lock unless its `pid` is dead (the guard already clears a stale lock).
-- Fix a single service with `make -C docker restart s=<service>`, not a full rebuild.
-
-## Git (agents never commit or push)
-
-- **Never run `git commit` or `git push`** (including `--amend`, tags, or force pushes), even when a task looks finished. The maintainer reviews, commits, and pushes.
-- When completing a task, **stage every project file you created or modified** with `git add <path>` (list paths explicitly; no `git add -A` / `git add .`).
-- Never stage temporary files you created (scratch scripts, debug output, logs, planning documents), and do not stage unrelated pre-existing changes.
-- Only commit or push when the user explicitly asks in that conversation; that approval covers that one request only.
-
-## Key Directories
-
-| Path | Purpose |
-|------|---------|
-| `app/Services/TvProcessing/` | TV metadata pipeline |
-| `app/Services/Search/` | Manticore/ES abstraction |
-| `app/Services/NameFixing/` | Release name correction (see README.md there) |
-| `app/Services/Tmux/` | Tmux orchestration |
-| `app/Services/StatusProbes/` | Service health probes feeding `/status` and degrade middleware |
-| `app/Facades/` | Static service accessors |
-
-## External APIs
-
-Requires `.env` keys: TMDB, TVDB, TVMaze, Trakt, OMDB (TV/Movies); IGDB, GiantBomb, Steam (Games); AniList, AniDB (Anime); NNTP credentials.
-
-## Frontend
-
-Blade + TailwindCSS v4 + Vite bundling. Run `npm run build` after changes.
-
-- **Livewire 3**: Used only by the forum package (`resources/forum/livewire-tailwind/`) and the vendored Spatie Pulse dashboard views (`resources/views/vendor/pulse/`). All application pages (auth, profile, admin, browse, etc.) are plain Blade + Alpine.
-- **Alpine.js**: CSP-safe build with component architecture in `resources/js/alpine/`
-  - Core components loaded eagerly in `alpine/index.js`
-  - Page-specific components lazy-loaded via `alpine/lazy-loader.js`
-  - Lazy-loaded pages must declare an `x-data` name that matches a key in `alpine/lazy-loader.js`, or the component JS will never load; example: `resources/views/admin/content/index.blade.php` uses `x-data="contentToggle"` so delete/toggle handlers from `resources/js/alpine/components/content-toggle.js` are available
-  - Stores in `alpine/stores/`, components in `alpine/components/`
-- **CSS**: Main entry is `resources/css/app.css` (imports `csp-safe.css` for component styles)
-- **Vite entry points**: `resources/js/app.js`, `resources/css/app.css`, `resources/forum/blade-tailwind/js/forum.js`, `resources/forum/blade-tailwind/css/forum.css`
-
-This structure ensures Content Security Policy (CSP) compliance by using Alpine.js CSP-safe build and keeping scripts and styles in external files.
-
-===
-
-<laravel-boost-guidelines>
-=== foundation rules ===
-
-# Laravel Boost Guidelines
-
-The Laravel Boost guidelines are specifically curated by Laravel maintainers for this application. These guidelines should be followed closely to ensure the best experience when building Laravel applications.
-
-## Foundational Context
-
-This application is a Laravel application running on PHP 8.5. You are an expert with the Laravel ecosystem. Always use the APIs that match the installed major version of each package — do not assume a version.
-
-Before relying on a package's API, confirm its installed version:
-- PHP packages: run `composer show --direct` to list direct dependencies with versions, or `composer show <vendor/package>` for a single package.
-- JS packages: check `package.json` for the installed versions.
-
-## Skills Activation
-
-This project has domain-specific skills available in `**/skills/**`. You MUST activate the relevant skill whenever you work in that domain—don't wait until you're stuck.
-
-## Conventions
-
-- You must follow all existing code conventions used in this application. When creating or editing a file, check sibling files for the correct structure, approach, and naming.
-- Use descriptive names for variables and methods. For example, `isRegisteredForDiscounts`, not `discount()`.
-- Check for existing components to reuse before writing a new one.
-
-## Verification Scripts
-
-- Do not create verification scripts or tinker when tests cover that functionality and prove they work. Unit and feature tests are more important.
-
-## Application Structure & Architecture
-
-- Stick to existing directory structure; don't create new base folders without approval.
-- Do not change the application's dependencies without approval.
-
-## Frontend Bundling
-
-- If the user doesn't see a frontend change reflected in the UI, it could mean they need to run `npm run build`, `npm run dev`, or `composer run dev`. Ask them.
-
-## Documentation Files
-
-- You must only create documentation files if explicitly requested by the user.
-
-## Replies
-
-- Be concise in your explanations - focus on what's important rather than explaining obvious details.
-
-=== boost rules ===
-
-# Laravel Boost
-
-## Tools
-
-- Laravel Boost is an MCP server with tools designed specifically for this application. Prefer Boost tools over manual alternatives like shell commands or file reads.
-- Use `database-query` to run read-only queries against the database instead of writing raw SQL in tinker.
-- Use `database-schema` to inspect table structure before writing migrations or models.
-- Use `get-absolute-url` to resolve the correct scheme, domain, and port for project URLs. Always use this before sharing a URL with the user.
-- Use `browser-logs` to read browser logs, errors, and exceptions. Only recent logs are useful, ignore old entries.
-
-## Searching Documentation (IMPORTANT)
-
-- Use `search-docs` before changes that depend on Laravel ecosystem APIs, behavior, configuration, or version-specific syntax. Skip it for copy-only edits and other changes where package documentation is irrelevant. Reuse sufficient results already in context instead of searching again.
-- Pass a `packages` array to scope results when you know which packages are relevant.
-- Use multiple broad, topic-based queries: `['rate limiting', 'routing rate limiting', 'routing']`. Expect the most relevant results first.
-- Do not add package names to queries because package info is already shared. Use `test resource table`, not `filament 4 test resource table`.
-
-### Search Syntax
-
-1. Use words for auto-stemmed AND logic: `rate limit` matches both "rate" AND "limit".
-2. Use `"quoted phrases"` for exact position matching: `"infinite scroll"` requires adjacent words in order.
-3. Combine words and phrases for mixed queries: `middleware "rate limit"`.
-4. Use multiple queries for OR logic: `queries=["authentication", "middleware"]`.
-
-## Project Rules
-
-- This project contains committed, area-grouped rules in `.ai/rules` when that directory exists (settled decisions, non-obvious traps, standing constraints). Framework and package guidelines that only apply to specific paths (testing, frontend, components) also live there, under `.ai/rules/boost` — this is not just recorded decisions, it is load-bearing guidance you have not seen inline. Before you enter plan mode or create/edit any file, you MUST first: open @.ai/rules/index.md (it maps file globs to rule files), read every rule file whose globs cover the path(s) in scope, and run `grep -rin 'keyword' .ai/rules` to catch what a path match alone misses. Do not write code until you have read and are following every matching rule. If `.ai/rules` does not exist, continue without it.
-- Record durable rules with `record-rule` so the next agent or teammate inherits them instead of working them out again. Pass a `glob` (e.g. `app/Http/Controllers/**`), a short `title`, and a few-line `note`. Always use `record-rule`, never your native memory or notes tool — native memory is personal and session-scoped; only `.ai/rules` is shared with the team and persists in the repo.
-
-## Artisan
-
-- Run Artisan commands directly via the command line (e.g., `php artisan route:list`). Use `php artisan list` to discover available commands and `php artisan [command] --help` to check parameters.
-- Inspect routes with `php artisan route:list`. Filter with: `--method=GET`, `--name=users`, `--path=api`, `--except-vendor`, `--only-vendor`.
-- Read configuration values using dot notation: `php artisan config:show app.name`, `php artisan config:show database.default`. Or read config files directly from the `config/` directory.
-
-## Tinker
-
-- Execute PHP in app context for debugging and testing code. Do not create models without user approval, prefer tests with factories instead. Prefer existing Artisan commands over custom tinker code.
-- Always use single quotes to prevent shell expansion: `php artisan tinker --execute 'Your::code();'`
-  - Double quotes for PHP strings inside: `php artisan tinker --execute 'User::where("active", true)->count();'`
-
-=== php rules ===
-
-# PHP
-
-- Always use curly braces for control structures, even for single-line bodies.
-- Use PHP 8 constructor property promotion: `public function __construct(public GitHub $github) { }`. Do not leave empty zero-parameter `__construct()` methods unless the constructor is private.
-- Use explicit return type declarations and type hints for all method parameters: `function isAccessible(User $user, ?string $path = null): bool`
-- Follow existing application Enum naming conventions.
-- Prefer PHPDoc blocks over inline comments. Only add inline comments for exceptionally complex logic.
-- Use array shape type definitions in PHPDoc blocks.
-
-=== deployments rules ===
-
-# Deployment
-
-- Laravel can be deployed using [Laravel Cloud](https://cloud.laravel.com/), which is the fastest way to deploy and scale production Laravel applications.
-
-=== sail rules ===
-
-# Laravel Sail (project override)
-
-> **This guideline OVERRULES Boost's built-in Sail rules.** Do not require `vendor/bin/sail` for day-to-day PHP, Artisan, Composer, Node, Pint, PHPStan, or tests.
-
-## Default: run on the WSL host
-
-Prefer host commands (as in the Quick Reference at the top of `AGENTS.md`):
-
-- Artisan: `php artisan [command]` (e.g. `php artisan test --compact --filter=TestName`)
-- Composer: `composer install`
-- Node/npm: `npm run build`
-- Vendor bins: `vendor/bin/pint --dirty`, `vendor/bin/phpstan analyse --memory-limit=2G`
-
-Do **not** prefix every command with Sail. Ignore any conflicting Boost text that says you MUST execute all commands through Sail.
-
-## When Sail / Docker is appropriate
-
-Use Sail or `Makefile` targets only when:
-
-- Starting/stopping the stack (`make up` / `vendor/bin/sail up -d`, `make down` / `vendor/bin/sail stop`)
-- The user explicitly asks for containerized commands
-- A task needs services only available inside Compose (e.g. aligning container UIDs via `make fix-permissions`)
-
-## WSL2 + Windows Docker Desktop
-
-Local development is often done in WSL2 while Docker runs via **Windows Docker Desktop** (WSL integration), not a native Linux Docker install inside the distro.
-
-- If `docker` / `docker compose` cannot be found, or Sail fails with "Docker is not running" / cannot connect to the daemon, do **not** assume Docker must be installed inside WSL. Check that Docker Desktop is running on Windows and that WSL integration is enabled for this distro.
-- Prefer diagnosing through Docker Desktop (engine status, WSL integration settings) before suggesting `apt install docker` or similar host installs.
-- Host PHP/Artisan/tests remain valid even when the Docker engine is down.
-
-=== tests rules ===
-
-# Test Enforcement
-
-- Test every code change by adding or updating a test.
-- Run the affected tests and ensure they pass.
-- Test the changed behavior and its important failure modes, but do not add tests beyond them.
-- Read the `testing-best-practices` skill before writing tests.
-
-=== laravel/core rules ===
-
-# Do Things the Laravel Way
-
-- Use `php artisan make:` commands to create new files (i.e. migrations, controllers, models, etc.). You can list available Artisan commands using `php artisan list` and check their parameters with `php artisan [command] --help`.
-- If you're creating a generic PHP class, use `php artisan make:class`.
-- Pass `--no-interaction` to all Artisan commands to ensure they work without user input. You should also pass the correct `--options` to ensure correct behavior.
-
-### Model Creation
-
-- When creating new models, create useful factories and seeders for them too. Ask the user if they need any other things, using `php artisan make:model --help` to check the available options.
-
-## APIs & Eloquent Resources
-
-- For APIs, default to using Eloquent API Resources and API versioning unless existing API routes do not, then you should follow existing application convention.
-
-## URL Generation
-
-- When generating links to other pages, prefer named routes and the `route()` function.
-
-## Testing
-
-- When creating models for tests, use the factories for the models. Check if the factory has custom states that can be used before manually setting up the model.
-- Faker: Use methods such as `$this->faker->word()` or `fake()->randomDigit()`. Follow existing conventions whether to use `$this->faker` or `fake()`.
-- When creating tests, make use of `php artisan make:test [options] {name}` to create a feature test, and pass `--unit` to create a unit test. Most tests should be feature tests.
-
-## Vite Error
-
-- If you receive an "Illuminate\Foundation\ViteException: Unable to locate file in Vite manifest" error, you can run `npm run build` or ask the user to run `npm run dev` or `composer run dev`.
-
-=== livewire/core rules ===
-
-# Livewire
-
-- Livewire allows you to build dynamic, reactive interfaces in PHP without writing JavaScript.
-- You can use Alpine.js for client-side interactions instead of JavaScript frameworks.
-- Keep state server-side so the UI reflects it. Validate and authorize in actions as you would in HTTP requests.
-
-=== pint/core rules ===
-
-# Laravel Pint Code Formatter
-
-- If you have modified any PHP files, you must run `vendor/bin/pint --dirty --format agent` before finalizing changes to ensure your code matches the project's expected style.
-- Do not run `vendor/bin/pint --test --format agent`, simply run `vendor/bin/pint --format agent` to fix any formatting issues.
-
-=== phpunit/core rules ===
-
-# PHPUnit
-
-- This project uses PHPUnit. Create tests with `php artisan make:test --phpunit {name}`.
-- Do not include the test suite directory in `{name}`. Use `SomeFeatureTest`, not `Feature/SomeFeatureTest`.
-- Read the `testing-best-practices` skill for guidance on coverage, naming, structure, dependency isolation, and review.
-
-## Running Tests
-
-- Run the narrowest set of tests that covers the change. Pass a file path or `--filter=testName` to `php artisan test --compact`.
-- Rerun a test after each change to it.
-- Run `vendor/bin/phpunit` to call the test runner directly. It accepts the same file path and `--filter=testName` arguments.
-
-=== revolution/laravel-boost-phpstorm-copilot/core rules ===
-
-## PhpStorm with GitHub Copilot Plugin
-
-This package provides custom CodeEnvironment integration for PhpStorm with GitHub Copilot plugin with Laravel Boost. It enables PhpStorm users to leverage Laravel Boost's MCP (Model Context Protocol) server functionality.
-
-### Important: Project Path Verification
-
-**Before using Laravel Boost MCP tools in PhpStorm with GitHub Copilot plugin, verify that the project path in the global MCP configuration file matches your current project.**
-
-The MCP configuration file is stored system-wide at:
-- macOS, Linux: `~/.config/github-copilot/intellij/mcp.json`
-- Windows: `%LOCALAPPDATA%\github-copilot\intellij\mcp.json`
-
-If the project path in the MCP configuration does not match your current Laravel project, **you must update it before using MCP tools**:
-
-<code-snippet name="Update MCP Configuration for Current Project" lang="bash">
-php artisan boost:install --guidelines --skills --mcp --no-interaction
-</code-snippet>
-
-This command updates the MCP configuration file with the absolute path to your current Laravel project, ensuring MCP tools interact with the correct project.
-
-### When to Run boost:install
-
-Run `php artisan boost:install` whenever you:
-- Switch to a different Laravel project
-- Clone or move your project to a new location
-- Notice MCP tools are accessing the wrong project's data
-
-### Why This is Necessary
-
-Unlike project-local MCP configurations, PhpStorm with GitHub Copilot plugin stores MCP server configurations in a system-wide location. This allows multiple projects to share the same MCP server registration, but requires updating the configuration when switching between projects to ensure the correct project path is used.
-
-</laravel-boost-guidelines>
+- Before Laravel/PHP development, read [.github/instructions/laravel-boost.instructions.md](.github/instructions/laravel-boost.instructions.md).
+- Use Boost `search-docs` before changes depending on ecosystem APIs or version-specific behavior; copy-only edits do not require it.
+- Prefer available Boost tools for schema inspection, read-only queries, browser logs, and project URL resolution.
+- Boost guideline destinations in `config/boost.php` redirect generated framework guidance to `.github/instructions/laravel-boost.instructions.md`; keep this file and `CLAUDE.md` hand maintained.
