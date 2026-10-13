@@ -10,6 +10,8 @@ use RuntimeException;
 
 final class NzbFingerprintAnalyzer
 {
+    public const MAX_ARTICLE_SAMPLES = 128;
+
     public function __construct(private readonly YencService $yenc) {}
 
     /** @return array<string, mixed> */
@@ -63,6 +65,7 @@ final class NzbFingerprintAnalyzer
                 $segmentElements = $element->xpath('./*[local-name()="segments"]/*[local-name()="segment"]') ?: [];
                 $invalidSegmentCount = 0;
                 $invalidSegmentMetadataCount = 0;
+                $advertisedBytes = 0;
                 foreach ($segmentElements as $segment) {
                     $messageId = trim((string) $segment);
                     if ($messageId === '' || preg_match('/\A[^\s<>\x00-\x1f\x7f]+\z/D', trim($messageId, '<>')) !== 1) {
@@ -72,13 +75,15 @@ final class NzbFingerprintAnalyzer
                     }
                     $segmentNumber = trim((string) $segment['number']);
                     $segmentBytes = trim((string) $segment['bytes']);
-                    if (preg_match('/\A[0-9]+\z/D', $segmentNumber) !== 1 || (int) $segmentNumber < 1
-                        || preg_match('/\A[0-9]+\z/D', $segmentBytes) !== 1) {
+                    $parsedNumber = self::metadataNumber($segmentNumber);
+                    $parsedBytes = self::metadataNumber($segmentBytes);
+                    if ($parsedNumber === null || $parsedNumber < 1 || $parsedBytes === null) {
                         $invalidSegmentMetadataCount++;
                     }
+                    $advertisedBytes = self::checkedAdd($advertisedBytes, $parsedBytes);
                     $segments[] = [
-                        'number' => max(0, (int) $segmentNumber),
-                        'bytes' => max(0, (int) $segmentBytes),
+                        'number' => $parsedNumber ?? 0,
+                        'bytes' => $parsedBytes,
                         'messageid' => trim($messageId, '<>'),
                     ];
                 }
@@ -86,7 +91,6 @@ final class NzbFingerprintAnalyzer
                 $segmentNumbers = array_column($segments, 'number');
                 $messageIds = array_column($segments, 'messageid');
                 $numberSequenceValid = $segmentNumbers !== [] && $segmentNumbers === range(1, count($segmentNumbers));
-                $advertisedBytes = array_sum(array_column($segments, 'bytes'));
                 $groups = [];
                 $groupElements = $element->xpath('./*[local-name()="groups"]/*[local-name()="group"]') ?: [];
                 foreach ($groupElements as $group) {
@@ -112,13 +116,15 @@ final class NzbFingerprintAnalyzer
                 ];
                 $totals[$kind]['file_count']++;
                 $totals[$kind]['segment_count'] += count($segments);
-                $totals[$kind]['advertised_bytes'] += $advertisedBytes;
+                $totals[$kind]['advertised_bytes'] = self::checkedAdd($totals[$kind]['advertised_bytes'], $advertisedBytes);
             }
             if ($files === []) {
                 throw new RuntimeException('NZB contains no files.');
             }
 
-            $par2ToRarPercent = $totals['rar']['advertised_bytes'] > 0
+            $advertisedByteTotalsValid = count(array_filter($totals, static fn (array $total): bool => is_int($total['advertised_bytes']))) === count($totals);
+            $par2ToRarPercent = is_int($totals['rar']['advertised_bytes']) && $totals['rar']['advertised_bytes'] > 0
+                && is_int($totals['par2']['advertised_bytes'])
                 ? round($totals['par2']['advertised_bytes'] / $totals['rar']['advertised_bytes'] * 100, 3)
                 : null;
 
@@ -126,6 +132,7 @@ final class NzbFingerprintAnalyzer
                 'file_count' => count($files),
                 'files' => $files,
                 'totals' => $totals,
+                'advertised_byte_totals_valid' => $advertisedByteTotalsValid,
                 'nzb_meta_values' => $meta,
                 'par2_to_rar_advertised_percent' => $par2ToRarPercent,
                 'par2_to_rar_percent_basis' => 'NZB advertised segment bytes; includes article and yEnc overhead and is not the PAR2 recovery percentage.',
@@ -137,12 +144,16 @@ final class NzbFingerprintAnalyzer
     }
 
     /** @param list<array<string, mixed>> $files
-     * @return list<array{file_index: int, kind: string, subject: string, segment_number: int, messageid: string, segment_bytes: int, sample_role: string}>
+     * @param-out int $omittedSampleCount
+     *
+     * @return list<array{file_index: int, kind: string, subject: string, segment_number: int, messageid: string, segment_bytes: int|null, sample_role: string}>
      */
-    public function selectArticleSamples(array $files): array
+    public function selectArticleSamples(array $files, int $maximumSamples = self::MAX_ARTICLE_SAMPLES, ?int &$omittedSampleCount = null): array
     {
         $samples = [];
         $seen = [];
+        $omittedSampleCount = 0;
+        $maximumSamples = max(1, min(self::MAX_ARTICLE_SAMPLES, $maximumSamples));
         foreach ($files as $file) {
             $segments = $file['segments'] ?? [];
             if (! is_array($segments) || $segments === []) {
@@ -164,16 +175,21 @@ final class NzbFingerprintAnalyzer
                 if ($messageId === '' || isset($seen[$sampleKey])) {
                     continue;
                 }
+                $seen[$sampleKey] = true;
+                if (count($samples) >= $maximumSamples) {
+                    $omittedSampleCount++;
+
+                    continue;
+                }
                 $samples[] = [
                     'file_index' => (int) $file['index'],
                     'kind' => (string) $file['kind'],
                     'subject' => (string) $file['subject'],
                     'segment_number' => (int) $segment['number'],
                     'messageid' => $messageId,
-                    'segment_bytes' => (int) ($segment['bytes'] ?? 0),
+                    'segment_bytes' => is_int($segment['bytes'] ?? null) ? $segment['bytes'] : null,
                     'sample_role' => $sampleRole,
                 ];
-                $seen[$sampleKey] = true;
             }
         }
 
@@ -339,7 +355,7 @@ final class NzbFingerprintAnalyzer
             preg_match_all('/^(?:=ybegin|=ypart|=yend)[^\r\n]*/mi', $rawBody, $controlMatches);
             $controlLines = $controlMatches[0] ?? [];
             $par2PrefixLength = min($headerExpectedDecodedSize ?? 16_384, 16_384);
-            $prefixCoverageIsValid = $payloadEscapeStateValid && $decodedSize !== null && $par2PrefixLength > 0
+            $prefixCoverageIsValid = $payloadEscapeStateValid && $par2PrefixLength > 0
                 && $decodedSize >= $par2PrefixLength
                 && (! $multipart
                     ? $headerExpectedDecodedSize === null || $decodedSize === $headerExpectedDecodedSize
@@ -449,6 +465,11 @@ final class NzbFingerprintAnalyzer
         }
 
         return ($escapeCount % 2) === 0;
+    }
+
+    private static function checkedAdd(?int $left, ?int $right): ?int
+    {
+        return $left === null || $right === null || $left > PHP_INT_MAX - $right ? null : $left + $right;
     }
 
     private static function metadataNumber(string $value): ?int

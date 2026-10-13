@@ -34,6 +34,10 @@ class NNTPService extends NntpClient
     /**
      * Read one bounded, undecoded article for integrity verification.
      *
+     * @param  array<string, mixed>|null  $responseMetadata
+     *
+     * @param-out array{response_code: int|null, response_text: string|null, response_text_basis: string, error_type: string|null}|null $responseMetadata
+     *
      * @throws \RuntimeException
      */
     public function verificationArticle(string $messageId, int $maximumBytes, ?array &$responseMetadata = null): string
@@ -1202,7 +1206,13 @@ class NNTPService extends NntpClient
         throw new \RuntimeException('NNTP server profile response was truncated.');
     }
 
-    /** @return list<string> */
+    /**
+     * @param  array<string, mixed>|null  $responseMetadata
+     *
+     * @param-out array{response_code: int|null, response_text: string|null, response_text_basis: string, error_type: string|null} $responseMetadata
+     *
+     * @return list<string>
+     */
     private function readFingerprintArticleHeaders(string $identifier, int $maximumBytes, ?array &$responseMetadata = null): array
     {
         $response = $this->_sendCommand('HEAD <'.$identifier.'>');

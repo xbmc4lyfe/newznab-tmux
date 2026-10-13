@@ -1,5 +1,11 @@
 # To do
 
+## Fingerprint review follow-up (not deployed)
+
+- [ ] Re-run the complete PHPUnit and Rust native suites on the final reviewed follow-up head, including malformed RAR5 typed-header boundaries, collection budgets, terminal queue failure, and numeric overflow.
+- [ ] Validate Linux CLI PHP FFI against the rebuilt native library and check native/PHP metadata parity; host PHP fallback tests do not establish Linux FFI behavior.
+- [ ] Keep deployment on hold until these checks and independent review pass; the single deployment owner must verify image/source/schema parity and collected public metadata before reporting live validation.
+
 ## Release identification follow-up (implemented, not deployed)
 
 - [x] Prioritize one recovery volume per filename family and hidden PAR2 candidates before repeated volumes, retaining every volume for fallback and durable resume.

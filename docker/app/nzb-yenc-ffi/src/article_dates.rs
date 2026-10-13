@@ -402,3 +402,17 @@ fn hex(bytes: &[u8]) -> String {
     }
     value
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flushes_the_final_date_once_at_the_header_body_boundary() {
+        let parsed =
+            parse(b"Subject: sample\r\nDate: Thu, 01 Jan 1970 00:00:00 +0000\r\n\r\nbody\r\n");
+        assert_eq!(parsed.date.occurrence_count, 1);
+        assert_eq!(parsed.date.parse_status, "valid");
+        assert_eq!(parsed.date.utc_epoch_seconds, Some(0));
+    }
+}
