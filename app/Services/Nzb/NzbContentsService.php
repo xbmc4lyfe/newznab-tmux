@@ -354,12 +354,6 @@ class NzbContentsService
             $recovery = new Par2CandidateRecovery($this->nntp, $this->postProcessService, $alternate);
             $outcome = Par2RenameOutcome::NoMatch;
             foreach ($pending as $index) {
-                if ($candidates[$index]['classification'] === 'volume') {
-                    $family = $this->par2FamilyKey($candidates[$index]['subject']);
-                    if ($family === null || ! $this->hasIncompleteExplicitPar2Progress($relID, $candidates, $family)) {
-                        continue;
-                    }
-                }
                 if ($this->par2Stats['candidates_probed'] >= $budget) {
                     $incompleteIndex = $this->hasIncompleteExplicitPar2Progress($relID, $candidates);
 
@@ -464,8 +458,7 @@ class NzbContentsService
     }
 
     /**
-     * Recovery volumes can resume a previously partial index, but an unavailable or malformed
-     * index must not let unrelated recovery volumes consume the bounded probe budget.
+     * Distinguish a partial index from a failed probe when reporting exhaustion of the budget.
      *
      * @param  list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}>  $candidates
      */
@@ -584,7 +577,7 @@ class NzbContentsService
     /** @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> */
     private function par2Candidates(SimpleXMLElement $nzb): array
     {
-        $explicit = $volumes = $legacy = $hidden = [];
+        $explicit = $volumes = $firstVolumes = $families = $legacy = $hidden = [];
         $this->par2Manifest = [];
         $this->par2StructureValid = count($nzb->file) > 0;
         $maxBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
@@ -633,10 +626,18 @@ class NzbContentsService
                 'legacy' => $legacy[$key] = $candidate,
                 default => $hidden[$key] = $candidate,
             };
+            if ($classification === 'volume') {
+                $family = mb_strtolower($this->par2FamilyKey($subject) ?? $key);
+                if (! isset($families[$family])) {
+                    $families[$family] = true;
+                    $firstVolumes[$key] = $candidate;
+                }
+            }
         }
         uasort($hidden, static fn (array $left, array $right): int => $left['segments'][0]['bytes'] <=> $right['segments'][0]['bytes']);
 
-        return array_values($explicit + $volumes + $legacy + $hidden);
+        // Families prioritize probes only; later volumes retain their own resumable metadata.
+        return array_values($explicit + $firstVolumes + $legacy + $hidden + $volumes);
     }
 
     /**
