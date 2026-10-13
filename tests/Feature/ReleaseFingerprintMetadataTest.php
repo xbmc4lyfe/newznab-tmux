@@ -96,6 +96,29 @@ final class ReleaseFingerprintMetadataTest extends TestCase
     }
 
     #[Test]
+    public function it_withholds_fallback_integrity_for_conflicting_or_unbounded_framing(): void
+    {
+        config(['yenc.native_library' => '']);
+        $normal = "=ybegin size=3 line=128 name=x.rar\r\nklm\r\n=yend size=3 crc32=a3830348\r\n";
+        $filler = implode(' ', array_map(static fn (int $i): string => 'x'.$i.'=v', range(1, 62)));
+        foreach ([
+            str_replace('size=3 line=', 'size=0 size=3 line=', $normal),
+            str_replace('=yend size=3', '=yend size=0 size=3', $normal),
+            str_replace('=yend size=3', '=yend size=0 '.$filler.' size=3', $normal),
+            $normal.$normal,
+        ] as $body) {
+            $article = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $body);
+            self::assertTrue($article['yenc']['integrity_checks_ambiguous']);
+            self::assertNull($article['yenc']['par2_first_16k_md5_candidate']);
+            self::assertFalse(Par2MetadataParser::declaredYencCrc32Valid($article['yenc']));
+        }
+        $same = str_replace('size=3 line=', 'size=3 size=3 line=', $normal);
+        self::assertFalse((new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $same)['yenc']['integrity_checks_ambiguous']);
+        $name = str_replace('name=x.rar', 'name=some file size=9.rar', $normal);
+        self::assertFalse((new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $name)['yenc']['integrity_checks_ambiguous']);
+    }
+
+    #[Test]
     public function it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated(): void
     {
         $filler = implode(' ', array_map(static fn (int $i): string => 'x'.$i.'=v', range(1, 62)));
@@ -1130,12 +1153,17 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $metadata = $method->invoke(null, [
             'invalid_packet_count' => 0,
             'integer_range_valid' => true,
-            'optional_packet_summaries' => [['input_slice_index' => '9223372036854775808']],
+            'recovery_to_source_percent' => 50.0,
+            'optional_packet_summaries' => [['input_slice_index' => '9223372036854775808',
+                'fileslic_relationship' => ['layout_status' => 'index-out-of-range', 'logical_file_offset' => '9223372036854775808']]],
         ]);
         self::assertSame(0, $metadata['invalid_packet_count']);
         self::assertTrue($metadata['integer_range_valid']);
         self::assertSame('9223372036854775808', $metadata['optional_packet_summaries'][0]['input_slice_index']);
         self::assertFalse($metadata['optional_packet_summaries'][0]['input_slice_index_integer_range_valid']);
+        self::assertSame('9223372036854775808', $metadata['optional_packet_summaries'][0]['fileslic_relationship']['logical_file_offset']);
+        self::assertFalse($metadata['optional_packet_summaries'][0]['fileslic_relationship']['logical_file_offset_integer_range_valid']);
+        self::assertSame(50.0, $metadata['recovery_to_source_percent']);
     }
 
     #[Test]

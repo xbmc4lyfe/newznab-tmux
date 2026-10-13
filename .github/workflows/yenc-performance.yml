@@ -6,6 +6,8 @@ on:
       - '.github/workflows/yenc-performance.yml'
       - 'scripts/benchmark-yenc.php'
       - 'scripts/benchmark-yenc-abi.py'
+      - 'tests/Unit/test_yenc_abi_benchmark.py'
+      - 'tests/Feature/ReleaseFingerprintMetadataTest.php'
       - 'scripts/build-rapidyenc.sh'
       - 'app/Services/Yenc/**'
       - 'app/Services/YencService.php'
@@ -64,7 +66,9 @@ jobs:
         run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
 
       - name: Test benchmark decisions and failure retention
-        run: php vendor/bin/phpunit --filter=YencBenchmarkTest
+        run: |
+          php vendor/bin/phpunit --filter=YencBenchmarkTest
+          python3 tests/Unit/test_yenc_abi_benchmark.py
 
       - name: Build pinned C++ baseline
         shell: bash
@@ -92,6 +96,14 @@ jobs:
               --filter='YencNativeDecoderTest|YencServiceTest|NNTPBodyDecodingTest' \
               2>&1 | tee "benchmark-evidence/build/parity-$backend.log"
           done
+
+      - name: Verify native framing budget integration on Linux
+        shell: bash
+        run: |
+          YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
+              --filter=it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated \
+              2>&1 | tee benchmark-evidence/build/framing-budget-integration.log
 
       - name: Record build and runtime identities
         shell: bash

@@ -635,8 +635,8 @@ pub struct Rar5CompressionMetadata {
     pub dictionary_exponent_observed: u8,
     pub dictionary_fraction_bits_observed: u8,
     pub algorithm_zero_compatibility_bit_observed: bool,
-    pub actual_algorithm_version: Option<u8>,
-    pub minimum_decoder_generation: Option<&'static str>,
+    pub algorithm_version_from_flags: Option<u8>,
+    pub encoding_generation: Option<&'static str>,
     pub declared_dictionary_bytes: Option<u64>,
     pub effective_dictionary_bytes: Option<u64>,
 }
@@ -652,7 +652,7 @@ fn rar5_compression_metadata(info: u64, header_trusted: bool) -> Rar5Compression
         1 => info & !0x1fffff == 0,
         _ => false,
     };
-    let interpretation_status = if version > 1 {
+    let mut interpretation_status = if version > 1 {
         "compression_version_unsupported"
     } else if !known_encoding {
         "compression_flags_unsupported"
@@ -670,6 +670,9 @@ fn rar5_compression_metadata(info: u64, header_trusted: bool) -> Rar5Compression
             base.checked_add(addition)
         })
         .flatten();
+    if declared_dictionary_bytes.is_some_and(|size| size > (1u64 << 40)) {
+        interpretation_status = "dictionary_size_exceeds_format_limit";
+    }
     Rar5CompressionMetadata {
         status: if header_trusted {
             interpretation_status
@@ -682,18 +685,18 @@ fn rar5_compression_metadata(info: u64, header_trusted: bool) -> Rar5Compression
         dictionary_exponent_observed: exponent,
         dictionary_fraction_bits_observed: fraction,
         algorithm_zero_compatibility_bit_observed: compatibility,
-        actual_algorithm_version: known_encoding.then_some(if version == 1 && !compatibility {
+        algorithm_version_from_flags: known_encoding.then_some(if version == 1 && !compatibility {
             1
         } else {
             0
         }),
-        minimum_decoder_generation: known_encoding.then_some(if version == 0 {
+        encoding_generation: known_encoding.then_some(if version == 0 {
             "RAR 5.0"
         } else {
             "RAR 7.0"
         }),
         declared_dictionary_bytes,
-        effective_dictionary_bytes: header_trusted
+        effective_dictionary_bytes: (header_trusted && interpretation_status == "supported")
             .then_some(declared_dictionary_bytes)
             .flatten(),
     }
@@ -2183,10 +2186,14 @@ fn parse_rar5_file_header(
     result.solid = Some(compression_info & 0x40 != 0);
     result.compression_method = Some(((compression_info >> 7) & 0x07) as u8);
     result.dictionary_size_exponent = Some(((compression_info >> 10) & 0x1f) as u8);
-    result.compression_metadata = Some(rar5_compression_metadata(
-        compression_info,
-        header_crc32_valid == Some(true),
-    ));
+    result.compression_metadata = Some(rar5_compression_metadata(compression_info, false));
+    if header_crc32_valid == Some(true) {
+        result
+            .compression_metadata
+            .as_mut()
+            .expect("just set compression metadata")
+            .status = "file_header_incomplete";
+    }
 
     let Some(host_os) = read_rar5_vint_bounded(data, &mut cursor, fields_end) else {
         return result;
@@ -2222,6 +2229,15 @@ fn parse_rar5_file_header(
         result.filename = utf8_name.ok().map(str::to_owned);
     }
     result.status = "parsed";
+    let mut compression =
+        rar5_compression_metadata(compression_info, header_crc32_valid == Some(true));
+    if header_crc32_valid == Some(true)
+        && (file_flags & 1 != 0 || result.compression_method == Some(0))
+    {
+        compression.status = "dictionary_not_applicable";
+        compression.effective_dictionary_bytes = None;
+    }
+    result.compression_metadata = Some(compression);
     derive_rar5_file_checksum_relations(&mut result);
 
     result
@@ -7063,7 +7079,7 @@ mod tests {
             ),
             (
                 1 | (23 << 10) | (31 << 15) | 0x100000,
-                "supported",
+                "dictionary_size_exceeds_format_limit",
                 Some(2_164_663_517_184),
                 Some(0),
                 Some("RAR 7.0"),
@@ -7100,6 +7116,11 @@ mod tests {
             ),
         ];
         for (info, status, dictionary, algorithm, minimum_generation) in cases {
+            let info = if (info >> 7) & 7 == 0 {
+                info | (1 << 7)
+            } else {
+                info
+            };
             let block = rar5_test_file_block(0, 0, 0, 0, None, None, info, 0, b"x", &[], &[]);
             let mut archive = RAR5.to_vec();
             archive.extend_from_slice(&rar5_test_block(&[1, 0, 0], &[]));
@@ -7115,14 +7136,18 @@ mod tests {
             );
             assert_eq!(
                 compression["effective_dictionary_bytes"],
-                serde_json::json!(dictionary)
+                serde_json::json!(if status == "supported" {
+                    dictionary
+                } else {
+                    None
+                })
             );
             assert_eq!(
-                compression["actual_algorithm_version"],
+                compression["algorithm_version_from_flags"],
                 serde_json::json!(algorithm)
             );
             assert_eq!(
-                compression["minimum_decoder_generation"],
+                compression["encoding_generation"],
                 serde_json::json!(minimum_generation)
             );
             archive[file_start] ^= 1;
@@ -7131,6 +7156,56 @@ mod tests {
                 ["compression_metadata"];
             assert_eq!(compression["status"], "header_untrusted");
             assert!(compression["effective_dictionary_bytes"].is_null());
+        }
+    }
+
+    #[test]
+    fn rar5_dictionary_full_size_limit_preserves_the_oversized_declaration() {
+        for compatibility in [0, 0x100000] {
+            let boundary =
+                rar5_compression_metadata(1 | (1 << 7) | (23 << 10) | compatibility, true);
+            assert_eq!(boundary.status, "supported");
+            assert_eq!(boundary.effective_dictionary_bytes, Some(1u64 << 40));
+            for fraction in [1u64, 31] {
+                let result = rar5_compression_metadata(
+                    1 | (1 << 7) | (23 << 10) | (fraction << 15) | compatibility,
+                    true,
+                );
+                assert_eq!(result.status, "dictionary_size_exceeds_format_limit");
+                assert!(result.declared_dictionary_bytes.unwrap() > (1u64 << 40));
+                assert_eq!(result.effective_dictionary_bytes, None);
+            }
+        }
+    }
+
+    #[test]
+    fn rar5_incomplete_stored_and_directory_headers_withhold_effective_dictionary() {
+        for (info, file_flags, malformed) in
+            [(1 << 7, 0, true), (1, 0, false), (1 | (1 << 7), 1, false)]
+        {
+            let mut file =
+                rar5_test_file_block(0, file_flags, 0, 0, None, None, info, 0, b"x", &[], &[]);
+            if malformed {
+                let name_length_offset = file.len() - 2;
+                file[name_length_offset] = 5;
+                recalculate_rar5_header_crc(&mut file, 0);
+            }
+            let mut archive = RAR5.to_vec();
+            archive.extend_from_slice(&rar5_test_block(&[1, 0, 0], &[]));
+            archive.extend_from_slice(&file);
+            let metadata = serde_json::to_value(parse(&archive)).unwrap();
+            let header = &metadata["headers"][0]["visible_block_walk"]["blocks"][1]["file_header"];
+            let compression = &header["compression_metadata"];
+            assert!(compression["declared_dictionary_bytes"].is_number());
+            assert!(compression["effective_dictionary_bytes"].is_null());
+            assert_eq!(
+                compression["status"],
+                if malformed {
+                    "file_header_incomplete"
+                } else {
+                    "dictionary_not_applicable"
+                }
+            );
         }
     }
 
@@ -7508,6 +7583,27 @@ mod tests {
         }
         // The raw locator observations remain attached to the rejected header.
         assert!(metadata["headers"][0]["main_extra_records"]["quick_open_offset"].is_number());
+    }
+
+    #[test]
+    fn incomplete_rar5_main_fields_with_valid_crc_withhold_locator_targets() {
+        let mut archive = RAR5.to_vec();
+        // Five bytes of locator extra data, but no main archive-flags field.
+        archive.extend_from_slice(&rar5_test_block(&[1, 1, 5, 4, 1, 3, 20, 30], &[]));
+        let metadata = serde_json::to_value(parse(&archive)).unwrap();
+        let header = &metadata["headers"][0];
+        assert_eq!(header["first_block_header_checksum_valid"], true);
+        assert!(header["main_archive_flags"].is_null());
+        assert_eq!(header["main_extra_records"]["quick_open_offset"], 20);
+        assert_eq!(header["main_extra_records"]["recovery_record_offset"], 30);
+        for kind in ["quick_open", "recovery_record"] {
+            assert_eq!(
+                header["visible_block_walk"][kind]["status"],
+                "main_header_untrusted"
+            );
+            assert!(header["visible_block_walk"][kind]["relative_offset"].is_null());
+            assert!(header["visible_block_walk"][kind]["target_sample_offset"].is_null());
+        }
     }
 
     #[test]

@@ -258,7 +258,7 @@ final class NzbFingerprintAnalyzer
             $rawBody,
         );
         $conflictingYencFields = [];
-        $framingEvidenceIncomplete = self::yencFramingEvidenceIncomplete($yencFramingMetadata);
+        $framingEvidenceIncomplete = self::yencFramingEvidenceIncomplete($yencFramingMetadata, $rawBody);
         $framingLines = is_array($yencFramingMetadata['lines'] ?? null) ? $yencFramingMetadata['lines'] : [];
         foreach ($framingLines as $controlLine) {
             if (! is_array($controlLine) || ! is_string($controlLine['kind'] ?? null)) {
@@ -435,6 +435,8 @@ final class NzbFingerprintAnalyzer
                 'conflicting_control_fields' => $conflictingYencFields,
                 'integrity_checks_ambiguous' => $integrityChecksAmbiguous,
                 'native_framing_evidence_status' => $yencFramingMetadata === null ? 'unavailable'
+                    : ($framingEvidenceIncomplete ? 'incomplete_or_ambiguous' : 'occurrence_scan_complete'),
+                'fallback_framing_evidence_status' => $yencFramingMetadata !== null ? null
                     : ($framingEvidenceIncomplete ? 'incomplete_or_ambiguous' : 'occurrence_scan_complete'),
                 'header_numeric_fields_representable' => $headerNumericFieldsRangeValid,
                 'begin' => $rangeStart,
@@ -646,15 +648,16 @@ final class NzbFingerprintAnalyzer
     }
 
     /** @param array<string, mixed>|null $metadata */
-    private static function yencFramingEvidenceIncomplete(?array $metadata): bool
+    private static function yencFramingEvidenceIncomplete(?array $metadata, string $body = ''): bool
     {
         if ($metadata === null) {
-            return false; // No native claim; the public status explicitly says unavailable.
+            return self::fallbackYencFramingEvidenceIncomplete($body);
         }
         if (($metadata['frames_truncated'] ?? false) === true
             || ($metadata['control_lines_truncated'] ?? false) === true
             || ! is_array($metadata['lines'] ?? null)
-            || ! is_array($metadata['frames'] ?? null)) {
+            || ! is_array($metadata['frames'] ?? null)
+            || count($metadata['frames']) !== 1) {
             return true;
         }
         foreach ($metadata['lines'] as $line) {
@@ -669,6 +672,57 @@ final class NzbFingerprintAnalyzer
         }
 
         return false;
+    }
+
+    private static function fallbackYencFramingEvidenceIncomplete(string $body): bool
+    {
+        if (strlen($body) > 2_000_000) {
+            return true;
+        }
+        $counts = ['ybegin' => 0, 'ypart' => 0, 'yend' => 0];
+        $critical = [
+            'ybegin' => ['name', 'line', 'size', 'part', 'total'],
+            'ypart' => ['begin', 'end'],
+            'yend' => ['size', 'part', 'total', 'pcrc32', 'crc32'],
+        ];
+        $offset = 0;
+        $bodyLength = strlen($body);
+        while ($offset < $bodyLength) {
+            $newline = strpos($body, "\n", $offset);
+            $end = $newline === false ? $bodyLength : $newline;
+            $prefix = substr($body, $offset, min(8, $end - $offset));
+            if (preg_match('/\A=(ybegin|ypart|yend)(?:[ \t\r]|$)/i', $prefix, $kindMatch) === 1) {
+                $kind = strtolower($kindMatch[1]);
+                $counts[$kind]++;
+                if ($counts[$kind] > 1 || $end - $offset > 16_384) {
+                    return true;
+                }
+                $line = rtrim(substr($body, $offset + strlen($kind) + 1, $end - $offset - strlen($kind) - 1), "\r");
+                $fields = [];
+                $fieldOffset = 0;
+                $fieldCount = 0;
+                while (preg_match('/(?:^|[ \t])([a-z][a-z0-9_-]*)=([^ \t]*)/i', $line, $match, PREG_OFFSET_CAPTURE, $fieldOffset) === 1) {
+                    if (++$fieldCount > 64 || strlen($match[1][0]) > 128) {
+                        return true;
+                    }
+                    $name = strtolower($match[1][0]);
+                    $value = $match[2][0];
+                    if ($kind === 'ybegin' && $name === 'name') {
+                        break; // The filename consumes the remainder, including spaces.
+                    }
+                    if (in_array($name, $critical[$kind], true)) {
+                        if (isset($fields[$name]) && $fields[$name] !== $value) {
+                            return true;
+                        }
+                        $fields[$name] = $value;
+                    }
+                    $fieldOffset = $match[0][1] + strlen($match[0][0]);
+                }
+            }
+            $offset = $newline === false ? $bodyLength : $newline + 1;
+        }
+
+        return $counts['ybegin'] !== 1 || $counts['yend'] !== 1;
     }
 
     /** @return list<array{name: string, offset: int, basis: string}> */

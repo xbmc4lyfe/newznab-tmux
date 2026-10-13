@@ -1246,17 +1246,16 @@ final class Par2MetadataParser
             'source_block_size', 'source_block_count', 'source_file_bytes', 'file_length',
             'expected_slice_count_from_file_length', 'source_byte_start', 'source_byte_end_exclusive',
             'source_bytes_in_slice', 'zero_padding_bytes',
-            'logical_file_offset', 'logical_byte_length',
             'ifsc_record_index', 'source_slice_checksum_bytes',
         ];
         $initialUnsupportedRangeCount = $unsupportedRangeCount;
         foreach ($values as $key => &$value) {
             if (is_array($value)) {
                 self::normalizeIntegerRangeValues($value, $unsupportedRangeCount);
-            } elseif ($key === 'input_slice_index' && $value !== null) {
+            } elseif (in_array($key, ['input_slice_index', 'logical_file_offset', 'logical_byte_length'], true) && $value !== null) {
                 // This optional unsigned observation is not a global validity constraint.
                 // Keep JSON_BIGINT_AS_STRING's exact decimal value for public evidence.
-                $values['input_slice_index_integer_range_valid'] = is_int($value);
+                $values[$key.'_integer_range_valid'] = is_int($value);
             } elseif (in_array($key, $integerFields, true) && $value !== null && ! is_int($value)) {
                 $value = null;
                 $unsupportedRangeCount++;

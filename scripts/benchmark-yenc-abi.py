@@ -130,9 +130,10 @@ def output_probe(destination, capacity, written, expected):
     }
 
 
-def valid_output(probe):
+def valid_output(probe, backend):
     return (probe["exact_output"] and probe["prefix_capacity_canary_intact"]
-            and probe["suffix_capacity_canary_intact"])
+            and probe["suffix_capacity_canary_intact"]
+            and (backend != "rust" or probe["unused_capacity_changed_bytes"] == 0))
 
 
 def worker(options):
@@ -161,7 +162,7 @@ def worker(options):
         invoke = lambda: int(crc(source_address, len(data), 0))
     warm_result = invoke()
     warm_probe = output_probe(destination, len(payload), warm_result, data) if decode and options.operation.startswith("decode") else None
-    if warm_probe is not None and not valid_output(warm_probe):
+    if warm_probe is not None and not valid_output(warm_probe, options.backend):
         return {"status": "incorrect", "library": identity, "warm_output_probe": warm_probe}
     if warm_probe is None and warm_result != expected_crc:
         raise ValueError("Warm CRC result disagrees with independent reference")
@@ -175,7 +176,7 @@ def worker(options):
     usage_after = resource.getrusage(resource.RUSAGE_SELF)
     last_result = results[-1]
     probe = output_probe(destination, len(payload), last_result, data) if warm_probe is not None else None
-    correct = valid_output(probe) if probe is not None else last_result == expected_crc
+    correct = valid_output(probe, options.backend) if probe is not None else last_result == expected_crc
     correct = correct and all(result == (len(data) if probe is not None else expected_crc) for result in results)
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return {
