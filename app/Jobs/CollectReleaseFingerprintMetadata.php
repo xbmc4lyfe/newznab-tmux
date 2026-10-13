@@ -54,23 +54,25 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         }
         $record->update(['status' => 'processing', 'last_error' => null]);
 
-        try {
-            $result = $collector->collect($release);
-            $encodedMetadata = json_encode($result['data'], JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
-            $safeMetadata = json_decode($encodedMetadata, true, 512, JSON_THROW_ON_ERROR);
-            $record->update([
-                'status' => $result['status'],
-                'metadata' => $safeMetadata,
-                'last_error' => $result['status'] === 'unavailable' ? ($result['data']['reason'] ?? 'NZB unavailable.') : null,
-                'collected_at' => now(),
-            ]);
-        } catch (Throwable $exception) {
-            $record->update([
+        $result = $collector->collect($release);
+        $encodedMetadata = json_encode($result['data'], JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
+        $safeMetadata = json_decode($encodedMetadata, true, 512, JSON_THROW_ON_ERROR);
+        $record->update([
+            'status' => $result['status'],
+            'metadata' => $safeMetadata,
+            'last_error' => $result['status'] === 'unavailable' ? ($result['data']['reason'] ?? 'NZB unavailable.') : null,
+            'collected_at' => now(),
+        ]);
+    }
+
+    public function failed(Throwable $exception): void
+    {
+        ReleaseFingerprintMetadata::query()
+            ->where('releases_id', $this->releaseId)
+            ->update([
                 'status' => 'failed',
                 'last_error' => class_basename($exception),
                 'collected_at' => now(),
             ]);
-            throw $exception;
-        }
     }
 }

@@ -163,6 +163,8 @@ final class Par2MetadataParser
                 $fileIdDerivationValid = $filenameBytesNonempty && $filenameAsciiValid && $filenamePaddingValid;
                 $derivedFileIdBytes = md5(substr($payload, 32, 16).substr($payload, 48, 8).$filename, true);
                 $advertisedFileIdBytes = substr($payload, 0, 16);
+                $md5 = bin2hex(substr($payload, 16, 16));
+                $md5First16k = bin2hex(substr($payload, 32, 16));
                 $source = [
                     'recovery_set_id' => $setId,
                     'filename' => $filename,
@@ -178,8 +180,10 @@ final class Par2MetadataParser
                     'file_length' => $fileSize,
                     'file_length_raw_little_endian_hex' => bin2hex(substr($payload, 48, 8)),
                     'file_length_integer_range_valid' => $fileSize !== null,
-                    'md5' => bin2hex(substr($payload, 16, 16)),
-                    'md5_first_16k' => bin2hex(substr($payload, 32, 16)),
+                    'md5' => $md5,
+                    'md5_first_16k' => $md5First16k,
+                    'short_file_hashes_consistent' => is_int($fileSize) && $fileSize <= 16_384
+                        ? hash_equals($md5, $md5First16k) : null,
                     'file_id' => bin2hex($advertisedFileIdBytes),
                     'derived_file_id' => bin2hex($derivedFileIdBytes),
                     'file_id_derivation_valid' => $fileIdDerivationValid,

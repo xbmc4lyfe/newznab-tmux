@@ -253,48 +253,72 @@ final class NzbFingerprintAnalyzer
             foreach (preg_split('/\r?\n/', rtrim($payload, "\r\n")) ?: [] as $line) {
                 $payloadLineLengths[] = strlen($line);
             }
-            $rangeStart = isset($frame->part['begin']) && ctype_digit($frame->part['begin']) ? (int) $frame->part['begin'] : null;
-            $rangeEnd = isset($frame->part['end']) && ctype_digit($frame->part['end']) ? (int) $frame->part['end'] : null;
+            $rangeStart = isset($frame->part['begin']) ? self::metadataNumber($frame->part['begin']) : null;
+            $rangeEnd = isset($frame->part['end']) ? self::metadataNumber($frame->part['end']) : null;
+            $headerExpectedDecodedSize = isset($frame->header['size'])
+                ? self::metadataNumber($frame->header['size']) : null;
             $hasRangeField = isset($frame->part['begin']) || isset($frame->part['end']);
             $rangeIsValid = ! $hasRangeField ? null : ($rangeStart !== null && $rangeEnd !== null
                 && $rangeStart >= 1 && $rangeEnd >= $rangeStart
-                && (! isset($frame->header['size']) || ! ctype_digit($frame->header['size']) || $rangeEnd <= (int) $frame->header['size']));
+                && (! isset($frame->header['size']) || ($headerExpectedDecodedSize !== null
+                    && $rangeEnd <= $headerExpectedDecodedSize)));
             $ypartExpectedDecodedSize = $rangeIsValid === true ? $rangeEnd - $rangeStart + 1 : null;
-            $trailerExpectedDecodedSize = isset($frame->trailer['size']) && ctype_digit($frame->trailer['size'])
-                ? (int) $frame->trailer['size'] : null;
+            $trailerExpectedDecodedSize = isset($frame->trailer['size'])
+                ? self::metadataNumber($frame->trailer['size']) : null;
             $trailerSizeIsDecimal = ! isset($frame->trailer['size']) || ctype_digit($frame->trailer['size']);
             $trailerNumericFieldsValid = true;
-            foreach (['part', 'total'] as $numericField) {
-                if (isset($frame->trailer[$numericField])
-                    && (! ctype_digit($frame->trailer[$numericField]) || (int) $frame->trailer[$numericField] < 1)) {
+            $trailerNumericFieldsRangeValid = true;
+            foreach (['size', 'part', 'total'] as $numericField) {
+                if (! isset($frame->trailer[$numericField])) {
+                    continue;
+                }
+                $number = self::metadataNumber($frame->trailer[$numericField]);
+                if ($number === null) {
+                    $trailerNumericFieldsRangeValid = false;
+                }
+                if ($number === null || (in_array($numericField, ['part', 'total'], true) && $number < 1)) {
                     $trailerNumericFieldsValid = false;
                 }
             }
+            $trailerPartNumber = isset($frame->trailer['part'])
+                ? self::metadataNumber($frame->trailer['part']) : null;
+            $trailerTotalNumber = isset($frame->trailer['total'])
+                ? self::metadataNumber($frame->trailer['total']) : null;
+            $headerPartNumber = isset($frame->header['part'])
+                ? self::metadataNumber($frame->header['part']) : null;
+            $headerTotalNumber = isset($frame->header['total'])
+                ? self::metadataNumber($frame->header['total']) : null;
             $trailerPartMatchesHeader = null;
-            if (isset($frame->trailer['part'], $frame->header['part'])
-                && ctype_digit($frame->trailer['part']) && ctype_digit($frame->header['part'])) {
-                $trailerPartMatchesHeader = (int) $frame->trailer['part'] === (int) $frame->header['part'];
+            if (isset($frame->trailer['part'], $frame->header['part'])) {
+                $trailerPartMatchesHeader = $trailerPartNumber !== null && $headerPartNumber !== null
+                    ? $trailerPartNumber === $headerPartNumber : false;
             }
             $trailerTotalMatchesHeader = null;
-            if (isset($frame->trailer['total'], $frame->header['total'])
-                && ctype_digit($frame->trailer['total']) && ctype_digit($frame->header['total'])) {
-                $trailerTotalMatchesHeader = (int) $frame->trailer['total'] === (int) $frame->header['total'];
+            if (isset($frame->trailer['total'], $frame->header['total'])) {
+                $trailerTotalMatchesHeader = $trailerTotalNumber !== null && $headerTotalNumber !== null
+                    ? $trailerTotalNumber === $headerTotalNumber : false;
             }
             $headerNumericFieldsValid = true;
+            $headerNumericFieldsRangeValid = true;
             foreach (['line', 'size', 'part', 'total'] as $numericField) {
-                if (isset($frame->header[$numericField])
-                    && (! ctype_digit($frame->header[$numericField]) || (int) $frame->header[$numericField] < 1)) {
+                if (! isset($frame->header[$numericField])) {
+                    continue;
+                }
+                $number = self::metadataNumber($frame->header[$numericField]);
+                if ($number === null) {
+                    $headerNumericFieldsRangeValid = false;
+                }
+                if ($number === null || $number < 1) {
                     $headerNumericFieldsValid = false;
                 }
             }
             if ((isset($frame->header['part']) && $frame->part === null)
                 || (isset($frame->header['part'], $frame->header['total'])
-                    && (int) $frame->header['part'] > (int) $frame->header['total'])) {
+                    && $headerPartNumber !== null && $headerTotalNumber !== null
+                    && $headerPartNumber > $headerTotalNumber)) {
                 $headerNumericFieldsValid = false;
             }
             $multipart = $frame->part !== null;
-            $headerExpectedDecodedSize = isset($frame->header['size']) && ctype_digit($frame->header['size'])
-                ? (int) $frame->header['size'] : null;
             $expectedDecodedSize = $multipart ? $ypartExpectedDecodedSize : $headerExpectedDecodedSize;
             $expectedCrc = $multipart
                 ? ($frame->trailer['pcrc32'] ?? null)
@@ -327,18 +351,20 @@ final class NzbFingerprintAnalyzer
                 'payload_escape_state_valid' => $payloadEscapeStateValid,
                 'payload_integrity_status' => $payloadEscapeStateValid ? 'escape_state_valid' : 'invalid_unmatched_escape',
                 'name' => $frame->header['name'] ?? null,
-                'file_size' => isset($frame->header['size']) ? (int) $frame->header['size'] : null,
-                'line_length' => isset($frame->header['line']) ? (int) $frame->header['line'] : null,
-                'part' => isset($frame->header['part']) ? (int) $frame->header['part'] : null,
+                'file_size' => $headerExpectedDecodedSize,
+                'line_length' => isset($frame->header['line']) ? self::metadataNumber($frame->header['line']) : null,
+                'part' => $headerPartNumber,
                 'multipart' => $multipart,
-                'total_parts' => isset($frame->header['total']) ? (int) $frame->header['total'] : null,
+                'total_parts' => $headerTotalNumber,
                 'header_numeric_fields_valid' => $headerNumericFieldsValid,
-                'begin' => isset($frame->part['begin']) ? (int) $frame->part['begin'] : null,
-                'end' => isset($frame->part['end']) ? (int) $frame->part['end'] : null,
+                'header_numeric_fields_representable' => $headerNumericFieldsRangeValid,
+                'begin' => $rangeStart,
+                'end' => $rangeEnd,
                 'ypart_range_valid' => $rangeIsValid,
                 'ypart_range_decoded_size' => $ypartExpectedDecodedSize,
-                'trailer_size' => isset($frame->trailer['size']) ? (int) $frame->trailer['size'] : null,
+                'trailer_size' => $trailerExpectedDecodedSize,
                 'trailer_numeric_fields_valid' => $trailerNumericFieldsValid,
+                'trailer_numeric_fields_representable' => $trailerNumericFieldsRangeValid,
                 'trailer_part_matches_header' => $trailerPartMatchesHeader,
                 'trailer_total_matches_header' => $trailerTotalMatchesHeader,
                 'header_size' => $headerExpectedDecodedSize,
@@ -423,6 +449,24 @@ final class NzbFingerprintAnalyzer
         }
 
         return ($escapeCount % 2) === 0;
+    }
+
+    private static function metadataNumber(string $value): ?int
+    {
+        if ($value === '' || ! ctype_digit($value)) {
+            return null;
+        }
+        $normalized = ltrim($value, '0');
+        if ($normalized === '') {
+            return 0;
+        }
+        $maximum = (string) PHP_INT_MAX;
+        if (strlen($normalized) > strlen($maximum)
+            || (strlen($normalized) === strlen($maximum) && strcmp($normalized, $maximum) > 0)) {
+            return null;
+        }
+
+        return (int) $normalized;
     }
 
     public static function fileKind(string $subject): string

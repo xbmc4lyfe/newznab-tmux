@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 13;
+    public const SCHEMA_VERSION = 14;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 
@@ -1053,7 +1053,7 @@ final class ReleaseFingerprintCollector
                     'source_file_definition_conflicts' => $par2SourceDefinitionConflicts,
                     'source_rar_files' => $par2SourceRarFiles,
                     'source_rar_total_bytes' => $par2SourceRarTotalBytes,
-                    'source_rar_article_matches' => $par2SourceArticleMatches,
+                    'source_file_article_matches' => $par2SourceArticleMatches,
                     'input_file_slice_checksums' => $par2Ifsc['files'],
                     'ifsc_conflicts' => $par2Ifsc['conflicts'],
                     'ifsc_slice_count_mismatches' => $par2Ifsc['slice_count_mismatches'],
@@ -1148,7 +1148,8 @@ final class ReleaseFingerprintCollector
         $crcSyntaxValid = ($yenc['all_declared_crc32_fields_are_hex'] ?? false) === true;
         $observedCrc = $yenc['observed_decoded_crc32'] ?? null;
         $crcValuesMatch = is_string($observedCrc);
-        foreach (['pcrc32', 'crc32'] as $crcField) {
+        $segmentCrcFields = ($yenc['part'] ?? null) !== null ? ['pcrc32'] : ['pcrc32', 'crc32'];
+        foreach ($segmentCrcFields as $crcField) {
             $declaredCrc = $yenc[$crcField] ?? null;
             if ($declaredCrc !== null && (! is_string($declaredCrc)
                 || preg_match('/\A[0-9a-f]{1,8}\z/i', $declaredCrc) !== 1
@@ -1598,18 +1599,16 @@ final class ReleaseFingerprintCollector
                 || ! is_int($observation['file_index'] ?? null)) {
                 continue;
             }
-            $signatures = $observation['metadata']['decoded_format_metadata']['signatures'] ?? [];
-            $startsWithRarSignature = count(array_filter($signatures, static function (mixed $signature): bool {
-                if (! is_array($signature)) {
-                    return false;
-                }
-                $format = $signature['format'] ?? $signature['name'] ?? null;
-
-                return in_array($format, ['RAR 4', 'RAR 5'], true) && ($signature['offset'] ?? null) === 0;
-            })) > 0;
-            if (! $startsWithRarSignature) {
+            if (($observation['kind'] ?? null) === 'par2') {
                 continue;
             }
+            $signatures = $observation['metadata']['decoded_format_metadata']['signatures'] ?? [];
+            $signaturesAtStart = array_values(array_filter(
+                is_array($signatures) ? $signatures : [],
+                static fn (mixed $signature): bool => is_array($signature)
+                    && ($signature['offset'] ?? null) === 0
+                    && is_string($signature['format'] ?? null),
+            ));
             $yenc = $observation['metadata']['yenc'] ?? null;
             $integrityConflicts = [];
             if (is_array($yenc)) {
@@ -1696,12 +1695,17 @@ final class ReleaseFingerprintCollector
                 implode(',', $candidateIds),
             ]);
             $matches[$key] ??= [
-                'relationship' => 'par2_source_file_to_nzb_rar',
+                'relationship' => 'par2_source_file_to_nzb_file',
                 'status' => $matchStatus,
                 'prefix_and_length_status' => $prefixAndLengthStatus,
                 'integrity_conflicts' => $integrityConflicts,
                 'nzb_file_index' => $observation['file_index'],
+                'nzb_file_kind' => $observation['kind'] ?? null,
                 'nzb_subject' => $observation['nzb_subject'] ?? null,
+                'decoded_format_signatures_at_offset_zero' => array_map(static fn (array $signature): array => [
+                    'format' => $signature['format'],
+                    'basis' => is_string($signature['basis'] ?? null) ? $signature['basis'] : null,
+                ], $signaturesAtStart),
                 'message_id' => $messageId,
                 'observed_first_16k_md5' => $hasPrefixMd5 ? $prefixMd5 : null,
                 'observed_yenc_file_length' => $expectedLength,
@@ -1732,7 +1736,7 @@ final class ReleaseFingerprintCollector
         unset($match);
 
         return [
-            'basis' => 'Compare PAR2 FileDesc md5_first_16k with the first 16384 decoded bytes from NZB segment 1; multipart yEnc samples must declare a valid range beginning at byte 1. A unique prefix-hash and whole-file length match is labeled matched_prefix_and_length only when available yEnc part numbering, numeric fields, size fields, and declared CRC checks have no contradiction; this does not verify the remaining file bytes.',
+            'basis' => 'Compare PAR2 FileDesc md5_first_16k with the first 16384 decoded bytes from NZB segment 1 for every non-PAR2 file, regardless of its recognized format signature; multipart yEnc samples must declare a valid range beginning at byte 1. A unique prefix-hash and whole-file length match is labeled matched_prefix_and_length only when available yEnc part numbering, numeric fields, size fields, and declared CRC checks have no contradiction; this does not verify the remaining file bytes. Format signatures are supporting byte-pattern observations, not proof of file type.',
             'matched_prefix_and_length_count' => count(array_filter($matches, static fn (array $match): bool => $match['status'] === 'matched_prefix_and_length')),
             'ambiguous_count' => count(array_filter($matches, static fn (array $match): bool => $match['status'] === 'ambiguous')),
             'unmatched_count' => count(array_filter($matches, static fn (array $match): bool => $match['status'] === 'unmatched')),
@@ -1826,6 +1830,8 @@ final class ReleaseFingerprintCollector
                             : (in_array($fileId, $allMainIds, true) ? 'non_recoverable' : 'unlisted'))));
                 $fileLength = is_array($source) && is_int($source['file_length'] ?? null)
                     ? $source['file_length'] : null;
+                $shortFileHashesConsistent = is_array($source)
+                    ? ($source['short_file_hashes_consistent'] ?? null) : null;
                 $validBlockSize = is_int($blockSize) && $blockSize > 0 ? $blockSize : null;
                 $expectedSliceCount = $fileLength !== null && $validBlockSize !== null
                     ? intdiv($fileLength, $validBlockSize) + (($fileLength % $validBlockSize) === 0 ? 0 : 1)
@@ -1856,7 +1862,8 @@ final class ReleaseFingerprintCollector
                 unset($variant);
 
                 $duplicateConflict = $localConflict || count($variants) > 1;
-                $definitionConflict = $mainConflict || $sourceConflict || $blockConflict;
+                $definitionConflict = $mainConflict || $sourceConflict || $blockConflict
+                    || $shortFileHashesConsistent === false;
                 $invalid = $duplicateConflict || $mainMembership === 'unlisted' || $sliceCountMismatch;
                 $validationStatus = $invalid ? 'invalid'
                     : ($mainMembership !== 'unknown' && $source !== null && $validBlockSize !== null
@@ -1880,6 +1887,7 @@ final class ReleaseFingerprintCollector
                     'duplicate_conflict' => $duplicateConflict,
                     'definition_conflict' => $definitionConflict,
                     'source_file_present' => $sourceConflict ? null : is_array($source),
+                    'source_file_short_hashes_consistent' => $shortFileHashesConsistent,
                     'source_file_length' => $fileLength,
                     'main_membership' => $mainMembership,
                     'source_block_size' => $validBlockSize,

@@ -116,8 +116,8 @@ def parse_nzb(path: Path) -> list[dict[str, Any]]:
         for node in file_node.iter():
             if node.tag.rsplit("}", 1)[-1] != "segment":
                 continue
-            message_id = (node.text or "").strip()
-            if message_id and not message_id.startswith("<") and not message_id.endswith(">"):
+            message_id = (node.text or "").strip().strip("<>")
+            if message_id:
                 message_id = f"<{message_id}>"
             if ID_RE.fullmatch(message_id):
                 segments.append({"bytes": safe_int(node.attrib.get("bytes")), "number": safe_int(node.attrib.get("number")), "id": message_id})
@@ -147,10 +147,10 @@ class Nntp:
         if self.user:
             if any(char in self.user for char in "\r\n") or (self.password and any(char in self.password for char in "\r\n")):
                 raise ValueError("NNTP credentials may not contain line breaks")
-            self.file.write(f"AUTHINFO USER {self.user}\r\n".encode("utf-8"))
+            self._write(f"AUTHINFO USER {self.user}\r\n".encode("utf-8"))
             auth_code, _ = self._response()
             if auth_code == 381 and self.password:
-                self.file.write(f"AUTHINFO PASS {self.password}\r\n".encode("utf-8"))
+                self._write(f"AUTHINFO PASS {self.password}\r\n".encode("utf-8"))
                 auth_code, _ = self._response()
             if auth_code != 281:
                 raise RuntimeError(f"NNTP authentication failed with response {auth_code}")
@@ -161,6 +161,16 @@ class Nntp:
         if not match:
             self._fail_connection("Invalid NNTP response")
         return int(match.group(1)), match.group(2)
+
+    def _write(self, data: bytes) -> None:
+        if self.poisoned:
+            raise RuntimeError("NNTP connection is unusable after a write failure")
+        try:
+            self.file.write(data)
+        except OSError:
+            self.poisoned = True
+            self._close_transport()
+            raise
 
     def _fail_connection(self, message: str) -> NoReturn:
         self.poisoned = True
@@ -207,7 +217,7 @@ class Nntp:
                 self._fail_connection(f"{description} exceeded its {NNTP_MULTILINE_COUNT_LIMIT}-line limit")
 
     def command(self, command: str, accepted: tuple[int, ...] = (281, 381, 250, 223)) -> str:
-        self.file.write(command.encode("ascii") + b"\r\n")
+        self._write(command.encode("ascii") + b"\r\n")
         code, message = self._response()
         if code not in accepted:
             raise RuntimeError(f"NNTP command failed with response {code}")
@@ -216,7 +226,7 @@ class Nntp:
     def status(self, verb: str, message_id: str) -> dict[str, Any]:
         if "\r" in message_id or "\n" in message_id:
             raise ValueError("Invalid message ID")
-        self.file.write(f"{verb} {message_id}\r\n".encode("ascii"))
+        self._write(f"{verb} {message_id}\r\n".encode("ascii"))
         code, message = self._response()
         found = (verb == "STAT" and code == 223) or (verb == "HEAD" and code == 221)
         result: dict[str, Any] = {"code": code, "message": message, "available": found}
@@ -227,7 +237,7 @@ class Nntp:
         return result
 
     def capabilities(self) -> list[str]:
-        self.file.write(b"CAPABILITIES\r\n")
+        self._write(b"CAPABILITIES\r\n")
         code, _ = self._response()
         if code != 101:
             return []
@@ -236,7 +246,7 @@ class Nntp:
         return [line.decode("ascii", "replace").strip() for line in lines]
 
     def overview_format(self) -> list[str]:
-        self.file.write(b"LIST OVERVIEW.FMT\r\n")
+        self._write(b"LIST OVERVIEW.FMT\r\n")
         code, _ = self._response()
         if code != 215:
             return []
@@ -249,11 +259,11 @@ class Nntp:
             return {"group": group, "available": False, "error": "invalid group name"}
         if article_number < 1:
             return {"group": group, "available": False, "error": "invalid article number"}
-        self.file.write(f"GROUP {group}\r\n".encode("ascii"))
+        self._write(f"GROUP {group}\r\n".encode("ascii"))
         code, message = self._response()
         if code != 211:
             return {"group": group, "available": False, "group_response": code}
-        self.file.write(f"OVER {article_number}-{article_number}\r\n".encode("ascii"))
+        self._write(f"OVER {article_number}-{article_number}\r\n".encode("ascii"))
         over_code, _ = self._response()
         rows = []
         if over_code == 224:
@@ -277,11 +287,11 @@ class Nntp:
     def overview_message_id(self, group: str, message_id: str, format_fields: list[str]) -> dict[str, Any]:
         if not re.fullmatch(r"[A-Za-z0-9+._-]+", group):
             return {"group": group, "available": False, "error": "invalid group name"}
-        self.file.write(f"GROUP {group}\r\n".encode("ascii"))
+        self._write(f"GROUP {group}\r\n".encode("ascii"))
         group_code, _ = self._response()
         if group_code != 211:
             return {"group": group, "available": False, "group_response": group_code}
-        self.file.write(f"OVER {message_id}\r\n".encode("ascii"))
+        self._write(f"OVER {message_id}\r\n".encode("ascii"))
         code, _ = self._response()
         if code != 224:
             return {"group": group, "available": False, "overview_response": code}
@@ -299,7 +309,7 @@ class Nntp:
                 "overview_fields": dict(zip(names, values))}
 
     def article(self, message_id: str, limit: int) -> tuple[dict[str, str], bytes]:
-        self.file.write(f"ARTICLE {message_id}\r\n".encode("ascii"))
+        self._write(f"ARTICLE {message_id}\r\n".encode("ascii"))
         code, _ = self._response()
         if code != 220:
             return {}, b""
@@ -828,7 +838,7 @@ def main() -> int:
                             if supports_message_id_overview:
                                 overview_rows.append(server.overview_message_id(group_name, message_id, overview_fields))
                             else:
-                                server.file.write(f"GROUP {group_name}\r\n".encode("ascii"))
+                                server._write(f"GROUP {group_name}\r\n".encode("ascii"))
                                 group_code, _ = server._response()
                                 group_number = None
                                 if group_code == 211:
@@ -1047,7 +1057,7 @@ def main() -> int:
         total_segments = len(item["segments"])
         coverage.append({"file_index": file_index, "subject": item["subject"],
                          "kind": file_kind(item["subject"], None),
-                         "nzb_advertised_bytes": sum(segment["bytes"] for segment in item["segments"]),
+                         "nzb_advertised_bytes": sum(segment["bytes"] or 0 for segment in item["segments"]),
                          "segment_count": total_segments,
                          "unique_articles_observed": len(observed_ids),
                          "article_observations_across_servers": sum(1 for sample in samples if sample["file_index"] == file_index),

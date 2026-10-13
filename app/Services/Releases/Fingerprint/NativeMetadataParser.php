@@ -141,11 +141,11 @@ final class NativeMetadataParser
         $encoded = null;
         try {
             $length = strlen($bytes);
-            $buffer = $length > 0 ? FFI::new('unsigned char['.$length.']') : FFI::new('unsigned char[1]');
+            $buffer = $library->new($length > 0 ? 'unsigned char['.$length.']' : 'unsigned char[1]');
             if ($length > 0) {
                 FFI::memcpy($buffer, $bytes, $length);
             }
-            $pointer = $library->{$function}($buffer, $length, ...$integerArguments); // @phpstan-ignore method.notFound
+            $pointer = $library->{$function}($buffer, $length, ...$integerArguments);
             if (FFI::isNull($pointer)) {
                 return null;
             }

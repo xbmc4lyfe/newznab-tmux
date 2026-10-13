@@ -53,15 +53,6 @@ pub fn parse(headers: &[u8]) -> ArticleDates {
             let line = physical.strip_suffix(b"\n").unwrap_or(physical);
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             if line.is_empty() {
-                append(
-                    &name,
-                    &value,
-                    &raw,
-                    &lines,
-                    &mut date,
-                    &mut injection,
-                    &mut legacy,
-                );
                 break;
             }
             if matches!(line.first(), Some(b' ' | b'\t')) {

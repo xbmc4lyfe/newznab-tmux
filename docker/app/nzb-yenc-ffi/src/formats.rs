@@ -67,6 +67,23 @@ pub struct ZipUnicodePathExtra {
     pub payload_has_required_fields: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ZipExtendedTimestamp {
+    pub record_index: usize,
+    pub payload_length: usize,
+    pub flags: Option<u8>,
+    pub modification_time_unix_seconds: Option<u32>,
+    pub access_time_unix_seconds: Option<u32>,
+    pub creation_time_unix_seconds: Option<u32>,
+    pub declared_time_fields_mask: Option<u8>,
+    pub available_time_fields_mask: u8,
+    pub missing_declared_time_fields_mask: Option<u8>,
+    pub unknown_flag_bits: Option<u8>,
+    pub trailing_payload_length: usize,
+    pub payload_has_flag_byte: bool,
+    pub declared_time_fields_complete: Option<bool>,
+}
+
 #[derive(Debug)]
 struct ZipExtraInspection<'a> {
     records: Vec<ZipExtraField>,
@@ -79,6 +96,8 @@ struct ZipExtraInspection<'a> {
     zip64_duplicate: bool,
     aes_records: Vec<ZipAesExtra>,
     aes_record_count: usize,
+    extended_timestamp_records: Vec<ZipExtendedTimestamp>,
+    extended_timestamp_record_count: usize,
     unicode_path_records: Vec<ZipUnicodePathExtra>,
     unicode_path_record_count: usize,
 }
@@ -233,6 +252,9 @@ pub enum FormatHeader {
         zip_aes_record_count: Option<usize>,
         zip_aes_records_truncated: Option<bool>,
         zip_aes_record_count_matches_encryption_indicators: Option<bool>,
+        zip_extended_timestamp_records: Option<Vec<ZipExtendedTimestamp>>,
+        zip_extended_timestamp_record_count: Option<usize>,
+        zip_extended_timestamp_records_truncated: Option<bool>,
         zip_unicode_path_records: Option<Vec<ZipUnicodePathExtra>>,
         zip_unicode_path_record_count: Option<usize>,
         zip_unicode_path_records_truncated: Option<bool>,
@@ -1139,6 +1161,15 @@ fn parse_zip(data: &[u8], offset: usize) -> FormatHeader {
         zip_aes_records_truncated: extra_inspection
             .as_ref()
             .map(|inspection| inspection.aes_record_count > inspection.aes_records.len()),
+        zip_extended_timestamp_records: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.extended_timestamp_records.clone()),
+        zip_extended_timestamp_record_count: extra_inspection
+            .as_ref()
+            .map(|inspection| inspection.extended_timestamp_record_count),
+        zip_extended_timestamp_records_truncated: extra_inspection.as_ref().map(|inspection| {
+            inspection.extended_timestamp_record_count > inspection.extended_timestamp_records.len()
+        }),
         zip_unicode_path_record_count: extra_inspection
             .as_ref()
             .map(|inspection| inspection.unicode_path_record_count),
@@ -1172,6 +1203,8 @@ fn inspect_zip_extra_fields<'a>(
         zip64_duplicate: false,
         aes_records: Vec::new(),
         aes_record_count: 0,
+        extended_timestamp_records: Vec::new(),
+        extended_timestamp_record_count: 0,
         unicode_path_records: Vec::new(),
         unicode_path_record_count: 0,
     };
@@ -1257,6 +1290,15 @@ fn inspect_zip_extra_fields<'a>(
                     ));
                 }
             }
+            0x5455 if complete => {
+                inspection.extended_timestamp_record_count =
+                    inspection.extended_timestamp_record_count.saturating_add(1);
+                if inspection.extended_timestamp_records.len() < MAX_EXTRA_RECORDS {
+                    inspection
+                        .extended_timestamp_records
+                        .push(parse_zip_extended_timestamp_record(record_index, payload));
+                }
+            }
             0x7075 if complete => {
                 inspection.unicode_path_record_count =
                     inspection.unicode_path_record_count.saturating_add(1);
@@ -1305,6 +1347,48 @@ fn resolve_zip_local_size(
         },
         Some(size) => (Some(u64::from(size)), Some("local_header")),
         None => (None, None),
+    }
+}
+
+fn parse_zip_extended_timestamp_record(
+    record_index: usize,
+    payload: &[u8],
+) -> ZipExtendedTimestamp {
+    let flags = payload.first().copied();
+    let declared_time_fields_mask = flags.map(|value| value & 0x07);
+    let unknown_flag_bits = flags.map(|value| value & !0x07);
+    let mut offset = usize::from(flags.is_some());
+    let mut available_time_fields_mask = 0u8;
+    let mut values = [None, None, None];
+    for (index, bit) in [0x01, 0x02, 0x04].into_iter().enumerate() {
+        if declared_time_fields_mask.is_some_and(|mask| mask & bit != 0) {
+            if let Some(bytes) = payload.get(offset..offset.saturating_add(4)) {
+                values[index] = Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+                available_time_fields_mask |= bit;
+                offset += 4;
+            } else {
+                offset = payload.len();
+            }
+        }
+    }
+    let missing_declared_time_fields_mask =
+        declared_time_fields_mask.map(|mask| mask & !available_time_fields_mask);
+
+    ZipExtendedTimestamp {
+        record_index,
+        payload_length: payload.len(),
+        flags,
+        modification_time_unix_seconds: values[0],
+        access_time_unix_seconds: values[1],
+        creation_time_unix_seconds: values[2],
+        declared_time_fields_mask,
+        available_time_fields_mask,
+        missing_declared_time_fields_mask,
+        unknown_flag_bits,
+        trailing_payload_length: payload.len().saturating_sub(offset),
+        payload_has_flag_byte: flags.is_some(),
+        declared_time_fields_complete: declared_time_fields_mask
+            .map(|_| missing_declared_time_fields_mask == Some(0)),
     }
 }
 

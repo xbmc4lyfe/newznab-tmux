@@ -69,6 +69,7 @@ pub struct SourceFile {
     pub file_length_raw_little_endian_hex: String,
     pub md5: String,
     pub md5_first_16k: String,
+    pub short_file_hashes_consistent: Option<bool>,
     pub file_id: String,
     pub derived_file_id: String,
     pub file_id_derivation_valid: bool,
@@ -344,6 +345,10 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
                 let file_length = read_u64(payload, 48).unwrap_or_default();
                 let derived_file_id =
                     hex(&md5_file_id(&payload[32..48], file_length_bytes, filename));
+                let md5 = hex(&payload[16..32]);
+                let md5_first_16k = hex(&payload[32..48]);
+                let short_file_hashes_consistent =
+                    (file_length <= 16_384).then(|| md5 == md5_first_16k);
                 let filename_ascii_valid = filename.is_ascii();
                 let expected_padding_bytes = (4 - filename.len() % 4) % 4;
                 let filename_padding_valid = filename_field.len() % 4 == 0
@@ -372,8 +377,9 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
                     filename_padding_valid,
                     file_length,
                     file_length_raw_little_endian_hex: hex(file_length_bytes),
-                    md5: hex(&payload[16..32]),
-                    md5_first_16k: hex(&payload[32..48]),
+                    md5,
+                    md5_first_16k,
+                    short_file_hashes_consistent,
                     file_id,
                     file_id_matches_derived,
                     derived_file_id,
