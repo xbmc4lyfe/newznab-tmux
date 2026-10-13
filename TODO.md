@@ -14,7 +14,7 @@
 
 ## Release identification follow-up (implemented, not deployed)
 
-- [x] Exclude explicitly named recovery-volume subjects from ordinary naming probes, preserving explicit indexes, legacy candidates, bounded hidden candidates and durable resume. The earlier same-family partial-index restriction caused a regression. The volume-fallback repair permits standalone recovery metadata while prioritizing one volume per family, hidden candidates, then remaining volumes; bounded multipart parsing and the newer heartbeat/ownership checks remain in place.
+- [x] Exclude explicitly named recovery-volume subjects from ordinary naming probes, preserving explicit indexes, legacy candidates, bounded hidden candidates and durable resume. The earlier same-family partial-index restriction caused a regression. The volume-fallback repair permits standalone recovery metadata while prioritizing matching-family volumes, hidden candidates, then one standalone volume per family and remaining volumes; bounded multipart parsing and the newer heartbeat/ownership checks remain in place.
 - [x] Preserve string results from the release name cleaner and recheck cleaner-supplied PreDB references against their current stored title. Missing or changed references no longer attach an unrelated identity.
 - [x] Run the affected PAR2, payload metadata, and PreDB matching regressions: 95 tests, 469 assertions (11 PHPUnit notices).
 - [ ] Deploy through the single deployment owner and measure historical rename yield versus arrivals. The regression checks prove the repaired mechanisms, not sustained throughput or a shrinking production backlog.

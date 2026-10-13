@@ -546,7 +546,7 @@ PHP;
         $this->assertSame(Par2RenameOutcome::Retryable, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
         $this->assertSame(0, (int) $release->fresh()->proc_par2);
         $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame(['first-volume', 'hidden', 'later-volume'], $this->downloaded);
+        $this->assertSame(['hidden', 'first-volume', 'later-volume'], $this->downloaded);
     }
 
     public function test_volume_fallback_recovers_without_an_index(): void
@@ -629,7 +629,7 @@ PHP;
         ]);
         $service = $this->service($nzb, ['hidden' => $data], rename: true);
         $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame(['partial-volume', 'hidden'], $this->downloaded);
+        $this->assertSame(['hidden'], $this->downloaded);
     }
 
     public function test_failed_index_does_not_prevent_recovery_volume_fallback(): void
