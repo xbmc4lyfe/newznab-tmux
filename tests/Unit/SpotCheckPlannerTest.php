@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use App\Services\Releases\Verification\NativeSpotCheckPlanner;
 use App\Services\Releases\Verification\SpotCheckPlanner;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
@@ -118,5 +119,82 @@ final class SpotCheckPlannerTest extends TestCase
                 ['number' => 1, 'messageid' => 'too-large', 'bytes' => 101],
             ]],
         ]], 1, 100));
+    }
+
+    #[Test]
+    public function it_keeps_small_inventories_on_php(): void
+    {
+        $native = $this->createMock(NativeSpotCheckPlanner::class);
+        $native->expects(self::never())->method('select');
+        $planner = new SpotCheckPlanner($native);
+        $small = $this->dispatchManifest(1023);
+
+        foreach ([$small] as $manifest) {
+            self::assertSame(
+                (new SpotCheckPlanner(new NativeSpotCheckPlanner('/missing/native/library.so')))->select($manifest, 4, 500, 200),
+                $planner->select($manifest, 4, 500, 200),
+            );
+        }
+    }
+
+    #[Test]
+    public function it_preserves_php_coercions_when_the_native_caller_rejects_an_inventory(): void
+    {
+        $manifest = $this->dispatchManifest(1024);
+        $manifest['files'][0]['segments'][0]['bytes'] = '100';
+        $manifest['files'][0]['segments'][1]['number'] = 2.9;
+        $native = $this->createMock(NativeSpotCheckPlanner::class);
+        $native->expects(self::once())->method('select')->willReturn(null);
+        $expected = (new SpotCheckPlanner(new NativeSpotCheckPlanner('/missing/native/library.so')))->select($manifest, 16, 2000);
+
+        self::assertCount(16, $expected);
+        self::assertSame($expected, (new SpotCheckPlanner($native))->select($manifest, 16, 2000));
+    }
+
+    #[Test]
+    public function it_uses_native_results_for_supported_large_inventories(): void
+    {
+        $manifest = $this->dispatchManifest(1024);
+        $expected = [['file_key' => 'native', 'totalparts' => 1, 'totalparts_inferred' => false,
+            'number' => 1, 'messageid' => 'native-result', 'bytes' => 100]];
+        $native = $this->createMock(NativeSpotCheckPlanner::class);
+        $native->expects(self::once())->method('select')->with($manifest, 4, 500, 200)->willReturn($expected);
+
+        self::assertSame($expected, (new SpotCheckPlanner($native))->select($manifest, 4, 500, 200));
+    }
+
+    #[Test]
+    public function it_preserves_the_php_sample_when_native_selection_is_unavailable(): void
+    {
+        $manifest = $this->dispatchManifest(1024);
+        $native = $this->createMock(NativeSpotCheckPlanner::class);
+        $native->expects(self::once())->method('select')->with($manifest, 4, 500, null)->willReturn(null);
+        $expected = (new SpotCheckPlanner(new NativeSpotCheckPlanner('/missing/native/library.so')))->select($manifest, 4, 500);
+
+        self::assertCount(4, $expected);
+        self::assertSame($expected, (new SpotCheckPlanner($native))->select($manifest, 4, 500));
+    }
+
+    #[Test]
+    public function it_treats_an_empty_native_sample_as_a_result(): void
+    {
+        $manifest = $this->dispatchManifest(1024);
+        $native = $this->createMock(NativeSpotCheckPlanner::class);
+        $native->expects(self::once())->method('select')->willReturn([]);
+
+        self::assertSame([], (new SpotCheckPlanner($native))->select($manifest, 4, 500));
+    }
+
+    /** @return array<string, mixed> */
+    private function dispatchManifest(int $articles): array
+    {
+        $segments = [];
+        for ($number = 1; $number <= $articles; $number++) {
+            $segments[] = ['number' => $number, 'messageid' => 'dispatch-'.$number, 'bytes' => 100];
+        }
+
+        return ['identity' => 'dispatch', 'files' => [
+            ['key' => 'file', 'totalparts' => $articles, 'totalparts_inferred' => true, 'segments' => $segments],
+        ]];
     }
 }
