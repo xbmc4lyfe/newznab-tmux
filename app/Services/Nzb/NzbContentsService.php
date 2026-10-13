@@ -264,7 +264,7 @@ class NzbContentsService
         return $this->checkPar2Result($guid, $relID, $groupID, $nameStatus, $show) === Par2RenameOutcome::Renamed;
     }
 
-    public function checkPar2Result(string $guid, int $relID, int $groupID, int $nameStatus, int $show, ?float $deadline = null): Par2RenameOutcome
+    public function checkPar2Result(string $guid, int $relID, int $groupID, int $nameStatus, int $show, ?float $deadline = null, ?callable $onArticleReceived = null): Par2RenameOutcome
     {
         $this->par2Stats = ['candidates_probed' => 0, 'articles_received' => 0];
         if ($nameStatus !== 1) {
@@ -336,7 +336,7 @@ class NzbContentsService
                     return Par2RenameOutcome::Deferred;
                 }
                 $result = $recovery->recover($candidates[$index], $snapshot, $signature, $groupID, $show,
-                    $budget - $this->par2Stats['candidates_probed'], $maxArticleBytes, $maxStateBytes, $guard);
+                    $budget - $this->par2Stats['candidates_probed'], $maxArticleBytes, $maxStateBytes, $guard, $onArticleReceived);
                 $this->par2Stats['candidates_probed'] += $result->probes;
                 $this->par2Stats['articles_received'] += $result->articles;
                 $outcome = $result->outcome;

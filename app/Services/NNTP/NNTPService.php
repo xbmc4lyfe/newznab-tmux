@@ -35,12 +35,19 @@ class NNTPService extends NntpClient
     /**
      * Read one bounded, undecoded article for integrity verification.
      *
+     * @param  array<string, mixed>|null  $responseMetadata
+     *
+     * @param-out array{response_code: int|null, response_text: string|null, response_text_basis: string, error_type: string|null}|null $responseMetadata
+     *
      * @throws \RuntimeException
      */
-    public function verificationArticle(string $messageId, int $maximumBytes): string
+    public function verificationArticle(string $messageId, int $maximumBytes, ?array &$responseMetadata = null): string
     {
         $messageId = self::verificationMessageId($messageId, $maximumBytes);
         $response = $this->_sendCommand('BODY <'.$messageId.'>');
+        if ($responseMetadata !== null) {
+            $responseMetadata = $this->fingerprintResponseMetadata($response);
+        }
         if ($response !== ResponseCode::BodyFollows->value) {
             throw new \RuntimeException('Article is unavailable; retry verification later.');
         }
@@ -986,7 +993,7 @@ class NNTPService extends NntpClient
      * @throws \Exception
      *                    On failure : (object) DariusIII\NetNntp\Error.
      */
-    public function getMessages(string $groupName, mixed $identifiers, bool $alternate = false): mixed
+    public function getMessages(string $groupName, mixed $identifiers, bool $alternate = false, ?callable $onRead = null): mixed
     {
         $connected = $this->_checkConnection();
         if ($connected !== true) {
@@ -1017,7 +1024,7 @@ class NNTPService extends NntpClient
                 }
 
                 // Download the body.
-                $message = $this->_getMessage($groupName, $wanted);
+                $message = $this->_getMessage($groupName, $wanted, $onRead);
 
                 // Append the body to $body.
                 if (! self::isError($message)) {
@@ -1037,7 +1044,7 @@ class NNTPService extends NntpClient
                     }
                     // If we connected successfully to usenet try to download the article body.
                     if ($aConnected === true) {
-                        $newBody = $nntp->_getMessage($groupName, $wanted);
+                        $newBody = $nntp->_getMessage($groupName, $wanted, $onRead);
                         // Check if we got an error.
                         if ($nntp->isError($newBody)) {
                             $nntp->doQuit();
@@ -1215,6 +1222,215 @@ class NNTPService extends NntpClient
         [$data, $part] = $this->_yencService->decodeWithFrame($raw);
 
         return ['data' => $data, 'part' => $part];
+    }
+
+    /**
+     * Read raw HEAD fields and a bounded raw BODY for a known article ID.
+     * The alternate provider is queried directly instead of only as a fallback.
+     *
+     * @return array{headers: list<string>, body: string, head_response: array{response_code: int|null, response_text: string|null, response_text_basis: string, error_type: string|null}, body_response: array{response_code: int|null, response_text: string|null, response_text_basis: string, error_type: string|null}, overview_response_code: int|null, overview_raw: string|null, overview_rows: list<string>, overview_row_count: int, overview_attempted: bool, command_results: list<array<string, mixed>>}
+     */
+    public function getFingerprintArticleByMessageID(string $identifier, int $maximumBodyBytes = 2_000_000,
+        int $maximumHeaderBytes = 65_536, bool $alternate = false, bool $includeOverview = false): array
+    {
+        $identifier = self::verificationMessageId($identifier, $maximumBodyBytes);
+        $connection = $this;
+        if ($alternate) {
+            $connection = $this->previewAlternateConnection();
+            $connected = $this->_currentServer === $this->_configServer
+                ? $connection->doConnect($this->_configCompressedHeaders, true) : $connection->doConnect();
+        } else {
+            $connected = $connection->_checkConnection(false);
+        }
+        if ($connected !== true) {
+            throw new \RuntimeException('Unable to connect to the requested NNTP provider.');
+        }
+
+        try {
+            $overviewCode = null;
+            $overviewRaw = null;
+            $overviewLines = [];
+            $overviewAttempted = $includeOverview;
+            if ($includeOverview) {
+                $overviewCode = $connection->_sendCommand('OVER <'.$identifier.'>');
+                if ($overviewCode === 224) {
+                    $overviewLines = $connection->readFingerprintMultiline(32_768);
+                    $overviewRaw = $overviewLines[0] ?? null;
+                }
+            }
+            $headResponse = [];
+            $headers = $connection->readFingerprintArticleHeaders($identifier, $maximumHeaderBytes, $headResponse);
+            $bodyResponse = [];
+            $body = $connection->verificationArticle($identifier, $maximumBodyBytes, $bodyResponse);
+
+            return [
+                'headers' => $headers,
+                'body' => $body,
+                'head_response' => $headResponse,
+                'body_response' => $bodyResponse,
+                'overview_response_code' => is_numeric($overviewCode) ? (int) $overviewCode : null,
+                'overview_raw' => $overviewRaw,
+                'overview_rows' => $overviewLines,
+                'overview_row_count' => count($overviewLines),
+                'overview_attempted' => $overviewAttempted,
+                'command_results' => [
+                    ...($includeOverview ? [[
+                        'command' => 'OVER MSGID',
+                        'attempted' => true,
+                        'response_code' => is_numeric($overviewCode) ? (int) $overviewCode : null,
+                        'available' => $overviewCode === 224,
+                        'error_type' => is_numeric($overviewCode) ? null : class_basename($overviewCode),
+                    ]] : []),
+                    ['command' => 'HEAD', 'attempted' => true, ...$headResponse, 'available' => $headResponse['response_code'] === 221],
+                    ['command' => 'BODY', 'attempted' => true, ...$bodyResponse, 'available' => $bodyResponse['response_code'] === 222],
+                ],
+            ];
+        } finally {
+            if ($alternate) {
+                try {
+                    $connection->doQuit();
+                } catch (\Throwable) {
+                    // Preserve the article result when alternate cleanup fails.
+                }
+            }
+        }
+    }
+
+    /**
+     * Capture the responding NNTP server's advertised capabilities and overview schema.
+     *
+     * @return array<string, mixed>
+     */
+    public function getFingerprintServerProfile(bool $alternate = false): array
+    {
+        $connection = $alternate ? $this->previewAlternateConnection() : $this;
+        $connected = $alternate
+            ? $connection->doConnect($this->_configCompressedHeaders, true)
+            : $connection->_checkConnection(false);
+        if ($connected !== true) {
+            throw new \RuntimeException('Unable to connect to the requested NNTP provider.');
+        }
+
+        try {
+            $capabilityCode = $connection->_sendCommand('CAPABILITIES');
+            $capabilities = $capabilityCode === 101 ? $connection->readFingerprintMultiline(65_536) : [];
+            $supportsOverview = count(array_filter($capabilities, static fn (string $line): bool => str_starts_with(strtoupper($line), 'OVER'))) > 0;
+            $overviewCode = null;
+            $overviewFormat = [];
+            if ($supportsOverview) {
+                $overviewCode = $connection->_sendCommand('LIST OVERVIEW.FMT');
+                if ($overviewCode === 215) {
+                    $overviewFormat = $connection->readFingerprintMultiline(32_768);
+                }
+            }
+
+            return [
+                'capabilities_response_code' => is_numeric($capabilityCode) ? (int) $capabilityCode : null,
+                'capabilities_error_type' => is_numeric($capabilityCode) ? null : class_basename($capabilityCode),
+                'capabilities_raw' => $capabilities,
+                'implementation' => current(array_values(array_filter($capabilities, static fn (string $line): bool => str_starts_with(strtoupper($line), 'IMPLEMENTATION ')))) ?: null,
+                'overview_format_response_code' => is_numeric($overviewCode) ? (int) $overviewCode : null,
+                'overview_format_error_type' => $overviewCode === null || is_numeric($overviewCode) ? null : class_basename($overviewCode),
+                'overview_format_raw' => $overviewFormat,
+                'profiled_at_utc' => now()->utc()->toIso8601String(),
+            ];
+        } finally {
+            if ($alternate) {
+                try {
+                    $connection->doQuit();
+                } catch (\Throwable) {
+                    // Preserve the profile if alternate cleanup fails.
+                }
+            }
+        }
+    }
+
+    /** @return list<string> */
+    private function readFingerprintMultiline(int $maximumBytes): array
+    {
+        $lines = [];
+        $bytes = 0;
+        while (($line = fgets($this->_socket, 16_385)) !== false) {
+            if ($line === ".\r\n" || $line === ".\n") {
+                return $lines;
+            }
+            if (! str_ends_with($line, "\n") || strlen($line) > 16_384) {
+                $this->doQuit(true);
+                throw new \RuntimeException('NNTP server profile line is truncated or oversized.');
+            }
+            if (str_starts_with($line, '..')) {
+                $line = substr($line, 1);
+            }
+            $bytes += strlen($line);
+            if ($bytes > $maximumBytes) {
+                $this->doQuit(true);
+                throw new \RuntimeException('NNTP server profile exceeds the metadata memory budget.');
+            }
+            $lines[] = rtrim($line, "\r\n");
+        }
+
+        $this->doQuit(true);
+        throw new \RuntimeException('NNTP server profile response was truncated.');
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $responseMetadata
+     *
+     * @param-out array{response_code: int|null, response_text: string|null, response_text_basis: string, error_type: string|null} $responseMetadata
+     *
+     * @return list<string>
+     */
+    private function readFingerprintArticleHeaders(string $identifier, int $maximumBytes, ?array &$responseMetadata = null): array
+    {
+        $response = $this->_sendCommand('HEAD <'.$identifier.'>');
+        $responseMetadata = $this->fingerprintResponseMetadata($response);
+        if ($response !== 221) {
+            throw new \RuntimeException('Article headers are unavailable.');
+        }
+
+        $headers = [];
+        $bytes = 0;
+        while (($line = fgets($this->_socket, 16_385)) !== false) {
+            if ($line === ".\r\n" || $line === ".\n") {
+                return $headers;
+            }
+            if (! str_ends_with($line, "\n") || strlen($line) > 16_384) {
+                $this->doQuit(true);
+                throw new \RuntimeException('Article header line is truncated or oversized.');
+            }
+            if (str_starts_with($line, '..')) {
+                $line = substr($line, 1);
+            }
+            $bytes += strlen($line);
+            if ($bytes > $maximumBytes) {
+                $this->doQuit(true);
+                throw new \RuntimeException('Article headers exceed the metadata memory budget.');
+            }
+            $headers[] = $line;
+        }
+
+        $this->doQuit(true);
+        throw new \RuntimeException('Article header response was truncated.');
+    }
+
+    /** @return array{response_code: int|null, response_text: string|null, response_text_basis: string, error_type: string|null} */
+    private function fingerprintResponseMetadata(mixed $response): array
+    {
+        $responseText = null;
+        if (is_numeric($response)) {
+            try {
+                $responseText = $this->_currentStatusResponse();
+            } catch (\Throwable) {
+                // Some client/test transports expose no text beyond the response code.
+            }
+        }
+
+        return [
+            'response_code' => is_numeric($response) ? (int) $response : null,
+            'response_text' => $responseText,
+            'response_text_basis' => 'net_nntp_current_status_response_trimmed_remainder',
+            'error_type' => is_numeric($response) ? null : class_basename($response),
+        ];
     }
 
     /**
@@ -1532,7 +1748,7 @@ class NNTPService extends NntpClient
      *
      * @throws \Exception
      */
-    protected function _getMessage(string $groupName, mixed $identifier): mixed
+    protected function _getMessage(string $groupName, mixed $identifier, ?callable $onRead = null): mixed
     {
         // Make sure the requested group is already selected, if not select it.
         if ($this->group() !== $groupName) {
@@ -1557,16 +1773,16 @@ class NNTPService extends NntpClient
         }
 
         if ($response === ResponseCode::BodyFollows->value) {
-            return $this->readBody();
+            return $this->readBody($onRead);
         }
 
         return $this->_handleErrorResponse($response);
     }
 
     /** Read one dot-terminated BODY response and yEnc decode it. */
-    protected function readBody(): mixed
+    protected function readBody(?callable $onRead = null): mixed
     {
-        $body = $this->readRawBody();
+        $body = $this->readRawBody($onRead);
         if (! is_string($body)) {
             return $body;
         }
@@ -1577,7 +1793,7 @@ class NNTPService extends NntpClient
     }
 
     /** Read one dot-terminated BODY response, removing NNTP dot stuffing exactly once. */
-    protected function readRawBody(): mixed
+    protected function readRawBody(?callable $onRead = null): mixed
     {
         $body = '';
         $line = '';
@@ -1586,6 +1802,11 @@ class NNTPService extends NntpClient
             $fragment = fgets($socket, 8192);
             if ($fragment === false) {
                 return $this->throwError('Failed to read line from socket.', null);
+            }
+            if ($onRead !== null && ! $onRead()) {
+                $this->doQuit();
+
+                return $this->throwError('NNTP article read stopped after processing lock ownership was lost.', null);
             }
             $line .= $fragment;
             if (! str_ends_with($line, "\n")) {

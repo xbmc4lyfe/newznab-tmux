@@ -786,6 +786,23 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidate
         return trim($string);
     }
 
+    private static function prepareReleaseFieldSearchQuery(string $field, string $query): string
+    {
+        if ($field !== 'fromname') {
+            return self::prepareUserSearchQuery($query);
+        }
+
+        $query = trim($query);
+        if ($query === '') {
+            return '';
+        }
+
+        $escapeFrom = ['\\', '@', '~', '&', '/', '$', '=', "'", '[', ']', '(', ')', '"', '!', '-', '|', '^', '<', '>', '*', '?', '%'];
+        $escapeTo = ['\\\\', '\\@', '\\~', '\\&', '\\/', '\\$', '\\=', "\\'", '\\[', '\\]', '\\(', '\\)', '\\"', '\\!', '\\-', '\\|', '\\^', '\\<', '\\>', '\\*', '\\?', '\\%'];
+
+        return str_replace($escapeFrom, $escapeTo, $query);
+    }
+
     /**
      * Prepares a user search query for ManticoreSearch, preserving search operators.
      *
@@ -2983,7 +3000,10 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidate
 
         $phrases = $criteria['phrases'] ?? null;
         $hasText = $phrases !== null && $phrases !== '' && $phrases !== -1;
-        $tryFuzzy = (bool) ($criteria['try_fuzzy'] ?? true) && ! self::hasMediaInfoFieldQuery($phrases);
+        $hasPosterFieldQuery = self::hasPosterFieldQuery($phrases);
+        $tryFuzzy = (bool) ($criteria['try_fuzzy'] ?? true)
+            && ! self::hasMediaInfoFieldQuery($phrases)
+            && ! $hasPosterFieldQuery;
 
         $execute = function (bool $useFuzzy) use ($criteria, $limit, $offset, $hasText, $phrases): array {
             $query = (new Search($this->manticoreSearch))
@@ -3009,13 +3029,22 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidate
                         ->option('distance', $distance)
                         ->option('field_weights', $profile['fields']);
                 } else {
-                    $searchExpression = self::buildFieldSearchExpression(
-                        $this->phrasesToSearchArray($phrases),
-                        self::RELEASE_FIELD_SEARCH_FIELDS,
-                    );
-                    if ($searchExpression === null) {
+                    $searchArray = $this->phrasesToSearchArray($phrases);
+                    $terms = [];
+                    foreach ($searchArray as $key => $value) {
+                        if (! is_string($key) || ! in_array($key, self::RELEASE_FIELD_SEARCH_FIELDS, true) || $value === '' || $value === null) {
+                            continue;
+                        }
+                        $rawValue = (string) $value;
+                        $prepared = self::prepareReleaseFieldSearchQuery($key, $rawValue);
+                        if ($prepared !== '') {
+                            $terms[] = self::scopeReleaseSearchQuery($rawValue, $prepared, '@'.$key);
+                        }
+                    }
+                    if ($terms === []) {
                         return ['ids' => [], 'total' => 0, 'fuzzy' => false];
                     }
+                    $searchExpression = '@@relaxed '.implode(' ', $terms);
                     $profile = ManticoreIndexRegistry::profile('releases');
                     $query->search($searchExpression)
                         ->option('ranker', $profile['ranker'])
@@ -3082,7 +3111,7 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidate
         };
 
         if ($hasText && (bool) ($criteria['fuzzy_only'] ?? false)) {
-            return $execute(true);
+            return $execute(! $hasPosterFieldQuery);
         }
 
         if ($hasText) {
@@ -3147,6 +3176,14 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidate
         }
 
         return false;
+    }
+
+    private static function hasPosterFieldQuery(mixed $phrases): bool
+    {
+        return is_array($phrases)
+            && isset($phrases['fromname'])
+            && $phrases['fromname'] !== ''
+            && $phrases['fromname'] !== -1;
     }
 
     /**

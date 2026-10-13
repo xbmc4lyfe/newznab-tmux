@@ -7,6 +7,7 @@ namespace Tests\Feature;
 use App\Services\Monitoring\Collectors\ReleaseVerificationCollector;
 use App\Services\Monitoring\Prometheus\TextFormatter;
 use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\ScratchBudget;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use RuntimeException;
@@ -18,6 +19,7 @@ class ReleaseVerificationMetricsTest extends ReleaseVerificationCandidatesTest
         DB::table('release_verification_scratch_budget')->where('id', 1)->update(['initialized' => true]);
         $nativeRoot = (string) config('release_verification.storage_path');
         File::ensureDirectoryExists($nativeRoot.'/scratch', 0700);
+        $this->assertTrue(app(ScratchBudget::class)->initialize());
         VerificationMetricTreeProbe::$nativeRoot = $nativeRoot;
         VerificationMetricTreeProbe::$reads = 0;
         stream_wrapper_register('verification-metric-probe', VerificationMetricTreeProbe::class);

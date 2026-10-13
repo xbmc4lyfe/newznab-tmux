@@ -42,6 +42,8 @@ class SearchController extends BasePageController
         $orderBy = (string) $listQuery['ob'];
         $page = $request->integer('page', 1);
         $perPage = max(1, (int) config('nntmux.items_per_page'));
+        $posterReleaseId = $request->integer('poster_release_id') ?: null;
+        $exactPoster = $this->scalarInput($request, 'poster');
         $group = $this->scalarInput($request, 'group');
         $ranges = $request->ranges();
         $searchFields = [
@@ -50,8 +52,8 @@ class SearchController extends BasePageController
             'fromname' => $this->scalarInput($request, 'searchadvposter'),
             'filename' => $this->scalarInput($request, 'searchadvfilename'),
         ];
-        $hasText = $request->anyFilled(['search', 'searchadvsubject', 'searchadvposter', 'searchadvfilename']);
-        $hasFilters = $ranges !== [] || $group !== '' || $category !== [-1] || $request->anyFilled(['minage', 'maxage']);
+        $hasText = $posterReleaseId === null && $exactPoster === '' && $request->anyFilled(['search', 'searchadvsubject', 'searchadvposter', 'searchadvfilename']);
+        $hasFilters = $posterReleaseId !== null || $exactPoster !== '' || $ranges !== [] || $group !== '' || $category !== [-1] || $request->anyFilled(['minage', 'maxage']);
         $results = [];
         if ($hasText || $hasFilters) {
             $matches = $this->releaseSearchService->search(
@@ -69,7 +71,7 @@ class SearchController extends BasePageController
                 (string) $listQuery['search_type'],
                 $category,
                 0,
-                ['ranges' => $ranges, 'filter_only' => ! $hasText && $hasFilters],
+                ['ranges' => $ranges, 'filter_only' => ! $hasText && $hasFilters, 'poster_release_id' => $posterReleaseId, 'poster' => $exactPoster],
             );
             $results = $this->paginate($matches ?? [], $matches[0]->_totalrows ?? 0, $perPage, $page, $request->url(), $listQuery);
         }
@@ -87,6 +89,8 @@ class SearchController extends BasePageController
             'lastvisit' => $this->userdata->lastlogin,
             'results' => $results,
             'searchSubmitted' => $hasText || $hasFilters,
+            'posterReleaseId' => $posterReleaseId,
+            'exactPoster' => $exactPoster,
             'sadvanced' => $listQuery['search_type'] === 'adv',
             'listQuery' => $listQuery,
             'catlist' => $this->getCategorySelectOptions(),

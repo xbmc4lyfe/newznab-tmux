@@ -210,6 +210,19 @@ return [
             'timeout' => 60,
             'nice' => 0,
         ],
+        'supervisor-fingerprint' => [
+            'connection' => 'release-fingerprint',
+            'queue' => ['release-fingerprint'],
+            'balance' => 'simple',
+            'maxProcesses' => 1,
+            'maxTime' => 0,
+            'maxJobs' => 0,
+            'memory' => 128,
+            'tries' => 3,
+            // Above the job's 1800s timeout and below the 1920s reservation.
+            'timeout' => 1860,
+            'nice' => 0,
+        ],
     ],
 
     'environments' => [

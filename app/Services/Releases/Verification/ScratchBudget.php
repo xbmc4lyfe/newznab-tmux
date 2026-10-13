@@ -44,7 +44,8 @@ final class ScratchBudget
                     return;
                 }
                 foreach (DB::table('release_verification_scratch')->orderBy('id')->cursor() as $entry) {
-                    $bytes = $this->directoryBytes($root.'/'.app(ScratchInventory::class)->directoryName($entry));
+                    $directory = $root.'/'.app(ScratchInventory::class)->directoryName($entry);
+                    $bytes = is_link($directory) ? 0 : $this->directoryBytes($directory);
                     DB::table('release_verification_scratch')->where('id', $entry->id)->update(['reserved_bytes' => $bytes]);
                 }
                 DB::table('release_verification_scratch_budget')->where('id', 1)->update(['initialized' => true, 'reserved_bytes' => $total]);
@@ -147,7 +148,7 @@ final class ScratchBudget
                 $heartbeat();
             }
             if ($entry->isLink()) {
-                throw new RuntimeException('Scratch budget cannot measure linked files.');
+                continue;
             }
             if ($entry->isFile()) {
                 $bytes += $entry->getSize();
