@@ -42,7 +42,7 @@ class YencService
             $part = $this->number($frame->header, 'part');
             $begin = $this->number($frame->part, 'begin');
             $end = $this->number($frame->part, 'end');
-            if ($part < 1 || $part !== $this->number($frame->trailer, 'part')
+            if ($part < 1 || (isset($frame->trailer['part']) && $part !== $this->number($frame->trailer, 'part'))
                 || $begin < 1 || $end < $begin || $end > $size
                 || (isset($frame->header['total']) && $part > $this->number($frame->header, 'total'))
                 || (isset($frame->trailer['total']) && $this->number($frame->trailer, 'total') !== $this->number($frame->header, 'total'))) {

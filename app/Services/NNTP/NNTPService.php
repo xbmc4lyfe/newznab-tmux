@@ -52,7 +52,7 @@ class NNTPService extends NntpClient
             throw new \RuntimeException('Article is unavailable; retry verification later.');
         }
         $raw = '';
-        while (($line = fgets($this->_socket, max(4, min($maximumBytes, 65534) + 2))) !== false) {
+        while (($line = fgets($this->_socket, max(4, min($maximumBytes - strlen($raw), 65534) + 2))) !== false) {
             if ($line === ".\r\n" || $line === ".\n") {
                 return $raw;
             }

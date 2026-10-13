@@ -27,6 +27,10 @@ final class PayloadVerifier
     /** @param array<string, mixed> $manifest */
     public function verify(array $manifest, string $directory, callable $heartbeat): VerificationResult
     {
+        if (($this->options['mode'] ?? 'full') === 'spot_check') {
+            return (new SpotCheckVerifier($this->source, $this->options, $this->decoder))->verify($manifest, $heartbeat);
+        }
+
         try {
             return $this->downloadAndVerify($manifest, $directory, $heartbeat);
         } catch (Throwable $error) {

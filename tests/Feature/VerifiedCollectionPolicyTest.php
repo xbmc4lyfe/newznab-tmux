@@ -6,6 +6,7 @@ namespace Tests\Feature;
 
 use App\Facades\Search;
 use App\Services\NNTP\NNTPService;
+use App\Services\Nzb\NzbService;
 use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
 use App\Services\ReleaseProcessingService;
@@ -65,14 +66,14 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->publicationSchema();
         $this->mock(NNTPService::class, function ($mock): void {
             $mock->shouldReceive('doConnect')->twice()->with(false)->andReturn(false, true);
-            $mock->shouldReceive('verificationArticle')->once()->with('a@b', 16777216)->andReturn((new YencService)->encode('hello', 'movie.mkv'));
+            $mock->shouldReceive('verificationArticle')->once()->with('a@b', 1048576)->andReturn((new YencService)->encode('hello', 'movie.mkv'));
             $mock->shouldReceive('doQuit')->andReturn(null);
         });
         $this->artisan('releases:verify-candidates')->assertSuccessful();
         $this->assertSame('unknown', DB::table('release_verification_candidates')->value('status'));
         $this->travel(16)->minutes();
         $this->limits($min, $max, $files, $groupMin, $groupFiles);
-        $this->artisan('releases:verify-candidates')->expectsOutputToContain('filtered — Verified')->assertSuccessful();
+        $this->artisan('releases:verify-candidates')->expectsOutputToContain('filtered — Declared')->assertSuccessful();
         $this->assertSame('filtered', DB::table('release_verification_candidates')->value('status'));
         $this->assertSame(0, DB::table('releases')->count());
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
@@ -217,6 +218,36 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertIsInt($id);
     }
 
+    public function test_spot_checked_candidate_publishes_with_declared_size_and_explicit_spot_check_metadata(): void
+    {
+        $id = $this->collectionForPolicy();
+        DB::table('collections')->where('id', $id)->update(['filesize' => 100000]);
+        DB::table('parts')->update(['size' => 100000]);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($id);
+        $claim = $repository->claim();
+        $manifest = app(ManifestStore::class)->read($claim->manifest_path);
+        $manifest += ['verification_mode' => 'spot_check', 'declared_size' => 100000,
+            'publication_size' => 100000, 'publication_file_count' => 1, 'verified_file_names' => ['movie.mkv'],
+            'verified_file_count' => 1, 'identity_hints' => [['name' => 'movie.mkv', 'source' => 'yenc-spot-check']],
+            'spot_check' => ['articles' => 1, 'bytes' => 256, 'sampled_files' => 1, 'method' => 'yenc-crc-and-identity']];
+        $this->publicationSchema();
+        Search::shouldReceive('updateRelease')->once();
+
+        $releaseId = app(VerifiedReleasePublisher::class)->publish($claim,
+            new VerificationResult('sampled', 'Sampled article checks passed; the full payload was not downloaded.', $manifest));
+
+        $this->assertIsInt($releaseId);
+        $this->assertSame(100000, (int) DB::table('releases')->where('id', $releaseId)->value('size'));
+        $this->assertSame('sampled', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
+        $this->assertSame($releaseId, (int) DB::table('release_verification_candidates')->where('id', $claim->id)->value('release_id'));
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $contents = app(NzbService::class)->readNzbContents((string) DB::table('releases')->where('id', $releaseId)->value('guid'));
+        $this->assertIsString($contents);
+        $this->assertStringContainsString('nntmux:verification-mode', $contents);
+        $this->assertStringContainsString('spot-check', $contents);
+    }
+
     public function test_passed_collection_without_authoritative_inventory_fails_closed(): void
     {
         app(CandidateRepository::class)->archive($this->collectionForPolicy());
@@ -257,10 +288,10 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         }
         $this->mock(NNTPService::class, function ($mock): void {
             $mock->shouldReceive('doConnect')->once()->with(false)->andReturn(true);
-            $mock->shouldReceive('verificationArticle')->once()->with('a@b', 16777216)->andReturn((new YencService)->encode('hello', 'movie.mkv'));
+            $mock->shouldReceive('verificationArticle')->once()->with('a@b', 1048576)->andReturn((new YencService)->encode('hello', 'movie.mkv'));
             $mock->shouldReceive('doQuit')->andReturn(null);
         });
-        $this->artisan('releases:verify-candidates')->expectsOutputToContain('filtered — Verified payload exceeds')->assertSuccessful();
+        $this->artisan('releases:verify-candidates')->expectsOutputToContain('filtered — Declared collection size exceeds')->assertSuccessful();
         $this->assertSame('filtered', DB::table('release_verification_candidates')->value('status'));
         $this->assertSame(0, DB::table('releases')->count());
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));

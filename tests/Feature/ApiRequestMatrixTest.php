@@ -118,7 +118,9 @@ class ApiRequestMatrixTest extends TestCase
         $releaseSearch = Mockery::mock(ReleaseSearchService::class);
         $releaseSearch->shouldReceive('search')
             ->once()
-            ->withArgs(fn (array $searchArr): bool => ($searchArr['fromname'] ?? null) === $poster)
+            ->withArgs(fn (...$arguments): bool => ($arguments[0]['fromname'] ?? null) === $poster
+                && ($arguments[14]['poster'] ?? null) === ''
+                && ($arguments[14]['filter_only'] ?? false) === false)
             ->andReturn(collect());
         $this->app->instance(ReleaseSearchService::class, $releaseSearch);
 
@@ -136,6 +138,103 @@ class ApiRequestMatrixTest extends TestCase
             ->get(route('search', ['searchadvposter' => $poster, 'search_type' => 'adv']));
 
         $response->assertOk();
+    }
+
+    public function test_legacy_exact_poster_url_prefills_advanced_poster_field(): void
+    {
+        $poster = 'legacy@example.test';
+        $releaseSearch = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearch->shouldReceive('search')
+            ->once()
+            ->withArgs(fn (...$arguments): bool => ($arguments[0]['fromname'] ?? null) === ''
+                && ($arguments[14]['poster'] ?? null) === $poster
+                && ($arguments[14]['filter_only'] ?? false) === true)
+            ->andReturn(collect());
+        $this->app->instance(ReleaseSearchService::class, $releaseSearch);
+
+        $releaseBrowse = Mockery::mock(ReleaseBrowseService::class);
+        $releaseBrowse->shouldReceive('getBrowseOrdering')->once()->andReturn(['posted_desc']);
+        $this->app->instance(ReleaseBrowseService::class, $releaseBrowse);
+
+        $searchService = Mockery::mock(SearchServiceInterface::class);
+        $searchService->shouldReceive('isSuggestEnabled')->once()->andReturnFalse();
+        $searchService->shouldReceive('isAutocompleteEnabled')->once()->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $searchService);
+
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        $response = $this->actingAs(User::query()->where('username', 'matrix_user')->firstOrFail())
+            ->get(route('search', ['poster' => $poster, 'search_type' => 'adv']));
+
+        $response->assertOk();
+        $response->assertViewHas('listQuery', fn (array $query): bool => ($query['searchadvposter'] ?? null) === $poster);
+        $document = HTMLDocument::createFromString($response->getContent());
+        $this->assertSame($poster, $document->querySelector('input[name="searchadvposter"]')?->getAttribute('value'));
+    }
+
+    public function test_edited_advanced_poster_overrides_hidden_exact_poster(): void
+    {
+        $searchRelease = Mockery::mock(ReleaseSearchService::class);
+        $searchRelease->shouldReceive('search')
+            ->once()
+            ->withArgs(fn (...$arguments): bool => ($arguments[14]['poster'] ?? null) === 'edited@example.test'
+                && ($arguments[0]['fromname'] ?? null) === ''
+                && ($arguments[14]['filter_only'] ?? false) === true)
+            ->andReturn(collect());
+        $this->app->instance(ReleaseSearchService::class, $searchRelease);
+
+        $browse = Mockery::mock(ReleaseBrowseService::class);
+        $browse->shouldReceive('getBrowseOrdering')->once()->andReturn(['posted_desc']);
+        $this->app->instance(ReleaseBrowseService::class, $browse);
+
+        $search = Mockery::mock(SearchServiceInterface::class);
+        $search->shouldReceive('isSuggestEnabled')->once()->andReturnFalse();
+        $search->shouldReceive('isAutocompleteEnabled')->once()->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $search);
+
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        $response = $this->actingAs(User::query()->where('username', 'matrix_user')->firstOrFail())
+            ->get(route('search', [
+                'poster' => 'original@example.test',
+                'searchadvposter' => 'edited@example.test',
+                'search_type' => 'adv',
+            ]));
+
+        $response->assertOk();
+        $response->assertViewHas('listQuery', fn (array $query): bool => ($query['poster'] ?? null) === 'edited@example.test');
+    }
+
+    public function test_clearing_advanced_poster_clears_hidden_exact_poster(): void
+    {
+        $releaseSearch = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearch->shouldReceive('search')
+            ->once()
+            ->withArgs(fn (...$arguments): bool => ($arguments[1] ?? null) === 'alt.binaries.example'
+                && ($arguments[0]['fromname'] ?? null) === ''
+                && ($arguments[14]['poster'] ?? null) === ''
+                && ($arguments[14]['filter_only'] ?? false) === true)
+            ->andReturn(collect());
+        $this->app->instance(ReleaseSearchService::class, $releaseSearch);
+
+        $browse = Mockery::mock(ReleaseBrowseService::class);
+        $browse->shouldReceive('getBrowseOrdering')->once()->andReturn(['posted_desc']);
+        $this->app->instance(ReleaseBrowseService::class, $browse);
+
+        $search = Mockery::mock(SearchServiceInterface::class);
+        $search->shouldReceive('isSuggestEnabled')->once()->andReturnFalse();
+        $search->shouldReceive('isAutocompleteEnabled')->once()->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $search);
+
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        $response = $this->actingAs(User::query()->where('username', 'matrix_user')->firstOrFail())
+            ->get(route('search', [
+                'poster' => 'original@example.test',
+                'searchadvposter' => '',
+                'group' => 'alt.binaries.example',
+                'search_type' => 'adv',
+            ]));
+
+        $response->assertOk();
+        $response->assertViewHas('listQuery', fn (array $query): bool => ! array_key_exists('poster', $query));
     }
 
     public function test_exact_poster_detail_link_preserves_whitespace_through_http_and_returns_its_own_release(): void
@@ -165,6 +264,7 @@ class ApiRequestMatrixTest extends TestCase
         $this->assertNotNull($link);
         $url = $link->getAttribute('href');
         parse_str((string) parse_url($url, PHP_URL_QUERY), $query);
+        $this->assertSame($poster, $query['searchadvposter']);
         $this->assertSame($poster, $query['poster']);
 
         $database = DB::connection();
@@ -204,10 +304,34 @@ class ApiRequestMatrixTest extends TestCase
         try {
             $response = $this->actingAs($user)->get($url);
             $response->assertOk();
-            $response->assertViewHas('listQuery', fn (array $query): bool => ($query['poster'] ?? null) === $poster);
+            $response->assertViewHas('listQuery', fn (array $listQuery): bool => ($listQuery['searchadvposter'] ?? null) === $poster);
+            $response->assertViewHas('exactPoster', $poster);
             $this->assertFalse($response->viewData('results')->isEmpty(), 'Exact poster queries: '.json_encode($fixture->posterQueries, JSON_THROW_ON_ERROR));
-            $response->assertSeeText('Whitespace anchor release');
-            $response->assertDontSeeText('Different normalized poster release');
+            $this->assertCount(1, $response->viewData('results'));
+            $this->assertSame([$poster, $poster], $fixture->posterQueries[0]['bindings']);
+            $response->assertSee('name="searchadvposter"', false);
+            $form = HTMLDocument::createFromString($response->getContent());
+            $visiblePoster = $form->querySelector('input[name="searchadvposter"]')?->getAttribute('value');
+            $this->assertSame($poster, $visiblePoster);
+            $resubmitted = $this->actingAs($user)->get(route('search', [
+                'poster' => $poster,
+                'searchadvposter' => $visiblePoster,
+                'search_type' => 'adv',
+            ]));
+            $resubmitted->assertOk();
+            $resubmitted->assertViewHas('exactPoster', $poster);
+            $this->assertSame((int) $source['id'], (int) $resubmitted->viewData('results')->first()->id);
+
+            $edited = $this->actingAs($user)->get(route('search', [
+                'poster' => $poster,
+                'searchadvposter' => trim($visiblePoster),
+                'search_type' => 'adv',
+            ]));
+            $edited->assertOk();
+            $edited->assertViewHas('exactPoster', trim($poster));
+            $this->assertCount(1, $edited->viewData('results'));
+            $this->assertSame((int) $lookalike['id'], (int) $edited->viewData('results')->first()->id);
+            $edited->assertViewHas('listQuery', fn (array $listQuery): bool => ($listQuery['poster'] ?? null) === trim($poster));
         } finally {
             if ($originalResolver === null) {
                 Model::unsetConnectionResolver();

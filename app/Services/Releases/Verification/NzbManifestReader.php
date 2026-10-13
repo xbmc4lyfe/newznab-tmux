@@ -23,10 +23,14 @@ final class NzbManifestReader
             $files = [];
             $groups = [];
             $expected = 0;
+            $verificationMode = null;
             $conflict = false;
             foreach ($document->head->meta ?? [] as $metadata) {
                 $value = (string) $metadata;
-                if ((string) $metadata['type'] === 'nntmux:verified-file-count'
+                if ((string) $metadata['type'] === 'nntmux:verification-mode' && $value === 'spot-check') {
+                    $verificationMode = 'spot_check';
+                }
+                if (in_array((string) $metadata['type'], ['nntmux:verified-file-count', 'nntmux:declared-file-count'], true)
                     && preg_match('/^[1-9][0-9]{0,6}$/D', $value) === 1) {
                     $expected = max($expected, (int) $value);
                 }
@@ -66,6 +70,9 @@ final class NzbManifestReader
                 'groups' => array_keys($groups), 'files' => $files, 'metadata_source' => $metadataSource];
             if ($conflict) {
                 $manifest['conflict'] = true;
+            }
+            if ($verificationMode !== null) {
+                $manifest['verification_mode'] = $verificationMode;
             }
             if ($metadataSource === 'import' && is_int($release->categories_id ?? null) && $release->categories_id > 0) {
                 $manifest['categories_id'] = $release->categories_id;

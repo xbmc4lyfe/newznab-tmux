@@ -136,7 +136,7 @@ class ReleaseResultsViewTest extends TestCase
         $this->assertSame(0, $document->querySelectorAll('.report-trigger')->length);
     }
 
-    public function test_detail_submitter_links_to_advanced_search_for_all_posts(): void
+    public function test_detail_submitter_links_to_exact_advanced_search_for_all_posts(): void
     {
         $submitter = 'alice+usenet@example.test';
         $release = (object) [
@@ -156,7 +156,7 @@ class ReleaseResultsViewTest extends TestCase
         $submitterLink = $document->querySelector('a[aria-label="View releases with the exact same poster field as '.$submitter.'"]');
 
         $this->assertNotNull($submitterLink);
-        $this->assertSame(route('search', ['poster' => $submitter, 'search_type' => 'adv']), $submitterLink->getAttribute('href'));
+        $this->assertSame(route('search', ['poster' => $submitter, 'searchadvposter' => $submitter, 'search_type' => 'adv']), $submitterLink->getAttribute('href'));
         $this->assertSame($submitter, trim($submitterLink->textContent));
     }
 }

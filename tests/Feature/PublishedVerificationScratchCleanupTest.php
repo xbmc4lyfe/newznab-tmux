@@ -107,7 +107,7 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
     public function test_sweep_recovers_expired_filtered_and_repaired_scratch_left_after_cleanup_failure(): void
     {
         $directories = [];
-        foreach (['expired', 'filtered', 'repaired'] as $index => $status) {
+        foreach (['expired', 'filtered', 'repaired', 'sampled'] as $index => $status) {
             $directories[] = $this->candidateScratch($index + 1, $status);
         }
 
@@ -143,17 +143,15 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
             'files' => [['key' => 'file', 'subject' => 'movie.mkv', 'totalparts' => 1,
                 'segments' => [['number' => 1, 'messageid' => 'new@article', 'bytes' => 5]]]]]);
         $this->mock(NNTPService::class, function ($mock): void {
-            $mock->shouldReceive('doConnect')->once()->with(false)->andReturn(true);
-            $mock->shouldReceive('verificationArticle')->once()->andReturn((new YencService)->encode('hello', 'movie.mkv'));
-            $mock->shouldReceive('doQuit')->andReturn(null);
+            $mock->shouldNotReceive('doConnect');
         });
 
         $this->artisan('releases:verify-candidates')->assertSuccessful();
 
         $this->assertDirectoryDoesNotExist($directory);
         $candidate = DB::table('release_verification_candidates')->whereNull('release_id')->sole();
-        $this->assertSame('Declared file inventory cannot be proved complete.', $candidate->reason);
-        $this->assertFileExists(dirname($directory).'/'.$candidate->id.'-1/articles/'.hash('sha256', 'new@article'));
+        $this->assertSame('Declared file inventory is still uploading; publication deferred.', $candidate->reason);
+        $this->assertDirectoryDoesNotExist(dirname($directory).'/'.$candidate->id.'-1');
     }
 
     public function test_sweep_is_bounded_and_resumes_after_an_entry_budget(): void
@@ -397,6 +395,8 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
                 'segments' => [['number' => 1, 'messageid' => 'publish@article', 'bytes' => 5]]]]]);
         $id = (int) DB::table('release_verification_candidates')->value('id');
         $directory = config('release_verification.storage_path').'/scratch/'.$id.'-1';
+        File::ensureDirectoryExists($directory);
+        file_put_contents($directory.'/old-checkpoint', 'previous interrupted verifier');
         $filesystem = new Filesystem;
         File::partialMock()->shouldReceive('deleteDirectory')->andReturnUsing(static fn ($path): bool => $path === $directory ? false : $filesystem->deleteDirectory($path));
         $this->mock(NNTPService::class, static function ($mock): void {
@@ -406,7 +406,7 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
         });
 
         $this->artisan('releases:verify-candidates')->assertSuccessful();
-        $this->assertSame('complete', DB::table('release_verification_candidates')->value('status'), (string) DB::table('release_verification_candidates')->value('reason'));
+        $this->assertSame('sampled', DB::table('release_verification_candidates')->value('status'), (string) DB::table('release_verification_candidates')->value('reason'));
         $this->assertSame(1, DB::table('releases')->count());
         $this->assertDirectoryExists($directory);
         $this->assertSame(1, DB::table('release_verification_scratch')->count());
@@ -450,7 +450,7 @@ PHP;
     private function candidateScratch(int $id, string $status = 'complete'): string
     {
         DB::table('release_verification_candidates')->insert(['id' => $id, 'identity' => sha1('scratch-'.$id), 'groups_id' => 1,
-            'version' => 1, 'status' => $status, 'release_id' => in_array($status, ['complete', 'repaired'], true) ? 77 : null,
+            'version' => 1, 'status' => $status, 'release_id' => in_array($status, ['complete', 'repaired', 'sampled'], true) ? 77 : null,
             'manifest_path' => '', 'manifest_hash' => str_repeat('a', 64), 'manifest_bytes' => 0,
             'last_unique_at' => now(), 'next_attempt_at' => now()->addHour()]);
         app(ScratchInventory::class)->register($id, 1);

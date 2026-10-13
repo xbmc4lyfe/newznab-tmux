@@ -44,12 +44,26 @@ class SearchController extends BasePageController
         $perPage = max(1, (int) config('nntmux.items_per_page'));
         $posterReleaseId = $request->integer('poster_release_id') ?: null;
         $exactPoster = $this->scalarInput($request, 'poster');
+        $advancedPoster = $this->scalarInput($request, 'searchadvposter');
+        if ($request->exists('poster') && $request->exists('searchadvposter') && $advancedPoster !== $exactPoster) {
+            $exactPoster = $advancedPoster;
+            if ($exactPoster === '') {
+                unset($listQuery['poster']);
+            } else {
+                $listQuery['poster'] = $exactPoster;
+            }
+        } elseif (! $request->exists('poster')) {
+            $exactPoster = '';
+        }
+        if ($exactPoster !== '' && ! array_key_exists('searchadvposter', $listQuery)) {
+            $listQuery['searchadvposter'] = $exactPoster;
+        }
         $group = $this->scalarInput($request, 'group');
         $ranges = $request->ranges();
         $searchFields = [
             'searchname' => $search,
             'name' => $this->scalarInput($request, 'searchadvsubject'),
-            'fromname' => $this->scalarInput($request, 'searchadvposter'),
+            'fromname' => $exactPoster === '' ? $advancedPoster : '',
             'filename' => $this->scalarInput($request, 'searchadvfilename'),
         ];
         $hasText = $posterReleaseId === null && $exactPoster === '' && $request->anyFilled(['search', 'searchadvsubject', 'searchadvposter', 'searchadvfilename']);

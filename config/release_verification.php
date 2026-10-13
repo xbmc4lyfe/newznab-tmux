@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 return [
     'required' => env('RELEASE_VERIFICATION_REQUIRED', true),
+    'spot_check_articles' => (int) env('RELEASE_VERIFICATION_SPOT_CHECK_ARTICLES', 1),
+    'spot_check_bytes' => (int) env('RELEASE_VERIFICATION_SPOT_CHECK_BYTES', 1048576),
+    'spot_check_article_bytes' => (int) env('RELEASE_VERIFICATION_SPOT_CHECK_ARTICLE_BYTES', 1048576),
     'scheduled' => env('RELEASE_VERIFICATION_SCHEDULED', true),
     'worker_limit' => (int) env('RELEASE_VERIFICATION_WORKER_LIMIT', 1000),
     'worker_seconds' => (int) env('RELEASE_VERIFICATION_WORKER_SECONDS', 300),
