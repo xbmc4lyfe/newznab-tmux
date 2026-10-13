@@ -164,7 +164,15 @@ class Nntp:
 
     def _fail_connection(self, message: str) -> NoReturn:
         self.poisoned = True
+        self._close_transport()
         raise RuntimeError(message)
+
+    def _close_transport(self) -> None:
+        for stream in (self.file, self.sock):
+            try:
+                stream.close()
+            except OSError:
+                pass
 
     def _read_line(self, maximum_bytes: int, description: str) -> bytes:
         if self.poisoned:
@@ -173,10 +181,11 @@ class Nntp:
             line = self.file.readline(maximum_bytes + 1)
         except OSError:
             self.poisoned = True
+            self._close_transport()
             raise
         if not line:
             self._fail_connection(f"Truncated {description}")
-        if len(line) > maximum_bytes or not line.endswith(b"\n"):
+        if len(line) > maximum_bytes or not line.endswith(b"\r\n"):
             self._fail_connection(f"{description} line exceeded its {maximum_bytes}-byte limit")
         return line
 
@@ -304,7 +313,7 @@ class Nntp:
         line_count = 0
         in_headers = True
         while True:
-            line = self._read_line(NNTP_ARTICLE_LINE_LIMIT, "NNTP ARTICLE")
+            line = self._read_line(NNTP_HEADER_LINE_LIMIT if in_headers else NNTP_ARTICLE_LINE_LIMIT, "NNTP ARTICLE")
             line_count += 1
             if line_count > NNTP_ARTICLE_LINE_COUNT_LIMIT:
                 self._fail_connection(f"NNTP ARTICLE exceeded its {NNTP_ARTICLE_LINE_COUNT_LIMIT}-line limit")
@@ -352,8 +361,7 @@ class Nntp:
                 self.command("QUIT", accepted=(205,))
             except Exception:
                 pass
-        self.file.close()
-        self.sock.close()
+        self._close_transport()
 
 
 def parse_article(headers: dict[str, str], body: bytes) -> dict[str, Any]:
@@ -362,7 +370,14 @@ def parse_article(headers: dict[str, str], body: bytes) -> dict[str, Any]:
     end_matches = list(YEND_RE.finditer(text))
     ybegin = attrs(begin_matches[0].group("attrs")) if begin_matches else {}
     yend = attrs(end_matches[-1].group("attrs")) if end_matches else {}
-    decoded = decode_yenc(text[begin_matches[0].end():end_matches[-1].start()] if begin_matches and end_matches else "") if begin_matches and end_matches else None
+    decoded = None
+    payload_escape_state_valid = None
+    if begin_matches and end_matches:
+        try:
+            decoded = decode_yenc(text[begin_matches[0].end():end_matches[-1].start()])
+            payload_escape_state_valid = True
+        except ValueError:
+            payload_escape_state_valid = False
     yp = re.search(r"=ypart\s+([^\r\n]+)", text, re.IGNORECASE)
     ypart = attrs(yp.group(1)) if yp else {}
     parsed_date = parse_date(headers.get("date"))
@@ -388,7 +403,8 @@ def parse_article(headers: dict[str, str], body: bytes) -> dict[str, Any]:
         and (total_size is None or part_end <= total_size)
     )
     header_size_matches = None if total_size is None or decoded is None else (
-        part_end is not None and part_end <= total_size if multipart else len(decoded) == total_size
+        ypart_range_valid is True and len(decoded) == part_end - part_begin + 1
+        if multipart else len(decoded) == total_size
     )
     crc_is_hex = bool(expected_segment_crc and re.fullmatch(r"[0-9a-fA-F]{1,8}", expected_segment_crc))
     crc_matches = None if not expected_segment_crc or (multipart and not yend.get("pcrc32")) else (
@@ -405,10 +421,13 @@ def parse_article(headers: dict[str, str], body: bytes) -> dict[str, Any]:
                         "injection_date_utc": injection_date.isoformat() if injection_date else None,
                         "injection_delay_seconds": (injection_date - parsed_date).total_seconds() if injection_date and parsed_date else None},
         "yenc": {"begin": ybegin or None, "end": yend or None, "ypart": ypart or None,
+                 "payload_escape_state_valid": payload_escape_state_valid,
+                 "payload_integrity_status": "invalid_unmatched_escape" if payload_escape_state_valid is False else "escape_state_valid" if payload_escape_state_valid is True else "unavailable",
                  "raw_controls": {"ybegin": raw_ybegin, "ypart": raw_ypart, "yend": raw_yend},
                  "part": safe_int(ybegin.get("part")), "total_size": total_size,
                  "line": safe_int(ybegin.get("line")), "name": ybegin.get("name"),
                  "total_parts": safe_int(ybegin.get("total")),
+                 "total_parts_is_decimal": None if "total" not in ybegin else bool(re.fullmatch(r"[0-9]+", ybegin["total"])),
                  "part_size": part_size, "part_begin": part_begin, "part_end": part_end,
                  "header_size_matches": header_size_matches,
                  "end_part": safe_int(yend.get("part")),
@@ -451,6 +470,8 @@ def decode_yenc(payload_text: str) -> bytes:
                 escaped = True
             else:
                 output.append((char - 42) & 0xff)
+    if escaped:
+        raise ValueError("Unmatched yEnc escape marker")
     return bytes(output)
 
 
@@ -469,7 +490,7 @@ def inspect_binary_metadata(data: bytes) -> dict[str, Any]:
             break
         unparsed_bytes += marker - offset
         length = int.from_bytes(data[marker + 8:marker + 16], "little")
-        if length < 64 or marker + length > len(data):
+        if length < 64 or length % 4 != 0 or marker + length > len(data):
             unparsed_bytes += len(data) - marker
             break
         packet_hash = data[marker + 16:marker + 32]
@@ -483,6 +504,9 @@ def inspect_binary_metadata(data: bytes) -> dict[str, Any]:
                   "payload_bytes": len(body), "packet_structure_valid": True}
         if packet_type in ("RecvSlic", "PkdRecvS") and len(body) >= 4:
             packet["recovery_exponent"] = int.from_bytes(body[:4], "little")
+            packet["recovery_exponent_identity"] = 0 if packet["recovery_exponent"] == 65535 else packet["recovery_exponent"]
+            packet["recovery_data_sha256"] = hashlib.sha256(body[4:]).hexdigest()
+            packet["packet_structure_valid"] = packet["recovery_exponent"] <= 65535
         elif packet_type in ("RecvSlic", "PkdRecvS"):
             packet["packet_structure_valid"] = False
         elif packet_type in ("Main", "PkdMain"):
@@ -499,28 +523,44 @@ def inspect_binary_metadata(data: bytes) -> dict[str, Any]:
             packet["recoverable_file_ids"] = packet["all_file_ids"][:recoverable_count]
             packet["non_recoverable_file_ids"] = packet["all_file_ids"][recoverable_count:]
             packet["file_ids"] = packet["recoverable_file_ids"]
-            packet["packet_structure_valid"] = len(body) >= ids_start and (len(body) - ids_start) % 16 == 0 and recoverable_count <= len(packet["all_file_ids"])
+            slice_size = packet["recovery_block_size"]
+            subslice_size = packet["subslice_size"]
+            packet["packet_structure_valid"] = (len(body) >= ids_start
+                                                and (len(body) - ids_start) % 16 == 0
+                                                and recoverable_count <= len(packet["all_file_ids"])
+                                                and slice_size is not None and slice_size > 0 and slice_size % 4 == 0
+                                                and (not packed or (subslice_size is not None and subslice_size > 0
+                                                                    and subslice_size % 4 == 0 and slice_size % subslice_size == 0)))
         elif packet_type == "FileDesc" and len(body) >= 56:
             packet["file_id"] = body[:16].hex()
             packet["file_hash"] = body[16:32].hex()
             packet["file_hash16k"] = body[32:48].hex()
             packet["file_length"] = int.from_bytes(body[48:56], "little")
-            packet["filename"] = body[56:].rstrip(b"\0").decode("ascii", "replace")
+            filename_field = body[56:]
+            filename = filename_field.split(b"\0", 1)[0]
+            padding = filename_field[len(filename):]
+            packet["filename"] = filename.decode("ascii", "replace")
+            packet["filename_ascii_valid"] = filename.isascii()
+            packet["filename_padding_valid"] = (len(filename_field) % 4 == 0
+                                                  and len(padding) == (-len(filename)) % 4
+                                                  and padding == b"\0" * len(padding))
+            packet["packet_structure_valid"] = bool(filename) and packet["filename_ascii_valid"] and packet["filename_padding_valid"]
         elif packet_type == "IFSC" and len(body) >= 16:
             packet["file_id"] = body[:16].hex()
             checksum_body = body[16:]
+            packet["packet_structure_valid"] = len(checksum_body) % 20 == 0
             packet["slice_checksums"] = [{"md5": checksum_body[i:i + 16].hex(),
                                           "crc32": f"{int.from_bytes(checksum_body[i + 16:i + 20], 'little'):08x}"}
                                          for i in range(0, len(checksum_body) - 19, 20)]
         elif packet_type == "Creator":
             packet["creator"] = body.rstrip(b"\0").decode("ascii", "replace")
-        elif packet_type in ("Main", "FileDesc"):
+        elif packet_type in ("Main", "FileDesc", "IFSC"):
             packet["packet_structure_valid"] = False
         packets.append(packet)
         offset = marker + length
     if packets:
-        valid_packets = [p for p in packets if p["packet_md5_valid"]]
-        recovery = [p["recovery_exponent"] for p in valid_packets if "recovery_exponent" in p]
+        valid_packets = [p for p in packets if p["packet_md5_valid"] and p["packet_structure_valid"]]
+        recovery = [p["recovery_exponent_identity"] for p in valid_packets if "recovery_exponent_identity" in p]
         mains = [p for p in valid_packets if p["type"] == "Main"]
         file_descriptions = {p["file_id"]: p for p in valid_packets if p["type"] == "FileDesc" and p.get("file_length") is not None}
         slice_size = mains[0].get("recovery_block_size") if mains else None
@@ -618,7 +658,7 @@ def make_findings(files: list[dict[str, Any]], articles: list[dict[str, Any]]) -
         confidence = "none"
     obfuscation_terms = ("obfuscated", "(1/", "[1/", "_broken", "no-nfo", "no nfo")
     obscured_names = sum(1 for subject in subjects_for_signals if not re.search(r"(?i)\.(?:rar|par2)(?:\s|$)", subject))
-    recovery_exponents = sorted({p["recovery_exponent"] for a in articles for p in a.get("metadata", {}).get("formats", {}).get("par2", {}).get("packets", []) if "recovery_exponent" in p})
+    recovery_exponents = sorted({p["recovery_exponent_identity"] for a in articles for p in a.get("metadata", {}).get("formats", {}).get("par2", {}).get("packets", []) if "recovery_exponent_identity" in p and p.get("packet_md5_valid") and p.get("packet_structure_valid")})
     par_source_blocks = max((a.get("metadata", {}).get("formats", {}).get("par2", {}).get("source_block_count_estimate") or 0 for a in articles), default=0)
     format_signals = {
         "nzb_subjects_without_visible_rar_or_par2_extension": obscured_names,
@@ -871,12 +911,15 @@ def main() -> int:
             and yenc.get("decoded_size_matches_yend") is True
             and (yenc.get("decoded_size_matches_ypart_range") is True if multipart else True)
             and (yenc.get("end_part") == yenc.get("part") if multipart else yenc.get("part") is None)
-            and (yenc.get("total_parts") in (None, len(segments)))
-            and (yenc.get("crc32_matches") is True if multipart else yenc.get("crc32_matches") is not False)
+            and (yenc.get("total_parts_is_decimal") is None
+                 or (yenc.get("total_parts_is_decimal") is True and yenc.get("total_parts") == len(segments)))
             for yenc in yencs
         )
         if multipart and any(sample.get("segment_number") != yenc.get("part") for sample, yenc in zip(chosen_samples, yencs)):
             yenc_structure_valid = False
+        whole_file_crc32_matches = None
+        whole_file_crc32_computed = None
+        whole_file_crc32_values = sorted({yenc.get("crc32").lower() for yenc in yencs if yenc.get("crc32")})
         if yenc_structure_valid and multipart:
             ranges = sorted((yenc.get("part_begin"), yenc.get("part_end")) for yenc in yencs)
             next_byte = 1
@@ -886,14 +929,23 @@ def main() -> int:
                     break
                 next_byte = end + 1
             yenc_structure_valid = yenc_structure_valid and next_byte - 1 == next(iter(total_sizes))
-            whole_file_crcs = {yenc.get("crc32", "").lower().zfill(8) for yenc in yencs if yenc.get("crc32")}
-            if whole_file_crcs:
-                assembled_crc = f"{binascii.crc32(assembled) & 0xffffffff:08x}"
-                yenc_structure_valid = yenc_structure_valid and len(whole_file_crcs) == 1 and assembled_crc in whole_file_crcs
+            if yenc_structure_valid and whole_file_crc32_values:
+                whole_file_crc32_computed = f"{binascii.crc32(assembled) & 0xffffffff:08x}"
+                whole_file_crcs = {value.zfill(8) for value in whole_file_crc32_values}
+                whole_file_crc32_matches = (all(re.fullmatch(r"[0-9a-f]{1,8}", value) for value in whole_file_crc32_values)
+                                           and len(whole_file_crcs) == 1 and whole_file_crc32_computed in whole_file_crcs)
+                yenc_structure_valid = whole_file_crc32_matches
         elif yenc_structure_valid:
             yenc_structure_valid = len(segments) == 1 and len(assembled) == next(iter(total_sizes))
+        yenc_structure_valid = yenc_structure_valid and all(
+            yenc.get("crc32_matches") is True if multipart else yenc.get("crc32_matches") is not False
+            for yenc in yencs
+        )
         complete_par2.append({"file_index": file_index, "name": nzb_file["subject"], "server": chosen_server,
                               "all_segments_retrieved": is_complete, "yenc_structure_valid": yenc_structure_valid, "decoded_bytes": len(assembled),
+                              "multipart_whole_file_crc32": {"declared_values": whole_file_crc32_values,
+                                                             "computed": whole_file_crc32_computed,
+                                                             "matches": whole_file_crc32_matches},
                               "metadata": inspect_binary_metadata(assembled)})
     findings = make_findings(all_files, samples)
     par2_packet_sets = [item["metadata"].get("par2", {}) for item in complete_par2]
@@ -907,6 +959,7 @@ def main() -> int:
             else:
                 par2_packets_valid = False
     set_recovery: dict[str, set[int]] = defaultdict(set)
+    set_recovery_hashes: dict[str, dict[int, str]] = defaultdict(dict)
     set_sources: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     set_mains: dict[str, dict[str, Any]] = {}
     set_block_sizes: dict[str, int] = {}
@@ -915,6 +968,7 @@ def main() -> int:
         for packet in packets:
             if not packet.get("packet_structure_valid", False):
                 par2_packets_valid = False
+                continue
             if packet["type"] == "Main":
                 main_definition = (packet.get("recovery_block_size"), packet.get("recoverable_file_count"), tuple(packet.get("all_file_ids", [])))
                 previous_main = set_mains.get(set_id)
@@ -930,8 +984,14 @@ def main() -> int:
                 set_sources[set_id][packet["file_id"]] = packet
             elif packet["type"] in ("PkdMain", "PkdRecvS"):
                 packed_recovery_layout = True
-            elif packet["type"] == "RecvSlic" and "recovery_exponent" in packet:
-                set_recovery[set_id].add(packet["recovery_exponent"])
+            elif packet["type"] == "RecvSlic" and "recovery_exponent_identity" in packet:
+                exponent = packet["recovery_exponent_identity"]
+                recovery_hash = packet["recovery_data_sha256"]
+                previous_hash = set_recovery_hashes[set_id].get(exponent)
+                if previous_hash is not None and previous_hash != recovery_hash:
+                    par2_packets_valid = False
+                set_recovery_hashes[set_id][exponent] = recovery_hash
+                set_recovery[set_id].add(exponent)
     source_block_count = 0
     for set_id, main in set_mains.items():
         recoverable_ids = main.get("recoverable_file_ids", [])

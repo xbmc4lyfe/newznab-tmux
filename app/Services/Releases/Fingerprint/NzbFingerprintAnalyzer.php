@@ -18,8 +18,10 @@ final class NzbFingerprintAnalyzer
         if (strlen($xml) > 33_554_432 || str_contains(strtoupper($xml), '<!ENTITY')) {
             throw new RuntimeException('NZB exceeds the metadata parser budget or contains an entity declaration.');
         }
+        // Remove only the app's standard external declaration before parsing;
+        // internal subsets and other declarations remain rejected below.
         $xml = preg_replace(
-            '/<!DOCTYPE\s+nzb\s+PUBLIC\s+["\']-\/\/newzBin\/\/DTD NZB 1\.1\/\/EN["\']\s+["\']http:\/\/www\.newzbin\.com\/DTD\/nzb\/nzb-1\.1\.dtd["\']\s*>/i',
+            '/<!DOCTYPE\s+nzb\s+PUBLIC\s+(["\'])-\/\/newzBin\/\/DTD NZB 1\.1\/\/EN\1\s+(["\'])http:\/\/www\.newzbin\.com\/DTD\/nzb\/nzb-1\.1\.dtd\2\s*>/i',
             '',
             $xml,
         ) ?? $xml;
@@ -29,7 +31,11 @@ final class NzbFingerprintAnalyzer
 
         $previous = libxml_use_internal_errors(true);
         try {
-            $document = simplexml_load_string($xml, options: LIBXML_NONET | LIBXML_NOBLANKS);
+            $options = LIBXML_NONET | LIBXML_NOBLANKS;
+            if (defined('LIBXML_NO_XXE')) {
+                $options |= (int) constant('LIBXML_NO_XXE');
+            }
+            $document = simplexml_load_string($xml, options: $options);
             if ($document === false || $document->getName() !== 'nzb') {
                 throw new RuntimeException('Invalid NZB XML.');
             }
@@ -61,6 +67,7 @@ final class NzbFingerprintAnalyzer
                     $messageId = trim((string) $segment);
                     if ($messageId === '' || preg_match('/\A[^\s<>\x00-\x1f\x7f]+\z/D', trim($messageId, '<>')) !== 1) {
                         $invalidSegmentCount++;
+
                         continue;
                     }
                     $segmentNumber = trim((string) $segment['number']);
@@ -130,7 +137,7 @@ final class NzbFingerprintAnalyzer
     }
 
     /** @param list<array<string, mixed>> $files
-     *  @return list<array{file_index: int, kind: string, subject: string, segment_number: int, messageid: string, segment_bytes: int, sample_role: string}>
+     * @return list<array{file_index: int, kind: string, subject: string, segment_number: int, messageid: string, segment_bytes: int, sample_role: string}>
      */
     public function selectArticleSamples(array $files): array
     {
@@ -174,7 +181,7 @@ final class NzbFingerprintAnalyzer
     }
 
     /** @param list<string> $rawHeaders
-     *  @return array<string, mixed>
+     * @return array<string, mixed>
      */
     public function analyzeArticle(array $rawHeaders, string $rawBody): array
     {
@@ -182,7 +189,7 @@ final class NzbFingerprintAnalyzer
     }
 
     /** @param list<string> $rawHeaders
-     *  @return array{metadata: array<string, mixed>, decoded_bytes: ?string}
+     * @return array{metadata: array<string, mixed>, decoded_bytes: ?string}
      */
     public function analyzeArticleAndDecodedBytes(array $rawHeaders, string $rawBody): array
     {
@@ -195,6 +202,7 @@ final class NzbFingerprintAnalyzer
                 if ($previousName !== null) {
                     $values[$previousName] = rtrim((string) ($values[$previousName] ?? '')).' '.trim($content);
                 }
+
                 continue;
             }
             if (! str_contains($content, ':')) {
@@ -224,8 +232,9 @@ final class NzbFingerprintAnalyzer
         $decodedBytes = null;
         if ($frame !== null) {
             $decoded = $this->yenc->decodeWithFrame($rawBody);
-            $decodedBytes = $decoded[0];
             $payload = substr($rawBody, $frame->payloadOffset, $frame->payloadLength);
+            $payloadEscapeStateValid = self::payloadEscapeStateValid($payload);
+            $decodedBytes = $payloadEscapeStateValid ? $decoded[0] : null;
             $payloadHash = hash('sha256', $payload);
             $decodedHash = hash('sha256', $decoded[0]);
             $decodedSize = strlen($decoded[0]);
@@ -306,7 +315,7 @@ final class NzbFingerprintAnalyzer
             preg_match_all('/^(?:=ybegin|=ypart|=yend)[^\r\n]*/mi', $rawBody, $controlMatches);
             $controlLines = $controlMatches[0] ?? [];
             $par2PrefixLength = min($headerExpectedDecodedSize ?? 16_384, 16_384);
-            $prefixCoverageIsValid = $decodedSize !== null && $par2PrefixLength > 0
+            $prefixCoverageIsValid = $payloadEscapeStateValid && $decodedSize !== null && $par2PrefixLength > 0
                 && $decodedSize >= $par2PrefixLength
                 && (! $multipart
                     ? $headerExpectedDecodedSize === null || $decodedSize === $headerExpectedDecodedSize
@@ -315,6 +324,8 @@ final class NzbFingerprintAnalyzer
             $par2PrefixMd5Candidate = $prefixCoverageIsValid
                 ? hash('md5', substr($decoded[0], 0, $par2PrefixLength)) : null;
             $yenc = [
+                'payload_escape_state_valid' => $payloadEscapeStateValid,
+                'payload_integrity_status' => $payloadEscapeStateValid ? 'escape_state_valid' : 'invalid_unmatched_escape',
                 'name' => $frame->header['name'] ?? null,
                 'file_size' => isset($frame->header['size']) ? (int) $frame->header['size'] : null,
                 'line_length' => isset($frame->header['line']) ? (int) $frame->header['line'] : null,
@@ -363,7 +374,7 @@ final class NzbFingerprintAnalyzer
                 'declared_crc32_is_hex' => is_string($expectedCrc) ? preg_match('/\A[0-9a-f]{1,8}\z/i', $expectedCrc) === 1 : null,
                 'all_declared_crc32_fields_are_hex' => $allDeclaredCrc32FieldsAreHex,
                 'declared_crc32_matches' => is_string($expectedCrc) && preg_match('/\A[0-9a-f]{1,8}\z/i', $expectedCrc) === 1
-                    ? strcasecmp(str_pad($expectedCrc, 8, '0', STR_PAD_LEFT), $observedCrc) === 0 : null,
+                    ? $payloadEscapeStateValid && strcasecmp(str_pad($expectedCrc, 8, '0', STR_PAD_LEFT), $observedCrc) === 0 : null,
                 'escape_sequence_count' => substr_count($payload, '='),
             ];
         }
@@ -400,6 +411,20 @@ final class NzbFingerprintAnalyzer
         ];
     }
 
+    private static function payloadEscapeStateValid(string $payload): bool
+    {
+        $escapeCount = 0;
+        for ($offset = strlen($payload) - 1; $offset >= 0; $offset--) {
+            if ($payload[$offset] === '=') {
+                $escapeCount++;
+            } elseif ($payload[$offset] !== "\r" && $payload[$offset] !== "\n") {
+                break;
+            }
+        }
+
+        return ($escapeCount % 2) === 0;
+    }
+
     public static function fileKind(string $subject): string
     {
         if (preg_match('/\.par2\b/i', $subject) === 1) {
@@ -432,7 +457,7 @@ final class NzbFingerprintAnalyzer
             ['name' => 'ZIP', 'signature' => "PK\x03\x04", 'offset' => 0],
             ['name' => 'gzip', 'signature' => "\x1F\x8B\x08", 'offset' => 0],
             ['name' => 'XZ', 'signature' => "\xFD7zXZ\x00", 'offset' => 0],
-            ['name' => 'ISO 9660 descriptor', 'signature' => "CD001", 'offset' => 32_769],
+            ['name' => 'ISO 9660 descriptor', 'signature' => 'CD001', 'offset' => 32_769],
         ] as $candidate) {
             $offset = $candidate['offset'];
             if (strlen($bytes) >= $offset + strlen($candidate['signature'])

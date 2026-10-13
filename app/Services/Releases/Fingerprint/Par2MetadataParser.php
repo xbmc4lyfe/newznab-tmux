@@ -11,7 +11,7 @@ final class Par2MetadataParser
     {
         $native = (new NativeMetadataParser)->parsePar2($data);
         if ($native !== null) {
-            return $native;
+            return self::normalizeNativeIntegerRanges($native);
         }
 
         $offset = 0;
@@ -35,6 +35,9 @@ final class Par2MetadataParser
         $packetDefinitions = [];
         $packetCount = 0;
         $invalidPacketCount = 0;
+        $unsupportedIntegerRangeCount = 0;
+        $unsupportedIntegerRangeObservations = [];
+        $unsupportedIntegerSets = [];
         $unparsedBytes = 0;
         $length = strlen($data);
         $maximumPackets = 20_000;
@@ -49,11 +52,20 @@ final class Par2MetadataParser
                 }
                 $unparsedBytes += $next - $offset;
                 $offset = $next;
+
                 continue;
             }
-            $unpackedLength = unpack('Vlow/Vhigh', substr($data, $offset + 8, 8));
-            $packetLength = (int) ($unpackedLength['low'] ?? 0) + ((int) ($unpackedLength['high'] ?? 0) * 4_294_967_296);
-            if ($packetLength < 64 || $packetLength % 4 !== 0 || $packetLength > $length - $offset) {
+            $packetLengthBytes = substr($data, $offset + 8, 8);
+            $packetLength = self::unsigned64($packetLengthBytes);
+            if ($packetLength === null) {
+                $unsupportedIntegerRangeCount++;
+                $unsupportedIntegerRangeObservations[] = [
+                    'packet_offset' => $offset,
+                    'field' => 'packet_length',
+                    'raw_little_endian_hex' => bin2hex($packetLengthBytes),
+                ];
+            }
+            if ($packetLength === null || $packetLength < 64 || $packetLength > $length - $offset || $packetLength % 4 !== 0) {
                 $invalidPacketCount++;
                 break;
             }
@@ -82,6 +94,7 @@ final class Par2MetadataParser
             if (! $checksumValid) {
                 $invalidPacketCount++;
                 $offset += (int) $packetLength;
+
                 continue;
             }
             if ($type === "PAR 2.0\0Main" || $type === "PAR 2.0\0FileDesc") {
@@ -97,10 +110,19 @@ final class Par2MetadataParser
             }
             if ($type === "PAR 2.0\0Main" && strlen($payload) >= 12) {
                 $candidateBlockSize = self::unsigned64(substr($payload, 0, 8));
+                if ($candidateBlockSize === null) {
+                    $unsupportedIntegerRangeCount++;
+                    $unsupportedIntegerSets[bin2hex(substr($packet, 32, 16))] = true;
+                    $unsupportedIntegerRangeObservations[] = [
+                        'packet_offset' => $offset,
+                        'field' => 'source_block_size',
+                        'raw_little_endian_hex' => bin2hex(substr($payload, 0, 8)),
+                    ];
+                }
                 $recoverableFileCount = (int) (unpack('V', substr($payload, 8, 4))[1] ?? 0);
                 $fileIdsBytes = substr($payload, 12);
                 $fileIds = strlen($fileIdsBytes) % 16 === 0 ? array_map('bin2hex', str_split($fileIdsBytes, 16)) : [];
-                if ($candidateBlockSize < 1 || $candidateBlockSize % 4 !== 0 || strlen($fileIdsBytes) % 16 !== 0 || $recoverableFileCount > count($fileIds) || count(array_unique($fileIds)) !== count($fileIds)) {
+                if ($candidateBlockSize === null || $candidateBlockSize < 1 || $candidateBlockSize % 4 !== 0 || strlen($fileIdsBytes) % 16 !== 0 || $recoverableFileCount > count($fileIds) || count(array_unique($fileIds)) !== count($fileIds)) {
                     $invalidPacketCount++;
                     $offset += (int) $packetLength;
 
@@ -119,6 +141,10 @@ final class Par2MetadataParser
             } elseif ($type === "PAR 2.0\0FileDesc" && strlen($payload) >= 57) {
                 $setId = bin2hex(substr($packet, 32, 16));
                 $fileSize = self::unsigned64(substr($payload, 48, 8));
+                if ($fileSize === null) {
+                    $unsupportedIntegerRangeCount++;
+                    $invalidPacketCount++;
+                }
                 $filenameField = substr($payload, 56);
                 $terminator = strpos($filenameField, "\0");
                 $filename = $terminator === false ? $filenameField : substr($filenameField, 0, $terminator);
@@ -131,6 +157,9 @@ final class Par2MetadataParser
                     && strlen($padding) === $expectedPaddingBytes
                     && strspn($padding, "\0") === strlen($padding);
                 $filenameBytesNonempty = $filename !== '';
+                if (! $filenameAsciiValid || ! $filenamePaddingValid) {
+                    $invalidPacketCount++;
+                }
                 $fileIdDerivationValid = $filenameBytesNonempty && $filenameAsciiValid && $filenamePaddingValid;
                 $derivedFileIdBytes = md5(substr($payload, 32, 16).substr($payload, 48, 8).$filename, true);
                 $advertisedFileIdBytes = substr($payload, 0, 16);
@@ -147,6 +176,8 @@ final class Par2MetadataParser
                     'filename_padding_bytes' => strlen($padding),
                     'filename_padding_valid' => $filenamePaddingValid,
                     'file_length' => $fileSize,
+                    'file_length_raw_little_endian_hex' => bin2hex(substr($payload, 48, 8)),
+                    'file_length_integer_range_valid' => $fileSize !== null,
                     'md5' => bin2hex(substr($payload, 16, 16)),
                     'md5_first_16k' => bin2hex(substr($payload, 32, 16)),
                     'file_id' => bin2hex($advertisedFileIdBytes),
@@ -211,8 +242,9 @@ final class Par2MetadataParser
             foreach ($fileChecksums as $fileId => $ifsc) {
                 $source = $sourcesBySet[$setId][$fileId] ?? null;
                 $setBlockSize = $blockSizesBySet[$setId] ?? null;
-                $expectedSliceCount = is_array($source) && is_int($setBlockSize) && $setBlockSize > 0
-                    ? (int) ceil($source['file_length'] / $setBlockSize) : null;
+                $expectedSliceCount = is_array($source) && is_int($source['file_length'] ?? null)
+                    && is_int($setBlockSize) && $setBlockSize > 0
+                    ? intdiv($source['file_length'], $setBlockSize) + (($source['file_length'] % $setBlockSize) === 0 ? 0 : 1) : null;
                 $inputFileSliceChecksums[] = $ifsc + [
                     'recovery_set_id' => $setId,
                     'file_id' => $fileId,
@@ -235,14 +267,22 @@ final class Par2MetadataParser
             $recoveryExponentsObservedBySet[$setId][$exponent] = true;
             if ($exponent > 65535) {
                 $invalidPacketCount++;
+
                 continue;
             }
             $exponentIdentity = $exponent === 65535 ? 0 : $exponent;
             $setBlockSize = $blockSizesBySet[$setId] ?? null;
             if (! is_int($setBlockSize) || $setBlockSize < 1) {
                 $recoverySliceLengthsUnvalidatedBySet[$setId] = ($recoverySliceLengthsUnvalidatedBySet[$setId] ?? 0) + 1;
+            } elseif ($setBlockSize > PHP_INT_MAX - 4) {
+                $unsupportedIntegerRangeCount++;
+                $unsupportedIntegerSets[$setId] = true;
+                $invalidPacketCount++;
+
+                continue;
             } elseif ($payloadLength !== $setBlockSize + 4) {
                 $invalidPacketCount++;
+
                 continue;
             }
             $previousHash = $recoverySliceHashesBySet[$setId][$exponentIdentity] ?? null;
@@ -268,9 +308,27 @@ final class Par2MetadataParser
             $setRecoverableIds = $setMain['recoverable_file_ids'] ?? [];
             $setInventoryComplete = $setMain !== null && $setMissingFileIds === [] && $setUnexpectedFileIds === [];
             $setSourceBlockCount = 0;
+            $setSourceBytes = 0;
+            $setIntegerRangeValid = ! isset($unsupportedIntegerSets[$setId]);
             foreach ($setSources as $fileId => $source) {
+                $fileLength = $source['file_length'] ?? null;
+                $previousBytes = $setSourceBytes;
+                $setSourceBytes = self::checkedAdd($setSourceBytes, $fileLength);
+                if ($previousBytes !== null && $setSourceBytes === null && $fileLength !== null) {
+                    $unsupportedIntegerRangeCount++;
+                    $invalidPacketCount++;
+                }
+                $setIntegerRangeValid = $setIntegerRangeValid && $fileLength !== null && $setSourceBytes !== null;
                 if (in_array($fileId, $setRecoverableIds, true) && is_int($setBlockSize) && $setBlockSize > 0) {
-                    $setSourceBlockCount += (int) ceil($source['file_length'] / $setBlockSize);
+                    $fileBlocks = $fileLength === null ? null
+                        : intdiv($fileLength, $setBlockSize) + (($fileLength % $setBlockSize) === 0 ? 0 : 1);
+                    $previousBlocks = $setSourceBlockCount;
+                    $setSourceBlockCount = self::checkedAdd($setSourceBlockCount, $fileBlocks);
+                    if ($previousBlocks !== null && $setSourceBlockCount === null && $fileBlocks !== null) {
+                        $unsupportedIntegerRangeCount++;
+                        $invalidPacketCount++;
+                    }
+                    $setIntegerRangeValid = $setIntegerRangeValid && $setSourceBlockCount !== null;
                 }
             }
             if (! $setInventoryComplete || $setSourceBlockCount === 0) {
@@ -286,7 +344,8 @@ final class Par2MetadataParser
                 'missing_file_description_ids' => $setMissingFileIds,
                 'unexpected_file_description_ids' => $setUnexpectedFileIds,
                 'source_file_count' => count($setSources),
-                'source_file_bytes' => array_sum(array_column($setSources, 'file_length')),
+                'source_file_bytes' => $setSourceBytes,
+                'integer_range_valid' => $setIntegerRangeValid,
                 'source_files' => array_values($setSources),
                 'input_file_slice_checksums' => $setIfsc,
                 'ifsc_slice_count_mismatch_count' => $ifscSliceCountMismatchesBySet[$setId] ?? 0,
@@ -304,7 +363,15 @@ final class Par2MetadataParser
         $sourceInventoryComplete = ($singleSet['source_inventory_complete'] ?? false) === true;
         $missingFileDescriptionIds = $singleSet['missing_file_description_ids'] ?? [];
         $unexpectedFileDescriptionIds = $singleSet['unexpected_file_description_ids'] ?? [];
-        $sourceBytes = array_sum(array_map(static fn (array $set): int => $set['source_file_bytes'], $recoverySets));
+        $sourceBytes = 0;
+        foreach ($recoverySets as $set) {
+            $previousBytes = $sourceBytes;
+            $sourceBytes = self::checkedAdd($sourceBytes, $set['source_file_bytes']);
+            if ($previousBytes !== null && $sourceBytes === null && $set['source_file_bytes'] !== null) {
+                $unsupportedIntegerRangeCount++;
+                $invalidPacketCount++;
+            }
+        }
         $recoveryCount = $recoverySets === [] ? null : array_sum(array_column($recoverySets, 'unique_recovery_slice_count'));
         $recoverySliceConflictCount = array_sum(array_map('count', $recoverySliceConflictsBySet));
         $recoverySliceLengthUnvalidatedCount = array_sum($recoverySliceLengthsUnvalidatedBySet);
@@ -323,6 +390,9 @@ final class Par2MetadataParser
             'trailing_unparsed_bytes' => max(0, $length - $offset),
             'unparsed_bytes' => $unparsedBytes,
             'invalid_packet_count' => $invalidPacketCount,
+            'unsupported_integer_range_count' => $unsupportedIntegerRangeCount,
+            'unsupported_integer_range_observations' => $unsupportedIntegerRangeObservations,
+            'integer_range_valid' => $unsupportedIntegerRangeCount === 0,
             'source_block_size' => $blockSize,
             'source_block_count' => $sourceBlockCount ?: null,
             'main_packet' => $main,
@@ -353,10 +423,74 @@ final class Par2MetadataParser
         ];
     }
 
-    private static function unsigned64(string $bytes): int
+    /**
+     * @param  array<string, mixed>  $metadata
+     * @return array<string, mixed>
+     */
+    private static function normalizeNativeIntegerRanges(array $metadata): array
     {
-        $parts = unpack('Vlow/Vhigh', $bytes);
+        $unsupportedRangeCount = 0;
+        self::normalizeIntegerRangeValues($metadata, $unsupportedRangeCount);
+        $metadata['unsupported_integer_range_count'] = (int) ($metadata['unsupported_integer_range_count'] ?? 0) + $unsupportedRangeCount;
+        if ($unsupportedRangeCount > 0) {
+            $metadata['invalid_packet_count'] = (int) ($metadata['invalid_packet_count'] ?? 0) + $unsupportedRangeCount;
+            $metadata['integer_range_valid'] = false;
+            $metadata['recovery_to_source_percent'] = null;
+        }
 
-        return (int) ($parts['low'] ?? 0) + ((int) ($parts['high'] ?? 0) * 4_294_967_296);
+        return $metadata;
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function normalizeIntegerRangeValues(array &$values, int &$unsupportedRangeCount): void
+    {
+        $integerFields = [
+            'source_block_size', 'source_block_count', 'source_file_bytes', 'file_length',
+            'expected_slice_count_from_file_length', 'source_byte_start', 'source_byte_end_exclusive',
+            'source_bytes_in_slice', 'zero_padding_bytes',
+        ];
+        $initialUnsupportedRangeCount = $unsupportedRangeCount;
+        foreach ($values as $key => &$value) {
+            if (is_array($value)) {
+                self::normalizeIntegerRangeValues($value, $unsupportedRangeCount);
+            } elseif (in_array($key, $integerFields, true) && $value !== null && ! is_int($value)) {
+                $value = null;
+                $unsupportedRangeCount++;
+                if ($key === 'file_length') {
+                    $values['file_length_integer_range_valid'] = false;
+                }
+            }
+        }
+        unset($value);
+        if ($unsupportedRangeCount > $initialUnsupportedRangeCount && array_key_exists('integer_range_valid', $values)) {
+            $values['integer_range_valid'] = false;
+        }
+    }
+
+    private static function checkedAdd(?int $left, ?int $right): ?int
+    {
+        if ($left === null || $right === null || $left < 0 || $right < 0 || $left > PHP_INT_MAX - $right) {
+            return null;
+        }
+
+        return $left + $right;
+    }
+
+    private static function unsigned64(string $bytes): ?int
+    {
+        if (strlen($bytes) !== 8) {
+            return null;
+        }
+        $parts = unpack('Vlow/Vhigh', $bytes);
+        $low = (int) ($parts['low'] ?? 0);
+        $high = (int) ($parts['high'] ?? 0);
+        if (PHP_INT_SIZE < 8) {
+            return $high === 0 && $low >= 0 ? $low : null;
+        }
+        if ($high > 0x7FFF_FFFF) {
+            return null;
+        }
+
+        return $low + ($high * 4_294_967_296);
     }
 }

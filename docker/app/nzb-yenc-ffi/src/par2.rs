@@ -16,6 +16,8 @@ pub struct Par2Metadata {
     pub trailing_unparsed_bytes: usize,
     pub unparsed_bytes: usize,
     pub invalid_packet_count: usize,
+    pub unsupported_integer_range_count: usize,
+    pub integer_range_valid: bool,
     pub source_block_size: Option<u64>,
     pub source_block_count: Option<u64>,
     pub main_packet: Option<MainPacket>,
@@ -23,7 +25,7 @@ pub struct Par2Metadata {
     pub missing_file_description_ids: Vec<String>,
     pub unexpected_file_description_ids: Vec<String>,
     pub source_file_count: usize,
-    pub source_file_bytes: u64,
+    pub source_file_bytes: Option<u64>,
     pub source_files: Vec<SourceFile>,
     pub input_file_slice_checksums: Vec<InputFileSliceChecksums>,
     pub ifsc_slice_count_mismatch_count: usize,
@@ -64,6 +66,7 @@ pub struct SourceFile {
     pub filename_padding_bytes: usize,
     pub filename_padding_valid: bool,
     pub file_length: u64,
+    pub file_length_raw_little_endian_hex: String,
     pub md5: String,
     pub md5_first_16k: String,
     pub file_id: String,
@@ -111,7 +114,8 @@ pub struct RecoverySetInventory {
     pub missing_file_description_ids: Vec<String>,
     pub unexpected_file_description_ids: Vec<String>,
     pub source_file_count: usize,
-    pub source_file_bytes: u64,
+    pub source_file_bytes: Option<u64>,
+    pub integer_range_valid: bool,
     pub source_files: Vec<SourceFile>,
     pub input_file_slice_checksums: Vec<InputFileSliceChecksums>,
     pub ifsc_slice_count_mismatch_count: usize,
@@ -199,6 +203,8 @@ struct IfscPacket {
 pub fn parse(data: &[u8]) -> Par2Metadata {
     let mut parsed = Parsed::default();
     let mut offset = 0usize;
+    let mut unsupported_integer_range_count = 0usize;
+    let mut unsupported_integer_sets = BTreeSet::new();
 
     while offset.saturating_add(64) <= data.len() && parsed.packet_count < MAX_PACKETS {
         let Some(relative) = find_magic(data, offset) else {
@@ -342,6 +348,9 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
                     && padding.len() == expected_padding_bytes
                     && padding.iter().all(|byte| *byte == 0);
                 let filename_bytes_nonempty = !filename.is_empty();
+                if !filename_ascii_valid || !filename_padding_valid {
+                    parsed.invalid_packet_count += 1;
+                }
                 let file_id_derivation_valid =
                     filename_bytes_nonempty && filename_ascii_valid && filename_padding_valid;
                 let file_id_matches_derived =
@@ -360,6 +369,7 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
                     filename_padding_bytes: padding.len(),
                     filename_padding_valid,
                     file_length,
+                    file_length_raw_little_endian_hex: hex(file_length_bytes),
                     md5: hex(&payload[16..32]),
                     md5_first_16k: hex(&payload[32..48]),
                     file_id,
@@ -521,14 +531,19 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
         } else {
             raw_exponent
         };
-        match parsed
+        let expected_payload_length = parsed
             .block_sizes_by_set
             .get(&set_id)
-            .and_then(|block_size| block_size.checked_add(4))
-        {
-            Some(expected) if u64::try_from(payload_len).ok() == Some(expected) => {}
-            Some(_) => {
+            .map(|block_size| block_size.checked_add(4));
+        match expected_payload_length {
+            Some(Some(expected)) if u64::try_from(payload_len).ok() == Some(expected) => {}
+            Some(Some(_)) => {
                 parsed.invalid_packet_count += 1;
+                continue;
+            }
+            Some(None) => {
+                unsupported_integer_range_count += 1;
+                unsupported_integer_sets.insert(set_id.clone());
                 continue;
             }
             None => {
@@ -641,6 +656,7 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
             let source_inventory_complete = main_packet.is_some()
                 && missing_file_description_ids.is_empty()
                 && unexpected_file_description_ids.is_empty();
+            let mut integer_range_valid = !unsupported_integer_sets.contains(set_id);
             let source_block_count = if source_inventory_complete {
                 let recoverable_file_ids = main_packet
                     .as_ref()
@@ -650,12 +666,18 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
                     .block_sizes_by_set
                     .get(set_id)
                     .filter(|size| **size > 0)
-                    .map(|block_size| {
-                        source_files
+                    .and_then(|block_size| {
+                        let count = source_files
                             .iter()
                             .filter(|source| recoverable_file_ids.contains(&source.file_id))
-                            .map(|source| source.file_length.div_ceil(*block_size))
-                            .sum::<u64>()
+                            .try_fold(0u64, |total, source| {
+                                total.checked_add(source.file_length.div_ceil(*block_size))
+                            });
+                        if count.is_none() {
+                            unsupported_integer_range_count += 1;
+                            integer_range_valid = false;
+                        }
+                        count
                     })
                     .filter(|count| *count > 0)
             } else {
@@ -666,6 +688,13 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
                 .filter(|ifsc| &ifsc.recovery_set_id == set_id)
                 .cloned()
                 .collect::<Vec<_>>();
+            let source_file_bytes = source_files
+                .iter()
+                .try_fold(0u64, |total, source| total.checked_add(source.file_length));
+            if source_file_bytes.is_none() {
+                unsupported_integer_range_count += 1;
+                integer_range_valid = false;
+            }
             RecoverySetInventory {
                 recovery_set_id: set_id.clone(),
                 source_block_size: parsed.block_sizes_by_set.get(set_id).copied(),
@@ -675,7 +704,8 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
                 missing_file_description_ids,
                 unexpected_file_description_ids,
                 source_file_count: source_files.len(),
-                source_file_bytes: source_files.iter().map(|source| source.file_length).sum(),
+                source_file_bytes,
+                integer_range_valid,
                 source_files,
                 input_file_slice_checksums: set_slice_checksums,
                 ifsc_slice_count_mismatch_count: *ifsc_slice_count_mismatches_by_set
@@ -715,7 +745,17 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
     let source_block_size = single_set.and_then(|set| set.source_block_size);
     let main_packet = single_set.and_then(|set| set.main_packet.clone());
     let source_file_count = recovery_sets.iter().map(|set| set.source_file_count).sum();
-    let source_file_bytes = recovery_sets.iter().map(|set| set.source_file_bytes).sum();
+    let source_file_bytes = recovery_sets
+        .iter()
+        .try_fold(0u64, |total, set| total.checked_add(set.source_file_bytes?));
+    if source_file_bytes.is_none()
+        && recovery_sets
+            .iter()
+            .all(|set| set.source_file_bytes.is_some())
+    {
+        unsupported_integer_range_count += 1;
+    }
+    parsed.invalid_packet_count += unsupported_integer_range_count;
     let source_files = recovery_sets
         .iter()
         .flat_map(|set| set.source_files.iter().cloned())
@@ -761,6 +801,8 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
         trailing_unparsed_bytes: data.len().saturating_sub(offset),
         unparsed_bytes: parsed.unparsed_bytes,
         invalid_packet_count: parsed.invalid_packet_count,
+        unsupported_integer_range_count,
+        integer_range_valid: unsupported_integer_range_count == 0,
         source_block_size,
         source_block_count,
         main_packet,

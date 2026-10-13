@@ -301,6 +301,7 @@ final class ReleaseFingerprintCollector
                         $decoded = $this->yenc->decodeWithFrame($article['body']);
                         $yencIntegrity = $metadata['yenc'] ?? null;
                         $sizeValid = is_array($yencIntegrity)
+                            && ($yencIntegrity['payload_escape_state_valid'] ?? false) === true
                             && ($yencIntegrity['header_numeric_fields_valid'] ?? false) === true
                             && ($yencIntegrity['decoded_size_matches_header_size'] ?? false) === true
                             && ($yencIntegrity['decoded_size_matches_yenc'] ?? false) === true
@@ -407,12 +408,14 @@ final class ReleaseFingerprintCollector
             $singlePartCoversFile = $allSegmentsSampled
                 && count($file['segments']) === 1
                 && count($yencSamples) === 1
+                && ($yencSamples[0]['payload_escape_state_valid'] ?? false) === true
                 && $declaredFileSize !== null
                 && ($yencSamples[0]['part'] ?? null) === null
                 && ($yencSamples[0]['decoded_segment_size'] ?? null) === $declaredFileSize;
             $allMultipartNumbersMatch = count(array_filter(
                 $fileObservations,
                 static fn (array $observation): bool => ($observation['metadata']['yenc_nzb_part_number_matches'] ?? false) === true
+                    && ($observation['metadata']['yenc']['payload_escape_state_valid'] ?? false) === true
                     && ($observation['metadata']['yenc_nzb_total_parts_matches'] ?? null) !== false,
             )) === count($fileObservations);
             $rangesCoverFile = ! $allSegmentsSampled ? null : ($singlePartCoversFile || ($allMultipartNumbersMatch && $rangesContiguous
@@ -422,8 +425,11 @@ final class ReleaseFingerprintCollector
                 $yencSizeConflictCounts[$file['kind']]++;
             } elseif (($yencConsistency['file_size']['consistent'] ?? false)
                 && is_array($yenc) && is_int($yenc['file_size'] ?? null)) {
-                $yencSizes[$file['kind']] += $yenc['file_size'];
+                $yencSizes[$file['kind']] = $this->checkedNonNegativeIntegerAdd($yencSizes[$file['kind']], $yenc['file_size']);
                 $yencSizeCounts[$file['kind']]++;
+                if ($yencSizes[$file['kind']] === null) {
+                    $yencSizeConflictCounts[$file['kind']]++;
+                }
             }
             $fileRows[] = [
                 'index' => $file['index'],
@@ -500,12 +506,12 @@ final class ReleaseFingerprintCollector
                     'decoded_bytes' => $bytes,
                     'metadata' => null,
                 ];
+
                 continue;
             }
             $assembled = implode('', $parts);
             $metadata = $this->par2->parse($assembled);
-            $fileObservations = array_values(array_filter($observations, static fn (array $observation): bool =>
-                $observation['file_index'] === (int) $file['index'] && $observation['server_role'] === 'primary'));
+            $fileObservations = array_values(array_filter($observations, static fn (array $observation): bool => $observation['file_index'] === (int) $file['index'] && $observation['server_role'] === 'primary'));
             $yencNames = array_values(array_unique(array_filter(array_map(
                 static fn (array $observation): ?string => $observation['metadata']['yenc']['name'] ?? null,
                 $fileObservations,
@@ -514,13 +520,11 @@ final class ReleaseFingerprintCollector
                 static fn (array $observation): ?int => $observation['metadata']['yenc']['file_size'] ?? null,
                 $fileObservations,
             ), 'is_int')));
-            $hasMultipartYenc = count(array_filter($fileObservations, static fn (array $observation): bool =>
-                ($observation['metadata']['yenc']['multipart'] ?? false) === true)) > 0;
+            $hasMultipartYenc = count(array_filter($fileObservations, static fn (array $observation): bool => ($observation['metadata']['yenc']['multipart'] ?? false) === true)) > 0;
             $yencStructureValid = count($fileObservations) === count($file['segments'])
                 && count($yencNames) === 1 && count($par2YencSizes) === 1
                 && ($hasMultipartYenc || count($fileObservations) === 1)
-                && count(array_filter($fileObservations, static fn (array $observation): bool =>
-                    ((($observation['metadata']['yenc']['multipart'] ?? false) === true)
+                && count(array_filter($fileObservations, static fn (array $observation): bool => ((($observation['metadata']['yenc']['multipart'] ?? false) === true)
                         ? ($observation['metadata']['yenc_nzb_part_number_matches'] ?? false) === true
                         : ($observation['metadata']['yenc']['part'] ?? null) === null)
                     && ($observation['metadata']['yenc_nzb_total_parts_matches'] ?? null) !== false
@@ -657,6 +661,7 @@ final class ReleaseFingerprintCollector
                 }
                 if ($par2IfscObservationCount >= self::MAX_RELEASE_IFSC_RECORDS) {
                     $par2IfscObservationsOmitted++;
+
                     continue;
                 }
                 $par2IfscObservationCount++;
@@ -688,6 +693,7 @@ final class ReleaseFingerprintCollector
             ), 'set_id')));
             if (count($fileSetIds) !== 1) {
                 $par2Complete = false;
+
                 continue;
             }
             $setId = $fileSetIds[0];
@@ -809,6 +815,7 @@ final class ReleaseFingerprintCollector
             $sourceFiles = $par2SetSources[$setId] ?? [];
             if (! is_array($main)) {
                 $par2Complete = false;
+
                 continue;
             }
             $mainFileIds = [...($main['recoverable_file_ids'] ?? []), ...($main['non_recoverable_file_ids'] ?? [])];
@@ -884,11 +891,18 @@ final class ReleaseFingerprintCollector
                         break;
                     }
                     $fileSize = $par2SetSources[$singleSetId][$fileId]['file_length'];
-                    $sourceBlockCount += intdiv($fileSize, $blockSize) + (($fileSize % $blockSize) === 0 ? 0 : 1);
+                    $fileBlockCount = intdiv($fileSize, $blockSize) + (($fileSize % $blockSize) === 0 ? 0 : 1);
+                    $sourceBlockCount = $this->checkedNonNegativeIntegerAdd($sourceBlockCount, $fileBlockCount);
+                    if ($sourceBlockCount === null) {
+                        $denominatorIsDefined = false;
+                        break;
+                    }
                 }
             }
             if ($denominatorIsDefined) {
                 $par2SourceBlocks = $sourceBlockCount;
+            } else {
+                $par2Complete = false;
             }
         }
         $par2SourceFiles = array_values($par2Sources);
@@ -896,6 +910,12 @@ final class ReleaseFingerprintCollector
             '/(?:\.part\d+\.rar|\.rar|\.r\d{2,})\z/i',
             (string) ($sourceFile['filename'] ?? ''),
         ) === 1));
+        $par2SourceFileTotalBytes = $this->sourceFileLengthTotal($par2SourceFiles);
+        $par2SourceRarTotalBytes = $this->sourceFileLengthTotal($par2SourceRarFiles);
+        $par2SourceSizeTotalsAvailable = $par2SourceFileTotalBytes !== null && $par2SourceRarTotalBytes !== null;
+        if (! $par2SourceSizeTotalsAvailable || $yencSizes['rar'] === null || $yencSizes['par2'] === null) {
+            $par2Complete = false;
+        }
         $par2SourceArticleMatches = $this->matchPar2SourcesToNzbFiles($par2SourceFiles, $observations);
         $par2SourceSliceRelationships = $this->resolvePar2SourceSliceRelationships(
             $par2SourceFiles,
@@ -908,7 +928,8 @@ final class ReleaseFingerprintCollector
         $par2RecoveryPercent = $par2Complete && $par2RecoverySliceConflicts === [] && ! $multiplePar2Sets && is_int($par2SourceBlocks) && $par2SourceBlocks > 0 && ! $par2PackedLayout
             ? round($recoveryCount / $par2SourceBlocks * 100, 3)
             : null;
-        $yencFileLengthPercent = $yencSizeCounts['rar'] > 0 && $yencSizeCounts['par2'] > 0 && $yencSizes['rar'] > 0
+        $yencFileLengthPercent = $yencSizeCounts['rar'] > 0 && $yencSizeCounts['par2'] > 0
+            && is_int($yencSizes['rar']) && is_int($yencSizes['par2']) && $yencSizes['rar'] > 0
             ? round($yencSizes['par2'] / $yencSizes['rar'] * 100, 3)
             : null;
 
@@ -920,6 +941,7 @@ final class ReleaseFingerprintCollector
             count(array_unique(array_column($samples, 'messageid'))),
         );
         $completePrimarySamples = count(array_filter($samples, fn (array $sample): bool => $this->primaryObservation($sample['file_index'], $observations, $sample['messageid']) !== null));
+        $allFilesSampled = count(array_unique(array_column($samples, 'file_index'))) === count($manifest['files']);
         $allFilesHaveSegments = count(array_filter(
             $manifest['files'],
             static fn (array $file): bool => ($file['segments'] ?? []) !== [],
@@ -934,11 +956,19 @@ final class ReleaseFingerprintCollector
         )) === count($manifest['files']);
         $allSamplesAvailable = $samples !== []
             && $completePrimarySamples === count($samples)
+            && $allFilesSampled
             && $allFilesHaveSegments
             && $manifestIntegrityValid;
         $providerCoverageComplete = count($servers) < 2 || count($comparisons) >= count(array_unique(array_column($samples, 'messageid')));
         $profileCoverageComplete = count($serverProfiles) === count($servers)
-            && count(array_filter($serverProfiles, static fn (array $profile): bool => ! isset($profile['profile_error_type']))) === count($servers);
+            && count(array_filter($serverProfiles, static fn (array $profile): bool => ! isset($profile['profile_error_type'])
+                && ! isset($profile['profile']['capabilities_error_type'])
+                && ! isset($profile['profile']['overview_format_error_type'])
+                // Explicit unsupported commands are valid observations; transport
+                // failures and other unexpected responses need another collection.
+                && in_array($profile['profile']['capabilities_response_code'] ?? null, [101, 500, 501], true)
+                && (($profile['profile']['overview_format_response_code'] ?? null) === null
+                    || in_array($profile['profile']['overview_format_response_code'], [215, 500, 501], true)))) === count($servers);
         $identityParserCoverageComplete = $observations !== [] && count(array_filter(
             $observations,
             static fn (array $observation): bool => ($observation['metadata']['article_identity']['parser_engine'] ?? null)
@@ -952,8 +982,12 @@ final class ReleaseFingerprintCollector
                 === 'nntmux-rust-article-xref'
                 && ($observation['metadata']['article_xref']['schema_version'] ?? null) === 1,
         )) === count($observations);
+        $yencEscapeStateValid = count(array_filter(
+            $observations,
+            static fn (array $observation): bool => ($observation['metadata']['yenc']['payload_escape_state_valid'] ?? null) === false,
+        )) === 0;
         $status = $allSamplesAvailable && $par2Complete && $providerCoverageComplete && $profileCoverageComplete
-            && $identityParserCoverageComplete && $xrefParserCoverageComplete ? 'complete' : 'partial';
+            && $identityParserCoverageComplete && $xrefParserCoverageComplete && $yencEscapeStateValid ? 'complete' : 'partial';
 
         return [
             'status' => $status,
@@ -998,11 +1032,12 @@ final class ReleaseFingerprintCollector
                     'set_ids' => array_keys($par2SetIds),
                     'multiple_recovery_sets' => $multiplePar2Sets,
                     'source_files' => $par2SourceFiles,
-                    'source_file_total_bytes' => array_sum(array_column($par2SourceFiles, 'file_length')),
+                    'source_file_total_bytes' => $par2SourceFileTotalBytes,
+                    'source_size_totals_available' => $par2SourceSizeTotalsAvailable,
                     'main_definition_conflicts' => $par2MainDefinitionConflicts,
                     'source_file_definition_conflicts' => $par2SourceDefinitionConflicts,
                     'source_rar_files' => $par2SourceRarFiles,
-                    'source_rar_total_bytes' => array_sum(array_column($par2SourceRarFiles, 'file_length')),
+                    'source_rar_total_bytes' => $par2SourceRarTotalBytes,
                     'source_rar_article_matches' => $par2SourceArticleMatches,
                     'input_file_slice_checksums' => $par2Ifsc['files'],
                     'ifsc_conflicts' => $par2Ifsc['conflicts'],
@@ -1060,11 +1095,14 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param array<string, mixed> $metadata
-     *  @return array<string, mixed>
+     * @return array<string, mixed>
      */
     private function decodedFileRange(array $metadata, ?string $decodedBytes): array
     {
         $yenc = $metadata['yenc'] ?? null;
+        if (is_array($yenc) && ($yenc['payload_escape_state_valid'] ?? null) === false) {
+            return ['mapping_status' => 'invalid', 'integrity_status' => 'invalid_unmatched_escape'];
+        }
         if (! is_array($yenc) || ! is_string($decodedBytes)) {
             return ['mapping_status' => 'unavailable', 'integrity_status' => 'unavailable'];
         }
@@ -1128,7 +1166,7 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param array<string, mixed> $metadata
-     *  @return array<string, mixed>|null
+     * @return array<string, mixed>|null
      */
     private function sevenZipAnchor(array $metadata): ?array
     {
@@ -1146,7 +1184,7 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param array<string, array<string, mixed>> $candidates
-     *  @return list<array<string, mixed>>
+     * @return list<array<string, mixed>>
      */
     private function resolveSevenZipRelationships(array $candidates): array
     {
@@ -1175,6 +1213,7 @@ final class ReleaseFingerprintCollector
                     'declared_file_sizes' => array_values($declaredSizes),
                     'omitted_ranges' => $candidate['budget_omitted_ranges'],
                 ];
+
                 continue;
             }
             if (($candidate['anchor_fragment_retained'] ?? false) !== true) {
@@ -1184,6 +1223,7 @@ final class ReleaseFingerprintCollector
                     'omitted_ranges' => $candidate['budget_omitted_ranges'],
                     'budget_reason' => 'The first 7-Zip header sample was omitted from the release-wide decoded-byte budget.',
                 ];
+
                 continue;
             }
             if (count($fragments) > self::MAX_SEVEN_ZIP_FRAGMENTS_PER_RECORD) {
@@ -1192,6 +1232,7 @@ final class ReleaseFingerprintCollector
                     'declared_file_size' => $declaredSizes[0],
                     'omitted_ranges' => $candidate['budget_omitted_ranges'],
                 ];
+
                 continue;
             }
 
@@ -1205,6 +1246,7 @@ final class ReleaseFingerprintCollector
                         'declared_file_size' => $declaredSizes[0],
                         'omitted_ranges' => $candidate['budget_omitted_ranges'],
                     ];
+
                     continue 2;
                 }
                 $packed .= $this->packUint64($offset).pack('V', strlen($bytes)).$bytes;
@@ -1216,6 +1258,7 @@ final class ReleaseFingerprintCollector
             ];
             if (! is_array($resolution)) {
                 $relationships[] = $references + ['resolution_status' => 'native_resolver_unavailable'];
+
                 continue;
             }
             $contributorIndexes = $resolution['source_fragment_indexes'] ?? [];
@@ -1269,7 +1312,7 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param list<array{start: int, end_exclusive: int}> $omittedRanges
-     *  @param list<array{start: int, end_exclusive: int}> $missingRanges
+     * @param  list<array{start: int, end_exclusive: int}>  $missingRanges
      */
     private function omittedRangesIntersect(array $omittedRanges, array $missingRanges): bool
     {
@@ -1318,6 +1361,7 @@ final class ReleaseFingerprintCollector
         foreach ($sampledFiles as $sampledFile) {
             if (count($records) >= self::MAX_PAR2_SOURCE_RELATIONSHIPS || ! is_array($sampledFile)) {
                 $omittedRelationshipCount++;
+
                 continue;
             }
             $firstSample = $sampledFile['first_sample'] ?? null;
@@ -1359,8 +1403,7 @@ final class ReleaseFingerprintCollector
                         : (! is_array($variant) ? 'ifsc_variant_unavailable' : 'validated')));
             $slices = is_array($variant) && is_array($variant['slice_preview'] ?? null)
                 ? $variant['slice_preview'] : [];
-            $usableSlices = array_values(array_filter($slices, static fn (array $slice): bool =>
-                ($slice['source_range_valid'] ?? false) === true
+            $usableSlices = array_values(array_filter($slices, static fn (array $slice): bool => ($slice['source_range_valid'] ?? false) === true
                 && is_int($slice['slice_index'] ?? null)
                 && is_int($slice['source_byte_start'] ?? null)
                 && is_int($slice['source_byte_end_exclusive'] ?? null)
@@ -1415,8 +1458,7 @@ final class ReleaseFingerprintCollector
                     continue;
                 }
                 $originFileIndex = $origin['file_index'];
-                $originArticles = array_values(array_filter($observations, static fn (array $observation): bool =>
-                    ($observation['file_index'] ?? null) === $originFileIndex
+                $originArticles = array_values(array_filter($observations, static fn (array $observation): bool => ($observation['file_index'] ?? null) === $originFileIndex
                     && ($observation['kind'] ?? null) === 'par2'
                     && ($observation['server_role'] ?? null) === 'primary'));
                 $origin['article_references'] = array_map(static fn (array $observation): array => [
@@ -1486,7 +1528,7 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param list<array<string, mixed>> $fragments
-     *  @param list<array<string, mixed>> $slices
+     * @param  list<array<string, mixed>>  $slices
      */
     private function packPar2SourceRangeInput(int $fileLength, array $fragments, array $slices): ?string
     {
@@ -1521,8 +1563,8 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param list<array<string, mixed>> $sourceFiles
-     *  @param list<array<string, mixed>> $observations
-     *  @return array{basis: string, matched_prefix_and_length_count: int, ambiguous_count: int, unmatched_count: int, contradictory_length_count: int, insufficient_prefix_count: int, length_unavailable_count: int, integrity_conflict_count: int, matches: list<array<string, mixed>>}
+     * @param  list<array<string, mixed>>  $observations
+     * @return array{basis: string, matched_prefix_and_length_count: int, ambiguous_count: int, unmatched_count: int, contradictory_length_count: int, insufficient_prefix_count: int, length_unavailable_count: int, integrity_conflict_count: int, matches: list<array<string, mixed>>}
      */
     private function matchPar2SourcesToNzbFiles(array $sourceFiles, array $observations): array
     {
@@ -1557,6 +1599,7 @@ final class ReleaseFingerprintCollector
             $integrityConflicts = [];
             if (is_array($yenc)) {
                 foreach ([
+                    'payload_escape_state_valid' => 'unmatched_yenc_escape',
                     'header_numeric_fields_valid' => 'invalid_yenc_numeric_fields',
                     'trailer_numeric_fields_valid' => 'invalid_yend_numeric_fields',
                     'decoded_size_matches_header_size' => 'decoded_size_header_size_mismatch',
@@ -1723,6 +1766,7 @@ final class ReleaseFingerprintCollector
                     if (! is_int($sliceCount) || $sliceCount < 0
                         || ! is_string($digest) || preg_match('/\\A[a-f0-9]{64}\\z/i', $digest) !== 1) {
                         $localConflict = true;
+
                         continue;
                     }
                     $variantKey = $sliceCount.':'.strtolower($digest);
@@ -2001,7 +2045,7 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param list<array<string, mixed>> $files
-     *  @return array<string, mixed>
+     * @return array<string, mixed>
      */
     private function estimatePostingTimeline(array $files, array $observations, array $servers, int $expectedSamples): array
     {
@@ -2121,7 +2165,7 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param array<string, int> $timestamps
-     *  @return array<string, mixed>
+     * @return array<string, mixed>
      */
     private static function timestampSummary(array $timestamps, int $observations, int $expected): array
     {
@@ -2155,7 +2199,7 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param list<array<string, mixed>> $observations
-     *  @return list<array<string, mixed>>
+     * @return list<array<string, mixed>>
      */
     private function compareProviders(array $observations): array
     {
@@ -2183,6 +2227,7 @@ final class ReleaseFingerprintCollector
                 foreach ($headers as $server => $serverHeaders) {
                     $values[$server] = $serverHeaders[$headerName] ?? null;
                 }
+                // Compare raw bytes before JSON persistence replaces invalid UTF-8.
                 if (count(array_unique(array_map(static fn (mixed $value): string => serialize($value), $values))) > 1) {
                     $headerDifferences[$headerName] = $values;
                 }
@@ -2204,7 +2249,7 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param list<string> $format
-     *  @return array<string, string>
+     * @return array<string, string>
      */
     private function parseOverview(?string $row, array $format): array
     {
@@ -2235,6 +2280,29 @@ final class ReleaseFingerprintCollector
         return $parsed;
     }
 
+    /** @param list<array<string, mixed>> $sourceFiles */
+    private function sourceFileLengthTotal(array $sourceFiles): ?int
+    {
+        $total = 0;
+        foreach ($sourceFiles as $sourceFile) {
+            $total = $this->checkedNonNegativeIntegerAdd($total, $sourceFile['file_length'] ?? null);
+            if ($total === null) {
+                return null;
+            }
+        }
+
+        return $total;
+    }
+
+    private function checkedNonNegativeIntegerAdd(?int $total, mixed $value): ?int
+    {
+        if ($total === null || $total < 0 || ! is_int($value) || $value < 0 || $total > PHP_INT_MAX - $value) {
+            return null;
+        }
+
+        return $total + $value;
+    }
+
     /** @param array<string, mixed> $article */
     private function overviewRowProtocolStatus(array $article): string
     {
@@ -2256,7 +2324,7 @@ final class ReleaseFingerprintCollector
     }
 
     /** @param list<array<string, mixed>> $observations
-     *  @return list<array<string, mixed>>
+     * @return list<array<string, mixed>>
      */
     private function softwareCandidates(array $observations): array
     {

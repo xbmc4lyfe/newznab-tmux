@@ -25,9 +25,12 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
 
     public int $uniqueFor = 3600;
 
-    public string $connection = 'redis';
-
-    public function __construct(private readonly int $releaseId) {}
+    public function __construct(private readonly int $releaseId)
+    {
+        // Enrichment must stay asynchronous even when the default queue uses sync.
+        $this->onConnection('release-fingerprint');
+        $this->onQueue('release-fingerprint');
+    }
 
     public function uniqueId(): string
     {
