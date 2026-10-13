@@ -18,6 +18,7 @@ use std::panic::catch_unwind;
 use std::ptr;
 use std::slice;
 
+mod article_dates;
 mod article_identity;
 mod article_xref;
 mod formats;
@@ -126,6 +127,33 @@ pub unsafe extern "C" fn nntmux_format_metadata_json(
     };
     let encoded = catch_unwind(|| serde_json::to_string(&formats::parse(input)));
     match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Parse bounded raw HEAD fields into occurrence-aware absolute date metadata.
+/// The caller must release the returned JSON with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs above 65536 bytes are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_article_dates_v1_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > 65_536 || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    match catch_unwind(|| serde_json::to_string(&article_dates::parse(input))) {
         Ok(Ok(json)) => CString::new(json)
             .map(CString::into_raw)
             .unwrap_or(ptr::null_mut()),

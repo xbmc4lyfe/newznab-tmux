@@ -87,6 +87,39 @@ pub struct EncodedHeaderCoder {
     pub properties_prefix_truncated: Option<bool>,
     pub properties_parse_status: &'static str,
     pub seven_zip_aes: Option<SevenZipAesProperties>,
+    pub compression_properties: Option<SevenZipCompressionProperties>,
+    pub properties_interpretation_scope: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum SevenZipCompressionProperties {
+    Lzma {
+        expected_properties_length: usize,
+        properties_length_valid: bool,
+        properties_length_canonical: bool,
+        trailing_properties_bytes: usize,
+        encoded_property_byte: Option<u8>,
+        property_byte_in_range: Option<bool>,
+        literal_context_bits: Option<u8>,
+        literal_position_bits: Option<u8>,
+        position_bits: Option<u8>,
+        declared_dictionary_size_bytes: Option<u32>,
+        decoder_effective_dictionary_size_bytes: Option<u32>,
+    },
+    Lzma2 {
+        expected_properties_length: usize,
+        properties_length_valid: bool,
+        encoded_dictionary_property_byte: Option<u8>,
+        dictionary_property_in_range: Option<bool>,
+        decoder_effective_dictionary_size_bytes: Option<u32>,
+    },
+    Delta {
+        expected_properties_length: usize,
+        properties_length_valid: bool,
+        encoded_distance_minus_one: Option<u8>,
+        distance_bytes: Option<u16>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -908,6 +941,7 @@ fn parse_encoded_header_folder(
         {
             return None;
         }
+        let compression_properties;
         let (
             properties_length,
             properties_sha256,
@@ -930,12 +964,18 @@ fn parse_encoded_header_folder(
             *cursor = end;
             let aes = (seven_zip_method_id(method_id) == 0x06f1_0701)
                 .then(|| parse_seven_zip_aes_properties(properties));
+            compression_properties = parse_compression_properties(method_id, properties);
             (
                 Some(length_usize),
                 Some(sha256_hex(properties)),
                 Some(hex(&properties[..properties.len().min(256)])),
                 Some(properties.len() > 256),
-                if aes
+                if compression_properties
+                    .as_ref()
+                    .is_some_and(|value| !compression_properties_valid(value))
+                {
+                    "malformed_compression_properties"
+                } else if aes
                     .as_ref()
                     .is_none_or(|value| value.properties_length_valid)
                 {
@@ -948,6 +988,7 @@ fn parse_encoded_header_folder(
         } else {
             let aes = (seven_zip_method_id(method_id) == 0x06f1_0701)
                 .then(|| parse_seven_zip_aes_properties(&[]));
+            compression_properties = parse_compression_properties(method_id, &[]);
             (None, None, None, None, "properties_not_present", aes)
         };
         coders.push(EncodedHeaderCoder {
@@ -963,6 +1004,9 @@ fn parse_encoded_header_folder(
             properties_prefix_truncated,
             properties_parse_status,
             seven_zip_aes,
+            compression_properties,
+            properties_interpretation_scope:
+                "encoded_header_coder_properties_without_stream_decompression",
         });
     }
     let bind_count = total_output_streams.checked_sub(1)?;
@@ -1044,6 +1088,96 @@ fn seven_zip_method_id(method_id: &[u8]) -> u64 {
     method_id
         .iter()
         .fold(0u64, |value, byte| (value << 8) | u64::from(*byte))
+}
+
+fn parse_compression_properties(
+    method_id: &[u8],
+    properties: &[u8],
+) -> Option<SevenZipCompressionProperties> {
+    let first = properties.first().copied();
+    match seven_zip_method_id(method_id) {
+        0x03_01_01 => {
+            // 7-Zip C/LzmaDec.c, LzmaProps_Decode: five canonical bytes.
+            // Its decoder also tolerates trailing bytes; report both decoder
+            // compatibility and canonical length without discarding raw bytes.
+            let length_valid = properties.len() >= 5;
+            let property_in_range = first.map(|value| value < 9 * 5 * 5);
+            let valid = length_valid && property_in_range == Some(true);
+            let declared_dictionary = properties
+                .get(1..5)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_le_bytes);
+            Some(SevenZipCompressionProperties::Lzma {
+                expected_properties_length: 5,
+                properties_length_valid: length_valid,
+                properties_length_canonical: properties.len() == 5,
+                trailing_properties_bytes: properties.len().saturating_sub(5),
+                encoded_property_byte: first,
+                property_byte_in_range: property_in_range,
+                literal_context_bits: first.filter(|_| valid).map(|value| value % 9),
+                literal_position_bits: first.filter(|_| valid).map(|value| (value / 9) % 5),
+                position_bits: first.filter(|_| valid).map(|value| (value / 9) / 5),
+                declared_dictionary_size_bytes: declared_dictionary,
+                decoder_effective_dictionary_size_bytes: declared_dictionary
+                    .filter(|_| valid)
+                    .map(|size| size.max(4096)),
+            })
+        }
+        0x21 => {
+            // 7-Zip C/Lzma2Dec.c, Lzma2Dec_GetOldProps. lc/lp/pb occur
+            // inside stream chunks and cannot be inferred from this byte.
+            let length_valid = properties.len() == 1;
+            let property_in_range = first.map(|value| value <= 40);
+            let dictionary = first
+                .filter(|_| length_valid && property_in_range == Some(true))
+                .map(|value| {
+                    if value == 40 {
+                        u32::MAX
+                    } else {
+                        (2u32 | u32::from(value & 1)) << (u32::from(value) / 2 + 11)
+                    }
+                });
+            Some(SevenZipCompressionProperties::Lzma2 {
+                expected_properties_length: 1,
+                properties_length_valid: length_valid,
+                encoded_dictionary_property_byte: first,
+                dictionary_property_in_range: property_in_range,
+                decoder_effective_dictionary_size_bytes: dictionary,
+            })
+        }
+        0x03 => {
+            // 7-Zip CPP/7zip/Compress/DeltaFilter.cpp, SetDecoderProperties2.
+            let length_valid = properties.len() == 1;
+            Some(SevenZipCompressionProperties::Delta {
+                expected_properties_length: 1,
+                properties_length_valid: length_valid,
+                encoded_distance_minus_one: first,
+                distance_bytes: first
+                    .filter(|_| length_valid)
+                    .map(|value| u16::from(value) + 1),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn compression_properties_valid(properties: &SevenZipCompressionProperties) -> bool {
+    match properties {
+        SevenZipCompressionProperties::Lzma {
+            properties_length_valid,
+            property_byte_in_range,
+            ..
+        } => *properties_length_valid && *property_byte_in_range == Some(true),
+        SevenZipCompressionProperties::Lzma2 {
+            properties_length_valid,
+            dictionary_property_in_range,
+            ..
+        } => *properties_length_valid && *dictionary_property_in_range == Some(true),
+        SevenZipCompressionProperties::Delta {
+            properties_length_valid,
+            ..
+        } => *properties_length_valid,
+    }
 }
 
 fn parse_seven_zip_aes_properties(properties: &[u8]) -> SevenZipAesProperties {

@@ -154,6 +154,7 @@ pub struct PacketSummary {
     pub offset: usize,
     pub packet_bytes: usize,
     pub packet_type: String,
+    pub packet_type_raw_hex: String,
     pub set_id: String,
     pub packet_md5: String,
     pub checksum_valid: bool,
@@ -257,6 +258,7 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
             offset,
             packet_bytes: packet_len,
             packet_type: packet_type.clone(),
+            packet_type_raw_hex: hex(packet_type_bytes),
             set_id: set_id.clone(),
             packet_md5,
             checksum_valid,
@@ -854,24 +856,25 @@ fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
 }
 
 fn type_string(bytes: &[u8]) -> String {
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len());
-    let mut output = String::new();
-    for byte in &bytes[..end] {
-        output.push(*byte as char);
-    }
-    if end < bytes.len() {
-        output.push_str("\\0");
-        for byte in &bytes[end + 1..] {
-            if *byte == 0 {
-                break;
-            }
-            output.push(*byte as char);
-        }
-    }
-    output
+    // Packet types are exact 16-byte identifiers, not NUL-terminated strings.
+    // Preserve the legacy labels only for canonical core/optional identifiers.
+    // An extension with a matching prefix must never dispatch as a known type.
+    let known = match bytes {
+        b"PAR 2.0\0Main\0\0\0\0" => Some("PAR 2.0\\0Main"),
+        b"PAR 2.0\0FileDesc" => Some("PAR 2.0\\0FileDesc"),
+        b"PAR 2.0\0IFSC\0\0\0\0" => Some("PAR 2.0\\0IFSC"),
+        b"PAR 2.0\0RecvSlic" => Some("PAR 2.0\\0RecvSlic"),
+        b"PAR 2.0\0Creator\0" => Some("PAR 2.0\\0Creator"),
+        b"PAR 2.0\0UniFileN" => Some("PAR 2.0\\0UniFileN"),
+        b"PAR 2.0\0CommASCI" => Some("PAR 2.0\\0CommASCI"),
+        b"PAR 2.0\0CommUni\0" => Some("PAR 2.0\\0CommUni"),
+        b"PAR 2.0\0FileSlic" => Some("PAR 2.0\\0FileSlic"),
+        b"PAR 2.0\0PkdMain\0" => Some("PAR 2.0\\0PkdMain"),
+        b"PAR 2.0\0PkdRecvS" => Some("PAR 2.0\\0PkdRecvS"),
+        b"PAR 2.0\0RFSC\0\0\0\0" => Some("PAR 2.0\\0RFSC"),
+        _ => None,
+    };
+    known.map_or_else(|| format!("unknown:{}", hex(bytes)), str::to_owned)
 }
 
 fn md5(bytes: &[u8]) -> [u8; 16] {

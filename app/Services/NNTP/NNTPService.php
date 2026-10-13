@@ -40,12 +40,9 @@ class NNTPService extends NntpClient
     {
         $messageId = self::verificationMessageId($messageId, $maximumBytes);
         $response = $this->_sendCommand('BODY <'.$messageId.'>');
-        $responseMetadata = [
-            'response_code' => is_numeric($response) ? (int) $response : null,
-            'response_text' => is_numeric($response) ? $this->_currentStatusResponse() : null,
-            'response_text_basis' => 'net_nntp_current_status_response_trimmed_remainder',
-            'error_type' => is_numeric($response) ? null : class_basename($response),
-        ];
+        if ($responseMetadata !== null) {
+            $responseMetadata = $this->fingerprintResponseMetadata($response);
+        }
         if ($response !== ResponseCode::BodyFollows->value) {
             throw new \RuntimeException('Article is unavailable; retry verification later.');
         }
@@ -1209,12 +1206,7 @@ class NNTPService extends NntpClient
     private function readFingerprintArticleHeaders(string $identifier, int $maximumBytes, ?array &$responseMetadata = null): array
     {
         $response = $this->_sendCommand('HEAD <'.$identifier.'>');
-        $responseMetadata = [
-            'response_code' => is_numeric($response) ? (int) $response : null,
-            'response_text' => is_numeric($response) ? $this->_currentStatusResponse() : null,
-            'response_text_basis' => 'net_nntp_current_status_response_trimmed_remainder',
-            'error_type' => is_numeric($response) ? null : class_basename($response),
-        ];
+        $responseMetadata = $this->fingerprintResponseMetadata($response);
         if ($response !== 221) {
             throw new \RuntimeException('Article headers are unavailable.');
         }
@@ -1242,6 +1234,26 @@ class NNTPService extends NntpClient
 
         $this->doQuit(true);
         throw new \RuntimeException('Article header response was truncated.');
+    }
+
+    /** @return array{response_code: int|null, response_text: string|null, response_text_basis: string, error_type: string|null} */
+    private function fingerprintResponseMetadata(mixed $response): array
+    {
+        $responseText = null;
+        if (is_numeric($response)) {
+            try {
+                $responseText = $this->_currentStatusResponse();
+            } catch (\Throwable) {
+                // Some client/test transports expose no text beyond the response code.
+            }
+        }
+
+        return [
+            'response_code' => is_numeric($response) ? (int) $response : null,
+            'response_text' => $responseText,
+            'response_text_basis' => 'net_nntp_current_status_response_trimmed_remainder',
+            'error_type' => is_numeric($response) ? null : class_basename($response),
+        ];
     }
 
     /**

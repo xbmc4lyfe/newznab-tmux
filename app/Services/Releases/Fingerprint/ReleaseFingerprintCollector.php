@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 12;
+    public const SCHEMA_VERSION = 13;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 
@@ -260,6 +260,13 @@ final class ReleaseFingerprintCollector
                         $overviewFormatResponseCode,
                     );
                     $metadata['article_xref'] = $articleXref ?? [
+                        'parser_engine' => null,
+                        'schema_version' => 1,
+                        'collection_status' => 'unavailable',
+                        'reason' => 'native_parser_unavailable_or_input_exceeded_budget',
+                    ];
+                    $articleDates = (new NativeMetadataParser)->parseArticleDates($article['headers']);
+                    $metadata['article_dates'] = $articleDates ?? [
                         'parser_engine' => null,
                         'schema_version' => 1,
                         'collection_status' => 'unavailable',
@@ -982,12 +989,19 @@ final class ReleaseFingerprintCollector
                 === 'nntmux-rust-article-xref'
                 && ($observation['metadata']['article_xref']['schema_version'] ?? null) === 1,
         )) === count($observations);
+        $dateParserCoverageComplete = $observations !== [] && count(array_filter(
+            $observations,
+            static fn (array $observation): bool => ($observation['metadata']['article_dates']['parser_engine'] ?? null)
+                === 'nntmux-rust-article-dates'
+                && ($observation['metadata']['article_dates']['schema_version'] ?? null) === 1,
+        )) === count($observations);
         $yencEscapeStateValid = count(array_filter(
             $observations,
             static fn (array $observation): bool => ($observation['metadata']['yenc']['payload_escape_state_valid'] ?? null) === false,
         )) === 0;
         $status = $allSamplesAvailable && $par2Complete && $providerCoverageComplete && $profileCoverageComplete
-            && $identityParserCoverageComplete && $xrefParserCoverageComplete && $yencEscapeStateValid ? 'complete' : 'partial';
+            && $identityParserCoverageComplete && $xrefParserCoverageComplete && $dateParserCoverageComplete
+            && $yencEscapeStateValid ? 'complete' : 'partial';
 
         return [
             'status' => $status,
@@ -995,6 +1009,7 @@ final class ReleaseFingerprintCollector
                 'schema_version' => self::SCHEMA_VERSION,
                 'article_identity_parser_coverage_complete' => $identityParserCoverageComplete,
                 'article_xref_parser_coverage_complete' => $xrefParserCoverageComplete,
+                'article_date_parser_coverage_complete' => $dateParserCoverageComplete,
                 'collection_policy' => [
                     'all_nzb_files_listed' => true,
                     'non_par2_article_samples_per_file' => 'first, middle, and last segment; repeated Message-IDs are deduplicated within each NZB file',
@@ -2099,29 +2114,42 @@ final class ReleaseFingerprintCollector
         }
         $articleSpans = [];
         $injectionSpans = [];
+        $legacyPostingDateSpans = [];
         $deltas = [];
         foreach ($servers as $server) {
             $serverObservations = array_values(array_filter($observations, static fn (array $observation): bool => $observation['server'] === $server['name'] && $observation['server_role'] === ($server['alternate'] ? 'alternate' : 'primary')));
             $articleTimes = [];
             $injectionTimes = [];
+            $legacyPostingDateTimes = [];
             foreach ($serverObservations as $observation) {
-                $headers = $observation['metadata']['headers'] ?? [];
-                $date = is_string($headers['date'] ?? null) ? strtotime($headers['date']) : false;
-                $injectionDate = is_string($headers['injection-date'] ?? null) ? strtotime($headers['injection-date']) : false;
-                if ($date !== false) {
-                    $articleTimes[$observation['message_id']] = $date;
+                $dates = $observation['metadata']['article_dates'] ?? [];
+                $date = $dates['date']['parse_status'] ?? null;
+                $articleTimestamp = $date === 'valid' && is_int($dates['date']['utc_epoch_seconds'] ?? null)
+                    ? $dates['date']['utc_epoch_seconds'] : null;
+                $injectionDate = $dates['injection_date']['parse_status'] ?? null;
+                $injectionTimestamp = $injectionDate === 'valid' && is_int($dates['injection_date']['utc_epoch_seconds'] ?? null)
+                    ? $dates['injection_date']['utc_epoch_seconds'] : null;
+                $legacyDate = $dates['legacy_nntp_posting_date']['parse_status'] ?? null;
+                $legacyTimestamp = $legacyDate === 'valid' && is_int($dates['legacy_nntp_posting_date']['utc_epoch_seconds'] ?? null)
+                    ? $dates['legacy_nntp_posting_date']['utc_epoch_seconds'] : null;
+                if ($articleTimestamp !== null) {
+                    $articleTimes[$observation['message_id']] = $articleTimestamp;
                 }
-                if ($injectionDate !== false) {
-                    $injectionTimes[$observation['message_id']] = $injectionDate;
+                if ($injectionTimestamp !== null) {
+                    $injectionTimes[$observation['message_id']] = $injectionTimestamp;
                 }
-                if ($date !== false && $injectionDate !== false) {
-                    $deltas[] = ['server' => $server['name'], 'message_id' => $observation['message_id'], 'seconds' => $injectionDate - $date];
+                if ($legacyTimestamp !== null) {
+                    $legacyPostingDateTimes[$observation['message_id']] = $legacyTimestamp;
+                }
+                if ($articleTimestamp !== null && $injectionTimestamp !== null) {
+                    $deltas[] = ['server' => $server['name'], 'message_id' => $observation['message_id'], 'seconds' => $injectionTimestamp - $articleTimestamp];
                 }
             }
             $serverKey = ($server['alternate'] ? 'alternate ' : 'primary ').$server['name'];
             $uniqueServerSamples = count(array_unique(array_column($serverObservations, 'message_id')));
             $articleSpans[$serverKey] = self::timestampSummary($articleTimes, $uniqueServerSamples, $expectedSamples);
             $injectionSpans[$serverKey] = self::timestampSummary($injectionTimes, $uniqueServerSamples, $expectedSamples);
+            $legacyPostingDateSpans[$serverKey] = self::timestampSummary($legacyPostingDateTimes, $uniqueServerSamples, $expectedSamples);
         }
         $deltaValues = array_column($deltas, 'seconds');
         sort($deltaValues);
@@ -2135,6 +2163,7 @@ final class ReleaseFingerprintCollector
             'nzb_file_timestamp_span' => $nzbTimestampSpan,
             'observed_article_date_span_by_server' => $articleSpans,
             'observed_injection_date_span_by_server' => $injectionSpans,
+            'observed_legacy_nntp_posting_date_span_by_server' => $legacyPostingDateSpans,
             'composition_to_injection_delta_seconds' => [
                 'min' => $deltaValues === [] ? null : min($deltaValues),
                 'median' => self::percentile($deltaValues, 0.5),
@@ -2215,10 +2244,36 @@ final class ReleaseFingerprintCollector
             }
             $bodyHashes = [];
             $headers = [];
+            $headerOccurrenceOrders = [];
+            $decodedSegmentHashes = [];
+            $decodedSegmentRanges = [];
+            $decodedSegmentIntegrity = [];
             $allHeaderNames = [];
             foreach ($perServer as $server => $observation) {
                 $bodyHashes[$server] = $observation['metadata']['article_body_sha256'] ?? null;
                 $headers[$server] = $observation['metadata']['headers'] ?? [];
+                $orderedNames = $observation['metadata']['header_profile']['ordered_names'] ?? null;
+                $headerOccurrenceOrders[$server] = is_array($orderedNames) ? array_values($orderedNames) : null;
+                $yenc = $observation['metadata']['yenc'] ?? [];
+                $decodedSegmentHashes[$server] = is_string($yenc['decoded_segment_sha256'] ?? null)
+                    ? strtolower($yenc['decoded_segment_sha256']) : null;
+                $multipart = ($yenc['multipart'] ?? false) === true;
+                $fileSize = is_int($yenc['file_size'] ?? null) ? $yenc['file_size'] : null;
+                $decodedSegmentRanges[$server] = [
+                    'begin' => $multipart ? (is_int($yenc['begin'] ?? null) ? $yenc['begin'] : null) : ($fileSize === null ? null : 1),
+                    'end' => $multipart ? (is_int($yenc['end'] ?? null) ? $yenc['end'] : null) : $fileSize,
+                    'file_size' => $fileSize,
+                ];
+                $decodedSegmentIntegrity[$server] = ($yenc['payload_escape_state_valid'] ?? null) === true
+                    && ($yenc['header_numeric_fields_valid'] ?? null) === true
+                    && ($yenc['trailer_numeric_fields_valid'] ?? null) === true
+                    && ($yenc['decoded_size_matches_yenc'] ?? null) === true
+                    && ($yenc['declared_crc32_matches'] ?? null) === true
+                    && ($multipart
+                        ? ($yenc['ypart_range_valid'] ?? null) === true
+                            && ($yenc['decoded_size_matches_ypart_range'] ?? null) === true
+                            && ($yenc['trailer_part_matches_header'] ?? null) === true
+                        : ($yenc['decoded_size_matches_header_size'] ?? null) === true);
                 $allHeaderNames = array_unique(array_merge($allHeaderNames, array_keys($headers[$server])));
             }
             $headerDifferences = [];
@@ -2232,16 +2287,38 @@ final class ReleaseFingerprintCollector
                     $headerDifferences[$headerName] = $values;
                 }
             }
+            $decodedComparisonAvailable = ! in_array(null, $decodedSegmentHashes, true)
+                && ! in_array(false, $decodedSegmentIntegrity, true);
+            $decodedRangeValues = array_values($decodedSegmentRanges);
+            $decodedRangeMatch = $decodedComparisonAvailable
+                ? count(array_unique(array_map(static fn (array $range): string => serialize($range), $decodedRangeValues))) === 1
+                    && ! in_array(null, array_merge(...array_map('array_values', $decodedRangeValues)), true)
+                : null;
+            $decodedSegmentMatch = $decodedComparisonAvailable
+                ? count(array_unique($decodedSegmentHashes)) === 1
+                : null;
+            $decodedSegmentRangeContentMatch = $decodedSegmentMatch === null || $decodedRangeMatch === null
+                ? null : ($decodedSegmentMatch && $decodedRangeMatch);
             $comparisons[] = [
                 'message_id' => $messageId,
                 'body_hashes_by_server' => $bodyHashes,
                 'body_matches' => count(array_unique($bodyHashes)) === 1 && ! in_array(null, $bodyHashes, true),
+                'decoded_segment_sha256_by_server' => $decodedSegmentHashes,
+                'decoded_segment_integrity_valid_by_server' => $decodedSegmentIntegrity,
+                'decoded_segment_ranges_by_server' => $decodedSegmentRanges,
+                'decoded_segment_bytes_match' => $decodedSegmentMatch,
+                'decoded_segment_range_match' => $decodedRangeMatch,
+                'decoded_segment_content_for_same_range_match' => $decodedSegmentRangeContentMatch,
+                'decoded_segment_comparison_basis' => 'Exact SHA-256 of yEnc-decoded segment bytes; equality claims require valid framing, declared size, and CRC32 on every compared provider. Range equality compares inclusive yEnc offsets (single-part files use 1..file_size) and full file size.',
                 'headers_by_server' => $headers,
                 'header_differences' => $headerDifferences,
                 'header_values_match' => $headerDifferences === [],
-                'header_order_match' => count(array_unique(array_map(static function (array $value): string {
+                'header_order_match' => ! in_array(null, $headerOccurrenceOrders, true)
+                    && count(array_unique(array_map(static fn (array $value): string => serialize($value), $headerOccurrenceOrders))) === 1,
+                'normalized_header_order_match' => count(array_unique(array_map(static function (array $value): string {
                     return hash('sha256', serialize(array_keys($value)));
                 }, $headers))) === 1,
+                'header_order_comparison_basis' => 'Original field-name occurrence sequence with duplicates and capitalization preserved; normalized_header_order_match separately compares case-folded unique map keys.',
             ];
         }
 

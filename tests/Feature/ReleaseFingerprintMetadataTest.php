@@ -29,9 +29,9 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertSame(3, $report['file_count']);
         self::assertCount(3, $report['files']);
         self::assertSame(200, $report['files'][0]['advertised_bytes']);
-        self::assertSame(300, $report['totals']['rar']['advertised_bytes']);
+        self::assertSame(400, $report['totals']['rar']['advertised_bytes']);
         self::assertSame(50, $report['totals']['par2']['advertised_bytes']);
-        self::assertSame(16.667, $report['par2_to_rar_advertised_percent']);
+        self::assertSame(12.5, $report['par2_to_rar_advertised_percent']);
         self::assertSame(['Movies'], $report['nzb_meta_values']['category']);
     }
 
@@ -59,10 +59,10 @@ final class ReleaseFingerprintMetadataTest extends TestCase
     #[Test]
     public function it_reads_par2_file_description_offsets_and_recovery_denominator(): void
     {
-        $fileId = str_repeat("F", 16);
+        $fileId = str_repeat('F', 16);
         $main = pack('V2', 4096, 0).pack('V', 1).$fileId;
-        $fileDescription = $fileId.str_repeat("M", 16).str_repeat("N", 16).pack('V2', 5000).'payload.rar'."\0";
-        $recovery = pack('V', 0).str_repeat("R", 4096);
+        $fileDescription = $fileId.str_repeat('M', 16).str_repeat('N', 16).pack('V2', 5000, 0).'payload.rar'."\0";
+        $recovery = pack('V', 0).str_repeat('R', 4096);
         $binary = $this->par2Packet("PAR 2.0\0Main", $main)
             .$this->par2Packet("PAR 2.0\0FileDesc", $fileDescription)
             .$this->par2Packet("PAR 2.0\0RecvSlic", $recovery);
@@ -100,7 +100,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
     {
         $type = str_pad($type, 16, "\0");
         $length = 64 + strlen($payload);
-        $packet = "PAR2\0PKT".pack('V2', $length, 0).str_repeat("\0", 16).str_repeat("S", 16).$type.$payload;
+        $packet = "PAR2\0PKT".pack('V2', $length, 0).str_repeat("\0", 16).str_repeat('S', 16).$type.$payload;
 
         return substr($packet, 0, 16).md5(substr($packet, 32), true).substr($packet, 32);
     }

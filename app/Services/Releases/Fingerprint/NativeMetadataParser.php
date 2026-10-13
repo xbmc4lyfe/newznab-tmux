@@ -18,6 +18,22 @@ final class NativeMetadataParser
     /** @var array<string, FFI> */
     private static array $xrefLibraries = [];
 
+    /** @var array<string, FFI> */
+    private static array $dateLibraries = [];
+
+    /** @param list<string> $rawHeaders
+     * @return array<string, mixed>|null
+     */
+    public function parseArticleDates(array $rawHeaders): ?array
+    {
+        $headerBlock = implode('', $rawHeaders);
+        if (strlen($headerBlock) > 65_536) {
+            return null;
+        }
+
+        return $this->parseJson('nntmux_article_dates_v1_json', $headerBlock);
+    }
+
     /** @return array<string, mixed>|null */
     public function parsePar2(string $bytes): ?array
     {
@@ -43,7 +59,7 @@ final class NativeMetadataParser
     }
 
     /** @param list<string> $rawHeaders
-     *  @return array<string, mixed>|null
+     * @return array<string, mixed>|null
      */
     public function parseArticleIdentity(
         string $requestedMessageId,
@@ -116,7 +132,8 @@ final class NativeMetadataParser
     {
         $identityParser = $function === 'nntmux_article_identity_v2_json';
         $xrefParser = $function === 'nntmux_article_identity_xref_v1_json';
-        $library = $this->library($identityParser, $xrefParser);
+        $dateParser = $function === 'nntmux_article_dates_v1_json';
+        $library = $this->library($identityParser, $xrefParser, $dateParser);
         if ($library === null || strlen($bytes) > 67_108_864) {
             return null;
         }
@@ -163,7 +180,7 @@ final class NativeMetadataParser
         return $packed;
     }
 
-    private function library(bool $articleIdentity = false, bool $articleXref = false): ?FFI
+    private function library(bool $articleIdentity = false, bool $articleXref = false, bool $articleDates = false): ?FFI
     {
         if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || ! extension_loaded('FFI')) {
             return null;
@@ -177,6 +194,7 @@ final class NativeMetadataParser
         $libraries = match (true) {
             $articleIdentity => self::$identityLibraries,
             $articleXref => self::$xrefLibraries,
+            $articleDates => self::$dateLibraries,
             default => self::$libraries,
         };
         if (isset($libraries[$key])) {
@@ -194,6 +212,11 @@ final class NativeMetadataParser
                 char* nntmux_article_identity_xref_v1_json(const unsigned char* data, size_t length, int head_response_code, int overview_response_code, int overview_attempted, int overview_row_count, int overview_format_response_code);
                 void nntmux_metadata_string_free(char* value);
                 C;
+            } elseif ($articleDates) {
+                $definitions = <<<'C'
+                char* nntmux_article_dates_v1_json(const unsigned char* data, size_t length);
+                void nntmux_metadata_string_free(char* value);
+                C;
             } else {
                 $definitions = <<<'C'
                 char* nntmux_par2_metadata_json(const unsigned char* data, size_t length);
@@ -208,6 +231,8 @@ final class NativeMetadataParser
                 self::$identityLibraries[$key] = $library;
             } elseif ($articleXref) {
                 self::$xrefLibraries[$key] = $library;
+            } elseif ($articleDates) {
+                self::$dateLibraries[$key] = $library;
             } else {
                 self::$libraries[$key] = $library;
             }
