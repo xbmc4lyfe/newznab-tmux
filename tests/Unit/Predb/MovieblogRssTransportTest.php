@@ -6,6 +6,10 @@ namespace Tests\Unit\Predb;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Services\Predb\Feeds\Sources\RssFeedSource;
+use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Psr7\Response;
+use GuzzleHttp\Psr7\StreamDecoratorTrait;
+use GuzzleHttp\Psr7\Utils;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Foundation\Application as ApplicationContract;
@@ -17,6 +21,7 @@ use Illuminate\Support\Facades\Http;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use Psr\Http\Message\StreamInterface;
 use RuntimeException;
 
 final class MovieblogRssTransportTest extends TestCase
@@ -169,6 +174,87 @@ final class MovieblogRssTransportTest extends TestCase
 
         $this->assertCount(1, $entries);
         $this->assertSame('Wildauge.The.Midwife.2015.German.720p.BluRay.x264-TiG', $entries[0]->title);
+    }
+
+    #[Test]
+    public function rss_wire_read_stops_at_the_cap_and_closes_the_stream(): void
+    {
+        $stream = new class(Utils::streamFor(str_repeat('x', 1049000))) implements StreamInterface
+        {
+            use StreamDecoratorTrait;
+
+            public int $bytesRead = 0;
+
+            public bool $closed = false;
+
+            public function __construct(private StreamInterface $stream) {}
+
+            public function read(int $length): string
+            {
+                $result = $this->stream->read($length);
+                $this->bytesRead += strlen($result);
+
+                return $result;
+            }
+
+            public function close(): void
+            {
+                $this->closed = true;
+                $this->stream->close();
+            }
+        };
+        $factory = (new Factory)->preventStrayRequests();
+        $factory->fake(['https://movieblog.to/feed/' => static fn () => Create::promiseFor(new Response(200, ['Content-Length' => '1'], $stream))]);
+        Http::swap($factory);
+        try {
+            $this->source()->fetch();
+            $this->fail('An oversized wire response must be rejected.');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('body limit', $exception->getMessage());
+            $this->assertSame(1048577, $stream->bytesRead);
+            $this->assertTrue($stream->closed);
+        }
+    }
+
+    #[Test]
+    public function rss_gzip_fetch_keeps_the_literal_titles(): void
+    {
+        Http::swap((new Factory)->preventStrayRequests());
+        Http::fake(['https://movieblog.to/feed/' => Http::response(gzencode($this->fixture()), 200, ['Content-Encoding' => 'gzip'])]);
+        $entries = $this->source()->fetch();
+        $this->assertCount(3, $entries);
+        $this->assertSame('Wildauge.The.Midwife.2015.German.720p.BluRay.x264-TiG', $entries[0]->title);
+    }
+
+    #[Test]
+    public function oversized_rss_body_is_rejected_before_parsing(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->source()->parseXml('<rss><channel><description>'.str_repeat('x', 1048576).'</description></channel></rss>');
+    }
+
+    #[Test]
+    public function compressed_rss_cannot_expand_beyond_the_body_limit(): void
+    {
+        Http::swap((new Factory)->preventStrayRequests());
+        Http::fake(['https://movieblog.to/feed/' => Http::response(gzencode('<rss><channel><description>'.str_repeat('x', 1048576).'</description></channel></rss>'), 200, ['Content-Encoding' => 'gzip'])]);
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('body limit');
+        $this->source()->fetch();
+    }
+
+    #[Test]
+    public function rss_input_item_limit_applies_before_the_output_page_limit(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->source(pageSize: 1)->parseXml('<rss><channel>'.str_repeat('<item><title>Same.Release-GRP</title></item>', 5001).'</channel></rss>');
+    }
+
+    #[Test]
+    public function rss_entity_declarations_are_rejected(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->source()->parseXml('<!DOCTYPE rss [<!ENTITY title "Scene.Release-GRP">]><rss><channel><item><title>&title;</title></item></channel></rss>');
     }
 
     private function source(int $pageSize = 100): RssFeedSource

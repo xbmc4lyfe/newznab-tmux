@@ -297,8 +297,30 @@ class NzbContentsService
                 return Par2RenameOutcome::Deferred;
             }
             $snapshot = ['id' => $relID, 'guid' => $guid, 'name' => $release->name, 'searchname' => $release->searchname];
-            $guard = function () use ($lock, $deadline): bool {
-                return ($deadline === null || now()->getTimestampMs() / 1000 < $deadline) && $this->refreshPar2Claim($lock);
+            $readerOwnership = new class
+            {
+                public bool $held = true;
+            };
+            $refreshOwnership = function () use ($lock, $onArticleReceived, $readerOwnership): bool {
+                return $readerOwnership->held && ($onArticleReceived === null || $onArticleReceived())
+                    && $this->refreshPar2Claim($lock);
+            };
+            $guard = function () use ($deadline, $refreshOwnership): bool {
+                return ($deadline === null || now()->getTimestampMs() / 1000 < $deadline) && $refreshOwnership();
+            };
+            $lastHeartbeat = 0;
+            $onArticleRead = function () use ($refreshOwnership, &$lastHeartbeat, $readerOwnership): bool {
+                if (! $readerOwnership->held) {
+                    return false;
+                }
+                $now = now()->getTimestamp();
+                if ($now - $lastHeartbeat < 30) {
+                    return true;
+                }
+                $lastHeartbeat = $now;
+                $readerOwnership->held = $refreshOwnership();
+
+                return $readerOwnership->held;
             };
             if (! $this->canContinuePar2($guard)) {
                 return Par2RenameOutcome::Deferred;
@@ -331,12 +353,10 @@ class NzbContentsService
             $pending = array_values(array_unique(array_merge($pending, array_keys($retry))));
             $recovery = new Par2CandidateRecovery($this->nntp, $this->postProcessService, $alternate);
             $outcome = Par2RenameOutcome::NoMatch;
-            $allowRecoveryVolumes = [];
             foreach ($pending as $index) {
                 if ($candidates[$index]['classification'] === 'volume') {
                     $family = $this->par2FamilyKey($candidates[$index]['subject']);
-                    if ($family === null || (! isset($allowRecoveryVolumes[$family])
-                        && ! $this->hasIncompleteExplicitPar2Progress($relID, $candidates))) {
+                    if ($family === null || ! $this->hasIncompleteExplicitPar2Progress($relID, $candidates, $family)) {
                         continue;
                     }
                 }
@@ -349,16 +369,10 @@ class NzbContentsService
                     return Par2RenameOutcome::Deferred;
                 }
                 $result = $recovery->recover($candidates[$index], $snapshot, $signature, $groupID, $show,
-                    $budget - $this->par2Stats['candidates_probed'], $maxArticleBytes, $maxStateBytes, $guard, $onArticleReceived);
+                    $budget - $this->par2Stats['candidates_probed'], $maxArticleBytes, $maxStateBytes, $guard, onArticleReceived: $onArticleRead, onRead: $onArticleRead);
                 $this->par2Stats['candidates_probed'] += $result->probes;
                 $this->par2Stats['articles_received'] += $result->articles;
                 $outcome = $result->outcome;
-                if ($candidates[$index]['classification'] === 'index' && $outcome === Par2RenameOutcome::NoMatch) {
-                    $family = $this->par2FamilyKey($candidates[$index]['subject']);
-                    if ($family !== null) {
-                        $allowRecoveryVolumes[$family] = true;
-                    }
-                }
                 if ($outcome === Par2RenameOutcome::Renamed) {
                     return $outcome;
                 }
@@ -455,10 +469,11 @@ class NzbContentsService
      *
      * @param  list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}>  $candidates
      */
-    private function hasIncompleteExplicitPar2Progress(int $releaseId, array $candidates): bool
+    private function hasIncompleteExplicitPar2Progress(int $releaseId, array $candidates, ?string $familyKey = null): bool
     {
         foreach ($candidates as $candidate) {
-            if ($candidate['classification'] !== 'index') {
+            if ($candidate['classification'] !== 'index'
+                || ($familyKey !== null && $this->par2FamilyKey($candidate['subject']) !== $familyKey)) {
                 continue;
             }
             $signature = hash('sha256', json_encode([
@@ -469,7 +484,8 @@ class NzbContentsService
                 ], $candidate['segments']),
             ], JSON_THROW_ON_ERROR));
             if (DB::table('par2_rename_candidate_progress')->where('releases_id', $releaseId)
-                ->where('candidate_signature', $signature)->where('next_segment', '>', 0)->exists()) {
+                ->where('candidate_signature', $signature)->where('next_segment', '>', 0)
+                ->whereNull('blocked_reason')->whereNotNull('accumulator_state')->exists()) {
                 return true;
             }
         }
@@ -591,11 +607,7 @@ class NzbContentsService
                 }
             }
             $isExplicit = preg_match('/\.par2(?:["\s]|$)/i', $subject) === 1;
-            $classification = $isExplicit
-                ? (preg_match('/\.vol0{3}\+0*1\.par2(?:["\s]|$)/i', $subject) === 1
-                    ? 'index'
-                    : (preg_match('/\.vol\d+\+\d+\.par2(?:["\s]|$)/i', $subject) === 1 ? 'volume' : 'index'))
-                : 'excluded';
+            $classification = $isExplicit ? (preg_match('/\.vol\d+\+\d+\.par2(?:["\s]|$)/i', $subject) === 1 ? 'volume' : 'index') : 'excluded';
             $singlePart = count($segments) === 1 && $this->parserService->extractPartsTotal($subject) <= 1;
             $knownContent = preg_match('/\.(?:rar|r\d{2,4}|\d{3}|7z|zip|mkv|mp4|avi|m2ts|ts|iso|nfo|sfv|srr|srs|jpg|png|mp3|flac)(?:["\s]|$)/i', $subject) === 1;
             if (! $isExplicit && (! $knownContent || $singlePart) && $segments !== []) {

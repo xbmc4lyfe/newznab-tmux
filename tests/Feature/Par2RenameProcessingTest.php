@@ -401,7 +401,7 @@ class Par2RenameProcessingTest extends TestCase
         ]), ['index' => $body, 'volume' => $body]);
 
         $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
-        $this->assertSame(['index', 'volume', 'legacy', 'hidden'], $this->downloaded);
+        $this->assertSame(['index', 'legacy', 'hidden'], $this->downloaded);
         $this->assertSame(1, (int) $release->fresh()->proc_par2);
     }
 
@@ -544,6 +544,19 @@ PHP;
 
         $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
         $this->assertSame([], $this->downloaded);
+        $this->assertSame(1, (int) $release->fresh()->proc_par2);
+    }
+
+    public function test_first_single_block_volume_alone_does_not_bypass_the_partial_index_guard(): void
+    {
+        $release = $this->release();
+        $service = $this->service($this->nzb([
+            ['"set.vol000+01.par2" yEnc', 'first-volume'],
+        ]), ['first-volume' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
+
+        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame([], $this->downloaded);
+        $this->assertSame(0, (int) $release->fresh()->isrenamed);
         $this->assertSame(1, (int) $release->fresh()->proc_par2);
     }
 
@@ -810,9 +823,12 @@ PHP;
         {
             public function __construct(private \Closure $fetch) {}
 
-            public function getMessageBounded(string $groupName, string $messageId, int $maxDecodedBytes, bool $alternate = false): BoundedArticleResult
+            public function getMessageBounded(string $groupName, string $messageId, int $maxDecodedBytes, bool $alternate = false, ?callable $onRead = null): BoundedArticleResult
             {
                 $response = ($this->fetch)($groupName, $messageId);
+                if ($onRead !== null && ! $onRead()) {
+                    return BoundedArticleResult::failure('Fixture processing lock ownership was lost.');
+                }
 
                 return is_string($response) ? BoundedArticleResult::success($response) : BoundedArticleResult::failure('Fixture provider failure');
             }

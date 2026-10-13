@@ -64,7 +64,7 @@ final class Nima4kSource extends BoundedHttpFeedSource
         }
         $invalidNumericReference = false;
         preg_replace_callback('/&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));?/', static function (array $match) use (&$invalidNumericReference): string {
-            $hexadecimal = ($match[1] ?? '') !== '';
+            $hexadecimal = $match[1] !== '';
             $digits = $hexadecimal ? $match[1] : $match[2];
             $limit = $hexadecimal ? '10ffff' : '1114111';
             $normalized = ltrim(strtolower($digits), '0');

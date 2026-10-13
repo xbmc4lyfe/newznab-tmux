@@ -106,6 +106,7 @@ class NntmuxResetDb extends Command
                 'media_infos',
                 'par_hashes',
                 'par_file_hashes',
+                'par_file_hash_inventories',
                 'par2_hash_retry',
                 'par2_rename_candidate_progress',
                 'par2_rename_progress',

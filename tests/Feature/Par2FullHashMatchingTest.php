@@ -42,6 +42,57 @@ final class Par2FullHashMatchingTest extends TestCase
         });
     }
 
+    public function test_shared_support_tuple_does_not_identify_an_unrelated_release(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Unrelated.Scene.Release.2026-GRP');
+        foreach ([42, 20] as $id) {
+            $this->remember($id, md5('shared readme'), md5('shared readme'), 128);
+        }
+        self::assertSame([], $this->lookup()['donors']);
+    }
+
+    public function test_hash_donor_requires_symmetric_inventory_coverage(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Scene.Release.2026-GRP');
+        foreach ([42, 20] as $id) {
+            $this->remember($id, md5('payload one'), md5('prefix one'), 20000);
+            $this->remember($id, md5('payload two'), md5('prefix two'), 30000);
+        }
+        self::assertCount(1, $this->lookup()['donors']);
+        $this->remember(42, md5('target-only payload'), md5('target-only prefix'), 40000);
+        self::assertSame([], $this->lookup()['donors']);
+        DB::table('par_file_hashes')->where('releases_id', 42)->where('full_md5', md5('target-only payload'))->delete();
+        $this->remember(20, md5('donor-only payload'), md5('donor-only prefix'), 50000);
+        self::assertSame([], $this->lookup()['donors']);
+    }
+
+    public function test_duplicate_full_tuple_with_different_prefixes_is_not_independent_evidence(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Scene.Release.2026-GRP');
+        foreach ([42, 20] as $id) {
+            $this->remember($id, md5('one payload'), md5('prefix one'), 20000);
+            $this->remember($id, md5('one payload'), md5('prefix two'), 20000);
+        }
+        self::assertSame([], $this->lookup()['donors']);
+    }
+
+    public function test_complete_donor_inventories_with_conflicting_canonical_titles_remain_ambiguous(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'First.Scene.Release.2026-GRP');
+        $this->donor(30, 2, 'Second.Scene.Release.2026-GRP');
+        foreach ([42, 20, 30] as $id) {
+            $this->remember($id, md5('first payload'), md5('first prefix'), 20000);
+            $this->remember($id, md5('second payload'), md5('second prefix'), 30000);
+        }
+        $result = $this->lookup();
+        self::assertCount(2, $result['donors']);
+        self::assertNull((new DonorMatchSelector)->selectCanonical($result['donors']));
+    }
+
     public function test_actual_parser_and_persistence_keep_full_digest_exact_size_and_requeue_once(): void
     {
         $this->pendingPar2Release(['id' => 42, 'guid' => 'target', 'proc_hash16k' => 1]);
@@ -97,46 +148,6 @@ final class Par2FullHashMatchingTest extends TestCase
         self::assertSame(20, (int) $result['donors'][0]->releases_id);
     }
 
-    public function test_one_shared_support_file_is_not_enough_evidence_to_link_releases(): void
-    {
-        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
-        $this->donor(20, 1, 'Unrelated.Scene.Release.2026-GRP');
-        foreach ([42, 20] as $id) {
-            $this->remember($id, md5('shared readme'), md5('shared readme'), 128);
-        }
-
-        self::assertSame([], $this->lookup()['donors']);
-    }
-
-    public function test_duplicate_tuple_with_different_prefixes_is_not_independent_evidence(): void
-    {
-        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
-        $this->donor(20, 1, 'Scene.Release.2026-GRP');
-        foreach ([42, 20] as $id) {
-            $this->remember($id, md5('one payload'), md5('prefix one'), 20000);
-            $this->remember($id, md5('one payload'), md5('prefix two'), 20000);
-        }
-
-        self::assertSame([], $this->lookup()['donors']);
-    }
-
-    public function test_matching_requires_symmetric_complete_inventory_coverage(): void
-    {
-        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
-        $this->donor(20, 1, 'Scene.Release.2026-GRP');
-        foreach ([42, 20] as $id) {
-            $this->remember($id, md5('payload one'), md5('prefix one'), 20000);
-            $this->remember($id, md5('payload two'), md5('prefix two'), 30000);
-        }
-        self::assertCount(1, $this->lookup()['donors']);
-
-        $this->remember(42, md5('target-only payload'), md5('target-only prefix'), 40000);
-        self::assertSame([], $this->lookup()['donors']);
-        DB::table('par_file_hashes')->where('releases_id', 42)->where('full_md5', md5('target-only payload'))->delete();
-        $this->remember(20, md5('donor-only payload'), md5('donor-only prefix'), 50000);
-        self::assertSame([], $this->lookup()['donors']);
-    }
-
     public function test_partial_par2_descriptor_inventories_cannot_nominate_a_donor(): void
     {
         $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
@@ -147,6 +158,64 @@ final class Par2FullHashMatchingTest extends TestCase
         }
 
         self::assertSame([], $this->lookup()['donors']);
+    }
+
+    public function test_upgrade_requires_recertification_of_both_legacy_completeness_markers(): void
+    {
+        Schema::dropIfExists('par_file_hash_inventories');
+        Schema::create('par_file_hash_inventories', static function (Blueprint $table): void {
+            $table->unsignedInteger('releases_id')->primary();
+            $table->string('release_guid', 40);
+            $table->unsignedBigInteger('evidence_last_id');
+            $table->unsignedBigInteger('evidence_count');
+        });
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 1, 'Unrelated.Scene.Release-GRP');
+        foreach ([42, 20] as $id) {
+            self::assertTrue($this->rememberUnmarked($id, md5('shared payload one'), md5('prefix one'), 20000));
+            self::assertTrue($this->rememberUnmarked($id, md5('shared payload two'), md5('prefix two'), 30000));
+            $evidence = DB::table('par_file_hashes')->where('releases_id', $id);
+            DB::table('par_file_hash_inventories')->insert([
+                'releases_id' => $id, 'release_guid' => $this->snapshot($id)['guid'],
+                'evidence_last_id' => (clone $evidence)->max('id'), 'evidence_count' => $evidence->count(),
+            ]);
+        }
+        (require database_path('migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->up();
+
+        self::assertSame(2, DB::table('par_file_hash_inventories')->count());
+        self::assertSame([], $this->lookup()['donors']);
+        self::assertSame([0, 0], DB::table('par_file_hash_inventories')->orderBy('releases_id')->pluck('proof_version')->all());
+        self::assertTrue(Par2FileHashEvidence::markInventoryComplete(42, $this->snapshot(42)));
+        self::assertSame([], $this->lookup()['donors']);
+        self::assertTrue(Par2FileHashEvidence::markInventoryComplete(20, $this->snapshot(20)));
+        self::assertCount(1, $this->lookup()['donors']);
+    }
+
+    public function test_descriptor_only_packet_stream_cannot_mark_a_complete_inventory(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $inventory = $this->inventory('shared content', 'shared.nfo');
+        self::assertTrue($inventory->isComplete());
+        self::assertFalse($inventory->hasCompleteMainInventory());
+
+        $processor = new Par2Processor(new NameFixingService, new Par2Info, false, false);
+        self::assertSame(Par2RenameOutcome::NoMatch, $processor->applyInventoryForRename($inventory, 42, 1, 0, null, true, $this->snapshot(42)));
+        self::assertSame(1, DB::table('par_file_hashes')->where('releases_id', 42)->count());
+        self::assertSame(0, DB::table('par_file_hash_inventories')->where('releases_id', 42)->count());
+    }
+
+    public function test_complete_index_does_not_mark_unrelated_partial_evidence_complete(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        self::assertTrue($this->rememberUnmarked(42, md5('other partial set'), md5('other partial prefix'), 40000));
+        $inventory = new Par2PacketAccumulator;
+        $inventory->append(file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2')));
+        self::assertTrue($inventory->hasCompleteMainInventory());
+
+        $processor = new Par2Processor(new NameFixingService, new Par2Info, false, false);
+        self::assertSame(Par2RenameOutcome::NoMatch, $processor->applyInventoryForRename($inventory, 42, 1, 0, null, true, $this->snapshot(42)));
+        self::assertGreaterThan(1, DB::table('par_file_hashes')->where('releases_id', 42)->count());
+        self::assertSame(0, DB::table('par_file_hash_inventories')->where('releases_id', 42)->count());
     }
 
     public function test_new_partial_evidence_invalidates_a_previously_complete_inventory(): void
@@ -304,6 +373,7 @@ final class Par2FullHashMatchingTest extends TestCase
         self::assertSame(Par2RenameOutcome::NoMatch, $processor->applyInventoryForRename($inventory, 42, 1, 0, null, true, $this->snapshot(42)));
         self::assertSame(10, DB::table('par_file_hashes')->where('releases_id', 42)->count());
         self::assertSame(1, DB::table('par_file_hash_inventories')->where('releases_id', 42)->count());
+        self::assertSame(Par2FileHashEvidence::INVENTORY_PROOF_VERSION, DB::table('par_file_hash_inventories')->where('releases_id', 42)->value('proof_version'));
         self::assertSame(0, DB::table('release_files')->count());
         self::assertSame(10, DB::table('releases')->where('id', 42)->value('rarinnerfilecount'));
         DB::table('releases')->where('id', 42)->update(['proc_hash16k' => 1]);

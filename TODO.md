@@ -14,10 +14,24 @@
 
 ## Release identification follow-up (implemented, not deployed)
 
-- [x] Prioritize one recovery volume per filename family and hidden PAR2 candidates before repeated volumes, retaining every volume for fallback and durable resume.
+- [x] Exclude explicitly named recovery-volume subjects from ordinary naming probes, preserving explicit indexes, legacy candidates, bounded hidden candidates and durable resume. The follow-up permits only same-family recovery volumes backed by an unblocked saved partial index; standalone first-block volumes remain excluded.
 - [x] Preserve string results from the release name cleaner and recheck cleaner-supplied PreDB references against their current stored title. Missing or changed references no longer attach an unrelated identity.
 - [x] Run the affected PAR2, payload metadata, and PreDB matching regressions: 95 tests, 469 assertions (11 PHPUnit notices).
 - [ ] Deploy through the single deployment owner and measure historical rename yield versus arrivals. The regression checks prove the repaired mechanisms, not sustained throughput or a shrinking production backlog.
+
+## Retest the final synchronized PreDB/publication integration
+
+The PR #73 review follow-up incorporates the merged PreDB/publication changes and fork master through PR #90, including fingerprint metadata (#84), native workflow checks (#86), renewable PAR2 sweep leases (#87), poster-search/verification repairs (#88), fingerprint parser/typing corrections (#89), and exact poster query/index repairs (#90). It retains the configurable RSS body cap and post-article callback alongside bounded-read ownership renewal. Completeness markers require a complete Main inventory with exact current evidence coverage and the current proof version. The additive migration leaves legacy markers untrusted until recertified and persists ownership for tables it creates; rollback preserves pre-existing marker tables and their rows. Targeted checks qualify their reproduced cases; complete integrated qualification remains deferred.
+
+- [ ] Run the complete PHPUnit suite with an explicit 2 GiB PHP memory limit, native tests/parity, frontend build and required CI on the final synchronized PR head. A combined run aborted at the host default 128 MiB limit; that runtime failure is not a failing application assertion.
+- [ ] Retest donor inventory/canonical identity, completeness generation/invalidation and reset, fresh/upgrade migration ownership, bounded RSS wire/decoded/item limits, multipart checkpoint resume and primary/alternate bounded-read ownership renewal together. Retain processing claims, exact release snapshots and the same-family partial-index guard for recovery volumes.
+- [ ] Retest article-set coverage against independently reconstructed stored/emitted NZBs, publication transaction/row-lock rechecks, fingerprint after-commit dispatch, queue isolation, rollback and cleanup/reset behavior in private runtimes.
+- [ ] Validate source/image/schema and live release/NZB/search evidence only through the single deployment owner after explicit deployment and writer-resume authorization. No deployment or production qualification is included in this audit.
+
+## Qualify PAR2 donor inventory matching
+
+- [ ] Validate the symmetric full-MD5/size donor inventory query on isolated MariaDB fixtures with sparse, dense and maximum descriptor inventories. The two-distinct-tuple threshold and symmetric coverage prevent a lone shared file or partial inventory from attaching a donor; they do not establish production throughput.
+- [ ] Decide whether filename or payload classification should be persisted independently of optional file collection. Identical inventories made entirely of shared support files remain indistinguishable without that evidence; inventory agreement alone does not prove a scene release identity.
 
 ## Retest verification and throughput PRs after the expedited rollout
 
@@ -114,7 +128,7 @@ Work proceeds from small contract corrections to broader operational decisions. 
 
 Live rename observation at this inventory: 17 completed bounded passes (nine recent, eight historical) report 22 recovered names and 2,433 received articles. Historical passes report two recovered names, one completed miss, five retryable outcomes, and 330 deferrals. These are reported outcomes, not evidence that the net backlog is shrinking. Continue distinguishing real recovered names from completed checks.
 
-Next operational priority: inspect a bounded sample of existing historical NZBs and durable checkpoints and measure the candidate-priority repair after deployment. The sampled historical runs deferred 330 of 338 attempts (97.6%) and averaged 3.92 received articles per attempt, close to the four-probe cap. Current logs combine probe-budget, deadline, and claim-loss deferrals, so the live cause is not yet proven. The follow-up prioritizes explicit indexes, one recovery volume per filename family, hidden candidates, then remaining volumes. Regression fixtures reproduce repeated volumes crowding out useful candidates and retain later-volume fallback and durable resume. No volumes are excluded. Existing regression gates retain missing/corrupt-index volume recovery, partial/multiple recovery sets, obfuscated indexes, transient retries, restart/resume, changed NZBs, and worker overlap.
+Next operational priority: inspect a bounded sample of existing historical NZBs and durable checkpoints and measure the candidate-priority repair after deployment. The sampled historical runs deferred 330 of 338 attempts (97.6%) and averaged 3.92 received articles per attempt, close to the four-probe cap. Current logs combine probe-budget, deadline, and claim-loss deferrals, so the live cause is not yet proven. The follow-up prioritizes explicit indexes, one recovery volume per filename family, hidden candidates, then remaining volumes. Regression fixtures reproduce repeated volumes crowding out useful candidates and retain later-volume fallback and durable resume. That earlier policy was superseded by PR #83: explicitly named recovery volumes are now excluded from naming probes. Historical regression gates retained missing/corrupt-index volume recovery, partial/multiple recovery sets, obfuscated indexes, transient retries, restart/resume, changed NZBs, and worker overlap.
 
 Monitor baseline for the next comparison (2026-10-11 22:46:54 UTC): the Renames row reports 465,835 unmatched and 24,317 matched. These monitor counts span all rename methods and must be assessed alongside actual changed-name/download outcomes.
 
