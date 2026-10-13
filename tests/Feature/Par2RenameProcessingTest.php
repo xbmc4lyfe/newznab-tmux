@@ -603,6 +603,46 @@ PHP;
         $this->assertSame(1, (int) $release->fresh()->proc_par2);
     }
 
+    #[DataProvider('unquotedPar2Families')]
+    public function test_unquoted_index_and_volume_share_priority_before_hidden_candidates(string $indexSubject, string $volumeSubject): void
+    {
+        $release = $this->release();
+        config(['tmux.fix_names.par2_max_probes' => 2]);
+        $service = $this->service($this->nzb([
+            [$indexSubject, 'index'], [$volumeSubject, 'volume'], ['"hidden-index" yEnc', 'hidden'],
+        ]), ['index' => new Error('Index unavailable', 430),
+            'volume' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
+
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['index', 'volume'], $this->downloaded);
+        $this->assertSame(1, (int) $release->fresh()->isrenamed);
+    }
+
+    /** @return array<string, array{string, string}> */
+    public static function unquotedPar2Families(): array
+    {
+        return [
+            'unquoted' => ['set.par2 yEnc', 'set.vol001+002.par2 yEnc'],
+            'prefix and case' => ['[1/6] SET.PAR2 yEnc (1/1)', '[2/6] set.vol001+002.par2 yEnc (1/2)'],
+            'quoted index' => ['"set.par2" yEnc', 'set.vol001+002.par2 yEnc'],
+            'quoted volume' => ['set.par2 yEnc', '"set.vol001+002.par2" yEnc'],
+        ];
+    }
+
+    public function test_unquoted_repeated_volumes_do_not_crowd_out_another_family(): void
+    {
+        $release = $this->release();
+        config(['tmux.fix_names.par2_max_probes' => 2]);
+        $service = $this->service($this->nzb([
+            ['set.vol001+002.par2 yEnc', 'first'], ['set.vol003+004.par2 yEnc', 'repeated'],
+            ['another.vol001+002.par2 yEnc', 'another'],
+        ]), ['another' => file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'))], rename: true);
+
+        $this->assertSame(Par2RenameOutcome::Renamed, $service->checkPar2Result($release->guid, $release->id, 1, 1, 0));
+        $this->assertSame(['first', 'another'], $this->downloaded);
+        $this->assertSame(1, (int) $release->fresh()->isrenamed);
+    }
+
     public function test_first_volume_from_another_family_precedes_repeated_volumes(): void
     {
         $release = $this->release();
