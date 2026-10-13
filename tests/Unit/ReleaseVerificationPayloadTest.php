@@ -51,6 +51,43 @@ class ReleaseVerificationPayloadTest extends TestCase
         }
     }
 
+    public function test_complete_multipart_without_trailer_part_reconstructs_its_published_nzb(): void
+    {
+        $articles = ['a@b' => str_replace('=yend size=3 part=1 ', '=yend size=3 ', YencArticles::part('abc', 'movie.mkv', 6, 1, 1, 2)),
+            'c@d' => str_replace('=yend size=3 part=2 ', '=yend size=3 ', YencArticles::part('def', 'movie.mkv', 6, 2, 4, 2))];
+        $manifest = $this->manifest(1);
+        $manifest['files'][0]['totalparts'] = 2;
+        $manifest['files'][0]['segments'] = [['number' => 1, 'messageid' => 'a@b', 'bytes' => 3], ['number' => 2, 'messageid' => 'c@d', 'bytes' => 3]];
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $result = $verifier->verify($manifest, $scratch, static function (): void {});
+            $this->assertSame('complete', $result->verdict, $result->reason);
+            $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', 'abcdef');
+        } finally {
+            $this->removeDirectory($scratch);
+        }
+    }
+
+    public function test_multipart_without_trailer_part_can_only_publish_missing_bytes_after_actual_par2_repair(): void
+    {
+        $bytes = str_repeat('movie-data', 64);
+        [$articles, $files, $fixture] = $this->par2Upload('movie.mkv', $bytes, 'set');
+        $length = strlen($bytes) - 1;
+        $raw = YencArticles::part(substr($bytes, 0, -1), 'movie.mkv', strlen($bytes), 1, 1, 2);
+        $articles['source@article'] = str_replace('=yend size='.$length.' part=1 ', '=yend size='.$length.' ', $raw);
+        $files[0]['totalparts'] = 2;
+        $files[0]['segments'] = [['number' => 1, 'messageid' => 'source@article', 'bytes' => $length], ['number' => 2, 'messageid' => 'missing@article', 'bytes' => 1]];
+        [$verifier, $scratch] = $this->verifier($articles);
+        try {
+            $result = $verifier->verify(['expected_files' => count($files), 'files' => $files], $scratch, static function (): void {});
+            $this->assertSame('repaired', $result->verdict, $result->reason);
+            $this->assertPublishedArticlesCanRepair($result->manifest, $articles, 'movie.mkv', $bytes);
+        } finally {
+            $this->removeDirectory($fixture);
+            $this->removeDirectory($scratch);
+        }
+    }
+
     public function test_verified_download_passes_and_resumes_from_checksum_checked_article_cache(): void
     {
         [$verifier, $directory] = $this->verifier(['a@b' => (new YencService)->encode('hello', 'movie.mkv')]);
