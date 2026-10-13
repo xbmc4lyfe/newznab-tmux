@@ -777,10 +777,10 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $this->prepareFullPar2Evidence();
         Schema::table('releases', function (Blueprint $table): void {
-            foreach (['videos_id', 'tv_episodes_id', 'tv_lookup_attempts', 'book_lookup_attempts', 'iscategorized', 'proc_par2', 'proc_files'] as $column) {
+            foreach (['videos_id', 'tv_episodes_id', 'book_lookup_attempts', 'iscategorized', 'proc_par2', 'proc_files'] as $column) {
                 $table->integer($column)->default(0);
             }
-            foreach (['imdbid', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'tv_lookup_retry_at', 'book_lookup_retry_at', 'book_name_normalized_at', 'anidbid'] as $column) {
+            foreach (['imdbid', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'book_lookup_retry_at', 'book_name_normalized_at', 'anidbid'] as $column) {
                 $table->string($column)->nullable();
             }
         });
