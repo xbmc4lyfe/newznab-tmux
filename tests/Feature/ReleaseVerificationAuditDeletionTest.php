@@ -5,9 +5,12 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Facades\Search;
+use App\Models\Release;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseImageService;
+use App\Services\Releases\Verification\AuditReleaseDeletion;
+use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\YencService;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
@@ -17,7 +20,6 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
-use Symfony\Component\Process\Process;
 use Tests\TestCase;
 
 class ReleaseVerificationAuditDeletionTest extends TestCase
@@ -75,14 +77,12 @@ class ReleaseVerificationAuditDeletionTest extends TestCase
         file_put_contents($this->imagePath, 'thumbnail');
         $this->app->instance(ReleaseImageService::class, $images);
         Search::shouldReceive('deleteRelease')->with(1)->andReturnNull();
-        file_put_contents($this->directory.'/movie.mkv', str_repeat('movie-data', 64));
-        (new Process(['par2', 'c', '-q', '-t1', '-s64', '-r100', '-n1', '--', 'set.par2', 'movie.mkv'], $this->directory))->mustRun();
-        $parity = file_get_contents($this->directory.'/set.par2');
+        $parity = 'bounded metadata fixture';
         $xml = '<nzb><file subject="Release [1/1] &quot;set.par2&quot; (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="'.strlen($parity).'" number="1">parity@article</segment></segments></file></nzb>';
         file_put_contents($this->nzbPath, gzencode($xml));
         $this->mock(NNTPService::class, static function ($mock) use ($parity): void {
             $mock->shouldReceive('doConnect')->with(false)->andReturnTrue();
-            $mock->shouldReceive('verificationArticle')->with('parity@article', 16777216)->andReturn((new YencService)->encode($parity, 'set.par2'));
+            $mock->shouldReceive('verificationArticle')->with('parity@article', 1048576)->andReturn((new YencService)->encode($parity, 'set.par2'));
             $mock->shouldReceive('doQuit')->andReturnNull();
         });
     }
@@ -189,11 +189,11 @@ class ReleaseVerificationAuditDeletionTest extends TestCase
         $this->assertSame(0, DB::table('release_verification_scratch')->count());
     }
 
-    public function test_dry_run_keeps_proven_unrepairable_release_and_artifacts(): void
+    public function test_spot_check_with_delete_option_keeps_release_and_artifacts(): void
     {
         $this->assertSame(0, Artisan::call('releases:verify-repairable', ['--delete' => true, '--dry-run' => true]));
         $record = json_decode(trim(file_get_contents($this->directory.'/verification/audit.jsonl')), true);
-        $this->assertSame('unrepairable', $record['verdict']);
+        $this->assertSame('sampled', $record['verdict']);
         $this->worker();
         $this->assertSame(1, DB::table('releases')->count());
         $this->assertSame(1, DB::table('release_children')->count());
@@ -203,7 +203,19 @@ class ReleaseVerificationAuditDeletionTest extends TestCase
 
     private function audit(): void
     {
-        $this->assertSame(0, Artisan::call('releases:verify-repairable', ['--delete' => true, '--resume' => true]));
+        // Exercise cleanup of a previously committed full-audit verdict without a new full download.
+        $inventory = app(ScratchInventory::class);
+        $entry = $inventory->registerAudit(1);
+        $scratch = $this->scratch((int) $entry->id);
+        File::ensureDirectoryExists($scratch);
+        file_put_contents($scratch.'/legacy-evidence', 'retained proof from the prior audit');
+        $inventory->recordAudit((int) $entry->id, 'unrepairable', 'Previously proved audit result.');
+        DB::transaction(function () use ($entry, $inventory): void {
+            DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+            app(AuditReleaseDeletion::class)->commit(Release::query()->findOrFail(1), (int) $entry->id);
+            $inventory->finishAudit((int) $entry->id);
+            DB::table('release_verification_state')->where('id', 1)->update(['audit_cursor' => 1]);
+        });
     }
 
     private function worker(): void

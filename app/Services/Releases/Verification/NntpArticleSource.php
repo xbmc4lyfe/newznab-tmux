@@ -22,7 +22,8 @@ final class NntpArticleSource implements ArticleSource
     private array $prefetched = [];
 
     public function __construct(private readonly NNTPService $nntp, private ?NNTPService $alternate = null,
-        private readonly ?YencService $decoder = null) {}
+        private readonly ?YencService $decoder = null, private readonly ?int $maximumBytes = null,
+        private readonly bool $allowAlternateFallback = true) {}
 
     public function batchSize(): int
     {
@@ -44,7 +45,7 @@ final class NntpArticleSource implements ArticleSource
         if (count($ids) > $this->batchSize()) {
             throw new RuntimeException('Too many articles in a verification prefetch.');
         }
-        $maximumBytes = (int) config('release_verification.article_bytes');
+        $maximumBytes = $this->maximumArticleBytes();
         $connectionCount = min(count($ids), max(1, min(8, (int) config('release_verification.download_connections', 1))));
         $window = (int) ceil(count($ids) / $connectionCount);
         $batches = [];
@@ -100,6 +101,16 @@ final class NntpArticleSource implements ArticleSource
         return $fetched instanceof FetchedArticle ? $fetched->raw : $fetched;
     }
 
+    public function fetchBounded(string $messageId, int $remainingBytes): string
+    {
+        if ($remainingBytes < 1) {
+            throw new RuntimeException('Spot-check transfer budget is exhausted.');
+        }
+        $fetched = $this->fetchFromProviders($messageId, maximumBytes: $remainingBytes);
+
+        return $fetched instanceof FetchedArticle ? $fetched->raw : $fetched;
+    }
+
     /** @param callable(VerifiedArticle): void $validate */
     public function fetchValidated(string $messageId, callable $validate): string
     {
@@ -118,9 +129,9 @@ final class NntpArticleSource implements ArticleSource
     }
 
     /** @param (callable(VerifiedArticle): void)|null $validate */
-    private function fetchFromProviders(string $messageId, ?callable $validate = null): string|FetchedArticle
+    private function fetchFromProviders(string $messageId, ?callable $validate = null, ?int $maximumBytes = null): string|FetchedArticle
     {
-        $maximumBytes = (int) config('release_verification.article_bytes');
+        $maximumBytes = min($this->maximumArticleBytes(), $maximumBytes ?? PHP_INT_MAX);
         $messageId = NNTPService::verificationMessageId($messageId, $maximumBytes);
         try {
             if (array_key_exists($messageId, $this->prefetched)) {
@@ -147,7 +158,7 @@ final class NntpArticleSource implements ArticleSource
                 $this->disconnect($this->nntp);
                 $this->connected = false;
             }
-            if (! (bool) config('nntmux_nntp.alternate_article_fallback', false)) {
+            if (! $this->allowAlternateFallback || ! (bool) config('nntmux_nntp.alternate_article_fallback', false)) {
                 throw $error instanceof RuntimeException ? $error : new RuntimeException('NNTP is unavailable.', previous: $error);
             }
         }
@@ -202,6 +213,11 @@ final class NntpArticleSource implements ArticleSource
         } catch (Exception) {
             // A failed transport cleanup must not prevent trying the alternate provider.
         }
+    }
+
+    private function maximumArticleBytes(): int
+    {
+        return min((int) config('release_verification.article_bytes'), $this->maximumBytes ?? PHP_INT_MAX);
     }
 
     public function __destruct()

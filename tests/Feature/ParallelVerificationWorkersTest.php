@@ -84,7 +84,7 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
     {
         config(['release_verification.bytes_per_second' => 0]);
         foreach (['one', 'two'] as $name) {
-            app(CandidateRepository::class)->enqueue(['identity' => sha1($name), 'groups_id' => 1, 'expected_files' => 2,
+            app(CandidateRepository::class)->enqueue(['identity' => sha1($name), 'groups_id' => 1, 'expected_files' => 1,
                 'files' => [['key' => 'movie', 'subject' => 'movie.mkv', 'totalparts' => 1,
                     'segments' => [['number' => 1, 'messageid' => $name.'@article', 'bytes' => 5]]]]]);
         }
@@ -113,7 +113,7 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
     {
         config(['release_verification.bytes_per_second' => 0]);
         foreach (['one', 'two'] as $name) {
-            app(CandidateRepository::class)->enqueue(['identity' => sha1($name), 'groups_id' => 1, 'expected_files' => 2,
+            app(CandidateRepository::class)->enqueue(['identity' => sha1($name), 'groups_id' => 1, 'expected_files' => 1,
                 'files' => [['key' => 'movie', 'subject' => 'movie.mkv', 'totalparts' => 1,
                     'segments' => [['number' => 1, 'messageid' => $name.'@article', 'bytes' => 5]]]]]);
         }

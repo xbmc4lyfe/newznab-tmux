@@ -66,7 +66,7 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
         $this->travel(16)->minutes();
         $this->audit();
 
-        $this->assertSame(['unknown', 'complete'], array_column($this->records(), 'verdict'));
+        $this->assertSame(['unknown', 'sampled'], array_column($this->records(), 'verdict'));
         $this->assertSame([1, 1], array_column($this->records(), 'id'));
         $this->assertSame(1, (int) DB::table('release_verification_state')->value('audit_cursor'));
         $this->assertSame(0, DB::table('release_verification_audit_retries')->count());
@@ -81,7 +81,7 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
         });
         $this->mock(NNTPService::class, function ($mock): void {
             $mock->shouldReceive('doConnect')->with(false)->andReturn(false, true);
-            $mock->shouldReceive('verificationArticle')->with('a@b', 16777216)->andReturn((new YencService)->encode('hello', 'movie.mkv'));
+            $mock->shouldReceive('verificationArticle')->with('a@b', 1048576)->andReturn((new YencService)->encode('hello', 'movie.mkv'));
             $mock->shouldReceive('doQuit')->andReturn(null);
         });
         $this->audit();
@@ -90,24 +90,24 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
         $this->travel(16)->minutes();
         $this->audit();
 
-        $this->assertSame(['unknown', 'complete'], array_column($this->records(), 'verdict'));
+        $this->assertSame(['unknown', 'sampled'], array_column($this->records(), 'verdict'));
         $this->assertSame(0, DB::table('release_verification_audit_retries')->count());
     }
 
-    public function test_scratch_exhaustion_can_recover_on_a_later_resume(): void
+    public function test_sample_budget_exhaustion_can_recover_on_a_later_resume(): void
     {
         $this->release(1);
         $this->mock(NzbService::class, function ($mock): void {
             $mock->shouldReceive('readNzbContents')->with('audit-1')->andReturn($this->xml());
         });
         $this->availableNntp();
-        config(['release_verification.scratch_bytes' => 1]);
+        config(['release_verification.spot_check_bytes' => 1]);
         $this->audit();
-        config(['release_verification.scratch_bytes' => 2147483648]);
+        config(['release_verification.spot_check_bytes' => 1048576]);
         $this->travel(16)->minutes();
         $this->audit();
 
-        $this->assertSame(['unknown', 'complete'], array_column($this->records(), 'verdict'));
+        $this->assertSame(['unknown', 'sampled'], array_column($this->records(), 'verdict'));
     }
 
     public function test_one_release_limit_alternates_due_retries_and_forward_progress(): void
@@ -195,6 +195,7 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
         File::partialMock()->shouldReceive('deleteDirectory')->andReturn(false);
         $this->audit();
         $scratch = glob($this->directory.'/scratch/audit-*')[0];
+        file_put_contents($scratch.'/legacy-checkpoint', 'retained prior audit state');
         $this->assertSame(1, (int) DB::table('release_verification_state')->value('audit_cursor'));
         $this->assertSame(1, DB::table('release_verification_scratch')->count(), 'Committed terminal audit must retain durable cleanup work.');
         $filesystem = new Filesystem;
@@ -237,25 +238,23 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
         fclose($lock);
     }
 
-    public function test_unknown_audit_retains_registered_cache_across_worker_sweep_and_retry(): void
+    public function test_incomplete_audit_defers_without_downloading_and_retains_registered_inventory(): void
     {
         $this->release(1);
         $this->mock(NzbService::class, function ($mock): void {
             $mock->shouldReceive('readNzbContents')->twice()->andReturn(str_replace('[1/1]', '[1/2]', $this->xml()));
         });
-        $this->mock(NNTPService::class, function ($mock): void {
-            $mock->shouldReceive('doConnect')->once()->with(false)->andReturn(true);
-            $mock->shouldReceive('verificationArticle')->once()->andReturn((new YencService)->encode('hello', 'movie.mkv'));
-            $mock->shouldReceive('doQuit')->andReturn(null);
+        $this->mock(NNTPService::class, static function ($mock): void {
+            $mock->shouldNotReceive('doConnect');
         });
         $this->audit();
         $cache = glob($this->directory.'/scratch/audit-*/articles/*');
-        $this->assertCount(1, $cache);
+        $this->assertCount(0, $cache);
         $this->assertSame(0, Artisan::call('releases:verify-candidates'));
-        $this->assertFileExists($cache[0]);
+        $this->assertCount(0, glob($this->directory.'/scratch/audit-*/articles/*'));
         $this->travel(16)->minutes();
         $this->audit();
-        $this->assertFileExists($cache[0]);
+        $this->assertCount(0, glob($this->directory.'/scratch/audit-*/articles/*'));
         $this->assertSame(1, DB::table('release_verification_scratch')->count());
         $this->assertSame(['unknown', 'unknown'], array_column($this->records(), 'verdict'));
     }
@@ -353,7 +352,7 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
     {
         $this->mock(NNTPService::class, function ($mock): void {
             $mock->shouldReceive('doConnect')->with(false)->andReturn(true);
-            $mock->shouldReceive('verificationArticle')->with('a@b', 16777216)->andReturn((new YencService)->encode('hello', 'movie.mkv'));
+            $mock->shouldReceive('verificationArticle')->with('a@b', 1048576)->andReturn((new YencService)->encode('hello', 'movie.mkv'));
             $mock->shouldReceive('doQuit')->andReturn(null);
         });
     }

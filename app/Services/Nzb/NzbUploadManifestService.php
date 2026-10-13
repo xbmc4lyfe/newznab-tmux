@@ -243,10 +243,10 @@ final class NzbUploadManifestService
             ->leftJoin('releases as published', 'published.id', '=', 'candidates.release_id')
             ->where('candidates.identity', $identity)->lockForUpdate()
             ->first(['candidates.status', 'candidates.release_id', 'candidates.verified_at', 'published.guid']);
-        if ($candidate !== null && ! in_array($candidate->status, ['complete', 'repaired', 'expired', 'unrepairable'], true)) {
+        if ($candidate !== null && ! in_array($candidate->status, ['complete', 'repaired', 'sampled', 'expired', 'unrepairable'], true)) {
             return $manifest;
         }
-        if ($candidate !== null && in_array($candidate->status, ['complete', 'repaired'], true) && $candidate->verified_at !== null
+        if ($candidate !== null && in_array($candidate->status, ['complete', 'repaired', 'sampled'], true) && $candidate->verified_at !== null
             && (int) $candidate->release_id > 0 && is_string($candidate->guid) && $candidate->guid !== '') {
             $manifest['state'] = self::STATE_NZB_IMPORTED;
             $manifest['release_id'] = (int) $candidate->release_id;

@@ -63,12 +63,25 @@ final class VerifiedNzbWriter
         $xml->writeAttribute('xmlns', 'http://www.newzbin.com/DTD/2003/nzb');
         $inventory = max((int) ($manifest['expected_files'] ?? 0), (int) ($manifest['verified_file_count'] ?? 0),
             count(array_filter($manifest['files'], static fn (array $file): bool => $file['segments'] !== [])));
-        if ($inventory > 0) {
+        if ($inventory > 0 || ($manifest['verification_mode'] ?? null) === 'spot_check') {
             $xml->startElement('head');
-            $xml->startElement('meta');
-            $xml->writeAttribute('type', 'nntmux:verified-file-count');
-            $xml->text((string) $inventory);
-            $xml->endElement();
+            if (($manifest['verification_mode'] ?? null) === 'spot_check') {
+                if ($inventory > 0) {
+                    $xml->startElement('meta');
+                    $xml->writeAttribute('type', 'nntmux:declared-file-count');
+                    $xml->text((string) $inventory);
+                    $xml->endElement();
+                }
+                $xml->startElement('meta');
+                $xml->writeAttribute('type', 'nntmux:verification-mode');
+                $xml->text('spot-check');
+                $xml->endElement();
+            } elseif ($inventory > 0) {
+                $xml->startElement('meta');
+                $xml->writeAttribute('type', 'nntmux:verified-file-count');
+                $xml->text((string) $inventory);
+                $xml->endElement();
+            }
             $xml->endElement();
         }
         foreach ($manifest['files'] as $file) {

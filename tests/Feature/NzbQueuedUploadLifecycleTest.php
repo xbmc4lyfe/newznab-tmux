@@ -121,6 +121,21 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->assertSame(7, $manifest['release_id']);
     }
 
+    public function test_nzb_upload_reconciliation_accepts_published_spot_checked_candidate(): void
+    {
+        $identity = sha1('import:spot-checked');
+        $this->candidate($identity, 'sampled', 7);
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'sampled-guid']);
+        [$path, $manifests] = $this->upload('sampled');
+
+        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+
+        $result = $manifests->reconcilePending(dirname($path).'/'.NzbUploadManifestService::FILENAME);
+        $this->assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $result['state']);
+        $this->assertSame(7, $result['release_id']);
+        $this->assertSame('sampled-guid', $result['release_guid']);
+    }
+
     public function test_expired_candidate_is_terminal_and_cannot_create_an_import_retry_loop(): void
     {
         $identity = sha1('import:expired');
@@ -369,7 +384,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
     {
         DB::table('release_verification_candidates')->insert(['identity' => $identity, 'source_identity' => $identity, 'groups_id' => 1,
             'manifest_path' => '', 'manifest_hash' => str_repeat('a', 64), 'manifest_bytes' => 0, 'status' => $status,
-            'release_id' => $releaseId, 'verified_at' => in_array($status, ['complete', 'repaired'], true) ? now() : null,
+            'release_id' => $releaseId, 'verified_at' => in_array($status, ['complete', 'repaired', 'sampled'], true) ? now() : null,
             'last_unique_at' => now(), 'next_attempt_at' => now()]);
     }
 

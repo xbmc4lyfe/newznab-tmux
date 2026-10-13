@@ -16,6 +16,13 @@ final class CollectionReleasePolicy
         if (($manifest['metadata_source'] ?? null) === 'import') {
             return null;
         }
+        if (($manifest['verification_mode'] ?? null) === 'spot_check') {
+            if (($rejection = (new CandidateHeaderInventory)->rejection($manifest)) !== null) {
+                throw new RuntimeException($rejection);
+            }
+
+            return $this->spotCheckRejection($manifest);
+        }
         $bytes = $manifest['verified_bytes'] ?? null;
         $names = $manifest['verified_file_names'] ?? null;
         if (! is_int($bytes) || $bytes < 0 || ! is_array($names) || ! array_is_list($names) || $names === []) {
@@ -39,6 +46,39 @@ final class CollectionReleasePolicy
         }
         if (array_filter($names, static fn (string $name): bool => preg_match('/\.par2\z/i', $name) !== 1) === []) {
             return 'Verified inventory contains only PAR2 files without a proved source payload.';
+        }
+
+        return null;
+    }
+
+    /** @param array<string, mixed> $manifest */
+    private function spotCheckRejection(array $manifest): ?string
+    {
+        $sample = $manifest['spot_check'] ?? null;
+        if (! is_array($sample) || (int) ($sample['articles'] ?? 0) < 1
+            || (int) ($sample['bytes'] ?? PHP_INT_MAX) > (int) config('release_verification.spot_check_bytes', 1048576)) {
+            return 'A bounded article spot check did not complete.';
+        }
+        $bytes = (new CandidateHeaderInventory)->bytes($manifest);
+        $fileCount = count($manifest['files'] ?? []);
+        $limits = $this->limits((int) $manifest['groups_id']);
+        if ($bytes < $limits['min_size']) {
+            return 'Declared collection size is below the configured minimum.';
+        }
+        if ($limits['max_size'] > 0 && $bytes > $limits['max_size']) {
+            return 'Declared collection size exceeds the configured maximum.';
+        }
+        if ($fileCount < $limits['min_files']) {
+            return 'Declared file count is below the configured minimum.';
+        }
+
+        $subjects = array_map(static fn (array $file): string => (string) ($file['subject'] ?? ''), $manifest['files'] ?? []);
+        $hasPayload = array_filter($subjects,
+            static fn (string $subject): bool => preg_match('/\.par2(?:["\'\s]|$)/i', $subject) !== 1) !== [];
+        $sampledNames = array_filter($manifest['verified_file_names'] ?? [],
+            static fn (mixed $name): bool => is_string($name) && preg_match('/\.par2\z/i', $name) !== 1);
+        if (! $hasPayload && $sampledNames === []) {
+            return 'Header inventory contains only PAR2 files without a declared source payload.';
         }
 
         return null;

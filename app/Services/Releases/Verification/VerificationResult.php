@@ -11,6 +11,6 @@ final readonly class VerificationResult
 
     public function passed(): bool
     {
-        return in_array($this->verdict, ['complete', 'repaired'], true);
+        return in_array($this->verdict, ['complete', 'repaired', 'sampled'], true);
     }
 }
