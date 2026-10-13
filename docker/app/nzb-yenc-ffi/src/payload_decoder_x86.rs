@@ -20,6 +20,29 @@ static KEPT_BYTES: [u8; 256] = {
     counts
 };
 
+// Sparse ordinary payload blocks usually remove one escape marker or one CRLF
+// pair. A whole-vector shuffle avoids joining two compacted scalar words.
+const REMOVE_ONE: [[u8; 16]; 16] = removal_shuffles::<16>(1);
+const REMOVE_PAIR: [[u8; 16]; 15] = removal_shuffles::<15>(2);
+
+const fn removal_shuffles<const POSITIONS: usize>(removed: usize) -> [[u8; 16]; POSITIONS] {
+    let mut table = [[0x80; 16]; POSITIONS];
+    let mut position = 0;
+    while position < POSITIONS {
+        let mut source = 0;
+        let mut destination = 0;
+        while source < 16 {
+            if source < position || source >= position + removed {
+                table[position][destination] = source as u8;
+                destination += 1;
+            }
+            source += 1;
+        }
+        position += 1;
+    }
+    table
+}
+
 /// Join two zero-padded compacted words and write exactly their retained bytes.
 #[inline]
 unsafe fn store_pair(
@@ -77,6 +100,23 @@ unsafe fn compact_ssse3(
             _mm_storeu_si128(destination.cast(), _mm_sub_epi8(bytes, _mm_set1_epi8(42)));
             return 16;
         }
+        if newlines == 0 && ((!*escaped && equals == 0x5555) || (*escaped && equals == 0xaaaa)) {
+            // Exact alternating marker/value pairs retain eight bytes. If a
+            // previous marker is pending, values occupy even lanes and the
+            // final marker remains pending; otherwise values occupy odd lanes.
+            let indices = if *escaped {
+                _mm_setr_epi8(
+                    0, 2, 4, 6, 8, 10, 12, 14, -128, -128, -128, -128, -128, -128, -128, -128,
+                )
+            } else {
+                _mm_setr_epi8(
+                    1, 3, 5, 7, 9, 11, 13, 15, -128, -128, -128, -128, -128, -128, -128, -128,
+                )
+            };
+            let decoded = _mm_shuffle_epi8(_mm_sub_epi8(bytes, _mm_set1_epi8(106)), indices);
+            _mm_storel_epi64(destination.cast(), decoded);
+            return 8;
+        }
         let following = equals.wrapping_shl(1);
         let incoming = *escaped;
         let (remove, offsets) = if following & (equals | newlines) == 0
@@ -105,6 +145,30 @@ unsafe fn compact_ssse3(
             )
         };
         let decoded = _mm_sub_epi8(bytes, offsets);
+        if remove == 0 {
+            _mm_storeu_si128(destination.cast(), decoded);
+            return 16;
+        }
+        let first_removed = remove.trailing_zeros() as usize;
+        if remove.is_power_of_two() {
+            let packed = _mm_shuffle_epi8(
+                decoded,
+                _mm_loadu_si128(REMOVE_ONE[first_removed].as_ptr().cast()),
+            );
+            // Two overlapping eight-byte stores cover exactly fifteen bytes.
+            _mm_storel_epi64(destination.cast(), packed);
+            _mm_storel_epi64(destination.add(7).cast(), _mm_srli_si128::<7>(packed));
+            return 15;
+        }
+        if remove >> first_removed == 3 {
+            let packed = _mm_shuffle_epi8(
+                decoded,
+                _mm_loadu_si128(REMOVE_PAIR[first_removed].as_ptr().cast()),
+            );
+            _mm_storel_epi64(destination.cast(), packed);
+            _mm_storel_epi64(destination.add(6).cast(), _mm_srli_si128::<6>(packed));
+            return 14;
+        }
         let low = _mm_shuffle_epi8(
             decoded,
             _mm_loadl_epi64(COMPACT[(remove & 255) as usize].as_ptr().cast()),
@@ -192,6 +256,33 @@ pub(crate) unsafe fn decode_avx2(source: *const u8, destination: *mut u8, length
                 let equals_vector = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'=' as i8));
                 let equals = _mm256_movemask_epi8(equals_vector) as u32;
                 let newlines = specials & !equals;
+                if newlines == 0
+                    && ((!escaped && equals == 0x5555_5555) || (escaped && equals == 0xaaaa_aaaa))
+                {
+                    let indices = if escaped {
+                        _mm_setr_epi8(
+                            0, 2, 4, 6, 8, 10, 12, 14, -128, -128, -128, -128, -128, -128, -128,
+                            -128,
+                        )
+                    } else {
+                        _mm_setr_epi8(
+                            1, 3, 5, 7, 9, 11, 13, 15, -128, -128, -128, -128, -128, -128, -128,
+                            -128,
+                        )
+                    };
+                    let packed = _mm256_shuffle_epi8(
+                        _mm256_sub_epi8(bytes, _mm256_set1_epi8(106)),
+                        _mm256_broadcastsi128_si256(indices),
+                    );
+                    let contiguous = _mm_unpacklo_epi64(
+                        _mm256_castsi256_si128(packed),
+                        _mm256_extracti128_si256::<1>(packed),
+                    );
+                    _mm_storeu_si128(destination.add(written).cast(), contiguous);
+                    written += 16;
+                    read += 32;
+                    continue;
+                }
                 written += compact_ssse3(
                     _mm256_castsi256_si128(bytes),
                     _mm256_castsi256_si128(equals_vector),
@@ -282,6 +373,87 @@ mod tests {
                         assert_eq!(&output[..written], &expected[..expected_length]);
                         assert!(output[written..].iter().all(|&byte| byte == 0xa5));
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_removals_and_dense_carries_preserve_overlapping_storage() {
+        let mut kernels: Vec<unsafe fn(*const u8, *mut u8, usize) -> usize> = Vec::new();
+        if is_x86_feature_detected!("ssse3") {
+            kernels.push(decode_ssse3);
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
+            kernels.push(decode_avx2);
+        }
+        let mut payloads = Vec::new();
+        for position in 0..32 {
+            let mut payload = vec![b'k'; 96];
+            payload[position] = b'=';
+            payloads.push(payload);
+            let mut payload = vec![b'k'; 96];
+            payload[position] = b'\r';
+            payload[position + 1] = b'\n';
+            payloads.push(payload);
+        }
+        for prefix in 0..33 {
+            let mut payload = vec![b'k'; prefix];
+            payload.extend_from_slice(&b"=@=J=M=}".repeat(40));
+            payload.extend_from_slice(b"=\r\n=\n\r");
+            payload.extend_from_slice(&b"@=".repeat(40));
+            payload.extend_from_slice(b"\r\n");
+            payloads.push(payload);
+        }
+        for kernel in kernels {
+            for payload in &payloads {
+                let mut reference = vec![0; payload.len()];
+                let reference_len = unsafe {
+                    scalar_tail(
+                        payload.as_ptr(),
+                        reference.as_mut_ptr(),
+                        payload.len(),
+                        0,
+                        0,
+                        false,
+                    )
+                };
+                for (source_start, destination_start) in
+                    [(32, 32), (32, 33), (33, 32), (32, 63), (63, 32)]
+                {
+                    let mut storage = vec![0xa5; payload.len() + 96];
+                    storage[source_start..source_start + payload.len()].copy_from_slice(payload);
+                    let original = storage.clone();
+                    // destination-ahead overlaps are the public wrapper's
+                    // responsibility; exercise that wrapper for those cases.
+                    let written = unsafe {
+                        if destination_start > source_start {
+                            crate::payload_decoder::decode_into(
+                                storage.as_ptr().add(source_start),
+                                storage.as_mut_ptr().add(destination_start),
+                                payload.len(),
+                            )
+                        } else {
+                            kernel(
+                                storage.as_ptr().add(source_start),
+                                storage.as_mut_ptr().add(destination_start),
+                                payload.len(),
+                            )
+                        }
+                    };
+                    assert_eq!(written, reference_len);
+                    assert_eq!(
+                        &storage[destination_start..destination_start + written],
+                        &reference[..reference_len]
+                    );
+                    assert_eq!(
+                        &storage[..destination_start],
+                        &original[..destination_start]
+                    );
+                    assert_eq!(
+                        &storage[destination_start + written..],
+                        &original[destination_start + written..]
+                    );
                 }
             }
         }

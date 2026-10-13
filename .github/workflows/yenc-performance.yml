@@ -102,7 +102,7 @@ jobs:
         run: |
           YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
             php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
-              --filter=it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated \
+              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines' \
               2>&1 | tee benchmark-evidence/build/framing-budget-integration.log
 
       - name: Record build and runtime identities

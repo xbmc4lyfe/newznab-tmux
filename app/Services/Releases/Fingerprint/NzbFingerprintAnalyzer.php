@@ -81,7 +81,8 @@ final class NzbFingerprintAnalyzer
                     if ($parsedNumber === null || $parsedNumber < 1 || $parsedBytes === null) {
                         $invalidSegmentMetadataCount++;
                     }
-                    if (is_int($advertisedBytes) && is_int($parsedBytes) && $parsedBytes > PHP_INT_MAX - $advertisedBytes) {
+                    if (($parsedBytes === null && ctype_digit($segmentBytes))
+                        || (is_int($advertisedBytes) && is_int($parsedBytes) && $parsedBytes > PHP_INT_MAX - $advertisedBytes)) {
                         $advertisedBytesOverflow = true;
                     }
                     $advertisedBytes = self::checkedAdd($advertisedBytes, $parsedBytes);
@@ -661,7 +662,9 @@ final class NzbFingerprintAnalyzer
             return true;
         }
         foreach ($metadata['lines'] as $line) {
-            if (! is_array($line) || ($line['field_occurrences_truncated'] ?? false) === true) {
+            if (! is_array($line) || ($line['field_occurrences_truncated'] ?? false) === true
+                || ! is_int($line['frame_index'] ?? null)
+                || $line['frame_index'] !== ($metadata['frames'][0]['frame_index'] ?? null)) {
                 return true;
             }
         }
@@ -695,6 +698,10 @@ final class NzbFingerprintAnalyzer
                 $kind = strtolower($kindMatch[1]);
                 $counts[$kind]++;
                 if ($counts[$kind] > 1 || $end - $offset > 16_384) {
+                    return true;
+                }
+                if (($kind === 'ypart' && ($counts['ybegin'] !== 1 || $counts['yend'] !== 0))
+                    || ($kind === 'yend' && $counts['ybegin'] !== 1)) {
                     return true;
                 }
                 $line = rtrim(substr($body, $offset + strlen($kind) + 1, $end - $offset - strlen($kind) - 1), "\r");

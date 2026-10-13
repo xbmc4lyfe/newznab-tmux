@@ -54,6 +54,18 @@ final class ReleaseFingerprintMetadataTest extends TestCase
     }
 
     #[Test]
+    public function it_flags_individual_decimal_nzb_size_overflow_separately_from_malformed_values(): void
+    {
+        foreach (['9223372036854775808' => true, '0009223372036854775808' => true, '18446744073709551615' => true, 'not-a-number' => false, '-1' => false] as $bytes => $overflow) {
+            $xml = '<nzb><file subject="one.rar"><segments><segment bytes="'.$bytes.'" number="1">one@example.net</segment></segments></file></nzb>';
+            $report = (new NzbFingerprintAnalyzer(new YencService))->analyzeManifest($xml);
+            self::assertNull($report['files'][0]['advertised_bytes']);
+            self::assertSame($overflow, $report['files'][0]['advertised_bytes_overflow']);
+            self::assertSame($overflow, $report['totals']['rar']['advertised_bytes_overflow']);
+        }
+    }
+
+    #[Test]
     public function it_does_not_round_overflowing_nzb_totals_across_files(): void
     {
         $analyzer = new NzbFingerprintAnalyzer(new YencService);
@@ -82,7 +94,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
     public function it_treats_incomplete_native_framing_evidence_as_ambiguous(): void
     {
         $method = new \ReflectionMethod(NzbFingerprintAnalyzer::class, 'yencFramingEvidenceIncomplete');
-        $complete = ['frames' => [['size_relationship_status' => 'consistent']], 'lines' => [['field_occurrences_truncated' => false]]];
+        $complete = ['frames' => [['frame_index' => 1, 'size_relationship_status' => 'consistent']], 'lines' => [['frame_index' => 1, 'field_occurrences_truncated' => false]]];
         self::assertFalse($method->invoke(null, $complete));
         foreach (['frames_truncated', 'control_lines_truncated'] as $flag) {
             self::assertTrue($method->invoke(null, $complete + [$flag => true]));
@@ -93,6 +105,9 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $ambiguous = $complete;
         $ambiguous['frames'][0]['size_relationship_status'] = 'ambiguous';
         self::assertTrue($method->invoke(null, $ambiguous));
+        $orphan = $complete;
+        $orphan['lines'][] = ['frame_index' => null, 'field_occurrences_truncated' => false];
+        self::assertTrue($method->invoke(null, $orphan));
     }
 
     #[Test]
@@ -106,6 +121,8 @@ final class ReleaseFingerprintMetadataTest extends TestCase
             str_replace('=yend size=3', '=yend size=0 size=3', $normal),
             str_replace('=yend size=3', '=yend size=0 '.$filler.' size=3', $normal),
             $normal.$normal,
+            "=ypart begin=1 end=3\r\n".$normal,
+            $normal."=ypart begin=1 end=3\r\n",
         ] as $body) {
             $article = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $body);
             self::assertTrue($article['yenc']['integrity_checks_ambiguous']);
@@ -116,6 +133,25 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertFalse((new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $same)['yenc']['integrity_checks_ambiguous']);
         $name = str_replace('name=x.rar', 'name=some file size=9.rar', $normal);
         self::assertFalse((new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $name)['yenc']['integrity_checks_ambiguous']);
+    }
+
+    #[Test]
+    public function it_withholds_native_integrity_for_orphan_control_lines(): void
+    {
+        $normal = "=ybegin size=3 line=128 name=x.rar\r\nklm\r\n=yend size=3 crc32=a3830348\r\n";
+        foreach (['=yend size=3', '=ypart begin=1 end=3'] as $orphan) {
+            foreach ([$orphan."\r\n".$normal, $normal.$orphan."\r\n"] as $body) {
+                $native = (new NativeMetadataParser)->parseYencFraming($body);
+                if ($native === null) {
+                    self::markTestSkipped('Native yEnc framing library is required for orphan-line integration.');
+                }
+                self::assertContains(null, array_column($native['lines'], 'frame_index'));
+                $article = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $body);
+                self::assertTrue($article['yenc']['integrity_checks_ambiguous']);
+                self::assertNull($article['yenc']['par2_first_16k_md5_candidate']);
+                self::assertFalse(Par2MetadataParser::declaredYencCrc32Valid($article['yenc']));
+            }
+        }
     }
 
     #[Test]

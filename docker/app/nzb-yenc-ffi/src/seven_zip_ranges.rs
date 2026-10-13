@@ -69,6 +69,9 @@ pub struct EncodedHeaderFolder {
     pub bind_pairs: Vec<EncodedHeaderBindPair>,
     pub packed_input_stream_indexes: Vec<u64>,
     pub output_stream_unpack_sizes: Vec<u64>,
+    pub final_output_stream_index: Option<u64>,
+    pub final_output_unpack_size: Option<u64>,
+    pub final_output_observation_status: &'static str,
     pub crc32: Option<u32>,
     pub parse_status: &'static str,
 }
@@ -885,6 +888,23 @@ fn parse_encoded_header_unpack_info(
     } else {
         "unpack_info_parsed"
     };
+    for folder in &mut folders {
+        folder.final_output_observation_status = if parse_status == "unpack_info_parsed" {
+            // This is only the uniquely unbound output in the retained topology.
+            // It proves neither graph connectivity nor successful decompression.
+            folder.final_output_unpack_size = folder
+                .final_output_stream_index
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| folder.output_stream_unpack_sizes.get(index).copied());
+            if folder.final_output_unpack_size.is_some() {
+                "declared_not_decoded"
+            } else {
+                "final_output_size_unavailable"
+            }
+        } else {
+            parse_status
+        };
+    }
     EncodedHeaderUnpackInfo {
         parse_status,
         declared_folder_count: Some(folder_count),
@@ -1057,6 +1077,12 @@ fn parse_encoded_header_folder(
     if packed_input_stream_indexes.len() as u64 != packed_count {
         return None;
     }
+    let mut unbound_outputs =
+        (0..total_output_streams).filter(|index| !bound_outputs.contains(index));
+    let final_output_stream_index = unbound_outputs.next();
+    if final_output_stream_index.is_none() || unbound_outputs.next().is_some() {
+        return None;
+    }
     Some(EncodedHeaderFolder {
         folder_index,
         declared_coder_count: Some(coder_count),
@@ -1066,6 +1092,9 @@ fn parse_encoded_header_folder(
         bind_pairs,
         packed_input_stream_indexes,
         output_stream_unpack_sizes: Vec::with_capacity(usize::try_from(total_output_streams).ok()?),
+        final_output_stream_index,
+        final_output_unpack_size: None,
+        final_output_observation_status: "unpack_info_incomplete",
         crc32: None,
         parse_status: "folder_parsed",
     })
@@ -1409,4 +1438,75 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod final_output_tests {
+    use super::*;
+
+    fn two_coder_unpack_info(input: u8, output: u8, terminator: u8) -> Vec<u8> {
+        vec![
+            0x07, 0x0b, 1, 0, 2, 1, 0, 1, 0, input, output, 0x0c, 10, 20, terminator, 0,
+        ]
+    }
+
+    #[test]
+    fn final_folder_output_uses_the_unbound_index_not_sum_or_last_output() {
+        for (input, output, index, size) in [(1, 0, 1, 20), (0, 1, 0, 10), (0, 0, 1, 20)] {
+            let result =
+                parse_encoded_header_unpack_info(&two_coder_unpack_info(input, output, 0), 0, 1);
+            let value = serde_json::to_value(result).unwrap();
+            assert_eq!(value["parse_status"], "unpack_info_parsed");
+            assert_eq!(value["coder_output_stream_size_total"], 30);
+            assert_eq!(value["folders"][0]["final_output_stream_index"], index);
+            assert_eq!(value["folders"][0]["final_output_unpack_size"], size);
+            assert_eq!(
+                value["folders"][0]["final_output_observation_status"],
+                "declared_not_decoded"
+            );
+            assert!(value["folders"][0]["crc32"].is_null());
+        }
+    }
+
+    #[test]
+    fn incomplete_or_mismatched_unpack_info_withholds_final_size() {
+        for (data, pack_count, status) in [
+            (
+                two_coder_unpack_info(1, 0, 1),
+                1,
+                "unpack_info_end_marker_missing",
+            ),
+            (
+                two_coder_unpack_info(1, 0, 0),
+                2,
+                "pack_stream_count_mismatch",
+            ),
+        ] {
+            let value =
+                serde_json::to_value(parse_encoded_header_unpack_info(&data, 0, pack_count))
+                    .unwrap();
+            assert_eq!(value["parse_status"], status);
+            assert!(value["folders"][0]["final_output_unpack_size"].is_null());
+            assert_eq!(
+                value["folders"][0]["final_output_observation_status"],
+                status
+            );
+        }
+        let mut missing_size = two_coder_unpack_info(1, 0, 0);
+        missing_size.truncate(13);
+        let result = parse_encoded_header_unpack_info(&missing_size, 0, 1);
+        assert_eq!(result.parse_status, "truncated_output_stream_unpack_sizes");
+        assert!(result.folders.is_empty());
+    }
+
+    #[test]
+    fn invalid_bindings_and_external_folders_do_not_invent_a_final_output() {
+        let data = two_coder_unpack_info(1, 2, 0);
+        let result = parse_encoded_header_unpack_info(&data, 0, 1);
+        assert_eq!(result.parse_status, "malformed_or_unsupported_folder");
+        assert!(result.folders.is_empty());
+        let result = parse_encoded_header_unpack_info(&[0x07, 0x0b, 1, 1, 0], 0, 1);
+        assert_eq!(result.parse_status, "external_folder_data_unsupported");
+        assert!(result.folders.is_empty());
+    }
 }
