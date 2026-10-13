@@ -42,6 +42,15 @@ final class SpotCheckVerifier
         if ($sample === []) {
             return new VerificationResult('unknown', 'No article fits the configured spot-check budget.');
         }
+        $inferredTotals = [];
+        foreach ($manifest['files'] as $file) {
+            if (($file['totalparts_inferred'] ?? false) === true) {
+                $inferredTotals[$file['key']] = false;
+            }
+        }
+        if (array_diff_key($inferredTotals, array_fill_keys(array_column($sample, 'file_key'), true)) !== []) {
+            return new VerificationResult('unknown', 'Inferred article totals cannot be proved within the spot-check budget.');
+        }
 
         $bytes = 0;
         $names = [];
@@ -74,6 +83,9 @@ final class SpotCheckVerifier
                 return new VerificationResult('unknown', 'Spot-check article identity differs from its header.');
             }
             $fileKey = $segment['file_key'];
+            if ($segment['totalparts_inferred'] && ($article->totalParts !== null || $article->part === $segment['totalparts'])) {
+                $inferredTotals[$fileKey] = true;
+            }
             $fileIdentity = [$article->name, $article->size];
             if (isset($fileIdentities[$fileKey]) && $fileIdentities[$fileKey] !== $fileIdentity) {
                 return new VerificationResult('unknown', 'Spot-check articles have conflicting file identities.');
@@ -88,6 +100,9 @@ final class SpotCheckVerifier
             $bytes += strlen($raw);
             $names[$article->name] = true;
             $identityHints[] = ['name' => $article->name, 'source' => 'yenc-spot-check'];
+        }
+        if (in_array(false, $inferredTotals, true)) {
+            return new VerificationResult('unknown', 'Inferred article total has no body total or terminal endpoint proof.');
         }
         foreach ($ranges as $fileRanges) {
             ksort($fileRanges);

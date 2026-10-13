@@ -102,6 +102,11 @@ final class SpotCheckVerifierTest extends TestCase
         $result = $verifier->verify(['expected_files' => 2, 'files' => [$file, $duplicate]], static function (): void {});
         self::assertSame('unknown', $result->verdict);
         self::assertStringContainsString('duplicate article reference', $result->reason);
+        $duplicate['segments'][0]['messageid'] = 'other@article';
+        $file['totalparts_inferred'] = $duplicate['totalparts_inferred'] = true;
+        $result = $verifier->verify(['expected_files' => 2, 'files' => [$file, $duplicate]], static function (): void {});
+        self::assertSame('unknown', $result->verdict);
+        self::assertStringContainsString('within the spot-check budget', $result->reason);
     }
 
     #[Test]
@@ -122,6 +127,36 @@ final class SpotCheckVerifierTest extends TestCase
 
         self::assertSame('unknown', $result->verdict);
         self::assertFalse($result->passed());
+    }
+
+    #[Test]
+    public function inferred_totals_without_yenc_total_require_a_proved_terminal_endpoint(): void
+    {
+        foreach ([15 => 'unknown', 10 => 'sampled'] as $fileSize => $verdict) {
+            $raw = str_replace(' total=3', '', YencArticles::part('world', 'movie.mkv', $fileSize, 2, 6, 3));
+            $source = new class($raw) implements ArticleSource
+            {
+                public array $requests = [];
+
+                public function __construct(private readonly string $raw) {}
+
+                public function fetch(string $messageId): string
+                {
+                    $this->requests[] = $messageId;
+
+                    return $this->raw;
+                }
+            };
+            $manifest = ['identity' => sha1('inferred-no-total'), 'expected_files' => 1, 'files' => [
+                ['key' => 'movie', 'subject' => 'movie.mkv', 'totalparts' => 2, 'totalparts_inferred' => true, 'segments' => [
+                    ['number' => 1, 'messageid' => 'first@article', 'bytes' => 5],
+                    ['number' => 2, 'messageid' => 'last@article', 'bytes' => 5],
+                ]],
+            ]];
+            $result = (new SpotCheckVerifier($source, []))->verify($manifest, static function (): void {});
+            self::assertSame($verdict, $result->verdict);
+            self::assertSame(['last@article'], $source->requests);
+        }
     }
 
     #[Test]

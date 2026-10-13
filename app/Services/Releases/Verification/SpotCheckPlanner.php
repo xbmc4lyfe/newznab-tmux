@@ -42,8 +42,16 @@ final class SpotCheckPlanner
             }
             if ($segments !== []) {
                 $identity = (string) ($manifest['identity'] ?? '');
-                usort($segments, static fn (array $a, array $b): int => hash('sha256', $identity."\0".$a['messageid'])
-                    <=> hash('sha256', $identity."\0".$b['messageid']));
+                usort($segments, static function (array $a, array $b) use ($identity): int {
+                    if ($a['totalparts_inferred']) {
+                        $terminal = (int) ($b['number'] === $b['totalparts']) <=> (int) ($a['number'] === $a['totalparts']);
+                        if ($terminal !== 0) {
+                            return $terminal;
+                        }
+                    }
+
+                    return hash('sha256', $identity."\0".$a['messageid']) <=> hash('sha256', $identity."\0".$b['messageid']);
+                });
                 $files[$file['key']] = $segments;
             }
         }
@@ -54,8 +62,11 @@ final class SpotCheckPlanner
 
         $identity = (string) ($manifest['identity'] ?? '');
         $keys = array_keys($files);
-        usort($keys, static fn (string $a, string $b): int => hash('sha256', $identity."\0".$a)
-            <=> hash('sha256', $identity."\0".$b));
+        usort($keys, static function (string $a, string $b) use ($identity, $files): int {
+            $inferred = (int) $files[$b][0]['totalparts_inferred'] <=> (int) $files[$a][0]['totalparts_inferred'];
+
+            return $inferred !== 0 ? $inferred : hash('sha256', $identity."\0".$a) <=> hash('sha256', $identity."\0".$b);
+        });
 
         $selected = [];
         $seen = [];
