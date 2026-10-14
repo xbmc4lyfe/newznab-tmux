@@ -1216,6 +1216,10 @@ final class ReleaseProcessingService
                         continue;
                     }
 
+                    if ($result->isDeferred()) {
+                        continue;
+                    }
+
                     if ($this->shouldDeleteFailedNzbCreation($release, $result)) {
                         $this->deleteFailedNzbCreationRelease($release, $result, $claimToken);
                         $deletedCount++;
