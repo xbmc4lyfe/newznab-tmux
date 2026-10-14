@@ -141,7 +141,7 @@ class FileNameCleaner
      * @param  string  $fileName  The filename to clean
      * @return string|false The cleaned filename or false if invalid
      */
-    public function cleanForMatching(string $fileName): string|false
+    public function cleanForMatching(string $fileName, bool $preserveLeadingNumber = false): string|false
     {
         if (! mb_check_encoding($fileName, 'UTF-8')
             || preg_match('/(?![\x00-\x7F])\p{C}/u', $fileName) !== 0) {
@@ -184,7 +184,9 @@ class FileNameCleaner
         $fileName = preg_replace('/[\.\-_]?(part|vol|cd|dvd|disc|disk)\d*$/i', '', $fileName);
 
         // Remove leading track numbers
-        $fileName = preg_replace('/^\d{1,3}[\.\-_\s]+(?=[A-Za-z])/', '', $fileName);
+        if (! $preserveLeadingNumber) {
+            $fileName = preg_replace('/^\d{1,3}[\.\-_\s]+(?=[A-Za-z])/', '', $fileName);
+        }
 
         // Trim whitespace and punctuation
         $fileName = trim($fileName, " \t\n\r\0\x0B.-_");

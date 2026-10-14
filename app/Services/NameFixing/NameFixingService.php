@@ -441,7 +441,7 @@ class NameFixingService
     protected function preDbFileCheck(object $release, bool $echo, string $type, bool $nameStatus, bool $show, ?bool &$hadEvidence = null): bool
     {
         $hadEvidence = true;
-        $fileName = $this->fileNameCleaner->cleanForMatching($release->textstring);
+        $fileName = $this->fileNameCleaner->cleanForMatching($release->textstring, preserveLeadingNumber: true);
 
         if (empty($fileName)) {
             return false;
@@ -513,7 +513,7 @@ class NameFixingService
                 $candidate = is_array($result) ? $result : (array) $result;
                 $candidateIdentity = PredbSearchDocument::exactValue((string) ($candidate['title'] ?? ''));
                 $sameTitle = $candidateIdentity === $matchIdentity;
-                $candidateFilename = $this->fileNameCleaner->cleanForMatching((string) ($candidate['filename'] ?? ''));
+                $candidateFilename = $this->fileNameCleaner->cleanForMatching((string) ($candidate['filename'] ?? ''), preserveLeadingNumber: true);
                 $sameFilename = $matchIdentity !== $fileIdentity && $candidateFilename !== false
                     && PredbSearchDocument::exactValue($candidateFilename) === $fileIdentity;
                 if (($sameTitle || $sameFilename)
@@ -1746,7 +1746,7 @@ class NameFixingService
         $prioritizedFiles = $this->filePrioritizer->prioritizeForPreDb($files);
 
         foreach ($prioritizedFiles as $fileName) {
-            $cleanedFileName = $this->fileNameCleaner->cleanForMatching($fileName);
+            $cleanedFileName = $this->fileNameCleaner->cleanForMatching($fileName, preserveLeadingNumber: true);
 
             if (empty($cleanedFileName) || strlen($cleanedFileName) < 8) {
                 continue;
