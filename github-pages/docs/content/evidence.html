@@ -26,7 +26,11 @@
 python3 tests/Unit/test_docs_site.py
 python3 tests/Unit/test_benchmark_pages.py
 python3 tests/Unit/test_benchmark_summary_export.py
-python3 scripts/build-docs.py --output /tmp/nntmux-docs-preview</code></pre>
+preview_dir="$(mktemp -d "${TMPDIR:-/tmp}/nntmux-docs.XXXXXX")"
+bash github-pages/deployment/prepare-benchmarks.sh "$preview_dir"
+echo '{"status":"unavailable","reason":"Offline preview has no current-build collection"}' &gt; "$preview_dir/results.json"
+python3 scripts/build-docs.py --output "$preview_dir"
+python3 scripts/check-docs.py --site "$preview_dir"</code></pre>
 <p>Review source links and PR associations when updating a page. Preserve historical numbers with their original protocol and revision, and update the current dashboard through its collector. Don't rewrite a historical report to make it look current. New Rust files must appear in the coverage inventory even before a benchmark exists.</p>
 <h2 id="limits">Scope of this site</h2>
 <p>This site documents a personal fork under development and testing. It doesn't certify production readiness or compare the quality of this project with <a href="https://github.com/NNTmux/newznab-tmux">upstream NNTmux</a>. The upstream maintainers and contributors deserve credit for the main app and the foundation these experiments use.</p>
