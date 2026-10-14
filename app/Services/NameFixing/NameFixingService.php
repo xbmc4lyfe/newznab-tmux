@@ -513,9 +513,12 @@ class NameFixingService
                 $candidate = is_array($result) ? $result : (array) $result;
                 $candidateIdentity = PredbSearchDocument::exactValue((string) ($candidate['title'] ?? ''));
                 $sameTitle = $candidateIdentity === $matchIdentity;
-                $candidateFilename = $this->fileNameCleaner->cleanForMatching((string) ($candidate['filename'] ?? ''), preserveLeadingNumber: true);
-                $sameFilename = $matchIdentity !== $fileIdentity && $candidateFilename !== false
-                    && PredbSearchDocument::exactValue($candidateFilename) === $fileIdentity;
+                $sameFilename = false;
+                if ($matchIdentity !== $fileIdentity) {
+                    $candidateFilename = $this->fileNameCleaner->cleanForMatching((string) ($candidate['filename'] ?? ''), preserveLeadingNumber: true);
+                    $sameFilename = $candidateFilename !== false
+                        && PredbSearchDocument::exactValue($candidateFilename) === $fileIdentity;
+                }
                 if (($sameTitle || $sameFilename)
                     && ((int) ($candidate['id'] ?? 0) !== $matchId || ! $sameTitle)) {
                     return $this->predbMatchCache[$fileName] = null;

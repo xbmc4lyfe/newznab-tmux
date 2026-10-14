@@ -24,6 +24,40 @@ class YencServiceTest extends TestCase
         $this->yencService = new YencService;
     }
 
+    public function test_reuse_integrity_requires_checksum_without_changing_lenient_decode(): void
+    {
+        $body = $this->yencService->encode('FIRST', 'archive.rar', includeCrc32: false);
+        [$data] = $this->yencService->decodeWithFrame($body);
+        $this->assertSame('FIRST', $data);
+        $this->assertFalse($this->yencService->hasValidatedIntegrity($body, $data));
+        $body = $this->yencService->encode('FIRST', 'archive.rar');
+        $this->assertTrue($this->yencService->hasValidatedIntegrity($body, $data));
+        $this->assertFalse($this->yencService->hasValidatedIntegrity($body, 'OTHER'));
+    }
+
+    public function test_reuse_integrity_has_identical_php_and_native_frame_checks(): void
+    {
+        $this->withNativeFixture(['WITH_SPAN_DECODER', 'SPLIT_ESCAPE_DECODER', 'WITH_CRC'], function (NativePayloadDecoder $decoder): void {
+            foreach ([new YencService, new YencService($decoder)] as $service) {
+                $single = "=ybegin line=128 size=3 name=archive.rar\r\nklm\r\n=yend size=3 crc32=a3830348";
+                $multipart = "=ybegin part=1 total=2 line=128 size=6 name=archive.rar\r\n=ypart begin=1 end=3\r\nklm\r\n=yend size=3 part=1 pcrc32=a3830348";
+                $this->assertTrue($service->hasValidatedIntegrity($single, 'ABC'));
+                $this->assertTrue($service->hasValidatedIntegrity($multipart, 'ABC'));
+                foreach (array_merge(array_column(iterator_to_array(YencDecoderTest::corruptArticles()), 0), [
+                    str_replace(' crc32=a3830348', '', $single),
+                    str_replace('pcrc32=a3830348', 'pcrc32=00000000', $multipart),
+                    str_replace('begin=1 end=3', 'begin=0 end=2', $multipart),
+                    str_replace('part=1 total=2', 'part=3 total=2', $multipart),
+                    str_replace('size=3 part=1', 'size=4 part=1', $multipart),
+                ]) as $raw) {
+                    [$data, $part] = $service->decodeWithFrame($raw);
+                    $this->assertFalse($service->hasValidatedIntegrity($raw, $data));
+                    $this->assertEquals([$data, $part], $service->decodeWithFrame($raw));
+                }
+            }
+        });
+    }
+
     public function test_enabled_returns_true(): void
     {
         $this->assertTrue($this->yencService->enabled());
