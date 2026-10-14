@@ -1,17 +1,6 @@
-//! C ABI shim that exposes nzb-decode's yEnc decoder under RapidYenc's symbol
-//! names, so `App\Services\Yenc\NativePayloadDecoder` loads it through FFI
-//! unchanged (`YENC_NATIVE_LIBRARY=/path/to/libnzbyenc.so`).
-//!
-//! NNTmux hands the decoder only the encoded payload between `=ybegin`/`=ypart`
-//! and `=yend`, while nzb-decode decodes whole articles. The payload is
-//! therefore wrapped in a minimal header and footer.
-//!
-//! nzb-decode reads `=yend` and `=ypart` wherever a line starts with them, but
-//! inside a payload `=y` is just an escaped byte (encoders never emit it, yet
-//! NNTmux must decode it). Line endings carry no data, so they are removed
-//! first; that leaves the payload's first bytes as its only line start, and any
-//! leading `=y` escapes there are decoded before handing over the rest. Removing
-//! them first also joins escapes split across a line break, as the PHP decoder does.
+//! RapidYenc-compatible C ABI for NNTmux. Payload decoding writes directly
+//! into the caller's buffer; metadata parsers expose separate JSON exports.
+//! Framing and CRC validation remain at the PHP caller boundary.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::panic::catch_unwind;
@@ -22,53 +11,42 @@ mod article_dates;
 mod article_identity;
 mod article_xref;
 mod formats;
+mod nntp_body;
+mod nntp_headers;
 mod par2;
 mod par2_source_ranges;
+mod payload_decoder;
+#[cfg(target_arch = "aarch64")]
+mod payload_decoder_arm;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod payload_decoder_x86;
 mod sample_plan;
 mod seven_zip_ranges;
+mod yenc_framing;
 
-/// nzb-decode 0.1.3, packed as RapidYenc packs its version (major << 16 | minor << 8 | patch).
+/// Historical shim version retained for callers, packed as major << 16 | minor << 8 | patch.
 const VERSION: c_int = 3 | (1 << 8);
 
 /// Returned instead of a length when decoding fails; NativePayloadDecoder rejects
 /// any length larger than its input.
 const DECODE_FAILED: usize = usize::MAX;
 
-const HEADER: &[u8] = b"=ybegin line=128 name=payload\r\n";
-const FOOTER: &[u8] = b"\r\n=yend\r\n";
 const MAX_METADATA_INPUT_BYTES: usize = 67_108_864;
 const MAX_SEVEN_ZIP_RANGE_INPUT_BYTES: usize = 16 * 1024 * 1024 + 4096;
 const MAX_PAR2_SOURCE_RANGE_INPUT_BYTES: usize = 16 * 1024 * 1024 + 16 * 1024;
 const MAX_ARTICLE_IDENTITY_INPUT_BYTES: usize = 131_072;
 const MAX_ARTICLE_XREF_INPUT_BYTES: usize = 196_608;
+const MAX_NNTP_HEADER_INPUT_BYTES: usize = 131_072;
 
 /// Decode a yEnc payload (CR/LF line endings are skipped, `=X` escapes resolved).
 pub fn decode_payload(payload: &[u8]) -> Option<Vec<u8>> {
-    let mut article = Vec::with_capacity(HEADER.len() + payload.len() + FOOTER.len());
-    article.extend_from_slice(HEADER);
-    let body_start = article.len();
-    article.extend(
-        payload
-            .iter()
-            .copied()
-            .filter(|&b| b != b'\r' && b != b'\n'),
-    );
-
-    let mut decoded = Vec::new();
-    let mut skip = body_start;
-    while article.len() >= skip + 2 && article[skip] == b'=' && article[skip + 1] == b'y' {
-        decoded.push(b'y'.wrapping_sub(106));
-        skip += 2;
-    }
-    article.drain(body_start..skip);
-    article.extend_from_slice(FOOTER);
-
-    let result = nzb_decode::decode_yenc(&article).ok()?;
-    if decoded.is_empty() {
-        return Some(result.data);
-    }
-    decoded.extend_from_slice(&result.data);
-
+    let mut decoded = Vec::with_capacity(payload.len());
+    // SAFETY: the destination has payload.len() bytes of capacity, and the
+    // decoder initializes exactly the returned number of bytes (never more).
+    let written = unsafe {
+        payload_decoder::decode_into(payload.as_ptr(), decoded.as_mut_ptr(), payload.len())
+    };
+    unsafe { decoded.set_len(written) };
     Some(decoded)
 }
 
@@ -78,6 +56,13 @@ pub extern "C" fn rapidyenc_decode_init() {}
 #[unsafe(no_mangle)]
 pub extern "C" fn rapidyenc_version() -> c_int {
     VERSION
+}
+
+/// Return 1 when raw payload decoding skips CR/LF inside escape pairs.
+/// This optional NNTmux capability leaves the RapidYenc compatibility ABI intact.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_yenc_supports_split_escapes() -> c_int {
+    1
 }
 
 /// Return PAR2 packet metadata as a newly allocated UTF-8 JSON C string.
@@ -217,6 +202,200 @@ pub unsafe extern "C" fn nntmux_par2_source_ranges_json(
     }
 }
 
+/// Return bounded, ordered yEnc control-field occurrences as UTF-8 JSON.
+/// The caller must release it with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs over the bounded parser
+/// budget are rejected by returning a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_yenc_framing_metadata_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > MAX_METADATA_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let encoded = catch_unwind(|| serde_json::to_string(&yenc_framing::parse(input)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Return bounded, ordered NNTP header-field occurrences as UTF-8 JSON.
+/// The caller must release it with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Header blocks over the parser
+/// budget are rejected by returning a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nntp_header_metadata_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > MAX_NNTP_HEADER_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let encoded = catch_unwind(|| serde_json::to_string(&nntp_headers::parse(input)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Compare two length-prefixed NNTP header blocks without collapsing
+/// duplicate field occurrences. The identity flag is -1 when unavailable,
+/// zero when response identities disagree, and one when they agree.
+///
+/// # Safety
+/// data must contain two little-endian u32-length-prefixed header blocks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nntp_header_pair_comparison_json(
+    data: *const u8,
+    length: usize,
+    identity_match: c_int,
+) -> *mut c_char {
+    if length > MAX_NNTP_HEADER_INPUT_BYTES * 2 + 8 || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees data is readable for length bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let Some((left, right)) = unpack_header_pair(input) else {
+        return ptr::null_mut();
+    };
+    let identity_match = match identity_match {
+        0 => Some(false),
+        1 => Some(true),
+        -1 => None,
+        _ => return ptr::null_mut(),
+    };
+    let encoded =
+        catch_unwind(|| serde_json::to_string(&nntp_headers::compare(left, right, identity_match)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+fn unpack_header_pair(input: &[u8]) -> Option<(&[u8], &[u8])> {
+    let left_length = usize::try_from(u32::from_le_bytes(input.get(..4)?.try_into().ok()?)).ok()?;
+    let left_end = 4usize.checked_add(left_length)?;
+    let right_length = usize::try_from(u32::from_le_bytes(
+        input
+            .get(left_end..left_end.checked_add(4)?)?
+            .try_into()
+            .ok()?,
+    ))
+    .ok()?;
+    let right_start = left_end.checked_add(4)?;
+    let right_end = right_start.checked_add(right_length)?;
+    (right_end == input.len()).then(|| (&input[4..left_end], &input[right_start..right_end]))
+}
+
+/// Return body-line framing measurements for post-dot-unstuffing NNTP BODY bytes.
+/// The caller must release the result with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs over the bounded parser
+/// budget are rejected by returning a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nntp_body_measurement_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > MAX_METADATA_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let encoded = catch_unwind(|| serde_json::to_string(&nntp_body::parse(input)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Compare a unique RFC 5536 Lines header occurrence with observed BODY framing.
+/// `data` is a little-endian u32 header length, header bytes, then body bytes.
+/// The caller must release the result with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` must be readable for `length` bytes. Inputs over the bounded parser
+/// budget are rejected by returning a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nntp_lines_body_relationship_json(
+    data: *const u8,
+    length: usize,
+) -> *mut c_char {
+    if length > MAX_NNTP_HEADER_INPUT_BYTES + 2_000_004 || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `data` is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    let Some(header_length) = input
+        .get(..4)
+        .and_then(|bytes| usize::try_from(u32::from_le_bytes(bytes.try_into().ok()?)).ok())
+    else {
+        return ptr::null_mut();
+    };
+    let Some(header_end) = 4usize.checked_add(header_length) else {
+        return ptr::null_mut();
+    };
+    let Some(headers) = input.get(4..header_end) else {
+        return ptr::null_mut();
+    };
+    if headers.len() > MAX_NNTP_HEADER_INPUT_BYTES {
+        return ptr::null_mut();
+    }
+    let Some(body) = input.get(header_end..) else {
+        return ptr::null_mut();
+    };
+    if body.len() > 2_000_000 {
+        return ptr::null_mut();
+    }
+    let encoded =
+        catch_unwind(|| serde_json::to_string(&nntp_body::compare_lines_to_body(headers, body)));
+    match encoded {
+        Ok(Ok(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
 /// Parse a v2 relationship between a requested Message-ID, protocol response
 /// lines, a HEAD field, and the mandatory Message-ID column in an OVER response.
 /// `data` is AI02 followed by five little-endian length-prefixed byte strings;
@@ -311,7 +490,7 @@ pub unsafe extern "C" fn nntmux_article_identity_json(
     overview_response_code: i32,
     overview_attempted: i32,
 ) -> *mut c_char {
-    if length > MAX_ARTICLE_IDENTITY_INPUT_BYTES || length < 4 || data.is_null() {
+    if !(4..=MAX_ARTICLE_IDENTITY_INPUT_BYTES).contains(&length) || data.is_null() {
         return ptr::null_mut();
     }
     // SAFETY: the caller guarantees `data` is readable for `length` bytes.
@@ -433,21 +612,94 @@ pub unsafe extern "C" fn rapidyenc_decode_ex(
     if src.is_null() || dest.is_null() {
         return DECODE_FAILED;
     }
-    // SAFETY: the caller guarantees `src` is readable for `src_length` bytes.
-    let input = unsafe { slice::from_raw_parts(src.cast::<u8>(), src_length) };
+    match catch_unwind(|| {
+        // SAFETY: the caller supplies readable/writable buffers of src_length.
+        unsafe { payload_decoder::decode_into(src.cast(), dest.cast(), src_length) }
+    }) {
+        Ok(written) => written,
+        Err(_) => DECODE_FAILED,
+    }
+}
 
-    match catch_unwind(|| decode_payload(input)) {
-        Ok(Some(decoded)) if decoded.len() <= src_length => {
-            // SAFETY: `dest` is writable for `src_length` bytes and `decoded` fits.
-            unsafe { ptr::copy_nonoverlapping(decoded.as_ptr(), dest.cast::<u8>(), decoded.len()) };
-            decoded.len()
+/// Decode a bounded payload span from a larger source buffer.
+///
+/// CR/LF and escape handling match `rapidyenc_decode_ex`. Only the returned
+/// number of destination bytes are written. A nonnull `crc32_output` receives
+/// the CRC-32 of those decoded bytes; null skips CRC computation.
+/// Invalid ranges, capacity, or required null pointers return `usize::MAX`
+/// without modifying the destination or CRC output. Valid empty spans return
+/// zero and set a supplied CRC output to zero.
+///
+/// # Safety
+///
+/// For nonzero `source_length`, `src` must point to an allocation readable for
+/// the whole `source_length`. For nonzero `payload_length`, `dest` must point
+/// to an allocation writable for `destination_capacity` bytes. Source and
+/// destination allocations may overlap, including in-place decoding.
+/// A nonnull `crc32_output` must be writable for four bytes, and its four-byte
+/// range must not overlap either source or destination allocation. Alignment
+/// is not required. These pointer requirements apply when validation succeeds;
+/// invalid argument combinations are rejected before any pointer access.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_yenc_decode_span_v1(
+    src: *const c_void,
+    source_length: usize,
+    payload_offset: usize,
+    payload_length: usize,
+    dest: *mut c_void,
+    destination_capacity: usize,
+    crc32_output: *mut u32,
+) -> usize {
+    if source_length > isize::MAX as usize
+        || payload_offset > source_length
+        || payload_length > source_length - payload_offset
+        || destination_capacity < payload_length
+        || (source_length > 0 && src.is_null())
+        || (payload_length > 0 && dest.is_null())
+    {
+        return DECODE_FAILED;
+    }
+    match catch_unwind(|| {
+        if payload_length == 0 {
+            if !crc32_output.is_null() {
+                // SAFETY: the caller provides four writable, disjoint bytes.
+                unsafe { crc32_output.write_unaligned(0) };
+            }
+            return 0;
         }
-        _ => DECODE_FAILED,
+        // SAFETY: validation bounds this nonempty span within the readable
+        // source allocation and ensures sufficient writable destination space.
+        let written = unsafe {
+            payload_decoder::decode_into(
+                src.cast::<u8>().add(payload_offset),
+                dest.cast(),
+                payload_length,
+            )
+        };
+        if !crc32_output.is_null() {
+            // SAFETY: the decoder initialized exactly `written` bytes, and
+            // the disjoint CRC output remains writable during this shared read.
+            let decoded = unsafe { slice::from_raw_parts(dest.cast::<u8>(), written) };
+            let crc = crc32fast::hash(decoded);
+            unsafe { crc32_output.write_unaligned(crc) };
+        }
+        written
+    }) {
+        Ok(written) => written,
+        Err(_) => DECODE_FAILED,
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rapidyenc_crc_init() {}
+
+/// Identity from the same runtime selector used by payload decoding.
+/// 0 scalar, 1 SSSE3, 2 AVX2, 3 AVX-512 VBMI2, 4 AArch64 NEON.
+/// This is decoder provenance, not evidence about the posting application.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_yenc_payload_kernel_v1() -> u32 {
+    payload_decoder::selected_kernel()
+}
 
 /// CRC-32 (the same digest as PHP's `crc32b`), continuing from `init_crc`.
 ///
@@ -475,6 +727,111 @@ pub unsafe extern "C" fn rapidyenc_crc(
 mod tests {
     use super::*;
 
+    #[test]
+    fn payload_kernel_export_reports_the_runtime_selector_without_decoding() {
+        let selected = nntmux_yenc_payload_kernel_v1();
+        assert!(selected <= 4);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(selected, 4);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if selected == 3 {
+            assert!(is_x86_feature_detected!("avx2"));
+            assert!(is_x86_feature_detected!("avx512vbmi2"));
+            assert!(is_x86_feature_detected!("avx512bw"));
+            assert!(is_x86_feature_detected!("avx512vl"));
+            assert!(is_x86_feature_detected!("popcnt"));
+        }
+        assert_eq!(decode_payload(b"klm").unwrap(), b"ABC");
+        assert_eq!(nntmux_yenc_payload_kernel_v1(), selected);
+    }
+
+    #[test]
+    fn framing_export_retains_trailer_only_part_without_single_part_authority() {
+        let body =
+            b"=ybegin line=128 size=3 name=x.rar\r\nklm\r\n=yend size=3 part=1 pcrc32=a3830348\r\n";
+        let output = unsafe { nntmux_yenc_framing_metadata_json(body.as_ptr(), body.len()) };
+        assert!(!output.is_null());
+        let json: serde_json::Value = unsafe {
+            let text = std::ffi::CStr::from_ptr(output).to_bytes();
+            let parsed = serde_json::from_slice(text);
+            nntmux_metadata_string_free(output);
+            parsed.unwrap()
+        };
+        assert_eq!(json["frames"][0]["yend_part_number"], 1);
+        assert_eq!(json["frames"][0]["multipart_pcrc32_status"], "present-hex");
+        assert_eq!(json["frames"][0]["size_relationship_status"], "incomplete");
+        assert_eq!(
+            json["frames"][0]["expected_segment_size"],
+            serde_json::Value::Null
+        );
+    }
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::ffi::CStr;
+
+    thread_local! {
+        static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct ObservedAllocator;
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: ObservedAllocator = ObservedAllocator;
+
+    unsafe impl GlobalAlloc for ObservedAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count_allocation();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            count_allocation();
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            count_allocation();
+            unsafe { System.realloc(pointer, layout, size) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    fn count_allocation() {
+        let _ = COUNT_ALLOCATIONS.try_with(|enabled| {
+            if enabled.get() {
+                let _ = ALLOCATION_COUNT.try_with(|count| count.set(count.get() + 1));
+            }
+        });
+    }
+
+    #[test]
+    fn abi_decodes_without_heap_allocation() {
+        let payload = b"klm=@=J=M=}..\x0b==";
+        let mut output = [0xcc; 32];
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
+        let written = unsafe {
+            rapidyenc_decode_ex(
+                0,
+                payload.as_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                payload.len(),
+                ptr::null_mut(),
+            )
+        };
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+        let allocations = ALLOCATION_COUNT.with(Cell::get);
+        assert_eq!(&output[..written], b"ABC\xd6\xe0\xe3\x13\x04\x04\xe1\xd3");
+        assert_eq!(
+            allocations, 0,
+            "the caller already supplies the destination buffer"
+        );
+    }
+
     fn decode_via_abi(payload: &[u8]) -> Result<Vec<u8>, usize> {
         let mut output = vec![0u8; payload.len()];
         let written = unsafe {
@@ -492,6 +849,374 @@ mod tests {
         output.truncate(written);
 
         Ok(output)
+    }
+
+    #[test]
+    fn span_abi_decodes_all_values_from_nonzero_offsets_with_optional_crc_and_exact_writes() {
+        let original: Vec<u8> = (0..=255).cycle().take(4096).collect();
+        let mut payload = Vec::new();
+        for &byte in &original {
+            let encoded = byte.wrapping_add(42);
+            if matches!(encoded, 0 | 10 | 13 | 61) {
+                payload.extend_from_slice(&[b'=', b'\r', b'\n', encoded.wrapping_add(64)]);
+            } else {
+                payload.push(encoded);
+            }
+            if payload.len() % 31 == 0 {
+                payload.extend_from_slice(b"\r\n");
+            }
+        }
+        let mut source = b"unselected prefix=".to_vec();
+        let offset = source.len();
+        source.extend_from_slice(&payload);
+        source.extend_from_slice(b"unselected suffix=");
+        for alignment in 0..32 {
+            for with_crc in [false, true] {
+                let mut output = vec![0xa5; payload.len() + 64];
+                let mut crc = 0xa1b2_c3d4;
+                let written = unsafe {
+                    nntmux_yenc_decode_span_v1(
+                        source.as_ptr().cast(),
+                        source.len(),
+                        offset,
+                        payload.len(),
+                        output.as_mut_ptr().add(alignment).cast(),
+                        payload.len(),
+                        if with_crc { &mut crc } else { ptr::null_mut() },
+                    )
+                };
+                assert_eq!(written, original.len());
+                assert_eq!(&output[alignment..alignment + written], &original);
+                assert!(output[..alignment].iter().all(|&byte| byte == 0xa5));
+                assert!(
+                    output[alignment + written..]
+                        .iter()
+                        .all(|&byte| byte == 0xa5)
+                );
+                assert_eq!(
+                    crc,
+                    if with_crc {
+                        crc32fast::hash(&original)
+                    } else {
+                        0xa1b2_c3d4
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn span_abi_rejects_invalid_arguments_without_writing_destination_or_crc() {
+        let source = b"klm";
+        let cases = [
+            (
+                source.len(),
+                source.len() + 1,
+                0,
+                source.len(),
+                false,
+                false,
+            ),
+            (source.len(), source.len(), 1, source.len(), false, false),
+            (source.len(), 1, source.len(), source.len(), false, false),
+            (
+                source.len(),
+                0,
+                source.len(),
+                source.len() - 1,
+                false,
+                false,
+            ),
+            (source.len(), usize::MAX, 0, source.len(), false, false),
+            (source.len(), 0, usize::MAX, usize::MAX, false, false),
+            (usize::MAX, 0, 0, 0, false, false),
+            (isize::MAX as usize + 1, 0, 0, 0, false, false),
+            (source.len(), 0, 0, 0, true, false),
+            (source.len(), 0, source.len(), source.len(), false, true),
+            (0, 1, 0, 0, true, true),
+            (0, 0, 1, 1, true, false),
+        ];
+        for (source_length, offset, length, capacity, null_source, null_destination) in cases {
+            let mut output = [0xa5; 8];
+            let mut crc = 0xa1b2_c3d4;
+            let written = unsafe {
+                nntmux_yenc_decode_span_v1(
+                    if null_source {
+                        ptr::null()
+                    } else {
+                        source.as_ptr().cast()
+                    },
+                    source_length,
+                    offset,
+                    length,
+                    if null_destination {
+                        ptr::null_mut()
+                    } else {
+                        output.as_mut_ptr().cast()
+                    },
+                    capacity,
+                    &mut crc,
+                )
+            };
+            assert_eq!(
+                written, DECODE_FAILED,
+                "source {source_length}, offset {offset}, length {length}, capacity {capacity}"
+            );
+            assert_eq!(output, [0xa5; 8]);
+            assert_eq!(crc, 0xa1b2_c3d4);
+        }
+    }
+
+    #[test]
+    fn span_abi_accepts_empty_spans_and_initializes_only_requested_crc() {
+        let source = b"prefix";
+        for (pointer, source_length, offset) in [
+            (ptr::null(), 0, 0),
+            (source.as_ptr().cast(), source.len(), 0),
+            (source.as_ptr().cast(), source.len(), source.len()),
+        ] {
+            let mut crc = 0xa1b2_c3d4;
+            let written = unsafe {
+                nntmux_yenc_decode_span_v1(
+                    pointer,
+                    source_length,
+                    offset,
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut crc,
+                )
+            };
+            assert_eq!(written, 0);
+            assert_eq!(crc, 0);
+            assert_eq!(
+                unsafe {
+                    nntmux_yenc_decode_span_v1(
+                        pointer,
+                        source_length,
+                        offset,
+                        0,
+                        ptr::null_mut(),
+                        0,
+                        ptr::null_mut(),
+                    )
+                },
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn span_abi_preserves_lenient_split_escape_and_dangling_marker_semantics() {
+        for (payload, expected) in [
+            (b"klm\r\n".as_slice(), b"ABC".as_slice()),
+            (b"k=\r\n@", b"A\xd6"),
+            (b"=\r\n=\n=\r=", b"\xd3\xd3"),
+            (b"k=\r\n", b"A\x13"),
+            (b"\r\n\r\n", b""),
+        ] {
+            let mut source = b"prefix".to_vec();
+            let offset = source.len();
+            source.extend_from_slice(payload);
+            source.extend_from_slice(b"suffix");
+            let mut output = [0xa5; 32];
+            let mut crc = 0;
+            let written = unsafe {
+                nntmux_yenc_decode_span_v1(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    offset,
+                    payload.len(),
+                    output.as_mut_ptr().cast(),
+                    output.len(),
+                    &mut crc,
+                )
+            };
+            assert_eq!(written, expected.len());
+            assert_eq!(&output[..written], expected);
+            assert!(output[written..].iter().all(|&byte| byte == 0xa5));
+            assert_eq!(crc, crc32fast::hash(expected));
+        }
+    }
+
+    #[test]
+    fn span_abi_supports_both_overlap_directions_and_in_place_exact_writes() {
+        let payload = [b"klm=@=J=M=}\r\n".repeat(9), b"=\r\n@===".to_vec()].concat();
+        let expected = decode_via_abi(&payload).unwrap();
+        for destination_start in [16, 40, 41, 63] {
+            let mut storage = vec![0xa5; payload.len() + 128];
+            storage[40..40 + payload.len()].copy_from_slice(&payload);
+            let before = storage.clone();
+            let mut crc = 0;
+            let written = unsafe {
+                nntmux_yenc_decode_span_v1(
+                    storage.as_ptr().cast(),
+                    storage.len(),
+                    40,
+                    payload.len(),
+                    storage.as_mut_ptr().add(destination_start).cast(),
+                    payload.len(),
+                    &mut crc,
+                )
+            };
+            assert_eq!(written, expected.len());
+            assert_eq!(
+                &storage[destination_start..destination_start + written],
+                &expected
+            );
+            assert_eq!(&storage[..destination_start], &before[..destination_start]);
+            assert_eq!(
+                &storage[destination_start + written..],
+                &before[destination_start + written..]
+            );
+            assert_eq!(crc, crc32fast::hash(&expected));
+        }
+    }
+
+    #[test]
+    fn span_abi_uses_no_heap_allocation_for_disjoint_buffers_even_with_crc() {
+        let payload = b"klm=@=J=M=}..\x0b==";
+        for with_crc in [false, true] {
+            let mut output = [0xa5; 32];
+            let mut crc = 0;
+            ALLOCATION_COUNT.with(|count| count.set(0));
+            COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
+            let written = unsafe {
+                nntmux_yenc_decode_span_v1(
+                    payload.as_ptr().cast(),
+                    payload.len(),
+                    0,
+                    payload.len(),
+                    output.as_mut_ptr().cast(),
+                    output.len(),
+                    if with_crc { &mut crc } else { ptr::null_mut() },
+                )
+            };
+            COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+            let allocations = ALLOCATION_COUNT.with(Cell::get);
+            assert_eq!(written, 11);
+            assert_eq!(allocations, 0);
+        }
+    }
+
+    #[test]
+    fn span_abi_writes_unaligned_crc_without_touching_adjacent_bytes() {
+        let payload = b"klm";
+        let mut output = [0xa5; 8];
+        let mut crc_storage = [0xa5; 8];
+        let crc_pointer = unsafe { crc_storage.as_mut_ptr().add(1).cast::<u32>() };
+        let written = unsafe {
+            nntmux_yenc_decode_span_v1(
+                payload.as_ptr().cast(),
+                payload.len(),
+                0,
+                payload.len(),
+                output.as_mut_ptr().cast(),
+                output.len(),
+                crc_pointer,
+            )
+        };
+        assert_eq!(written, 3);
+        assert_eq!(&output[..written], b"ABC");
+        assert!(output[written..].iter().all(|&byte| byte == 0xa5));
+        assert_eq!(
+            unsafe { crc_pointer.read_unaligned() },
+            crc32fast::hash(b"ABC")
+        );
+        assert_eq!(crc_storage[0], 0xa5);
+        assert_eq!(&crc_storage[5..], &[0xa5; 3]);
+    }
+
+    #[test]
+    fn exposes_iso_character_set_declaration_through_ffi() {
+        let offset = 16 * 2048;
+        let mut sample = vec![0u8; offset + 2048];
+        sample[offset] = 2;
+        sample[offset + 1..offset + 6].copy_from_slice(b"CD001");
+        sample[offset + 6] = 1;
+        sample[offset + 88..offset + 91].copy_from_slice(b"%/E");
+        sample[offset + 881] = 1;
+        let pointer = unsafe { nntmux_format_metadata_json(sample.as_ptr(), sample.len()) };
+        assert!(!pointer.is_null());
+        let json = unsafe { CStr::from_ptr(pointer) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { nntmux_metadata_string_free(pointer) };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sequence = &parsed["iso_descriptor_sequence"];
+        assert_eq!(sequence["status"], "sample_truncated");
+        assert_eq!(sequence["image_origin_known"], false);
+        assert_eq!(sequence["descriptors"][0]["offset"], offset);
+        assert_eq!(
+            sequence["descriptors"][0]["character_set_declaration"]["recognized_character_set"],
+            "ucs2_be"
+        );
+        assert_eq!(
+            sequence["descriptors"][0]["character_set_declaration"]["joliet_prefix_level_observed"],
+            3
+        );
+    }
+
+    #[test]
+    fn exposes_ordered_provider_header_comparison_through_ffi() {
+        let left = b"X-Test: a\r\nX-Test: b\r\n\r\n";
+        let right = b"X-Test: a, b\r\n\r\n";
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&(left.len() as u32).to_le_bytes());
+        packed.extend_from_slice(left);
+        packed.extend_from_slice(&(right.len() as u32).to_le_bytes());
+        packed.extend_from_slice(right);
+        let pointer =
+            unsafe { nntmux_nntp_header_pair_comparison_json(packed.as_ptr(), packed.len(), 1) };
+        assert!(!pointer.is_null());
+        let json = unsafe { CStr::from_ptr(pointer) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { nntmux_metadata_string_free(pointer) };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["same_article_comparison_status"],
+            "eligible_same_article"
+        );
+        assert_eq!(parsed["fields"][0]["left_occurrence_count"], 2);
+        assert_eq!(parsed["fields"][0]["right_occurrence_count"], 1);
+        assert_eq!(parsed["fields"][0]["unfolded_value_hashes_match"], false);
+    }
+
+    #[test]
+    fn exposes_lines_body_relationship_through_ffi() {
+        let headers = b"Lines: 2\r\n\r\n";
+        let body = b"a\r\n\r\n";
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+        packed.extend_from_slice(headers);
+        packed.extend_from_slice(body);
+        let pointer =
+            unsafe { nntmux_nntp_lines_body_relationship_json(packed.as_ptr(), packed.len()) };
+        assert!(!pointer.is_null());
+        let json = unsafe { CStr::from_ptr(pointer) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { nntmux_metadata_string_free(pointer) };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["status"], "match");
+        assert_eq!(parsed["declared_body_line_count"], 2);
+        assert_eq!(parsed["observed_body_line_count"], 2);
+    }
+
+    #[test]
+    fn rejects_over_budget_lines_body_headers_at_the_ffi_boundary() {
+        let headers = vec![b'x'; MAX_NNTP_HEADER_INPUT_BYTES + 1];
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+        packed.extend_from_slice(&headers);
+        packed.extend_from_slice(b"body\r\n");
+        let pointer =
+            unsafe { nntmux_nntp_lines_body_relationship_json(packed.as_ptr(), packed.len()) };
+        assert!(pointer.is_null());
     }
 
     #[test]
@@ -551,6 +1276,19 @@ mod tests {
     }
 
     #[test]
+    fn advertised_split_escape_capability_matches_abi_decoding() {
+        assert_eq!(nntmux_yenc_supports_split_escapes(), 1);
+        for payload in [b"=\n@".as_slice(), b"=\r@", b"=\r\n\r\n@", b"=\r\n=\n=\r="] {
+            let expected = if payload.ends_with(b"@") {
+                b"\xd6".as_slice()
+            } else {
+                b"\xd3\xd3".as_slice()
+            };
+            assert_eq!(decode_via_abi(payload).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn decodes_empty_input_to_nothing() {
         assert_eq!(decode_via_abi(b"").unwrap(), b"");
     }
@@ -573,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_the_nzb_decode_version() {
+    fn reports_the_compatible_shim_version() {
         assert_eq!(rapidyenc_version(), 0x0103);
     }
     #[test]

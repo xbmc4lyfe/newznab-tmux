@@ -247,15 +247,14 @@ fn unpack_lines(
     (cursor == data.len()).then_some(lines)
 }
 
-fn parse_overview_format<'a>(
-    data: Option<&'a [u8]>,
-    response_code: i32,
-) -> (
+type ParsedOverviewFormat<'a> = (
     &'static str,
     &'static str,
     Vec<&'a [u8]>,
     Vec<(usize, bool)>,
-) {
+);
+
+fn parse_overview_format(data: Option<&[u8]>, response_code: i32) -> ParsedOverviewFormat<'_> {
     if response_code != 215 {
         return (
             if response_code < 0 {

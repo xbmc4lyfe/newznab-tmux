@@ -5,17 +5,32 @@ declare(strict_types=1);
 namespace App\Services\Yenc;
 
 use FFI;
+use FFI\CData;
 use FFI\Exception as FfiException;
 use RuntimeException;
 
 final class NativePayloadDecoder implements RawPayloadDecoder
 {
-    /** @var array<string, array{decoder: FFI, crc: FFI|null}> */
+    private const MAX_SPAN_OUTPUT_CAPACITY = 65_536;
+
+    /** @var array<string, array{decoder: FFI, crc: FFI|null, split_escapes: bool, span: FFI|null}> */
     private static array $libraries = [];
 
     private readonly FFI $library;
 
     private readonly ?FFI $crcLibrary;
+
+    private readonly bool $splitEscapesSupported;
+
+    private readonly ?FFI $spanLibrary;
+
+    private ?CData $spanOutput = null;
+
+    private int $spanOutputCapacity = 0;
+
+    private ?CData $spanCrc = null;
+
+    private bool $spanBuffersBorrowed = false;
 
     public function __construct(string $path)
     {
@@ -32,6 +47,8 @@ final class NativePayloadDecoder implements RawPayloadDecoder
         if (isset(self::$libraries[$key])) {
             $this->library = self::$libraries[$key]['decoder'];
             $this->crcLibrary = self::$libraries[$key]['crc'];
+            $this->splitEscapesSupported = self::$libraries[$key]['split_escapes'];
+            $this->spanLibrary = self::$libraries[$key]['span'];
 
             return;
         }
@@ -49,12 +66,95 @@ final class NativePayloadDecoder implements RawPayloadDecoder
         if ($this->crcLibrary !== null && $this->crc32('ABC') !== 'a3830348') {
             throw new RuntimeException('RapidYenc failed its CRC32 known-answer check.');
         }
-        self::$libraries[$key] = ['decoder' => $this->library, 'crc' => $this->crcLibrary];
+        $this->splitEscapesSupported = $this->detectSplitEscapeSupport($resolved);
+        $this->spanLibrary = $this->loadSpanLibrary($resolved);
+        self::$libraries[$key] = [
+            'decoder' => $this->library,
+            'crc' => $this->crcLibrary,
+            'split_escapes' => $this->splitEscapesSupported,
+            'span' => $this->spanLibrary,
+        ];
+    }
+
+    public function __clone(): void
+    {
+        // FFI handles may be shared; mutable scratch storage belongs to one decoder.
+        $this->spanOutput = null;
+        $this->spanOutputCapacity = 0;
+        $this->spanCrc = null;
+        $this->spanBuffersBorrowed = false;
     }
 
     public function decode(string $payload): string
     {
         return $this->decodeRaw($payload);
+    }
+
+    public function supportsSplitEscapes(): bool
+    {
+        return $this->splitEscapesSupported;
+    }
+
+    /** @return array{decoded: string, crc32: string|null}|null */
+    public function decodeSpan(string $source, int $payloadOffset, int $payloadLength, bool $withCrc): ?array
+    {
+        // Capability absence selects the legacy path without inspecting a span.
+        if ($this->spanLibrary === null) {
+            return null;
+        }
+        $sourceLength = strlen($source);
+        if ($payloadOffset < 0 || $payloadLength < 0 || $payloadOffset > $sourceLength
+            || $payloadLength > $sourceLength - $payloadOffset) {
+            throw new RuntimeException('Invalid yEnc payload span.');
+        }
+
+        $cacheBuffers = ! $this->spanBuffersBorrowed;
+        if ($cacheBuffers) {
+            $this->spanBuffersBorrowed = true;
+        }
+        try {
+            // Keep verified calls here to avoid a helper frame and repeated strlen.
+            // Signal handlers can reenter before copyout; nested buffers stay transient.
+            $output = null;
+            if ($payloadLength > 0) {
+                if ($cacheBuffers && $payloadLength <= self::MAX_SPAN_OUTPUT_CAPACITY) {
+                    if ($this->spanOutputCapacity < $payloadLength) {
+                        $capacity = max(256, $this->spanOutputCapacity);
+                        while ($capacity < $payloadLength) {
+                            $capacity *= 2;
+                        }
+                        $this->spanOutput = $this->spanLibrary->new("char[{$capacity}]");
+                        $this->spanOutputCapacity = $capacity;
+                    }
+                    $output = $this->spanOutput;
+                } else {
+                    $output = $this->spanLibrary->new("char[{$payloadLength}]");
+                }
+            }
+            $crc = null;
+            if ($withCrc) {
+                $crc = $cacheBuffers
+                    ? ($this->spanCrc ??= $this->spanLibrary->new('uint32_t[1]'))
+                    : $this->spanLibrary->new('uint32_t[1]');
+            }
+            /** @var int $written */
+            $written = $this->spanLibrary->nntmux_yenc_decode_span_v1( // @phpstan-ignore method.notFound
+                $source, $sourceLength, $payloadOffset, $payloadLength, $output, $payloadLength,
+                $crc,
+            );
+            if ($written < 0 || $written > $payloadLength) {
+                throw new RuntimeException('RapidYenc returned an invalid decoded length.');
+            }
+
+            return [
+                'decoded' => $output === null ? '' : FFI::string($output, $written),
+                'crc32' => $crc === null ? null : str_pad(dechex($crc[0]), 8, '0', STR_PAD_LEFT),
+            ];
+        } finally {
+            if ($cacheBuffers) {
+                $this->spanBuffersBorrowed = false;
+            }
+        }
     }
 
     public function decodeRaw(string $payload): string
@@ -96,6 +196,78 @@ final class NativePayloadDecoder implements RawPayloadDecoder
         $version = $this->library->rapidyenc_version(); // @phpstan-ignore method.notFound
 
         return sprintf('%d.%d.%d', ($version >> 16) & 0xFF, ($version >> 8) & 0xFF, $version & 0xFF);
+    }
+
+    private function detectSplitEscapeSupport(string $path): bool
+    {
+        try {
+            $capability = FFI::cdef('int nntmux_yenc_supports_split_escapes(void);', $path);
+        } catch (FfiException $exception) {
+            if ($exception->getMessage() !== "Failed resolving C function 'nntmux_yenc_supports_split_escapes'") {
+                throw $exception;
+            }
+
+            return false;
+        }
+        if ($capability->nntmux_yenc_supports_split_escapes() !== 1) { // @phpstan-ignore method.notFound
+            return false;
+        }
+        try {
+            return $this->decodeRaw("k=\r\n\r\n@l=\nJm=\rM=\r\n=\n=\r=") === "A\xd6B\xe0C\xe3\xd3\xd3";
+        } catch (RuntimeException) {
+            return false;
+        }
+    }
+
+    private function loadSpanLibrary(string $path): ?FFI
+    {
+        try {
+            $library = FFI::cdef(<<<'C'
+                size_t nntmux_yenc_decode_span_v1(const void* src, size_t source_length,
+                    size_t payload_offset, size_t payload_length, void* dest,
+                    size_t destination_capacity, uint32_t* crc32_output);
+                C, $path);
+        } catch (FfiException $exception) {
+            if ($exception->getMessage() !== "Failed resolving C function 'nntmux_yenc_decode_span_v1'") {
+                throw $exception;
+            }
+
+            return null;
+        }
+        try {
+            $source = "ignore|k=\r\n@lm|not-payload";
+            if ($this->decodeSpanWithLibrary($library, $source, 7, 7, true)
+                !== ['decoded' => "A\xd6BC", 'crc32' => 'a672946b']
+                || $this->decodeSpanWithLibrary($library, $source, 7, 7, false)
+                !== ['decoded' => "A\xd6BC", 'crc32' => null]) {
+                return null;
+            }
+        } catch (RuntimeException) {
+            return null;
+        }
+
+        return $library;
+    }
+
+    /** @return array{decoded: string, crc32: string|null} */
+    private function decodeSpanWithLibrary(FFI $library, string $source, int $payloadOffset, int $payloadLength, bool $withCrc): array
+    {
+        // Cold capability probes never publish or borrow mutable instance storage.
+        $output = $payloadLength > 0 ? $library->new("char[{$payloadLength}]") : null;
+        $crc = $withCrc ? $library->new('uint32_t[1]') : null;
+        /** @var int $written */
+        $written = $library->nntmux_yenc_decode_span_v1( // @phpstan-ignore method.notFound
+            $source, strlen($source), $payloadOffset, $payloadLength, $output, $payloadLength,
+            $crc,
+        );
+        if ($written < 0 || $written > $payloadLength) {
+            throw new RuntimeException('RapidYenc returned an invalid decoded length.');
+        }
+
+        return [
+            'decoded' => $output === null ? '' : FFI::string($output, $written),
+            'crc32' => $crc === null ? null : str_pad(dechex($crc[0]), 8, '0', STR_PAD_LEFT),
+        ];
     }
 
     private function loadCrcLibrary(string $path): ?FFI
