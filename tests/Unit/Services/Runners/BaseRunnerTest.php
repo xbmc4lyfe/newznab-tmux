@@ -5,9 +5,12 @@ declare(strict_types=1);
 namespace Tests\Unit\Services\Runners;
 
 use App\Services\Runners\BaseRunner;
+use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use PHPUnit\Framework\Attributes\Test;
 use RuntimeException;
+use Tests\Support\ConfigurationTestBuilder;
 use Tests\TestCase;
 
 class BaseRunnerTest extends TestCase
@@ -145,6 +148,110 @@ class BaseRunnerTest extends TestCase
     }
 
     #[Test]
+    public function cooperative_drain_finishes_active_workers_and_leaves_queued_work_unstarted(): void
+    {
+        if (! function_exists('pcntl_signal') || ! function_exists('posix_kill')) {
+            $this->markTestSkipped('POSIX signals are unavailable.');
+        }
+        $runner = new BaseRunnerTestDouble;
+        $marker = tempnam(sys_get_temp_dir(), 'nntmux-drain-');
+        $this->assertNotFalse($marker);
+        try {
+            $results = $runner->pool([
+                'active' => [PHP_BINARY, '-r', 'usleep(100000); posix_kill(posix_getppid(), SIGUSR1); usleep(200000); echo "completed"; file_put_contents($argv[1], "active");', $marker],
+                'queued' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "queued");', $marker],
+            ], 1, 5);
+            $this->assertSame(['active' => 'completed'], $results);
+            $this->assertSame('active', file_get_contents($marker));
+            $this->assertSame('drained', $runner->outcomes()['queued']['status']);
+            $this->assertSame(['active'], $runner->started);
+            $this->assertSame(['active' => 'completed'], $runner->completed);
+            $this->assertTrue($runner->draining());
+        } finally {
+            unlink($marker);
+        }
+    }
+
+    #[Test]
+    public function a_paused_pool_launches_nothing_and_reports_every_task_as_drained(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['stop_requested' => true]);
+        $runner = new BaseRunnerTestDouble;
+        $marker = tempnam(sys_get_temp_dir(), 'nntmux-paused-');
+        $this->assertNotFalse($marker);
+        try {
+            $this->assertSame([], $runner->pool(['queued' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "started");', $marker]], 1, 5));
+            $this->assertSame('', file_get_contents($marker));
+            $this->assertSame([], $runner->started);
+            $this->assertSame('drained', $runner->outcomes()['queued']['status']);
+            $this->assertTrue($runner->draining());
+        } finally {
+            unlink($marker);
+        }
+    }
+
+    #[Test]
+    public function drain_signal_during_runtime_poll_cannot_be_overwritten_by_a_false_database_flag(): void
+    {
+        if (! function_exists('pcntl_signal') || ! function_exists('posix_kill')) {
+            $this->markTestSkipped('POSIX signals are unavailable.');
+        }
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['stop_requested' => false]);
+        $sent = false;
+        DB::listen(function (QueryExecuted $query) use (&$sent): void {
+            if (! $sent && str_starts_with($query->sql, 'select') && str_contains($query->sql, 'processing_runtime_states')) {
+                $sent = true;
+                posix_kill(getmypid(), SIGUSR1);
+            }
+        });
+        $runner = new BaseRunnerTestDouble;
+        $marker = tempnam(sys_get_temp_dir(), 'nntmux-drain-race-');
+        $this->assertNotFalse($marker);
+        try {
+            $results = $runner->pool([
+                'queued' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "started");', $marker],
+            ], 1, 5);
+
+            $this->assertTrue($sent);
+            $this->assertSame([], $results);
+            $this->assertSame('', file_get_contents($marker));
+            $this->assertSame([], $runner->started);
+            $this->assertSame('drained', $runner->outcomes()['queued']['status']);
+            $this->assertTrue($runner->draining());
+        } finally {
+            unlink($marker);
+        }
+    }
+
+    #[Test]
+    public function shared_group_workers_are_serialized_while_other_groups_fill_free_slots(): void
+    {
+        $runner = new class extends BaseRunnerTestDouble
+        {
+            protected function workerConcurrencyKey(string|int $key): string|int|null
+            {
+                return explode(':', (string) $key)[0];
+            }
+        };
+        $marker = tempnam(sys_get_temp_dir(), 'nntmux-groups-');
+        $this->assertNotFalse($marker);
+        $command = static fn (string $name, int $delay): array => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "start:".$argv[2]."\n", FILE_APPEND); usleep((int) $argv[3]); file_put_contents($argv[1], "finish:".$argv[2]."\n", FILE_APPEND);', $marker, $name, (string) $delay];
+        try {
+            $runner->pool(['a:1' => $command('a:1', 400000), 'a:2' => $command('a:2', 50000), 'b:1' => $command('b:1', 100000), 'c:1' => $command('c:1', 100000)], 2, 5);
+            $events = file_get_contents($marker);
+            $this->assertLessThan(strpos($events, 'start:a:2'), strpos($events, 'finish:a:1'));
+            $this->assertLessThan(strpos($events, 'finish:a:1'), strpos($events, 'start:c:1'));
+            $this->assertSame(['a:1', 'b:1', 'c:1', 'a:2'], $runner->started);
+        } finally {
+            unlink($marker);
+        }
+    }
+
+    #[Test]
     public function legacy_worker_commands_preserve_arguments_without_shell_interpolation(): void
     {
         $group = 'alt.test; literal "quote" $(literal)';
@@ -173,6 +280,27 @@ class BaseRunnerTest extends TestCase
 
 class BaseRunnerTestDouble extends BaseRunner
 {
+    /** @var list<string|int> */
+    public array $started = [];
+
+    /** @var array<string|int, string> */
+    public array $completed = [];
+
+    protected function workerStarting(string|int $key): void
+    {
+        $this->started[] = $key;
+    }
+
+    protected function workerCompleted(string|int $key, string $output): void
+    {
+        $this->completed[$key] = $output;
+    }
+
+    public function draining(): bool
+    {
+        return $this->hasDrainRequest();
+    }
+
     public function runCommand(string $command): string
     {
         return $this->executeCommand($command);

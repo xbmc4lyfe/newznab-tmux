@@ -336,6 +336,9 @@ final class ReleaseProcessingService
         $nzbFilesAdded = $limit;
 
         do {
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                break;
+            }
             $windowIds = [];
             $selectedReader = null;
             while ($windowsProcessed < self::COLLECTION_WINDOWS_PER_PASS
@@ -405,6 +408,9 @@ final class ReleaseProcessingService
         if ($groupId <= 0) {
             throw new \InvalidArgumentException('Ready release processing requires a positive group ID.');
         }
+        if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            return ['releases' => 0, 'nzbs' => 0, 'dupes' => 0, 'iterations' => 0];
+        }
         $limit = min(self::READY_WINDOW_SIZE, max(1, $this->settings->releaseCreationLimit));
         $cursorKey = self::READY_WINDOW_CURSOR_PREFIX.$groupId;
         $savedState = Cache::get($cursorKey);
@@ -443,10 +449,16 @@ final class ReleaseProcessingService
         $totals = $this->hasReleaseCreationWork($groupId)
             ? $this->processReleaseCreationBatches($groupId, $afterCreation)
             : ['releases' => 0, 'nzbs' => 0, 'dupes' => 0, 'iterations' => 0];
+        if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            return $totals;
+        }
         $windowSize = max(1, min(self::BATCH_SIZE, $this->settings->releaseCreationLimit));
 
         $this->processIncompleteCollections($groupId, function (array $ids) use ($groupId, $windowSize, $afterCreation, &$totals): void {
             foreach (array_chunk($ids, $windowSize) as $windowIds) {
+                if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                    return;
+                }
                 $readyIds = Collection::query()->whereIn('id', $windowIds)
                     ->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
                     ->when($groupId !== null, static fn ($q) => $q->where('groups_id', $groupId))
@@ -464,6 +476,10 @@ final class ReleaseProcessingService
                 $totals['iterations']++;
             }
         });
+
+        if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            return $totals;
+        }
 
         // Preserve the final sweep for collections completed concurrently by ingestion,
         // and the normal cursor/NZB retry behavior after preparation finishes.
@@ -735,6 +751,9 @@ final class ReleaseProcessingService
         $this->outputSubHeader('Finding Complete Collections');
 
         $normalizedGroupId = $this->normalizeGroupId($groupID);
+        if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            return;
+        }
         $this->processStuckCollections($normalizedGroupId ?? 0);
         $this->reconcileIncompleteCollections($normalizedGroupId, $afterReconciliation);
 
@@ -757,6 +776,9 @@ final class ReleaseProcessingService
         $lastId = 0;
         $normalizedGroupId = $this->normalizeGroupId($groupID);
         do {
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                break;
+            }
             $query = Collection::query()
                 ->where('id', '>', $lastId)
                 ->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
@@ -797,6 +819,9 @@ final class ReleaseProcessingService
         ];
 
         do {
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                break;
+            }
             $ids = $this->withCollectionReconciliationBarrier(function () use ($lastId, $groupId, $statuses): array {
                 $query = Collection::query()
                     ->where('id', '>', $lastId)

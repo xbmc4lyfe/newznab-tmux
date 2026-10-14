@@ -67,6 +67,28 @@ class ReleaseCollectionWindowTest extends TestCase
         return ['one group' => [1, [5, 9]], 'all groups' => [null, [5, 7, 9]]];
     }
 
+    public function test_drain_yields_after_a_completed_collection_window_and_resumes_the_persisted_cursor(): void
+    {
+        foreach (range(1, 12) as $id) {
+            $this->insertCollection($id);
+        }
+        ConfigurationTestBuilder::updateRuntime(['stop_requested' => false]);
+        $creation = new WindowTestReleaseCreationService;
+        $service = $this->service($creation);
+        $totals = $service->processReleaseCreationBatches(1, static function (): void {
+            ConfigurationTestBuilder::updateRuntime(['stop_requested' => true]);
+        });
+
+        $this->assertSame(1, $totals['iterations']);
+        $this->assertSame([1, 2, 3], DB::table('releases')->orderBy('id')->pluck('id')->all());
+        $this->assertIsArray(Cache::get('cbp:release-priority-window:cursor:group:1'));
+        ConfigurationTestBuilder::updateRuntime(['stop_requested' => false]);
+        $resumed = new WindowTestReleaseCreationService;
+        $this->service($resumed)->processReleaseCreationBatches(1);
+        $this->assertSame(range(1, 12), DB::table('releases')->orderBy('id')->pluck('id')->all());
+        $this->assertSame(1, count(array_filter(array_merge($creation->windows, $resumed->windows), static fn (array $ids): bool => in_array(1, $ids, true))));
+    }
+
     /** @param list<int> $expected */
     #[DataProvider('groupScopes')]
     public function test_invalid_only_windows_do_not_stop_later_valid_releases_or_drain_every_invalid_row_first(?int $groupId, array $expected): void
@@ -447,6 +469,31 @@ class ReleaseCollectionWindowTest extends TestCase
     }
 
     #[DataProvider('processingCommands')]
+    public function test_group_commands_yield_before_retention_cleanup_when_the_collection_window_requests_drain(string $commandClass): void
+    {
+        foreach (range(1, 12) as $id) {
+            $this->insertCollection($id);
+        }
+        $creation = new WindowTestReleaseCreationService;
+        $creation->drainAfterWindow = true;
+        $command = new $commandClass($this->service($creation));
+        $method = $command instanceof ProcessReleasesCommand ? 'processReleasesForGroup' : 'processReleases';
+        (new ReflectionMethod($command, $method))->invoke($command, '1');
+
+        $this->assertSame([1, 2, 3], DB::table('releases')->orderBy('id')->pluck('id')->all());
+        $this->assertSame(12, DB::table('collections')->count(), 'Retention must not start after the completed window requests drain.');
+    }
+
+    public function test_a_paused_maintenance_worker_does_not_enter_cleanup_or_categorization(): void
+    {
+        ConfigurationTestBuilder::updateRuntime(['stop_requested' => true]);
+        $creation = new WindowTestReleaseCreationService;
+        $this->app->instance(ReleaseProcessingService::class, $this->service($creation));
+        $this->artisan('releases:process --maintenance-only')->assertExitCode(0);
+        $this->assertSame([], $creation->windows);
+    }
+
+    #[DataProvider('processingCommands')]
     public function test_group_command_paths_create_a_valid_window_before_the_invalid_tail_is_drained(string $commandClass): void
     {
         $this->seedMixedCollections();
@@ -817,6 +864,8 @@ class WindowTestReleaseCreationService extends ReleaseCreationService
 
     public bool $createdBeforeTailCleanup = false;
 
+    public bool $drainAfterWindow = false;
+
     public function __construct(private readonly ?int $failedId = null, private readonly bool $failAll = false) {}
 
     public function createReleases(int|string|null $groupID, int $limit, bool $echoCLI, ?array $allowedIds = null): array
@@ -840,6 +889,10 @@ class WindowTestReleaseCreationService extends ReleaseCreationService
             if ($this->checkTailAtCreation && $collection->id === 5 && DB::table('collections')->where('id', 10)->exists()) {
                 $this->createdBeforeTailCleanup = true;
             }
+        }
+
+        if ($this->drainAfterWindow) {
+            ConfigurationTestBuilder::updateRuntime(['stop_requested' => true]);
         }
 
         return ['added' => $added, 'dupes' => 0];

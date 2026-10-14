@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\IRCScraper;
 use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Services\Predb\Irc\IrcNetworks;
@@ -109,6 +110,8 @@ class IrcScraperCommand extends Command
                     app(PredbFeedImporter::class),
                     $silent,
                 ))->run();
+
+                return self::SUCCESS;
             }
 
             new IRCScraper($silent, $debug, $network);
@@ -142,11 +145,17 @@ class IrcScraperCommand extends Command
         /** @var array<string, int> $failures */
         $failures = array_fill_keys($networks, 0);
 
-        while (true) { // @phpstan-ignore while.alwaysTrue
+        while (true) {
+            $draining = app(ProcessingRuntimeStateRepository::class)->stopRequested();
             foreach ($networks as $network) {
                 $process = $running[$network] ?? null;
 
                 if ($process !== null && ! $process->isRunning()) {
+                    if ($draining) {
+                        unset($running[$network]);
+
+                        continue;
+                    }
                     $healthy = time() - ($startedAt[$network] ?? time()) >= self::HEALTHY_RUN_SECONDS;
                     $failures[$network] = $healthy ? 1 : $failures[$network] + 1;
                     $delay = self::restartDelay($failures[$network]);
@@ -155,10 +164,14 @@ class IrcScraperCommand extends Command
                     $restartAt[$network] = time() + $delay;
                 }
 
-                if (! isset($running[$network]) && time() >= $restartAt[$network]) {
+                if (! $draining && ! isset($running[$network]) && time() >= $restartAt[$network]) {
                     $running[$network] = $this->startChild($network);
                     $startedAt[$network] = time();
                 }
+            }
+
+            if ($draining && $running === []) {
+                return self::SUCCESS;
             }
 
             sleep(1);

@@ -9,6 +9,8 @@ use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Tmux\CollectionDowntimeCompensator;
+use DariusIII\NetNntp\Error as NntpError;
+use DariusIII\NetNntp\Protocol\ResponseCode;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -61,6 +63,8 @@ class BinariesService
     private int $first = 0;
 
     private int $last = 0;
+
+    private ?int $completedRangeEnd = null;
 
     private int $notYEnc = 0;
 
@@ -124,6 +128,12 @@ class BinariesService
     public function getMessageBuffer(): int
     {
         return $this->config->messageBuffer;
+    }
+
+    /** The requested range was fully downloaded and stored (or durably queued for repair). */
+    public function completedRangeEnd(): ?int
+    {
+        return $this->completedRangeEnd;
     }
 
     /**
@@ -279,6 +289,7 @@ class BinariesService
      */
     public function scan(array $groupMySQL, int $first, int $last, string $type = 'update', ?array $missingParts = null): array
     {
+        $this->completedRangeEnd = null;
         if (! app(CandidateRepository::class)->capacityAvailable()) {
             if ($type !== 'partrepair') {
                 $this->missedPartHandler->addMissingRange($first, $last, (int) $groupMySQL['id']);
@@ -311,6 +322,8 @@ class BinariesService
 
         $msgCount = \count($headers);
         if ($msgCount < 1) {
+            $this->completedRangeEnd = $last;
+
             return $returnArray;
         }
 
@@ -369,6 +382,10 @@ class BinariesService
         }
         unset($headers);
 
+        if ($headersNotInserted !== [] && ! $this->config->partRepair && ! $partRepair) {
+            throw new \RuntimeException('Header storage did not complete and part repair is disabled; retry this range.');
+        }
+
         if ($this->config->echoCli && ! $partRepair) {
             $this->outputHeaderInitial();
         }
@@ -393,6 +410,8 @@ class BinariesService
         }
 
         $this->outputHeaderDuration();
+
+        $this->completedRangeEnd = $last;
 
         return $returnArray;
     }
@@ -579,7 +598,13 @@ class BinariesService
     private function calculateArticleRange(array $groupMySQL, array $groupNNTP, int $maxHeaders): array
     {
         if ((int) $groupMySQL['last_record'] === 0) {
-            return $this->calculateNewGroupRange($groupNNTP);
+            $range = $this->calculateNewGroupRange($groupNNTP);
+            if ($maxHeaders > 0 && $range['total'] > $maxHeaders) {
+                $range['last'] = $range['groupLast'] = $range['first'] + $maxHeaders;
+                $range['total'] = $maxHeaders;
+            }
+
+            return $range;
         }
 
         return $this->calculateExistingGroupRange($groupMySQL, $groupNNTP, $maxHeaders);
@@ -675,6 +700,10 @@ class BinariesService
         $done = false;
 
         while (! $done) {
+            if ($this->runtimeState->stopRequested()) {
+                return;
+            }
+
             // Calculate chunk bounds
             if ($range['total'] > $this->config->messageBuffer) {
                 $last = (int) min($first + $this->config->messageBuffer, $groupLast);
@@ -692,6 +721,9 @@ class BinariesService
 
             // Scan this chunk
             $scanSummary = $this->scan($groupMySQL, $first, $last);
+            if ($scanSummary === [] && $this->completedRangeEnd === null) {
+                return;
+            }
 
             // Update group record
             $this->updateGroupAfterScan($groupMySQL, $groupNNTP, $scanSummary, $last);
@@ -732,7 +764,7 @@ class BinariesService
             $lastArticleDate = $lastArticleTimestamp !== false ? $lastArticleTimestamp : time();
 
             UsenetGroup::query()->where('id', $groupMySQL['id'])->update([
-                'last_record' => $scanSummary['lastArticleNumber'],
+                'last_record' => $this->completedRangeEnd ?? $scanSummary['lastArticleNumber'],
                 'last_record_postdate' => Carbon::createFromTimestamp($lastArticleDate, date_default_timezone_get()),
                 'last_updated' => now(),
             ]);
@@ -757,6 +789,11 @@ class BinariesService
             $headers = $nntp->getXOVER($this->first.'-'.$this->last);
         }
 
+        // For an overview range, 423 confirms that no articles exist in that window.
+        if ($headers instanceof NntpError && $headers->getCode() === ResponseCode::NoSuchArticleNumber->value) {
+            return [];
+        }
+
         if (NNTPService::isError($headers) || ! \is_array($headers)) {
             if ($partRepair) {
                 return null;
@@ -771,6 +808,10 @@ class BinariesService
             $nntp->selectGroup($this->groupMySQL['name']);
             $headers = $nntp->getXOVER($this->first.'-'.$this->last);
             $nntp->enableCompression();
+
+            if ($headers instanceof NntpError && $headers->getCode() === ResponseCode::NoSuchArticleNumber->value) {
+                return [];
+            }
 
             if (NNTPService::isError($headers) || ! \is_array($headers)) {
                 if (\is_object($headers) && isset($headers->code, $headers->message)) {

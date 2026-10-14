@@ -113,3 +113,11 @@ deploy/**/__pycache__/
 # Local builds of the existing NNTmux Rust runtime.
 /docker/app/nzb-yenc-ffi/target/
 /storage/app/nntmux-native/
+
+# Separate successful image builds from healthy application rollouts.
+/docker/.build.stamp
+/docker/.deploy.time
+/docker/.deploy.stamp
+/docker/.deploy.log
+/docker/.deploy.lock
+/docker/.deploy.lock.claim
