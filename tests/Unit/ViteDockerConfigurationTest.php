@@ -47,6 +47,23 @@ class ViteDockerConfigurationTest extends TestCase
         $this->assertServicesUseLatestTags('docker-compose.yml.prod-dist');
     }
 
+    public function test_self_hosted_stack_enables_ffi_only_for_the_indexer(): void
+    {
+        $compose = Yaml::parse($this->projectFile('docker/docker-compose.yml'));
+
+        $this->assertSame(
+            '/usr/local/etc/php/conf.d:/usr/local/etc/php/indexer-conf.d',
+            $compose['services']['indexer']['environment']['PHP_INI_SCAN_DIR'],
+        );
+        foreach (['web', 'horizon', 'scheduler'] as $service) {
+            $this->assertArrayNotHasKey('PHP_INI_SCAN_DIR', $compose['services'][$service]['environment']);
+        }
+        $this->assertDoesNotMatchRegularExpression(
+            '~^COPY[^\n]+yenc-ffi\.ini[^\n]+/conf\.d/~m',
+            $this->projectFile('docker/app/Dockerfile'),
+        );
+    }
+
     /**
      * docker-compose.yml is the developer's local Sail file and is gitignored, so it only exists outside CI.
      */
