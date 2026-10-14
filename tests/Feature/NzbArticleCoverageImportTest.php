@@ -91,6 +91,11 @@ final class NzbArticleCoverageImportTest extends TestCase
         unset($cases['proof_before_saturation']);
         $cases['proof before saturation'] = [['a1@x', 'a2@x'], true, 100, NzbImportStatus::Duplicate, false, 'proof_before_saturation'];
         $cases['schema absent'] = [['a1@x'], false, 100, NzbImportStatus::Duplicate, false, 'schema_absent'];
+        $cases['prefixed incoming'] = [['a1@x', 'a2@x'], true, 100, NzbImportStatus::Duplicate, false, 'prefixed_incoming'];
+        $cases['prefixed stored'] = [['a1@x', 'a2@x'], true, 100, NzbImportStatus::Duplicate, false, 'prefixed_stored'];
+        $cases['prefixed both'] = [['a1@x', 'a2@x'], true, 100, NzbImportStatus::Duplicate, false, 'prefixed_both'];
+        $cases['prefixed subset'] = [['a1@x'], true, 100, NzbImportStatus::Duplicate, false, 'prefixed_subset'];
+        $cases['prefixed adds new articles'] = [['a1@x', 'a2@x', 'b3@x'], true, 100, NzbImportStatus::Inserted, false, 'prefixed_added'];
         $result = [];
         foreach ($cases as $label => $case) {
             foreach ([false, true] as $enabled) {
@@ -131,7 +136,15 @@ final class NzbArticleCoverageImportTest extends TestCase
 
             return '<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><head><meta type="category">7010</meta></head><file poster="poster" date="1" subject="Same.Release-GRP"><groups><group>alt.test</group></groups><segments>'.$segments.'</segments></file></nzb>';
         };
+        $prefix = static function (string $contents): string {
+            $contents = preg_replace('~(<\\/?)(nzb|head|meta|file|groups|group|segments|segment)(?=[\\s>/])~', '$1p:$2', $contents);
+
+            return str_replace('xmlns="http://www.newzbin.com/DTD/2003/nzb"', 'xmlns:p="http://www.newzbin.com/DTD/2003/nzb"', $contents);
+        };
         $original = $xml(['a1@x', 'a2@x'], 100);
+        if (in_array($mode, ['prefixed_stored', 'prefixed_both'], true)) {
+            $original = $prefix($original);
+        }
         DB::table('releases')->insert(['guid' => 'original', 'name' => 'Same.Release-GRP', 'searchname' => 'Same.Release-GRP', 'predb_id' => 42, 'size' => 200, 'article_fingerprint' => $persisted ? NzbArticleFingerprint::fromContents($original) : null]);
         $directory = sys_get_temp_dir().'/article-review-'.bin2hex(random_bytes(4));
         mkdir($directory);
@@ -173,6 +186,9 @@ final class NzbArticleCoverageImportTest extends TestCase
         }
         $incoming = $directory.'/Same.Release-GRP.nzb';
         $incomingXml = $xml($ids, $bytes);
+        if (in_array($mode, ['prefixed_incoming', 'prefixed_both', 'prefixed_subset', 'prefixed_added'], true)) {
+            $incomingXml = $prefix($incomingXml);
+        }
         if ($mode === 'incoming_incomplete') {
             $incomingXml = str_replace('</nzb>', '<file poster="poster" date="1" subject="empty"><groups><group>alt.test</group></groups><segments /></file></nzb>', $incomingXml);
         }

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Services\Nzb\NzbXmlElements;
 use RuntimeException;
 
 final class NzbManifestReader
@@ -111,7 +112,8 @@ final class NzbManifestReader
         $expected = 0;
         $verificationMode = null;
         $conflict = false;
-        foreach (($namespace === '' ? ($document->xpath('./head[1]/meta') ?: []) : ($document->children($namespace)->head->children($namespace)->meta ?? [])) as $metadata) {
+        $elements = new NzbXmlElements($document);
+        foreach ($elements->metadata() as $metadata) {
             $value = (string) $metadata;
             if ((string) $metadata->attributes()['type'] === 'nntmux:verification-mode' && $value === 'spot-check') {
                 $verificationMode = 'spot_check';
@@ -121,7 +123,7 @@ final class NzbManifestReader
                 $expected = max($expected, (int) $value);
             }
         }
-        foreach (($namespace === '' ? ($document->xpath('./file') ?: []) : $document->children($namespace)->file) as $file) {
+        foreach ($elements->files() as $file) {
             $fileAttributes = $file->attributes();
             $subject = (string) $fileAttributes['subject'];
             $expected = max($expected, self::declaredFileCount($subject));
@@ -129,7 +131,7 @@ final class NzbManifestReader
             $segments = [];
             $observedParts = 0;
             $partNumbers = [];
-            foreach (($namespace === '' ? ($file->xpath('./segments[1]/segment') ?: []) : ($file->children($namespace)->segments->children($namespace)->segment ?? [])) as $segment) {
+            foreach ($elements->segments($file) as $segment) {
                 $segmentAttributes = $segment->attributes();
                 $number = (int) $segmentAttributes['number'];
                 $messageId = trim((string) $segment);
@@ -142,7 +144,7 @@ final class NzbManifestReader
                     $observedParts = max($observedParts, $number);
                 }
             }
-            foreach (($namespace === '' ? ($file->xpath('./groups[1]/group') ?: []) : ($file->children($namespace)->groups->children($namespace)->group ?? [])) as $group) {
+            foreach ($elements->groups($file) as $group) {
                 $groups[(string) $group] = true;
             }
             $files[] = ['key' => hash('sha256', $subject), 'subject' => preg_replace('/\s*\(\d+\/\d+\)\s*$/', '', $subject),
