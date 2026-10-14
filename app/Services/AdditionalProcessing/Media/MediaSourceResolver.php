@@ -132,42 +132,46 @@ class MediaSourceResolver
                 }
 
                 $attempts++;
-                $result = $this->downloadService->downloadArticle(
-                    DownloadKind::MediaSource,
-                    $messageId,
-                    $context->releaseGroupName,
-                    $context->release->id,
-                );
-                if ($result['groupUnavailable']) {
-                    $context->groupUnavailable = true;
+                try {
+                    $result = $this->downloadService->downloadMappingArticle(
+                        $messageId,
+                        $context->releaseGroupName,
+                        $context->release->id,
+                    );
+                    if ($result['groupUnavailable']) {
+                        $context->groupUnavailable = true;
 
-                    break 2;
-                }
-                if (! $result['success'] || ! is_string($result['data'])) {
-                    continue;
-                }
-                $budget->spend(strlen($result['data']));
-
-                $part = $result['part'];
-                if ($part !== null && $part->length() !== null && $part->end !== null && $part->end < $part->size) {
-                    $articlePartSize ??= $part->length();
-                }
-
-                foreach ($files as $file) {
-                    if (in_array($file, $verified, true)) {
+                        break 2;
+                    }
+                    if (! $result['success'] || ! is_string($result['data'])) {
                         continue;
                     }
-                    if ($file->matchesStartOf($result['data'])
-                        || ($part !== null && $part->name === $file->name && $part->size === $file->size)
-                    ) {
-                        $verified[$sourceIndex] = $file;
+                    $budget->spend(strlen($result['data']));
 
+                    $part = $result['part'];
+                    if ($part !== null && $part->length() !== null && $part->end !== null && $part->end < $part->size) {
+                        $articlePartSize ??= $part->length();
+                    }
+
+                    foreach ($files as $file) {
+                        if (in_array($file, $verified, true)) {
+                            continue;
+                        }
+                        if ($file->matchesStartOf($result['data'])
+                            || ($part !== null && $part->name === $file->name && $part->size === $file->size)
+                        ) {
+                            $verified[$sourceIndex] = $file;
+                            $this->downloadService->retainMappedArchiveArticle($file);
+
+                            break;
+                        }
+                    }
+
+                    if (in_array($wanted, $verified, true)) {
                         break;
                     }
-                }
-
-                if (in_array($wanted, $verified, true)) {
-                    break;
+                } finally {
+                    $this->downloadService->discardPendingMappingArticle();
                 }
             }
         }
