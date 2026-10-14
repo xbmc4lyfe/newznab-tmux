@@ -1270,6 +1270,18 @@ class NNTPService extends NntpClient
     }
 
     /**
+     * Reuse a verified mapped article only after the original connection check succeeds.
+     *
+     * @param  callable(): (array{data: string, part: YencPart}|null)  $lookup
+     * @param  callable(int): void  $onReused
+     * @return array{data: string, part: YencPart|null}|NntpError
+     */
+    public function getArticleByMessageIDWithReuse(string $identifier, bool $alternate, callable $lookup, callable $onReused): array|NntpError
+    {
+        return $this->readArticleWithMetadata($identifier, $alternate, lookup: $lookup, onReused: $onReused);
+    }
+
+    /**
      * @param  callable(string, YencPart): void  $onValidatedPrimary
      * @return array{data: string, part: YencPart|null}|NntpError
      */
@@ -1279,11 +1291,18 @@ class NNTPService extends NntpClient
     }
 
     /** @return array{data: string, part: YencPart|null}|NntpError */
-    private function readArticleWithMetadata(string $identifier, bool $alternate, ?callable $onValidatedPrimary = null): array|NntpError
+    private function readArticleWithMetadata(string $identifier, bool $alternate, ?callable $onValidatedPrimary = null, ?callable $lookup = null, ?callable $onReused = null): array|NntpError
     {
         $connected = $this->_checkConnection(false);
         if ($connected !== true) {
             return $connected instanceof NntpError ? $connected : $this->throwError('Unable to connect to usenet!');
+        }
+
+        $cached = $lookup === null ? null : $lookup();
+        if ($cached !== null) {
+            $onReused(strlen($cached['data']));
+
+            return $cached;
         }
 
         $raw = $this->_getMessageByMessageID($identifier, true);
