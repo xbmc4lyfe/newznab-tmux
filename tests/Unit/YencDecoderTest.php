@@ -98,6 +98,36 @@ class YencDecoderTest extends TestCase
             strlen($prefix),
             '',
         ];
+
+        $prefix = "=ybegin\tline=64 LINE=128 size=9 size=3 extra-field= unknown_2=v NaMe= first name=second size=999\r\r\n";
+        yield 'first filename consumes remainder and duplicate values retain last occurrence' => [
+            $prefix."klm\r\n=yend size=9 SIZE=3 crc32=a3830348 name=trailer ignored=after\r\r\n",
+            ['line' => '128', 'size' => '3', 'extra-field' => '', 'unknown_2' => 'v', 'name' => ' first name=second size=999'],
+            null,
+            ['size' => '3', 'crc32' => 'a3830348', 'name' => 'trailer', 'ignored' => 'after'],
+            strlen($prefix),
+            "klm\r\n",
+        ];
+
+        $prefix = "=ybegin line=128 size=3 names=other NAME=\r\n=ypart begin=9 BEGIN=1 end=3 name=part after=\r\n";
+        yield 'empty filename and nonheader name remain ordinary fields' => [
+            $prefix."klm\n=yend size=3 crc32=a3830348\n",
+            ['line' => '128', 'size' => '3', 'names' => 'other', 'name' => ''],
+            ['begin' => '1', 'end' => '3', 'name' => 'part', 'after' => ''],
+            ['size' => '3', 'crc32' => 'a3830348'],
+            strlen($prefix),
+            "klm\n",
+        ];
+
+        $prefix = "=ybegin line=128 size=3 name=\x00\xff\tfile\rinside.bin\r\n";
+        yield 'filename retains binary bytes tabs and internal carriage returns' => [
+            $prefix."klm\n=yend size=3 crc32=a3830348",
+            ['line' => '128', 'size' => '3', 'name' => "\x00\xff\tfile\rinside.bin"],
+            null,
+            ['size' => '3', 'crc32' => 'a3830348'],
+            strlen($prefix),
+            "klm\n",
+        ];
     }
 
     /**
