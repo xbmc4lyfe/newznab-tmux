@@ -1,5 +1,13 @@
 # To do
 
+## Qualify mapped standalone video article reuse (2026-10-14)
+
+Reuse a freshly checksum-qualified primary first article that matched an ambiguous PAR2 main-video entry. Return its original yEnc metadata through an opt-in single-article path after the existing connection gate. Keep normal aggregate results first, mapped archives ahead of video receipts, and pending receipts within the shared limits. Preserve the ordinary media byte/deadline/offset checks, thumbnail inputs and filename evidence; mapping itself still obtains fresh internal receipts. No publication or main-video eligibility change is included.
+
+- [x] Reproduce mapping followed by video-head fetching with the same bytes, genuine offsets, metadata and thumbnail inputs, then verify one fewer BODY read. Cover strict admission exclusions, first failure, connection failure, alternate fallback, scope reset and unchanged offered-byte budgets.
+- [x] Qualify full-video-cache admission of a later archive, full archive/aggregate rejection of video receipts, and pending/video eviction before protected entries. Measure all retained payloads against the four-entry, 8 MiB per-entry and 16 MiB total limits.
+- [ ] Run final reviewed focused/native suites and required CI; obtain current-head Codex clearance, verified signed squash and guarded deployment by the existing owner. Observe actual reuse and useful naming, and attribute network versus decoding/probe/extraction costs before reporting an elapsed-time speedup.
+
 ## Retest publication phase timing (2026-10-14)
 
 Publication timing is opt-in and reports aggregate durations after the outer transaction. State-lock acquisition includes query/network overhead; callback time after acquisition excludes commit/after-commit finalization. These measurements identify candidates for optimization, not a proven throughput improvement.

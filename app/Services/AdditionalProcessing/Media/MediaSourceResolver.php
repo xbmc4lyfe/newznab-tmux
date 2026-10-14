@@ -161,7 +161,7 @@ class MediaSourceResolver
                             || ($part !== null && $part->name === $file->name && $part->size === $file->size)
                         ) {
                             $verified[$sourceIndex] = $file;
-                            $this->downloadService->retainMappedArchiveArticle($file);
+                            $this->downloadService->retainMappedSourceArticle($file);
 
                             break;
                         }

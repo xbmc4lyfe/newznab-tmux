@@ -21,7 +21,8 @@ final class MappingArticleNntpHarness extends NNTPService
 
     public bool $connectionFailure = false;
 
-    public function __construct(string $wire)
+    /** @param array<string, string> $responsesByCommand */
+    public function __construct(string $wire, private readonly array $responsesByCommand = [])
     {
         $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         if ($pair === false) {
@@ -31,7 +32,9 @@ final class MappingArticleNntpHarness extends NNTPService
         socket_set_option(socket_import_stream($this->peer), SOL_SOCKET, SO_SNDBUF, 1_048_576);
         socket_set_option(socket_import_stream($this->_socket), SOL_SOCKET, SO_RCVBUF, 1_048_576);
         fwrite($this->peer, $wire);
-        stream_socket_shutdown($this->peer, STREAM_SHUT_WR);
+        if ($this->responsesByCommand === []) {
+            stream_socket_shutdown($this->peer, STREAM_SHUT_WR);
+        }
         stream_set_blocking($this->peer, false);
         stream_set_timeout($this->_socket, 1);
         $this->_yencService = new YencService;
@@ -71,6 +74,18 @@ final class MappingArticleNntpHarness extends NNTPService
         $this->_socket = null;
 
         return true;
+    }
+
+    protected function _sendCommand(string $cmd): mixed
+    {
+        if ($this->responsesByCommand !== []) {
+            $response = $this->responsesByCommand[$cmd] ?? "430 missing\r\n";
+            if (fwrite($this->peer, $response) !== strlen($response)) {
+                throw new \RuntimeException('Could not write the fixture response.');
+            }
+        }
+
+        return parent::_sendCommand($cmd);
     }
 
     protected function previewAlternateConnection(): NNTPService
