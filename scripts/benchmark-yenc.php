@@ -7,6 +7,7 @@ declare(strict_types=1);
  * php scripts/benchmark-yenc.php [--native=/absolute/librapidyenc.so] [--baseline=/snapshot/directory]
  * A baseline directory contains unmodified YencService.php and NNTPService.php snapshots.
  * Paired native mode: --cpp-native=... --rust-native=... [--order-seed=20261013]
+ * PHP versus Rust: --php-baseline --rust-native=/absolute/libnzbyenc.so (no C++ library needed).
  * [--output-dir=/new/directory] [--timeout=30] [--min-improvement-percent=5] [--max-regression-percent=5].
  * Paired mode retains fixtures, all raw child outputs, hashes and per-stratum decisions.
  * It compares only yEnc decoding through the same PHP service, not archive metadata or production capacity.
@@ -23,13 +24,13 @@ if (defined('NNTMUX_YENC_BENCHMARK_FUNCTIONS_ONLY')) {
 
 require dirname(__DIR__).'/vendor/autoload.php';
 
-$options = getopt('', ['native:', 'baseline:', 'size:', 'samples:', 'worker:', 'data-path:', 'article-path:', 'path:', 'paired-worker', 'cpp-native:', 'rust-native:', 'order-seed:', 'timeout:', 'output-dir:', 'runtime-manifest:', 'min-improvement-percent:', 'max-regression-percent:']);
+$options = getopt('', ['native:', 'baseline:', 'size:', 'samples:', 'worker:', 'data-path:', 'article-path:', 'path:', 'paired-worker', 'php-baseline', 'cpp-native:', 'rust-native:', 'order-seed:', 'timeout:', 'output-dir:', 'runtime-manifest:', 'min-improvement-percent:', 'max-regression-percent:']);
 $samples = (int) ($options['samples'] ?? 11);
 if ($samples < (isset($options['paired-worker']) ? 1 : 3)) {
     throw new InvalidArgumentException('Use at least three samples.');
 }
 
-if (! isset($options['worker']) && (isset($options['cpp-native']) || isset($options['rust-native']))) {
+if (! isset($options['worker']) && (isset($options['php-baseline']) || isset($options['cpp-native']) || isset($options['rust-native']))) {
     exit(runPairedYencBenchmark($options, $samples));
 }
 
@@ -189,10 +190,10 @@ function yencBenchmarkRandom(int &$state): int
 }
 
 /**
- * @param  list<float>  $ratios  Correct matched observations only, Rust time / C++ time.
+ * @param  list<float>  $ratios  Correct matched observations only, Rust time / baseline time.
  * @return array<string, mixed>
  */
-function yencBenchmarkDecision(array $ratios, int $invalidPairs, float $improvementPercent, float $regressionPercent, int $seed, int $familySize = 1): array
+function yencBenchmarkDecision(array $ratios, int $invalidPairs, float $improvementPercent, float $regressionPercent, int $seed, int $familySize = 1, string $baseline = 'cpp'): array
 {
     if ($invalidPairs > 0 || count($ratios) < 3) {
         return ['decision' => 'invalid', 'eligible_pairs' => count($ratios), 'invalid_pairs' => $invalidPairs,
@@ -216,12 +217,29 @@ function yencBenchmarkDecision(array $ratios, int $invalidPairs, float $improvem
 
     return [
         'decision' => $decision, 'eligible_pairs' => count($ratios), 'invalid_pairs' => 0,
-        'median_rust_over_cpp' => yencBenchmarkMedian($ratios),
+        'median_rust_over_'.$baseline => yencBenchmarkMedian($ratios),
         'bootstrap_95_percent_interval' => [$lower, $upper],
         'bootstrap_replicates' => 10000,
         'confidence_family_size' => $familySize,
         'confidence_scope' => 'Bonferroni simultaneous 95 percent intervals across the predeclared stratum family',
     ];
+}
+
+/**
+ * @param  array<string, mixed>  $options
+ * @return array{baseline: string, library_options: array<string, string>}
+ */
+function yencBenchmarkBackends(array $options): array
+{
+    if (isset($options['php-baseline'])) {
+        if (isset($options['cpp-native'])) {
+            throw new InvalidArgumentException('Choose either --php-baseline or --cpp-native.');
+        }
+
+        return ['baseline' => 'php', 'library_options' => ['rust' => 'rust-native']];
+    }
+
+    return ['baseline' => 'cpp', 'library_options' => ['cpp' => 'cpp-native', 'rust' => 'rust-native']];
 }
 
 /**
@@ -311,9 +329,11 @@ function yencBenchmarkSourceHashes(string $root): array
  */
 function runPairedYencBenchmark(array $options, int $samples): int
 {
-    foreach (['cpp-native', 'rust-native'] as $name) {
+    $backends = yencBenchmarkBackends($options);
+    $baseline = $backends['baseline'];
+    foreach ($backends['library_options'] as $name) {
         if (! isset($options[$name]) || ! is_readable($options[$name]) || ! is_file($options[$name])) {
-            throw new InvalidArgumentException('Paired mode requires readable --cpp-native and --rust-native libraries.');
+            throw new InvalidArgumentException('Paired mode requires a readable --'.$name.' library.');
         }
     }
     $seed = (int) ($options['order-seed'] ?? random_int(1, 2147483647));
@@ -343,14 +363,14 @@ function runPairedYencBenchmark(array $options, int $samples): int
     $root = dirname(__DIR__);
     try {
         $libraries = [];
-        foreach (['cpp' => 'cpp-native', 'rust' => 'rust-native'] as $backend => $option) {
+        foreach ($backends['library_options'] as $backend => $option) {
             $frozenPath = $directory.'/'.$backend.'.so';
             if (! copy($options[$option], $frozenPath)) {
                 throw new RuntimeException('Unable to freeze native library '.$backend);
             }
             $libraries[$backend] = ['path' => $frozenPath, 'sha256' => hash_file('sha256', $frozenPath)];
         }
-        if ($libraries['cpp']['sha256'] === $libraries['rust']['sha256']) {
+        if ($baseline === 'cpp' && $libraries['cpp']['sha256'] === $libraries['rust']['sha256']) {
             throw new InvalidArgumentException('The named C++ and Rust libraries must contain different bytes.');
         }
         $runtimeManifest = null;
@@ -364,7 +384,7 @@ function runPairedYencBenchmark(array $options, int $samples): int
         $sourceHashes = yencBenchmarkSourceHashes($root);
         if ($runtimeManifest !== null) {
             $manifest = $runtimeManifest['contents'];
-            foreach (['cpp', 'rust'] as $backend) {
+            foreach (array_keys($libraries) as $backend) {
                 if (($manifest[$backend.'_library_sha256'] ?? null) !== $libraries[$backend]['sha256']) {
                     throw new RuntimeException('Build manifest does not match frozen '.$backend.' library.');
                 }
@@ -383,14 +403,15 @@ function runPairedYencBenchmark(array $options, int $samples): int
             'pcre_jit' => ini_get('pcre.jit'), 'manifest' => $runtimeManifest,
         ];
         $protocol = [
-            'type' => 'protocol', 'version' => 'paired-yenc-v1',
-            'scope' => 'identical yEnc fixtures through YencService native decoding; strict CRC, tolerant decoding and memory-backed NNTP BODY',
+            'type' => 'protocol', 'version' => $baseline === 'php' ? 'paired-yenc-php-v1' : 'paired-yenc-v1',
+            'baseline' => $baseline, 'candidate' => 'rust',
+            'scope' => 'identical yEnc fixtures through YencService; strict CRC, tolerant decoding and memory-backed NNTP BODY',
             'claim_limit' => 'this fixed decoder fixture matrix only; no archive metadata or production capacity claim',
             'output_directory' => $directory, 'samples' => $samples, 'warmups_per_worker' => 1,
             'timed_samples_per_worker' => 1, 'order_seed' => $seed, 'timeout_seconds_per_worker' => $timeout,
             'sizes' => $sizes, 'densities' => ['ordinary', 'heavy'], 'paths' => ['tolerant', 'strict', 'body'],
             'min_improvement_percent' => $improvement, 'max_regression_percent' => $regression,
-            'decision_rule' => 'paired median Rust/CPP ratios; 10000-resample simultaneous 95% bootstrap intervals across all predeclared strata; regression only if entire interval exceeds regression margin; useful improvement only if entire interval beats useful-effect margin; otherwise inconclusive',
+            'decision_rule' => 'paired median Rust/'.$baseline.' ratios; 10000-resample simultaneous 95% bootstrap intervals across all predeclared strata; regression only if entire interval exceeds regression margin; useful improvement only if entire interval beats useful-effect margin; otherwise inconclusive',
             'timed_boundary' => 'service decode/fetch call only; initialization, fixture creation, rewind and independent byte/hash verification outside timing',
             'source_sha256' => $sourceHashes, 'libraries' => $libraries, 'runtime' => $runtime,
             'library_source_parity' => 'library bytes frozen; source-build correspondence must be established by the build manifest',
@@ -415,13 +436,16 @@ function runPairedYencBenchmark(array $options, int $samples): int
                     $ratios = [];
                     $invalidPairs = 0;
                     for ($pair = 0; $pair < $samples; $pair++) {
-                        $order = yencBenchmarkRandom($state) & 1 ? ['cpp', 'rust'] : ['rust', 'cpp'];
+                        $order = yencBenchmarkRandom($state) & 1 ? [$baseline, 'rust'] : ['rust', $baseline];
                         $pairResults = [];
                         foreach ($order as $position => $backend) {
                             $command = [PHP_BINARY, '-d', 'ffi.enable='.ini_get('ffi.enable'), '-d', 'memory_limit='.ini_get('memory_limit'),
                                 '-d', 'opcache.enable_cli='.ini_get('opcache.enable_cli'), '-d', 'opcache.jit='.ini_get('opcache.jit'),
-                                '-d', 'pcre.jit='.ini_get('pcre.jit'), __FILE__, '--worker=native', '--paired-worker', '--samples=1',
-                                '--path='.$path, '--native='.$libraries[$backend]['path'], '--data-path='.$dataPath, '--article-path='.$articlePath];
+                                '-d', 'pcre.jit='.ini_get('pcre.jit'), __FILE__, '--worker='.($backend === 'php' ? 'php' : 'native'), '--paired-worker', '--samples=1',
+                                '--path='.$path, '--data-path='.$dataPath, '--article-path='.$articlePath];
+                            if ($backend !== 'php') {
+                                $command[] = '--native='.$libraries[$backend]['path'];
+                            }
                             $prefix = $directory.'/'.$size.'-'.$density.'-'.$path.'-'.$pair.'-'.$backend;
                             $observation = yencBenchmarkRunChild($command, $prefix, $timeout);
                             $result = $observation['result'] ?? null;
@@ -429,25 +453,25 @@ function runPairedYencBenchmark(array $options, int $samples): int
                             $correct = count($raw) === 2 && array_all($raw, static fn (mixed $sample): bool => is_array($sample) && ($sample['correct'] ?? false)
                                 && ($sample['decoded_sha256'] ?? null) === $fixture['decoded_sha256'] && ($sample['decoded_bytes'] ?? null) === $size);
                             $eligible = $observation['status'] === 'ok' && $correct
-                                && ($result['library_sha256'] ?? null) === $libraries[$backend]['sha256'];
+                                && ($result['library_sha256'] ?? null) === ($libraries[$backend]['sha256'] ?? null);
                             $pairResults[$backend] = ['eligible' => $eligible, 'median_ms' => $result['median_ms'] ?? null];
                             $emit(['type' => 'observation', 'size' => $size, 'density' => $density, 'path' => $path,
                                 'pair' => $pair, 'position' => $position, 'backend' => $backend, 'order' => $order,
                                 'fixture' => $fixture, 'eligible' => $eligible] + $observation);
                         }
-                        $eligible = $pairResults['cpp']['eligible'] && $pairResults['rust']['eligible'];
-                        $ratio = $eligible ? $pairResults['rust']['median_ms'] / $pairResults['cpp']['median_ms'] : null;
+                        $eligible = $pairResults[$baseline]['eligible'] && $pairResults['rust']['eligible'];
+                        $ratio = $eligible ? $pairResults['rust']['median_ms'] / $pairResults[$baseline]['median_ms'] : null;
                         if ($eligible) {
                             $ratios[] = $ratio;
                         } else {
                             $invalidPairs++;
                         }
                         $emit(['type' => 'pair', 'size' => $size, 'density' => $density, 'path' => $path,
-                            'pair' => $pair, 'eligible' => $eligible, 'rust_over_cpp' => $ratio]);
+                            'pair' => $pair, 'eligible' => $eligible, 'rust_over_'.$baseline => $ratio]);
                     }
                     $decisionSeed = ($seed ^ crc32($size.'-'.$density.'-'.$path)) & 0xFFFFFFFF;
                     $summary = ['type' => 'stratum_summary', 'size' => $size, 'density' => $density, 'path' => $path]
-                        + yencBenchmarkDecision($ratios, $invalidPairs, $improvement, $regression, $decisionSeed, count($sizes) * 6);
+                        + yencBenchmarkDecision($ratios, $invalidPairs, $improvement, $regression, $decisionSeed, count($sizes) * 6, $baseline);
                     $summaries[] = $summary;
                     $emit($summary);
                 }
