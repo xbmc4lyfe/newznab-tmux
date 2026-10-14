@@ -1813,10 +1813,12 @@ class NNTPService extends NntpClient
         $body = '';
         $line = '';
         $socket = $this->_socket;
-        while (! feof($socket)) {
+        while (true) {
             $fragment = fgets($socket, 8192);
             if ($fragment === false) {
-                return $this->throwError('Failed to read line from socket.', null);
+                return $this->throwError(feof($socket)
+                    ? 'End of stream! Connection lost?'
+                    : 'Failed to read line from socket.', null);
             }
             if ($onRead !== null && ! $onRead()) {
                 $this->doQuit();
@@ -1833,8 +1835,6 @@ class NNTPService extends NntpClient
             $body .= str_starts_with($line, '..') ? substr($line, 1) : $line;
             $line = '';
         }
-
-        return $this->throwError('End of stream! Connection lost?', null);
     }
 
     /**

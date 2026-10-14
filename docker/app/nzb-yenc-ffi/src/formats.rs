@@ -730,6 +730,7 @@ pub struct Rar5FileExtraRecords {
     pub record_count: usize,
     pub encryption_record_count: usize,
     pub hash_record_count: usize,
+    pub redirection_record_count: usize,
     pub encryption: Option<Rar5FileEncryptionRecord>,
     pub hash: Option<Rar5FileHashRecord>,
     pub unambiguous_stored_blake2sp_hex: Option<String>,
@@ -755,6 +756,29 @@ pub struct Rar5FileExtraRecord {
     pub status: &'static str,
     pub encryption: Option<Rar5FileEncryptionRecord>,
     pub hash: Option<Rar5FileHashRecord>,
+    pub redirection: Option<Rar5RedirectionRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Rar5RedirectionRecord {
+    pub status: &'static str,
+    pub interpretation_status: &'static str,
+    pub evidence_basis: &'static str,
+    pub redirection_type: Option<u64>,
+    pub kind_observed: Option<&'static str>,
+    pub flags: Option<u64>,
+    pub unknown_flags: Option<u64>,
+    pub target_directory_observed: Option<bool>,
+    pub target_byte_length: Option<u64>,
+    pub target_utf8_valid: Option<bool>,
+    pub target_contains_nul: Option<bool>,
+    pub target_utf8: Option<String>,
+    pub target_text_truncated: bool,
+    pub target_sha256: Option<String>,
+    pub target_preview_hex: Option<String>,
+    pub target_preview_truncated: bool,
+    pub trailing_byte_count: Option<usize>,
+    pub target_resolution_performed: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -2257,6 +2281,19 @@ fn parse_rar5_file_header(
         compression.effective_dictionary_bytes = None;
     }
     result.compression_metadata = Some(compression);
+    for record in &mut result.file_extra_records.records {
+        if let Some(redirection) = &mut record.redirection {
+            redirection.interpretation_status = if header_crc32_valid != Some(true) {
+                "header_checksum_unconfirmed"
+            } else if name_end != fields_end {
+                "file_header_fields_trailing_bytes"
+            } else if redirection.status != "parsed" {
+                "record_not_interpretable"
+            } else {
+                "validated_header_declaration"
+            };
+        }
+    }
     derive_rar5_file_checksum_relations(&mut result);
 
     result
@@ -2278,6 +2315,7 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
         record_count: 0,
         encryption_record_count: 0,
         hash_record_count: 0,
+        redirection_record_count: 0,
         encryption: None,
         hash: None,
         unambiguous_stored_blake2sp_hex: None,
@@ -2320,6 +2358,9 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
         let payload = &bounded[cursor..record_end];
         let encryption = (kind == 1).then(|| parse_rar5_file_encryption_record(payload));
         let hash = (kind == 2).then(|| parse_rar5_file_hash_record(payload));
+        if kind == 5 {
+            result.redirection_record_count += 1;
+        }
         if let Some(encryption) = &encryption {
             result.encryption_record_count += 1;
             if result.encryption.is_none() {
@@ -2333,6 +2374,7 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
             }
         }
         if result.records.len() < MAX_RAR5_FILE_EXTRA_RECORD_OBSERVATIONS {
+            let redirection = (kind == 5).then(|| parse_rar5_redirection_record(payload));
             let preview = &payload[..payload.len().min(MAX_RAR5_FILE_EXTRA_PAYLOAD_PREVIEW_BYTES)];
             result.records.push(Rar5FileExtraRecord {
                 index: result.record_count,
@@ -2349,9 +2391,11 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
                     .as_ref()
                     .map(|value| value.status)
                     .or_else(|| hash.as_ref().map(|value| value.status))
+                    .or_else(|| redirection.as_ref().map(|value| value.status))
                     .unwrap_or("unknown_record_type_skipped"),
                 encryption,
                 hash,
+                redirection,
             });
         } else {
             result.records_truncated = true;
@@ -2363,6 +2407,84 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
     if cursor < end {
         result.stopped_offset = Some(cursor);
     }
+    result
+}
+
+fn parse_rar5_redirection_record(payload: &[u8]) -> Rar5RedirectionRecord {
+    let mut result = Rar5RedirectionRecord {
+        status: "payload_truncated",
+        interpretation_status: "file_header_fields_incomplete",
+        evidence_basis: "RAR5_file_extra_record_5_declaration",
+        redirection_type: None,
+        kind_observed: None,
+        flags: None,
+        unknown_flags: None,
+        target_directory_observed: None,
+        target_byte_length: None,
+        target_utf8_valid: None,
+        target_contains_nul: None,
+        target_utf8: None,
+        target_text_truncated: false,
+        target_sha256: None,
+        target_preview_hex: None,
+        target_preview_truncated: false,
+        trailing_byte_count: None,
+        target_resolution_performed: false,
+    };
+    let mut cursor = 0;
+    let Some(kind) = read_vint(payload, &mut cursor) else {
+        return result;
+    };
+    result.redirection_type = Some(kind);
+    result.kind_observed = match kind {
+        1 => Some("unix_symlink"),
+        2 => Some("windows_symlink"),
+        3 => Some("windows_junction"),
+        4 => Some("hard_link"),
+        5 => Some("file_copy"),
+        _ => None,
+    };
+    let Some(flags) = read_vint(payload, &mut cursor) else {
+        return result;
+    };
+    result.flags = Some(flags);
+    result.unknown_flags = Some(flags & !1);
+    result.target_directory_observed = Some(flags & 1 != 0);
+    let Some(length) = read_vint(payload, &mut cursor) else {
+        return result;
+    };
+    result.target_byte_length = Some(length);
+    let Some(target) = usize::try_from(length)
+        .ok()
+        .and_then(|length| take_rar5_extra_bytes(payload, &mut cursor, length))
+    else {
+        return result;
+    };
+    let utf8 = std::str::from_utf8(target);
+    result.target_utf8_valid = Some(utf8.is_ok());
+    result.target_contains_nul = Some(target.contains(&0));
+    result.target_sha256 = Some(hex(&Sha256::digest(target)));
+    let preview = &target[..target.len().min(MAX_RAR5_FILE_EXTRA_PAYLOAD_PREVIEW_BYTES)];
+    result.target_preview_hex = Some(hex(preview));
+    result.target_preview_truncated = preview.len() < target.len();
+    result.target_text_truncated = target.len() > MAX_RAR5_FILENAME_RETAIN_BYTES;
+    if !result.target_text_truncated {
+        result.target_utf8 = utf8.ok().map(str::to_owned);
+    }
+    result.trailing_byte_count = Some(payload.len().saturating_sub(cursor));
+    result.status = if result.trailing_byte_count != Some(0) {
+        "trailing_bytes"
+    } else if result.kind_observed.is_none() {
+        "unsupported_redirection_type"
+    } else if flags & !1 != 0 {
+        "unknown_flags"
+    } else if result.target_utf8_valid != Some(true) {
+        "invalid_target_utf8"
+    } else if result.target_contains_nul == Some(true) {
+        "target_contains_nul"
+    } else {
+        "parsed"
+    };
     result
 }
 
@@ -7537,6 +7659,161 @@ mod tests {
         }
         let (observation, _, _) = read_rar5_block_observation(&block, 0, 0);
         serde_json::to_value(observation.file_header.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn rar5_redirection_retains_each_declared_link_kind_without_resolving_targets() {
+        for (kind, name) in [
+            (1, "unix_symlink"),
+            (2, "windows_symlink"),
+            (3, "windows_junction"),
+            (4, "hard_link"),
+            (5, "file_copy"),
+        ] {
+            let extra = rar5_test_file_extra_record(5, &[kind, 1, 1, b'x']);
+            let file = rar5_test_file_extra_json(&extra, 0, false);
+            let link = &file["file_extra_records"]["records"][0]["redirection"];
+            assert_eq!(file["file_extra_records"]["redirection_record_count"], 1);
+            assert_eq!(link["status"], "parsed");
+            assert_eq!(
+                link["interpretation_status"],
+                "validated_header_declaration"
+            );
+            assert_eq!(link["kind_observed"], name);
+            assert_eq!(link["target_directory_observed"], true);
+            assert_eq!(link["target_utf8"], "x");
+            assert_eq!(
+                link["target_sha256"],
+                "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+            );
+            assert_eq!(link["target_resolution_performed"], false);
+            assert_eq!(link["trailing_byte_count"], 0);
+        }
+    }
+
+    #[test]
+    fn rar5_redirection_never_borrows_target_bytes_from_the_next_record() {
+        for payload in [&[][..], &[1], &[1, 0], &[1, 0, 2, b'x'], &[0x80; 10]] {
+            let mut extra = rar5_test_file_extra_record(5, payload);
+            extra.extend(rar5_test_file_extra_record(2, &[0; 33]));
+            let file = rar5_test_file_extra_json(&extra, 0, false);
+            let records = &file["file_extra_records"]["records"];
+            assert_eq!(records.as_array().unwrap().len(), 2);
+            assert_eq!(records[0]["redirection"]["status"], "payload_truncated");
+            assert_eq!(
+                records[0]["redirection"]["target_sha256"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                records[0]["redirection"]["trailing_byte_count"],
+                serde_json::Value::Null
+            );
+            assert_eq!(records[1]["hash"]["status"], "parsed");
+        }
+        for (payload, status) in [
+            (&[9, 0, 1, b'x'][..], "unsupported_redirection_type"),
+            (&[1, 2, 1, b'x'][..], "unknown_flags"),
+            (&[1, 0, 1, 0xff][..], "invalid_target_utf8"),
+            (&[1, 0, 1, b'x', 0][..], "trailing_bytes"),
+            (&[1, 0, 1, 0][..], "target_contains_nul"),
+        ] {
+            let file =
+                rar5_test_file_extra_json(&rar5_test_file_extra_record(5, payload), 0, false);
+            let link = &file["file_extra_records"]["records"][0]["redirection"];
+            assert_eq!(link["status"], status);
+            assert_ne!(
+                link["interpretation_status"],
+                "validated_header_declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn rar5_redirection_bounds_retention_and_keeps_duplicate_and_crc_evidence() {
+        let target = vec![b'x'; MAX_RAR5_FILENAME_RETAIN_BYTES + 1];
+        let mut payload = vec![1, 0];
+        payload.extend(encode_rar5_test_vint(target.len() as u64));
+        payload.extend(&target);
+        let extra = rar5_test_file_extra_record(5, &payload);
+        let file = rar5_test_file_extra_json(&extra, 0, true);
+        let link = &file["file_extra_records"]["records"][0]["redirection"];
+        assert_eq!(link["status"], "parsed");
+        assert_eq!(link["interpretation_status"], "header_checksum_unconfirmed");
+        assert_eq!(link["target_byte_length"], target.len());
+        assert_eq!(link["target_utf8"], serde_json::Value::Null);
+        assert_eq!(link["target_text_truncated"], true);
+        assert_eq!(link["target_preview_hex"].as_str().unwrap().len(), 256);
+        assert_eq!(link["target_sha256"], hex(&Sha256::digest(&target)));
+        let repeated = rar5_test_file_extra_record(5, &[1, 0, 1, b'x']).repeat(65);
+        let file = rar5_test_file_extra_json(&repeated, 0, false);
+        assert_eq!(file["file_extra_records"]["redirection_record_count"], 65);
+        assert_eq!(
+            file["file_extra_records"]["records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(file["file_extra_records"]["records_truncated"], true);
+    }
+
+    #[test]
+    fn rar5_redirection_ffi_preserves_header_scope_and_partial_observations() {
+        // Padded VInts are permitted; the target bytes contain no terminator.
+        let extra = rar5_test_file_extra_record(5, &[0x81, 0, 0x80, 0, 0x81, 0, b'x']);
+        let mut sample = RAR5.to_vec();
+        sample.extend(rar5_test_block(&[1, 0, 0], &[]));
+        sample.extend(rar5_test_file_block(
+            3,
+            0,
+            0,
+            0,
+            None,
+            None,
+            0,
+            0,
+            b"link",
+            &extra,
+            &[],
+        ));
+        let pointer = unsafe { crate::nntmux_format_metadata_json(sample.as_ptr(), sample.len()) };
+        assert!(!pointer.is_null());
+        let json: serde_json::Value =
+            serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(pointer) }.to_bytes())
+                .unwrap();
+        unsafe { crate::nntmux_metadata_string_free(pointer) };
+        let link = &json["headers"][0]["visible_block_walk"]["blocks"][1]["file_header"]["file_extra_records"]
+            ["records"][0]["redirection"];
+        assert_eq!(link["target_utf8"], "x");
+        assert_eq!(
+            link["interpretation_status"],
+            "validated_header_declaration"
+        );
+
+        // Complete extra bytes and a valid CRC cannot supply missing file fields.
+        let file = parse_rar5_file_header(&extra, 0, 0..extra.len(), 1, None, Some(true));
+        let json = serde_json::to_value(file).unwrap();
+        assert_eq!(json["status"], "file_header_fields_truncated");
+        let link = &json["file_extra_records"]["records"][0]["redirection"];
+        assert_eq!(link["status"], "parsed");
+        assert_eq!(
+            link["interpretation_status"],
+            "file_header_fields_incomplete"
+        );
+
+        let many = rar5_test_file_extra_record(5, &[1, 0, 1, b'x']).repeat(4097);
+        let json = rar5_test_file_extra_json(&many, 0, false);
+        assert_eq!(
+            json["file_extra_records"]["status"],
+            "record_scan_limit_reached"
+        );
+        assert_eq!(json["file_extra_records"]["redirection_record_count"], 4096);
+        assert!(
+            json["file_extra_records"]["unparsed_byte_count"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
     }
 
     #[test]
