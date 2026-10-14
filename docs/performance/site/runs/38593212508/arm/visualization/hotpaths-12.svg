@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 770" role="img">
+<title>profiles/rust-rar5-metadata/php.callgrind — exclusive function cost</title>
+<rect width="100%" height="100%" fill="#101827"/>
+<g fill="#e5e7eb" font-family="sans-serif" font-size="14">
+<text x="20" y="30">profiles/rust-rar5-metadata/php.callgrind — exclusive function cost</text>
+<text x="20" y="76">php::hash_file</text>
+<rect x="540" y="60" width="530.00" height="22" fill="#38bdf8"/>
+<text x="1078.00" y="76">224.685 ms</text>
+<text x="20" y="110">App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer-&gt;analyzeArticleAnd</text>
+<rect x="540" y="94" width="146.92" height="22" fill="#38bdf8"/>
+<text x="694.92" y="110">62.283 ms</text>
+<text x="20" y="144">App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseJson</text>
+<rect x="540" y="128" width="136.42" height="22" fill="#38bdf8"/>
+<text x="684.42" y="144">57.833 ms</text>
+<text x="20" y="178">php::json_decode</text>
+<rect x="540" y="162" width="120.88" height="22" fill="#38bdf8"/>
+<text x="668.88" y="178">51.247 ms</text>
+<text x="20" y="212">php::finfo-&gt;buffer</text>
+<rect x="540" y="196" width="102.02" height="22" fill="#38bdf8"/>
+<text x="650.02" y="212">43.249 ms</text>
+<text x="20" y="246">yencProfileExecuteMetadata</text>
+<rect x="540" y="230" width="62.97" height="22" fill="#38bdf8"/>
+<text x="610.97" y="246">26.695 ms</text>
+<text x="20" y="280">Illuminate\Support\Arr::get</text>
+<rect x="540" y="264" width="44.81" height="22" fill="#38bdf8"/>
+<text x="592.81" y="280">18.997 ms</text>
+<text x="20" y="314">ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</text>
+<rect x="540" y="298" width="29.85" height="22" fill="#38bdf8"/>
+<text x="577.85" y="314">12.657 ms</text>
+<text x="20" y="348">App\Services\Yenc\ArticleFrame::parse</text>
+<rect x="540" y="332" width="29.46" height="22" fill="#38bdf8"/>
+<text x="577.46" y="348">12.490 ms</text>
+<text x="20" y="382">Illuminate\Support\Arr::exists</text>
+<rect x="540" y="366" width="24.07" height="22" fill="#38bdf8"/>
+<text x="572.07" y="382">10.202 ms</text>
+<text x="20" y="416">App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer::metadataNumber</text>
+<rect x="540" y="400" width="23.57" height="22" fill="#38bdf8"/>
+<text x="571.57" y="416">9.993 ms</text>
+<text x="20" y="450">Illuminate\Container\Container-&gt;resolve</text>
+<rect x="540" y="434" width="22.95" height="22" fill="#38bdf8"/>
+<text x="570.95" y="450">9.731 ms</text>
+<text x="20" y="484">Illuminate\Config\Repository-&gt;get</text>
+<rect x="540" y="468" width="21.38" height="22" fill="#38bdf8"/>
+<text x="569.38" y="484">9.062 ms</text>
+<text x="20" y="518">php::is_readable</text>
+<rect x="540" y="502" width="20.21" height="22" fill="#38bdf8"/>
+<text x="568.21" y="518">8.569 ms</text>
+<text x="20" y="552">{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassL</text>
+<rect x="540" y="536" width="17.93" height="22" fill="#38bdf8"/>
+<text x="565.93" y="552">7.601 ms</text>
+<text x="20" y="586">config</text>
+<rect x="540" y="570" width="15.62" height="22" fill="#38bdf8"/>
+<text x="563.62" y="586">6.622 ms</text>
+<text x="20" y="620">{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autolo</text>
+<rect x="540" y="604" width="15.49" height="22" fill="#38bdf8"/>
+<text x="563.49" y="620">6.565 ms</text>
+<text x="20" y="654">App\Services\Yenc\ArticleFrame::findControl</text>
+<rect x="540" y="638" width="14.77" height="22" fill="#38bdf8"/>
+<text x="562.77" y="654">6.264 ms</text>
+<text x="20" y="688">App\Services\YencService-&gt;decodeWithFrame</text>
+<rect x="540" y="672" width="12.39" height="22" fill="#38bdf8"/>
+<text x="560.39" y="688">5.251 ms</text>
+<text x="20" y="722">App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;library</text>
+<rect x="540" y="706" width="11.96" height="22" fill="#38bdf8"/>
+<text x="559.96" y="722">5.071 ms</text>
+</g></svg>

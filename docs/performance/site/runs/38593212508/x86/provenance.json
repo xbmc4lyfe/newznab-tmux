@@ -1,0 +1,12 @@
+{
+  "repository": "xbmc4lyfe/newznab-tmux",
+  "head_sha": "dc74ec057ebdd80a3ff7d10cbcf12147c06cf55d",
+  "run_id": 38593212508,
+  "run_url": "https://github.com/xbmc4lyfe/newznab-tmux/actions/runs/38593212508",
+  "event": "pull_request",
+  "artifact_id": 11909418821,
+  "artifact_attempt": 2,
+  "artifact_sha256": "718365065385a7f948de3c11f378bbb52e6cb4de61b9e680fc05c667a6d09475",
+  "recorded": "2026-10-14",
+  "scope": "Frozen fixture benchmark and executed-call profiles. Not production throughput or Rust adoption qualification."
+}

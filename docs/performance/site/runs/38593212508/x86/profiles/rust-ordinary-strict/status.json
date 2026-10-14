@@ -1,0 +1,22 @@
+{
+  "php_profile": "captured",
+  "native_profile": "captured",
+  "native_samples": 58,
+  "workload_identity_matches": true,
+  "native_folded_cpu_clock_nanoseconds": 116232464,
+  "native_flamegraph_weight_unit": "cpu-clock nanoseconds",
+  "native_exit": 0,
+  "native_exit_cause": "complete",
+  "php_exit": 0,
+  "native_timed_out": false,
+  "php_timed_out": false,
+  "php_exit_cause": "complete",
+  "native_postprocess_exit": 0,
+  "native_postprocess_stage": "complete",
+  "perf_preflight_exit": 0,
+  "perf_preflight_cause": "complete",
+  "perf_preflight_timed_out": false,
+  "php_profile_sha256": "ac348969861b1182f7b0333c3e044c89cf088d26cc1bf6b4b595ec85fefee579",
+  "boundary": "Whole-process profiles include setup and exact-output verification; diagnostic builds differ from timed builds.",
+  "claim": "Call-cost attribution only. No latency or production-capacity conclusion from instrumented runs."
+}

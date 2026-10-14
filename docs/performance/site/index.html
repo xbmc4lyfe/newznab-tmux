@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NNTmux performance evidence</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 17px/1.6 system-ui, sans-serif; background: #101827; color: #e5e7eb; max-width: 950px; margin: auto; padding: 32px 20px; }
+  a { color: #93c5fd; } h1, h2 { line-height: 1.2; }
+  section { border: 1px solid #334155; border-radius: 12px; padding: 20px; margin: 24px 0; }
+  table { border-collapse: collapse; width: 100%; } td, th { text-align: left; padding: 10px; border-bottom: 1px solid #334155; }
+  code { overflow-wrap: anywhere; } small { color: #cbd5e1; }
+</style>
+<body>
+<h1>NNTmux performance evidence</h1>
+<p>Measured C++ RapidYenc versus Rust yEnc decoding, PHP function costs, and searchable native flamegraphs from executed application calls.</p>
+<p><a href="latest/">Latest successful master benchmark</a> · <a href="https://github.com/xbmc4lyfe/newznab-tmux/actions/workflows/yenc-performance.yml">Benchmark workflow</a> · <a href="https://github.com/xbmc4lyfe/newznab-tmux/pull/139">Implementation and review</a></p>
+<section>
+<h2>Recorded comparison · 14 October 2026</h2>
+<p>Source <code>dc74ec057ebdd80a3ff7d10cbcf12147c06cf55d</code>, <a href="https://github.com/xbmc4lyfe/newznab-tmux/actions/runs/38593212508">CI run 38593212508</a>. These frozen reports remain available after temporary CI artifacts expire. Each report links its PHP hot paths and available native flamegraphs.</p>
+<table>
+<tr><th>Runner</th><th>Report</th><th>Evidence</th></tr>
+<tr><td>x86 · qualified retry</td><td><a href="runs/38593212508/x86/visualization/report.html">Speedups and hot paths</a></td><td><a href="runs/38593212508/x86/provenance.json">Provenance</a></td></tr>
+<tr><td>ARM</td><td><a href="runs/38593212508/arm/visualization/report.html">Speedups and hot paths</a></td><td><a href="runs/38593212508/arm/provenance.json">Provenance</a></td></tr>
+</table>
+<p>x86: all 24 strata showed useful improvement, with 31 valid pairs each. Ordinary 512 KiB fixtures used 23.67% less strict-decoding time (1.310×) and 14.00% less BODY time (1.163×). All 13 PHP and 13 native captures were valid.</p>
+<p>ARM: the overall timing result was inconclusive. PHP profiles were available; native sampling was unavailable on that runner. Missing captures cannot identify native hot paths.</p>
+<p><a href="SHA256SUMS.txt">Published snapshot checksums</a></p>
+</section>
+<section>
+<h2>Reading the evidence</h2>
+<p>Timings use uninstrumented, randomized paired processes with identical verified output. Speedup is C++ time divided by Rust time. Confidence intervals and invalid or inconclusive outcomes remain visible.</p>
+<p>Profiles separately execute strict decoding, tolerant decoding, in-memory NNTP BODY handling, and RAR5 metadata analysis through application classes. They include setup and output verification. They do not reproduce database, provider-network, or full production ingestion costs.</p>
+<p>PHP charts show exclusive function cost; call-edge tables show inclusive cost. Native flamegraph width represents sampled CPU-clock period weights in nanoseconds, not elapsed wall time or the number of samples.</p>
+<p>These fixture results do not establish production throughput or satisfy the project's 1.5× common-path and uncommon-p99 Rust adoption gate. This work publishes diagnostics; it does not adopt another replacement.</p>
+</section>
+<small>Built from reviewed repository content. Automated report refreshes accept successful master-branch benchmark runs from this repository only.</small>
+</body>
+</html>
