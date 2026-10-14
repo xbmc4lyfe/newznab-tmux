@@ -14,6 +14,7 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use Tests\Fixtures\MappingArticleNntpHarness;
+use Tests\Fixtures\YencArticles;
 
 class UsenetDownloadServiceTest extends TestCase
 {
@@ -23,6 +24,345 @@ class UsenetDownloadServiceTest extends TestCase
     {
         Mockery::close();
         parent::tearDown();
+    }
+
+    #[Test]
+    #[DataProvider('articleConnectionErrors')]
+    public function opt_in_video_lookup_preserves_legacy_connection_error_conversion(mixed $error, string $message): void
+    {
+        $nntp = Mockery::mock(NNTPService::class)->makePartial()->shouldAllowMockingProtectedMethods();
+        $nntp->shouldReceive('_checkConnection')->twice()->with(false)->andReturn($error);
+        $lookups = 0;
+        $result = $nntp->getArticleByMessageIDWithReuse('a', false, static function () use (&$lookups): ?array {
+            $lookups++;
+
+            return null;
+        }, static function (int $bytes): void {});
+        $legacy = $nntp->getArticleByMessageID('a');
+        $this->assertInstanceOf(NntpError::class, $result);
+        $this->assertSame($message, $result->getMessage());
+        $this->assertSame($legacy->getMessage(), $result->getMessage());
+        $this->assertSame(0, $lookups);
+    }
+
+    public static function articleConnectionErrors(): array
+    {
+        return ['existing NNTP error' => [new NntpError('fixture error'), 'fixture error'], 'non-error false value' => [false, 'Unable to connect to usenet!']];
+    }
+
+    #[Test]
+    public function an_integrity_valid_video_without_a_transport_terminator_cannot_be_reused(): void
+    {
+        $raw = YencArticles::part('AAAA', 'Movie.mkv', 8, 1, 1, 2);
+        $nntp = new MappingArticleNntpHarness("222 body follows\r\n".$raw."\r\n");
+        $service = $this->videoService($nntp);
+        $service->beginReleaseScope();
+        $this->assertFalse($service->downloadMappingArticle('a')['success']);
+        $service->retainMappedSourceArticle(new Par2FileEntry('Movie.mkv', 8));
+        $this->assertFalse($service->downloadArticle(DownloadKind::MediaSource, 'a')['success']);
+        $this->assertSame(0, $service->finishReleaseScope()->cacheHits);
+    }
+
+    #[Test]
+    public function a_mapping_exception_clears_previously_retained_video_articles(): void
+    {
+        $nntp = Mockery::mock(NNTPService::class);
+        $nntp->shouldReceive('getArticleForArchiveMapping')->once()->with('a', false, Mockery::any())->andReturnUsing(static function (string $id, bool $alternate, callable $onValidated): array {
+            $part = new YencPart('Movie.mkv', 8, 1, 1, 4);
+            $onValidated('AAAA', $part);
+
+            return ['data' => 'AAAA', 'part' => $part];
+        });
+        $nntp->shouldReceive('getArticleForArchiveMapping')->once()->with('broken', false, Mockery::any())->andThrow(new \RuntimeException('fixture exception'));
+        $nntp->shouldReceive('getArticleByMessageID')->once()->with('a', false)->andReturn(['data' => 'NETWORK', 'part' => new YencPart('Movie.mkv', 7)]);
+        $service = $this->videoService($nntp);
+        $service->beginReleaseScope();
+        $service->downloadMappingArticle('a');
+        $service->retainMappedSourceArticle(new Par2FileEntry('Movie.mkv', 8));
+        try {
+            $service->downloadMappingArticle('broken');
+            $this->fail('The existing mapping exception must propagate.');
+        } catch (\RuntimeException $exception) {
+            $this->assertSame('fixture exception', $exception->getMessage());
+        }
+        $this->assertSame('NETWORK', $service->downloadArticle(DownloadKind::MediaSource, 'a')['data']);
+        $this->assertSame(0, $service->finishReleaseScope()->cacheHits);
+    }
+
+    #[Test]
+    public function a_full_video_cache_yields_to_later_archive_mapping_and_aggregate_priority(): void
+    {
+        $responses = ['BODY <archive>' => MappingArticleNntpHarness::body('R', 'release.rar'), 'BODY <aggregate>' => MappingArticleNntpHarness::body('FULL')];
+        foreach (range(0, 3) as $number) {
+            $responses['BODY <v'.$number.'>'] = MappingArticleNntpHarness::rawBody(YencArticles::part('AAAA', 'Movie'.$number.'.mkv', 8, 1, 1, 2));
+        }
+        $nntp = new MappingArticleNntpHarness('', $responses);
+        $service = $this->videoService($nntp);
+        $service->beginReleaseScope();
+        foreach (range(0, 3) as $number) {
+            $service->downloadMappingArticle('v'.$number);
+            $service->retainMappedSourceArticle(new Par2FileEntry('Movie'.$number.'.mkv', 8));
+        }
+        $this->assertSame(['entries' => 4, 'bytes' => 16, 'accounted' => 16], $this->retainedCacheState($service));
+        $service->downloadMappingArticle('archive');
+        $this->assertSame(['entries' => 4, 'bytes' => 13, 'accounted' => 13], $this->retainedCacheState($service));
+        $service->retainMappedSourceArticle(new Par2FileEntry('release.rar', 1, md5('R')));
+        $service->download(DownloadKind::Sample, ['aggregate']);
+        $this->assertSame(['entries' => 4, 'bytes' => 13, 'accounted' => 13], $this->retainedCacheState($service));
+        $this->assertSame('AAAA', $service->downloadArticle(DownloadKind::MediaSource, 'v2')['data']);
+        $this->assertSame('R', $service->download(DownloadKind::Compressed, ['archive'], cache: false)['data']);
+        $this->assertSame(['BODY <v0>', 'BODY <v1>', 'BODY <v2>', 'BODY <v3>', 'BODY <archive>', 'BODY <aggregate>'], $nntp->sentCommands());
+    }
+
+    #[Test]
+    #[DataProvider('protectedCacheCases')]
+    public function pending_video_admission_never_displaces_protected_archives_or_aggregates(int $archives): void
+    {
+        $responses = ['BODY <video>' => MappingArticleNntpHarness::rawBody(YencArticles::part('AAAA', 'Movie.mkv', 8, 1, 1, 2))];
+        foreach (range(0, 3) as $number) {
+            $responses['BODY <a'.$number.'>'] = MappingArticleNntpHarness::body('R', 'release.rar');
+        }
+        $nntp = new MappingArticleNntpHarness('', $responses);
+        $service = $this->videoService($nntp);
+        $service->beginReleaseScope();
+        foreach (range(0, 3) as $number) {
+            if ($number < $archives) {
+                $service->downloadMappingArticle('a'.$number);
+                $service->retainMappedSourceArticle(new Par2FileEntry('release.rar', 1, md5('R')));
+            } else {
+                $service->download(DownloadKind::Sample, ['a'.$number]);
+            }
+        }
+        $service->downloadMappingArticle('video');
+        $this->assertNull((new \ReflectionProperty($service, 'pendingMappingArticle'))->getValue($service));
+        $service->retainMappedSourceArticle(new Par2FileEntry('Movie.mkv', 8));
+        $this->assertSame(['entries' => 4, 'bytes' => 4, 'accounted' => 4], $this->retainedCacheState($service));
+        foreach (range(0, 3) as $number) {
+            $this->assertSame('R', $service->download($number < $archives ? DownloadKind::Compressed : DownloadKind::Sample, ['a'.$number], cache: false)['data']);
+        }
+        $this->assertSame(['BODY <a0>', 'BODY <a1>', 'BODY <a2>', 'BODY <a3>', 'BODY <video>'], $nntp->sentCommands());
+    }
+
+    public static function protectedCacheCases(): array
+    {
+        return ['archive cache full' => [4], 'aggregate cache full' => [0], 'mixed protected cache full' => [2]];
+    }
+
+    #[Test]
+    public function the_shared_byte_limit_evicts_videos_before_archives_for_mapping_and_aggregates(): void
+    {
+        $large = str_repeat('A', 8_388_608);
+        $nntp = Mockery::mock(NNTPService::class)->makePartial()->shouldAllowMockingProtectedMethods();
+        $nntp->shouldReceive('getArticleForArchiveMapping')->andReturnUsing(static function (string $id, bool $alternate, callable $onValidated) use ($large): array {
+            $part = new YencPart($id === 'archive' ? 'release.rar' : 'Movie.mkv', strlen($large));
+            $onValidated($large, $part);
+
+            return ['data' => $large, 'part' => $part];
+        });
+        $nntp->shouldReceive('getMessagesByMessageID')->once()->with(['aggregate'], false)->andReturn($large);
+        $service = $this->videoService($nntp);
+        $service->beginReleaseScope();
+        foreach (['video1', 'video2'] as $id) {
+            $service->downloadMappingArticle($id);
+            $service->retainMappedSourceArticle(new Par2FileEntry('Movie.mkv', strlen($large), md5(substr($large, 0, 16384))));
+        }
+        $this->assertSame(['entries' => 2, 'bytes' => 16_777_216, 'accounted' => 16_777_216], $this->retainedCacheState($service));
+        $service->downloadMappingArticle('archive');
+        $this->assertSame(['entries' => 2, 'bytes' => 16_777_216, 'accounted' => 16_777_216], $this->retainedCacheState($service));
+        $service->retainMappedSourceArticle(new Par2FileEntry('release.rar', strlen($large), md5(substr($large, 0, 16384))));
+        $service->download(DownloadKind::Sample, ['aggregate']);
+        $this->assertSame([], (new \ReflectionProperty($service, 'mappedVideoArticles'))->getValue($service));
+        $this->assertCount(1, (new \ReflectionProperty($service, 'mappedArchiveArticles'))->getValue($service));
+        $service->downloadMappingArticle('video3');
+        $this->assertNull((new \ReflectionProperty($service, 'pendingMappingArticle'))->getValue($service));
+        $this->assertSame(['entries' => 2, 'bytes' => 16_777_216, 'accounted' => 16_777_216], $this->retainedCacheState($service));
+    }
+
+    #[Test]
+    public function alternate_mapping_results_and_alternate_main_sockets_do_not_admit_video(): void
+    {
+        $raw = YencArticles::part('AAAA', 'Movie.mkv', 8, 1, 1, 2);
+        foreach ([false, true] as $mainIsAlternate) {
+            $wire = ($mainIsAlternate ? MappingArticleNntpHarness::rawBody($raw) : "430 missing\r\n").MappingArticleNntpHarness::body('NETWORK', 'Movie.mkv');
+            $nntp = new MappingArticleNntpHarness($wire);
+            $nntp->alternate = new MappingArticleNntpHarness(MappingArticleNntpHarness::rawBody($raw));
+            if ($mainIsAlternate) {
+                $nntp->useAlternateAsCurrentConnection();
+            }
+            $service = $this->videoService($nntp, ['alternateNNTP' => true]);
+            $service->beginReleaseScope();
+            $this->assertSame('AAAA', $service->downloadMappingArticle('a')['data']);
+            $service->retainMappedSourceArticle(new Par2FileEntry('Movie.mkv', 8));
+            $this->assertSame('NETWORK', $service->downloadArticle(DownloadKind::MediaSource, 'a')['data']);
+            $this->assertSame(0, $service->finishReleaseScope()->cacheHits);
+        }
+    }
+
+    #[Test]
+    public function the_opt_in_single_article_miss_preserves_alternate_fallback_and_part_metadata(): void
+    {
+        $nntp = new MappingArticleNntpHarness("430 missing\r\n");
+        $nntp->alternate = new MappingArticleNntpHarness(MappingArticleNntpHarness::rawBody(YencArticles::part('AAAA', 'Movie.mkv', 8, 1, 1, 2)));
+        $reused = 0;
+        $result = $nntp->getArticleByMessageIDWithReuse('a', true, static fn (): ?array => null, static function (int $bytes) use (&$reused): void {
+            $reused += $bytes;
+        });
+        $this->assertSame('AAAA', $result['data']);
+        $this->assertEquals(new YencPart('Movie.mkv', 8, 1, 1, 4), $result['part']);
+        $this->assertSame(0, $reused);
+        $this->assertSame(['BODY <a>'], $nntp->sentCommands());
+        $this->assertSame(['BODY <a>'], $nntp->alternate->sentCommands());
+        $this->assertSame(1, $nntp->alternate->quits);
+    }
+
+    #[Test]
+    #[DataProvider('ineligibleMappedVideoCases')]
+    public function video_admission_exclusions_preserve_the_lenient_mapping_result(string $raw, Par2FileEntry $file, array $overrides): void
+    {
+        $nntp = new MappingArticleNntpHarness('', [
+            'BODY <a>' => MappingArticleNntpHarness::rawBody($raw),
+        ]);
+        $service = $this->videoService($nntp, $overrides);
+        $service->beginReleaseScope();
+        $mapping = $service->downloadMappingArticle('a');
+        [$expectedData, $expectedPart] = (new YencService)->decodeWithFrame($raw."\r\n");
+        $this->assertSame($expectedData, $mapping['data']);
+        $this->assertEquals($expectedPart, $mapping['part']);
+        $service->retainMappedSourceArticle($file);
+        $media = $service->downloadArticle(DownloadKind::MediaSource, 'a');
+        $this->assertSame($mapping['data'], $media['data']);
+        $this->assertEquals($mapping['part'], $media['part']);
+        $this->assertSame(['BODY <a>', 'BODY <a>'], $nntp->sentCommands());
+        $this->assertSame(0, $service->finishReleaseScope()->cacheHits);
+    }
+
+    public static function ineligibleMappedVideoCases(): array
+    {
+        $raw = YencArticles::part('AAAA', 'Movie.mkv', 8, 1, 1, 2);
+        $file = new Par2FileEntry('Movie.mkv', 8);
+
+        return [
+            'checksumless' => [preg_replace('/ pcrc32=[0-9a-f]+/', '', $raw), $file, []],
+            'bad CRC' => [preg_replace('/pcrc32=[0-9a-f]+/', 'pcrc32=00000000', $raw), $file, []],
+            'bad declared size' => [str_replace('=yend size=4', '=yend size=5', $raw), $file, []],
+            'unframed' => ['AAAA', $file, []],
+            'nonzero offset' => [YencArticles::part('AAAA', 'Movie.mkv', 8, 1, 5, 2), $file, []],
+            'part2 at offset0' => [YencArticles::part('AAAA', 'Movie.mkv', 8, 2, 1, 2), $file, []],
+            'whole-file size disagrees despite PAR2 prefix match' => [$raw, new Par2FileEntry('Movie.mkv', 4, md5('AAAA')), []],
+            'unmatched PAR2 name' => [$raw, new Par2FileEntry('Other.mkv', 8), []],
+            'sample excluded' => [YencArticles::part('AAAA', 'Movie-sample.mkv', 8, 1, 1, 2), new Par2FileEntry('Movie-sample.mkv', 8), []],
+            'configured video type excluded' => [$raw, $file, ['videoFileRegex' => '\\.(MP4)']],
+            'below configured main-video size' => [$raw, $file, ['mediaMainVideoMinBytes' => 9]],
+            'main-video fallback disabled' => [$raw, $file, ['mediaMainVideoFallback' => false]],
+            'thumbnail processing disabled' => [$raw, $file, ['processThumbnails' => false]],
+        ];
+    }
+
+    #[Test]
+    public function video_cache_connection_failure_does_not_consume_a_hit_or_try_alternate(): void
+    {
+        $nntp = new MappingArticleNntpHarness('', ['BODY <a>' => MappingArticleNntpHarness::rawBody(YencArticles::part('AAAA', 'Movie.mkv', 8, 1, 1, 2))]);
+        $nntp->alternate = new MappingArticleNntpHarness('', ['BODY <a>' => MappingArticleNntpHarness::body('ALTERNATE')]);
+        $service = $this->videoService($nntp, ['alternateNNTP' => true]);
+        $service->beginReleaseScope();
+        $service->downloadMappingArticle('a');
+        $service->retainMappedSourceArticle(new Par2FileEntry('Movie.mkv', 8));
+        $nntp->doQuit();
+        $nntp->connectionFailure = true;
+        $result = $service->downloadArticle(DownloadKind::MediaSource, 'a');
+        $this->assertFalse($result['success']);
+        $this->assertSame('Fixture connection failed.', $result['error']);
+        $this->assertSame([], $nntp->alternate->sentCommands());
+        $metrics = $service->finishReleaseScope();
+        $this->assertSame(2, $metrics->networkRequests);
+        $this->assertSame(0, $metrics->cacheHits);
+        $this->assertSame(0, $metrics->bytesReused);
+        $this->assertSame(4, $metrics->bytesDownloaded);
+    }
+
+    #[Test]
+    public function mapping_bypasses_video_reuse_and_the_legacy_archive_entrypoint_stays_archive_only(): void
+    {
+        $raw = YencArticles::part('AAAA', 'Movie.mkv', 8, 1, 1, 2);
+        $nntp = new MappingArticleNntpHarness('', ['BODY <a>' => MappingArticleNntpHarness::rawBody($raw)]);
+        $service = $this->videoService($nntp);
+        $service->beginReleaseScope();
+        $service->downloadMappingArticle('a');
+        $service->retainMappedArchiveArticle(new Par2FileEntry('Movie.mkv', 8));
+        $service->downloadArticle(DownloadKind::MediaSource, 'a');
+        $service->downloadMappingArticle('a');
+        $service->retainMappedSourceArticle(new Par2FileEntry('Movie.mkv', 8));
+        $service->downloadMappingArticle('a');
+        $service->discardPendingMappingArticle();
+        $this->assertSame(['BODY <a>', 'BODY <a>', 'BODY <a>', 'BODY <a>'], $nntp->sentCommands());
+        $this->assertSame(0, $service->finishReleaseScope()->cacheHits);
+    }
+
+    #[Test]
+    public function exact_aggregate_cache_keeps_precedence_over_video_metadata_and_connection_gate(): void
+    {
+        $nntp = new PreviewNntpHarness((new YencService)->encode('AAAA', 'Movie.mkv')."\r\n.\r\n".(new YencService)->encode('WHOLE', 'Movie.mkv')."\r\n.\r\n");
+        $service = $this->videoService($nntp);
+        $service->beginReleaseScope();
+        $service->downloadMappingArticle('a');
+        $service->retainMappedSourceArticle(new Par2FileEntry('Movie.mkv', 4, md5('AAAA')));
+        $service->download(DownloadKind::Sample, ['a']);
+        $nntp->doQuit();
+        $result = $service->downloadArticle(DownloadKind::MediaSource, 'a');
+        $this->assertSame('WHOLE', $result['data']);
+        $this->assertNull($result['part']);
+        $this->assertSame(['BODY <a>', 'BODY <a>'], $nntp->commands);
+    }
+
+    #[Test]
+    #[DataProvider('videoReuseIsolationCases')]
+    public function video_reuse_requires_the_exact_scope_group_id_and_media_kind(string $mode): void
+    {
+        $nntp = new MappingArticleNntpHarness('', ['BODY <a>' => MappingArticleNntpHarness::rawBody(YencArticles::part('AAAA', 'Movie.mkv', 8, 1, 1, 2))]);
+        $service = $this->videoService($nntp);
+        $service->beginReleaseScope();
+        $service->downloadMappingArticle('a', 'group');
+        $service->retainMappedSourceArticle(new Par2FileEntry('Movie.mkv', 8));
+        if ($mode === 'new scope') {
+            $service->beginReleaseScope();
+        } elseif ($mode === 'finished scope') {
+            $service->finishReleaseScope();
+        }
+        $service->downloadArticle($mode === 'other kind' ? DownloadKind::Sample : DownloadKind::MediaSource, $mode === 'other ID text' ? '<a>' : 'a', $mode === 'other group' ? 'other' : 'group');
+        $this->assertSame(['BODY <a>', 'BODY <a>'], $nntp->sentCommands());
+        $this->assertSame(0, $service->finishReleaseScope()->cacheHits);
+    }
+
+    public static function videoReuseIsolationCases(): array
+    {
+        return array_map(static fn (string $mode): array => [$mode], ['new scope', 'finished scope', 'other kind', 'other ID text', 'other group']);
+    }
+
+    /** @param array<string, mixed> $overrides */
+    private function videoService(NNTPService $nntp, array $overrides = []): UsenetDownloadService
+    {
+        return new UsenetDownloadService($this->makeConfig(['processThumbnails' => true, 'mediaMainVideoFallback' => true, 'mediaMainVideoMinBytes' => 1, ...$overrides]), $nntp);
+    }
+
+    #[Test]
+    public function a_mapped_video_cache_hit_returns_the_original_part_after_the_connection_gate(): void
+    {
+        $nntp = new MappingArticleNntpHarness(MappingArticleNntpHarness::rawBody(YencArticles::part('AAAA', 'Movie.mkv', 8, 1, 1, 2)));
+        $service = new UsenetDownloadService($this->makeConfig(['processThumbnails' => true, 'mediaMainVideoFallback' => true, 'mediaMainVideoMinBytes' => 1]), $nntp);
+        $service->beginReleaseScope();
+        $mapping = $service->downloadMappingArticle('a', 'group');
+        $service->retainMappedSourceArticle(new Par2FileEntry('Movie.mkv', 8));
+        $cached = $service->downloadArticle(DownloadKind::MediaSource, 'a', 'group');
+        $this->assertSame($mapping['data'], $cached['data']);
+        $this->assertSame($mapping['part'], $cached['part']);
+        $this->assertSame(0, $cached['part']->offset());
+        $this->assertSame(['BODY <a>'], $nntp->sentCommands());
+        $metrics = $service->finishReleaseScope();
+        $this->assertSame(2, $metrics->logicalRequests);
+        $this->assertSame(1, $metrics->networkRequests);
+        $this->assertSame(4, $metrics->bytesReused);
+        $this->assertSame(4, $metrics->bytesDownloaded);
+        $this->assertSame(4, $metrics->mediaBytesDownloaded);
     }
 
     #[Test]
@@ -88,7 +428,8 @@ class UsenetDownloadServiceTest extends TestCase
         $aggregate = (new \ReflectionProperty($service, 'releaseCache'))->getValue($service);
         $mapped = (new \ReflectionProperty($service, 'mappedArchiveArticles'))->getValue($service);
         $pending = (new \ReflectionProperty($service, 'pendingMappingArticle'))->getValue($service);
-        $entries = [...array_values($aggregate), ...array_values($mapped), ...($pending === null ? [] : [$pending])];
+        $videos = (new \ReflectionProperty($service, 'mappedVideoArticles'))->getValue($service);
+        $entries = [...array_values($aggregate), ...array_values($mapped), ...array_values($videos), ...($pending === null ? [] : [$pending])];
 
         return [
             'entries' => count($entries),

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Unit\AdditionalProcessing;
 
 use App\Models\Release;
+use App\Services\AdditionalProcessing\AdditionalWorkPlanner;
 use App\Services\AdditionalProcessing\ConsoleOutputService;
 use App\Services\AdditionalProcessing\DTO\AdditionalWorkPlan;
 use App\Services\AdditionalProcessing\DTO\ArchivedMediaEntry;
@@ -14,6 +15,7 @@ use App\Services\AdditionalProcessing\Enums\SourcePosition;
 use App\Services\AdditionalProcessing\Enums\VideoContainer;
 use App\Services\AdditionalProcessing\Media\ArchivedMediaSlicer;
 use App\Services\AdditionalProcessing\Media\MediaArticleFetcher;
+use App\Services\AdditionalProcessing\Media\MediaSourceResolver;
 use App\Services\AdditionalProcessing\Media\MediaSourceStage;
 use App\Services\AdditionalProcessing\MediaExtractionService;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
@@ -25,9 +27,12 @@ use Illuminate\Support\Facades\Facade;
 use Mockery;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use Tests\Fixtures\MappingArticleNntpHarness;
+use Tests\Fixtures\YencArticles;
 
 class MediaSourceStageTest extends TestCase
 {
+    use BuildsArchiveFixtures;
     use CreatesProcessingConfiguration;
 
     private const string MKV_HEAD = "\x1A\x45\xDF\xA3".'HEADERS'."\x1F\x43\xB6\x75".'OPENING';
@@ -51,6 +56,66 @@ class MediaSourceStageTest extends TestCase
         (new Filesystem)->deleteDirectory($this->tmpPath);
         Mockery::close();
         parent::tearDown();
+    }
+
+    #[Test]
+    public function mapped_video_reuse_preserves_actual_stage_thumbnail_inputs_and_source_evidence(): void
+    {
+        $observations = [];
+        foreach ([false, true] as $withChecksum) {
+            $config = $this->makeConfig(['processThumbnails' => true, 'par2MediaMapping' => true, 'par2VerifyFiles' => 1, 'mediaMainVideoFallback' => true, 'mediaMainVideoMinBytes' => 1]);
+            $video = self::MKV_HEAD.'MORE';
+            $length = strlen($video);
+            $index = $this->par2Index([['Movie.mkv', $length, $video], ['Other.mkv', $length, str_repeat('Z', $length)]]);
+            $a = YencArticles::part(self::MKV_HEAD, 'Movie.mkv', $length, 1, 1, 2);
+            if (! $withChecksum) {
+                $a = preg_replace('/ pcrc32=[0-9a-f]+/', '', $a);
+            }
+            $nntp = new MappingArticleNntpHarness('', [
+                'BODY <index>' => MappingArticleNntpHarness::body($index, 'index.par2'),
+                'BODY <a>' => MappingArticleNntpHarness::rawBody($a),
+                'BODY <b>' => MappingArticleNntpHarness::rawBody(YencArticles::part('MORE', 'Movie.mkv', $length, 2, strlen(self::MKV_HEAD) + 1, 2)),
+            ]);
+            $download = new UsenetDownloadService($config, $nntp);
+            $context = $this->context([
+                ['title' => 'index.par2', 'size' => strlen($index), 'segments' => ['index'], 'filecount' => 1],
+                ['title' => 'opaque1', 'size' => $length, 'segments' => ['a', 'b'], 'filecount' => 1],
+                ['title' => 'opaque2', 'size' => $length, 'segments' => ['c', 'd'], 'filecount' => 1],
+            ]);
+            $planner = new AdditionalWorkPlanner($config);
+            $context->workPlan = $planner->plan($context->nzbContents, $context->releaseGroupName);
+            $download->beginReleaseScope();
+            $context->mediaPlan = (new MediaSourceResolver($config, $download))->resolve($context);
+            $this->assertNotNull($context->mediaPlan);
+            $renamed = $context->nzbContents;
+            foreach ($context->mediaPlan->mappedFiles as $sourceIndex => $mapped) {
+                $renamed[$sourceIndex]['title'] = '"'.$mapped->file->name.'" yEnc (1/2)';
+            }
+            $context->workPlan = $planner->plan($renamed, $context->releaseGroupName);
+            $media = Mockery::mock(MediaExtractionService::class);
+            $inputs = [];
+            $media->shouldReceive('getSample')->once()->andReturnUsing(static function (string $path, string $tmp, string $guid, MediaSourceHints $hints) use (&$inputs): bool {
+                $inputs[] = [file_get_contents($path), $hints, pathinfo($path, PATHINFO_EXTENSION)];
+
+                return true;
+            });
+            $media->shouldReceive('getMediaInfo')->once()->andReturnUsing(static function (string $path, int $releaseId) use (&$inputs): bool {
+                $inputs[] = [file_get_contents($path), $releaseId];
+
+                return false;
+            });
+            $media->shouldNotReceive('getVideo');
+            (new MediaSourceStage($config, $media, new MediaArticleFetcher($download), new ArchivedMediaSlicer($config), Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing()))->run($context);
+            $this->assertTrue($context->foundSample);
+            $this->assertSame($video, $inputs[0][0]);
+            $this->assertSame(SourcePosition::Complete, $inputs[0][1]->position);
+            $this->assertSame($length, $inputs[0][1]->realSize);
+            $this->assertSame($length, $inputs[0][1]->availableBytes);
+            $this->assertSame($withChecksum ? ['BODY <index>', 'BODY <a>', 'BODY <b>'] : ['BODY <index>', 'BODY <a>', 'BODY <a>', 'BODY <b>'], $nntp->sentCommands());
+            $this->assertSame($withChecksum ? strlen(self::MKV_HEAD) : 0, $download->finishReleaseScope()->bytesReused);
+            $observations[] = [$inputs, $context->mediaPlan, $context->mediaBudget->remaining()];
+        }
+        $this->assertEquals($observations[0], $observations[1]);
     }
 
     #[Test]

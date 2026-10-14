@@ -234,7 +234,7 @@ class MediaSourceResolverTest extends TestCase
      */
     private function resolver(ReleaseProcessingContext $context, UsenetDownloadService $download, array $config = []): MediaSourceResolver
     {
-        $download->shouldReceive('retainMappedArchiveArticle')->zeroOrMoreTimes()->andReturnNull();
+        $download->shouldReceive('retainMappedSourceArticle')->zeroOrMoreTimes()->andReturnNull();
         $download->shouldReceive('discardPendingMappingArticle')->zeroOrMoreTimes()->andReturnNull();
 
         return new MediaSourceResolver($this->makeConfig(['par2MediaMapping' => true, ...$config]), $download);
