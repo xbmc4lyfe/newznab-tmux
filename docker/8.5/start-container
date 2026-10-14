@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+# Build Linux artifacts from the mounted source before any PHP workers start.
+# Keep Cargo output inside the image rather than the host's mounted target tree.
+if ! /usr/local/bin/build-native.sh; then
+    echo 'Sail startup stopped because required native helpers are unavailable.' >&2
+    exit 1
+fi
+
 if [ -n "$WWWUSER" ]; then
     # Ubuntu already owns UID 1000 in the base image. Allow Sail to share the
     # requested host UID so bind-mounted files remain accessible on the host.

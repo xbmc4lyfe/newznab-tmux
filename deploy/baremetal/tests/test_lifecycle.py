@@ -1,8 +1,11 @@
 """Lifecycle failure-mode tests. No root privileges or live services are used."""
 
+import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -28,8 +31,8 @@ class LifecycleTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name) / "srv/nntmux"
-        self.config = Path(self.temp.name) / "etc/nntmux"
+        self.root = Path(self.temp.name).resolve() / "srv/nntmux"
+        self.config = Path(self.temp.name).resolve() / "etc/nntmux"
         self.root.mkdir(parents=True)
         self.config.mkdir(parents=True)
         self.addCleanup(patch.stopall)
@@ -70,6 +73,151 @@ class LifecycleTest(unittest.TestCase):
         (self.root / "shared/storage/framework").mkdir(parents=True)
         (self.root / "releases" / SHA).mkdir(parents=True)
         (self.root / "current").symlink_to(self.root / "releases" / SHA)
+
+    def prepare_source(self):
+        release = self.root / "releases" / OTHER
+        for directory in [
+            "public/build",
+            "bootstrap/cache",
+            "node_modules",
+            "docker/app/nzb-yenc-ffi",
+        ]:
+            (release / directory).mkdir(parents=True)
+        for filename in [
+            "composer.lock",
+            "package-lock.json",
+            "public/build/manifest.json",
+            "docker/app/nzb-yenc-ffi/Cargo.lock",
+        ]:
+            (release / filename).write_text("{}")
+        (self.config / "candidates").mkdir()
+        (self.config / "candidates" / (OTHER + ".json")).write_text(
+            json.dumps(self.candidate())
+        )
+        return release
+
+    def preparation_command(
+        self,
+        release,
+        *,
+        build_fails=False,
+        smoke="6f7698b1ec74b32ce9471482301220fc5c104ebe",
+        missing_library=False,
+    ):
+        def command(argv, **kwargs):
+            argv = [str(value) for value in argv]
+            output = ""
+            if "rev-parse" in argv:
+                output = OTHER
+            if "build" in argv and any(value.endswith("/cargo") for value in argv):
+                self.assertFalse((release / ".baremetal-ready.json").exists())
+                if build_fails:
+                    raise host.DeploymentError("Rust build failed")
+                self.assertIn("--locked", argv)
+                self.assertEqual(
+                    argv[argv.index("--target-dir") + 1],
+                    str(release / "docker/app/nzb-yenc-ffi/target"),
+                )
+                artifacts = release / "docker/app/nzb-yenc-ffi/target/release"
+                artifacts.mkdir(parents=True)
+                if not missing_library:
+                    (artifacts / "libnzbyenc.so").write_bytes(b"candidate library")
+                worker = artifacts / "nntmux-article-fingerprint"
+                worker.write_bytes(b"candidate worker")
+                worker.chmod(0o755)
+            if "-r" in argv:
+                self.assertFalse((release / ".baremetal-ready.json").exists())
+                self.assertIn("ffi.enable=false", argv)
+                self.assertIn(
+                    str(
+                        release
+                        / "docker/app/nzb-yenc-ffi/target/release/nntmux-article-fingerprint"
+                    ),
+                    argv,
+                )
+                output = smoke
+            return subprocess.CompletedProcess(argv, 0, output, "")
+
+        return command
+
+    def test_prepare_builds_and_verifies_release_local_native_runtime_before_readiness(
+        self,
+    ):
+        self.initialized()
+        release = self.prepare_source()
+        shared = self.root / "shared/storage/app/nntmux-native"
+        shared.mkdir(parents=True)
+        (shared / "libnzbyenc.so").write_bytes(b"active library")
+        with patch.object(
+            host, "run", side_effect=self.preparation_command(release)
+        ) as run:
+            host.prepare(OTHER)
+        manifest = host.read_json(release / ".baremetal-ready.json")
+        self.assertIn("native", manifest)
+        self.assertEqual(
+            manifest["native"]["libnzbyenc.so"],
+            hashlib.sha256(b"candidate library").hexdigest(),
+        )
+        self.assertEqual(
+            manifest["native"]["nntmux-article-fingerprint"],
+            hashlib.sha256(b"candidate worker").hexdigest(),
+        )
+        self.assertTrue(any("-r" in call.args[0] for call in run.call_args_list))
+        self.assertEqual((shared / "libnzbyenc.so").read_bytes(), b"active library")
+        self.assertEqual(host.current_commit(), SHA)
+
+    def test_native_build_or_verification_failure_never_marks_release_ready(self):
+        for options in [
+            {"build_fails": True},
+            {"smoke": ""},
+            {"smoke": "incorrect digest"},
+            {"missing_library": True},
+        ]:
+            with self.subTest(options=options):
+                release = self.prepare_source()
+                try:
+                    with patch.object(
+                        host,
+                        "run",
+                        side_effect=self.preparation_command(release, **options),
+                    ):
+                        with self.assertRaises(host.DeploymentError):
+                            host.prepare(OTHER)
+                    self.assertFalse((release / ".baremetal-ready.json").exists())
+                finally:
+                    shutil.rmtree(release)
+                    shutil.rmtree(self.config / "candidates")
+
+    def test_fresh_install_activates_only_after_native_verification(self):
+        release = self.prepare_source()
+        with patch.object(
+            host, "run", side_effect=self.preparation_command(release)
+        ), patch.object(host, "configure_elasticsearch"), patch.object(
+            host, "ready"
+        ), patch.object(
+            host, "cache"
+        ), patch.object(
+            host, "enable_initial_services"
+        ) as enable:
+            host.initialize(OTHER)
+        self.assertIn("native", host.read_json(release / ".baremetal-ready.json"))
+        self.assertEqual(host.current_commit(), OTHER)
+        enable.assert_called_once()
+
+    def test_update_native_build_failure_preserves_running_release(self):
+        self.initialized()
+        release = self.prepare_source()
+        with patch.object(
+            host, "run", side_effect=self.preparation_command(release, build_fails=True)
+        ), patch.object(host, "stop_services") as stop, patch.object(
+            host, "backup"
+        ) as backup:
+            with self.assertRaises(host.DeploymentError):
+                host.update(OTHER)
+        stop.assert_not_called()
+        backup.assert_not_called()
+        self.assertFalse((release / ".baremetal-ready.json").exists())
+        self.assertEqual(host.current_commit(), SHA)
 
     def test_managed_release_cannot_escape_release_root(self):
         (self.root / "current").symlink_to("/tmp")
@@ -511,6 +659,57 @@ class InventoryTest(unittest.TestCase):
         for selected in ["all", "*", "indexer:other"]:
             with self.assertRaises(ValueError):
                 deploy.validate_inventory(self.inventory(), selected)
+
+
+@unittest.skipUnless(
+    shutil.which("ansible-playbook"), "Ansible is required for task graph checks"
+)
+class DeploymentPlanTest(unittest.TestCase):
+    def task_plan(self, operation):
+        root = DIRECTORY.parents[1]
+        environment = os.environ | {
+            "ANSIBLE_CONFIG": str(root / "infra/ansible/ansible.cfg")
+        }
+        result = subprocess.run(
+            [
+                "ansible-playbook",
+                "-i",
+                "infra/ansible/inventory/hosts.yml.example",
+                f"infra/ansible/playbooks/{operation}.yml",
+                "--list-tasks",
+            ],
+            cwd=root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        return result.stdout
+
+    def test_install_builds_native_runtime_before_application_preparation(self):
+        plan = self.task_plan("install")
+        self.assertLess(
+            plan.index("packages : Verify pinned Rust compiler"),
+            plan.index("application : Build release with locked dependencies"),
+        )
+
+    def test_update_refreshes_only_native_prerequisites_and_helpers_before_preparation(
+        self,
+    ):
+        plan = self.task_plan("update")
+        self.assertLess(
+            plan.index("packages : Verify pinned Rust compiler"),
+            plan.index("base : Install lifecycle helpers"),
+        )
+        self.assertLess(
+            plan.index("base : Install lifecycle helpers"),
+            plan.index("application : Build release with locked dependencies"),
+        )
+        self.assertNotIn("base : Enable firewall", plan)
+        self.assertNotIn(
+            "packages : Install native runtime and build dependencies", plan
+        )
+        self.assertNotIn("services :", plan)
 
 
 if __name__ == "__main__":

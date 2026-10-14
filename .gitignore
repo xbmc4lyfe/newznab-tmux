@@ -109,3 +109,7 @@ deploy/**/__pycache__/
 /docker/.env
 /docker/config/app.env
 /docker/config/usenet_servers.json
+
+# Local builds of the existing NNTmux Rust runtime.
+/docker/app/nzb-yenc-ffi/target/
+/storage/app/nntmux-native/
