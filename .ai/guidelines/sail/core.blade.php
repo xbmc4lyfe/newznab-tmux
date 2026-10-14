@@ -5,9 +5,9 @@
 
 > **This guideline OVERRULES Boost's built-in Sail rules.** Do not require `{{ $assist->sailBinaryPath() }}` for day-to-day PHP, Artisan, Composer, Node, Pint, PHPStan, or tests.
 
-## Default: run on the WSL host
+## Default: use macOS or Linux host tools
 
-Prefer host commands (as in the Quick Reference at the top of `AGENTS.md`):
+Use macOS or Linux for development, builds, tests, CI, runtime, and deployment. Run host commands as described in `AGENTS.md`:
 
 - Artisan: `{{ $assist->artisanCommand('[command]') }}` (e.g. `php artisan test --compact --filter=TestName`)
 - Composer: `{{ $assist->composerCommand('install') }}`
@@ -24,10 +24,8 @@ Use Sail or `Makefile` targets only when:
 - The user explicitly asks for containerized commands
 - A task needs services only available inside Compose (e.g. aligning container UIDs via `make fix-permissions`)
 
-## WSL2 + Windows Docker Desktop
+## Docker diagnostics
 
-Local development is often done in WSL2 while Docker runs via **Windows Docker Desktop** (WSL integration), not a native Linux Docker install inside the distro.
-
-- If `docker` / `docker compose` cannot be found, or Sail fails with "Docker is not running" / cannot connect to the daemon, do **not** assume Docker must be installed inside WSL. Check that Docker Desktop is running on Windows and that WSL integration is enabled for this distro.
-- Prefer diagnosing through Docker Desktop (engine status, WSL integration settings) before suggesting `apt install docker` or similar host installs.
-- Host PHP/Artisan/tests remain valid even when the Docker engine is down.
+- Check Docker Desktop or the configured Linux VM on macOS when the daemon is unavailable.
+- Check the Docker service and socket access on Linux.
+- Host PHP, Artisan, and tests can run without Docker if their required services are reachable.
