@@ -131,6 +131,22 @@ final class VerificationWorkerLocks
         return $this->gc !== null;
     }
 
+    /** Alternate the first maintenance task across exclusively held GC turns. */
+    public function preferExpiry(): bool
+    {
+        if ($this->gc === null || $this->slot === null || $this->global === null) {
+            throw new RuntimeException('Maintenance selection requires an active worker and GC lock.');
+        }
+        rewind($this->gc);
+        $expiryFirst = stream_get_contents($this->gc, 16) === '1';
+        rewind($this->gc);
+        if (fwrite($this->gc, $expiryFirst ? '0' : '1') !== 1 || ! ftruncate($this->gc, 1) || ! fflush($this->gc)) {
+            throw new RuntimeException('Cannot persist verification maintenance selection.');
+        }
+
+        return $expiryFirst;
+    }
+
     public function releaseCandidate(): void
     {
         $this->release($this->candidate);

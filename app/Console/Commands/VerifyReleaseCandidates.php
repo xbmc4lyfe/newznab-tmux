@@ -58,8 +58,18 @@ class VerifyReleaseCandidates extends Command
             }
             if ($locks->tryGc()) {
                 try {
-                    $this->cleanupTerminalScratch($root, $locks);
-                    $repository->expire();
+                    // A slow maintenance backlog must not monopolize a verification slot.
+                    // Finish admitted transactions and individual filesystem operations; retain partial directories.
+                    $expiryFirst = $locks->preferExpiry();
+                    $maintenanceDeadline = hrtime(true) + 5_000_000_000;
+                    $mayMaintain = static fn (): bool => hrtime(true) < $maintenanceDeadline;
+                    if ($expiryFirst) {
+                        $repository->expire($mayMaintain);
+                        $this->cleanupTerminalScratch($root, $locks, $mayMaintain);
+                    } else {
+                        $this->cleanupTerminalScratch($root, $locks, $mayMaintain);
+                        $repository->expire($mayMaintain);
+                    }
                 } finally {
                     $locks->releaseGc();
                 }
@@ -153,12 +163,19 @@ class VerifyReleaseCandidates extends Command
         return self::SUCCESS;
     }
 
-    /** Recover interrupted terminal cleanup without delaying claims indefinitely. */
-    private function cleanupTerminalScratch(string $root, VerificationWorkerLocks $locks): void
+    /**
+     * Recover interrupted terminal cleanup without delaying claims indefinitely.
+     *
+     * @param  (callable(): bool)|null  $mayStart
+     */
+    private function cleanupTerminalScratch(string $root, VerificationWorkerLocks $locks, ?callable $mayStart = null): void
     {
         $scratch = $root.'/scratch';
         if (! $this->scratchRootIsSafe($scratch)) {
             throw new RuntimeException('Verification scratch root is inaccessible or linked; inventory retained.');
+        }
+        if ($mayStart !== null && ! $mayStart()) {
+            return;
         }
         $cursorPath = $root.'/indexed-scratch.cursor';
         $cursor = is_file($cursorPath) ? json_decode((string) file_get_contents($cursorPath), true) : null;
@@ -175,6 +192,10 @@ class VerifyReleaseCandidates extends Command
         $remaining = 1000;
         $exhausted = false;
         foreach ($entries as $entry) {
+            if ($mayStart !== null && ! $mayStart()) {
+                $exhausted = true;
+                break;
+            }
             if ($entry->candidate_id !== null && ! $locks->tryCandidate((int) $entry->candidate_id)) {
                 $after = (int) $entry->id;
 
@@ -206,8 +227,8 @@ class VerifyReleaseCandidates extends Command
                             ->exists();
                     if ($terminal) {
                         try {
-                            $this->deleteStaleScratch($directory, static function () use (&$remaining, &$exhausted): void {
-                                if ($remaining-- <= 0) {
+                            $this->deleteStaleScratch($directory, static function () use (&$remaining, &$exhausted, $mayStart): void {
+                                if ($remaining-- <= 0 || ($mayStart !== null && ! $mayStart())) {
                                     $exhausted = true;
                                     throw new RuntimeException('Terminal scratch cleanup will resume on the next run.');
                                 }

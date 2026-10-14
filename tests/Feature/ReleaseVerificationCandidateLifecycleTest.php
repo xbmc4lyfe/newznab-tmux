@@ -25,6 +25,114 @@ use PHPUnit\Framework\Attributes\DataProvider;
 
 class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandidatesTest
 {
+    public function test_expiry_deadline_finishes_admitted_transaction_and_retains_later_candidates(): void
+    {
+        $repository = app(CandidateRepository::class);
+        foreach (['old-one', 'old-two', 'old-three'] as $identity) {
+            $repository->enqueue(['identity' => sha1($identity), 'groups_id' => 1, 'files' => []]);
+        }
+        DB::table('release_verification_candidates')->update(['last_unique_at' => now()->subDays(3)]);
+        $before = DB::table('release_verification_candidates')->orderBy('id')->get();
+        $remaining = 2;
+        $repository->expire(static function () use (&$remaining): bool {
+            return $remaining-- > 0;
+        });
+
+        $this->assertSame(['expired', $before[1]->status, $before[2]->status], DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+        $this->assertSame((int) $before[1]->manifest_bytes + (int) $before[2]->manifest_bytes,
+            (int) DB::table('release_verification_state')->value('pending_bytes'));
+        foreach ([$before[1], $before[2]] as $candidate) {
+            $this->assertFileExists(app(ManifestStore::class)->path($candidate->manifest_path));
+        }
+        $this->assertSame(0, DB::transactionLevel());
+
+        $repository->expire();
+        $this->assertSame(3, DB::table('release_verification_candidates')->where('status', 'expired')->count());
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    public function test_expiry_defers_selection_when_maintenance_deadline_has_passed(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $queries = 0;
+        DB::listen(static function () use (&$queries): void {
+            $queries++;
+        });
+        $repository->expire(static fn (): bool => false);
+
+        $this->assertSame(0, $queries);
+    }
+
+    public function test_expiry_selection_consuming_deadline_retains_candidates_for_retry(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->enqueue(['identity' => sha1('old-after-slow-query'), 'groups_id' => 1, 'files' => []]);
+        DB::table('release_verification_candidates')->update(['last_unique_at' => now()->subDays(3)]);
+        $before = DB::table('release_verification_candidates')->sole();
+        $allowed = true;
+        DB::listen(static function ($query) use (&$allowed): void {
+            if (str_starts_with($query->sql, 'select') && str_contains($query->sql, '"last_unique_at"')) {
+                $allowed = false;
+            }
+        });
+        $repository->expire(static function () use (&$allowed): bool {
+            return $allowed;
+        });
+
+        $this->assertEquals($before, DB::table('release_verification_candidates')->sole());
+        $this->assertFileExists(app(ManifestStore::class)->path($before->manifest_path));
+        $this->assertSame((int) $before->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $repository->expire();
+        $this->assertSame('expired', DB::table('release_verification_candidates')->value('status'));
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function expiryOuterTransactions(): iterable
+    {
+        yield 'outer commit' => [true];
+        yield 'outer rollback' => [false];
+    }
+
+    #[DataProvider('expiryOuterTransactions')]
+    public function test_bounded_expiry_defers_manifest_deletion_until_outer_transaction_finishes(bool $commit): void
+    {
+        $repository = app(CandidateRepository::class);
+        foreach (['outer-one', 'outer-two'] as $identity) {
+            $repository->enqueue(['identity' => sha1($identity), 'groups_id' => 1, 'files' => []]);
+        }
+        DB::table('release_verification_candidates')->update(['last_unique_at' => now()->subDays(3)]);
+        $before = DB::table('release_verification_candidates')->orderBy('id')->get();
+        $bytes = (int) DB::table('release_verification_state')->value('pending_bytes');
+        DB::beginTransaction();
+        try {
+            $remaining = 2;
+            $repository->expire(static function () use (&$remaining): bool {
+                return $remaining-- > 0;
+            });
+            $this->assertSame('expired', DB::table('release_verification_candidates')->where('id', $before[0]->id)->value('status'));
+            $this->assertFileExists(app(ManifestStore::class)->path($before[0]->manifest_path));
+            if ($commit) {
+                DB::commit();
+            } else {
+                DB::rollBack();
+            }
+        } finally {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+        }
+        $this->assertEquals($before[1], DB::table('release_verification_candidates')->where('id', $before[1]->id)->sole());
+        $this->assertFileExists(app(ManifestStore::class)->path($before[1]->manifest_path));
+        if ($commit) {
+            $this->assertFileDoesNotExist(app(ManifestStore::class)->path($before[0]->manifest_path));
+            $this->assertSame($bytes - (int) $before[0]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        } else {
+            $this->assertEquals($before[0], DB::table('release_verification_candidates')->where('id', $before[0]->id)->sole());
+            $this->assertFileExists(app(ManifestStore::class)->path($before[0]->manifest_path));
+            $this->assertSame($bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        }
+    }
+
     /** @return iterable<string, array{bool}> */
     public static function filteredReplays(): iterable
     {
