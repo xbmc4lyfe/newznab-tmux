@@ -349,6 +349,70 @@ final class DockerDeployGuardTest extends TestCase
         $this->assertSame($replacement, readlink($this->dir.'/lock'), 'a late trap must not unlink a different owner');
     }
 
+    #[Test]
+    public function an_orphaned_release_child_cannot_unlink_a_new_owners_lock(): void
+    {
+        $bin = $this->dir.'/bin';
+        mkdir($bin);
+        $rm = trim((new Process(['sh', '-c', 'command -v rm']))->mustRun()->getOutput());
+        $ready = $this->dir.'/removal-ready';
+        $allow = $this->dir.'/allow-removal';
+        $done = $this->dir.'/removal-done';
+        $secondReady = $this->dir.'/second-ready';
+        $secondFinish = $this->dir.'/second-finish';
+        // Pause the actual removal child after the guard compared its ownership record.
+        file_put_contents($bin.'/rm', "#!/bin/sh\ntouch ".escapeshellarg($ready)
+            ."\nwhile [ ! -f ".escapeshellarg($allow)." ]; do sleep 0.05; done\n"
+            .escapeshellarg($rm).' "$@"'."\ntouch ".escapeshellarg($done)."\n");
+        chmod($bin.'/rm', 0755);
+        $first = $this->guardProcess(['run', 'up', '--', 'true'], ['PATH' => $bin.':'.getenv('PATH')]);
+        $second = $this->guardProcess(['run', 'up', '--', 'sh', '-c',
+            'touch '.escapeshellarg($secondReady).' && while [ ! -f '.escapeshellarg($secondFinish).' ]; do sleep 0.05; done',
+        ]);
+        $first->start();
+        try {
+            $this->waitFor(fn (): bool => file_exists($ready));
+            $first->signal(9);
+            $this->waitFor(fn (): bool => ! $first->isRunning());
+            $second->start();
+            $this->waitFor(fn (): bool => file_exists($secondReady) || ! $second->isRunning());
+            $replacement = is_link($this->dir.'/lock') ? readlink($this->dir.'/lock') : false;
+            touch($allow);
+            $this->waitFor(fn (): bool => file_exists($done));
+            if (file_exists($secondReady)) {
+                $this->assertSame($replacement, is_link($this->dir.'/lock') ? readlink($this->dir.'/lock') : false,
+                    'the orphaned removal must not unlink a newly acquired generation');
+            }
+            $this->assertSame(75, $second->getExitCode(), $second->getErrorOutput());
+            $this->assertFileDoesNotExist($secondReady);
+            $this->assertDirectoryExists($this->dir.'/lock.claim', 'an interrupted mutation requires explicit recovery');
+        } finally {
+            touch($allow);
+            touch($secondFinish);
+            if ($second->isStarted()) {
+                $second->wait();
+            }
+            $first->wait();
+            $this->waitFor(fn (): bool => file_exists($done));
+        }
+    }
+
+    #[Test]
+    public function an_old_mutation_claim_is_not_reclaimed_based_on_age(): void
+    {
+        $owner = 'pid=999999 by=gone target=up since=then';
+        symlink($owner, $this->dir.'/lock');
+        mkdir($this->dir.'/lock.claim');
+        touch($this->dir.'/lock.claim', time() - 7200);
+
+        $process = $this->guard(['run', 'up', '--', 'touch', $this->dir.'/payload-ran']);
+
+        $this->assertSame(75, $process->getExitCode(), $process->getErrorOutput());
+        $this->assertFileDoesNotExist($this->dir.'/payload-ran');
+        $this->assertSame($owner, readlink($this->dir.'/lock'));
+        $this->assertDirectoryExists($this->dir.'/lock.claim');
+    }
+
     private function guardShell(string $arguments): string
     {
         return 'sh '.escapeshellarg(dirname(__DIR__, 2).'/docker/bin/deploy-guard').' '.$arguments;

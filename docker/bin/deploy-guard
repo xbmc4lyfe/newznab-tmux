@@ -116,9 +116,16 @@ owner_alive() {
 }
 
 release() {
-    if [ "$(lock_info)" = "$owned_info" ]; then
-        rm -f "$LOCK"
+    # Serialize the comparison and its removal child with every lock acquisition/reclaim. If the
+    # owner dies while that child is running, the claim stays: no new generation can be installed.
+    if ! mkdir "$CLAIM" 2>/dev/null; then
+        echo "deploy-guard: lock mutation is claimed; leaving the owner record for later recovery." >&2
+        return 0
     fi
+    if [ "$(lock_info)" = "$owned_info" ]; then
+        rm -f "$LOCK" || return 1
+    fi
+    rmdir "$CLAIM"
 }
 
 busy() {
@@ -168,9 +175,10 @@ check_recovery_hold() {
         | cmp -s - "$HOLD" || recovery_busy
 }
 
-# Take the lock. A lock whose owner has died is removed under a short-lived claim directory, and only
-# if it still holds the dead owner's text, so two sessions that see the same stale lock cannot remove
-# each other's fresh one.
+# Every mutation uses the same short-lived claim directory, including creation and release. Never
+# reclaim a claim by age or parent death: an orphaned filesystem child may still be about to act.
+# An interrupted mutation therefore requires explicit recovery; an ordinary payload crash still
+# permits stale owner reclamation once no mutation is claimed.
 acquire() {
     target=$1
     generation=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
@@ -182,29 +190,23 @@ acquire() {
     while [ "$attempts" -lt 10 ]; do
         attempts=$((attempts + 1))
         check_recovery_hold
-        if ln -sn "$info" "$LOCK" 2>/dev/null; then
-            return 0
-        fi
-
-        seen=$(lock_info)
-        if owner_alive "$seen"; then
-            busy "$seen"
-        fi
-
         if mkdir "$CLAIM" 2>/dev/null; then
-            now=$(lock_info)
-            if [ -n "$now" ] && [ "$now" = "$seen" ] && ! owner_alive "$now"; then
+            if ln -sn "$info" "$LOCK" 2>/dev/null; then
+                rmdir "$CLAIM"
+                return 0
+            fi
+            seen=$(lock_info)
+            if owner_alive "$seen"; then
+                rmdir "$CLAIM"
+                busy "$seen"
+            fi
+            if [ -n "$seen" ] && [ "$(lock_info)" = "$seen" ] && ! owner_alive "$seen"; then
                 echo "deploy-guard: removing a stale lock" >&2
-                rm -rf "$LOCK"
+                rm -f "$LOCK"
             fi
-            rmdir "$CLAIM" 2>/dev/null || true
+            rmdir "$CLAIM"
         else
-            # Someone else is clearing it. A claim older than a minute was left by a crashed process.
-            if [ -n "$(find "$CLAIM" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
-                rmdir "$CLAIM" 2>/dev/null || true
-            else
-                sleep 0.3
-            fi
+            sleep 0.3
         fi
     done
     busy "$(lock_info)"
