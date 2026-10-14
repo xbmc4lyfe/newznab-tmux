@@ -521,15 +521,47 @@ final class ArticleProcessingBenchmarkTest extends TestCase
 
     public function test_build_manifest_requires_matching_source_and_library_identities(): void
     {
+        $sources = ['baseline' => self::syntheticBuildSourceIdentities('old-source'), 'candidate' => self::syntheticBuildSourceIdentities('new-source')];
         $manifest = ['baseline_library_sha256' => 'old-library', 'candidate_library_sha256' => 'new-library',
-            'baseline_source_sha256' => ['source.php' => 'old-source'], 'candidate_source_sha256' => ['source.php' => 'new-source']];
+            'baseline_source_sha256' => $sources['baseline'], 'candidate_source_sha256' => $sources['candidate']];
         $libraries = ['baseline' => ['path' => '/old.so', 'sha256' => 'old-library'], 'candidate' => ['path' => '/new.so', 'sha256' => 'new-library']];
-        $sources = ['baseline' => ['source.php' => 'old-source'], 'candidate' => ['source.php' => 'new-source']];
         articleBenchmarkVerifyManifest($manifest, $libraries, $sources);
-        $sources['candidate']['source.php'] = 'changed-after-build';
+        $sources['candidate']['docker/app/nzb-yenc-ffi/src/lib.rs'] = 'changed-after-build';
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('Source changed since recorded candidate build');
         articleBenchmarkVerifyManifest($manifest, $libraries, $sources);
+    }
+
+    public function test_build_manifest_cannot_omit_caller_or_native_source_identities(): void
+    {
+        $sources = ['baseline' => ['composer.lock' => 'lock', 'docker/app/nzb-yenc-ffi/src/lib.rs' => 'native-source'],
+            'candidate' => ['composer.lock' => 'lock', 'docker/app/nzb-yenc-ffi/src/lib.rs' => 'changed-native-source']];
+        $libraries = ['baseline' => ['path' => '/old.so', 'sha256' => 'old-library'], 'candidate' => ['path' => '/new.so', 'sha256' => 'new-library']];
+        $manifest = ['baseline_library_sha256' => 'old-library', 'candidate_library_sha256' => 'new-library',
+            'baseline_source_sha256' => ['composer.lock' => 'lock'], 'candidate_source_sha256' => ['composer.lock' => 'lock']];
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Build manifest requires source identity');
+        articleBenchmarkVerifyManifest($manifest, $libraries, $sources);
+    }
+
+    public function test_build_manifest_requires_each_caller_cargo_and_nested_native_identity(): void
+    {
+        $sources = ['baseline' => self::syntheticBuildSourceIdentities('baseline'), 'candidate' => self::syntheticBuildSourceIdentities('candidate')];
+        $libraries = ['baseline' => ['path' => '/old.so', 'sha256' => 'old-library'], 'candidate' => ['path' => '/new.so', 'sha256' => 'new-library']];
+        foreach (['baseline', 'candidate'] as $backend) {
+            foreach (['app/Services/NNTP/NNTPService.php', 'app/Services/Yenc/DecoderFactory.php',
+                'docker/app/nzb-yenc-ffi/Cargo.toml', 'docker/app/nzb-yenc-ffi/src/nested/module.rs'] as $path) {
+                $manifest = ['baseline_library_sha256' => 'old-library', 'candidate_library_sha256' => 'new-library',
+                    'baseline_source_sha256' => $sources['baseline'], 'candidate_source_sha256' => $sources['candidate']];
+                unset($manifest[$backend.'_source_sha256'][$path]);
+                try {
+                    articleBenchmarkVerifyManifest($manifest, $libraries, $sources);
+                    self::fail('Incomplete source inventory was accepted.');
+                } catch (\RuntimeException $exception) {
+                    self::assertSame('Build manifest requires source identity for '.$backend.': '.$path, $exception->getMessage());
+                }
+            }
+        }
     }
 
     public function test_paired_run_retains_all_failed_pairs_and_frozen_setup_evidence(): void
@@ -627,6 +659,15 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         }
     }
 
+    /** @return array<string, string> */
+    private static function syntheticBuildSourceIdentities(string $marker): array
+    {
+        return array_fill_keys([...articleBenchmarkBaselinePaths(), 'composer.lock', 'app/Services/YencService.php',
+            'app/Services/Yenc/DecoderFactory.php', 'app/Services/Yenc/NativePayloadDecoder.php', 'app/Services/Yenc/ArticleFrame.php',
+            'docker/app/nzb-yenc-ffi/Cargo.toml', 'docker/app/nzb-yenc-ffi/Cargo.lock', 'docker/app/nzb-yenc-ffi/src/lib.rs',
+            'docker/app/nzb-yenc-ffi/src/nested/module.rs'], $marker);
+    }
+
     /** @param array<string, mixed> $options */
     private static function createSyntheticBuildManifest(string $directory, array $options): string
     {
@@ -697,8 +738,12 @@ return true;
 PHP);
         file_put_contents($root.'/composer.json', '{}');
         file_put_contents($root.'/composer.lock', '{}');
+        mkdir($root.'/docker/app/nzb-yenc-ffi/src', 0700, true);
+        file_put_contents($root.'/docker/app/nzb-yenc-ffi/Cargo.toml', '[package]');
+        file_put_contents($root.'/docker/app/nzb-yenc-ffi/Cargo.lock', 'version = 4');
+        file_put_contents($root.'/docker/app/nzb-yenc-ffi/src/lib.rs', '// Synthetic native source');
         articleBenchmarkGit($root, ['init', '--quiet']);
-        $paths = ['app', 'tests', 'composer.json', 'composer.lock'];
+        $paths = ['app', 'tests', 'docker', 'composer.json', 'composer.lock'];
         articleBenchmarkGit($root, ['add', ...$paths]);
     }
 

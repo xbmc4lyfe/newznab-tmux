@@ -614,6 +614,19 @@ function articleBenchmarkVerifyManifest(array $manifest, array $libraries, array
         if (! is_array($sourceMap) || $sourceMap === []) {
             throw new RuntimeException('Build manifest requires '.$backend.'_source_sha256.');
         }
+        $requiredPaths = array_merge(articleBenchmarkBaselinePaths(), ['composer.lock', 'app/Services/YencService.php',
+            'app/Services/Yenc/DecoderFactory.php', 'app/Services/Yenc/NativePayloadDecoder.php', 'app/Services/Yenc/ArticleFrame.php',
+            'docker/app/nzb-yenc-ffi/Cargo.toml', 'docker/app/nzb-yenc-ffi/Cargo.lock', 'docker/app/nzb-yenc-ffi/src/lib.rs']);
+        foreach (array_keys($sources[$backend]) as $path) {
+            if (str_starts_with($path, 'app/Services/Yenc/') || str_starts_with($path, 'docker/app/nzb-yenc-ffi/src/')) {
+                $requiredPaths[] = $path;
+            }
+        }
+        foreach (array_unique($requiredPaths) as $path) {
+            if (! is_string($sources[$backend][$path] ?? null) || ! is_string($sourceMap[$path] ?? null)) {
+                throw new RuntimeException('Build manifest requires source identity for '.$backend.': '.$path);
+            }
+        }
         foreach ($sourceMap as $path => $digest) {
             if (! is_string($digest) || ($sources[$backend][$path] ?? null) !== $digest) {
                 throw new RuntimeException('Source changed since recorded '.$backend.' build: '.$path);

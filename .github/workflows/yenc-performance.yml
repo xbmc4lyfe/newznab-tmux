@@ -409,11 +409,13 @@ jobs:
           }
           callers = ['app/Services/NNTP/NNTPService.php',
               'app/Services/Releases/Fingerprint/NativeMetadataParser.php',
-              'app/Services/Releases/Fingerprint/NzbFingerprintAnalyzer.php']
+              'app/Services/Releases/Fingerprint/NzbFingerprintAnalyzer.php',
+              'app/Services/YencService.php', 'composer.lock']
           native = ['docker/app/nzb-yenc-ffi/Cargo.toml', 'docker/app/nzb-yenc-ffi/Cargo.lock']
           def sources(root):
               return {str(path.relative_to(root)): digest(path) for path in
-                  [root / name for name in callers + native] + sorted((root / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs'))}
+                  [root / name for name in callers + native] + sorted(path for directory in
+                      ['app/Services/Yenc', 'docker/app/nzb-yenc-ffi/src'] for path in (root / directory).rglob('*') if path.is_file())}
           candidate_library = pathlib.Path(os.environ['CANDIDATE_SOURCE']) / library
           candidate_kernel_id = optional_kernel(candidate_library)
           manifest.update({
