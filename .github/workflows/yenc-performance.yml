@@ -1,0 +1,245 @@
+name: Paired native yEnc performance
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/yenc-performance.yml'
+      - 'scripts/benchmark-yenc.php'
+      - 'scripts/benchmark-yenc-abi.py'
+      - 'tests/Unit/test_yenc_abi_benchmark.py'
+      - 'tests/Feature/ReleaseFingerprintMetadataTest.php'
+      - 'scripts/build-rapidyenc.sh'
+      - 'app/Services/Yenc/**'
+      - 'app/Services/Releases/Fingerprint/**'
+      - 'app/Services/YencService.php'
+      - 'app/Services/NNTP/NNTPService.php'
+      - 'docker/app/nzb-yenc-ffi/**'
+      - 'tests/Fixtures/YencArticles.php'
+      - 'tests/Support/YencNntpHarness.php'
+      - 'tests/Unit/Yenc*Test.php'
+      - 'tests/Unit/NNTPBodyDecodingTest.php'
+      - 'composer.json'
+      - 'composer.lock'
+  workflow_dispatch:
+    inputs:
+      samples:
+        description: Matched fresh-process pairs per fixture stratum
+        default: '31'
+        required: true
+      seed:
+        description: Recorded order and bootstrap seed
+        default: '20261013'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yenc-performance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paired-decoding:
+    # PR code runs only on disposable GitHub-hosted workers.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      RUST_TOOLCHAIN: '1.98.0'
+      BENCHMARK_SAMPLES: ${{ inputs.samples || '31' }}
+      BENCHMARK_SEED: ${{ inputs.seed || '20261013' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: dom, curl, ffi, intl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite
+          coverage: none
+
+      - name: Install locked PHP dependencies without application boot
+        run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
+
+      - name: Test benchmark decisions and failure retention
+        run: |
+          php vendor/bin/phpunit --filter=YencBenchmarkTest
+          python3 tests/Unit/test_yenc_abi_benchmark.py
+
+      - name: Build pinned C++ baseline
+        shell: bash
+        run: |
+          mkdir -p benchmark-evidence/build
+          bash scripts/build-rapidyenc.sh 2>&1 | tee benchmark-evidence/build/cpp-build.log
+
+      - name: Build and test locked Rust candidate
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-test.log
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-build.log
+
+      - name: Verify each native decoder through the same PHP services
+        shell: bash
+        run: |
+          for backend in cpp rust; do
+            if [[ "$backend" == cpp ]]; then
+              library="$GITHUB_WORKSPACE/storage/app/rapidyenc/librapidyenc.so"
+            else
+              library="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so"
+            fi
+            YENC_NATIVE_LIBRARY="$library" php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
+              --filter='YencNativeDecoderTest|YencServiceTest|NNTPBodyDecodingTest' \
+              2>&1 | tee "benchmark-evidence/build/parity-$backend.log"
+          done
+
+      - name: Verify native framing budget integration on Linux
+        shell: bash
+        run: |
+          YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
+              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines|it_withholds_integrity_for_trailer_only_multipart_declarations|it_accepts_identical_control_fields_in_native_and_fallback_metadata|it_requires_multipart_footer_fields_before_granting_integrity' \
+              2>&1 | tee benchmark-evidence/build/framing-budget-integration.log
+
+      - name: Record build and runtime identities
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ctypes, hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path.cwd()
+          def run(*args):
+              return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
+          def digest(path):
+              return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+          sources = sorted((root / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs'))
+          decoder = ctypes.CDLL(str(root / 'docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so'))
+          decoder.nntmux_yenc_payload_kernel_v1.argtypes = []
+          decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          kernel = decoder.nntmux_yenc_payload_kernel_v1()
+          kernel_names = {0: 'scalar', 1: 'ssse3', 2: 'avx2', 3: 'avx512-vbmi2', 4: 'neon'}
+          if kernel not in kernel_names:
+              raise RuntimeError('Unknown Rust runtime payload kernel identity')
+          manifest = {
+              'git_head': run('git', 'rev-parse', 'HEAD'),
+              'runner_image_os': os.environ.get('ImageOS'),
+              'runner_image_version': os.environ.get('ImageVersion'),
+              'runner_arch': os.environ.get('RUNNER_ARCH'),
+              'github_run_id': os.environ.get('GITHUB_RUN_ID'),
+              'uname': run('uname', '-a'), 'cpu': run('lscpu'),
+              'php': run('php', '-v'), 'cpp_compiler': run('c++', '--version'),
+              'cmake': run('cmake', '--version'),
+              'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
+              'cargo': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'cargo', '-V'),
+              'rust_source_sha256': {str(path.relative_to(root)): digest(path) for path in sources},
+              'cargo_lock_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.lock'),
+              'cargo_toml_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.toml'),
+              'rust_build_command': 'cargo +1.98.0 build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml',
+              'cpp_build_script_sha256': digest('scripts/build-rapidyenc.sh'),
+              'cpp_source_archive_sha256': {path.name: digest(path) for path in pathlib.Path('storage/app/rapidyenc').glob('rapidyenc-*.tar.gz')},
+              'cpp_library_sha256': digest('storage/app/rapidyenc/librapidyenc.so'),
+              'rust_library_sha256': digest('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so'),
+              'rust_payload_kernel': {'id': kernel, 'name': kernel_names[kernel],
+                  'basis': 'untimed export from the same runtime selector used by payload decoding'},
+          }
+          pathlib.Path('benchmark-evidence/build/runtime.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+
+      - name: Require execution of the designated SIMD kernel
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, shutil
+          directory = pathlib.Path('benchmark-evidence/build')
+          manifest = json.loads((directory / 'runtime.json').read_text())
+          expected = {'X64': 3, 'ARM64': 4}.get(manifest['runner_arch'])
+          observed = manifest['rust_payload_kernel']['id']
+          qualified = expected is not None and observed == expected
+          for source, name in [
+              ('storage/app/rapidyenc/librapidyenc.so', 'cpp.so'),
+              ('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so', 'rust.so'),
+          ]:
+              shutil.copyfile(source, directory / name)
+          qualification = {
+              'status': 'qualified' if qualified else 'unsupported_hardware',
+              'runner_arch': manifest['runner_arch'],
+              'required_kernel_id': expected, 'observed_kernel': manifest['rust_payload_kernel'],
+              'git_head': manifest['git_head'],
+              'rust_library_sha256': manifest['rust_library_sha256'],
+              'cpp_library_sha256': manifest['cpp_library_sha256'],
+              'basis': 'Same runtime selector used by the tested decoder; x86 requires VBMI2, ARM requires NEON.',
+              'conclusion': 'Hardware qualified for the paired comparison.' if qualified else
+                  'Required SIMD kernel was not exercised; no eligible performance comparison.',
+          }
+          (directory / 'kernel-qualification.json').write_text(json.dumps(qualification, indent=2) + '\n')
+          if not qualified:
+              raise SystemExit(f'Unsupported hardware: required kernel {expected}, observed {observed}; evidence retained.')
+          PY
+
+      - name: Run randomized paired decoder comparison
+        shell: bash
+        run: |
+          php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-yenc.php \
+            --cpp-native="$GITHUB_WORKSPACE/storage/app/rapidyenc/librapidyenc.so" \
+            --rust-native="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            --samples="$BENCHMARK_SAMPLES" --order-seed="$BENCHMARK_SEED" --timeout=30 \
+            --min-improvement-percent=5 --max-regression-percent=5 \
+            --runtime-manifest="$GITHUB_WORKSPACE/benchmark-evidence/build/runtime.json" \
+            --output-dir="$GITHUB_WORKSPACE/benchmark-evidence/paired" \
+            2>&1 | tee benchmark-evidence/build/paired-console.log
+
+      - name: Explain native decode and CRC costs without changing the caller gate
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [[ -f benchmark-evidence/paired/cpp.so && -f benchmark-evidence/paired/rust.so ]]; then
+            python3 scripts/benchmark-yenc-abi.py \
+              --fixture-dir="$GITHUB_WORKSPACE/benchmark-evidence/paired" \
+              --output-dir="$GITHUB_WORKSPACE/benchmark-evidence/abi-diagnostic" \
+              --runtime-manifest="$GITHUB_WORKSPACE/benchmark-evidence/build/runtime.json" \
+              --samples=11 --iterations=8 --seed=20261013 --timeout=30 \
+              2>&1 | tee benchmark-evidence/build/abi-diagnostic-console.log
+          else
+            echo 'ABI diagnostic skipped: paired native libraries/fixtures unavailable.'
+            mkdir -p benchmark-evidence/abi-diagnostic
+            echo '{"type":"run_summary","status":"skipped","reason":"paired native libraries/fixtures unavailable","claim":"no ABI performance conclusion"}' > benchmark-evidence/abi-diagnostic/observations.jsonl
+          fi
+
+      - name: Summarize every measured stratum
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path('benchmark-evidence/paired/observations.jsonl')
+          rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## Native yEnc paired fixture comparison\n\n')
+              qualification_path = pathlib.Path('benchmark-evidence/build/kernel-qualification.json')
+              if qualification_path.exists():
+                  qualification = json.loads(qualification_path.read_text())
+                  summary.write('Kernel qualification: `' + qualification['status'] + '`. ' + qualification['conclusion'] + '\n\n')
+              summary.write('Scope: identical synthetic fixtures through the same PHP decoder service and memory-backed NNTP BODY harness. No archive-metadata or production-capacity claim.\n\n')
+              summary.write('| Bytes | Density | Path | Decision | Rust / C++ median | 95% interval | Eligible / invalid pairs |\n|---:|---|---|---|---:|---|---|\n')
+              for row in rows:
+                  if row.get('type') != 'stratum_summary':
+                      continue
+                  summary.write(f"| {row['size']} | {row['density']} | {row['path']} | {row['decision']} | {row.get('median_rust_over_cpp', 'unavailable')} | {row.get('bootstrap_95_percent_interval', 'unavailable')} | {row['eligible_pairs']} / {row['invalid_pairs']} |\n")
+              final = next((row for row in reversed(rows) if row.get('type') in ('run_summary', 'run_failure')), None)
+              summary.write('\nRun result: `' + (final['status'] if final else 'setup incomplete; no performance conclusion') + '`.\n\n')
+              summary.write('Intervals use a simultaneous 95% bootstrap rule across the predeclared fixture groups. Inconclusive strata do not demonstrate a Rust speed advantage. Failed or timed-out pairs are retained and make the affected stratum invalid.\n')
+          PY
+
+      - name: Retain fixtures, libraries, identities and every observation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yenc-performance-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: benchmark-evidence/
+          if-no-files-found: warn
+          retention-days: 14

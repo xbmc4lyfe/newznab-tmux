@@ -1845,15 +1845,27 @@ class NNTPService extends NntpClient
         $body = '';
         $line = '';
         $socket = $this->_socket;
-        while (! feof($socket)) {
+        while (true) {
             $fragment = fgets($socket, 8192);
             if ($fragment === false) {
-                return $this->throwError('Failed to read line from socket.', null);
+                return $this->throwError(feof($socket)
+                    ? 'End of stream! Connection lost?'
+                    : 'Failed to read line from socket.', null);
             }
             if ($onRead !== null && ! $onRead()) {
                 $this->doQuit();
 
                 return $this->throwError('NNTP article read stopped after processing lock ownership was lost.', null);
+            }
+            // Most reads contain a complete line. Keep the accumulator for
+            // fragmented lines, without copying/resetting it on ordinary reads.
+            if ($line === '' && str_ends_with($fragment, "\n")) {
+                if ($fragment === ".\r\n") {
+                    return $body;
+                }
+                $body .= str_starts_with($fragment, '..') ? substr($fragment, 1) : $fragment;
+
+                continue;
             }
             $line .= $fragment;
             if (! str_ends_with($line, "\n")) {
@@ -1865,8 +1877,6 @@ class NNTPService extends NntpClient
             $body .= str_starts_with($line, '..') ? substr($line, 1) : $line;
             $line = '';
         }
-
-        return $this->throwError('End of stream! Connection lost?', null);
     }
 
     /**
