@@ -97,3 +97,11 @@ jobs:
           PAR2_DONOR_TEST_USERNAME: root
           PAR2_DONOR_TEST_PASSWORD: donor-fixture-only
         run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/VerificationReadyQueueMariaDbTest.php
+
+      - name: Qualify disabled-password additional admission against MariaDB
+        env:
+          ADDITIONAL_ADMISSION_TEST_HOST: 127.0.0.1
+          ADDITIONAL_ADMISSION_TEST_PORT: 3306
+          ADDITIONAL_ADMISSION_TEST_USERNAME: root
+          ADDITIONAL_ADMISSION_TEST_PASSWORD: donor-fixture-only
+        run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/AdditionalPasswordDisabledMariaDbTest.php

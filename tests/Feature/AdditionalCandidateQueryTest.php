@@ -192,6 +192,95 @@ class AdditionalCandidateQueryTest extends TestCase
         $this->assertSame([1], AdditionalCandidateQuery::claimBatch('a', 10, 'token-two', columns: ['id'])->pluck('id')->all());
     }
 
+    public function test_disabling_password_checks_keeps_pending_media_in_selection_and_claims(): void
+    {
+        config(['nntmux_settings.check_passworded_rars' => false]);
+        DB::table('categories')->insert(['id' => 1, 'disablepreview' => 0]);
+        DB::table('releases')->insert([
+            $this->releaseRow(1, 'a'),
+            array_replace($this->releaseRow(2, 'a'), ['passwordstatus' => 0]),
+            array_replace($this->releaseRow(3, 'b'), ['passwordstatus' => 1]),
+            array_replace($this->releaseRow(4, 'b'), ['passwordstatus' => 0, 'haspreview' => 0]),
+        ]);
+
+        $this->assertSame([1, 2], AdditionalCandidateQuery::baseBuilder()->orderBy('r.id')->pluck('r.id')->all());
+        $this->assertSame(['total' => 2, 'available' => 2], AdditionalCandidateQuery::backlogCounts());
+        $this->assertSame(['a'], AdditionalCandidateQuery::bucketChars());
+        $this->assertSame([1, 2], AdditionalCandidateQuery::claimBatch('a', 10, 'disabled-password-claim', columns: ['id'])->pluck('id')->all());
+        $this->assertSame(['total' => 2, 'available' => 0], AdditionalCandidateQuery::backlogCounts());
+    }
+
+    public function test_enabled_password_checks_keep_the_existing_unchecked_only_gate(): void
+    {
+        config(['nntmux_settings.check_passworded_rars' => true]);
+        DB::table('categories')->insert(['id' => 1, 'disablepreview' => 0]);
+        DB::table('releases')->insert([
+            $this->releaseRow(1, 'a'),
+            array_replace($this->releaseRow(2, 'a'), ['passwordstatus' => 0]),
+            array_replace($this->releaseRow(3, 'b'), ['passwordstatus' => 1]),
+        ]);
+
+        $this->assertSame([1], AdditionalCandidateQuery::baseBuilder()->pluck('r.id')->all());
+        $this->assertSame([1], AdditionalCandidateQuery::claimBatch('a', 10, 'enabled-password-claim', columns: ['id'])->pluck('id')->all());
+    }
+
+    public function test_password_disabled_candidates_still_obey_other_admission_gates(): void
+    {
+        config(['nntmux_settings.check_passworded_rars' => false]);
+        DB::table('categories')->insert([
+            ['id' => 1, 'disablepreview' => 0],
+            ['id' => 2, 'disablepreview' => 1],
+        ]);
+        DB::table('releases')->insert([
+            array_replace($this->releaseRow(1, 'a'), ['passwordstatus' => 0]),
+            array_replace($this->releaseRow(2, 'a', categoriesId: 2), ['passwordstatus' => 0]),
+            array_replace($this->releaseRow(3, 'a'), ['passwordstatus' => 0, 'nzbstatus' => 0]),
+            array_replace($this->releaseRow(4, 'a'), ['passwordstatus' => 0, 'size' => 1048576]),
+            array_replace($this->releaseRow(5, 'a'), ['passwordstatus' => 0, 'size' => AdditionalCandidateQuery::DEFAULT_MAX_SIZE_BYTES]),
+            array_replace($this->releaseRow(6, 'a', claimedAt: now()), ['passwordstatus' => 0]),
+            array_replace($this->releaseRow(7, 'a', archiveRetryAt: now()->addMinute()), ['passwordstatus' => 0]),
+            array_replace($this->releaseRow(8, 'a', claimedAt: now()->subSeconds(301)), ['passwordstatus' => 0]),
+            array_replace($this->releaseRow(9, 'a', categoriesId: 999), ['passwordstatus' => 0]),
+        ]);
+
+        $this->assertSame([1, 8], AdditionalCandidateQuery::baseBuilder()->orderBy('r.id')->pluck('r.id')->all());
+        $this->assertSame([1, 8], AdditionalCandidateQuery::claimBatch('a', 10, 'guarded-password-claim', columns: ['id'])->pluck('id')->all());
+    }
+
+    public function test_disabled_mode_merges_bounded_status_prefixes_in_global_order(): void
+    {
+        config(['nntmux_settings.check_passworded_rars' => false]);
+        DB::table('categories')->insert(['id' => 1, 'disablepreview' => 0]);
+        $rows = [];
+        for ($id = 1; $id <= 24; $id++) {
+            $rows[] = array_replace($this->releaseRow($id, 'a'), [
+                'passwordstatus' => $id % 2 === 0 ? 0 : -1,
+                'postdate' => $id <= 2 ? null : ($id <= 6 ? '2026-07-13 00:00:00' : '2026-07-12 00:00:00'),
+            ]);
+        }
+        DB::table('releases')->insert($rows);
+
+        $this->assertSame([3, 5, 6], AdditionalCandidateQuery::claimBatch('a', 3, 'first', columns: ['id'], excludedReleaseIds: [4])->pluck('id')->all());
+        $this->assertSame(range(7, 24), AdditionalCandidateQuery::claimBatch('a', 18, 'next', columns: ['id'], excludedReleaseIds: [4])->pluck('id')->all());
+        $this->assertSame([1, 2], AdditionalCandidateQuery::claimBatch('a', 10, 'null-dates', columns: ['id'], excludedReleaseIds: [4])->pluck('id')->all());
+    }
+
+    public function test_disabled_mode_completed_media_stays_out_and_deferred_media_returns_once_due(): void
+    {
+        config(['nntmux_settings.check_passworded_rars' => false]);
+        DB::table('categories')->insert(['id' => 1, 'disablepreview' => 0]);
+        DB::table('releases')->insert(array_replace($this->releaseRow(1, 'a'), ['passwordstatus' => 0]));
+        $this->assertSame([1], AdditionalCandidateQuery::claimBatch('a', 1, 'first', columns: ['id'])->pluck('id')->all());
+        DB::table('releases')->where('id', 1)->update(['archive_retry_at' => now()->addMinute()]);
+        AdditionalCandidateQuery::clearClaim(1, 'first');
+        $this->assertSame([], AdditionalCandidateQuery::claimBatch('a', 1, 'early', columns: ['id'])->pluck('id')->all());
+        $this->travel(61)->seconds();
+        $this->assertSame([1], AdditionalCandidateQuery::claimBatch('a', 1, 'retry', columns: ['id'])->pluck('id')->all());
+        DB::table('releases')->where('id', 1)->update(['haspreview' => 0]);
+        AdditionalCandidateQuery::clearClaim(1, 'retry');
+        $this->assertFalse(AdditionalCandidateQuery::hasAnyCandidate());
+    }
+
     /**
      * @return array<string, mixed>
      */

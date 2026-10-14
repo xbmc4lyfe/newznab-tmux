@@ -13,6 +13,7 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use PDO;
+use PHPUnit\Framework\Attributes\DataProvider;
 use ReflectionClass;
 use ReflectionMethod;
 use ReflectionProperty;
@@ -281,8 +282,17 @@ class TmuxProcessingBacklogTest extends TestCase
         $this->assertSame(1, (int) $counts->processnfo);
     }
 
-    public function test_stripped_mode_counts_sequential_additional_and_nfo_work_for_active_or_backfill_groups(): void
+    /** @return iterable<string, array{bool, int}> */
+    public static function passwordModes(): iterable
     {
+        yield 'enabled' => [true, 2];
+        yield 'disabled' => [false, 3];
+    }
+
+    #[DataProvider('passwordModes')]
+    public function test_stripped_mode_counts_sequential_additional_and_nfo_work_for_active_or_backfill_groups(bool $passwordChecks, int $additionalWork): void
+    {
+        config(['nntmux_settings.check_passworded_rars' => $passwordChecks]);
         ConfigurationTestBuilder::update(ConfigurationDomain::Tmux, [
             'sequential_mode' => 2, 'post_mode' => 0, 'post_non_mode' => 0, 'post_amazon_mode' => 0,
         ]);
@@ -301,10 +311,10 @@ class TmuxProcessingBacklogTest extends TestCase
 
         $counts = $this->monitorCounts(postMode: 0, sequentialMode: 2);
 
-        $this->assertSame(2, $counts['work']);
-        $this->assertSame(2, $counts['work_available']);
+        $this->assertSame($additionalWork, $counts['work']);
+        $this->assertSame($additionalWork, $counts['work_available']);
         $this->assertSame(1, (int) $counts['processnfo']);
-        $this->assertSame(3, $counts['total_work']);
+        $this->assertSame($additionalWork + 1, $counts['total_work']);
     }
 
     public function test_recent_rename_count_keeps_a_stable_cache_key_and_the_six_hour_cutoff(): void
