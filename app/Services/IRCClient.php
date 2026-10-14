@@ -85,6 +85,16 @@ class IRCClient
     protected ?string $_buffer = null;
 
     /**
+     * Incomplete frame retained while the same connection remains alive.
+     */
+    protected string $_partialReadBuffer = '';
+
+    /**
+     * Ignore an oversized frame through its terminating LF, across reads.
+     */
+    protected bool $_discardReadFrame = false;
+
+    /**
      * When someone types something into a channel, buffer it.
      * array(
      *     'nickname' => string(The nick name of the person who posted.),
@@ -482,7 +492,9 @@ class IRCClient
      */
     protected function _readSocket(): void
     {
-        $buffer = '';
+        $buffer = $this->_partialReadBuffer;
+        $this->_partialReadBuffer = '';
+        $this->_buffer = '';
         do {
             // Use a shorter timeout for reading to be more responsive
             stream_set_timeout($this->_socket, 5);
@@ -497,6 +509,8 @@ class IRCClient
                     // Check if the connection is still valid
                     if (! $this->_connected()) {
                         echo 'Connection lost (timeout), attempting to reconnect...'.PHP_EOL;
+                        $buffer = '';
+                        $this->_discardReadFrame = false;
                         $this->_reconnect();
                     }
                     break;
@@ -505,6 +519,8 @@ class IRCClient
                 // If EOF or other error, the connection is dead
                 if ($meta['eof'] || ! $this->_connected()) {
                     echo 'Connection lost, attempting to reconnect...'.PHP_EOL;
+                    $buffer = '';
+                    $this->_discardReadFrame = false;
                     $this->_reconnect();
                     break;
                 }
@@ -512,13 +528,44 @@ class IRCClient
                 // No data available but connection is fine
                 break;
             }
-            $buffer .= $line;
-        } while (! empty($buffer) && ! preg_match('/\v+$/', $buffer));
-        $this->_buffer = trim($buffer);
+            $complete = str_ends_with($line, "\n");
+            if (! $this->_discardReadFrame) {
+                $buffer .= $line;
+                if ($this->_readFrameTooLong($buffer, $complete)) {
+                    $buffer = '';
+                    $this->_discardReadFrame = true;
+                }
+            }
+            if ($complete) {
+                $this->_discardReadFrame = false;
+                break;
+            }
+        } while (true);
+
+        if (str_ends_with($buffer, "\n")) {
+            $this->_buffer = substr($buffer, 0, str_ends_with($buffer, "\r\n") ? -2 : -1);
+        } else {
+            $this->_partialReadBuffer = $buffer;
+        }
 
         if ($this->_debug && $this->_buffer !== '') {
             echo 'RECV '.$this->_buffer.PHP_EOL;
         }
+    }
+
+    /**
+     * Tolerant total frame ceiling: 8703 bytes including CRLF.
+     * LF-only frames retain the same 8701-byte payload allowance.
+     */
+    protected function _readFrameTooLong(string $buffer, bool $complete): bool
+    {
+        $bytes = \strlen($buffer);
+        if (! $complete) {
+            // Reserve the final LF; a partial frame may already include its CR.
+            return $bytes > 8702;
+        }
+
+        return $bytes + (str_ends_with($buffer, "\r\n") ? 0 : 1) > 8703;
     }
 
     /**
@@ -663,6 +710,8 @@ class IRCClient
      */
     protected function _closeStream(): void
     {
+        $this->_partialReadBuffer = '';
+        $this->_discardReadFrame = false;
         if ($this->_socket !== null) {
             if (\is_resource($this->_socket)) {
                 @fclose($this->_socket);
