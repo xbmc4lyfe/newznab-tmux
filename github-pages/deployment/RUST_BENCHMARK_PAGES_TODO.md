@@ -35,7 +35,7 @@ The frozen run's PR head is `dc74ec057ebdd80a3ff7d10cbcf12147c06cf55d`; its **ex
 
 ## Existing runners and commands
 
-Inventory based on fork master `1d38e987a40d2e34193ba1853df20a948897c6f4` plus PR #139. Re-audit after later module additions. There is one Rust crate, `docker/app/nzb-yenc-ffi`; it has no Cargo `[[bench]]`/Criterion bench harness. `cargo bench` alone does not run the application comparisons below.
+Inventory based on fork master `af9880b4e41912a77ae724eee594ac61747e56c5` plus PR #139. Re-audit after later module additions. There is one Rust crate, `docker/app/nzb-yenc-ffi`; it has no Cargo `[[bench]]`/Criterion bench harness. `cargo bench` alone does not run the application comparisons below.
 
 Use disposable workers with PHP 8.5, locked Composer dependencies, FFI, Rust 1.98.0 and locked Cargo dependencies. Prefer the existing workflow as the complete command specification, including its native build/runtime manifests. Never source production `.env` or cached Laravel configuration. Do not install or change dependencies without separate approval.
 
@@ -85,7 +85,7 @@ These are coverage states, not speed claims. Discover Rust modules from `src/lib
 | `article_fingerprint` | Standalone paired harness | Wire both backends and extend uncommon-tail coverage. |
 | `cpu_snapshot` | Standalone CLI paired harness; correctness tests | Wire benchmark execution separately from collection; expose p99 protocol limits. |
 | `article_dates`, `article_identity`, `article_xref` | Correctness/parity or indirect caller coverage | Define explicit native-baseline comparisons and representative unusual headers/date/Xref inputs. |
-| `formats`, including RAR5 Quick Open / archive metadata | Rust/unit and PHP parity tests; one RAR5 profile fixture | Add isolated and caller-level comparisons per archive format and metadata path; preserve malformed/bounded-input semantics. A fixed RAR5 profile is not all-format performance coverage. |
+| `formats`, including RAR5 Quick Open / copy-entry checksums / archive metadata | Rust/unit and PHP parity tests; one RAR5 profile fixture | Add isolated and caller-level comparisons per archive format and metadata path; preserve malformed/bounded-input semantics. A fixed RAR5 profile is not all-format performance coverage. |
 | `par2`, `par2_source_ranges` | Correctness/parity only identified | Add real caller baselines, valid/corrupt/large/uncommon recovery fixtures and ownership/correctness checks. |
 | `seven_zip_ranges` | Correctness/parity only identified | Add 7z-specific common/uncommon comparisons and caller overhead. |
 | `sample_plan` | Correctness/parity only identified | Add representative common/uncommon planning workloads, output/order equivalence and real caller cost. |
