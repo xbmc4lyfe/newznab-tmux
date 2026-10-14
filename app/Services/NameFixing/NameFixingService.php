@@ -1357,7 +1357,7 @@ class NameFixingService
             foreach ($this->literalPredbCandidates($page['ids'], $title) as $release) {
                 $matches[(int) $release->releases_id] = $release;
             }
-            $pageMatched = $this->hasLinkedPredbCandidate($page['ids'], $predbId, $title);
+            $pageMatched = ! $matched && $this->hasLinkedPredbCandidate($page['ids'], $predbId, $title);
             $matched = $matched || $pageMatched;
             if (count($matches) >= 16 || ! $page['has_more']) {
                 return array_values($matches);
