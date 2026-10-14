@@ -486,20 +486,18 @@ unsafe fn vbmi2_specials(bytes: x86::__m256i) -> u32 {
     }
 }
 
-// Join the already loaded halves before any output write. One register
-// compression handles removals across byte 31 without joining two outputs.
+// One register compression handles removals across byte 31 without joining
+// two outputs. The complete source block is loaded before overlapping stores.
 #[target_feature(enable = "avx2,avx512f,avx512vbmi2,avx512bw,avx512vl,popcnt")]
 #[inline]
 unsafe fn compact_wide_vbmi2(
-    low: x86::__m256i,
-    high: x86::__m256i,
+    bytes: x86::__m512i,
     specials: u64,
     destination: *mut u8,
     escaped: &mut bool,
 ) -> usize {
     use x86::*;
     unsafe {
-        let bytes = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(low), high);
         let equals = _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(b'=' as i8));
         let newlines = specials & !equals;
         let incoming = *escaped;
@@ -550,6 +548,21 @@ unsafe fn compact_wide_vbmi2(
 }
 
 #[target_feature(enable = "avx2,avx512f,avx512vbmi2,avx512bw,avx512vl,popcnt")]
+#[inline]
+unsafe fn wide_vbmi2_specials(bytes: x86::__m512i) -> u64 {
+    use x86::*;
+    unsafe {
+        _mm512_cmpeq_epi8_mask(
+            bytes,
+            _mm512_shuffle_epi8(
+                _mm512_broadcast_i32x4(_mm_loadu_si128(SPECIAL_BYTES.as_ptr().cast())),
+                _mm512_min_epu8(bytes, _mm512_set1_epi8(46)),
+            ),
+        )
+    }
+}
+
+#[target_feature(enable = "avx2,avx512f,avx512vbmi2,avx512bw,avx512vl,popcnt")]
 pub(crate) unsafe fn decode_vbmi2(source: *const u8, destination: *mut u8, length: usize) -> usize {
     use x86::*;
     let mut read = 0;
@@ -561,29 +574,18 @@ pub(crate) unsafe fn decode_vbmi2(source: *const u8, destination: *mut u8, lengt
                 read += 1;
                 continue;
             }
-            // Load both vectors before any store, including overlapping output.
-            let low = _mm256_loadu_si256(source.add(read).cast());
-            let high = _mm256_loadu_si256(source.add(read + 32).cast());
-            let low_specials = vbmi2_specials(low);
-            let high_specials = vbmi2_specials(high);
-            if !escaped && low_specials | high_specials == 0 {
-                _mm256_storeu_si256(
+            // Read all 64 bytes before any store, including overlapping output.
+            let bytes = _mm512_loadu_si512(source.add(read).cast());
+            let specials = wide_vbmi2_specials(bytes);
+            if !escaped && specials == 0 {
+                _mm512_storeu_si512(
                     destination.add(written).cast(),
-                    _mm256_sub_epi8(low, _mm256_set1_epi8(42)),
-                );
-                _mm256_storeu_si256(
-                    destination.add(written + 32).cast(),
-                    _mm256_sub_epi8(high, _mm256_set1_epi8(42)),
+                    _mm512_sub_epi8(bytes, _mm512_set1_epi8(42)),
                 );
                 written += 64;
             } else {
-                written += compact_wide_vbmi2(
-                    low,
-                    high,
-                    u64::from(low_specials) | (u64::from(high_specials) << 32),
-                    destination.add(written),
-                    &mut escaped,
-                );
+                written +=
+                    compact_wide_vbmi2(bytes, specials, destination.add(written), &mut escaped);
             }
             read += 64;
         }
