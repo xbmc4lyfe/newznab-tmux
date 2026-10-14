@@ -404,7 +404,8 @@ jobs:
         shell: bash
         run: |
           php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-article-processing.php \
-            --profile --native="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            --profile --candidate-dir="$GITHUB_WORKSPACE/$CANDIDATE_SOURCE" \
+            --native="$GITHUB_WORKSPACE/$CANDIDATE_SOURCE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
             --samples=7 --runtime-manifest="$GITHUB_WORKSPACE/processing-evidence/build/runtime.json" \
             --output-dir="$GITHUB_WORKSPACE/processing-evidence/profile" \
             2>&1 | tee processing-evidence/build/profile-console.log

@@ -9,6 +9,7 @@ use App\Services\YencService;
 use Illuminate\Container\Container;
 use InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Process\Process;
 
 final class ArticleProcessingBenchmarkTest extends TestCase
 {
@@ -27,6 +28,44 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         self::assertSame(7, $options['samples']);
         self::assertSame(30.0, $options['timeout']);
         self::assertSame([64], articleBenchmarkOptions(['native' => '/native.so', 'size' => '64'])['sizes']);
+    }
+
+    public function test_workflow_profile_uses_the_selected_candidate_graph_and_library(): void
+    {
+        $workflow = (string) file_get_contents(dirname(__DIR__, 2).'/.github/workflows/yenc-performance.yml');
+        self::assertSame(1, preg_match('/- name: Profile actual BODY assembly and metadata callers\n +shell: bash\n +run: \|\n(?<script>(?: {10}.+\n)+)/', $workflow, $match));
+        $directory = sys_get_temp_dir().'/nntmux-workflow-profile-'.bin2hex(random_bytes(8));
+        mkdir($directory.'/bin', 0700, true);
+        mkdir($directory.'/processing-evidence/build', 0700, true);
+        // Probe the workflow's PHP boundary without loading Linux FFI on macOS.
+        file_put_contents($directory.'/bin/php', '#!'.PHP_BINARY."\n".<<<'PHP'
+<?php
+$root = getenv('GITHUB_WORKSPACE');
+$library = '';
+foreach ($argv as $argument) {
+    if (str_starts_with($argument, '--candidate-dir=')) { $root = substr($argument, 16); }
+    if (str_starts_with($argument, '--native=')) { $library = substr($argument, 9); }
+}
+echo json_encode(['source_marker' => file_get_contents($root.'/.profile-marker'),
+    'library_sha256' => hash_file('sha256', $library)], JSON_THROW_ON_ERROR).PHP_EOL;
+PHP);
+        chmod($directory.'/bin/php', 0700);
+        try {
+            foreach (['.' => 'head', 'candidate-source' => 'historical-candidate'] as $source => $marker) {
+                mkdir($directory.'/'.$source.'/docker/app/nzb-yenc-ffi/target/release', 0700, true);
+                file_put_contents($directory.'/'.$source.'/.profile-marker', $marker);
+                file_put_contents($directory.'/'.$source.'/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so', $marker.'-library');
+                $process = new Process(['bash', '-e', '-o', 'pipefail', '-c', $match['script']], $directory,
+                    ['PATH' => $directory.'/bin:'.(string) getenv('PATH'), 'GITHUB_WORKSPACE' => $directory, 'CANDIDATE_SOURCE' => $source]);
+                $process->run();
+                self::assertSame(0, $process->getExitCode(), $process->getErrorOutput());
+                $result = json_decode($process->getOutput(), true, flags: JSON_THROW_ON_ERROR);
+                self::assertSame($marker, $result['source_marker']);
+                self::assertSame(hash('sha256', $marker.'-library'), $result['library_sha256']);
+            }
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
     }
 
     public function test_profile_and_worker_sample_limits_keep_child_json_within_reader_budget(): void
