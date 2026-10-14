@@ -553,6 +553,9 @@ class IRCClient
         $this->_partialReadBuffer = '';
         $this->_buffer = '';
         do {
+            if ($this->_stopRequested()) {
+                break;
+            }
             // Use a shorter timeout for reading to be more responsive
             stream_set_timeout($this->_socket, 5);
             $line = fgets($this->_socket, 1024);

@@ -7,6 +7,8 @@ namespace Tests\Feature;
 use App\Services\IRCClient;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
+use PHPUnit\Framework\Attributes\DataProvider;
+use RuntimeException;
 use Tests\Support\ConfigurationTestBuilder;
 use Tests\TestCase;
 
@@ -165,6 +167,48 @@ class IrcConnectionDrainTest extends TestCase
         $this->assertSame(0, $client->resolutions);
     }
 
+    public static function unfinishedFrames(): iterable
+    {
+        yield 'partial frame' => [1, false];
+        yield 'oversized discarded frame' => [3, true];
+    }
+
+    #[DataProvider('unfinishedFrames')]
+    public function test_drain_stops_continuous_unfinished_frame_reads(int $stopOnRead, bool $discarded): void
+    {
+        $client = $this->streamingClient($stopOnRead);
+
+        $client->readIncoming();
+
+        $this->assertSame([], $client->messages);
+        $this->assertSame($stopOnRead, IrcDrainContinuousStream::$reads);
+        $this->assertSame($discarded, $client->discardingAtQuit);
+        $this->assertSame([false, '', false], $client->state());
+    }
+
+    public function test_drain_finishes_a_frame_completed_by_the_current_read(): void
+    {
+        $client = $this->streamingClient(1, true);
+
+        $client->readIncoming();
+
+        $this->assertSame(['example'], $client->messages);
+        $this->assertSame(1, IrcDrainContinuousStream::$reads);
+        $this->assertSame([false, '', false], $client->state());
+    }
+
+    private function streamingClient(int $stopOnRead, bool $complete = false): IrcDrainReadClient
+    {
+        if (! in_array('ircdraincontinuous', stream_get_wrappers(), true)) {
+            stream_wrapper_register('ircdraincontinuous', IrcDrainContinuousStream::class);
+        }
+        IrcDrainContinuousStream::$reads = 0;
+        IrcDrainContinuousStream::$stopOnRead = $stopOnRead;
+        IrcDrainContinuousStream::$complete = $complete;
+
+        return new IrcDrainReadClient(fopen('ircdraincontinuous://fixture', 'r+'));
+    }
+
     private function client(): IrcConnectionDrainClient
     {
         $client = new IrcConnectionDrainClient;
@@ -238,5 +282,88 @@ class IrcConnectionDrainClient extends IRCClient
     protected function _closeStream(): void
     {
         $this->connected = false;
+    }
+}
+
+class IrcDrainReadClient extends IRCClient
+{
+    /** @var list<string> */
+    public array $messages = [];
+
+    public bool $discardingAtQuit = false;
+
+    /** @param resource $stream */
+    public function __construct($stream)
+    {
+        $this->_socket = $stream;
+        $this->_lastPing = time();
+        $this->_debug = false;
+    }
+
+    public function __destruct()
+    {
+        $this->_closeStream();
+    }
+
+    /** @return array{bool, string, bool} */
+    public function state(): array
+    {
+        return [is_resource($this->_socket), $this->_partialReadBuffer, $this->_discardReadFrame];
+    }
+
+    public function quit(?string $message = null): bool
+    {
+        $this->discardingAtQuit = $this->_discardReadFrame;
+
+        return parent::quit($message);
+    }
+
+    protected function processChannelMessages(): void
+    {
+        $this->messages[] = $this->_channelData['message'];
+    }
+
+    protected function _writeSocket(string $command): bool
+    {
+        return true;
+    }
+}
+
+class IrcDrainContinuousStream
+{
+    public $context;
+
+    public static int $reads = 0;
+
+    public static int $stopOnRead = 1;
+
+    public static bool $complete = false;
+
+    public function stream_open(string $path, string $mode, int $options, ?string &$openedPath): bool
+    {
+        return true;
+    }
+
+    public function stream_read(int $count): string
+    {
+        self::$reads++;
+        if (self::$reads > self::$stopOnRead) {
+            throw new RuntimeException('IRC continued reading an unfinished frame after drain.');
+        }
+        if (self::$reads === self::$stopOnRead) {
+            ConfigurationTestBuilder::updateRuntime(['stop_requested' => true]);
+        }
+
+        return self::$complete ? ":user!host PRIVMSG #pre :example\r\n" : str_repeat('x', $count);
+    }
+
+    public function stream_eof(): bool
+    {
+        return false;
+    }
+
+    public function stream_set_option(int $option, int $arg1, ?int $arg2): bool
+    {
+        return true;
     }
 }
