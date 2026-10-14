@@ -138,22 +138,36 @@ final class NzbArticleCoverage
     private function coverageIds(\SimpleXMLElement $xml): ?array
     {
         $serialized = $xml->asXML();
-        $namespace = $xml->getDocNamespaces()[''] ?? '';
-        if ($serialized === false || strlen($serialized) > self::COVERAGE_DECODED_BYTES
-            || $xml->getName() !== 'nzb' || ! in_array($namespace, ['', 'http://www.newzbin.com/DTD/2003/nzb'], true)
-            || count($xml->file) === 0 || count($xml->xpath('/*/*[local-name()="file"]') ?: []) !== count($xml->file)) {
+        if ($serialized === false || strlen($serialized) > self::COVERAGE_DECODED_BYTES) {
+            return null;
+        }
+        try {
+            $elements = new NzbXmlElements($xml);
+        } catch (\RuntimeException) {
+            return null;
+        }
+        $files = [];
+        foreach ($elements->files() as $file) {
+            $files[] = $file;
+        }
+        if ($files === [] || count($xml->xpath('/*/*[local-name()="file"]') ?: []) !== count($files)) {
             return null;
         }
         $ids = [];
         $segments = 0;
-        foreach ($xml->file as $file) {
-            if (count($file->segments) !== 1 || count($file->xpath('./*[local-name()="segments"]') ?: []) !== 1 || count($file->segments->segment) === 0
-                || count($file->xpath('./*[local-name()="segments"]/*') ?: []) !== count($file->segments->segment)) {
+        foreach ($files as $file) {
+            $fileSegments = [];
+            foreach ($elements->segments($file) as $segment) {
+                $fileSegments[] = $segment;
+            }
+            if (count($file->xpath('./*[local-name()="segments"]') ?: []) !== 1 || $fileSegments === []
+                || count($file->xpath('./*[local-name()="segments"]/*') ?: []) !== count($fileSegments)) {
                 return null;
             }
-            foreach ($file->segments->segment as $segment) {
-                $number = (string) $segment['number'];
-                $bytes = (string) $segment['bytes'];
+            foreach ($fileSegments as $segment) {
+                $attributes = $segment->attributes();
+                $number = (string) $attributes['number'];
+                $bytes = (string) $attributes['bytes'];
                 if (! preg_match('/^[1-9][0-9]*$/D', $number) || ! ctype_digit($bytes) || count($segment->xpath('./*') ?: []) !== 0) {
                     return null;
                 }
@@ -165,6 +179,6 @@ final class NzbArticleCoverage
             }
         }
 
-        return $ids === [] ? null : $ids;
+        return $ids;
     }
 }

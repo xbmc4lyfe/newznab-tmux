@@ -310,8 +310,13 @@ final class NzbArticleFingerprint
     public static function fromXml(SimpleXMLElement $nzb): ?string
     {
         $fingerprint = new self;
-        foreach ($nzb->file as $file) {
-            foreach ($file->segments->segment as $segment) {
+        try {
+            $elements = new NzbXmlElements($nzb);
+        } catch (\RuntimeException) {
+            return null;
+        }
+        foreach ($elements->files() as $file) {
+            foreach ($elements->segments($file) as $segment) {
                 $fingerprint->add((string) $segment);
             }
         }
