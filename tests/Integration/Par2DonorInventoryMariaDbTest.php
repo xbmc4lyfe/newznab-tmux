@@ -205,8 +205,8 @@ final class Par2DonorInventoryMariaDbTest extends TestCase
     public function test_large_inventory_checks_the_last_descriptor_without_page_truncation(string $isolation): void
     {
         $this->isolation($isolation);
-        // Above the descriptor cardinality possible in one default 8 MiB metadata
-        // state, even before Main/JSON/base64 overhead. This is a SQL fixture,
+        // Above the descriptor cardinality possible in one default 8 MiB
+        // JSON/base64 metadata state. This is a SQL fixture,
         // not a parser limit, a global inventory bound, or a throughput benchmark.
         $descriptors = 65_536;
         $this->inventory(42, $descriptors, donor: false);
