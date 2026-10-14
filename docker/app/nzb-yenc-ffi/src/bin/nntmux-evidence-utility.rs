@@ -352,12 +352,28 @@ fn summary(root: &Path, cpp: bool, output: &Path) -> Result<()> {
     }
     Ok(())
 }
+fn presentation_header(root: &Path) -> Result<()> {
+    let header = fs::read_to_string(root.join("docker/app/php/release-presentation.h"))?
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut output = File::create(root.join("benchmark-evidence/presentation.h"))?;
+    let needle = "/usr/local/lib/nntmux/libnzbyenc.so";
+    let rendered = if header.contains(needle) {
+        let library = root.join("docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so");
+        header.replace(needle, library.to_str().ok_or("library path is not UTF-8")?)
+    } else {
+        header
+    };
+    output.write_all(rendered.as_bytes())?;
+    Ok(())
+}
 fn run() -> Result<()> {
     let args: Vec<_> = env::args().collect();
     if args.len() != 3 || args[1] != "--mode" {
-        return Err("usage: nntmux-evidence-utility --mode qualify|cpp-summary|php-summary".into());
+        return Err("usage: nntmux-evidence-utility --mode qualify|cpp-summary|php-summary|presentation-header".into());
     }
     match args[2].as_str() {
+        "presentation-header" => presentation_header(&env::current_dir()?),
         "qualify" => qualify(Path::new(".")),
         "cpp-summary" => summary(
             Path::new("."),
@@ -431,6 +447,65 @@ mod tests {
         }
     }
     const ROW: &str = r#"{"type":"stratum_summary","size":1024,"density":"dense","path":"decode","decision":"inconclusive","eligible_pairs":11,"invalid_pairs":0,"median_rust_over_cpp":0.9999999999999999,"median_rust_over_php":1.0,"bootstrap_95_percent_interval":[0.00001,1e20]}"#;
+
+    #[test]
+    fn presentation_header_rewrites_all_paths_and_normalizes_newlines() {
+        let f = Fixture::new();
+        f.write("docker/app/php/release-presentation.h", "#define LIB \"/usr/local/lib/nntmux/libnzbyenc.so\"\r\n// /usr/local/lib/nntmux/libnzbyenc.so\r// café\n");
+        presentation_header(&f.0).unwrap();
+        let library =
+            f.0.join("docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so");
+        assert_eq!(
+            f.read("benchmark-evidence/presentation.h"),
+            format!(
+                "#define LIB \"{}\"\n// {}\n// café\n",
+                library.display(),
+                library.display()
+            )
+        );
+    }
+
+    #[test]
+    fn presentation_header_preserves_unmatched_content_and_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.write(
+            "docker/app/php/release-presentation.h",
+            "\u{feff}// unchanged\r\n",
+        );
+        f.write("benchmark-evidence/presentation.h", "old");
+        let output = f.0.join("benchmark-evidence/presentation.h");
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o640)).unwrap();
+        presentation_header(&f.0).unwrap();
+        assert_eq!(
+            f.read("benchmark-evidence/presentation.h"),
+            "\u{feff}// unchanged\n"
+        );
+        assert_eq!(
+            fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn presentation_header_input_failure_does_not_truncate_output() {
+        let f = Fixture::new();
+        f.write("benchmark-evidence/presentation.h", "keep");
+        assert!(presentation_header(&f.0).is_err());
+        f.write("docker/app/php/release-presentation.h", "placeholder");
+        fs::write(f.0.join("docker/app/php/release-presentation.h"), [255]).unwrap();
+        assert!(presentation_header(&f.0).is_err());
+        assert_eq!(f.read("benchmark-evidence/presentation.h"), "keep");
+    }
+
+    #[test]
+    fn presentation_header_does_not_create_a_missing_output_parent() {
+        let f = Fixture::new();
+        f.write("docker/app/php/release-presentation.h", "header");
+        fs::remove_dir_all(f.0.join("benchmark-evidence")).unwrap();
+        assert!(presentation_header(&f.0).is_err());
+        assert!(!f.0.join("benchmark-evidence").exists());
+    }
 
     #[test]
     fn qualified_architectures_copy_libraries_and_record_identity() {
