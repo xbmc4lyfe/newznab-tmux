@@ -319,7 +319,7 @@ class ReleaseFileManager
         $pendingReleaseFiles = array_values($context->pendingReleaseFiles);
         $pendingParHashes = array_values($context->pendingParHashes);
         $pendingFullParHashes = array_values($context->pendingFullParHashes);
-        $requiresSnapshotGuard = $pendingFullParHashes !== [] || $context->audioMetadataCommitted || $context->producerNamingAttempted;
+        $requiresSnapshotGuard = $pendingReleaseFiles !== [] || $pendingFullParHashes !== [] || $context->audioMetadataCommitted || $context->producerNamingAttempted;
 
         try {
             $insertedReleaseFiles = DB::transaction(function () use (
@@ -351,6 +351,13 @@ class ReleaseFileManager
                 $inserted = $pendingReleaseFiles === []
                     ? 0
                     : ReleaseFile::query()->insertOrIgnore($pendingReleaseFiles);
+
+                if ($inserted > 0) {
+                    $current = DB::table('releases')->where('id', $context->release->id)->lockForUpdate()->first();
+                    if ($current !== null && (int) $current->isrenamed === 0 && (int) $current->predb_id === 0) {
+                        $updateRows['proc_files'] = NameFixingService::PROC_FILES_NONE;
+                    }
+                }
 
                 if ($pendingParHashes !== []) {
                     ParHash::query()->insertOrIgnore($pendingParHashes);
