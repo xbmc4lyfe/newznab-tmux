@@ -96,6 +96,9 @@ final class YencContainerTest extends TestCase
 
     public function test_auto_reports_a_configured_failure_only_once(): void
     {
+        if (PHP_OS_FAMILY !== 'Linux') {
+            $this->markTestSkipped('Auto mode intentionally selects PHP without probing native libraries outside Linux CLI.');
+        }
         $logger = new class extends AbstractLogger
         {
             public int $warnings = 0;

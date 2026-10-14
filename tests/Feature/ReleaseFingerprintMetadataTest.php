@@ -20,6 +20,160 @@ use Tests\TestCase;
 final class ReleaseFingerprintMetadataTest extends TestCase
 {
     #[Test]
+    public function it_excludes_unconfirmed_head_dates_from_effective_timeline_statistics(): void
+    {
+        $observations = [
+            $this->timelineObservation('first@example.net', 1000),
+            $this->timelineObservation('last@example.net', 1060),
+        ];
+        foreach ($this->unconfirmedHeadIdentities() as $name => $case) {
+            $observation = $this->timelineObservation($name.'@example.net', 5000);
+            $observation['metadata']['article_identity'] = array_replace_recursive(
+                $observation['metadata']['article_identity'],
+                $case['identity'],
+            );
+            $observations[] = $observation;
+        }
+        $originalObservations = $observations;
+        $expected = count($observations);
+        $report = $this->postingTimeline($observations, $expected);
+
+        foreach ([
+            'observed_article_date_span_by_server' => ['1970-01-01T00:16:40+00:00', '1970-01-01T00:17:40+00:00'],
+            'observed_injection_date_span_by_server' => ['1970-01-01T00:16:50+00:00', '1970-01-01T00:17:50+00:00'],
+            'observed_legacy_nntp_posting_date_span_by_server' => ['1970-01-01T00:17:00+00:00', '1970-01-01T00:18:00+00:00'],
+        ] as $key => [$first, $last]) {
+            $span = $report[$key]['primary news.example.net'];
+            self::assertSame(2, $span['valid_timestamp_count'], $key);
+            self::assertSame($first, $span['first_utc'], $key);
+            self::assertSame($last, $span['last_utc'], $key);
+            self::assertSame(60, $span['seconds'], $key);
+            self::assertSame($expected, $span['observations'], $key);
+            self::assertSame($expected, $span['expected_samples'], $key);
+            self::assertFalse($span['complete'], $key);
+        }
+        $deltas = $report['composition_to_injection_delta_seconds'];
+        self::assertSame(2, $deltas['paired_samples']);
+        foreach (['min', 'median', 'p95', 'max'] as $key) {
+            self::assertSame(10, $deltas[$key]);
+        }
+        $coverage = $report['head_date_identity_coverage_by_server']['primary news.example.net'];
+        self::assertSame(2, $coverage['admitted_count']);
+        self::assertSame($expected - 2, $coverage['excluded_count']);
+        self::assertSame(2, $coverage['status_counts']['identity_verified']);
+        self::assertSame($originalObservations, $observations);
+        self::assertSame('valid', $observations[2]['metadata']['article_dates']['date']['parse_status']);
+        self::assertSame(5000, $observations[2]['metadata']['article_dates']['date']['utc_epoch_seconds']);
+    }
+
+    #[Test]
+    public function it_reports_each_head_identity_exclusion_without_discarding_raw_dates(): void
+    {
+        foreach ($this->unconfirmedHeadIdentities() as $name => $case) {
+            $observation = $this->timelineObservation($name.'@example.net', 1000);
+            $observation['metadata']['article_identity'] = array_replace_recursive(
+                $observation['metadata']['article_identity'],
+                $case['identity'],
+            );
+            $report = $this->postingTimeline([$observation], 1);
+            foreach (['observed_article_date_span_by_server', 'observed_injection_date_span_by_server', 'observed_legacy_nntp_posting_date_span_by_server'] as $key) {
+                self::assertFalse($report[$key]['primary news.example.net']['available'], $name.' '.$key);
+                self::assertSame(0, $report[$key]['primary news.example.net']['valid_timestamp_count'], $name);
+                self::assertSame(1, $report[$key]['primary news.example.net']['expected_samples'], $name);
+            }
+            self::assertSame(0, $report['composition_to_injection_delta_seconds']['paired_samples'], $name);
+            self::assertNull($report['composition_to_injection_delta_seconds']['min'], $name);
+            $coverage = $report['head_date_identity_coverage_by_server']['primary news.example.net'];
+            self::assertSame(0, $coverage['admitted_count'], $name);
+            self::assertSame(1, $coverage['excluded_count'], $name);
+            self::assertSame(1, $coverage['status_counts'][$case['status']], $name);
+            self::assertSame(1000, $observation['metadata']['article_dates']['date']['utc_epoch_seconds'], $name);
+        }
+    }
+
+    #[Test]
+    public function it_admits_verified_head_dates_independently_of_body_and_overview_identity(): void
+    {
+        $observation = $this->timelineObservation('head-only@example.net', 1000);
+        $observation['metadata']['article_identity']['body_response'] = ['availability' => 'failed', 'parse_status' => 'unavailable', 'response_code' => null];
+        $observation['metadata']['article_identity']['overview_message_id'] = ['availability' => 'unavailable', 'parse_status' => 'unavailable'];
+        $observation['metadata']['article_identity']['relations']['body_response_matches_request'] = false;
+        $observation['metadata']['article_identity']['relations']['head_response_matches_body_response'] = false;
+        $report = $this->postingTimeline([$observation], 1);
+        foreach (['observed_article_date_span_by_server', 'observed_injection_date_span_by_server', 'observed_legacy_nntp_posting_date_span_by_server'] as $key) {
+            self::assertTrue($report[$key]['primary news.example.net']['available'], $key);
+            self::assertSame(1, $report[$key]['primary news.example.net']['valid_timestamp_count'], $key);
+            self::assertTrue($report[$key]['primary news.example.net']['complete'], $key);
+        }
+        self::assertSame(1, $report['composition_to_injection_delta_seconds']['paired_samples']);
+        $coverage = $report['head_date_identity_coverage_by_server']['primary news.example.net'];
+        self::assertSame(1, $coverage['admitted_count']);
+        self::assertSame(0, $coverage['excluded_count']);
+    }
+
+    /** @return array<string, array{identity: array<string, mixed>, status: string}> */
+    private function unconfirmedHeadIdentities(): array
+    {
+        return [
+            'invalid-request' => ['identity' => ['request' => ['syntax_status' => 'malformed', 'token' => null]], 'status' => 'invalid_request_identity'],
+            'wrong-request-token' => ['identity' => ['request' => ['token' => '<other@example.net>']], 'status' => 'invalid_request_identity'],
+            'request-case-differs' => ['identity' => ['request' => ['token' => '<REQUEST-CASE-DIFFERS@example.net>']], 'status' => 'invalid_request_identity'],
+            'response-mismatch' => ['identity' => ['relations' => ['head_response_matches_request' => false]], 'status' => 'identity_mismatch'],
+            'header-mismatch' => ['identity' => ['head_message_id' => ['matches_request' => false], 'relations' => ['head_response_matches_head_field' => false]], 'status' => 'identity_mismatch'],
+            'header-case-differs' => ['identity' => ['head_message_id' => ['matches_request' => false, 'candidates' => [['token' => '<HEADER-CASE-DIFFERS@example.net>', 'syntax_status' => 'valid']]], 'relations' => ['head_response_matches_head_field' => false]], 'status' => 'identity_mismatch'],
+            'missing-header-id' => ['identity' => ['head_message_id' => ['parse_status' => 'missing', 'occurrence_count' => 0, 'matches_request' => null], 'relations' => ['head_response_matches_head_field' => null]], 'status' => 'identity_unconfirmed'],
+            'duplicate-header-id' => ['identity' => ['head_message_id' => ['parse_status' => 'duplicate', 'occurrence_count' => 2, 'matches_request' => null], 'relations' => ['head_response_matches_head_field' => null]], 'status' => 'identity_unconfirmed'],
+            'header-budget' => ['identity' => ['head_message_id' => ['availability' => 'budget_exceeded', 'parse_status' => 'budget_exceeded']], 'status' => 'identity_unconfirmed'],
+            'response-budget' => ['identity' => ['head_response' => ['availability' => 'budget_exceeded', 'parse_status' => 'budget_exceeded']], 'status' => 'identity_unconfirmed'],
+            'failed-head' => ['identity' => ['head_response' => ['availability' => 'failed', 'parse_status' => 'unavailable', 'response_code' => null]], 'status' => 'identity_unconfirmed'],
+            'malformed-response' => ['identity' => ['head_response' => ['parse_status' => 'malformed_article_number']], 'status' => 'identity_unconfirmed'],
+            'unsupported-engine' => ['identity' => ['parser_engine' => null], 'status' => 'identity_parser_unavailable'],
+            'unsupported-schema' => ['identity' => ['schema_version' => 2], 'status' => 'identity_parser_unavailable'],
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    private function timelineObservation(string $messageId, int $timestamp): array
+    {
+        return [
+            'message_id' => $messageId,
+            'server' => 'news.example.net',
+            'server_role' => 'primary',
+            'metadata' => [
+                'article_dates' => [
+                    'date' => ['parse_status' => 'valid', 'utc_epoch_seconds' => $timestamp],
+                    'injection_date' => ['parse_status' => 'valid', 'utc_epoch_seconds' => $timestamp + 10],
+                    'legacy_nntp_posting_date' => ['parse_status' => 'valid', 'utc_epoch_seconds' => $timestamp + 20],
+                ],
+                'article_identity' => [
+                    'parser_engine' => 'nntmux-rust-article-identity',
+                    'schema_version' => 3,
+                    'request' => ['syntax_status' => 'valid', 'token' => '<'.$messageId.'>'],
+                    'head_response' => ['availability' => 'available', 'parse_status' => 'valid', 'response_code' => 221, 'message_id' => '<'.$messageId.'>'],
+                    'head_message_id' => ['availability' => 'available', 'parse_status' => 'valid', 'occurrence_count' => 1, 'matches_request' => true, 'candidates' => [['token' => '<'.$messageId.'>', 'syntax_status' => 'valid']]],
+                    'relations' => ['head_response_matches_request' => true, 'head_response_matches_head_field' => true],
+                ],
+            ],
+        ];
+    }
+
+    /** @param list<array<string, mixed>> $observations
+     * @return array<string, mixed>
+     */
+    private function postingTimeline(array $observations, int $expected): array
+    {
+        $collector = (new \ReflectionClass(ReleaseFingerprintCollector::class))->newInstanceWithoutConstructor();
+
+        return (new \ReflectionMethod($collector, 'estimatePostingTimeline'))->invoke(
+            $collector,
+            [],
+            $observations,
+            [['name' => 'news.example.net', 'alternate' => false]],
+            $expected,
+        );
+    }
+
+    #[Test]
     public function it_keeps_timestamp_evidence_when_advertised_byte_rates_overflow(): void
     {
         // This pure estimator does not use the collector's storage or NNTP dependencies.

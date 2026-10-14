@@ -1081,6 +1081,37 @@ mod tests {
     }
 
     #[test]
+    fn exposes_iso_character_set_declaration_through_ffi() {
+        let offset = 16 * 2048;
+        let mut sample = vec![0u8; offset + 2048];
+        sample[offset] = 2;
+        sample[offset + 1..offset + 6].copy_from_slice(b"CD001");
+        sample[offset + 6] = 1;
+        sample[offset + 88..offset + 91].copy_from_slice(b"%/E");
+        sample[offset + 881] = 1;
+        let pointer = unsafe { nntmux_format_metadata_json(sample.as_ptr(), sample.len()) };
+        assert!(!pointer.is_null());
+        let json = unsafe { CStr::from_ptr(pointer) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { nntmux_metadata_string_free(pointer) };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sequence = &parsed["iso_descriptor_sequence"];
+        assert_eq!(sequence["status"], "sample_truncated");
+        assert_eq!(sequence["image_origin_known"], false);
+        assert_eq!(sequence["descriptors"][0]["offset"], offset);
+        assert_eq!(
+            sequence["descriptors"][0]["character_set_declaration"]["recognized_character_set"],
+            "ucs2_be"
+        );
+        assert_eq!(
+            sequence["descriptors"][0]["character_set_declaration"]["joliet_prefix_level_observed"],
+            3
+        );
+    }
+
+    #[test]
     fn exposes_ordered_provider_header_comparison_through_ffi() {
         let left = b"X-Test: a\r\nX-Test: b\r\n\r\n";
         let right = b"X-Test: a, b\r\n\r\n";

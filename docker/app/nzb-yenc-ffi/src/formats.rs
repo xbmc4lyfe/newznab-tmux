@@ -48,6 +48,25 @@ pub struct IsoDescriptorObservation {
     pub version: u8,
     pub standard_identifier_valid: bool,
     pub type_version_supported: bool,
+    pub character_set_declaration: Option<IsoCharacterSetDeclaration>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IsoCharacterSetDeclaration {
+    pub status: &'static str,
+    pub descriptor_kind: &'static str,
+    pub basis: &'static str,
+    pub volume_flags_observed: u8,
+    pub unregistered_escape_sequence_declared: bool,
+    pub reserved_volume_flag_bits_valid: bool,
+    pub file_structure_version_observed: u8,
+    pub file_structure_version_valid: bool,
+    pub escape_sequences_raw_hex: String,
+    pub escape_sequences_all_zero: bool,
+    pub joliet_prefix_level_observed: Option<u8>,
+    pub joliet_prefix_remaining_bytes_zero: bool,
+    pub recognized_character_set: Option<&'static str>,
+    pub directory_hierarchy_inspected: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3783,6 +3802,10 @@ fn scan_iso_descriptor_sequence(data: &[u8]) -> Option<IsoDescriptorSequence> {
             version,
             standard_identifier_valid,
             type_version_supported,
+            character_set_declaration: (standard_identifier_valid
+                && descriptor_type == 2
+                && type_version_supported)
+                .then(|| iso_character_set_declaration(descriptor)),
         });
         if !standard_identifier_valid {
             return Some(IsoDescriptorSequence {
@@ -3855,6 +3878,69 @@ fn scan_iso_descriptor_sequence(data: &[u8]) -> Option<IsoDescriptorSequence> {
         terminator_reserved_bytes_zero: None,
         scan_limit_sectors: 240,
     })
+}
+
+fn iso_character_set_declaration(descriptor: &[u8]) -> IsoCharacterSetDeclaration {
+    // The scanner supplies complete 2048-byte type-2 descriptors. ECMA-119
+    // 9.5.3/4/7 and Annex C distinguish declarations from directory conformance.
+    let version = descriptor[6];
+    let flags = descriptor[7];
+    let escape_sequences = &descriptor[88..120];
+    let reserved_volume_flag_bits_valid = flags & 0xfe == 0;
+    let unregistered_escape_sequence_declared = flags & 1 != 0;
+    let file_structure_version_observed = descriptor[881];
+    let file_structure_version_valid = file_structure_version_observed == version;
+    let escape_sequences_all_zero = escape_sequences.iter().all(|byte| *byte == 0);
+    let joliet_prefix_level_observed = match &escape_sequences[..3] {
+        b"%/@" => Some(1),
+        b"%/C" => Some(2),
+        b"%/E" => Some(3),
+        _ => None,
+    };
+    let joliet_prefix_remaining_bytes_zero = escape_sequences[3..].iter().all(|byte| *byte == 0);
+    let (status, recognized_character_set) =
+        if !reserved_volume_flag_bits_valid || !file_structure_version_valid {
+            ("inconsistent_declaration", None)
+        } else if version == 2 {
+            // Enhanced descriptor text is subject to originator/recipient agreement.
+            ("enhanced_declaration_uninterpreted", None)
+        } else if unregistered_escape_sequence_declared
+            && (escape_sequences_all_zero
+                || (joliet_prefix_level_observed.is_some() && joliet_prefix_remaining_bytes_zero))
+        {
+            ("inconsistent_declaration", None)
+        } else if escape_sequences_all_zero {
+            ("recognized_ecma6_declaration", Some("ecma6"))
+        } else if !unregistered_escape_sequence_declared
+            && joliet_prefix_level_observed.is_some()
+            && joliet_prefix_remaining_bytes_zero
+        {
+            ("recognized_joliet_declaration", Some("ucs2_be"))
+        } else {
+            // Other or multiple contiguous escape sequences may be legitimate;
+            // retaining raw bytes does not imply that they are malformed.
+            ("uninterpreted_escape_declaration", None)
+        };
+    IsoCharacterSetDeclaration {
+        status,
+        descriptor_kind: if version == 1 {
+            "supplementary"
+        } else {
+            "enhanced"
+        },
+        basis: "descriptor declaration only; directory hierarchy and character contents not inspected",
+        volume_flags_observed: flags,
+        unregistered_escape_sequence_declared,
+        reserved_volume_flag_bits_valid,
+        file_structure_version_observed,
+        file_structure_version_valid,
+        escape_sequences_raw_hex: hex(escape_sequences),
+        escape_sequences_all_zero,
+        joliet_prefix_level_observed,
+        joliet_prefix_remaining_bytes_zero,
+        recognized_character_set,
+        directory_hierarchy_inspected: false,
+    }
 }
 
 fn parse_iso_pvd(data: &[u8], offset: usize) -> FormatHeader {
@@ -6054,6 +6140,168 @@ mod tests {
         descriptor[1..6].copy_from_slice(b"CD001");
         descriptor[6] = version;
         descriptor
+    }
+
+    fn iso_declaration_json(descriptor: &[u8]) -> serde_json::Value {
+        let mut iso = vec![0u8; ISO_PVD_OFFSET];
+        iso.extend_from_slice(descriptor);
+        let metadata = serde_json::to_value(parse(&iso)).unwrap();
+        metadata["iso_descriptor_sequence"]["descriptors"][0]["character_set_declaration"].clone()
+    }
+
+    #[test]
+    fn iso_character_set_declarations_recognize_each_joliet_level_and_ecma6() {
+        for (marker, level) in [(b"%/@", 1), (b"%/C", 2), (b"%/E", 3)] {
+            let mut descriptor = iso_volume_descriptor(2, 1);
+            descriptor[881] = 1;
+            descriptor[88..91].copy_from_slice(marker);
+            let declaration = iso_declaration_json(&descriptor);
+            assert_eq!(declaration["status"], "recognized_joliet_declaration");
+            assert_eq!(declaration["joliet_prefix_level_observed"], level);
+            assert_eq!(declaration["recognized_character_set"], "ucs2_be");
+            assert_eq!(
+                declaration["escape_sequences_raw_hex"],
+                hex(&descriptor[88..120])
+            );
+            assert_eq!(declaration["directory_hierarchy_inspected"], false);
+        }
+        let mut descriptor = iso_volume_descriptor(2, 1);
+        descriptor[881] = 1;
+        let declaration = iso_declaration_json(&descriptor);
+        assert_eq!(declaration["status"], "recognized_ecma6_declaration");
+        assert_eq!(declaration["recognized_character_set"], "ecma6");
+        assert_eq!(declaration["escape_sequences_all_zero"], true);
+        assert!(declaration["joliet_prefix_level_observed"].is_null());
+        descriptor[7] = 1;
+        let conflicting_default = iso_declaration_json(&descriptor);
+        assert_eq!(conflicting_default["status"], "inconsistent_declaration");
+        assert_eq!(conflicting_default["escape_sequences_all_zero"], true);
+        assert_eq!(
+            conflicting_default["escape_sequences_raw_hex"],
+            "00".repeat(32)
+        );
+        assert!(conflicting_default["recognized_character_set"].is_null());
+    }
+
+    #[test]
+    fn iso_character_set_declarations_withhold_conflicting_and_uninterpreted_values() {
+        let mut descriptor = iso_volume_descriptor(2, 1);
+        descriptor[881] = 1;
+        descriptor[88..91].copy_from_slice(b"%/E");
+        for flags in [1, 2, 4, 8, 16, 32, 64, 128, 255] {
+            descriptor[7] = flags;
+            let declaration = iso_declaration_json(&descriptor);
+            assert_eq!(declaration["status"], "inconsistent_declaration");
+            assert_eq!(declaration["volume_flags_observed"], flags);
+            assert_eq!(declaration["joliet_prefix_level_observed"], 3);
+            assert!(declaration["recognized_character_set"].is_null());
+        }
+        descriptor[7] = 0;
+        descriptor[881] = 2;
+        assert_eq!(
+            iso_declaration_json(&descriptor)["status"],
+            "inconsistent_declaration"
+        );
+        descriptor[6] = 2;
+        let enhanced = iso_declaration_json(&descriptor);
+        assert_eq!(enhanced["status"], "enhanced_declaration_uninterpreted");
+        assert_eq!(enhanced["file_structure_version_valid"], true);
+        assert_eq!(enhanced["joliet_prefix_level_observed"], 3);
+        assert!(enhanced["recognized_character_set"].is_null());
+
+        descriptor[6] = 1;
+        descriptor[881] = 1;
+        for position in [91, 100, 119] {
+            descriptor[position] = 0x41;
+            let declaration = iso_declaration_json(&descriptor);
+            assert_eq!(declaration["status"], "uninterpreted_escape_declaration");
+            assert!(declaration["recognized_character_set"].is_null());
+            descriptor[position] = 0;
+        }
+        descriptor[7] = 1;
+        descriptor[91..94].copy_from_slice(b"$+:");
+        let multiple = iso_declaration_json(&descriptor);
+        assert_eq!(multiple["status"], "uninterpreted_escape_declaration");
+        assert_eq!(multiple["joliet_prefix_level_observed"], 3);
+        assert!(multiple["recognized_character_set"].is_null());
+        descriptor[7] = 0;
+        descriptor[91..94].fill(0);
+        for marker in [b"\x1b%/".as_slice(), b"%/e", b" %/"] {
+            descriptor[88..91].copy_from_slice(marker);
+            let declaration = iso_declaration_json(&descriptor);
+            assert_eq!(declaration["status"], "uninterpreted_escape_declaration");
+            assert!(declaration["joliet_prefix_level_observed"].is_null());
+        }
+    }
+
+    #[test]
+    fn iso_character_set_declarations_remain_bounded_and_sample_relative() {
+        let mut descriptor = iso_volume_descriptor(2, 1);
+        descriptor[881] = 1;
+        descriptor[88..91].copy_from_slice(b"%/E");
+        for descriptor_type in [0, 1, 3, 255] {
+            descriptor[0] = descriptor_type;
+            assert!(iso_declaration_json(&descriptor).is_null());
+        }
+        descriptor[0] = 2;
+        descriptor[6] = 3;
+        assert!(iso_declaration_json(&descriptor).is_null());
+        descriptor[6] = 1;
+        // A later malformed identifier stays visible without being interpreted.
+        let mut iso = vec![0u8; ISO_PVD_OFFSET];
+        iso.extend_from_slice(&descriptor);
+        let mut bad = descriptor.clone();
+        bad[1] = b'X';
+        iso.extend_from_slice(&bad);
+        let json = serde_json::to_value(parse(&iso)).unwrap();
+        let sequence = &json["iso_descriptor_sequence"];
+        assert_eq!(sequence["status"], "malformed");
+        assert_eq!(sequence["image_origin_known"], false);
+        assert_eq!(
+            sequence["descriptors"][0]["character_set_declaration"]["status"],
+            "recognized_joliet_declaration"
+        );
+        assert!(sequence["descriptors"][1]["character_set_declaration"].is_null());
+        for retained_bytes in [7, 88, 91, 119, 120, 881, 882, 2047] {
+            let json =
+                serde_json::to_value(parse(&iso[..ISO_PVD_OFFSET + retained_bytes])).unwrap();
+            assert!(
+                json["iso_descriptor_sequence"]["descriptors"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                json["iso_descriptor_sequence"]["status"],
+                "sample_truncated"
+            );
+        }
+        let json = serde_json::to_value(parse(&iso[..ISO_PVD_OFFSET + 2048])).unwrap();
+        assert_eq!(
+            json["iso_descriptor_sequence"]["status"],
+            "sample_truncated"
+        );
+        assert_eq!(
+            json["iso_descriptor_sequence"]["descriptors"][0]["character_set_declaration"]["recognized_character_set"],
+            "ucs2_be"
+        );
+        let mut bounded = vec![0u8; ISO_PVD_OFFSET];
+        for _ in 0..241 {
+            bounded.extend_from_slice(&descriptor);
+        }
+        let json = serde_json::to_value(parse(&bounded)).unwrap();
+        let sequence = &json["iso_descriptor_sequence"];
+        assert_eq!(sequence["status"], "scan_limit_reached");
+        let observations = sequence["descriptors"].as_array().unwrap();
+        assert_eq!(observations.len(), 240);
+        assert!(observations.iter().all(|observation| {
+            observation["character_set_declaration"]["recognized_character_set"] == "ucs2_be"
+                && observation["character_set_declaration"]["escape_sequences_raw_hex"]
+                    .as_str()
+                    .unwrap()
+                    .len()
+                    == 64
+        }));
     }
 
     #[test]

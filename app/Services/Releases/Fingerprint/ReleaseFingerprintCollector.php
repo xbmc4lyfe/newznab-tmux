@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 19;
+    public const SCHEMA_VERSION = 20;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 
@@ -2392,13 +2392,22 @@ final class ReleaseFingerprintCollector
         $articleSpans = [];
         $injectionSpans = [];
         $legacyPostingDateSpans = [];
+        $headDateIdentityCoverage = [];
         $deltas = [];
         foreach ($servers as $server) {
             $serverObservations = array_values(array_filter($observations, static fn (array $observation): bool => $observation['server'] === $server['name'] && $observation['server_role'] === ($server['alternate'] ? 'alternate' : 'primary')));
             $articleTimes = [];
             $injectionTimes = [];
             $legacyPostingDateTimes = [];
+            $identityStatusCounts = [];
+            $admittedCount = 0;
             foreach ($serverObservations as $observation) {
+                $identityStatus = self::headDateIdentityStatus($observation);
+                $identityStatusCounts[$identityStatus] = ($identityStatusCounts[$identityStatus] ?? 0) + 1;
+                if ($identityStatus !== 'identity_verified') {
+                    continue;
+                }
+                $admittedCount++;
                 $dates = $observation['metadata']['article_dates'] ?? [];
                 $date = $dates['date']['parse_status'] ?? null;
                 $articleTimestamp = $date === 'valid' && is_int($dates['date']['utc_epoch_seconds'] ?? null)
@@ -2423,6 +2432,14 @@ final class ReleaseFingerprintCollector
                 }
             }
             $serverKey = ($server['alternate'] ? 'alternate ' : 'primary ').$server['name'];
+            $headDateIdentityCoverage[$serverKey] = [
+                'admitted_count' => $admittedCount,
+                'excluded_count' => count($serverObservations) - $admittedCount,
+                'status_counts' => $identityStatusCounts,
+                'count_basis' => 'sampled HEAD observations, including repeated requested article IDs',
+                'admission_basis' => 'supported Rust identity evidence: exact requested ID, successful HEAD response, and one valid matching Message-ID field; BODY and OVER identity do not gate HEAD dates',
+                'excluded_raw_dates_retained' => true,
+            ];
             $uniqueServerSamples = count(array_unique(array_column($serverObservations, 'message_id')));
             $articleSpans[$serverKey] = self::timestampSummary($articleTimes, $uniqueServerSamples, $expectedSamples);
             $injectionSpans[$serverKey] = self::timestampSummary($injectionTimes, $uniqueServerSamples, $expectedSamples);
@@ -2441,6 +2458,7 @@ final class ReleaseFingerprintCollector
             'observed_article_date_span_by_server' => $articleSpans,
             'observed_injection_date_span_by_server' => $injectionSpans,
             'observed_legacy_nntp_posting_date_span_by_server' => $legacyPostingDateSpans,
+            'head_date_identity_coverage_by_server' => $headDateIdentityCoverage,
             'composition_to_injection_delta_seconds' => [
                 'min' => $deltaValues === [] ? null : min($deltaValues),
                 'median' => self::percentile($deltaValues, 0.5),
@@ -2468,6 +2486,40 @@ final class ReleaseFingerprintCollector
             ],
             'interpretation' => 'Date is the article composition time; Injection-Date is an observed injection timestamp. Both can be overridden or normalized, and sampled spans do not equal the full upload duration. Actual uploader bandwidth requires uploader-side telemetry.',
         ];
+    }
+
+    /** @param array<string, mixed> $observation */
+    private static function headDateIdentityStatus(array $observation): string
+    {
+        $identity = $observation['metadata']['article_identity'] ?? null;
+        if (! is_array($identity) || ($identity['parser_engine'] ?? null) !== 'nntmux-rust-article-identity'
+            || ($identity['schema_version'] ?? null) !== 3) {
+            return 'identity_parser_unavailable';
+        }
+        $requestedId = $observation['message_id'] ?? null;
+        if (! is_string($requestedId) || ($identity['request']['syntax_status'] ?? null) !== 'valid'
+            || ($identity['request']['token'] ?? null) !== '<'.$requestedId.'>') {
+            return 'invalid_request_identity';
+        }
+        if (($identity['head_response']['availability'] ?? null) !== 'available'
+            || ($identity['head_response']['parse_status'] ?? null) !== 'valid'
+            || ($identity['head_response']['response_code'] ?? null) !== 221
+            || ($identity['head_message_id']['availability'] ?? null) !== 'available'
+            || ($identity['head_message_id']['parse_status'] ?? null) !== 'valid'
+            || ($identity['head_message_id']['occurrence_count'] ?? null) !== 1) {
+            return 'identity_unconfirmed';
+        }
+        $matches = [
+            $identity['head_message_id']['matches_request'] ?? null,
+            $identity['relations']['head_response_matches_request'] ?? null,
+            $identity['relations']['head_response_matches_head_field'] ?? null,
+        ];
+        if (in_array(false, $matches, true)) {
+            return 'identity_mismatch';
+        }
+
+        return count(array_filter($matches, static fn (mixed $match): bool => $match === true)) === 3
+            ? 'identity_verified' : 'identity_unconfirmed';
     }
 
     /** @param array<string, int> $timestamps
