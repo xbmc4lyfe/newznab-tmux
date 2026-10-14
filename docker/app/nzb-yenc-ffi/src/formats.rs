@@ -606,6 +606,7 @@ pub struct Rar5VisibleBlock {
     pub service_name_bytes_hex: Option<String>,
     pub service_name_utf8_valid: Option<bool>,
     pub file_header: Option<Rar5FileHeaderObservation>,
+    pub service_header: Option<Rar5FileHeaderObservation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -640,6 +641,7 @@ pub struct Rar5FileHeaderObservation {
     pub name_byte_length: Option<usize>,
     pub name_utf8_valid: Option<bool>,
     pub filename: Option<String>,
+    pub name_interpretation: &'static str,
     pub name_sha256: Option<String>,
     pub name_preview_hex: Option<String>,
     pub name_preview_truncated: bool,
@@ -797,6 +799,11 @@ pub struct Rar5TimeValue {
     pub nanoseconds_raw_hex: String,
     pub nanoseconds_bytes_available: usize,
     pub nanoseconds_range_valid: Option<bool>,
+    pub filetime_unix_seconds_floor: Option<i64>,
+    pub filetime_unix_subsecond_nanoseconds: Option<u32>,
+    pub filetime_calendar_api_input_range_supported: Option<bool>,
+    pub filetime_epoch_relationship_status: &'static str,
+    pub filetime_epoch_relationship_basis: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -2009,6 +2016,7 @@ fn read_rar5_block_observation(
         service_name_bytes_hex: None,
         service_name_utf8_valid: None,
         file_header: None,
+        service_header: None,
     };
     let Some(size_start) = start.checked_add(4) else {
         return (observation, None, "header_offset_overflow");
@@ -2094,15 +2102,70 @@ fn read_rar5_block_observation(
     } else {
         None
     };
-    if header_type == 2 {
-        observation.file_header = Some(parse_rar5_file_header(
+    if matches!(header_type, 2 | 3) {
+        let mut header = parse_rar5_file_header(
             header_data,
             cursor,
             extra_start..header_end,
             header_flags,
             (header_flags & 0x02 != 0).then_some(data_size),
             observation.header_crc32_valid,
-        ));
+        );
+        if header_type == 2 {
+            observation.file_header = Some(header);
+        } else {
+            header.name_interpretation = "service_identifier_not_archived_file_name";
+            header.directory = None;
+            header.solid = None;
+            // The documented packed-data exception describes split files. Do not
+            // transfer it to split service data without independently verified evidence.
+            header.checksum_domain = if header.split_before || header.split_after {
+                "split_service_data_scope_not_interpreted"
+            } else {
+                "unpacked_service_data"
+            };
+            if header.data_crc32.is_some() {
+                header.data_crc32_scope = Some(header.checksum_domain);
+                header.data_crc32_scope_basis =
+                    Some("RAR5_service_data_declaration_split_scope_withheld");
+            }
+            // The directory flag is valid only for file headers. Keep its bytes,
+            // but revoke timestamp authority when it appears on a service header.
+            let unsupported = if header.file_flags.is_some_and(|flags| flags & 1 != 0) {
+                Some("service_file_flags_unsupported")
+            } else if header.compression_info.is_some_and(|info| info & 0x40 != 0) {
+                Some("service_compression_flags_unsupported")
+            } else {
+                None
+            };
+            if let Some(status) = unsupported {
+                if let Some(compression) = &mut header.compression_metadata {
+                    compression.status = status;
+                    compression.interpretation_status = status;
+                    compression.effective_dictionary_bytes = None;
+                }
+                let extras = &mut header.file_extra_records;
+                for time in extras
+                    .records
+                    .iter_mut()
+                    .filter_map(|record| record.time.as_mut())
+                    .chain(extras.time.iter_mut())
+                {
+                    if time.interpretation_status == "validated_header_declaration" {
+                        derive_rar5_filetime_epoch_relationship(time, status);
+                    }
+                }
+                extras.base_header_mtime_seconds_matches = None;
+                if extras
+                    .time
+                    .as_ref()
+                    .is_some_and(|time| time.interpretation_status == status)
+                {
+                    extras.mtime_comparison_status = status;
+                }
+            }
+            observation.service_header = Some(header);
+        }
     }
     if let Some(name) = service_name.as_deref() {
         observation.service_name_bytes_hex = Some(hex(name));
@@ -2205,6 +2268,7 @@ fn parse_rar5_file_header(
         name_byte_length: None,
         name_utf8_valid: None,
         filename: None,
+        name_interpretation: "archived_file_name",
         name_sha256: None,
         name_preview_hex: None,
         name_preview_truncated: false,
@@ -2534,6 +2598,15 @@ fn parse_rar5_file_time_record(
                 nanoseconds_raw_hex: String::new(),
                 nanoseconds_bytes_available: 0,
                 nanoseconds_range_valid: None,
+                filetime_unix_seconds_floor: None,
+                filetime_unix_subsecond_nanoseconds: None,
+                filetime_calendar_api_input_range_supported: None,
+                filetime_epoch_relationship_status: if unix {
+                    "not_applicable_unix_seconds"
+                } else {
+                    "file_header_fields_incomplete"
+                },
+                filetime_epoch_relationship_basis: "Exact encoded 100ns tick arithmetic relative to Unix epoch; calendar API input range only, not calendar validation, original clock precision, upload time or identity",
             });
         }
     }
@@ -2618,10 +2691,10 @@ fn derive_rar5_file_time_relations(file: &mut Rar5FileHeaderObservation, fields_
         .iter_mut()
         .filter_map(|record| record.time.as_mut())
     {
-        time.interpretation_status = status;
+        derive_rar5_filetime_epoch_relationship(time, status);
     }
     if let Some(time) = &mut extras.time {
-        time.interpretation_status = status;
+        derive_rar5_filetime_epoch_relationship(time, status);
     }
     extras.mtime_comparison_status = status;
     if status != "validated_header_declaration" {
@@ -2637,12 +2710,49 @@ fn derive_rar5_file_time_relations(file: &mut Rar5FileHeaderObservation, fields_
         return;
     };
     if time.storage_format != Some("unix_seconds") {
-        extras.mtime_comparison_status = "filetime_epoch_conversion_not_performed";
+        let Some(seconds) = modified
+            .filetime_unix_seconds_floor
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            extras.mtime_comparison_status = "filetime_seconds_not_representable_in_base_header";
+            return;
+        };
+        extras.base_header_mtime_seconds_matches = Some(seconds == base);
+        extras.mtime_comparison_status = "declared_filetime_floor_seconds_consistency_only";
         return;
     }
     extras.base_header_mtime_seconds_matches =
         modified.base_value.map(|value| value == u64::from(base));
     extras.mtime_comparison_status = "declared_base_seconds_consistency_only";
+}
+
+fn derive_rar5_filetime_epoch_relationship(time: &mut Rar5FileTimeRecord, status: &'static str) {
+    time.interpretation_status = status;
+    if time.storage_format != Some("windows_filetime_100ns") {
+        return;
+    }
+    for value in &mut time.times {
+        value.filetime_unix_seconds_floor = None;
+        value.filetime_unix_subsecond_nanoseconds = None;
+        value.filetime_calendar_api_input_range_supported = None;
+        value.filetime_epoch_relationship_status = status;
+        if status != "validated_header_declaration" {
+            continue;
+        }
+        let Some(ticks) = value.base_value else {
+            value.filetime_epoch_relationship_status = "filetime_scalar_incomplete";
+            continue;
+        };
+        // Divide before subtracting so pre-epoch values retain floor seconds and a
+        // nonnegative fraction. Every u64 quotient and remainder fits these types.
+        value.filetime_unix_seconds_floor = i64::try_from(ticks / 10_000_000)
+            .ok()
+            .and_then(|seconds| seconds.checked_sub(11_644_473_600));
+        value.filetime_unix_subsecond_nanoseconds = u32::try_from((ticks % 10_000_000) * 100).ok();
+        // This is FileTimeToSystemTime's documented input bound, not a calendar conversion.
+        value.filetime_calendar_api_input_range_supported = Some(ticks < (1u64 << 63));
+        value.filetime_epoch_relationship_status = "declared_epoch_arithmetic_only";
+    }
 }
 
 fn parse_rar5_redirection_record(payload: &[u8]) -> Rar5RedirectionRecord {
@@ -7963,6 +8073,367 @@ mod tests {
         assert_eq!(time["storage_format"], "windows_filetime_100ns");
         assert_eq!(time["times"][0]["base_value"], 0);
         assert_eq!(time["times"][0]["nanoseconds_declared"], false);
+    }
+
+    fn rar5_test_filetime_with_coarse_base(
+        extra: &[u8],
+        base: u32,
+        corrupt_crc: bool,
+    ) -> serde_json::Value {
+        let mut block =
+            rar5_test_file_block(3, 2, 0, 0, Some(base), None, 0, 1, b"time", extra, &[]);
+        if corrupt_crc {
+            block[0] ^= 1;
+        }
+        let (observation, _, _) = read_rar5_block_observation(&block, 0, 0);
+        serde_json::to_value(observation.file_header.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn rar5_filetime_epoch_arithmetic_keeps_floor_seconds_and_exact_fraction() {
+        for (raw, seconds, nanos, base, matches, calendar_supported) in [
+            ([0; 8], -11_644_473_600i64, 0, 0, None, true),
+            (
+                [0x00, 0x80, 0x3e, 0xd5, 0xde, 0xb1, 0x9d, 0x01],
+                0,
+                0,
+                0,
+                Some(true),
+                true,
+            ),
+            (
+                [0xff, 0x7f, 0x3e, 0xd5, 0xde, 0xb1, 0x9d, 0x01],
+                -1,
+                999_999_900,
+                0,
+                None,
+                true,
+            ),
+            (
+                [0x07, 0xed, 0xe9, 0xd5, 0xde, 0xb1, 0x9d, 0x01],
+                1,
+                123_456_700,
+                1,
+                Some(true),
+                true,
+            ),
+            (
+                [0x07, 0xed, 0xe9, 0xd5, 0xde, 0xb1, 0x9d, 0x01],
+                1,
+                123_456_700,
+                2,
+                Some(false),
+                true,
+            ),
+            (
+                [0xff, 0x7f, 0x3e, 0xd5, 0x5e, 0x48, 0x36, 0x02],
+                4_294_967_295,
+                999_999_900,
+                u32::MAX,
+                Some(true),
+                true,
+            ),
+            (
+                [0x00, 0x80, 0x3e, 0xd5, 0x5e, 0x48, 0x36, 0x02],
+                4_294_967_296,
+                0,
+                0,
+                None,
+                true,
+            ),
+            (
+                [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80],
+                910_692_730_085,
+                477_580_800,
+                0,
+                None,
+                false,
+            ),
+            ([0xff; 8], 1_833_029_933_770, 955_161_500, 0, None, false),
+        ] {
+            let mut extra = vec![0x0a, 3, 2];
+            extra.extend(raw);
+            let file = rar5_test_filetime_with_coarse_base(&extra, base, false);
+            let extras = &file["file_extra_records"];
+            let time = &extras["time"]["times"][0];
+            assert_eq!(time["filetime_unix_seconds_floor"], seconds);
+            assert_eq!(time["filetime_unix_subsecond_nanoseconds"], nanos);
+            assert_eq!(
+                time["filetime_calendar_api_input_range_supported"],
+                calendar_supported
+            );
+            assert_eq!(
+                time["filetime_epoch_relationship_status"],
+                "declared_epoch_arithmetic_only"
+            );
+            assert_eq!(
+                extras["time"]["times"],
+                extras["records"][0]["time"]["times"]
+            );
+            assert_eq!(
+                extras["base_header_mtime_seconds_matches"].as_bool(),
+                matches
+            );
+            assert_eq!(
+                extras["mtime_comparison_status"],
+                if matches.is_some() {
+                    "declared_filetime_floor_seconds_consistency_only"
+                } else {
+                    "filetime_seconds_not_representable_in_base_header"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn rar5_filetime_literal_ffi_exports_raw_ticks_and_qualified_relationships() {
+        let sample = [
+            0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00, 0xc5, 0x1a, 0x33, 0x32, 0x03, 0x01,
+            0x00, 0x00, 0xc1, 0xf0, 0x85, 0xc5, 0x19, 0x02, 0x01, 0x0b, 0x02, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x78, 0x0a, 0x03, 0x02, 0x07, 0xed, 0xe9, 0xd5,
+            0xde, 0xb1, 0x9d, 0x01, 0x19, 0xb2, 0x3a, 0x35, 0x03, 0x05, 0x00, 0x00,
+        ];
+        let pointer = unsafe { crate::nntmux_format_metadata_json(sample.as_ptr(), sample.len()) };
+        assert!(!pointer.is_null());
+        let json: serde_json::Value =
+            serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(pointer).to_bytes() })
+                .unwrap();
+        unsafe { crate::nntmux_metadata_string_free(pointer) };
+        let extras = &json["headers"][0]["visible_block_walk"]["blocks"][1]["file_header"]["file_extra_records"];
+        assert_eq!(
+            extras["mtime_comparison_status"],
+            "declared_filetime_floor_seconds_consistency_only"
+        );
+        assert_eq!(extras["base_header_mtime_seconds_matches"], true);
+        let time = &extras["time"];
+        assert_eq!(time["source_payload_offset"], 37);
+        assert_eq!(
+            time["source_payload_sha256"],
+            hex(&Sha256::digest(&sample[37..46]))
+        );
+        let value = &time["times"][0];
+        assert_eq!(value["base_value"], 116_444_736_011_234_567u64);
+        assert_eq!(value["base_value_raw_hex"], "07ede9d5deb19d01");
+        assert_eq!(value["filetime_unix_seconds_floor"], 1);
+        assert_eq!(value["filetime_unix_subsecond_nanoseconds"], 123_456_700);
+        assert_eq!(
+            value["filetime_epoch_relationship_status"],
+            "declared_epoch_arithmetic_only"
+        );
+        assert_eq!(time["times"], extras["records"][0]["time"]["times"]);
+    }
+
+    #[test]
+    fn rar5_service_headers_retain_time_extras_without_claiming_an_archived_file() {
+        let extra = [0x0a, 3, 2, 0x07, 0xed, 0xe9, 0xd5, 0xde, 0xb1, 0x9d, 0x01];
+        for (bad_crc, service_flags, compression, header_flags, expected_status) in [
+            (false, 6, 0, 1, "validated_header_declaration"),
+            (true, 2, 0, 1, "header_checksum_unconfirmed"),
+            (false, 3, 0, 1, "service_file_flags_unsupported"),
+            (false, 2, 0x40, 1, "service_compression_flags_unsupported"),
+            (false, 6, 0, 0x11, "validated_header_declaration"),
+        ] {
+            let mut block = rar5_test_file_block(
+                header_flags,
+                service_flags,
+                0,
+                0,
+                Some(1),
+                Some(123),
+                compression,
+                1,
+                b"CMT",
+                &extra,
+                &[],
+            );
+            block[5] = 3; // Change only the literal header type, then independently recompute CRC.
+            recalculate_rar5_header_crc(&mut block, 0);
+            if bad_crc {
+                block[0] ^= 1;
+            }
+            let (observation, _, _) = read_rar5_block_observation(&block, 0, 0);
+            let json = serde_json::to_value(observation).unwrap();
+            assert!(json["file_header"].is_null());
+            assert_eq!(json["header_type"], 3);
+            assert_eq!(json["service_name_bytes_hex"], "434d54");
+            let service = &json["service_header"];
+            assert!(service["directory"].is_null());
+            assert!(service["solid"].is_null());
+            assert_eq!(
+                service["name_interpretation"],
+                "service_identifier_not_archived_file_name"
+            );
+            if compression == 0x40 {
+                assert!(service["compression_metadata"]["effective_dictionary_bytes"].is_null());
+                assert_eq!(
+                    service["compression_metadata"]["interpretation_status"],
+                    "service_compression_flags_unsupported"
+                );
+            }
+            if service_flags & 4 != 0 {
+                assert_eq!(
+                    service["data_crc32_scope"],
+                    if header_flags & 0x10 != 0 {
+                        "split_service_data_scope_not_interpreted"
+                    } else {
+                        "unpacked_service_data"
+                    }
+                );
+            }
+            let extras = &service["file_extra_records"];
+            assert_eq!(extras["time_record_count"], 1);
+            assert_eq!(extras["time"]["interpretation_status"], expected_status);
+            assert_eq!(
+                extras["time"]["times"][0]["base_value"],
+                116_444_736_011_234_567u64
+            );
+            assert_eq!(
+                extras["time"]["times"],
+                extras["records"][0]["time"]["times"]
+            );
+            if expected_status == "validated_header_declaration" {
+                assert_eq!(extras["time"]["times"][0]["filetime_unix_seconds_floor"], 1);
+                assert_eq!(extras["base_header_mtime_seconds_matches"], true);
+            } else {
+                assert!(extras["time"]["times"][0]["filetime_unix_seconds_floor"].is_null());
+                assert!(extras["base_header_mtime_seconds_matches"].is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn rar5_filetime_epoch_relationship_respects_all_record_authority_gates() {
+        let epoch = [0x0a, 3, 2, 0x00, 0x80, 0x3e, 0xd5, 0xde, 0xb1, 0x9d, 0x01];
+        let mut duplicate = epoch.to_vec();
+        duplicate.extend(epoch);
+        let mut unknown = epoch.to_vec();
+        unknown[2] = 0x22;
+        let mut late = [1, 11].repeat(64);
+        late.extend(epoch);
+        let mut late_duplicate = epoch.to_vec();
+        late_duplicate.extend([1, 11].repeat(63));
+        late_duplicate.extend(epoch);
+        let partial = [0x09, 3, 2, 0x00, 0x80, 0x3e, 0xd5, 0xde, 0xb1, 0x9d];
+        let malformed_following = {
+            let mut data = epoch.to_vec();
+            data.extend([0x80]);
+            data
+        };
+        for (extra, bad_crc, status) in [
+            (epoch.to_vec(), true, "header_checksum_unconfirmed"),
+            (duplicate, false, "duplicate_time_records"),
+            (unknown, false, "time_record_not_interpretable"),
+            (late, false, "record_observation_limit"),
+            (late_duplicate, false, "duplicate_time_records"),
+            (epoch.repeat(4097), false, "extra_framing_incomplete"),
+            (partial.to_vec(), false, "time_record_not_interpretable"),
+            (malformed_following, false, "extra_framing_incomplete"),
+        ] {
+            let file = rar5_test_filetime_with_coarse_base(&extra, 0, bad_crc);
+            let extras = &file["file_extra_records"];
+            assert!(extras["time"]["times"][0]["filetime_unix_seconds_floor"].is_null());
+            assert!(extras["time"]["times"][0]["filetime_unix_subsecond_nanoseconds"].is_null());
+            assert!(
+                extras["time"]["times"][0]["filetime_calendar_api_input_range_supported"].is_null()
+            );
+            assert_eq!(
+                extras["time"]["times"][0]["filetime_epoch_relationship_status"],
+                status
+            );
+            assert_eq!(extras["mtime_comparison_status"], status);
+            assert!(extras["base_header_mtime_seconds_matches"].is_null());
+            for record in extras["records"].as_array().unwrap() {
+                if let Some(values) = record["time"]["times"].as_array() {
+                    for value in values {
+                        assert!(value["filetime_unix_seconds_floor"].is_null());
+                        assert!(value["filetime_unix_subsecond_nanoseconds"].is_null());
+                        assert!(value["filetime_calendar_api_input_range_supported"].is_null());
+                        assert_eq!(value["filetime_epoch_relationship_status"], status);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rar5_filetime_incomplete_and_trailing_file_fields_withhold_epoch_relationships() {
+        let epoch = [0x0a, 3, 2, 0x00, 0x80, 0x3e, 0xd5, 0xde, 0xb1, 0x9d, 0x01];
+        let mut trailing = vec![0, 0, 0, 0, 1, 1, b'x', 0xff];
+        trailing.extend(epoch);
+        let partial = parse_rar5_file_header(&epoch, 0, 0..epoch.len(), 1, None, Some(true));
+        let trailing = parse_rar5_file_header(&trailing, 0, 8..trailing.len(), 1, None, Some(true));
+        let mut unsupported = vec![0x10, 0, 0, 0, 1, 1, b'x'];
+        unsupported.extend(epoch);
+        let unsupported =
+            parse_rar5_file_header(&unsupported, 0, 7..unsupported.len(), 1, None, Some(true));
+        for (file, status) in [
+            (
+                serde_json::to_value(partial).unwrap(),
+                "file_header_fields_incomplete",
+            ),
+            (
+                serde_json::to_value(trailing).unwrap(),
+                "file_header_fields_trailing_bytes",
+            ),
+            (
+                serde_json::to_value(unsupported).unwrap(),
+                "file_flags_unsupported",
+            ),
+        ] {
+            let extras = &file["file_extra_records"];
+            for time in [&extras["time"], &extras["records"][0]["time"]] {
+                assert_eq!(time["times"][0]["base_value"], 116_444_736_000_000_000u64);
+                let value = &time["times"][0];
+                assert!(value["filetime_unix_seconds_floor"].is_null());
+                assert!(value["filetime_unix_subsecond_nanoseconds"].is_null());
+                assert!(value["filetime_calendar_api_input_range_supported"].is_null());
+                assert_eq!(value["filetime_epoch_relationship_status"], status);
+            }
+            assert!(extras["base_header_mtime_seconds_matches"].is_null());
+        }
+    }
+
+    #[test]
+    fn rar5_filetime_epoch_relationship_covers_creation_access_without_base_mtime() {
+        let extra = [
+            0x1a, 3, 0x0e, 0x00, 0x80, 0x3e, 0xd5, 0xde, 0xb1, 0x9d, 0x01, 0xff, 0x7f, 0x3e, 0xd5,
+            0xde, 0xb1, 0x9d, 0x01, 0x07, 0xed, 0xe9, 0xd5, 0xde, 0xb1, 0x9d, 0x01,
+        ];
+        let file = rar5_test_file_extra_json(&extra, 0, false);
+        let extras = &file["file_extra_records"];
+        assert_eq!(
+            extras["mtime_comparison_status"],
+            "base_header_mtime_absent"
+        );
+        assert!(extras["base_header_mtime_seconds_matches"].is_null());
+        for (index, kind, seconds, nanos) in [
+            (0, "modification", 0, 0),
+            (1, "creation", -1, 999_999_900),
+            (2, "access", 1, 123_456_700),
+        ] {
+            let value = &extras["time"]["times"][index];
+            assert_eq!(value["kind"], kind);
+            assert_eq!(value["filetime_unix_seconds_floor"], seconds);
+            assert_eq!(value["filetime_unix_subsecond_nanoseconds"], nanos);
+        }
+        assert_eq!(
+            extras["time"]["times"],
+            extras["records"][0]["time"]["times"]
+        );
+        // A complete mtime followed by a partial ctime must not authorize either conversion.
+        let mut partial = vec![0x0b, 3, 6];
+        partial.extend(&extra[3..11]);
+        partial.push(0xff);
+        let file = rar5_test_filetime_with_coarse_base(&partial, 0, false);
+        let time = &file["file_extra_records"]["time"];
+        assert_eq!(time["times"][0]["base_value"], 116_444_736_000_000_000u64);
+        for value in time["times"].as_array().unwrap() {
+            assert!(value["filetime_unix_seconds_floor"].is_null());
+            assert_eq!(
+                value["filetime_epoch_relationship_status"],
+                "time_record_not_interpretable"
+            );
+        }
     }
 
     #[test]

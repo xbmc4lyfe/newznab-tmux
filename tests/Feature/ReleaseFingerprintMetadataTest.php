@@ -42,6 +42,43 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertSame(37, $extras['time']['source_payload_offset']);
         self::assertSame([1, 2, 3], array_column($extras['time']['times'], 'base_value'));
         self::assertSame([4, 5, 6], array_column($extras['time']['times'], 'nanoseconds'));
+        self::assertSame(['not_applicable_unix_seconds'], array_unique(array_column($extras['time']['times'], 'filetime_epoch_relationship_status')));
+
+        // Independently framed literal: coarse mtime 1, FILETIME epoch + 1.1234567 seconds.
+        $filetimeSample = hex2bin('526172211a070100c51a333203010000c1f085c51902010b0200000100000000010178'
+            .'0a030207ede9d5deb19d0119b23a3503050000');
+        self::assertIsString($filetimeSample);
+        $filetimeBody = YencArticles::article($filetimeSample);
+        $filetimeAnalysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $filetimeBody);
+        self::assertSame($filetimeSample, $filetimeAnalysis['decoded_bytes']);
+        self::assertSame(hash('sha256', $filetimeBody), $filetimeAnalysis['metadata']['article_body_sha256']);
+        $filetimeExtras = $filetimeAnalysis['metadata']['decoded_format_metadata']['headers'][0]['visible_block_walk']['blocks'][1]['file_header']['file_extra_records'];
+        self::assertTrue($filetimeExtras['base_header_mtime_seconds_matches']);
+        self::assertSame('declared_filetime_floor_seconds_consistency_only', $filetimeExtras['mtime_comparison_status']);
+        $time = $filetimeExtras['time']['times'][0];
+        self::assertSame(116444736011234567, $time['base_value']);
+        self::assertSame(1, $time['filetime_unix_seconds_floor']);
+        self::assertSame(123456700, $time['filetime_unix_subsecond_nanoseconds']);
+        self::assertTrue($time['filetime_calendar_api_input_range_supported']);
+        self::assertSame('declared_epoch_arithmetic_only', $time['filetime_epoch_relationship_status']);
+        self::assertSame(37, $filetimeExtras['time']['source_payload_offset']);
+        self::assertSame($filetimeExtras['time']['times'], $filetimeExtras['records'][0]['time']['times']);
+
+        $serviceSample = hex2bin('526172211a070100c51a3332030100005330bc561b03010b02000001000000000103434d54'
+            .'0a030207ede9d5deb19d0119b23a3503050000');
+        self::assertIsString($serviceSample);
+        $serviceAnalysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], YencArticles::article($serviceSample));
+        self::assertSame($serviceSample, $serviceAnalysis['decoded_bytes']);
+        $block = $serviceAnalysis['metadata']['decoded_format_metadata']['headers'][0]['visible_block_walk']['blocks'][1];
+        self::assertSame(3, $block['header_type']);
+        self::assertNull($block['file_header']);
+        self::assertSame('434d54', $block['service_name_bytes_hex']);
+        self::assertSame('service_identifier_not_archived_file_name', $block['service_header']['name_interpretation']);
+        $serviceExtras = $block['service_header']['file_extra_records'];
+        self::assertSame(39, $serviceExtras['time']['source_payload_offset']);
+        self::assertSame(1, $serviceExtras['time']['times'][0]['filetime_unix_seconds_floor']);
+        self::assertSame(123456700, $serviceExtras['time']['times'][0]['filetime_unix_subsecond_nanoseconds']);
+        self::assertTrue($serviceExtras['base_header_mtime_seconds_matches']);
     }
 
     #[Test]
