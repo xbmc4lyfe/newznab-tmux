@@ -54,7 +54,7 @@ final class GenericPredbAttachmentTest extends TestCase
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication($container);
         DB::statement('CREATE TABLE par2_rename_progress (releases_id INTEGER PRIMARY KEY)');
-        DB::statement('CREATE TABLE predb (id INTEGER PRIMARY KEY, title TEXT)');
+        DB::statement('CREATE TABLE predb (id INTEGER PRIMARY KEY, title TEXT, filename TEXT)');
         DB::statement('CREATE TABLE releases (id INTEGER PRIMARY KEY, guid TEXT, name TEXT COLLATE NOCASE, searchname TEXT COLLATE NOCASE, predb_id INTEGER DEFAULT 0, fromname TEXT, groups_id INTEGER DEFAULT 1, categories_id INTEGER DEFAULT 10, size INTEGER DEFAULT 5000, nfostatus INTEGER DEFAULT 1, isrenamed INTEGER DEFAULT 0, proc_nfo INTEGER DEFAULT 0, proc_files INTEGER DEFAULT 0, proc_par2 INTEGER DEFAULT 0, proc_uid INTEGER DEFAULT 0, proc_srr INTEGER DEFAULT 0, proc_hash16k INTEGER DEFAULT 0, proc_crc32 INTEGER DEFAULT 0)');
         DB::statement('CREATE TABLE release_files (releases_id INTEGER, name TEXT, crc32 TEXT)');
     }
@@ -216,6 +216,46 @@ final class GenericPredbAttachmentTest extends TestCase
         return (new ReflectionMethod(NameFixingService::class, 'applyDonorMatch'))->invoke($service, $release, [$donor], 5, 'hashCheck: PAR2', 'PAR2 hash, ', true, true, false);
     }
 
+    public static function numericStems(): array
+    {
+        return array_map(static fn ($s) => [$s], ['123456', '١٢٣٤٥٦', '１２３４５６', '१२३४५६', '¹²³⁴⁵⁶', 'ⅢⅣⅤⅥ', '١２३⁴Ⅴ', '١٢٣.٤٥٦', '１２３-４５６', '１２３_４５６', '１２３　４５６', '١٢٣٫٤٥٦', '(１２３４５６)']);
+    }
+
+    #[DataProvider('numericStems')]
+    public function test_numeric_alias_rejected_by_public_revalidation(string $stem): void
+    {
+        $release = $this->seed(0);
+        DB::table('predb')->where('id', 7)->update(['filename' => $stem.'.mkv']);
+        [, $updater] = $this->services();
+        $attached = $updater->attachPredbSnapshot($release, 7, self::TITLE, $stem);
+        self::assertSame(0, (int) DB::table('releases')->where('id', 42)->value('predb_id'));
+        self::assertFalse($attached);
+        self::assertNull($updater->currentPredbTitle(7, self::TITLE, $stem));
+    }
+
+    #[DataProvider('numericStems')]
+    public function test_numeric_literal_title_keeps_revalidation_precedence(string $stem): void
+    {
+        $release = $this->seed(0);
+        DB::table('predb')->where('id', 7)->update(['title' => $stem]);
+        DB::table('releases')->where('id', 42)->update(['name' => $stem, 'searchname' => $stem]);
+        $release->name = $release->searchname = $stem;
+        [, $updater] = $this->services();
+        self::assertSame($stem, $updater->currentPredbTitle(7, $stem, $stem));
+        self::assertTrue($updater->attachPredbSnapshot($release, 7, $stem, $stem));
+        self::assertSame(7, (int) DB::table('releases')->where('id', 42)->value('predb_id'));
+    }
+
+    public function test_alphanumeric_filename_remains_usable_by_revalidation(): void
+    {
+        $release = $this->seed(0);
+        DB::table('predb')->where('id', 7)->update(['filename' => '第１２話.mkv']);
+        [, $updater] = $this->services();
+        self::assertSame(self::TITLE, $updater->currentPredbTitle(7, self::TITLE, '第１２話'));
+        self::assertTrue($updater->attachPredbSnapshot($release, 7, self::TITLE, '第１２話'));
+        self::assertSame(7, (int) DB::table('releases')->where('id', 42)->value('predb_id'));
+    }
+
     private function seed(int $predbId): object
     {
         DB::table('predb')->insert(['id' => 7, 'title' => self::TITLE]);
@@ -233,6 +273,7 @@ final class GenericPredbAttachmentTest extends TestCase
     {
         $updater = (new ReflectionClass(ReleaseUpdateService::class))->newInstanceWithoutConstructor();
         $service = (new ReflectionClass(NameFixingService::class))->newInstanceWithoutConstructor();
+        (new ReflectionProperty(ReleaseUpdateService::class, 'fileNameCleaner'))->setValue($updater, new FileNameCleaner);
         (new ReflectionProperty(NameFixingService::class, 'updateService'))->setValue($service, $updater);
         (new ReflectionProperty(NameFixingService::class, 'fileNameCleaner'))->setValue($service, new FileNameCleaner);
         (new ReflectionProperty(NameFixingService::class, 'filePrioritizer'))->setValue($service, new FilePrioritizer);
