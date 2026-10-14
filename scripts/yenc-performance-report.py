@@ -13,7 +13,9 @@ import html
 import json
 import math
 from pathlib import Path
+from os.path import relpath
 import re
+from urllib.parse import quote
 
 
 def comparison(row):
@@ -140,9 +142,13 @@ def render(evidence, output):
     final = next((row for row in reversed(records) if row.get('type') in ('run_summary', 'run_failure')), {})
     status = final.get('status', 'setup incomplete; no performance conclusion')
     sections = [f'<h1>Native yEnc performance evidence</h1><p>Run result: <strong>{html.escape(status)}</strong>.</p>',
-                '<p>C++ is the pinned RapidYenc baseline; Rust is the built candidate. Identical synthetic article fixtures execute real YencService and memory-backed NNTP BODY calls. This does not measure network, database, archive metadata or production throughput.</p>',
+                '<p>C++ is the pinned RapidYenc baseline; Rust is the built candidate. Identical synthetic article fixtures execute real YencService and memory-backed NNTP BODY calls. This paired comparison does not measure network, database, archive metadata or production throughput.</p>',
                 '<p>Speedup = C++ time / Rust time. 1× means equal time. Time saved = 100 × (1 − Rust time / C++ time). Decisions and simultaneous confidence intervals come from the uninstrumented paired benchmark; inconclusive estimates do not establish a gain.</p>',
                 '<table><tr><th>Stratum</th><th>Decision</th><th>Speedup</th><th>95% speedup interval</th><th>Time saved</th><th>Eligible / invalid</th></tr>']
+    markdown = ['## Native decoder speedup estimates', '', f'Run result: `{status}`.', '',
+                'Fixture comparison only. Inconclusive estimates do not establish a gain. Profiles do not supply timings.', '',
+                '| Stratum | Decision | C++ / Rust | 95% interval | Time saved | Eligible / invalid |',
+                '|---|---|---:|---|---:|---|']
     chart = []
     for row in summaries:
         label = f"{row['size']} B / {row['density']} / {row['path']}"
@@ -152,12 +158,13 @@ def render(evidence, output):
                    f"{metrics['time_saved_percent']:.2f}%"]
         cells = [label, row['decision'], *values, f"{row['eligible_pairs']} / {row['invalid_pairs']}"]
         sections.append('<tr>' + ''.join('<td>' + html.escape(str(cell)) + '</td>' for cell in cells) + '</tr>')
+        markdown.append('| ' + ' | '.join(str(cell).replace('|', '\\|') for cell in cells) + ' |')
         if metrics:
             chart.append((label + ' [' + row['decision'] + ']', metrics['speedup']))
     sections.append('</table>')
     (output / 'speedup.svg').write_text(bar_svg('Uninstrumented C++ / Rust median paired speedup (decision shown)', chart, '×', 1))
     sections.append('<img src="speedup.svg" alt="Paired speedup estimates by fixture and call path">')
-    sections.append('<h2>Executed PHP hot paths</h2><p>Xdebug profiles include process bootstrap, fixture setup, warmup, decoding and correctness checks. Exclusive function time is shown below; inclusive call-edge cost is listed separately and must not be added across edges. FFI calls are opaque here; native internals appear in the separate CPU sampling flamegraphs. Instrumentation changes cost and these numbers are not speedup measurements.</p>')
+    sections.append('<h2>Executed PHP hot paths</h2><p>The separate Rust-only metadata workload executes NzbFingerprintAnalyzer and native RAR5/NNTP metadata parsing over a fixed verified archive-header fixture. It has no C++ counterpart and supplies no migration speedup estimate.</p><p>Xdebug profiles include process bootstrap, fixture setup, warmup, decoding and correctness checks. Exclusive function time is shown below; inclusive call-edge cost is listed separately and must not be added across edges. FFI calls are opaque here; native internals appear in the separate CPU sampling flamegraphs. Instrumentation changes cost and these numbers are not speedup measurements.</p>')
     profile_records = []
     for index, path in enumerate(sorted((evidence / 'profiles').rglob('*.callgrind'))):
         label = str(path.relative_to(evidence))
@@ -188,9 +195,22 @@ def render(evidence, output):
             profile_records.append({'path': label, 'status': 'invalid', 'error': str(error)})
     if not profile_records:
         sections.append('<p>No executed PHP profile available. Check retained profiling logs; no hot-path conclusion.</p>')
-    sections.append('<h2>Native CPU sampling</h2><p>Open the profiles/*/*.svg artifacts for searchable, zoomable sampled native stacks. Width represents CPU samples, not wall time. Sampling uses separate optimized builds with debug information. Consult each status.json and build manifest; unavailable samples cannot identify hot paths.</p>')
+    sections.append('<h2>Native CPU sampling</h2><p>Searchable, zoomable sampled native stacks use separate optimized builds with debug information. Width represents CPU samples, not wall time. Whole-process samples include setup and correctness verification. Unavailable or invalid captures cannot identify native hot paths.</p>')
+    sections.append('<table><tr><th>Workload</th><th>Capture status</th><th>CPU samples</th><th>Flamegraph</th></tr>')
+    for receipt_path in sorted((evidence / 'profiles').glob('*/status.json')):
+        receipt = json.loads(receipt_path.read_text())
+        graph = receipt_path.parent / 'native.svg'
+        state = receipt.get('native_profile', 'unavailable')
+        link = 'unavailable'
+        if state == 'captured' and receipt.get('workload_identity_matches') and graph.is_file():
+            link = '<a href="' + html.escape(quote(relpath(graph, output))) + '">Open flamegraph</a>'
+        sections.append('<tr><td>' + html.escape(receipt_path.parent.name) + '</td><td>'
+                        + html.escape(str(state)) + '</td><td>' + html.escape(str(receipt.get('native_samples', 0)))
+                        + '</td><td>' + link + '</td></tr>')
+    sections.append('</table>')
     document = '<!doctype html><html lang="en"><meta charset="utf-8"><title>yEnc performance evidence</title><style>body{font:16px system-ui;background:#101827;color:#e5e7eb;margin:32px;max-width:1400px}table{border-collapse:collapse}td,th{padding:8px;text-align:left;border-bottom:1px solid #334155}img{width:100%;margin:20px 0}summary{cursor:pointer}</style><body>' + '\n'.join(sections) + '</body></html>'
     (output / 'report.html').write_text(document)
+    (output / 'summary.md').write_text('\n'.join(markdown) + '\n')
     (output / 'status.json').write_text(json.dumps({'benchmark_status': status, 'profiles': profile_records,
         'observations_sha256': hashlib.sha256(observations.read_bytes()).hexdigest() if observations.exists() else None}, indent=2) + '\n')
 

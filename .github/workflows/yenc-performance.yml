@@ -236,7 +236,7 @@ jobs:
           fi
           sudo apt-get update -qq
           sudo apt-get install -y linux-tools-generic
-          perf_binary=$(find /usr/lib/linux-tools -type f -name perf | sort | tail -n 1)
+          perf_binary=$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -n 1)
           if [[ -z "$perf_binary" ]]; then
             echo 'No perf executable installed.' >&2
             exit 1
@@ -253,8 +253,11 @@ jobs:
         run: |
           python3 scripts/yenc-performance-report.py --evidence-dir=benchmark-evidence \
             --output-dir=benchmark-evidence/visualization
-          echo '### Performance visualizations' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Download the evidence artifact and open visualization/report.html for per-stratum speedup estimates and executed PHP call costs. Open profiles/*/native.svg for zoomable native CPU stacks. Profile status and failures are retained; instrumented costs are separate from paired timings.' >> "$GITHUB_STEP_SUMMARY"
+          {
+            cat benchmark-evidence/visualization/summary.md
+            echo '### Performance visualizations'
+            echo 'Download the evidence artifact and open visualization/report.html for per-stratum speedup estimates and executed PHP call costs. Open profiles/*/native.svg for zoomable native CPU stacks. Profile status and failures are retained; instrumented costs are separate from paired timings.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summarize every measured stratum
         if: always()

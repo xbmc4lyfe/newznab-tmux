@@ -50,12 +50,21 @@ for backend in cpp rust; do
     else
         library="$profile_build/rust/release/libnzbyenc.so"
     fi
-    for density in ordinary heavy; do
-        for path in strict tolerant body; do
+    workloads=(ordinary-strict ordinary-tolerant ordinary-body heavy-strict heavy-tolerant heavy-body)
+    if [[ "$backend" == rust ]]; then
+        workloads+=(rar5-metadata)
+    fi
+    for workload in "${workloads[@]}"; do
+            density=${workload%-*}
+            path=${workload##*-}
             directory="$evidence/profiles/$backend-$density-$path"
             mkdir -p "$directory"
-            args=(scripts/profile-yenc.php "--native=$library" "--path=$path" \
-                --size=524288 "--density=$density" --iterations=400)
+            if [[ "$path" == metadata ]]; then
+                args=(scripts/profile-yenc.php "--native=$library" --path=metadata --iterations=2000)
+            else
+                args=(scripts/profile-yenc.php "--native=$library" "--path=$path" \
+                    --size=524288 "--density=$density" --iterations=400)
+            fi
             php_exit=0
             timeout --kill-after=5s 90s env XDEBUG_MODE=profile php -d ffi.enable=true \
                 -d memory_limit=1G -d xdebug.start_with_request=yes -d xdebug.use_compression=0 \
@@ -101,8 +110,9 @@ native = workload('native-workload.json')
 callgrind = directory / 'php.callgrind'
 folded = directory / 'native.folded'
 samples = sum(int(line.rsplit(' ', 1)[1]) for line in folded.read_text().splitlines()) if folded.exists() else 0
-matched = bool(php and native and all(php[key] == native[key] for key in
-    ('input_sha256', 'output_sha256', 'wire_sha256', 'verified_calls', 'size', 'iterations')))
+matched = bool(php and native and all(key in php and key in native and php[key] == native[key] for key in
+    ('input_sha256', 'output_sha256', 'wire_sha256', 'verified_calls', 'size', 'iterations'))
+    and php.get('headers_sha256') == native.get('headers_sha256'))
 status = {
     'php_profile': 'captured' if php_exit == '0' and php and callgrind.is_file() and callgrind.stat().st_size else 'invalid',
     'native_profile': 'unavailable' if native_exit == 'unavailable' else (
@@ -121,11 +131,11 @@ PY
             then
                 invalid=1
             fi
-        done
     done
 done
 # Debug build intermediates dwarf evidence size; keep libraries and source identities.
 cp "$profile_build/cpp/librapidyenc.so" "$profile_build/cpp.so"
 cp "$profile_build/rust/release/libnzbyenc.so" "$profile_build/rust.so"
+(cd "$profile_build" && sha256sum cpp.so rust.so > retained-libraries.sha256)
 rm -rf -- "$profile_build/cpp" "$profile_build/cpp-source" "$profile_build/rust"
 exit "$invalid"

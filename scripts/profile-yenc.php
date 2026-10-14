@@ -9,10 +9,14 @@ declare(strict_types=1);
  * decoding, exact-output verification and JSON reporting. Instrumented results are not latency evidence.
  */
 use App\Services\NNTP\NNTPService;
+use App\Services\Releases\Fingerprint\NativeMetadataParser;
+use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
 use App\Services\Yenc\ArticleFrame;
 use App\Services\Yenc\DecoderFactory;
 use App\Services\Yenc\NativePayloadDecoder;
 use App\Services\YencService;
+use Illuminate\Config\Repository;
+use Illuminate\Container\Container;
 use Tests\Fixtures\YencArticles;
 use Tests\Support\YencNntpHarness;
 
@@ -32,7 +36,7 @@ try {
     $sourceHashes = [];
     foreach ([YencService::class, DecoderFactory::class, NativePayloadDecoder::class,
         ArticleFrame::class, NNTPService::class,
-        YencArticles::class, YencNntpHarness::class] as $class) {
+        YencArticles::class, YencNntpHarness::class, NzbFingerprintAnalyzer::class, NativeMetadataParser::class] as $class) {
         $source = (new ReflectionClass($class))->getFileName();
         $sourceHashes[$class] = $source === false ? null : hash_file('sha256', $source);
     }
@@ -56,7 +60,7 @@ try {
 
 /**
  * @param  list<string>  $arguments
- * @return array{native: string, path: string, size: int, density: string, iterations: int}
+ * @return array{native: string, path: string, size: int|null, density: string|null, iterations: int}
  */
 function yencProfileOptions(array $arguments): array
 {
@@ -74,9 +78,12 @@ function yencProfileOptions(array $arguments): array
     }
     $path = $values['path'] ?? 'strict';
     $density = $values['density'] ?? 'ordinary';
-    if (! in_array($path, ['strict', 'tolerant', 'body'], true)
+    if (! in_array($path, ['strict', 'tolerant', 'body', 'metadata'], true)
         || ! in_array($density, ['ordinary', 'heavy'], true)) {
         throw new InvalidArgumentException('Invalid workload path or density.');
+    }
+    if ($path === 'metadata' && (isset($values['size']) || isset($values['density']))) {
+        throw new InvalidArgumentException('Metadata uses a fixed RAR5 literal; --size and --density apply only to decoder paths.');
     }
     foreach (['size' => 8388608, 'iterations' => 10000] as $name => $maximum) {
         $value = $values[$name] ?? ($name === 'size' ? '524288' : '100');
@@ -87,8 +94,8 @@ function yencProfileOptions(array $arguments): array
         $values[$name] = (int) $value;
     }
 
-    return ['native' => $native, 'path' => $path, 'size' => $values['size'],
-        'density' => $density, 'iterations' => $values['iterations']];
+    return ['native' => $native, 'path' => $path, 'size' => $path === 'metadata' ? null : $values['size'],
+        'density' => $path === 'metadata' ? null : $density, 'iterations' => $values['iterations']];
 }
 
 /** @return array{data: string, article: string} */
@@ -104,11 +111,17 @@ function yencProfileFixture(int $size, string $density): array
 }
 
 /**
- * @param  array{native: string, path: string, size: int, density: string, iterations: int}  $options
+ * @param  array{native: string, path: string, size: int|null, density: string|null, iterations: int}  $options
  * @return array<string, mixed>
  */
 function yencProfileExecute(YencService $service, array $options): array
 {
+    if ($options['path'] === 'metadata') {
+        return yencProfileExecuteMetadata($service, $options['native'], $options['iterations']);
+    }
+    if ($options['size'] === null || $options['density'] === null) {
+        throw new InvalidArgumentException('Decoder paths require fixture size and density.');
+    }
     $fixture = yencProfileFixture($options['size'], $options['density']);
     $stream = null;
     $harness = null;
@@ -160,5 +173,90 @@ function yencProfileExecute(YencService $service, array $options): array
         if (is_resource($stream)) {
             fclose($stream);
         }
+    }
+}
+
+/** @return array{data: string, article: string, headers: list<string>} */
+function yencProfileMetadataFixture(): array
+{
+    $data = hex2bin('526172211a070100c51a333203010000af35bf2f2902011b0200000100000000010178'
+        .'1a031f01000000020000000300000004000000050000000600000019b23a3503050000');
+    if ($data === false) {
+        throw new RuntimeException('Invalid fixed RAR5 fixture.');
+    }
+    $article = YencArticles::article($data)."\r\n";
+
+    return ['data' => $data, 'article' => $article, 'headers' => [
+        "Message-ID: <metadata-profile@example.test>\r\n",
+        "Subject: fixture.rar (1/1)\r\n",
+        "Date: Wed, 14 Oct 2026 00:00:00 +0000\r\n",
+        "Newsgroups: alt.test\r\n",
+        "Lines: 3\r\n",
+    ]];
+}
+
+/**
+ * @param  array{metadata: array<string, mixed>, decoded_bytes: ?string}  $analysis
+ * @return array<string, mixed>
+ */
+function yencProfileVerifyMetadata(array $analysis, string $expected): array
+{
+    if ($analysis['decoded_bytes'] !== $expected) {
+        throw new RuntimeException('Metadata workload decoded incorrect fixture bytes.');
+    }
+    $metadata = $analysis['metadata'];
+    foreach (['decoded_format_metadata' => 'nntmux-rust-ffi', 'yenc_framing_metadata' => 'nntmux-rust-ffi',
+        'nntp_header_metadata' => 'nntmux-rust-nntp-headers', 'nntp_body_metadata' => 'nntmux-rust-nntp-body',
+        'nntp_lines_body_relationship' => 'nntmux-rust-nntp-body'] as $key => $engine) {
+        if (($metadata[$key]['parser_engine'] ?? null) !== $engine) {
+            throw new RuntimeException('Native metadata output unavailable for '.$key.'.');
+        }
+    }
+    $extras = $metadata['decoded_format_metadata']['headers'][0]['visible_block_walk']['blocks'][1]['file_header']['file_extra_records'] ?? null;
+    $times = $extras['time']['times'] ?? [];
+    if (($extras['time_record_count'] ?? null) !== 1
+        || ($extras['base_header_mtime_seconds_matches'] ?? null) !== true
+        || ($extras['mtime_comparison_status'] ?? null) !== 'declared_base_seconds_consistency_only'
+        || ($extras['time']['interpretation_status'] ?? null) !== 'validated_header_declaration'
+        || ($extras['time']['source_payload_offset'] ?? null) !== 37
+        || ! is_array($times) || array_column($times, 'base_value') !== [1, 2, 3]
+        || array_column($times, 'nanoseconds') !== [4, 5, 6]
+        || array_column($times, 'filetime_epoch_relationship_status') !== array_fill(0, 3, 'not_applicable_unix_seconds')) {
+        throw new RuntimeException('Native RAR5 timestamp output differs from independent literal expectations.');
+    }
+
+    return ['base_values' => [1, 2, 3], 'nanoseconds' => [4, 5, 6], 'source_payload_offset' => 37];
+}
+
+/** @return array<string, mixed> */
+function yencProfileExecuteMetadata(YencService $service, string $native, int $iterations): array
+{
+    if ($iterations < 1 || $iterations > 10000) {
+        throw new InvalidArgumentException('Metadata iterations must be between 1 and 10000.');
+    }
+    $fixture = yencProfileMetadataFixture();
+    $previous = Container::getInstance();
+    $container = new Container;
+    $container->instance('config', new Repository(['yenc' => ['native_library' => $native]]));
+    Container::setInstance($container);
+    try {
+        $analyzer = new NzbFingerprintAnalyzer($service);
+        for ($iteration = -1; $iteration < $iterations; $iteration++) {
+            $analysis = $analyzer->analyzeArticleAndDecodedBytes($fixture['headers'], $fixture['article']);
+            $timestamps = yencProfileVerifyMetadata($analysis, $fixture['data']);
+        }
+
+        return [
+            'status' => 'ok', 'path' => 'metadata', 'fixture' => 'fixed_literal_rar5_unix_seconds_and_nanoseconds',
+            'size' => strlen($fixture['data']), 'density' => null, 'iterations' => $iterations, 'warmups' => 1,
+            'verified_calls' => $iterations + 1, 'input_bytes' => strlen($fixture['article']),
+            'input_sha256' => hash('sha256', $fixture['article']),
+            'headers_sha256' => hash('sha256', implode('', $fixture['headers'])),
+            'wire_sha256' => null, 'output_sha256' => hash('sha256', $fixture['data']), 'verified_rar5_timestamps' => $timestamps,
+            'profile_boundary' => 'Whole process: autoload, native capability probes, fixed fixture and inert config container setup, warmup, NzbFingerprintAnalyzer and NativeMetadataParser calls, exact bytes and literal timestamp verification and reporting.',
+            'claim_limit' => 'Rust-only fixed-fixture executed-call attribution; no C++ equivalent or speed comparison. Instrumentation does not establish latency or production capacity.',
+        ];
+    } finally {
+        Container::setInstance($previous);
     }
 }
