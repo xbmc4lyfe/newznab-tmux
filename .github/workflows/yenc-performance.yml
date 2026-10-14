@@ -285,6 +285,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out frozen caller and native baseline
+        if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
         uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.base.sha || inputs.baseline_ref || 'master' }}
@@ -310,6 +311,11 @@ jobs:
           cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-build.log
           cp docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so processing-evidence/build/native.so
+
+      - name: Build frozen baseline with identical locked PHP dependencies
+        if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
+        shell: bash
+        run: |
           cmp composer.lock baseline-source/composer.lock
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path baseline-source/docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/baseline-build.log
           cp baseline-source/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so processing-evidence/build/baseline.so
@@ -352,19 +358,22 @@ jobs:
           def sources(root):
               return {str(path.relative_to(root)): digest(path) for path in
                   [root / name for name in callers + native] + sorted((root / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs'))}
-          baseline = pathlib.Path('baseline-source')
-          baseline_library = baseline / library
-          baseline_decoder = ctypes.CDLL(str(baseline_library.resolve()))
-          baseline_decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
           manifest.update({
-              'baseline_git_head': run('git', '-C', str(baseline), 'rev-parse', 'HEAD'),
-              'baseline_library_sha256': digest(baseline_library),
               'candidate_library_sha256': digest(library),
-              'baseline_source_sha256': sources(baseline),
               'candidate_source_sha256': sources(pathlib.Path('.')),
-              'baseline_payload_kernel_id': baseline_decoder.nntmux_yenc_payload_kernel_v1(),
               'build_command': 'cargo +1.98.0 build --release --locked',
           })
+          baseline = pathlib.Path('baseline-source')
+          if baseline.is_dir():
+              baseline_library = baseline / library
+              baseline_decoder = ctypes.CDLL(str(baseline_library.resolve()))
+              baseline_decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+              manifest.update({
+                  'baseline_git_head': run('git', '-C', str(baseline), 'rev-parse', 'HEAD'),
+                  'baseline_library_sha256': digest(baseline_library),
+                  'baseline_source_sha256': sources(baseline),
+                  'baseline_payload_kernel_id': baseline_decoder.nntmux_yenc_payload_kernel_v1(),
+              })
           pathlib.Path('processing-evidence/build/runtime.json').write_text(json.dumps(manifest, indent=2) + '\n')
           PY
 
