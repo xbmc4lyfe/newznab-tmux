@@ -53,6 +53,7 @@ jobs:
       - name: Verify native parity and restricted web scope
         run: php vendor/bin/phpunit --fail-on-skipped tests/Unit/AdminReleaseNamesNativeTest.php tests/Unit/AdminReleaseNamesTest.php tests/Feature/AdminReleaseNameViewTest.php
       - name: Compare complete rendering integration with PHP
+        shell: bash
         run: |
           mkdir -p benchmark-evidence
           docker/app/nzb-yenc-ffi/target/release/nntmux-evidence-utility --mode presentation-header
