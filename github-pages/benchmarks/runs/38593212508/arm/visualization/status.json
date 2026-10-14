@@ -1,0 +1,81 @@
+{
+  "benchmark_status": "inconclusive",
+  "profiling_setup": {
+    "status": "complete",
+    "exit_code": 0,
+    "phase": "native-build-and-capture",
+    "script_receipt": {
+      "status": "complete",
+      "exit_code": 0,
+      "phase": "capture-summary"
+    }
+  },
+  "profiles": [
+    {
+      "path": "profiles/cpp-heavy-body/php.callgrind",
+      "status": "ok",
+      "sha256": "e3856fe0cb57244fe85f7e38eb8932657d9413141b68d6fb50b203f3c84fffc7"
+    },
+    {
+      "path": "profiles/cpp-heavy-strict/php.callgrind",
+      "status": "ok",
+      "sha256": "28d6c29e9faee26e897a939715663e5749652d5e29f4937c8c5fbb035705ee5d"
+    },
+    {
+      "path": "profiles/cpp-heavy-tolerant/php.callgrind",
+      "status": "ok",
+      "sha256": "a6ca040a57360a4a8141836008ddfe6823f995a89f43890f2dbfaf443e64f560"
+    },
+    {
+      "path": "profiles/cpp-ordinary-body/php.callgrind",
+      "status": "ok",
+      "sha256": "2dd079d19ae025f9c99a8d5f1ae9bff8e037727eda0826922cf9d5410b104d39"
+    },
+    {
+      "path": "profiles/cpp-ordinary-strict/php.callgrind",
+      "status": "ok",
+      "sha256": "e8c4ac09d4196a66dcf1c0edef1560d90a813eb9baddcbb806378fdbae0bd322"
+    },
+    {
+      "path": "profiles/cpp-ordinary-tolerant/php.callgrind",
+      "status": "ok",
+      "sha256": "43137a8a3451782600fed546e027ceb6512cbeb381090b3fbf43999e41e9bb2e"
+    },
+    {
+      "path": "profiles/rust-heavy-body/php.callgrind",
+      "status": "ok",
+      "sha256": "fba200163a9ca6b2e673f9b10715905d11dd1337d3351c706807dab1ca1cec7e"
+    },
+    {
+      "path": "profiles/rust-heavy-strict/php.callgrind",
+      "status": "ok",
+      "sha256": "a01253f882c71018bdb1b375a073d0b7fa4d921123f7e8c362ea750e6233652b"
+    },
+    {
+      "path": "profiles/rust-heavy-tolerant/php.callgrind",
+      "status": "ok",
+      "sha256": "dfc15635b78f0c452ce9cea82e1d797989ad233e64f2491560a89c253989444f"
+    },
+    {
+      "path": "profiles/rust-ordinary-body/php.callgrind",
+      "status": "ok",
+      "sha256": "15ca43983999de424a93421ce2c371d12d4e548bb16dbd45fc9ec01686fe89ed"
+    },
+    {
+      "path": "profiles/rust-ordinary-strict/php.callgrind",
+      "status": "ok",
+      "sha256": "69f10affdb21f002cdda3e5b30ddb2adbfcff288696636c3fd0506ee1ba7eae2"
+    },
+    {
+      "path": "profiles/rust-ordinary-tolerant/php.callgrind",
+      "status": "ok",
+      "sha256": "75b8e1f574d0bbe91e2de89e2436af61ae67bd78d575ae1880c157ae34e17b7e"
+    },
+    {
+      "path": "profiles/rust-rar5-metadata/php.callgrind",
+      "status": "ok",
+      "sha256": "ffef60a49a83469d3d055db96de91a425e654e8122ad37f05ba0af78d646b9f8"
+    }
+  ],
+  "observations_sha256": "e0dbe67eacccd44e4f99835da96288ae64b959ab731bde2fcb00d6d1c3e12090"
+}

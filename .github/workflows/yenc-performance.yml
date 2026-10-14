@@ -8,6 +8,11 @@ on:
       - 'scripts/benchmark-article-processing.php'
       - 'tests/Unit/ArticleProcessingBenchmarkTest.php'
       - 'scripts/benchmark-yenc-abi.py'
+      - 'scripts/yenc-performance-report.py'
+      - 'scripts/profile-yenc.php'
+      - 'scripts/profile-yenc.sh'
+      - 'tests/Unit/test_yenc_performance_report.py'
+      - 'tests/Unit/YencProfileTest.php'
       - 'tests/Unit/test_yenc_abi_benchmark.py'
       - 'tests/Feature/ReleaseFingerprintMetadataTest.php'
       - 'scripts/build-rapidyenc.sh'
@@ -71,7 +76,8 @@ jobs:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 35
+    # Keep the original comparison budget plus bounded diagnostics and upload time.
+    timeout-minutes: 60
     env:
       RUST_TOOLCHAIN: '1.98.0'
       BENCHMARK_SAMPLES: ${{ inputs.samples || '31' }}
@@ -93,8 +99,9 @@ jobs:
 
       - name: Test benchmark decisions and failure retention
         run: |
-          php vendor/bin/phpunit --filter=YencBenchmarkTest
+          php vendor/bin/phpunit --filter='YencBenchmarkTest|YencProfileTest'
           python3 tests/Unit/test_yenc_abi_benchmark.py
+          python3 tests/Unit/test_yenc_performance_report.py
 
       - name: Build pinned C++ baseline
         shell: bash
@@ -215,6 +222,78 @@ jobs:
             mkdir -p benchmark-evidence/abi-diagnostic
             echo '{"type":"run_summary","status":"skipped","reason":"paired native libraries/fixtures unavailable","claim":"no ABI performance conclusion"}' > benchmark-evidence/abi-diagnostic/observations.jsonl
           fi
+
+      # Install/enable instrumentation only after uninstrumented observations finish.
+      - name: Set up isolated PHP call profiling
+        if: always()
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: dom, curl, ffi, intl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite
+          coverage: xdebug
+
+      - name: Capture executed PHP and native hot paths
+        if: always()
+        # 13 workloads × 2 captures × (20s + 2s kill grace) < 10 minutes.
+        # The step cap also bounds build/tool setup; later always() uploads still run.
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          mkdir -p benchmark-evidence/profiles
+          profile_phase=runtime-check
+          preserve_status=0
+          finish_profile_setup() {
+            run_exit=$?
+            if [[ "$preserve_status" == 1 ]]; then
+              return
+            fi
+            python3 - "$run_exit" "$profile_phase" <<'PY'
+          import json, pathlib, sys
+          code, phase = int(sys.argv[1]), sys.argv[2]
+          path = pathlib.Path('benchmark-evidence/profiles/status.json')
+          record = {'status': 'complete' if code == 0 else 'invalid', 'exit_code': code, 'phase': phase}
+          if phase == 'native-build-and-capture' and path.is_file():
+              record['script_receipt'] = json.loads(path.read_text())
+          path.write_text(json.dumps(record, indent=2) + '\n')
+          PY
+          }
+          trap finish_profile_setup EXIT
+          if [[ ! -f benchmark-evidence/build/runtime.json ]]; then
+            preserve_status=1
+            echo '{"status":"skipped","reason":"native build/runtime identity unavailable","claim":"no hot-path conclusion"}' > benchmark-evidence/profiles/status.json
+            exit 0
+          fi
+          profile_phase=apt-update
+          sudo apt-get update -qq
+          profile_phase=tool-installation
+          sudo apt-get install -y linux-tools-generic
+          profile_phase=perf-discovery
+          perf_binary=$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -n 1)
+          if [[ -z "$perf_binary" ]]; then
+            echo 'No perf executable installed.' >&2
+            exit 1
+          fi
+          profile_phase=flamegraph-fetch
+          git clone https://github.com/brendangregg/FlameGraph.git "$RUNNER_TEMP/nntmux-flamegraph"
+          profile_phase=flamegraph-pin
+          git -C "$RUNNER_TEMP/nntmux-flamegraph" checkout --detach 41fee1f99f9276008b7cd112fca19dc3ea84ac32
+          profile_phase=native-build-and-capture
+          bash scripts/profile-yenc.sh "$GITHUB_WORKSPACE/benchmark-evidence" \
+            "$RUNNER_TEMP/nntmux-flamegraph" "$perf_binary" \
+            2>&1 | tee benchmark-evidence/build/profile-console.log
+
+      - name: Render paired speedups and executed call-cost visualizations
+        if: always()
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          python3 scripts/yenc-performance-report.py --evidence-dir=benchmark-evidence \
+            --output-dir=benchmark-evidence/visualization
+          {
+            cat benchmark-evidence/visualization/summary.md
+            echo '### Performance visualizations'
+            echo 'Download the evidence artifact and open visualization/report.html for per-stratum speedup estimates and executed PHP call costs. Open profiles/*/native.svg for zoomable native CPU stacks. Profile status and failures are retained; instrumented costs are separate from paired timings.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summarize every measured stratum
         if: always()
