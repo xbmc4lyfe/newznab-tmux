@@ -78,12 +78,16 @@ final class CandidatePreparationService
                         $cursors[$status] = [$row->next_attempt_at, $row->id];
                         $assessmentStarted = $diagnostics?->start();
                         try {
-                            $assessment = $this->inventory->assessment($this->store->read($row->manifest_path));
+                            $manifest = $diagnostics === null ? $this->store->read($row->manifest_path)
+                                : $this->store->readWithDiagnostics($row->manifest_path, $diagnostics);
+                            $assessment = $diagnostics === null ? $this->inventory->assessment($manifest)
+                                : $diagnostics->measurePhase('assessment', fn () => $this->inventory->assessment($manifest));
                             $diagnostics?->assessed($assessment['status']);
                         } catch (Throwable $readError) {
                             $diagnostics?->readAssessmentFailed();
                             $assessment = ['status' => 'unknown', 'reason' => $readError->getMessage()];
                         } finally {
+                            unset($manifest);
                             $diagnostics?->finish('read_assessment', $assessmentStarted);
                         }
                         $updateStarted = $diagnostics?->start();
