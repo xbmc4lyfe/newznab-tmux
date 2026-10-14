@@ -7,6 +7,7 @@ namespace Tests\Feature\Console;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use Closure;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Manticoresearch\Client;
@@ -97,6 +98,82 @@ final class NntmuxPredbSearchReconcileCommandTest extends SearchConsoleCommandTe
         }
         self::assertSame([], $this->written);
         self::assertSame([1, 1, 1], DB::table('predb')->pluck('searched')->all());
+    }
+
+    public function test_concurrent_producer_document_survives_repair_and_rerun_repairs_remaining_ids(): void
+    {
+        $documents = [3 => ['title' => 'Release.3', 'filename' => 'file.3', 'source' => 'test']];
+        $fresh = ['title' => 'Fresh.Release.17', 'filename' => 'fresh.file.17', 'source' => 'irc'];
+        $operations = [];
+        $race = true;
+        $driver = null;
+        $respond = function (Request $request) use (&$documents, &$operations, &$race, &$driver, $fresh): array {
+            if ($request->getPath() === '/sql') {
+                parse_str($request->getBody(), $body);
+                preg_match('/IN \(([\d,]+)\)/', $body['query'], $matches);
+                $ids = array_map('intval', explode(',', $matches[1]));
+                $present = array_values(array_intersect($ids, array_keys($documents)));
+
+                return [['data' => array_map(static fn (int $id): array => ['id' => $id], $present),
+                    'total' => count($present), 'error' => '', 'warning' => '']];
+            }
+
+            self::assertSame('/bulk', $request->getPath());
+            self::assertSame('POST', $request->getMethod());
+            self::assertSame('application/x-ndjson', $request->getContentType());
+            if ($race) {
+                $race = false;
+                DB::table('predb')->where('id', 17)->update($fresh);
+                self::assertSame(['success' => 1, 'errors' => 0], $driver->bulkInsertPredb([['id' => 17] + $fresh]));
+            }
+            $writes = array_map(static fn (string $line): array => json_decode($line, true, 512, JSON_THROW_ON_ERROR),
+                explode("\n", trim($request->getBody())));
+            $operations[] = array_map(static fn (array $write): string => array_key_first($write), $writes);
+            foreach ($writes as $write) {
+                if (isset($write['insert']) && isset($documents[$write['insert']['id']])) {
+                    return ['items' => [['insert' => ['table' => 'predb_rt', 'error' => 'secret-title: duplicate ID']]],
+                        'errors' => true, 'error' => 'secret-title: duplicate ID', 'current_line' => 1, 'skipped_lines' => 1];
+                }
+            }
+            foreach ($writes as $write) {
+                $operation = reset($write);
+                self::assertSame('predb_rt', $operation['table']);
+                $documents[$operation['id']] = $operation['doc'];
+            }
+
+            return ['items' => [['bulk' => ['table' => 'predb_rt', '_id' => 0, 'created' => count($writes),
+                'deleted' => 0, 'updated' => 0, 'result' => 'created', 'status' => 201]]],
+                'errors' => false, 'error' => '', 'current_line' => count($writes) + 1, 'skipped_lines' => 0];
+        };
+        $client = new class($respond) extends Client
+        {
+            public function __construct(private Closure $respond) {}
+
+            public function request(Request $request, array $params = [], string $retryReason = ''): Response
+            {
+                $responseClass = $params['responseClass'] ?? Response::class;
+
+                return new $responseClass(($this->respond)($request));
+            }
+        };
+        $driver = Mockery::mock(ManticoreSearchDriver::class, [['indexes' => ['predb' => 'predb_rt']]])->makePartial();
+        $driver->shouldReceive('isAvailable')->andReturnTrue();
+        $driver->manticoreSearch = $client;
+        $this->app->instance(ManticoreSearchDriver::class, $driver);
+
+        $status = Artisan::call('nntmux:search-reconcile', ['--predb' => true, '--all' => true, '--reindex' => true]);
+        self::assertSame($fresh, $documents[17]);
+        self::assertSame(1, $status);
+        self::assertStringNotContainsString('secret-title', Artisan::output());
+        self::assertArrayNotHasKey(91, $documents);
+        self::assertSame([['replace'], ['insert', 'insert']], $operations);
+        $afterProducer = DB::table('predb')->orderBy('id')->get()->toArray();
+
+        self::assertSame(0, Artisan::call('nntmux:search-reconcile', ['--predb' => true, '--all' => true, '--reindex' => true]));
+        self::assertSame($fresh, $documents[17]);
+        self::assertSame(['title' => 'Release.91', 'filename' => 'file.91', 'source' => 'test'], $documents[91]);
+        self::assertSame([['replace'], ['insert', 'insert'], ['insert']], $operations);
+        self::assertEquals($afterProducer, DB::table('predb')->orderBy('id')->get()->toArray());
     }
 
     public function test_keyset_chunks_and_subbatches_exclude_new_higher_ids(): void

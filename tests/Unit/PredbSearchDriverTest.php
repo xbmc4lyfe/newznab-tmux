@@ -19,6 +19,7 @@ use Illuminate\Container\Container;
 use Illuminate\Support\Facades\Facade;
 use Illuminate\Support\Facades\Log;
 use Manticoresearch\Client;
+use Manticoresearch\Request;
 use Manticoresearch\Response;
 use Mockery;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -64,6 +65,44 @@ final class PredbSearchDriverTest extends TestCase
     public static function backends(): array
     {
         return ['manticore' => ['manticore'], 'elasticsearch' => ['elasticsearch']];
+    }
+
+    #[DataProvider('repairBulkResponses')]
+    public function test_insert_only_repair_requires_a_complete_bulk_acknowledgement(array $response, bool $accepted): void
+    {
+        $client = new class($response) extends Client
+        {
+            public function __construct(private array $response) {}
+
+            public function request(Request $request, array $params = [], string $retryReason = ''): Response
+            {
+                return new Response($this->response);
+            }
+        };
+        $driver = new ManticoreSearchDriver(['indexes' => ['predb' => 'predb_rt']]);
+        $driver->manticoreSearch = $client;
+
+        self::assertSame($accepted ? ['success' => 2, 'errors' => 0] : ['success' => 0, 'errors' => 2],
+            $driver->bulkInsertPredb([['id' => 17, 'title' => 'A'], ['id' => 91, 'title' => 'B']], false));
+    }
+
+    public static function repairBulkResponses(): array
+    {
+        $acknowledgement = ['items' => [['bulk' => ['table' => 'predb_rt', '_id' => 17, 'created' => 2,
+            'deleted' => 0, 'updated' => 0, 'result' => 'created', 'status' => 201]]],
+            'errors' => false, 'error' => '', 'current_line' => 3, 'skipped_lines' => 0];
+        $cases = ['complete' => [$acknowledgement, true], 'empty' => [[], false],
+            'missing acknowledgement' => [['errors' => false], false]];
+        foreach (['errors' => true, 'error' => 'duplicate ID', 'warning' => 'partial write', 'skipped_lines' => 1] as $key => $value) {
+            $cases[$key] = [array_replace($acknowledgement, [$key => $value]), false];
+        }
+        foreach (['table' => 'wrong_table', 'created' => 1, 'deleted' => 1, 'updated' => 1, 'result' => 'updated', 'status' => 500] as $key => $value) {
+            $response = $acknowledgement;
+            $response['items'][0]['bulk'][$key] = $value;
+            $cases[$key] = [$response, false];
+        }
+
+        return $cases;
     }
 
     #[DataProvider('backends')]

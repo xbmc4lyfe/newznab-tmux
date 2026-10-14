@@ -689,9 +689,10 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidate
      * Bulk insert multiple predb records into the index.
      *
      * @param  array<array<string, mixed>>  $predbRecords  Array of predb data arrays
+     * @param  bool  $replaceExisting  Disable replacement for missing-document reconciliation
      * @return array<string, mixed> Results with 'success' and 'errors' counts
      */
-    public function bulkInsertPredb(array $predbRecords): array
+    public function bulkInsertPredb(array $predbRecords, bool $replaceExisting = true): array
     {
         if (empty($predbRecords)) {
             return ['success' => 0, 'errors' => 0];
@@ -716,12 +717,39 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidate
         }
 
         try {
-            $this->manticoreSearch->table($this->config['indexes']['predb'])
-                ->replaceDocuments($documents);
+            $index = $this->getPredbIndex();
+            $table = $this->manticoreSearch->table($index);
+            if ($replaceExisting) {
+                $table->replaceDocuments($documents);
+            } else {
+                $response = $table->addDocuments($documents);
+                // One table and no empty NDJSON lines produce one transaction ack.
+                // The SDK does not reject every bulk error, so validate before counting.
+                $acknowledgement = $response['items'][0]['bulk'] ?? null;
+                if (($response['errors'] ?? null) !== false
+                    || ($response['error'] ?? '') !== ''
+                    || ($response['warning'] ?? '') !== ''
+                    || ($response['skipped_lines'] ?? 0) !== 0
+                    || ! is_array($response['items'] ?? null)
+                    || count($response['items']) !== 1
+                    || ! is_array($acknowledgement)
+                    || ($acknowledgement['table'] ?? null) !== $index
+                    || ($acknowledgement['created'] ?? null) !== count($documents)
+                    || ($acknowledgement['deleted'] ?? null) !== 0
+                    || ($acknowledgement['updated'] ?? null) !== 0
+                    || ($acknowledgement['result'] ?? null) !== 'created'
+                    || ($acknowledgement['status'] ?? null) !== 201) {
+                    return ['success' => 0, 'errors' => count($documents)];
+                }
+            }
 
             return ['success' => count($documents), 'errors' => 0];
         } catch (\Throwable $e) {
-            Log::error('ManticoreSearch bulkInsertPredb error: '.$e->getMessage());
+            if ($replaceExisting) {
+                Log::error('ManticoreSearch bulkInsertPredb error: '.$e->getMessage());
+            } else {
+                Log::error('ManticoreSearch PreDB repair insert failed.', ['exception_class' => $e::class]);
+            }
 
             return ['success' => 0, 'errors' => count($documents)];
         }

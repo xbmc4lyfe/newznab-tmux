@@ -181,9 +181,9 @@ class NntmuxSearchReconcile extends Command
 
                         if ($reindex && $missing !== []) {
                             $documents = $batch->whereIn('id', $missing)->map(static fn (Predb $row): array => $row->getAttributes())->values()->all();
-                            // REPLACE is idempotent by ID. A normal concurrent reindex of
-                            // the same ID may race this repair; SQL state is never changed.
-                            $result = $driver->bulkInsertPredb($documents);
+                            // INSERT rejects IDs indexed by a producer since the probe,
+                            // preserving its fresher document and allowing a safe rerun.
+                            $result = $driver->bulkInsertPredb($documents, replaceExisting: false);
                             if (($result['success'] ?? null) !== count($missing) || ($result['errors'] ?? null) !== 0) {
                                 throw new RuntimeException('PreDB bulk write failed.');
                             }
