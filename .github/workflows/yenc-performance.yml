@@ -51,7 +51,8 @@ jobs:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 35
+    # Keep the original comparison budget plus bounded diagnostics and upload time.
+    timeout-minutes: 60
     env:
       RUST_TOOLCHAIN: '1.98.0'
       BENCHMARK_SAMPLES: ${{ inputs.samples || '31' }}
@@ -227,6 +228,9 @@ jobs:
 
       - name: Capture executed PHP and native hot paths
         if: always()
+        # 13 workloads × 2 captures × (20s + 2s kill grace) < 10 minutes.
+        # The step cap also bounds build/tool setup; later always() uploads still run.
+        timeout-minutes: 15
         shell: bash
         run: |
           mkdir -p benchmark-evidence/profiles

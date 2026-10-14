@@ -18,6 +18,68 @@ import re
 from urllib.parse import quote
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1048576), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def exit_cause(code):
+    if not isinstance(code, int):
+        return 'not_run'
+    if code == 0:
+        return 'complete'
+    if code == 124:
+        return 'timeout'
+    if code in (125, 126, 127):
+        return 'invocation_failure'
+    if code >= 128:
+        return 'signal'
+    return 'nonzero_exit'
+
+
+def profile_status(directory, native_exit, php_exit, postprocess_exit, postprocess_stage, preflight_exit):
+    directory = Path(directory)
+
+    def workload(name):
+        try:
+            result = json.loads((directory / name).read_text())
+            return result if (isinstance(result, dict) and result.get('status') == 'ok'
+                and isinstance(result.get('iterations'), int) and 1 <= result['iterations'] <= 10000
+                and result.get('warmups') == 1 and result.get('verified_calls') == result['iterations'] + 1) else None
+        except (ValueError, OSError):
+            return None
+
+    php, native = workload('php-workload.json'), workload('native-workload.json')
+    callgrind, folded = directory / 'php.callgrind', directory / 'native.folded'
+    samples = 0
+    try:
+        samples = sum(int(line.rsplit(' ', 1)[1]) for line in folded.read_text().splitlines())
+    except (ValueError, OSError):
+        pass
+    matched = bool(php and native and all(key in php and key in native and php[key] == native[key] for key in
+        ('input_sha256', 'output_sha256', 'wire_sha256', 'verified_calls', 'size', 'iterations'))
+        and php.get('headers_sha256') == native.get('headers_sha256'))
+    native_state = 'invalid'
+    if native_exit == 'unavailable' and exit_cause(preflight_exit) == 'nonzero_exit':
+        native_state = 'unavailable'
+    elif (native_exit == 0 and postprocess_exit == 0 and postprocess_stage == 'complete'
+            and matched and samples > 0 and (directory / 'native.svg').is_file()):
+        native_state = 'captured'
+    return {
+        'php_profile': 'captured' if php_exit == 0 and php and callgrind.is_file() and callgrind.stat().st_size else 'invalid',
+        'native_profile': native_state, 'native_samples': samples, 'workload_identity_matches': matched,
+        'native_exit': native_exit, 'native_exit_cause': exit_cause(native_exit), 'php_exit': php_exit,
+        'native_postprocess_exit': postprocess_exit, 'native_postprocess_stage': postprocess_stage,
+        'perf_preflight_exit': preflight_exit, 'perf_preflight_cause': exit_cause(preflight_exit),
+        'php_profile_sha256': file_sha256(callgrind) if callgrind.is_file() else None,
+        'boundary': 'Whole-process profiles include setup and exact-output verification; diagnostic builds differ from timed builds.',
+        'claim': 'Call-cost attribution only. No latency or production-capacity conclusion from instrumented runs.',
+    }
+
+
 def comparison(row):
     ratio = row.get('median_rust_over_cpp')
     interval = row.get('bootstrap_95_percent_interval')
@@ -37,11 +99,6 @@ def read_callgrind(path):
     maps = {'file': {}, 'function': {}}
     functions = defaultdict(int)
     edges = defaultdict(lambda: {'calls': 0, 'inclusive_cost': 0})
-    file_name = function = target_file = target_function = None
-    pending_calls = None
-    events = None
-    positions = 1
-
     def name(value, kind):
         match = re.fullmatch(r'\((\d+)\)(?: (.*))?', value)
         if not match:
@@ -53,7 +110,14 @@ def read_callgrind(path):
             raise ValueError('Unknown compressed Callgrind name: ' + value)
         return maps[kind][identity]
 
-    for line in Path(path).read_text().splitlines():
+    with Path(path).open() as stream:
+        return parse_callgrind_lines(stream, functions, edges, name)
+
+
+def parse_callgrind_lines(lines, functions, edges, name):
+    file_name = function = target_file = target_function = None
+    pending_calls, events, positions = None, None, 1
+    for line in lines:
         line = line.strip()
         if not line or line.startswith('#'):
             continue
@@ -166,12 +230,14 @@ def render(evidence, output):
     sections.append('<img src="speedup.svg" alt="Paired speedup estimates by fixture and call path">')
     sections.append('<h2>Executed PHP hot paths</h2><p>The separate Rust-only metadata workload executes NzbFingerprintAnalyzer and native RAR5/NNTP metadata parsing over a fixed verified archive-header fixture. It has no C++ counterpart and supplies no migration speedup estimate.</p><p>Xdebug profiles include process bootstrap, fixture setup, warmup, decoding and correctness checks. Exclusive function time is shown below; inclusive call-edge cost is listed separately and must not be added across edges. FFI calls are opaque here; native internals appear in the separate CPU sampling flamegraphs. Instrumentation changes cost and these numbers are not speedup measurements.</p>')
     profile_records = []
-    for index, path in enumerate(sorted((evidence / 'profiles').rglob('*.callgrind'))):
+    profile_paths = set((evidence / 'profiles').rglob('*.callgrind'))
+    profile_paths.update(receipt.parent / 'php.callgrind' for receipt in (evidence / 'profiles').glob('*/status.json'))
+    for index, path in enumerate(sorted(profile_paths)):
         label = str(path.relative_to(evidence))
         try:
             receipt = json.loads((path.parent / 'status.json').read_text())
             workload = json.loads((path.parent / 'php-workload.json').read_text())
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            digest = file_sha256(path)
             if (receipt.get('php_profile') != 'captured' or receipt.get('php_profile_sha256') != digest
                     or workload.get('status') != 'ok' or workload.get('warmups') != 1
                     or not isinstance(workload.get('iterations'), int) or workload['iterations'] < 1
@@ -189,7 +255,7 @@ def render(evidence, output):
             for (source, target), edge in sorted(profile['edges'].items(), key=lambda item: item[1]['inclusive_cost'], reverse=True)[:30]:
                 sections.append(f"<tr><td>{html.escape(source[1])} → {html.escape(target[1])}</td><td>{edge['calls']}</td><td>{edge['inclusive_cost'] / 100000:.3f}</td></tr>")
             sections.append('</table></details>')
-            profile_records.append({'path': label, 'status': 'ok', 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+            profile_records.append({'path': label, 'status': 'ok', 'sha256': digest})
         except (ValueError, OSError) as error:
             sections.append(f'<p>Invalid profile {html.escape(label)}: {html.escape(str(error))}</p>')
             profile_records.append({'path': label, 'status': 'invalid', 'error': str(error)})
@@ -212,12 +278,29 @@ def render(evidence, output):
     (output / 'report.html').write_text(document)
     (output / 'summary.md').write_text('\n'.join(markdown) + '\n')
     (output / 'status.json').write_text(json.dumps({'benchmark_status': status, 'profiles': profile_records,
-        'observations_sha256': hashlib.sha256(observations.read_bytes()).hexdigest() if observations.exists() else None}, indent=2) + '\n')
+        'observations_sha256': file_sha256(observations) if observations.exists() else None}, indent=2) + '\n')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--evidence-dir', required=True)
-    parser.add_argument('--output-dir', required=True)
+    parser.add_argument('--evidence-dir')
+    parser.add_argument('--output-dir')
+    parser.add_argument('--record-profile-status')
+    parser.add_argument('--native-exit')
+    parser.add_argument('--php-exit', type=int)
+    parser.add_argument('--postprocess-exit', type=int)
+    parser.add_argument('--postprocess-stage')
+    parser.add_argument('--preflight-exit', type=int)
     args = parser.parse_args()
+    if args.record_profile_status:
+        if any(value is None for value in (args.native_exit, args.php_exit, args.postprocess_exit,
+                                          args.postprocess_stage, args.preflight_exit)):
+            parser.error('Profile status requires all process exit receipts')
+        native_exit = args.native_exit if args.native_exit == 'unavailable' else int(args.native_exit)
+        status = profile_status(args.record_profile_status, native_exit, args.php_exit, args.postprocess_exit,
+                                args.postprocess_stage, args.preflight_exit)
+        (Path(args.record_profile_status) / 'status.json').write_text(json.dumps(status, indent=2) + '\n')
+        raise SystemExit(1 if status['php_profile'] == 'invalid' or status['native_profile'] == 'invalid' else 0)
+    if not args.evidence_dir or not args.output_dir:
+        parser.error('Rendering requires --evidence-dir and --output-dir')
     render(args.evidence_dir, args.output_dir)

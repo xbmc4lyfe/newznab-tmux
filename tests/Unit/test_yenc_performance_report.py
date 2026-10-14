@@ -109,6 +109,42 @@ calls=2 10
             self.assertEqual('invalid', json.loads((output / 'status.json').read_text())['profiles'][0]['status'])
             self.assertFalse((output / 'hotpaths-0.svg').exists())
 
+    def test_profile_status_retains_postprocessing_and_preflight_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            for code, cause in [(124, 'timeout'), (127, 'invocation_failure'), (139, 'signal'), (1, 'nonzero_exit')]:
+                self.assertEqual(cause, self.report.exit_cause(code))
+            status = self.report.profile_status(path, 'unavailable', 0, 0, 'not_run', 124)
+            self.assertEqual(124, status['perf_preflight_exit'])
+            self.assertEqual('timeout', status['perf_preflight_cause'])
+            self.assertEqual('invalid', status['native_profile'])
+            status = self.report.profile_status(path, 'unavailable', 0, 0, 'not_run', 1)
+            self.assertEqual('unavailable', status['native_profile'])
+            status = self.report.profile_status(path, 139, 0, 0, 'not_run', 0)
+            self.assertEqual('invalid', status['native_profile'])
+            self.assertEqual('signal', status['native_exit_cause'])
+            status = self.report.profile_status(path, 0, 0, 7, 'perf-script', 0)
+            self.assertEqual('invalid', status['native_profile'])
+            self.assertEqual(7, status['native_postprocess_exit'])
+            self.assertEqual('perf-script', status['native_postprocess_stage'])
+
+    def test_missing_php_capture_is_reported_even_when_another_workload_has_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            path = evidence / 'profiles' / 'missing'
+            path.mkdir(parents=True)
+            (path / 'status.json').write_text(json.dumps({'php_profile': 'invalid'}))
+            (path / 'php-workload.json').write_text(json.dumps({'status': 'invalid'}))
+            other = evidence / 'profiles' / 'partial'
+            other.mkdir()
+            (other / 'php.callgrind').write_text('events: Time_(10ns)\nfl=/app.php\nfn=decode\n1 200\n')
+            output = evidence / 'visualization'
+            self.report.render(evidence, output)
+            profiles = json.loads((output / 'status.json').read_text())['profiles']
+            self.assertEqual(2, len(profiles))
+            self.assertTrue(all(profile['status'] == 'invalid' for profile in profiles))
+            self.assertIn('profiles/missing/php.callgrind', (output / 'report.html').read_text())
+
 
 if __name__ == '__main__':
     unittest.main()
