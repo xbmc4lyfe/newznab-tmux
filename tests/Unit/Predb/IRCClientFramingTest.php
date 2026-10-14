@@ -6,12 +6,22 @@ namespace Tests\Unit\Predb;
 
 use App\Services\IRCClient;
 use App\Services\Predb\Irc\PreAnnounceParser;
+use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\DataProvider;
-use PHPUnit\Framework\TestCase;
 use RuntimeException;
+use Tests\Support\ConfigurationTestBuilder;
+use Tests\TestCase;
 
 final class IRCClientFramingTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['stop_requested' => false]);
+    }
+
     public static function frames(): iterable
     {
         foreach ([511, 512, 513, 3002, 8702, 8703, 8704] as $bytes) {
