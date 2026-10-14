@@ -818,6 +818,7 @@ mod tests {
         if selected == 3 {
             assert!(is_x86_feature_detected!("avx2"));
             assert!(is_x86_feature_detected!("avx512vbmi2"));
+            assert!(is_x86_feature_detected!("avx512f"));
             assert!(is_x86_feature_detected!("avx512bw"));
             assert!(is_x86_feature_detected!("avx512vl"));
             assert!(is_x86_feature_detected!("popcnt"));

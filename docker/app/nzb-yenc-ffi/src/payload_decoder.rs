@@ -65,6 +65,7 @@ pub(crate) fn selected_kernel() -> u32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("avx512f")
             && is_x86_feature_detected!("avx512vbmi2")
             && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512vl")
@@ -289,6 +290,73 @@ mod tests {
                 unsafe { decode_into(payload.as_ptr(), output.as_mut_ptr(), payload.len()) };
             assert_eq!(&output[..written], expected, "length {length}");
             assert!(output[written..].iter().all(|byte| *byte == 0xcc));
+        }
+    }
+
+    #[test]
+    fn wide_escape_boundary_literals_preserve_exact_writes_and_both_overlap_directions() {
+        let mut across_32 = vec![b'k'; 31];
+        across_32.extend(b"=k");
+        across_32.extend([b'k'; 32]);
+        let mut across_32_expected = vec![b'A'; 31];
+        across_32_expected.push(1);
+        across_32_expected.extend([b'A'; 32]);
+
+        let mut across_64 = vec![b'k'; 63];
+        across_64.extend(b"=\r\n@");
+        across_64.extend([b'k'; 64]);
+        let mut across_64_expected = vec![b'A'; 63];
+        across_64_expected.push(0xd6);
+        across_64_expected.extend([b'A'; 64]);
+
+        let mut alternating = vec![b'k'; 63];
+        alternating.push(b'=');
+        alternating.extend(b"@=".repeat(32));
+        alternating.extend(b"@k");
+        let mut alternating_expected = vec![b'A'; 63];
+        alternating_expected.extend([0xd6; 33]);
+        alternating_expected.push(b'A');
+
+        let mut newline_carry = vec![b'k'; 63];
+        newline_carry.push(b'=');
+        newline_carry.extend([b'\n'; 64]);
+        newline_carry.extend(b"@k");
+        let mut newline_carry_expected = vec![b'A'; 63];
+        newline_carry_expected.extend([0xd6, b'A']);
+
+        let mut adjust_only = vec![b'='];
+        adjust_only.extend([b'\n'; 63]);
+        adjust_only.extend([b'k'; 64]);
+        let mut adjust_only_expected = vec![1];
+        adjust_only_expected.extend([b'A'; 63]);
+
+        for (payload, expected) in [
+            (across_32, across_32_expected),
+            (across_64, across_64_expected),
+            (alternating, alternating_expected),
+            (newline_carry, newline_carry_expected),
+            (adjust_only, adjust_only_expected),
+            (vec![b'\n'; 64], vec![]),
+            (vec![b'k'; 64], vec![b'A'; 64]),
+            (vec![b'='; 64], vec![0xd3; 32]),
+        ] {
+            for (source_start, destination_start) in [(64, 64), (64, 0), (0, 64), (1, 63), (63, 1)]
+            {
+                let mut storage = vec![0xa5; payload.len() + 160];
+                storage[source_start..source_start + payload.len()].copy_from_slice(&payload);
+                let mut expected_storage = storage.clone();
+                expected_storage[destination_start..destination_start + expected.len()]
+                    .copy_from_slice(&expected);
+                let written = unsafe {
+                    decode_into(
+                        storage.as_ptr().add(source_start),
+                        storage.as_mut_ptr().add(destination_start),
+                        payload.len(),
+                    )
+                };
+                assert_eq!(written, expected.len());
+                assert_eq!(storage, expected_storage);
+            }
         }
     }
 
