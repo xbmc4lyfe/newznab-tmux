@@ -15,6 +15,7 @@ use App\Services\AdditionalProcessing\ConsoleOutputService;
 use App\Services\AdditionalProcessing\DTO\DownloadMetrics;
 use App\Services\AdditionalProcessing\Enums\DownloadKind;
 use App\Services\AdditionalProcessing\Enums\ProcessingOutcome;
+use App\Services\AdditionalProcessing\Media\MediaSourceResolver;
 use App\Services\AdditionalProcessing\MediaExtractionService;
 use App\Services\AdditionalProcessing\NzbContentParser;
 use App\Services\AdditionalProcessing\ReleaseFileManager;
@@ -53,6 +54,8 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use ReflectionClass;
 use ReflectionMethod;
 use ReflectionProperty;
+use Tests\Fixtures\MappingArticleNntpHarness;
+use Tests\Fixtures\YencArticles;
 use Tests\TestCase;
 use Tests\Unit\AdditionalProcessing\BuildsArchiveFixtures;
 use Tests\Unit\AdditionalProcessing\CreatesProcessingConfiguration;
@@ -883,6 +886,72 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->assertSame(1, DB::table('releases')->where('id', 1)->value('rarinnerfilecount'));
         $this->assertNull(DB::table('releases')->where('id', 1)->value('additional_pp_claimed_at'));
         $this->assertNull(DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
+    }
+
+    #[DataProvider('mappedArticleIntegrityCases')]
+    public function test_mapped_archive_download_persists_the_scene_filename_and_wakes_the_real_filename_fixer(bool $withChecksum): void
+    {
+        $this->prepareFilenameNaming();
+        $title = 'Example.Movie.2026.1080p.WEB-DL.x264-GRP';
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
+        Search::shouldReceive('searchPredb')->andReturn([]);
+        Search::shouldReceive('updateRelease')->twice()->with(1);
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        $queries = new NameFixingQueryService;
+        $fixer->fixNamesWithFiles(0, true, 1, true, false);
+        self::assertSame([], $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
+        $manager = $this->makeManager($fixer);
+        $config = $this->makeConfig(['par2MediaMapping' => true, 'par2VerifyFiles' => 1]);
+        $archive = $this->rar($title.'.mkv', str_repeat('CONTENT', 3000));
+        $index = $this->par2Index([
+            ['release.part01.rar', strlen($archive), $archive],
+            ['release.part02.rar', strlen($archive), str_repeat('OTHER', 5000)],
+        ]);
+        $a = YencArticles::part(substr($archive, 0, 17000), 'opaque', strlen($archive), 1, 1, 3);
+        $mapping = $withChecksum ? $a : preg_replace('/ pcrc32=[0-9a-f]+/', '', $a);
+        $wire = MappingArticleNntpHarness::body($index, 'release.par2').MappingArticleNntpHarness::rawBody($mapping);
+        if (! $withChecksum) {
+            $wire .= MappingArticleNntpHarness::rawBody($a);
+        }
+        $wire .= MappingArticleNntpHarness::rawBody(YencArticles::part(substr($archive, 17000, 2000), 'opaque', strlen($archive), 2, 17001, 3))
+            .MappingArticleNntpHarness::rawBody(YencArticles::part(substr($archive, 19000), 'opaque', strlen($archive), 3, 19001, 3));
+        $nntp = new MappingArticleNntpHarness($wire);
+        $download = new UsenetDownloadService($config, $nntp);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context->nzbContents = [
+            ['title' => '"release.par2" yEnc (1/1)', 'segments' => ['index'], 'size' => strlen($index), 'filecount' => 1],
+            ['title' => '"opaque1" yEnc (1/3)', 'segments' => ['a', 'b', 'c'], 'size' => (int) ceil(strlen($archive) * 1.03), 'filecount' => 1],
+            ['title' => '"opaque2" yEnc (1/3)', 'segments' => ['d', 'e', 'f'], 'size' => (int) ceil(strlen($archive) * 1.03), 'filecount' => 1],
+        ];
+        $context->workPlan = (new AdditionalWorkPlanner($config))->plan($context->nzbContents, 'group');
+        $context->releaseGroupName = 'group';
+        $download->beginReleaseScope();
+        $context->mediaPlan = (new MediaSourceResolver($config, $download))->resolve($context);
+        self::assertSame('release.part01.rar', $context->mediaPlan?->mappedFiles[1]->file->name);
+        $downloaded = $download->download(DownloadKind::Compressed, ['a', 'b', 'c'], 'group', 1);
+        self::assertSame($archive, $downloaded['data']);
+        $listing = (new ArchiveExtractionService($config))->processCompressedData($downloaded['data'], $context, '/tmp/');
+        self::assertTrue($listing['success']);
+        self::assertSame($title.'.mkv', $listing['files'][0]['name']);
+        foreach ($listing['files'] as $file) {
+            self::assertTrue($manager->addFileInfo($file, $context, '\.(?:par2|sfv|nzb)'));
+        }
+        $manager->finalizeRelease($context, false);
+        self::assertSame($title.'.mkv', DB::table('release_files')->where('name', $title.'.mkv')->value('name'));
+        self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+        self::assertCount(1, $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
+        $fixer->fixNamesWithFiles(0, true, 1, true, false);
+        $release = Release::query()->findOrFail(1);
+        self::assertSame($title, $release->searchname);
+        self::assertSame(1, (int) $release->isrenamed);
+        self::assertSame(1, (int) $release->proc_files);
+        self::assertSame($withChecksum ? ['BODY <index>', 'BODY <a>', 'BODY <b>', 'BODY <c>'] : ['BODY <index>', 'BODY <a>', 'BODY <a>', 'BODY <b>', 'BODY <c>'], $nntp->sentCommands());
+        self::assertSame($withChecksum ? 17000 : 0, $download->finishReleaseScope()->bytesReused);
+    }
+
+    public static function mappedArticleIntegrityCases(): array
+    {
+        return ['retained CRC-valid primary article' => [true], 'checksumless mapping control' => [false]];
     }
 
     public function test_late_archive_filename_reopens_the_real_filename_pass_and_recovers_its_exact_title(): void
