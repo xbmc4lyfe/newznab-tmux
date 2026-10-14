@@ -49,7 +49,7 @@ class NNTPService extends NntpClient
             $responseMetadata = $this->fingerprintResponseMetadata($response);
         }
         if ($response !== ResponseCode::BodyFollows->value) {
-            if (self::isError($response)) {
+            if ($response !== ResponseCode::NoSuchArticleId->value) {
                 $this->doQuit();
             }
             throw new \RuntimeException('Article is unavailable; retry verification later.');

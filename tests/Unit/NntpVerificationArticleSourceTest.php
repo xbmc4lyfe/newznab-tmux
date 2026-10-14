@@ -22,6 +22,37 @@ use Tests\Fixtures\YencArticles;
 
 final class NntpVerificationArticleSourceTest extends TestCase
 {
+    /** @return iterable<string, array{int}> */
+    public static function sessionFailures(): iterable
+    {
+        yield 'authentication required' => [480];
+        yield 'connection closing' => [400];
+        yield 'encryption required' => [483];
+        yield 'access denied' => [502];
+    }
+
+    #[DataProvider('sessionFailures')]
+    public function test_session_failure_reply_closes_transport_for_reauthentication(int $status): void
+    {
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], $status." session requires reset\r\n");
+        $primary = new PipelineSocketNntpHarness($pair[0]);
+        $source = new NntpArticleSource($primary, maximumBytes: 64, allowAlternateFallback: false);
+        try {
+            try {
+                $source->fetchBounded('next@example', 64);
+                $this->fail('A session failure cannot verify an article.');
+            } catch (RuntimeException) {
+                $this->assertSame("BODY <next@example>\r\n", fgets($pair[1]));
+                $this->assertFalse($primary->isConnected(), 'The next candidate must reconnect and authenticate.');
+            }
+        } finally {
+            unset($source);
+            $primary->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
     public function test_body_status_timeout_closes_an_open_transport_before_session_reuse(): void
     {
         $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
