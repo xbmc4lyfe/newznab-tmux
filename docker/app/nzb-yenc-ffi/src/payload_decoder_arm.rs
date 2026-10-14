@@ -147,6 +147,22 @@ unsafe fn decode_neon_block(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline(never)]
+unsafe fn decode_neon_regular_fallback(
+    bytes: std::arch::aarch64::uint8x16_t,
+    equals: std::arch::aarch64::uint8x16_t,
+    special: std::arch::aarch64::uint8x16_t,
+    destination: *mut u8,
+    mut escaped: bool,
+) -> (usize, bool) {
+    // Keep general compaction outside the ordinary loop without changing the
+    // dense decoder's use of decode_neon_block or its register allocation.
+    let count = unsafe { decode_neon_block(bytes, equals, special, destination, &mut escaped) };
+    (count, escaped)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
 unsafe fn decode_neon_regular_lane(
     bytes: std::arch::aarch64::uint8x16_t,
     equals: std::arch::aarch64::uint8x16_t,
@@ -172,9 +188,8 @@ unsafe fn decode_neon_regular_lane(
         let sparse = remove == 0 || single || remove >> first_removed == 3;
         if !sparse || following & remove != 0 || (incoming && remove & 1 != 0) {
             // Keep the incoming state intact for malformed escapes or general
-            // compaction. The dense decoder and tails also use this helper.
-            let count = decode_neon_block(bytes, equals, special, destination, &mut escaped);
-            return (count, escaped);
+            // compaction. Only this fallback crosses a function boundary.
+            return decode_neon_regular_fallback(bytes, equals, special, destination, escaped);
         }
         escaped = equals_mask & 0x8000 != 0;
         let adjustment = vorrq_u8(
@@ -612,6 +627,22 @@ mod tests {
         let mut expected = vec![65; 15];
         expected.push(214);
         expected.extend(std::iter::repeat_n(66, 15));
+        expected.push(19);
+        verify_regular_guards(&payload, &expected);
+    }
+
+    #[test]
+    fn ordinary_general_lane_carry_reaches_sparse_lane_and_scalar_tail() {
+        // Three separated escapes force general compaction. The last marker
+        // remains pending across CR/LF and then across the next lane boundary.
+        let mut payload = b"=@kk=Jkk=}kkkkk=\r\nkkkkkkkkkkkkk=".to_vec();
+        payload.extend_from_slice(b"llllllllllllllll\r\n=");
+        let mut expected = vec![214, 65, 65, 224, 65, 65, 19];
+        expected.extend_from_slice(&[65; 5]);
+        expected.push(1);
+        expected.extend_from_slice(&[65; 12]);
+        expected.push(2);
+        expected.extend_from_slice(&[66; 15]);
         expected.push(19);
         verify_regular_guards(&payload, &expected);
     }
