@@ -863,6 +863,10 @@ function articleBenchmarkGraphFiles(string $root): array
     $paths = [];
     $pending = [['path' => 'vendor', 'ancestors' => []]];
     foreach ($tracked as $path) {
+        $resolved = realpath($root.'/'.$path);
+        if ($resolved !== false && str_starts_with($resolved, $root.'/') && articleBenchmarkPrivatePath(substr($resolved, strlen($root) + 1))) {
+            throw new RuntimeException('Tracked path resolves to a private source target: '.$path);
+        }
         if (is_dir($root.'/'.$path)) {
             $pending[] = ['path' => $path, 'ancestors' => []];
         } else {
@@ -874,6 +878,9 @@ function articleBenchmarkGraphFiles(string $root): array
         $realDirectory = realpath($root.'/'.$entry['path']);
         if ($realDirectory === false || ! str_starts_with($realDirectory, $root.'/') || in_array($realDirectory, $entry['ancestors'], true)) {
             throw new RuntimeException('Source directory escapes selected source or contains a symlink cycle.');
+        }
+        if (articleBenchmarkPrivatePath(substr($realDirectory, strlen($root) + 1))) {
+            throw new RuntimeException('Directory resolves to a private source target: '.$entry['path']);
         }
         $names = scandir($root.'/'.$entry['path']);
         if ($names === false) {
@@ -890,6 +897,9 @@ function articleBenchmarkGraphFiles(string $root): array
             $resolved = realpath($root.'/'.$path);
             if ($resolved === false || ! str_starts_with($resolved, $root.'/')) {
                 throw new RuntimeException('Source symlink escapes selected source: '.$path);
+            }
+            if (articleBenchmarkPrivatePath(substr($resolved, strlen($root) + 1))) {
+                throw new RuntimeException('Source resolves to a private source target: '.$path);
             }
             if (is_dir($root.'/'.$path)) {
                 $pending[] = ['path' => $path, 'ancestors' => [...$entry['ancestors'], $realDirectory]];
@@ -919,6 +929,9 @@ function articleBenchmarkFreezeGraph(string $root, string $destination): array
         $resolved = realpath($root.'/'.$path);
         if ($resolved === false || ! str_starts_with($resolved, $root.'/') || ! is_file($resolved)) {
             throw new RuntimeException('Tracked source escapes selected source or is not a file: '.$path);
+        }
+        if (articleBenchmarkPrivatePath(substr($resolved, strlen($root) + 1))) {
+            throw new RuntimeException('File resolves to a private source target: '.$path);
         }
         $target = $destination.'/'.$path;
         if (! is_dir(dirname($target))) {

@@ -443,6 +443,33 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         }
     }
 
+    public function test_snapshot_rejects_tracked_aliases_to_private_files_and_directories(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-private-alias-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        try {
+            foreach (['.env', 'auth.json', '.git'] as $index => $target) {
+                $root = $directory.'/source-'.$index;
+                self::createSyntheticSource($root, 'private-alias');
+                if ($target !== '.git') {
+                    file_put_contents($root.'/'.$target, 'synthetic-private-content');
+                }
+                symlink($target, $root.'/evidence-input');
+                articleBenchmarkGit($root, ['add', 'evidence-input']);
+                $snapshot = $directory.'/snapshot-'.$index;
+                try {
+                    articleBenchmarkFreezeGraph($root, $snapshot);
+                    self::fail('Private symlink target was copied into the snapshot.');
+                } catch (\RuntimeException $exception) {
+                    self::assertStringContainsString('private source target', $exception->getMessage());
+                }
+                self::assertFileDoesNotExist($snapshot.'/evidence-input');
+            }
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
     public function test_snapshot_rejects_tracked_symlinks_to_external_source(): void
     {
         $directory = sys_get_temp_dir().'/nntmux-symlink-escape-'.bin2hex(random_bytes(8));
