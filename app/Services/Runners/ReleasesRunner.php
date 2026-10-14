@@ -6,6 +6,7 @@ namespace App\Services\Runners;
 
 use App\Models\UsenetGroup;
 use App\Services\Configuration\ConfigurationProvider;
+use App\Services\NameFixing\NameFixingQueryService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
@@ -177,11 +178,10 @@ class ReleasesRunner extends BaseRunner
         $leftGuids = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
 
         if ($mode === 'predbft') {
-            $preCount = DB::select(
-                "SELECT COUNT(p.id) AS num FROM predb p WHERE LENGTH(p.title) >= 15 AND p.title NOT REGEXP '[\"\<\> ]' AND p.searched = 0 AND (p.predate < (NOW() - INTERVAL 1 DAY) OR (p.predate IS NULL AND p.imported_at < (NOW() - INTERVAL 1 DAY)))"
-            );
-            if (! empty($preCount) && (int) $preCount[0]->num > 0 && $maxPerRun > 0) {
-                $leftGuids = \array_slice($leftGuids, 0, (int) ceil($preCount[0]->num / $maxPerRun));
+            $preCount = app(NameFixingQueryService::class)->countPredbLauncherCandidates($maxPerRun, count($leftGuids));
+            if ($preCount > 0 && $maxPerRun > 0) {
+                $workers = intdiv($preCount, $maxPerRun) + ($preCount % $maxPerRun === 0 ? 0 : 1);
+                $leftGuids = \array_slice($leftGuids, 0, $workers);
             } else {
                 $leftGuids = [];
             }
