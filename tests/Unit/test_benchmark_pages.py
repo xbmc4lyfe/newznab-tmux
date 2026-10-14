@@ -24,6 +24,8 @@ class PagesTest(unittest.TestCase):
         manual.update(id=13, event='workflow_dispatch')
         self.assertEqual(12, pages.select_run([old, self.run_row(), manual], SHA)['id'])
         self.assertIsNone(pages.select_run([manual], SHA))
+        self.assertIsNone(pages.select_run([dict(old, head_repository=None)], SHA))
+        self.assertIsNone(pages.select_run([dict(old, head_sha=None)], None))
 
     def test_archive_is_bounded_and_exact_member_only(self):
         for members in [('summary.json', 'extra.txt'), ('../summary.json',), ('summary.json', 'summary.json')]:
@@ -96,6 +98,76 @@ class PagesTest(unittest.TestCase):
     def test_overflow_float_is_rejected(self):
         with self.assertRaises(ValueError):
             pages.strict_json('{"value":1e999}')
+
+    def complete_cpp(self, run, runner):
+        import itertools
+        return dict(schema_version=1, kind='cpp', runner=runner, head_sha=run['head_sha'], run_id=run['id'],
+                    run_attempt=run['run_attempt'], repository=pages.REPOSITORY, adoption_qualified=False,
+                    evidence_type='paired_median_screen', status='inconclusive', completeness={'complete': True, 'expected_rows': 24, 'observed_rows': 24},
+                    rows=[dict(size=size, density=density, path=path, eligible_pairs=31, invalid_pairs=0,
+                               decision='inconclusive', median_rust_over_cpp=0.9, bootstrap_95_percent_interval=[0.8, 1.1])
+                          for size, density, path in itertools.product((4096, 524288, 1048576, 8388608), ('ordinary', 'heavy'), ('tolerant', 'strict', 'body'))])
+
+    def test_last_valid_complete_cpp_is_separate_and_survives_new_profile_only_run(self):
+        newer = self.run_row()
+        older = self.run_row()
+        older.update(id=11, head_sha='b' * 40)
+        archives = {}
+        for artifact_id, runner in ((1, 'ubuntu-latest'), (2, 'ubuntu-24.04-arm')):
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, 'w') as archive:
+                archive.writestr('summary.json', json.dumps(self.complete_cpp(older, runner)))
+            archives[artifact_id] = buffer.getvalue()
+        def fetch(path):
+            if path.startswith('actions/workflows/'):
+                return {'workflow_runs': [newer, older]}
+            if path.startswith('actions/runs/12/'):
+                return {'artifacts': []}
+            return {'artifacts': [dict(name=f'public-benchmark-cpp-{runner}-11-2', id=i, expired=False, size_in_bytes=100)
+                                  for i, runner in ((1, 'ubuntu-latest'), (2, 'ubuntu-24.04-arm'))]}
+        history = pages.last_valid_comparison(fetch, lambda i: archives[i])
+        self.assertEqual(history['status'], 'Available historical comparison')
+        self.assertEqual(history['head_sha'], older['head_sha'])
+        self.assertEqual(history['run_id'], 11)
+        self.assertEqual(len(history['results']), 2)
+        report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[], results=[], last_valid_comparison=history)
+        rendered = pages.render(report)
+        self.assertIn('Last valid complete C++ comparison', rendered)
+        self.assertIn(older['head_sha'], rendered)
+
+    def test_last_valid_does_not_reuse_prior_attempt_partial_or_untrusted_runs(self):
+        run = self.run_row()
+        for changes in ({'event': 'pull_request'}, {'head_repository': {'full_name': 'other/repo'}}, {}):
+            candidate = dict(run, **changes)
+            def fetch(path):
+                if path.startswith('actions/workflows/'):
+                    return {'workflow_runs': [candidate]}
+                return {'artifacts': [dict(name='public-benchmark-cpp-ubuntu-latest-12-1', id=1, expired=False, size_in_bytes=100)]}
+            result = pages.last_valid_comparison(fetch, lambda _: self.fail('Wrong attempt or untrusted artifact must not be downloaded'))
+            self.assertNotEqual(result['status'], 'Available historical comparison')
+
+    def test_utility_summary_runtime_identity_and_public_fields(self):
+        summary = dict(schema_version=1, kind='cpu-snapshot', runner='ubuntu-latest', head_sha=SHA,
+                       run_id=12, run_attempt=2, repository=pages.REPOSITORY, rows=[], adoption_qualified=False,
+                       runtime_identity={'executed_sha': SHA, 'command': 'private'})
+        with self.assertRaises(ValueError):
+            pages.validate_summary(summary, self.run_row(), 'cpu-snapshot', 'ubuntu-latest')
+        summary['runtime_identity'] = {'executed_sha': 'b' * 40}
+        with self.assertRaises(ValueError):
+            pages.validate_summary(summary, self.run_row(), 'cpu-snapshot', 'ubuntu-latest')
+        summary['runtime_identity'] = {'executed_sha': SHA}
+        pages.validate_summary(summary, self.run_row(), 'cpu-snapshot', 'ubuntu-latest')
+
+    def test_utility_family_coverage_and_new_auxiliary_remains_explicit_gap(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / 'docker/app/nzb-yenc-ffi/src'
+            source.mkdir(parents=True)
+            for name in ('article_fingerprint', 'cpu_snapshot', 'new_auxiliary'):
+                (source / (name + '.rs')).write_text('')
+            rows = {Path(row['target']).stem: row for row in pages.coverage(Path(root))}
+            self.assertIn('Comparative', rows['article_fingerprint']['coverage'])
+            self.assertIn('Comparative', rows['cpu_snapshot']['coverage'])
+            self.assertEqual(rows['new_auxiliary']['coverage'], 'No automated benchmark')
 
     def test_frozen_reports_link_remains_separate_from_current_results(self):
         report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[], results=[], frozen_reports_available=True)

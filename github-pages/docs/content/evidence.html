@@ -1,0 +1,32 @@
+<h1>How to read the evidence</h1>
+<p class="lead">Every claim needs an identity, a boundary, and a limit.</p>
+<h2 id="states">Keep evidence states separate</h2>
+<table><thead><tr><th>State</th><th>What it establishes</th><th>What it doesn't establish</th></tr></thead><tbody>
+<tr><td>Source inspection</td><td>The behavior implemented at a named revision.</td><td>Successful execution or production behavior.</td></tr>
+<tr><td>Correctness test</td><td>The tested inputs met their assertions.</td><td>Performance, complete input coverage, or deployment.</td></tr>
+<tr><td>Paired benchmark</td><td>A comparison within a defined fixture and measured boundary.</td><td>Whole-system throughput or a different machine's result.</td></tr>
+<tr><td>Diagnostic profile</td><td>Where an instrumented workload spent time.</td><td>An uninstrumented speedup against another implementation.</td></tr>
+<tr><td>Merged pull request</td><td>The fork accepted a specific source change.</td><td>That a running installation uses it.</td></tr>
+<tr><td>Healthy deployment</td><td>Services passed their deployment health checks.</td><td>That a newly admitted release completed verification and publication.</td></tr>
+<tr><td>Live publication</td><td>A fresh candidate produced persisted release/NZB evidence in the observed installation.</td><td>A universal success rate or performance claim.</td></tr>
+</tbody></table>
+<h2 id="revisions">Record both source and executed revisions</h2>
+<p>A pull request's head can differ from the synthetic merge checkout that Actions executes. The frozen decoder reports come from PR head <code>dc74ec057ebdd80a3ff7d10cbcf12147c06cf55d</code> and executed merge <code>35c5a5a1bf1f8bd98a4e3f6f62ff4fa0f6eb4c04</code>. The <a href="benchmarks/runs/38593212508/x86/provenance.json">x86 provenance</a> and <a href="benchmarks/runs/38593212508/arm/provenance.json">ARM provenance</a> retain those identities.</p>
+<p>The newer retained PHP and presentation summaries are historical PR evidence. The API head is <code>35858d906f135266be148f5b20417ff73041f54c</code>, executed merge <code>57dfddcfd029b361e92c4d6ddae21b200b57323b</code>. Neither becomes a current-master result when documentation changes.</p>
+<h2 id="current">Current build publication</h2>
+<p>One Pages workflow combines the documentation, current summaries, and frozen reports. Every master push starts fresh benchmark workflows. Workflow start and completion events refresh the current dashboard. Collection checks repository, branch, source revision, architecture, run ID, and attempt. A newer attempt's failure must not fall back to an older attempt's pass.</p>
+<p>The publisher accepts bounded public summaries, not arbitrary build directories. Raw fixture payloads, private configuration, binaries, and unrestricted logs don't belong on the site. Current, historical, and unavailable evidence use separate labels.</p>
+<h2 id="statistics">Ratios, intervals, and missing results</h2>
+<p>For latency, speedup equals baseline time divided by candidate time. For throughput, it equals candidate throughput divided by baseline throughput. A 2× latency speedup means half the time, or a 50% reduction. It doesn't mean a 200% reduction.</p>
+<p>A confidence interval describes uncertainty under the experiment's method. A useful-improvement decision follows that harness's threshold. It'sn't a general approval. An inconclusive comparison supports neither a reliable gain nor a reliable regression under that rule. A missing artifact, skipped workload, setup failure, invalid pair, or timeout is unavailable or invalid evidence, never zero latency.</p>
+<p>The <a href="performance.html">performance guide</a> distinguishes median screens from the project's common-path and uncommon-p99 adoption requirement. The historical ingestion studies under <a href="https://github.com/xbmc4lyfe/newznab-tmux/blob/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7/docs/performance/evidence">performance evidence</a> compare PHP/SQL storage changes. They're not PHP-to-Rust measurements.</p>
+<h2 id="maintain">Maintain the documentation</h2>
+<p>The prose uses the vendored Google style for Vale, version 0.7.1, with its <code>MIT</code> license. Run the following commands from an isolated repository checkout:</p>
+<pre><code>vale --config=github-pages/docs/.vale.ini github-pages/docs/content
+python3 tests/Unit/test_docs_site.py
+python3 tests/Unit/test_benchmark_pages.py
+python3 tests/Unit/test_benchmark_summary_export.py
+python3 scripts/build-docs.py --output /tmp/nntmux-docs-preview</code></pre>
+<p>Review source links and PR associations when updating a page. Preserve historical numbers with their original protocol and revision, and update the current dashboard through its collector. Don't rewrite a historical report to make it look current. New Rust files must appear in the coverage inventory even before a benchmark exists.</p>
+<h2 id="limits">Scope of this site</h2>
+<p>This site documents a personal fork under development and testing. It doesn't certify production readiness or compare the quality of this project with <a href="https://github.com/NNTmux/newznab-tmux">upstream NNTmux</a>. The upstream maintainers and contributors deserve credit for the main app and the foundation these experiments use.</p>

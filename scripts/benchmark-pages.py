@@ -22,6 +22,7 @@ WORKFLOWS = {
                              ('php', 'ubuntu-latest'), ('php', 'ubuntu-24.04-arm'),
                              ('profile', 'ubuntu-latest'), ('profile', 'ubuntu-24.04-arm')],
     'release-presentation.yml': [('presentation', 'ubuntu-latest')],
+    'native-utilities-performance.yml': [(kind, runner) for kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot') for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')],
     'laravel.yml': [], 'rust-clippy.yml': [],
 }
 LIMIT = 1024 * 1024
@@ -88,9 +89,12 @@ def read_summary(data):
 
 
 def select_run(runs, sha):
-    eligible = [run for run in runs if run.get('head_sha') == sha and run.get('event') == 'push'
+    if not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{40}', sha):
+        return None
+    eligible = [run for run in runs if isinstance(run, dict) and run.get('head_sha') == sha and run.get('event') == 'push'
                 and run.get('head_branch') == 'master'
-                and run.get('head_repository', {}).get('full_name') == REPOSITORY]
+                and isinstance(run.get('head_repository'), dict)
+                and run['head_repository'].get('full_name') == REPOSITORY]
     return max(eligible, key=lambda run: int(run['id']), default=None)
 
 
@@ -103,7 +107,7 @@ def validate_summary(summary, run, kind, runner):
     if not isinstance(summary.get('rows'), list) or len(summary['rows']) > 100:
         raise ValueError('Invalid summary rows')
     allowed = set(expected) | {'rows', 'status', 'evidence_type', 'completeness', 'source_sha256',
-                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable'}
+                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256'}
     if set(summary) - allowed:
         raise ValueError('Unexpected public summary fields')
     for mapping in ('source_sha256', 'library_sha256'):
@@ -117,14 +121,38 @@ def validate_summary(summary, run, kind, runner):
                 'median_rust_over_cpp', 'median_rust_over_php', 'bootstrap_95_percent_interval',
                 'median_ms', 'min_ms', 'max_ms', 'candidate_backend', 'correctness_passed', 'performance_gate',
                 'gate_passed', 'samples', 'iterations', 'php_median_ns', 'rust_median_ns', 'improvement_percent',
-                'body_ffi_median_ms'}
+                'body_ffi_median_ms', 'fixture', 'p99_sample_sufficient', 'baseline_median_ns', 'candidate_median_ns', 'median_ratio', 'paired_median_ratio', 'baseline_p99_ns', 'candidate_p99_ns', 'p99_ratio', 'median_ratio_ci95', 'p99_ratio_ci95', 'median_baseline_over_candidate_ratio', 'median_cold_baseline_over_candidate_ratio'}
     if any(not isinstance(row, dict) or set(row) - row_keys for row in summary['rows']):
         raise ValueError('Unexpected public measurement fields')
+
+    if kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot'):
+        revision = '5cc5303b502e653d83bba1951dec2f5d2da1db35' if kind == 'cpu-snapshot' else 'a1a9b0829610c3b62e7d0bdb418669a89c36c90b'
+        if summary.get('rows') and summary.get('baseline_revision') != revision:
+            raise ValueError('Invalid frozen baseline revision')
+        for field in ('protocol_sha256', 'report_sha256'):
+            if field in summary and (not isinstance(summary[field], str) or not re.fullmatch('[0-9a-f]{64}', summary[field])):
+                raise ValueError('Invalid utility evidence digest')
+        runtime = summary.get('runtime_identity', {})
+        runtime_keys = {'executed_sha', 'rustc', 'cargo', 'php', 'python', 'architecture', 'cpu_model', 'runner_image_os', 'runner_image_version', 'build_profile', 'logical_cpus'}
+        if not isinstance(runtime, dict) or set(runtime) - runtime_keys:
+            raise ValueError('Unexpected utility runtime identity')
+        for key, value in runtime.items():
+            if key == 'logical_cpus':
+                if type(value) is not int or value < 1:
+                    raise ValueError('Invalid utility CPU count')
+            elif not isinstance(value, str) or len(value) > 4096:
+                raise ValueError('Invalid utility runtime value')
+        if runtime and runtime.get('executed_sha') != run['head_sha']:
+            raise ValueError('Utility runtime source mismatch')
+        fixtures = {'common-mounted', 'rare-deep64', 'rare-unavailable', 'rare-host-unavailable'} if kind == 'cpu-snapshot' else {'ids16', 'ids4096', 'ids10000-unique-plus-duplicates', 'ids50000', 'xml10000'}
+        if any(row.get('fixture') not in fixtures for row in summary['rows']):
+            raise ValueError('Unexpected utility fixture')
+
 
 
 def coverage(root):
     comparative = {'payload_decoder', 'payload_decoder_x86', 'payload_decoder_arm', 'yenc_framing'}
-    diagnostic = {'nntp_body', 'nntp_headers', 'article_identity', 'article_xref', 'article_dates', 'formats', 'par2'}
+    diagnostic = {'nntp_body', 'nntp_headers', 'formats'}
     rows = []
     for path in sorted((root / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs')):
         name = path.stem
@@ -134,17 +162,88 @@ def coverage(root):
         elif name == 'release_names':
             label, detail = 'Comparative caller benchmark', 'Release rendering, x86; 5% median screen for batches of 16+ rows.'
         elif name in diagnostic:
-            label, detail = 'Diagnostic caller profile', 'Costs included in article analysis profiles; no isolated baseline comparison.'
+            label, detail = 'Diagnostic caller profile', 'Fixed article-analysis inputs; no isolated baseline comparison or complete archive-format coverage.'
+        elif name in ('article_identity', 'article_xref', 'article_dates', 'par2'):
+            detail = 'Correctness/parity checks exist; no independent comparative timing protocol or module-specific caller benchmark.'
+        elif name == 'nntmux-evidence-utility':
+            label, detail = 'Auxiliary correctness only', 'CI evidence and rendering utility; running it does not measure its own performance.'
         elif name == 'lib':
             label, detail = 'Mixed coverage', 'FFI exports: decoding/rendering comparisons; metadata profiles; some APIs unbenchmarked.'
-        elif name.startswith('benchmark-'):
-            detail = 'Local comparison harness exists; not invoked automatically in CI.'
-        elif name == 'article_fingerprint' or name == 'nntmux-article-fingerprint':
-            detail = 'NZB article-ID digest harness exists; separate from release metadata fingerprint profiles.'
-        elif name in ('cpu_snapshot', 'nntmux-cpu-snapshot'):
-            detail = 'Used for CPU evidence collection; local comparison harness is not recurring CI.'
+        elif name in ('article_fingerprint', 'nntmux-article-fingerprint', 'benchmark-article-fingerprint'):
+            label, detail = 'Comparative public operation benchmark', 'PHP baseline vs Rust FFI and worker; 31-pair median screen, p99 unqualified; PHP process startup excluded.'
+        elif name in ('cpu_snapshot', 'nntmux-cpu-snapshot', 'benchmark-cpu-snapshot'):
+            label, detail = 'Comparative synthetic CLI benchmark', 'Python baseline vs Rust, 1000 pairs per synthetic proc/cgroup fixture; startup included, production load unverified.'
         rows.append({'target': str(path.relative_to(root)), 'coverage': label, 'detail': detail})
     return rows
+
+
+def complete_cpp_comparison(summary):
+    expected = {(size, density, path) for size in (4096, 524288, 1048576, 8388608)
+                for density in ('ordinary', 'heavy') for path in ('tolerant', 'strict', 'body')}
+    completeness = summary.get('completeness')
+    if summary.get('status') not in ('useful_improvement', 'inconclusive', 'regression') or not isinstance(completeness, dict) or completeness.get('complete') is not True:
+        return False
+    rows = summary['rows']
+    if len(rows) != len(expected):
+        return False
+    keys = set()
+    for row in rows:
+        key = (row.get('size'), row.get('density'), row.get('path'))
+        if key not in expected or key in keys or type(row.get('eligible_pairs')) is not int or row['eligible_pairs'] < 3 or row.get('invalid_pairs') != 0:
+            return False
+        if row.get('decision') not in ('useful_improvement', 'inconclusive', 'regression'):
+            return False
+        ratio, interval = row.get('median_rust_over_cpp'), row.get('bootstrap_95_percent_interval')
+        if type(ratio) not in (int, float) or ratio <= 0 or not math.isfinite(ratio):
+            return False
+        if not isinstance(interval, list) or len(interval) != 2 or any(type(value) not in (int, float) or value <= 0 or not math.isfinite(value) for value in interval) or interval[0] > interval[1]:
+            return False
+        keys.add(key)
+    return keys == expected
+
+
+def last_valid_comparison(fetch=api, archive_download=download):
+    """Find a complete historical C++ matrix without replacing current-build state.
+
+    Search is bounded to the newest 20 trusted master push runs. In-progress,
+    failed, cancelled or partial attempts are never replaced by an older attempt
+    of that same run. Both architecture summaries must belong to its latest attempt.
+    """
+    result = dict(status='No complete comparison in newest 20 trusted master push runs', results=[], unavailable_runs=0, expired_artifacts=0, searched_runs=0)
+    try:
+        runs = fetch('actions/workflows/yenc-performance.yml/runs?branch=master&event=push&per_page=20')['workflow_runs']
+        trusted = [run for run in runs if isinstance(run, dict) and select_run([run], run.get('head_sha')) is not None]
+        for run in sorted(trusted, key=lambda row: int(row['id']), reverse=True)[:20]:
+            if run.get('status') != 'completed':
+                continue
+            result['searched_runs'] += 1
+            try:
+                artifacts = fetch(f"actions/runs/{run['id']}/artifacts?per_page=100")['artifacts']
+                summaries = []
+                for runner in ('ubuntu-latest', 'ubuntu-24.04-arm'):
+                    name = f"public-benchmark-cpp-{runner}-{run['id']}-{run['run_attempt']}"
+                    matches = [a for a in artifacts if a.get('name') == name]
+                    if len(matches) == 1 and matches[0].get('expired'):
+                        result['expired_artifacts'] += 1
+                    if len(matches) != 1 or matches[0]['expired'] or matches[0]['size_in_bytes'] > 2 * LIMIT:
+                        break
+                    artifact = matches[0]
+                    summary = read_summary(archive_download(artifact['id']))
+                    validate_summary(summary, run, 'cpp', runner)
+                    if not complete_cpp_comparison(summary):
+                        break
+                    summaries.append(dict(summary, artifact_id=artifact['id'], workflow_status=run.get('conclusion')))
+                if len(summaries) == 2:
+                    return dict(result, status='Available historical comparison', results=summaries,
+                                head_sha=run['head_sha'], run_id=run['id'], run_attempt=run['run_attempt'])
+            except (OSError, ValueError, KeyError, TypeError, OverflowError, RuntimeError, NotImplementedError, zipfile.BadZipFile):
+                result['unavailable_runs'] += 1
+                continue
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        result['status'] = 'Historical comparison collection unavailable'
+    if result['unavailable_runs']:
+        result['status'] = 'Historical comparison collection incomplete; some attempts unavailable'
+    return result
 
 
 def collect(sha, root, fetch=api, archive_download=download):
@@ -189,6 +288,7 @@ def collect(sha, root, fetch=api, archive_download=download):
                     except (OSError, ValueError, KeyError, TypeError, RuntimeError, NotImplementedError, zipfile.BadZipFile):
                         result['status'] = 'Summary invalid or unavailable'
             report['results'].append(result)
+    report['last_valid_comparison'] = last_valid_comparison(fetch, archive_download)
     return report
 
 
@@ -206,9 +306,9 @@ def run_link(row):
 def measurement_table(rows):
     table = ['<table><tr><th>Workload</th><th>Median latency / ratio</th><th>Decision / eligibility</th></tr>']
     for row in rows:
-        label = ' · '.join(str(row[key]) for key in ('size', 'density', 'path', 'phase', 'scenario', 'rows') if key in row)
-        metrics = {key: value for key, value in row.items() if key.startswith('median_') or key in ('php_median_ns', 'rust_median_ns', 'improvement_percent', 'body_ffi_median_ms')}
-        status = {key: row[key] for key in ('decision', 'eligible', 'eligible_pairs', 'invalid_pairs', 'gate_passed', 'performance_gate') if key in row}
+        label = ' · '.join(str(row[key]) for key in ('size', 'density', 'path', 'phase', 'scenario', 'rows', 'fixture') if key in row)
+        metrics = {key: value for key, value in row.items() if key.startswith('median_') or key in ('php_median_ns', 'rust_median_ns', 'improvement_percent', 'body_ffi_median_ms', 'baseline_median_ns', 'candidate_median_ns', 'baseline_p99_ns', 'candidate_p99_ns', 'p99_ratio', 'p99_ratio_ci95')}
+        status = {key: row[key] for key in ('decision', 'eligible', 'eligible_pairs', 'invalid_pairs', 'gate_passed', 'performance_gate', 'samples', 'p99_sample_sufficient') if key in row}
         table.append(f'<tr><td>{escape(label)}</td><td>{escape(json.dumps(metrics))}</td><td>{escape(json.dumps(status))}</td></tr>')
     table.append('</table>')
     return '\n'.join(table)
@@ -220,7 +320,7 @@ def render(report):
             '<h1>NNTmux Rust benchmarks</h1>',
             f'<p>Master build <code>{escape(report["head_sha"])}</code>. Updated {escape(report["generated_at"])}. <a href="results.json">Machine-readable results</a>.</p>',
             '<p>Coverage is incomplete. Comparative median screens and diagnostic profiles are separate evidence. These builds do not establish the required 1.5× gain for every common path and representative uncommon p99 workload, or production throughput.</p>',
-            '<p>Each master push runs fresh yEnc comparisons on x86/ARM, BODY/fingerprint profiles on x86/ARM and release rendering on x86. Missing, failed, cancelled and inconclusive results remain visible. Local/manual experiments are excluded. Raw evidence is retained in Actions for 14 days; published summaries last until the next build.</p>',
+            '<p>Each master push runs fresh yEnc comparisons on x86/ARM, BODY/fingerprint profiles on x86/ARM release rendering on x86 and NZB digest/CPU utility comparisons on x86/ARM. Missing, failed, cancelled and inconclusive results remain visible. Local/manual experiments are excluded. Raw evidence is retained in Actions for 14 days; published summaries last until the next build.</p>',
             '<h2>Build checks</h2><table><tr><th>Workflow</th><th>Latest state</th><th>Evidence</th></tr>']
     for row in report['workflows']:
         body.append(f'<tr><td>{escape(row["workflow"])}</td><td>{escape(row["status"])}</td><td>{run_link(row)}</td></tr>')
@@ -233,7 +333,16 @@ def render(report):
             body.append(f'<p>Overall workflow: {escape(row["workflow_status"])}</p>')
         body.append(measurement_table(row['rows']) if row['rows'] else '<p>No current measurement rows available.</p>')
         body.append('<details><summary>Summary data and identities</summary><pre>' + escape(json.dumps(row, indent=2, ensure_ascii=False, allow_nan=False)) + '</pre></details></details>')
-    body.append('<h2>Rust target coverage and priorities</h2><p>Next priorities: compare repeated native body/format scans through the full caller; automate existing NZB digest and CPU collector harnesses; then cover archive range parsers and sample planning. Newly added Rust source files appear automatically as gaps until their benchmark mapping is reviewed.</p><table><tr><th>Source target</th><th>Automated evidence</th><th>Scope / gap</th></tr>')
+    historical = report.get('last_valid_comparison', {})
+    if historical:
+        body.append('<h2>Last valid complete C++ comparison</h2><p>' + escape(historical.get('status')) + '. Historical evidence remains separate from the current build; a newer PHP-only/profile-only run cannot replace this comparison.</p>')
+        if historical.get('unavailable_runs') or historical.get('expired_artifacts'):
+            body.append('<p>Unavailable attempts: ' + escape(historical.get('unavailable_runs', 0)) + '; expired summary artifacts: ' + escape(historical.get('expired_artifacts', 0)) + '. Newer unavailable attempts may contain comparisons that cannot be verified.</p>')
+        if historical.get('results'):
+            body.append('<p>Executed source <code>' + escape(historical['head_sha']) + '</code>. ' + run_link(historical) + '.</p>')
+            for row in historical['results']:
+                body.append('<h3>' + escape(row['runner']) + '</h3>' + measurement_table(row['rows']))
+    body.append('<h2>Rust target coverage and priorities</h2><p>Next priorities: compare repeated native body/format scans through the full caller; extend NZB digest uncommon-tail coverage; then cover archive range parsers and sample planning. Newly added Rust source files appear automatically as gaps until their benchmark mapping is reviewed.</p><table><tr><th>Source target</th><th>Automated evidence</th><th>Scope / gap</th></tr>')
     for row in report['coverage']:
         body.append(f'<tr><td><code>{escape(row["target"])}</code></td><td>{escape(row["coverage"])}</td><td>{escape(row["detail"])}</td></tr>')
     body.append('</table></html>')
