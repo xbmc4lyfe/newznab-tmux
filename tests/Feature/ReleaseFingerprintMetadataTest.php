@@ -22,6 +22,37 @@ use Tests\TestCase;
 final class ReleaseFingerprintMetadataTest extends TestCase
 {
     #[Test]
+    public function it_exposes_archived_revision_declarations_without_replacing_stored_names(): void
+    {
+        $sample = hex2bin('526172211a070100c51a333203010000c238faf81702010400000000010a7265706f72742e7478740304000719b23a3503050000');
+        self::assertIsString($sample);
+        if ((new NativeMetadataParser)->parseFormats($sample) === null) {
+            self::markTestSkipped('Native Rust format metadata is required for archived revision integration.');
+        }
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], YencArticles::article($sample));
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        $file = $analysis['metadata']['decoded_format_metadata']['headers'][0]['visible_block_walk']['blocks'][1]['file_header'];
+        self::assertSame('report.txt', $file['filename']);
+        $extras = $file['file_extra_records'];
+        self::assertSame(1, $extras['version_record_count']);
+        self::assertSame(7, $extras['version']['version_number']);
+        self::assertSame('validated_header_declaration', $extras['version']['interpretation_status']);
+        self::assertSame('record-payload-relative', $extras['version']['coordinate_basis']);
+        self::assertSame(42, $extras['version']['source_payload_offset']);
+        self::assertSame(1, $extras['version']['version_number_byte_offset']);
+        self::assertSame('report.txt;7', $extras['reference_interpreted_name']);
+        self::assertSame($extras['version'], $extras['records'][0]['version']);
+
+        $large = hex2bin('526172211a070100c51a333203010000afdaaf5e1702010d000000000101780c0400ffffffffffffffffff0119b23a3503050000');
+        self::assertIsString($large);
+        $largeAnalysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], YencArticles::article($large));
+        $largeExtras = $largeAnalysis['metadata']['decoded_format_metadata']['headers'][0]['visible_block_walk']['blocks'][1]['file_header']['file_extra_records'];
+        self::assertSame('18446744073709551615', $largeExtras['version']['version_number']);
+        self::assertSame('version_outside_32bit_reference_range', $largeExtras['reference_name_relationship_status']);
+        self::assertNull($largeExtras['reference_interpreted_name']);
+    }
+
+    #[Test]
     public function it_exposes_rar5_file_times_in_native_release_metadata(): void
     {
         $sample = hex2bin('526172211a070100c51a333203010000af35bf2f2902011b0200000100000000010178'
