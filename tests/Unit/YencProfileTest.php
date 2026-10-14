@@ -14,6 +14,106 @@ use RuntimeException;
 
 final class YencProfileTest extends TestCase
 {
+    public function test_prepared_fixture_custody_and_hash_verification(): void
+    {
+        $directory = sys_get_temp_dir().'/yenc-profile-fixture-'.bin2hex(random_bytes(8));
+        try {
+            $prepared = yencProfilePrepareFixture($directory, 5, 'heavy');
+            $this->assertSame('ok', $prepared['status']);
+            $fixture = yencProfileLoadFixture($directory, 5, 'heavy');
+            $this->assertSame("\xd6\xe0\xe3\x13\xd6", $fixture['data']);
+            $article = $fixture['article'];
+            $this->assertSame($fixture['data'], (new YencService)->decodeIgnore($article));
+            try {
+                yencProfilePrepareFixture($directory, 5, 'ordinary');
+                $this->fail('Existing fixture directory was overwritten.');
+            } catch (InvalidArgumentException) {
+                $this->addToAssertionCount(1);
+            }
+            $this->assertSame($fixture, yencProfileLoadFixture($directory, 5, 'heavy'));
+            foreach ([[6, 'heavy'], [5, 'ordinary']] as [$size, $density]) {
+                try {
+                    yencProfileLoadFixture($directory, $size, $density);
+                    $this->fail('Incorrect fixture properties were accepted.');
+                } catch (RuntimeException) {
+                    $this->addToAssertionCount(1);
+                }
+            }
+            foreach (['strict', 'tolerant', 'body'] as $path) {
+                $result = yencProfileExecute(new YencService, yencProfileOptions(['--native=/lib.so', '--size=5',
+                    '--density=heavy', '--path='.$path, '--iterations=1', '--fixture-dir='.$directory]));
+                $this->assertSame('ok', $result['status']);
+                $this->assertSame('prepared_files', $result['fixture_source']);
+                $this->assertSame(2, $result['verified_calls']);
+            }
+            unlink($directory.'/data');
+            symlink($directory.'/article', $directory.'/data');
+            try {
+                yencProfileLoadFixture($directory, 5, 'heavy');
+                $this->fail('Symlink fixture file was accepted.');
+            } catch (RuntimeException) {
+                $this->addToAssertionCount(1);
+            }
+            unlink($directory.'/data');
+            file_put_contents($directory.'/data', $fixture['data']);
+            file_put_contents($directory.'/article', '!'.substr($fixture['article'], 1));
+            $this->expectException(RuntimeException::class);
+            yencProfileLoadFixture($directory, 5, 'heavy');
+        } finally {
+            foreach (['data', 'article', 'manifest.json'] as $file) {
+                if (is_file($directory.'/'.$file)) {
+                    unlink($directory.'/'.$file);
+                }
+            }
+            if (is_dir($directory)) {
+                rmdir($directory);
+            }
+        }
+    }
+
+    public function test_fixture_modes_require_absolute_paths_and_cannot_mix_with_metadata_or_each_other(): void
+    {
+        foreach ([['--fixture-dir=relative'], ['--prepare-dir=relative'],
+            ['--fixture-dir=/a', '--prepare-dir=/b'], ['--path=metadata', '--fixture-dir=/a'],
+            ['--path=metadata', '--prepare-dir=/a']] as $arguments) {
+            try {
+                yencProfileOptions(['--native=/lib.so', ...$arguments]);
+                $this->fail('Invalid fixture mode was accepted.');
+            } catch (InvalidArgumentException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+    }
+
+    public function test_prepare_cli_exits_before_attempting_native_service_construction(): void
+    {
+        $directory = sys_get_temp_dir().'/yenc-profile-cli-'.bin2hex(random_bytes(8));
+        try {
+            $process = proc_open([PHP_BINARY, dirname(__DIR__, 2).'/scripts/profile-yenc.php',
+                '--native='.__FILE__, '--size=5', '--density=heavy', '--prepare-dir='.$directory],
+                [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+            $this->assertIsResource($process);
+            fclose($pipes[0]);
+            $stdout = stream_get_contents($pipes[1]);
+            $stderr = stream_get_contents($pipes[2]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            $this->assertSame(0, proc_close($process));
+            $this->assertSame('', $stderr);
+            $this->assertSame('prepare', json_decode($stdout, true, flags: JSON_THROW_ON_ERROR)['mode']);
+            $this->assertSame("\xd6\xe0\xe3\x13\xd6", yencProfileLoadFixture($directory, 5, 'heavy')['data']);
+        } finally {
+            foreach (['data', 'article', 'manifest.json'] as $file) {
+                if (is_file($directory.'/'.$file)) {
+                    unlink($directory.'/'.$file);
+                }
+            }
+            if (is_dir($directory)) {
+                rmdir($directory);
+            }
+        }
+    }
+
     public static function setUpBeforeClass(): void
     {
         if (! defined('NNTMUX_YENC_PROFILE_FUNCTIONS_ONLY')) {

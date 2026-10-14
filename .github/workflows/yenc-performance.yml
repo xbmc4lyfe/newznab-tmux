@@ -234,25 +234,51 @@ jobs:
         shell: bash
         run: |
           mkdir -p benchmark-evidence/profiles
+          profile_phase=runtime-check
+          preserve_status=0
+          finish_profile_setup() {
+            run_exit=$?
+            if [[ "$preserve_status" == 1 ]]; then
+              return
+            fi
+            python3 - "$run_exit" "$profile_phase" <<'PY'
+          import json, pathlib, sys
+          code, phase = int(sys.argv[1]), sys.argv[2]
+          path = pathlib.Path('benchmark-evidence/profiles/status.json')
+          record = {'status': 'complete' if code == 0 else 'invalid', 'exit_code': code, 'phase': phase}
+          if phase == 'native-build-and-capture' and path.is_file():
+              record['script_receipt'] = json.loads(path.read_text())
+          path.write_text(json.dumps(record, indent=2) + '\n')
+          PY
+          }
+          trap finish_profile_setup EXIT
           if [[ ! -f benchmark-evidence/build/runtime.json ]]; then
+            preserve_status=1
             echo '{"status":"skipped","reason":"native build/runtime identity unavailable","claim":"no hot-path conclusion"}' > benchmark-evidence/profiles/status.json
             exit 0
           fi
+          profile_phase=apt-update
           sudo apt-get update -qq
+          profile_phase=tool-installation
           sudo apt-get install -y linux-tools-generic
+          profile_phase=perf-discovery
           perf_binary=$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -n 1)
           if [[ -z "$perf_binary" ]]; then
             echo 'No perf executable installed.' >&2
             exit 1
           fi
+          profile_phase=flamegraph-fetch
           git clone https://github.com/brendangregg/FlameGraph.git "$RUNNER_TEMP/nntmux-flamegraph"
+          profile_phase=flamegraph-pin
           git -C "$RUNNER_TEMP/nntmux-flamegraph" checkout --detach 41fee1f99f9276008b7cd112fca19dc3ea84ac32
+          profile_phase=native-build-and-capture
           bash scripts/profile-yenc.sh "$GITHUB_WORKSPACE/benchmark-evidence" \
             "$RUNNER_TEMP/nntmux-flamegraph" "$perf_binary" \
             2>&1 | tee benchmark-evidence/build/profile-console.log
 
       - name: Render paired speedups and executed call-cost visualizations
         if: always()
+        timeout-minutes: 5
         shell: bash
         run: |
           python3 scripts/yenc-performance-report.py --evidence-dir=benchmark-evidence \

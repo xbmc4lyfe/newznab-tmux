@@ -26,12 +26,22 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def exit_cause(code):
+def timeout_fired(path):
+    if path is None:
+        return False
+    try:
+        with Path(path).open() as stream:
+            return any(line.startswith('timeout: sending signal ') for line in stream)
+    except OSError:
+        return False
+
+
+def exit_cause(code, timed_out=False):
     if not isinstance(code, int):
         return 'not_run'
     if code == 0:
         return 'complete'
-    if code == 124:
+    if code == 124 or timed_out:
         return 'timeout'
     if code in (125, 126, 127):
         return 'invocation_failure'
@@ -40,7 +50,7 @@ def exit_cause(code):
     return 'nonzero_exit'
 
 
-def profile_status(directory, native_exit, php_exit, postprocess_exit, postprocess_stage, preflight_exit):
+def profile_status(directory, native_exit, php_exit, postprocess_exit, postprocess_stage, preflight_exit, preflight_stderr=None):
     directory = Path(directory)
 
     def workload(name):
@@ -62,8 +72,11 @@ def profile_status(directory, native_exit, php_exit, postprocess_exit, postproce
     matched = bool(php and native and all(key in php and key in native and php[key] == native[key] for key in
         ('input_sha256', 'output_sha256', 'wire_sha256', 'verified_calls', 'size', 'iterations'))
         and php.get('headers_sha256') == native.get('headers_sha256'))
+    native_timed_out = timeout_fired(directory / 'perf.stderr')
+    php_timed_out = timeout_fired(directory / 'php.stderr')
+    preflight_timed_out = timeout_fired(preflight_stderr)
     native_state = 'invalid'
-    if native_exit == 'unavailable' and exit_cause(preflight_exit) == 'nonzero_exit':
+    if native_exit == 'unavailable' and exit_cause(preflight_exit, preflight_timed_out) == 'nonzero_exit':
         native_state = 'unavailable'
     elif (native_exit == 0 and postprocess_exit == 0 and postprocess_stage == 'complete'
             and matched and samples > 0 and (directory / 'native.svg').is_file()):
@@ -71,9 +84,12 @@ def profile_status(directory, native_exit, php_exit, postprocess_exit, postproce
     return {
         'php_profile': 'captured' if php_exit == 0 and php and callgrind.is_file() and callgrind.stat().st_size else 'invalid',
         'native_profile': native_state, 'native_samples': samples, 'workload_identity_matches': matched,
-        'native_exit': native_exit, 'native_exit_cause': exit_cause(native_exit), 'php_exit': php_exit,
+        'native_exit': native_exit, 'native_exit_cause': exit_cause(native_exit, native_timed_out), 'php_exit': php_exit,
+        'native_timed_out': native_timed_out, 'php_timed_out': php_timed_out,
+        'php_exit_cause': exit_cause(php_exit, php_timed_out),
         'native_postprocess_exit': postprocess_exit, 'native_postprocess_stage': postprocess_stage,
-        'perf_preflight_exit': preflight_exit, 'perf_preflight_cause': exit_cause(preflight_exit),
+        'perf_preflight_exit': preflight_exit, 'perf_preflight_cause': exit_cause(preflight_exit, preflight_timed_out),
+        'perf_preflight_timed_out': preflight_timed_out,
         'php_profile_sha256': file_sha256(callgrind) if callgrind.is_file() else None,
         'boundary': 'Whole-process profiles include setup and exact-output verification; diagnostic builds differ from timed builds.',
         'claim': 'Call-cost attribution only. No latency or production-capacity conclusion from instrumented runs.',
@@ -229,6 +245,9 @@ def render(evidence, output):
     (output / 'speedup.svg').write_text(bar_svg('Uninstrumented C++ / Rust median paired speedup (decision shown)', chart, '×', 1))
     sections.append('<img src="speedup.svg" alt="Paired speedup estimates by fixture and call path">')
     sections.append('<h2>Executed PHP hot paths</h2><p>The separate Rust-only metadata workload executes NzbFingerprintAnalyzer and native RAR5/NNTP metadata parsing over a fixed verified archive-header fixture. It has no C++ counterpart and supplies no migration speedup estimate.</p><p>Xdebug profiles include process bootstrap, fixture setup, warmup, decoding and correctness checks. Exclusive function time is shown below; inclusive call-edge cost is listed separately and must not be added across edges. FFI calls are opaque here; native internals appear in the separate CPU sampling flamegraphs. Instrumentation changes cost and these numbers are not speedup measurements.</p>')
+    setup_path = evidence / 'profiles' / 'status.json'
+    profiling_setup = json.loads(setup_path.read_text()) if setup_path.is_file() else {'status': 'unavailable', 'phase': 'no setup receipt'}
+    sections.append('<p>Profiling setup/run receipt: ' + html.escape(json.dumps(profiling_setup, sort_keys=True)) + '</p>')
     profile_records = []
     profile_paths = set((evidence / 'profiles').rglob('*.callgrind'))
     profile_paths.update(receipt.parent / 'php.callgrind' for receipt in (evidence / 'profiles').glob('*/status.json'))
@@ -277,7 +296,7 @@ def render(evidence, output):
     document = '<!doctype html><html lang="en"><meta charset="utf-8"><title>yEnc performance evidence</title><style>body{font:16px system-ui;background:#101827;color:#e5e7eb;margin:32px;max-width:1400px}table{border-collapse:collapse}td,th{padding:8px;text-align:left;border-bottom:1px solid #334155}img{width:100%;margin:20px 0}summary{cursor:pointer}</style><body>' + '\n'.join(sections) + '</body></html>'
     (output / 'report.html').write_text(document)
     (output / 'summary.md').write_text('\n'.join(markdown) + '\n')
-    (output / 'status.json').write_text(json.dumps({'benchmark_status': status, 'profiles': profile_records,
+    (output / 'status.json').write_text(json.dumps({'benchmark_status': status, 'profiling_setup': profiling_setup, 'profiles': profile_records,
         'observations_sha256': file_sha256(observations) if observations.exists() else None}, indent=2) + '\n')
 
 
@@ -291,6 +310,7 @@ if __name__ == '__main__':
     parser.add_argument('--postprocess-exit', type=int)
     parser.add_argument('--postprocess-stage')
     parser.add_argument('--preflight-exit', type=int)
+    parser.add_argument('--preflight-stderr')
     args = parser.parse_args()
     if args.record_profile_status:
         if any(value is None for value in (args.native_exit, args.php_exit, args.postprocess_exit,
@@ -298,7 +318,7 @@ if __name__ == '__main__':
             parser.error('Profile status requires all process exit receipts')
         native_exit = args.native_exit if args.native_exit == 'unavailable' else int(args.native_exit)
         status = profile_status(args.record_profile_status, native_exit, args.php_exit, args.postprocess_exit,
-                                args.postprocess_stage, args.preflight_exit)
+                                args.postprocess_stage, args.preflight_exit, args.preflight_stderr)
         (Path(args.record_profile_status) / 'status.json').write_text(json.dumps(status, indent=2) + '\n')
         raise SystemExit(1 if status['php_profile'] == 'invalid' or status['native_profile'] == 'invalid' else 0)
     if not args.evidence_dir or not args.output_dir:

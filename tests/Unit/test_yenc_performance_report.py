@@ -1,8 +1,13 @@
 import importlib.util
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 
 
@@ -127,6 +132,57 @@ calls=2 10
             self.assertEqual('invalid', status['native_profile'])
             self.assertEqual(7, status['native_postprocess_exit'])
             self.assertEqual('perf-script', status['native_postprocess_stage'])
+            self.assertEqual('timeout', self.report.exit_cause(137, timed_out=True))
+            self.assertEqual('signal', self.report.exit_cause(137, timed_out=False))
+            (path / 'perf.stderr').write_text('timeout: sending signal TERM to command env\ntimeout: sending signal KILL to command env\n')
+            status = self.report.profile_status(path, 137, 0, 0, 'not_run', 0)
+            self.assertTrue(status['native_timed_out'])
+            self.assertEqual('timeout', status['native_exit_cause'])
+
+    def test_setup_failure_receipt_is_visible_without_any_workload_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            (evidence / 'profiles').mkdir()
+            (evidence / 'profiles' / 'status.json').write_text(json.dumps({'status': 'invalid', 'phase': 'apt-update', 'exit_code': 100}))
+            output = evidence / 'visualization'
+            self.report.render(evidence, output)
+            status = json.loads((output / 'status.json').read_text())
+            self.assertEqual('apt-update', status['profiling_setup']['phase'])
+            self.assertEqual(100, status['profiling_setup']['exit_code'])
+            self.assertIn('apt-update', (output / 'report.html').read_text())
+
+    def test_workflow_records_actual_package_setup_failure_before_any_capture(self):
+        workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()
+        step = workflow.split('      - name: Capture executed PHP and native hot paths\n', 1)[1].split('      - name:', 1)[0]
+        command = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'bin').mkdir()
+            sudo = root / 'bin/sudo'
+            sudo.write_text('#!/bin/sh\necho fixture-package-failure >&2\nexit 100\n')
+            sudo.chmod(0o700)
+            (root / 'benchmark-evidence/build').mkdir(parents=True)
+            (root / 'benchmark-evidence/build/runtime.json').write_text('{}')
+            environment = dict(os.environ, PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'])
+            child = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', command], cwd=root,
+                                   env=environment, capture_output=True, text=True, timeout=10)
+            self.assertEqual(100, child.returncode)
+            receipt = json.loads((root / 'benchmark-evidence/profiles/status.json').read_text())
+            self.assertEqual({'status': 'invalid', 'exit_code': 100, 'phase': 'apt-update'}, receipt)
+
+    @unittest.skipUnless(sys.platform.startswith('linux') and shutil.which('timeout'), 'GNU timeout integration runs in Linux CI')
+    def test_forced_kill_from_real_timeout_retains_timeout_cause(self):
+        child = subprocess.run(['timeout', '--verbose', '--kill-after=0.1s', '0.2s', sys.executable, '-c',
+                                'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(5)'],
+                               env=dict(os.environ, LC_ALL='C'), capture_output=True, text=True, timeout=3)
+        code = 128 - child.returncode if child.returncode < 0 else child.returncode
+        self.assertEqual(137, code)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / 'perf.stderr').write_text(child.stderr)
+            status = self.report.profile_status(path, code, 0, 0, 'not_run', 0)
+            self.assertTrue(status['native_timed_out'])
+            self.assertEqual('timeout', status['native_exit_cause'])
 
     def test_missing_php_capture_is_reported_even_when_another_workload_has_one(self):
         with tempfile.TemporaryDirectory() as directory:

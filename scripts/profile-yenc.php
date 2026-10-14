@@ -31,6 +31,13 @@ try {
         throw new InvalidArgumentException('--native must name a readable library file.');
     }
     require dirname(__DIR__).'/vendor/autoload.php';
+    if ($options['prepare_dir'] !== null) {
+        if ($options['size'] === null || $options['density'] === null) {
+            throw new InvalidArgumentException('Preparation requires decoder fixture properties.');
+        }
+        echo json_encode(yencProfilePrepareFixture($options['prepare_dir'], $options['size'], $options['density']), JSON_THROW_ON_ERROR).PHP_EOL;
+        exit(0);
+    }
     $service = new YencService((new DecoderFactory)->make('native', $library));
     $result = yencProfileExecute($service, $options);
     $sourceHashes = [];
@@ -60,13 +67,13 @@ try {
 
 /**
  * @param  list<string>  $arguments
- * @return array{native: string, path: string, size: int|null, density: string|null, iterations: int}
+ * @return array{native: string, path: string, size: int|null, density: string|null, iterations: int, prepare_dir: string|null, fixture_dir: string|null}
  */
 function yencProfileOptions(array $arguments): array
 {
     $values = [];
     foreach ($arguments as $argument) {
-        if (! preg_match('/\A--(native|path|size|density|iterations)=(.+)\z/s', $argument, $match)
+        if (! preg_match('/\A--(native|path|size|density|iterations|prepare-dir|fixture-dir)=(.+)\z/s', $argument, $match)
             || isset($values[$match[1]])) {
             throw new InvalidArgumentException('Use unique --name=value workload options.');
         }
@@ -77,6 +84,15 @@ function yencProfileOptions(array $arguments): array
         throw new InvalidArgumentException('An absolute --native library path is required.');
     }
     $path = $values['path'] ?? 'strict';
+    foreach (['prepare-dir', 'fixture-dir'] as $name) {
+        if (isset($values[$name]) && (! str_starts_with($values[$name], '/') || str_contains($values[$name], "\0"))) {
+            throw new InvalidArgumentException('--'.$name.' requires an absolute directory path.');
+        }
+    }
+    if ((isset($values['prepare-dir']) && isset($values['fixture-dir']))
+        || ($path === 'metadata' && (isset($values['prepare-dir']) || isset($values['fixture-dir'])))) {
+        throw new InvalidArgumentException('Fixture preparation/loading cannot be combined or used with metadata.');
+    }
     $density = $values['density'] ?? 'ordinary';
     if (! in_array($path, ['strict', 'tolerant', 'body', 'metadata'], true)
         || ! in_array($density, ['ordinary', 'heavy'], true)) {
@@ -95,7 +111,8 @@ function yencProfileOptions(array $arguments): array
     }
 
     return ['native' => $native, 'path' => $path, 'size' => $path === 'metadata' ? null : $values['size'],
-        'density' => $path === 'metadata' ? null : $density, 'iterations' => $values['iterations']];
+        'density' => $path === 'metadata' ? null : $density, 'iterations' => $values['iterations'],
+        'prepare_dir' => $values['prepare-dir'] ?? null, 'fixture_dir' => $values['fixture-dir'] ?? null];
 }
 
 /** @return array{data: string, article: string} */
@@ -111,7 +128,7 @@ function yencProfileFixture(int $size, string $density): array
 }
 
 /**
- * @param  array{native: string, path: string, size: int|null, density: string|null, iterations: int}  $options
+ * @param  array{native: string, path: string, size: int|null, density: string|null, iterations: int, prepare_dir: string|null, fixture_dir: string|null}  $options
  * @return array<string, mixed>
  */
 function yencProfileExecute(YencService $service, array $options): array
@@ -122,7 +139,8 @@ function yencProfileExecute(YencService $service, array $options): array
     if ($options['size'] === null || $options['density'] === null) {
         throw new InvalidArgumentException('Decoder paths require fixture size and density.');
     }
-    $fixture = yencProfileFixture($options['size'], $options['density']);
+    $fixture = $options['fixture_dir'] === null ? yencProfileFixture($options['size'], $options['density'])
+        : yencProfileLoadFixture($options['fixture_dir'], $options['size'], $options['density']);
     $stream = null;
     $harness = null;
     $wire = null;
@@ -166,7 +184,8 @@ function yencProfileExecute(YencService $service, array $options): array
             'input_sha256' => hash('sha256', $fixture['article']),
             'wire_sha256' => $wire === null ? null : hash('sha256', $wire),
             'output_sha256' => hash('sha256', $fixture['data']),
-            'profile_boundary' => 'Whole process: autoload, native capability probes, fixture setup, warmup, executed decoder calls, exact-output verification and reporting.',
+            'fixture_source' => $options['fixture_dir'] === null ? 'in_memory_encoding' : 'prepared_files',
+            'profile_boundary' => 'Whole process: autoload, native capability probes, '.($options['fixture_dir'] === null ? 'fixture encoding' : 'prepared fixture loading and hash verification').', stream setup, warmup, executed decoder calls, exact-output verification and reporting.',
             'claim_limit' => 'Executed-call attribution only; instrumented profiles do not establish latency, comparative speed or production capacity.',
         ];
     } finally {
@@ -193,6 +212,83 @@ function yencProfileMetadataFixture(): array
         "Newsgroups: alt.test\r\n",
         "Lines: 3\r\n",
     ]];
+}
+
+/** @return array<string, mixed> */
+function yencProfilePrepareFixture(string $directory, int $size, string $density): array
+{
+    if (! str_starts_with($directory, '/') || str_contains($directory, "\0") || file_exists($directory) || is_link($directory)) {
+        throw new InvalidArgumentException('Preparation requires a new absolute fixture directory.');
+    }
+    $fixture = yencProfileFixture($size, $density);
+    if (! mkdir($directory, 0700)) {
+        throw new RuntimeException('Unable to reserve fixture directory.');
+    }
+    $created = [];
+    $complete = false;
+    try {
+        $manifest = ['schema_version' => 1, 'size' => $size, 'density' => $density,
+            'data_bytes' => strlen($fixture['data']), 'article_bytes' => strlen($fixture['article']),
+            'data_sha256' => hash('sha256', $fixture['data']), 'article_sha256' => hash('sha256', $fixture['article'])];
+        foreach (['data' => $fixture['data'], 'article' => $fixture['article'],
+            'manifest.json' => json_encode($manifest, JSON_THROW_ON_ERROR).PHP_EOL] as $name => $contents) {
+            $path = $directory.'/'.$name;
+            $handle = fopen($path, 'x');
+            if ($handle === false) {
+                throw new RuntimeException('Unable to create owned fixture file.');
+            }
+            $created[] = $path;
+            try {
+                if (fwrite($handle, $contents) !== strlen($contents)) {
+                    throw new RuntimeException('Incomplete fixture write.');
+                }
+            } finally {
+                fclose($handle);
+            }
+        }
+        $complete = true;
+
+        return ['status' => 'ok', 'mode' => 'prepare', 'fixture_dir' => $directory, 'manifest' => $manifest];
+    } finally {
+        if (! $complete) {
+            foreach ($created as $path) {
+                unlink($path);
+            }
+            rmdir($directory);
+        }
+    }
+}
+
+/** @return array{data: string, article: string} */
+function yencProfileLoadFixture(string $directory, int $size, string $density): array
+{
+    if (! str_starts_with($directory, '/') || str_contains($directory, "\0") || ! is_dir($directory) || is_link($directory)
+        || $size < 1 || $size > 8388608 || ! in_array($density, ['ordinary', 'heavy'], true)) {
+        throw new RuntimeException('Invalid prepared fixture directory or requested properties.');
+    }
+    $contents = [];
+    foreach (['manifest.json' => 4096, 'data' => $size, 'article' => $size * 2 + (int) ceil($size / 64) * 2 + 256] as $name => $maximum) {
+        $path = $directory.'/'.$name;
+        if (is_link($path) || ! is_file($path) || ! is_readable($path)) {
+            throw new RuntimeException('Prepared fixture requires regular readable owned files.');
+        }
+        $content = file_get_contents($path, length: $maximum + 1);
+        if ($content === false || strlen($content) > $maximum) {
+            throw new RuntimeException('Prepared fixture file exceeds its bounded budget.');
+        }
+        $contents[$name] = $content;
+    }
+    $manifest = json_decode($contents['manifest.json'], true, 16, JSON_THROW_ON_ERROR);
+    if (! is_array($manifest) || ($manifest['schema_version'] ?? null) !== 1
+        || ($manifest['size'] ?? null) !== $size || ($manifest['density'] ?? null) !== $density
+        || ($manifest['data_bytes'] ?? null) !== $size || strlen($contents['data']) !== $size
+        || ($manifest['article_bytes'] ?? null) !== strlen($contents['article'])
+        || ($manifest['data_sha256'] ?? null) !== hash('sha256', $contents['data'])
+        || ($manifest['article_sha256'] ?? null) !== hash('sha256', $contents['article'])) {
+        throw new RuntimeException('Prepared fixture manifest properties, lengths or hashes do not match.');
+    }
+
+    return ['data' => $contents['data'], 'article' => $contents['article']];
 }
 
 /**
