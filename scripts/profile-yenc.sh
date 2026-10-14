@@ -63,8 +63,11 @@ done
 profile_phase=perf-preflight
 perf_available=0
 preflight_exit=0
-timeout --verbose --kill-after=2s 10s sudo -n "$perf_binary" record -e cpu-clock -F 499 \
-    -o "$profile_build/perf-preflight.data" -- /bin/sleep 0.1 \
+timeout --verbose --kill-after=2s 10s sudo -n "$perf_binary" record -e cpu-clock -F 499 --call-graph dwarf,16384 \
+    -o "$profile_build/perf-preflight.data" -- "$(command -v python3)" -c 'import time
+cutoff = time.process_time() + 0.05
+while time.process_time() < cutoff:
+    pass' \
     > "$profile_build/perf-preflight.stdout" 2> "$profile_build/perf-preflight.stderr" || preflight_exit=$?
 printf '%s\n' "$preflight_exit" > "$profile_build/perf-preflight-exit.txt"
 if [[ "$preflight_exit" == 0 ]]; then
