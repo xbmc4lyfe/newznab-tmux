@@ -19,6 +19,26 @@ class YencDecoderTest extends TestCase
         return new YencService;
     }
 
+    public function test_archive_reuse_integrity_requires_valid_single_and_multipart_checksums(): void
+    {
+        $service = $this->service();
+        $data = YencArticles::bytes();
+        $single = YencArticles::article($data);
+        $multipart = YencArticles::part($data, 'archive.rar', 512, 1, 1, 2);
+        foreach ([$single, $multipart] as $article) {
+            [$decoded, $part] = $service->decodeWithFrame($article);
+            $this->assertSame($data, $decoded);
+            $this->assertTrue($service->hasValidatedIntegrity($article, $decoded));
+            $this->assertFalse($service->hasValidatedIntegrity($article, $decoded.'x'));
+            $withoutChecksum = preg_replace('/ (?:pcrc32|crc32)=[0-9a-f]{8}/i', '', $article);
+            $corruptChecksum = preg_replace('/((?:pcrc32|crc32)=)[0-9a-f]{8}/i', '${1}00000000', $article);
+            foreach ([$withoutChecksum, $corruptChecksum] as $invalid) {
+                $this->assertFalse($service->hasValidatedIntegrity($invalid, $decoded));
+                $this->assertEquals([$decoded, $part], $service->decodeWithFrame($invalid));
+            }
+        }
+    }
+
     /** @return iterable<string, array{string}> */
     public static function corpus(): iterable
     {

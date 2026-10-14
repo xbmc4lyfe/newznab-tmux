@@ -98,6 +98,24 @@ class YencService
         return [$decoded, $part];
     }
 
+    /** Validate reuse eligibility without changing the lenient processing result. */
+    public function hasValidatedIntegrity(string $text, string $decoded): bool
+    {
+        $frame = ArticleFrame::parse($text);
+        if ($frame === null) {
+            return false;
+        }
+        $multipart = isset($frame->header['part']) || isset($frame->trailer['part']) || $frame->part !== null;
+        if (! isset($frame->trailer[$multipart ? 'pcrc32' : 'crc32'])) {
+            return false;
+        }
+        try {
+            return $this->decode($text) === $decoded;
+        } catch (RuntimeException) {
+            return false;
+        }
+    }
+
     public function enabled(): bool
     {
         return true;

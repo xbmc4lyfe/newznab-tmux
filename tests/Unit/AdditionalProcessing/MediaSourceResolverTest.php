@@ -17,6 +17,7 @@ use dariusiii\rarinfo\Par2Info;
 use Mockery;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use Tests\Fixtures\MappingArticleNntpHarness;
 
 class MediaSourceResolverTest extends TestCase
 {
@@ -27,6 +28,29 @@ class MediaSourceResolverTest extends TestCase
     {
         Mockery::close();
         parent::tearDown();
+    }
+
+    #[Test]
+    public function unmatched_integrity_valid_mapping_article_is_discarded_at_the_attempt_boundary(): void
+    {
+        $config = $this->makeConfig(['par2MediaMapping' => true, 'par2VerifyFiles' => 1]);
+        $context = $this->contextFor([
+            $this->entry('<index>', 600),
+            $this->entry('<a>', 20000),
+            $this->entry('<b>', 20000),
+        ], ['par2VerifyFiles' => 1]);
+        $index = $this->par2Index([
+            ['Movie.rar', 20000, str_repeat('EXPECTED-A', 2000)],
+            ['Other.bin', 20000, str_repeat('EXPECTED-B', 2000)],
+        ]);
+        $nntp = new MappingArticleNntpHarness(MappingArticleNntpHarness::body($index, 'index.par2').MappingArticleNntpHarness::body('UNMATCHED', 'opaque'));
+        $download = new UsenetDownloadService($config, $nntp);
+        $download->beginReleaseScope();
+        $resolver = new MediaSourceResolver($config, $download);
+        $this->assertNull($resolver->resolve($context));
+        $this->assertSame(['BODY <index>', 'BODY <a>'], $nntp->sentCommands());
+        $this->assertNull((new \ReflectionProperty($download, 'pendingMappingArticle'))->getValue($download));
+        $this->assertSame(0, (new \ReflectionProperty($download, 'cachedBytes'))->getValue($download));
     }
 
     #[Test]
@@ -42,7 +66,7 @@ class MediaSourceResolverTest extends TestCase
         $download->shouldReceive('download')->once()
             ->with(DownloadKind::Par2Index, ['<index>'], 'alt.binaries.test', 1, Mockery::any(), false)
             ->andReturn($this->ok($this->indexWithVerificationBeforeDescription($name, $data)));
-        $download->shouldNotReceive('downloadArticle');
+        $download->shouldNotReceive('downloadMappingArticle');
 
         $plan = $this->resolver($context, $download, ['par2VerifyFiles' => 0])->resolve($context);
 
@@ -66,7 +90,7 @@ class MediaSourceResolverTest extends TestCase
         ]);
         $download = Mockery::mock(UsenetDownloadService::class);
         $download->shouldReceive('download')->once()->andReturn($this->ok($bytes));
-        $download->shouldNotReceive('downloadArticle');
+        $download->shouldNotReceive('downloadMappingArticle');
 
         $this->assertNull($this->resolver($context, $download)->resolve($context));
     }
@@ -105,13 +129,13 @@ class MediaSourceResolverTest extends TestCase
                 ['Movie.part01.rar', 50000, $part01],
                 ['Movie.part02.rar', 50000, $part02],
             ])));
-        $download->shouldReceive('downloadArticle')
+        $download->shouldReceive('downloadMappingArticle')
             ->once()
-            ->with(DownloadKind::MediaSource, '<vol-a>.1', 'alt.binaries.test', 1)
+            ->with('<vol-a>.1', 'alt.binaries.test', 1)
             ->andReturn($this->ok($part02, new YencPart('a1b2', 50000, 1, 1, 25000)));
-        $download->shouldReceive('downloadArticle')
+        $download->shouldReceive('downloadMappingArticle')
             ->once()
-            ->with(DownloadKind::MediaSource, '<vol-b>.1', 'alt.binaries.test', 1)
+            ->with('<vol-b>.1', 'alt.binaries.test', 1)
             ->andReturn($this->ok($part01, new YencPart('c3d4', 50000, 1, 1, 25000)));
 
         $plan = $this->resolver($context, $download, ['par2VerifyFiles' => 2])->resolve($context);
@@ -139,7 +163,7 @@ class MediaSourceResolverTest extends TestCase
             ['Movie.part02.rar', 50000, 'SECOND'],
             ['Movie.part03.rar', 50000, 'THIRD'],
         ])));
-        $download->shouldReceive('downloadArticle')->once()->andReturn($this->ok('UNRELATED'));
+        $download->shouldReceive('downloadMappingArticle')->once()->andReturn($this->ok('UNRELATED'));
 
         $this->assertNull($this->resolver($context, $download, ['par2VerifyFiles' => 1])->resolve($context));
     }
@@ -167,7 +191,7 @@ class MediaSourceResolverTest extends TestCase
         $context->mediaBudget->spend(8);
         $download = Mockery::mock(UsenetDownloadService::class);
         $download->shouldNotReceive('download');
-        $download->shouldNotReceive('downloadArticle');
+        $download->shouldNotReceive('downloadMappingArticle');
 
         $this->assertNull($this->resolver($context, $download)->resolve($context));
     }
@@ -210,6 +234,9 @@ class MediaSourceResolverTest extends TestCase
      */
     private function resolver(ReleaseProcessingContext $context, UsenetDownloadService $download, array $config = []): MediaSourceResolver
     {
+        $download->shouldReceive('retainMappedArchiveArticle')->zeroOrMoreTimes()->andReturnNull();
+        $download->shouldReceive('discardPendingMappingArticle')->zeroOrMoreTimes()->andReturnNull();
+
         return new MediaSourceResolver($this->makeConfig(['par2MediaMapping' => true, ...$config]), $download);
     }
 

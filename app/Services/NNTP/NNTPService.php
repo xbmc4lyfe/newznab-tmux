@@ -1150,6 +1150,22 @@ class NNTPService extends NntpClient
      */
     public function getMessagesByMessageID(mixed $identifiers, bool $alternate = false): mixed
     {
+        return $this->readOrderedMessages($identifiers, $alternate);
+    }
+
+    /**
+     * Reuse articles at their original loop position; unresolved failures still stop the batch.
+     *
+     * @param  callable(mixed): ?string  $lookup
+     * @param  callable(int): void  $onReused
+     */
+    public function getMessagesByMessageIDWithArticleReuse(mixed $identifiers, bool $alternate, callable $lookup, callable $onReused): mixed
+    {
+        return $this->readOrderedMessages($identifiers, $alternate, $lookup, $onReused);
+    }
+
+    private function readOrderedMessages(mixed $identifiers, bool $alternate, ?callable $lookup = null, ?callable $onReused = null): mixed
+    {
         $connected = $this->_checkConnection(false); // no need to reselect group
         if ($connected !== true) {
             return $connected; // error passthrough
@@ -1157,7 +1173,7 @@ class NNTPService extends NntpClient
 
         $body = '';
         $aConnected = false;
-        $alt = ($alternate ? new self : null);
+        $alt = ($alternate ? $this->previewAlternateConnection() : null);
 
         // Normalise to array for loop processing
         $ids = is_array($identifiers) ? $identifiers : [$identifiers];
@@ -1168,7 +1184,13 @@ class NNTPService extends NntpClient
             if ((++$loops * $messageSize) >= 1700000000) { // prevent huge string growth
                 return $body;
             }
-            $msg = $this->_getMessageByMessageID($id);
+            $reused = $lookup === null ? null : $lookup($id);
+            if ($reused !== null) {
+                $msg = $reused;
+                $onReused(strlen($reused));
+            } else {
+                $msg = $this->_getMessageByMessageID($id);
+            }
             if (! self::isError($msg)) {
                 $body .= $msg;
                 if ($messageSize === 0) {
@@ -1244,14 +1266,30 @@ class NNTPService extends NntpClient
      */
     public function getArticleByMessageID(string $identifier, bool $alternate = false): array|NntpError
     {
+        return $this->readArticleWithMetadata($identifier, $alternate);
+    }
+
+    /**
+     * @param  callable(string, YencPart): void  $onValidatedPrimary
+     * @return array{data: string, part: YencPart|null}|NntpError
+     */
+    public function getArticleForArchiveMapping(string $identifier, bool $alternate, callable $onValidatedPrimary): array|NntpError
+    {
+        return $this->readArticleWithMetadata($identifier, $alternate, $onValidatedPrimary);
+    }
+
+    /** @return array{data: string, part: YencPart|null}|NntpError */
+    private function readArticleWithMetadata(string $identifier, bool $alternate, ?callable $onValidatedPrimary = null): array|NntpError
+    {
         $connected = $this->_checkConnection(false);
         if ($connected !== true) {
             return $connected instanceof NntpError ? $connected : $this->throwError('Unable to connect to usenet!');
         }
 
         $raw = $this->_getMessageByMessageID($identifier, true);
+        $primary = is_string($raw) && $this->_currentServer === $this->_configServer;
         if (self::isError($raw) && $alternate) {
-            $alt = new self;
+            $alt = $this->previewAlternateConnection();
             $altConnected = $this->_currentServer === $this->_configServer
                 ? $alt->doConnect($this->_configCompressedHeaders, true)
                 : $alt->doConnect();
@@ -1266,6 +1304,10 @@ class NNTPService extends NntpClient
 
         $this->_yencService ??= app(YencService::class);
         [$data, $part] = $this->_yencService->decodeWithFrame($raw);
+        if ($primary && $onValidatedPrimary !== null && $part !== null
+            && $this->_yencService->hasValidatedIntegrity($raw, $data)) {
+            $onValidatedPrimary($data, $part);
+        }
 
         return ['data' => $data, 'part' => $part];
 
