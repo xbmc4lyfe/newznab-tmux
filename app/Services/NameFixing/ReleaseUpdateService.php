@@ -787,6 +787,22 @@ class ReleaseUpdateService
     /** Update a status only while the captured release remains unchanged and unlinked. */
     public function updateSnapshotColumn(object $release, string $column, int $status): bool
     {
+        return $this->updateSnapshotStatus($release, $column, $status, 0);
+    }
+
+    /** Complete filename inspection only while the captured identity and PreDB link remain unchanged. */
+    public function completeFilenameSnapshot(object $release): bool
+    {
+        $predbId = filter_var($release->predb_id ?? 0, FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
+        if ($predbId === false) {
+            return false;
+        }
+
+        return $this->updateSnapshotStatus($release, 'proc_files', self::PROC_FILES_DONE, $predbId);
+    }
+
+    private function updateSnapshotStatus(object $release, string $column, int $status, int $expectedPredbId): bool
+    {
         if (! in_array($column, self::SINGLE_UPDATE_COLUMNS, true) || $column === 'predb_id') {
             throw new InvalidArgumentException("Unsupported release status column [{$column}].");
         }
@@ -796,7 +812,7 @@ class ReleaseUpdateService
             return false;
         }
         $release->releases_id = $snapshot['id'];
-        $updated = $this->predbSnapshotQuery($release)->update([$column => $status]);
+        $updated = $this->releaseSnapshotQuery($release)->where('predb_id', $expectedPredbId)->update([$column => $status]);
         if ($updated > 0 && $column === 'proc_par2' && $status === 1) {
             $this->clearCompletedPar2Progress($snapshot['id'], $snapshot);
         }
