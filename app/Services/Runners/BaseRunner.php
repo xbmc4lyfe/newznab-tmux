@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Runners;
 
+use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Symfony\Component\Process\Exception\ProcessTimedOutException;
@@ -15,6 +16,31 @@ abstract class BaseRunner
     protected array $workerOutcomes = [];
 
     private bool $cancellationRequested = false;
+
+    private bool $drainRequested = false;
+
+    private float $lastDrainCheckAt = 0.0;
+
+    protected function hasDrainRequest(bool $refresh = false): bool
+    {
+        if (! $this->drainRequested && ($refresh || microtime(true) - $this->lastDrainCheckAt >= 0.25)) {
+            $this->lastDrainCheckAt = microtime(true);
+            if (app()->bound('db') && app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                $this->drainRequested = true;
+            }
+        }
+
+        return $this->drainRequested;
+    }
+
+    protected function workerStarting(string|int $key): void {}
+
+    protected function workerCompleted(string|int $key, string $output): void {}
+
+    protected function workerConcurrencyKey(string|int $key): string|int|null
+    {
+        return null;
+    }
 
     /**
      * Resolve the configured worker timeout in seconds.
@@ -64,7 +90,7 @@ abstract class BaseRunner
     /** @param string|list<string> $command */
     protected function executeCommand(string|array $command): string
     {
-        return $this->runWorkerPool([$command], 1, $this->concurrencyTimeout(), false)[0];
+        return $this->runWorkerPool([$command], 1, $this->concurrencyTimeout(), false)[0] ?? '';
     }
 
     protected function headerStart(string $workType, int $count, int $maxProcesses): void
@@ -137,6 +163,10 @@ abstract class BaseRunner
                     $this->cancellationRequested = true;
                 });
             }
+            $handlers[SIGUSR1] = pcntl_signal_get_handler(SIGUSR1);
+            pcntl_signal(SIGUSR1, function (): void {
+                $this->drainRequested = true;
+            });
         }
 
         try {
@@ -144,13 +174,34 @@ abstract class BaseRunner
                 if ($this->isCancellationRequested()) {
                     break;
                 }
-                while (! $this->isCancellationRequested() && count($running) < max(1, $maxProcesses) && $queue !== []) {
-                    $key = array_key_first($queue);
+                if ($this->hasDrainRequest() && $running === []) {
+                    break;
+                }
+                while (! $this->isCancellationRequested() && ! $this->hasDrainRequest(true) && count($running) < max(1, $maxProcesses) && $queue !== []) {
+                    $key = null;
+                    $busy = [];
+                    foreach (array_keys($running) as $runningKey) {
+                        $group = $this->workerConcurrencyKey($runningKey);
+                        if ($group !== null) {
+                            $busy[$group] = true;
+                        }
+                    }
+                    foreach (array_keys($queue) as $queuedKey) {
+                        $group = $this->workerConcurrencyKey($queuedKey);
+                        if ($group === null || ! isset($busy[$group])) {
+                            $key = $queuedKey;
+                            break;
+                        }
+                    }
+                    if ($key === null) {
+                        break;
+                    }
                     $process = $this->workerProcess($queue[$key]);
                     unset($queue[$key]);
                     $process->setTimeout($timeout);
                     $running[$key] = $process;
                     try {
+                        $this->workerStarting($key);
                         $process->start($stream ? static function (string $type, string $buffer): void {
                             echo $buffer;
                         } : null);
@@ -180,6 +231,9 @@ abstract class BaseRunner
                     }
                     $this->recordWorkerOutcome($key, $status, $process->getExitCode(), $this->outputTail($process));
                     unset($running[$key]);
+                    if ($status === 'success') {
+                        $this->workerCompleted($key, $output);
+                    }
                     if ($onComplete !== null && $status === 'success') {
                         $onComplete($key, $output);
                     }
@@ -210,8 +264,9 @@ abstract class BaseRunner
                 }
                 $this->recordWorkerOutcome($key, 'cancellation', $process->getExitCode());
             }
+            $queuedOutcome = $this->drainRequested && ! $this->isCancellationRequested() ? 'drained' : 'cancellation';
             foreach ($queue as $key => $command) {
-                $this->recordWorkerOutcome($key, 'cancellation', null);
+                $this->recordWorkerOutcome($key, $queuedOutcome, null);
             }
             foreach ($handlers as $signal => $handler) {
                 pcntl_signal($signal, $handler);
@@ -221,7 +276,7 @@ abstract class BaseRunner
             }
         }
 
-        $failed = array_filter($this->workerOutcomes, static fn (array $outcome): bool => $outcome['status'] !== 'success');
+        $failed = array_filter($this->workerOutcomes, static fn (array $outcome): bool => ! in_array($outcome['status'], ['success', 'drained'], true));
         if ($failed !== []) {
             throw new RuntimeException('Worker batch did not succeed: '.implode(', ', array_map(
                 static fn (string|int $key, array $outcome): string => $key.' '.$outcome['status'].($outcome['status'] === 'timeout' ? ' exceeded the timeout' : '').' (exit '.($outcome['exit_code'] ?? 'none').')',
@@ -240,7 +295,7 @@ abstract class BaseRunner
     private function recordWorkerOutcome(string|int $key, string $status, ?int $exitCode, string $outputTail = ''): void
     {
         $this->workerOutcomes[$key] = ['status' => $status, 'exit_code' => $exitCode];
-        if ($status !== 'success') {
+        if (! in_array($status, ['success', 'drained'], true)) {
             Log::error('Multiprocessing worker did not succeed', [
                 'worker' => $key,
                 'outcome' => $status,

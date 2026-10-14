@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Predb\Stream;
 
+use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Services\Predb\Feeds\Sources\PredbClubSource;
@@ -46,13 +47,18 @@ class PredbStreamListener
         }
     }
 
-    public function run(): never
+    public function run(): void
     {
         $this->client->connect();
         $this->say('connected');
         $connectedAt = time();
 
         while (true) {
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                $this->client->close();
+
+                return;
+            }
             $message = $this->client->receive(self::IDLE_PING_SECONDS);
 
             if ($message === null) {

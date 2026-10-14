@@ -7,11 +7,13 @@ namespace Tests\Feature;
 use App\Console\Commands\TmuxStart;
 use App\Enums\TmuxMode;
 use App\Enums\TmuxPaneRole;
+use App\Services\Runners\BaseRunner;
 use App\Services\Tmux\TmuxCommand;
 use App\Services\Tmux\TmuxLayoutBuilder;
 use App\Services\Tmux\TmuxPaneManager;
 use App\Services\Tmux\TmuxSessionManager;
 use App\Services\Tmux\TmuxTaskRunner;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Symfony\Component\Process\Process;
@@ -389,9 +391,261 @@ PHP;
         $this->assertSame(1, substr_count($output, 'child='));
         $this->assertFalse(posix_kill($childPid, 0), 'The owned child process must be gone when stop returns.');
         $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
-        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('stop_requested'));
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('stop_requested'));
         $this->assertFalse($session->sessionExists());
         $this->assertTrue($keeper->sessionExists());
+        $standalone = new class extends BaseRunner
+        {
+            public function run(): string
+            {
+                return $this->executeCommand([PHP_BINARY, '-r', 'echo "standalone after real stop";']);
+            }
+        };
+        $this->assertSame('standalone after real stop', $standalone->run());
+    }
+
+    public function test_stop_clears_a_stale_stop_request_when_the_isolated_tmux_server_is_absent(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true, 'stop_requested' => true]);
+
+        $this->artisan('tmux:stop --session=absent --force')->assertExitCode(0);
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('stop_requested'));
+    }
+
+    public function test_drain_finishes_active_subprocesses_without_starting_the_queue_or_later_shell_commands(): void
+    {
+        $database = $this->temporaryFile();
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => $database]);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true, 'stop_requested' => false]);
+        $session = new TmuxSessionManager('cooperative');
+        $pane = $session->createSession();
+        $this->assertNotNull($pane);
+        $panes = new TmuxPaneManager('cooperative');
+        $this->assertTrue($panes->setPaneRole($pane, TmuxPaneRole::Binaries));
+        $marker = $this->temporaryFile();
+        $script = <<<'PHP'
+require $argv[1].'/vendor/autoload.php';
+$app = new Illuminate\Foundation\Application($argv[1]);
+$app->instance('log', new Psr\Log\NullLogger);
+$capsule = new Illuminate\Database\Capsule\Manager;
+$capsule->addConnection(['driver' => 'sqlite', 'database' => $argv[3]]);
+$capsule->setAsGlobal();
+$capsule->bootEloquent();
+$app->instance('db', $capsule->getDatabaseManager());
+$app->instance('db.schema', $capsule->getConnection()->getSchemaBuilder());
+Illuminate\Support\Facades\Facade::setFacadeApplication($app);
+$runner = new class extends App\Services\Runners\BaseRunner {
+    public function batch(string $marker): void {
+        $this->runParallelCommands([
+            'active' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "started\n"); usleep(700000); file_put_contents($argv[1], "finished\n", FILE_APPEND); echo "persisted";', $marker],
+            'queued' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "queued\n", FILE_APPEND);', $marker],
+        ], 1, 10);
+    }
+};
+$runner->batch($argv[2]);
+PHP;
+        $runner = new TmuxTaskRunner('cooperative');
+        $worker = implode(' ', array_map('escapeshellarg', [PHP_BINARY, '-r', $script, base_path(), $marker, $database]));
+        $batch = (new \ReflectionMethod($runner, 'batchCommand'))->invoke($runner, [$worker, 'printf "later shell command\\n" >> '.escapeshellarg($marker)]);
+        $this->assertTrue($panes->respawnPane($pane, ['bash', '-c', $runner->buildCommand($batch, ['sleep' => 30])]));
+        $this->await(static fn (): bool => str_contains(file_get_contents($marker), 'started'));
+
+        $started = microtime(true);
+        $exitCode = Artisan::call('tmux:drain', ['--session' => 'cooperative', '--timeout' => 5]);
+        $capture = new Process(TmuxCommand::arguments(['capture-pane', '-p', '-t', $pane]));
+        $capture->run();
+        $this->assertSame(0, $exitCode, Artisan::output().$capture->getOutput());
+        $this->assertLessThan(3, microtime(true) - $started, 'Drain must skip the cooldown after active work finishes.');
+        $this->assertSame("started\nfinished\n", file_get_contents($marker));
+        $panes->refresh();
+        $this->assertFalse($panes->isAlive($pane));
+        $this->assertTrue($session->sessionExists());
+        $this->artisan('tmux:drain --session=cooperative --resume')->assertExitCode(0);
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+    }
+
+    public function test_drain_ownership_preserves_prior_pauses_and_rejected_attempts_on_a_real_socket(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true, 'stop_requested' => false]);
+        $session = new TmuxSessionManager('ownership');
+        $pane = $session->createSession();
+        $this->assertNotNull($pane);
+        $panes = new TmuxPaneManager('ownership');
+        $this->assertTrue($panes->setPaneRole($pane, TmuxPaneRole::Binaries));
+        $this->await(function () use ($panes, $pane): bool {
+            $panes->refresh();
+
+            return ! $panes->isAlive($pane);
+        });
+        $this->artisan('tmux:drain --session=ownership --timeout=0')->assertExitCode(0);
+        $this->artisan('tmux:drain --session=ownership --timeout=0 --token=deployment')->assertExitCode(0);
+        $this->artisan('tmux:drain --session=ownership --resume --token=deployment')->assertExitCode(0);
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->assertTrue($panes->respawnPane($pane, ['sleep', '30']));
+        $this->artisan('tmux:drain --session=ownership --timeout=0 --token=rejected')->assertExitCode(1);
+        $this->artisan('tmux:drain --session=ownership --resume --token=rejected')->assertExitCode(0);
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('stop_requested'));
+        $panes->refresh();
+        $this->assertTrue($panes->isAlive($pane));
+        $this->artisan('tmux:drain --session=ownership --resume')->assertExitCode(0);
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+    }
+
+    public function test_concurrent_drain_control_is_rejected_and_process_death_releases_the_lock(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true, 'stop_requested' => false]);
+        $session = new TmuxSessionManager('locked');
+        $pane = $session->createSession();
+        $this->assertNotNull($pane);
+        $panes = new TmuxPaneManager('locked');
+        $this->await(function () use ($panes, $pane): bool {
+            $panes->refresh();
+
+            return ! $panes->isAlive($pane);
+        });
+        $this->artisan('tmux:drain --session=locked --timeout=0 --token=owner')->assertExitCode(0);
+        $path = sys_get_temp_dir().'/nntmux-drain-'.hash('sha256', json_encode(TmuxCommand::arguments(['locked']), JSON_THROW_ON_ERROR)).'.lock';
+        $holder = new Process([PHP_BINARY, '-r', '$lock = fopen($argv[1], "c"); flock($lock, LOCK_EX); echo "locked"; fflush(STDOUT); sleep(30);', $path]);
+        $holder->start();
+        try {
+            $this->await(static fn (): bool => $holder->getOutput() === 'locked');
+            $this->artisan('tmux:drain --session=locked --timeout=0 --token=rejected')->assertExitCode(1);
+            $this->artisan('tmux:drain --session=locked --resume --token=owner')->assertExitCode(1);
+            $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        } finally {
+            $holder->stop(0);
+        }
+        $this->artisan('tmux:drain --session=locked --resume --token=rejected')->assertExitCode(0);
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->artisan('tmux:drain --session=locked --resume --token=owner')->assertExitCode(0);
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+    }
+
+    public function test_drain_timeout_preserves_a_real_active_worker_and_restores_processing(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true, 'stop_requested' => false]);
+        $session = new TmuxSessionManager('drain-timeout');
+        $pane = $session->createSession();
+        $this->assertNotNull($pane);
+        $panes = new TmuxPaneManager('drain-timeout');
+        $this->assertTrue($panes->setPaneRole($pane, TmuxPaneRole::Binaries));
+        $marker = $this->temporaryFile();
+        $this->assertTrue($panes->respawnPane($pane, [PHP_BINARY, '-r', 'file_put_contents($argv[1], "started\n"); usleep(700000); file_put_contents($argv[1], "finished\n", FILE_APPEND);', $marker]));
+        $this->await(static fn (): bool => str_contains(file_get_contents($marker), 'started'));
+
+        $this->artisan('tmux:drain --session=drain-timeout --timeout=0')->assertExitCode(1);
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('stop_requested'));
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->assertTrue($session->sessionExists());
+        $this->await(static fn (): bool => str_contains(file_get_contents($marker), 'finished'));
+        $this->assertSame("started\nfinished\n", file_get_contents($marker));
+    }
+
+    #[DataProvider('monitorRecoveryModes')]
+    public function test_drain_restores_an_exited_monitor_on_an_isolated_tmux_socket(bool $timeout): void
+    {
+        $root = sys_get_temp_dir().'/nntmux-drain-monitor-'.bin2hex(random_bytes(8));
+        mkdir($root, 0700);
+        touch($root.'/runtime.sqlite');
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => $root.'/runtime.sqlite']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true, 'stop_requested' => false]);
+        Artisan::all();
+        $originalBase = base_path();
+        $script = '<?php require '.var_export($originalBase.'/vendor/autoload.php', true).'; '
+            .'$app = require '.var_export($originalBase.'/bootstrap/app.php', true).'; '
+            .'$app->make(Illuminate\\Contracts\\Console\\Kernel::class)->bootstrap(); '
+            .'config(["database.default" => "sqlite", "database.connections.sqlite.database" => __DIR__."/runtime.sqlite"]); '
+            .'Illuminate\\Support\\Facades\\DB::purge("sqlite"); '
+            .'$monitor = new App\\Services\\Tmux\\TmuxMonitorService; '
+            .'file_put_contents(__DIR__."/events", "started ".implode(" ", $argv)."\\n", FILE_APPEND); '
+            .'while ($monitor->shouldContinue()) { usleep(20000); } '
+            .'file_put_contents(__DIR__."/events", "stopped\\n", FILE_APPEND);';
+        file_put_contents($root.'/artisan', $script);
+        $session = new TmuxSessionManager('monitor-recovery');
+        try {
+            $monitor = $session->createSession();
+            $this->assertNotNull($monitor, (string) $session->lastError());
+            $panes = new TmuxPaneManager('monitor-recovery');
+            $this->assertTrue($panes->setPaneRole($monitor, TmuxPaneRole::Monitor));
+            if ($timeout) {
+                $worker = $panes->createWindow(1, 'Worker');
+                $this->assertNotNull($worker);
+                $this->assertTrue($panes->setPaneRole($worker, TmuxPaneRole::Binaries));
+                $this->assertTrue($panes->respawnPane($worker, ['sleep', '60']));
+            }
+            $this->app->setBasePath($root);
+            $this->assertTrue($panes->respawnPane($monitor, TmuxCommand::monitor('monitor-recovery')));
+            $this->await(static fn (): bool => is_file($root.'/events') && str_contains(file_get_contents($root.'/events'), 'started'));
+
+            $exitCode = Artisan::call('tmux:drain', ['--session' => 'monitor-recovery', '--timeout' => 1]);
+            $this->assertSame($timeout ? 1 : 0, $exitCode, Artisan::output());
+            $this->assertStringContainsString('stopped', file_get_contents($root.'/events'));
+            if (! $timeout) {
+                $panes->refresh();
+                $this->assertFalse($panes->isAlive($monitor));
+                $this->assertSame(0, Artisan::call('tmux:drain', ['--session' => 'monitor-recovery', '--resume' => true]), Artisan::output());
+            }
+            $this->await(static fn (): bool => substr_count(file_get_contents($root.'/events'), 'started') === 2);
+            $panes->refresh();
+            $this->assertTrue($panes->isAlive($monitor));
+            $this->assertStringContainsString('tmux:monitor --session=monitor-recovery', file_get_contents($root.'/events'));
+            $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('stop_requested'));
+            $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        } finally {
+            $session->killSession();
+            $this->app->setBasePath($originalBase);
+            DB::purge('sqlite');
+            app('files')->deleteDirectory($root);
+        }
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function monitorRecoveryModes(): iterable
+    {
+        yield 'resume' => [false];
+        yield 'timeout' => [true];
+    }
+
+    public function test_drain_wakes_a_pane_already_in_its_cooldown(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => false, 'stop_requested' => false]);
+        $session = new TmuxSessionManager('sleeping-drain');
+        $pane = $session->createSession();
+        $this->assertNotNull($pane);
+        $panes = new TmuxPaneManager('sleeping-drain');
+        $this->assertTrue($panes->setPaneRole($pane, TmuxPaneRole::PostAdditional));
+        $runner = new TmuxTaskRunner('sleeping-drain');
+        $this->assertTrue($panes->respawnPane($pane, ['bash', '-c', $runner->buildCommand('true', ['sleep' => 300])]));
+        $this->await(function () use ($pane): bool {
+            $capture = new Process(TmuxCommand::arguments(['capture-pane', '-p', '-t', $pane]));
+            $capture->run();
+
+            return str_contains($capture->getOutput(), 'Sleeping');
+        });
+
+        $started = microtime(true);
+        $this->artisan('tmux:drain --session=sleeping-drain --timeout=3')->assertExitCode(0);
+        $this->assertLessThan(2.5, microtime(true) - $started);
+        $panes->refresh();
+        $this->assertFalse($panes->isAlive($pane));
+        $this->assertTrue($session->sessionExists());
+        $this->artisan('tmux:drain --session=sleeping-drain --resume')->assertExitCode(0);
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('stop_requested'));
     }
 
     /** @param list<string> $arguments */
