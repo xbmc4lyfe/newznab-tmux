@@ -87,6 +87,7 @@ final class YencBenchmarkTest extends TestCase
                 }
             }
             $this->assertSame('invalid', $rows[array_key_last($rows)]['status']);
+            $this->assertTrue($rows[array_key_last($rows)]['bootstrap_worker_identity_stable']);
             $this->assertFalse($rows[array_key_last($rows)]['rust_speed_advantage_demonstrated_for_every_stratum']);
             $this->assertCount(36, glob($directory.'/paired/*.stderr'));
         } finally {
@@ -98,6 +99,43 @@ final class YencBenchmarkTest extends TestCase
                 rmdir($directory.'/paired');
             }
             unlink($directory.'/not-a-library.so');
+            rmdir($directory);
+        }
+    }
+
+    public function test_paired_run_rejects_bootstrap_worker_drift_after_the_last_stratum(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-bootstrap-drift-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        $library = dirname(__DIR__, 2).'/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.'.(PHP_OS_FAMILY === 'Darwin' ? 'dylib' : 'so');
+        ob_start(static function (string $chunk) use ($directory): string {
+            if (str_contains($chunk, '"type":"stratum_summary"') && str_contains($chunk, '"path":"body"') && str_contains($chunk, '"density":"heavy"')) {
+                file_put_contents($directory.'/paired/nntmux-yenc-bootstrap', 'changed after the final decision');
+            }
+
+            return '';
+        }, 1);
+        try {
+            $code = runPairedYencBenchmark(['php-baseline' => false, 'rust-native' => $library,
+                'size' => 64, 'order-seed' => 123, 'output-dir' => $directory.'/paired'], 3);
+            $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
+                file($directory.'/paired/observations.jsonl', FILE_IGNORE_NEW_LINES));
+            $strata = array_values(array_filter($rows, static fn (array $row): bool => $row['type'] === 'stratum_summary'));
+            $this->assertCount(6, $strata);
+            if (PHP_OS_FAMILY === 'Linux') {
+                $this->assertNotContains('invalid', array_column($strata, 'decision'));
+            }
+            $this->assertSame(2, $code);
+            $summary = $rows[array_key_last($rows)];
+            $this->assertSame('invalid', $summary['status']);
+            $this->assertFalse($summary['bootstrap_worker_identity_stable'] ?? true);
+            $this->assertFalse($summary['rust_speed_advantage_demonstrated_for_every_stratum']);
+        } finally {
+            ob_end_clean();
+            foreach (glob($directory.'/paired/*') as $path) {
+                unlink($path);
+            }
+            rmdir($directory.'/paired');
             rmdir($directory);
         }
     }

@@ -492,10 +492,12 @@ function runPairedYencBenchmark(array $options, int $samples): int
                 }
             }
         }
-        $invalid = array_any($summaries, static fn (array $summary): bool => $summary['decision'] === 'invalid');
+        $bootstrapStable = (is_file($bootstrapPath) ? hash_file('sha256', $bootstrapPath) : null) === $bootstrapArtifact['sha256'];
+        $invalid = ! $bootstrapStable || array_any($summaries, static fn (array $summary): bool => $summary['decision'] === 'invalid');
         $regressed = array_any($summaries, static fn (array $summary): bool => $summary['decision'] === 'regression');
         $allImproved = array_all($summaries, static fn (array $summary): bool => $summary['decision'] === 'useful_improvement');
         $emit(['type' => 'run_summary', 'status' => $invalid ? 'invalid' : ($regressed ? 'regression' : ($allImproved ? 'useful_improvement' : 'inconclusive')),
+            'bootstrap_worker_identity_stable' => $bootstrapStable,
             'rust_speed_advantage_demonstrated_for_every_stratum' => ! $invalid && $allImproved,
             'strata' => count($summaries), 'claim_limit' => $protocol['claim_limit']]);
 
