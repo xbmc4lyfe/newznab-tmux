@@ -5,6 +5,8 @@ on:
     paths:
       - '.github/workflows/yenc-performance.yml'
       - 'scripts/benchmark-yenc.php'
+      - 'scripts/benchmark-article-processing.php'
+      - 'tests/Unit/ArticleProcessingBenchmarkTest.php'
       - 'scripts/benchmark-yenc-abi.py'
       - 'scripts/benchmark-cpu.py'
       - 'tests/Unit/test_benchmark_cpu.py'
@@ -27,7 +29,7 @@ on:
       comparison:
         description: Baseline to compare against Rust
         type: choice
-        options: [all, php, cpp]
+        options: [all, php, cpp, profile]
         default: all
       samples:
         description: Matched fresh-process pairs per fixture stratum
@@ -47,7 +49,7 @@ concurrency:
 
 jobs:
   paired-decoding:
-    if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'php'
+    if: github.event_name != 'workflow_dispatch' || inputs.comparison == 'all' || inputs.comparison == 'cpp'
     # PR code runs only on disposable GitHub-hosted workers.
     strategy:
       fail-fast: false
@@ -260,9 +262,104 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  article-processing:
+    name: Article processing profile (${{ matrix.runner }})
+    if: github.event_name == 'workflow_dispatch' && inputs.comparison == 'profile'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      RUST_TOOLCHAIN: '1.98.0'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: dom, curl, ffi, intl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite
+          coverage: none
+
+      - name: Install locked PHP dependencies without application boot
+        run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
+        env:
+          COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ secrets.GITHUB_TOKEN }}"}}'
+
+      - name: Build and test locked native parsers
+        shell: bash
+        run: |
+          mkdir -p processing-evidence/build
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-test.log
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-build.log
+          cp docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so processing-evidence/build/native.so
+
+      - name: Test real processing profile workers
+        env:
+          NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
+        run: php -d ffi.enable=true -d memory_limit=1G vendor/bin/phpunit --fail-on-skipped tests/Unit/ArticleProcessingBenchmarkTest.php
+
+      - name: Freeze build and runtime identity
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ctypes, hashlib, json, os, pathlib, subprocess
+          def run(*args):
+              return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
+          def digest(path):
+              return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+          library = pathlib.Path('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')
+          decoder = ctypes.CDLL(str(library.resolve()))
+          decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          manifest = {
+              'git_head': run('git', 'rev-parse', 'HEAD'),
+              'runner_arch': os.environ.get('RUNNER_ARCH'),
+              'runner_image_os': os.environ.get('ImageOS'),
+              'runner_image_version': os.environ.get('ImageVersion'),
+              'github_run_id': os.environ.get('GITHUB_RUN_ID'),
+              'cpu': run('lscpu'), 'uname': run('uname', '-a'), 'php': run('php', '-v'),
+              'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
+              'rust_source_sha256': {str(path): digest(path) for path in sorted(pathlib.Path('docker/app/nzb-yenc-ffi/src').rglob('*.rs'))},
+              'cargo_lock_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.lock'),
+              'cargo_toml_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.toml'),
+              'rust_library_sha256': digest(library),
+              'rust_payload_kernel_id': decoder.nntmux_yenc_payload_kernel_v1(),
+          }
+          pathlib.Path('processing-evidence/build/runtime.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+
+      - name: Capture CPU counters before caller profile
+        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/cpu-before.json
+
+      - name: Profile actual BODY assembly and metadata callers
+        shell: bash
+        run: |
+          php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-article-processing.php \
+            --profile --native="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            --samples=7 --runtime-manifest="$GITHUB_WORKSPACE/processing-evidence/build/runtime.json" \
+            --output-dir="$GITHUB_WORKSPACE/processing-evidence/profile" \
+            2>&1 | tee processing-evidence/build/profile-console.log
+
+      - name: Capture CPU counters after caller profile
+        if: always() && hashFiles('processing-evidence/build/cpu-before.json') != ''
+        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/cpu-after.json
+
+      - name: Retain all processing profile evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: article-processing-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: processing-evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
   php-decoding:
     name: Rust versus PHP (${{ matrix.runner }})
-    if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'cpp'
+    if: github.event_name != 'workflow_dispatch' || inputs.comparison == 'all' || inputs.comparison == 'php'
     strategy:
       fail-fast: false
       matrix:
