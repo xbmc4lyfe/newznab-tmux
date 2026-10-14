@@ -1411,6 +1411,7 @@ class NameFixingService
         $claimed = false;
         $outcomes = array_fill_keys(array_column(Par2RenameOutcome::cases(), 'value'), 0);
         $probes = $received = 0;
+        $regularAttempted = $localSkips = $inspected = 0;
         $deadline = now()->getTimestampMs() / 1000 + max(1, (int) config('tmux.fix_names.par2_budget_seconds', 60));
         try {
             $cache = Cache::store((string) config('tmux.fix_names.cache_store', 'redis'));
@@ -1437,32 +1438,57 @@ class NameFixingService
             $afterId = is_array($cursor) ? max(0, (int) ($cursor['after_id'] ?? 0)) : 0;
             $throughId = is_array($cursor) ? max(0, (int) ($cursor['through_id'] ?? 0)) : $this->queries->highWatermark();
             $limit = max(1, (int) config('tmux.fix_names.par2_max_releases', 300));
-            $releases = $this->queries->candidateBatch(NameFixingQueryService::SOURCE_PAR2, $time, $cats, $afterId, $limit, $throughId);
-            if ($releases === [] && $afterId > 0) {
-                $throughId = $this->queries->highWatermark();
-                $releases = $this->queries->candidateBatch(NameFixingQueryService::SOURCE_PAR2, $time, $cats, 0, $limit, $throughId);
-            }
+            $maxLocalSkips = max(0, (int) config('tmux.fix_names.par2_max_local_skips', 3000));
             $nzbContentsService = app(NzbContentsService::class);
             $nzbContentsService->setNntp($nntp);
-            foreach ($releases as $release) {
+            $firstPage = true;
+            while ($regularAttempted < $limit && $inspected < PHP_INT_MAX) {
                 if (now()->getTimestampMs() / 1000 >= $deadline || ! $this->refreshPar2Sweep($lock)) {
                     break;
                 }
-                $outcome = $nzbContentsService->checkPar2Result($release->guid, (int) $release->releases_id,
-                    (int) $release->groups_id, 1, (int) $show, $deadline,
-                    fn (): bool => $this->refreshPar2Sweep($lock));
-                $outcomes[$outcome->value]++;
-                $stats = $nzbContentsService->par2Stats();
-                $probes += $stats['candidates_probed'];
-                $received += $stats['articles_received'];
-                if ($outcome === Par2RenameOutcome::Renamed) {
-                    $this->updateService->fixed++;
+                $pageLimit = min(NameFixingQueryService::BATCH_SIZE, $limit - $regularAttempted);
+                $releases = $this->queries->candidateBatch(NameFixingQueryService::SOURCE_PAR2, $time, $cats, $afterId, $pageLimit, $throughId);
+                if ($releases === []) {
+                    if (! $firstPage || $afterId === 0
+                        || now()->getTimestampMs() / 1000 >= $deadline || ! $this->refreshPar2Sweep($lock)) {
+                        break;
+                    }
+                    $afterId = 0;
+                    $throughId = $this->queries->highWatermark();
+                    $firstPage = false;
+
+                    continue;
                 }
-                $this->updateService->incrementChecked();
-                if (! $this->refreshPar2Sweep($lock)) {
-                    break;
+                $firstPage = false;
+                foreach ($releases as $release) {
+                    if ($regularAttempted >= $limit || $inspected >= PHP_INT_MAX
+                        || now()->getTimestampMs() / 1000 >= $deadline || ! $this->refreshPar2Sweep($lock)) {
+                        break 2;
+                    }
+                    $outcome = $nzbContentsService->checkPar2Result($release->guid, (int) $release->releases_id,
+                        (int) $release->groups_id, 1, (int) $show, $deadline,
+                        fn (): bool => $this->refreshPar2Sweep($lock));
+                    $outcomes[$outcome->value]++;
+                    $stats = $nzbContentsService->par2Stats();
+                    $probes += $stats['candidates_probed'];
+                    $received += $stats['articles_received'];
+                    $inspected++;
+                    if ($outcome === Par2RenameOutcome::Retryable && $stats['candidates_probed'] === 0
+                        && $stats['articles_received'] === 0 && $localSkips < $maxLocalSkips) {
+                        $localSkips++;
+                    } else {
+                        $regularAttempted++;
+                    }
+                    if ($outcome === Par2RenameOutcome::Renamed) {
+                        $this->updateService->fixed++;
+                    }
+                    $this->updateService->incrementChecked();
+                    if (! $this->refreshPar2Sweep($lock)) {
+                        break 2;
+                    }
+                    $afterId = (int) $release->releases_id;
+                    $cache->forever($key, ['after_id' => $afterId, 'through_id' => $throughId]);
                 }
-                $cache->forever($key, ['after_id' => (int) $release->releases_id, 'through_id' => $throughId]);
             }
         } catch (Throwable $e) {
             Log::warning('PAR2 rename sweep stopped with work pending', ['error' => $e->getMessage()]);
@@ -1473,7 +1499,8 @@ class NameFixingService
             }
         }
         Log::info('PAR2 rename batch finished', ['time_scope' => $time, 'category_scope' => $cats,
-            'outcomes' => $outcomes, 'candidates_probed' => $probes, 'articles_received' => $received]);
+            'outcomes' => $outcomes, 'candidates_probed' => $probes, 'articles_received' => $received,
+            'local_skips' => $localSkips, 'regular_attempted' => $regularAttempted, 'inspected' => $inspected]);
         cli()->info(sprintf('PAR2 outcomes: renamed=%d no_match=%d retryable=%d deferred=%d',
             $outcomes['renamed'], $outcomes['no_match'], $outcomes['retryable'], $outcomes['deferred']));
         $this->echoFoundCount($echo, ' releases attempted');
