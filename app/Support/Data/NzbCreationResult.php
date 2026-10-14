@@ -12,6 +12,8 @@ final readonly class NzbCreationResult
 
     public const string FAILURE_TRANSIENT = 'transient';
 
+    public const string FAILURE_DEFERRED = 'deferred';
+
     /**
      * @param  list<int>  $collectionIds
      */
@@ -45,6 +47,19 @@ final readonly class NzbCreationResult
     public static function transient(string $reason, array $collectionIds = [], ?string $path = null): self
     {
         return new self(false, self::FAILURE_TRANSIENT, $reason, $path, $collectionIds);
+    }
+
+    /**
+     * @param  list<int>  $collectionIds
+     */
+    public static function deferred(string $reason, array $collectionIds = [], ?string $path = null): self
+    {
+        return new self(false, self::FAILURE_DEFERRED, $reason, $path, $collectionIds);
+    }
+
+    public function isDeferred(): bool
+    {
+        return $this->failureType === self::FAILURE_DEFERRED;
     }
 
     public function isDeterministicFailure(): bool

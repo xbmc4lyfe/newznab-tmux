@@ -187,7 +187,7 @@ class NzbService
 
             $cursor = ['collection_id' => 0, 'name' => '', 'binary_id' => 0, 'partnumber' => 0];
             $openBinaryId = 0;
-            $fingerprintAccumulator = new NzbArticleFingerprint;
+            $fingerprintAccumulator = app(NzbArticleFingerprint::class);
             do {
                 $page = $this->loadNzbRowPage((int) $release->id, $cursor);
                 foreach ($page as $row) {
@@ -289,6 +289,8 @@ class NzbService
                     'exception' => $dispatchException::class,
                 ]);
             }
+        } catch (NzbArticleFingerprintUnavailable $e) {
+            return NzbCreationResult::deferred($e->getMessage(), $collectionIds, $path);
         } catch (Throwable $e) {
             return NzbCreationResult::transient('Failed to write NZB file: '.$e->getMessage(), $collectionIds, $path);
         } finally {
