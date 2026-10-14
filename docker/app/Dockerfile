@@ -12,13 +12,15 @@ COPY docker/app/nzb-yenc-ffi/ /src/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo test --release --locked \
     && cargo build --release --locked \
-    && install -D -m 0644 target/release/libnzbyenc.so /out/libnzbyenc.so
+    && install -D -m 0644 target/release/libnzbyenc.so /out/libnzbyenc.so \
+    && install -D -m 0755 target/release/nntmux-article-fingerprint /out/nntmux-article-fingerprint
 
 FROM ${BASE_IMAGE}
 USER root
 RUN install-php-extensions ffi
 COPY --from=yenc /out/libnzbyenc.so /usr/local/lib/nntmux/libnzbyenc.so
 COPY docker/app/php/release-presentation.h docker/app/php/release-presentation-preload.php /usr/local/lib/nntmux/
+COPY --from=yenc /out/nntmux-article-fingerprint /usr/local/bin/nntmux-article-fingerprint
 # - unrar (non-free): unrar-free cannot open RAR5 archives used by most current posts.
 # - iproute2: NNTmux counts live NNTP sockets with `ss`.
 # - file, htop, git: helpers used by post-processing, the tmux htop pane and the monitor header.

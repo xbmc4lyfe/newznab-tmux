@@ -67,6 +67,17 @@ jobs:
           YENC_NATIVE_LIBRARY: ${{ github.workspace }}/storage/app/rapidyenc/librapidyenc.so
         run: php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter='YencNativeDecoderTest|YencNativeLibraryTest|YencServiceTest|YencDoctorCommandTest|NNTPBodyDecodingTest|NNTPBoundedArticleTest'
 
+      - name: Install the pinned Rust build toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Build Rust article identity runtime
+        env:
+          RUSTUP_TOOLCHAIN: 1.98.0
+        run: bash scripts/build-nntmux-native.sh
+
+      - name: Test article identity without PHP FFI
+        run: php -d ffi.enable=false vendor/bin/phpunit --fail-on-skipped tests/Unit/Nzb/NzbArticleFingerprintTest.php
+
       - name: Deployment configuration parser tests
         run: python3 deploy/cloud/tests/test_configuration.py
 
