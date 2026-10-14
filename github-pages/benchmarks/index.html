@@ -14,10 +14,10 @@
 <body>
 <h1>NNTmux performance evidence</h1>
 <p>Measured C++ RapidYenc versus Rust yEnc decoding, PHP function costs, and searchable native flamegraphs from executed application calls.</p>
-<p><a href="latest/">Latest successful master benchmark</a> · <a href="https://github.com/xbmc4lyfe/newznab-tmux/actions/workflows/yenc-performance.yml">Benchmark workflow</a> · <a href="https://github.com/xbmc4lyfe/newznab-tmux/pull/139">Implementation and review</a></p>
+<p><a href="https://github.com/xbmc4lyfe/newznab-tmux/actions/workflows/yenc-performance.yml">Benchmark workflow</a> · <a href="https://github.com/xbmc4lyfe/newznab-tmux/pull/139">Implementation and review</a></p>
 <section>
 <h2>Recorded comparison · 14 October 2026</h2>
-<p>Source <code>dc74ec057ebdd80a3ff7d10cbcf12147c06cf55d</code>, <a href="https://github.com/xbmc4lyfe/newznab-tmux/actions/runs/38593212508">CI run 38593212508</a>. These frozen reports remain available after temporary CI artifacts expire. Each report links its PHP hot paths and available native flamegraphs.</p>
+<p>PR head <code>dc74ec057ebdd80a3ff7d10cbcf12147c06cf55d</code>; executed CI merge <code>35c5a5a1bf1f8bd98a4e3f6f62ff4fa0f6eb4c04</code>, <a href="https://github.com/xbmc4lyfe/newznab-tmux/actions/runs/38593212508">CI run 38593212508</a>. These frozen reports remain available after temporary CI artifacts expire. Each report links its PHP hot paths and available native flamegraphs.</p>
 <table>
 <tr><th>Runner</th><th>Report</th><th>Evidence</th></tr>
 <tr><td>x86 · qualified retry</td><td><a href="runs/38593212508/x86/visualization/report.html">Speedups and hot paths</a></td><td><a href="runs/38593212508/x86/provenance.json">Provenance</a></td></tr>
@@ -34,6 +34,6 @@
 <p>PHP charts show exclusive function cost; call-edge tables show inclusive cost. Native flamegraph width represents sampled CPU-clock period weights in nanoseconds, not elapsed wall time or the number of samples.</p>
 <p>These fixture results do not establish production throughput or satisfy the project's 1.5× common-path and uncommon-p99 Rust adoption gate. This work publishes diagnostics; it does not adopt another replacement.</p>
 </section>
-<small>Built from reviewed repository content. Automated report refreshes accept successful master-branch benchmark runs from this repository only.</small>
+<small>Frozen CI evidence prepared for the future GitHub Pages site. Automated build coverage and publication are being implemented separately.</small>
 </body>
 </html>
