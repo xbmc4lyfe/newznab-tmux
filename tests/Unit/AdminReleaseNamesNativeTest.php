@@ -53,6 +53,8 @@ class AdminReleaseNamesNativeTest extends TestCase
                 $context = stream_context_create(['http' => ['method' => 'POST', 'timeout' => 5, 'header' => 'Content-Type: application/json', 'content' => json_encode(['url_prefix' => '/details/', 'url_suffix' => '', 'releases' => [['searchname' => $name, 'name' => null, 'guid' => 'abc123']]], JSON_THROW_ON_ERROR)]]);
                 $response = json_decode(file_get_contents('http://'.$address, false, $context), true, 512, JSON_THROW_ON_ERROR);
                 $this->assertSame('cli-server', $response['sapi']);
+                $this->assertTrue($response['wrapper_loaded']);
+                $this->assertTrue($response['header_locked']);
                 $this->assertSame(['cdef' => true, 'load' => true, 'scope' => true], $response['blocked']);
                 $html = $response['output'];
                 $this->assertStringContainsString('href="/details/abc123"', $html[0]);

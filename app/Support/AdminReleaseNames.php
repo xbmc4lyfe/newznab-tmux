@@ -10,6 +10,9 @@ use JsonException;
 /** Presentation only. Laravel owns release selection, routes and authorization. */
 final class AdminReleaseNames
 {
+    // Per-request native binding costs more than PHP for tiny result batches.
+    public const int MIN_NATIVE_ROWS = 16;
+
     /**
      * @param  iterable<object>  $releases
      * @return list<HtmlString>
@@ -29,7 +32,7 @@ final class AdminReleaseNames
         }
 
         // Only the dependency-free, preloaded wrapper may access the native scope.
-        if ($native && count($rows) > 1 && function_exists('nntmux_render_release_names')) {
+        if (count($rows) >= self::MIN_NATIVE_ROWS && $native && function_exists('nntmux_render_release_names')) {
             try {
                 // Laravel resolves host, deployment prefix and route defaults once.
                 // Rust only expands unreserved GUID segments; unusual GUIDs fall back.

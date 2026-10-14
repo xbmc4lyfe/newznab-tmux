@@ -13,8 +13,11 @@ function nntmux_render_release_names(string $input): ?array
         return null;
     }
     try {
-        static $scope = null;
-        $scope ??= FFI::scope('NNTMUX_RELEASE_PRESENTATION');
+        // FFI scopes are thread-local: FrankenPHP request threads do not inherit
+        // the startup thread's scope. Only this preloaded function may bind the
+        // header selected by immutable INI_SYSTEM configuration. Bind per batch
+        // so benchmarks include the same setup cost as a fresh web request.
+        $scope = FFI::load((string) ini_get('ffi.preload'));
         $length = strlen($input);
         $buffer = $scope->new('unsigned char['.max(1, $length).']');
         FFI::memcpy($buffer, $input, $length);

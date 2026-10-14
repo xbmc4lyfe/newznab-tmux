@@ -14,6 +14,8 @@ def request(index):
     with urllib.request.urlopen(urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'}), timeout=10) as response:
         data = json.load(response)
     assert data['sapi'] == 'frankenphp', data
+    assert data['wrapper_loaded'] is True and data['header_locked'] is True, data
+    assert data['ffi_mode'] == 'preload', data
     assert data['blocked'] == {'cdef': True, 'load': True, 'scope': True}, data
     result = data['output']
     assert len(result) == 1, data

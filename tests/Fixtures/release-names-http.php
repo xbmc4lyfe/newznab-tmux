@@ -19,6 +19,12 @@ foreach (['cdef', 'load', 'scope'] as $operation) {
 }
 echo json_encode([
     'sapi' => PHP_SAPI,
+    'wrapper_loaded' => function_exists('nntmux_render_release_names'),
+    'header_locked' => ini_set('ffi.preload', '/untrusted/not-a-header.h') === false,
+    'opcache_enabled' => ini_get('opcache.enable'),
+    'preload_script' => ini_get('opcache.preload'),
+    'ffi_preload' => ini_get('ffi.preload'),
+    'ffi_mode' => ini_get('ffi.enable'),
     'blocked' => $blocked,
     'output' => function_exists('nntmux_render_release_names') ? nntmux_render_release_names(file_get_contents('php://input')) : null,
 ], JSON_THROW_ON_ERROR);
