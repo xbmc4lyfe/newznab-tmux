@@ -12,15 +12,12 @@ use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request;
-use Illuminate\Process\Exceptions\ProcessTimedOutException;
-use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Schema;
-use Symfony\Component\Process\Exception\ProcessTimedOutException as SymfonyTimeoutException;
-use Symfony\Component\Process\Process as SymfonyProcess;
+use Symfony\Component\Process\Exception\ProcessSignaledException;
+use Symfony\Component\Process\Process;
 use Tests\Support\Monitoring\FailingMetricsCollector;
 use Tests\TestCase;
 
@@ -146,37 +143,78 @@ class ExportMonitoringMetricsCommandTest extends TestCase
         $this->assertFalse($this->exportEvent()->filtersPass($this->app));
     }
 
-    public function test_scheduled_exports_finish_before_the_overlap_lock_expires(): void
+    public function test_scheduled_exports_arm_a_process_deadline_and_restore_signal_state(): void
     {
-        Process::fake();
+        if (! function_exists('pcntl_alarm')) {
+            $this->markTestSkipped('Scheduled export deadlines require PCNTL.');
+        }
+        $handler = pcntl_signal_get_handler(SIGALRM);
+        $remaining = 0;
+        Http::fake([self::PUSH_URL => function () use (&$remaining) {
+            $this->assertSame(SIG_DFL, pcntl_signal_get_handler(SIGALRM));
+            $remaining = pcntl_alarm(0);
+
+            return Http::response('', 200);
+        }]);
 
         $this->assertStringContainsString('--scheduled', (string) $this->exportEvent()->command);
         $this->artisan('monitoring:export-metrics', ['--scheduled' => true])->assertSuccessful();
 
-        Process::assertRan(static fn (PendingProcess $process): bool => $process->command === [PHP_BINARY, base_path('artisan'), 'monitoring:export-metrics']
-            && $process->path === base_path()
-            && $process->timeout === 240);
+        $this->assertGreaterThan(0, $remaining);
+        $this->assertLessThanOrEqual(240, $remaining);
+        $this->assertSame(0, pcntl_alarm(0));
+        $this->assertSame($handler, pcntl_signal_get_handler(SIGALRM));
     }
 
-    public function test_scheduled_exports_propagate_worker_failure(): void
+    public function test_scheduled_exports_release_the_deadline_after_push_failure(): void
     {
-        Process::fake(['*' => Process::result(exitCode: 1)]);
+        if (! function_exists('pcntl_alarm')) {
+            $this->markTestSkipped('Scheduled export deadlines require PCNTL.');
+        }
+        $handler = pcntl_signal_get_handler(SIGALRM);
+        Http::fake([self::PUSH_URL => Http::response('', 400)]);
 
         $this->artisan('monitoring:export-metrics', ['--scheduled' => true])->assertFailed();
+
+        $this->assertSame(0, pcntl_alarm(0));
+        $this->assertSame($handler, pcntl_signal_get_handler(SIGALRM));
     }
 
-    public function test_scheduled_exports_report_a_timeout_as_failure(): void
+    public function test_the_process_deadline_terminates_a_blocked_exporter(): void
     {
-        $worker = new SymfonyProcess([PHP_BINARY, base_path('artisan'), 'monitoring:export-metrics']);
-        $worker->setTimeout(240);
-        Process::fake(['*' => static fn () => throw new ProcessTimedOutException(
-            new SymfonyTimeoutException($worker, SymfonyTimeoutException::TYPE_GENERAL),
-            Process::result(exitCode: 1),
-        )]);
+        if (! function_exists('pcntl_alarm')) {
+            $this->markTestSkipped('Scheduled export deadlines require PCNTL.');
+        }
+        $script = <<<'PHP'
+require 'vendor/autoload.php';
+$app = require 'bootstrap/app.php';
+$app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+config(['monitoring.enabled' => true]);
+$exporter = new class([], new App\Services\Monitoring\Prometheus\TextFormatter) extends App\Services\Monitoring\PrometheusMetricsExporter {
+    public function push(): bool
+    {
+        // Accelerate the already armed deadline instead of waiting four minutes in the test.
+        pcntl_alarm(1);
+        sleep(10);
+        echo 'exporter survived';
+        return true;
+    }
+};
+$app->instance(App\Services\Monitoring\PrometheusMetricsExporter::class, $exporter);
+Illuminate\Support\Facades\Artisan::call('monitoring:export-metrics', ['--scheduled' => true]);
+echo 'command survived';
+PHP;
+        $process = new Process([PHP_BINARY, '-r', $script], base_path(), ['APP_ENV' => 'testing']);
+        $process->setTimeout(5);
+        try {
+            $process->run();
+        } catch (ProcessSignaledException $exception) {
+            $this->assertSame(SIGALRM, $exception->getSignal());
+        }
 
-        $this->artisan('monitoring:export-metrics', ['--scheduled' => true])
-            ->expectsOutputToContain('exceeded its four-minute runtime limit')
-            ->assertFailed();
+        $this->assertTrue($process->hasBeenSignaled());
+        $this->assertSame(SIGALRM, $process->getTermSignal());
+        $this->assertStringNotContainsString('survived', $process->getOutput());
     }
 
     private function exportEvent(): Event

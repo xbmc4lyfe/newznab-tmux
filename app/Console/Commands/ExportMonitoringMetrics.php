@@ -6,8 +6,6 @@ namespace App\Console\Commands;
 
 use App\Services\Monitoring\PrometheusMetricsExporter;
 use Illuminate\Console\Command;
-use Illuminate\Process\Exceptions\ProcessTimedOutException;
-use Illuminate\Support\Facades\Process;
 use Symfony\Component\Console\Attribute\AsCommand;
 
 #[AsCommand(name: 'monitoring:export-metrics')]
@@ -39,28 +37,34 @@ class ExportMonitoringMetrics extends Command
             return self::SUCCESS;
         }
 
-        if ($this->option('scheduled')) {
-            try {
-                $result = Process::path(base_path())->timeout(240)
-                    ->run([PHP_BINARY, base_path('artisan'), 'monitoring:export-metrics']);
-            } catch (ProcessTimedOutException) {
-                $this->components->error('Monitoring export exceeded its four-minute runtime limit.');
-
-                return self::FAILURE;
-            }
-
-            $this->output->write($result->output());
-            $this->output->write($result->errorOutput());
-
-            return $result->exitCode();
-        }
-
-        if (! $exporter->push()) {
-            $this->components->error('Could not push metrics to '.config('monitoring.pushgateway.url').'. See the application log for details.');
+        $scheduled = (bool) $this->option('scheduled');
+        if ($scheduled && ! function_exists('pcntl_alarm')) {
+            $this->components->error('Scheduled monitoring exports require the PCNTL extension for their runtime limit.');
 
             return self::FAILURE;
         }
 
-        return self::SUCCESS;
+        $previousHandler = null;
+        if ($scheduled) {
+            $previousHandler = pcntl_signal_get_handler(SIGALRM);
+            // The OS default terminates even when PHP is blocked inside database or Redis I/O.
+            pcntl_signal(SIGALRM, SIG_DFL);
+            pcntl_alarm(240);
+        }
+
+        try {
+            if (! $exporter->push()) {
+                $this->components->error('Could not push metrics to '.config('monitoring.pushgateway.url').'. See the application log for details.');
+
+                return self::FAILURE;
+            }
+
+            return self::SUCCESS;
+        } finally {
+            if ($scheduled) {
+                pcntl_alarm(0);
+                pcntl_signal(SIGALRM, $previousHandler);
+            }
+        }
     }
 }
