@@ -42,8 +42,8 @@ Schedule::command('metrics:collect')->everyFiveMinutes()->withoutOverlapping();
 // Cleanup old system metrics daily (keep last 60 days)
 Schedule::command('metrics:collect --cleanup')->dailyAt('03:00');
 // Push NNTmux application metrics to the Prometheus Pushgateway (see config/monitoring.php)
-// Expire abandoned exporter locks promptly after an interrupted scheduler process.
-Schedule::command('monitoring:export-metrics')->everyMinute()->withoutOverlapping(5)->when(static fn (): bool => (bool) config('monitoring.enabled'));
+// Stop slow exports before the five-minute overlap lock can expire.
+Schedule::command('monitoring:export-metrics --scheduled')->everyMinute()->withoutOverlapping(5)->when(static fn (): bool => (bool) config('monitoring.enabled'));
 // Cleanup old user activity stats weekly (keep last 90 days)
 Schedule::call(function () {
     UserActivityStat::cleanupOldStats(90);

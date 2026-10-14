@@ -12,10 +12,15 @@ use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request;
+use Illuminate\Process\Exceptions\ProcessTimedOutException;
+use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Schema;
+use Symfony\Component\Process\Exception\ProcessTimedOutException as SymfonyTimeoutException;
+use Symfony\Component\Process\Process as SymfonyProcess;
 use Tests\Support\Monitoring\FailingMetricsCollector;
 use Tests\TestCase;
 
@@ -139,6 +144,39 @@ class ExportMonitoringMetricsCommandTest extends TestCase
         config(['monitoring.enabled' => false]);
 
         $this->assertFalse($this->exportEvent()->filtersPass($this->app));
+    }
+
+    public function test_scheduled_exports_finish_before_the_overlap_lock_expires(): void
+    {
+        Process::fake();
+
+        $this->assertStringContainsString('--scheduled', (string) $this->exportEvent()->command);
+        $this->artisan('monitoring:export-metrics', ['--scheduled' => true])->assertSuccessful();
+
+        Process::assertRan(static fn (PendingProcess $process): bool => $process->command === [PHP_BINARY, base_path('artisan'), 'monitoring:export-metrics']
+            && $process->path === base_path()
+            && $process->timeout === 240);
+    }
+
+    public function test_scheduled_exports_propagate_worker_failure(): void
+    {
+        Process::fake(['*' => Process::result(exitCode: 1)]);
+
+        $this->artisan('monitoring:export-metrics', ['--scheduled' => true])->assertFailed();
+    }
+
+    public function test_scheduled_exports_report_a_timeout_as_failure(): void
+    {
+        $worker = new SymfonyProcess([PHP_BINARY, base_path('artisan'), 'monitoring:export-metrics']);
+        $worker->setTimeout(240);
+        Process::fake(['*' => static fn () => throw new ProcessTimedOutException(
+            new SymfonyTimeoutException($worker, SymfonyTimeoutException::TYPE_GENERAL),
+            Process::result(exitCode: 1),
+        )]);
+
+        $this->artisan('monitoring:export-metrics', ['--scheduled' => true])
+            ->expectsOutputToContain('exceeded its four-minute runtime limit')
+            ->assertFailed();
     }
 
     private function exportEvent(): Event
