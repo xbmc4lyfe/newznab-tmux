@@ -1,5 +1,6 @@
 <?php
 
+use App\Services\Nzb\NzbArticleFingerprint;
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
@@ -7,7 +8,7 @@ use Illuminate\Support\Facades\Schema;
 return new class extends Migration
 {
     /**
-     * Article identity of a release's NZB ({@see \App\Services\Nzb\NzbArticleFingerprint}), used to keep
+     * Article identity of a release's NZB ({@see NzbArticleFingerprint}), used to keep
      * NZB imports idempotent when release dedupe is disabled.
      */
     public function up(): void

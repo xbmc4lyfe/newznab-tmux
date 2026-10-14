@@ -18,6 +18,7 @@ FROM ${BASE_IMAGE}
 USER root
 RUN install-php-extensions ffi
 COPY --from=yenc /out/libnzbyenc.so /usr/local/lib/nntmux/libnzbyenc.so
+COPY docker/app/php/release-presentation.h docker/app/php/release-presentation-preload.php /usr/local/lib/nntmux/
 # - unrar (non-free): unrar-free cannot open RAR5 archives used by most current posts.
 # - iproute2: NNTmux counts live NNTP sockets with `ss`.
 # - file, htop, git: helpers used by post-processing, the tmux htop pane and the monitor header.
