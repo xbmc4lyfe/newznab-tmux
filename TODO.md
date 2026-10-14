@@ -122,6 +122,12 @@ Approved approach:
 - [x] Deploy through the shared guard and validate live bounded batches, retained retry state, recovered names, and search-index synchronization.
 - [ ] Assess sustained actual rename yield and net backlog trend against incoming releases before raising concurrency.
 
+Historical PAR2 traversal follow-up (2026-10-14): a real parser/processor fixture with 301 noncontiguous fragments before a recoverable release reproduced the 300-release quota stopping without downloads or a rename. Streaming bounded keyset pages with a separate local-retry allowance recovered the exact title with one article read, while retaining all 301 blocked checkpoints and pending flags. The regular attempt quota, deadline, article limits, ownership checks, and frozen cohort remain in force; this fixture does not establish production names per second.
+
+- [ ] Obtain current-head Codex clearance and green CI for the streaming traversal, then squash merge and deploy through the shared guard.
+- [ ] Retest the deployed zero-allowance compatibility setting, total inspection bound, deadline and lease loss between pages, cursor wrap under new arrivals, and unchanged multipart/volume fallback behavior.
+- [ ] Compare actual recovered names and elapsed time against arrivals and net backlog over a stable live window; local skips and checked releases are separate from successful identifications.
+
 Evidence from the investigation: the separate database-only catch-up reported 33 changed names. The two supplemental experimental workers were stopped before redesign; the existing production rename worker continued. The redesign was validated in an isolated container without production mounts or network access.
 
 Validation: the complete PHPUnit suite ran 2,633 tests and 20,987 assertions with no failures, 93 skips, and 54 PHPUnit notices. Pint and PHP syntax checks passed. Full-project PHPStan reported the same ten findings reproduced on the unmodified base revision; no new findings remain. Independent review findings were fixed and regression-tested, including the real checker completing an unmatched release too early, stale success state between releases, unavailable candidates blocking recovery volumes, and retry starvation. Shared claims were also exercised across separate PHP processes.

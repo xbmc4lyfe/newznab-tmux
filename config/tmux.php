@@ -43,7 +43,10 @@ return [
         'predbft_scheduled' => (bool) env('TMUX_FIX_NAMES_PREDBFT_SCHEDULED', true),
         // Shared cache for interval claims, PAR2 claims and progress; use one backend, not failover.
         'cache_store' => (string) env('TMUX_FIX_NAMES_CACHE_STORE', 'redis'),
+        // Regular attempts include local retries after their separate skip allowance is exhausted.
         'par2_max_releases' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_RELEASES', 300),
+        // Extra zero-probe, zero-receipt retries per batch; zero restores the regular quota.
+        'par2_max_local_skips' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_LOCAL_SKIPS', 3000),
         'par2_budget_seconds' => (int) env('TMUX_FIX_NAMES_PAR2_BUDGET_SECONDS', 60),
         'par2_max_probes' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_PROBES', 4),
         'par2_max_probe_bytes' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_PROBE_BYTES', 2097152),
