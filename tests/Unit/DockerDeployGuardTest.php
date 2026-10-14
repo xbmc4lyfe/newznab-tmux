@@ -59,6 +59,59 @@ final class DockerDeployGuardTest extends TestCase
     }
 
     #[Test]
+    public function a_missing_lock_parent_is_rejected_before_mutation(): void
+    {
+        $this->assertInvalidLockParentIsRejected($this->dir.'/missing');
+    }
+
+    #[Test]
+    public function a_non_directory_lock_parent_is_rejected_before_mutation(): void
+    {
+        $parent = $this->dir.'/regular-file';
+        file_put_contents($parent, 'not a directory');
+
+        $this->assertInvalidLockParentIsRejected($parent);
+    }
+
+    #[Test]
+    public function a_directory_at_the_lock_path_is_preserved_and_refuses_execution(): void
+    {
+        mkdir($this->dir.'/lock');
+        file_put_contents($this->dir.'/lock/sentinel', 'preserve');
+
+        $process = $this->guard(['run', 'up', '--', 'touch', $this->dir.'/payload-ran'], ['DEPLOY_BY' => 's']);
+
+        $this->assertSame(75, $process->getExitCode(), (string) json_encode([
+            'stderr' => $process->getErrorOutput(),
+            'payload_ran' => file_exists($this->dir.'/payload-ran'),
+            'lock_entries' => scandir($this->dir.'/lock'),
+        ]));
+        $this->assertFileDoesNotExist($this->dir.'/payload-ran');
+        $this->assertSame(['.', '..', 'sentinel'], scandir($this->dir.'/lock'));
+        $this->assertSame('preserve', file_get_contents($this->dir.'/lock/sentinel'));
+    }
+
+    private function assertInvalidLockParentIsRejected(string $parent): void
+    {
+        $bin = $this->dir.'/bin';
+        mkdir($bin);
+        $attempts = $this->dir.'/mutation-attempts';
+        // Record the real guard's mutation attempts without writing an erroneous root-level lock.
+        file_put_contents($bin.'/mkdir', "#!/bin/sh\nprintf '%s\\n' \"$@\" >> ".escapeshellarg($attempts)."\nexit 1\n");
+        chmod($bin.'/mkdir', 0755);
+
+        $process = $this->guard(['run', 'up', '--', 'touch', $this->dir.'/payload-ran'], [
+            'DEPLOY_LOCK_DIR' => $parent.'/lock',
+            'PATH' => $bin.':'.getenv('PATH'),
+        ]);
+
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertFileDoesNotExist($attempts, 'invalid parent must be rejected before acquiring any other lock');
+        $this->assertFileDoesNotExist($this->dir.'/payload-ran');
+        $this->assertFileDoesNotExist($this->dir.'/deploy.log');
+    }
+
+    #[Test]
     public function a_second_deploy_is_refused_while_the_first_holds_the_lock(): void
     {
         $first = $this->guardProcess(['run', 'build', '--', 'sleep', '5'], ['DEPLOY_BY' => 'session-a']);

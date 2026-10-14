@@ -32,7 +32,11 @@ umask 0002
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 REPO="${DEPLOY_REPO:-$(cd "$DIR/.." && pwd)}"
 LOCK="${DEPLOY_LOCK_DIR:-$DIR/.deploy.lock}"
-LOCK="$(cd "$(dirname "$LOCK")" && pwd -P)/$(basename "$LOCK")"
+lock_parent=$(cd "$(dirname "$LOCK")" && pwd -P) || {
+    echo "deploy-guard: cannot resolve the lock parent; leaving the stack alone." >&2
+    exit 74
+}
+LOCK="$lock_parent/$(basename "$LOCK")"
 CLAIM="$LOCK.claim"
 HOLD="$LOCK.recovery-hold"
 LOG="${DEPLOY_LOG:-$DIR/.deploy.log}"
@@ -191,6 +195,12 @@ acquire() {
         attempts=$((attempts + 1))
         check_recovery_hold
         if mkdir "$CLAIM" 2>/dev/null; then
+            # ln treats an existing real directory as a destination directory. Refuse any
+            # non-symlink lock path while holding the mutation claim, preserving its contents.
+            if [ -e "$LOCK" ] && [ ! -L "$LOCK" ]; then
+                rmdir "$CLAIM"
+                busy "invalid non-symlink lock path"
+            fi
             if ln -sn "$info" "$LOCK" 2>/dev/null; then
                 rmdir "$CLAIM"
                 return 0
