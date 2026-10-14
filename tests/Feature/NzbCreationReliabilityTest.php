@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Facades\Search;
+use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Release;
 use App\Services\Binaries\BinariesConfig;
 use App\Services\CollectionCleanupService;
@@ -20,7 +21,9 @@ use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\SearchService;
 use App\Support\Data\NzbCreationResult;
 use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Log;
 use PDO;
 use Psr\Log\AbstractLogger;
@@ -39,7 +42,7 @@ class NzbCreationReliabilityTest extends TestCase
 
     public function createApplication()
     {
-        $this->databasePath = sys_get_temp_dir().'/nntmux-nzb-creation-reliability-test.sqlite';
+        $this->databasePath = tempnam(sys_get_temp_dir(), 'nntmux-reliability-');
 
         $this->originalEnvironment = [
             'APP_ENV' => getenv('APP_ENV'),
@@ -77,6 +80,7 @@ class NzbCreationReliabilityTest extends TestCase
 
         $this->createSchema();
         NzbCreationCandidateQuery::flushCapabilityCache();
+        $this->bindProtocolFingerprint();
     }
 
     protected function tearDown(): void
@@ -92,6 +96,178 @@ class NzbCreationReliabilityTest extends TestCase
         foreach ($this->originalEnvironment as $key => $value) {
             $this->setEnvironmentValue($key, $value === false ? null : $value);
         }
+    }
+
+    public function test_backend_restoration_replays_actual_writer_after_four_deferrals(): void
+    {
+        Bus::fake();
+        Event::fake(['eloquent.updated: '.Release::class]);
+        $this->insertRelease(1, 'a', attempts: 2);
+        $this->insertWritableCbp(200, 2000, 1);
+        DB::table('releases')->where('id', 1)->update(['article_fingerprint' => str_repeat('f', 40)]);
+        $nzb = new NzbService(app(CollectionCleanupService::class));
+        $priorPath = $nzb->getNzbPath(str_repeat('a', 36), createIfNotExist: true);
+        file_put_contents($priorPath, 'prior-artifact');
+        $failureBefore = (array) DB::table('release_nzb_creation_failures')->first();
+        $releaseBefore = (array) DB::table('releases')->first();
+        $cbpBefore = [];
+        foreach (['collections', 'binaries', 'parts'] as $table) {
+            $cbpBefore[$table] = DB::table($table)->get()->toJson();
+        }
+        $service = (new ReleaseProcessingService(
+            nzb: $nzb,
+            releaseManagement: new DatabaseOnlyReleaseManagementService,
+            collectionCleanupService: app(CollectionCleanupService::class),
+        ))->setEchoCLI(false);
+        $this->bindUnavailableFingerprint();
+        for ($pass = 0; $pass < 4; $pass++) {
+            $this->assertSame(0, $service->createNZBs(null));
+            $this->assertSame($failureBefore, (array) DB::table('release_nzb_creation_failures')->first());
+            $this->assertSame($releaseBefore, (array) DB::table('releases')->first());
+            foreach ($cbpBefore as $table => $rows) {
+                $this->assertSame($rows, DB::table($table)->get()->toJson());
+            }
+            $this->assertSame('prior-artifact', file_get_contents($priorPath));
+            $this->assertSame([], $nzb->findStaleTemporaryNzbPaths(0));
+        }
+        Bus::assertNothingDispatched();
+        Event::assertNotDispatched('eloquent.updated: '.Release::class);
+        $this->bindProtocolFingerprint();
+        try {
+            $this->assertSame(1, $service->createNZBs(null));
+            $xml = unzipGzipFile($priorPath);
+            $this->assertIsString($xml);
+            $this->assertNotSame('prior-artifact', file_get_contents($priorPath));
+            $this->assertStringContainsString('part01@example.test', $xml);
+            $this->assertSame(sha1(str_repeat('a', 40)), DB::table('releases')->value('article_fingerprint'));
+            $this->assertMatchesRegularExpression('/^[0-9a-f]{40}$/', DB::table('releases')->value('article_fingerprint'));
+            $this->assertNotSame(str_repeat('f', 40), DB::table('releases')->value('article_fingerprint'));
+            $this->assertSame(NzbService::NZB_ADDED, (int) DB::table('releases')->value('nzbstatus'));
+            $this->assertSame(1, DB::table('releases')->count());
+            $this->assertNull(DB::table('releases')->value('nzb_creation_claim_token'));
+            $this->assertNull(DB::table('releases')->value('nzb_creation_claimed_at'));
+            foreach (['collections', 'binaries', 'parts', 'release_nzb_creation_failures'] as $table) {
+                $this->assertSame(0, DB::table($table)->count());
+            }
+            $this->assertSame([], $nzb->findStaleTemporaryNzbPaths(0));
+            Event::assertDispatchedTimes('eloquent.updated: '.Release::class, 1);
+            Bus::assertDispatched(CollectReleaseFingerprintMetadata::class, fn ($job) => (new \ReflectionProperty($job, 'releaseId'))->getValue($job) === 1 && $job->connection === 'release-fingerprint' && $job->queue === 'release-fingerprint');
+            Bus::assertDispatchedTimes(CollectReleaseFingerprintMetadata::class, 1);
+            $this->assertSame(0, $service->createNZBs(null));
+            Bus::assertDispatchedTimes(CollectReleaseFingerprintMetadata::class, 1);
+        } finally {
+            $this->app->forgetInstance(NzbArticleFingerprint::class);
+        }
+    }
+
+    public function test_generic_constructor_failure_remains_transient_and_consumes_retry(): void
+    {
+        Bus::fake();
+        $this->app->bind(NzbArticleFingerprint::class, static function (): NzbArticleFingerprint {
+            throw new \RuntimeException('Rust article fingerprint is unavailable.');
+        });
+        $this->insertRelease(1, 'a');
+        $this->insertWritableCbp(200, 2000, 1);
+        $nzb = new NzbService(app(CollectionCleanupService::class));
+        $release = Release::query()->findOrFail(1);
+        $release->setRelation('category', (object) ['title' => 'Misc', 'parent' => (object) ['title' => 'Other']]);
+        $result = $nzb->createNzbForRelease($release);
+        $this->assertTrue($result->isTransientFailure());
+        $this->assertFalse($result->isDeferred());
+        $service = (new ReleaseProcessingService(
+            nzb: $nzb,
+            releaseManagement: new DatabaseOnlyReleaseManagementService,
+            collectionCleanupService: app(CollectionCleanupService::class),
+        ))->setEchoCLI(false);
+        $this->assertSame(0, $service->createNZBs(null));
+        $this->assertSame(1, (int) DB::table('release_nzb_creation_failures')->value('attempts'));
+        $this->assertSame(1, DB::table('releases')->count());
+        $this->assertNull(DB::table('releases')->value('nzb_creation_claim_token'));
+        $this->assertNull(DB::table('releases')->value('nzb_creation_claimed_at'));
+        $this->assertSame([], $nzb->findStaleTemporaryNzbPaths(0));
+        Bus::assertNothingDispatched();
+    }
+
+    public function test_malformed_collections_remain_deterministic_when_backend_is_unavailable(): void
+    {
+        $this->bindUnavailableFingerprint();
+        $this->insertRelease(1, 'a');
+        $release = Release::query()->findOrFail(1);
+        $result = (new NzbService(app(CollectionCleanupService::class)))->createNzbForRelease($release);
+        $this->assertTrue($result->isDeterministicFailure());
+        $this->assertFalse($result->isDeferred());
+        $this->assertStringContainsString('no collections', $result->reason);
+    }
+
+    public function test_backend_unavailable_defers_actual_writer_without_accounting_or_custody_changes(): void
+    {
+        $this->assertBackendDeferralPreservesCustody(2);
+    }
+
+    public function test_backend_unavailable_does_not_create_a_retry_record_for_a_fresh_release(): void
+    {
+        $this->assertBackendDeferralPreservesCustody(0);
+    }
+
+    private function bindProtocolFingerprint(): void
+    {
+        $worker = $this->tempNzbPath.'/fingerprint-worker';
+        copy(__DIR__.'/../Fixtures/article-fingerprint-worker.php', $worker);
+        chmod($worker, 0700);
+        $this->app->bind(NzbArticleFingerprint::class, static fn (): NzbArticleFingerprint => new NzbArticleFingerprint(workerPath: $worker));
+    }
+
+    private function bindUnavailableFingerprint(): void
+    {
+        $this->app->bind(NzbArticleFingerprint::class, static fn (): NzbArticleFingerprint => new NzbArticleFingerprint(libraryPath: __DIR__.'/missing-native-library'));
+    }
+
+    private function assertBackendDeferralPreservesCustody(int $attempts): void
+    {
+        $this->bindUnavailableFingerprint();
+        Bus::fake();
+        $cleanup = \Mockery::mock(CollectionCleanupService::class)->makePartial();
+        $cleanup->shouldNotReceive('deleteCollectionsAndDescendants');
+        $management = \Mockery::mock(DatabaseOnlyReleaseManagementService::class)->makePartial();
+        $management->shouldNotReceive('deleteSingleWithService');
+        $this->insertRelease(1, 'a', attempts: $attempts);
+        $this->insertWritableCbp(200, 2000, 1);
+        DB::table('releases')->where('id', 1)->update(['article_fingerprint' => str_repeat('f', 40)]);
+        $nzb = new NzbService($cleanup);
+        $priorPath = $nzb->getNzbPath(str_repeat('a', 36), createIfNotExist: true);
+        file_put_contents($priorPath, 'prior-artifact');
+        $failureBefore = (array) DB::table('release_nzb_creation_failures')->first();
+        $releaseBefore = (array) DB::table('releases')->first();
+        $cbpBefore = [];
+        foreach (['collections', 'binaries', 'parts'] as $table) {
+            $cbpBefore[$table] = DB::table($table)->get()->toJson();
+        }
+        $release = Release::query()->findOrFail(1);
+        $release->setRelation('category', (object) ['title' => 'Misc', 'parent' => (object) ['title' => 'Other']]);
+        $result = $nzb->createNzbForRelease($release);
+        $this->assertTrue($result->isDeferred());
+        $this->assertFalse($result->isTransientFailure());
+        $this->assertFalse($result->isDeterministicFailure());
+        $service = (new ReleaseProcessingService(
+            nzb: $nzb,
+            releaseManagement: $management,
+            collectionCleanupService: $cleanup,
+        ))->setEchoCLI(false);
+        for ($pass = 0; $pass < 4; $pass++) {
+            $this->assertSame(0, $service->createNZBs(null));
+            $this->assertSame($failureBefore, (array) DB::table('release_nzb_creation_failures')->first());
+            foreach ($cbpBefore as $table => $rows) {
+                $this->assertSame($rows, DB::table($table)->get()->toJson());
+            }
+            $this->assertSame($releaseBefore, (array) DB::table('releases')->first());
+            $this->assertSame('prior-artifact', file_get_contents($priorPath));
+            $this->assertSame(str_repeat('f', 40), DB::table('releases')->value('article_fingerprint'));
+            $this->assertSame(0, (int) DB::table('releases')->value('nzbstatus'));
+            $this->assertNull(DB::table('releases')->value('nzb_creation_claim_token'));
+            $this->assertNull(DB::table('releases')->value('nzb_creation_claimed_at'));
+            $this->assertSame([], $nzb->findStaleTemporaryNzbPaths(0));
+        }
+        Bus::assertNothingDispatched();
     }
 
     public function test_required_verification_does_not_claim_legacy_header_only_nzb_backlog(): void
@@ -370,7 +546,7 @@ class NzbCreationReliabilityTest extends TestCase
         $this->assertLessThan(strpos($xml, 'part03@example.test'), strpos($xml, 'part02@example.test'));
         $this->assertStringContainsString('<group>alt.test</group>', $xml);
         $this->assertSame(0, DB::table('release_nzb_creation_failures')->count());
-        $this->assertSame(NzbArticleFingerprint::fromContents($xml), DB::table('releases')->where('id', 1)->value('article_fingerprint'));
+        $this->assertSame(sha1(str_repeat('a', 40)), DB::table('releases')->where('id', 1)->value('article_fingerprint'));
     }
 
     public function test_stale_temporary_nzb_cleanup_deletes_only_old_temp_files(): void
