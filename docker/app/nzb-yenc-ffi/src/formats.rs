@@ -2127,7 +2127,11 @@ fn read_rar5_block_observation(
             if header.data_crc32.is_some() {
                 header.data_crc32_scope = Some(header.checksum_domain);
                 header.data_crc32_scope_basis =
-                    Some("RAR5_service_data_declaration_split_scope_withheld");
+                    Some(if header.split_before || header.split_after {
+                        "RAR5_service_data_declaration_split_scope_withheld"
+                    } else {
+                        "RAR5_unsplit_service_data_declaration"
+                    });
             }
             // The directory flag is valid only for file headers. Keep its bytes,
             // but revoke timestamp authority when it appears on a service header.
@@ -2140,7 +2144,11 @@ fn read_rar5_block_observation(
             };
             if let Some(status) = unsupported {
                 if let Some(compression) = &mut header.compression_metadata {
-                    compression.status = status;
+                    compression.status = if header.header_crc32_valid == Some(true) {
+                        status
+                    } else {
+                        "header_untrusted"
+                    };
                     compression.interpretation_status = status;
                     compression.effective_dictionary_bytes = None;
                 }
@@ -8221,6 +8229,98 @@ mod tests {
             "declared_epoch_arithmetic_only"
         );
         assert_eq!(time["times"], extras["records"][0]["time"]["times"]);
+    }
+
+    #[test]
+    fn rar5_service_crc_basis_distinguishes_unsplit_and_split_headers() {
+        for (header_flags, expected_scope, expected_basis) in [
+            (
+                1,
+                "unpacked_service_data",
+                "RAR5_unsplit_service_data_declaration",
+            ),
+            (
+                0x09,
+                "split_service_data_scope_not_interpreted",
+                "RAR5_service_data_declaration_split_scope_withheld",
+            ),
+            (
+                0x11,
+                "split_service_data_scope_not_interpreted",
+                "RAR5_service_data_declaration_split_scope_withheld",
+            ),
+        ] {
+            let mut block = rar5_test_file_block(
+                header_flags,
+                4,
+                0,
+                0,
+                None,
+                Some(123),
+                0,
+                1,
+                b"CMT",
+                &[],
+                &[],
+            );
+            block[5] = 3;
+            recalculate_rar5_header_crc(&mut block, 0);
+            let (observation, _, _) = read_rar5_block_observation(&block, 0, 0);
+            let json = serde_json::to_value(observation).unwrap();
+            let service = &json["service_header"];
+            assert_eq!(service["header_crc32_valid"], true);
+            assert_eq!(service["data_crc32_scope"], expected_scope);
+            assert_eq!(service["data_crc32_scope_basis"], expected_basis);
+        }
+    }
+
+    #[test]
+    fn rar5_service_prohibited_flags_preserve_untrusted_compression_status() {
+        for (file_flags, compression_info, problem) in [
+            (3, 0, "service_file_flags_unsupported"),
+            (2, 0x40, "service_compression_flags_unsupported"),
+        ] {
+            let extra = [0x0a, 3, 2, 0x07, 0xed, 0xe9, 0xd5, 0xde, 0xb1, 0x9d, 0x01];
+            let mut block = rar5_test_file_block(
+                1,
+                file_flags,
+                0,
+                0,
+                Some(1),
+                None,
+                compression_info,
+                1,
+                b"CMT",
+                &extra,
+                &[],
+            );
+            block[5] = 3;
+            recalculate_rar5_header_crc(&mut block, 0);
+            block[0] ^= 1;
+            let (observation, _, _) = read_rar5_block_observation(&block, 0, 0);
+            let json = serde_json::to_value(observation).unwrap();
+            let service = &json["service_header"];
+            assert_eq!(service["header_crc32_valid"], false);
+            assert_eq!(
+                service["compression_metadata"]["status"],
+                "header_untrusted"
+            );
+            assert_eq!(
+                service["compression_metadata"]["interpretation_status"],
+                problem
+            );
+            assert!(service["compression_metadata"]["effective_dictionary_bytes"].is_null());
+            let extras = &service["file_extra_records"];
+            assert_eq!(
+                extras["mtime_comparison_status"],
+                "header_checksum_unconfirmed"
+            );
+            assert!(extras["base_header_mtime_seconds_matches"].is_null());
+            for time in [&extras["time"], &extras["records"][0]["time"]] {
+                assert_eq!(time["interpretation_status"], "header_checksum_unconfirmed");
+                assert!(time["times"][0]["filetime_unix_seconds_floor"].is_null());
+            }
+        }
     }
 
     #[test]
