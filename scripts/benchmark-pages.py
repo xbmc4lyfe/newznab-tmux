@@ -149,7 +149,8 @@ def coverage(root):
 
 def collect(sha, root, fetch=api, archive_download=download):
     report = dict(schema_version=1, repository=REPOSITORY, head_sha=sha,
-                  generated_at=datetime.now(timezone.utc).isoformat(), workflows=[], results=[], coverage=coverage(root))
+                  generated_at=datetime.now(timezone.utc).isoformat(), workflows=[], results=[], coverage=coverage(root),
+                  frozen_reports_available=(root / 'github-pages/benchmarks/index.html').is_file())
     for workflow, expected in WORKFLOWS.items():
         try:
             runs = fetch(f'actions/workflows/{workflow}/runs?branch=master&event=push&head_sha={sha}&per_page=100')['workflow_runs']
@@ -224,6 +225,8 @@ def render(report):
     for row in report['workflows']:
         body.append(f'<tr><td>{escape(row["workflow"])}</td><td>{escape(row["status"])}</td><td>{run_link(row)}</td></tr>')
     body.append('</table><h2>Current measurements</h2>')
+    if report.get('frozen_reports_available'):
+        body.append('<p><a href="benchmarks/">Historical speedup charts, PHP call paths and native flamegraphs</a>. These frozen reports retain their own executed-commit and run provenance; they are separate from this build.</p>')
     for row in report['results']:
         body.append(f'<details><summary>{escape(row["kind"])} · {escape(row["runner"])} · {escape(row["status"])}</summary><p>{run_link(row)}. Evidence: {escape(row.get("evidence_type", "unavailable"))}; adoption qualification: not established.</p>')
         if 'workflow_status' in row:

@@ -59,12 +59,17 @@ jobs:
           persist-credentials: false
       - id: identity
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Preserve the reviewed historical reports
+        run: |
+          if [[ -f github-pages/deployment/prepare-benchmarks.sh ]]; then
+            bash github-pages/deployment/prepare-benchmarks.sh benchmark-site
+          fi
       - name: Collect current commit and attempt summaries
         env:
           GH_TOKEN: ${{ github.token }}
           BUILD_SHA: ${{ steps.identity.outputs.sha }}
         run: python3 scripts/benchmark-pages.py --sha="$BUILD_SHA" --output=benchmark-site
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v4
         with:
           path: benchmark-site
 

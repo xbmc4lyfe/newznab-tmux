@@ -97,6 +97,11 @@ class PagesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             pages.strict_json('{"value":1e999}')
 
+    def test_frozen_reports_link_remains_separate_from_current_results(self):
+        report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[], results=[], frozen_reports_available=True)
+        self.assertIn('href="benchmarks/"', pages.render(report))
+        self.assertIn('separate from this build', pages.render(report))
+
 
 if __name__ == '__main__':
     unittest.main()
