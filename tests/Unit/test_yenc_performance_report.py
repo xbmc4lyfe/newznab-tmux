@@ -215,5 +215,114 @@ calls=2 10
             self.assertIn('profiles/missing/php.callgrind', (output / 'report.html').read_text())
 
 
+class ProfileBuildTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('cc'), 'Native identity fixture needs the existing C compiler')
+    def test_profile_build_retains_selected_mode_command_and_actual_library_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'scripts').mkdir()
+            shutil.copyfile(SCRIPT.with_name('profile-yenc.sh'), root / 'scripts/profile-yenc.sh')
+            tools = root / 'bin'
+            tools.mkdir()
+            library = tools / 'kernel.so'
+            subprocess.run([shutil.which('cc'), '-shared', '-fPIC', '-x', 'c', '-', '-o', str(library)],
+                           input='unsigned nntmux_yenc_payload_kernel_v1(void) { return 4; }',
+                           text=True, check=True, capture_output=True)
+            dispatcher = tools / 'dispatcher'
+            dispatcher.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
+                import json, os, pathlib, shutil, sys
+                name = pathlib.Path(sys.argv[0]).name
+                args = sys.argv[1:]
+                if name == 'uname':
+                    print('Linux')
+                elif name == 'cmake' and args[0] == '--build':
+                    target = pathlib.Path(args[1])
+                    target.mkdir(parents=True, exist_ok=True)
+                    (target / 'librapidyenc.so').write_bytes(b'fixture-cpp')
+                elif name == 'cargo':
+                    target = pathlib.Path(os.environ['CARGO_TARGET_DIR'])
+                    (target / 'release').mkdir(parents=True)
+                    shutil.copyfile(pathlib.Path(__file__).resolve().parent / 'kernel.so',
+                                    target / 'release/libnzbyenc.so')
+                    (target.parent / 'cargo-argv.json').write_text(json.dumps(['cargo', *args]))
+                elif name == 'git':
+                    sys.exit(42)  # Stop after build custody, before instrumentation.
+                elif name not in ('sha256sum', 'tar', 'cmake'):
+                    sys.exit(99)
+                '''))
+            dispatcher.chmod(0o700)
+            for name in ('uname', 'cmake', 'cargo', 'git', 'sha256sum', 'tar'):
+                (tools / name).symlink_to(dispatcher)
+            perf = tools / 'perf'
+            perf.touch()
+            flamegraph = root / 'flamegraph'
+            flamegraph.mkdir()
+            environment = {'PATH': str(tools) + os.pathsep + os.environ['PATH'], 'RUST_TOOLCHAIN': '1.98.0'}
+            for supplied_mode in ('experimental', 'incumbent', None):
+                with self.subTest(mode=supplied_mode):
+                    evidence = root / ('evidence-' + str(supplied_mode))
+                    evidence.mkdir()
+                    command = ['bash', str(root / 'scripts/profile-yenc.sh'), str(evidence),
+                               str(flamegraph), str(perf)]
+                    if supplied_mode is not None:
+                        command.append(supplied_mode)
+                    child = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(42, child.returncode, child.stderr)
+                    mode = supplied_mode or 'incumbent'
+                    args = json.loads((evidence / 'profile-build/cargo-argv.json').read_text())
+                    if mode == 'experimental':
+                        self.assertEqual('experimental-payload-kernels', args[args.index('--features') + 1])
+                    else:
+                        self.assertNotIn('--features', args)
+                    receipt_path = evidence / 'profile-build/rust-build.json'
+                    self.assertTrue(receipt_path.is_file(), 'Missing payload build custody receipt')
+                    receipt = json.loads(receipt_path.read_text())
+                    self.assertEqual(mode, receipt['payload_profile'])
+                    self.assertEqual(args, receipt['command'])
+                    self.assertEqual(4, receipt['runtime_kernel_id'])
+                    self.assertEqual(hashlib.sha256(library.read_bytes()).hexdigest(), receipt['library_sha256'])
+                    self.assertEqual(str((evidence / 'profile-build/rust/release/libnzbyenc.so').resolve()), receipt['library'])
+                    status = json.loads((evidence / 'profiles/status.json').read_text())
+                    self.assertEqual(mode, status['rust_payload_profile'])
+                    self.assertEqual(receipt, status['rust_build_receipt'])
+            for invalid_mode in ('unknown', '--features=experimental-payload-kernels'):
+                evidence = root / ('invalid-' + invalid_mode.replace('/', '_'))
+                evidence.mkdir()
+                child = subprocess.run(['bash', str(root / 'scripts/profile-yenc.sh'), str(evidence),
+                                        str(flamegraph), str(perf), invalid_mode], env=environment,
+                                       capture_output=True, text=True, timeout=10)
+                self.assertEqual(2, child.returncode)
+                self.assertFalse((evidence / 'profile-build').exists())
+
+    def test_experimental_workflow_passes_its_payload_mode_to_the_profiling_handler(self):
+        workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()
+        step = workflow.split('      - name: Capture executed PHP and native hot paths\n', 1)[1].split('      - name:', 1)[0]
+        command = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'bin').mkdir()
+            for name in ('sudo', 'git'):
+                tool = root / 'bin' / name
+                tool.write_text('#!/bin/sh\nexit 0\n')
+                tool.chmod(0o700)
+            find = root / 'bin/find'
+            find.write_text('#!/bin/sh\nprintf "%s\\n" "$GITHUB_WORKSPACE/bin/perf"\n')
+            find.chmod(0o700)
+            (root / 'scripts').mkdir()
+            handler = root / 'scripts/profile-yenc.sh'
+            handler.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$GITHUB_WORKSPACE/profile-argv"\n'
+                               'printf \'{"status":"complete"}\\n\' > "$GITHUB_WORKSPACE/benchmark-evidence/profiles/status.json"\n')
+            (root / 'benchmark-evidence/build').mkdir(parents=True)
+            (root / 'benchmark-evidence/build/runtime.json').write_text('{}')
+            environment = dict(os.environ, PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'],
+                               GITHUB_WORKSPACE=str(root), RUNNER_TEMP=str(root))
+            child = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', command], cwd=root,
+                                   env=environment, capture_output=True, text=True, timeout=10)
+            self.assertEqual(0, child.returncode, child.stderr)
+            self.assertEqual([str(root / 'benchmark-evidence'), str(root / 'nntmux-flamegraph'),
+                              str(root / 'bin/perf'), 'experimental'],
+                             (root / 'profile-argv').read_text().splitlines())
+
+
 if __name__ == '__main__':
     unittest.main()

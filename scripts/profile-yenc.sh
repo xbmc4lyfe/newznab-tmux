@@ -4,8 +4,13 @@
 # Xdebug, perf and a pinned FlameGraph checkout supplied by the workflow.
 set -euo pipefail
 export LC_ALL=C
-if [[ $# -ne 3 || $(uname -s) != Linux ]]; then
-    echo 'Usage: profile-yenc.sh EVIDENCE_DIR FLAMEGRAPH_DIR PERF_BINARY (Linux only)' >&2
+if [[ $# -lt 3 || $# -gt 4 || $(uname -s) != Linux ]]; then
+    echo 'Usage: profile-yenc.sh EVIDENCE_DIR FLAMEGRAPH_DIR PERF_BINARY [incumbent|experimental] (Linux only)' >&2
+    exit 2
+fi
+payload_profile=${4:-incumbent}
+if [[ "$payload_profile" != incumbent && "$payload_profile" != experimental ]]; then
+    echo 'Rust payload profile must be incumbent or experimental.' >&2
     exit 2
 fi
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -20,11 +25,16 @@ profile_phase=native-source
 # shellcheck disable=SC2329
 finish_profile_run() {
     local run_exit=$?
-    python3 - "$evidence/profiles/status.json" "$run_exit" "$profile_phase" <<'PY_STATUS'
+    python3 - "$evidence/profiles/status.json" "$run_exit" "$profile_phase" \
+        "$payload_profile" "$profile_build/rust-build.json" <<'PY_STATUS'
 import json, pathlib, sys
-path, code, phase = sys.argv[1:]
-pathlib.Path(path).write_text(json.dumps({'status': 'complete' if int(code) == 0 else 'invalid',
-    'exit_code': int(code), 'phase': phase}, indent=2) + '\n')
+path, code, phase, mode, build_path = sys.argv[1:]
+record = {'status': 'complete' if int(code) == 0 else 'invalid',
+    'exit_code': int(code), 'phase': phase, 'rust_payload_profile': mode}
+build = pathlib.Path(build_path)
+if build.is_file():
+    record['rust_build_receipt'] = json.loads(build.read_text())
+pathlib.Path(path).write_text(json.dumps(record, indent=2) + '\n')
 PY_STATUS
 }
 trap 'finish_profile_run' EXIT
@@ -40,9 +50,30 @@ cmake -S "$profile_build/cpp-source" -B "$profile_build/cpp" \
     -DCMAKE_CXX_FLAGS_RELEASE='-O3 -DNDEBUG -g -fno-omit-frame-pointer'
 cmake --build "$profile_build/cpp" --target rapidyenc_shared --parallel 2
 profile_phase=rust-debug-build
+rust_build_args=(build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml)
+if [[ "$payload_profile" == experimental ]]; then
+    rust_build_args+=(--features experimental-payload-kernels)
+fi
 CARGO_TARGET_DIR="$profile_build/rust" CARGO_PROFILE_RELEASE_DEBUG=2 \
     CARGO_PROFILE_RELEASE_STRIP=none RUSTFLAGS='-C force-frame-pointers=yes' \
-    cargo +"${RUST_TOOLCHAIN:?}" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml
+    cargo +"${RUST_TOOLCHAIN:?}" "${rust_build_args[@]}"
+python3 - "$profile_build/rust-build.json" "$payload_profile" \
+    "$profile_build/rust/release/libnzbyenc.so" cargo "+$RUST_TOOLCHAIN" "${rust_build_args[@]}" <<'PY_BUILD'
+import ctypes, hashlib, json, pathlib, sys
+path, mode, library_path, *command = sys.argv[1:]
+library = pathlib.Path(library_path)
+native = ctypes.CDLL(str(library))
+kernel = native.nntmux_yenc_payload_kernel_v1
+kernel.argtypes = ()
+kernel.restype = ctypes.c_uint32
+record = {'payload_profile': mode, 'command': command,
+    'build_environment': {'CARGO_PROFILE_RELEASE_DEBUG': '2',
+        'CARGO_PROFILE_RELEASE_STRIP': 'none', 'RUSTFLAGS': '-C force-frame-pointers=yes'},
+    'library': str(library), 'library_sha256': hashlib.sha256(library.read_bytes()).hexdigest(),
+    'runtime_kernel_id': kernel(),
+    'claim': 'Diagnostic optimized build; instrumentation differs from paired timing libraries.'}
+pathlib.Path(path).write_text(json.dumps(record, indent=2) + '\n')
+PY_BUILD
 git -C "$flamegraph" rev-parse HEAD > "$profile_build/flamegraph-revision.txt"
 "$perf_binary" --version > "$profile_build/perf-version.txt"
 XDEBUG_MODE=off php --ri xdebug > "$profile_build/xdebug-version.txt"
