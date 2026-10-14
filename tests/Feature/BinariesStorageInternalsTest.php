@@ -899,6 +899,174 @@ class BinariesStorageInternalsTest extends TestCase
         $this->fail('Full verification capacity must not report successful empty work.');
     }
 
+    public function test_date_backfill_uses_the_selected_client_for_targeting_and_each_group_scan(): void
+    {
+        $this->travelTo(new \DateTimeImmutable('2026-10-14 12:00:00 UTC'));
+        $this->backfillTables(0);
+        DB::table('usenet_groups')->where('id', 1)->update(['first_record' => 901]);
+        DB::table('usenet_groups')->insert(['id' => 2, 'name' => 'alt.second', 'first_record' => 901]);
+        $selected = $this->dateBackfillNntp();
+        $binaries = $this->backfillBinaries($this->dateBackfillNntp());
+        $service = new BackfillService(new BackfillConfig(compressedHeaders: false), $binaries, $selected);
+
+        foreach (DB::table('usenet_groups')->orderBy('id')->get() as $group) {
+            $service->backfillGroup([...((array) $group), 'backfill_target' => 3], 0);
+        }
+
+        $this->assertSame([701, 701], DB::table('usenet_groups')->orderBy('id')->pluck('first_record')->all());
+        $this->assertSame(4, DB::table('parts')->count());
+        $this->assertSame(['alt.second', 'alt.test'], DB::table('collection_groups')->distinct()->orderBy('group_name')->pluck('group_name')->all());
+        foreach (DB::table('collections')->get() as $collection) {
+            $group = $collection->groups_id === 1 ? 'alt.test' : 'alt.second';
+            $this->assertStringStartsWith($group.'.', $collection->subject);
+        }
+    }
+
+    public function test_default_backfill_dependencies_use_the_selected_date_target(): void
+    {
+        $this->travelTo(new \DateTimeImmutable('2026-10-14 12:00:00 UTC'));
+        $this->backfillTables(0);
+        $service = new BackfillService(nntp: $this->dateBackfillNntp());
+
+        $service->backfillGroup([...$this->backfillGroup(), 'backfill_target' => 3], 0);
+
+        $this->assertSame(501, (int) DB::table('usenet_groups')->value('first_record'));
+        $this->assertSame(0, DB::table('parts')->count());
+    }
+
+    public function test_unknown_initial_forward_date_target_does_not_initialize_a_cursor(): void
+    {
+        $this->backfillTables(0);
+        DB::statement('ALTER TABLE usenet_groups ADD last_record INT DEFAULT 0');
+        DB::table('usenet_groups')->update(['first_record' => 0, 'first_record_postdate' => null]);
+        $service = new BinariesService(new BinariesConfig(newGroupScanByDays: true), nntp: $this->dateBackfillNntp(false));
+        $error = null;
+        try {
+            $service->updateGroup($this->backfillGroup());
+        } catch (\RuntimeException $failure) {
+            $error = $failure;
+        }
+
+        $this->assertInstanceOf(\RuntimeException::class, $error);
+        $this->assertSame(0, (int) DB::table('usenet_groups')->value('first_record'));
+        $this->assertSame(0, (int) DB::table('usenet_groups')->value('last_record'));
+        $this->assertSame(0, DB::table('parts')->count());
+    }
+
+    public function test_date_target_ignores_colliding_local_article_numbers(): void
+    {
+        $this->travelTo(new \DateTimeImmutable('2026-10-14 12:00:00 UTC'));
+        $this->backfillTables(0);
+        DB::table('usenet_groups')->where('id', 1)->update(['first_record' => 901]);
+        DB::table('collections')->insert(['id' => 99, 'groups_id' => 99, 'date' => '2026-10-14 12:00:00']);
+        DB::table('binaries')->insert(['id' => 99, 'collections_id' => 99]);
+        DB::table('parts')->insert(['binaries_id' => 99, 'number' => 1, 'partnumber' => 1]);
+        $nntp = $this->dateBackfillNntp();
+        $service = new BackfillService(new BackfillConfig, $this->backfillBinaries($nntp), $nntp);
+
+        $service->backfillGroup([...$this->backfillGroup(), 'backfill_target' => 3], 0);
+
+        $this->assertSame(701, (int) DB::table('usenet_groups')->where('id', 1)->value('first_record'));
+        $this->assertSame(3, DB::table('parts')->count());
+    }
+
+    #[DataProvider('unavailableTargetDates')]
+    public function test_unknown_date_target_preserves_the_cursor_and_group_status(mixed $date): void
+    {
+        $this->travelTo(new \DateTimeImmutable('2026-10-14 12:00:00 UTC'));
+        $this->backfillTables(0);
+        DB::statement('ALTER TABLE usenet_groups ADD backfill INT DEFAULT 1');
+        $nntp = $this->dateBackfillNntp($date);
+        $service = new BackfillService(new BackfillConfig(disableBackfillGroup: true), $this->backfillBinaries($nntp), $nntp);
+        $error = null;
+        try {
+            $service->backfillGroup([...$this->backfillGroup(), 'backfill_target' => 3], 0);
+        } catch (\RuntimeException $failure) {
+            $error = $failure;
+        }
+
+        $this->assertInstanceOf(\RuntimeException::class, $error);
+        $this->assertSame(501, (int) DB::table('usenet_groups')->value('first_record'));
+        $this->assertSame(1, (int) DB::table('usenet_groups')->value('backfill'));
+        $this->assertSame(0, DB::table('parts')->count());
+    }
+
+    public static function unavailableTargetDates(): array
+    {
+        return ['missing overview' => [false], 'empty date' => [''], 'malformed date' => ['not-a-date']];
+    }
+
+    #[DataProvider('backfillRangeResults')]
+    public function test_backfill_cursor_only_advances_after_a_completed_overview_range(bool $successful): void
+    {
+        $this->backfillTables(0);
+        $nntp = $this->dateBackfillNntp(rangeResult: $successful ? [] : false);
+        $service = new BackfillService(new BackfillConfig, $this->backfillBinaries($nntp), $nntp);
+        $error = null;
+        try {
+            $service->backfillGroup($this->backfillGroup(), 0, 100);
+        } catch (\RuntimeException $failure) {
+            $error = $failure;
+        }
+
+        $this->assertSame($successful ? 401 : 501, (int) DB::table('usenet_groups')->value('first_record'));
+        $this->assertSame(0, DB::table('parts')->count());
+        if ($successful) {
+            $this->assertNull($error);
+        } else {
+            $this->assertInstanceOf(\RuntimeException::class, $error);
+        }
+    }
+
+    public static function backfillRangeResults(): array
+    {
+        return ['successful empty range' => [true], 'failed download' => [false]];
+    }
+
+    private function dateBackfillNntp(mixed $date = null, mixed $rangeResult = null): NNTPService
+    {
+        return new class($date, $rangeResult) extends NNTPService
+        {
+            private string $selected = '';
+
+            public function __construct(private readonly mixed $date, private readonly mixed $rangeResult) {}
+
+            public function selectGroup(string $group, mixed $articles = false, bool $force = false): mixed
+            {
+                $this->selected = $group;
+
+                return ['group' => $group, 'first' => '1', 'last' => '1001'];
+            }
+
+            public function getXOVER(string $range): mixed
+            {
+                if ($this->selected === '' || $this->date === false) {
+                    return false;
+                }
+                if (str_contains($range, '-') && $this->rangeResult !== null) {
+                    return $this->rangeResult;
+                }
+                $number = (int) explode('-', $range)[0];
+                $date = $this->date ?? gmdate('r', strtotime('2026-10-04 12:00:00 UTC') + ($number - 1) * 864);
+
+                return [['Number' => (string) $number, 'Subject' => $this->selected.'.Release.'.$number.' (1/1)',
+                    'From' => 'fixture@example.invalid', 'Date' => $date, 'Bytes' => '100', 'Lines' => '1',
+                    'Message-ID' => '<'.$this->selected.'.'.$number.'@example.invalid>', 'References' => '',
+                    'Xref' => 'fixture '.$this->selected.':'.$number]];
+            }
+
+            public function doQuit(bool $force = false): mixed
+            {
+                return true;
+            }
+
+            public function doConnect(bool $compression = true, bool $alternate = false): mixed
+            {
+                return false;
+            }
+        };
+    }
+
     private function backfillTables(int $pendingBytes): void
     {
         $this->createHeaderStorageTables();
