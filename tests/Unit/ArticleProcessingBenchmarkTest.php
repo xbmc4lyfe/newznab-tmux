@@ -29,6 +29,44 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         self::assertSame([64], articleBenchmarkOptions(['native' => '/native.so', 'size' => '64'])['sizes']);
     }
 
+    public function test_profile_and_worker_sample_limits_keep_child_json_within_reader_budget(): void
+    {
+        self::assertSame(64, articleBenchmarkOptions(['profile' => false, 'native' => '/library.so', 'samples' => 64])['samples']);
+        self::assertSame(1000, articleBenchmarkOptions(['paired' => false, 'native' => '/library.so', 'samples' => 1000])['samples']);
+        $this->expectException(InvalidArgumentException::class);
+        articleBenchmarkOptions(['profile' => false, 'native' => '/library.so', 'samples' => 65]);
+    }
+
+    public function test_profile_bad_manifest_retains_structured_failure_and_invalid_summary(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-profile-manifest-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        file_put_contents($directory.'/bad.json', '{malformed');
+        file_put_contents($directory.'/fake.so', 'invalid native library');
+        ob_start();
+        try {
+            $options = ['profile' => false, 'native' => $directory.'/fake.so', 'size' => 64,
+                'runtime-manifest' => $directory.'/bad.json', 'output-dir' => $directory.'/evidence'];
+            self::assertSame(2, articleBenchmarkProfile($options, articleBenchmarkOptions($options)));
+            $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
+                file($directory.'/evidence/observations.jsonl', FILE_IGNORE_NEW_LINES));
+            self::assertSame('failure', $rows[0]['type']);
+            self::assertSame('invalid', $rows[array_key_last($rows)]['status']);
+            self::assertFalse($rows[array_key_last($rows)]['performance_advantage_demonstrated']);
+            $options['runtime-manifest'] = $directory.'/missing.json';
+            $options['output-dir'] = $directory.'/missing-evidence';
+            self::assertSame(2, articleBenchmarkProfile($options, articleBenchmarkOptions($options)));
+            $missing = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
+                file($directory.'/missing-evidence/observations.jsonl', FILE_IGNORE_NEW_LINES));
+            self::assertSame('failure', $missing[0]['type']);
+            self::assertStringContainsString('missing or unreadable', $missing[0]['reason']);
+            self::assertSame('invalid', $missing[array_key_last($missing)]['status']);
+        } finally {
+            ob_end_clean();
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
     public function test_invalid_sizes_cannot_escape_metadata_parser_budget(): void
     {
         $this->expectException(InvalidArgumentException::class);
@@ -85,32 +123,36 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         self::assertSame(articleBenchmarkResultHash(['bytes' => "\xff\0"]), articleBenchmarkResultHash(['bytes' => "\xff\0"]));
     }
 
-    public function test_profile_retains_every_failed_worker_without_claiming_an_advantage(): void
+    public function test_profile_retains_every_failed_worker_and_frozen_binary_without_claiming_an_advantage(): void
     {
         $directory = sys_get_temp_dir().'/nntmux-article-failure-test-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/source', 'profile');
+        file_put_contents($directory.'/fake.so', 'invalid native library');
         ob_start();
         try {
-            $options = ['native' => '/missing/native.so', 'samples' => 1, 'size' => 64, 'output-dir' => $directory];
+            $options = ['native' => $directory.'/fake.so', 'candidate-dir' => $directory.'/source', 'samples' => 1, 'size' => 64, 'output-dir' => $directory.'/evidence'];
             self::assertSame(2, articleBenchmarkProfile($options, articleBenchmarkOptions($options)));
             $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
-                file($directory.'/observations.jsonl', FILE_IGNORE_NEW_LINES));
+                file($directory.'/evidence/observations.jsonl', FILE_IGNORE_NEW_LINES));
             $summary = $rows[array_key_last($rows)];
             self::assertSame('invalid', $summary['status']);
             self::assertSame(14, $summary['invalid_observations']);
             self::assertFalse($summary['performance_advantage_demonstrated']);
-            self::assertCount(14, glob($directory.'/*.stderr'));
-            self::assertCount(14, glob($directory.'/*.stdout'));
-            foreach (glob($directory.'/*.stderr') as $path) {
+            self::assertCount(14, glob($directory.'/evidence/*.stderr'));
+            self::assertCount(14, glob($directory.'/evidence/*.stdout'));
+            self::assertSame(hash_file('sha256', $directory.'/fake.so'), hash_file('sha256', $directory.'/evidence/native.so'));
+            foreach ($rows as $row) {
+                if ($row['type'] === 'observation') {
+                    self::assertContains('--native='.$rows[0]['library']['path'], $row['command']);
+                }
+            }
+            foreach (glob($directory.'/evidence/*.stderr') as $path) {
                 self::assertStringContainsString('Native yEnc is unavailable', (string) file_get_contents($path));
             }
         } finally {
             ob_end_clean();
-            foreach (glob($directory.'/*') as $path) {
-                unlink($path);
-            }
-            if (is_dir($directory)) {
-                rmdir($directory);
-            }
+            self::removeOwnedDirectory($directory);
         }
     }
 
@@ -144,7 +186,7 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         self::assertTrue($regressionGate['acceptance_criteria_met']);
         self::assertFalse($regressionGate['performance_advantage_demonstrated']);
         self::assertSame('regression_only', $regressionGate['comparison_mode']);
-        self::assertTrue(articleBenchmarkPairedDecision($strata, true, 31)['acceptance_criteria_met']);
+        self::assertFalse(articleBenchmarkPairedDecision($strata, true, 31)['acceptance_criteria_met']);
         self::assertFalse(articleBenchmarkPairedDecision($strata, true, 31)['screen_median_criterion_met']);
         $strata[0]['decision'] = 'regression';
         self::assertSame('regression', articleBenchmarkPairedDecision($strata, true, 31)['status']);
@@ -201,9 +243,9 @@ final class ArticleProcessingBenchmarkTest extends TestCase
 
     public function test_paired_combined_qualification_is_explicit_and_candidate_only(): void
     {
-        self::assertSame([], articleBenchmarkPairOptions('candidate', '/snapshot', false));
-        self::assertSame(['--require-combined'], articleBenchmarkPairOptions('candidate', '/snapshot', true));
-        self::assertSame(['--baseline-dir=/snapshot'], articleBenchmarkPairOptions('baseline', '/snapshot', true));
+        self::assertSame(['--source-dir=/candidate'], articleBenchmarkPairOptions('candidate', '/candidate', false));
+        self::assertSame(['--source-dir=/candidate'], articleBenchmarkPairOptions('candidate', '/candidate', true));
+        self::assertSame(['--source-dir=/baseline'], articleBenchmarkPairOptions('baseline', '/baseline', true));
     }
 
     public function test_requested_missing_combined_method_cannot_silently_fall_back(): void
@@ -227,6 +269,158 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         articleBenchmarkQualifyCombined($parser, 'headers', 'body');
     }
 
+    public function test_workers_load_complete_selected_graphs_and_project_autoload_files(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-source-isolation-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/baseline', 'baseline');
+        self::createSyntheticSource($directory.'/candidate', 'candidate');
+        file_put_contents($directory.'/baseline/.env', 'private fixture');
+        file_put_contents($directory.'/baseline/auth.json', 'private fixture');
+        articleBenchmarkGit($directory.'/baseline', ['add', '.env', 'auth.json']);
+        try {
+            $baseline = articleBenchmarkFreezeGraph($directory.'/baseline', $directory.'/baseline-frozen');
+            $candidate = articleBenchmarkFreezeGraph($directory.'/candidate', $directory.'/candidate-frozen');
+            self::assertFileDoesNotExist($baseline['root'].'/.env');
+            self::assertFileDoesNotExist($baseline['root'].'/auth.json');
+            self::assertDirectoryDoesNotExist($baseline['root'].'/.git');
+            foreach (['baseline' => $baseline, 'candidate' => $candidate] as $backend => $snapshot) {
+                $child = yencBenchmarkRunChild(array_merge(articleBenchmarkPhpCommand(), [dirname(__DIR__, 2).'/scripts/benchmark-article-processing.php',
+                    '--worker=inspect-sources', '--native=/unused.so', '--source-dir='.$snapshot['root']]), $directory.'/'.$backend.'-inspection', 30);
+                self::assertSame('ok', $child['status'], (string) file_get_contents($child['stderr_path']));
+                self::assertTrue(articleBenchmarkRuntimeMatches($child, $snapshot));
+                $files = $child['result']['runtime_sources']['files'];
+                self::assertSame($snapshot['files']['app/Services/YencService.php'], $files['app/Services/YencService.php']);
+                self::assertSame($snapshot['files']['app/Services/Yenc/ArticleFrame.php'], $files['app/Services/Yenc/ArticleFrame.php']);
+                self::assertArrayHasKey('app/Extensions/helper/helpers.php', $files);
+                self::assertArrayHasKey('vendor/autoload.php', $files);
+            }
+            self::assertNotSame($baseline['files']['app/Services/YencService.php'], $candidate['files']['app/Services/YencService.php']);
+            self::assertNotSame($baseline['files']['app/Services/Yenc/ArticleFrame.php'], $candidate['files']['app/Services/Yenc/ArticleFrame.php']);
+            file_put_contents($directory.'/candidate/app/Services/YencService.php', '<?php changed source');
+            self::assertTrue(articleBenchmarkGraphStable($candidate));
+            self::assertFalse(articleBenchmarkGraphStable($candidate, $directory.'/candidate'));
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
+    public function test_worker_rejects_project_autoload_files_outside_selected_graph(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-autoload-escape-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/source', 'source');
+        file_put_contents($directory.'/outside.php', '<?php');
+        file_put_contents($directory.'/source/vendor/autoload.php', str_replace('return true;',
+            'require '.var_export($directory.'/outside.php', true).'; return true;', (string) file_get_contents($directory.'/source/vendor/autoload.php')));
+        try {
+            $child = yencBenchmarkRunChild(array_merge(articleBenchmarkPhpCommand(), [dirname(__DIR__, 2).'/scripts/benchmark-article-processing.php',
+                '--worker=inspect-sources', '--native=/unused.so', '--source-dir='.$directory.'/source']), $directory.'/escape', 30);
+            self::assertSame('child_failed', $child['status']);
+            self::assertStringContainsString('Included file escaped selected runtime', (string) file_get_contents($child['stderr_path']));
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
+    public function test_archive_only_graph_rejection_retains_setup_failure(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-archive-rejection-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/source', 'archive');
+        self::removeOwnedDirectory($directory.'/source/.git');
+        file_put_contents($directory.'/fake.so', 'invalid native library');
+        ob_start();
+        try {
+            $options = ['paired' => false, 'samples' => 1, 'baseline-dir' => $directory.'/source', 'candidate-dir' => $directory.'/source',
+                'native' => $directory.'/fake.so', 'baseline-native' => $directory.'/fake.so', 'output-dir' => $directory.'/evidence'];
+            self::assertSame(2, articleBenchmarkPaired($options, articleBenchmarkOptions($options)));
+            $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
+                file($directory.'/evidence/observations.jsonl', FILE_IGNORE_NEW_LINES));
+            self::assertSame('failure', $rows[0]['type']);
+            self::assertStringContainsString('Git tracked-file manifest', $rows[0]['reason']);
+            self::assertSame('invalid', $rows[array_key_last($rows)]['status']);
+        } finally {
+            ob_end_clean();
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
+    public function test_snapshot_rejects_tracked_symlinks_to_external_source(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-symlink-escape-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/source', 'source');
+        file_put_contents($directory.'/outside.php', '<?php');
+        symlink($directory.'/outside.php', $directory.'/source/escaped.php');
+        articleBenchmarkGit($directory.'/source', ['add', 'escaped.php']);
+        try {
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('Tracked source escapes selected source');
+            articleBenchmarkFreezeGraph($directory.'/source', $directory.'/snapshot');
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
+    public function test_measured_worker_cannot_run_candidate_only_qualification(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Combined qualification must run in its own');
+        articleBenchmarkWorker('full-analyzer', articleBenchmarkFixture(64, 'ordinary'), '/unused.so', 1, null, true);
+    }
+
+    public function test_frozen_binary_survives_atomic_replacement_of_the_supplied_path(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-library-freeze-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        file_put_contents($directory.'/native.so', 'first binary');
+        try {
+            $snapshot = articleBenchmarkFreezeLibrary($directory.'/native.so', $directory.'/frozen.so');
+            file_put_contents($directory.'/replacement.so', 'replacement binary');
+            rename($directory.'/replacement.so', $directory.'/native.so');
+            self::assertSame('first binary', file_get_contents($snapshot['path']));
+            self::assertSame($snapshot['sha256'], hash_file('sha256', $snapshot['path']));
+            self::assertNotSame($snapshot['sha256'], hash_file('sha256', $directory.'/native.so'));
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
+    public function test_requested_qualification_runs_before_pairs_in_its_own_process(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-qualification-order-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/source', 'qualification');
+        file_put_contents($directory.'/fake.so', 'invalid native library');
+        ob_start();
+        try {
+            $options = ['paired' => false, 'require-combined' => false, 'samples' => 1,
+                'baseline-dir' => $directory.'/source', 'candidate-dir' => $directory.'/source',
+                'native' => $directory.'/fake.so', 'baseline-native' => $directory.'/fake.so', 'output-dir' => $directory.'/evidence'];
+            self::assertSame(2, articleBenchmarkPaired($options, articleBenchmarkOptions($options)));
+            $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
+                file($directory.'/evidence/observations.jsonl', FILE_IGNORE_NEW_LINES));
+            $qualified = [];
+            foreach ($rows as $row) {
+                if ($row['type'] === 'qualification') {
+                    self::assertContains('--worker=qualify-combined', $row['command']);
+                    $qualified[$row['size'].'-'.$row['density']] = true;
+                } elseif ($row['type'] === 'observation') {
+                    self::assertArrayHasKey($row['size'].'-'.$row['density'], $qualified);
+                    self::assertContains('--worker=full-analyzer', $row['command']);
+                    self::assertNotContains('--require-combined', $row['command']);
+                    self::assertFalse($row['eligible']);
+                }
+            }
+            self::assertCount(6, $qualified);
+            self::assertSame('invalid', $rows[array_key_last($rows)]['status']);
+        } finally {
+            ob_end_clean();
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
     public function test_build_manifest_requires_matching_source_and_library_identities(): void
     {
         $manifest = ['baseline_library_sha256' => 'old-library', 'candidate_library_sha256' => 'new-library',
@@ -245,10 +439,12 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         $directory = sys_get_temp_dir().'/nntmux-article-paired-failure-'.bin2hex(random_bytes(8));
         mkdir($directory, 0700);
         file_put_contents($directory.'/fake-library.so', 'deliberately invalid native library');
+        self::createSyntheticSource($directory.'/baseline', 'baseline');
+        self::createSyntheticSource($directory.'/candidate', 'candidate');
         ob_start();
         try {
             $options = ['paired' => false, 'native' => $directory.'/fake-library.so', 'baseline-native' => $directory.'/fake-library.so',
-                'baseline-dir' => dirname(__DIR__, 2), 'samples' => 3, 'order-seed' => 123, 'output-dir' => $directory.'/paired'];
+                'baseline-dir' => $directory.'/baseline', 'candidate-dir' => $directory.'/candidate', 'samples' => 3, 'order-seed' => 123, 'output-dir' => $directory.'/paired'];
             self::assertSame(2, articleBenchmarkPaired($options, articleBenchmarkOptions($options)));
             $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
                 file($directory.'/paired/observations.jsonl', FILE_IGNORE_NEW_LINES));
@@ -275,10 +471,7 @@ final class ArticleProcessingBenchmarkTest extends TestCase
             self::assertSame(hash_file('sha256', $directory.'/fake-library.so'), hash_file('sha256', $directory.'/paired/candidate.so'));
         } finally {
             ob_end_clean();
-            foreach (new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS), \RecursiveIteratorIterator::CHILD_FIRST) as $file) {
-                $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
-            }
-            rmdir($directory);
+            self::removeOwnedDirectory($directory);
         }
     }
 
@@ -291,13 +484,14 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         $directory = sys_get_temp_dir().'/nntmux-article-worker-test-'.bin2hex(random_bytes(8));
         mkdir($directory, 0700);
         try {
-            $cases = array_map(static fn (string $phase): array => [$phase, 4096, 'ordinary'], articleBenchmarkPhases());
-            $cases[] = ['full-analyzer', 1048576, 'heavy'];
-            foreach ($cases as [$phase, $size, $density]) {
+            $cases = array_map(static fn (string $phase): array => [$phase, 4096, 'ordinary', 1], articleBenchmarkPhases());
+            $cases[] = ['full-analyzer', 1048576, 'heavy', 1];
+            $cases[] = ['body-metadata', 1048576, 'heavy', 64];
+            foreach ($cases as [$phase, $size, $density, $samples]) {
                 $prefix = $directory.'/'.$phase.'-'.$size;
                 file_put_contents($prefix.'.fixture', serialize(articleBenchmarkFixture($size, $density)));
                 $child = yencBenchmarkRunChild(array_merge(articleBenchmarkPhpCommand(), [dirname(__DIR__, 2).'/scripts/benchmark-article-processing.php',
-                    '--worker='.$phase, '--native='.$library, '--samples=1', '--fixture-path='.$prefix.'.fixture',
+                    '--worker='.$phase, '--native='.$library, '--samples='.$samples, '--fixture-path='.$prefix.'.fixture',
                     '--result-output='.$prefix.'.metadata']), $prefix, 30);
                 self::assertSame('ok', $child['status'], (string) file_get_contents($child['stderr_path']));
                 self::assertFalse($child['stdout_truncated_for_json']);
@@ -310,9 +504,9 @@ final class ArticleProcessingBenchmarkTest extends TestCase
                 self::assertSame('diagnostic_only', $result['evidence']);
                 self::assertTrue($result['cold_reference']['correct']);
                 self::assertGreaterThan(0, $result['cold_reference']['elapsed_ms']);
-                self::assertCount(2, $result['observations']);
+                self::assertCount($samples + 1, $result['observations']);
                 if ($phase === 'body-metadata') {
-                    self::assertCount(2, $result['body_ffi_breakdown']);
+                    self::assertCount($samples + 1, $result['body_ffi_breakdown']);
                     foreach ($result['body_ffi_breakdown'] as $bridge) {
                         self::assertTrue($bridge['correct']);
                         self::assertSame($result['reference_sha256'], $bridge['result_sha256']);
@@ -332,5 +526,77 @@ final class ArticleProcessingBenchmarkTest extends TestCase
             }
             rmdir($directory);
         }
+    }
+
+    private static function createSyntheticSource(string $root, string $marker): void
+    {
+        mkdir($root, 0700);
+        $classes = [
+            'App\\Services\\NNTP\\NNTPService' => '',
+            'App\\Services\\Releases\\Fingerprint\\NzbFingerprintAnalyzer' => '',
+            'App\\Services\\Releases\\Fingerprint\\NativeMetadataParser' => '',
+            'App\\Services\\YencService' => 'public const MARKER = '.var_export($marker, true).';',
+            'App\\Services\\Yenc\\DecoderFactory' => 'public function make(string $mode, string $path): object { throw new \\RuntimeException("Native yEnc is unavailable: synthetic invalid library"); }',
+            'App\\Services\\Yenc\\NativePayloadDecoder' => '',
+            'App\\Services\\Yenc\\ArticleFrame' => 'public const MARKER = '.var_export($marker, true).';',
+        ];
+        foreach ($classes as $class => $body) {
+            $separator = strrpos($class, '\\');
+            $namespace = substr($class, 0, $separator);
+            $name = substr($class, $separator + 1);
+            $path = $root.'/app/'.str_replace('\\', '/', substr($class, 4)).'.php';
+            if (! is_dir(dirname($path))) {
+                mkdir(dirname($path), 0700, true);
+            }
+            file_put_contents($path, '<?php namespace '.$namespace.'; class '.$name.' { '.$body.' }');
+        }
+        mkdir($root.'/app/Extensions/helper', 0700, true);
+        file_put_contents($root.'/app/Extensions/helper/helpers.php', '<?php const SYNTHETIC_SOURCE_MARKER = '.var_export($marker, true).';');
+        mkdir($root.'/tests/Support', 0700, true);
+        copy(dirname(__DIR__).'/Support/YencNntpHarness.php', $root.'/tests/Support/YencNntpHarness.php');
+        mkdir($root.'/vendor', 0700);
+        file_put_contents($root.'/vendor/framework.php', <<<'PHP'
+<?php
+namespace Illuminate\Container;
+class Container {
+    private static ?self $instance = null;
+    public static function getInstance(): self { return self::$instance ??= new self; }
+    public static function setInstance(?self $value): void { self::$instance = $value; }
+    public function instance(string $key, mixed $value): void {}
+}
+namespace Illuminate\Config;
+class Repository { public function __construct(array $values) {} }
+PHP);
+        file_put_contents($root.'/vendor/autoload.php', <<<'PHP'
+<?php
+require __DIR__.'/framework.php';
+require dirname(__DIR__).'/app/Extensions/helper/helpers.php';
+spl_autoload_register(static function (string $class): void {
+    $root = dirname(__DIR__);
+    foreach (['App\\' => '/app/', 'Tests\\' => '/tests/'] as $prefix => $directory) {
+        if (str_starts_with($class, $prefix)) {
+            $path = $root.$directory.str_replace('\\', '/', substr($class, strlen($prefix))).'.php';
+            if (is_file($path)) { require $path; }
+        }
+    }
+});
+return true;
+PHP);
+        file_put_contents($root.'/composer.json', '{}');
+        file_put_contents($root.'/composer.lock', '{}');
+        articleBenchmarkGit($root, ['init', '--quiet']);
+        $paths = ['app', 'tests', 'composer.json', 'composer.lock'];
+        articleBenchmarkGit($root, ['add', ...$paths]);
+    }
+
+    private static function removeOwnedDirectory(string $directory): void
+    {
+        if (! is_dir($directory)) {
+            return;
+        }
+        foreach (new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS), \RecursiveIteratorIterator::CHILD_FIRST) as $file) {
+            $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
+        }
+        rmdir($directory);
     }
 }

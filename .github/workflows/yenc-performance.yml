@@ -39,6 +39,19 @@ on:
         description: Frozen source revision for the manual caller comparison
         default: 'master'
         required: true
+      candidate_ref:
+        description: Optional application revision for the manual caller comparison
+        default: ''
+        required: false
+      caller_mode:
+        description: Require 1.5x median screening gains or only reject regressions
+        type: choice
+        options: [screen, regression]
+        default: screen
+      combined_qualification:
+        description: Require the candidate combined metadata API in a separate process
+        type: boolean
+        default: false
       seed:
         description: Recorded order and bootstrap seed
         default: '20261013'
@@ -279,6 +292,9 @@ jobs:
       RUST_TOOLCHAIN: '1.98.0'
       BENCHMARK_SAMPLES: ${{ inputs.samples || '31' }}
       BENCHMARK_SEED: ${{ inputs.seed || '20261014' }}
+      CANDIDATE_SOURCE: ${{ github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing') && inputs.candidate_ref != '' && 'candidate-source' || '.' }}
+      CALLER_MODE: ${{ inputs.caller_mode || 'screen' }}
+      REQUIRE_COMBINED: ${{ inputs.combined_qualification || false }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -290,6 +306,14 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha || inputs.baseline_ref || 'master' }}
           path: baseline-source
+          persist-credentials: false
+
+      - name: Check out optional application candidate
+        if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing') && inputs.candidate_ref != ''
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.candidate_ref }}
+          path: candidate-source
           persist-credentials: false
 
       - uses: shivammathur/setup-php@v2
@@ -316,9 +340,17 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
         shell: bash
         run: |
-          cmp composer.lock baseline-source/composer.lock
+          cmp "$CANDIDATE_SOURCE/composer.lock" baseline-source/composer.lock
+          composer install --working-dir=baseline-source --prefer-dist --no-interaction --no-progress --no-scripts
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path baseline-source/docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/baseline-build.log
           cp baseline-source/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so processing-evidence/build/baseline.so
+          if [[ "$CANDIDATE_SOURCE" != . ]]; then
+            composer install --working-dir="$CANDIDATE_SOURCE" --prefer-dist --no-interaction --no-progress --no-scripts
+            cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path "$CANDIDATE_SOURCE/docker/app/nzb-yenc-ffi/Cargo.toml" 2>&1 | tee processing-evidence/build/candidate-build.log
+          fi
+          cp "$CANDIDATE_SOURCE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" processing-evidence/build/candidate.so
+        env:
+          COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ secrets.GITHUB_TOKEN }}"}}'
 
       - name: Test real processing profile workers
         env:
@@ -334,6 +366,14 @@ jobs:
               return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
           def digest(path):
               return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+          def optional_kernel(library_path):
+              decoder = ctypes.CDLL(str(library_path.resolve()))
+              try:
+                  function = decoder.nntmux_yenc_payload_kernel_v1
+              except AttributeError:
+                  return None
+              function.restype = ctypes.c_uint32
+              return function()
           library = pathlib.Path('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')
           decoder = ctypes.CDLL(str(library.resolve()))
           decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
@@ -358,27 +398,32 @@ jobs:
           def sources(root):
               return {str(path.relative_to(root)): digest(path) for path in
                   [root / name for name in callers + native] + sorted((root / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs'))}
+          candidate_library = pathlib.Path(os.environ['CANDIDATE_SOURCE']) / library
+          candidate_kernel_id = optional_kernel(candidate_library)
           manifest.update({
-              'candidate_library_sha256': digest(library),
-              'candidate_source_sha256': sources(pathlib.Path('.')),
+              'candidate_payload_kernel_id': candidate_kernel_id,
+              'candidate_payload_kernel_status': 'available' if candidate_kernel_id is not None else 'diagnostic_export_unavailable',
+              'candidate_library_sha256': digest(pathlib.Path(os.environ['CANDIDATE_SOURCE']) / library),
+              'candidate_source_sha256': sources(pathlib.Path(os.environ['CANDIDATE_SOURCE'])),
+              'candidate_git_head': run('git', '-C', os.environ['CANDIDATE_SOURCE'], 'rev-parse', 'HEAD'),
               'build_command': 'cargo +1.98.0 build --release --locked',
           })
           baseline = pathlib.Path('baseline-source')
           if baseline.is_dir():
               baseline_library = baseline / library
-              baseline_decoder = ctypes.CDLL(str(baseline_library.resolve()))
-              baseline_decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+              baseline_kernel_id = optional_kernel(baseline_library)
               manifest.update({
                   'baseline_git_head': run('git', '-C', str(baseline), 'rev-parse', 'HEAD'),
                   'baseline_library_sha256': digest(baseline_library),
                   'baseline_source_sha256': sources(baseline),
-                  'baseline_payload_kernel_id': baseline_decoder.nntmux_yenc_payload_kernel_v1(),
+                  'baseline_payload_kernel_id': baseline_kernel_id,
+                  'baseline_payload_kernel_status': 'available' if baseline_kernel_id is not None else 'diagnostic_export_unavailable',
               })
           pathlib.Path('processing-evidence/build/runtime.json').write_text(json.dumps(manifest, indent=2) + '\n')
           PY
 
       - name: Capture CPU counters before caller profile
-        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/cpu-before.json
+        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/profile-cpu-before.json
 
       - name: Profile actual BODY assembly and metadata callers
         shell: bash
@@ -389,22 +434,33 @@ jobs:
             --output-dir="$GITHUB_WORKSPACE/processing-evidence/profile" \
             2>&1 | tee processing-evidence/build/profile-console.log
 
+      - name: Capture CPU counters after caller profile
+        if: always() && hashFiles('processing-evidence/build/profile-cpu-before.json') != ''
+        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/profile-cpu-after.json
+
+      - name: Capture CPU counters before paired caller comparison
+        if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
+        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/paired-cpu-before.json
+
       - name: Compare full fingerprint caller against frozen baseline
         if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
         shell: bash
         run: |
-          php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-article-processing.php \
-            --paired --baseline-dir="$GITHUB_WORKSPACE/baseline-source" \
+          caller_flags=()
+          if [[ "$CALLER_MODE" == regression ]]; then caller_flags+=(--regression-only); fi
+          if [[ "$REQUIRE_COMBINED" == true ]]; then caller_flags+=(--require-combined); fi
+          php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-article-processing.php "${caller_flags[@]}" \
+            --candidate-dir="$GITHUB_WORKSPACE/$CANDIDATE_SOURCE" --paired --baseline-dir="$GITHUB_WORKSPACE/baseline-source" \
             --baseline-native="$GITHUB_WORKSPACE/processing-evidence/build/baseline.so" \
-            --native="$GITHUB_WORKSPACE/processing-evidence/build/native.so" \
+            --native="$GITHUB_WORKSPACE/processing-evidence/build/candidate.so" \
             --samples="$BENCHMARK_SAMPLES" --order-seed="$BENCHMARK_SEED" --timeout=30 \
             --runtime-manifest="$GITHUB_WORKSPACE/processing-evidence/build/runtime.json" \
             --output-dir="$GITHUB_WORKSPACE/processing-evidence/paired" \
             2>&1 | tee processing-evidence/build/paired-console.log
 
-      - name: Capture CPU counters after caller profile
-        if: always() && hashFiles('processing-evidence/build/cpu-before.json') != ''
-        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/cpu-after.json
+      - name: Capture CPU counters after paired caller comparison
+        if: always() && hashFiles('processing-evidence/build/paired-cpu-before.json') != ''
+        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/paired-cpu-after.json
 
       - name: Summarize caller screen without claiming adoption
         if: always()

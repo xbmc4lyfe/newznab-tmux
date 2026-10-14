@@ -9,13 +9,16 @@ declare(strict_types=1);
  * Every phase uses a fresh process, one untimed reference and one recorded warmup.
  * Profile results are diagnostic only. Paired mode uses --paired --baseline-dir=ROOT
  * --baseline-native=LIB --native=LIB [--samples=31] [--order-seed=20261014].
- * [--require-combined] explicitly qualifies the candidate combined API before warmup.
+ * [--candidate-dir=ROOT] selects an independently installed app graph.
+ * [--require-combined] qualifies the candidate API in a separate process per fixture.
  * Paired mode currently screens median speedups only; p99/adoption is unqualified.
  */
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Fingerprint\NativeMetadataParser;
 use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
+use App\Services\Yenc\ArticleFrame;
 use App\Services\Yenc\DecoderFactory;
+use App\Services\Yenc\NativePayloadDecoder;
 use App\Services\YencService;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
@@ -32,18 +35,24 @@ if (defined('NNTMUX_ARTICLE_BENCHMARK_FUNCTIONS_ONLY')) {
     return;
 }
 
-require dirname(__DIR__).'/vendor/autoload.php';
-$options = getopt('', ['profile', 'paired', 'regression-only', 'min-speedup:', 'baseline-native:', 'order-seed:', 'require-combined', 'native:', 'size:', 'samples:', 'worker:', 'fixture-path:', 'output-dir:', 'timeout:', 'runtime-manifest:', 'baseline-dir:', 'result-output:']);
+$options = getopt('', ['profile', 'paired', 'regression-only', 'min-speedup:', 'baseline-native:', 'order-seed:', 'require-combined', 'native:', 'size:', 'samples:', 'worker:', 'fixture-path:', 'output-dir:', 'timeout:', 'runtime-manifest:', 'baseline-dir:', 'candidate-dir:', 'source-dir:', 'result-output:']);
 try {
     $validated = articleBenchmarkOptions($options);
-    if (isset($options['baseline-dir'], $options['worker'])) {
-        foreach (articleBenchmarkBaselinePaths() as $path) {
-            $source = rtrim((string) $options['baseline-dir'], '/').'/'.$path;
-            if (! is_file($source)) {
-                throw new InvalidArgumentException('Missing baseline source: '.$source);
-            }
-            require $source;
-        }
+    $sourceRoot = realpath((string) (isset($options['worker'])
+        ? ($options['source-dir'] ?? $options['candidate-dir'] ?? $options['baseline-dir'] ?? dirname(__DIR__))
+        : dirname(__DIR__))) ?: throw new InvalidArgumentException('Selected source directory does not exist.');
+    $autoloadPath = realpath($sourceRoot.'/vendor/autoload.php');
+    if ($autoloadPath === false || ! str_starts_with($autoloadPath, $sourceRoot.'/') || ! is_file($autoloadPath)) {
+        throw new InvalidArgumentException('Selected source directory needs its own installed Composer autoloader.');
+    }
+    chdir($sourceRoot);
+    require $autoloadPath;
+    if (($options['worker'] ?? null) === 'inspect-sources') {
+        $started = hrtime(true);
+        $runtimeSources = articleBenchmarkRuntimeSources($sourceRoot);
+        echo json_encode(['status' => 'ok', 'evidence' => 'runtime_inspection',
+            'median_ms' => (hrtime(true) - $started) / 1e6, 'runtime_sources' => $runtimeSources], JSON_THROW_ON_ERROR).PHP_EOL;
+        exit(0);
     }
     if (isset($options['worker'])) {
         $fixture = unserialize((string) file_get_contents((string) ($options['fixture-path'] ?? '')), ['allowed_classes' => false]);
@@ -51,6 +60,7 @@ try {
             throw new InvalidArgumentException('Worker requires a frozen article fixture.');
         }
         $result = articleBenchmarkWorker((string) $options['worker'], $fixture, $validated['native'], $validated['samples'], isset($options['result-output']) ? (string) $options['result-output'] : null, isset($options['require-combined']));
+        $result['runtime_sources'] = articleBenchmarkRuntimeSources($sourceRoot);
         echo json_encode($result, JSON_THROW_ON_ERROR).PHP_EOL;
         exit($result['status'] === 'ok' ? 0 : 2);
     }
@@ -62,6 +72,14 @@ try {
     }
     exit(articleBenchmarkProfile($options, $validated));
 } catch (Throwable $exception) {
+    if (isset($options['worker'], $sourceRoot)) {
+        try {
+            $runtime = articleBenchmarkRuntimeSources($sourceRoot);
+        } catch (Throwable $runtimeError) {
+            $runtime = ['error' => $runtimeError->getMessage()];
+        }
+        echo json_encode(['status' => 'invalid', 'error' => $exception->getMessage(), 'runtime_sources' => $runtime], JSON_THROW_ON_ERROR).PHP_EOL;
+    }
     fwrite(STDERR, $exception->getMessage().PHP_EOL);
     exit(2);
 }
@@ -117,8 +135,9 @@ function articleBenchmarkOptions(array $options): array
     $samples = filter_var($options['samples'] ?? (isset($options['paired']) ? 31 : 7), FILTER_VALIDATE_INT);
     $size = filter_var($options['size'] ?? 4096, FILTER_VALIDATE_INT);
     $timeout = filter_var($options['timeout'] ?? 30, FILTER_VALIDATE_FLOAT);
-    if ($samples === false || $samples < 1 || $samples > 1000) {
-        throw new InvalidArgumentException('Samples must be an integer between 1 and 1000.');
+    $maximumSamples = isset($options['paired']) ? 1000 : 64;
+    if ($samples === false || $samples < 1 || $samples > $maximumSamples) {
+        throw new InvalidArgumentException('Samples must be an integer between 1 and '.$maximumSamples.'.');
     }
     if ($size === false || $size < 1 || $size > 1048576) {
         throw new InvalidArgumentException('Size must be an integer between 1 and 1048576 bytes (including heavy escaping within the metadata budget).');
@@ -169,7 +188,7 @@ function articleBenchmarkResultHash(mixed $result): string
  */
 function articleBenchmarkWorker(string $phase, array $fixture, string $native, int $samples, ?string $resultOutput = null, bool $requireCombined = false): array
 {
-    if (! in_array($phase, articleBenchmarkPhases(), true)) {
+    if (! in_array($phase, [...articleBenchmarkPhases(), 'qualify-combined'], true)) {
         throw new InvalidArgumentException('Unknown worker phase: '.$phase);
     }
     $previous = Container::getInstance();
@@ -177,7 +196,20 @@ function articleBenchmarkWorker(string $phase, array $fixture, string $native, i
     $container->instance('config', new Repository(['yenc' => ['native_library' => $native]]));
     Container::setInstance($container);
     try {
-        return articleBenchmarkMeasure($phase, $fixture, $native, $samples, $resultOutput, $requireCombined);
+        if ($phase === 'qualify-combined') {
+            (new DecoderFactory)->make('native', $native);
+            $started = hrtime(true);
+            articleBenchmarkQualifyCombined(new NativeMetadataParser, implode('', $fixture['headers']), $fixture['body']);
+
+            return ['status' => 'ok', 'evidence' => 'qualification_only', 'median_ms' => (hrtime(true) - $started) / 1e6,
+                'combined_available' => true, 'library_sha256' => hash_file('sha256', $native),
+                'fixture_sha256' => articleBenchmarkResultHash($fixture)];
+        }
+        if ($requireCombined) {
+            throw new InvalidArgumentException('Combined qualification must run in its own qualify-combined worker.');
+        }
+
+        return articleBenchmarkMeasure($phase, $fixture, $native, $samples, $resultOutput);
     } finally {
         Container::setInstance($previous);
     }
@@ -187,7 +219,7 @@ function articleBenchmarkWorker(string $phase, array $fixture, string $native, i
  * @param  array{data: string, body: string, headers: list<string>, wire: string}  $fixture
  * @return array<string, mixed>
  */
-function articleBenchmarkMeasure(string $phase, array $fixture, string $native, int $samples, ?string $resultOutput = null, bool $requireCombined = false): array
+function articleBenchmarkMeasure(string $phase, array $fixture, string $native, int $samples, ?string $resultOutput = null): array
 {
     $service = new YencService((new DecoderFactory)->make('native', $native));
     $analyzer = new NzbFingerprintAnalyzer($service);
@@ -243,14 +275,6 @@ function articleBenchmarkMeasure(string $phase, array $fixture, string $native, 
         $referenceMetadataHash = $referenceMetadata === null ? null : hash('sha256', $referenceMetadata);
         unset($referenceMetadata);
         unset($reference);
-        $combinedAvailable = false;
-        if ($requireCombined) {
-            if ($phase !== 'full-analyzer') {
-                throw new RuntimeException('Combined metadata qualification requires the full analyzer phase.');
-            }
-            articleBenchmarkQualifyCombined($parser, $headers, $fixture['body']);
-            $combinedAvailable = true;
-        }
         for ($sample = -1; $sample < $samples; $sample++) {
             rewind($stream);
             $harness->commands = [];
@@ -293,7 +317,7 @@ function articleBenchmarkMeasure(string $phase, array $fixture, string $native, 
         return ['status' => $valid ? 'ok' : 'incorrect', 'evidence' => 'diagnostic_only', 'phase' => $phase,
             'cold_reference' => ['elapsed_ms' => $referenceElapsed, 'correct' => $referenceValid,
                 'process_cpu_before' => $referenceCpuBefore, 'process_cpu_after' => $referenceCpuAfter],
-            'combined_required' => $requireCombined, 'combined_available' => $combinedAvailable,
+            'combined_required' => false, 'combined_available' => false,
             'median_ms' => yencBenchmarkMedian($times), 'min_ms' => min($times), 'max_ms' => max($times),
             'observations' => $observations, 'body_ffi_breakdown' => $bodyBridge, 'reference_sha256' => $referenceHash,
             'reference_metadata_sha256' => $referenceMetadataHash, 'reference_metadata_path' => $referenceMetadataHash === null ? null : $resultOutput,
@@ -327,7 +351,7 @@ function articleBenchmarkQualifyCombined(object $parser, string $headers, string
 /** @return list<string> */
 function articleBenchmarkPairOptions(string $backend, string $baselineSnapshot, bool $requireCombined): array
 {
-    return $backend === 'baseline' ? ['--baseline-dir='.$baselineSnapshot] : ($requireCombined ? ['--require-combined'] : []);
+    return ['--source-dir='.$baselineSnapshot];
 }
 
 /** Call a symbol from the qualified FFI declaration; FFI exposes C functions dynamically. */
@@ -439,49 +463,63 @@ function articleBenchmarkProfile(array $options, array $validated): int
     if (file_exists($directory) || ! mkdir($directory, 0700, true)) {
         throw new InvalidArgumentException('Output directory must be new: '.$directory);
     }
+    $directory = realpath($directory) ?: throw new RuntimeException('Cannot resolve evidence directory.');
     $write = static function (array $row) use ($directory): void {
         $line = json_encode($row, JSON_THROW_ON_ERROR).PHP_EOL;
         file_put_contents($directory.'/observations.jsonl', $line, FILE_APPEND);
         echo $line;
     };
-    $write(['type' => 'protocol', 'evidence' => 'diagnostic_only', 'samples' => $validated['samples'], 'warmups' => 1,
-        'untimed_reference_calls' => 1, 'sizes' => $validated['sizes'], 'densities' => ['ordinary', 'heavy'],
-        'phases' => articleBenchmarkPhases(), 'timeout_seconds' => $validated['timeout'], 'output_dir' => $directory,
-        'library_sha256' => is_file($validated['native']) ? hash_file('sha256', $validated['native']) : null,
-        'sources' => articleBenchmarkSourceHashes(dirname(__DIR__)),
-        'baseline_sources' => isset($options['baseline-dir']) ? articleBenchmarkSourceHashes((string) $options['baseline-dir']) : null,
-        'runtime' => ['php' => PHP_VERSION, 'os' => php_uname(), 'opcache_cli' => ini_get('opcache.enable_cli'),
-            'jit' => ini_get('opcache.jit'), 'memory_limit' => ini_get('memory_limit'), 'ffi' => ini_get('ffi.enable'),
-            'extensions' => get_loaded_extensions(), 'fileinfo' => extension_loaded('fileinfo')],
-        'runtime_manifest' => isset($options['runtime-manifest']) ? json_decode((string) file_get_contents((string) $options['runtime-manifest']), true, flags: JSON_THROW_ON_ERROR) : null]);
-    $invalid = 0;
-    foreach ($validated['sizes'] as $size) {
-        foreach (['ordinary', 'heavy'] as $density) {
-            $fixture = articleBenchmarkFixture($size, $density);
-            $fixturePath = $directory.'/fixture-'.$size.'-'.$density.'.serialized';
-            file_put_contents($fixturePath, serialize($fixture));
-            $write(['type' => 'fixture', 'size' => $size, 'density' => $density, 'path' => $fixturePath,
-                'serialized_sha256' => hash_file('sha256', $fixturePath), 'decoded_sha256' => hash('sha256', $fixture['data']),
-                'body_sha256' => hash('sha256', $fixture['body']), 'headers_sha256' => hash('sha256', serialize($fixture['headers'])),
-                'wire_sha256' => hash('sha256', $fixture['wire']), 'body_bytes' => strlen($fixture['body'])]);
-            unset($fixture);
-            foreach (articleBenchmarkPhases() as $phase) {
-                $command = array_merge(articleBenchmarkPhpCommand(), [__FILE__, '--worker='.$phase, '--native='.$validated['native'],
-                    '--samples='.$validated['samples'], '--fixture-path='.$fixturePath,
-                    '--result-output='.$directory.'/'.$size.'-'.$density.'-'.$phase.'.metadata.serialized']);
-                if (isset($options['baseline-dir'])) {
-                    $command[] = '--baseline-dir='.$options['baseline-dir'];
+    try {
+        $manifest = isset($options['runtime-manifest']) ? articleBenchmarkReadManifest((string) $options['runtime-manifest']) : null;
+        $root = realpath((string) ($options['candidate-dir'] ?? dirname(__DIR__))) ?: throw new InvalidArgumentException('Source directory does not exist.');
+        $sources = articleBenchmarkSourceHashes($root);
+        $library = articleBenchmarkFreezeLibrary($validated['native'], $directory.'/native.so');
+        $snapshot = articleBenchmarkFreezeGraph($root, $directory.'/source');
+        file_put_contents($directory.'/source-manifest.json', json_encode($snapshot, JSON_THROW_ON_ERROR));
+        $write(['type' => 'protocol', 'evidence' => 'diagnostic_only', 'samples' => $validated['samples'], 'warmups' => 1,
+            'untimed_reference_calls' => 1, 'sizes' => $validated['sizes'], 'densities' => ['ordinary', 'heavy'],
+            'phases' => articleBenchmarkPhases(), 'timeout_seconds' => $validated['timeout'], 'output_dir' => $directory,
+            'library' => $library, 'sources' => $sources, 'source_manifest_path' => $directory.'/source-manifest.json',
+            'instrumentation' => articleBenchmarkInstrumentationHashes(),
+            'runtime' => ['php' => PHP_VERSION, 'os' => php_uname(), 'opcache_cli' => ini_get('opcache.enable_cli'),
+                'jit' => ini_get('opcache.jit'), 'memory_limit' => ini_get('memory_limit'), 'ffi' => ini_get('ffi.enable'),
+                'extensions' => get_loaded_extensions(), 'fileinfo' => extension_loaded('fileinfo')],
+            'runtime_manifest' => $manifest]);
+        $invalid = 0;
+        foreach ($validated['sizes'] as $size) {
+            foreach (['ordinary', 'heavy'] as $density) {
+                $fixture = articleBenchmarkFixture($size, $density);
+                $fixturePath = $directory.'/fixture-'.$size.'-'.$density.'.serialized';
+                file_put_contents($fixturePath, serialize($fixture));
+                $write(['type' => 'fixture', 'size' => $size, 'density' => $density, 'path' => $fixturePath,
+                    'serialized_sha256' => hash_file('sha256', $fixturePath), 'decoded_sha256' => hash('sha256', $fixture['data']),
+                    'body_sha256' => hash('sha256', $fixture['body']), 'headers_sha256' => hash('sha256', serialize($fixture['headers'])),
+                    'wire_sha256' => hash('sha256', $fixture['wire']), 'body_bytes' => strlen($fixture['body'])]);
+                unset($fixture);
+                foreach (articleBenchmarkPhases() as $phase) {
+                    $command = array_merge(articleBenchmarkPhpCommand(), [__FILE__, '--worker='.$phase, '--native='.$library['path'],
+                        '--samples='.$validated['samples'], '--fixture-path='.$fixturePath, '--source-dir='.$snapshot['root'],
+                        '--result-output='.$directory.'/'.$size.'-'.$density.'-'.$phase.'.metadata.serialized']);
+                    $child = yencBenchmarkRunChild($command, $directory.'/'.$size.'-'.$density.'-'.$phase, $validated['timeout']);
+                    $eligible = $child['status'] === 'ok' && ($child['result']['library_sha256'] ?? null) === $library['sha256']
+                        && articleBenchmarkRuntimeMatches($child, $snapshot);
+                    $invalid += $eligible ? 0 : 1;
+                    $write(['type' => 'observation', 'size' => $size, 'density' => $density, 'phase' => $phase, 'eligible' => $eligible, 'command' => $command] + $child);
                 }
-                $child = yencBenchmarkRunChild($command, $directory.'/'.$size.'-'.$density.'-'.$phase, $validated['timeout']);
-                $invalid += $child['status'] === 'ok' ? 0 : 1;
-                $write(['type' => 'observation', 'size' => $size, 'density' => $density, 'phase' => $phase] + $child);
             }
         }
-    }
-    $write(['type' => 'summary', 'status' => $invalid === 0 ? 'ok' : 'invalid', 'invalid_observations' => $invalid,
-        'evidence' => 'diagnostic_only', 'performance_advantage_demonstrated' => false]);
+        $stable = articleBenchmarkGraphStable($snapshot) && articleBenchmarkGraphStable($snapshot, $root)
+            && hash_file('sha256', $library['path']) === $library['sha256'] && articleBenchmarkSourceHashes($root) === $sources;
+        $write(['type' => 'summary', 'status' => $invalid === 0 && $stable ? 'ok' : 'invalid', 'invalid_observations' => $invalid,
+            'source_and_library_identities_stable' => $stable, 'evidence' => 'diagnostic_only', 'performance_advantage_demonstrated' => false]);
 
-    return $invalid === 0 ? 0 : 2;
+        return $invalid === 0 && $stable ? 0 : 2;
+    } catch (Throwable $exception) {
+        $write(['type' => 'failure', 'status' => 'invalid', 'phase' => 'setup_or_run', 'exception' => $exception::class, 'reason' => $exception->getMessage()]);
+        $write(['type' => 'summary', 'status' => 'invalid', 'evidence' => 'diagnostic_only', 'performance_advantage_demonstrated' => false]);
+
+        return 2;
+    }
 }
 
 /**
@@ -525,7 +563,7 @@ function articleBenchmarkPairedDecision(array $strata, bool $identitiesStable, i
 
     return ['type' => 'run_summary', 'status' => $invalid ? 'invalid' : ($regressed ? 'regression' : ($advantage ? 'useful_improvement' : 'inconclusive')),
         'comparison_mode' => $regressionOnly ? 'regression_only' : 'median_screen',
-        'acceptance_criteria_met' => ! $invalid && ! $regressed,
+        'acceptance_criteria_met' => ! $invalid && ! $regressed && ($regressionOnly || $advantage),
         'evidence' => 'paired_median_screen', 'adoption_not_qualified_p99_missing' => true,
         'all_strata_median_criterion_met' => ! $invalid && array_all($strata, static fn (array $row): bool => ($row['decision'] ?? null) === 'useful_improvement'),
         'screen_median_criterion_met' => $advantage, 'performance_advantage_demonstrated' => false, 'source_library_and_fixture_identities_stable' => $identitiesStable,
@@ -604,41 +642,29 @@ function articleBenchmarkPaired(array $options, array $validated): int
         echo $line;
     };
     try {
-        $root = dirname(__DIR__);
-        $baselineRoot = (string) ($options['baseline-dir'] ?? '');
+        $root = realpath((string) ($options['candidate-dir'] ?? dirname(__DIR__))) ?: throw new InvalidArgumentException('Candidate source directory does not exist.');
+        $baselineRoot = realpath((string) ($options['baseline-dir'] ?? '')) ?: throw new InvalidArgumentException('Baseline source directory does not exist.');
         $sources = ['baseline' => articleBenchmarkSourceHashes($baselineRoot), 'candidate' => articleBenchmarkSourceHashes($root)];
         $libraries = [];
         foreach (['baseline' => $options['baseline-native'] ?? '', 'candidate' => $validated['native']] as $backend => $library) {
-            if (! is_string($library) || ! is_file($library) || ! is_readable($library)) {
-                throw new InvalidArgumentException('Paired mode requires a readable '.$backend.' native library.');
+            if (! is_string($library)) {
+                throw new InvalidArgumentException('Paired mode requires named native libraries.');
             }
-            $frozen = $directory.'/'.$backend.'.so';
-            if (! copy($library, $frozen) || hash_file('sha256', $library) !== hash_file('sha256', $frozen)) {
-                throw new RuntimeException('Unable to freeze '.$backend.' library bytes.');
-            }
-            $libraries[$backend] = ['path' => $frozen, 'sha256' => hash_file('sha256', $frozen)];
+            $libraries[$backend] = articleBenchmarkFreezeLibrary($library, $directory.'/'.$backend.'.so');
         }
-        $baselineSnapshot = $directory.'/baseline-source';
-        foreach (articleBenchmarkBaselinePaths() as $path) {
-            $source = $baselineRoot.'/'.$path;
-            if (! is_file($source)) {
-                throw new InvalidArgumentException('Missing baseline source: '.$source);
-            }
-            $destination = $baselineSnapshot.'/'.$path;
-            if (! is_dir(dirname($destination))) {
-                mkdir(dirname($destination), 0700, true);
-            }
-            if (! copy($source, $destination) || hash_file('sha256', $destination) !== $sources['baseline'][$path]) {
-                throw new RuntimeException('Unable to freeze baseline caller source: '.$path);
-            }
+        $snapshots = ['baseline' => articleBenchmarkFreezeGraph($baselineRoot, $directory.'/baseline-source'),
+            'candidate' => articleBenchmarkFreezeGraph($root, $directory.'/candidate-source')];
+        $snapshotEvidence = [];
+        foreach ($snapshots as $backend => $snapshot) {
+            $path = $directory.'/'.$backend.'-source-manifest.json';
+            file_put_contents($path, json_encode($snapshot, JSON_THROW_ON_ERROR));
+            $snapshotEvidence[$backend] = ['root' => $snapshot['root'], 'git_head' => $snapshot['git_head'], 'git_tree' => $snapshot['git_tree'],
+                'manifest_path' => $path, 'manifest_sha256' => hash_file('sha256', $path)];
         }
         $runtimeManifest = null;
         if (isset($options['runtime-manifest'])) {
             $manifestPath = (string) $options['runtime-manifest'];
-            $manifest = json_decode((string) file_get_contents($manifestPath), true, flags: JSON_THROW_ON_ERROR);
-            if (! is_array($manifest)) {
-                throw new InvalidArgumentException('Runtime build manifest must be an object.');
-            }
+            $manifest = articleBenchmarkReadManifest($manifestPath);
             articleBenchmarkVerifyManifest($manifest, $libraries, $sources);
             copy($manifestPath, $directory.'/runtime-manifest.json');
             $runtimeManifest = ['path' => $directory.'/runtime-manifest.json', 'sha256' => hash_file('sha256', $manifestPath), 'contents' => $manifest];
@@ -649,18 +675,18 @@ function articleBenchmarkPaired(array $options, array $validated): int
             'pairs_per_stratum' => $validated['samples'], 'warmups_per_worker' => 1, 'timed_samples_per_worker' => 1,
             'cold_reference_calls_per_worker' => 1, 'cold_reference_scope' => 'first real analyzer call after decoder construction; reported separately from warm comparison',
             'candidate_combined_required' => $requireCombined,
-            'combined_qualification' => $requireCombined ? 'candidate combined metadata call must succeed after cold reference and before warmup' : 'not_requested',
+            'combined_qualification' => $requireCombined ? 'separate fresh qualification worker per fixture; measured workers have identical reference/warmup sequences' : 'not_requested',
             'sizes' => [4096, 524288, 1048576], 'densities' => ['ordinary', 'heavy'], 'confidence_family_size' => 6,
             'target_minimum_size' => 524288, 'min_latency_speedup' => $validated['min_speedup'], 'max_regression_percent' => 5,
             'evidence' => 'paired_median_screen', 'adoption_not_qualified_p99_missing' => true,
             'decision_rule' => 'Four target strata screen for simultaneous median speedup >= declared threshold; small controls may be inconclusive but no stratum may regress. Zero invalid pairs and at least 31 pairs required. No p99/adoption qualification is possible in this screen.',
             'order_seed' => $seed, 'timeout_seconds' => $validated['timeout'], 'output_dir' => $directory,
             'source_build_identity_verified' => $runtimeManifest !== null,
-            'source_sha256' => $sources, 'baseline_snapshot' => $baselineSnapshot, 'libraries' => $libraries,
+            'source_sha256' => $sources, 'source_snapshots' => $snapshotEvidence, 'instrumentation' => articleBenchmarkInstrumentationHashes(), 'libraries' => $libraries,
             'runtime' => ['php' => PHP_VERSION, 'php_binary_sha256' => hash_file('sha256', PHP_BINARY), 'os' => php_uname(),
                 'extensions' => get_loaded_extensions(), 'opcache_cli' => ini_get('opcache.enable_cli'), 'jit' => ini_get('opcache.jit'),
                 'pcre_jit' => ini_get('pcre.jit'), 'memory_limit' => ini_get('memory_limit'), 'ffi' => ini_get('ffi.enable'), 'build_manifest' => $runtimeManifest],
-            'timed_boundary' => 'real full analyzer call including fileinfo, metadata FFI/JSON, decoding and allocations; fixture/read/verification/qualification outside window'];
+            'timed_boundary' => 'real full analyzer call including fileinfo, metadata FFI/JSON, decoding and allocations; fixture/read/verification outside window; qualification runs in another process'];
         $protocol['protocol_sha256'] = hash('sha256', json_encode($protocol, JSON_THROW_ON_ERROR));
         $emit($protocol);
         $state = $seed;
@@ -678,6 +704,21 @@ function articleBenchmarkPaired(array $options, array $validated): int
                     'body_sha256' => hash('sha256', $fixture['body']), 'headers_sha256' => hash('sha256', serialize($fixture['headers'])),
                     'wire_sha256' => hash('sha256', $fixture['wire']), 'body_bytes' => strlen($fixture['body'])]);
                 unset($fixture);
+                $qualificationEligible = true;
+                $qualificationPath = null;
+                if ($requireCombined) {
+                    $qualificationPath = $directory.'/'.$size.'-'.$density.'-qualification';
+                    $qualificationCommand = array_merge(articleBenchmarkPhpCommand(), [__FILE__, '--worker=qualify-combined', '--samples=1',
+                        '--native='.$libraries['candidate']['path'], '--fixture-path='.$fixturePath, '--source-dir='.$snapshots['candidate']['root']]);
+                    $qualification = yencBenchmarkRunChild($qualificationCommand, $qualificationPath, $validated['timeout']);
+                    $qualificationEligible = $qualification['status'] === 'ok'
+                        && ($qualification['result']['combined_available'] ?? false) === true
+                        && ($qualification['result']['library_sha256'] ?? null) === $libraries['candidate']['sha256']
+                        && ($qualification['result']['fixture_sha256'] ?? null) === $fixtureHashes[$fixturePath]
+                        && articleBenchmarkRuntimeMatches($qualification, $snapshots['candidate']);
+                    $emit(['type' => 'qualification', 'size' => $size, 'density' => $density, 'eligible' => $qualificationEligible,
+                        'command' => $qualificationCommand] + $qualification);
+                }
                 $ratios = [];
                 $invalidPairs = 0;
                 for ($pair = 0; $pair < $validated['samples']; $pair++) {
@@ -688,12 +729,15 @@ function articleBenchmarkPaired(array $options, array $validated): int
                         $metadataPath = $prefix.'.metadata.serialized';
                         $command = array_merge(articleBenchmarkPhpCommand(), [__FILE__, '--worker=full-analyzer', '--samples=1',
                             '--native='.$libraries[$backend]['path'], '--fixture-path='.$fixturePath, '--result-output='.$metadataPath]);
-                        array_push($command, ...articleBenchmarkPairOptions($backend, $baselineSnapshot, $requireCombined));
+                        array_push($command, ...articleBenchmarkPairOptions($backend, $snapshots[$backend]['root'], false));
                         $child = yencBenchmarkRunChild($command, $prefix, $validated['timeout']);
-                        $eligible = articleBenchmarkPairedEligible($child, $decodedHash, $libraries[$backend]['sha256'], $metadataPath, $backend === 'candidate' && $requireCombined);
+                        $eligible = articleBenchmarkPairedEligible($child, $decodedHash, $libraries[$backend]['sha256'], $metadataPath, false)
+                            && articleBenchmarkRuntimeMatches($child, $snapshots[$backend])
+                            && ($backend !== 'candidate' || $qualificationEligible);
                         $results[$backend] = ['eligible' => $eligible, 'child' => $child, 'metadata_path' => $metadataPath];
                         $emit(['type' => 'observation', 'size' => $size, 'density' => $density, 'pair' => $pair,
-                            'backend' => $backend, 'order' => $order, 'position' => $position, 'command' => $command, 'eligible' => $eligible] + $child);
+                            'backend' => $backend, 'order' => $order, 'position' => $position, 'command' => $command,
+                            'qualification_evidence_prefix' => $backend === 'candidate' ? $qualificationPath : null, 'eligible' => $eligible] + $child);
                     }
                     $eligible = $results['baseline']['eligible'] && $results['candidate']['eligible']
                         && $results['baseline']['child']['result']['reference_sha256'] === $results['candidate']['child']['result']['reference_sha256']
@@ -720,9 +764,11 @@ function articleBenchmarkPaired(array $options, array $validated): int
                 $emit($stratum);
             }
         }
-        $identitiesStable = articleBenchmarkSourceHashes($root) === $sources['candidate'];
-        foreach (articleBenchmarkBaselinePaths() as $path) {
-            $identitiesStable = $identitiesStable && hash_file('sha256', $baselineSnapshot.'/'.$path) === $sources['baseline'][$path];
+        $identitiesStable = articleBenchmarkSourceHashes($root) === $sources['candidate']
+            && articleBenchmarkSourceHashes($baselineRoot) === $sources['baseline'];
+        foreach ($snapshots as $backend => $snapshot) {
+            $identitiesStable = $identitiesStable && articleBenchmarkGraphStable($snapshot)
+                && articleBenchmarkGraphStable($snapshot, $backend === 'candidate' ? $root : $baselineRoot);
         }
         foreach ($libraries as $library) {
             $identitiesStable = $identitiesStable && hash_file('sha256', $library['path']) === $library['sha256'];
@@ -733,11 +779,236 @@ function articleBenchmarkPaired(array $options, array $validated): int
         $summary = articleBenchmarkPairedDecision($strata, $identitiesStable, $validated['samples'], isset($options['regression-only']));
         $emit($summary);
 
-        return $summary['status'] === 'invalid' ? 2 : ($summary['status'] === 'regression' ? 1 : ($summary['acceptance_criteria_met'] ? 0 : 3));
+        return $summary['status'] === 'invalid' ? 2 : ($summary['acceptance_criteria_met'] ? 0 : 1);
     } catch (Throwable $exception) {
         $emit(['type' => 'failure', 'status' => 'invalid', 'phase' => 'setup_or_run', 'exception' => $exception::class, 'reason' => $exception->getMessage()]);
         $emit(['type' => 'run_summary', 'status' => 'invalid', 'evidence' => 'paired_median_screen', 'adoption_not_qualified_p99_missing' => true, 'performance_advantage_demonstrated' => false]);
 
         return 2;
     }
+}
+
+/** @param list<string> $arguments */
+function articleBenchmarkGit(string $root, array $arguments, bool $required = true): ?string
+{
+    $process = proc_open(['git', '-C', $root, ...$arguments], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    if (! is_resource($process)) {
+        throw new RuntimeException('Cannot inspect selected Git source tree.');
+    }
+    fclose($pipes[0]);
+    $output = stream_get_contents($pipes[1]);
+    $error = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $code = proc_close($process);
+    if ($code !== 0) {
+        if ($required) {
+            throw new RuntimeException('Selected source needs its own Git tracked-file manifest: '.trim($error));
+        }
+
+        return null;
+    }
+
+    return $output;
+}
+
+function articleBenchmarkPrivatePath(string $path): bool
+{
+    foreach (explode('/', $path) as $component) {
+        if ($component === '.git' || $component === 'auth.json' || $component === '.env'
+            || (str_starts_with($component, '.env.') && $component !== '.env.example')) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/** @return list<string> */
+function articleBenchmarkGraphFiles(string $root): array
+{
+    $root = realpath($root) ?: throw new InvalidArgumentException('Selected source root does not exist.');
+    if (trim((string) articleBenchmarkGit($root, ['rev-parse', '--show-toplevel'])) !== $root) {
+        throw new InvalidArgumentException('Selected source needs its own Git tracked-file manifest.');
+    }
+    foreach (['composer.json', 'composer.lock', 'vendor/autoload.php'] as $path) {
+        if (! is_file($root.'/'.$path)) {
+            throw new InvalidArgumentException('Selected source needs its own installed Composer graph: '.$path);
+        }
+    }
+    $paths = array_values(array_filter(explode("\0", (string) articleBenchmarkGit($root, ['ls-files', '-z'])),
+        static fn (string $path): bool => $path !== '' && ! articleBenchmarkPrivatePath($path)));
+    $pending = [['path' => 'vendor', 'ancestors' => []]];
+    while ($pending !== []) {
+        $entry = array_pop($pending);
+        $realDirectory = realpath($root.'/'.$entry['path']);
+        if ($realDirectory === false || ! str_starts_with($realDirectory, $root.'/') || in_array($realDirectory, $entry['ancestors'], true)) {
+            throw new RuntimeException('Vendor directory escapes selected source or contains a symlink cycle.');
+        }
+        $names = scandir($root.'/'.$entry['path']);
+        if ($names === false) {
+            throw new RuntimeException('Cannot inspect selected vendor graph.');
+        }
+        foreach ($names as $name) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+            $path = $entry['path'].'/'.$name;
+            if (articleBenchmarkPrivatePath($path)) {
+                continue;
+            }
+            $resolved = realpath($root.'/'.$path);
+            if ($resolved === false || ! str_starts_with($resolved, $root.'/')) {
+                throw new RuntimeException('Source symlink escapes selected source: '.$path);
+            }
+            if (is_dir($root.'/'.$path)) {
+                $pending[] = ['path' => $path, 'ancestors' => [...$entry['ancestors'], $realDirectory]];
+            } elseif (is_file($root.'/'.$path)) {
+                $paths[] = $path;
+            }
+        }
+    }
+    $paths = array_values(array_unique($paths));
+    sort($paths);
+
+    return $paths;
+}
+
+/**
+ * @return array{root: string, files: array<string, string>, git_head: ?string, git_tree: ?string}
+ */
+function articleBenchmarkFreezeGraph(string $root, string $destination): array
+{
+    $root = realpath($root) ?: throw new InvalidArgumentException('Selected source root does not exist.');
+    $paths = articleBenchmarkGraphFiles($root);
+    if (! mkdir($destination, 0700)) {
+        throw new RuntimeException('Source snapshot must be new.');
+    }
+    $hashes = [];
+    foreach ($paths as $path) {
+        $resolved = realpath($root.'/'.$path);
+        if ($resolved === false || ! str_starts_with($resolved, $root.'/') || ! is_file($resolved)) {
+            throw new RuntimeException('Tracked source escapes selected source or is not a file: '.$path);
+        }
+        $target = $destination.'/'.$path;
+        if (! is_dir(dirname($target))) {
+            mkdir(dirname($target), 0700, true);
+        }
+        $digest = hash_file('sha256', $resolved);
+        if ($digest === false || ! copy($resolved, $target) || hash_file('sha256', $target) !== $digest) {
+            throw new RuntimeException('Unable to freeze source graph file: '.$path);
+        }
+        $hashes[$path] = $digest;
+    }
+
+    return ['root' => realpath($destination) ?: $destination, 'files' => $hashes,
+        'git_head' => trim((string) articleBenchmarkGit($root, ['rev-parse', '--verify', 'HEAD'], false)) ?: null,
+        'git_tree' => trim((string) articleBenchmarkGit($root, ['rev-parse', '--verify', 'HEAD^{tree}'], false)) ?: null];
+}
+
+/** @return array{root: string, files: array<string, string|false>, classes: array<string, string>} */
+function articleBenchmarkRuntimeSources(string $root): array
+{
+    $root = realpath($root) ?: throw new InvalidArgumentException('Selected runtime root does not exist.');
+    $classes = [];
+    foreach ([NNTPService::class, NzbFingerprintAnalyzer::class, NativeMetadataParser::class, YencService::class,
+        DecoderFactory::class, NativePayloadDecoder::class, ArticleFrame::class, YencNntpHarness::class] as $class) {
+        $path = (new ReflectionClass($class))->getFileName();
+        $resolved = $path === false ? false : realpath($path);
+        if ($resolved === false || ! str_starts_with($resolved, $root.'/')) {
+            throw new RuntimeException('Application class escaped selected runtime: '.$class);
+        }
+        $classes[$class] = substr($resolved, strlen($root) + 1);
+    }
+    $allowed = [realpath(__FILE__), realpath(__DIR__.'/benchmark-yenc.php')];
+    $files = [];
+    foreach (get_included_files() as $path) {
+        $resolved = realpath($path);
+        if (in_array($resolved, $allowed, true)) {
+            continue;
+        }
+        if ($resolved === false || ! str_starts_with($resolved, $root.'/')) {
+            throw new RuntimeException('Included file escaped selected runtime: '.$path);
+        }
+        $files[substr($resolved, strlen($root) + 1)] = hash_file('sha256', $resolved);
+    }
+    ksort($files);
+
+    return ['root' => $root, 'files' => $files, 'classes' => $classes];
+}
+
+/**
+ * @param  array<string, mixed>  $child
+ * @param  array{root: string, files: array<string, string>, git_head: ?string, git_tree: ?string}  $snapshot
+ */
+function articleBenchmarkRuntimeMatches(array $child, array $snapshot): bool
+{
+    $runtime = $child['result']['runtime_sources'] ?? null;
+    if (! is_array($runtime) || ($runtime['root'] ?? null) !== $snapshot['root'] || ! is_array($runtime['files'] ?? null)) {
+        return false;
+    }
+    foreach ($runtime['files'] as $path => $digest) {
+        if (($snapshot['files'][$path] ?? null) !== $digest) {
+            return false;
+        }
+    }
+
+    return $runtime['files'] !== [];
+}
+
+/** @return array<string, mixed> */
+function articleBenchmarkReadManifest(string $path): array
+{
+    if (! is_file($path) || ! is_readable($path)) {
+        throw new InvalidArgumentException('Runtime manifest is missing or unreadable: '.$path);
+    }
+    $contents = file_get_contents($path);
+    if ($contents === false) {
+        throw new RuntimeException('Unable to read runtime manifest: '.$path);
+    }
+    $manifest = json_decode($contents, true, flags: JSON_THROW_ON_ERROR);
+    if (! is_array($manifest)) {
+        throw new InvalidArgumentException('Runtime manifest must be an object.');
+    }
+
+    return $manifest;
+}
+
+/** @return array{path: string, sha256: string} */
+function articleBenchmarkFreezeLibrary(string $source, string $destination): array
+{
+    if (! is_file($source) || ! is_readable($source)) {
+        throw new InvalidArgumentException('A readable native library is required: '.$source);
+    }
+    $digest = hash_file('sha256', $source);
+    if ($digest === false || ! copy($source, $destination) || hash_file('sha256', $destination) !== $digest
+        || hash_file('sha256', $source) !== $digest) {
+        throw new RuntimeException('Unable to freeze native library bytes.');
+    }
+
+    return ['path' => $destination, 'sha256' => $digest];
+}
+
+/** @return array<string, string|false> */
+function articleBenchmarkInstrumentationHashes(): array
+{
+    return ['benchmark-article-processing.php' => hash_file('sha256', __FILE__),
+        'benchmark-yenc.php' => hash_file('sha256', __DIR__.'/benchmark-yenc.php'),
+        'YencArticles.php' => hash_file('sha256', dirname(__DIR__).'/tests/Fixtures/YencArticles.php')];
+}
+
+/** @param array{root: string, files: array<string, string>, git_head: ?string, git_tree: ?string} $snapshot */
+function articleBenchmarkGraphStable(array $snapshot, ?string $origin = null): bool
+{
+    $root = $origin ?? $snapshot['root'];
+    foreach ($snapshot['files'] as $path => $digest) {
+        if (! is_file($root.'/'.$path) || hash_file('sha256', $root.'/'.$path) !== $digest) {
+            return false;
+        }
+    }
+    if ($origin !== null && articleBenchmarkGraphFiles($origin) !== array_keys($snapshot['files'])) {
+        return false;
+    }
+
+    return true;
 }
