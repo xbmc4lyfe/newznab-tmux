@@ -216,6 +216,11 @@ final class VerificationMetricTreeProbe
         return fflush($this->handle);
     }
 
+    public function stream_truncate(int $size): bool
+    {
+        return ftruncate($this->handle, $size);
+    }
+
     public function stream_lock(int $operation): bool
     {
         return $operation === 0 || flock($this->handle, $operation);

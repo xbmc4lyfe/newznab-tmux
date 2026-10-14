@@ -64,7 +64,7 @@ class LegacyVerificationBacklogTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(['added' => 0, 'dupes' => 0], $result);
         $this->assertSame([1], DB::table('collections')->orderBy('id')->pluck('id')->all());
         $candidate = DB::table('release_verification_candidates')->sole();
-        $this->assertSame('pending', $candidate->status);
+        $this->assertSame('ready', $candidate->status);
         $manifest = app(ManifestStore::class)->read($candidate->manifest_path);
         $this->assertSame('article-2@example.test', $manifest['files'][0]['segments'][0]['messageid']);
         $this->assertSame(0, $manifest['expected_files']);
@@ -80,7 +80,7 @@ class LegacyVerificationBacklogTest extends ReleaseVerificationCandidatesTest
         app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
         $this->assertSame(0, DB::table('collections')->count());
         $candidate = DB::table('release_verification_candidates')->sole();
-        $this->assertSame('pending', $candidate->status);
+        $this->assertSame('ready', $candidate->status);
         $manifest = app(ManifestStore::class)->read($candidate->manifest_path);
         $this->assertSame('article-1@example.test', $manifest['files'][0]['segments'][0]['messageid']);
         $this->assertSame([10, 11], DB::table('releases')->orderBy('id')->pluck('id')->all());

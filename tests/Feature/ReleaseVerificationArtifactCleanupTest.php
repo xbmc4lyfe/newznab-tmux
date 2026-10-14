@@ -58,6 +58,8 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $repository = app(CandidateRepository::class);
         $store = app(ManifestStore::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $original = DB::table('release_verification_candidates')->value('manifest_path');
         DB::beginTransaction();
         $repository->archive($this->arrival('second@article', 2));
@@ -122,6 +124,8 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $scratch = $this->scratch((int) $claim->id, (int) $claim->version);
         $external = dirname($scratch).'/'.$claim->id.'-0';
@@ -146,6 +150,8 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $scratch = $this->scratch((int) $claim->id, (int) $claim->version);
         $root = (string) config('release_verification.storage_path');
@@ -185,6 +191,8 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $repository = app(CandidateRepository::class);
         $store = app(ManifestStore::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $oldScratch = $this->scratch((int) $claim->id, (int) $claim->version);
         $repository->finish($claim, new VerificationResult('unknown', 'Retry later.'));
@@ -205,7 +213,7 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $this->assertGreaterThan($claim->version, $current->version);
         DB::commit();
 
-        $this->assertSame('pending', $current->status);
+        $this->assertSame('waiting_upload', $current->status);
         $this->assertFileExists($store->path($current->manifest_path));
         $this->assertSame('first@article', $store->read($current->manifest_path)['files'][0]['segments'][0]['messageid']);
         $this->assertFileExists($oldScratch.'/payload');
@@ -217,6 +225,8 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $repository = app(CandidateRepository::class);
         $store = app(ManifestStore::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $old = DB::table('release_verification_candidates')->sole();
 
         DB::beginTransaction();
@@ -227,6 +237,8 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $this->travel(49)->hours();
         $repository->expire();
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         DB::commit();
 
         $current = DB::table('release_verification_candidates')->sole();
@@ -241,6 +253,8 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $repository = app(CandidateRepository::class);
         $store = app(ManifestStore::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $manifest = $store->read($claim->manifest_path);
         $manifest += ['verified_bytes' => 5, 'verified_file_names' => ['movie.mkv']];
@@ -271,6 +285,8 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $repository = app(CandidateRepository::class);
         $store = app(ManifestStore::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $existing = DB::table('release_verification_candidates')->sole();
         $manifest = $store->read($existing->manifest_path);
         DB::table('release_verification_candidates')->where('id', $existing->id)
@@ -280,6 +296,8 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         try {
             if ($admission === 'archive') {
                 $repository->archive($this->arrival());
+                // Exercise retained legacy candidates before metadata preparation.
+                DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
             } else {
                 $repository->enqueue($manifest);
             }
@@ -297,6 +315,8 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         $repository = app(CandidateRepository::class);
         $store = app(ManifestStore::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $original = DB::table('release_verification_candidates')->sole();
 
         DB::beginTransaction();
@@ -305,6 +325,8 @@ class ReleaseVerificationArtifactCleanupTest extends ReleaseVerificationCandidat
         config(['release_verification.pending_bytes' => 0]);
         try {
             $repository->archive($this->arrival());
+            // Exercise retained legacy candidates before metadata preparation.
+            DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
             $this->fail('Capacity must reject another admission.');
         } catch (\RuntimeException $exception) {
             $this->assertStringContainsString('capacity is full', $exception->getMessage());

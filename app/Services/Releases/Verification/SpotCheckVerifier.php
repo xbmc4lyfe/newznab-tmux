@@ -26,13 +26,10 @@ final class SpotCheckVerifier
     /** @param array<string, mixed> $manifest */
     private function verifySample(array $manifest, callable $heartbeat): VerificationResult
     {
-        if (($manifest['conflict'] ?? false) === true) {
-            return new VerificationResult('unknown', 'Conflicting header identities require resolution.');
-        }
         $inventory = new CandidateHeaderInventory;
-        $headerRejection = $inventory->rejection($manifest);
-        if ($headerRejection !== null) {
-            return new VerificationResult('unknown', $headerRejection);
+        $assessment = $inventory->assessment($manifest);
+        if ($assessment['reason'] !== null) {
+            return new VerificationResult('unknown', $assessment['reason'], waitingForHeaders: $assessment['status'] === 'waiting_upload');
         }
 
         $articleLimit = max(0, min(16, (int) ($this->options['spot_check_articles'] ?? 1)));
