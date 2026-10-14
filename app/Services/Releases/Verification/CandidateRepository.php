@@ -394,14 +394,21 @@ final class CandidateRepository
         return $old;
     }
 
-    public function expire(): void
+    /** @param (callable(): bool)|null $mayStart */
+    public function expire(?callable $mayStart = null): void
     {
+        if ($mayStart !== null && ! $mayStart()) {
+            return;
+        }
         $ids = DB::table('release_verification_candidates')->whereNull('release_id')
             ->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'unrepairable', 'verifying', 'dirty'])
             ->where('last_unique_at', '<', now()->subHours((int) config('release_verification.expiry_hours')))
             ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
             ->orderBy('id')->limit(100)->pluck('id');
         foreach ($ids as $id) {
+            if ($mayStart !== null && ! $mayStart()) {
+                break;
+            }
             DB::transaction(function () use ($id): void {
                 DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                 $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();

@@ -320,6 +320,136 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
         }
     }
 
+    public function test_cleanup_admission_deadline_checkpoints_before_the_next_entry(): void
+    {
+        $directories = [];
+        foreach ([1, 2, 3] as $id) {
+            $directories[] = $this->candidateScratch($id);
+        }
+        $allowed = true;
+        DB::listen(static function ($query) use (&$allowed): void {
+            if (str_starts_with($query->sql, 'delete from "release_verification_scratch"')) {
+                $allowed = false;
+            }
+        });
+        $root = (string) config('release_verification.storage_path');
+        $command = app(VerifyReleaseCandidates::class);
+        $method = new \ReflectionMethod($command, 'cleanupTerminalScratch');
+        $locks = new VerificationWorkerLocks;
+        $this->assertTrue($locks->start());
+        try {
+            $method->invoke($command, $root, $locks, static function () use (&$allowed): bool {
+                return $allowed;
+            });
+
+            $this->assertDirectoryDoesNotExist($directories[0]);
+            $this->assertFileExists($directories[1].'/payload');
+            $this->assertFileExists($directories[2].'/payload');
+            $cursor = json_decode(file_get_contents($root.'/indexed-scratch.cursor'), true, flags: JSON_THROW_ON_ERROR);
+            $this->assertSame(['after' => 1, 'ceiling' => 3], $cursor);
+
+            $method->invoke($command, $root, $locks);
+            $this->assertDirectoryDoesNotExist($directories[1]);
+            $this->assertDirectoryDoesNotExist($directories[2]);
+            $this->assertSame(0, DB::table('release_verification_scratch')->count());
+        } finally {
+            $locks->close();
+        }
+    }
+
+    public function test_cleanup_deadline_keeps_partial_directory_accounting_until_retry(): void
+    {
+        $directory = $this->candidateScratch(1);
+        $allowed = true;
+        $filesystem = new Filesystem;
+        File::partialMock()->shouldReceive('delete')->andReturnUsing(static function ($path) use ($filesystem, &$allowed): bool {
+            $removed = $filesystem->delete($path);
+            $allowed = false;
+
+            return $removed;
+        });
+        $command = app(VerifyReleaseCandidates::class);
+        $method = new \ReflectionMethod($command, 'cleanupTerminalScratch');
+        $root = (string) config('release_verification.storage_path');
+        $locks = new VerificationWorkerLocks;
+        $this->assertTrue($locks->start());
+        try {
+            $method->invoke($command, $root, $locks, static function () use (&$allowed): bool {
+                return $allowed;
+            });
+
+            $this->assertDirectoryExists($directory);
+            $this->assertFileDoesNotExist($directory.'/payload');
+            $this->assertSame(1, DB::table('release_verification_scratch')->count());
+            $method->invoke($command, $root, $locks);
+            $this->assertDirectoryDoesNotExist($directory);
+            $this->assertSame(0, DB::table('release_verification_scratch')->count());
+        } finally {
+            $locks->close();
+        }
+    }
+
+    public function test_worker_shares_maintenance_deadline_between_cleanup_and_expiry(): void
+    {
+        $delayed = false;
+        $expirySelections = 0;
+        DB::listen(static function ($query) use (&$delayed, &$expirySelections): void {
+            if (! $delayed && str_starts_with($query->sql, 'select * from "release_verification_scratch"')) {
+                $delayed = true;
+                usleep(5100000);
+            }
+            if (str_starts_with($query->sql, 'select') && str_contains($query->sql, '"last_unique_at"')) {
+                $expirySelections++;
+            }
+        });
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+
+        $this->assertTrue($delayed);
+        $this->assertSame(0, $expirySelections, 'Cleanup consuming the shared window must defer expiry until the next run.');
+    }
+
+    public function test_saturated_cleanup_cannot_starve_expiry_on_the_next_worker_run(): void
+    {
+        $directory = $this->candidateScratch(1);
+        $repository = app(CandidateRepository::class);
+        $repository->enqueue(['identity' => sha1('expiry-behind-slow-cleanup'), 'groups_id' => 1, 'files' => []]);
+        DB::table('release_verification_candidates')->where('id', 2)->update(['last_unique_at' => now()->subDays(3)]);
+        DB::listen(static function ($query): void {
+            if (str_starts_with($query->sql, 'select * from "release_verification_scratch"')
+                && str_contains($query->sql, 'order by "id" asc limit 100')) {
+                usleep(5100000);
+            }
+        });
+
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->assertSame('unknown', DB::table('release_verification_candidates')->where('id', 2)->value('status'));
+        $this->assertFileExists($directory.'/payload');
+        $this->artisan('releases:verify-candidates')->assertSuccessful();
+        $this->assertSame('expired', DB::table('release_verification_candidates')->where('id', 2)->value('status'));
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertFileExists($directory.'/payload');
+    }
+
+    public function test_maintenance_order_persists_between_workers_without_replacing_gc_lock_inode(): void
+    {
+        $orders = [];
+        $root = (string) config('release_verification.storage_path');
+        $inode = null;
+        for ($run = 0; $run < 6; $run++) {
+            $locks = new VerificationWorkerLocks;
+            $this->assertTrue($locks->start());
+            $this->assertTrue($locks->tryGc());
+            try {
+                $orders[] = $locks->preferExpiry();
+                $inode ??= fileinode($root.'/locks/gc.lock');
+                $this->assertSame($inode, fileinode($root.'/locks/gc.lock'));
+            } finally {
+                $locks->close();
+            }
+        }
+        $this->assertSame([false, true, false, true, false, true], $orders);
+    }
+
     public function test_external_unregistered_scratch_and_missing_candidate_metadata_are_preserved(): void
     {
         $missing = $this->candidateScratch(1);
