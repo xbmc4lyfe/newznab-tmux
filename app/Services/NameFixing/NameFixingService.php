@@ -882,12 +882,44 @@ class NameFixingService
         }
 
         if (! $this->updateService->matched) {
-            $this->markProcessed($echo, $nameStatus, 'proc_files', (int) $release->releases_id);
+            $this->completeFilenamePass($release, $filenames, $echo, $nameStatus);
         }
 
         if ($showProgress) {
             $this->echoRenamed($show);
         }
+    }
+
+    /** @param list<string> $filenames */
+    private function completeFilenamePass(object $release, array $filenames, bool $echo, bool $nameStatus): void
+    {
+        if (! $echo || ! $nameStatus) {
+            return;
+        }
+        $release = clone $release;
+        $release->observed_isrenamed = (int) ($release->isrenamed ?? 0);
+        $observedCategory = isset($release->categories_id) ? (int) $release->categories_id : null;
+        sort($filenames, SORT_STRING);
+        DB::transaction(function () use ($release, $filenames, $observedCategory): void {
+            $query = DB::table('releases')->where('id', (int) $release->releases_id)
+                ->where('predb_id', $release->predb_id ?? 0)->where('isrenamed', $release->observed_isrenamed);
+            if ($observedCategory !== null) {
+                $query->where('categories_id', $observedCategory);
+            }
+            $current = $query->lockForUpdate()->first();
+            if ($current === null) {
+                return;
+            }
+            // A locking read sees newly committed names even under REPEATABLE READ.
+            $currentNames = DB::table('release_files')->where('releases_id', (int) $release->releases_id)
+                ->sharedLock()->pluck('name')->map(static fn (mixed $name): string => (string) $name)->all();
+            $currentNames = array_values(array_unique($currentNames));
+            sort($currentNames, SORT_STRING);
+            if ($currentNames !== $filenames) {
+                return;
+            }
+            $this->updateService->completeFilenameSnapshot($release);
+        }, 3);
     }
 
     protected function markProcessed(bool $echo, bool $nameStatus, string $column, int $releaseId): void
@@ -1528,7 +1560,7 @@ class NameFixingService
 
         foreach ($this->candidateBatches(NameFixingQueryService::SOURCE_XXX, $time, $cats) as $releases) {
             $files = $this->queries->groupByReleaseId(
-                $this->queries->fileRows($this->releaseIds($releases), NameFixingQueryService::SOURCE_XXX)
+                $this->queries->fileRows($this->releaseIds($releases))
             );
 
             foreach ($releases as $release) {
@@ -1544,7 +1576,11 @@ class NameFixingService
                 }
 
                 if (! $this->updateService->matched) {
-                    $this->markProcessed($echo, $nameStatus, 'proc_files', (int) $release->releases_id);
+                    $filenames = array_values(array_unique(array_map(
+                        static fn (object $file): string => (string) $file->textstring,
+                        $files[(int) $release->releases_id] ?? [],
+                    )));
+                    $this->completeFilenamePass($release, $filenames, $echo, $nameStatus);
                 }
 
                 $this->echoRenamed($show);
@@ -1723,7 +1759,11 @@ class NameFixingService
 
         // Update processing flags if not matched
         if ($echo && $nameStatus && $markProcessed && ! $this->updateService->matched) {
-            $this->updateProcessingFlags($type, $release->releases_id);
+            if ($type === 'Filenames, ') {
+                $this->completeFilenamePass($release, [(string) $identityText], $echo, $nameStatus);
+            } else {
+                $this->updateProcessingFlags($type, $release->releases_id);
+            }
         }
 
         return $this->updateService->matched;
@@ -1737,9 +1777,6 @@ class NameFixingService
         switch ($type) {
             case 'NFO, ':
                 $this->updateService->updateSingleColumn('proc_nfo', self::PROC_NFO_DONE, $releaseId);
-                break;
-            case 'Filenames, ':
-                $this->updateService->updateSingleColumn('proc_files', self::PROC_FILES_DONE, $releaseId);
                 break;
             case 'PAR2, ':
                 $this->updateService->updateSingleColumn('proc_par2', self::PROC_PAR2_DONE, $releaseId);
