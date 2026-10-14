@@ -219,23 +219,84 @@ fn utc_timestamp(seconds: i64, micros: u32) -> String {
     )
 }
 
+// Match the linker symbol selected below, including time32 compatibility ABIs.
+// Older 32-bit GNU/musl ABIs retain their two-long time32 compatibility symbol.
+// GNU x32 uses 64-bit seconds and syscall-long nanoseconds. Native-time64
+// 32-bit musl Hexagon and GNU/musl RISC-V use padded long nanos. OpenHarmony
+// uses that time64 layout with its explicit header redirect on 32-bit hosts.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "riscv32",
+        target_arch = "hexagon",
+        target_env = "ohos"
+    )
+))]
+type ClockSeconds = i64;
+#[cfg(not(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "riscv32",
+        target_arch = "hexagon",
+        target_env = "ohos"
+    )
+)))]
+type ClockSeconds = std::ffi::c_long;
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+type ClockNanoseconds = i64;
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+type ClockNanoseconds = std::ffi::c_long;
+
+#[repr(C)]
+struct Timespec<Seconds, Nanoseconds, const BEFORE: usize, const AFTER: usize> {
+    seconds: Seconds,
+    before: [u8; BEFORE],
+    nanoseconds: Nanoseconds,
+    after: [u8; AFTER],
+}
+const CLOCK_PADDING: usize = size_of::<ClockSeconds>() - size_of::<ClockNanoseconds>();
+const CLOCK_BEFORE: usize = if cfg!(target_endian = "big") {
+    CLOCK_PADDING
+} else {
+    0
+};
+const CLOCK_AFTER: usize = CLOCK_PADDING - CLOCK_BEFORE;
+type ClockTimespec = Timespec<ClockSeconds, ClockNanoseconds, CLOCK_BEFORE, CLOCK_AFTER>;
+
+// Compile-time checks cover the selected x32 ABI even when host tests run on
+// another architecture. These are literal glibc layout requirements.
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    target_arch = "x86_64",
+    target_pointer_width = "32"
+))]
+const _: () = {
+    assert!(size_of::<ClockTimespec>() == 16);
+    assert!(std::mem::align_of::<ClockTimespec>() == 8);
+    assert!(std::mem::offset_of!(ClockTimespec, nanoseconds) == 8);
+};
+
 fn monotonic_ns() -> u64 {
-    use std::ffi::{c_int, c_long};
-    #[repr(C)]
-    struct Timespec {
-        seconds: c_long,
-        nanoseconds: c_long,
-    }
+    use std::ffi::c_int;
     unsafe extern "C" {
-        fn clock_gettime(clock: c_int, result: *mut Timespec) -> c_int;
+        #[cfg_attr(
+            all(target_env = "ohos", target_pointer_width = "32"),
+            link_name = "__clock_gettime64"
+        )]
+        fn clock_gettime(clock: c_int, result: *mut ClockTimespec) -> c_int;
     }
     #[cfg(target_os = "linux")]
     const CLOCK_MONOTONIC: c_int = 1;
     #[cfg(target_os = "macos")]
     const CLOCK_MONOTONIC: c_int = 8;
-    let mut value = Timespec {
+    let mut value = ClockTimespec {
         seconds: 0,
+        before: [0; CLOCK_BEFORE],
         nanoseconds: 0,
+        after: [0; CLOCK_AFTER],
     };
     // SAFETY: the OS writes one ABI-compatible timespec to a valid local pointer.
     // Linux CLOCK_MONOTONIC and macOS CLOCK_UPTIME_RAW are system-wide and
@@ -316,6 +377,37 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn clock_abi_layouts_match_libc_headers() {
+        use std::mem::{offset_of, size_of};
+        // Explicit C ABI expectations; exercise all shapes on every host.
+        type Time32 = Timespec<i32, i32, 0, 0>;
+        type X32 = Timespec<i64, i64, 0, 0>;
+        type Time64Le = Timespec<i64, i32, 0, 4>;
+        type Time64Be = Timespec<i64, i32, 4, 0>;
+        assert_eq!(size_of::<Time32>(), 8);
+        assert_eq!(offset_of!(Time32, nanoseconds), 4);
+        assert_eq!(size_of::<X32>(), 16);
+        assert_eq!(offset_of!(X32, nanoseconds), 8);
+        assert_eq!(size_of::<Time64Le>(), 16);
+        assert_eq!(offset_of!(Time64Le, nanoseconds), 8);
+        assert_eq!(size_of::<Time64Be>(), 16);
+        assert_eq!(offset_of!(Time64Be, nanoseconds), 12);
+        // Literal alignment expectations on the host ABIs that also use the
+        // x32 alignment; other targets (e.g. i386/m68k) differ.
+        #[cfg(any(
+            target_arch = "aarch64",
+            target_arch = "x86_64",
+            target_arch = "riscv32"
+        ))]
+        {
+            assert_eq!(std::mem::align_of::<Time32>(), 4);
+            assert_eq!(std::mem::align_of::<X32>(), 8);
+            assert_eq!(std::mem::align_of::<Time64Le>(), 8);
+            assert_eq!(std::mem::align_of::<Time64Be>(), 8);
         }
     }
 
