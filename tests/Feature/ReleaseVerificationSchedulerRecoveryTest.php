@@ -125,7 +125,7 @@ class ReleaseVerificationSchedulerRecoveryTest extends TestCase
         config(['release_verification.scheduled' => false]);
 
         $this->assertFalse($this->dispatchMinute($event));
-        $this->assertSame('pending', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame('ready', DB::table('release_verification_candidates')->value('status'));
         $this->assertNull(DB::table('release_verification_candidates')->value('lease_token'));
     }
 

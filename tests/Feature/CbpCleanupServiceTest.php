@@ -98,7 +98,7 @@ class CbpCleanupServiceTest extends TestCase
         $this->assertCount(2, $candidates);
         foreach ($candidates as $candidate) {
             $manifest = app(ManifestStore::class)->read($candidate->manifest_path);
-            $this->assertSame('pending', $candidate->status);
+            $this->assertSame('waiting_upload', $candidate->status);
             $this->assertSame(10, $manifest['expected_files']);
             $this->assertSame(20, $manifest['files'][0]['totalparts']);
             $this->assertCount(1, $manifest['files'][0]['segments']);

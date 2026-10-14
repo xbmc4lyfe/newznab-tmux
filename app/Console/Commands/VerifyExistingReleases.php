@@ -148,7 +148,7 @@ class VerifyExistingReleases extends Command
 
     private function newCandidatesAreDue(): bool
     {
-        return DB::table('release_verification_candidates')->whereNull('release_id')->whereIn('status', ['pending', 'unknown', 'verifying'])
+        return DB::table('release_verification_candidates')->whereNull('release_id')->whereIn('status', ['ready', 'pending', 'unknown', 'verifying'])
             ->where('next_attempt_at', '<=', now())
             ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))->exists();
     }

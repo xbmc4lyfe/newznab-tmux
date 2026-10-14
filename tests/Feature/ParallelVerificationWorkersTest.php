@@ -127,7 +127,7 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
             $mock->shouldReceive('doQuit')->andReturn(null);
         });
         $this->artisan('releases:verify-candidates', ['--limit' => 1000, '--max-seconds' => 1])->assertSuccessful();
-        $this->assertSame(['unknown', 'pending'], DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+        $this->assertSame(['unknown', 'ready'], DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
         $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('lease_token')->count());
     }
 

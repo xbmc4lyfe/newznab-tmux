@@ -93,15 +93,18 @@ final class SpotCheckVerifierTest extends TestCase
         $result = $verifier->verify(['expected_files' => 1, 'files' => [$file]], static function (): void {});
         self::assertSame('unknown', $result->verdict);
         self::assertStringContainsString('article inventory is still uploading', $result->reason);
+        self::assertTrue($result->waitingForHeaders);
         $file['totalparts'] = 1;
         $result = $verifier->verify(['expected_files' => 2, 'files' => [$file]], static function (): void {});
         self::assertSame('unknown', $result->verdict);
         self::assertStringContainsString('file inventory is still uploading', $result->reason);
+        self::assertTrue($result->waitingForHeaders);
         $duplicate = $file;
         $duplicate['key'] = 'other-file';
         $result = $verifier->verify(['expected_files' => 2, 'files' => [$file, $duplicate]], static function (): void {});
         self::assertSame('unknown', $result->verdict);
         self::assertStringContainsString('duplicate article reference', $result->reason);
+        self::assertFalse($result->waitingForHeaders);
         $duplicate['segments'][0]['messageid'] = 'other@article';
         $file['totalparts_inferred'] = $duplicate['totalparts_inferred'] = true;
         $result = $verifier->verify(['expected_files' => 2, 'files' => [$file, $duplicate]], static function (): void {});

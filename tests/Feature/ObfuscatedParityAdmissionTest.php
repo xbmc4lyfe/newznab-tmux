@@ -63,7 +63,7 @@ class ObfuscatedParityAdmissionTest extends ReleaseVerificationCandidatesTest
         try {
             $repository->archive($collection);
             $candidate = DB::table('release_verification_candidates')->first();
-            $this->assertSame('pending', $candidate->status, 'A subject extension cannot prove that this article contains no recoverable PAR2 sources.');
+            $this->assertSame('ready', $candidate->status, 'A subject extension cannot prove that this article contains no recoverable PAR2 sources.');
             $manifest = app(ManifestStore::class)->read($candidate->manifest_path);
             $this->assertSame($status === 4 ? 0 : 1, $manifest['expected_files']);
             $this->assertSame('masked.rar', $manifest['files'][0]['subject']);

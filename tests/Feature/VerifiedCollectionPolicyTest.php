@@ -59,7 +59,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $id = $this->collectionForPolicy();
         app(ReleaseCreationService::class)->createReleases(1, 10, false);
         $candidate = DB::table('release_verification_candidates')->first();
-        $this->assertSame('pending', $candidate->status);
+        $this->assertSame('ready', $candidate->status);
         $this->assertFalse(DB::table('collections')->where('id', $id)->exists());
         $this->assertGreaterThan(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
         $this->assertFileExists(app(ManifestStore::class)->path($candidate->manifest_path));
@@ -101,7 +101,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $allowed = array_values(array_diff($window, $rejectedIds));
         $result = app(ReleaseCreationService::class)->createReleases(1, 10, false, $allowed);
         $this->assertSame(0, $result['added']);
-        $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'pending')->count());
+        $this->assertSame(2, DB::table('release_verification_candidates')->whereIn('status', ['ready', 'waiting_upload'])->count());
         $this->assertFalse(DB::table('collections')->where('id', $rejected)->exists());
         $this->assertFalse(DB::table('collections')->where('id', $partial)->exists());
         $this->assertTrue(DB::table('collections')->where('id', $tail)->exists());
@@ -127,7 +127,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(3, $totals['iterations']);
         $this->assertSame(0, DB::table('releases')->count());
         $this->assertSame(0, DB::table('release_verification_candidates')->where('status', 'filtered')->count());
-        $this->assertSame(3, DB::table('release_verification_candidates')->where('status', 'pending')->count());
+        $this->assertSame(3, DB::table('release_verification_candidates')->whereIn('status', ['ready', 'waiting_upload'])->count());
     }
 
     public function test_partial_and_parity_only_inputs_remain_eligible_for_download_proof(): void
@@ -136,7 +136,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $partial = $this->collectionForPolicy(totalParts: 2);
         $parity = $this->collectionForPolicy(name: 'movie.par2');
         app(ReleaseCreationService::class)->createReleases(1, 10, false);
-        $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'pending')->count());
+        $this->assertSame(2, DB::table('release_verification_candidates')->whereIn('status', ['ready', 'waiting_upload'])->count());
         $this->assertFalse(DB::table('collections')->whereIn('id', [$partial, $parity])->exists());
     }
 
@@ -165,6 +165,8 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->collectionForPolicy(totalParts: 2));
+        // Legacy retained candidates remain claimable until preparation parks them.
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $manifest = app(ManifestStore::class)->read($claim->manifest_path);
         $manifest['verified_bytes'] = $bytes;

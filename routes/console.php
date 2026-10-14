@@ -87,6 +87,12 @@ Schedule::command('predb:check 3 --quiet')->everyTenMinutes()->withoutOverlappin
 Schedule::command('multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBackground()
     ->when(static fn (): bool => (bool) config('tmux.fix_names.predbft') && (bool) config('tmux.fix_names.predbft_scheduled'));
 
+// One metadata preparer parks uploads without consuming a spot-verification slot.
+$preparationCommand = escapeshellarg(PHP_BINARY).' -d memory_limit=256M '
+    .escapeshellarg(base_path('artisan')).' releases:prepare-candidates --limit=5000 --max-seconds=30';
+Schedule::exec($preparationCommand)->everyMinute()->runInBackground()
+    ->when(static fn (): bool => (bool) config('release_verification.scheduled'));
+
 // Stable worker slots cap concurrency without a stale scheduler overlap mutex.
 for ($slot = 1; $slot <= max(1, min(8, (int) config('release_verification.candidate_workers', 2))); $slot++) {
     $verificationCommand = escapeshellarg(PHP_BINARY).' -d ffi.enable=true -d memory_limit=256M '

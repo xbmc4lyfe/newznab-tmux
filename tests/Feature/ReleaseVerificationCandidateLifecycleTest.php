@@ -37,6 +37,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $repository->archive($this->arrival('second@article', 2));
         $claim = $repository->claim();
         $repository->rejectByPolicy($claim, 'Verified payload below minimum size.');
@@ -66,6 +68,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $repository->rejectByPolicy($repository->claim(), 'Verified policy rejection.');
         config(['release_verification.pending_bytes' => 0]);
         $repository->archive($this->arrival('late@article', 2));
@@ -82,6 +86,7 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
         $this->assertSame('other@article', DB::table('parts')->value('messageid'));
         config(['release_verification.pending_bytes' => 1048576]);
         $repository->archive($other);
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $next = $repository->claim();
         $this->assertNotNull($next);
         $this->assertSame(sha1('other-identity'), $next->source_identity);
@@ -105,6 +110,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $repository->rejectByPolicy($repository->claim(), 'Verified policy rejection.');
         if ($changes !== []) {
             DB::table('release_verification_candidates')->update($changes);
@@ -127,6 +134,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $repository->rejectByPolicy($repository->claim(), 'Verified policy rejection.');
         $replay = $this->arrival('late@article', 2);
         DB::beginTransaction();
@@ -152,6 +161,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $claim = $repository->claim();
         DB::table('release_verification_candidates')->where('id', $claim->id)->update([
             'last_unique_at' => now()->subHours(49), 'lease_until' => now()->subSecond(),
@@ -191,6 +202,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $repository->finish($claim, new VerificationResult('unrepairable', 'Insufficient validated recovery data.'));
         $this->assertSame('unrepairable', DB::table('release_verification_candidates')->value('status'));
@@ -202,6 +215,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
         $this->artisan('releases:verify-candidates')->assertSuccessful();
         $this->assertNull($repository->claim());
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $this->assertNull($repository->claim());
         $repository->archive($this->arrival('late@article', 2));
         $next = $repository->claim();
@@ -215,6 +230,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $repository->finish($claim, new VerificationResult('unknown', 'NNTP unavailable.'));
         $this->assertNull($repository->claim());
@@ -226,6 +243,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $repository->finish($claim, new VerificationResult('unrepairable', 'Insufficient validated recovery data.'));
         app(ScratchInventory::class)->register((int) $claim->id, (int) $claim->version);
@@ -293,6 +312,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
         DB::table('releases')->insert(['id' => 7]);
         $repository = app(CandidateRepository::class);
         $repository->archive($this->arrival());
+        // Exercise retained legacy candidates before metadata preparation.
+        DB::table('release_verification_candidates')->where('status', 'waiting_upload')->update(['status' => 'pending']);
         $candidate = DB::table('release_verification_candidates')->first();
         $manifest = app(ManifestStore::class)->read($candidate->manifest_path);
         DB::table('release_verification_candidates')->update(['release_id' => 7, 'status' => 'complete']);
