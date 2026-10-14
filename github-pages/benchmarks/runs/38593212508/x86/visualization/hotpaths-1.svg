@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 770" role="img">
+<title>profiles/cpp-heavy-strict/php.callgrind — exclusive function cost</title>
+<rect width="100%" height="100%" fill="#101827"/>
+<g fill="#e5e7eb" font-family="sans-serif" font-size="14">
+<text x="20" y="30">profiles/cpp-heavy-strict/php.callgrind — exclusive function cost</text>
+<text x="20" y="76">php::hash_file</text>
+<rect x="540" y="60" width="530.00" height="22" fill="#38bdf8"/>
+<text x="1078.00" y="76">11.883 ms</text>
+<text x="20" y="110">php::preg_match</text>
+<rect x="540" y="94" width="492.59" height="22" fill="#38bdf8"/>
+<text x="1040.59" y="110">11.044 ms</text>
+<text x="20" y="144">php::stripos</text>
+<rect x="540" y="128" width="470.36" height="22" fill="#38bdf8"/>
+<text x="1018.36" y="144">10.546 ms</text>
+<text x="20" y="178">ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</text>
+<rect x="540" y="162" width="392.23" height="22" fill="#38bdf8"/>
+<text x="940.23" y="178">8.794 ms</text>
+<text x="20" y="212">php::substr</text>
+<rect x="540" y="196" width="288.79" height="22" fill="#38bdf8"/>
+<text x="836.79" y="212">6.475 ms</text>
+<text x="20" y="246">{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autolo</text>
+<rect x="540" y="230" width="272.85" height="22" fill="#38bdf8"/>
+<text x="820.85" y="246">6.117 ms</text>
+<text x="20" y="280">App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw</text>
+<rect x="540" y="264" width="272.15" height="22" fill="#38bdf8"/>
+<text x="820.15" y="280">6.102 ms</text>
+<text x="20" y="314">{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassL</text>
+<rect x="540" y="298" width="237.97" height="22" fill="#38bdf8"/>
+<text x="785.97" y="314">5.336 ms</text>
+<text x="20" y="348">php::FFI-&gt;new</text>
+<rect x="540" y="332" width="233.47" height="22" fill="#38bdf8"/>
+<text x="781.47" y="348">5.235 ms</text>
+<text x="20" y="382">yencProfileExecute</text>
+<rect x="540" y="366" width="193.74" height="22" fill="#38bdf8"/>
+<text x="741.74" y="382">4.344 ms</text>
+<text x="20" y="416">App\Services\Yenc\NativePayloadDecoder-&gt;crc32</text>
+<rect x="540" y="400" width="90.37" height="22" fill="#38bdf8"/>
+<text x="638.37" y="416">2.026 ms</text>
+<text x="20" y="450">php::hash</text>
+<rect x="540" y="434" width="87.39" height="22" fill="#38bdf8"/>
+<text x="635.39" y="450">1.959 ms</text>
+<text x="20" y="484">App\Services\YencService-&gt;decodePayload</text>
+<rect x="540" y="468" width="74.39" height="22" fill="#38bdf8"/>
+<text x="622.39" y="484">1.668 ms</text>
+<text x="20" y="518">App\Services\Yenc\ArticleFrame::parse</text>
+<rect x="540" y="502" width="60.95" height="22" fill="#38bdf8"/>
+<text x="608.95" y="518">1.366 ms</text>
+<text x="20" y="552">php::FFI::string</text>
+<rect x="540" y="536" width="57.83" height="22" fill="#38bdf8"/>
+<text x="605.83" y="552">1.297 ms</text>
+<text x="20" y="586">App\Services\YencService-&gt;decode</text>
+<rect x="540" y="570" width="51.65" height="22" fill="#38bdf8"/>
+<text x="599.65" y="586">1.158 ms</text>
+<text x="20" y="620">App\Services\Yenc\ArticleFrame::findControl</text>
+<rect x="540" y="604" width="29.95" height="22" fill="#38bdf8"/>
+<text x="577.95" y="620">0.671 ms</text>
+<text x="20" y="654">App\Services\Yenc\ArticleFrame::fields</text>
+<rect x="540" y="638" width="24.83" height="22" fill="#38bdf8"/>
+<text x="572.83" y="654">0.557 ms</text>
+<text x="20" y="688">App\Services\YencService-&gt;decodeFramePayload</text>
+<rect x="540" y="672" width="20.67" height="22" fill="#38bdf8"/>
+<text x="568.67" y="688">0.463 ms</text>
+<text x="20" y="722">App\Services\YencService-&gt;metadataNumber</text>
+<rect x="540" y="706" width="19.88" height="22" fill="#38bdf8"/>
+<text x="567.88" y="722">0.446 ms</text>
+</g></svg>
