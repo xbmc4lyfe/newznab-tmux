@@ -17,7 +17,7 @@ class DeployMigrationOrderTest extends TestCase
         mkdir($this->directory.'/docker/bin', 0700, true);
         mkdir($this->directory.'/bin', 0700);
         copy(__DIR__.'/../../docker/Makefile', $this->directory.'/docker/Makefile');
-        foreach (['deploy-guard', 'deploy-app', 'deploy-current', 'up-app', 'compose', 'legacy-drain.php'] as $script) {
+        foreach (['deploy-guard', 'deploy-app', 'deploy-current', 'up-app', 'compose', 'legacy-drain.php', 'legacy-scheduler-drain.py'] as $script) {
             copy(__DIR__.'/../../docker/bin/'.$script, $this->directory.'/docker/bin/'.$script);
             chmod($this->directory.'/docker/bin/'.$script, 0755);
         }
@@ -34,6 +34,13 @@ case "$*" in
     *'inspect --format {{.State.Status}}'*) echo "running ${NNTMUX_HEALTH_STATUS:-healthy}" ;;
     *' ps -a -q '*) [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] || echo fixture-container ;;
     *' ps -q '*) [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo fixture-container ;;
+    *'scheduler python3 -c '*) [ "${NNTMUX_SCHEDULER_CAPABILITY_FAIL:-0}" != 1 ] || exit 48; echo "${NNTMUX_SCHEDULER_CAPABILITY:-native}" ;;
+    *'scheduler.py drain --timeout='*)
+        [ "${NNTMUX_SCHEDULER_DRAIN_FAIL:-0}" != 1 ] || exit 47
+        if [ "${NNTMUX_STALE_SCHEDULER_DRAIN:-0}" = 1 ]; then echo two > "$NNTMUX_REPO/app.txt"; fi ;;
+    *'scheduler.py check'*) [ "${NNTMUX_SCHEDULER_CHECK_FAIL:-0}" != 1 ] || exit 49 ;;
+    *'scheduler python3 - drain '*) [ "${NNTMUX_SCHEDULER_DRAIN_FAIL:-0}" != 1 ] || exit 47 ;;
+    *'scheduler python3 - check '*) [ "${NNTMUX_SCHEDULER_CHECK_FAIL:-0}" != 1 ] || exit 49 ;;
     *'artisan list --raw'*)
         [ "${NNTMUX_CAPABILITY_FAIL:-0}" != 1 ] || exit 46
         [ "${NNTMUX_LEGACY_IMAGE:-0}" = 1 ] || echo 'tmux:drain Drain processing' ;;
@@ -70,7 +77,7 @@ SH);
     {
         $this->deploy()->mustRun();
         $events = $this->events();
-        $steps = ['build --target selfhosted', 'artisan tmux:drain --timeout=90', ' stop --timeout 1920 horizon', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --wait --wait-timeout 240 web horizon scheduler indexer'];
+        $steps = ['build --target selfhosted', 'scheduler.py drain --timeout=1800', 'artisan tmux:drain --timeout=90', ' stop --timeout 1920 horizon', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --wait --wait-timeout 240 web horizon scheduler indexer'];
         $previous = -1;
         foreach ($steps as $step) {
             $position = strpos($events, $step);
@@ -299,6 +306,97 @@ SH);
         $this->assertStringNotContainsString(' up -d', $this->events());
         $this->assertStringNotContainsString('tmux:drain --resume', $this->events());
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+    }
+
+    public function test_failed_scheduler_drain_keeps_all_services_live_and_never_migrates(): void
+    {
+        $process = $this->deploy(['NNTMUX_SCHEDULER_DRAIN_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+    }
+
+    public function test_indexer_drain_failure_resumes_an_already_drained_scheduler(): void
+    {
+        $process = $this->deploy(['NNTMUX_DRAIN_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('scheduler.py restore', $this->events());
+        $this->assertStringNotContainsString(' stop ', $this->events());
+    }
+
+    public function test_legacy_scheduler_requires_opt_in_before_any_service_stops(): void
+    {
+        $process = $this->deploy(['NNTMUX_SCHEDULER_CAPABILITY' => 'legacy']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString('scheduler python3 - drain', $this->events());
+    }
+
+    public function test_scheduler_probe_failure_never_falls_back_to_legacy(): void
+    {
+        $process = $this->deploy(['NNTMUX_SCHEDULER_CAPABILITY_FAIL' => '1', 'DEPLOY_LEGACY_DRAIN' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString('scheduler python3 - drain', $this->events());
+        $this->assertStringNotContainsString(' stop ', $this->events());
+    }
+
+    public function test_legacy_scheduler_is_reverified_then_stopped_without_reopening_admission(): void
+    {
+        $this->deploy(['NNTMUX_SCHEDULER_CAPABILITY' => 'legacy', 'DEPLOY_LEGACY_DRAIN' => '1'])->mustRun();
+        $steps = ['scheduler python3 - drain 1800', ' stop --timeout 1920 horizon', 'scheduler python3 - check', ' stop --timeout 1 scheduler', ' stop web scheduler indexer', 'artisan migrate'];
+        $previous = -1;
+        foreach ($steps as $step) {
+            $position = strpos($this->events(), $step);
+            $this->assertNotFalse($position, $step);
+            $this->assertGreaterThan($previous, $position, $step);
+            $previous = $position;
+        }
+        $this->assertStringNotContainsString('scheduler python3 - resume', $this->events());
+    }
+
+    public function test_lost_legacy_scheduler_barrier_prevents_stop_and_restores_admission(): void
+    {
+        $process = $this->deploy(['NNTMUX_SCHEDULER_CAPABILITY' => 'legacy', 'DEPLOY_LEGACY_DRAIN' => '1', 'NNTMUX_SCHEDULER_CHECK_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('scheduler python3 - resume', $this->events());
+        $this->assertStringNotContainsString(' stop --timeout 1 scheduler', $this->events());
+        $this->assertStringNotContainsString(' stop web', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+    }
+
+    public function test_stale_checkout_after_scheduler_drain_restores_without_stopping_services(): void
+    {
+        $process = $this->deploy(['NNTMUX_STALE_SCHEDULER_DRAIN' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('scheduler.py restore', $this->events());
+        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+    }
+
+    public function test_native_scheduler_barrier_is_rechecked_before_stopping_writers(): void
+    {
+        $process = $this->deploy(['NNTMUX_SCHEDULER_CHECK_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('scheduler.py restore --token=', $this->events());
+        $this->assertStringNotContainsString(' stop web', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+    }
+
+    public function test_invalid_scheduler_timeout_does_not_touch_admission(): void
+    {
+        $process = $this->deploy(['DEPLOY_SCHEDULER_DRAIN_TIMEOUT' => 'invalid']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString('scheduler.py drain', $this->events());
+        $this->assertStringNotContainsString('scheduler.py restore', $this->events());
+        $this->assertStringNotContainsString(' stop ', $this->events());
     }
 
     private function events(): string

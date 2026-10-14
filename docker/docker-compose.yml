@@ -83,9 +83,11 @@ services:
 
   scheduler:
     <<: *app
-    command: ["php", "artisan", "schedule:work"]
+    # Detached scheduled tasks remain owned by the subreaper through shutdown.
+    stop_grace_period: 1920s
+    command: ["python3", "/app/docker/app/bin/scheduler.py"]
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "schedule:work"]
+      test: ["CMD", "python3", "/app/docker/app/bin/scheduler.py", "status"]
       interval: 30s
       timeout: 5s
       retries: 3

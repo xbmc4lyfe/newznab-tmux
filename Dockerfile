@@ -53,6 +53,7 @@ RUN composer dump-autoload --no-dev --no-scripts --optimize \
     && touch /tmp/build.sqlite \
     && APP_ENV=testing DB_CONNECTION=sqlite DB_DATABASE=/tmp/build.sqlite CACHE_STORE=array SESSION_DRIVER=array QUEUE_CONNECTION=sync MAIL_MAILER=array php artisan package:discover --ansi \
     && APP_ENV=testing DB_CONNECTION=sqlite DB_DATABASE=/tmp/build.sqlite CACHE_STORE=array SESSION_DRIVER=array QUEUE_CONNECTION=sync MAIL_MAILER=array npm run build \
+    && python3 -c 'import ast; ast.parse(open("docker/app/bin/scheduler.py").read())' \
     && rm -rf node_modules /tmp/build.sqlite bootstrap/cache/*.php
 
 RUN mkdir -p /app/_install /app/storage/covers /app/storage/app/public \

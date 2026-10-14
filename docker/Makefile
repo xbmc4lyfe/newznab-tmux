@@ -47,6 +47,7 @@ perms: dirs ## Linux hosts: let the app containers' user (33:33) use their bind 
 APP_IMAGE ?= nntmux/app:local
 DEPLOY_MIN_INTERVAL ?= 900
 DEPLOY_DRAIN_TIMEOUT ?= 90
+DEPLOY_SCHEDULER_DRAIN_TIMEOUT ?= 1800
 DEPLOY_HEALTH_TIMEOUT ?= 240
 DEPLOY_BY ?=
 GUARD     := DEPLOY_BY="$(DEPLOY_BY)" $(CURDIR)/bin/deploy-guard
@@ -67,6 +68,7 @@ deploy: ## Batch changes, build while live, drain writers, migrate, and wait for
 		DEPLOY_CONFIG_COMMAND="$(CURDIR)/bin/deploy-current" \
 		CHECK_UNCHANGED_COMMAND="$(CURDIR)/bin/deploy-current" CHECK_HEALTH_COMMAND="$(CURDIR)/bin/deploy-current" \
 		DEPLOY_MIN_INTERVAL="$(DEPLOY_MIN_INTERVAL)" DEPLOY_DRAIN_TIMEOUT="$(DEPLOY_DRAIN_TIMEOUT)" \
+		DEPLOY_SCHEDULER_DRAIN_TIMEOUT="$(DEPLOY_SCHEDULER_DRAIN_TIMEOUT)" \
 		DEPLOY_HEALTH_TIMEOUT="$(DEPLOY_HEALTH_TIMEOUT)" APP_IMAGE="$(APP_IMAGE)" FORCE="$(FORCE)" \
 		$(GUARD) run deploy -- $(CURDIR)/bin/deploy-app
 

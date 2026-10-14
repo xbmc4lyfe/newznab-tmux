@@ -204,6 +204,10 @@ class IRCClient
      */
     public function connect(string $hostname, int $port = 6667, bool $tls = false): bool
     {
+        if ($this->_stopRequested()) {
+            return false;
+        }
+
         $this->_alreadyLoggedIn = false;
         $transport = ($tls === true ? 'tls' : 'tcp');
 
@@ -223,13 +227,17 @@ class IRCClient
 
             // Try to connect until we run out of retries.
             while ($this->_reconnectRetries >= $this->_currentRetries++) {
+                if ($this->_stopRequested()) {
+                    break;
+                }
                 $this->_initiateStream();
                 if ($this->_connected()) {
                     break;
                 }
 
-                // Sleep between retries.
-                sleep($this->_reconnectDelay);
+                if (! $this->_waitForReconnect()) {
+                    break;
+                }
             }
         } else {
             $this->_alreadyLoggedIn = true;
@@ -240,7 +248,27 @@ class IRCClient
         // Reset retries counter.
         $this->_currentRetries = 0;
 
-        return $this->_connected();
+        return ! $this->_stopRequested() && $this->_connected();
+    }
+
+    /** @phpstan-impure */
+    private function _stopRequested(): bool
+    {
+        return app(ProcessingRuntimeStateRepository::class)->stopRequested();
+    }
+
+    private function _waitForReconnect(): bool
+    {
+        $deadline = hrtime(true) + $this->_reconnectDelay * 1_000_000_000;
+        while (hrtime(true) < $deadline) {
+            if ($this->_stopRequested()) {
+                return false;
+            }
+
+            usleep((int) min(100_000, max(0, ($deadline - hrtime(true)) / 1000)));
+        }
+
+        return ! $this->_stopRequested();
     }
 
     /**
@@ -253,6 +281,10 @@ class IRCClient
      */
     public function login(string $nickName, string $userName, string $realName, ?string $password = null): bool
     {
+        if ($this->_stopRequested()) {
+            return false;
+        }
+
         if (! $this->_connected()) {
             echo 'ERROR: You must connect to IRC first!'.PHP_EOL;
 
@@ -285,7 +317,13 @@ class IRCClient
 
         // Loop over the socket buffer until we find "001".
         while (true) {
+            if ($this->_stopRequested()) {
+                return false;
+            }
             $this->_readSocket();
+            if ($this->_stopRequested()) {
+                return false;
+            }
 
             // We got pinged, reply with a pong.
             if (preg_match('/^PING\s*:(.+?)$/', (string) $this->_buffer, $hits)) {
@@ -471,16 +509,28 @@ class IRCClient
      */
     protected function _reconnect(): void
     {
+        if ($this->_stopRequested()) {
+            return;
+        }
+
         if (! $this->connect($this->_remote_host, $this->_remote_port, $this->_remote_tls)) {
+            if ($this->_stopRequested()) {
+                return;
+            }
             exit('FATAL: Could not reconnect to ('.$this->_remote_host.') after ('.$this->_reconnectRetries.') tries.'.PHP_EOL);
         }
 
         if (! $this->_alreadyLoggedIn) {
             if (! $this->login($this->_nickName, $this->_userName, $this->_realName, $this->_password)) {
+                if ($this->_stopRequested()) {
+                    return;
+                }
                 exit('FATAL: Could not log in to ('.$this->_remote_host.')!'.PHP_EOL);
             }
 
-            $this->joinChannels($this->_channels);
+            if (! $this->_stopRequested()) {
+                $this->joinChannels($this->_channels);
+            }
         }
     }
 
@@ -588,9 +638,12 @@ class IRCClient
             $canFallBack ? min($this->_remote_connection_timeout / 3, self::FIRST_ATTEMPT_TIMEOUT) : null
         );
 
-        if ($socket === false && $canFallBack) {
+        if ($socket === false && $canFallBack && ! $this->_stopRequested()) {
             $addresses = $this->_resolveAddresses($this->_remote_host);
             foreach ($addresses as $index => $address) {
+                if ($this->_stopRequested()) {
+                    break;
+                }
                 $remaining = $deadline - microtime(true);
                 if ($remaining <= 0) {
                     break;
