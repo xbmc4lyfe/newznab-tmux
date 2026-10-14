@@ -80,7 +80,7 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('lease_token')->count());
     }
 
-    public function test_completed_candidate_releases_its_article_source_before_the_next_claim(): void
+    public function test_worker_keeps_the_article_session_until_all_claims_are_finished(): void
     {
         config(['release_verification.bytes_per_second' => 0]);
         foreach (['one', 'two'] as $name) {
@@ -90,9 +90,9 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
         }
         $closed = 0;
         $this->mock(NNTPService::class, static function ($mock) use (&$closed): void {
-            $mock->shouldReceive('doConnect')->twice()->with(false)->andReturn(true);
+            $mock->shouldReceive('doConnect')->once()->with(false)->andReturn(true);
             $mock->shouldReceive('verificationArticle')->twice()->andReturn((new YencService)->encode('hello', 'movie.mkv'));
-            $mock->shouldReceive('doQuit')->twice()->andReturnUsing(static function () use (&$closed): void {
+            $mock->shouldReceive('doQuit')->once()->andReturnUsing(static function () use (&$closed): void {
                 $closed++;
             });
         });
@@ -100,13 +100,13 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
         DB::listen(function (QueryExecuted $query) use (&$claims, &$closed): void {
             if (str_starts_with($query->sql, 'update "release_verification_candidates"') && in_array('verifying', $query->bindings, true)) {
                 if (++$claims === 2) {
-                    $this->assertSame(1, $closed, 'Previous payload/source state must be released before another candidate is claimed.');
+                    $this->assertSame(0, $closed, 'A healthy authenticated session must remain available for the next candidate.');
                 }
             }
         });
         $this->artisan('releases:verify-candidates', ['--limit' => 2])->assertSuccessful();
         $this->assertSame(2, $claims);
-        $this->assertSame(2, $closed);
+        $this->assertSame(1, $closed);
     }
 
     public function test_run_duration_stops_new_claims_but_finishes_active_verification(): void
