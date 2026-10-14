@@ -128,7 +128,7 @@ jobs:
         run: |
           YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
             php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
-              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines|it_withholds_integrity_for_trailer_only_multipart_declarations|it_accepts_identical_control_fields_in_native_and_fallback_metadata|it_requires_multipart_footer_fields_before_granting_integrity|it_exposes_rar5_file_times_in_native_release_metadata|it_exposes_archived_revision_declarations_without_replacing_stored_names|it_exposes_quick_open_cache_relationships_in_native_release_metadata' \
+              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines|it_withholds_integrity_for_trailer_only_multipart_declarations|it_accepts_identical_control_fields_in_native_and_fallback_metadata|it_requires_multipart_footer_fields_before_granting_integrity|it_exposes_rar5_file_times_in_native_release_metadata|it_exposes_archived_revision_declarations_without_replacing_stored_names|it_exposes_quick_open_cache_relationships_in_native_release_metadata|it_exposes_empty_rar5_file_copy_checksums_without_hashing_target_contents' \
               2>&1 | tee benchmark-evidence/build/framing-budget-integration.log
 
       - name: Record build and runtime identities
