@@ -8,9 +8,12 @@ use App\Enums\TmuxMode;
 use App\Enums\TmuxPaneRole;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
+use App\Services\Tmux\TmuxCommand;
 use App\Services\Tmux\TmuxPaneManager;
 use App\Services\Tmux\TmuxSessionManager;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Process;
+use RuntimeException;
 
 class TmuxStop extends Command
 {
@@ -48,7 +51,10 @@ class TmuxStop extends Command
 
             // Check if session exists
             if (! $this->sessionManager->sessionExists()) {
-                app(ProcessingRuntimeStateRepository::class)->setTmuxRunning(false);
+                $this->confirmSessionAbsent($sessionName);
+                $runtimeState = app(ProcessingRuntimeStateRepository::class);
+                $runtimeState->setTmuxRunning(false);
+                $runtimeState->requestStop(false);
                 $this->warn("⚠️  Session '{$sessionName}' is not running");
 
                 return Command::SUCCESS;
@@ -100,6 +106,8 @@ class TmuxStop extends Command
 
             // Kill the session
             if ($this->sessionManager->killSession()) {
+                $this->confirmSessionAbsent($sessionName);
+                $runtimeState->requestStop(false);
                 $this->info("✅ Session '{$sessionName}' stopped successfully");
 
                 return Command::SUCCESS;
@@ -114,5 +122,24 @@ class TmuxStop extends Command
 
             return Command::FAILURE;
         }
+    }
+
+    private function confirmSessionAbsent(string $sessionName): void
+    {
+        $result = Process::timeout(10)->run(TmuxCommand::arguments(['list-sessions', '-F', '#{session_name}']));
+        if ($result->successful()) {
+            if (in_array($sessionName, explode("\n", trim($result->output())), true)) {
+                throw new RuntimeException('The tmux session still exists; keeping the stop request.');
+            }
+
+            return;
+        }
+        $error = trim($result->errorOutput());
+        if ($result->exitCode() === 1 && (str_starts_with($error, 'no server running on ')
+            || (str_starts_with($error, 'error connecting to ') && str_ends_with($error, '(No such file or directory)')))) {
+            return;
+        }
+
+        throw new RuntimeException('Unable to confirm the tmux session is absent; keeping the stop request.');
     }
 }

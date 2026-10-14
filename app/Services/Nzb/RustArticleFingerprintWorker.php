@@ -16,6 +16,8 @@ final class RustArticleFingerprintWorker
 
     private string $buffer = '';
 
+    private bool $unsupportedInput = false;
+
     public function __construct(string $binary)
     {
         if (! is_file($binary) || ! is_readable($binary) || ! is_executable($binary) || ! function_exists('proc_open')) {
@@ -47,6 +49,7 @@ final class RustArticleFingerprintWorker
     public function add(string $messageId): void
     {
         if (strlen($messageId) > 16 * 1024 * 1024) {
+            $this->unsupportedInput = $this->unsupportedInput || $this->process !== null;
             $this->close();
         } elseif ($this->process !== null) {
             $this->queue('A'.pack('N', strlen($messageId)));
@@ -56,19 +59,30 @@ final class RustArticleFingerprintWorker
 
     public function value(): ?string
     {
-        if ($this->process === null) {
+        if ($this->unsupportedInput) {
             return null;
+        }
+        if ($this->process === null) {
+            throw new NzbArticleFingerprintTransportFailure('Fingerprint worker stopped during accumulation.');
         }
         $this->queue('V');
         if (! $this->flush()) {
-            return null;
+            throw new NzbArticleFingerprintTransportFailure('Fingerprint worker request failed.');
         }
         $marker = $this->read(1);
-        if ($marker !== "\0" && $marker !== "\1") {
+        if ($marker === "\0") {
+            return null;
+        }
+        if ($marker !== "\1") {
             $this->close();
+            throw new NzbArticleFingerprintTransportFailure('Fingerprint worker returned an incomplete or invalid response.');
+        }
+        $digest = $this->read(40);
+        if ($digest === null) {
+            throw new NzbArticleFingerprintTransportFailure('Fingerprint worker returned an incomplete digest.');
         }
 
-        return $marker === "\1" ? $this->read(40) : null;
+        return $digest;
     }
 
     private function queue(string $bytes): void
@@ -116,7 +130,7 @@ final class RustArticleFingerprintWorker
 
     private function ready(bool $writing, float $deadline): bool
     {
-        if ($this->process === null || ! proc_get_status($this->process)['running'] || ($remaining = $deadline - microtime(true)) <= 0) {
+        if ($this->process === null || ($writing && ! proc_get_status($this->process)['running']) || ($remaining = $deadline - microtime(true)) <= 0) {
             return false;
         }
         $read = $writing ? [] : [$this->pipes[1]];

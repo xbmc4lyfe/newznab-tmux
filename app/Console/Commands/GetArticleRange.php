@@ -25,7 +25,9 @@ class GetArticleRange extends Command
                             {mode : Mode: binaries or backfill}
                             {group : Group name}
                             {first : First article number}
-                            {last : Last article number}';
+                            {last : Last article number}
+                            {--contiguous : Refuse a forward range beyond the persisted group cursor}
+                            {--repair : Repair missing headers before this group visit}';
 
     /**
      * The console command description.
@@ -54,6 +56,15 @@ class GetArticleRange extends Command
             $this->error('Article range must contain positive integers with first no greater than last.');
 
             return self::FAILURE;
+        }
+
+        if ($this->option('contiguous')) {
+            $cursor = UsenetGroup::query()->where('name', $groupName)->value('last_record');
+            if ($mode !== 'binaries' || $cursor === null || $firstArticle > (int) $cursor + 1) {
+                $this->error('A preceding header range is unfinished; leaving this range for the next pass.');
+
+                return self::FAILURE;
+            }
         }
 
         if (! app(CandidateRepository::class)->capacityAvailable()) {
@@ -91,6 +102,9 @@ class GetArticleRange extends Command
 
             $binaries = new BinariesService;
             $binaries->setNntp($nntp);
+            if ($this->option('repair') && app(ConfigurationProvider::class)->ingestion()->partRepair) {
+                $binaries->partRepair($groupMySQL);
+            }
             $scanned = true;
             $return = $binaries->scan(
                 $groupMySQL,
@@ -98,6 +112,28 @@ class GetArticleRange extends Command
                 $lastArticle,
                 ((int) app(ConfigurationProvider::class)->ingestion()->safePartRepair === 1 ? 'update' : 'backfill')
             );
+
+            if ($this->option('contiguous')) {
+                $completedEnd = $binaries->completedRangeEnd();
+                if ($completedEnd === null) {
+                    $this->error('Header download did not complete; leaving this range for the next pass.');
+
+                    return self::FAILURE;
+                }
+
+                // An empty response or sparse tail still completes the requested range. Preserve
+                // the previous date when no header supplied one, and never advance after failure.
+                $values = ['last_record' => $completedEnd, 'last_updated' => now()];
+                $date = $return['lastArticleDate'] ?? null;
+                $timestamp = is_numeric($date) ? (int) $date : (is_string($date) ? strtotime($date) : false);
+                if ($timestamp !== false) {
+                    $values['last_record_postdate'] = date('Y-m-d H:i:s', $timestamp);
+                }
+                UsenetGroup::query()->where('id', $groupMySQL['id'])
+                    ->where('last_record', '<', $completedEnd)->update($values);
+
+                return self::SUCCESS;
+            }
 
             if (empty($return)) {
                 return self::SUCCESS;

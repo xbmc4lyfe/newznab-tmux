@@ -74,3 +74,9 @@ docker/Makefile		-binary text eol=lf
 /tests/Fixtures/ReleasePresentation.Dockerfile -binary text eol=lf
 /scripts/test-release-presentation-web.py -binary text eol=lf
 /tests/Fixtures/ReleasePresentation.Dockerfile.dockerignore -binary text eol=lf
+
+# Guarded application rollout helpers are source, not binary artifacts.
+/docker/bin/compose -binary text eol=lf
+/docker/bin/deploy-app -binary text eol=lf
+/docker/bin/deploy-current -binary text eol=lf
+/docker/bin/up-app -binary text eol=lf

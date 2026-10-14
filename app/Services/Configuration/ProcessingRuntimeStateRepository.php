@@ -21,6 +21,7 @@ final class ProcessingRuntimeStateRepository
         $this->update(['tmux_running' => $running]);
     }
 
+    /** @phpstan-impure */
     public function stopRequested(): bool
     {
         return $this->state()->stop_requested;
