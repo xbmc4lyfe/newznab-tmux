@@ -486,7 +486,7 @@ unsafe fn vbmi2_specials(bytes: x86::__m256i) -> u32 {
     }
 }
 
-// One register compression handles removals across byte 31 without joining
+// One 64-byte compression handles removals across byte 31 without joining
 // two outputs. The complete source block is loaded before overlapping stores.
 #[target_feature(enable = "avx2,avx512f,avx512vbmi2,avx512bw,avx512vl,popcnt")]
 #[inline]
@@ -535,13 +535,9 @@ unsafe fn compact_wide_vbmi2(
         if count != 0 {
             let decoded = _mm512_sub_epi8(bytes, _mm512_set1_epi8(42));
             let decoded = _mm512_mask_sub_epi8(decoded, adjust, decoded, _mm512_set1_epi8(64));
-            let packed = _mm512_maskz_compress_epi8(keep, decoded);
-            let prefix = if count == 64 {
-                u64::MAX
-            } else {
-                (1u64 << count) - 1
-            };
-            _mm512_mask_storeu_epi8(destination.cast(), prefix, packed);
+            // Memory compression writes exactly the selected bytes as a
+            // contiguous prefix, without constructing a second output mask.
+            _mm512_mask_compressstoreu_epi8(destination.cast(), keep, decoded);
         }
         count
     }

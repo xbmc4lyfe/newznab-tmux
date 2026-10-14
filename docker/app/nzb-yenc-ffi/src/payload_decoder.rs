@@ -330,12 +330,17 @@ mod tests {
         let mut adjust_only_expected = vec![1];
         adjust_only_expected.extend([b'A'; 63]);
 
+        let mut single_byte_output = vec![b'k'];
+        single_byte_output.extend(b"\r\n".repeat(31));
+        single_byte_output.push(b'\n');
+
         for (payload, expected) in [
             (across_32, across_32_expected),
             (across_64, across_64_expected),
             (alternating, alternating_expected),
             (newline_carry, newline_carry_expected),
             (adjust_only, adjust_only_expected),
+            (single_byte_output, vec![b'A']),
             (vec![b'\n'; 64], vec![]),
             (vec![b'k'; 64], vec![b'A'; 64]),
             (vec![b'='; 64], vec![0xd3; 32]),

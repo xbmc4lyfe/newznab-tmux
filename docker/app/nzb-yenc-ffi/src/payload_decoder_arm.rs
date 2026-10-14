@@ -145,13 +145,59 @@ unsafe fn decode_neon_regular_lane(
     use std::arch::aarch64::*;
     unsafe {
         // A neighbouring lane can contain specials without this lane needing
-        // compaction. Pending escape state still requires the full helper.
+        // compaction. Pending escapes bypass this shortcut and qualify below.
         if !*escaped && vmaxvq_u8(special) == 0 {
             vst1q_u8(destination, vsubq_u8(bytes, vdupq_n_u8(42)));
-            16
-        } else {
-            decode_neon_block(bytes, equals, special, destination, escaped)
+            return 16;
         }
+        let weights =
+            vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+        let newlines = vbicq_u8(special, equals);
+        let pairs = vpaddq_u8(vandq_u8(equals, weights), vandq_u8(newlines, weights));
+        let quads = vpaddq_u8(pairs, pairs);
+        let masks = vgetq_lane_u32(vreinterpretq_u32_u8(vpaddq_u8(quads, quads)), 0);
+        let equals_mask = masks as u16;
+        let newline_mask = (masks >> 16) as u16;
+        let incoming = *escaped;
+        let following = equals_mask.wrapping_shl(1);
+        let remove = equals_mask | newline_mask;
+        let first_removed = remove.trailing_zeros() as usize;
+        let single = remove.is_power_of_two();
+        let sparse = remove == 0 || single || remove >> first_removed == 3;
+        if !sparse || following & remove != 0 || (incoming && remove & 1 != 0) {
+            // Keep the incoming state intact for malformed escapes or general
+            // compaction. The dense decoder and tails also use this helper.
+            return decode_neon_block(bytes, equals, special, destination, escaped);
+        }
+        *escaped = equals_mask & 0x8000 != 0;
+        let adjustment = vorrq_u8(
+            vandq_u8(vextq_u8(vdupq_n_u8(0), equals, 15), vdupq_n_u8(64)),
+            vsetq_lane_u8::<0>(u8::from(incoming) << 6, vdupq_n_u8(0)),
+        );
+        let decoded = vsubq_u8(bytes, vaddq_u8(vdupq_n_u8(42), adjustment));
+        if remove == 0 {
+            vst1q_u8(destination, decoded);
+            return 16;
+        }
+        let (indexes, count) = if single {
+            (SINGLE_REMOVAL_INDEXES[first_removed].as_ptr(), 15)
+        } else {
+            (PAIR_REMOVAL_INDEXES[first_removed].as_ptr(), 14)
+        };
+        let compact = vqtbl1q_u8(decoded, vld1q_u8(indexes));
+        vst1_u8(destination, vget_low_u8(compact));
+        if single {
+            vst1_u8(
+                destination.add(7),
+                vget_low_u8(vextq_u8(compact, compact, 7)),
+            );
+        } else {
+            vst1_u8(
+                destination.add(6),
+                vget_low_u8(vextq_u8(compact, compact, 6)),
+            );
+        }
+        count
     }
 }
 
@@ -476,6 +522,37 @@ mod tests {
                 }
                 verify_regular_guards(&payload, &expected);
             }
+        }
+    }
+
+    #[test]
+    fn ordinary_incoming_escape_and_sparse_removals_preserve_literal_guards() {
+        for (replacements, length, adjusted) in [
+            (vec![(15, b'='), (23, b'\n')], 190, Some(1)),
+            (vec![(15, b'='), (23, b'\r'), (24, b'\n')], 189, Some(1)),
+            (vec![(15, b'='), (16, b'=')], 191, Some(211)),
+            (vec![(15, b'='), (16, b'\r'), (17, b'\n')], 189, Some(1)),
+            (
+                std::iter::once((15, b'='))
+                    .chain(
+                        (16..32).map(|index| (index, if index % 2 == 0 { b'\r' } else { b'\n' })),
+                    )
+                    .chain(std::iter::once((40, b'\n')))
+                    .collect(),
+                174,
+                Some(1),
+            ),
+            (vec![(20, b'\n'), (24, b'\n')], 190, None),
+        ] {
+            let mut payload = vec![b'k'; 192];
+            for (index, byte) in replacements {
+                payload[index] = byte;
+            }
+            let mut expected = vec![65; length];
+            if let Some(byte) = adjusted {
+                expected[15] = byte;
+            }
+            verify_regular_guards(&payload, &expected);
         }
     }
 
