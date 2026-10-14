@@ -21,6 +21,12 @@ use Tests\TestCase;
 
 final class PredbFulltextCompletionTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse()->byDefault();
+    }
+
     private const TITLE = 'Valid.Scene.Release.2026-GROUP';
 
     #[DataProvider('winningPaths')]

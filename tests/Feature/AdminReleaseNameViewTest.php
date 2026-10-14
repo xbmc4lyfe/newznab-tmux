@@ -82,6 +82,10 @@ class AdminReleaseNameViewTest extends TestCase
 
     private function renderName(object $release): string
     {
-        return Blade::render('<x-admin.release-name :release="$release" />', ['release' => $release]);
+        $release->guid = 'abc123';
+        $html = Blade::render('<x-admin.release-name :release="$release" />', ['release' => $release]);
+        $this->assertStringContainsString('href="'.route('details', ['guid' => 'abc123']).'"', $html);
+
+        return $html;
     }
 }

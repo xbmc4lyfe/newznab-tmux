@@ -20,6 +20,12 @@ use Tests\TestCase;
 
 final class PredbFulltextConcurrentMutationTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse()->byDefault();
+    }
+
     private const TITLE = 'Valid.Scene.Release.2026-GROUP';
 
     #[DataProvider('concurrentChanges')]
@@ -31,7 +37,7 @@ final class PredbFulltextConcurrentMutationTest extends TestCase
         $updates = $this->updater($synchronized);
         $changed = false;
         Search::shouldReceive('isAvailable')->once()->andReturnTrue();
-        Search::shouldReceive('searchReleases')->once()->andReturn(range(1, 21));
+        Search::shouldReceive('searchReleases')->never();
         Search::shouldReceive('supportsReleaseCandidatePaging')->once()->andReturnTrue();
         Search::shouldReceive('searchReleaseCandidatesPage')->once()->with(self::TITLE, 21, 0)
             ->andReturn(['ids' => range(1, 21), 'available' => true, 'has_more' => true]);

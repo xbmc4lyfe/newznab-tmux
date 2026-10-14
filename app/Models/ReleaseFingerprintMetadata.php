@@ -6,13 +6,14 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Support\Carbon;
 
 /** @property int $releases_id
- *  @property string $status
- *  @property array<string, mixed>|null $metadata
- *  @property string|null $last_error
- *  @property \Illuminate\Support\Carbon|null $collected_at
- *  @property-read Release $release
+ * @property string $status
+ * @property array<string, mixed>|null $metadata
+ * @property string|null $last_error
+ * @property Carbon|null $collected_at
+ * @property-read Release $release
  */
 final class ReleaseFingerprintMetadata extends Model
 {

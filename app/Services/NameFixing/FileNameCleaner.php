@@ -19,6 +19,33 @@ class FileNameCleaner
 
     protected NzbSplitUnwrapper $nzbSplitUnwrapper;
 
+    /** @var array<string, string|false>|null */
+    private ?array $matchingReuse = null;
+
+    /**
+     * Reuse pure filename cleaning only during one synchronous PreDB lookup.
+     * Custom cleaners may depend on mutable state and must retain every call.
+     *
+     * @template TResult
+     *
+     * @param  callable(): TResult  $lookup
+     * @return TResult
+     */
+    public function withMatchingReuse(callable $lookup, bool $joinActiveLookup = false): mixed
+    {
+        if (get_class($this) !== self::class || ($joinActiveLookup && $this->matchingReuse !== null)) {
+            return $lookup();
+        }
+
+        $previous = $this->matchingReuse;
+        $this->matchingReuse = [];
+        try {
+            return $lookup();
+        } finally {
+            $this->matchingReuse = $previous;
+        }
+    }
+
     public function __construct(?NzbSplitUnwrapper $nzbSplitUnwrapper = null)
     {
         $this->nzbSplitUnwrapper = $nzbSplitUnwrapper ?? new NzbSplitUnwrapper;
@@ -143,6 +170,26 @@ class FileNameCleaner
      * @return string|false The cleaned filename or false if invalid
      */
     public function cleanForMatching(string $fileName, bool $preserveLeadingNumber = false): string|false
+    {
+        // Bound retained entries and raw key bytes; oversize inputs still use the normal cleaner.
+        if ($this->matchingReuse === null || strlen($fileName) > 4096) {
+            return $this->computeForMatching($fileName, $preserveLeadingNumber);
+        }
+
+        $key = ($preserveLeadingNumber ? '1:' : '0:').$fileName;
+        if (array_key_exists($key, $this->matchingReuse)) {
+            return $this->matchingReuse[$key];
+        }
+
+        $cleaned = $this->computeForMatching($fileName, $preserveLeadingNumber);
+        if (count($this->matchingReuse) < 256) {
+            $this->matchingReuse[$key] = $cleaned;
+        }
+
+        return $cleaned;
+    }
+
+    private function computeForMatching(string $fileName, bool $preserveLeadingNumber): string|false
     {
         if (! mb_check_encoding($fileName, 'UTF-8')
             || preg_match('/(?![\x00-\x7F])\p{C}/u', $fileName) !== 0) {

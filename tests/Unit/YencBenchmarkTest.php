@@ -33,6 +33,73 @@ final class YencBenchmarkTest extends TestCase
         $this->assertArrayNotHasKey('median_rust_over_cpp', $result);
     }
 
+    public function test_php_baseline_selects_the_real_php_worker_without_a_cpp_library(): void
+    {
+        $this->assertSame(['baseline' => 'php', 'library_options' => ['rust' => 'rust-native']],
+            yencBenchmarkBackends(['php-baseline' => false, 'rust-native' => '/rust.so']));
+        $this->assertSame(['baseline' => 'cpp', 'library_options' => ['cpp' => 'cpp-native', 'rust' => 'rust-native']],
+            yencBenchmarkBackends(['cpp-native' => '/cpp.so', 'rust-native' => '/rust.so']));
+    }
+
+    public function test_conflicting_php_and_cpp_baselines_are_rejected(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        yencBenchmarkBackends(['php-baseline' => false, 'cpp-native' => '/cpp.so', 'rust-native' => '/rust.so']);
+    }
+
+    public function test_php_comparison_names_its_denominator_and_preserves_invalidity(): void
+    {
+        $result = yencBenchmarkDecision(array_fill(0, 31, 0.8), 0, 5, 5, 123, 6, 'php');
+        $this->assertSame('useful_improvement', $result['decision']);
+        $this->assertSame(0.8, $result['median_rust_over_php']);
+        $this->assertArrayNotHasKey('median_rust_over_cpp', $result);
+        $invalid = yencBenchmarkDecision(array_fill(0, 30, 0.5), 1, 5, 5, 123, 6, 'php');
+        $this->assertSame('invalid', $invalid['decision']);
+        $this->assertArrayNotHasKey('median_rust_over_php', $invalid);
+    }
+
+    public function test_php_pairing_retains_native_failures_and_cannot_compare_php_to_itself(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-php-paired-test-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        file_put_contents($directory.'/not-a-library.so', 'deliberately invalid native library');
+        ob_start();
+        try {
+            $code = runPairedYencBenchmark(['php-baseline' => false,
+                'rust-native' => $directory.'/not-a-library.so', 'size' => 64, 'order-seed' => 123,
+                'output-dir' => $directory.'/paired'], 3);
+            $this->assertSame(2, $code);
+            $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
+                file($directory.'/paired/observations.jsonl', FILE_IGNORE_NEW_LINES));
+            $this->assertSame('php', $rows[0]['baseline']);
+            $this->assertSame(['rust'], array_keys($rows[0]['libraries']));
+            $php = array_values(array_filter($rows, static fn (array $row): bool => ($row['type'] ?? null) === 'observation' && $row['backend'] === 'php'));
+            $this->assertCount(18, $php);
+            foreach ($php as $row) {
+                $this->assertTrue($row['eligible']);
+                $this->assertNull($row['result']['library_sha256']);
+                $this->assertNull($row['result']['decoder_version']);
+                foreach ($row['result']['observations'] as $sample) {
+                    $this->assertArrayHasKey('ru_utime.tv_usec', $sample['process_cpu_before']);
+                    $this->assertArrayHasKey('ru_stime.tv_usec', $sample['process_cpu_after']);
+                }
+            }
+            $this->assertSame('invalid', $rows[array_key_last($rows)]['status']);
+            $this->assertFalse($rows[array_key_last($rows)]['rust_speed_advantage_demonstrated_for_every_stratum']);
+            $this->assertCount(36, glob($directory.'/paired/*.stderr'));
+        } finally {
+            ob_end_clean();
+            foreach (glob($directory.'/paired/*') as $path) {
+                unlink($path);
+            }
+            if (is_dir($directory.'/paired')) {
+                rmdir($directory.'/paired');
+            }
+            unlink($directory.'/not-a-library.so');
+            rmdir($directory);
+        }
+    }
+
     public function test_paired_order_and_bootstrap_are_reproducible_without_global_rng(): void
     {
         $first = 20261013;

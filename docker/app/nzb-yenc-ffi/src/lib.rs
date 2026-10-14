@@ -16,6 +16,8 @@ mod nntp_headers;
 mod par2;
 mod par2_source_ranges;
 mod payload_decoder;
+mod release_names;
+
 #[cfg(target_arch = "aarch64")]
 mod payload_decoder_arm;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -37,6 +39,85 @@ const MAX_PAR2_SOURCE_RANGE_INPUT_BYTES: usize = 16 * 1024 * 1024 + 16 * 1024;
 const MAX_ARTICLE_IDENTITY_INPUT_BYTES: usize = 131_072;
 const MAX_ARTICLE_XREF_INPUT_BYTES: usize = 196_608;
 const MAX_NNTP_HEADER_INPUT_BYTES: usize = 131_072;
+
+/// Render bounded UTF-8 HTML rows separated by 0xFF (impossible inside UTF-8).
+/// The explicit byte length preserves embedded NULs. Free through the matching
+/// export from this library; no allocator ownership crosses into PHP.
+///
+/// # Safety
+/// `data` is readable for `length` bytes; `output_length` is writable. The caller
+/// must release the returned pointer with its exact returned length once only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_names_html(
+    data: *const u8,
+    length: usize,
+    output_length: *mut usize,
+) -> *mut u8 {
+    if output_length.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { *output_length = 0 };
+    if length > 8 * 1024 * 1024 || data.is_null() {
+        return ptr::null_mut();
+    }
+    let input = unsafe { slice::from_raw_parts(data, length) };
+    match catch_unwind(|| release_names::render(input)) {
+        Ok(Some(rows)) => {
+            let mut output = Vec::new();
+            for (index, row) in rows.iter().enumerate() {
+                if index > 0 {
+                    output.push(0xff);
+                }
+                output.extend_from_slice(row.as_bytes());
+            }
+            let mut output = output.into_boxed_slice();
+            unsafe { *output_length = output.len() };
+            let pointer = output.as_mut_ptr();
+            std::mem::forget(output);
+            pointer
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
+/// # Safety
+/// `data` and `length` must be exactly the live pair returned by
+/// `nntmux_release_names_html`, and must not have been freed already.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_names_free(data: *mut u8, length: usize) {
+    if !data.is_null() {
+        unsafe { drop(Box::from_raw(ptr::slice_from_raw_parts_mut(data, length))) };
+    }
+}
+
+#[cfg(test)]
+mod release_names_abi_tests {
+    #[test]
+    fn rejects_null_and_over_budget_inputs_without_reading_them() {
+        unsafe {
+            let mut length = 999;
+            assert!(super::nntmux_release_names_html(std::ptr::null(), 1, &mut length).is_null());
+            assert_eq!(length, 0);
+            assert!(
+                super::nntmux_release_names_html(
+                    std::ptr::null(),
+                    8 * 1024 * 1024 + 1,
+                    &mut length
+                )
+                .is_null()
+            );
+            let input = br#"{"url_prefix":"/details/","url_suffix":"","releases":[]}"#;
+            assert!(
+                super::nntmux_release_names_html(input.as_ptr(), input.len(), std::ptr::null_mut())
+                    .is_null()
+            );
+            let output = super::nntmux_release_names_html(input.as_ptr(), input.len(), &mut length);
+            assert!(!output.is_null());
+            assert_eq!(length, 0);
+            super::nntmux_release_names_free(output, length);
+        }
+    }
+}
 
 /// Decode a yEnc payload (CR/LF line endings are skipped, `=X` escapes resolved).
 pub fn decode_payload(payload: &[u8]) -> Option<Vec<u8>> {
