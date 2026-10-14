@@ -67,6 +67,38 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         }
     }
 
+    public function test_paired_mode_requires_a_build_manifest_before_starting_workers(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-paired-build-manifest-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/source', 'missing-build-manifest');
+        file_put_contents($directory.'/native.so', 'invalid native library');
+        ob_start();
+        try {
+            foreach (['screen', 'regression-only'] as $mode) {
+                $options = ['paired' => false, 'native' => $directory.'/native.so', 'baseline-native' => $directory.'/native.so',
+                    'candidate-dir' => $directory.'/source', 'baseline-dir' => $directory.'/source', 'samples' => 1,
+                    'output-dir' => $directory.'/'.$mode];
+                if ($mode === 'regression-only') {
+                    $options['regression-only'] = false;
+                }
+                self::assertSame(2, articleBenchmarkPaired($options, articleBenchmarkOptions($options)));
+                $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
+                    file($options['output-dir'].'/observations.jsonl', FILE_IGNORE_NEW_LINES));
+                self::assertCount(2, $rows);
+                self::assertSame('failure', $rows[0]['type']);
+                self::assertStringContainsString('requires --runtime-manifest', $rows[0]['reason']);
+                self::assertSame('invalid', $rows[1]['status']);
+                self::assertFalse($rows[1]['acceptance_criteria_met']);
+                self::assertFalse($rows[1]['source_build_identity_verified']);
+                self::assertCount(0, glob($options['output-dir'].'/*.stdout'));
+            }
+        } finally {
+            ob_end_clean();
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
     public function test_invalid_sizes_cannot_escape_metadata_parser_budget(): void
     {
         $this->expectException(InvalidArgumentException::class);
@@ -334,6 +366,7 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         try {
             $options = ['paired' => false, 'samples' => 1, 'baseline-dir' => $directory.'/source', 'candidate-dir' => $directory.'/source',
                 'native' => $directory.'/fake.so', 'baseline-native' => $directory.'/fake.so', 'output-dir' => $directory.'/evidence'];
+            $options['runtime-manifest'] = self::createSyntheticBuildManifest($directory, $options);
             self::assertSame(2, articleBenchmarkPaired($options, articleBenchmarkOptions($options)));
             $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
                 file($directory.'/evidence/observations.jsonl', FILE_IGNORE_NEW_LINES));
@@ -462,6 +495,7 @@ final class ArticleProcessingBenchmarkTest extends TestCase
             $options = ['paired' => false, 'require-combined' => false, 'samples' => 1,
                 'baseline-dir' => $directory.'/source', 'candidate-dir' => $directory.'/source',
                 'native' => $directory.'/fake.so', 'baseline-native' => $directory.'/fake.so', 'output-dir' => $directory.'/evidence'];
+            $options['runtime-manifest'] = self::createSyntheticBuildManifest($directory, $options);
             self::assertSame(2, articleBenchmarkPaired($options, articleBenchmarkOptions($options)));
             $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
                 file($directory.'/evidence/observations.jsonl', FILE_IGNORE_NEW_LINES));
@@ -509,6 +543,7 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         try {
             $options = ['paired' => false, 'native' => $directory.'/fake-library.so', 'baseline-native' => $directory.'/fake-library.so',
                 'baseline-dir' => $directory.'/baseline', 'candidate-dir' => $directory.'/candidate', 'samples' => 3, 'order-seed' => 123, 'output-dir' => $directory.'/paired'];
+            $options['runtime-manifest'] = self::createSyntheticBuildManifest($directory, $options);
             self::assertSame(2, articleBenchmarkPaired($options, articleBenchmarkOptions($options)));
             $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
                 file($directory.'/paired/observations.jsonl', FILE_IGNORE_NEW_LINES));
@@ -590,6 +625,20 @@ final class ArticleProcessingBenchmarkTest extends TestCase
             }
             rmdir($directory);
         }
+    }
+
+    /** @param array<string, mixed> $options */
+    private static function createSyntheticBuildManifest(string $directory, array $options): string
+    {
+        $manifest = [];
+        foreach (['baseline', 'candidate'] as $backend) {
+            $manifest[$backend.'_library_sha256'] = hash_file('sha256', $options[$backend === 'baseline' ? 'baseline-native' : 'native']);
+            $manifest[$backend.'_source_sha256'] = array_filter(articleBenchmarkSourceHashes($options[$backend.'-dir']), is_string(...));
+        }
+        $path = $directory.'/build-manifest.json';
+        file_put_contents($path, json_encode($manifest, JSON_THROW_ON_ERROR));
+
+        return $path;
     }
 
     private static function createSyntheticSource(string $root, string $marker): void

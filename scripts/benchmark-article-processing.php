@@ -8,7 +8,8 @@ declare(strict_types=1);
  * [--samples=7] [--size=4096] [--output-dir=/new/directory] [--runtime-manifest=/manifest.json]
  * Every phase uses a fresh process, one untimed reference and one recorded warmup.
  * Profile results are diagnostic only. Paired mode uses --paired --baseline-dir=ROOT
- * --baseline-native=LIB --native=LIB [--samples=31] [--order-seed=20261014].
+ * --baseline-native=LIB --native=LIB --runtime-manifest=BUILD.json
+ * [--samples=31] [--order-seed=20261014].
  * [--candidate-dir=ROOT] selects an independently installed app graph.
  * [--require-combined] qualifies the candidate API in a separate process per fixture.
  * Paired mode currently screens median speedups only; p99/adoption is unqualified.
@@ -641,7 +642,12 @@ function articleBenchmarkPaired(array $options, array $validated): int
         file_put_contents($directory.'/observations.jsonl', $line, FILE_APPEND);
         echo $line;
     };
+    $sourceBuildIdentityVerified = false;
     try {
+        if (! isset($options['runtime-manifest'])) {
+            throw new InvalidArgumentException('Paired mode requires --runtime-manifest linking both built libraries to their source trees.');
+        }
+        $manifest = articleBenchmarkReadManifest((string) $options['runtime-manifest']);
         $root = realpath((string) ($options['candidate-dir'] ?? dirname(__DIR__))) ?: throw new InvalidArgumentException('Candidate source directory does not exist.');
         $baselineRoot = realpath((string) ($options['baseline-dir'] ?? '')) ?: throw new InvalidArgumentException('Baseline source directory does not exist.');
         $sources = ['baseline' => articleBenchmarkSourceHashes($baselineRoot), 'candidate' => articleBenchmarkSourceHashes($root)];
@@ -661,14 +667,13 @@ function articleBenchmarkPaired(array $options, array $validated): int
             $snapshotEvidence[$backend] = ['root' => $snapshot['root'], 'git_head' => $snapshot['git_head'], 'git_tree' => $snapshot['git_tree'],
                 'manifest_path' => $path, 'manifest_sha256' => hash_file('sha256', $path)];
         }
-        $runtimeManifest = null;
-        if (isset($options['runtime-manifest'])) {
-            $manifestPath = (string) $options['runtime-manifest'];
-            $manifest = articleBenchmarkReadManifest($manifestPath);
-            articleBenchmarkVerifyManifest($manifest, $libraries, $sources);
-            copy($manifestPath, $directory.'/runtime-manifest.json');
-            $runtimeManifest = ['path' => $directory.'/runtime-manifest.json', 'sha256' => hash_file('sha256', $manifestPath), 'contents' => $manifest];
+        articleBenchmarkVerifyManifest($manifest, $libraries, $sources);
+        $manifestPath = $directory.'/runtime-manifest.json';
+        if (file_put_contents($manifestPath, json_encode($manifest, JSON_THROW_ON_ERROR)) === false) {
+            throw new RuntimeException('Cannot retain validated build manifest.');
         }
+        $runtimeManifest = ['path' => $manifestPath, 'sha256' => hash_file('sha256', $manifestPath), 'contents' => $manifest];
+        $sourceBuildIdentityVerified = true;
         $requireCombined = isset($options['require-combined']);
         $protocol = ['type' => 'protocol', 'version' => 'paired-article-processing-v1', 'phase' => 'full-analyzer',
             'comparison_mode' => isset($options['regression-only']) ? 'regression_only' : 'median_screen',
@@ -681,7 +686,7 @@ function articleBenchmarkPaired(array $options, array $validated): int
             'evidence' => 'paired_median_screen', 'adoption_not_qualified_p99_missing' => true,
             'decision_rule' => 'Four target strata screen for simultaneous median speedup >= declared threshold; small controls may be inconclusive but no stratum may regress. Zero invalid pairs and at least 31 pairs required. No p99/adoption qualification is possible in this screen.',
             'order_seed' => $seed, 'timeout_seconds' => $validated['timeout'], 'output_dir' => $directory,
-            'source_build_identity_verified' => $runtimeManifest !== null,
+            'source_build_identity_verified' => $sourceBuildIdentityVerified,
             'source_sha256' => $sources, 'source_snapshots' => $snapshotEvidence, 'instrumentation' => articleBenchmarkInstrumentationHashes(), 'libraries' => $libraries,
             'runtime' => ['php' => PHP_VERSION, 'php_binary_sha256' => hash_file('sha256', PHP_BINARY), 'os' => php_uname(),
                 'extensions' => get_loaded_extensions(), 'opcache_cli' => ini_get('opcache.enable_cli'), 'jit' => ini_get('opcache.jit'),
@@ -764,7 +769,8 @@ function articleBenchmarkPaired(array $options, array $validated): int
                 $emit($stratum);
             }
         }
-        $identitiesStable = articleBenchmarkSourceHashes($root) === $sources['candidate']
+        $identitiesStable = hash_file('sha256', $manifestPath) === $runtimeManifest['sha256']
+            && articleBenchmarkSourceHashes($root) === $sources['candidate']
             && articleBenchmarkSourceHashes($baselineRoot) === $sources['baseline'];
         foreach ($snapshots as $backend => $snapshot) {
             $identitiesStable = $identitiesStable && articleBenchmarkGraphStable($snapshot)
@@ -777,12 +783,15 @@ function articleBenchmarkPaired(array $options, array $validated): int
             $identitiesStable = $identitiesStable && hash_file('sha256', $path) === $digest;
         }
         $summary = articleBenchmarkPairedDecision($strata, $identitiesStable, $validated['samples'], isset($options['regression-only']));
+        $summary['source_build_identity_verified'] = $sourceBuildIdentityVerified;
         $emit($summary);
 
         return $summary['status'] === 'invalid' ? 2 : ($summary['acceptance_criteria_met'] ? 0 : 1);
     } catch (Throwable $exception) {
         $emit(['type' => 'failure', 'status' => 'invalid', 'phase' => 'setup_or_run', 'exception' => $exception::class, 'reason' => $exception->getMessage()]);
-        $emit(['type' => 'run_summary', 'status' => 'invalid', 'evidence' => 'paired_median_screen', 'adoption_not_qualified_p99_missing' => true, 'performance_advantage_demonstrated' => false]);
+        $emit(['type' => 'run_summary', 'status' => 'invalid', 'acceptance_criteria_met' => false,
+            'source_build_identity_verified' => $sourceBuildIdentityVerified, 'evidence' => 'paired_median_screen',
+            'adoption_not_qualified_p99_missing' => true, 'performance_advantage_demonstrated' => false]);
 
         return 2;
     }
