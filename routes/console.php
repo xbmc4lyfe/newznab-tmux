@@ -90,7 +90,7 @@ Schedule::command('multiprocessing:fixrelnames predbft')->everyFiveMinutes()->wi
 
 // One metadata preparer parks uploads without consuming a spot-verification slot.
 $preparationCommand = escapeshellarg(PHP_BINARY).' -d memory_limit=256M '
-    .escapeshellarg(base_path('artisan')).' releases:prepare-candidates --limit=5000 --max-seconds=30';
+    .escapeshellarg(base_path('artisan')).' releases:prepare-candidates --limit=5000 --max-seconds=30 --diagnostics';
 Schedule::exec($preparationCommand)->everyMinute()->runInBackground()
     ->when(static fn (): bool => (bool) config('release_verification.scheduled'));
 

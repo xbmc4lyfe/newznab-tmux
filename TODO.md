@@ -1,5 +1,13 @@
 # To do
 
+## Qualify preparation run diagnostics (2026-10-14)
+
+Opt-in preparation diagnostics report bounded per-run outcomes and phase durations from the existing metadata pass. Scheduled preparation enables them without additional candidate scans. Inspected rows, affected updates and ready promotions are distinct; a diagnostic record does not establish faster publication or backlog throughput.
+
+- [ ] Run the full PHPUnit/native suites on final integrated master, including preparation fairness, deadlines, claim/version/backoff races, manifest read failures and diagnostics that throw. Preserve the original return values, exceptions, retry policy, inventory evidence and worker-lock lifetime.
+- [ ] After current-head Codex approval, green CI and guarded rollout by the deployment owner, verify source parity, scheduled diagnostics, service health and M4 TLS connectivity. Observe natural runs and classify the actual stop reason, ready yield and selection/read-assessment/update costs before choosing another throughput change.
+- [ ] Retain deployment transitions, worker-limit changes, empty cohorts and failed observations when comparing useful work. Use isolated MariaDB qualification for any later query or transaction optimization; these aggregate timings alone do not prove server lock hold time or production capacity.
+
 ## Retest additional admission with password checks disabled (2026-10-14)
 
 Password checks disabled at insertion produce passwordstatus=0 while media remains pending. Share the disabled-mode password-state gate across scheduling, worker selection and locked claim revalidation. Merge two individually ordered, bounded status prefixes to retain indexed claim selection. Keep enabled-mode selection, size/category/NZB/preview gates, claims and retry windows unchanged. No publication or runtime-setting change is included.
