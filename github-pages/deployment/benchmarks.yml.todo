@@ -1,0 +1,26 @@
+# DISABLED HANDOFF TEMPLATE. This file is not a GitHub Actions workflow.
+# The Pages-owner session must integrate these steps into its ONE publisher.
+# Do not simply enable a second workflow that overwrites the whole site.
+name: Benchmark reports handoff template
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  stage-reports:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Prepare frozen benchmark reports
+        run: bash github-pages/deployment/prepare-benchmarks.sh "$RUNNER_TEMP/site"
+      # TODO: Merge the Pages owner's dashboard/site into the SAME site directory.
+      # TODO: Collect current build summaries, failures and coverage gaps for ALL
+      # benchmark families listed in RUST_BENCHMARK_PAGES_TODO.md.
+      # TODO: Keep frozen /benchmarks/runs/... reports and their provenance intact.
+      # TODO: Configure Pages once, upload this combined directory with
+      # actions/upload-pages-artifact@v4, then deploy using actions/deploy-pages@v4
+      # in the Pages owner's master-only job with pages:write/id-token:write.
+      # There is intentionally no upload or deployment step in this template.

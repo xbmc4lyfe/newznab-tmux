@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 906" role="img">
+<title>Uninstrumented C++ / Rust median paired speedup (decision shown)</title>
+<rect width="100%" height="100%" fill="#101827"/>
+<g fill="#e5e7eb" font-family="sans-serif" font-size="14">
+<text x="20" y="30">Uninstrumented C++ / Rust median paired speedup (decision shown)</text>
+<path d="M813.36,48 V888" stroke="#94a3b8" stroke-dasharray="4"/>
+<text x="20" y="76">4096 B / ordinary / tolerant [useful_improvement]</text>
+<rect x="540" y="60" width="307.41" height="22" fill="#38bdf8"/>
+<text x="855.41" y="76">1.125 ×</text>
+<text x="20" y="110">4096 B / ordinary / strict [inconclusive]</text>
+<rect x="540" y="94" width="297.71" height="22" fill="#38bdf8"/>
+<text x="845.71" y="110">1.089 ×</text>
+<text x="20" y="144">4096 B / ordinary / body [inconclusive]</text>
+<rect x="540" y="128" width="302.10" height="22" fill="#38bdf8"/>
+<text x="850.10" y="144">1.105 ×</text>
+<text x="20" y="178">4096 B / heavy / tolerant [useful_improvement]</text>
+<rect x="540" y="162" width="360.33" height="22" fill="#38bdf8"/>
+<text x="908.33" y="178">1.318 ×</text>
+<text x="20" y="212">4096 B / heavy / strict [useful_improvement]</text>
+<rect x="540" y="196" width="342.65" height="22" fill="#38bdf8"/>
+<text x="890.65" y="212">1.253 ×</text>
+<text x="20" y="246">4096 B / heavy / body [useful_improvement]</text>
+<rect x="540" y="230" width="316.81" height="22" fill="#38bdf8"/>
+<text x="864.81" y="246">1.159 ×</text>
+<text x="20" y="280">524288 B / ordinary / tolerant [useful_improvement]</text>
+<rect x="540" y="264" width="408.85" height="22" fill="#38bdf8"/>
+<text x="956.85" y="280">1.496 ×</text>
+<text x="20" y="314">524288 B / ordinary / strict [useful_improvement]</text>
+<rect x="540" y="298" width="399.36" height="22" fill="#38bdf8"/>
+<text x="947.36" y="314">1.461 ×</text>
+<text x="20" y="348">524288 B / ordinary / body [useful_improvement]</text>
+<rect x="540" y="332" width="332.82" height="22" fill="#38bdf8"/>
+<text x="880.82" y="348">1.218 ×</text>
+<text x="20" y="382">524288 B / heavy / tolerant [useful_improvement]</text>
+<rect x="540" y="366" width="530.00" height="22" fill="#38bdf8"/>
+<text x="1078.00" y="382">1.939 ×</text>
+<text x="20" y="416">524288 B / heavy / strict [useful_improvement]</text>
+<rect x="540" y="400" width="523.52" height="22" fill="#38bdf8"/>
+<text x="1071.52" y="416">1.915 ×</text>
+<text x="20" y="450">524288 B / heavy / body [useful_improvement]</text>
+<rect x="540" y="434" width="341.23" height="22" fill="#38bdf8"/>
+<text x="889.23" y="450">1.248 ×</text>
+<text x="20" y="484">1048576 B / ordinary / tolerant [useful_improvement]</text>
+<rect x="540" y="468" width="406.58" height="22" fill="#38bdf8"/>
+<text x="954.58" y="484">1.487 ×</text>
+<text x="20" y="518">1048576 B / ordinary / strict [useful_improvement]</text>
+<rect x="540" y="502" width="400.36" height="22" fill="#38bdf8"/>
+<text x="948.36" y="518">1.465 ×</text>
+<text x="20" y="552">1048576 B / ordinary / body [useful_improvement]</text>
+<rect x="540" y="536" width="319.32" height="22" fill="#38bdf8"/>
+<text x="867.32" y="552">1.168 ×</text>
+<text x="20" y="586">1048576 B / heavy / tolerant [useful_improvement]</text>
+<rect x="540" y="570" width="505.77" height="22" fill="#38bdf8"/>
+<text x="1053.77" y="586">1.850 ×</text>
+<text x="20" y="620">1048576 B / heavy / strict [useful_improvement]</text>
+<rect x="540" y="604" width="497.55" height="22" fill="#38bdf8"/>
+<text x="1045.55" y="620">1.820 ×</text>
+<text x="20" y="654">1048576 B / heavy / body [useful_improvement]</text>
+<rect x="540" y="638" width="328.95" height="22" fill="#38bdf8"/>
+<text x="876.95" y="654">1.203 ×</text>
+<text x="20" y="688">8388608 B / ordinary / tolerant [useful_improvement]</text>
+<rect x="540" y="672" width="410.28" height="22" fill="#38bdf8"/>
+<text x="958.28" y="688">1.501 ×</text>
+<text x="20" y="722">8388608 B / ordinary / strict [useful_improvement]</text>
+<rect x="540" y="706" width="403.87" height="22" fill="#38bdf8"/>
+<text x="951.87" y="722">1.477 ×</text>
+<text x="20" y="756">8388608 B / ordinary / body [useful_improvement]</text>
+<rect x="540" y="740" width="309.07" height="22" fill="#38bdf8"/>
+<text x="857.07" y="756">1.131 ×</text>
+<text x="20" y="790">8388608 B / heavy / tolerant [useful_improvement]</text>
+<rect x="540" y="774" width="508.31" height="22" fill="#38bdf8"/>
+<text x="1056.31" y="790">1.859 ×</text>
+<text x="20" y="824">8388608 B / heavy / strict [useful_improvement]</text>
+<rect x="540" y="808" width="495.77" height="22" fill="#38bdf8"/>
+<text x="1043.77" y="824">1.814 ×</text>
+<text x="20" y="858">8388608 B / heavy / body [useful_improvement]</text>
+<rect x="540" y="842" width="322.47" height="22" fill="#38bdf8"/>
+<text x="870.47" y="858">1.180 ×</text>
+</g></svg>
