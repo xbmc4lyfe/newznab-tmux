@@ -12,6 +12,7 @@ use App\Models\MovieInfo;
 use App\Models\MusicInfo;
 use App\Models\SteamApp;
 use App\Models\Video;
+use App\Services\Search\Contracts\ReleaseCandidatePager;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
@@ -35,7 +36,7 @@ use RuntimeException;
  * Provides search functionality for the releases and predb indices with
  * caching, connection pooling, and automatic reconnection.
  */
-class ElasticSearchDriver implements SearchDriverInterface
+class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterface
 {
     private const CACHE_TTL_MINUTES = 5;
 
@@ -667,6 +668,76 @@ class ElasticSearchDriver implements SearchDriverInterface
         return is_array($result) ? $result : $result->toArray();
     }
 
+    /** @return array{ids: list<int>, available: bool, has_more: bool} */
+    public function searchReleaseCandidatesPage(string $title, int $limit = 21, int $afterId = 0): array
+    {
+        if ($limit < 1 || $limit > 1000 || $afterId < 0) {
+            throw new \InvalidArgumentException('Release candidate pages require a limit from 1 to 1000 and a nonnegative cursor.');
+        }
+        $unavailable = ['ids' => [], 'available' => false, 'has_more' => false];
+        if (! $this->isElasticsearchAvailable()) {
+            $this->recordSearchFailure();
+
+            return $unavailable;
+        }
+        if (preg_match('//u', $title) !== 1 || trim($title) === '') {
+            $this->recordSearchFailure();
+
+            return $unavailable;
+        }
+        $should = array_merge(
+            $this->buildReleaseFieldSpecificMustClauses(['name' => $title], false),
+            $this->buildReleaseFieldSpecificMustClauses(['searchname' => $title], false),
+        );
+        if (count($should) !== 2) {
+            $this->recordSearchFailure();
+
+            return $unavailable;
+        }
+
+        try {
+            $response = $this->getClient()->search([
+                'index' => $this->getReleasesIndex(),
+                'body' => [
+                    'query' => ['bool' => [
+                        'should' => $should,
+                        'minimum_should_match' => 1,
+                        'filter' => [['range' => ['id' => ['gt' => $afterId]]]],
+                    ]],
+                    'size' => $limit + 1,
+                    'sort' => [['id' => ['order' => 'asc']]],
+                    '_source' => false,
+                    'track_total_hits' => false,
+                ],
+            ]);
+            $hits = $response['hits']['hits'] ?? null;
+            if (! is_array($hits) || ($response['timed_out'] ?? false) || (int) ($response['_shards']['failed'] ?? 0) > 0) {
+                throw new RuntimeException('The release candidate response was partial or malformed.');
+            }
+            $ids = [];
+            $previousId = $afterId;
+            foreach ($hits as $hit) {
+                $rawId = $hit['_id'] ?? null;
+                if (! is_int($rawId) && (! is_string($rawId) || preg_match('/^[0-9]+$/D', $rawId) !== 1)) {
+                    throw new RuntimeException('The release candidate response contained an invalid ID type.');
+                }
+                $id = filter_var($rawId, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+                if ($id === false || $id <= $previousId || count($ids) >= $limit + 1) {
+                    throw new RuntimeException('The release candidate response did not preserve its cursor order.');
+                }
+                $ids[] = $id;
+                $previousId = $id;
+            }
+
+            return ['ids' => array_slice($ids, 0, $limit), 'available' => true, 'has_more' => count($ids) > $limit];
+        } catch (\Throwable $exception) {
+            $this->recordSearchFailure();
+            Log::error('ElasticSearch release candidate page failed: '.$exception->getMessage());
+
+            return $unavailable;
+        }
+    }
+
     /**
      * Search releases with fuzzy fallback.
      *
@@ -1073,7 +1144,7 @@ class ElasticSearchDriver implements SearchDriverInterface
             return [];
         }
 
-        $cacheKey = $this->buildCacheKey('predb_search_v2', [$keywords]); // @phpstan-ignore argument.type
+        $cacheKey = $this->buildCacheKey('predb_search_v3', [$keywords]); // @phpstan-ignore argument.type
         $cached = Cache::get($cacheKey);
         if ($cached !== null) {
             return $cached;
@@ -1090,6 +1161,8 @@ class ElasticSearchDriver implements SearchDriverInterface
                 ],
                 includeDateSort: false
             );
+
+            $search['body']['_source'] = ['title', 'filename', 'source'];
 
             $result = $this->executeSearch($search, fullResults: true);
             Cache::put($cacheKey, $result, now()->addMinutes($this->config['cache_minutes'] ?? self::CACHE_TTL_MINUTES));
@@ -2960,11 +3033,8 @@ class ElasticSearchDriver implements SearchDriverInterface
 
             $sortField = (string) ($criteria['sort_field'] ?? 'postdate_ts');
             $sortDir = strtolower((string) ($criteria['sort_dir'] ?? 'desc'));
-            $allowedSort = ['postdate_ts', 'adddate_ts', 'size', 'totalpart', 'grabs', 'categories_id', 'id'];
+            $allowedSort = ['postdate_ts', 'adddate_ts', 'size', 'totalpart', 'grabs', 'comments', 'categories_id', 'id'];
             if (! in_array($sortField, $allowedSort, true)) {
-                $sortField = 'postdate_ts';
-            }
-            if ($sortField === 'id') {
                 $sortField = 'postdate_ts';
             }
             $order = $sortDir === 'asc' ? 'asc' : 'desc';
@@ -3016,6 +3086,10 @@ class ElasticSearchDriver implements SearchDriverInterface
                 return ['ids' => [], 'total' => 0, 'fuzzy' => $useFuzzy, 'available' => false];
             }
         };
+
+        if ($hasText && (bool) ($criteria['fuzzy_only'] ?? false)) {
+            return $run(true);
+        }
 
         if ($hasText) {
             $first = $run(false);
@@ -3122,6 +3196,23 @@ class ElasticSearchDriver implements SearchDriverInterface
     private function buildElasticsearchReleaseFilters(array $criteria): array
     {
         $filter = [];
+        foreach (ReleaseSearchQuery::normalizeRanges($criteria['ranges'] ?? []) as $field => $bounds) {
+            $range = [];
+            foreach ($bounds as $bound => $value) {
+                $range[$bound === 'min' ? 'gte' : 'lte'] = $value;
+            }
+            $filter[] = ['range' => [$field => $range]];
+        }
+        $idRange = [];
+        foreach (['min_id' => 'gte', 'max_id' => 'lte'] as $bound => $operator) {
+            $value = ReleaseSearchQuery::normalizeRangeBound($criteria[$bound] ?? null);
+            if ($value !== null) {
+                $idRange[$operator] = $value;
+            }
+        }
+        if ($idRange !== []) {
+            $filter[] = ['range' => ['id' => $idRange]];
+        }
 
         $releaseIds = $criteria['release_ids'] ?? null;
         if (is_array($releaseIds) && $releaseIds !== []) {

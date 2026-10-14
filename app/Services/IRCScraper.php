@@ -7,6 +7,11 @@ namespace App\Services;
 use App\Facades\Search;
 use App\Models\Predb;
 use App\Models\UsenetGroup;
+use App\Services\Predb\Feeds\PredbFeedImporter;
+use App\Services\Predb\Irc\IrcNetworks;
+use App\Services\Predb\Irc\PreAnnounceParser;
+use App\Support\PredbSearchDocument;
+use Carbon\CarbonImmutable;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
@@ -59,15 +64,37 @@ class IRCScraper extends IRCClient
     protected string|false $_titleIgnoreRegex = false;
 
     /**
+     * Connection profile from IrcNetworks::resolve().
+     *
+     * @var array{name: string, type: string, format: string, source: ?string, server: string, port: int, tls: bool, tls_verify_peer_name: ?bool, channels: array<string, ?string>, url: ?string}
+     */
+    protected array $_network;
+
+    /**
+     * Parser for public pre channels; null for the NNTmux bot format.
+     */
+    protected ?PreAnnounceParser $_announceParser = null;
+
+    protected ?PredbFeedImporter $_importer = null;
+
+    /**
      * Construct.
      *
      * @param  bool  $silent  Run this in silent mode (no text output).
      * @param  bool  $debug  Turn on debug? Shows sent/received socket buffer messages.
+     * @param  string  $network  Key in irc_settings.networks to scrape.
      *
      * @throws \Exception
      */
-    public function __construct(bool $silent, bool $debug)
+    public function __construct(bool $silent, bool $debug, string $network = IrcNetworks::LEGACY)
     {
+        $this->_network = IrcNetworks::resolve($network);
+        if ($this->_network['format'] !== 'nntmux') {
+            $this->_announceParser = new PreAnnounceParser($this->_network['format'], (string) $this->_network['source']);
+            $this->_importer = app(PredbFeedImporter::class);
+        }
+        $this->_tlsVerifyPeerName = $this->_network['tls_verify_peer_name'];
+
         if (config('irc_settings.scrape_irc_source_ignore')) {
             try {
                 $ignored = unserialize(
@@ -123,56 +150,33 @@ class IRCScraper extends IRCClient
      */
     protected function _startScraping(): void
     {
+        $server = $this->_network['server'];
+        $port = $this->_network['port'];
+
         // Connect to IRC.
-        if ($this->connect((string) config('irc_settings.scrape_irc_server'), (int) config('irc_settings.scrape_irc_port'), (bool) config('irc_settings.scrape_irc_tls')) === false) {
-            exit(
-                'Error connecting to ('.
-                config('irc_settings.scrape_irc_server').
-                ':'.
-                config('irc_settings.scrape_irc_port').
-                '). Please verify your server information and try again.'.
-                PHP_EOL
-            );
+        if ($this->connect($server, $port, $this->_network['tls']) === false) {
+            $this->fail('Error connecting to ('.$server.':'.$port.'). Please verify your server information and try again.');
         }
 
-        // Normalize password to ?string
-        $password = config('irc_settings.scrape_irc_password');
+        // Normalize password to ?string. The server password belongs to the configured (synirc/ZNC) server only.
+        $password = $this->_network['name'] === IrcNetworks::LEGACY ? config('irc_settings.scrape_irc_password') : null;
         $password = ($password === false || $password === '' || $password === null) ? null : (string) $password;
 
         // Login to IRC. Note parameter order: nick, user, real, pass.
         if ($this->login((string) config('irc_settings.scrape_irc_nickname'), (string) config('irc_settings.scrape_irc_username'), (string) config('irc_settings.scrape_irc_realname'), $password) === false) {
-            exit(
-                'Error logging in to: ('.
-                config('irc_settings.scrape_irc_server').':'.config('irc_settings.scrape_irc_port').') nickname: ('.config('irc_settings.scrape_irc_nickname').
-                '). Verify your connection information, you might also be banned from this server or there might have been a connection issue.'.
-                PHP_EOL
+            $this->fail(
+                'Error logging in to: ('.$server.':'.$port.') nickname: ('.config('irc_settings.scrape_irc_nickname').
+                '). Verify your connection information, you might also be banned from this server or there might have been a connection issue.'
             );
         }
 
         // Join channels.
-        $channelsCfg = config('irc_settings.scrape_irc_channels');
-        if ($channelsCfg) {
-            try {
-                $channels = unserialize((string) $channelsCfg, ['allowed_classes' => false]);
-            } catch (\ValueError $e) {
-                $channels = ['#PreNNTmux' => null];
-            }
-            if (! is_array($channels)) {
-                $channels = ['#PreNNTmux' => null];
-            }
-        } else {
-            $channels = ['#PreNNTmux' => null];
-        }
-        $this->joinChannels($channels);
+        $this->joinChannels($this->_network['channels']);
 
         if (! $this->_silent) {
             echo '['.
                 date('r').
-                '] [Scraping of IRC channels for ('.
-                config('irc_settings.scrape_irc_server').
-                ':'.
-                config('irc_settings.scrape_irc_port').
-                ') ('.
+                '] [Scraping of IRC channels for ('.$server.':'.$port.') ('.
                 config('irc_settings.scrape_irc_nickname').
                 ') started.]'.
                 PHP_EOL;
@@ -180,6 +184,16 @@ class IRCScraper extends IRCClient
 
         // Scan incoming IRC messages.
         $this->readIncoming();
+    }
+
+    /**
+     * Report a fatal connection or login error and exit non-zero, so a supervisor can back off.
+     */
+    protected function fail(string $message): never
+    {
+        fwrite(STDERR, $message.PHP_EOL);
+
+        exit(1);
     }
 
     /**
@@ -191,6 +205,12 @@ class IRCScraper extends IRCClient
     {
         if ($this->_debug && ! $this->_silent) {
             echo '[DEBUG] Processing message: '.$this->_channelData['message'].PHP_EOL;
+        }
+
+        if ($this->_announceParser !== null) {
+            $this->processAnnounce();
+
+            return;
         }
 
         if (preg_match(
@@ -280,13 +300,38 @@ class IRCScraper extends IRCClient
     }
 
     /**
+     * Store a pre announced on a public pre channel, using the PreDB feed import rules.
+     *
+     * @throws \Exception
+     */
+    protected function processAnnounce(): void
+    {
+        $entry = $this->_announceParser?->parse($this->_channelData['message'], CarbonImmutable::now('UTC'));
+        if ($entry === null || $this->_importer === null) {
+            return;
+        }
+
+        if (($this->_categoryIgnoreRegex !== false && $entry->category !== null && preg_match((string) $this->_categoryIgnoreRegex, $entry->category))
+            || ($this->_titleIgnoreRegex !== false && preg_match((string) $this->_titleIgnoreRegex, $entry->title))) {
+            return;
+        }
+
+        $result = $this->_importer->import([$entry]);
+
+        if (! $this->_silent && $result['skipped'] === 0) {
+            echo '['.date('r').'] ['.($result['inserted'] > 0 ? 'Added Pre ' : ($entry->enrichOnly ? 'Info Pre  ' : 'Updated Pre')).'] ['.
+                $entry->source.'] ['.$entry->title.']'.($entry->category !== null ? ' ['.$entry->category.']' : '').PHP_EOL;
+        }
+    }
+
+    /**
      * Check if we already have the PRE, update if we have it, insert if not.
      *
      * @throws \Exception
      */
     protected function _checkForDupe(): void
     {
-        $this->_oldPre = Predb::query()->where('title', $this->_curPre['title'])->select(['category', 'size'])->first();
+        $this->_oldPre = Predb::query()->where('title', $this->_curPre['title'])->select(['id', 'title', 'category', 'size', 'source'])->first();
         if ($this->_oldPre === null) {
             if ($this->_debug && ! $this->_silent) {
                 echo '[DEBUG] New PRE found, inserting: '.$this->_curPre['title'].PHP_EOL;
@@ -402,14 +447,17 @@ class IRCScraper extends IRCClient
      */
     protected function _updatePre(): void
     {
-        if (empty($this->_curPre['title'])) {
+        if (empty($this->_curPre['title']) || $this->_oldPre === null
+            || PredbSearchDocument::exactValue((string) ($this->_oldPre['title'] ?? '')) !== PredbSearchDocument::exactValue((string) $this->_curPre['title'])
+        ) {
             return;
         }
 
         $query = 'UPDATE predb SET ';
 
         $query .= (! empty($this->_curPre['size']) ? 'size = '.escapeString($this->_curPre['size']).', ' : '');
-        $query .= (! empty($this->_curPre['source']) ? 'source = '.escapeString($this->_curPre['source']).', ' : '');
+        // Keep the source of the ingester that stored the PRE first; an update only names a missing source.
+        $query .= (! empty($this->_curPre['source']) && empty($this->_oldPre['source']) ? 'source = '.escapeString($this->_curPre['source']).', ' : '');
         $query .= (! empty($this->_curPre['files']) ? 'files = '.escapeString($this->_curPre['files']).', ' : '');
         $query .= (! empty($this->_curPre['reason']) ? 'nukereason = '.escapeString($this->_curPre['reason']).', ' : '');
         $query .= (! empty($this->_curPre['reqid']) ? 'requestid = '.$this->_curPre['reqid'].', ' : '');
@@ -428,15 +476,17 @@ class IRCScraper extends IRCClient
         }
 
         $query .= 'title = '.escapeString($this->_curPre['title']);
-        $query .= ' WHERE title = '.escapeString($this->_curPre['title']);
+        $query .= ' WHERE id = '.(int) $this->_oldPre['id'];
+        $query .= ' AND HEX(title) = '.escapeString(strtoupper(bin2hex((string) $this->_oldPre['title'])));
 
-        // Execute the update and then fetch the affected row ID by title.
-        DB::update($query);
+        $updated = DB::update($query);
 
-        // Look up the predb row ID by title for indexing backends.
-        $pre = Predb::query()->where('title', $this->_curPre['title'])->first(['id', 'title', 'filename', 'source']);
+        $pre = Predb::query()->find((int) $this->_oldPre['id'], ['id', 'title', 'filename', 'source']);
 
-        if ($pre !== null) {
+        if ($pre !== null
+            && PredbSearchDocument::exactValue((string) $pre->title) === PredbSearchDocument::exactValue((string) $this->_curPre['title'])
+            && ($updated > 0 || (string) $pre->title === (string) $this->_oldPre['title'])
+        ) {
             $parameters = [
                 'id' => (int) $pre->id,
                 'title' => $pre->title,

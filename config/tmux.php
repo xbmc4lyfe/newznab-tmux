@@ -21,6 +21,38 @@ return [
         'default_name' => 'nntmux',
     ],
 
+    /*
+    | Run the scheduled `tmux:health-check --auto-restart` from the Laravel scheduler.
+    | Disable when the scheduler runs in a different container than the tmux engine
+    | (e.g. docker/docker-compose.yml): there it would start a second tmux session
+    | inside the scheduler container. The indexer container supervises itself instead.
+    */
+    'scheduled_health_check' => (bool) env('TMUX_SCHEDULED_HEALTH_CHECK', true),
+
+    /*
+    | Fix-names pane. Recent database passes run each cycle; historical database passes run
+    | once per interval. Bounded recent and historical PAR2 sweeps resume each cycle.
+    */
+    'fix_names' => [
+        'full_backlog' => (bool) env('TMUX_FIX_NAMES_FULL_BACKLOG', true),
+        'full_backlog_interval_minutes' => (int) env('TMUX_FIX_NAMES_FULL_INTERVAL', 60),
+        'predbft' => (bool) env('TMUX_FIX_NAMES_PREDBFT', true),
+        // Run the PreDB full-text pass from the scheduler every five minutes (routes/console.php) instead of at the
+        // end of the tmux cycle, where slow passes starve it. While this is on, the tmux cycle skips the pass, so
+        // the pass has exactly one launcher. Only meaningful while `predbft` is on; `predbft` false turns the pass off.
+        'predbft_scheduled' => (bool) env('TMUX_FIX_NAMES_PREDBFT_SCHEDULED', true),
+        // Shared cache for interval claims, PAR2 claims and progress; use one backend, not failover.
+        'cache_store' => (string) env('TMUX_FIX_NAMES_CACHE_STORE', 'redis'),
+        // Regular attempts include local retries after their separate skip allowance is exhausted.
+        'par2_max_releases' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_RELEASES', 300),
+        // Extra zero-probe, zero-receipt retries per batch; zero restores the regular quota.
+        'par2_max_local_skips' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_LOCAL_SKIPS', 3000),
+        'par2_budget_seconds' => (int) env('TMUX_FIX_NAMES_PAR2_BUDGET_SECONDS', 60),
+        'par2_max_probes' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_PROBES', 4),
+        'par2_max_probe_bytes' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_PROBE_BYTES', 2097152),
+        'par2_max_state_bytes' => (int) env('TMUX_FIX_NAMES_PAR2_MAX_STATE_BYTES', 8388608),
+    ],
+
     'terminal' => [
         'type' => env('TMUX_TERMINAL', 'xterm-256color'),
         'escape_time' => 0,
@@ -130,6 +162,8 @@ return [
     'monitor' => [
         'delay' => env('TMUX_MONITOR_DELAY', 10),
         'refresh_interval' => env('TMUX_REFRESH_INTERVAL', 60),
+        // Seconds the monitor loop may go without beating before `tmux:health-check` calls it stale.
+        'heartbeat_max_age' => (int) env('TMUX_HEARTBEAT_MAX_AGE', 180),
     ],
 
     'performance' => [

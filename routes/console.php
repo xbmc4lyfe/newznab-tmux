@@ -42,7 +42,8 @@ Schedule::command('metrics:collect')->everyFiveMinutes()->withoutOverlapping();
 // Cleanup old system metrics daily (keep last 60 days)
 Schedule::command('metrics:collect --cleanup')->dailyAt('03:00');
 // Push NNTmux application metrics to the Prometheus Pushgateway (see config/monitoring.php)
-Schedule::command('monitoring:export-metrics')->everyMinute()->withoutOverlapping()->when(static fn (): bool => (bool) config('monitoring.enabled'));
+// Stop slow exports before the five-minute overlap lock can expire.
+Schedule::command('monitoring:export-metrics --scheduled')->everyMinute()->withoutOverlapping(5)->when(static fn (): bool => (bool) config('monitoring.enabled'));
 // Cleanup old user activity stats weekly (keep last 90 days)
 Schedule::call(function () {
     UserActivityStat::cleanupOldStats(90);
@@ -61,11 +62,43 @@ Schedule::call(function () {
     UserDownload::where('timestamp', '<', now()->subDay())->delete();
 })->name('cleanup-api-request-logs')->hourly()->withoutOverlapping();
 // Check tmux health and auto-restart if monitor pane is dead
-Schedule::command('tmux:health-check --auto-restart')->everyThirtyMinutes()->withoutOverlapping();
+Schedule::command('tmux:health-check --auto-restart')->everyThirtyMinutes()->withoutOverlapping()->when(static fn (): bool => (bool) config('tmux.scheduled_health_check'));
 Schedule::command('nntmux:check-service-health')->everyMinute()->withoutOverlapping();
 Schedule::command('nntmux:search-repair --limit=100')->everyMinute()->withoutOverlapping();
+// TV: retry episode lookups for shows whose episode wasn't available yet, and normalize
+// any release still carrying a legacy TV processor status.
+
+Schedule::command('tv:reprocess-missing-episodes --scheduled --limit=500')->everyThirtyMinutes()->withoutOverlapping()->runInBackground();
+Schedule::command('tv:repair-links --legacy --stuck --orphans --limit=50000')->dailyAt('05:15')->withoutOverlapping();
 // Tail storage/logs into the Manticore log index used by the admin log viewer search
 Schedule::command('nntmux:index-logs')->everyMinute()->withoutOverlapping()->runInBackground()->when(static fn (): bool => (bool) config('nntmux.log_viewer.index.enabled'));
 // Keep the admin dashboard snapshot (Cache::flexible) hot so admins never pay
 // the cold-cache cost when opening /admin/index.
 Schedule::command('admin:warm-dashboard')->everyFifteenMinutes()->withoutOverlapping();
+// Poll public PreDB JSON/RSS feeds (config/predb_feeds.php); the IRC scraper remains the realtime source
+Schedule::command('predb:import-feed --quiet')->everyFiveMinutes()->withoutOverlapping()->runInBackground()->when(static fn (): bool => (bool) config('predb_feeds.enabled'));
+// Link releases to PreDB titles that arrived after the release was created (feeds, IRC, history imports).
+// Only recent releases are scanned; the old ones are covered by running `predb:check` by hand.
+Schedule::command('predb:check 3 --quiet')->everyTenMinutes()->withoutOverlapping()->runInBackground();
+// Match each new PreDB title against the raw subjects of existing releases (full-text). A run takes up to
+// `fix_names_per_run` titles per worker (a few seconds). The tmux fix-names chain also ends with this pass,
+// but its slow NNTP passes can run for an hour or more, so on its own it reached only about 100 titles a day;
+// the tmux cycle skips it while this is on (TMUX_FIX_NAMES_PREDBFT_SCHEDULED), so there is one launcher.
+// TMUX_FIX_NAMES_PREDBFT=false still turns the pass off entirely.
+Schedule::command('multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBackground()
+    ->when(static fn (): bool => (bool) config('tmux.fix_names.predbft') && (bool) config('tmux.fix_names.predbft_scheduled'));
+
+// One metadata preparer parks uploads without consuming a spot-verification slot.
+$preparationCommand = escapeshellarg(PHP_BINARY).' -d memory_limit=256M '
+    .escapeshellarg(base_path('artisan')).' releases:prepare-candidates --limit=5000 --max-seconds=30';
+Schedule::exec($preparationCommand)->everyMinute()->runInBackground()
+    ->when(static fn (): bool => (bool) config('release_verification.scheduled'));
+
+// Stable worker slots cap concurrency without a stale scheduler overlap mutex.
+for ($slot = 1; $slot <= max(1, min(8, (int) config('release_verification.candidate_workers', 2))); $slot++) {
+    $verificationCommand = escapeshellarg(PHP_BINARY).' -d ffi.enable=true -d memory_limit=256M '
+        .escapeshellarg(base_path('artisan')).' releases:verify-candidates --limit='.max(1, (int) config('release_verification.worker_limit', 1000))
+        .' --max-seconds='.max(1, (int) config('release_verification.worker_seconds', 300)).' --slot='.$slot.' --no-summary';
+    Schedule::exec($verificationCommand)->everyMinute()->runInBackground()
+        ->when(static fn (): bool => (bool) config('release_verification.scheduled'));
+}

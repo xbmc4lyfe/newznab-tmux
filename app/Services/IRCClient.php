@@ -13,6 +13,11 @@ namespace App\Services;
 class IRCClient
 {
     /**
+     * Longest wait, in seconds, on the first attempt when the host's other addresses can still be tried.
+     */
+    private const FIRST_ATTEMPT_TIMEOUT = 10.0;
+
+    /**
      * Hostname IRC server used when connecting.
      */
     protected string $_remote_host = '';
@@ -41,6 +46,11 @@ class IRCClient
      * Are we using tls/ssl?
      */
     protected bool $_remote_tls = false;
+
+    /**
+     * Overrides TLS host name verification for this connection; null keeps the nntmux_ssl setting.
+     */
+    protected ?bool $_tlsVerifyPeerName = null;
 
     /**
      * Time in seconds to timeout on connect.
@@ -558,19 +568,35 @@ class IRCClient
     {
         $this->_closeStream();
 
-        // Create SSL/TLS context if using secure connection
-        $context = $this->_remote_tls
-            ? stream_context_create(streamSslContextOptions())
-            : null;
-
-        $socket = stream_socket_client(
+        // A round-robin host (irc.efnet.org) can list a dead server first, and PHP only tries one address.
+        // Try the rest of the host's addresses before giving up. One budget, equal to the connection timeout,
+        // covers the host name attempt and every fallback, so extra addresses never multiply the maximum wait.
+        $canFallBack = filter_var($this->_remote_host, FILTER_VALIDATE_IP) === false;
+        $deadline = microtime(true) + $this->_remote_connection_timeout;
+        $socket = $this->_openSocket(
             $this->_remote_socket_string,
+            null,
             $error_number,
             $error_string,
-            $this->_remote_connection_timeout,
-            STREAM_CLIENT_CONNECT,
-            $context
+            $canFallBack ? min($this->_remote_connection_timeout / 3, self::FIRST_ATTEMPT_TIMEOUT) : null
         );
+
+        if ($socket === false && $canFallBack) {
+            $addresses = $this->_resolveAddresses($this->_remote_host);
+            foreach ($addresses as $index => $address) {
+                $remaining = $deadline - microtime(true);
+                if ($remaining <= 0) {
+                    break;
+                }
+                // Share what is left evenly, so every address gets an attempt.
+                $share = $remaining / (\count($addresses) - $index);
+                $literal = str_contains($address, ':') ? '['.$address.']' : $address;
+                $socket = $this->_openSocket($this->_remote_transport.'://'.$literal.':'.$this->_remote_port, $this->_remote_host, $error_number, $error_string, $share);
+                if ($socket !== false) {
+                    break;
+                }
+            }
+        }
 
         if ($socket === false) {
             $protocol = $this->_remote_tls ? 'TLS/SSL' : 'TCP';
@@ -581,6 +607,55 @@ class IRCClient
             stream_set_blocking($this->_socket, true);
             stream_set_timeout($this->_socket, $this->_socket_timeout);
         }
+    }
+
+    /**
+     * All IPv4 and IPv6 addresses of a host, in random order.
+     *
+     * @return list<string>
+     */
+    protected function _resolveAddresses(string $host): array
+    {
+        // The system resolver first, so /etc/hosts and other name services count, as they do for the first attempt.
+        $addresses = gethostbynamel($host) ?: [];
+        // Query each type on its own: a failing AAAA lookup would make a combined query return nothing at all.
+        foreach ([DNS_A, DNS_AAAA] as $type) {
+            foreach (@dns_get_record($host, $type) ?: [] as $record) {
+                $address = $record['ip'] ?? $record['ipv6'] ?? null;
+                if (\is_string($address) && $address !== '') {
+                    $addresses[] = $address;
+                }
+            }
+        }
+        $addresses = array_values(array_unique($addresses));
+        shuffle($addresses);
+
+        return $addresses;
+    }
+
+    /**
+     * Open one stream socket.
+     *
+     * @param  string|null  $peerName  Host name to verify the TLS certificate against when connecting by IP address.
+     * @return resource|false
+     */
+    protected function _openSocket(string $socketString, ?string $peerName, ?int &$errorNumber, ?string &$errorString, ?float $timeout = null)
+    {
+        $context = null;
+        if ($this->_remote_tls) {
+            $options = streamSslContextOptions();
+            foreach (array_keys($options) as $wrapper) {
+                if ($this->_tlsVerifyPeerName !== null) {
+                    $options[$wrapper]['verify_peer_name'] = $this->_tlsVerifyPeerName;
+                }
+                if ($peerName !== null) {
+                    $options[$wrapper]['peer_name'] = $peerName;
+                }
+            }
+            $context = stream_context_create($options);
+        }
+
+        return @stream_socket_client($socketString, $errorNumber, $errorString, $timeout ?? $this->_remote_connection_timeout, STREAM_CLIENT_CONNECT, $context);
     }
 
     /**
@@ -613,11 +688,14 @@ class IRCClient
             [
                 '/\x03\d{1,2}(?:,\d{1,2})?/', // Color code with foreground and optional background
                 '/\x03/', // Color code without parameters (reset)
+                '/\x04[0-9A-Fa-f]{6}(?:,[0-9A-Fa-f]{6})?/', // Hex foreground and optional background
+                '/\x04/', // Hex color reset
                 '/\x02/', // Bold
                 '/\x0F/', // Reset/Normal
                 '/\x16/', // Reverse/Italic
                 '/\x1F/', // Underline
                 '/\x1D/', // Italic
+                '/\x1E/', // Strikethrough
                 '/\x11/', // Monospace
             ],
             '',

@@ -12,6 +12,7 @@ use App\Services\AdditionalProcessing\Enums\DownloadKind;
 use App\Services\AdditionalProcessing\State\MediaByteBudget;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\AdditionalProcessing\UsenetDownloadService;
+use App\Services\Par2FileList;
 use dariusiii\rarinfo\Par2Info;
 
 /**
@@ -54,7 +55,8 @@ class MediaSourceResolver
     private function readIndex(ReleaseProcessingContext $context, array $candidates, MediaByteBudget $budget): array
     {
         foreach ($candidates as $candidate) {
-            if ($context->groupUnavailable || ! $budget->allows($this->estimatedBytes($context, $candidate->sourceIndex, count($candidate->messageIds)))) {
+
+            if ($context->groupUnavailable || $budget->exhausted() || ! $budget->allows($this->estimatedBytes($context, $candidate->sourceIndex, count($candidate->messageIds)))) {
                 return [];
             }
 
@@ -86,7 +88,7 @@ class MediaSourceResolver
                 continue;
             }
 
-            $files = Par2FileEntry::listFromPar2Info($par2Info->getFileList());
+            $files = Par2FileEntry::listFromPar2Info((new Par2FileList)->getFiles($par2Info));
             if ($files !== []) {
                 return $files;
             }
@@ -124,47 +126,52 @@ class MediaSourceResolver
                 }
 
                 $messageId = (string) ($context->nzbContents[$sourceIndex]['segments'][0] ?? '');
-                if ($messageId === '' || ! $budget->allows($this->estimatedBytes($context, $sourceIndex, 1))) {
+
+                if ($messageId === '' || $budget->exhausted() || ! $budget->allows($this->estimatedBytes($context, $sourceIndex, 1))) {
                     break 2;
                 }
 
                 $attempts++;
-                $result = $this->downloadService->downloadArticle(
-                    DownloadKind::MediaSource,
-                    $messageId,
-                    $context->releaseGroupName,
-                    $context->release->id,
-                );
-                if ($result['groupUnavailable']) {
-                    $context->groupUnavailable = true;
+                try {
+                    $result = $this->downloadService->downloadMappingArticle(
+                        $messageId,
+                        $context->releaseGroupName,
+                        $context->release->id,
+                    );
+                    if ($result['groupUnavailable']) {
+                        $context->groupUnavailable = true;
 
-                    break 2;
-                }
-                if (! $result['success'] || ! is_string($result['data'])) {
-                    continue;
-                }
-                $budget->spend(strlen($result['data']));
-
-                $part = $result['part'];
-                if ($part !== null && $part->length() !== null && $part->end !== null && $part->end < $part->size) {
-                    $articlePartSize ??= $part->length();
-                }
-
-                foreach ($files as $file) {
-                    if (in_array($file, $verified, true)) {
+                        break 2;
+                    }
+                    if (! $result['success'] || ! is_string($result['data'])) {
                         continue;
                     }
-                    if ($file->matchesStartOf($result['data'])
-                        || ($part !== null && $part->name === $file->name && $part->size === $file->size)
-                    ) {
-                        $verified[$sourceIndex] = $file;
+                    $budget->spend(strlen($result['data']));
 
+                    $part = $result['part'];
+                    if ($part !== null && $part->length() !== null && $part->end !== null && $part->end < $part->size) {
+                        $articlePartSize ??= $part->length();
+                    }
+
+                    foreach ($files as $file) {
+                        if (in_array($file, $verified, true)) {
+                            continue;
+                        }
+                        if ($file->matchesStartOf($result['data'])
+                            || ($part !== null && $part->name === $file->name && $part->size === $file->size)
+                        ) {
+                            $verified[$sourceIndex] = $file;
+                            $this->downloadService->retainMappedSourceArticle($file);
+
+                            break;
+                        }
+                    }
+
+                    if (in_array($wanted, $verified, true)) {
                         break;
                     }
-                }
-
-                if (in_array($wanted, $verified, true)) {
-                    break;
+                } finally {
+                    $this->downloadService->discardPendingMappingArticle();
                 }
             }
         }

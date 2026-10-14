@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace App\Services\NameFixing\Extractors;
 
 use App\Services\NameFixing\Data\NameFixResult;
+use App\Services\NameFixing\FileNameCleaner;
+use App\Services\NameFixing\ReleaseUpdateService;
+use App\Support\PredbSearchDocument;
 
 /**
  * Extracts release names from NFO content.
@@ -14,10 +17,92 @@ use App\Services\NameFixing\Data\NameFixResult;
 class NfoNameExtractor
 {
     /**
+     * Exclude upstream Source fields from release identity evidence.
+     *
+     * Keep line boundaries, and stop indented continuations at a new field or
+     * blank line. The original NFO remains available for technical metadata.
+     */
+    public function identityText(string $nfoContent): string
+    {
+        $lines = preg_split('/\r\n|\r|\n/', $nfoContent);
+        if ($lines === false) {
+            return '';
+        }
+        $sourceField = false;
+        foreach ($lines as &$line) {
+            if (preg_match('/^[ \t]*Source[ \t]*:/i', $line)) {
+                $sourceField = true;
+                $line = '';
+
+                continue;
+            }
+            if ($sourceField && preg_match('/^[ \t]+\S/', $line)
+                && (! preg_match('/^[ \t]*[A-Za-z][A-Za-z0-9 _-]*[ \t]*:/', $line)
+                    || preg_match('~^[ \t]*[A-Za-z]:[\\\\/]~', $line))) {
+                $line = '';
+
+                continue;
+            }
+            $sourceField = false;
+        }
+        unset($line);
+
+        return implode("\n", $lines);
+    }
+
+    /**
+     * A bounded Source-safe view for authoritative lookup. Declared filename
+     * paths and suffixes use the same literal cleanup as filename matching.
+     *
+     * @return array{titles: list<string>, complete: bool}
+     */
+    public function predbCandidates(string $nfoContent): array
+    {
+        $identity = $this->identityText($nfoContent);
+        $cleaner = new FileNameCleaner;
+        $titles = [];
+        $raw = [];
+        foreach ($this->literalNameFields($identity) as $field) {
+            $title = $cleaner->cleanForMatching($field);
+            if ($title !== false) {
+                $raw[] = $title;
+            }
+        }
+        if (preg_match_all(ReleaseUpdateService::PREDB_REGEX, $identity, $matches)) {
+            foreach ($matches[0] as $title) {
+                $raw[] = trim($title);
+            }
+        }
+        foreach ($raw as $title) {
+            if (! mb_check_encoding($title, 'UTF-8') || mb_strlen($title, 'UTF-8') > 255
+                || preg_match('/\p{C}/u', $title) !== 0) {
+                continue;
+            }
+            $titles[PredbSearchDocument::exactValue($title)] = $title;
+            if (count($titles) > 100) {
+                return ['titles' => [], 'complete' => false];
+            }
+        }
+
+        return ['titles' => array_values($titles), 'complete' => true];
+    }
+
+    /** @return list<string> */
+    private function literalNameFields(string $identity): array
+    {
+        if (! preg_match_all('/^[ \t]*(?:Filename|File[ \t]+Name|Complete[ \t]+Name|Release(?:[ \t]+Name)?)[ \t]*[:=][ \t]*([^\r\n]+)$/im', $identity, $fields)) {
+            return [];
+        }
+
+        return array_map(trim(...), $fields[1]);
+    }
+
+    /**
      * Check NFO content for TV patterns.
      */
     public function checkForTv(string $nfoContent): ?NameFixResult
     {
+        $nfoContent = $this->identityText($nfoContent);
         $result = [];
 
         // Generic TV pattern 1: path with SxxExx
@@ -38,6 +123,7 @@ class NfoNameExtractor
      */
     public function checkForMovie(string $nfoContent): ?NameFixResult
     {
+        $nfoContent = $this->identityText($nfoContent);
         $result = [];
 
         // Generic Movies 1
@@ -63,6 +149,7 @@ class NfoNameExtractor
      */
     public function checkForMusic(string $nfoContent): ?NameFixResult
     {
+        $nfoContent = $this->identityText($nfoContent);
         $result = [];
 
         // FM Radio pattern
@@ -82,6 +169,8 @@ class NfoNameExtractor
      */
     public function checkForTitleYear(string $nfoContent): ?NameFixResult
     {
+        $metadata = $nfoContent;
+        $nfoContent = $this->identityText($nfoContent);
         $result = [];
 
         // Skip PDFs and audiobooks
@@ -97,19 +186,19 @@ class NfoNameExtractor
         $releaseName = $result[0];
 
         // Extract language
-        $releaseName = $this->appendLanguageFromNfo($releaseName, $nfoContent);
+        $releaseName = $this->appendLanguageFromNfo($releaseName, $metadata);
 
         // Extract resolution
-        $releaseName = $this->appendResolutionFromNfo($releaseName, $nfoContent);
+        $releaseName = $this->appendResolutionFromNfo($releaseName, $metadata);
 
         // Extract source
-        $releaseName = $this->appendSourceFromNfo($releaseName, $nfoContent);
+        $releaseName = $this->appendSourceFromNfo($releaseName, $metadata);
 
         // Extract video codec
-        $releaseName = $this->appendVideoCodecFromNfo($releaseName, $nfoContent);
+        $releaseName = $this->appendVideoCodecFromNfo($releaseName, $metadata);
 
         // Extract audio codec
-        $releaseName = $this->appendAudioCodecFromNfo($releaseName, $nfoContent);
+        $releaseName = $this->appendAudioCodecFromNfo($releaseName, $metadata);
 
         $releaseName .= '-NoGroup';
 
@@ -121,6 +210,7 @@ class NfoNameExtractor
      */
     public function checkForGame(string $nfoContent): ?NameFixResult
     {
+        $nfoContent = $this->identityText($nfoContent);
         $result = [];
 
         // Check for known game groups
@@ -150,6 +240,7 @@ class NfoNameExtractor
      */
     public function checkForIguana(string $nfoContent): ?NameFixResult
     {
+        $nfoContent = $this->identityText($nfoContent);
         if (! preg_match('/Supplier.+?IGUANA/i', $nfoContent)) {
             return null;
         }
@@ -309,6 +400,14 @@ class NfoNameExtractor
      */
     public function extractFromNfo(string $nfoContent): ?NameFixResult
     {
+        $cleaner = new FileNameCleaner;
+        foreach ($this->literalNameFields($this->identityText($nfoContent)) as $field) {
+            $title = $cleaner->cleanForMatching($field);
+            if ($title !== false && $cleaner->isLiteralTechnicalSceneTitle($title)) {
+                return NameFixResult::fromMatch($title, 'Complete literal NFO field', 'NFO');
+            }
+        }
+
         // Try each pattern in order of reliability
         $result = $this->checkForTv($nfoContent);
         if ($result !== null) {

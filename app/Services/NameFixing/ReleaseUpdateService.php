@@ -8,10 +8,15 @@ use App\Events\ReleaseNameFixed;
 use App\Models\Category;
 use App\Models\Release;
 use App\Models\UsenetGroup;
+use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\AdditionalProcessing\ReleaseSearchSyncCoordinator;
 use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\Categorization\CategorizationService;
 use App\Services\ReleaseCleaningService;
+use App\Services\TvProcessing\TvProcessingCandidateQuery;
+use App\Support\Par2RenameProgress;
+use App\Support\PredbSearchDocument;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
@@ -85,6 +90,14 @@ class ReleaseUpdateService
 
     private readonly ReleaseSearchSyncCoordinator $searchSyncCoordinator;
 
+    /** @var array{before: array{id: int, guid: string, name: ?string, searchname: ?string}, after: array{id: int, guid: string, name: ?string, searchname: ?string}}|null */
+    private ?array $committedIdentity = null;
+
+    /** @var array{id: int, guid: string, name: ?string, searchname: ?string}|null */
+    private ?array $admittedIdentity = null;
+
+    private int $identityAttempt = 0;
+
     /**
      * The release ID we are trying to rename.
      */
@@ -133,6 +146,7 @@ class ReleaseUpdateService
      * @param  bool  $nameStatus  Whether to update status columns
      * @param  bool  $show  Whether to show output
      * @param  int|null  $preId  PreDB ID if matched
+     * @param  string|null  $filenameEvidence  Cleaned literal filename used to select a PreDB mapping
      *
      * @throws \Exception
      */
@@ -144,23 +158,38 @@ class ReleaseUpdateService
         string $type,
         bool $nameStatus,
         bool $show,
-        ?int $preId = 0
+        ?int $preId = 0,
+        ?string $filenameEvidence = null
     ): void {
+        $this->clearIdentityAttestation();
+        $this->matched = $this->done = false;
         $preId = $preId ?? 0;
         if (is_array($release)) {
             $release = (object) $release;
         }
+        $release = clone $release;
 
         // If $release does not have a releases_id, we should add it.
         if (! isset($release->releases_id)) {
             $release->releases_id = $release->id;
         }
+        $expectedSnapshot = $this->completedReleaseSnapshot($release) === null ? null : clone $release;
+        if ($expectedSnapshot === null && $this->hasObservedAdditionalClaim($release)) {
+            return;
+        }
 
-        if ($this->relid !== $release->releases_id) {
-            $cleanedName = (new ReleaseCleaningService)->fixerCleaner($name);
+        if ($preId > 0) {
+            $this->updateConfirmedPredbRelease($release, $name, $method, $echo, $type, $nameStatus, $show, $preId, $filenameEvidence);
+
+            return;
+        }
+
+        if ($expectedSnapshot !== null || $this->relid !== $release->releases_id) {
+            $literalSceneName = $this->fileNameCleaner->isLiteralTechnicalSceneTitle($name);
+            $cleanedName = $literalSceneName ? $name : (new ReleaseCleaningService)->fixerCleaner($name);
             // Normalize and sanity-check candidate for non-trusted sources
             $normalizedName = $this->fileNameCleaner->normalizeCandidateTitle($cleanedName);
-            $newName = $this->fileNameCleaner->formatSearchName($cleanedName, $normalizedName);
+            $newName = $literalSceneName ? $name : $this->fileNameCleaner->formatSearchName($cleanedName, $normalizedName);
 
             // Determine if the source is trusted enough to bypass plausibility checks
             $trustedSource = $this->isTrustedSource($type, $method, $preId);
@@ -173,23 +202,27 @@ class ReleaseUpdateService
             }
 
             if (strtolower($newName) !== strtolower($release->searchname)) {
-                $this->matched = true;
-                $this->relid = (int) $release->releases_id;
-
-                if ($type === 'PAR2, ') {
+                if ($type === 'PAR2, ' && ! $literalSceneName) {
                     $newName = ucwords($newName);
                     if (preg_match('/(.+?)\.[a-z0-9]{2,3}(PAR2)?$/i', $name, $hit)) {
                         $newName = $hit[1];
                     }
                 }
 
-                $this->fixed++;
-
                 // Split on path separator backslash to strip any path
                 $newName = explode('\\', $newName);
                 $newName = preg_replace(['/^[=_.:\s-]+/', '/[=_.:\s-]+$/'], '', $newName[0]);
 
-                $newTitle = substr($newName, 0, 299);
+                $newTitle = $literalSceneName ? $newName : substr($newName, 0, 299);
+
+                if ($echo && ! $this->performDatabaseUpdate($release, $newTitle, $type, $nameStatus, $preId, $expectedSnapshot)) {
+                    $this->relid = 0;
+
+                    return;
+                }
+                $this->matched = true;
+                $this->relid = (int) $release->releases_id;
+                $this->incrementFixed($echo, $release, $newTitle);
 
                 $determinedCategory = null;
                 if ($this->echoOutput && $show) {
@@ -202,12 +235,337 @@ class ReleaseUpdateService
                     $this->echoReleaseInfo($release, $newTitle, $determinedCategory, $type, $method);
                 }
 
-                if ($echo === true) {
-                    $this->performDatabaseUpdate($release, $newTitle, $type, $nameStatus, $preId);
-                }
             }
         }
         $this->done = true;
+    }
+
+    /** Confirmed catalogue titles keep their canonical bytes and require an unchanged release snapshot. */
+    private function updateConfirmedPredbRelease(
+        object $release,
+        string $title,
+        string $method,
+        bool $update,
+        string $type,
+        bool $nameStatus,
+        bool $show,
+        int $predbId,
+        ?string $filenameEvidence = null
+    ): void {
+        $this->reset();
+        $release = clone $release;
+        if (trim($title) === '' || ! mb_check_encoding($title, 'UTF-8')
+            || mb_strlen($title, 'UTF-8') > 255 || preg_match('/\p{C}/u', $title) !== 0
+            || $this->completedReleaseSnapshot($release) === null) {
+            return;
+        }
+        if (! $update) {
+            $currentTitle = $this->currentPredbTitle($predbId, $title, $filenameEvidence);
+            if ($currentTitle === null) {
+                return;
+            }
+            $title = $currentTitle;
+        }
+        if (PredbSearchDocument::exactValue($title) === PredbSearchDocument::exactValue((string) $release->searchname)) {
+            if ($update) {
+                $this->attachPredbSnapshot($release, $predbId, $title, $filenameEvidence);
+            }
+
+            return;
+        }
+        if ($update && ! $this->performDatabaseUpdate($release, $title, $type, $nameStatus, $predbId, $release, $filenameEvidence)) {
+            return;
+        }
+
+        $this->relid = (int) $release->releases_id;
+        $this->matched = $this->done = true;
+        $this->incrementFixed($update, $release, $title);
+        if ($this->echoOutput && $show) {
+            $category = $this->category->determineCategory($release->groups_id, $title, (string) ($release->fromname ?? ''));
+            $this->echoReleaseInfo($release, $title, $category, $type, $method);
+        }
+    }
+
+    /**
+     * Apply fulltext evidence only while the release still has its confirmed identity and no link.
+     * Snapshot predicates belong to the write itself, so a worker cannot win a read/write race.
+     */
+    public function updatePredbCandidate(object $release, string $title, int $predbId, string $source, bool $show = false): bool
+    {
+        $this->reset();
+        $release = clone $release;
+        $releaseId = (int) ($release->releases_id ?? 0);
+        if ($releaseId <= 0 || $predbId <= 0 || ! isset($release->guid)
+            || trim($title) === '' || ! mb_check_encoding($title, 'UTF-8')
+            || mb_strlen($title, 'UTF-8') > 255 || preg_match('/\p{Cc}/u', $title) !== 0) {
+            return false;
+        }
+
+        if (PredbSearchDocument::exactValue($title) === PredbSearchDocument::exactValue((string) $release->searchname)) {
+            $attempt = $this->identityAttempt;
+            if (! $this->withPredbIdentity($predbId, $title, null, function () use ($release, $predbId, $attempt): bool {
+                $before = $this->predbSnapshotQuery($release)->lockForUpdate()->first();
+                if ($before === null || $this->predbSnapshotQuery($release)->update(['predb_id' => $predbId]) !== 1) {
+                    return false;
+                }
+                $after = $this->releaseSnapshotQuery($release)->lockForUpdate()->first();
+                $this->queueIdentityAttestation($before, $after, $attempt);
+
+                return true;
+            })) {
+                return false;
+            }
+            $this->clearCompletedPar2Progress($releaseId, $this->completedReleaseSnapshot($release));
+        } else {
+            if (! $this->performDatabaseUpdate($release, $title, 'PreDB FT Exact, ', true, $predbId, $release)) {
+                return false;
+            }
+
+            $this->incrementFixed(true, $release, $title);
+            if ($this->echoOutput && $show) {
+                $category = $this->category->determineCategory($release->groups_id, $title, (string) ($release->fromname ?? ''));
+                $this->echoReleaseInfo($release, $title, $category, 'PreDB FT Exact, ', 'Title Match source: '.$source);
+            }
+        }
+
+        $this->relid = $releaseId;
+        $this->matched = $this->done = true;
+
+        return true;
+    }
+
+    /** @return array{id: int, guid: string, name: ?string, searchname: ?string}|null */
+    private function completedReleaseSnapshot(object $release, ?string $newTitle = null): ?array
+    {
+        $attributes = $release instanceof Release ? $release->getAttributes() : get_object_vars($release);
+        if (! isset($release->guid) || ! array_key_exists('name', $attributes)
+            || ! array_key_exists('searchname', $attributes)) {
+            return null;
+        }
+
+        return ['id' => (int) ($release->releases_id ?? $release->id ?? 0),
+            'guid' => (string) $release->guid,
+            'name' => $release->name === null ? null : (string) $release->name,
+            'searchname' => $newTitle ?? ($release->searchname === null ? null : (string) $release->searchname)];
+    }
+
+    /** @param null|callable(): bool $guard */
+    public function updateMediaSnapshot(object $release, string $title, int $categoryId, ?callable $guard = null): bool
+    {
+        $this->clearIdentityAttestation();
+        $this->matched = $this->done = false;
+        $release = clone $release;
+        $snapshot = $this->completedReleaseSnapshot($release);
+        if ($snapshot === null || $snapshot['id'] <= 0 || $snapshot['guid'] === '' || $categoryId <= 0
+            || trim($title) === '' || ! mb_check_encoding($title, 'UTF-8') || mb_strlen($title, 'UTF-8') > 255
+            || preg_match('/\p{C}/u', $title) !== 0) {
+            return false;
+        }
+        $release->releases_id = $snapshot['id'];
+        $attempt = $this->identityAttempt;
+        $aborted = new \RuntimeException('Media release identity or admission changed.');
+        try {
+            $written = DB::transaction(function () use ($release, $title, $categoryId, $guard, $attempt, $aborted): bool {
+                $before = $this->predbSnapshotQuery($release)->lockForUpdate()->first();
+                if ($before === null || ($guard !== null && ! $guard())) {
+                    return false;
+                }
+                $values = ['searchname' => $title, 'categories_id' => $categoryId, 'isrenamed' => 1, 'iscategorized' => 1, 'proc_pp' => 1];
+                $updated = $this->predbSnapshotQuery($release)->update($values);
+                $after = DB::table('releases')->where('id', $before->id)->lockForUpdate()->first();
+                if ($after === null || $after->guid !== $before->guid || $after->name !== $before->name
+                    || (int) $after->predb_id !== 0 || ($guard !== null && ! $guard())) {
+                    throw $aborted;
+                }
+                foreach ($values as $column => $value) {
+                    $actual = $after->{$column};
+                    if (is_int($value)) {
+                        $actual = (int) $actual;
+                    }
+                    if ($actual !== $value) {
+                        throw $aborted;
+                    }
+                }
+                if ($updated === 0 && $before->searchname !== $title) {
+                    throw $aborted;
+                }
+                $this->queueIdentityAttestation($before, $after, $attempt);
+                $this->clearCompletedPar2Progress((int) $before->id, $this->completedReleaseSnapshot($after));
+                $coordinator = $this->searchSyncCoordinator;
+                $releaseId = (int) $before->id;
+                DB::afterCommit(static function () use ($coordinator, $releaseId): void {
+                    $coordinator->request($releaseId);
+                });
+
+                return true;
+            });
+        } catch (\RuntimeException $exception) {
+            if ($exception !== $aborted) {
+                throw $exception;
+            }
+
+            return false;
+        }
+        if ($written) {
+            $this->matched = $this->done = true;
+            $this->relid = $snapshot['id'];
+        }
+
+        return $written;
+    }
+
+    /** @return array{before: array{id: int, guid: string, name: ?string, searchname: ?string}, after: array{id: int, guid: string, name: ?string, searchname: ?string}}|null */
+    public function lastCommittedIdentity(): ?array
+    {
+        return $this->committedIdentity;
+    }
+
+    private function clearIdentityAttestation(): void
+    {
+        $this->committedIdentity = null;
+        $this->admittedIdentity = null;
+        $this->identityAttempt++;
+    }
+
+    private function queueIdentityAttestation(object $before, ?object $after, int $attempt): void
+    {
+        $beforeIdentity = $this->completedReleaseSnapshot($before);
+        $afterIdentity = $after === null ? null : $this->completedReleaseSnapshot($after);
+        if ($beforeIdentity === null || $afterIdentity === null || $beforeIdentity['guid'] === ''
+            || $beforeIdentity['id'] !== $afterIdentity['id'] || $beforeIdentity['guid'] !== $afterIdentity['guid']
+            || $beforeIdentity['name'] !== $afterIdentity['name']) {
+            return;
+        }
+        $this->admittedIdentity = $afterIdentity;
+        DB::afterCommit(function () use ($beforeIdentity, $afterIdentity, $attempt): void {
+            if ($this->identityAttempt === $attempt && $this->committedSnapshotMatches($afterIdentity)) {
+                $this->committedIdentity = ['before' => $beforeIdentity, 'after' => $afterIdentity];
+            }
+        });
+    }
+
+    private function incrementFixed(bool $write, object $release, string $title): void
+    {
+        if (! $write) {
+            $this->fixed++;
+
+            return;
+        }
+        $snapshot = $this->admittedIdentity ?? $this->completedReleaseSnapshot($release, $title);
+        DB::afterCommit(function () use ($snapshot): void {
+            if ($snapshot === null || $this->committedSnapshotMatches($snapshot)) {
+                $this->fixed++;
+            }
+        });
+    }
+
+    /** @param array{id: int, guid: string, name: ?string, searchname: ?string} $snapshot */
+    private function committedSnapshotMatches(array $snapshot): bool
+    {
+        $current = DB::table('releases')->where('id', $snapshot['id'])->first(['id', 'guid', 'name', 'searchname']);
+
+        return $current !== null && $this->completedReleaseSnapshot($current) === $snapshot;
+    }
+
+    /** @param array{id: int, guid: string, name: ?string, searchname: ?string}|null $snapshot */
+    private function clearCompletedPar2Progress(int $releaseId, ?array $snapshot): void
+    {
+        if ($snapshot === null || $snapshot['id'] !== $releaseId) {
+            return;
+        }
+
+        DB::afterCommit(static function () use ($snapshot): void {
+            Par2RenameProgress::forgetCompletedSnapshot($snapshot);
+        });
+    }
+
+    /** @return Builder<Release> */
+    private function predbSnapshotQuery(object $release): Builder
+    {
+        return $this->releaseSnapshotQuery($release)->where('predb_id', 0);
+    }
+
+    /** @return Builder<Release> */
+    private function releaseSnapshotQuery(object $release): Builder
+    {
+        $query = Release::query()->where('id', (int) $release->releases_id);
+        if ($this->hasObservedAdditionalClaim($release)) {
+            $claim = $release->observed_additional_pp_claim;
+            if (! is_array($claim) || ! array_key_exists('token', $claim) || ! array_key_exists('claimed_at', $claim)
+                || ($claim['token'] !== null && ! is_string($claim['token']))
+                || ($claim['claimed_at'] !== null && ! is_string($claim['claimed_at']))) {
+                return $query->whereRaw('1 = 0');
+            }
+            $token = $claim['token'];
+            $stamp = $claim['claimed_at'];
+            if ($token === null || $token === '') {
+                if ($stamp !== null) {
+                    return $query->whereRaw('1 = 0');
+                }
+                $query->whereNull(AdditionalCandidateQuery::CLAIMED_AT_COLUMN);
+            } else {
+                $parsed = $stamp === null ? false : \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $stamp);
+                if ($parsed === false || $parsed->format('Y-m-d H:i:s') !== $stamp) {
+                    return $query->whereRaw('1 = 0');
+                }
+                $query->where(AdditionalCandidateQuery::CLAIMED_AT_COLUMN, $stamp)
+                    ->where(AdditionalCandidateQuery::CLAIMED_AT_COLUMN, '>=', AdditionalCandidateQuery::claimStaleBefore()->toDateTimeString());
+            }
+            if ($token === null) {
+                $query->whereNull(AdditionalCandidateQuery::CLAIM_TOKEN_COLUMN);
+            } else {
+                $query->whereRaw('HEX('.AdditionalCandidateQuery::CLAIM_TOKEN_COLUMN.') = ?', [strtoupper(bin2hex($token))]);
+            }
+        }
+        if (isset($release->observed_isrenamed)) {
+            $query->where('isrenamed', (int) $release->observed_isrenamed);
+        }
+        if (isset($release->observed_par2_hash_generation) || property_exists($release, 'observed_par2_hash_generation')) {
+            $generation = $release->observed_par2_hash_generation;
+            if (! is_string($generation) || preg_match('/^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$/D', $generation, $parts) !== 1
+                || (string) (int) $parts[1] !== $parts[1] || (string) (int) $parts[2] !== $parts[2]) {
+                return $query->whereRaw('1 = 0');
+            }
+            $query->whereRaw('(SELECT COALESCE(MAX(pfh.id), 0) FROM par_file_hashes pfh WHERE pfh.releases_id = releases.id) = ?', [(int) $parts[1]])
+                ->whereRaw('(SELECT COUNT(*) FROM par_file_hashes pfh WHERE pfh.releases_id = releases.id) = ?', [(int) $parts[2]]);
+        }
+        $cast = DB::connection()->getDriverName() === 'sqlite' ? 'BLOB' : 'BINARY';
+        foreach (['guid', 'name', 'searchname'] as $column) {
+            if (($release->{$column} ?? null) === null) {
+                $query->whereNull($column);
+            } else {
+                $query->whereRaw("CAST({$column} AS {$cast}) = CAST(? AS {$cast})", [(string) $release->{$column}]);
+            }
+        }
+
+        return $query;
+    }
+
+    private function hasObservedAdditionalClaim(object $release): bool
+    {
+        return $release instanceof Release
+            ? array_key_exists('observed_additional_pp_claim', $release->getAttributes())
+            : isset($release->observed_additional_pp_claim) || property_exists($release, 'observed_additional_pp_claim');
+    }
+
+    /**
+     * Run work that renames a release, and send its search index update only after the work returns, so a
+     * caller's own transaction has committed first. A throwing callback sends no update.
+     */
+    public function deferSearchSync(int $releaseId, \Closure $work): void
+    {
+        $this->searchSyncCoordinator->beginReleaseScope($releaseId);
+
+        try {
+            $work();
+        } catch (\Throwable $exception) {
+            $this->searchSyncCoordinator->discard($releaseId);
+            $this->searchSyncCoordinator->finishReleaseScope();
+
+            throw $exception;
+        }
+
+        $this->searchSyncCoordinator->finishReleaseScope();
     }
 
     /**
@@ -283,15 +641,30 @@ class ReleaseUpdateService
         string $newTitle,
         string $type,
         bool $nameStatus,
-        int $preId
-    ): void {
-        DB::transaction(function () use ($release, $newTitle, $type, $nameStatus, $preId): void {
+        int $preId,
+        ?object $expectedSnapshot = null,
+        ?string $filenameEvidence = null
+    ): bool {
+        $release = clone $release;
+        $expectedSnapshot = $expectedSnapshot === null ? null : clone $expectedSnapshot;
+        $releaseId = (int) $release->releases_id;
+        $completedSnapshot = null;
+        $attempt = $this->identityAttempt;
+        $write = function (?string $canonicalTitle = null) use ($release, $releaseId, $newTitle, $type, $nameStatus, $preId, $expectedSnapshot, $attempt, &$completedSnapshot): bool {
+            $newTitle = $canonicalTitle ?? $newTitle;
+            $actualRelease = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
+            if ($actualRelease === null) {
+                return false;
+            }
+            $completedSnapshot = $this->completedReleaseSnapshot($actualRelease, $newTitle);
+            $query = $expectedSnapshot !== null
+                ? $this->predbSnapshotQuery($expectedSnapshot)
+                : Release::query()->where('id', $releaseId);
             if ($nameStatus === true) {
                 $status = $this->getStatusColumnsForType($type);
 
                 $updateColumns = [
-                    'videos_id' => 0,
-                    'tv_episodes_id' => 0,
+                    ...TvProcessingCandidateQuery::resetColumns(),
                     'imdbid' => null,
                     'musicinfo_id' => '',
                     'consoleinfo_id' => '',
@@ -310,40 +683,64 @@ class ReleaseUpdateService
                     }
                 }
 
-                Release::query()
-                    ->where('id', $release->releases_id)
-                    ->update($updateColumns);
+                $affected = $query->update($updateColumns);
             } else {
-                Release::query()
-                    ->where('id', $release->releases_id)
-                    ->update([
-                        'videos_id' => 0,
-                        'tv_episodes_id' => 0,
-                        'imdbid' => null,
-                        'musicinfo_id' => null,
-                        'consoleinfo_id' => null,
-                        'bookinfo_id' => null,
-                        'book_lookup_attempts' => 0,
-                        'book_lookup_retry_at' => null,
-                        'book_name_normalized_at' => null,
-                        'anidbid' => null,
-                        'predb_id' => $preId,
-                        'searchname' => $newTitle,
-                        'iscategorized' => 1,
-                    ]);
+
+                $affected = $query->update([
+                    ...TvProcessingCandidateQuery::resetColumns(),
+                    'imdbid' => null,
+                    'musicinfo_id' => null,
+                    'consoleinfo_id' => null,
+                    'bookinfo_id' => null,
+                    'book_lookup_attempts' => 0,
+                    'book_lookup_retry_at' => null,
+                    'book_name_normalized_at' => null,
+                    'anidbid' => null,
+                    'predb_id' => $preId,
+                    'searchname' => $newTitle,
+                    'iscategorized' => 1,
+                ]);
             }
 
-            event(new ReleaseNameFixed(
-                (int) $release->releases_id,
+            if ($expectedSnapshot !== null && $affected !== 1) {
+                return false;
+            }
+
+            $after = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
+            if ($after !== null && $after->searchname === $newTitle) {
+                $this->queueIdentityAttestation($actualRelease, $after, $attempt);
+            }
+
+            $nameFixed = new ReleaseNameFixed(
+                $releaseId,
                 (string) $release->searchname,
                 $newTitle,
                 (int) $release->categories_id,
                 $release->groups_id,
-                (string) ($release->fromname ?? '')
-            ));
-        });
+                (string) ($release->fromname ?? ''),
+                $completedSnapshot
+            );
+            DB::afterCommit(static function () use ($nameFixed): void {
+                event($nameFixed);
+            });
 
-        $this->searchSyncCoordinator->request((int) $release->releases_id);
+            return true;
+        };
+        $updated = $preId > 0
+            ? $this->withPredbIdentity($preId, $newTitle, $filenameEvidence, $write)
+            : DB::transaction(static fn (): bool => $write());
+
+        if ($updated) {
+            if ($preId > 0 || ($nameStatus && ($this->getStatusColumnsForType($type)['isrenamed'] ?? 0) === 1)) {
+                $this->clearCompletedPar2Progress($releaseId, $completedSnapshot);
+            }
+            $coordinator = $this->searchSyncCoordinator;
+            DB::afterCommit(static function () use ($coordinator, $releaseId): void {
+                $coordinator->request($releaseId);
+            });
+        }
+
+        return $updated;
     }
 
     /**
@@ -378,19 +775,171 @@ class ReleaseUpdateService
 
         if ($id !== 0) {
             DB::update("UPDATE releases SET {$column} = ? WHERE id = ?", [$status, $id]);
+            if (($column === 'proc_par2' && $status === 1) || ($column === 'predb_id' && $status > 0)) {
+                $completed = DB::table('releases')->where('id', $id)->first(['id as releases_id', 'guid', 'name', 'searchname']);
+                if ($completed !== null) {
+                    $this->clearCompletedPar2Progress($id, $this->completedReleaseSnapshot($completed));
+                }
+            }
         }
+    }
+
+    /** Update a status only while the captured release remains unchanged and unlinked. */
+    public function updateSnapshotColumn(object $release, string $column, int $status): bool
+    {
+        return $this->updateSnapshotStatus($release, $column, $status, 0);
+    }
+
+    /** Complete filename inspection only while the captured identity and PreDB link remain unchanged. */
+    public function completeFilenameSnapshot(object $release): bool
+    {
+        $predbId = filter_var($release->predb_id ?? 0, FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
+        if ($predbId === false) {
+            return false;
+        }
+
+        return $this->updateSnapshotStatus($release, 'proc_files', self::PROC_FILES_DONE, $predbId);
+    }
+
+    private function updateSnapshotStatus(object $release, string $column, int $status, int $expectedPredbId): bool
+    {
+        if (! in_array($column, self::SINGLE_UPDATE_COLUMNS, true) || $column === 'predb_id') {
+            throw new InvalidArgumentException("Unsupported release status column [{$column}].");
+        }
+        $release = clone $release;
+        $snapshot = $this->completedReleaseSnapshot($release);
+        if ($snapshot === null || $snapshot['id'] <= 0 || $snapshot['guid'] === '') {
+            return false;
+        }
+        $release->releases_id = $snapshot['id'];
+        $updated = $this->releaseSnapshotQuery($release)->where('predb_id', $expectedPredbId)->update([$column => $status]);
+        if ($updated > 0 && $column === 'proc_par2' && $status === 1) {
+            $this->clearCompletedPar2Progress($snapshot['id'], $snapshot);
+        }
+
+        return $updated > 0;
     }
 
     public function attachPredbId(int $releaseId, int $predbId): void
     {
-        if ($releaseId === 0 || $predbId === 0) {
+        $this->reset();
+        if ($releaseId <= 0 || $predbId <= 0) {
             return;
         }
 
-        $this->updateSingleColumn('predb_id', $predbId, $releaseId);
+        $release = DB::table('releases')->where('id', $releaseId)
+            ->select(['id as releases_id', 'guid', 'name', 'searchname'])->first();
+        if ($release !== null) {
+            $this->attachPredbSnapshot($release, $predbId);
+        }
+    }
+
+    /**
+     * Attach same-name evidence only while its release identity is unchanged.
+     * An established identical link is a match without another write.
+     */
+    public function attachPredbSnapshot(object $release, int $predbId, ?string $expectedTitle = null, ?string $filenameEvidence = null): bool
+    {
+        $this->reset();
+        $releaseId = (int) ($release->releases_id ?? 0);
+        $attributes = $release instanceof Release ? $release->getAttributes() : get_object_vars($release);
+        if ($releaseId <= 0 || $predbId <= 0 || ! isset($release->guid, $release->searchname)
+            || ! array_key_exists('name', $attributes)
+            || ($expectedTitle !== null && PredbSearchDocument::exactValue($expectedTitle) !== PredbSearchDocument::exactValue((string) $release->searchname))) {
+            return false;
+        }
+
+        $release = clone $release;
+        $attached = false;
+        $attempt = $this->identityAttempt;
+        $accepted = $this->withPredbIdentity($predbId, $expectedTitle ?? (string) $release->searchname, $filenameEvidence, function () use ($release, $predbId, $attempt, &$attached): bool {
+            $identity = $this->releaseSnapshotQuery($release);
+            $before = (clone $identity)->lockForUpdate()->first();
+            if ($before === null) {
+                return false;
+            }
+            $alreadyLinked = (clone $identity)->where('predb_id', $predbId)->exists();
+            $attached = ! $alreadyLinked && (clone $identity)->where('predb_id', 0)->update(['predb_id' => $predbId]) === 1;
+            $accepted = $alreadyLinked || $attached || (clone $identity)->where('predb_id', $predbId)->exists();
+            if ($accepted) {
+                $after = (clone $identity)->where('predb_id', $predbId)->lockForUpdate()->first();
+                $this->queueIdentityAttestation($before, $after, $attempt);
+            }
+
+            return $accepted;
+        });
+        if (! $accepted) {
+            return false;
+        }
+        if ($attached) {
+            $this->clearCompletedPar2Progress($releaseId, $this->completedReleaseSnapshot($release));
+        }
+
         $this->relid = $releaseId;
-        $this->matched = true;
-        $this->done = true;
+        $this->matched = $this->done = true;
+
+        return true;
+    }
+
+    /**
+     * Search documents and donor snapshots are discovery evidence, not the current canonical row.
+     * Hold its lock through the release write and roll back if either observation loses identity.
+     *
+     * @param  callable(string): bool  $write
+     */
+    private function withPredbIdentity(int $predbId, string $title, ?string $filenameEvidence, callable $write): bool
+    {
+        $lostIdentity = new \RuntimeException('PreDB identity changed during release matching.');
+        try {
+            return DB::transaction(function () use ($predbId, $title, $filenameEvidence, $write, $lostIdentity): bool {
+                $canonicalTitle = $this->predbCanonicalTitle($predbId, $title, $filenameEvidence);
+                if ($canonicalTitle === null) {
+                    return false;
+                }
+                $accepted = $write($canonicalTitle);
+                if ($accepted && $this->predbCanonicalTitle($predbId, $title, $filenameEvidence) !== $canonicalTitle) {
+                    throw $lostIdentity;
+                }
+
+                return $accepted;
+            });
+        } catch (\RuntimeException $exception) {
+            if ($exception !== $lostIdentity) {
+                throw $exception;
+            }
+
+            return false;
+        }
+    }
+
+    /** Read-only preview evidence; the guarded write must independently validate it again. */
+    public function currentPredbTitle(int $predbId, string $title, ?string $filenameEvidence = null): ?string
+    {
+        return $this->predbCanonicalTitle($predbId, $title, $filenameEvidence, false);
+    }
+
+    private function predbCanonicalTitle(int $predbId, string $title, ?string $filenameEvidence, bool $lock = true): ?string
+    {
+        if ($predbId <= 0 || trim($title) === '' || ! mb_check_encoding($title, 'UTF-8')
+            || mb_strlen($title, 'UTF-8') > 255 || preg_match('/\p{C}/u', $title) !== 0) {
+            return null;
+        }
+        $query = DB::table('predb')->where('id', $predbId);
+        if ($lock) {
+            $query->lockForUpdate();
+        }
+        $row = $query->first();
+        if ($row === null || ! mb_check_encoding((string) $row->title, 'UTF-8')
+            || mb_strlen((string) $row->title, 'UTF-8') > 255 || preg_match('/\p{C}/u', (string) $row->title) !== 0
+            || PredbSearchDocument::exactValue((string) $row->title) !== PredbSearchDocument::exactValue($title)) {
+            return null;
+        }
+        if ($filenameEvidence === null || PredbSearchDocument::exactValue($title) === PredbSearchDocument::exactValue($filenameEvidence)) {
+            return (string) $row->title;
+        }
+
+        return $this->fileNameCleaner->matchesPredbFilenameEvidence((string) ($row->filename ?? ''), $filenameEvidence)
+            ? (string) $row->title : null;
     }
 
     /**
@@ -425,12 +974,13 @@ class ReleaseUpdateService
         );
         $matches = [];
         foreach ($rows as $row) {
-            $matches[(string) $row->title] = ['title' => (string) $row->title, 'id' => (int) $row->id];
+            $matches[PredbSearchDocument::exactValue((string) $row->title)] = ['title' => (string) $row->title, 'id' => (int) $row->id];
         }
 
         foreach ($candidateValues as $candidate) {
-            if (isset($matches[$candidate])) {
-                return $matches[$candidate];
+            $identity = PredbSearchDocument::exactValue($candidate);
+            if (isset($matches[$identity])) {
+                return $matches[$identity];
             }
         }
 
@@ -442,6 +992,7 @@ class ReleaseUpdateService
      */
     public function reset(): void
     {
+        $this->clearIdentityAttestation();
         $this->done = $this->matched = false;
     }
 

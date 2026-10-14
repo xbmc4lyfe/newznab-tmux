@@ -17,7 +17,10 @@ class ProcessReleasesCommand extends Command
      *
      * @var string
      */
-    protected $signature = 'releases:process {groupId? : Group ID to process (optional)}';
+    protected $signature = 'releases:process
+                            {groupId? : Group ID to process (optional)}
+                            {--maintenance-only : Run release cleanup and categorization without processing collections}
+                            {--ready-only : Process one bounded ready window for a group without reconciliation or retention cleanup}';
 
     /**
      * The console command description.
@@ -39,8 +42,30 @@ class ProcessReleasesCommand extends Command
     {
         $groupId = $this->argument('groupId');
 
+        if ($groupId !== null && (! ctype_digit((string) $groupId) || (int) $groupId <= 0)) {
+            $this->error('Group ID must be a positive integer.');
+
+            return self::FAILURE;
+        }
+
+        if ($this->option('maintenance-only') && $groupId !== null) {
+            $this->error('The --maintenance-only option cannot be combined with a group ID.');
+
+            return self::FAILURE;
+        }
+
+        if ($this->option('ready-only') && ($groupId === null || $this->option('maintenance-only'))) {
+            $this->error('The --ready-only option requires a group ID and cannot be combined with --maintenance-only.');
+
+            return self::FAILURE;
+        }
+
         try {
-            if (is_numeric($groupId)) {
+            if ($this->option('ready-only')) {
+                $this->releaseProcessingService->processReadyReleaseWindow((int) $groupId);
+            } elseif ($this->option('maintenance-only')) {
+                $this->runPostProcessingTasks();
+            } elseif ($groupId !== null) {
                 $this->processReleasesForGroup((string) $groupId);
             } else {
                 $this->processReleasesForGroup('');
@@ -61,18 +86,7 @@ class ProcessReleasesCommand extends Command
      */
     private function processReleasesForGroup(string $groupID): void
     {
-        $limit = $this->releaseProcessingService->getReleaseCreationLimit();
-
-        $this->releaseProcessingService->processIncompleteCollections($groupID);
-        $this->releaseProcessingService->processCollectionSizes($groupID);
-        $this->releaseProcessingService->deleteUnwantedCollections($groupID);
-
-        do {
-            $result = $this->releaseProcessingService->createReleases($groupID);
-            $nzbFilesAdded = $this->releaseProcessingService->createNZBs($groupID);
-
-            $shouldContinue = $result->total() >= $limit || $nzbFilesAdded >= $limit;
-        } while ($shouldContinue);
+        $this->releaseProcessingService->processCollectionsAndReleases($groupID);
 
         $this->releaseProcessingService->deleteCollections($groupID);
     }

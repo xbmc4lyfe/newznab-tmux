@@ -6,10 +6,13 @@ namespace Tests\Feature;
 
 use App\Enums\CollectionFileCheckStatus;
 use App\Services\Binaries\BinariesConfig;
+use App\Services\Binaries\BinaryHandler;
 use App\Services\Binaries\CollectionHandler;
 use App\Services\Binaries\HeaderStorageService;
+use App\Services\Binaries\HeaderStorageTransaction;
 use App\Services\CollectionsCleaningService;
 use App\Services\ReleaseProcessingService;
+use App\Services\Tmux\CollectionReconciliationBarrier;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -22,6 +25,7 @@ class CbpReleaseEligibilityTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        config(['release_verification.required' => false]);
         $this->configureDatabase();
         $this->travelTo(now()->startOfSecond());
         config(['nntmux.echocli' => false]);
@@ -38,11 +42,21 @@ class CbpReleaseEligibilityTest extends TestCase
     protected function tearDown(): void
     {
         if ($this->ownsTables) {
-            foreach (['parts', 'binaries', 'collection_groups', 'collections'] as $table) {
+            foreach (['parts', 'binaries', 'collection_groups', 'collections', 'usenet_groups'] as $table) {
                 Schema::dropIfExists($table);
             }
         }
         parent::tearDown();
+    }
+
+    public function test_verification_mode_preserves_declared_inventory_when_stale(): void
+    {
+        config(['release_verification.required' => true]);
+        $id = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        $this->process(1);
+        $collection = DB::table('collections')->where('id', $id)->first();
+        $this->assertSame(2, (int) $collection->totalfiles);
+        $this->assertSame(CollectionFileCheckStatus::Sized->value, (int) $collection->filecheck);
     }
 
     public function test_duplicate_ingestion_does_not_postpone_unknown_file_count_collection(): void
@@ -133,9 +147,295 @@ class CbpReleaseEligibilityTest extends TestCase
         $this->assertStatus($inserted, CollectionFileCheckStatus::Inserted);
     }
 
+    public function test_reconcile_repairs_drifted_binary_aggregates_across_chunks(): void
+    {
+        $collectionId = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        $partial = (int) DB::table('binaries')->where('collections_id', $collectionId)->value('id');
+        $complete = DB::table('binaries')->insertGetId(['collections_id' => $collectionId, 'totalparts' => 2]);
+        foreach ([1, 2] as $part) {
+            DB::table('parts')->insert(['binaries_id' => $complete, 'partnumber' => $part, 'size' => 150, 'number' => 1000 + $part, 'messageid' => '<'.$complete.'-'.$part.'@example.test>']);
+        }
+        $empty = DB::table('binaries')->insertGetId(['collections_id' => $collectionId, 'totalparts' => 1]);
+        DB::table('binaries')->where('collections_id', $collectionId)->update(['currentparts' => 9, 'partsize' => 9, 'partcheck' => 1]);
+
+        $this->process(1);
+
+        $binaries = DB::table('binaries')->where('collections_id', $collectionId)->get()->keyBy('id');
+        $this->assertSame([1, 100, 0], [(int) $binaries[$partial]->currentparts, (int) $binaries[$partial]->partsize, (int) $binaries[$partial]->partcheck]);
+        $this->assertSame([2, 300, 1], [(int) $binaries[$complete]->currentparts, (int) $binaries[$complete]->partsize, (int) $binaries[$complete]->partcheck]);
+        $this->assertSame([0, 0, 0], [(int) $binaries[$empty]->currentparts, (int) $binaries[$empty]->partsize, (int) $binaries[$empty]->partcheck]);
+        $this->assertSame(400, (int) DB::table('collections')->where('id', $collectionId)->value('filesize'));
+    }
+
+    public function test_reconcile_writes_nothing_when_no_aggregate_drifted(): void
+    {
+        $first = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        $second = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        $reconciler = new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 2, reconcileBatchSize: 2));
+        $reconciler->processIncompleteCollections(1);
+        $this->assertStatus($first, CollectionFileCheckStatus::CompleteParts);
+        $this->assertStatus($second, CollectionFileCheckStatus::CompleteParts);
+
+        $writes = [];
+        DB::listen(static function ($query) use (&$writes): void {
+            if (preg_match('/^\s*update\b/i', $query->sql) === 1) {
+                $writes[] = $query->sql;
+            }
+        });
+        $reads = 0;
+        DB::listen(static function ($query) use (&$reads): void {
+            $reads += preg_match('/^\s*select\b.*\bfrom\s+[`"]?parts\b/is', $query->sql);
+        });
+        $reconciler->processIncompleteCollections(1);
+
+        $this->assertGreaterThan(0, $reads, 'The collections were reconciled again.');
+
+        $this->assertSame([], array_values(array_filter($writes, static fn (string $sql): bool => preg_match('/\b(binaries|collections)\b/', $sql) === 1)));
+    }
+
+    public function test_header_storage_aggregate_refresh_writes_parts_totals_across_chunks(): void
+    {
+        $collectionId = $this->collection(1, now()->format('Y-m-d H:i:s'));
+        $partial = (int) DB::table('binaries')->where('collections_id', $collectionId)->value('id');
+        $complete = DB::table('binaries')->insertGetId(['collections_id' => $collectionId, 'totalparts' => 2]);
+        foreach ([1, 2] as $part) {
+            DB::table('parts')->insert(['binaries_id' => $complete, 'partnumber' => $part, 'size' => 150, 'number' => 2000 + $part, 'messageid' => '<h'.$complete.'-'.$part.'@example.test>']);
+        }
+        $third = DB::table('binaries')->insertGetId(['collections_id' => $collectionId, 'totalparts' => 1]);
+        DB::table('parts')->insert(['binaries_id' => $third, 'partnumber' => 1, 'size' => 50, 'number' => 3001, 'messageid' => '<h'.$third.'@example.test>']);
+        DB::table('collections')->where('id', $collectionId)->update(['totalfiles' => 3, 'filecheck' => CollectionFileCheckStatus::Default->value]);
+
+        $this->assertTrue((new BinaryHandler)->refreshAggregates([$third, $partial, $complete], 2));
+        $this->assertTrue((new CollectionHandler(new CollectionsCleaningService))->refreshAggregates([$collectionId], 2));
+
+        $binaries = DB::table('binaries')->where('collections_id', $collectionId)->get()->keyBy('id');
+        $this->assertSame([1, 100, 0], [(int) $binaries[$partial]->currentparts, (int) $binaries[$partial]->partsize, (int) $binaries[$partial]->partcheck]);
+        $this->assertSame([2, 300, 1], [(int) $binaries[$complete]->currentparts, (int) $binaries[$complete]->partsize, (int) $binaries[$complete]->partcheck]);
+        $this->assertSame([1, 50, 1], [(int) $binaries[$third]->currentparts, (int) $binaries[$third]->partsize, (int) $binaries[$third]->partcheck]);
+        $this->assertSame(450, (int) DB::table('collections')->where('id', $collectionId)->value('filesize'));
+        $this->assertStatus($collectionId, CollectionFileCheckStatus::Default);
+
+        DB::table('parts')->insert(['binaries_id' => $partial, 'partnumber' => 2, 'size' => 100, 'number' => 1999, 'messageid' => '<h'.$partial.'-2@example.test>']);
+        (new BinaryHandler)->refreshAggregates([$partial], 2);
+        (new CollectionHandler(new CollectionsCleaningService))->refreshAggregates([$collectionId], 2);
+        $this->assertStatus($collectionId, CollectionFileCheckStatus::Sized);
+        $this->assertSame(550, (int) DB::table('collections')->where('id', $collectionId)->value('filesize'));
+    }
+
+    public function test_header_storage_transaction_reads_committed_rows(): void
+    {
+        $connection = DB::getDefaultConnection();
+        if (! \in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
+            $this->markTestSkipped('Isolation levels apply to MariaDB.');
+        }
+        DB::statement('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+        config(["database.connections.{$connection}_other" => config("database.connections.{$connection}")]);
+
+        $transaction = new HeaderStorageTransaction(new CollectionHandler(new CollectionsCleaningService), new BinaryHandler);
+        $transaction->begin();
+        $before = DB::table('collections')->count();
+        DB::connection("{$connection}_other")->table('collections')->insert(['groups_id' => 1]);
+        $after = DB::table('collections')->count();
+        $transaction->finish();
+        DB::purge("{$connection}_other");
+
+        $this->assertSame($before + 1, $after, 'Rows other workers commit are visible inside the transaction.');
+    }
+
+    public function test_aggregate_refreshes_lock_their_rows_before_reading_totals(): void
+    {
+        if (! \in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
+            $this->markTestSkipped('Row locks apply to MariaDB.');
+        }
+        $collectionId = $this->collection(1, now()->format('Y-m-d H:i:s'));
+        $binaryId = (int) DB::table('binaries')->where('collections_id', $collectionId)->value('id');
+        $queries = [];
+        DB::listen(static function ($query) use (&$queries): void {
+            $queries[] = strtolower($query->sql);
+        });
+
+        (new BinaryHandler)->refreshAggregates([$binaryId]);
+        (new CollectionHandler(new CollectionsCleaningService))->refreshAggregates([$collectionId]);
+
+        // A concurrent writer to the same row must commit before the totals are read,
+        // or its parts are missing from the totals written back.
+        $position = static function (string $pattern) use ($queries): int {
+            foreach ($queries as $index => $sql) {
+                if (preg_match($pattern, $sql) === 1) {
+                    return $index;
+                }
+            }
+
+            return PHP_INT_MAX;
+        };
+        $this->assertLessThan($position('/from `parts`/'), $position('/from `binaries`.*for update/'));
+        $this->assertLessThan($position('/count\(\*\) as currentfiles/'), $position('/from `collections`.*for update/'));
+    }
+
+    public function test_unwanted_collection_cleanup_deletes_every_batch_without_sorting(): void
+    {
+        Schema::create('usenet_groups', static function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('name');
+            $table->boolean('active')->default(true);
+            $table->bigInteger('minsizetoformrelease')->default(0);
+            $table->integer('minfilestoformrelease')->default(0);
+        });
+        DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.binaries.test', 'minsizetoformrelease' => 1000]);
+        if (DB::getDriverName() === 'sqlite') {
+            DB::connection()->getPdo()->sqliteCreateFunction('REGEXP', static fn (string $pattern, ?string $value): int => (int) preg_match('~'.$pattern.'~i', (string) $value));
+        }
+        $rows = [];
+        foreach (range(1, 501) as $i) {
+            $rows[] = ['groups_id' => 1, 'filecheck' => CollectionFileCheckStatus::Sized->value, 'filesize' => $i, 'totalfiles' => 2];
+        }
+        foreach (array_chunk($rows, 100) as $chunk) {
+            DB::table('collections')->insert($chunk);
+        }
+        $kept = DB::table('collections')->insertGetId(['groups_id' => 1, 'filecheck' => CollectionFileCheckStatus::Sized->value, 'filesize' => 104857600, 'totalfiles' => 2]);
+        $selects = [];
+        DB::listen(static function ($query) use (&$selects): void {
+            if (preg_match('/^\s*select\b.*\bfrom\s+[`"]?collections\b.*\blimit\b/is', $query->sql) === 1) {
+                $selects[] = strtolower($query->sql);
+            }
+        });
+
+        (new ReleaseProcessingService)->deleteUnwantedCollections(1);
+
+        $this->assertSame([$kept], DB::table('collections')->pluck('id')->map(static fn ($id): int => (int) $id)->all(), 'All 501 small collections are deleted across batches.');
+        $this->assertNotEmpty($selects);
+        foreach ($selects as $sql) {
+            $this->assertStringNotContainsString('order by', $sql);
+        }
+    }
+
+    public function test_stuck_collection_cleanup_matches_the_coalesce_rule_without_sorting(): void
+    {
+        $cutoff = now()->subHours(48);
+        $old = $cutoff->copy()->subHour()->format('Y-m-d H:i:s');
+        $new = $cutoff->copy()->addHour()->format('Y-m-d H:i:s');
+        $row = static fn (int $group, int $filecheck, ?string $seen, ?string $dateAdded, ?string $added): int => DB::table('collections')->insertGetId([
+            'groups_id' => $group, 'filecheck' => $filecheck, 'last_seen_at' => $seen, 'dateadded' => $dateAdded, 'added' => $added,
+        ]);
+        $deleted = [
+            'last seen long ago' => $row(1, 0, $old, $new, $new),
+            'never seen, added long ago' => $row(1, 1, null, $old, $new),
+            'never seen, only the original timestamp' => $row(1, 15, null, null, $old),
+        ];
+        $kept = [
+            'seen recently' => $row(1, 0, $new, $old, $old),
+            'never seen, dateadded recent' => $row(1, 0, null, $new, $old),
+            'already sized' => $row(1, CollectionFileCheckStatus::Sized->value, $old, $old, $old),
+            'another group' => $row(2, 0, $old, $old, $old),
+        ];
+        $selects = [];
+        DB::listen(static function ($query) use (&$selects): void {
+            if (preg_match('/^\s*select\b.*\bfrom\s+[`"]?collections\b.*\blimit\b/is', $query->sql) === 1) {
+                $selects[] = strtolower($query->sql);
+            }
+        });
+
+        $service = new ReleaseProcessingService;
+        (new \ReflectionMethod($service, 'deleteStuckCollectionBatch'))->invoke($service, 1, $cutoff);
+
+        $remaining = DB::table('collections')->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+        foreach ($deleted as $case => $id) {
+            $this->assertNotContains($id, $remaining, $case);
+        }
+        foreach ($kept as $case => $id) {
+            $this->assertContains($id, $remaining, $case);
+        }
+        $this->assertNotEmpty($selects);
+        foreach ($selects as $sql) {
+            $this->assertStringNotContainsString('order by', $sql);
+            $this->assertStringNotContainsString('coalesce(last_seen_at', $sql);
+        }
+    }
+
+    public function test_reconcile_writes_changed_collections_in_batches(): void
+    {
+        $stale = [];
+        foreach (range(1, 5) as $i) {
+            $stale[] = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        }
+        $updates = 0;
+        DB::listen(static function ($query) use (&$updates): void {
+            $updates += preg_match('/^\s*update\s+[`"]?collections\b/i', $query->sql);
+        });
+
+        (new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 2, reconcileBatchSize: 500)))->processIncompleteCollections(1);
+
+        foreach ($stale as $id) {
+            $this->assertStatus($id, CollectionFileCheckStatus::CompleteParts);
+        }
+        $this->assertSame(3, $updates, 'Five changed collections in batches of two: three UPDATEs, not five.');
+    }
+
+    public function test_reconcile_handles_the_largest_configured_batches(): void
+    {
+        $rows = [];
+        foreach (range(1, 1001) as $i) {
+            $rows[] = ['groups_id' => 1, 'totalfiles' => 2, 'dateadded' => now()->subHours(3)->format('Y-m-d H:i:s'), 'added' => now()->subHours(3)->format('Y-m-d H:i:s')];
+        }
+        foreach (array_chunk($rows, 200) as $chunk) {
+            DB::table('collections')->insert($chunk);
+        }
+
+        (new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 1000, reconcileBatchSize: 2000)))->processIncompleteCollections(1);
+
+        $this->assertSame(1001, DB::table('collections')->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)->count());
+    }
+
+    public function test_reconciliation_waits_for_downtime_compensation_before_stale_selection(): void
+    {
+        $waiting = $this->collection(1, now()->subHours(3)->format('Y-m-d H:i:s'));
+        $this->app->instance(CollectionReconciliationBarrier::class, new class($waiting) implements CollectionReconciliationBarrier
+        {
+            public function __construct(private readonly int $collectionId) {}
+
+            public function withReconciliationBarrier(int $delayHours, callable $work): mixed
+            {
+                DB::table('collections')->where('id', $this->collectionId)->update(['dateadded' => now()]);
+
+                return $work();
+            }
+        });
+
+        $this->process(1);
+
+        $this->assertStatus($waiting, CollectionFileCheckStatus::Default);
+        $this->assertSame(2, (int) DB::table('collections')->where('id', $waiting)->value('totalfiles'));
+        $this->assertSame(1, DB::table('parts')->count());
+    }
+
+    public function test_stuck_cleanup_waits_for_downtime_compensation_before_deletion(): void
+    {
+        $waiting = $this->collection(1, now()->subDays(3)->format('Y-m-d H:i:s'));
+        DB::table('collections')->where('id', $waiting)->update(['last_seen_at' => null]);
+        $this->app->instance(CollectionReconciliationBarrier::class, new class($waiting) implements CollectionReconciliationBarrier
+        {
+            public function __construct(private readonly int $collectionId) {}
+
+            public function withReconciliationBarrier(int $delayHours, callable $work): mixed
+            {
+                DB::table('collections')->where('id', $this->collectionId)->update(['dateadded' => now()]);
+
+                return $work();
+            }
+        });
+
+        $service = new ReleaseProcessingService;
+        (new \ReflectionMethod($service, 'processStuckCollections'))->invoke($service, 1);
+
+        $this->assertSame(1, DB::table('collections')->where('id', $waiting)->count());
+        $this->assertStatus($waiting, CollectionFileCheckStatus::Default);
+        $this->assertSame(1, DB::table('binaries')->count());
+        $this->assertSame(1, DB::table('parts')->count());
+    }
+
     private function process(?int $groupId): void
     {
-        $processor = new ReleaseProcessingService(binariesConfig: new BinariesConfig(reconcileBatchSize: 2));
+        $processor = new ReleaseProcessingService(binariesConfig: new BinariesConfig(sqlChunkSize: 2, reconcileBatchSize: 2));
         $processor->processIncompleteCollections($groupId);
         $processor->processCollectionSizes($groupId);
     }

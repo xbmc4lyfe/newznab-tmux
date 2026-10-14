@@ -17,6 +17,7 @@ use App\Services\AdditionalProcessing\Media\ImageCandidateRanker;
 use App\Services\AdditionalProcessing\Media\MediaArticleFetcher;
 use App\Services\AdditionalProcessing\Media\MediaSourceResolver;
 use App\Services\AdditionalProcessing\Media\MediaSourceStage;
+use App\Services\AdditionalProcessing\State\MediaByteBudget;
 use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\AdditionalProcessing\State\ProcessingMetrics;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
@@ -202,6 +203,7 @@ class ReleaseProcessor
                 }
 
                 if (! $bookFlood && $context->nzbHasCompressedFile) {
+                    $context->archiveInspectionAttempted = true;
                     $triedCompressedMids = [];
                     $metrics->measure(
                         ProcessingStage::ArchiveDownloads,
@@ -250,7 +252,7 @@ class ReleaseProcessor
                 }
 
                 $metrics->measure(ProcessingStage::ArchiveFallbacks, function () use ($context): void {
-                    if (! $context->foundJPGSample && $this->config->processJPGSample) {
+                    if (! $context->foundJPGSample && $this->config->processJPGSample && ! ($context->mediaBudget?->exhausted() ?? false)) {
                         $this->archiveFallback->processJpgFromReleaseFiles($context);
                     }
 
@@ -268,6 +270,10 @@ class ReleaseProcessor
                 ProcessingStage::Finalization,
                 fn () => $this->releaseManager->finalizeRelease($context, $this->config->processPasswords),
             );
+
+            if ($context->fullPar2EvidenceDeferred) {
+                return $this->result($context, ProcessingOutcome::Failed, reason: 'Release identity or additional-processing claim changed before metadata commit.');
+            }
 
             $artifactsCreated = $releaseNameChanged || $this->createdArtifacts($context, $releaseNeededNfo);
             $outcome = match (true) {
@@ -307,6 +313,11 @@ class ReleaseProcessor
      */
     private function downloadProbe(ReleaseProcessingContext $context): ?array
     {
+        // A multi-file probe only feeds archive inspection, which needs downloads enabled.
+        if ($context->workPlan?->probeIsOnlyFile !== true && ! $this->shouldProcessDownloads()) {
+            return null;
+        }
+
         foreach ($context->workPlan->probeCandidates ?? [] as $candidate) {
             if ($context->groupUnavailable) {
                 return null;
@@ -338,6 +349,8 @@ class ReleaseProcessor
     private function processProbedArchive(ReleaseProcessingContext $context, ArchiveCandidate $candidate, string $data): void
     {
         if ($context->groupUnavailable) {
+            $context->archiveRetryable = true;
+
             return;
         }
 
@@ -354,6 +367,8 @@ class ReleaseProcessor
                     $context->groupUnavailable = true;
                 }
                 if (! $result['success'] || ! is_string($result['data'])) {
+                    $context->archiveRetryable = true;
+
                     return;
                 }
 
@@ -643,22 +658,27 @@ class ReleaseProcessor
      */
     private function processImageDownloads(ReleaseProcessingContext $context): void
     {
+
+        $budget = $context->mediaBudget ??= new MediaByteBudget($this->config->mediaMaxBytes);
         $candidates = $context->workPlan->imageCandidates ?? [];
         $messageIdLists = $candidates !== []
             ? array_map(static fn ($candidate): array => $candidate->messageIds, $candidates)
             : [$context->jpgMessageIDs];
 
         foreach ($messageIdLists as $messageIds) {
-            if ($context->foundJPGSample || $context->groupUnavailable) {
+
+            if ($context->foundJPGSample || $context->groupUnavailable || $budget->exhausted()) {
                 return;
             }
 
-            $result = $this->downloadService->download(
+            $result = $this->downloadService->downloadBounded(
                 DownloadKind::Jpg,
                 $messageIds,
+                min($this->config->mediaImageMaxBytes, $budget->remaining()),
                 $context->releaseGroupName,
                 $context->release->id
             );
+            $budget->spend($result['bytesDownloaded']);
             if ($result['groupUnavailable']) {
                 $context->groupUnavailable = true;
             }
@@ -732,6 +752,7 @@ class ReleaseProcessor
 
             if ($result['groupUnavailable']) {
                 $context->groupUnavailable = true;
+                $context->archiveRetryable = true;
                 $this->output->echoGroupUnavailable();
                 break;
             }
@@ -752,6 +773,7 @@ class ReleaseProcessor
                 }
             } else {
                 $failed++;
+                $context->archiveRetryable = true;
                 $this->output->echoCompressedFailure($failed);
             }
         }

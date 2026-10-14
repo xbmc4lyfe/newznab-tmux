@@ -10,6 +10,7 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Models\UsenetGroup;
 use App\Services\NameFixing\ReleaseUpdateService;
+use App\Support\Par2RenameProgress;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -65,6 +66,8 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
         DB::reconnect();
 
         $this->createSchema();
+        $migration = require base_path('database/migrations/2026_10_11_215821_create_par2_rename_progress_table.php');
+        $migration->up();
     }
 
     protected function tearDown(): void
@@ -96,6 +99,9 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
             'book_lookup_attempts' => 5,
             'book_lookup_retry_at' => now()->addDay(),
             'book_name_normalized_at' => now(),
+            'tv_episodes_id' => -10,
+            'tv_lookup_attempts' => 3,
+            'tv_lookup_retry_at' => now()->addDay(),
             'fromname' => 'poster@example.com',
             'groups_id' => $group->id,
             'categories_id' => Category::OTHER_HASHED,
@@ -108,6 +114,7 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
             'adddate' => now(),
         ]);
 
+        Par2RenameProgress::save($release->id, str_repeat('a', 64), 1, [0]);
         $service = app(ReleaseUpdateService::class);
         $service->updateRelease(
             $release->fresh(),
@@ -125,9 +132,13 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
         $this->assertSame(0, (int) $release->book_lookup_attempts);
         $this->assertNull($release->book_lookup_retry_at);
         $this->assertNull($release->book_name_normalized_at);
+        $this->assertSame(0, (int) $release->tv_episodes_id);
+        $this->assertSame(0, (int) $release->tv_lookup_attempts);
+        $this->assertNull($release->tv_lookup_retry_at);
         $this->assertSame(Category::TV_HD, $release->categories_id);
         $this->assertSame(1, (int) $release->iscategorized);
         $this->assertSame(1, (int) $release->isrenamed);
+        $this->assertNull(Par2RenameProgress::get($release->id));
     }
 
     public function test_renaming_tv_episode_to_full_season_keeps_it_out_of_movies(): void
@@ -286,6 +297,11 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
         ]);
 
         app(ReleaseUpdateService::class)->updateSingleColumn('proc_nfo', 1, $release->id);
+        Schema::create('predb', function (Blueprint $table): void {
+            $table->id();
+            $table->string('title');
+        });
+        DB::table('predb')->insert(['id' => 123, 'title' => $release->searchname]);
         app(ReleaseUpdateService::class)->attachPredbId($release->id, 123);
 
         $this->assertSame(1, (int) $release->fresh()->proc_nfo);
@@ -347,6 +363,8 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
                 $table->integer('categories_id')->default(Category::OTHER_MISC);
                 $table->unsignedInteger('videos_id')->default(0);
                 $table->integer('tv_episodes_id')->default(0);
+                $table->unsignedTinyInteger('tv_lookup_attempts')->default(0);
+                $table->dateTime('tv_lookup_retry_at')->nullable();
                 $table->string('imdbid')->nullable();
                 $table->integer('musicinfo_id')->nullable();
                 $table->integer('consoleinfo_id')->nullable();

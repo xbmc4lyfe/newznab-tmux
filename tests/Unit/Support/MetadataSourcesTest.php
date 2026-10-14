@@ -57,14 +57,14 @@ class MetadataSourcesTest extends TestCase
         $this->assertFalse(MetadataSources::isAvailable(MetadataSources::TRAKT));
         $this->assertSame('no API key (TRAKTTV_APIKEY)', MetadataSources::unavailableReason(MetadataSources::TRAKT));
         $this->assertSame('no API key (FANARTTV_APIKEY)', MetadataSources::unavailableReason(MetadataSources::FANARTTV));
-        $this->assertSame('no user PIN (TVDB_PIN)', MetadataSources::unavailableReason(MetadataSources::TVDB));
+        // Licensed TVDB keys have no PIN, so the API key alone is enough.
+        $this->assertTrue(MetadataSources::isAvailable(MetadataSources::TVDB));
         $this->assertSame('no API key (TWITCH_CLIENT_SECRET)', MetadataSources::unavailableReason(MetadataSources::IGDB));
         $this->assertSame('disabled by IMDB_SCRAPER_ENABLED', MetadataSources::unavailableReason(MetadataSources::IMDB_SCRAPER));
         $this->assertSame('disabled by IMDBAPI_DEV_ENABLED', MetadataSources::unavailableReason(MetadataSources::IMDBAPI_DEV));
         $this->assertTrue(MetadataSources::isAvailable(MetadataSources::TMDB));
 
         $this->assertSame([
-            'Metadata source TVDB: no user PIN (TVDB_PIN), lookups disabled',
             'Metadata source Fanart.tv: no API key (FANARTTV_APIKEY), lookups disabled',
             'Metadata source Trakt: no API key (TRAKTTV_APIKEY), lookups disabled',
             'Metadata source IMDb scraping: disabled by IMDB_SCRAPER_ENABLED, lookups disabled',
@@ -91,6 +91,15 @@ class MetadataSourcesTest extends TestCase
         $this->assertTrue(MetadataSources::logDailySummary());
 
         Log::shouldHaveReceived('info')->twice();
+    }
+
+    public function test_a_cache_failure_skips_the_daily_summary_instead_of_throwing(): void
+    {
+        Cache::shouldReceive('add')->once()->andThrow(new \RuntimeException('Connection refused'));
+        Log::spy();
+
+        $this->assertFalse(MetadataSources::logDailySummary());
+        Log::shouldNotHaveReceived('info');
     }
 
     public function test_startup_summary_always_logs_and_covers_the_day(): void

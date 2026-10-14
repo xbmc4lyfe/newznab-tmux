@@ -15,6 +15,9 @@ final readonly class AdditionalWorkPlanner
 {
     private const string SEVEN_ZIP_PATTERN = '/([^"\s\/]+)\.7z(?:\.(\d{3}))?($|[ ")]|-)/i';
 
+    /** A quoted "name.001", or a bare one ending the subject or followed by yEnc or a part count. */
+    private const string NUMBERED_VOLUME_PATTERN = '/"([^"\r\n]+)\.(\d{3})"|(?:^|\s)([^"\s\/]+)\.(\d{3})(?=$|\s+(?:yEnc\b|\(\d+\/\d+\)))/i';
+
     private const string ARCHIVE_PATTERN = '/(\.(part\d+|[rz]\d+|rar|7z|0+|0*10?|zipr\d{2,3}|zipx?)("|\s*\.rar)*($|[ ")]|-])|"[a-f0-9]{32}\.[1-9]\d{1,2}".*\(\d+\/\d{2,}\)$)/i';
 
     /** Posted images smaller than this are icons or banners. */
@@ -57,11 +60,11 @@ final readonly class AdditionalWorkPlanner
                 }
 
                 // 7z keeps its file list at the end of the last volume.
-                $sevenZip = $this->sevenZipVolume($title);
-                if ($sevenZip !== null && $segments !== []
-                    && ($sevenZipTails[$sevenZip[0]][0] ?? -1) < $sevenZip[1]
+                $volume = $this->splitVolume($title);
+                if ($volume !== null && $segments !== []
+                    && ($sevenZipTails[$volume[0]][0] ?? -1) < $volume[1]
                 ) {
-                    $sevenZipTails[$sevenZip[0]] = [$sevenZip[1], (string) $segments[array_key_last($segments)]];
+                    $sevenZipTails[$volume[0]] = [$volume[1], (string) $segments[array_key_last($segments)]];
                 }
 
                 if (preg_match(self::ARCHIVE_PATTERN, $title) === 1) {
@@ -77,6 +80,7 @@ final readonly class AdditionalWorkPlanner
                             messageIds: $archiveMessageIds,
                             likelyFirstVolume: $this->isLikelyFirstVolume($title),
                             sourceIndex: $sourceIndex,
+                            hasFirstSegment: ($file['firstsegment'] ?? true) !== false,
                         );
                     }
                 }
@@ -126,8 +130,8 @@ final readonly class AdditionalWorkPlanner
         }
 
         foreach ($archiveCandidates as $index => $candidate) {
-            $sevenZip = $this->sevenZipVolume($candidate->title);
-            $tail = $sevenZip === null ? null : ($sevenZipTails[$sevenZip[0]][1] ?? null);
+            $volume = $this->splitVolume($candidate->title);
+            $tail = $volume === null ? null : ($sevenZipTails[$volume[0]][1] ?? null);
             if ($tail !== null && $candidate->likelyFirstVolume && ! in_array($tail, $candidate->messageIds, true)) {
                 $archiveCandidates[$index] = new ArchiveCandidate(
                     title: $candidate->title,
@@ -135,9 +139,12 @@ final readonly class AdditionalWorkPlanner
                     likelyFirstVolume: true,
                     sourceIndex: $candidate->sourceIndex,
                     tailMessageIds: [$tail],
+                    hasFirstSegment: $candidate->hasFirstSegment,
                 );
             }
         }
+
+        $archiveCandidates = $this->preferRarVolumesWithHeaders($archiveCandidates);
 
         // Files without an extension can't be classified by name; sample their first segments.
         // Each entry must stand for exactly one NZB file, not several merged by a stripped subject.
@@ -344,6 +351,76 @@ final readonly class AdditionalWorkPlanner
         return array_slice(array_keys($sizes), 0, 2);
     }
 
+    /**
+     * Every RAR volume starts with its own archive and file headers, but only in segment 1.
+     * When the first volume lacks that segment, inspect the earliest volume that has it.
+     *
+     * @param  list<ArchiveCandidate>  $candidates
+     * @return list<ArchiveCandidate>
+     */
+    private function preferRarVolumesWithHeaders(array $candidates): array
+    {
+        $volumes = [];
+        foreach ($candidates as $index => $candidate) {
+            $volume = $this->rarVolume($candidate->title);
+            if ($volume !== null) {
+                $volumes[$volume[0]][$index] = $volume[1];
+            }
+        }
+
+        foreach ($volumes as $set) {
+            asort($set);
+            $first = array_key_first($set);
+            if (! $candidates[$first]->likelyFirstVolume || $candidates[$first]->hasFirstSegment) {
+                continue;
+            }
+
+            foreach (array_keys($set) as $index) {
+                if ($candidates[$index]->hasFirstSegment) {
+                    $candidates[$first] = $this->withLikelyFirstVolume($candidates[$first], false);
+                    $candidates[$index] = $this->withLikelyFirstVolume($candidates[$index], true);
+                    break;
+                }
+            }
+        }
+
+        return $candidates;
+    }
+
+    private function withLikelyFirstVolume(ArchiveCandidate $candidate, bool $likelyFirstVolume): ArchiveCandidate
+    {
+        return new ArchiveCandidate(
+            title: $candidate->title,
+            messageIds: $candidate->messageIds,
+            likelyFirstVolume: $likelyFirstVolume,
+            sourceIndex: $candidate->sourceIndex,
+            tailMessageIds: $candidate->tailMessageIds,
+            hasFirstSegment: $candidate->hasFirstSegment,
+        );
+    }
+
+    /**
+     * @return array{0: string, 1: int}|null set name and volume order (.rar before .r00, part01 before part02)
+     */
+    private function rarVolume(string $title): ?array
+    {
+        [$name, $prefix] = preg_match('/"([^"\r\n]+)"/', $title, $quoted) === 1
+            ? [$quoted[1], '^(.+)']
+            : [$title, '([^"\s\/]+)'];
+
+        if (preg_match('/'.$prefix.'\.part(\d+)\.rar(?:$|[ ")-])/i', $name, $match) === 1) {
+            return [strtolower($match[1]), (int) $match[2]];
+        }
+        if (preg_match('/'.$prefix.'\.rar(?:$|[ ")-])/i', $name, $match) === 1) {
+            return [strtolower($match[1]), 0];
+        }
+        if (preg_match('/'.$prefix.'\.r(\d{2,3})(?:$|[ ")-])/i', $name, $match) === 1) {
+            return [strtolower($match[1]), (int) $match[2] + 1];
+        }
+
+        return null;
+    }
+
     private function hasFileExtension(string $title): bool
     {
         $name = preg_match('/"([^"]+)"/', $title, $quoted) === 1 ? $quoted[1] : $title;
@@ -374,7 +451,38 @@ final readonly class AdditionalWorkPlanner
             return $sevenZip[1] <= 1;
         }
 
-        return preg_match('/\.(rar|zip)($|[ ")]|-])/i', $title) === 1;
+        if (preg_match('/\.(rar|zip)($|[ ")]|-])/i', $title) === 1) {
+            return true;
+        }
+
+        $numbered = $this->numberedVolume($title);
+
+        return $numbered !== null && $numbered[1] <= 1;
+    }
+
+    /**
+     * A 7z volume, or a plain numbered split volume (`name.001`) that may turn out to be 7z
+     * once its first bytes are read, so the last volume's tail is kept for both.
+     *
+     * @return array{0: string, 1: int}|null set name and volume number (0 for a single .7z)
+     */
+    private function splitVolume(string $title): ?array
+    {
+        return $this->sevenZipVolume($title) ?? $this->numberedVolume($title);
+    }
+
+    /**
+     * @return array{0: string, 1: int}|null set name (kept apart from 7z set names) and volume number
+     */
+    private function numberedVolume(string $title): ?array
+    {
+        if (preg_match(self::NUMBERED_VOLUME_PATTERN, $title, $match) !== 1) {
+            return null;
+        }
+
+        $quoted = $match[1] !== '';
+
+        return ['#'.strtolower($quoted ? $match[1] : $match[3]), (int) ($quoted ? $match[2] : $match[4])];
     }
 
     /**

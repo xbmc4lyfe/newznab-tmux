@@ -40,6 +40,25 @@ class CollectionsCleaningService
     public const int REGEX_MUSIC_MATCH = -20;
 
     /**
+     * Normalized subjects remembered per process before the memo is cleared. See normalizeString().
+     */
+    private const int NORMALIZE_MEMO_SIZE = 4096;
+
+    /**
+     * Every encoding mbstring supports, cached per process.
+     *
+     * @var list<string>|null
+     */
+    private static ?array $allEncodings = null;
+
+    /**
+     * Recent normalizeString() results keyed by the collapsed subject.
+     *
+     * @var array<string, string>
+     */
+    private static array $normalizeMemo = [];
+
+    /**
      * Cached file extension patterns
      */
     public string $e0;
@@ -259,8 +278,23 @@ class CollectionsCleaningService
         // Collapse multiple spaces into one
         $normalized = trim(preg_replace('/\s\s+/', ' ', $subject));
 
-        // Ensure UTF-8 encoding
-        return mb_convert_encoding($normalized, 'UTF-8', mb_list_encodings());
+        // Ensure UTF-8 encoding. Collection hashes depend on this output, so it must be
+        // detection over every encoding: mbstring's choice depends on the whole candidate
+        // set, so even a reduced list that decodes each byte the same can pick another
+        // encoding (`S/3/S*Z%7}` is UTF-8 over all encodings but UCS-2 over a UTF/UCS
+        // subset). Detection is costly, but every part of a post shares its collection
+        // name, so the result is memoized per process.
+        if (isset(self::$normalizeMemo[$normalized])) {
+            return self::$normalizeMemo[$normalized];
+        }
+
+        if (count(self::$normalizeMemo) >= self::NORMALIZE_MEMO_SIZE) {
+            self::$normalizeMemo = [];
+        }
+
+        self::$allEncodings ??= mb_list_encodings();
+
+        return self::$normalizeMemo[$normalized] = mb_convert_encoding($normalized, 'UTF-8', self::$allEncodings);
     }
 
     /**

@@ -10,10 +10,11 @@ use App\Models\Collection;
 use App\Models\Predb;
 use App\Models\Release;
 use App\Models\ReleaseRegex;
-use App\Models\UsenetGroup;
 use App\Services\Categorization\CategorizationService;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Services\Releases\ReleaseGroupResolver;
+use App\Services\Releases\Verification\CandidateRepository;
 use App\Support\Utf8;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -31,12 +32,37 @@ class ReleaseCreationService
     /**
      * Create releases from complete collections.
      *
+     * @param  list<int>|null  $allowedIds
      * @return array{added:int,dupes:int}
      *
      * @throws \Throwable
      */
-    public function createReleases(int|string|null $groupID, int $limit, bool $echoCLI): array
+    public function createReleases(int|string|null $groupID, int $limit, bool $echoCLI, ?array $allowedIds = null): array
     {
+        if ($allowedIds === []) {
+            return ['added' => 0, 'dupes' => 0];
+        }
+        if (config('release_verification.required', true)) {
+            $ids = $this->collectionCleanupService->verificationReadyCollections()
+                ->when(! empty($groupID), static fn ($q) => $q->where('groups_id', $groupID))
+                ->when($allowedIds !== null, static fn ($q) => $q->whereIn('id', $allowedIds))
+                ->orderBy('id')->limit(max(1, $limit))->pluck('id');
+            foreach ($ids as $id) {
+                try {
+                    app(CandidateRepository::class)->archive((int) $id);
+                } catch (\Throwable $error) {
+                    // Keep this collection for retry without starving later
+                    // candidates or preventing the bounded window cursor saving.
+                    Log::warning('Verification archival failed; original headers retained.', [
+                        'collection_id' => (int) $id,
+                        'error_type' => $error::class,
+                    ]);
+                }
+            }
+
+            return ['added' => 0, 'dupes' => 0];
+        }
+
         $startTime = now()->toImmutable();
         $categorize = new CategorizationService;
         $returnCount = 0;
@@ -51,6 +77,9 @@ class ReleaseCreationService
             ->where('collections.filesize', '>', 0);
         if (! empty($groupID)) {
             $collectionsQuery->where('collections.groups_id', $groupID);
+        }
+        if ($allowedIds !== null) {
+            $collectionsQuery->whereIn('collections.id', $allowedIds);
         }
         $collectionsQuery->select(['collections.*', 'usenet_groups.name as gname'])
             ->join('usenet_groups', 'usenet_groups.id', '=', 'collections.groups_id')
@@ -227,28 +256,7 @@ class ReleaseCreationService
         foreach ($namesByCollection as $names) {
             $allNames += $names;
         }
-        $idsByName = UsenetGroup::query()
-            ->whereIn('name', array_keys($allNames))
-            ->pluck('id', 'name')
-            ->map(static fn ($id): int => (int) $id)
-            ->all();
-        foreach (array_keys($allNames) as $name) {
-            $validName = UsenetGroup::isValidGroup($name);
-            if ($validName === false || isset($idsByName[$validName])) {
-                continue;
-            }
-            $idsByName[$validName] = (int) UsenetGroup::addGroup([
-                'name' => $validName,
-                'description' => 'Added by Release processing',
-                'backfill_target' => 1,
-                'first_record' => 0,
-                'last_record' => 0,
-                'active' => 0,
-                'backfill' => 0,
-                'minfilestoformrelease' => '',
-                'minsizetoformrelease' => '',
-            ]);
-        }
+        $idsByName = app(ReleaseGroupResolver::class)->idsByName(array_keys($allNames));
 
         $resolved = [];
         foreach ($namesByCollection as $collectionId => $names) {
@@ -258,6 +266,11 @@ class ReleaseCreationService
                 }
             }
         }
+
+        foreach ($resolved as &$ids) {
+            $ids = array_values(array_unique($ids));
+        }
+        unset($ids);
 
         return $resolved;
     }

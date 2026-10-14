@@ -8,6 +8,8 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseManagementService;
+use App\Support\SizeUnit;
+use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
@@ -54,6 +56,19 @@ use Illuminate\Support\Facades\DB;
  */
 class UsenetGroup extends Model
 {
+    public const array LIST_SORT_COLUMNS = [
+        'name' => 'name',
+        'first_post' => 'first_record_postdate',
+        'last_post' => 'last_record_postdate',
+        'last_updated' => 'last_updated',
+        'active' => 'active',
+        'backfill' => 'backfill',
+        'releases' => 'num_releases',
+        'min_files' => 'minfilestoformrelease',
+        'min_size' => 'minsizetoformrelease',
+        'backfill_days' => 'backfill_target',
+    ];
+
     protected $dateFormat = false;
 
     /**
@@ -213,7 +228,10 @@ class UsenetGroup extends Model
         return $res === null ? 0 : $res->count('id');
     }
 
-    public static function getGroupsRange(string $groupname = '', mixed $active = null): LengthAwarePaginator // @phpstan-ignore missingType.generics
+    /**
+     * @param  array<string, mixed>  $options  Validated admin list filters and ordering.
+     */
+    public static function getGroupsRange(string $groupname = '', mixed $active = null, bool $withReleaseCounts = false, array $options = []): LengthAwarePaginator // @phpstan-ignore missingType.generics
     {
         $groups = self::query()
             ->select([
@@ -228,8 +246,10 @@ class UsenetGroup extends Model
                 'minfilestoformrelease',
                 'minsizetoformrelease',
                 'backfill_target',
-            ])
-            ->orderBy('name');
+            ]);
+
+        $sort = is_string($options['sort'] ?? null) && isset(self::LIST_SORT_COLUMNS[$options['sort']]) ? $options['sort'] : 'name';
+        $direction = ($options['direction'] ?? 'asc') === 'desc' ? 'desc' : 'asc';
 
         if ($groupname !== '') {
             $groups->where('name', 'like', '%'.$groupname.'%');
@@ -239,9 +259,92 @@ class UsenetGroup extends Model
             $groups->where('active', '=', 1);
         } elseif ($active === false) {
             $groups->where('active', '=', 0);
+        } elseif (isset($options['active'])) {
+            $groups->where('active', '=', $options['active']);
         }
 
-        return $groups->paginate(config('nntmux.items_per_page'));
+        if (isset($options['backfill'])) {
+            $groups->where('backfill', '=', $options['backfill']);
+        }
+
+        foreach (['first_post', 'last_post', 'last_updated'] as $field) {
+            $column = self::LIST_SORT_COLUMNS[$field];
+            if (isset($options[$field.'_from'])) {
+                $groups->where($column, '>=', $options[$field.'_from'].' 00:00:00');
+            }
+            if (isset($options[$field.'_to'])) {
+                $end = CarbonImmutable::parse($options[$field.'_to'])->addDay()->startOfDay();
+                $groups->where($column, '<', $end->format('Y-m-d H:i:s'));
+            }
+        }
+
+        // Only count across the matching groups when release filtering/ordering needs it.
+        // Other list requests retain the cheaper, page-scoped count below.
+        $releaseCount = DB::table('releases')->selectRaw('COUNT(*)')
+            ->whereColumn('groups_id', 'usenet_groups.id');
+        foreach (['releases', 'min_files', 'min_size', 'backfill_days'] as $field) {
+            foreach (['min' => '>=', 'max' => '<='] as $bound => $operator) {
+                if (! isset($options[$field.'_'.$bound])) {
+                    continue;
+                }
+                $value = $field === 'min_size'
+                    ? SizeUnit::toBytes($options[$field.'_'.$bound], 'MB')
+                    : (int) $options[$field.'_'.$bound];
+                if ($field === 'releases') {
+                    $groups->whereRaw('('.$releaseCount->toSql().') '.$operator.' ?', [...$releaseCount->getBindings(), $value]);
+                } else {
+                    $column = self::LIST_SORT_COLUMNS[$field];
+                    $groups->whereRaw('COALESCE('.$column.', 0) '.$operator.' ?', [$value]);
+                }
+            }
+        }
+
+        $sortColumn = self::LIST_SORT_COLUMNS[$sort];
+        if ($sort === 'releases') {
+            $groups->selectSub($releaseCount, 'num_releases')->orderBy('num_releases', $direction);
+        } elseif (in_array($sort, ['min_files', 'min_size'], true)) {
+            $groups->orderByRaw('COALESCE('.$sortColumn.', 0) '.$direction);
+        } else {
+            if (in_array($sort, ['first_post', 'last_post', 'last_updated'], true)) {
+                $groups->orderByRaw($sortColumn.' IS NULL');
+            }
+            $groups->orderBy($sortColumn, $direction);
+        }
+        // Stable ties prevent groups from moving between pages with equal values.
+        if ($sort !== 'name') {
+            $groups->orderBy('name');
+        }
+        $groups->orderBy('id');
+
+        $page = $groups->paginate(config('nntmux.items_per_page'));
+        if ($withReleaseCounts && $sort !== 'releases') {
+            self::attachReleaseCounts($page);
+        }
+
+        return $page;
+    }
+
+    /**
+     * Set num_releases on the groups of one page. Counting only this page's groups keeps the
+     * query bounded; a count across every group made the list too slow (upstream 5dc7dce1a).
+     *
+     * @param  LengthAwarePaginator<int, self>  $page
+     */
+    private static function attachReleaseCounts(LengthAwarePaginator $page): void
+    {
+        $groups = $page->items();
+        if ($groups === []) {
+            return;
+        }
+
+        $releaseCounts = DB::table('releases')
+            ->whereIn('groups_id', array_map(static fn (self $group): int => (int) $group->id, $groups))
+            ->groupBy('groups_id')
+            ->pluck(DB::raw('COUNT(*)'), 'groups_id');
+
+        foreach ($groups as $group) {
+            $group->setAttribute('num_releases', (int) ($releaseCounts[$group->id] ?? 0));
+        }
     }
 
     /**

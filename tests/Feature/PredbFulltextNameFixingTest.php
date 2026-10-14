@@ -14,6 +14,12 @@ use Tests\TestCase;
 
 class PredbFulltextNameFixingTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse()->byDefault();
+    }
+
     public function test_it_attaches_predb_id_when_the_confirmed_title_is_already_correct(): void
     {
         $title = 'Valid.Scene.Release.2026-GROUP';
@@ -38,7 +44,7 @@ class PredbFulltextNameFixingTest extends TestCase
             ]);
 
         $updates = $this->createMock(ReleaseUpdateService::class);
-        $updates->expects($this->once())->method('attachPredbId')->with(42, 7);
+        $updates->expects($this->once())->method('updatePredbCandidate')->with($this->callback(static fn (object $release): bool => (int) $release->releases_id === 42), $title, 7, 'srrdb', false)->willReturn(true);
         $service = new NameFixingService(
             updateService: $updates,
             queries: new NameFixingQueryService($database)

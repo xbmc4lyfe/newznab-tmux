@@ -70,14 +70,25 @@ class ReleaseResultsViewTest extends TestCase
 
         foreach (['.release-result-row', '.release-result-card'] as $selector) {
             $view = $document->querySelector($selector);
+            $actions = $view->querySelector('.release-row-actions');
+            $this->assertSame('group', $actions->getAttribute('role'));
+            $this->assertSame('Release actions', $actions->getAttribute('aria-label'));
+            foreach ($actions->querySelectorAll('a, button') as $action) {
+                $this->assertNotEmpty($action->getAttribute('title'));
+            }
             $this->assertSame('Select '.$result->searchname, $view->querySelector('.chkRelease')->getAttribute('aria-label'));
             $this->assertStringEndsWith('/getnzb/'.$result->guid, $view->querySelector('.download-nzb')->getAttribute('href'));
             $this->assertSame('button', $view->querySelector('.add-to-cart')->getAttribute('type'));
             $this->assertSame($result->guid, $view->querySelector('.add-to-cart')->getAttribute('data-guid'));
             $this->assertSame('17', $view->querySelector('.report-trigger')->getAttribute('data-report-release-id'));
             $this->assertSame(1, $view->querySelectorAll('a[title="Add to My Movies"]')->length);
+            $tools = $view->querySelector('.release-inspection-actions');
+            $this->assertSame('group', $tools->getAttribute('role'));
+            $this->assertSame('Release tools', $tools->getAttribute('aria-label'));
             foreach (['nfo-badge', 'preview-badge', 'sample-badge'] as $badge) {
-                $this->assertSame($result->guid, $view->querySelector('.'.$badge)->getAttribute('data-guid'));
+                $tool = $tools->querySelector('.'.$badge);
+                $this->assertSame($result->guid, $tool->getAttribute('data-guid'));
+                $this->assertSame('button', $tool->getAttribute('type'));
             }
             $this->assertSame('17', $view->querySelector('.mediainfo-badge')->getAttribute('data-release-id'));
             $this->assertStringContainsString('Reported (2)', $view->textContent);
@@ -113,10 +124,39 @@ class ReleaseResultsViewTest extends TestCase
         $document = HTMLDocument::createFromString('<!doctype html><html><head><title>Release</title></head><body>'.$html.'</body></html>');
 
         $this->assertSame($release->searchname, $document->querySelector('h2')->textContent);
+        $actions = $document->querySelector('.release-detail-actions');
+        $this->assertSame('group', $actions->getAttribute('role'));
+        $this->assertSame('Release actions', $actions->getAttribute('aria-label'));
         $this->assertStringEndsWith('/getnzb/'.$release->guid, $document->querySelector('.download-nzb')->getAttribute('href'));
         foreach (['nfo-badge', 'filelist-badge', 'add-to-cart'] as $action) {
-            $this->assertSame($release->guid, $document->querySelector('.'.$action)->getAttribute('data-guid'));
+            $button = $actions->querySelector('.'.$action);
+            $this->assertSame($release->guid, $button->getAttribute('data-guid'));
+            $this->assertSame('button', $button->getAttribute('type'));
         }
         $this->assertSame(0, $document->querySelectorAll('.report-trigger')->length);
+    }
+
+    public function test_detail_submitter_links_to_exact_advanced_search_for_all_posts(): void
+    {
+        $submitter = 'alice+usenet@example.test';
+        $release = (object) [
+            'id' => 47,
+            'category_name' => 'TV',
+            'size' => 1073741824,
+            'totalpart' => 42,
+            'adddate' => '2026-10-12 12:00:00',
+            'group_name' => 'alt.binaries.example',
+            'postdate' => '2026-10-12 12:00:00',
+            'fromname' => $submitter,
+            'grabs' => 2,
+        ];
+
+        $html = view('details.partials.info-sidebar', compact('release'))->render();
+        $document = HTMLDocument::createFromString('<!doctype html><html><head><title>Release</title></head><body>'.$html.'</body></html>');
+        $submitterLink = $document->querySelector('a[aria-label="View releases with the exact same poster field as '.$submitter.'"]');
+
+        $this->assertNotNull($submitterLink);
+        $this->assertSame(route('search', ['poster' => $submitter, 'searchadvposter' => $submitter, 'search_type' => 'adv']), $submitterLink->getAttribute('href'));
+        $this->assertSame($submitter, trim($submitterLink->textContent));
     }
 }

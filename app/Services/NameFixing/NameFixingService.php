@@ -4,12 +4,23 @@ declare(strict_types=1);
 
 namespace App\Services\NameFixing;
 
+use App\Enums\Par2RenameOutcome;
+use App\Exceptions\IncompletePredbMatchException;
 use App\Facades\Search;
 use App\Services\NameFixing\Extractors\FileNameExtractor;
 use App\Services\NameFixing\Extractors\NfoNameExtractor;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
+use App\Support\Par2FileHashEvidence;
+use App\Support\PredbSearchDocument;
+use Illuminate\Cache\Lock;
+use Illuminate\Contracts\Cache\LockProvider;
+use Illuminate\Database\Query\Builder;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
+use Throwable;
 
 /**
  * Main service for name fixing operations.
@@ -19,6 +30,10 @@ use RuntimeException;
  */
 class NameFixingService
 {
+    private const PREDB_CANDIDATE_PAGE_SIZE = 21;
+
+    private const PREDB_CANDIDATE_MAX_PAGES = 10;
+
     // Constants for name fixing status
     public const PROC_NFO_NONE = 0;
 
@@ -76,6 +91,9 @@ class NameFixingService
      */
     protected array $predbMatchCache = [];
 
+    /** @var array<string, bool> */
+    protected array $predbEvidenceCache = [];
+
     protected bool $echoOutput;
 
     protected int $_totalReleases = 0;
@@ -119,6 +137,7 @@ class NameFixingService
         }
 
         foreach ($this->candidateBatches(NameFixingQueryService::SOURCE_NFO, $time, $cats) as $releases) {
+            $releases = array_map(static fn (object $release): object => clone $release, $releases);
             $nfos = $this->queries->groupByReleaseId($this->queries->nfoRows($this->releaseIds($releases)));
 
             foreach ($releases as $release) {
@@ -126,38 +145,15 @@ class NameFixingService
                 $this->updateService->reset();
                 $nfo = $nfos[(int) $release->releases_id][0] ?? null;
                 if ($nfo === null) {
-                    $this->markProcessed($echo, $nameStatus, 'proc_nfo', (int) $release->releases_id);
+                    if ($echo && $nameStatus) {
+                        $this->updateService->updateSnapshotColumn($release, 'proc_nfo', self::PROC_NFO_DONE);
+                    }
 
                     continue;
                 }
 
                 $release->textstring = (string) ($nfo->textstring ?? '');
-                if (preg_match('/^=newz\[NZB\]=\w+/', $release->textstring)) {
-                    $this->markProcessed($echo, $nameStatus, 'proc_nfo', (int) $release->releases_id);
-
-                    continue;
-                }
-
-                $nfoResult = $this->nfoExtractor->extractFromNfo($release->textstring);
-                if ($nfoResult !== null) {
-                    $this->updateService->updateRelease(
-                        $release,
-                        $nfoResult->newName,
-                        'nfoCheck: '.$nfoResult->method,
-                        $echo,
-                        $type,
-                        $nameStatus,
-                        $show
-                    );
-                }
-
-                if (! $this->updateService->matched) {
-                    $this->checkWithPatternMatchers($release, $echo, $type, $nameStatus, $show, $preIdOnly);
-                }
-
-                if (! $this->updateService->matched) {
-                    $this->markProcessed($echo, $nameStatus, 'proc_nfo', (int) $release->releases_id);
-                }
+                $this->processNfoCandidate($release, $echo, $nameStatus, $show, true, ! $preIdOnly);
 
                 $this->echoRenamed($show);
             }
@@ -340,7 +336,7 @@ class NameFixingService
         }
 
         foreach ($this->candidateBatches(NameFixingQueryService::SOURCE_HASH, $time, $cats) as $releases) {
-            $hashes = $this->queries->groupByReleaseId($this->queries->hashRows($this->releaseIds($releases)));
+            $hashes = $this->queries->groupByReleaseId($this->queries->legacyHashRows($this->releaseIds($releases)));
             $hashValues = $this->distinctValues($hashes, 'hash');
             $donors = $this->queries->hashDonors($hashValues);
 
@@ -348,16 +344,7 @@ class NameFixingService
                 $this->updateService->reset();
                 $this->updateService->incrementChecked();
 
-                foreach ($hashes[(int) $release->releases_id] ?? [] as $row) {
-                    $hash = (string) ($row->hash ?? '');
-                    if ($hash !== '' && $this->applyDonorMatch($release, $donors[$hash] ?? [], 5, 'hashCheck: PAR2 hash_16K', $type, $echo, $nameStatus, $show)) {
-                        break;
-                    }
-                }
-
-                if (! $this->updateService->matched) {
-                    $this->markProcessed($echo, $nameStatus, 'proc_hash16k', (int) $release->releases_id);
-                }
+                $this->processPar2HashCandidate($release, $hashes[(int) $release->releases_id] ?? [], $donors, $echo, $nameStatus, $show);
 
                 $this->echoRenamed($show);
             }
@@ -371,6 +358,11 @@ class NameFixingService
      */
     protected function checkWithPatternMatchers(object $release, bool $echo, string $type, bool $nameStatus, bool $show, bool $preId): void
     {
+        if ($type === 'NFO, ') {
+            $release = clone $release;
+            $release->textstring = $this->nfoExtractor->identityText($release->textstring);
+        }
+
         // Check for PreDB match first
         $preDbMatch = $this->updateService->checkPreDbMatch($release, $release->textstring);
         if ($preDbMatch !== null) {
@@ -446,21 +438,28 @@ class NameFixingService
     /**
      * Check PreDB for filename matches.
      */
-    protected function preDbFileCheck(object $release, bool $echo, string $type, bool $nameStatus, bool $show): bool
+    protected function preDbFileCheck(object $release, bool $echo, string $type, bool $nameStatus, bool $show, ?bool &$hadEvidence = null): bool
     {
-        $fileName = $this->fileNameCleaner->cleanForMatching($release->textstring);
+        $hadEvidence = true;
+        $fileName = $this->fileNameCleaner->cleanForMatching($release->textstring, preserveLeadingNumber: true);
 
         if (empty($fileName)) {
             return false;
         }
 
         $bestMatch = $this->findBestPredbMatch($fileName);
+        $hadEvidence = $bestMatch !== null || ($this->predbEvidenceCache[$fileName] ?? false);
         if ($bestMatch !== null) {
-            if (strcasecmp((string) ($bestMatch['title'] ?? ''), (string) $release->searchname) === 0) {
-                $this->updateService->attachPredbId(
-                    (int) $release->releases_id,
-                    (int) ($bestMatch['id'] ?? 0)
-                );
+            if ((int) ($bestMatch['id'] ?? 0) <= 0) {
+                return false;
+            }
+            if (! $echo && $this->updateService->currentPredbTitle((int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $fileName) === null) {
+                return false;
+            }
+            if (PredbSearchDocument::exactValue((string) ($bestMatch['title'] ?? '')) === PredbSearchDocument::exactValue((string) $release->searchname)) {
+                if ($echo) {
+                    $this->updateService->attachPredbSnapshot($release, (int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $fileName);
+                }
 
                 return $this->updateService->matched;
             }
@@ -473,7 +472,8 @@ class NameFixingService
                 $type,
                 $nameStatus,
                 $show,
-                $bestMatch['id'] ?? null
+                $bestMatch['id'] ?? null,
+                $fileName
             );
 
             return $this->updateService->matched;
@@ -493,11 +493,61 @@ class NameFixingService
 
         if (count($this->predbMatchCache) >= 5000) {
             $this->predbMatchCache = [];
+            $this->predbEvidenceCache = [];
         }
 
-        $results = Search::searchPredb($fileName);
+        return $this->fileNameCleaner->withMatchingReuse(fn (): ?array => $this->resolvePredbMatch($fileName));
+    }
 
-        return $this->predbMatchCache[$fileName] = $this->predbMatchSelector->selectBestMatch($fileName, $results);
+    /** @return array<string, mixed>|null */
+    private function resolvePredbMatch(string $fileName): ?array
+    {
+        $searchText = self::predbSearchText($fileName);
+        $results = $searchText === '' ? [] : Search::searchPredb($searchText);
+
+        $this->predbEvidenceCache[$fileName] = $results !== [];
+
+        $match = $this->predbMatchSelector->selectBestMatch($fileName, $results);
+        if ($match !== null) {
+            $matchId = (int) ($match['id'] ?? 0);
+            $matchIdentity = PredbSearchDocument::exactValue((string) ($match['title'] ?? ''));
+            $fileIdentity = PredbSearchDocument::exactValue($fileName);
+            if ($matchId <= 0) {
+                return $this->predbMatchCache[$fileName] = null;
+            }
+            foreach ($results as $result) {
+                $candidate = is_array($result) ? $result : (array) $result;
+                $candidateIdentity = PredbSearchDocument::exactValue((string) ($candidate['title'] ?? ''));
+                $sameTitle = $candidateIdentity === $matchIdentity;
+                $sameFilename = false;
+                if ($matchIdentity !== $fileIdentity) {
+                    $candidateFilename = $this->fileNameCleaner->cleanForMatching((string) ($candidate['filename'] ?? ''), preserveLeadingNumber: true);
+                    $sameFilename = $candidateFilename !== false
+                        && PredbSearchDocument::exactValue($candidateFilename) === $fileIdentity;
+                }
+                if (($sameTitle || $sameFilename)
+                    && ((int) ($candidate['id'] ?? 0) !== $matchId || ! $sameTitle)) {
+                    return $this->predbMatchCache[$fileName] = null;
+                }
+            }
+        }
+
+        return $this->predbMatchCache[$fileName] = $match;
+    }
+
+    /**
+     * Release file names are machine generated, so they are searched as plain words. The PreDB search
+     * keeps query operators for people typing searches; a stray parenthesis, quote or `|` in a hashed
+     * name reached Manticore unescaped and failed the lookup with a syntax error. Everything except
+     * letters, digits and the `.`, `_` and `-` separators becomes a space, and a leading `-` (a negation
+     * operator) is dropped.
+     */
+    public static function predbSearchText(string $fileName): string
+    {
+        $text = preg_replace('/[^\p{L}\p{N}\s._-]+/u', ' ', $fileName) ?? '';
+        $text = preg_replace('/(?<=^|\s)-+/', '', $text) ?? '';
+
+        return trim(preg_replace('/\s+/', ' ', $text) ?? '');
     }
 
     /**
@@ -565,6 +615,122 @@ class NameFixingService
     }
 
     /**
+     * Serialize hash completion and evidence requeue on the exact target. Strong
+     * misses remain pending with a GUID-bound cooldown for later donor linkage.
+     *
+     * @param  list<object>  $legacyRows
+     * @param  array<string, list<object>>  $legacyDonors
+     */
+    protected function processPar2HashCandidate(object $release, array $legacyRows, array $legacyDonors, bool $echo, bool $nameStatus, bool $show): bool
+    {
+        $release = clone $release;
+        $release->observed_isrenamed = (int) ($release->isrenamed ?? 0);
+        $releaseId = (int) $release->releases_id;
+        if (! isset($release->guid) || ! property_exists($release, 'name') || ! property_exists($release, 'searchname')) {
+            return false;
+        }
+
+        return DB::transaction(function () use ($release, $releaseId, $legacyRows, $legacyDonors, $echo, $nameStatus, $show): bool {
+            $current = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
+            if (! $this->par2HashSnapshotMatches($current, $release)) {
+                return false;
+            }
+            $retry = DB::table('par2_hash_retry')->where('releases_id', $releaseId)->lockForUpdate()->first();
+            if ($retry !== null && $retry->release_guid === $release->guid && (string) $retry->retry_at > now()->toDateTimeString()) {
+                return false;
+            }
+            $strong = $this->queries->fullHashDonorsForRelease($releaseId, (string) $release->guid);
+            $release->observed_par2_hash_generation = $strong['generation'];
+            if ($strong['known']) {
+                if (! $this->par2HashSnapshotMatches(DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first(), $release)) {
+                    return false;
+                }
+                $donor = $strong['usable'] && ! $strong['overflow']
+                    ? $this->donorMatchSelector->selectCanonical($strong['donors']) : null;
+                if ($this->queries->hashEvidenceGeneration($releaseId) !== $strong['generation']) {
+                    return false;
+                }
+                if ($donor !== null) {
+                    $this->updateService->updateRelease($release, (string) $donor->canonical_title,
+                        'hashCheck: PAR2 full MD5 and exact file size', $echo, 'PAR2 hash, ', $nameStatus, $show, (int) $donor->predb_id);
+                    if ($this->updateService->matched) {
+                        if ($echo) {
+                            DB::table('par2_hash_retry')->where('releases_id', $releaseId)
+                                ->whereRaw('HEX(release_guid) = ?', [strtoupper(bin2hex((string) $release->guid))])->delete();
+                        }
+
+                        return true;
+                    }
+                }
+                $after = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
+                if ($echo && $nameStatus && $this->par2HashSnapshotMatches($after, $release)
+                    && $this->queries->hashEvidenceGeneration($releaseId) === $strong['generation']) {
+                    $this->deferPar2HashCandidate($release, $strong['generation'], $retry !== null);
+                }
+
+                return false;
+            }
+            foreach ($legacyRows as $row) {
+                $hash = (string) ($row->hash ?? '');
+                if ($hash !== '' && $this->applyDonorMatch($release, $legacyDonors[$hash] ?? [], 5,
+                    'hashCheck: PAR2 hash_16K', 'PAR2 hash, ', $echo, $nameStatus, $show)) {
+                    return true;
+                }
+            }
+            $after = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
+            if ($this->par2HashSnapshotMatches($after, $release)
+                && ! DB::table('par_file_hashes')->where('releases_id', $releaseId)->exists()) {
+                if ($echo && $nameStatus) {
+                    $this->par2HashSnapshotQuery($release)->whereNotExists(function (Builder $query): void {
+                        $query->selectRaw('1')->from('par_file_hashes')->whereColumn('par_file_hashes.releases_id', 'releases.id');
+                    })->update(['proc_hash16k' => 1]);
+                }
+            }
+
+            return false;
+        });
+    }
+
+    private function par2HashSnapshotMatches(?object $current, object $release): bool
+    {
+        return $current !== null && $current->guid === $release->guid && $current->name === $release->name
+            && $current->searchname === $release->searchname && (int) $current->predb_id === 0
+            && (int) $current->isrenamed === (int) ($release->isrenamed ?? 0);
+    }
+
+    private function par2HashSnapshotQuery(object $release): Builder
+    {
+        $query = DB::table('releases')->where('id', (int) $release->releases_id)->where('predb_id', 0)
+            ->where('isrenamed', (int) ($release->isrenamed ?? 0))
+            ->whereRaw('HEX(guid) = ?', [strtoupper(bin2hex((string) $release->guid))]);
+        foreach (['name', 'searchname'] as $column) {
+            if ($release->{$column} === null) {
+                $query->whereNull($column);
+            } else {
+                $query->whereRaw('HEX('.$column.') = ?', [strtoupper(bin2hex((string) $release->{$column}))]);
+            }
+        }
+
+        return $query;
+    }
+
+    private function deferPar2HashCandidate(object $release, string $generation, bool $exists): void
+    {
+        [$lastId, $count] = explode(':', $generation);
+        $eligible = $this->par2HashSnapshotQuery($release)
+            ->whereRaw('(SELECT COALESCE(MAX(pfh.id), 0) FROM par_file_hashes pfh WHERE pfh.releases_id = releases.id) = ?', [(int) $lastId])
+            ->whereRaw('(SELECT COUNT(*) FROM par_file_hashes pfh WHERE pfh.releases_id = releases.id) = ?', [(int) $count]);
+        $retryAt = now()->addSeconds(Par2FileHashEvidence::RETRY_DELAY_SECONDS)->toDateTimeString();
+        if ($exists) {
+            DB::table('par2_hash_retry')->where('releases_id', (int) $release->releases_id)
+                ->whereExists((clone $eligible)->selectRaw('1'))->update(['release_guid' => $release->guid, 'retry_at' => $retryAt]);
+        } else {
+            DB::table('par2_hash_retry')->insertOrIgnoreUsing(['releases_id', 'release_guid', 'retry_at'],
+                $eligible->selectRaw('? AS releases_id, ? AS release_guid, ? AS retry_at', [(int) $release->releases_id, $release->guid, $retryAt]));
+        }
+    }
+
+    /**
      * @param  list<object>  $donors
      */
     protected function applyDonorMatch(
@@ -582,11 +748,10 @@ class NameFixingService
             return false;
         }
 
-        if (strcasecmp((string) $donor->searchname, (string) $release->searchname) === 0) {
-            $this->updateService->attachPredbId(
-                (int) $release->releases_id,
-                (int) $donor->predb_id
-            );
+        if (PredbSearchDocument::exactValue((string) $donor->searchname) === PredbSearchDocument::exactValue((string) $release->searchname)) {
+            if ($echo) {
+                $this->updateService->attachPredbSnapshot($release, (int) $donor->predb_id);
+            }
 
             return $this->updateService->matched;
         }
@@ -601,6 +766,74 @@ class NameFixingService
             $show,
             (int) $donor->predb_id
         );
+
+        return $this->updateService->matched;
+    }
+
+    /**
+     * Freeze NFO provenance before lookup, extraction, naming, or completion.
+     *
+     * @phpstan-impure
+     */
+    private function processNfoCandidate(
+        object $release,
+        bool $echo,
+        bool $nameStatus,
+        bool $show,
+        bool $allowExtraction = true,
+        bool $allowPatternFallback = true,
+        bool $markProcessed = true
+    ): bool {
+        $entry = clone $release;
+        $this->updateService->reset();
+        $text = (string) ($entry->textstring ?? '');
+        if (! preg_match('/^=newz\[NZB\]=\w+/', $text)) {
+            $view = $this->nfoExtractor->predbCandidates($text);
+            if (! $view['complete']) {
+                return false;
+            }
+            $rows = $view['titles'] === [] ? [] : DB::table('predb')->whereIn('title', $view['titles'])
+                ->select(['id', 'title'])->limit(101)->get()->all();
+            if ($rows !== []) {
+                $identities = [];
+                $expected = array_fill_keys(array_map(PredbSearchDocument::exactValue(...), $view['titles']), true);
+                foreach ($rows as $row) {
+                    if ((int) $row->id <= 0 || ! mb_check_encoding((string) $row->title, 'UTF-8')
+                        || mb_strlen((string) $row->title, 'UTF-8') > 255 || preg_match('/\p{C}/u', (string) $row->title) !== 0
+                        || ! isset($expected[PredbSearchDocument::exactValue((string) $row->title)])) {
+                        return false;
+                    }
+                    $identities[(int) $row->id.':'.PredbSearchDocument::exactValue((string) $row->title)] = $row;
+                }
+                if (count($rows) === 101 || count($identities) !== 1) {
+                    return false;
+                }
+                $match = array_values($identities)[0];
+                $this->updateService->updateRelease($entry, (string) $match->title, 'preDB: NFO literal match',
+                    $echo, 'NFO, ', $nameStatus, $show, (int) $match->id);
+
+                return $this->updateService->matched;
+            }
+            if ($allowExtraction) {
+                $result = $this->nfoExtractor->extractFromNfo($text);
+                if ($result !== null) {
+                    $this->updateService->updateRelease($entry, $result->newName, 'nfoCheck: '.$result->method,
+                        $echo, 'NFO, ', $nameStatus, $show);
+                }
+                if (! $this->updateService->matched && $allowPatternFallback) {
+                    $candidate = clone $entry;
+                    $candidate->textstring = $this->nfoExtractor->identityText($text);
+                    $result = $this->checkerService->check($candidate, $candidate->textstring);
+                    if ($result !== null) {
+                        $this->updateService->updateRelease($entry, $result->newName, $result->getFormattedMethod(),
+                            $echo, 'NFO, ', $nameStatus, $show);
+                    }
+                }
+            }
+        }
+        if (! $this->updateService->matched && $markProcessed && $echo && $nameStatus) {
+            $this->updateService->updateSnapshotColumn($entry, 'proc_nfo', self::PROC_NFO_DONE);
+        }
 
         return $this->updateService->matched;
     }
@@ -630,6 +863,14 @@ class NameFixingService
         foreach ($prioritized as $filename) {
             $candidate = clone $release;
             $candidate->textstring = $filename;
+            $hadEvidence = false;
+            $this->preDbFileCheck($candidate, $echo, 'Filenames, ', $nameStatus, $show, $hadEvidence);
+            if ($this->updateService->matched) {
+                break;
+            }
+            if ($hadEvidence) {
+                continue;
+            }
             $fileResult = $this->fileExtractor->extractFromFile($filename);
 
             if ($fileResult !== null) {
@@ -644,22 +885,50 @@ class NameFixingService
                 );
             }
 
-            if (! $this->updateService->matched) {
-                $this->preDbFileCheck($candidate, $echo, 'Filenames, ', $nameStatus, $show);
-            }
-
             if ($this->updateService->matched) {
                 break;
             }
         }
 
         if (! $this->updateService->matched) {
-            $this->markProcessed($echo, $nameStatus, 'proc_files', (int) $release->releases_id);
+            $this->completeFilenamePass($release, $filenames, $echo, $nameStatus);
         }
 
         if ($showProgress) {
             $this->echoRenamed($show);
         }
+    }
+
+    /** @param list<string> $filenames */
+    private function completeFilenamePass(object $release, array $filenames, bool $echo, bool $nameStatus): void
+    {
+        if (! $echo || ! $nameStatus) {
+            return;
+        }
+        $release = clone $release;
+        $release->observed_isrenamed = (int) ($release->isrenamed ?? 0);
+        $observedCategory = isset($release->categories_id) ? (int) $release->categories_id : null;
+        sort($filenames, SORT_STRING);
+        DB::transaction(function () use ($release, $filenames, $observedCategory): void {
+            $query = DB::table('releases')->where('id', (int) $release->releases_id)
+                ->where('predb_id', $release->predb_id ?? 0)->where('isrenamed', $release->observed_isrenamed);
+            if ($observedCategory !== null) {
+                $query->where('categories_id', $observedCategory);
+            }
+            $current = $query->lockForUpdate()->first();
+            if ($current === null) {
+                return;
+            }
+            // A locking read sees newly committed names even under REPEATABLE READ.
+            $currentNames = DB::table('release_files')->where('releases_id', (int) $release->releases_id)
+                ->sharedLock()->pluck('name')->map(static fn (mixed $name): string => (string) $name)->all();
+            $currentNames = array_values(array_unique($currentNames));
+            sort($currentNames, SORT_STRING);
+            if ($currentNames !== $filenames) {
+                return;
+            }
+            $this->updateService->completeFilenameSnapshot($release);
+        }, 3);
     }
 
     protected function markProcessed(bool $echo, bool $nameStatus, string $column, int $releaseId): void
@@ -746,7 +1015,7 @@ class NameFixingService
     /**
      * Process one GUID-partitioned release batch using all standard name sources.
      *
-     * @param  null|callable(object): bool  $par2Processor
+     * @param  null|callable(object): (bool|Par2RenameOutcome)  $par2Processor
      * @return array{checked: int, fixed: int}
      */
     public function processStandardBatch(
@@ -755,16 +1024,17 @@ class NameFixingService
         bool $show,
         ?callable $par2Processor = null
     ): array {
-        $releases = $this->queries->standardCandidateBatch($leftGuid, $limit);
+        $releases = $this->reserveStandardBatch($leftGuid, $limit);
         if ($releases === []) {
             return ['checked' => 0, 'fixed' => 0];
         }
 
+        $releases = array_map(static fn (object $release): object => clone $release, $releases);
         $releaseIds = $this->releaseIds($releases);
         $nfos = $this->queries->groupByReleaseId($this->queries->nfoRows($releaseIds));
         $files = $this->queries->groupByReleaseId($this->queries->fileRows($releaseIds));
         $media = $this->queries->groupByReleaseId($this->queries->mediaRows($releaseIds));
-        $hashes = $this->queries->groupByReleaseId($this->queries->hashRows($releaseIds));
+        $hashes = $this->queries->groupByReleaseId($this->queries->legacyHashRows($releaseIds));
         $uidDonors = $this->queries->uidDonors($this->distinctValues($media, 'uid'));
         $crcDonors = $this->queries->crcDonors($this->distinctValues($files, 'crc32'));
         $hashDonors = $this->queries->hashDonors($this->distinctValues($hashes, 'hash'));
@@ -862,16 +1132,7 @@ class NameFixingService
 
             if ((int) $release->proc_hash16k === self::PROC_HASH16K_NONE) {
                 $this->updateService->reset();
-                foreach ($hashes[$releaseId] ?? [] as $row) {
-                    $hash = (string) ($row->hash ?? '');
-                    if ($hash !== '' && $this->applyDonorMatch($release, $hashDonors[$hash] ?? [], 5, 'hashCheck: PAR2 hash_16K', 'PAR2 hash, ', true, true, $show)) {
-                        break;
-                    }
-                }
-
-                if (! $this->updateService->matched) {
-                    $this->updateService->updateSingleColumn('proc_hash16k', self::PROC_HASH16K_DONE, $releaseId);
-                }
+                $this->processPar2HashCandidate($release, $hashes[$releaseId] ?? [], $hashDonors, true, true, $show);
             }
 
             if ($this->updateService->matched) {
@@ -879,33 +1140,9 @@ class NameFixingService
             }
 
             if ((int) $release->proc_nfo === self::PROC_NFO_NONE) {
-                $this->updateService->reset();
                 $nfo = $nfos[$releaseId][0] ?? null;
-                if ($nfo !== null) {
-                    $release->textstring = (string) ($nfo->textstring ?? '');
-                    if (! preg_match('/^=newz\[NZB\]=\w+/', $release->textstring)) {
-                        $nfoResult = $this->nfoExtractor->extractFromNfo($release->textstring);
-                        if ($nfoResult !== null) {
-                            $this->updateService->updateRelease(
-                                $release,
-                                $nfoResult->newName,
-                                'nfoCheck: '.$nfoResult->method,
-                                true,
-                                'NFO, ',
-                                true,
-                                $show
-                            );
-                        }
-
-                        if (! $this->updateService->matched) {
-                            $this->checkWithPatternMatchers($release, true, 'NFO, ', true, $show, false);
-                        }
-                    }
-                }
-
-                if (! $this->updateService->matched) {
-                    $this->updateService->updateSingleColumn('proc_nfo', self::PROC_NFO_DONE, $releaseId);
-                }
+                $release->textstring = (string) ($nfo->textstring ?? '');
+                $this->processNfoCandidate($release, true, true, $show);
             }
 
             if ($this->updateService->matched) {
@@ -922,10 +1159,10 @@ class NameFixingService
 
             if ((int) $release->proc_par2 === self::PROC_PAR2_NONE) {
                 $this->updateService->reset();
-                $matched = $par2Processor !== null && $par2Processor($release);
-                if ($matched) {
+                $result = $par2Processor !== null ? $par2Processor($release) : Par2RenameOutcome::Deferred;
+                if ($result === true || $result === Par2RenameOutcome::Renamed) {
                     $this->updateService->fixed++;
-                } else {
+                } elseif ($result === false || $result === Par2RenameOutcome::NoMatch) {
                     $this->updateService->updateSingleColumn('proc_par2', self::PROC_PAR2_DONE, $releaseId);
                 }
             }
@@ -937,56 +1174,251 @@ class NameFixingService
         ];
     }
 
+    /** @return list<object> */
+    private function reserveStandardBatch(string $leftGuid, int $limit): array
+    {
+        $cache = Cache::store((string) config('tmux.fix_names.cache_store', 'redis'));
+        $store = $cache->getStore();
+        if (! $store instanceof LockProvider) {
+            throw new RuntimeException('The grouped rename cache store must support atomic locks.');
+        }
+        $key = 'rename:standard:cursor:'.$leftGuid;
+        $lock = $store->lock($key.':lock', 120);
+        if (! $lock instanceof Lock) {
+            throw new RuntimeException('The grouped rename cache lock must support renewal.');
+        }
+        if (! $lock->get()) {
+            return [];
+        }
+        try {
+            $cursor = max(0, (int) $cache->get($key, 0));
+            $releases = $this->queries->standardCandidateBatch($leftGuid, $limit, $cursor > 0 ? $cursor : null);
+            if ($releases === [] && $cursor > 0) {
+                $releases = $this->queries->standardCandidateBatch($leftGuid, $limit);
+            }
+            if (! $lock->refresh()) {
+                return [];
+            }
+            if ($releases !== []) {
+                $cache->forever($key, min($this->releaseIds($releases)));
+            } else {
+                $cache->forget($key);
+            }
+
+            return $releases;
+        } finally {
+            $lock->release();
+        }
+    }
+
     /**
      * Match one PreDB title against indexed release candidates.
      */
     public function matchPredbFulltext(object $pre, bool $show = false): int
     {
+        return $this->matchPredbFulltextWithCompletion($pre, $show)['updated'];
+    }
+
+    /**
+     * Keep successful writes separate from current canonical matches and unfinished candidates.
+     *
+     * @return array{updated: int, matched: bool, retry: bool}
+     */
+    public function matchPredbFulltextWithCompletion(object $pre, bool $show = false): array
+    {
         $title = (string) ($pre->title ?? '');
-        if (strlen($title) < 15 || ! preg_match('/([\w()]+[\s._-]){2,}[\w()]+-\w+/u', $title)) {
-            return 0;
+        if (! mb_check_encoding($title, 'UTF-8') || mb_strlen($title, 'UTF-8') > 255
+            || preg_match('/\p{Cc}/u', $title) !== 0
+            || strlen($title) < 15 || ! preg_match('/([\w()]+[\s._-]){2,}[\w()]+-\w+/u', $title)) {
+            return ['updated' => 0, 'matched' => false, 'retry' => false];
         }
 
         if (! Search::isAvailable()) {
             throw new RuntimeException('The configured search backend is unavailable for PreDB matching.');
         }
 
-        $searchResults = Search::searchReleases(['name' => $title, 'searchname' => $title], 21);
-        $candidateIds = [];
-        foreach ($searchResults as $key => $value) {
-            $candidateId = is_numeric($value) ? (int) $value : (is_numeric($key) ? (int) $key : 0);
-            if ($candidateId > 0) {
-                $candidateIds[$candidateId] = $candidateId;
+        $matched = false;
+        if (Search::supportsReleaseCandidatePaging()) {
+            $matches = $this->pagedLiteralPredbCandidates($title, (int) $pre->predb_id, $matched);
+        } else {
+            $searchResults = Search::searchReleases(['name' => $title, 'searchname' => $title], self::PREDB_CANDIDATE_PAGE_SIZE);
+            $candidateIds = [];
+            foreach ($searchResults as $key => $value) {
+                $candidateId = is_numeric($value) ? (int) $value : (is_numeric($key) ? (int) $key : 0);
+                if ($candidateId > 0) {
+                    $candidateIds[$candidateId] = $candidateId;
+                }
+            }
+
+            $matches = $this->literalPredbCandidates(array_values($candidateIds), $title);
+            $matched = $matches === [] && $this->hasLinkedPredbCandidate(array_values($candidateIds), (int) $pre->predb_id, $title);
+            if (count($searchResults) >= self::PREDB_CANDIDATE_PAGE_SIZE && count($matches) < 16) {
+                throw new IncompletePredbMatchException('PreDB fulltext matching is incomplete: the search driver does not support candidate paging.');
             }
         }
-
-        $matches = $this->queries->confirmPredbCandidates(array_values($candidateIds), $title);
         if (count($matches) >= 16) {
-            return -1;
+            $linked = $matched ? ['matched' => true, 'retry' => false] : $this->predbLinkCompletion((int) $pre->predb_id, $title);
+
+            return ['updated' => -1, 'matched' => $linked['matched'], 'retry' => $linked['retry']];
         }
 
         $matching = 0;
+        $retry = false;
         foreach ($matches as $release) {
-            if (strcasecmp($title, (string) $release->searchname) === 0) {
-                $this->updateService->attachPredbId((int) $release->releases_id, (int) $pre->predb_id);
-            } else {
-                $this->updateService->reset();
-                $this->updateService->updateRelease(
-                    $release,
-                    $title,
-                    'Title Match source: '.(string) ($pre->source ?? ''),
-                    true,
-                    'PreDB FT Exact, ',
-                    true,
-                    $show,
-                    (int) $pre->predb_id
-                );
+            if ($this->updateService->updatePredbCandidate(
+                $release,
+                $title,
+                (int) $pre->predb_id,
+                (string) ($pre->source ?? ''),
+                $show
+            )) {
+                $matching++;
+                $matched = true;
+
+                continue;
             }
 
-            $matching++;
+            $current = DB::table('releases')->useWritePdo()
+                ->where('id', (int) $release->releases_id)
+                ->first(['predb_id', 'name', 'searchname']);
+            if ($current === null) {
+                continue;
+            }
+            if ((int) $current->predb_id === (int) $pre->predb_id
+                && PredbSearchDocument::exactValue((string) $current->searchname) === PredbSearchDocument::exactValue($title)) {
+                $matched = true;
+            } elseif ((int) $current->predb_id === 0
+                && ($this->hasLiteralPredbTitle((string) $current->name, $title)
+                    || $this->hasLiteralPredbTitle((string) $current->searchname, $title))) {
+                $retry = true;
+            }
         }
 
-        return $matching;
+        if (! $matched) {
+            $linked = $this->predbLinkCompletion((int) $pre->predb_id, $title);
+            $matched = $linked['matched'];
+            $retry = $retry || $linked['retry'];
+        }
+
+        return ['updated' => $matching, 'matched' => $matched, 'retry' => $retry];
+    }
+
+    /** @return array{matched: bool, retry: bool} */
+    private function predbLinkCompletion(int $predbId, string $title): array
+    {
+        $links = $this->queries->existingPredbLinks($predbId);
+        foreach ($links as $release) {
+            if (PredbSearchDocument::exactValue((string) $release->searchname) === PredbSearchDocument::exactValue($title)) {
+                return ['matched' => true, 'retry' => false];
+            }
+        }
+
+        return ['matched' => false, 'retry' => count($links) >= 17];
+    }
+
+    /**
+     * @param  list<int>  $ids
+     * @return list<object>
+     */
+    private function literalPredbCandidates(array $ids, string $title): array
+    {
+        return array_values(array_filter(
+            $this->queries->confirmPredbCandidates($ids, $title),
+            fn (object $release): bool => $this->hasLiteralPredbTitle((string) ($release->name ?? ''), $title)
+                || $this->hasLiteralPredbTitle((string) ($release->searchname ?? ''), $title)
+        ));
+    }
+
+    /**
+     * @param  list<int>  $ids
+     */
+    private function hasLinkedPredbCandidate(array $ids, int $predbId, string $title): bool
+    {
+        foreach ($this->queries->linkedPredbCandidates($ids, $predbId) as $release) {
+            if (PredbSearchDocument::exactValue((string) $release->searchname) === PredbSearchDocument::exactValue($title)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** @return list<object> */
+    private function pagedLiteralPredbCandidates(string $title, int $predbId, bool &$matched): array
+    {
+        $matches = [];
+        $afterId = 0;
+        for ($pageNumber = 0; $pageNumber < self::PREDB_CANDIDATE_MAX_PAGES; $pageNumber++) {
+            $response = Search::searchReleaseCandidatesPage($title, self::PREDB_CANDIDATE_PAGE_SIZE, $afterId);
+            if (($response['available'] ?? false) !== true) {
+                throw new RuntimeException('The configured search backend is unavailable for paged PreDB matching.');
+            }
+            $page = $this->validatePredbCandidatePage($response, $afterId);
+            foreach ($this->literalPredbCandidates($page['ids'], $title) as $release) {
+                $matches[(int) $release->releases_id] = $release;
+            }
+            $pageMatched = $this->hasLinkedPredbCandidate($page['ids'], $predbId, $title);
+            $matched = $matched || $pageMatched;
+            if (count($matches) >= 16 || ! $page['has_more']) {
+                return array_values($matches);
+            }
+            $afterId = $page['last_id'];
+        }
+
+        throw new IncompletePredbMatchException('PreDB fulltext matching is incomplete: the 210-candidate scan budget was reached.');
+    }
+
+    /**
+     * @param  array<string, mixed>  $page
+     * @return array{ids: list<int>, has_more: bool, last_id: int}
+     */
+    private function validatePredbCandidatePage(array $page, int $afterId): array
+    {
+        $ids = $page['ids'] ?? null;
+        $hasMore = $page['has_more'] ?? null;
+        if (! is_array($ids) || ! array_is_list($ids) || ! is_bool($hasMore)
+            || count($ids) > self::PREDB_CANDIDATE_PAGE_SIZE || ($hasMore && count($ids) < self::PREDB_CANDIDATE_PAGE_SIZE)) {
+            throw new IncompletePredbMatchException('PreDB fulltext matching is incomplete: invalid candidate page boundaries.');
+        }
+        $validated = [];
+        $lastId = $afterId;
+        foreach ($ids as $id) {
+            if (! is_int($id) || $id <= $lastId) {
+                throw new IncompletePredbMatchException('PreDB fulltext matching is incomplete: candidate IDs did not advance in order.');
+            }
+            $validated[] = $id;
+            $lastId = $id;
+        }
+
+        return ['ids' => $validated, 'has_more' => $hasMore, 'last_id' => $lastId];
+    }
+
+    /**
+     * SQL LIKE only discovers candidates. Confirm an intact literal title, optionally followed by
+     * known filename suffixes, inside explicit subject delimiters; never strip semantic title text.
+     */
+    private function hasLiteralPredbTitle(string $subject, string $title): bool
+    {
+        $literal = PredbSearchDocument::exactValue($title);
+        $subject = PredbSearchDocument::exactValue($subject);
+        if ($subject === $literal) {
+            return true;
+        }
+
+        $opening = '(?:[\s\[({]|(?<![\p{L}\p{N}._-])(?:#34;|["\']))';
+        $closing = '(?:[\s\])}]|(?:#34;|["\'])(?![\p{L}\p{N}._-]))';
+        $pattern = '~(?:^|'.$opening.')('.preg_quote($literal, '~').'(?:(?!#34;)[^\s"\'\[\](){}])*)(?=$|'.$closing.')~u';
+        if (preg_match_all($pattern, $subject, $matches) === false) {
+            return false;
+        }
+        foreach ($matches[1] as $candidate) {
+            $suffix = substr($candidate, strlen($literal));
+            if ($this->fileNameCleaner->isKnownFileSuffix($suffix)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -1011,34 +1443,115 @@ class NameFixingService
     public function fixNamesWithPar2(int $time, bool $echo, int $cats, bool $nameStatus, bool $show, NNTPService $nntp): void
     {
         $this->echoStartMessage($time, 'par2 files');
-
-        if (! $this->startBatch(NameFixingQueryService::SOURCE_PAR2, $time, $cats, ' releases to process.')) {
-            cli()->info('Nothing to fix.');
+        if (! $echo || ! $nameStatus) {
+            cli()->info('PAR2 downloads require --update and --set-status.');
 
             return;
         }
 
-        $nzbContentsService = app(NzbContentsService::class);
-        foreach ($this->candidateBatches(NameFixingQueryService::SOURCE_PAR2, $time, $cats) as $releases) {
-            foreach ($releases as $release) {
-                if ($nzbContentsService->checkPar2(
-                    $release->guid,
-                    $release->releases_id,
-                    $release->groups_id,
-                    (int) ($echo && $nameStatus),
-                    (int) $show
-                )) {
-                    $this->updateService->fixed++;
-                } else {
-                    $this->markProcessed($echo, $nameStatus, 'proc_par2', (int) $release->releases_id);
-                }
+        $lock = null;
+        $claimed = false;
+        $outcomes = array_fill_keys(array_column(Par2RenameOutcome::cases(), 'value'), 0);
+        $probes = $received = 0;
+        $regularAttempted = $localSkips = $inspected = 0;
+        $deadline = now()->getTimestampMs() / 1000 + max(1, (int) config('tmux.fix_names.par2_budget_seconds', 60));
+        try {
+            $cache = Cache::store((string) config('tmux.fix_names.cache_store', 'redis'));
+            $store = $cache->getStore();
+            if (! $store instanceof LockProvider) {
+                throw new RuntimeException('The PAR2 rename cache store must support atomic locks.');
+            }
+            $key = "rename:par2:sweep:{$time}:{$cats}";
+            $socketTimeout = max(
+                (int) config('nntmux_nntp.socket_timeout', 120),
+                (int) config('nntmux_nntp.alternate_server_socket_timeout', 120)
+            );
+            $lock = $store->lock($key.':lock', max(300, 2 * $socketTimeout));
+            if (! $lock instanceof Lock) {
+                throw new RuntimeException('The PAR2 rename cache lock must support renewal.');
+            }
+            $claimed = $lock->get();
+            if (! $claimed) {
+                cli()->info('Another PAR2 sweep is running.');
 
-                $this->updateService->incrementChecked();
-                $this->echoRenamed($show);
+                return;
+            }
+            $cursor = $cache->get($key);
+            $afterId = is_array($cursor) ? max(0, (int) ($cursor['after_id'] ?? 0)) : 0;
+            $throughId = is_array($cursor) ? max(0, (int) ($cursor['through_id'] ?? 0)) : $this->queries->highWatermark();
+            $limit = max(1, (int) config('tmux.fix_names.par2_max_releases', 300));
+            $maxLocalSkips = max(0, (int) config('tmux.fix_names.par2_max_local_skips', 3000));
+            $nzbContentsService = app(NzbContentsService::class);
+            $nzbContentsService->setNntp($nntp);
+            $firstPage = true;
+            while ($regularAttempted < $limit && $inspected < PHP_INT_MAX) {
+                if (now()->getTimestampMs() / 1000 >= $deadline || ! $this->refreshPar2Sweep($lock)) {
+                    break;
+                }
+                $pageLimit = min(NameFixingQueryService::BATCH_SIZE, $limit - $regularAttempted);
+                $releases = $this->queries->candidateBatch(NameFixingQueryService::SOURCE_PAR2, $time, $cats, $afterId, $pageLimit, $throughId);
+                if ($releases === []) {
+                    if (! $firstPage || $afterId === 0
+                        || now()->getTimestampMs() / 1000 >= $deadline || ! $this->refreshPar2Sweep($lock)) {
+                        break;
+                    }
+                    $afterId = 0;
+                    $throughId = $this->queries->highWatermark();
+                    $firstPage = false;
+
+                    continue;
+                }
+                $firstPage = false;
+                foreach ($releases as $release) {
+                    if ($regularAttempted >= $limit || $inspected >= PHP_INT_MAX
+                        || now()->getTimestampMs() / 1000 >= $deadline || ! $this->refreshPar2Sweep($lock)) {
+                        break 2;
+                    }
+                    $outcome = $nzbContentsService->checkPar2Result($release->guid, (int) $release->releases_id,
+                        (int) $release->groups_id, 1, (int) $show, $deadline,
+                        fn (): bool => $this->refreshPar2Sweep($lock));
+                    $outcomes[$outcome->value]++;
+                    $stats = $nzbContentsService->par2Stats();
+                    $probes += $stats['candidates_probed'];
+                    $received += $stats['articles_received'];
+                    $inspected++;
+                    if ($outcome === Par2RenameOutcome::Retryable && $stats['candidates_probed'] === 0
+                        && $stats['articles_received'] === 0 && $localSkips < $maxLocalSkips) {
+                        $localSkips++;
+                    } else {
+                        $regularAttempted++;
+                    }
+                    if ($outcome === Par2RenameOutcome::Renamed) {
+                        $this->updateService->fixed++;
+                    }
+                    $this->updateService->incrementChecked();
+                    if (! $this->refreshPar2Sweep($lock)) {
+                        break 2;
+                    }
+                    $afterId = (int) $release->releases_id;
+                    $cache->forever($key, ['after_id' => $afterId, 'through_id' => $throughId]);
+                }
+            }
+        } catch (Throwable $e) {
+            Log::warning('PAR2 rename sweep stopped with work pending', ['error' => $e->getMessage()]);
+            throw $e;
+        } finally {
+            if ($claimed && $lock !== null) {
+                $lock->release();
             }
         }
+        Log::info('PAR2 rename batch finished', ['time_scope' => $time, 'category_scope' => $cats,
+            'outcomes' => $outcomes, 'candidates_probed' => $probes, 'articles_received' => $received,
+            'local_skips' => $localSkips, 'regular_attempted' => $regularAttempted, 'inspected' => $inspected]);
+        cli()->info(sprintf('PAR2 outcomes: renamed=%d no_match=%d retryable=%d deferred=%d',
+            $outcomes['renamed'], $outcomes['no_match'], $outcomes['retryable'], $outcomes['deferred']));
+        $this->echoFoundCount($echo, ' releases attempted');
+    }
 
-        $this->echoFoundCount($echo, ' files');
+    /** @phpstan-impure */
+    private function refreshPar2Sweep(Lock $lock): bool
+    {
+        return $lock->refresh();
     }
 
     /**
@@ -1057,7 +1570,7 @@ class NameFixingService
 
         foreach ($this->candidateBatches(NameFixingQueryService::SOURCE_XXX, $time, $cats) as $releases) {
             $files = $this->queries->groupByReleaseId(
-                $this->queries->fileRows($this->releaseIds($releases), NameFixingQueryService::SOURCE_XXX)
+                $this->queries->fileRows($this->releaseIds($releases))
             );
 
             foreach ($releases as $release) {
@@ -1073,7 +1586,11 @@ class NameFixingService
                 }
 
                 if (! $this->updateService->matched) {
-                    $this->markProcessed($echo, $nameStatus, 'proc_files', (int) $release->releases_id);
+                    $filenames = array_values(array_unique(array_map(
+                        static fn (object $file): string => (string) $file->textstring,
+                        $files[(int) $release->releases_id] ?? [],
+                    )));
+                    $this->completeFilenamePass($release, $filenames, $echo, $nameStatus);
                 }
 
                 $this->echoRenamed($show);
@@ -1160,6 +1677,29 @@ class NameFixingService
         }
 
         if ($newName !== '') {
+            if (! mb_check_encoding($newName, 'UTF-8') || mb_strlen($newName, 'UTF-8') > 255
+                || preg_match('/\p{C}/u', $newName) !== 0) {
+                return false;
+            }
+            $catalogueRows = DB::table('predb')->where('title', $newName)->limit(2)->get(['id', 'title']);
+            if ($catalogueRows->isNotEmpty()) {
+                if ($catalogueRows->count() !== 1) {
+                    return false;
+                }
+                $row = $catalogueRows->first();
+                if ((int) $row->id <= 0
+                    || PredbSearchDocument::exactValue((string) $row->title) !== PredbSearchDocument::exactValue($newName)) {
+                    return false;
+                }
+                $match = $this->predbMatchSelector->selectBestMatch($newName, [$row]);
+                if ($match === null) {
+                    return false;
+                }
+                $this->updateService->updateRelease($release, (string) $match['title'], 'MediaInfo: Exact PreDB Title',
+                    $echo, $type, $nameStatus, $show, (int) $match['id']);
+
+                return $this->updateService->matched;
+            }
             $this->updateService->updateRelease($release, $newName, 'MediaInfo: Movie Name', $echo, $type, $nameStatus, $show, $release->predb_id ?? 0);
 
             return $this->updateService->matched;
@@ -1173,14 +1713,20 @@ class NameFixingService
      *
      * @throws \Exception
      */
-    public function checkName(object $release, bool $echo, string $type, bool $nameStatus, bool $show, bool $preId = false): bool
+    public function checkName(object $release, bool $echo, string $type, bool $nameStatus, bool $show, bool $preId = false, bool $markProcessed = true): bool
     {
+        if ($type === 'NFO, ') {
+            return $this->processNfoCandidate(clone $release, $echo, $nameStatus, $show, ! $preId, false, $markProcessed && ! $preId);
+        }
+
+        $identityText = $release->textstring;
+
         // Check PreDB first
-        $preDbMatch = $this->updateService->checkPreDbMatch($release, $release->textstring);
+        $preDbMatch = $this->updateService->checkPreDbMatch($release, $identityText);
         if ($preDbMatch !== null) {
-            if (strcasecmp((string) $preDbMatch['title'], (string) $release->searchname) === 0) {
+            if (PredbSearchDocument::exactValue((string) $preDbMatch['title']) === PredbSearchDocument::exactValue((string) $release->searchname)) {
                 if ($echo) {
-                    $this->updateService->attachPredbId((int) $release->releases_id, (int) $preDbMatch['id']);
+                    $this->updateService->attachPredbSnapshot($release, (int) $preDbMatch['id']);
                 }
             } else {
                 $this->updateService->updateRelease($release, $preDbMatch['title'], 'preDB: Match', $echo, $type, $nameStatus, $show, $preDbMatch['id']);
@@ -1202,24 +1748,14 @@ class NameFixingService
                 }
                 break;
 
-            case 'NFO, ':
-                $result = $this->nfoExtractor->extractFromNfo($release->textstring);
-                if ($result !== null) {
-                    $this->updateService->updateRelease($release, $result->newName, 'nfoCheck: '.$result->method, $echo, $type, $nameStatus, $show);
-                }
-                break;
-
             case 'Filenames, ':
-                // Try direct file name extraction first (handles NZBSPLIT wrappers)
-                if (! $this->updateService->matched) {
+                $hadEvidence = false;
+                $this->preDbFileCheck($release, $echo, $type, $nameStatus, $show, $hadEvidence);
+                if (! $this->updateService->matched && ! $hadEvidence) {
                     $result = $this->fileExtractor->extractFromFile($release->textstring);
                     if ($result !== null) {
                         $this->updateService->updateRelease($release, $result->newName, 'fileCheck: '.$result->method, $echo, $type, $nameStatus, $show);
                     }
-                }
-                // Try PreDB file check
-                if (! $this->updateService->matched) {
-                    $this->preDbFileCheck($release, $echo, $type, $nameStatus, $show);
                 }
                 break;
 
@@ -1232,8 +1768,12 @@ class NameFixingService
         }
 
         // Update processing flags if not matched
-        if ($echo && $nameStatus && ! $this->updateService->matched) {
-            $this->updateProcessingFlags($type, $release->releases_id);
+        if ($echo && $nameStatus && $markProcessed && ! $this->updateService->matched) {
+            if ($type === 'Filenames, ') {
+                $this->completeFilenamePass($release, [(string) $identityText], $echo, $nameStatus);
+            } else {
+                $this->updateProcessingFlags($type, $release->releases_id);
+            }
         }
 
         return $this->updateService->matched;
@@ -1247,9 +1787,6 @@ class NameFixingService
         switch ($type) {
             case 'NFO, ':
                 $this->updateService->updateSingleColumn('proc_nfo', self::PROC_NFO_DONE, $releaseId);
-                break;
-            case 'Filenames, ':
-                $this->updateService->updateSingleColumn('proc_files', self::PROC_FILES_DONE, $releaseId);
                 break;
             case 'PAR2, ':
                 $this->updateService->updateSingleColumn('proc_par2', self::PROC_PAR2_DONE, $releaseId);
@@ -1283,7 +1820,7 @@ class NameFixingService
         $prioritizedFiles = $this->filePrioritizer->prioritizeForPreDb($files);
 
         foreach ($prioritizedFiles as $fileName) {
-            $cleanedFileName = $this->fileNameCleaner->cleanForMatching($fileName);
+            $cleanedFileName = $this->fileNameCleaner->cleanForMatching($fileName, preserveLeadingNumber: true);
 
             if (empty($cleanedFileName) || strlen($cleanedFileName) < 8) {
                 continue;
@@ -1292,10 +1829,18 @@ class NameFixingService
             $bestMatch = $this->findBestPredbMatch($cleanedFileName);
 
             if ($bestMatch !== null && (int) ($bestMatch['id'] ?? 0) > 0) {
-                if (strcasecmp((string) $bestMatch['title'], (string) $release->searchname) !== 0) {
-                    $this->updateService->updateRelease($release, $bestMatch['title'], 'file matched source: '.($bestMatch['source'] ?? ''), $echo, 'PreDB file match, ', $nameStatus, $show, (int) $bestMatch['id']);
+                if (! $echo && $this->updateService->currentPredbTitle((int) $bestMatch['id'], (string) $bestMatch['title'], $cleanedFileName) === null) {
+                    continue;
+                }
+                if (PredbSearchDocument::exactValue((string) $bestMatch['title']) !== PredbSearchDocument::exactValue((string) $release->searchname)) {
+                    $this->updateService->updateRelease($release, $bestMatch['title'], 'file matched source: '.($bestMatch['source'] ?? ''), $echo, 'PreDB file match, ', $nameStatus, $show, (int) $bestMatch['id'], $cleanedFileName);
+                    if ($echo && ! $this->updateService->matched) {
+                        continue;
+                    }
                 } elseif ($echo) {
-                    $this->updateService->attachPredbId((int) $release->releases_id, (int) $bestMatch['id']);
+                    $matching = $this->updateService->attachPredbSnapshot($release, (int) $bestMatch['id'], (string) $bestMatch['title'], $cleanedFileName) ? 1 : 0;
+
+                    return $matching;
                 }
                 $matching++;
 
@@ -1323,6 +1868,12 @@ class NameFixingService
     public function reset(): void
     {
         $this->updateService->reset();
+    }
+
+    /** @return array{before: array{id: int, guid: string, name: ?string, searchname: ?string}, after: array{id: int, guid: string, name: ?string, searchname: ?string}}|null */
+    public function lastCommittedIdentity(): ?array
+    {
+        return $this->updateService->lastCommittedIdentity();
     }
 
     /**

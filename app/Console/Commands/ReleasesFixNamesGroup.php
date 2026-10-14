@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Enums\Par2RenameOutcome;
+use App\Exceptions\IncompletePredbMatchException;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NfoService;
@@ -84,7 +86,7 @@ class ReleasesFixNamesGroup extends Command
         $nntp = null;
         $nzbcontents = null;
         $connectionAttempted = false;
-        $par2Processor = function (object $release) use (&$connectionAttempted, &$nntp, &$nzbcontents): bool {
+        $par2Processor = function (object $release) use (&$connectionAttempted, &$nntp, &$nzbcontents): Par2RenameOutcome {
             if (! $connectionAttempted) {
                 $connectionAttempted = true;
                 $nntp = app(NNTPService::class);
@@ -107,7 +109,11 @@ class ReleasesFixNamesGroup extends Command
                 }
             }
 
-            return $nzbcontents !== null && $nzbcontents->checkPar2(
+            if ($nzbcontents === null) {
+                return Par2RenameOutcome::Retryable;
+            }
+
+            return $nzbcontents->checkPar2Result(
                 $release->guid,
                 $release->releases_id,
                 $release->groups_id,
@@ -142,7 +148,13 @@ class ReleasesFixNamesGroup extends Command
         $this->info('Processing PreDB fulltext matching');
         $this->info("Worker: {$thread}/{$workers}, Limit: {$maxPerRun}");
 
-        $pres = $this->queries->predbBatch($thread, $workers, $maxPerRun);
+        try {
+            $pres = $this->queries->reservePredbBatch($thread, $workers, $maxPerRun);
+        } catch (RuntimeException $exception) {
+            $this->error($exception->getMessage());
+
+            return Command::FAILURE;
+        }
 
         if ($pres === []) {
             $this->info('No PreDB entries to process');
@@ -154,11 +166,24 @@ class ReleasesFixNamesGroup extends Command
         $bar = $this->output->createProgressBar(count($pres));
         $bar->start();
 
+        $incomplete = 0;
         foreach ($pres as $pre) {
             $searched = 0;
 
             try {
-                $ftmatched = $this->nameFixingService->matchPredbFulltext($pre);
+                $outcome = $this->nameFixingService->matchPredbFulltextWithCompletion($pre);
+                if ($outcome['retry']) {
+                    throw new IncompletePredbMatchException('PreDB fulltext matching is incomplete: current release evidence could not be completely confirmed.');
+                }
+                $ftmatched = $outcome['updated'];
+            } catch (IncompletePredbMatchException $exception) {
+                $this->newLine();
+                $this->warn('PreDB '.(int) $pre->predb_id.': '.$exception->getMessage());
+                $incomplete++;
+                $this->checked++;
+                $bar->advance();
+
+                continue;
             } catch (RuntimeException $exception) {
                 $bar->finish();
                 $this->newLine(2);
@@ -167,7 +192,7 @@ class ReleasesFixNamesGroup extends Command
                 return Command::FAILURE;
             }
 
-            if ($ftmatched > 0) {
+            if ($outcome['matched']) {
                 $searched = 1;
             } elseif ($ftmatched < 0) {
                 $searched = -6;
@@ -175,7 +200,8 @@ class ReleasesFixNamesGroup extends Command
                 $searched = (int) $pre->searched - 1;
             }
 
-            DB::update('UPDATE predb SET searched = ? WHERE id = ?', [$searched, $pre->predb_id]);
+            $completionPredicate = $searched === 1 ? '' : ' AND searched = 0';
+            DB::update('UPDATE predb SET searched = ? WHERE id = ?'.$completionPredicate, [$searched, $pre->predb_id]);
             $this->checked++;
 
             $bar->advance();
@@ -185,6 +211,11 @@ class ReleasesFixNamesGroup extends Command
         $this->newLine(2);
 
         $this->info("✅ Processed {$this->checked} PreDB entries");
+        if ($incomplete > 0) {
+            $this->warn("{$incomplete} PreDB entries remain unsearched after incomplete matching.");
+
+            return Command::FAILURE;
+        }
 
         return Command::SUCCESS;
     }

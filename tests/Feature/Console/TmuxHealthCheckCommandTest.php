@@ -11,7 +11,10 @@ use Illuminate\Support\Facades\Process;
 use PDO;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\Support\ConfigurationTestBuilder;
+use Tests\Support\MarkerIoFailures;
 use Tests\TestCase;
+
+require_once __DIR__.'/../../Support/MarkerIoFailures.php';
 
 class TmuxHealthCheckCommandTest extends TestCase
 {
@@ -174,6 +177,31 @@ class TmuxHealthCheckCommandTest extends TestCase
         Process::assertNotRan(fn (PendingProcess $process): bool => $this->isTmuxCommand($process, 'respawn-pane') || $this->isTmuxCommand($process, 'kill-session'));
     }
 
+    public function test_a_slow_monitor_loop_within_the_heartbeat_tolerance_is_healthy(): void
+    {
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true]);
+        $this->fakeExistingMonitor(dead: false, heartbeat: time() - 90);
+        $this->artisan('tmux:health-check --auto-restart --session=custom-session')->assertExitCode(0);
+    }
+
+    public function test_the_heartbeat_tolerance_is_configurable(): void
+    {
+        // Below the old 60-second floor: a 45-second-old heartbeat must now be stale.
+        config(['tmux.monitor.heartbeat_max_age' => 30]);
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true]);
+        $this->fakeExistingMonitor(dead: false, heartbeat: time() - 45);
+        $this->artisan('tmux:health-check --auto-restart --session=custom-session')->assertExitCode(1);
+    }
+
+    public function test_the_heartbeat_limit_never_drops_below_the_monitor_delay(): void
+    {
+        // A 300-second delay means a healthy heartbeat is up to 300 seconds old between beats.
+        config(['tmux.monitor.delay' => 300]);
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true]);
+        $this->fakeExistingMonitor(dead: false, heartbeat: time() - 250);
+        $this->artisan('tmux:health-check --auto-restart --session=custom-session')->assertExitCode(0);
+    }
+
     public function test_session_probe_reports_missing_even_when_stopped(): void
     {
         $this->fakeMissingSession();
@@ -258,6 +286,28 @@ class TmuxHealthCheckCommandTest extends TestCase
         $this->artisan('tmux:start --session=custom-session --force')->assertExitCode(1);
 
         Process::assertNotRan(fn (PendingProcess $process): bool => $this->isTmuxCommand($process, 'kill-session'));
+        Process::assertNotRan(fn (PendingProcess $process): bool => $this->isTmuxCommand($process, 'new-session'));
+    }
+
+    public function test_start_does_not_create_a_session_after_compensation_fails(): void
+    {
+        Process::fake(function (PendingProcess $process) {
+            if ($process->command === 'which tmux 2>/dev/null') {
+                return Process::result('tmux');
+            }
+            if ($this->isTmuxCommand($process, 'has-session')) {
+                return Process::result('', '', 1);
+            }
+
+            return Process::result();
+        });
+        MarkerIoFailures::$shortWrite = true;
+        try {
+            $this->artisan('tmux:start --session=compensation-failure --force')->assertExitCode(1);
+        } finally {
+            MarkerIoFailures::$shortWrite = false;
+        }
+
         Process::assertNotRan(fn (PendingProcess $process): bool => $this->isTmuxCommand($process, 'new-session'));
     }
 

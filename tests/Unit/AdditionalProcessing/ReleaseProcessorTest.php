@@ -22,6 +22,7 @@ use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\AdditionalProcessing\UsenetDownloadService;
 use App\Services\Categorization\CategorizationService;
+use App\Services\NNTP\NNTPService;
 use App\Services\ReleaseExtraService;
 use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseBrowseService;
@@ -31,9 +32,12 @@ use Illuminate\Filesystem\Filesystem;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Facade;
 use Mockery;
+use Mockery\MockInterface;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use Tests\Fixtures\MappingArticleNntpHarness;
+use Tests\Fixtures\YencArticles;
 
 class ReleaseProcessorTest extends TestCase
 {
@@ -50,6 +54,103 @@ class ReleaseProcessorTest extends TestCase
         }
         Mockery::close();
         parent::tearDown();
+    }
+
+    #[Test]
+    public function mapped_archive_reuse_preserves_real_archive_bytes_and_inner_scene_name(): void
+    {
+        $name = 'Example.Movie.2026.1080p.WEB-DL.x264-GRP.mkv';
+        $archive = $this->rar($name, str_repeat('CONTENT', 3000));
+        $parts = [substr($archive, 0, 17000), substr($archive, 17000, 2000), substr($archive, 19000)];
+        $index = $this->par2Index([
+            ['release.part01.rar', strlen($archive), $archive],
+            ['release.part02.rar', strlen($archive), str_repeat('OTHER', 5000)],
+        ]);
+        $observations = [];
+        foreach ([false, true] as $withChecksum) {
+            $config = $this->makeConfig(['par2MediaMapping' => true, 'par2VerifyFiles' => 1, 'processPasswords' => true, 'archiveProbeFiles' => 0]);
+            $wire = MappingArticleNntpHarness::body($index, 'release.par2');
+            $mapping = YencArticles::part($parts[0], 'opaque', strlen($archive), 1, 1, 3);
+            if (! $withChecksum) {
+                $mapping = preg_replace('/ pcrc32=[0-9a-f]+/', '', $mapping);
+            }
+            $wire .= MappingArticleNntpHarness::rawBody($mapping);
+            if (! $withChecksum) {
+                $wire .= MappingArticleNntpHarness::rawBody(YencArticles::part($parts[0], 'opaque', strlen($archive), 1, 1, 3));
+            }
+            $wire .= MappingArticleNntpHarness::rawBody(YencArticles::part($parts[1], 'opaque', strlen($archive), 2, 17001, 3))
+                .MappingArticleNntpHarness::rawBody(YencArticles::part($parts[2], 'opaque', strlen($archive), 3, 19001, 3));
+            $nntp = new MappingArticleNntpHarness($wire);
+            $download = new UsenetDownloadService($config, $nntp);
+            $parser = Mockery::mock(NzbContentParser::class);
+            $parser->shouldReceive('parseNzb')->once()->andReturn(['error' => null, 'contents' => [
+                ['title' => '"release.par2" yEnc (1/1)', 'segments' => ['index'], 'size' => strlen($index), 'filecount' => 1],
+                ['title' => '"opaque1" yEnc (1/3)', 'segments' => ['a', 'b', 'c'], 'size' => (int) ceil(strlen($archive) * 1.03), 'filecount' => 1],
+                ['title' => '"opaque2" yEnc (1/3)', 'segments' => ['d', 'e', 'f'], 'size' => (int) ceil(strlen($archive) * 1.03), 'filecount' => 1],
+            ]]);
+            $manager = Mockery::mock(ReleaseFileManager::class);
+            $manager->shouldReceive('processReleaseNameFromNzbContents')->once()->andReturnFalse();
+            $files = [];
+            $manager->shouldReceive('addFileInfo')->once()->andReturnUsing(static function (array $file, ReleaseProcessingContext $context) use (&$files): bool {
+                $files[] = $file;
+                $context->totalFileInfo++;
+                $context->releaseFilesChanged = true;
+                $context->release->searchname = $file['name'];
+
+                return true;
+            });
+            $manager->shouldReceive('finalizeRelease')->once()->andReturnNull();
+            $archiveService = Mockery::mock(ArchiveExtractionService::class, [$config])->makePartial();
+            $archiveBytes = [];
+            $archiveService->shouldReceive('processCompressedData')->once()->andReturnUsing(static function (string $data, ReleaseProcessingContext $context, string $path) use (&$archiveBytes, $config): array {
+                $archiveBytes[] = $data;
+
+                return (new ArchiveExtractionService($config))->processCompressedData($data, $context, $path);
+            });
+            $processor = new ReleaseProcessor($config, $parser, new AdditionalWorkPlanner($config), $archiveService,
+                Mockery::mock(MediaExtractionService::class), $download, $manager,
+                Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(), $this->tempWorkspaceWithoutFiles(),
+                Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing());
+            $context = $this->makeContext();
+            $context->release->nfostatus = 1;
+            $result = $processor->process($context, '/tmp/main/');
+            $this->assertSame([$archive], $archiveBytes);
+            $this->assertSame($name, $context->release->searchname);
+            $this->assertSame(1, $context->totalFileInfo);
+            $this->assertTrue($result->artifactsCreated);
+            $this->assertSame($withChecksum ? ['BODY <index>', 'BODY <a>', 'BODY <b>', 'BODY <c>'] : ['BODY <index>', 'BODY <a>', 'BODY <a>', 'BODY <b>', 'BODY <c>'], $nntp->sentCommands());
+            $this->assertSame($withChecksum ? 17000 : 0, $result->downloadMetrics?->bytesReused);
+            $observations[] = [$files, $context->release->searchname, $archiveBytes, $result->outcome];
+        }
+        $this->assertSame($observations[0], $observations[1]);
+    }
+
+    #[Test]
+    public function it_does_not_report_deferred_full_hash_metadata_as_successful(): void
+    {
+        /** @var ReleaseFileManager&MockInterface $manager */
+        $manager = Mockery::mock(ReleaseFileManager::class);
+        $manager->shouldReceive('processReleaseNameFromNzbContents')->once()->andReturnFalse();
+        $manager->shouldReceive('finalizeRelease')->once()->andReturnUsing(static function (ReleaseProcessingContext $context): void {
+            $context->fullPar2EvidenceDeferred = true;
+        });
+        /** @var NzbContentParser&MockInterface $parser */
+        $parser = Mockery::mock(NzbContentParser::class);
+        $parser->shouldReceive('parseNzb')->once()->andReturn(['error' => null, 'contents' => [['title' => 'file.nzb', 'segments' => []]]]);
+        /** @var ConsoleOutputService&MockInterface $output */
+        $output = Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing();
+        $processor = $this->makeProcessor(
+            nzbParser: $parser,
+            releaseManager: $manager,
+            tempWorkspace: $this->successfulTempWorkspace(),
+            output: $output,
+        );
+
+        $result = $processor->process($this->makeContext(), sys_get_temp_dir());
+
+        $this->assertSame(ProcessingOutcome::Failed, $result->outcome);
+        $this->assertFalse($result->isSuccessful());
+        $this->assertStringContainsString('before metadata commit', $result->reason);
     }
 
     #[Test]
@@ -809,6 +910,84 @@ class ReleaseProcessorTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_a_probed_archive_retryable_when_the_group_drops_before_inspection(): void
+    {
+        $config = $this->makeConfig(['processPasswords' => true]);
+        $archive = $this->rar('Movie.2026.1080p.mkv', str_repeat('x', 100));
+        $nzbParser = Mockery::mock(NzbContentParser::class);
+        $nzbParser->shouldReceive('parseNzb')->once()->andReturn([
+            'error' => null,
+            'contents' => [
+                ['title' => '"kL2mN4pQ6rS8" yEnc (1/2)', 'segments' => ['<rar-1>', '<rar-2>'], 'size' => 800, 'filecount' => 1],
+                ['title' => '"tT1uU2vV3wW4" yEnc (1/1)', 'segments' => ['<other-1>'], 'size' => 700, 'filecount' => 1],
+            ],
+        ]);
+
+        $downloadService = Mockery::mock(UsenetDownloadService::class);
+        $this->expectDownloadScope($downloadService);
+        $downloadService->shouldReceive('download')
+            ->once()
+            ->with(DownloadKind::Compressed, ['<rar-1>'], '', 1)
+            ->andReturn(['success' => true, 'data' => substr($archive, 0, 60), 'groupUnavailable' => true, 'error' => null]);
+
+        $releaseManager = Mockery::mock(ReleaseFileManager::class);
+        $releaseManager->shouldReceive('processReleaseNameFromNzbContents')->once()->andReturnFalse();
+        $releaseManager->shouldNotReceive('deleteRelease');
+        $releaseManager->shouldNotReceive('addFileInfo');
+        $releaseManager->shouldReceive('finalizeRelease')->once()->andReturnNull();
+
+        $processor = new ReleaseProcessor(
+            $config,
+            $nzbParser,
+            new AdditionalWorkPlanner($config),
+            new ArchiveExtractionService($config),
+            Mockery::mock(MediaExtractionService::class),
+            $downloadService,
+            $releaseManager,
+            Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(),
+            $this->tempWorkspaceWithoutFiles(),
+            Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing()
+        );
+
+        $context = $this->makeContext();
+        $context->release->nfostatus = 1;
+        $processor->process($context, '/tmp/main/');
+
+        $this->assertTrue($context->groupUnavailable);
+        $this->assertTrue($context->archiveInspectionAttempted);
+        $this->assertTrue($context->archiveRetryable);
+    }
+
+    #[Test]
+    public function it_skips_multi_file_probes_with_every_download_option_off(): void
+    {
+        $config = $this->makeConfig();
+        $nzbParser = Mockery::mock(NzbContentParser::class);
+        $nzbParser->shouldReceive('parseNzb')->once()->andReturn([
+            'error' => null,
+            'contents' => array_map(
+                static fn (int $i): array => ['title' => '"obfuscated'.$i.'" yEnc (1/1)', 'segments' => ['<file-'.$i.'>'], 'size' => 100, 'filecount' => 1],
+                range(1, 3),
+            ),
+        ]);
+
+        $downloadService = Mockery::mock(UsenetDownloadService::class);
+        $this->expectDownloadScope($downloadService);
+        $downloadService->shouldNotReceive('download');
+
+        $releaseManager = Mockery::mock(ReleaseFileManager::class);
+        $releaseManager->shouldReceive('processReleaseNameFromNzbContents')->once()->andReturnFalse();
+        $releaseManager->shouldNotReceive('deleteRelease');
+        $releaseManager->shouldReceive('finalizeRelease')->once()->andReturnNull();
+
+        $context = $this->makeContext();
+        $this->multiFileProbeProcessor($config, $nzbParser, $downloadService, $releaseManager)
+            ->process($context, '/tmp/main/');
+
+        $this->assertFalse($context->nzbHasCompressedFile);
+    }
+
+    #[Test]
     public function it_probes_at_most_the_configured_number_of_files_and_never_deletes_a_multi_file_release(): void
     {
         $config = $this->makeConfig(['processPasswords' => true, 'archiveProbeFiles' => 2]);
@@ -1081,10 +1260,11 @@ class ReleaseProcessorTest extends TestCase
 
         $downloadService = Mockery::mock(UsenetDownloadService::class);
         $this->expectDownloadScope($downloadService);
-        $downloadService->shouldReceive('download')->once()->ordered()->with(DownloadKind::Jpg, ['<s1>', '<s2>'], '', 1)
-            ->andReturn(['success' => true, 'data' => 'BROKEN', 'groupUnavailable' => false, 'error' => null]);
-        $downloadService->shouldReceive('download')->once()->ordered()->with(DownloadKind::Jpg, ['<cover>'], '', 1)
-            ->andReturn(['success' => true, 'data' => 'GOOD', 'groupUnavailable' => false, 'error' => null]);
+
+        $downloadService->shouldReceive('downloadBounded')->once()->ordered()->with(DownloadKind::Jpg, ['<s1>', '<s2>'], 8388608, '', 1)
+            ->andReturn(['success' => true, 'data' => 'BROKEN', 'groupUnavailable' => false, 'error' => null, 'bytesDownloaded' => 6]);
+        $downloadService->shouldReceive('downloadBounded')->once()->ordered()->with(DownloadKind::Jpg, ['<cover>'], 8388608, '', 1)
+            ->andReturn(['success' => true, 'data' => 'GOOD', 'groupUnavailable' => false, 'error' => null, 'bytesDownloaded' => 4]);
 
         $media = Mockery::mock(MediaExtractionService::class);
         $media->shouldReceive('isUsableImage')->twice()->andReturnUsing(static fn (string $path): bool => file_get_contents($path) === 'GOOD');
@@ -1115,6 +1295,57 @@ class ReleaseProcessorTest extends TestCase
         $processor->process($context, '/tmp/main/');
 
         $this->assertTrue($context->foundJPGSample);
+    }
+
+    #[Test]
+
+    #[DataProvider('imageByteBudgets')]
+    public function failed_ranked_images_share_the_preview_budget_and_report_every_consumed_byte(int $limit): void
+    {
+        $tmpPath = $this->useRealFilesystem();
+        $config = $this->makeConfig(['processJPGSample' => true, 'mediaMaxBytes' => $limit]);
+        $nzbParser = Mockery::mock(NzbContentParser::class);
+        $contents = [];
+        foreach (range(1, 3) as $number) {
+            $contents[] = ['title' => '"movie.screens'.$number.'.jpg" yEnc (1/1)', 'segments' => ['image'.$number.'@test'], 'size' => 8388608, 'filecount' => 1];
+        }
+        $nzbParser->shouldReceive('parseNzb')->once()->andReturn(['error' => null, 'contents' => $contents]);
+        $nntp = Mockery::mock(NNTPService::class);
+        $nntp->shouldNotReceive('getMessagesByMessageID');
+        $nntp->shouldReceive('getBoundedArticleByMessageID')->once()->ordered()->with('image1@test', 8388608, false)
+            ->andReturn(['data' => 'UNUSABLE', 'bytesDownloaded' => 8388608, 'error' => null]);
+        $nntp->shouldReceive('getBoundedArticleByMessageID')->once()->ordered()->with('image2@test', $limit - 8388608, false)
+            ->andReturn(['data' => null, 'bytesDownloaded' => $limit - 8388608, 'error' => 'Truncated article']);
+        $download = new UsenetDownloadService($config, $nntp);
+        $media = Mockery::mock(MediaExtractionService::class);
+        $media->shouldReceive('isUsableImage')->once()->andReturnFalse();
+        $manager = Mockery::mock(ReleaseFileManager::class);
+        $manager->shouldReceive('processReleaseNameFromNzbContents')->once()->andReturnFalse();
+        $manager->shouldReceive('finalizeRelease')->once()->andReturnNull();
+        $processor = new ReleaseProcessor($config, $nzbParser, new AdditionalWorkPlanner($config),
+            Mockery::mock(ArchiveExtractionService::class), $media, $download, $manager,
+            Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldNotReceive('processJpgFromReleaseFiles')->getMock(),
+            Mockery::mock(TempWorkspaceService::class)->shouldReceive('createReleaseTempFolder')->once()->andReturn($tmpPath)
+                ->shouldReceive('clearDirectory')->once()->andReturnNull()->getMock(),
+            Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing());
+        $context = $this->makeContext();
+        $context->release->nfostatus = 1;
+
+        $result = $processor->process($context, '/tmp/main/');
+
+        $this->assertFalse($context->foundJPGSample);
+        $this->assertLessThanOrEqual($limit, $result->downloadMetrics?->bytesDownloaded);
+        $this->assertSame(0, $context->mediaBudget?->remaining());
+        $this->assertSame($limit, $result->downloadMetrics?->bytesDownloaded);
+        $this->assertSame($limit, $result->downloadMetrics?->mediaBytesDownloaded);
+        $this->assertSame(2, $result->downloadMetrics?->networkRequests);
+    }
+
+    /** @return iterable<string, array{int}> */
+    public static function imageByteBudgets(): iterable
+    {
+        yield 'two full attempts' => [16777216];
+        yield 'second attempt capped to remaining' => [10485760];
     }
 
     #[Test]
@@ -1156,6 +1387,59 @@ class ReleaseProcessorTest extends TestCase
         $processor->process($context, '/tmp/main/');
 
         $this->assertNull($context->mediaPlan);
+    }
+
+    #[Test]
+    public function it_lists_a_later_rar_volume_when_the_first_lacks_its_header_segment(): void
+    {
+        $config = $this->makeConfig(['processPasswords' => true]);
+        $volume = $this->rar('Movie.2026.1080p.mkv', str_repeat('x', 100), laterVolume: true);
+        $nzbParser = Mockery::mock(NzbContentParser::class);
+        $nzbParser->shouldReceive('parseNzb')->once()->andReturn([
+            'error' => null,
+            'contents' => [
+                ['title' => '"release.part01.rar" yEnc (2/2)', 'segments' => ['<p1-2>'], 'firstsegment' => false],
+                ['title' => '"release.part02.rar" yEnc (1/2)', 'segments' => ['<p2-1>'], 'firstsegment' => true],
+            ],
+        ]);
+
+        $downloadService = Mockery::mock(UsenetDownloadService::class);
+        $this->expectDownloadScope($downloadService);
+        $downloadService->shouldReceive('download')
+            ->once()
+            ->with(DownloadKind::Compressed, ['<p2-1>'], '', 1, '"release.part02.rar" yEnc (1/2)')
+            ->andReturn(['success' => true, 'data' => $volume, 'groupUnavailable' => false, 'error' => null]);
+
+        $releaseManager = Mockery::mock(ReleaseFileManager::class);
+        $releaseManager->shouldReceive('processReleaseNameFromNzbContents')->once()->andReturnFalse();
+        $releaseManager->shouldReceive('addFileInfo')
+            ->once()
+            ->with(Mockery::on(static fn (array $file): bool => $file['name'] === 'Movie.2026.1080p.mkv'), Mockery::any(), Mockery::any())
+            ->andReturnUsing(static function (array $file, ReleaseProcessingContext $context): bool {
+                $context->totalFileInfo++;
+
+                return true;
+            });
+        $releaseManager->shouldReceive('finalizeRelease')->once()->andReturnNull();
+
+        $processor = new ReleaseProcessor(
+            $config,
+            $nzbParser,
+            new AdditionalWorkPlanner($config),
+            new ArchiveExtractionService($config),
+            Mockery::mock(MediaExtractionService::class),
+            $downloadService,
+            $releaseManager,
+            Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(),
+            $this->tempWorkspaceWithoutFiles(),
+            Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing()
+        );
+
+        $context = $this->makeContext();
+        $context->release->nfostatus = 1;
+        $processor->process($context, '/tmp/main/');
+
+        $this->assertSame(1, $context->totalFileInfo);
     }
 
     /**

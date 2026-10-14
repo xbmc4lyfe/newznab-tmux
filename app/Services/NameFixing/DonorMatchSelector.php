@@ -4,8 +4,41 @@ declare(strict_types=1);
 
 namespace App\Services\NameFixing;
 
+use App\Support\PredbSearchDocument;
+
 final class DonorMatchSelector
 {
+    /** @param list<object> $donors */
+    public function selectCanonical(array $donors): ?object
+    {
+        if (count($donors) > 256) {
+            return null;
+        }
+        $identity = null;
+        $selected = null;
+        foreach ($donors as $donor) {
+            $title = (string) ($donor->canonical_title ?? '');
+            $searchName = (string) ($donor->searchname ?? '');
+            if ((int) ($donor->predb_id ?? 0) <= 0 || trim($title) === '' || ! mb_check_encoding($title, 'UTF-8')
+                || ! mb_check_encoding($searchName, 'UTF-8') || mb_strlen($title, 'UTF-8') > 255
+                || preg_match('/\p{C}/u', $title) !== 0
+                || PredbSearchDocument::exactValue($title) !== PredbSearchDocument::exactValue($searchName)) {
+                return null;
+            }
+            $currentIdentity = (int) $donor->predb_id.':'.PredbSearchDocument::exactValue($title);
+            if ($identity !== null && $identity !== $currentIdentity) {
+                return null;
+            }
+            $identity = $currentIdentity;
+            if ($selected === null || (int) $donor->releases_id < (int) $selected->releases_id) {
+                $selected = clone $donor;
+                $selected->searchname = $title;
+            }
+        }
+
+        return $selected;
+    }
+
     /**
      * @param  list<object>  $donors
      */

@@ -51,3 +51,25 @@ Dockerfile		-binary text
 /deploy/** -binary text eol=lf
 .env.example -binary text eol=lf
 /tests/Fixtures/rapidyenc-abi.c -binary text eol=lf
+
+# Reviewable, mergeable text despite the repository-wide `* binary` default
+docker/bin/deploy-guard	-binary text eol=lf
+docker/Makefile		-binary text eol=lf
+/scripts/nzb_fingerprint.py	-binary text eol=lf
+/tests/Unit/test_nzb_fingerprint.py	-binary text eol=lf
+/scripts/benchmark-yenc-abi.py -binary text eol=lf
+/tests/Unit/test_yenc_abi_benchmark.py -binary text eol=lf
+/scripts/benchmark-cpu.py -binary text eol=lf
+/tests/Unit/test_benchmark_cpu.py -binary text eol=lf
+/docker/app/nzb-yenc-ffi/Cargo.toml	-binary text eol=lf
+/docker/app/nzb-yenc-ffi/Cargo.lock	-binary text eol=lf
+/docker/app/nzb-yenc-ffi/src/*.rs	-binary text eol=lf
+
+/tests/Fixtures/NativeSpotCheckPlannerInvalidLibrary.c -binary text eol=lf
+
+# Native release presentation and its runtime fixtures must be reviewable.
+/docker/app/Caddyfile -binary text eol=lf
+/docker/app/php/release-presentation.h -binary text eol=lf
+/tests/Fixtures/ReleasePresentation.Dockerfile -binary text eol=lf
+/scripts/test-release-presentation-web.py -binary text eol=lf
+/tests/Fixtures/ReleasePresentation.Dockerfile.dockerignore -binary text eol=lf

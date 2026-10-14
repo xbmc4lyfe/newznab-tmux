@@ -59,8 +59,7 @@ final class MetadataSources
         return match ($source) {
             self::TMDB => self::missingKey('tmdb.api_key', 'TMDB_APIKEY'),
             self::OMDB => self::missingKey('nntmux_api.omdb_api_key', 'OMDB_APIKEY'),
-            self::TVDB => self::missingKey('tvdb.api_key', 'TVDB_APIKEY')
-                ?? (config('tvdb.user_pin') === null ? 'no user PIN (TVDB_PIN)' : null),
+            self::TVDB => self::missingKey('tvdb.api_key', 'TVDB_APIKEY'),
             self::FANARTTV => self::missingKey('nntmux_api.fanarttv_api_key', 'FANARTTV_APIKEY'),
             self::TRAKT => self::missingKey('nntmux_api.trakttv_api_key', 'TRAKTTV_APIKEY'),
             self::IMDB_SCRAPER => self::disabled('nntmux_api.imdb_scraper_enabled', 'IMDB_SCRAPER_ENABLED'),
@@ -128,7 +127,14 @@ final class MetadataSources
      */
     public static function logDailySummary(): bool
     {
-        if (! Cache::add(self::summaryCacheKey(), true, now()->addDay())) {
+        // Best effort: the tmux monitor calls this every cycle, and a cache outage must not stop it.
+        try {
+            if (! Cache::add(self::summaryCacheKey(), true, now()->addDay())) {
+                return false;
+            }
+        } catch (\Throwable $e) {
+            Log::debug('Metadata source summary skipped: '.$e->getMessage());
+
             return false;
         }
 

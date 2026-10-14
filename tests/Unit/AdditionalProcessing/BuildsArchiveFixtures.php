@@ -6,15 +6,17 @@ trait BuildsArchiveFixtures
 {
     /**
      * Build a minimal single-file 7z archive (stored, plain end header), optionally
-     * with an AES coder on the file or on the whole end header.
+     * with an AES coder on the file, or an AES- or LZMA-encoded end header.
      */
     private function sevenZip(
         string $name,
         string $content,
         bool $encryptedFile = false,
         bool $encryptedHeader = false,
+        bool $compressedHeader = false,
     ): string {
         $aes = "\x24\x06\xF1\x07\x01\x02\x13\x00";
+        $lzma = "\x23\x03\x01\x01\x05\x5D\x00\x00\x10\x00";
         $utf16Name = mb_convert_encoding($name, 'UTF-16LE', 'UTF-8')."\x00\x00";
 
         $packed = $content;
@@ -25,10 +27,10 @@ trait BuildsArchiveFixtures
             ."\x05\x01\x11".chr(strlen($utf16Name) + 1)."\x00".$utf16Name."\x00"
             ."\x00";
 
-        if ($encryptedHeader) {
+        if ($encryptedHeader || $compressedHeader) {
             $packed .= str_repeat("\xAA", 16);
             $header = "\x17\x06".chr(strlen($content))."\x01\x09\x10\x00"
-                ."\x07\x0B\x01\x00\x01".$aes."\x0C\x10\x00"
+                ."\x07\x0B\x01\x00\x01".($encryptedHeader ? $aes : $lzma)."\x0C\x10\x00"
                 ."\x00";
         }
 
@@ -38,15 +40,22 @@ trait BuildsArchiveFixtures
     }
 
     /**
-     * Build a minimal RAR4 archive with one file, stored unless another method is given.
+     * Build a minimal RAR4 archive with one file, stored unless another method is given,
+     * or a later volume continuing it.
      */
-    private function rar(string $name, string $content, bool $encryptedFile = false, int $method = 0x30): string
-    {
+    private function rar(
+        string $name,
+        string $content,
+        bool $encryptedFile = false,
+        int $method = 0x30,
+        bool $laterVolume = false,
+    ): string {
         $file = pack('VVCVVCCvV', strlen($content), strlen($content), 0, crc32($content), 0, 20, $method, strlen($name), 0x20).$name;
+        $fileFlags = 0x8000 | ($encryptedFile ? 0x04 : 0) | ($laterVolume ? 0x03 : 0);
 
         return "Rar!\x1A\x07\x00"
-            ."\x00\x00\x73\x00\x00\x0D\x00\x00\x00\x00\x00\x00\x00"
-            ."\x00\x00\x74".pack('vv', $encryptedFile ? 0x8004 : 0x8000, 7 + strlen($file)).$file
+            ."\x00\x00\x73".pack('v', $laterVolume ? 0x0101 : 0)."\x0D\x00\x00\x00\x00\x00\x00\x00"
+            ."\x00\x00\x74".pack('vv', $fileFlags, 7 + strlen($file)).$file
             .$content;
     }
 

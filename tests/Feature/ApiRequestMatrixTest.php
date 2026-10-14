@@ -7,16 +7,23 @@ namespace Tests\Feature;
 use App\Facades\Search;
 use App\Http\Controllers\Api\ApiController;
 use App\Http\Controllers\Api\ApiV2Controller;
+use App\Http\Middleware\Google2FAMiddleware;
 use App\Models\Category;
+use App\Models\User;
 use App\Services\Api\ApiUsageService;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
+use App\Services\Search\Contracts\SearchServiceInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
 use App\Services\Search\Support\SearchFailureTracker;
+use Dom\HTMLDocument;
 use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Database\ConnectionResolver;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Database\SQLiteConnection;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
@@ -30,6 +37,7 @@ use Mockery;
 use PDO;
 use PHPUnit\Framework\Attributes\DataProvider;
 use ReflectionClass;
+use Spatie\Permission\PermissionRegistrar;
 use Tests\TestCase;
 
 class ApiRequestMatrixTest extends TestCase
@@ -101,6 +109,235 @@ class ApiRequestMatrixTest extends TestCase
 
         foreach ($this->originalEnvironment as $key => $value) {
             $this->setEnvironmentValue($key, $value === false ? null : $value);
+        }
+    }
+
+    public function test_submitter_search_request_preserves_operator_bearing_poster_as_field_value(): void
+    {
+        $poster = '-VIP- <poster@example.test>';
+        $releaseSearch = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearch->shouldReceive('search')
+            ->once()
+            ->withArgs(fn (...$arguments): bool => ($arguments[0]['fromname'] ?? null) === $poster
+                && ($arguments[14]['poster'] ?? null) === ''
+                && ($arguments[14]['filter_only'] ?? false) === false)
+            ->andReturn(collect());
+        $this->app->instance(ReleaseSearchService::class, $releaseSearch);
+
+        $releaseBrowse = Mockery::mock(ReleaseBrowseService::class);
+        $releaseBrowse->shouldReceive('getBrowseOrdering')->once()->andReturn(['posted_desc']);
+        $this->app->instance(ReleaseBrowseService::class, $releaseBrowse);
+
+        $searchService = Mockery::mock(SearchServiceInterface::class);
+        $searchService->shouldReceive('isSuggestEnabled')->once()->andReturnFalse();
+        $searchService->shouldReceive('isAutocompleteEnabled')->once()->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $searchService);
+
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        $response = $this->actingAs(User::query()->where('username', 'matrix_user')->firstOrFail())
+            ->get(route('search', ['searchadvposter' => $poster, 'search_type' => 'adv']));
+
+        $response->assertOk();
+    }
+
+    public function test_legacy_exact_poster_url_prefills_advanced_poster_field(): void
+    {
+        $poster = 'legacy@example.test';
+        $releaseSearch = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearch->shouldReceive('search')
+            ->once()
+            ->withArgs(fn (...$arguments): bool => ($arguments[0]['fromname'] ?? null) === ''
+                && ($arguments[14]['poster'] ?? null) === $poster
+                && ($arguments[14]['filter_only'] ?? false) === true)
+            ->andReturn(collect());
+        $this->app->instance(ReleaseSearchService::class, $releaseSearch);
+
+        $releaseBrowse = Mockery::mock(ReleaseBrowseService::class);
+        $releaseBrowse->shouldReceive('getBrowseOrdering')->once()->andReturn(['posted_desc']);
+        $this->app->instance(ReleaseBrowseService::class, $releaseBrowse);
+
+        $searchService = Mockery::mock(SearchServiceInterface::class);
+        $searchService->shouldReceive('isSuggestEnabled')->once()->andReturnFalse();
+        $searchService->shouldReceive('isAutocompleteEnabled')->once()->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $searchService);
+
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        $response = $this->actingAs(User::query()->where('username', 'matrix_user')->firstOrFail())
+            ->get(route('search', ['poster' => $poster, 'search_type' => 'adv']));
+
+        $response->assertOk();
+        $response->assertViewHas('listQuery', fn (array $query): bool => ($query['searchadvposter'] ?? null) === $poster);
+        $document = HTMLDocument::createFromString($response->getContent());
+        $this->assertSame($poster, $document->querySelector('input[name="searchadvposter"]')?->getAttribute('value'));
+    }
+
+    public function test_edited_advanced_poster_overrides_hidden_exact_poster(): void
+    {
+        $searchRelease = Mockery::mock(ReleaseSearchService::class);
+        $searchRelease->shouldReceive('search')
+            ->once()
+            ->withArgs(fn (...$arguments): bool => ($arguments[14]['poster'] ?? null) === 'edited@example.test'
+                && ($arguments[0]['fromname'] ?? null) === ''
+                && ($arguments[14]['filter_only'] ?? false) === true)
+            ->andReturn(collect());
+        $this->app->instance(ReleaseSearchService::class, $searchRelease);
+
+        $browse = Mockery::mock(ReleaseBrowseService::class);
+        $browse->shouldReceive('getBrowseOrdering')->once()->andReturn(['posted_desc']);
+        $this->app->instance(ReleaseBrowseService::class, $browse);
+
+        $search = Mockery::mock(SearchServiceInterface::class);
+        $search->shouldReceive('isSuggestEnabled')->once()->andReturnFalse();
+        $search->shouldReceive('isAutocompleteEnabled')->once()->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $search);
+
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        $response = $this->actingAs(User::query()->where('username', 'matrix_user')->firstOrFail())
+            ->get(route('search', [
+                'poster' => 'original@example.test',
+                'searchadvposter' => 'edited@example.test',
+                'search_type' => 'adv',
+            ]));
+
+        $response->assertOk();
+        $response->assertViewHas('listQuery', fn (array $query): bool => ($query['poster'] ?? null) === 'edited@example.test');
+    }
+
+    public function test_clearing_advanced_poster_clears_hidden_exact_poster(): void
+    {
+        $releaseSearch = Mockery::mock(ReleaseSearchService::class);
+        $releaseSearch->shouldReceive('search')
+            ->once()
+            ->withArgs(fn (...$arguments): bool => ($arguments[1] ?? null) === 'alt.binaries.example'
+                && ($arguments[0]['fromname'] ?? null) === ''
+                && ($arguments[14]['poster'] ?? null) === ''
+                && ($arguments[14]['filter_only'] ?? false) === true)
+            ->andReturn(collect());
+        $this->app->instance(ReleaseSearchService::class, $releaseSearch);
+
+        $browse = Mockery::mock(ReleaseBrowseService::class);
+        $browse->shouldReceive('getBrowseOrdering')->once()->andReturn(['posted_desc']);
+        $this->app->instance(ReleaseBrowseService::class, $browse);
+
+        $search = Mockery::mock(SearchServiceInterface::class);
+        $search->shouldReceive('isSuggestEnabled')->once()->andReturnFalse();
+        $search->shouldReceive('isAutocompleteEnabled')->once()->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $search);
+
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        $response = $this->actingAs(User::query()->where('username', 'matrix_user')->firstOrFail())
+            ->get(route('search', [
+                'poster' => 'original@example.test',
+                'searchadvposter' => '',
+                'group' => 'alt.binaries.example',
+                'search_type' => 'adv',
+            ]));
+
+        $response->assertOk();
+        $response->assertViewHas('listQuery', fn (array $query): bool => ! array_key_exists('poster', $query));
+    }
+
+    public function test_exact_poster_detail_link_preserves_whitespace_through_http_and_returns_its_own_release(): void
+    {
+        $poster = ' alice+usenet@example.test ';
+        $source = (array) DB::table('releases')->first();
+        $source['fromname'] = $poster;
+        $source['searchname'] = 'Whitespace anchor release';
+        $source['passwordstatus'] = 0;
+        DB::table('releases')->where('id', $source['id'])->update($source);
+        $lookalike = $source;
+        $lookalike['id'] = DB::table('releases')->max('id') + 1;
+        $lookalike['guid'] = str_repeat('b', 40);
+        $lookalike['fromname'] = trim($poster);
+        $lookalike['searchname'] = 'Different normalized poster release';
+        DB::table('releases')->insert($lookalike);
+
+        $user = User::query()->where('username', 'matrix_user')->firstOrFail();
+        $permissionId = DB::table('permissions')->insertGetId(['name' => 'view tv', 'guard_name' => 'web']);
+        DB::table('model_has_permissions')->insert(['permission_id' => $permissionId, 'model_type' => $user->getMorphClass(), 'model_id' => $user->getKey()]);
+        app(PermissionRegistrar::class)->forgetCachedPermissions();
+
+        $release = (object) array_merge($source, ['category_name' => 'TV', 'group_name' => 'alt.binaries.example']);
+        $html = view('details.partials.info-sidebar', compact('release'))->render();
+        $document = HTMLDocument::createFromString('<!doctype html><html><head><title>Release</title></head><body>'.$html.'</body></html>');
+        $link = $document->querySelector('a[aria-label^="View releases with the exact same poster field"]');
+        $this->assertNotNull($link);
+        $url = $link->getAttribute('href');
+        parse_str((string) parse_url($url, PHP_URL_QUERY), $query);
+        $this->assertSame($poster, $query['searchadvposter']);
+        $this->assertSame($poster, $query['poster']);
+
+        $database = DB::connection();
+        // SQLite cannot render the MySQL report-badge projection. Keep the real
+        // public service predicates, bindings, order, and page window intact.
+        $fixture = new class($database->getPdo(), $database->getDatabaseName(), $database->getTablePrefix(), $database->getConfig()) extends SQLiteConnection
+        {
+            /** @var list<array{sql: string, bindings: array}> */
+            public array $posterQueries = [];
+
+            public function select($query, $bindings = [], $useReadPdo = true, array $fetchUsing = [])
+            {
+                if (str_starts_with($query, 'SELECT * FROM (')) {
+                    if (! preg_match('/(WHERE .*)\n\s*GROUP BY r.id/s', $query, $where)
+                        || ! preg_match('/\) r (ORDER BY .*)$/s', $query, $order)) {
+                        throw new \RuntimeException('Unable to isolate the public search predicates.');
+                    }
+                    $query = 'SELECT r.* FROM releases r '.$where[1].' '.$order[1];
+                }
+                if (str_contains($query, 'r.fromname')) {
+                    $this->posterQueries[] = ['sql' => $query, 'bindings' => $bindings];
+                }
+
+                return parent::select($query, $bindings, $useReadPdo, $fetchUsing);
+            }
+        };
+        $originalResolver = Model::getConnectionResolver();
+        $resolver = new ConnectionResolver(['sqlite' => $fixture]);
+        $resolver->setDefaultConnection('sqlite');
+        Model::setConnectionResolver($resolver);
+        $this->app->instance(ReleaseSearchService::class, new ReleaseSearchService);
+        $searchService = Mockery::mock(SearchServiceInterface::class);
+        $searchService->shouldReceive('isSuggestEnabled')->andReturnFalse();
+        $searchService->shouldReceive('isAutocompleteEnabled')->andReturnFalse();
+        $this->app->instance(SearchServiceInterface::class, $searchService);
+        $this->withoutMiddleware(Google2FAMiddleware::class);
+        try {
+            $response = $this->actingAs($user)->get($url);
+            $response->assertOk();
+            $response->assertViewHas('listQuery', fn (array $listQuery): bool => ($listQuery['searchadvposter'] ?? null) === $poster);
+            $response->assertViewHas('exactPoster', $poster);
+            $this->assertFalse($response->viewData('results')->isEmpty(), 'Exact poster queries: '.json_encode($fixture->posterQueries, JSON_THROW_ON_ERROR));
+            $this->assertCount(1, $response->viewData('results'));
+            $this->assertSame([$poster, $poster], $fixture->posterQueries[0]['bindings']);
+            $response->assertSee('name="searchadvposter"', false);
+            $form = HTMLDocument::createFromString($response->getContent());
+            $visiblePoster = $form->querySelector('input[name="searchadvposter"]')?->getAttribute('value');
+            $this->assertSame($poster, $visiblePoster);
+            $resubmitted = $this->actingAs($user)->get(route('search', [
+                'poster' => $poster,
+                'searchadvposter' => $visiblePoster,
+                'search_type' => 'adv',
+            ]));
+            $resubmitted->assertOk();
+            $resubmitted->assertViewHas('exactPoster', $poster);
+            $this->assertSame((int) $source['id'], (int) $resubmitted->viewData('results')->first()->id);
+
+            $edited = $this->actingAs($user)->get(route('search', [
+                'poster' => $poster,
+                'searchadvposter' => trim($visiblePoster),
+                'search_type' => 'adv',
+            ]));
+            $edited->assertOk();
+            $edited->assertViewHas('exactPoster', trim($poster));
+            $this->assertCount(1, $edited->viewData('results'));
+            $this->assertSame((int) $lookalike['id'], (int) $edited->viewData('results')->first()->id);
+            $edited->assertViewHas('listQuery', fn (array $listQuery): bool => ($listQuery['poster'] ?? null) === trim($poster));
+        } finally {
+            if ($originalResolver === null) {
+                Model::unsetConnectionResolver();
+            } else {
+                Model::setConnectionResolver($originalResolver);
+            }
         }
     }
 
@@ -192,7 +429,7 @@ class ApiRequestMatrixTest extends TestCase
         $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
         $releaseSearchService->shouldReceive('apiSearch')
             ->once()
-            ->with('ubuntu', -1, 0, 100, -1, [5030], [-1], 0, 'posted_desc', null)
+            ->with('ubuntu', -1, 0, 250, -1, [5030], [-1], 0, 'posted_desc', null)
             ->andReturn(collect());
 
         $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
@@ -220,7 +457,7 @@ class ApiRequestMatrixTest extends TestCase
         $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
         $releaseSearchService->shouldReceive('apiSearch')
             ->once()
-            ->with('ubuntu', -1, 0, 100, -1, [5030], [-1], 0, 'posted_desc', null)
+            ->with('ubuntu', -1, 0, 250, -1, [5030], [-1], 0, 'posted_desc', null)
             ->andReturn(collect([
                 (object) [
                     '_totalrows' => 1,
@@ -266,7 +503,7 @@ class ApiRequestMatrixTest extends TestCase
         $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
         $releaseSearchService->shouldReceive('apiSearch')
             ->once()
-            ->with('ubuntu', -1, 0, 100, -1, [5030], [-1], 0, 'posted_desc')
+            ->with('ubuntu', -1, 0, 250, -1, [5030], [-1], 0, 'posted_desc')
             ->andReturn(collect([
                 (object) [
                     '_totalrows' => 1,
@@ -310,7 +547,7 @@ class ApiRequestMatrixTest extends TestCase
         $releaseSearchService = Mockery::mock(ReleaseSearchService::class);
         $releaseSearchService->shouldReceive('apiSearch')
             ->once()
-            ->with('ubuntu', -1, 0, 100, -1, [5030], [-1], 0, 'posted_desc')
+            ->with('ubuntu', -1, 0, 250, -1, [5030], [-1], 0, 'posted_desc')
             ->andReturn(collect());
 
         $releaseBrowseService = Mockery::mock(ReleaseBrowseService::class);
@@ -442,7 +679,7 @@ class ApiRequestMatrixTest extends TestCase
                 1,
                 ['3000', '3010', '3020', '3030', '3040', '3050', '3060', '3999'],
                 0,
-                100,
+                250,
                 'posted_desc',
                 -1,
                 [5030],
@@ -495,7 +732,7 @@ class ApiRequestMatrixTest extends TestCase
                 1,
                 ['3030', '7020', '8010'],
                 0,
-                100,
+                250,
                 'posted_desc',
                 -1,
                 [5030],
@@ -550,7 +787,7 @@ class ApiRequestMatrixTest extends TestCase
                     1,
                     $expectedCategory,
                     0,
-                    100,
+                    250,
                     'posted_desc',
                     -1,
                     [5030],
@@ -592,7 +829,7 @@ class ApiRequestMatrixTest extends TestCase
                 1,
                 ['3000', '3010', '3020', '3030', '3040', '3050', '3060', '3999'],
                 0,
-                100,
+                250,
                 'posted_desc',
                 -1,
                 [5030],
@@ -626,7 +863,7 @@ class ApiRequestMatrixTest extends TestCase
                 1,
                 ['3030', '7020', '8010'],
                 0,
-                100,
+                250,
                 'posted_desc',
                 -1,
                 [5030],
@@ -663,7 +900,7 @@ class ApiRequestMatrixTest extends TestCase
                     1,
                     $expectation['category'],
                     0,
-                    100,
+                    250,
                     'posted_desc',
                     -1,
                     [5030],
@@ -718,6 +955,19 @@ class ApiRequestMatrixTest extends TestCase
             ->assertOk()
             ->assertJsonPath('groups.0.name', 'alt.binaries.test')
             ->assertJsonPath('genres.0.name', 'Test Genre');
+    }
+
+    public function test_caps_advertise_the_configured_page_limits(): void
+    {
+        $this->assertStringContainsString('<limits max="500" default="250"/>', $this->get('/api/v1/api?t=caps')->assertOk()->getContent());
+        $this->getJson('/api/v2/capabilities')
+            ->assertOk()
+            ->assertJsonPath('limits', ['max' => 500, 'default' => 250]);
+
+        config(['nntmux.api.max_limit' => 300, 'nntmux.api.default_limit' => 400]);
+
+        $this->assertStringContainsString('<limits max="300" default="300"/>', $this->get('/api/v1/api?t=caps')->assertOk()->getContent());
+        $this->getJson('/api/v2/capabilities')->assertJsonPath('limits', ['max' => 300, 'default' => 300]);
     }
 
     public function test_v2_details_response_shape_is_unchanged(): void
@@ -857,7 +1107,7 @@ class ApiRequestMatrixTest extends TestCase
         $search = $this->bindSearchMocks();
         $search->shouldReceive('apiSearch')
             ->once()
-            ->with('ubuntu', -1, 0, 100, -1, [5030], ['2000', '5030'], 0, 'posted_desc', null)
+            ->with('ubuntu', -1, 0, 250, -1, [5030], ['2000', '5030'], 0, 'posted_desc', null)
             ->andReturn(collect([$this->releaseRow(1)]));
 
         $query = $this->queryJson('/api/v2/search', ['api_token' => $token, 'id' => 'ubuntu', 'cat' => [2000, 5030]]);
@@ -875,7 +1125,7 @@ class ApiRequestMatrixTest extends TestCase
         $search = $this->bindSearchMocks();
         $search->shouldReceive('apiSearch')
             ->once()
-            ->with('ubuntu', -1, 0, 100, -1, [5030], [-1], 0, 'posted_desc')
+            ->with('ubuntu', -1, 0, 250, -1, [5030], [-1], 0, 'posted_desc')
             ->andReturn(collect());
 
         $response = $this->queryJson('/api/v1/api', ['t' => 'search', 'apikey' => $this->apiToken(), 'q' => 'ubuntu']);
@@ -1025,7 +1275,7 @@ class ApiRequestMatrixTest extends TestCase
         $token = $this->apiToken();
         $this->bindSearchMocks()->shouldReceive('apiSearch')
             ->once()
-            ->with(null, -1, 0, 100, -1, [5030], [-1], 0, 'posted_desc', null)
+            ->with(null, -1, 0, 250, -1, [5030], [-1], 0, 'posted_desc', null)
             ->andReturn(collect());
 
         $this->getJson('/api/v2/search?api_token='.$token.'&id=')->assertOk();
@@ -1260,8 +1510,8 @@ class ApiRequestMatrixTest extends TestCase
     public static function invalidV2PaginationProvider(): array
     {
         return [
-            'zero limit' => ['limit=0', 'Incorrect parameter (limit must be a positive integer, at most 100 results are returned)'],
-            'non-numeric limit' => ['limit=ten', 'Incorrect parameter (limit must be a positive integer, at most 100 results are returned)'],
+            'zero limit' => ['limit=0', 'Incorrect parameter (limit must be a positive integer, at most 500 results are returned)'],
+            'non-numeric limit' => ['limit=ten', 'Incorrect parameter (limit must be a positive integer, at most 500 results are returned)'],
             'negative offset' => ['offset=-5', 'Incorrect parameter (offset must be a non-negative integer)'],
             'fractional offset' => ['offset=1.5', 'Incorrect parameter (offset must be a non-negative integer)'],
         ];
@@ -1281,7 +1531,7 @@ class ApiRequestMatrixTest extends TestCase
     {
         $this->bindSearchMocks()->shouldReceive('apiSearch')
             ->once()
-            ->with('ubuntu', -1, 0, 100, -1, [5030], [-1], 0, 'posted_desc', null)
+            ->with('ubuntu', -1, 0, 500, -1, [5030], [-1], 0, 'posted_desc', null)
             ->andReturn(collect());
 
         $this->getJson('/api/v2/search?api_token='.$this->apiToken().'&id=ubuntu&limit=5000')->assertOk();
@@ -1302,7 +1552,7 @@ class ApiRequestMatrixTest extends TestCase
     {
         $this->bindSearchMocks()->shouldReceive('animeSearch')
             ->once()
-            ->with(-1, 0, 100, 'naruto', [-1], -1, [5030], -1, 'posted_desc', 1024)
+            ->with(-1, 0, 250, 'naruto', [-1], -1, [5030], -1, 'posted_desc', 1024)
             ->andReturn(collect());
 
         $this->getJson('/api/v2/anime?api_token='.$this->apiToken().'&id=naruto&minsize=1024')->assertOk();
@@ -1394,6 +1644,23 @@ class ApiRequestMatrixTest extends TestCase
         $this->assertTrue($firstPage[0]->_search_has_more);
         $this->assertSame(['Ubuntu.Release'], $secondPage->pluck('searchname')->all());
         $this->assertFalse($secondPage[0]->_search_has_more);
+    }
+
+    public function test_name_sorted_api_search_falls_back_to_mysql_when_the_index_has_no_candidates(): void
+    {
+        config(['nntmux.mysql_search_fallback' => true]);
+        $pdo = DB::connection()->getPdo();
+        if ($pdo instanceof PDO && method_exists($pdo, 'sqliteCreateFunction')) {
+            $pdo->sqliteCreateFunction('CONCAT', static fn (...$parts): string => implode('', $parts));
+        }
+        Search::shouldReceive('isAvailable')->andReturn(true);
+        Search::shouldReceive('searchReleasePage')->once()->andReturn(new SearchPage(ids: [], total: 0, fuzzy: false, driver: 'manticore'));
+        // The fallback must not ask the index again: an unfiltered lookup could return only unrelated IDs.
+        Search::shouldNotReceive('searchReleasesWithFuzzy');
+
+        $releases = app(ReleaseSearchService::class)->apiSearch('ubuntu', -1, 0, 10, -1, [], [-1], 0, 'name_asc');
+
+        $this->assertSame(['Ubuntu.Release'], $releases->pluck('searchname')->all());
     }
 
     public function test_movie_name_search_filters_every_index_match_before_capping(): void
@@ -1494,6 +1761,7 @@ class ApiRequestMatrixTest extends TestCase
             $table->string('api_token')->nullable()->index();
             $table->string('host')->nullable();
             $table->timestamp('apiaccess')->nullable();
+            $table->timestamp('lastlogin')->nullable();
             $table->boolean('verified')->default(true);
             $table->timestamp('email_verified_at')->nullable();
             $table->integer('rate_limit')->default(60);
@@ -1643,6 +1911,14 @@ class ApiRequestMatrixTest extends TestCase
             $table->unsignedInteger('created_by')->nullable();
             $table->unsignedInteger('updated_by')->nullable();
             $table->timestamps();
+        });
+
+        Schema::create('content', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->integer('contenttype');
+            $table->integer('status');
+            $table->integer('ordinal')->nullable();
+            $table->integer('role')->default(0);
         });
     }
 

@@ -1,5 +1,7 @@
 <?php
 
+use App\Support\IrcChannelList;
+
 return [
     /***********************************************************************************************************************
      * You can use this to set the NICKNAME=>REALNAME and USERNAME below.
@@ -72,12 +74,115 @@ return [
      * This is a list of all the channels we fetch PRE's from.
      **********************************************************************************************************************/
 
-    'scrape_irc_channels' => serialize(
-        [
-            // '#Channel'                => 'Password',
-            '#PreNNTmux' => null,
-        ]
-    ),
+    // Comma-separated, optional ":password" per channel, e.g. "#PreNNTmux,#nZEDbPRE".
+    'scrape_irc_channels' => serialize(IrcChannelList::parse(env('SCRAPE_IRC_CHANNELS', '#PreNNTmux'))),
+
+    /***********************************************************************************************************************
+     * Additional public scene pre channels. Each enabled network runs as its own `irc:scrape --network=<key>`
+     * process (plain `irc:scrape` supervises all enabled networks). They announce only a section and a release
+     * name, so entries are stored with the receive time as the PRE time and enriched by the PreDB feeds.
+     * The "synirc" network is the server and channels configured above (NNTmux bot format).
+     **********************************************************************************************************************/
+    'networks' => [
+        'synirc' => [
+            'enabled' => (bool) env('SCRAPE_IRC_SYNIRC_ENABLED', true),
+            'format' => 'nntmux',
+        ],
+        // Each IRC network's parser reads every channel it joins: PRE lines add releases, INFO lines
+        // (in the *.spam channels) only fill in files and size for releases already stored.
+        'corruptnet' => [
+            'enabled' => (bool) env('SCRAPE_IRC_CORRUPTNET_ENABLED', false),
+            'format' => 'corruptnet',
+            'source' => 'corrupt-net',
+            'server' => env('SCRAPE_IRC_CORRUPTNET_SERVER', 'irc.corrupt-net.org'),
+            'port' => (int) env('SCRAPE_IRC_CORRUPTNET_PORT', 6697),
+            'tls' => true,
+            'channels' => ['#pre' => null, '#Pre.Spam' => null],
+        ],
+        'zenet' => [
+            'enabled' => (bool) env('SCRAPE_IRC_ZENET_ENABLED', false),
+            'format' => 'zenet',
+            'source' => 'zenet',
+            'server' => env('SCRAPE_IRC_ZENET_SERVER', 'irc.zenet.org'),
+            'port' => (int) env('SCRAPE_IRC_ZENET_PORT', 6697),
+            'tls' => true,
+            // zenet's TLS certificate does not name irc.zenet.org; the chain is still verified.
+            'tls_verify_peer_name' => false,
+            'channels' => ['#pre' => null, '#Pre.Spam' => null],
+        ],
+        'predatabase' => [
+            'enabled' => (bool) env('SCRAPE_IRC_PREDATABASE_ENABLED', false),
+            'format' => 'predatabase',
+            'source' => 'predataba.se',
+            'server' => env('SCRAPE_IRC_PREDATABASE_SERVER', 'irc.predataba.se'),
+            'port' => (int) env('SCRAPE_IRC_PREDATABASE_PORT', 6697),
+            'tls' => true,
+            // #p2ptrace announces P2P releases (WEB-DL groups) that the scene pre channels never carry.
+            'channels' => ['#pre' => null, '#pre.spam' => null, '#p2ptrace' => null],
+        ],
+        'efnet' => [
+            'enabled' => (bool) env('SCRAPE_IRC_EFNET_ENABLED', false),
+            'format' => 'corruptnet',
+            'source' => 'efnet',
+            'server' => env('SCRAPE_IRC_EFNET_SERVER', 'irc.efnet.org'),
+            // EFnet's servers present self-signed certificates, so verified TLS cannot connect. Plain IRC is
+            // the default (the channel is public and no password is sent); set TLS with port 6697 to opt in.
+            'port' => (int) env('SCRAPE_IRC_EFNET_PORT', 6667),
+            'tls' => (bool) env('SCRAPE_IRC_EFNET_TLS', false),
+            'channels' => ['#pre' => null],
+        ],
+        'abjects' => [
+            'enabled' => (bool) env('SCRAPE_IRC_ABJECTS_ENABLED', false),
+            'format' => 'zenet',
+            'source' => 'abjects',
+            'server' => env('SCRAPE_IRC_ABJECTS_SERVER', 'irc.abjects.net'),
+            'port' => (int) env('SCRAPE_IRC_ABJECTS_PORT', 6697),
+            'tls' => true,
+            'channels' => ['#MG-Pre' => null],
+        ],
+        'ngp' => [
+            'enabled' => (bool) env('SCRAPE_IRC_NGP_ENABLED', false),
+            'format' => 'ngp',
+            'source' => 'ngp.re',
+            'server' => env('SCRAPE_IRC_NGP_SERVER', 'irc.ngp.re'),
+            'port' => (int) env('SCRAPE_IRC_NGP_PORT', 6697),
+            'tls' => true,
+            'channels' => ['#ngpre' => null, '#ngpre.p2p.spam' => null],
+        ],
+        'rizon' => [
+            'enabled' => (bool) env('SCRAPE_IRC_RIZON_ENABLED', false),
+            'format' => 'rizon',
+            'source' => 'rizon',
+            'server' => env('SCRAPE_IRC_RIZON_SERVER', 'irc.rizon.net'),
+            'port' => (int) env('SCRAPE_IRC_RIZON_PORT', 6697),
+            'tls' => true,
+            'channels' => ['#pre' => null],
+        ],
+        // Public mixed-format relay: receipt is only an observation; upstream PRE time stays unknown.
+        'opentrackers' => [
+            'enabled' => (bool) env('SCRAPE_IRC_OPENTRACKERS_ENABLED', false),
+            'format' => 'opentrackers',
+            'source' => 'opentrackers-relay',
+            'server' => env('SCRAPE_IRC_OPENTRACKERS_SERVER', 'irc.opentrackers.org'),
+            'port' => (int) env('SCRAPE_IRC_OPENTRACKERS_PORT', 6697),
+            'tls' => true,
+            'channels' => ['#pre-all' => null, '#p2p-pre' => null],
+        ],
+        // WebSocket push feeds (not IRC): the same rows as the predb.club and predb.net JSON APIs, about
+        // a second after the pre. The scheduled feed import still backfills anything missed while disconnected.
+        'predbclub_ws' => [
+            'enabled' => (bool) env('PREDB_STREAM_PREDB_CLUB_ENABLED', false),
+            'type' => 'websocket',
+            'format' => 'predb_club',
+            'url' => env('PREDB_STREAM_PREDB_CLUB_URL', 'wss://predb.club/api/v1/ws'),
+        ],
+        'predbnet_ws' => [
+            'enabled' => (bool) env('PREDB_STREAM_PREDB_NET_ENABLED', false),
+            'type' => 'websocket',
+            'format' => 'predb_net',
+            'url' => env('PREDB_STREAM_PREDB_NET_URL', 'wss://api.predb.net/ws'),
+        ],
+    ],
 
     /***********************************************************************************************************************
      * This is a list of all the sources we fetch PRE's from.

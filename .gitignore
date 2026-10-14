@@ -4,6 +4,7 @@ docker/.zsh_history
 docker/composer-auth.json
 docker/php-overrides.local.ini
 docker-compose.yml
+!docker/docker-compose.yml
 docker-compose.override.yml
 .env
 install.lock
@@ -72,8 +73,14 @@ yarn.lock
 pnpm-lock.yaml
 
 # Agent skills are installed globally by scripts/install-global-skills.sh
-/.agents/skills/
-/.claude/skills/
+/.agents/skills/*
+!/.agents/skills/nntmux-development
+!/.agents/skills/performance-validation
+!/.agents/skills/production-operations
+/.claude/skills/*
+!/.claude/skills/nntmux-development
+!/.claude/skills/performance-validation
+!/.claude/skills/production-operations
 /.cursor/skills/
 
 # Terraform providers, local configuration, plans, and state
@@ -94,3 +101,11 @@ deploy/**/__pycache__/
 /infra/ansible/inventory/*.yml
 /infra/ansible/inventory/*.json
 /infra/ansible/.cache/
+
+# Self-hosted docker/ stack runtime state and secrets
+/docker/data/
+/docker/logs/
+/docker/backups/
+/docker/.env
+/docker/config/app.env
+/docker/config/usenet_servers.json

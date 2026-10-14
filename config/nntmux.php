@@ -64,6 +64,8 @@ return [
         'reconcile_batch_size' => (int) env('CBP_RECONCILE_BATCH_SIZE', 500),
         // Maximum flattened binary/part rows loaded while streaming an NZB.
         'nzb_stream_rows' => (int) env('CBP_NZB_STREAM_ROWS', 5000),
+        // Collection id span checked for orphans by one cleanup pass; passes resume from a stored cursor.
+        'orphan_scan_window' => (int) env('CBP_ORPHAN_SCAN_WINDOW', 250000),
         // Explicit maintenance-window approval for the destructive hash/key migration.
         'storage_migration_execute' => (bool) env('CBP_STORAGE_MIGRATION_EXECUTE', false),
     ],
@@ -76,11 +78,18 @@ return [
         'release_cache_stale_ttl' => (int) env('API_RELEASE_CACHE_STALE_TTL', 900),
         'release_cache_lock_ttl' => (int) env('API_RELEASE_CACHE_LOCK_TTL', 15),
         'async_audit' => (bool) env('API_ASYNC_AUDIT', true),
+        // Cache store holding the per-user quota lock. Blank = the default store, or "database" when the
+        // default is a failover chain (a lock split across two backends could be granted twice).
+        'quota_lock_store' => (string) env('API_QUOTA_LOCK_STORE', ''),
         'audit_queue' => env('API_AUDIT_QUEUE', 'api-audit'),
         'access_update_interval' => (int) env('API_ACCESS_UPDATE_INTERVAL', 60),
         'metrics_sample_rate' => (float) env('API_METRICS_SAMPLE_RATE', 0.01),
         // Max JSON body for HTTP QUERY API requests; nginx bounds QUERY bodies before PHP decodes them.
         'query_max_body_bytes' => (int) env('API_QUERY_MAX_BODY_BYTES', 8192),
+        // Rows per search page, advertised in caps as <limits max default>; clients such as
+        // Lidarr and Prowlarr page with the advertised default.
+        'max_limit' => (int) env('API_MAX_LIMIT', 500),
+        'default_limit' => (int) env('API_DEFAULT_LIMIT', 250),
     ],
     'block_proxy_indexer_apps' => (bool) env('BLOCK_PROXY_INDEXER_APPS', false),
     'block_proxy_indexer_app_user_agents' => env('BLOCK_PROXY_INDEXER_APP_USER_AGENTS', 'Prowlarr/,NZBHydra2'),
@@ -105,11 +114,20 @@ return [
     | Release dedupe (import-time)
     |--------------------------------------------------------------------------
     |
-    | Size tolerance for matching an existing release when deduping imports
-    | (collections / NZB). Default 0.05 = ±5% on total bytes (par2/RAR drift).
+    | Legacy dedupe options remain compatible with existing installations. Metadata
+    | equality never suppresses an upload without actual article coverage proof.
+    | NZB import verifies coverage independently of release_dedupe_enabled; its
+    | bounded comparison retains uploads when coverage cannot be proved. The size
+    | tolerance is retained for compatibility and does not define article identity.
+    | Metadata-only cross-post cleanup is disabled. Header collection grouping is
+    | a separate ingestion behavior, unaffected by these settings.
     |
     */
+    'release_dedupe_enabled' => (bool) env('RELEASE_DEDUPE_ENABLED', true),
     'release_dedupe_size_tolerance' => (float) env('RELEASE_DEDUPE_SIZE_TOLERANCE', 0.05),
+    // Cache store for the per-article NZB import lock under every metadata setting. Use a store with real
+    // lock support (database needs the cache_locks table; redis works too), not a failover store.
+    'release_dedupe_lock_store' => (string) env('RELEASE_DEDUPE_LOCK_STORE', 'database'),
     'btcpay_webhook_secret' => env('BTCPAY_SECRET'),
     'tmp_unrar_path' => env('TEMP_UNRAR_PATH', storage_path('tmp/unrar/')),
     'tmp_unzip_path' => env('TEMP_UNZIP_PATH', storage_path('tmp/unzip/')),

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\NameFixing;
 
+use App\Support\PredbSearchDocument;
 use App\Traits\DetectsHashedNames;
 
 /**
@@ -17,6 +18,33 @@ class FileNameCleaner
     use DetectsHashedNames;
 
     protected NzbSplitUnwrapper $nzbSplitUnwrapper;
+
+    /** @var array<string, string|false>|null */
+    private ?array $matchingReuse = null;
+
+    /**
+     * Reuse pure filename cleaning only during one synchronous PreDB lookup.
+     * Custom cleaners may depend on mutable state and must retain every call.
+     *
+     * @template TResult
+     *
+     * @param  callable(): TResult  $lookup
+     * @return TResult
+     */
+    public function withMatchingReuse(callable $lookup, bool $joinActiveLookup = false): mixed
+    {
+        if (get_class($this) !== self::class || ($joinActiveLookup && $this->matchingReuse !== null)) {
+            return $lookup();
+        }
+
+        $previous = $this->matchingReuse;
+        $this->matchingReuse = [];
+        try {
+            return $lookup();
+        } finally {
+            $this->matchingReuse = $previous;
+        }
+    }
 
     public function __construct(?NzbSplitUnwrapper $nzbSplitUnwrapper = null)
     {
@@ -82,15 +110,94 @@ class FileNameCleaner
     private const SUBTITLE_EXTENSIONS = '/\.(srt|sub|idx|ass|ssa|vtt|sup)$/i';
 
     /**
+     * Strip archive wrappers and part/volume markers repeatedly (`.rar.par2`, `.tar.zst`, `.7z.003`,
+     * `.part01.rar`), then at most one payload extension. Only one, so a title that ends in a token that is
+     * also an extension (`Movie.2020.1080p.DTS.mkv`) keeps it.
+     */
+    public function stripFileSuffixes(string $fileName): string
+    {
+        return $this->stripKnownFileSuffixes($fileName, preserveCodecAfterWrapper: true);
+    }
+
+    /**
+     * Validate only bytes appended after an already confirmed complete canonical title.
+     * Codec words here are payload extensions, so title-preservation heuristics do not apply.
+     */
+    public function isKnownFileSuffix(string $suffix): bool
+    {
+        return $suffix === '' || $this->stripKnownFileSuffixes('Title'.$suffix, preserveCodecAfterWrapper: false) === 'Title';
+    }
+
+    private function stripKnownFileSuffixes(string $fileName, bool $preserveCodecAfterWrapper): string
+    {
+        $wrappers = [
+            ...self::ARCHIVE_PATTERNS,
+            '/\.(zst|tgz|lz4|enc|rev)$/i',
+            '/\.vol\d+[+-]\d+$/i',
+            '/\.part\d{0,4}$/i',
+            '/\.(nfo|sfv|nzb|srr|srs)$/i',
+        ];
+
+        $original = $fileName;
+        do {
+            $previous = $fileName;
+            $fileName = preg_replace($wrappers, '', $fileName) ?? $fileName;
+        } while ($fileName !== $previous);
+
+        // After a wrapper (`.rar`, `.par2`) came off, a trailing codec word is part of the title, not a file
+        // extension: `Movie.2020.1080p.DTS.rar` is the title `Movie.2020.1080p.DTS`.
+        if ($preserveCodecAfterWrapper && $fileName !== $original && preg_match('/\.(dts|ac3|eac3|truehd|ts|opus|flac|aac|mp3|ogg|wav|m4a|mka|wma)$/i', $fileName) === 1) {
+            return $fileName;
+        }
+
+        // Document and playlist files that the shared payload lists do not cover.
+        $extraPayload = '/\.(docx?|rtf|xlsx?|pptx?|odt|m3u8?|txt|m4b|aiff?|amr|m2v|m1v|mpv|mpgv|qt|mp2|ra|w64|ifo|mks|ogm)$/i';
+
+        foreach ([self::VIDEO_EXTENSIONS, self::AUDIO_EXTENSIONS, self::IMAGE_EXTENSIONS, self::EBOOK_EXTENSIONS, self::GAMEAPP_EXTENSIONS, self::SUBTITLE_EXTENSIONS, $extraPayload] as $payload) {
+            $stripped = preg_replace($payload, '', $fileName) ?? $fileName;
+            if ($stripped !== $fileName) {
+                return $stripped;
+            }
+        }
+
+        return $fileName;
+    }
+
+    /**
      * Clean a filename for PreDB matching.
      *
      * @param  string  $fileName  The filename to clean
      * @return string|false The cleaned filename or false if invalid
      */
-    public function cleanForMatching(string $fileName): string|false
+    public function cleanForMatching(string $fileName, bool $preserveLeadingNumber = false): string|false
     {
-        // Strip non-printing characters
-        $fileName = preg_replace('/[[:^print:]]/', '', $fileName);
+        // Bound retained entries and raw key bytes; oversize inputs still use the normal cleaner.
+        if ($this->matchingReuse === null || strlen($fileName) > 4096) {
+            return $this->computeForMatching($fileName, $preserveLeadingNumber);
+        }
+
+        $key = ($preserveLeadingNumber ? '1:' : '0:').$fileName;
+        if (array_key_exists($key, $this->matchingReuse)) {
+            return $this->matchingReuse[$key];
+        }
+
+        $cleaned = $this->computeForMatching($fileName, $preserveLeadingNumber);
+        if (count($this->matchingReuse) < 256) {
+            $this->matchingReuse[$key] = $cleaned;
+        }
+
+        return $cleaned;
+    }
+
+    private function computeForMatching(string $fileName, bool $preserveLeadingNumber): string|false
+    {
+        if (! mb_check_encoding($fileName, 'UTF-8')
+            || preg_match('/(?![\x00-\x7F])\p{C}/u', $fileName) !== 0) {
+            return false;
+        }
+
+        // Keep ASCII control cleanup without erasing valid Unicode spelling into another title.
+        $fileName = preg_replace('/[\x00-\x1F\x7F]/', '', $fileName);
 
         if ($fileName === '' || str_starts_with($fileName, '.')) {
             return false;
@@ -125,7 +232,9 @@ class FileNameCleaner
         $fileName = preg_replace('/[\.\-_]?(part|vol|cd|dvd|disc|disk)\d*$/i', '', $fileName);
 
         // Remove leading track numbers
-        $fileName = preg_replace('/^\d{1,3}[\.\-_\s]+(?=[A-Za-z])/', '', $fileName);
+        if (! $preserveLeadingNumber) {
+            $fileName = preg_replace('/^\d{1,3}[\.\-_\s]+(?=[A-Za-z])/', '', $fileName);
+        }
 
         // Trim whitespace and punctuation
         $fileName = trim($fileName, " \t\n\r\0\x0B.-_");
@@ -135,6 +244,16 @@ class FileNameCleaner
         }
 
         return $fileName;
+    }
+
+    /** Numeric-only aliases cannot establish a canonical release identity. */
+    public function matchesPredbFilenameEvidence(string $fileName, string $query): bool
+    {
+        $cleaned = $this->cleanForMatching($fileName, preserveLeadingNumber: true);
+
+        return $cleaned !== false
+            && preg_match('/^[\p{N}\p{P}\p{Z}\s]+$/uD', $cleaned) === 0
+            && PredbSearchDocument::exactValue($cleaned) === PredbSearchDocument::exactValue($query);
     }
 
     /**
@@ -368,6 +487,23 @@ class FileNameCleaner
         }
 
         return false;
+    }
+
+    /** Keep only complete technical scene titles eligible for literal byte preservation. */
+    public function isLiteralTechnicalSceneTitle(string $title): bool
+    {
+        if (! mb_check_encoding($title, 'UTF-8') || mb_strlen($title, 'UTF-8') > 255
+            || preg_match('/\p{C}/u', $title) !== 0
+            || preg_match('/\A(?<stem>[\p{L}\p{N}][\p{L}\p{N}\p{M}._-]*)-[A-Za-z0-9]{2,15}\z/u', $title, $parts) !== 1
+            || preg_match('/[._-](?:sample|proof|thumbs?|part\d+|vol\d+(?:[+-]\d+)?)\z/i', $title) === 1) {
+            return false;
+        }
+
+        $technicalToken = '/(?:^|[._-])(?:480p|576p|720p|1080[pi]|2160p|4320p|[48]k|web[._-]?dl|webrip|bluray|bdrip|brrip|dvdrip|hdtv|sdtv|x264|x265|h[._]?26[45]|hevc|avc|xvid|divx|aac|ac3|eac3|ddp?[0-9](?:[._][0-9])?|dts(?:[._-]?hd)?|flac|mp3|truehd|pal|ntsc)(?=$|[._-])/i';
+
+        return preg_match($technicalToken, $parts['stem']) === 1
+            && $this->looksLikeSceneRelease($title)
+            && $this->isPlausibleReleaseTitle($title);
     }
 
     public function extractNzbSplitName(string $value): ?string

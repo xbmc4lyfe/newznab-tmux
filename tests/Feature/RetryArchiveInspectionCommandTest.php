@@ -58,10 +58,22 @@ class RetryArchiveInspectionCommandTest extends TestCase
         DB::purge();
         DB::reconnect();
 
+        Schema::dropIfExists('categories');
+        Schema::create('categories', function (Blueprint $table): void {
+            $table->unsignedInteger('id')->primary();
+            $table->integer('disablepreview');
+        });
+        DB::table('categories')->insert([
+            ['id' => 2000, 'disablepreview' => 0],
+            ['id' => 3000, 'disablepreview' => 1],
+        ]);
+
         Schema::dropIfExists('releases');
         Schema::create('releases', function (Blueprint $table): void {
             $table->unsignedInteger('id')->primary();
             $table->string('name');
+            $table->unsignedInteger('categories_id');
+            $table->unsignedBigInteger('size');
             $table->integer('passwordstatus');
             $table->integer('haspreview');
             $table->integer('nzbstatus');
@@ -77,6 +89,8 @@ class RetryArchiveInspectionCommandTest extends TestCase
             $this->releaseRow(6, 'Listed.Release.rar', passwordStatus: 0),
             $this->releaseRow(7, 'Pending.Release.rar', hasPreview: -1),
             $this->releaseRow(8, 'No.Nzb.Release.rar', nzbStatus: 0),
+            $this->releaseRow(9, 'Preview.Disabled.Release.rar', categoryId: 3000),
+            $this->releaseRow(10, 'Too.Small.Release.rar', size: 1024),
         ]);
     }
 
@@ -123,7 +137,8 @@ class RetryArchiveInspectionCommandTest extends TestCase
         $this->assertSame([now()->toDateTimeString()], $queued->pluck('archive_retry_at')->unique()->values()->all());
         $this->assertSame(0, (int) DB::table('releases')->where('id', 5)->value('haspreview'));
         $this->assertSame('2026-10-01 00:00:00', DB::table('releases')->where('id', 5)->value('archive_retry_at'));
-        $this->assertSame(0, DB::table('releases')->whereIn('id', [6, 7, 8])->whereNotNull('archive_retry_at')->count());
+        $this->assertSame(0, DB::table('releases')->whereIn('id', [6, 7, 8, 9, 10])->whereNotNull('archive_retry_at')->count());
+        $this->assertSame(0, DB::table('releases')->whereIn('id', [9, 10])->where('haspreview', -1)->count());
     }
 
     /**
@@ -136,10 +151,14 @@ class RetryArchiveInspectionCommandTest extends TestCase
         int $hasPreview = 0,
         int $nzbStatus = 1,
         ?string $archiveRetryAt = null,
+        int $categoryId = 2000,
+        int $size = 10_485_760,
     ): array {
         return [
             'id' => $id,
             'name' => $name,
+            'categories_id' => $categoryId,
+            'size' => $size,
             'passwordstatus' => $passwordStatus,
             'haspreview' => $hasPreview,
             'nzbstatus' => $nzbStatus,

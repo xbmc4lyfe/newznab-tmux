@@ -182,10 +182,15 @@ final class BinaryHandler
             $existingKeys[$key] = true;
         }
 
+        // Unique-key order (collections_id, binaryhash), so concurrent workers upserting the
+        // same cross-posted binaries take their locks in the same sequence instead of deadlocking.
+        $sortedRows = $lookupRows;
+        usort($sortedRows, static fn (array $a, array $b): int => [(int) $a['collections_id'], (string) $a['hash']] <=> [(int) $b['collections_id'], (string) $b['hash']]);
+
         if (DB::getDriverName() === 'sqlite') {
-            $this->bulkInsertBinariesSqlite($lookupRows);
+            $this->bulkInsertBinariesSqlite($sortedRows);
         } else {
-            $this->bulkInsertBinariesMysql($lookupRows);
+            $this->bulkInsertBinariesMysql($sortedRows);
         }
 
         // Only re-query for rows we couldn't satisfy from the prefetch
@@ -288,33 +293,25 @@ final class BinaryHandler
         $driver = DB::getDriverName();
         $hashExpression = $driver === 'sqlite' ? 'binaryhash' : 'LOWER(HEX(binaryhash))';
 
-        // Group lookups by collections_id and run small `binaryhash IN (...)`
-        // queries per collection. This avoids producing a single
-        // `WHERE (... AND ...) OR (... AND ...) OR ...` expression with
-        // thousands of clauses and bindings, which both bloats the SQL
-        // string in PHP and can force MySQL into pathological plans.
-        $rowsByCollection = [];
-        foreach ($rows as $row) {
-            $rowsByCollection[(int) $row['collections_id']][] = (string) $row['hash'];
-        }
-
+        // Resolve bounded composite keys together: per-collection lookups add round trips
+        // while the header transaction holds parent locks across cross-posted collections.
         $results = [];
-        foreach ($rowsByCollection as $collectionId => $hashes) {
-            $hashes = array_values(array_unique($hashes));
-            foreach (array_chunk($hashes, $this->sqlChunkSize) as $chunk) {
-                $placeholders = implode(',', array_fill(0, \count($chunk), $driver === 'sqlite' ? '?' : 'UNHEX(?)'));
-                $bindings = $chunk;
-                $bindings[] = $collectionId;
+        foreach (array_chunk($rows, $this->sqlChunkSize) as $chunk) {
+            $tuples = implode(',', array_fill(0, \count($chunk), $driver === 'sqlite' ? '(?, ?)' : '(?, UNHEX(?))'));
+            $bindings = [];
+            foreach ($chunk as $row) {
+                $bindings[] = (int) $row['collections_id'];
+                $bindings[] = (string) $row['hash'];
+            }
 
-                $rowsResult = DB::select(
-                    "SELECT id, {$hashExpression} AS hashvalue, collections_id FROM binaries "
-                    ."WHERE binaryhash IN ({$placeholders}) AND collections_id = ?",
-                    $bindings
-                );
+            $rowsResult = DB::select(
+                "SELECT id, {$hashExpression} AS hashvalue, collections_id FROM binaries "
+                ."WHERE (collections_id, binaryhash) IN ({$tuples})",
+                $bindings
+            );
 
-                foreach ($rowsResult as $r) {
-                    $results[] = $r;
-                }
+            foreach ($rowsResult as $row) {
+                $results[] = $row;
             }
         }
 
@@ -436,21 +433,44 @@ final class BinaryHandler
                 return true;
             }
 
+            // An UPDATE that joins parts locks every parts row it reads, even under
+            // READ-COMMITTED, and concurrent header writers on the same group deadlocked
+            // on those locks. Instead lock just the binaries rows, in id order, so a
+            // concurrent writer to the same binary commits first; then a plain SELECT
+            // (READ COMMITTED, see HeaderStorageTransaction) sees its parts and ours.
             $chunkSize = max(1, min($chunkSize, $this->sqlChunkSize));
+            sort($binaryIds);
             foreach (array_chunk($binaryIds, $chunkSize) as $chunk) {
-                $placeholders = implode(',', array_fill(0, \count($chunk), '?'));
+                DB::table('binaries')->whereIn('id', $chunk)->orderBy('id')->lockForUpdate()->pluck('id');
+                $aggregates = DB::table('parts')
+                    ->whereIn('binaries_id', $chunk)
+                    ->groupBy('binaries_id')
+                    ->orderBy('binaries_id')
+                    ->selectRaw('binaries_id, COUNT(*) AS currentparts, COALESCE(SUM(size), 0) AS partsize')
+                    ->get();
+                if ($aggregates->isEmpty()) {
+                    continue;
+                }
+
+                $currentParts = '';
+                $partSizes = '';
+                $bindings = ['currentparts' => [], 'partsize' => [], 'partcheck' => [], 'ids' => []];
+                foreach ($aggregates as $aggregate) {
+                    $currentParts .= ' WHEN ? THEN ?';
+                    $partSizes .= ' WHEN ? THEN ?';
+                    array_push($bindings['currentparts'], (int) $aggregate->binaries_id, (int) $aggregate->currentparts);
+                    array_push($bindings['partsize'], (int) $aggregate->binaries_id, (int) $aggregate->partsize);
+                    array_push($bindings['partcheck'], (int) $aggregate->binaries_id, (int) $aggregate->currentparts);
+                    $bindings['ids'][] = (int) $aggregate->binaries_id;
+                }
+                $placeholders = implode(',', array_fill(0, \count($bindings['ids']), '?'));
                 DB::update(
-                    "UPDATE binaries b
-                     INNER JOIN (
-                         SELECT p.binaries_id, COUNT(*) AS currentparts, COALESCE(SUM(p.size), 0) AS partsize
-                         FROM parts p
-                         WHERE p.binaries_id IN ({$placeholders})
-                         GROUP BY p.binaries_id
-                     ) a ON a.binaries_id = b.id
-                     SET b.currentparts = a.currentparts,
-                         b.partsize = a.partsize,
-                         b.partcheck = CASE WHEN a.currentparts >= b.totalparts THEN 1 ELSE 0 END",
-                    $chunk
+                    "UPDATE binaries
+                     SET currentparts = CASE id{$currentParts} END,
+                         partsize = CASE id{$partSizes} END,
+                         partcheck = CASE WHEN (CASE id{$currentParts} END) >= totalparts THEN 1 ELSE 0 END
+                     WHERE id IN ({$placeholders})",
+                    [...$bindings['currentparts'], ...$bindings['partsize'], ...$bindings['partcheck'], ...$bindings['ids']]
                 );
             }
 

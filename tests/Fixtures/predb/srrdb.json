@@ -1,0 +1,30 @@
+{
+ "results": [
+  {
+   "release": "Kopfwehmusik_-_Mitten_in_Karnten-(4068413259169)-SINGLE-WEB-DE-2026-ZzZz",
+   "date": "2026-10-09 22:13:12",
+   "hasNFO": "no",
+   "hasSRS": "no",
+   "isForeign": "no",
+   "imdbId": null,
+   "size": 122400
+  },
+  {
+   "release": "The.Celebrity.Traitors.S02E04.1080p.HDTV.H264-DARKFLiX",
+   "date": "2026-10-09 22:12:51",
+   "hasNFO": "yes",
+   "hasSRS": "yes",
+   "isForeign": "no",
+   "imdbId": null,
+   "size": 2525477629
+  },
+  {
+   "release": "",
+   "date": "2026-10-09 00:00:00",
+   "size": 0
+  }
+ ],
+ "resultsCount": 10060427,
+ "warnings": [],
+ "query": []
+}

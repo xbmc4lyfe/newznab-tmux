@@ -300,6 +300,41 @@ class TmuxRuntimeTest extends TestCase
         $this->assertLessThan(2, microtime(true) - $started);
     }
 
+    public function test_wait_notices_an_exit_whose_hook_never_fires(): void
+    {
+        // No pane-died hook: the wait must still see the pane die, as it must when tmux
+        // misses the SIGCHLD or the wake-up goes to a stale waiter.
+        $session = new TmuxSessionManager('hookless-session');
+        $id = $session->createSession();
+        $this->assertNotNull($id);
+        $panes = new TmuxPaneManager('hookless-session');
+        $this->assertTrue($panes->respawnPane($id, [PHP_BINARY, '-r', 'usleep(200000);']));
+
+        $started = microtime(true);
+        $panes->waitForExit(5);
+
+        $this->assertLessThan(2.5, microtime(true) - $started);
+        $panes->refresh();
+        $this->assertTrue($panes->paneSnapshot()[$id]['dead']);
+    }
+
+    public function test_wait_lasts_the_full_timeout_while_every_pane_keeps_running(): void
+    {
+        $session = new TmuxSessionManager('busy-session');
+        $id = $session->createSession();
+        $this->assertNotNull($id);
+        $panes = new TmuxPaneManager('busy-session');
+        $this->assertTrue($panes->installExitHook());
+        $this->assertTrue($panes->respawnPane($id, ['sleep', '60']));
+
+        $started = microtime(true);
+        $panes->waitForExit(2);
+        $elapsed = microtime(true) - $started;
+
+        $this->assertGreaterThanOrEqual(1.9, $elapsed);
+        $this->assertLessThan(3.5, $elapsed);
+    }
+
     public function test_stop_cancels_owned_workers_without_finishing_or_starting_queued_jobs(): void
     {
         if (! function_exists('pcntl_signal') || ! function_exists('posix_kill')) {

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Unit;
 
 use App\Console\Commands\NntmuxOffsetWorker;
+use App\Services\NameFixing\PredbMatchSelector;
 use App\Services\Search\Drivers\ElasticSearchDriver;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use App\Support\PredbSearchDocument;
@@ -18,6 +19,7 @@ use Illuminate\Container\Container;
 use Illuminate\Support\Facades\Facade;
 use Illuminate\Support\Facades\Log;
 use Manticoresearch\Client;
+use Manticoresearch\Request;
 use Manticoresearch\Response;
 use Mockery;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -63,6 +65,44 @@ final class PredbSearchDriverTest extends TestCase
     public static function backends(): array
     {
         return ['manticore' => ['manticore'], 'elasticsearch' => ['elasticsearch']];
+    }
+
+    #[DataProvider('repairBulkResponses')]
+    public function test_insert_only_repair_requires_a_complete_bulk_acknowledgement(array $response, bool $accepted): void
+    {
+        $client = new class($response) extends Client
+        {
+            public function __construct(private array $response) {}
+
+            public function request(Request $request, array $params = [], string $retryReason = ''): Response
+            {
+                return new Response($this->response);
+            }
+        };
+        $driver = new ManticoreSearchDriver(['indexes' => ['predb' => 'predb_rt']]);
+        $driver->manticoreSearch = $client;
+
+        self::assertSame($accepted ? ['success' => 2, 'errors' => 0] : ['success' => 0, 'errors' => 2],
+            $driver->bulkInsertPredb([['id' => 17, 'title' => 'A'], ['id' => 91, 'title' => 'B']], false));
+    }
+
+    public static function repairBulkResponses(): array
+    {
+        $acknowledgement = ['items' => [['bulk' => ['table' => 'predb_rt', '_id' => 17, 'created' => 2,
+            'deleted' => 0, 'updated' => 0, 'result' => 'created', 'status' => 201]]],
+            'errors' => false, 'error' => '', 'current_line' => 3, 'skipped_lines' => 0];
+        $cases = ['complete' => [$acknowledgement, true], 'empty' => [[], false],
+            'missing acknowledgement' => [['errors' => false], false]];
+        foreach (['errors' => true, 'error' => 'duplicate ID', 'warning' => 'partial write', 'skipped_lines' => 1] as $key => $value) {
+            $cases[$key] = [array_replace($acknowledgement, [$key => $value]), false];
+        }
+        foreach (['table' => 'wrong_table', 'created' => 1, 'deleted' => 1, 'updated' => 1, 'result' => 'updated', 'status' => 500] as $key => $value) {
+            $response = $acknowledgement;
+            $response['items'][0]['bulk'][$key] = $value;
+            $cases[$key] = [$response, false];
+        }
+
+        return $cases;
     }
 
     #[DataProvider('backends')]
@@ -244,6 +284,88 @@ final class PredbSearchDriverTest extends TestCase
             self::assertSame(['term' => [$field.'_exact' => mb_strtolower($name)]], $request['body']['query']);
             self::assertSame(1, $request['body']['size']);
         }
+    }
+
+    public function test_projection_aware_public_search_feeds_real_selector(): void
+    {
+        $query = 'Synthetic.Archive-GROUP';
+        $document = ['id' => 999, 'title' => 'Canonical.Release-GROUP', 'filename' => $query.'.mkv', 'source' => 'synthetic-fixture'];
+        $requests = [];
+        $client = $this->elasticClient(function (RequestInterface $request) use (&$requests, $document): HttpResponse {
+            self::assertSame('/custom_pre/_search', $request->getUri()->getPath());
+            $body = json_decode((string) $request->getBody(), true, 512, JSON_THROW_ON_ERROR);
+            $requests[] = $body;
+            self::assertIsArray($body['_source']);
+            // Enforce the actual Elasticsearch source projection rather than returning the full fixture.
+            $projected = array_intersect_key($document, array_flip($body['_source']));
+
+            return $this->elasticResponse(['hits' => ['hits' => [['_id' => '7', '_source' => $projected]], 'total' => ['value' => 1, 'relation' => 'eq']]]);
+        });
+        $this->setElasticClient($client);
+        $driver = new ElasticSearchDriver(['indexes' => ['predb' => 'custom_pre']]);
+        $hits = $driver->searchPredb($query);
+        self::assertCount(1, $requests);
+        $selector = new PredbMatchSelector;
+        $selected = $selector->selectBestMatch($query, $hits);
+        self::assertSame(['id' => 7, 'title' => $document['title'], 'filename' => $document['filename'], 'source' => $document['source']], $selected);
+        self::assertSame(['title', 'filename', 'source'], $requests[0]['_source']);
+        self::assertNull($selector->selectBestMatch('Synthetic_Archive-GROUP', $hits));
+    }
+
+    public function test_projection_aware_public_search_rejects_punctuation_near_filename(): void
+    {
+        $query = 'Synthetic.Archive-GROUP';
+        $document = ['id' => 999, 'title' => 'Canonical.Release-GROUP', 'filename' => 'Synthetic_Archive-GROUP.mkv', 'source' => 'synthetic-fixture'];
+        $requests = [];
+        $client = $this->elasticClient(function (RequestInterface $request) use (&$requests, $document): HttpResponse {
+            $body = json_decode((string) $request->getBody(), true, 512, JSON_THROW_ON_ERROR);
+            $requests[] = $body;
+            $projected = array_intersect_key($document, array_flip($body['_source']));
+
+            return $this->elasticResponse(['hits' => ['hits' => [['_id' => '7', '_source' => $projected]], 'total' => ['value' => 1, 'relation' => 'eq']]]);
+        });
+        $this->setElasticClient($client);
+        $driver = new ElasticSearchDriver(['indexes' => ['predb' => 'custom_pre']]);
+        $hits = $driver->searchPredb($query);
+        self::assertCount(1, $requests);
+        self::assertSame(7, $hits[0]['id']);
+        self::assertSame($document['filename'], $hits[0]['filename']);
+        self::assertNull((new PredbMatchSelector)->selectBestMatch($query, $hits));
+    }
+
+    public function test_public_predb_search_skips_stale_projection_cache_and_caches_canonical_results(): void
+    {
+        $query = 'Synthetic.Archive-GROUP';
+        $driver = new ElasticSearchDriver(['indexes' => ['predb' => 'custom_pre']]);
+        $keywords = (new ReflectionMethod($driver, 'sanitizeSearchTerms'))->invoke($driver, $query);
+        $keyMethod = new ReflectionMethod($driver, 'buildCacheKey');
+        $oldKey = $keyMethod->invoke($driver, 'predb_search_v2', [$keywords]);
+        $newKey = $keyMethod->invoke($driver, 'predb_search_v3', [$keywords]);
+        $cache = Container::getInstance()->make('cache');
+        $stale = [['id' => 7, 'title' => '', 'filename' => '', 'source' => '']];
+        $cache->put($oldKey, $stale, 300);
+        $cache->put('unrelated-fixture-key', ['keep' => true], 300);
+        $document = ['id' => 999, 'title' => 'Canonical.Release-GROUP', 'filename' => $query.'.mkv', 'source' => 'synthetic-fixture'];
+        $requests = [];
+        $this->setElasticClient($this->elasticClient(function (RequestInterface $request) use (&$requests, $document): HttpResponse {
+            self::assertSame('/custom_pre/_search', $request->getUri()->getPath());
+            $body = json_decode((string) $request->getBody(), true, 512, JSON_THROW_ON_ERROR);
+            $requests[] = $body;
+            self::assertSame(['title', 'filename', 'source'], $body['_source']);
+            $projected = array_intersect_key($document, array_flip($body['_source']));
+
+            return $this->elasticResponse(['hits' => ['hits' => [['_id' => '7', '_source' => $projected]], 'total' => ['value' => 1, 'relation' => 'eq']]]);
+        }));
+        $hits = $driver->searchPredb($query);
+        self::assertCount(1, $requests, 'Stale v2 cache must not suppress the fresh projected request');
+        $expected = ['id' => 7, 'title' => $document['title'], 'filename' => $document['filename'], 'source' => $document['source']];
+        self::assertSame([$expected], $hits);
+        self::assertSame($expected, (new PredbMatchSelector)->selectBestMatch($query, $hits));
+        self::assertSame([$expected], $cache->get($newKey));
+        self::assertSame($hits, $driver->searchPredb($query));
+        self::assertCount(1, $requests, 'Second lookup must reuse v3 results');
+        self::assertSame($stale, $cache->get($oldKey));
+        self::assertSame(['keep' => true], $cache->get('unrelated-fixture-key'));
     }
 
     private function setElasticClient(ElasticClient $client): void

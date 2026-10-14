@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
+use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Collection;
 use App\Models\Release;
 use App\Models\ReleaseNzbCreationFailure;
@@ -99,6 +100,9 @@ class NzbService
 
     public function createNzbForRelease(Release $release): NzbCreationResult
     {
+        if (config('release_verification.required', true)) {
+            return NzbCreationResult::transient('Release verification must publish the verified NZB; header-only creation is disabled.');
+        }
         try {
             $collections = Collection::whereReleasesId($release->id)
                 ->join('usenet_groups', 'collections.groups_id', '=', 'usenet_groups.id')
@@ -183,6 +187,7 @@ class NzbService
 
             $cursor = ['collection_id' => 0, 'name' => '', 'binary_id' => 0, 'partnumber' => 0];
             $openBinaryId = 0;
+            $fingerprintAccumulator = new NzbArticleFingerprint;
             do {
                 $page = $this->loadNzbRowPage((int) $release->id, $cursor);
                 foreach ($page as $row) {
@@ -221,6 +226,7 @@ class NzbService
                         return NzbCreationResult::deterministic("Part {$row->partnumber} for binary {$binaryId} has an empty message ID.", $collectionIds, $path);
                     }
 
+                    $fingerprintAccumulator->add($messageId);
                     $XMLWriter->startElement('segment');
                     $XMLWriter->writeAttribute('bytes', (string) $row->size);
                     $XMLWriter->writeAttribute('number', (string) $row->partnumber);
@@ -263,8 +269,10 @@ class NzbService
                 return NzbCreationResult::transient("Final NZB file is missing or unreadable: {$path}", $collectionIds, $path);
             }
 
-            DB::transaction(function () use ($release): void {
-                $release->update($this->successfulReleaseUpdateValues());
+            $fingerprint = $fingerprintAccumulator->value();
+
+            DB::transaction(function () use ($release, $fingerprint): void {
+                $release->update($this->successfulReleaseUpdateValues($fingerprint));
 
                 if (NzbCreationCandidateQuery::supportsFailureState()) {
                     ReleaseNzbCreationFailure::query()
@@ -273,6 +281,14 @@ class NzbService
                     $release->unsetRelation('nzbCreationFailure');
                 }
             });
+            try {
+                CollectReleaseFingerprintMetadata::dispatch((int) $release->id);
+            } catch (Throwable $dispatchException) {
+                Log::warning('Could not queue release fingerprint metadata collection.', [
+                    'release_id' => $release->id,
+                    'exception' => $dispatchException::class,
+                ]);
+            }
         } catch (Throwable $e) {
             return NzbCreationResult::transient('Failed to write NZB file: '.$e->getMessage(), $collectionIds, $path);
         } finally {
@@ -473,6 +489,56 @@ class NzbService
     }
 
     /**
+     * Comparison-only read ceiling. Failed or over-limit reads consume their whole
+     * decoded allowance, so repeated corrupt candidates cannot bypass the budget.
+     */
+    public function readNzbContentsBounded(string $releaseGuid, int $maxCompressedBytes, int $maxDecodedBytes, ?int &$decodedBytes = null): string|false
+    {
+        $decodedBytes = 0;
+        if ($maxCompressedBytes <= 0 || $maxDecodedBytes <= 0) {
+            return false;
+        }
+        $path = $this->nzbPath($releaseGuid);
+        if (! is_string($path)) {
+            return false;
+        }
+        $compressed = @file_get_contents($path, false, null, 0, $maxCompressedBytes + 1);
+        if ($compressed === false || strlen($compressed) > $maxCompressedBytes || ! str_starts_with($compressed, "\x1f\x8b")) {
+            $decodedBytes = $maxDecodedBytes;
+
+            return false;
+        }
+        $inflater = @inflate_init(ZLIB_ENCODING_GZIP);
+        if ($inflater === false) {
+            $decodedBytes = $maxDecodedBytes;
+
+            return false;
+        }
+        $contents = '';
+        $length = strlen($compressed);
+        for ($offset = 0; $offset < $length; $offset += 256) {
+            $chunk = @inflate_add($inflater, substr($compressed, $offset, 256), $offset + 256 >= $length ? ZLIB_FINISH : ZLIB_SYNC_FLUSH);
+            if ($chunk === false || strlen($contents) + strlen($chunk) > $maxDecodedBytes) {
+                $decodedBytes = $maxDecodedBytes;
+
+                return false;
+            }
+            $contents .= $chunk;
+            if (inflate_get_status($inflater) === ZLIB_STREAM_END) {
+                break;
+            }
+        }
+        $decodedBytes = strlen($contents);
+        if (inflate_get_status($inflater) !== ZLIB_STREAM_END || inflate_get_read_len($inflater) !== $length) {
+            $decodedBytes = $maxDecodedBytes;
+
+            return false;
+        }
+
+        return $contents === '' ? false : $contents;
+    }
+
+    /**
      * Delete an NZB file.
      *
      * @param  string  $releaseGuid  The release GUID
@@ -658,27 +724,7 @@ class NzbService
      */
     private function normalizeSegmentMessageId(string $messageId): string
     {
-        $messageId = trim($messageId);
-
-        if ($messageId === '') {
-            return '';
-        }
-
-        if (
-            \strlen($messageId) >= 2
-            && (($messageId[0] === '"' && str_ends_with($messageId, '"'))
-                || ($messageId[0] === "'" && str_ends_with($messageId, "'")))
-        ) {
-            $messageId = substr($messageId, 1, -1);
-        }
-
-        $messageId = trim($messageId);
-
-        if (str_starts_with($messageId, '<') && str_ends_with($messageId, '>')) {
-            $messageId = substr($messageId, 1, -1);
-        }
-
-        return trim($messageId);
+        return NzbArticleFingerprint::normalizeMessageId($messageId);
     }
 
     /**
@@ -697,14 +743,27 @@ class NzbService
         return [];
     }
 
-    private function temporaryNzbPath(string $path): string
+    /**
+     * Temporary sibling for an NZB being written; recognised by {@see findStaleTemporaryNzbPaths()}.
+     */
+    public static function temporaryNzbPathFor(string $path): string
     {
         return $path.'.tmp.'.getmypid().'.'.bin2hex(random_bytes(6));
     }
 
-    private function isTemporaryNzbPath(string $path): bool
+    public static function isTemporaryNzbPathName(string $path): bool
     {
         return preg_match('/\.nzb\.gz\.tmp\.\d+\.[0-9a-f]{12}$/', basename($path)) === 1;
+    }
+
+    private function temporaryNzbPath(string $path): string
+    {
+        return self::temporaryNzbPathFor($path);
+    }
+
+    private function isTemporaryNzbPath(string $path): bool
+    {
+        return self::isTemporaryNzbPathName($path);
     }
 
     /**
@@ -740,9 +799,13 @@ class NzbService
     /**
      * @return array<string, mixed>
      */
-    private function successfulReleaseUpdateValues(): array
+    private function successfulReleaseUpdateValues(?string $articleFingerprint = null): array
     {
         $values = ['nzbstatus' => self::NZB_ADDED];
+
+        if ($articleFingerprint !== null && ReleaseArticleFingerprintStore::columnExists()) {
+            $values[ReleaseArticleFingerprintStore::COLUMN] = $articleFingerprint;
+        }
 
         if (NzbCreationCandidateQuery::supportsClaims()) {
             $values += [

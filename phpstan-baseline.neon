@@ -235,18 +235,6 @@ parameters:
 			path: app/Facades/Search.php
 
 		-
-			message: '#^Class App\\Facades\\TvProcessing has PHPDoc tag @method for method getStats\(\) return type with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Facades/TvProcessing.php
-
-		-
-			message: '#^Class App\\Facades\\TvProcessing has PHPDoc tag @method for method processRelease\(\) return type with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Facades/TvProcessing.php
-
-		-
 			message: '#^Unable to resolve the template type TKey in call to function collect$#'
 			identifier: argument.templateType
 			count: 2
@@ -800,12 +788,6 @@ parameters:
 			path: app/Services/Releases/ReleaseSearchService.php
 
 		-
-			message: '#^Method App\\Services\\Releases\\ReleaseSearchService\:\:apiSearchLegacyMysql\(\) has parameter \$excludedCats with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Services/Releases/ReleaseSearchService.php
-
-		-
 			message: '#^Method App\\Services\\Releases\\ReleaseSearchService\:\:intersectReleaseIdsWithSearchFilters\(\) has parameter \$releaseIds with no value type specified in iterable type array\.$#'
 			identifier: missingType.iterableValue
 			count: 1
@@ -814,7 +796,7 @@ parameters:
 		-
 			message: '#^Offset 0 does not exist on array\<string, mixed\>\.$#'
 			identifier: offsetAccess.notFound
-			count: 8
+			count: 7
 			path: app/Services/Releases/ReleaseSearchService.php
 
 		-

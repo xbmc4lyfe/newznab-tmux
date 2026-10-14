@@ -20,10 +20,14 @@ use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\NfoService;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
+use App\Services\Par2FileList;
 use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseBrowseService;
+use App\Support\Par2FileHashEvidence;
+use App\Support\PredbSearchDocument;
 use dariusiii\rarinfo\Par2Info;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -150,9 +154,10 @@ class ReleaseFileManager
                 $context->passwordStatus = ReleaseBrowseService::PASSWD_RAR;
             } elseif ($file['name'] !== '' && ! str_starts_with($file['name'], '.')) {
                 // Run PreDB filename check
-                $context->release['filename'] = $file['name'];
-                $context->release['releases_id'] = $context->release->id;
-                $this->nameFixingService->matchPreDbFiles($context->release, true, true, true);
+                $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($file): void {
+                    $entry->setAttribute('filename', $file['name']);
+                    $this->nameFixingService->matchPreDbFiles($entry, true, true, true);
+                });
             }
 
             return true;
@@ -167,6 +172,67 @@ class ReleaseFileManager
     public function updateSearchIndex(int $releaseId): void
     {
         $this->searchSyncCoordinator->request($releaseId);
+    }
+
+    /** @param callable(Release): void $rename */
+    private function applyProducerName(ReleaseProcessingContext $context, ReleaseUpdateService|NameFixingService $service, callable $rename): bool
+    {
+        if ($context->fullPar2EvidenceDeferred) {
+            return false;
+        }
+        if ($context->producerNamingClaim !== null) {
+            $context->producerNamingAttempted = true;
+            if (! $this->ownsFullPar2Evidence($context)) {
+                $this->deferProducerNaming($context);
+
+                return false;
+            }
+        }
+        $entry = clone $context->release;
+        $entry->releases_id = $entry->id;
+        if ($context->producerNamingClaim !== null) {
+            $entry->setAttribute('observed_additional_pp_claim', $context->producerNamingClaim);
+        }
+        $service->reset();
+        $rename($entry);
+        if ($service->lastCommittedIdentity() !== null) {
+            return $this->acceptProducerName($context, $service);
+        }
+        if (DB::getFacadeApplication() !== null && DB::transactionLevel() > 0) {
+            $generation = $context->producerNamingGeneration;
+            DB::afterCommit(function () use ($context, $service, $generation): void {
+                if ($context->producerNamingGeneration === $generation) {
+                    $this->acceptProducerName($context, $service);
+                }
+            });
+
+            return false;
+        }
+
+        return $this->acceptProducerName($context, $service);
+    }
+
+    private function acceptProducerName(ReleaseProcessingContext $context, ReleaseUpdateService|NameFixingService $service): bool
+    {
+        $proof = $service->lastCommittedIdentity();
+        if ($proof !== null && ! $context->advanceFullPar2EvidenceIdentity($proof)) {
+            $this->deferProducerNaming($context);
+
+            return false;
+        }
+        if ($context->producerNamingClaim !== null && ! $this->ownsFullPar2Evidence($context)) {
+            $this->deferProducerNaming($context);
+
+            return false;
+        }
+
+        return $proof !== null;
+    }
+
+    private function deferProducerNaming(ReleaseProcessingContext $context): void
+    {
+        $context->fullPar2EvidenceDeferred = true;
+        $this->searchSyncCoordinator->discard($context->par2EvidenceSnapshot['id']);
     }
 
     /**
@@ -200,19 +266,17 @@ class ReleaseFileManager
                 continue;
             }
 
-            $this->releaseUpdateService->updateRelease(
-                $context->release,
-                $candidate,
-                'NZBSPLIT wrapper',
-                true,
-                'Filenames, ',
-                true,
-                true
-            );
-
-            $context->release->searchname = $candidate;
-
-            return true;
+            return $this->applyProducerName($context, $this->releaseUpdateService, function (Release $entry) use ($candidate): void {
+                $this->releaseUpdateService->updateRelease(
+                    $entry,
+                    $candidate,
+                    'NZBSPLIT wrapper',
+                    true,
+                    'Filenames, ',
+                    true,
+                    true
+                );
+            });
         }
 
         return false;
@@ -223,6 +287,11 @@ class ReleaseFileManager
      */
     public function finalizeRelease(ReleaseProcessingContext $context, bool $processPasswords): void
     {
+        if ($context->fullPar2EvidenceDeferred) {
+            $this->searchSyncCoordinator->discard($context->par2EvidenceSnapshot['id']);
+
+            return;
+        }
         $updateRows = ['haspreview' => 0];
 
         // Check for existing samples
@@ -249,50 +318,94 @@ class ReleaseFileManager
 
         $pendingReleaseFiles = array_values($context->pendingReleaseFiles);
         $pendingParHashes = array_values($context->pendingParHashes);
+        $pendingFullParHashes = array_values($context->pendingFullParHashes);
+        $requiresSnapshotGuard = $pendingReleaseFiles !== [] || $pendingFullParHashes !== [] || $context->audioMetadataCommitted || $context->producerNamingAttempted;
 
-        $insertedReleaseFiles = DB::transaction(function () use (
-            $context,
-            $pendingReleaseFiles,
-            $pendingParHashes,
-            $updateRows,
-            $processPasswords,
-            $passwordStatus,
-        ): int {
-            $inserted = $pendingReleaseFiles === []
-                ? 0
-                : ReleaseFile::query()->insertOrIgnore($pendingReleaseFiles);
-
-            if ($pendingParHashes !== []) {
-                ParHash::query()->insertOrIgnore($pendingParHashes);
-            }
-
-            $releaseFilesCount = ReleaseFile::whereReleasesId($context->release->id)->count('releases_id') ?? 0;
-
-            if (! $context->releaseHasPassword && $context->nzbHasCompressedFile && $releaseFilesCount === 0) {
-                // No file list could be read, often because volumes were still missing.
-                // Queue the release once more after a delay; a second failure stays unknown.
-                $retried = $updateRows['haspreview'] === 0 && Release::query()
-                    ->where('id', $context->release->id)
-                    ->whereNull(AdditionalCandidateQuery::ARCHIVE_RETRY_COLUMN)
-                    ->update([
-                        ...$updateRows,
-                        'haspreview' => -1,
-                        AdditionalCandidateQuery::ARCHIVE_RETRY_COLUMN => now()->addSeconds(AdditionalCandidateQuery::archiveRetryDelaySeconds()),
-                    ]) > 0;
-                if (! $retried) {
-                    Release::query()->where('id', $context->release->id)->update($updateRows);
+        try {
+            $insertedReleaseFiles = DB::transaction(function () use (
+                $context,
+                $pendingReleaseFiles,
+                $pendingParHashes,
+                $pendingFullParHashes,
+                $requiresSnapshotGuard,
+                $updateRows,
+                $processPasswords,
+                $passwordStatus,
+            ): ?int {
+                if ($requiresSnapshotGuard) {
+                    if (! $this->ownsFullPar2Evidence($context)) {
+                        return null;
+                    }
+                    foreach ($pendingFullParHashes as $evidence) {
+                        if (! Par2FileHashEvidence::remember(
+                            $context->fullPar2EvidenceSnapshot()['id'], $evidence['full_md5'], $evidence['hash16k'], $evidence['size'],
+                            $context->fullPar2EvidenceSnapshot(), fn (): bool => $this->ownsFullPar2Evidence($context),
+                        )) {
+                            throw new \RuntimeException('Additional-processing evidence admission failed.');
+                        }
+                    }
+                    if (! $this->ownsFullPar2Evidence($context)) {
+                        throw new \RuntimeException('Additional-processing evidence ownership changed inside finalization.');
+                    }
                 }
-            } else {
-                $updateRows['passwordstatus'] = $processPasswords ? $passwordStatus : ReleaseBrowseService::PASSWD_NONE;
-                $updateRows['rarinnerfilecount'] = $releaseFilesCount;
-                Release::query()->where('id', $context->release->id)->update($updateRows);
-            }
+                $inserted = $pendingReleaseFiles === []
+                    ? 0
+                    : ReleaseFile::query()->insertOrIgnore($pendingReleaseFiles);
 
-            return $inserted;
-        }, 3);
+                if ($inserted > 0) {
+                    $current = DB::table('releases')->where('id', $context->release->id)->lockForUpdate()->first();
+                    if ($current !== null && (int) $current->isrenamed === 0 && (int) $current->predb_id === 0) {
+                        $updateRows['proc_files'] = NameFixingService::PROC_FILES_NONE;
+                    }
+                }
+
+                if ($pendingParHashes !== []) {
+                    ParHash::query()->insertOrIgnore($pendingParHashes);
+                }
+
+                $releaseFilesCount = ReleaseFile::whereReleasesId($context->release->id)->count('releases_id') ?? 0;
+
+                if (! $context->releaseHasPassword && $context->nzbHasCompressedFile && $releaseFilesCount === 0) {
+                    // No file list could be read, often because volumes were still missing.
+                    // Queue the release once more after a delay; a second failure stays unknown.
+                    // Only retry when inspection ran and a later attempt could still read the list.
+                    $retried = $updateRows['haspreview'] === 0
+                        && $context->archiveInspectionAttempted
+                        && (! $context->archiveListingUndecodable || $context->archiveRetryable)
+                        && $this->commitFullPar2FinalizationUpdate(
+                            $context,
+                            Release::query()->where('id', $context->release->id)->whereNull(AdditionalCandidateQuery::ARCHIVE_RETRY_COLUMN),
+                            [...$updateRows, 'haspreview' => -1, AdditionalCandidateQuery::ARCHIVE_RETRY_COLUMN => now()->addSeconds(AdditionalCandidateQuery::archiveRetryDelaySeconds())],
+                            $requiresSnapshotGuard,
+                            true,
+                        ) > 0;
+                    if (! $retried) {
+                        $this->commitFullPar2FinalizationUpdate($context, Release::query()->where('id', $context->release->id), $updateRows, $requiresSnapshotGuard);
+                    }
+                } else {
+                    $updateRows['passwordstatus'] = $processPasswords ? $passwordStatus : ReleaseBrowseService::PASSWD_NONE;
+                    $updateRows['rarinnerfilecount'] = $releaseFilesCount;
+                    $this->commitFullPar2FinalizationUpdate($context, Release::query()->where('id', $context->release->id), $updateRows, $requiresSnapshotGuard);
+                }
+
+                return $inserted;
+            }, 3);
+        } catch (\Throwable $exception) {
+            if ($requiresSnapshotGuard) {
+                $this->searchSyncCoordinator->discard($context->par2EvidenceSnapshot['id']);
+            }
+            throw $exception;
+        }
 
         $context->pendingReleaseFiles = [];
         $context->pendingParHashes = [];
+        $context->pendingFullParHashes = [];
+        if ($insertedReleaseFiles === null) {
+            $context->fullPar2EvidenceDeferred = true;
+            $this->searchSyncCoordinator->discard($context->par2EvidenceSnapshot['id']);
+
+            return;
+        }
         $context->releaseFilesChanged = $context->releaseFilesChanged || $insertedReleaseFiles > 0;
 
         $this->searchSyncCoordinator->request((int) $context->release->id);
@@ -410,6 +523,7 @@ class ReleaseFileManager
         ReleaseProcessingContext $context,
         Par2Info $par2Info
     ): bool {
+        $this->nameFixingService->reset();
         $par2Info->open($fileLocation);
 
         if ($par2Info->error) {
@@ -435,9 +549,10 @@ class ReleaseFileManager
             $foundName = false;
         }
 
+        $this->queueFullPar2Evidence($fileLocation, $context, $par2Info);
         $filesAdded = 0;
 
-        foreach ($par2Info->getFileList() as $file) {
+        foreach ((new Par2FileList)->getFiles($par2Info) as $file) {
             if (! isset($file['name'])) {
                 continue;
             }
@@ -468,8 +583,13 @@ class ReleaseFileManager
             // Try to get a new name
             if (! $foundName) {
                 $context->release->textstring = $file['name'];
-                $context->release->releases_id = $context->release->id;
-                if ($this->nameFixingService->checkName($context->release, $this->config->echoCLI, 'PAR2, ', true, true)) {
+                $matched = false;
+                $committed = $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($file, &$matched): void {
+                    $entry->textstring = $file['name'];
+                    $matched = $this->nameFixingService->checkName($entry, $this->config->echoCLI, 'PAR2, ', true, true);
+                });
+                // Retain a pending transaction's chosen name without advancing the context before commit.
+                if ($committed || ($matched && DB::transactionLevel() > 0)) {
                     $foundName = true;
                 }
             }
@@ -478,6 +598,169 @@ class ReleaseFileManager
         $context->foundPAR2Info = true;
 
         return true;
+    }
+
+    /**
+     * @param  Builder<Release>  $query
+     * @param  array<string, mixed>  $values
+     */
+    private function commitFullPar2FinalizationUpdate(ReleaseProcessingContext $context, Builder $query, array $values, bool $guarded, bool $allowNoMatch = false): int
+    {
+        if (! $guarded) {
+            return $query->update($values);
+        }
+        if (! $this->ownsFullPar2Evidence($context)) {
+            throw new \RuntimeException('Additional-processing evidence ownership changed before final status update.');
+        }
+        $snapshot = $context->fullPar2EvidenceSnapshot();
+        $locked = DB::table('releases')->where('id', $snapshot['id'])->lockForUpdate()->first();
+        if ($locked === null) {
+            throw new \RuntimeException('Additional-processing release disappeared before final status update.');
+        }
+        foreach ($snapshot as $column => $value) {
+            if ($column === AdditionalCandidateQuery::CLAIM_TOKEN_COLUMN && ! property_exists($locked, $column)) {
+                continue;
+            }
+            if ($value === null) {
+                $query->whereNull($column);
+            } elseif ($column === 'id') {
+                $query->where($column, $value);
+            } else {
+                $query->whereRaw('HEX('.$column.') = ?', [strtoupper(bin2hex($value))]);
+            }
+        }
+        if (property_exists($locked, AdditionalCandidateQuery::CLAIMED_AT_COLUMN)) {
+            $stamp = $locked->{AdditionalCandidateQuery::CLAIMED_AT_COLUMN};
+            if ($stamp === null) {
+                $query->whereNull(AdditionalCandidateQuery::CLAIMED_AT_COLUMN);
+            } else {
+                $query->where(AdditionalCandidateQuery::CLAIMED_AT_COLUMN, $stamp);
+            }
+            if ($snapshot[AdditionalCandidateQuery::CLAIM_TOKEN_COLUMN] === null || $snapshot[AdditionalCandidateQuery::CLAIM_TOKEN_COLUMN] === '') {
+                $query->whereNull(AdditionalCandidateQuery::CLAIMED_AT_COLUMN);
+            } else {
+                $query->where(AdditionalCandidateQuery::CLAIMED_AT_COLUMN, '>=', AdditionalCandidateQuery::claimStaleBefore()->toDateTimeString());
+            }
+        }
+        if ($allowNoMatch && ! (clone $query)->exists()) {
+            if (! $this->ownsFullPar2Evidence($context)) {
+                throw new \RuntimeException('Additional-processing evidence ownership changed during final status admission.');
+            }
+
+            return 0;
+        }
+        $updated = $query->update($values);
+        $current = DB::table('releases')->where('id', $snapshot['id'])->lockForUpdate()->first();
+        foreach ([...$snapshot, ...$values] as $column => $value) {
+            $actual = $current->{$column} ?? null;
+            if (is_int($value)) {
+                $actual = (int) $actual;
+            } elseif ($value instanceof \DateTimeInterface) {
+                $value = $value->format('Y-m-d H:i:s');
+            }
+            if ($current === null || $actual !== $value) {
+                throw new \RuntimeException('Additional-processing evidence ownership or terminal state changed during final status update.');
+            }
+        }
+
+        if ((int) $context->release->id !== $snapshot['id'] || (string) $context->release->guid !== $snapshot['guid']) {
+            throw new \RuntimeException('Additional-processing caller identity changed during final status update.');
+        }
+
+        return $updated;
+    }
+
+    /** @phpstan-impure */
+    private function ownsFullPar2Evidence(ReleaseProcessingContext $context): bool
+    {
+        $snapshot = $context->fullPar2EvidenceSnapshot();
+        if ((int) $context->release->id !== $snapshot['id'] || (string) $context->release->guid !== $snapshot['guid']) {
+            return false;
+        }
+        $current = DB::table('releases')->where('id', $snapshot['id'])->lockForUpdate()->first();
+        if ($current === null) {
+            return false;
+        }
+        foreach ($snapshot as $column => $value) {
+            $actual = $current->{$column} ?? null;
+            if ($column === 'id') {
+                $actual = (int) $actual;
+            }
+            if ($actual !== $value) {
+                return false;
+            }
+        }
+        $token = $snapshot['additional_pp_claim_token'];
+        $claimedAt = $current->additional_pp_claimed_at ?? null;
+        if ($context->producerNamingAttempted && $context->producerNamingClaim !== null
+            && $claimedAt !== $context->producerNamingClaim['claimed_at']) {
+            return false;
+        }
+        if ($token === null || $token === '') {
+            return $claimedAt === null;
+        }
+
+        if (! is_string($claimedAt)) {
+            return false;
+        }
+        $parsed = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $claimedAt);
+
+        return $parsed !== false && $parsed->format('Y-m-d H:i:s') === $claimedAt
+            && $claimedAt >= AdditionalCandidateQuery::claimStaleBefore()->toDateTimeString();
+    }
+
+    private function queueFullPar2Evidence(string $fileLocation, ReleaseProcessingContext $context, Par2Info $par2Info): void
+    {
+        $packets = $par2Info->getPackets(true);
+        if (! is_array($packets)) {
+            return;
+        }
+        $stream = is_file($fileLocation) ? fopen($fileLocation, 'rb') : false;
+        try {
+            foreach ($packets as $packet) {
+                if (($packet['head_type'] ?? null) !== Par2Info::PACKET_FILEDESC) {
+                    continue;
+                }
+                $full = $packet['file_hash'] ?? '';
+                $prefix = $packet['file_hash_16K'] ?? '';
+                if (! is_string($full) || ! is_string($prefix) || strlen($full) !== 32 || strlen($prefix) !== 32
+                    || ! ctype_xdigit($full) || ! ctype_xdigit($prefix)) {
+                    continue;
+                }
+                $size = Par2FileHashEvidence::sizeDecimal($packet['file_length'] ?? null);
+                $offset = $packet['offset'] ?? null;
+                $length = $packet['head_length'] ?? null;
+                if (is_resource($stream) && is_int($offset) && $offset >= 0 && is_int($length) && $length >= 120
+                    && fseek($stream, $offset) === 0) {
+                    $fixed = fread($stream, 120);
+                    if (is_string($fixed) && strlen($fixed) === 120 && substr($fixed, 0, 8) === "PAR2\0PKT") {
+                        $checksum = hash_init('md5');
+                        hash_update($checksum, substr($fixed, 32));
+                        $remaining = $length - 120;
+                        while ($remaining > 0) {
+                            $chunk = fread($stream, min(16384, $remaining));
+                            if (! is_string($chunk) || $chunk === '') {
+                                break;
+                            }
+                            hash_update($checksum, $chunk);
+                            $remaining -= strlen($chunk);
+                        }
+                        if ($remaining === 0 && hash_final($checksum) === ($packet['head_hash'] ?? null)) {
+                            $size = Par2FileHashEvidence::littleEndianSize(substr($fixed, 112, 8));
+                        }
+                    }
+                }
+                $full = strtolower($full);
+                $prefix = strtolower($prefix);
+                $context->pendingFullParHashes[$full.':'.$prefix.':'.($size ?? '')] = [
+                    'full_md5' => $full, 'hash16k' => $prefix, 'size' => $size,
+                ];
+            }
+        } finally {
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
+        }
     }
 
     /**
@@ -614,21 +897,25 @@ class ReleaseFileManager
 
         if ($extractedName !== null) {
             $preCheck = Predb::whereTitle($extractedName)->first();
-            $context->release->preid = $preCheck?->id ?? 0;
-            $candidate = $preCheck?->title ?? $extractedName;
-            $candidate = $this->normalizeCandidateTitle($candidate);
+            if ($preCheck !== null && PredbSearchDocument::exactValue($preCheck->title) !== PredbSearchDocument::exactValue($extractedName)) {
+                $preCheck = null;
+            }
+            $preId = $preCheck?->id ?? 0;
+            $candidate = $preCheck?->title ?? $this->normalizeCandidateTitle($extractedName);
 
             if ($this->isPlausibleReleaseTitle($candidate)) {
-                $this->releaseUpdateService->updateRelease(
-                    $context->release,
-                    $candidate,
-                    'RarInfo FileName Match',
-                    true,
-                    'Filenames, ',
-                    true,
-                    true,
-                    $context->release->preid
-                );
+                $this->applyProducerName($context, $this->releaseUpdateService, function (Release $entry) use ($candidate, $preId): void {
+                    $this->releaseUpdateService->updateRelease(
+                        $entry,
+                        $candidate,
+                        'RarInfo FileName Match',
+                        true,
+                        'Filenames, ',
+                        true,
+                        true,
+                        $preId
+                    );
+                });
             } elseif ($this->config->debugMode) {
                 Log::debug('RarInfo: Ignored low-quality candidate "'.$candidate.'" from inner file name.');
             }
@@ -640,21 +927,25 @@ class ReleaseFileManager
 
             if ($extractedName !== null) {
                 $preCheck = Predb::whereTitle($extractedName)->first();
-                $context->release->preid = $preCheck?->id ?? 0;
-                $candidate = $preCheck?->title ?? $extractedName;
-                $candidate = $this->normalizeCandidateTitle($candidate);
+                if ($preCheck !== null && PredbSearchDocument::exactValue($preCheck->title) !== PredbSearchDocument::exactValue($extractedName)) {
+                    $preCheck = null;
+                }
+                $preId = $preCheck?->id ?? 0;
+                $candidate = $preCheck?->title ?? $this->normalizeCandidateTitle($extractedName);
 
                 if ($this->isPlausibleReleaseTitle($candidate)) {
-                    $this->releaseUpdateService->updateRelease(
-                        $context->release,
-                        $candidate,
-                        'RarInfo FileName Match',
-                        true,
-                        'Filenames, ',
-                        true,
-                        true,
-                        $context->release->preid
-                    );
+                    $this->applyProducerName($context, $this->releaseUpdateService, function (Release $entry) use ($candidate, $preId): void {
+                        $this->releaseUpdateService->updateRelease(
+                            $entry,
+                            $candidate,
+                            'RarInfo FileName Match',
+                            true,
+                            'Filenames, ',
+                            true,
+                            true,
+                            $preId
+                        );
+                    });
                 }
             }
         }
@@ -707,11 +998,19 @@ class ReleaseFileManager
         string $hash = '',
         string $crc = ''
     ): bool {
-        if ($name === '') {
+        if ($name === '' || (int) $releaseId !== (int) $context->release->id) {
             return false;
         }
 
         $this->loadExistingReleaseFileNames($context);
+        if ($this->config->addPAR2Files && strlen($hash) === 32 && ctype_xdigit($hash)) {
+            $normalizedHash = strtolower($hash);
+            $context->pendingParHashes[$normalizedHash] = [
+                'releases_id' => (int) $context->release->id,
+                'hash' => $normalizedHash,
+            ];
+        }
+
         if (isset($context->existingReleaseFileNames[$name]) || isset($context->pendingReleaseFiles[$name])) {
             return false;
         }
@@ -727,13 +1026,6 @@ class ReleaseFileManager
         ];
         $context->existingReleaseFileNames[$name] = true;
         $context->addedFileInfo++;
-
-        if (\strlen($hash) === 32) {
-            $context->pendingParHashes[$hash] = [
-                'releases_id' => (int) $releaseId,
-                'hash' => $hash,
-            ];
-        }
 
         return true;
     }

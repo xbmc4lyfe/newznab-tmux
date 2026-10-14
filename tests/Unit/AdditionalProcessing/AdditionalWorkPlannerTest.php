@@ -84,6 +84,28 @@ class AdditionalWorkPlannerTest extends TestCase
     }
 
     #[Test]
+    public function it_keeps_the_last_volume_tail_for_numbered_split_volumes(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+
+        $plan = $planner->plan([
+            ['title' => '[2/3] - "abcdef.002" yEnc (1/3)', 'segments' => ['<v2-1>', '<v2-2>', '<v2-3>']],
+            ['title' => '[1/3] - "abcdef.001" yEnc (1/3)', 'segments' => ['<v1-1>', '<v1-2>', '<v1-3>']],
+            ['title' => '[3/3] - "abcdef.003" yEnc (1/2)', 'segments' => ['<v3-1>', '<v3-2>']],
+        ], 'alt.binaries.misc');
+        $rar = $planner->plan([
+            ['title' => 'Movie H.264 [1/1] - "Movie.H.264-GRP.rar" yEnc (1/2)', 'segments' => ['<r-1>', '<r-2>']],
+        ], 'alt.binaries.misc');
+
+        $this->assertSame('[1/3] - "abcdef.001" yEnc (1/3)', $plan->archiveCandidates[0]->title);
+        $this->assertTrue($plan->archiveCandidates[0]->likelyFirstVolume);
+        $this->assertSame(['<v3-2>'], $plan->archiveCandidates[0]->tailMessageIds);
+
+        $this->assertTrue($rar->archiveCandidates[0]->likelyFirstVolume);
+        $this->assertSame([], $rar->archiveCandidates[0]->tailMessageIds);
+    }
+
+    #[Test]
     public function it_reports_book_floods_and_releases_without_supported_candidates(): void
     {
         $planner = new AdditionalWorkPlanner($this->makeConfig());
@@ -332,5 +354,55 @@ class AdditionalWorkPlannerTest extends TestCase
             ['"movie.screens.jpg" yEnc (1/4)', '"movie.cover.jpg" yEnc (1/3)', '"movie.jpg" yEnc (1/1)'],
             array_map(static fn ($candidate): string => $candidate->title, $plan->imageCandidates),
         );
+    }
+
+    #[Test]
+    public function it_inspects_the_earliest_rar_volume_that_has_its_first_segment(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+        $titles = static fn (array $candidates): array => array_map(
+            static fn (ArchiveCandidate $candidate): string => $candidate->title,
+            $candidates,
+        );
+
+        $plan = $planner->plan([
+            ['title' => '"release.part01.rar" yEnc (2/50)', 'segments' => ['<p1-2>', '<p1-3>'], 'firstsegment' => false],
+            ['title' => '"release.part02.rar" yEnc (2/50)', 'segments' => ['<p2-2>'], 'firstsegment' => false],
+            ['title' => '"release.part03.rar" yEnc (1/50)', 'segments' => ['<p3-1>', '<p3-2>'], 'firstsegment' => true],
+            ['title' => '"release.part04.rar" yEnc (1/50)', 'segments' => ['<p4-1>'], 'firstsegment' => true],
+        ], 'alt.binaries.test');
+        $oldStyle = $planner->plan([
+            ['title' => 'release.rar yEnc (2/50)', 'segments' => ['<rar-2>'], 'firstsegment' => false],
+            ['title' => 'release.r00 yEnc (1/50)', 'segments' => ['<r00-1>'], 'firstsegment' => true],
+        ], 'alt.binaries.test');
+
+        $this->assertSame(
+            ['"release.part03.rar" yEnc (1/50)', '"release.part01.rar" yEnc (2/50)', '"release.part02.rar" yEnc (2/50)', '"release.part04.rar" yEnc (1/50)'],
+            $titles($plan->prioritizedArchiveCandidates()),
+        );
+        $this->assertSame(['<p3-1>', '<p3-2>'], $plan->prioritizedArchiveCandidates()[0]->messageIds);
+        $this->assertSame(['release.r00 yEnc (1/50)', 'release.rar yEnc (2/50)'], $titles($oldStyle->prioritizedArchiveCandidates()));
+    }
+
+    #[Test]
+    public function it_keeps_the_first_rar_volume_when_it_has_its_first_segment_or_no_volume_does(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+
+        $complete = $planner->plan([
+            ['title' => '"release.part01.rar" yEnc (1/50)', 'segments' => ['<p1-1>'], 'firstsegment' => true],
+            ['title' => '"release.part02.rar" yEnc (1/50)', 'segments' => ['<p2-1>'], 'firstsegment' => true],
+        ], 'alt.binaries.test');
+        $noneComplete = $planner->plan([
+            ['title' => '"release.part01.rar" yEnc (2/50)', 'segments' => ['<p1-2>'], 'firstsegment' => false],
+            ['title' => '"release.part02.rar" yEnc (2/50)', 'segments' => ['<p2-2>'], 'firstsegment' => false],
+        ], 'alt.binaries.test');
+
+        foreach ([$complete, $noneComplete] as $plan) {
+            [$first, $second] = $plan->prioritizedArchiveCandidates();
+            $this->assertStringStartsWith('"release.part01.rar"', $first->title);
+            $this->assertTrue($first->likelyFirstVolume);
+            $this->assertFalse($second->likelyFirstVolume);
+        }
     }
 }

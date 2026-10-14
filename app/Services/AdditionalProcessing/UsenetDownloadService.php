@@ -6,6 +6,7 @@ namespace App\Services\AdditionalProcessing;
 
 use App\Services\AdditionalProcessing\Config\ProcessingConfiguration;
 use App\Services\AdditionalProcessing\DTO\DownloadMetrics;
+use App\Services\AdditionalProcessing\DTO\Par2FileEntry;
 use App\Services\AdditionalProcessing\Enums\DownloadKind;
 use App\Services\NNTP\NNTPService;
 use App\Services\Yenc\YencPart;
@@ -32,6 +33,17 @@ class UsenetDownloadService
      * @var array<string, array{success: bool, data: string|null, groupUnavailable: bool, error: string|null}>
      */
     private array $releaseCache = [];
+
+    /** @var array<string, array{data: string, part: YencPart}> */
+    private array $mappedArchiveArticles = [];
+
+    /** @var array<string, array{data: string, part: YencPart}> */
+    private array $mappedVideoArticles = [];
+
+    /** @var array{key: string, data: string, part: YencPart}|null */
+    private ?array $pendingMappingArticle = null;
+
+    private bool $capturingMappingArticle = false;
 
     private int $cachedBytes = 0;
 
@@ -120,6 +132,17 @@ class UsenetDownloadService
 
         $binary = $this->nntp->getMessagesByMessageID($messageIDs, $this->config->alternateNNTP);
 
+        return $this->resultFromBinary($binary, $messageIDs, $groupName, $releaseId);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $messageIDs
+     * @return array{success: bool, data: string|null, groupUnavailable: bool, error: string|null}
+     */
+    private function resultFromBinary(mixed $binary, array $messageIDs, string $groupName, ?int $releaseId): array
+    {
+        $result = ['success' => false, 'data' => null, 'groupUnavailable' => false, 'error' => null];
+
         // Handle non-string or empty response as failure
         if (! is_string($binary) || $binary === '') {
             $errorMessage = null;
@@ -200,15 +223,36 @@ class UsenetDownloadService
             ]);
         }
 
-        if ($this->releaseScopeActive && $messageIdList !== [] && $messageIdList !== ['']) {
-            $this->networkRequests++;
+        $reusedBytes = 0;
+        if ($this->releaseScopeActive && $kind === DownloadKind::Compressed && ! empty($messageIDs) && $this->mappedArchiveArticles !== []) {
+            $networkRequired = $messageIdList !== [] && $messageIdList !== ['']
+                && array_any($messageIdList, fn (mixed $id): bool => ! isset($this->mappedArchiveArticles[$this->downloadFingerprint([(string) $id], $groupName)]));
+            $binary = $this->nntp->getMessagesByMessageIDWithArticleReuse(
+                $messageIDs,
+                $this->config->alternateNNTP,
+                fn (mixed $id): ?string => $this->mappedArchiveArticles[$this->downloadFingerprint([(string) $id], $groupName)]['data'] ?? null,
+                function (int $bytes) use (&$reusedBytes): void {
+                    $reusedBytes += $bytes;
+                },
+            );
+            if ($networkRequired) {
+                $this->networkRequests++;
+            }
+            if ($reusedBytes > 0) {
+                $this->cacheHits++;
+                $this->bytesReused += $reusedBytes;
+            }
+            $result = $this->resultFromBinary($binary, $messageIdList, $groupName, $releaseId);
+        } else {
+            if ($this->releaseScopeActive && $messageIdList !== [] && $messageIdList !== ['']) {
+                $this->networkRequests++;
+            }
+            $result = $this->downloadByMessageIDs($messageIDs, $groupName, $releaseId);
         }
-
-        $result = $this->downloadByMessageIDs($messageIDs, $groupName, $releaseId);
 
         if ($this->releaseScopeActive && $result['success'] && is_string($result['data'])) {
             $byteSize = strlen($result['data']);
-            $this->bytesDownloaded += $byteSize;
+            $this->bytesDownloaded += $byteSize - $reusedBytes;
             if ($kind->isPreviewSource()) {
                 $this->mediaBytesDownloaded += $byteSize;
             }
@@ -230,6 +274,49 @@ class UsenetDownloadService
         }
 
         return $result;
+    }
+
+    /**
+     * Read a complete preview file within a hard BODY-byte allowance, including failed attempts.
+     * Partial files are never returned as successful images and bounded requests bypass the cache.
+     *
+     * @param  list<string>  $messageIds
+     * @return array{success: bool, data: string|null, groupUnavailable: bool, error: string|null, bytesDownloaded: int}
+     */
+    public function downloadBounded(DownloadKind $kind, array $messageIds, int $maximumBytes, string $groupName = '', ?int $releaseId = null): array
+    {
+        $result = ['success' => false, 'data' => null, 'groupUnavailable' => false, 'error' => null, 'bytesDownloaded' => 0];
+        if ($maximumBytes <= 0 || $messageIds === []) {
+            return [...$result, 'error' => 'No preview download allowance or message IDs.'];
+        }
+        if ($this->releaseScopeActive) {
+            $this->logicalRequests++;
+        }
+        $data = '';
+        foreach ($messageIds as $messageId) {
+            $remaining = $maximumBytes - $result['bytesDownloaded'];
+            if ($remaining <= 0) {
+                return [...$result, 'error' => 'Preview download byte budget exhausted.'];
+            }
+            if ($this->releaseScopeActive) {
+                $this->networkRequests++;
+            }
+            $article = $this->nntp->getBoundedArticleByMessageID($messageId, $remaining, $this->config->alternateNNTP);
+            $result['bytesDownloaded'] += $article['bytesDownloaded'];
+            if ($this->releaseScopeActive) {
+                $this->bytesDownloaded += $article['bytesDownloaded'];
+                if ($kind->isPreviewSource()) {
+                    $this->mediaBytesDownloaded += $article['bytesDownloaded'];
+                }
+            }
+            if ($article['data'] === null) {
+                return [...$result, 'error' => $article['error'],
+                    'groupUnavailable' => $article['error'] !== null && $this->isGroupUnavailableMessage($article['error'])];
+            }
+            $data .= $article['data'];
+        }
+
+        return [...$result, 'success' => $data !== '', 'data' => $data];
     }
 
     /**
@@ -268,7 +355,30 @@ class UsenetDownloadService
             $this->networkRequests++;
         }
 
-        $article = $this->nntp->getArticleByMessageID($messageId, $this->config->alternateNNTP);
+        $reusedBytes = 0;
+        if ($this->releaseScopeActive && $kind === DownloadKind::MediaSource && ! $this->capturingMappingArticle
+            && isset($this->mappedVideoArticles[$cacheKey])) {
+            $article = $this->nntp->getArticleByMessageIDWithReuse($messageId, $this->config->alternateNNTP,
+                fn (): ?array => $this->mappedVideoArticles[$cacheKey] ?? null,
+                function (int $bytes) use (&$reusedBytes): void {
+                    $reusedBytes = $bytes;
+                    $this->networkRequests--;
+                    $this->cacheHits++;
+                    $this->bytesReused += $bytes;
+                });
+        } elseif ($this->capturingMappingArticle && $this->releaseScopeActive) {
+            $article = $this->nntp->getArticleForArchiveMapping($messageId, $this->config->alternateNNTP,
+                function (string $data, YencPart $part) use ($cacheKey): void {
+                    $bytes = strlen($data);
+                    if ($this->pendingMappingArticle === null && $bytes > 0 && $bytes <= self::MAX_CACHE_ENTRY_BYTES
+                        && $this->makeRoomForMappingArticle($bytes)) {
+                        $this->pendingMappingArticle = ['key' => $cacheKey, 'data' => $data, 'part' => $part];
+                        $this->cachedBytes += $bytes;
+                    }
+                });
+        } else {
+            $article = $this->nntp->getArticleByMessageID($messageId, $this->config->alternateNNTP);
+        }
         if (! is_array($article) || $article['data'] === '') {
             $errorMessage = is_array($article) ? null : $article->getMessage();
             $result['groupUnavailable'] = $errorMessage !== null && $this->isGroupUnavailableMessage($errorMessage);
@@ -289,13 +399,107 @@ class UsenetDownloadService
 
         if ($this->releaseScopeActive) {
             $byteSize = strlen($article['data']);
-            $this->bytesDownloaded += $byteSize;
+            $this->bytesDownloaded += $byteSize - $reusedBytes;
             if ($kind->isPreviewSource()) {
-                $this->mediaBytesDownloaded += $byteSize;
+                $this->mediaBytesDownloaded += $byteSize - $reusedBytes;
             }
         }
 
         return [...$result, 'success' => true, 'data' => $article['data'], 'part' => $article['part']];
+    }
+
+    /**
+     * Capture a fresh integrity-checked primary article for possible PAR2 source mapping.
+     *
+     * @return array{success: bool, data: string|null, part: YencPart|null, groupUnavailable: bool, error: string|null}
+     */
+    public function downloadMappingArticle(string $messageId, string $groupName = '', ?int $releaseId = null): array
+    {
+        $this->discardPendingMappingArticle();
+        $this->capturingMappingArticle = true;
+        try {
+            return $this->downloadArticle(DownloadKind::MediaSource, $messageId, $groupName, $releaseId);
+        } catch (\Throwable $exception) {
+            $this->clearReleaseScope();
+            throw $exception;
+        } finally {
+            $this->capturingMappingArticle = false;
+        }
+    }
+
+    /** Keep the legacy archive-only admission contract. */
+    public function retainMappedArchiveArticle(Par2FileEntry $file): void
+    {
+        $this->promoteMappedArticle($file, allowVideo: false);
+    }
+
+    /** Promote a fresh receipt after the resolver matched its real PAR2 file. */
+    public function retainMappedSourceArticle(Par2FileEntry $file): void
+    {
+        $this->promoteMappedArticle($file, allowVideo: true);
+    }
+
+    private function promoteMappedArticle(Par2FileEntry $file, bool $allowVideo): void
+    {
+        $article = $this->pendingMappingArticle;
+        $this->discardPendingMappingArticle();
+        if (! $this->releaseScopeActive || $article === null
+            || (! $file->matchesStartOf($article['data'])
+                && ($article['part']->name !== $file->name || $article['part']->size !== $file->size))) {
+            return;
+        }
+        $archive = preg_match('/\.(?:rar|7z(?:\.\d+)?|zip|\d{3})$/i', $file->name) === 1;
+        $video = $allowVideo && ! $archive && $this->config->processThumbnails && $this->config->mediaMainVideoFallback
+            && $file->size >= $this->config->mediaMainVideoMinBytes
+            && stripos($file->name, 'sample') === false
+            && preg_match('/'.$this->config->videoFileRegex.'$/i', $file->name) === 1
+            && $article['part']->size === $file->size && $article['part']->offset() === 0
+            && ($article['part']->part === null || $article['part']->part === 1);
+        $key = $article['key'];
+        $size = strlen($article['data']);
+        if ((! $archive && ! $video) || isset($this->mappedArchiveArticles[$key]) || isset($this->mappedVideoArticles[$key])
+            || $this->cacheEntryCount() >= self::MAX_CACHE_ENTRIES
+            || $this->cachedBytes + $size > self::MAX_CACHE_BYTES) {
+            return;
+        }
+        if ($archive) {
+            $this->mappedArchiveArticles[$key] = ['data' => $article['data'], 'part' => $article['part']];
+        } else {
+            $this->mappedVideoArticles[$key] = ['data' => $article['data'], 'part' => $article['part']];
+        }
+        $this->cachedBytes += $size;
+    }
+
+    /** Mapping receipts may replace videos while preserving archives and aggregate downloads. */
+    private function makeRoomForMappingArticle(int $bytes): bool
+    {
+        while ($this->mappedVideoArticles !== []
+            && ($this->cacheEntryCount() >= self::MAX_CACHE_ENTRIES || $this->cachedBytes + $bytes > self::MAX_CACHE_BYTES)) {
+            $this->evictMappedVideoArticle();
+        }
+
+        return $this->cacheEntryCount() < self::MAX_CACHE_ENTRIES && $this->cachedBytes + $bytes <= self::MAX_CACHE_BYTES;
+    }
+
+    private function evictMappedVideoArticle(): void
+    {
+        $key = array_key_first($this->mappedVideoArticles);
+        $this->cachedBytes -= strlen($this->mappedVideoArticles[$key]['data']);
+        unset($this->mappedVideoArticles[$key]);
+    }
+
+    /** Release an unmatched receipt at the end of a mapping attempt. */
+    public function discardPendingMappingArticle(): void
+    {
+        if ($this->pendingMappingArticle !== null) {
+            $this->cachedBytes -= strlen($this->pendingMappingArticle['data']);
+            $this->pendingMappingArticle = null;
+        }
+    }
+
+    private function cacheEntryCount(): int
+    {
+        return count($this->releaseCache) + count($this->mappedArchiveArticles) + count($this->mappedVideoArticles) + ($this->pendingMappingArticle === null ? 0 : 1);
     }
 
     private function isGroupUnavailableMessage(string $errorMessage): bool
@@ -321,10 +525,27 @@ class UsenetDownloadService
      */
     private function rememberSuccessfulDownload(string $cacheKey, array $result, int $byteSize): void
     {
-        if ($byteSize > self::MAX_CACHE_ENTRY_BYTES
-            || count($this->releaseCache) >= self::MAX_CACHE_ENTRIES
-            || ($this->cachedBytes + $byteSize) > self::MAX_CACHE_BYTES
-        ) {
+        if ($byteSize > self::MAX_CACHE_ENTRY_BYTES || count($this->releaseCache) >= self::MAX_CACHE_ENTRIES) {
+            return;
+        }
+        while (($this->pendingMappingArticle !== null || $this->mappedVideoArticles !== [] || $this->mappedArchiveArticles !== [])
+            && ($this->cacheEntryCount() >= self::MAX_CACHE_ENTRIES
+                || $this->cachedBytes + $byteSize > self::MAX_CACHE_BYTES)) {
+            if ($this->pendingMappingArticle !== null) {
+                $this->discardPendingMappingArticle();
+
+                continue;
+            }
+            if ($this->mappedVideoArticles !== []) {
+                $this->evictMappedVideoArticle();
+
+                continue;
+            }
+            $key = array_key_first($this->mappedArchiveArticles);
+            $this->cachedBytes -= strlen($this->mappedArchiveArticles[$key]['data']);
+            unset($this->mappedArchiveArticles[$key]);
+        }
+        if ($this->cachedBytes + $byteSize > self::MAX_CACHE_BYTES) {
             return;
         }
 
@@ -336,6 +557,10 @@ class UsenetDownloadService
     {
         $this->releaseScopeActive = false;
         $this->releaseCache = [];
+        $this->mappedArchiveArticles = [];
+        $this->mappedVideoArticles = [];
+        $this->pendingMappingArticle = null;
+        $this->capturingMappingArticle = false;
         $this->cachedBytes = 0;
         $this->logicalRequests = 0;
         $this->networkRequests = 0;

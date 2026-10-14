@@ -25,6 +25,7 @@ use Elastic\Elasticsearch\ClientBuilder;
 use GuzzleHttp\Psr7\Response as HttpResponse;
 use Illuminate\Console\OutputStyle;
 use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -68,6 +69,7 @@ final class PredbMatchingTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        config(['release_verification.required' => false]);
         config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => $this->databasePath, 'nntmux.echocli' => false]);
         DB::purge();
         DB::reconnect();
@@ -75,6 +77,8 @@ final class PredbMatchingTest extends TestCase
         DB::statement('CREATE TABLE predb (id INTEGER PRIMARY KEY, title TEXT, filename TEXT, source TEXT, size TEXT, category TEXT, nuked INTEGER DEFAULT 0)');
         DB::table('predb')->insert(['id' => 7, 'title' => 'Canonical.Scene-GROUP', 'filename' => 'File.Name-GROUP', 'source' => 'srrdb']);
         DB::statement('CREATE TABLE releases (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, searchname TEXT, totalpart INTEGER, groups_id INTEGER, adddate TEXT, guid TEXT, leftguid TEXT, postdate TEXT, fromname TEXT, size INTEGER, passwordstatus INTEGER, haspreview INTEGER, categories_id INTEGER, nfostatus INTEGER, nzbstatus INTEGER, isrenamed INTEGER, iscategorized INTEGER, predb_id INTEGER)');
+        DB::statement('PRAGMA foreign_keys = ON');
+        (require base_path('database/migrations/2026_10_11_215821_create_par2_rename_progress_table.php'))->up();
         DB::statement('CREATE TABLE usenet_groups (id INTEGER PRIMARY KEY, name TEXT)');
         DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.binaries.test']);
     }
@@ -149,10 +153,13 @@ final class PredbMatchingTest extends TestCase
         config(['nntmux.echocli' => $output]);
         $updates = $this->createMock(ReleaseUpdateService::class);
         if ($rename) {
-            $updates->expects(self::once())->method('updateRelease')->with(self::anything(), 'Canonical.Scene-GROUP', 'file matched source: srrdb', true, 'PreDB file match, ', true, false, 7);
-            $updates->expects(self::never())->method('attachPredbId');
+            $updates->expects(self::once())->method('updateRelease')->with(self::anything(), 'Canonical.Scene-GROUP', 'file matched source: srrdb', true, 'PreDB file match, ', true, false, 7)
+                ->willReturnCallback(static function () use ($updates): void {
+                    $updates->matched = true;
+                });
+            $updates->expects(self::never())->method('attachPredbSnapshot');
         } else {
-            $updates->expects(self::once())->method('attachPredbId')->with(42, 7);
+            $updates->expects(self::once())->method('attachPredbSnapshot')->with(self::callback(static fn (object $release): bool => (int) $release->releases_id === 42), 7)->willReturn(true);
             $updates->expects(self::never())->method('updateRelease');
         }
         Search::shouldReceive('searchPredb')->once()->andReturn([$this->hit()]);
@@ -163,8 +170,9 @@ final class PredbMatchingTest extends TestCase
     public function test_filename_match_does_not_attach_id_when_writes_are_disabled(): void
     {
         $updates = $this->createMock(ReleaseUpdateService::class);
+        $updates->expects(self::once())->method('currentPredbTitle')->with(7, 'Canonical.Scene-GROUP', 'File.Name-GROUP')->willReturn('Canonical.Scene-GROUP');
         $updates->expects(self::never())->method('updateRelease');
-        $updates->expects(self::never())->method('attachPredbId');
+        $updates->expects(self::never())->method('attachPredbSnapshot');
         Search::shouldReceive('searchPredb')->once()->andReturn([$this->hit()]);
 
         self::assertSame(1, (new NameFixingService(updateService: $updates))->matchPreDbFiles((object) ['releases_id' => 42, 'filename' => 'File.Name-GROUP.mkv', 'searchname' => 'Canonical.Scene-GROUP'], false, true, false));
@@ -174,10 +182,10 @@ final class PredbMatchingTest extends TestCase
     public function test_filename_match_saves_association_with_real_update_service(bool $rename, bool $output): void
     {
         config(['nntmux.echocli' => $output]);
-        foreach (['videos_id', 'tv_episodes_id', 'imdbid', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'book_lookup_attempts', 'book_lookup_retry_at', 'book_name_normalized_at', 'anidbid'] as $column) {
+        foreach (['videos_id', 'tv_episodes_id', 'imdbid', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'book_lookup_attempts', 'book_lookup_retry_at', 'book_name_normalized_at', 'tv_lookup_attempts', 'tv_lookup_retry_at', 'anidbid'] as $column) {
             DB::statement('ALTER TABLE releases ADD COLUMN '.$column.' TEXT');
         }
-        DB::table('releases')->insert(['id' => 42, 'searchname' => $rename ? 'Old.Title' : 'Canonical.Scene-GROUP', 'predb_id' => 0, 'categories_id' => 7010, 'groups_id' => 1]);
+        DB::table('releases')->insert(['id' => 42, 'guid' => 'synthetic-release-42', 'name' => 'posted-subject', 'searchname' => $rename ? 'Old.Title' : 'Canonical.Scene-GROUP', 'predb_id' => 0, 'categories_id' => 7010, 'groups_id' => 1]);
         Event::fake([ReleaseNameFixed::class]);
         Search::shouldReceive('searchPredb')->once()->andReturn([$this->hit()]);
         Search::shouldReceive('updateRelease')->times($rename ? 1 : 0)->with(42);
@@ -194,7 +202,7 @@ final class PredbMatchingTest extends TestCase
     {
         $updates = $this->createMock(ReleaseUpdateService::class);
         $updates->expects(self::never())->method('updateRelease');
-        $updates->expects(self::never())->method('attachPredbId');
+        $updates->expects(self::never())->method('attachPredbSnapshot');
         Search::shouldReceive('searchPredb')->once()->andReturn([array_replace($this->hit(), ['id' => 0])]);
         self::assertSame(0, (new NameFixingService(updateService: $updates))->matchPreDbFiles((object) ['releases_id' => 42, 'filename' => 'File.Name-GROUP.mkv', 'searchname' => 'Old.Title'], false, true, false));
     }
@@ -281,7 +289,7 @@ final class PredbMatchingTest extends TestCase
             public function __construct()
             {
                 $this->_curPre = ['title' => 'Canonical.Scene-GROUP', 'nuked' => 2];
-                $this->_oldPre = ['category' => ''];
+                $this->_oldPre = Predb::query()->find(7, ['id', 'title', 'category', 'size', 'source']);
                 $this->_debug = false;
                 $this->_silent = true;
             }
@@ -355,14 +363,21 @@ final class PredbMatchingTest extends TestCase
         $this->mockElasticIndexCreation($created);
         $this->app->detectEnvironment(static fn (): string => 'local');
         config(['search.default' => 'elasticsearch', 'nntmux_settings.path_to_nzbs' => '/unused']);
-        DB::partialMock()->shouldReceive('statement')->andReturnTrue();
-        File::shouldReceive('allFiles')->twice()->andReturn([]);
+        $verificationRoot = storage_path('framework/testing/reset-es-'.bin2hex(random_bytes(6)));
+        config(['release_verification.storage_path' => $verificationRoot]);
+        DB::swap($manager = Mockery::mock(DB::getFacadeRoot()));
+        $manager->shouldReceive('statement')->andReturnTrue();
+        File::partialMock()->shouldReceive('allFiles')->twice()->andReturn([]);
         File::shouldReceive('delete')->once()->with([])->andReturnTrue();
         File::shouldReceive('exists')->andReturnFalse();
 
-        $this->artisan('nntmux:resetdb')
-            ->expectsConfirmation('This command removes all releases, nzb files, samples, previews , nfos, truncates all article tables and resets all groups. Are you sure you want reset the DB?', 'yes')
-            ->assertSuccessful();
+        try {
+            $this->artisan('nntmux:resetdb')
+                ->expectsConfirmation('This command removes all releases, nzb files, samples, previews , nfos, truncates all article tables and resets all groups. Are you sure you want reset the DB?', 'yes')
+                ->assertSuccessful();
+        } finally {
+            (new Filesystem)->deleteDirectory($verificationRoot);
+        }
 
         self::assertArrayNotHasKey('predb', $created);
         self::assertSame(['type' => 'keyword'], $created['custom_pre']['mappings']['properties']['title_exact']);
@@ -403,5 +418,108 @@ final class PredbMatchingTest extends TestCase
             putenv($key.'='.$value);
             $_ENV[$key] = $_SERVER[$key] = $value;
         }
+    }
+
+    /** @return array<string, array{bool, bool}> */
+    public static function numericPrefixPaths(): array
+    {
+        return [
+            'subject numbered' => [false, true],
+            'files numbered' => [true, true],
+            'subject unnumbered' => [false, false],
+            'files unnumbered' => [true, false],
+        ];
+    }
+
+    #[DataProvider('numericPrefixPaths')]
+    public function test_numeric_prefix_incoming_paths_preserve_canonical_identity(bool $filesPath, bool $numbered): void
+    {
+        $hits = [
+            ['id' => 91, 'title' => 'Fixture.Canonical.Alpha.2026-GRP', 'filename' => '123.Fixture.Alias.2026-GRP.mkv', 'source' => 'fixture'],
+            ['id' => 92, 'title' => 'Fixture.Canonical.Beta.2026-GRP', 'filename' => 'Fixture.Alias.2026-GRP.mkv', 'source' => 'fixture'],
+        ];
+        DB::table('predb')->insert($hits);
+        $hit = $hits[$numbered ? 0 : 1];
+        $evidence = $numbered ? '123.Fixture.Alias.2026-GRP' : 'Fixture.Alias.2026-GRP';
+        Search::shouldReceive('searchPredb')->once()->with($evidence)->andReturn($hits);
+        $updates = $this->getMockBuilder(ReleaseUpdateService::class)->onlyMethods(['updateRelease'])->getMock();
+        $updates->expects(self::once())->method('updateRelease')
+            ->with(self::anything(), $hit['title'], self::anything(), false, self::anything(), true, false, $hit['id'], $evidence)
+            ->willReturnCallback(static function () use ($updates): void {
+                $updates->matched = true;
+            });
+        $service = new NameFixingService(updateService: $updates);
+        $release = (object) ['releases_id' => 42, 'filename' => $hit['filename'], 'textstring' => $hit['filename'], 'searchname' => 'Opaque.Fixture'];
+        $result = $filesPath ? $service->matchPreDbFiles($release, false, true, false)
+            : (new ReflectionMethod($service, 'preDbFileCheck'))->invoke($service, $release, false, 'fixture', true, false);
+        self::assertSame($filesPath ? 1 : true, $result);
+    }
+
+    /** @return array<string, array{bool, bool}> */
+    public static function numericPrefixAmbiguityPaths(): array
+    {
+        return [
+            'subject conflicting titles' => [false, false],
+            'files conflicting titles' => [true, false],
+            'subject duplicate IDs' => [false, true],
+            'files duplicate IDs' => [true, true],
+        ];
+    }
+
+    #[DataProvider('numericPrefixAmbiguityPaths')]
+    public function test_numeric_prefix_incoming_paths_reject_ambiguous_aliases(bool $filesPath, bool $sameTitle): void
+    {
+        $hits = [
+            ['id' => 91, 'title' => 'Fixture.Canonical.Alpha.2026-GRP', 'filename' => '123.Fixture.Alias.2026-GRP.mkv'],
+            ['id' => 92, 'title' => $sameTitle ? 'Fixture.Canonical.Alpha.2026-GRP' : 'Fixture.Canonical.Beta.2026-GRP', 'filename' => '123.Fixture.Alias.2026-GRP.mkv'],
+        ];
+        Search::shouldReceive('searchPredb')->once()->with('123.Fixture.Alias.2026-GRP')->andReturn($hits);
+        $updates = $this->createMock(ReleaseUpdateService::class);
+        $updates->expects(self::never())->method('updateRelease');
+        $updates->expects(self::never())->method('attachPredbSnapshot');
+        $service = new NameFixingService(updateService: $updates);
+        $release = (object) ['releases_id' => 42, 'filename' => $hits[0]['filename'], 'textstring' => $hits[0]['filename'], 'searchname' => 'Opaque.Fixture'];
+        $result = $filesPath ? $service->matchPreDbFiles($release, false, true, false)
+            : (new ReflectionMethod($service, 'preDbFileCheck'))->invoke($service, $release, false, 'fixture', true, false);
+        self::assertSame($filesPath ? 0 : false, $result);
+    }
+
+    public function test_numeric_prefix_revalidates_current_canonical_filename_and_rejects_stale_identity(): void
+    {
+        DB::table('predb')->insert(['id' => 91, 'title' => 'Fixture.Canonical.Alpha.2026-GRP', 'filename' => '123.Fixture.Alias.2026-GRP.mkv']);
+        $updates = new ReleaseUpdateService;
+        self::assertSame('Fixture.Canonical.Alpha.2026-GRP', $updates->currentPredbTitle(91, 'Fixture.Canonical.Alpha.2026-GRP', '123.Fixture.Alias.2026-GRP'));
+        self::assertNull($updates->currentPredbTitle(91, 'Fixture.Canonical.Alpha.2026-GRP', 'Fixture.Alias.2026-GRP'));
+        DB::table('predb')->where('id', 91)->update(['filename' => 'Fixture.Alias.2026-GRP.mkv']);
+        self::assertNull($updates->currentPredbTitle(91, 'Fixture.Canonical.Alpha.2026-GRP', '123.Fixture.Alias.2026-GRP'));
+        self::assertSame('Fixture.Canonical.Alpha.2026-GRP', $updates->currentPredbTitle(91, 'Fixture.Canonical.Alpha.2026-GRP', 'Fixture.Alias.2026-GRP'));
+    }
+
+    #[DataProvider('numericPrefixPaths')]
+    public function test_numeric_prefix_incoming_paths_persist_real_canonical_association(bool $filesPath, bool $numbered): void
+    {
+        foreach (['videos_id', 'tv_episodes_id', 'imdbid', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'book_lookup_attempts', 'book_lookup_retry_at', 'book_name_normalized_at', 'tv_lookup_attempts', 'tv_lookup_retry_at', 'anidbid'] as $column) {
+            DB::statement('ALTER TABLE releases ADD COLUMN '.$column.' TEXT');
+        }
+        $hits = [
+            ['id' => 91, 'title' => 'Fixture.Canonical.Alpha.2026-GRP', 'filename' => '123.Fixture.Alias.2026-GRP.mkv', 'source' => 'fixture'],
+            ['id' => 92, 'title' => 'Fixture.Canonical.Beta.2026-GRP', 'filename' => 'Fixture.Alias.2026-GRP.mkv', 'source' => 'fixture'],
+        ];
+        DB::table('predb')->insert($hits);
+        DB::table('releases')->insert(['id' => 42, 'guid' => 'numeric-fixture-release-42', 'name' => 'fixture-subject', 'searchname' => 'Opaque.Fixture', 'predb_id' => 0, 'categories_id' => 7010, 'groups_id' => 1]);
+        $hit = $hits[$numbered ? 0 : 1];
+        $evidence = $numbered ? '123.Fixture.Alias.2026-GRP' : 'Fixture.Alias.2026-GRP';
+        Event::fake([ReleaseNameFixed::class]);
+        Search::shouldReceive('searchPredb')->once()->with($evidence)->andReturn($hits);
+        Search::shouldReceive('updateRelease')->once()->with(42);
+        $release = DB::table('releases')->first();
+        $release->releases_id = 42;
+        $release->filename = $release->textstring = $hit['filename'];
+        $service = new NameFixingService;
+        $result = $filesPath ? $service->matchPreDbFiles($release, true, true, false)
+            : (new ReflectionMethod($service, 'preDbFileCheck'))->invoke($service, $release, true, 'fixture', true, false);
+        self::assertSame($filesPath ? 1 : true, $result);
+        self::assertSame($hit['id'], DB::table('releases')->value('predb_id'));
+        self::assertSame($hit['title'], DB::table('releases')->value('searchname'));
     }
 }

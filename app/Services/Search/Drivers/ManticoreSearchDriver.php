@@ -14,9 +14,12 @@ use App\Models\MusicInfo;
 use App\Models\Release;
 use App\Models\SteamApp;
 use App\Models\Video;
+use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
+use App\Services\Search\Contracts\ReleaseCandidatePager;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
+use App\Services\Search\SearchService;
 use App\Services\Search\Support\ManticoreClientFactory;
 use App\Services\Search\Support\ManticoreIndexRegistry;
 use App\Services\Search\Support\ReleaseIndexProjection;
@@ -35,11 +38,16 @@ use Manticoresearch\Search;
 /**
  * ManticoreSearch driver for full-text search functionality.
  */
-class ManticoreSearchDriver implements SearchDriverInterface
+class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidatePager, SearchDriverInterface
 {
     private const AVAILABILITY_CHECK_CACHE_TTL = 30;
 
     /** @var list<string> */
+    /**
+     * Matches a release name in either name field; one selector is an OR across both fields.
+     */
+    private const string RELEASE_NAME_FIELDS_SELECTOR = '@(name,searchname)';
+
     private const RELEASE_FIELD_SEARCH_FIELDS = [
         'searchname',
         'plainsearchname',
@@ -327,18 +335,31 @@ class ManticoreSearchDriver implements SearchDriverInterface
             return;
         }
 
+        $this->insertReleaseDocument($parameters);
+    }
+
+    /**
+     * @param  array<string, mixed>  $parameters  Release projection with an id
+     * @return bool Whether the document was written
+     */
+    private function insertReleaseDocument(array $parameters): bool
+    {
         $releaseId = (int) $parameters['id'];
-        if (! $this->replaceReleaseDocumentWithRetry($parameters)) {
-            $this->recordReleaseIndexFailure($releaseId, 'insertRelease', 'upsert');
-            try {
-                ReindexReleaseJob::dispatch($releaseId)->delay(now()->addSeconds(2));
-            } catch (\Throwable $e) {
-                Log::error('ManticoreSearch: failed to queue ReindexReleaseJob', [
-                    'release_id' => $releaseId,
-                    'error' => $e->getMessage(),
-                ]);
-            }
+        if ($this->replaceReleaseDocumentWithRetry($parameters)) {
+            return true;
         }
+
+        $this->recordReleaseIndexFailure($releaseId, 'insertRelease', 'upsert');
+        try {
+            ReindexReleaseJob::dispatch($releaseId)->delay(now()->addSeconds(2));
+        } catch (\Throwable $e) {
+            Log::error('ManticoreSearch: failed to queue ReindexReleaseJob', [
+                'release_id' => $releaseId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return false;
     }
 
     /**
@@ -411,22 +432,7 @@ class ManticoreSearchDriver implements SearchDriverInterface
     {
         Cache::increment('search:index:failures:releases');
         try {
-            $existing = DB::table('search_index_failures')
-                ->where('release_id', $releaseId)
-                ->first(['attempts']);
-            $attempts = ((int) ($existing->attempts ?? 0)) + 1;
-            DB::table('search_index_failures')->updateOrInsert(
-                ['release_id' => $releaseId],
-                [
-                    'operation' => $operation,
-                    'attempts' => $attempts,
-                    'last_error' => $phase,
-                    'next_attempt_at' => now()->addSeconds(min(3600, 2 ** min($attempts, 10))),
-                    'resolved_at' => null,
-                    'updated_at' => now(),
-                    'created_at' => now(),
-                ]
-            );
+            $this->persistReleaseIndexFailure($releaseId, $phase, $operation);
         } catch (\Throwable $e) {
             Log::error('ManticoreSearch: unable to persist release index failure', [
                 'release_id' => $releaseId,
@@ -443,6 +449,39 @@ class ManticoreSearchDriver implements SearchDriverInterface
         }
     }
 
+    /**
+     * Record the failure with conditional writes, so a deferral lease that a release
+     * pass writes concurrently is never replaced: on a lease the failure only counts an
+     * attempt, keeping the pass's token and lease (the pass hands the release to repair,
+     * or repair takes over when the lease expires).
+     */
+    private function persistReleaseIndexFailure(int $releaseId, string $phase, string $operation): void
+    {
+        $failures = static fn () => DB::table('search_index_failures')->where('release_id', $releaseId);
+
+        for ($try = 0; $try < 3; $try++) {
+            $attempts = ((int) $failures()->value('attempts')) + 1;
+            $failure = [
+                'operation' => $operation,
+                'last_error' => $phase,
+                'next_attempt_at' => now()->addSeconds(min(3600, 2 ** min($attempts, 10))),
+                'resolved_at' => null,
+                'updated_at' => now(),
+            ];
+
+            if ($failures()->where('operation', SearchService::DEFERRED_RELEASE_OPERATION)->increment('attempts', 1, ['updated_at' => now()]) > 0) {
+                return;
+            }
+            if ($failures()->where('operation', '!=', SearchService::DEFERRED_RELEASE_OPERATION)->update($failure + ['attempts' => DB::raw('attempts + 1')]) > 0) {
+                return;
+            }
+            if (DB::table('search_index_failures')->insertOrIgnore([$failure + ['release_id' => $releaseId, 'attempts' => 1, 'created_at' => now()]]) > 0) {
+                return;
+            }
+            // The row changed between the writes; look again.
+        }
+    }
+
     private function resolveReleaseIndexFailure(int $releaseId): void
     {
         if ($releaseId <= 0) {
@@ -450,8 +489,11 @@ class ManticoreSearchDriver implements SearchDriverInterface
         }
 
         try {
+            // A 'deferred' row is a lease owned by a running release pass (see
+            // SearchService::deferReleaseUpdates()); only that pass or repair removes it.
             DB::table('search_index_failures')
                 ->where('release_id', $releaseId)
+                ->where('operation', '!=', SearchService::DEFERRED_RELEASE_OPERATION)
                 ->update([
                     'resolved_at' => now(),
                     'next_attempt_at' => null,
@@ -537,6 +579,16 @@ class ManticoreSearchDriver implements SearchDriverInterface
             return;
         }
 
+        $this->deleteReleaseDocuments($ids);
+    }
+
+    /**
+     * @param  non-empty-list<int>  $ids
+     * @return bool Whether the documents were deleted
+     */
+    private function deleteReleaseDocuments(array $ids): bool
+    {
+
         $attempts = max(1, (int) ($this->config['retry_attempts'] ?? config('search.drivers.manticore.retry_attempts', 2)));
         $delayMs = max(0, (int) ($this->config['retry_delay_ms'] ?? config('search.drivers.manticore.retry_delay_ms', 100)));
 
@@ -548,7 +600,7 @@ class ManticoreSearchDriver implements SearchDriverInterface
                     $this->resolveReleaseIndexFailure((int) $id);
                 }
 
-                return;
+                return true;
             } catch (\Throwable $e) {
                 if ($attempt < $attempts - 1) {
                     if ($delayMs > 0) {
@@ -566,6 +618,8 @@ class ManticoreSearchDriver implements SearchDriverInterface
                 }
             }
         }
+
+        return false;
     }
 
     /**
@@ -634,10 +688,11 @@ class ManticoreSearchDriver implements SearchDriverInterface
     /**
      * Bulk insert multiple predb records into the index.
      *
-     * @param  array<string, mixed>  $predbRecords  Array of predb data arrays
+     * @param  array<array<string, mixed>>  $predbRecords  Array of predb data arrays
+     * @param  bool  $replaceExisting  Disable replacement for missing-document reconciliation
      * @return array<string, mixed> Results with 'success' and 'errors' counts
      */
-    public function bulkInsertPredb(array $predbRecords): array
+    public function bulkInsertPredb(array $predbRecords, bool $replaceExisting = true): array
     {
         if (empty($predbRecords)) {
             return ['success' => 0, 'errors' => 0];
@@ -662,12 +717,39 @@ class ManticoreSearchDriver implements SearchDriverInterface
         }
 
         try {
-            $this->manticoreSearch->table($this->config['indexes']['predb'])
-                ->replaceDocuments($documents);
+            $index = $this->getPredbIndex();
+            $table = $this->manticoreSearch->table($index);
+            if ($replaceExisting) {
+                $table->replaceDocuments($documents);
+            } else {
+                $response = $table->addDocuments($documents);
+                // One table and no empty NDJSON lines produce one transaction ack.
+                // The SDK does not reject every bulk error, so validate before counting.
+                $acknowledgement = $response['items'][0]['bulk'] ?? null;
+                if (($response['errors'] ?? null) !== false
+                    || ($response['error'] ?? '') !== ''
+                    || ($response['warning'] ?? '') !== ''
+                    || ($response['skipped_lines'] ?? 0) !== 0
+                    || ! is_array($response['items'] ?? null)
+                    || count($response['items']) !== 1
+                    || ! is_array($acknowledgement)
+                    || ($acknowledgement['table'] ?? null) !== $index
+                    || ($acknowledgement['created'] ?? null) !== count($documents)
+                    || ($acknowledgement['deleted'] ?? null) !== 0
+                    || ($acknowledgement['updated'] ?? null) !== 0
+                    || ($acknowledgement['result'] ?? null) !== 'created'
+                    || ($acknowledgement['status'] ?? null) !== 201) {
+                    return ['success' => 0, 'errors' => count($documents)];
+                }
+            }
 
             return ['success' => count($documents), 'errors' => 0];
         } catch (\Throwable $e) {
-            Log::error('ManticoreSearch bulkInsertPredb error: '.$e->getMessage());
+            if ($replaceExisting) {
+                Log::error('ManticoreSearch bulkInsertPredb error: '.$e->getMessage());
+            } else {
+                Log::error('ManticoreSearch PreDB repair insert failed.', ['exception_class' => $e::class]);
+            }
 
             return ['success' => 0, 'errors' => count($documents)];
         }
@@ -730,6 +812,23 @@ class ManticoreSearchDriver implements SearchDriverInterface
         $string = rtrim($string, '-!');
 
         return trim($string);
+    }
+
+    private static function prepareReleaseFieldSearchQuery(string $field, string $query): string
+    {
+        if ($field !== 'fromname') {
+            return self::prepareUserSearchQuery($query);
+        }
+
+        $query = trim($query);
+        if ($query === '') {
+            return '';
+        }
+
+        $escapeFrom = ['\\', '@', '~', '&', '/', '$', '=', "'", '[', ']', '(', ')', '"', '!', '-', '|', '^', '<', '>', '*', '?', '%'];
+        $escapeTo = ['\\\\', '\\@', '\\~', '\\&', '\\/', '\\$', '\\=', "\\'", '\\[', '\\]', '\\(', '\\)', '\\"', '\\!', '\\-', '\\|', '\\^', '\\<', '\\>', '\\*', '\\?', '\\%'];
+
+        return str_replace($escapeFrom, $escapeTo, $query);
     }
 
     /**
@@ -863,6 +962,34 @@ class ManticoreSearchDriver implements SearchDriverInterface
     }
 
     /**
+     * Combine per-field terms into one query. `@@relaxed` is a query-wide modifier that is only valid
+     * once, at the start; repeating it before each field made every multi-field search (such as the
+     * PreDB title match on `name` and `searchname`) a syntax error.
+     *
+     * @param  array<string, mixed>  $searchArray
+     * @param  list<string>|null  $allowedFields  When given, only these string keys are searched
+     */
+    public static function buildFieldSearchExpression(array $searchArray, ?array $allowedFields = null): ?string
+    {
+        $terms = [];
+        foreach ($searchArray as $key => $value) {
+            if ($allowedFields !== null && (! is_string($key) || ! in_array($key, $allowedFields, true))) {
+                continue;
+            }
+            // An explicit check: empty() would also drop the legitimate search term "0".
+            if ($value !== null && $value !== '') {
+                $rawValue = (string) $value;
+                $preparedValue = self::prepareUserSearchQuery($rawValue);
+                if ($preparedValue !== '') {
+                    $terms[] = self::scopeReleaseSearchQuery($rawValue, $preparedValue, '@'.$key);
+                }
+            }
+        }
+
+        return $terms === [] ? null : '@@relaxed '.implode(' ', $terms);
+    }
+
+    /**
      * Build a release-name query that also handles punctuation used as token
      * separators in Usenet subjects (for example, WEB-DL.x265).
      *
@@ -875,7 +1002,7 @@ class ManticoreSearchDriver implements SearchDriverInterface
     {
         $primary = self::scopePreparedQueryToField($preparedQuery, $fieldSelector);
 
-        if ($fieldSelector !== '@searchname' || self::queryHasNegation($rawQuery)) {
+        if (! in_array($fieldSelector, ['@searchname', self::RELEASE_NAME_FIELDS_SELECTOR], true) || self::queryHasNegation($rawQuery)) {
             return $primary;
         }
 
@@ -938,21 +1065,156 @@ class ManticoreSearchDriver implements SearchDriverInterface
             return;
         }
 
-        try {
-            $release = ReleaseIndexProjection::forId((int) $releaseID);
+        $this->refreshRelease((int) $releaseID);
+    }
 
-            if ($release !== null) {
-                $this->insertRelease($release);
-            } else {
-                Log::warning('ManticoreSearch: Release not found for update, removing from index', ['id' => $releaseID]);
-                $this->recordReleaseNotFoundForIndex($releaseID);
-                $this->deleteRelease((int) $releaseID);
-            }
+    /**
+     * @return bool Whether the release's document now matches its row (or is gone with it)
+     */
+    private function refreshRelease(int $releaseId): bool
+    {
+        try {
+            $release = ReleaseIndexProjection::forId($releaseId);
         } catch (\Throwable $e) {
             Log::error('ManticoreSearch updateRelease error: '.$e->getMessage(), [
-                'release_id' => $releaseID,
+                'release_id' => $releaseId,
             ]);
-            $this->recordReleaseIndexFailure((int) $releaseID, 'updateRelease_query');
+            $this->recordReleaseIndexFailure($releaseId, 'updateRelease_query');
+
+            return false;
+        }
+
+        if ($release !== null) {
+            return $this->insertReleaseDocument($release);
+        }
+
+        Log::warning('ManticoreSearch: Release not found for update, removing from index', ['id' => $releaseId]);
+        $this->recordReleaseNotFoundForIndex($releaseId);
+
+        return $this->deleteReleaseDocuments([$releaseId]);
+    }
+
+    /**
+     * Refresh many release documents with one projection query and one bulk replace.
+     *
+     * Each release ends up as updateRelease() would leave it: the same document,
+     * removal when the row is gone, and failure tracking resolved on success. If the
+     * projection or the bulk replace fails, every release falls back to the
+     * single-release path, which retries and records its own failure.
+     *
+     * @param  list<int>  $releaseIds
+     * @return list<int> The releases that could not be refreshed
+     */
+    public function updateReleases(array $releaseIds): array
+    {
+        $releaseIds = array_values(array_unique(array_filter(array_map('intval', $releaseIds), static fn (int $id): bool => $id > 0)));
+        if ($releaseIds === []) {
+            return [];
+        }
+
+        try {
+            $documents = [];
+            foreach (ReleaseIndexProjection::query()->whereIn('r.id', $releaseIds)->get() as $row) {
+                $release = ReleaseSearchIndexDocument::normalize((array) $row);
+                $documents[(int) $release['id']] = $release;
+            }
+        } catch (\Throwable $e) {
+            Log::error('ManticoreSearch updateReleases query error: '.$e->getMessage(), ['release_ids' => count($releaseIds)]);
+
+            return array_values(array_filter($releaseIds, fn (int $releaseId): bool => ! $this->refreshRelease($releaseId)));
+        }
+
+        $failed = [];
+        $missing = array_values(array_diff($releaseIds, array_keys($documents)));
+        foreach ($missing as $releaseId) {
+            Log::warning('ManticoreSearch: Release not found for update, removing from index', ['id' => $releaseId]);
+            $this->recordReleaseNotFoundForIndex($releaseId);
+        }
+        if ($missing !== [] && ! $this->deleteReleaseDocuments($missing)) {
+            $failed = $missing;
+        }
+        if ($documents === []) {
+            return $failed;
+        }
+
+        if ($this->replaceReleaseDocumentsWithRetry($documents)) {
+            $this->resolveReleaseIndexFailures(array_keys($documents));
+
+            return $failed;
+        }
+
+        foreach ($documents as $releaseId => $release) {
+            if (! $this->insertReleaseDocument($release)) {
+                $failed[] = $releaseId;
+            }
+        }
+
+        return $failed;
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $releases  Normalized projections keyed by release id
+     */
+    private function replaceReleaseDocumentsWithRetry(array $releases): bool
+    {
+        $documents = [];
+        foreach ($releases as $releaseId => $release) {
+            // As in replaceReleaseDocumentWithRetry(): the projection is already
+            // normalized, so normalizeForBulk() keeps its *_ts fields.
+            $documents[] = array_merge(['id' => $releaseId], ReleaseSearchIndexDocument::normalizeForBulk($release));
+        }
+
+        $indexName = $this->config['indexes']['releases'];
+        $attempts = max(1, (int) ($this->config['retry_attempts'] ?? config('search.drivers.manticore.retry_attempts', 3)));
+        $delayMs = max(0, (int) ($this->config['retry_delay_ms'] ?? config('search.drivers.manticore.retry_delay_ms', 100)));
+
+        for ($attempt = 0; $attempt < $attempts; $attempt++) {
+            try {
+                $this->manticoreSearch->table($indexName)->replaceDocuments($documents);
+
+                return true;
+            } catch (\Throwable $e) {
+                $retryable = $e instanceof ResponseException || $e instanceof RuntimeException;
+                if ($retryable && $attempt < $attempts - 1) {
+                    if ($delayMs > 0) {
+                        usleep($delayMs * 1000 * ($attempt + 1));
+                    }
+
+                    continue;
+                }
+
+                Log::error('ManticoreSearch updateReleases bulk replace failed; retrying one by one: '.$e->getMessage(), [
+                    'releases' => count($documents),
+                    'index' => $indexName,
+                ]);
+
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param  list<int>  $releaseIds
+     */
+    private function resolveReleaseIndexFailures(array $releaseIds): void
+    {
+        try {
+            DB::table('search_index_failures')
+                ->whereIn('release_id', $releaseIds)
+                ->whereNull('resolved_at')
+                ->where('operation', '!=', SearchService::DEFERRED_RELEASE_OPERATION)
+                ->update([
+                    'resolved_at' => now(),
+                    'next_attempt_at' => null,
+                    'updated_at' => now(),
+                ]);
+        } catch (\Throwable $e) {
+            Log::debug('ManticoreSearch: unable to mark release index failures resolved', [
+                'releases' => count($releaseIds),
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
@@ -1124,9 +1386,94 @@ class ManticoreSearchDriver implements SearchDriverInterface
             }
         }
 
-        $result = $this->searchIndexes($this->getReleasesIndex(), '', [], $searchArray, $limit);
+        // The same text for both name fields means "match it in either one" (the PreDB title lookup); a
+        // per-field AND would miss releases whose searchname has not been fixed yet.
+        $nameText = self::sharedNameFieldText($searchArray);
+        $result = $nameText !== null
+            ? $this->searchIndexes($this->getReleasesIndex(), $nameText, ['name', 'searchname'], [], $limit) // @phpstan-ignore argument.type
+            : $this->searchIndexes($this->getReleasesIndex(), '', [], $searchArray, $limit);
 
         return ! empty($result) ? ($result['id'] ?? []) : [];
+    }
+
+    /** @return array{ids: list<int>, available: bool, has_more: bool} */
+    public function searchReleaseCandidatesPage(string $title, int $limit = 21, int $afterId = 0): array
+    {
+        if ($limit < 1 || $limit > 1000 || $afterId < 0) {
+            throw new \InvalidArgumentException('Release candidate pages require a limit from 1 to 1000 and a nonnegative cursor.');
+        }
+        $unavailable = ['ids' => [], 'available' => false, 'has_more' => false];
+        if (! $this->isAvailable()) {
+            $this->recordSearchFailure();
+
+            return $unavailable;
+        }
+
+        // Titles are data rather than search syntax; literal confirmation belongs to the caller.
+        $tokens = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $title);
+        if ($tokens === null || trim($tokens) === '') {
+            $this->recordSearchFailure();
+
+            return $unavailable;
+        }
+        $prepared = self::prepareUserSearchQuery(trim($tokens));
+        $expression = '@@relaxed ('.self::scopePreparedQueryToField($prepared, '@name').' | '.self::scopePreparedQueryToField($prepared, '@searchname').')';
+        $profile = ManticoreIndexRegistry::profile('releases');
+
+        try {
+            $results = (new Search($this->manticoreSearch))
+                ->setTable($this->getReleasesIndex())
+                ->stripBadUtf8(true)
+                ->search($expression)
+                ->filter('id', 'gt', $afterId)
+                ->sort('id', 'asc')
+                ->option('ranker', $profile['ranker'])
+                ->option('field_weights', $profile['fields'])
+                ->maxMatches($limit + 1)
+                ->limit($limit + 1)
+                ->get();
+            $response = $results->getResponse()->getResponse();
+            if ($results->hasTimedout() || ! is_array($response['hits']['hits'] ?? null)) {
+                throw new \RuntimeException('The release candidate response was partial or malformed.');
+            }
+            $ids = [];
+            $previousId = $afterId;
+            foreach ($results as $hit) {
+                $rawId = $hit->getId();
+                if (! is_int($rawId) && (! is_string($rawId) || preg_match('/^[0-9]+$/D', $rawId) !== 1)) {
+                    throw new \RuntimeException('The release candidate response contained an invalid ID type.');
+                }
+                $id = filter_var($rawId, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+                if ($id === false || $id <= $previousId || count($ids) >= $limit + 1) {
+                    throw new \RuntimeException('The release candidate response did not preserve its cursor order.');
+                }
+                $ids[] = $id;
+                $previousId = $id;
+            }
+
+            return ['ids' => array_slice($ids, 0, $limit), 'available' => true, 'has_more' => count($ids) > $limit];
+        } catch (\Throwable $exception) {
+            $this->recordSearchFailure();
+            Log::error('ManticoreSearch release candidate page failed: '.$exception->getMessage());
+
+            return $unavailable;
+        }
+    }
+
+    /**
+     * The shared text when a search covers exactly `name` and `searchname` with identical, non-empty values.
+     *
+     * @param  array<string, mixed>  $searchArray
+     */
+    public static function sharedNameFieldText(array $searchArray): ?string
+    {
+        if (count($searchArray) !== 2 || ! array_key_exists('name', $searchArray) || ! array_key_exists('searchname', $searchArray)) {
+            return null;
+        }
+
+        $name = (string) $searchArray['name'];
+
+        return $name !== '' && $name === (string) $searchArray['searchname'] ? $name : null;
     }
 
     /**
@@ -1485,19 +1832,8 @@ class ManticoreSearchDriver implements SearchDriverInterface
         // Use prepareUserSearchQuery() to preserve search operators (!, -, "", |, *)
         $searchExpr = null;
         if (! empty($searchArray)) {
-            $terms = [];
-            foreach ($searchArray as $key => $value) {
-                if (! empty($value)) {
-                    $rawValue = (string) $value;
-                    $preparedValue = self::prepareUserSearchQuery($rawValue);
-                    if (! empty($preparedValue)) {
-                        $terms[] = '@@relaxed '.self::scopeReleaseSearchQuery($rawValue, $preparedValue, '@'.$key);
-                    }
-                }
-            }
-            if (! empty($terms)) {
-                $searchExpr = implode(' ', $terms);
-            } else {
+            $searchExpr = self::buildFieldSearchExpression($searchArray);
+            if ($searchExpr === null) {
                 if (config('app.debug')) {
                     Log::debug('ManticoreSearch::searchIndexes no terms after escaping searchArray');
                 }
@@ -2692,7 +3028,10 @@ class ManticoreSearchDriver implements SearchDriverInterface
 
         $phrases = $criteria['phrases'] ?? null;
         $hasText = $phrases !== null && $phrases !== '' && $phrases !== -1;
-        $tryFuzzy = (bool) ($criteria['try_fuzzy'] ?? true) && ! self::hasMediaInfoFieldQuery($phrases);
+        $hasPosterFieldQuery = self::hasPosterFieldQuery($phrases);
+        $tryFuzzy = (bool) ($criteria['try_fuzzy'] ?? true)
+            && ! self::hasMediaInfoFieldQuery($phrases)
+            && ! $hasPosterFieldQuery;
 
         $execute = function (bool $useFuzzy) use ($criteria, $limit, $offset, $hasText, $phrases): array {
             $query = (new Search($this->manticoreSearch))
@@ -2724,16 +3063,18 @@ class ManticoreSearchDriver implements SearchDriverInterface
                         if (! is_string($key) || ! in_array($key, self::RELEASE_FIELD_SEARCH_FIELDS, true) || $value === '' || $value === null) {
                             continue;
                         }
-                        $prepared = self::prepareUserSearchQuery((string) $value);
+                        $rawValue = (string) $value;
+                        $prepared = self::prepareReleaseFieldSearchQuery($key, $rawValue);
                         if ($prepared !== '') {
-                            $terms[] = '@@relaxed '.self::scopeReleaseSearchQuery((string) $value, $prepared, '@'.$key);
+                            $terms[] = self::scopeReleaseSearchQuery($rawValue, $prepared, '@'.$key);
                         }
                     }
                     if ($terms === []) {
                         return ['ids' => [], 'total' => 0, 'fuzzy' => false];
                     }
+                    $searchExpression = '@@relaxed '.implode(' ', $terms);
                     $profile = ManticoreIndexRegistry::profile('releases');
-                    $query->search(implode(' ', $terms))
+                    $query->search($searchExpression)
                         ->option('ranker', $profile['ranker'])
                         ->option('field_weights', $profile['fields']);
                 }
@@ -2743,7 +3084,7 @@ class ManticoreSearchDriver implements SearchDriverInterface
 
             $sortField = (string) ($criteria['sort_field'] ?? 'postdate_ts');
             $sortDir = strtolower((string) ($criteria['sort_dir'] ?? 'desc'));
-            $allowedSort = ['postdate_ts', 'adddate_ts', 'size', 'totalpart', 'grabs', 'categories_id', 'id'];
+            $allowedSort = ['postdate_ts', 'adddate_ts', 'size', 'totalpart', 'grabs', 'comments', 'categories_id', 'id'];
             if (! in_array($sortField, $allowedSort, true)) {
                 $sortField = 'postdate_ts';
             }
@@ -2796,6 +3137,10 @@ class ManticoreSearchDriver implements SearchDriverInterface
                 'documents' => $documents,
             ];
         };
+
+        if ($hasText && (bool) ($criteria['fuzzy_only'] ?? false)) {
+            return $execute(! $hasPosterFieldQuery);
+        }
 
         if ($hasText) {
             $first = $execute(false);
@@ -2861,11 +3206,31 @@ class ManticoreSearchDriver implements SearchDriverInterface
         return false;
     }
 
+    private static function hasPosterFieldQuery(mixed $phrases): bool
+    {
+        return is_array($phrases)
+            && isset($phrases['fromname'])
+            && $phrases['fromname'] !== ''
+            && $phrases['fromname'] !== -1;
+    }
+
     /**
      * @param  array<string, mixed>  $criteria
      */
     private function applyManticoreReleaseIndexFilters(Search $query, array $criteria): void
     {
+        foreach (ReleaseSearchQuery::normalizeRanges($criteria['ranges'] ?? []) as $field => $bounds) {
+            foreach ($bounds as $bound => $value) {
+                $query->filter($field, $bound === 'min' ? 'gte' : 'lte', $value);
+            }
+        }
+        foreach (['min_id' => 'gte', 'max_id' => 'lte'] as $bound => $operator) {
+            $value = ReleaseSearchQuery::normalizeRangeBound($criteria[$bound] ?? null);
+            if ($value !== null) {
+                $query->filter('id', $operator, $value);
+            }
+        }
+
         $releaseIds = $criteria['release_ids'] ?? null;
         if (is_array($releaseIds) && $releaseIds !== []) {
             $valid = array_values(array_filter(

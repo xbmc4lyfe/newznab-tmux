@@ -1,0 +1,215 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Services\Releases\Verification;
+
+use Illuminate\Support\Facades\File;
+use RuntimeException;
+
+/** Stable file locks outlive database leases and manifest generations. */
+final class VerificationWorkerLocks
+{
+    /** @var resource|null */
+    private $global = null;
+
+    /** @var resource|null */
+    private $slot = null;
+
+    /** @var resource|null */
+    private $candidate = null;
+
+    /** @var resource|null */
+    private $gc = null;
+
+    private ?int $candidateId = null;
+
+    private bool $exclusive = false;
+
+    public function start(int $slot = 0): bool
+    {
+        $this->close();
+        $this->global = $this->acquire('worker.lock', LOCK_SH);
+        if ($this->global === null) {
+            return false;
+        }
+        $maximum = max(1, min(8, (int) config('release_verification.candidate_workers', 2)));
+        foreach ($slot > 0 ? [$slot] : range(1, $maximum) as $number) {
+            if ($number > $maximum) {
+                break;
+            }
+            $this->slot = $this->acquire('locks/worker-'.$number.'.lock', LOCK_EX);
+            if ($this->slot !== null) {
+                return true;
+            }
+        }
+        $this->close();
+
+        return false;
+    }
+
+    public function startPreparation(): bool
+    {
+        $this->close();
+        $this->global = $this->acquire('worker.lock', LOCK_SH);
+        if ($this->global !== null) {
+            $this->slot = $this->acquire('locks/preparation.lock', LOCK_EX);
+            if ($this->slot !== null) {
+                return true;
+            }
+        }
+        $this->close();
+
+        return false;
+    }
+
+    /** Persist claim-selection fairness in the already exclusively held worker slot. */
+    public function preferReady(): bool
+    {
+        return $this->preferPrimaryQueue(true);
+    }
+
+    public function preferPending(bool $advance): bool
+    {
+        return $this->preferPrimaryQueue($advance);
+    }
+
+    private function preferPrimaryQueue(bool $advance): bool
+    {
+        if ($this->slot === null || $this->global === null) {
+            throw new RuntimeException('Queue selection requires an active slot.');
+        }
+        rewind($this->slot);
+        $stored = stream_get_contents($this->slot, 16);
+        $phase = is_string($stored) && preg_match('/\A[0-4]\z/D', $stored) === 1 ? (int) $stored : 0;
+        $next = ($phase + 1) % 5;
+        if ($advance) {
+            rewind($this->slot);
+            if (fwrite($this->slot, (string) $next) !== 1 || ! ftruncate($this->slot, 1) || ! fflush($this->slot)) {
+                throw new RuntimeException('Cannot persist verification queue selection.');
+            }
+        }
+
+        return $next !== 0;
+    }
+
+    public function tryExclusive(): bool
+    {
+        $this->close();
+        $this->global = $this->acquire('worker.lock', LOCK_EX);
+        $this->exclusive = $this->global !== null;
+
+        return $this->exclusive;
+    }
+
+    public function tryCandidate(int $id): bool
+    {
+        if ($this->candidateId === $id && $this->candidate !== null) {
+            return true;
+        }
+        if ($this->candidate !== null || $this->global === null) {
+            throw new RuntimeException('Candidate lock requires an active worker and no other candidate lock.');
+        }
+        $this->candidate = $this->acquire('locks/candidate-'.$id.'.lock', LOCK_EX);
+        if ($this->candidate === null) {
+            return false;
+        }
+        $this->candidateId = $id;
+
+        return true;
+    }
+
+    public function protects(int $id): bool
+    {
+        return $this->exclusive || ($this->candidate !== null && $this->candidateId === $id);
+    }
+
+    public function tryGc(): bool
+    {
+        $this->gc = $this->acquire('locks/gc.lock', LOCK_EX);
+
+        return $this->gc !== null;
+    }
+
+    /** Alternate the first maintenance task across exclusively held GC turns. */
+    public function preferExpiry(): bool
+    {
+        if ($this->gc === null || $this->slot === null || $this->global === null) {
+            throw new RuntimeException('Maintenance selection requires an active worker and GC lock.');
+        }
+        rewind($this->gc);
+        $expiryFirst = stream_get_contents($this->gc, 16) === '1';
+        rewind($this->gc);
+        if (fwrite($this->gc, $expiryFirst ? '0' : '1') !== 1 || ! ftruncate($this->gc, 1) || ! fflush($this->gc)) {
+            throw new RuntimeException('Cannot persist verification maintenance selection.');
+        }
+
+        return $expiryFirst;
+    }
+
+    public function releaseCandidate(): void
+    {
+        $this->release($this->candidate);
+        $this->candidateId = null;
+    }
+
+    public function releaseGc(): void
+    {
+        $this->release($this->gc);
+    }
+
+    public function close(): void
+    {
+        $this->releaseCandidate();
+        $this->releaseGc();
+        $this->release($this->slot);
+        $this->release($this->global);
+        $this->exclusive = false;
+    }
+
+    public function __destruct()
+    {
+        $this->close();
+    }
+
+    /** @return resource|null */
+    private function acquire(string $name, int $mode)
+    {
+        $root = (string) config('release_verification.storage_path');
+        foreach ([$root, $root.'/locks'] as $directory) {
+            if (is_link($directory)) {
+                throw new RuntimeException('Verification lock directory cannot be a symlink.');
+            }
+            File::ensureDirectoryExists($directory, 0700);
+        }
+        $path = $root.'/'.$name;
+        if (is_link($path)) {
+            throw new RuntimeException('Verification lock cannot be a symlink.');
+        }
+        $handle = fopen($path, 'c+');
+        if ($handle === false) {
+            throw new RuntimeException('Verification lock is unavailable.');
+        }
+        if (! flock($handle, $mode | LOCK_NB)) {
+            fclose($handle);
+
+            return null;
+        }
+
+        return $handle;
+    }
+
+    /**
+     * @param  resource|null  $handle
+     *
+     * @param-out null $handle
+     */
+    private function release(&$handle): void
+    {
+        if (is_resource($handle)) {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+        }
+        $handle = null;
+    }
+}

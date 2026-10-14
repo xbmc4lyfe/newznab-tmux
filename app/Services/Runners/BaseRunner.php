@@ -26,6 +26,11 @@ abstract class BaseRunner
         return (int) ($configured ?? config('nntmux.multiprocessing_max_child_time', 1800));
     }
 
+    protected function hasCancellationRequest(): bool
+    {
+        return $this->cancellationRequested;
+    }
+
     /** @return list<string> */
     protected function buildDnrCommand(string $args): array
     {
@@ -88,6 +93,15 @@ abstract class BaseRunner
         return $this->runWorkerPool($commands, $maxProcesses, $timeout ?? $this->concurrencyTimeout(), false);
     }
 
+    /**
+     * @param  array<string|int, string|list<string>>  $commands
+     * @param  callable(string|int, string): void  $onComplete
+     */
+    protected function runParallelCommandsWithCompletion(array $commands, int $maxProcesses, callable $onComplete): void
+    {
+        $this->runWorkerPool($commands, $maxProcesses, $this->concurrencyTimeout(), false, $onComplete);
+    }
+
     /** @param array<string|int, string|list<string>> $commands */
     protected function runStreamingCommands(array $commands, int $maxProcesses, string $desc): void
     {
@@ -103,9 +117,10 @@ abstract class BaseRunner
 
     /**
      * @param  array<string|int, string|list<string>>  $commands
+     * @param  callable(string|int, string): void|null  $onComplete
      * @return array<string|int, string>
      */
-    private function runWorkerPool(array $commands, int $maxProcesses, int $timeout, bool $stream): array
+    private function runWorkerPool(array $commands, int $maxProcesses, int $timeout, bool $stream, ?callable $onComplete = null): array
     {
         $queue = $commands;
         $running = [];
@@ -156,12 +171,18 @@ abstract class BaseRunner
                     } catch (ProcessTimedOutException) {
                         $status = 'timeout';
                     }
-                    $results[$key] = $process->getOutput();
+                    $output = $process->getOutput();
+                    if ($onComplete === null) {
+                        $results[$key] = $output;
+                    }
                     if (! $stream) {
                         echo $process->getErrorOutput();
                     }
-                    $this->recordWorkerOutcome($key, $status, $process->getExitCode());
+                    $this->recordWorkerOutcome($key, $status, $process->getExitCode(), $this->outputTail($process));
                     unset($running[$key]);
+                    if ($onComplete !== null && $status === 'success') {
+                        $onComplete($key, $output);
+                    }
                 }
                 usleep(50000);
             }
@@ -216,11 +237,37 @@ abstract class BaseRunner
         return $this->cancellationRequested;
     }
 
-    private function recordWorkerOutcome(string|int $key, string $status, ?int $exitCode): void
+    private function recordWorkerOutcome(string|int $key, string $status, ?int $exitCode, string $outputTail = ''): void
     {
         $this->workerOutcomes[$key] = ['status' => $status, 'exit_code' => $exitCode];
         if ($status !== 'success') {
-            Log::error('Multiprocessing worker did not succeed', ['worker' => $key, 'outcome' => $status, 'exit_code' => $exitCode]);
+            Log::error('Multiprocessing worker did not succeed', [
+                'worker' => $key,
+                'outcome' => $status,
+                'exit_code' => $exitCode,
+                ...($outputTail !== '' ? ['output_tail' => $outputTail] : []),
+            ]);
         }
+    }
+
+    /**
+     * The last lines a worker wrote, so a failed worker's reason reaches the log instead of
+     * only the tmux pane. Bounded, and only read for workers that did not succeed.
+     */
+    private function outputTail(Process $process): string
+    {
+        if ($process->isSuccessful()) {
+            return '';
+        }
+
+        $tail = static function (string $text): string {
+            $text = trim(preg_replace('/\e\[[0-9;]*m/', '', $text) ?? $text);
+
+            return mb_substr($text, -400);
+        };
+        $stderr = $tail($process->getErrorOutput());
+        $stdout = $tail($process->getOutput());
+
+        return trim(($stderr !== '' ? 'stderr: '.$stderr : '').($stdout !== '' ? "\nstdout: ".$stdout : ''));
     }
 }

@@ -40,11 +40,14 @@ use App\Services\Monitoring\Collectors\ApplicationCollector;
 use App\Services\Monitoring\Collectors\FailedJobsCollector;
 use App\Services\Monitoring\Collectors\HorizonCollector;
 use App\Services\Monitoring\Collectors\MetricsCollector;
+use App\Services\Monitoring\Collectors\ReleaseVerificationCollector;
 use App\Services\Monitoring\Collectors\ServiceStatusCollector;
 use App\Services\Monitoring\Collectors\TmuxSnapshotCollector;
 use App\Services\Monitoring\Prometheus\TextFormatter;
 use App\Services\Monitoring\PrometheusMetricsExporter;
 use App\Services\Search\Support\ManticoreClientFactory;
+use App\Services\Tmux\CollectionDowntimeCompensator;
+use App\Services\Tmux\CollectionReconciliationBarrier;
 use App\Services\Yenc\DecoderFactory;
 use App\Services\YencService;
 use App\View\Composers\AdminDataComposer;
@@ -56,6 +59,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\ServiceProvider;
 use PragmaRX\Google2FALaravel\Listeners\LoginViaRemember;
+use Symfony\Component\Console\Input\ArgvInput;
 
 class AppServiceProvider extends ServiceProvider
 {
@@ -110,6 +114,22 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
+        if ($this->app->runningInConsole() && ! $this->app['config']->get('pulse.processing_enabled', false)) {
+            $arguments = $_SERVER['argv'] ?? [];
+            foreach ($arguments as $index => $argument) {
+                if ($argument === '--env' && isset($arguments[$index + 1]) && ! str_starts_with($arguments[$index + 1], '-')) {
+                    $arguments[$index] = '--env='.$arguments[$index + 1];
+                    unset($arguments[$index + 1]);
+                }
+            }
+            $command = (new ArgvInput(array_values($arguments)))->getFirstArgument();
+            if ($command !== null && preg_match('/^(?:tmux|multiprocessing|postprocess|update|releases|binaries|backfill|group|predb):/', $command) === 1) {
+                $this->app['config']->set('pulse.enabled', false);
+            }
+        }
+
+        $this->app->alias(CollectionDowntimeCompensator::class, CollectionReconciliationBarrier::class);
+
         $this->app->singleton(YencService::class, function (Application $app): YencService {
             $decoder = (new DecoderFactory($app['log']))->make(
                 (string) $app['config']->get('yenc.decoder', 'auto'),
@@ -124,6 +144,7 @@ class AppServiceProvider extends ServiceProvider
             TmuxSnapshotCollector::class,
             HorizonCollector::class,
             FailedJobsCollector::class,
+            ReleaseVerificationCollector::class,
             ServiceStatusCollector::class,
         ], MetricsCollector::TAG);
 

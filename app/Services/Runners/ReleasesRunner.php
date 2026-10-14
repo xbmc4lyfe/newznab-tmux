@@ -6,6 +6,7 @@ namespace App\Services\Runners;
 
 use App\Models\UsenetGroup;
 use App\Services\Configuration\ConfigurationProvider;
+use App\Services\NameFixing\NameFixingQueryService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
@@ -17,11 +18,33 @@ class ReleasesRunner extends BaseRunner
         $groups = DB::select('SELECT id, name FROM usenet_groups WHERE (active = 1 OR backfill = 1)');
         $maxProcesses = (int) app(ConfigurationProvider::class)->ingestion()->releaseThreads;
 
+        $hasCollections = [];
+        if ($groups !== []) {
+            $groupIds = array_map(static fn (object $group): int => (int) $group->id, $groups);
+            $placeholders = implode(',', array_fill(0, count($groupIds), '?'));
+            try {
+                $presence = DB::select(
+                    'SELECT id,
+                        EXISTS (SELECT 1 FROM collections WHERE collections.groups_id = usenet_groups.id) AS has_collections
+                     FROM usenet_groups WHERE id IN ('.$placeholders.')',
+                    $groupIds
+                );
+                foreach ($presence as $group) {
+                    $hasCollections[(int) $group->id] = (bool) $group->has_collections;
+                }
+            } catch (\PDOException) {
+                // Preserve per-group recovery when the batched collection lookup fails.
+                $hasCollections = null;
+            }
+        }
+
         $uGroups = [];
         foreach ($groups as $group) {
             try {
-                $query = DB::select(sprintf('SELECT id FROM collections WHERE groups_id = %d LIMIT 1', $group->id));
-                if (! empty($query)) {
+                $hasCollection = $hasCollections === null
+                    ? ! empty(DB::select(sprintf('SELECT id FROM collections WHERE groups_id = %d LIMIT 1', $group->id)))
+                    : ($hasCollections[(int) $group->id] ?? false);
+                if ($hasCollection) {
                     $uGroups[] = ['id' => $group->id, 'name' => $group->name];
                 }
             } catch (\PDOException $e) {
@@ -38,6 +61,9 @@ class ReleasesRunner extends BaseRunner
             return;
         }
 
+        $streaming = (bool) config('nntmux.stream_fork_output', false);
+        $this->runReadyReleasePass(array_map(static fn (array $group): int => (int) $group['id'], $uGroups), $maxProcesses, $streaming);
+
         // Streaming mode
         if ((bool) config('nntmux.stream_fork_output', false) === true) {
             $commands = [];
@@ -51,28 +77,20 @@ class ReleasesRunner extends BaseRunner
 
         $this->headerStart('releases', $count, $maxProcesses);
 
-        // Run bounded batches through the shared worker pool
-        $batches = array_chunk($uGroups, max(1, $maxProcesses));
+        $tasks = [];
+        foreach ($uGroups as $group) {
+            $tasks[$group['id']] = $this->buildDnrCommand('releases  '.$group['id']);
+        }
 
-        foreach ($batches as $batchIndex => $batch) {
-            $tasks = [];
-            foreach ($batch as $group) {
-                $command = $this->buildDnrCommand('releases  '.$group['id']);
-                $tasks[$group['id']] = $command;
-            }
-
-            try {
-                $results = $this->runParallelCommands($tasks, $maxProcesses);
-
-                foreach ($results as $groupId => $output) {
-                    echo $output;
-                    cli()->primary('Finished performing release processing for group ID: '.$groupId);
-                }
-            } catch (\Throwable $e) {
-                Log::error('Release processing batch failed: '.$e->getMessage());
-                cli()->error('Batch '.($batchIndex + 1).' failed: '.$e->getMessage());
-                throw new RuntimeException('Worker batch failed.', 0, $e);
-            }
+        try {
+            $this->runParallelCommandsWithCompletion($tasks, $maxProcesses, static function (int|string $groupId, string $output): void {
+                echo $output;
+                cli()->primary('Finished performing release processing for group ID: '.$groupId);
+            });
+        } catch (\Throwable $e) {
+            Log::error('Release processing batch failed: '.$e->getMessage());
+            cli()->error('Release processing failed: '.$e->getMessage());
+            throw new RuntimeException('Worker batch failed.', 0, $e);
         }
     }
 
@@ -88,6 +106,9 @@ class ReleasesRunner extends BaseRunner
             return;
         }
 
+        $streaming = (bool) config('nntmux.stream_fork_output', false);
+        $this->runReadyReleasePass(array_map(static fn (object $group): int => (int) $group->id, $groups), $maxProcesses, $streaming);
+
         // Streaming mode
         if ((bool) config('nntmux.stream_fork_output', false) === true) {
             $commands = [];
@@ -101,29 +122,52 @@ class ReleasesRunner extends BaseRunner
 
         $this->headerStart('update_per_group', $count, $maxProcesses);
 
-        // Run bounded batches through the shared worker pool
-        $batches = array_chunk($groups, max(1, $maxProcesses));
+        $tasks = [];
+        foreach ($groups as $group) {
+            $tasks[$group->id] = $this->buildDnrCommand('update_per_group  '.$group->id);
+        }
 
-        foreach ($batches as $batchIndex => $batch) {
-            $tasks = [];
-            foreach ($batch as $group) {
-                $command = $this->buildDnrCommand('update_per_group  '.$group->id);
-                $tasks[$group->id] = $command;
-            }
+        try {
+            $this->runParallelCommandsWithCompletion($tasks, $maxProcesses, static function (int|string $groupId, string $output): void {
+                echo $output;
+                $name = UsenetGroup::getNameByID($groupId);
+                cli()->primary('Finished updating binaries, processing releases and additional postprocessing for group: '.$name);
+            });
+        } catch (\Throwable $e) {
+            Log::error('Update per group batch failed: '.$e->getMessage());
+            cli()->error('Update per group failed: '.$e->getMessage());
+            throw new RuntimeException('Worker batch failed.', 0, $e);
+        }
+    }
 
-            try {
-                $results = $this->runParallelCommands($tasks, $maxProcesses);
-
-                foreach ($results as $groupId => $output) {
+    /** @param list<int> $groupIds */
+    private function runReadyReleasePass(array $groupIds, int $maxProcesses, bool $streaming): void
+    {
+        $commands = [];
+        foreach ($groupIds as $groupId) {
+            $commands[$groupId] = [...$this->buildDnrCommand('releases  '.$groupId), '--ready-only'];
+        }
+        try {
+            if ($streaming) {
+                $this->runStreamingCommands($commands, $maxProcesses, 'ready_releases');
+            } else {
+                $this->headerStart('ready releases', count($commands), $maxProcesses);
+                $this->runParallelCommandsWithCompletion($commands, $maxProcesses, static function (int|string $groupId, string $output): void {
                     echo $output;
-                    $name = UsenetGroup::getNameByID($groupId);
-                    cli()->primary('Finished updating binaries, processing releases and additional postprocessing for group: '.$name);
-                }
-            } catch (\Throwable $e) {
-                Log::error('Update per group batch failed: '.$e->getMessage());
-                cli()->error('Batch '.($batchIndex + 1).' failed: '.$e->getMessage());
-                throw new RuntimeException('Worker batch failed.', 0, $e);
+                    cli()->primary('Finished ready release processing for group ID: '.$groupId);
+                });
             }
+            if ($this->hasCancellationRequest()) {
+                throw new RuntimeException('Ready release pass stopped by cancellation.');
+            }
+        } catch (\Throwable $exception) {
+            if ($this->hasCancellationRequest()
+                || array_filter($this->workerOutcomes, static fn (array $outcome): bool => $outcome['status'] === 'cancellation') !== []) {
+                throw $exception;
+            }
+            Log::error('Ready release pass failed: '.$exception->getMessage());
+
+            return;
         }
     }
 
@@ -134,11 +178,10 @@ class ReleasesRunner extends BaseRunner
         $leftGuids = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
 
         if ($mode === 'predbft') {
-            $preCount = DB::select(
-                "SELECT COUNT(p.id) AS num FROM predb p WHERE LENGTH(p.title) >= 15 AND p.title NOT REGEXP '[\"\<\> ]' AND p.searched = 0 AND p.predate < (NOW() - INTERVAL 1 DAY)"
-            );
-            if (! empty($preCount) && (int) $preCount[0]->num > 0 && $maxPerRun > 0) {
-                $leftGuids = \array_slice($leftGuids, 0, (int) ceil($preCount[0]->num / $maxPerRun));
+            $preCount = app(NameFixingQueryService::class)->countPredbLauncherCandidates($maxPerRun, count($leftGuids));
+            if ($preCount > 0 && $maxPerRun > 0) {
+                $workers = intdiv($preCount, $maxPerRun) + ($preCount % $maxPerRun === 0 ? 0 : 1);
+                $leftGuids = \array_slice($leftGuids, 0, $workers);
             } else {
                 $leftGuids = [];
             }

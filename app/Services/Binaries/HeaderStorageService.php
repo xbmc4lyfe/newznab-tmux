@@ -4,8 +4,13 @@ declare(strict_types=1);
 
 namespace App\Services\Binaries;
 
+use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Tmux\CollectionDowntimeCompensator;
 use App\Support\SqlError;
+use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * Orchestrates the header storage process.
@@ -16,6 +21,9 @@ use Illuminate\Support\Facades\Log;
 final class HeaderStorageService
 {
     private const int LOCK_RETRY_MAX = 10;
+
+    /** @var array<int, true> */
+    private array $verificationCollectionIds = [];
 
     private CollectionHandler $collectionHandler;
 
@@ -52,10 +60,14 @@ final class HeaderStorageService
      * @param  array<string, mixed>  $groupMySQL  Group info from database
      * @param  bool  $addToPartRepair  Caller repair mode; failures are returned in every mode
      * @return array<int, int|string> Article numbers that failed to insert
+     *
+     * @phpstan-impure
      */
     public function store(array $headers, array $groupMySQL, bool $addToPartRepair = true): array
     {
         if (empty($headers)) {
+            $this->noteIngestion(); // A caught-up group is still live ingestion.
+
             return [];
         }
 
@@ -98,6 +110,8 @@ final class HeaderStorageService
             unset($chunk);
         }
 
+        $this->noteIngestion();
+
         return array_values(array_unique($this->failedInserts));
     }
 
@@ -117,16 +131,20 @@ final class HeaderStorageService
             }
 
             $attempt++;
-            if ($attempt >= self::LOCK_RETRY_MAX || ! $this->isTransientLockError($this->lastStorageException)) {
+            if ($attempt >= self::LOCK_RETRY_MAX || ! $this->isRetryableStorageError($this->lastStorageException)) {
                 if ($this->lastStorageException !== null) {
                     Log::error('Binary header storage chunk rolled back', [
                         'groups_id' => $groupMySQL['id'],
                         'article_count' => \count($headers),
                         'attempts' => $attempt,
-                        'reason' => $this->isTransientLockError($this->lastStorageException)
-                            ? 'Lock retries exhausted' : 'Storage failed',
+                        'reason' => match (true) {
+                            $this->isTransientLockError($this->lastStorageException) => 'Lock retries exhausted',
+                            $this->isMissingParentRow($this->lastStorageException) => 'Parent row retries exhausted',
+                            default => 'Storage failed',
+                        },
                         'exception' => $this->lastStorageException::class,
                         'code' => $this->lastStorageException->getCode(),
+                        ...$this->constraintContext($this->lastStorageException),
                     ]);
                 }
 
@@ -139,12 +157,34 @@ final class HeaderStorageService
     }
 
     /**
+     * The driver error number and the key or column a constraint failure names, without
+     * the statement, its bindings or the offending value.
+     *
+     * @return array{driver_code?: int, constraint?: string}
+     */
+    private function constraintContext(\Throwable $exception): array
+    {
+        if (! $exception instanceof QueryException) {
+            return [];
+        }
+
+        $context = ['driver_code' => (int) ($exception->errorInfo[1] ?? 0)];
+        $message = (string) ($exception->errorInfo[2] ?? '');
+        if (preg_match("/for key '([^']+)'|Column '([^']+)' cannot be null|constraint failed: (\\S+)|CONSTRAINT `([^`]+)`/", $message, $match) === 1) {
+            $context['constraint'] = (string) (array_values(array_filter(array_slice($match, 1), static fn (string $part): bool => $part !== ''))[0] ?? '');
+        }
+
+        return $context;
+    }
+
+    /**
      * @param  array<int, array<string, mixed>>  $headers
      * @param  array<string, mixed>  $groupMySQL
      */
     private function storeChunkAttempt(array $headers, array $groupMySQL, bool $addToPartRepair): bool
     {
         $this->lastStorageException = null;
+        $this->verificationCollectionIds = [];
         $this->collectionHandler->reset();
         $this->binaryHandler->reset();
         $this->partHandler->reset();
@@ -191,6 +231,9 @@ final class HeaderStorageService
                 }
             }
 
+            if (! $transaction->hasErrors()) {
+                $this->invalidateVerificationCandidates();
+            }
         } catch (\Throwable $e) {
             $this->lastStorageException = $e;
             $transaction->markError();
@@ -225,6 +268,23 @@ final class HeaderStorageService
     }
 
     /**
+     * Lock conflicts, and a collection or binary deleted by the releases or cleanup pass after this
+     * attempt resolved its id. A fresh attempt re-resolves (or recreates) the parent row.
+     */
+    private function isRetryableStorageError(?\Throwable $exception): bool
+    {
+        return $this->isTransientLockError($exception) || $this->isMissingParentRow($exception);
+    }
+
+    /**
+     * MySQL/MariaDB 1452: a child row's foreign key names a parent row that no longer exists.
+     */
+    private function isMissingParentRow(?\Throwable $exception): bool
+    {
+        return $exception instanceof QueryException && (int) ($exception->errorInfo[1] ?? 0) === 1452;
+    }
+
+    /**
      * @param  array<int, array<string, mixed>>  $headers
      * @param  array<string, mixed>  $groupMySQL
      */
@@ -247,6 +307,27 @@ final class HeaderStorageService
             $transaction->getBatchNoise()
         );
 
+        if (config('release_verification.required', true)) {
+            $ids = array_values(array_unique($collectionIds));
+            sort($ids);
+            $locked = DB::table('collections')
+                ->when(in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
+                ->whereIn('id', $ids)->orderBy('id')->lockForUpdate()->pluck('id')->all();
+            if (Schema::hasTable('release_verification_candidates')) {
+                $hashes = DB::table('collections')->whereIn('id', $ids)->pluck('collectionhash', 'id');
+                $identities = $hashes->map(static fn ($hash): string => bin2hex($hash))->all();
+                $active = DB::table('release_verification_candidates')->whereIn('source_identity', $identities)
+                    ->whereNull('release_id')->whereNotIn('status', ['expired'])->pluck('source_identity')->all();
+                $tracked = $hashes->filter(static fn ($hash): bool => in_array(bin2hex($hash), $active, true))->keys()->all();
+                foreach ($tracked as $id) {
+                    $this->verificationCollectionIds[(int) $id] = true;
+                }
+            }
+            if (count($locked) !== count($ids)) {
+                throw new \RuntimeException('Collection was archived during header resolution; retry ingestion.');
+            }
+        }
+
         $binaryRecords = [];
         foreach ($headers as $index => $header) {
             if (! isset($collectionIds[$index])) {
@@ -264,17 +345,35 @@ final class HeaderStorageService
 
         $binaryIds = $this->binaryHandler->getOrCreateBinaries($binaryRecords, $groupMySQL['id']);
 
+        $partIndexes = [];
         foreach ($binaryRecords as $index => $record) {
-            $header = $record['header'];
             if (! isset($binaryIds[$index])) {
-                $this->markHeaderFailed($header, $transaction);
+                $this->markHeaderFailed($record['header'], $transaction);
 
                 continue;
             }
 
+            $partIndexes[] = $index;
+        }
+
+        // The part handler flushes every SQL chunk inside this transaction, so parts are queued in
+        // primary-key order (binaries_id, partnumber) across all flushes. Concurrent workers then
+        // take shared part locks in one order instead of deadlocking across flush boundaries.
+        usort($partIndexes, static fn (int $a, int $b): int => [$binaryIds[$a], (int) ($binaryRecords[$a]['header']['matches'][2] ?? 0)]
+            <=> [$binaryIds[$b], (int) ($binaryRecords[$b]['header']['matches'][2] ?? 0)]);
+
+        foreach ($partIndexes as $index) {
+            $header = $binaryRecords[$index]['header'];
             if (! $this->partHandler->addPart($binaryIds[$index], $header)) {
                 $this->markHeaderFailed($header, $transaction);
             }
+        }
+    }
+
+    private function invalidateVerificationCandidates(): void
+    {
+        if ($this->verificationCollectionIds !== []) {
+            app(CandidateRepository::class)->invalidateHotCollections(array_keys($this->verificationCollectionIds));
         }
     }
 
@@ -308,5 +407,18 @@ final class HeaderStorageService
         }
 
         return $fileCount;
+    }
+
+    /**
+     * Headers were stored: ingestion is running even if the tmux monitor is not, so a
+     * monitor-only recovery doesn't count as downtime (see CollectionDowntimeCompensator).
+     */
+    private function noteIngestion(): void
+    {
+        try {
+            app(CollectionDowntimeCompensator::class)->noteIngestion();
+        } catch (\Throwable $e) {
+            Log::debug('Unable to record ingestion activity: '.$e->getMessage());
+        }
     }
 }

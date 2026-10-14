@@ -1,0 +1,48 @@
+{
+    "found": 13645278,
+    "limit": 10,
+    "offset": 0,
+    "next_page_id": "WzE3OTE1ODk2NDJd",
+    "pages": 1364527,
+    "results": [
+        {
+            "hash": "70c7a788",
+            "has_nfo": true,
+            "files": 20,
+            "size": 274,
+            "traces": 7,
+            "id": "14363051",
+            "section": "FLAC-WEB",
+            "rlsname": "Revival_Season-This_Machine..-16BIT-WEB-FLAC-2026-MEiDUNG",
+            "grp": "MEiDUNG",
+            "status": 0,
+            "ctime": 1791589642
+        },
+        {
+            "hash": "18495039",
+            "has_nfo": true,
+            "files": 24,
+            "size": 249,
+            "traces": 7,
+            "id": "14363052",
+            "section": "FLAC-WEB",
+            "rlsname": "Rosama-My_Forte-16BIT-WEB-FLAC-2026-MEiDUNG",
+            "grp": "MEiDUNG",
+            "status": 0,
+            "ctime": 1791589652
+        },
+        {
+            "hash": "0",
+            "has_nfo": false,
+            "files": 0,
+            "size": 0,
+            "traces": 0,
+            "id": "1",
+            "section": "",
+            "rlsname": "Unknown.Size-GRP",
+            "grp": "GRP",
+            "status": 0,
+            "ctime": 0
+        }
+    ]
+}

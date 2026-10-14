@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use App\Services\Yenc\ArticleFrame;
 use App\Services\Yenc\PayloadDecoder;
 use App\Services\YencService;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -16,6 +17,26 @@ class YencDecoderTest extends TestCase
     protected function service(): YencService
     {
         return new YencService;
+    }
+
+    public function test_archive_reuse_integrity_requires_valid_single_and_multipart_checksums(): void
+    {
+        $service = $this->service();
+        $data = YencArticles::bytes();
+        $single = YencArticles::article($data);
+        $multipart = YencArticles::part($data, 'archive.rar', 512, 1, 1, 2);
+        foreach ([$single, $multipart] as $article) {
+            [$decoded, $part] = $service->decodeWithFrame($article);
+            $this->assertSame($data, $decoded);
+            $this->assertTrue($service->hasValidatedIntegrity($article, $decoded));
+            $this->assertFalse($service->hasValidatedIntegrity($article, $decoded.'x'));
+            $withoutChecksum = preg_replace('/ (?:pcrc32|crc32)=[0-9a-f]{8}/i', '', $article);
+            $corruptChecksum = preg_replace('/((?:pcrc32|crc32)=)[0-9a-f]{8}/i', '${1}00000000', $article);
+            foreach ([$withoutChecksum, $corruptChecksum] as $invalid) {
+                $this->assertFalse($service->hasValidatedIntegrity($invalid, $decoded));
+                $this->assertEquals([$decoded, $part], $service->decodeWithFrame($invalid));
+            }
+        }
     }
 
     /** @return iterable<string, array{string}> */
@@ -51,6 +72,137 @@ class YencDecoderTest extends TestCase
         $this->assertSame([
             'name' => 'a size=999 name=file with spaces.bin', 'size' => 3, 'line' => 128, 'crc32' => 'A3830348',
         ], $this->service()->extractMetadata($article));
+    }
+
+    /** @return iterable<string, array{string, array<string, string>, array<string, string>|null, array<string, string>, int, string}> */
+    public static function framesWithOptionalTrailerFields(): iterable
+    {
+        $prefix = "=YbEgIn PaRt=2 ToTaL=3 LiNe=128 SiZe=9 NaMe=a size=999 name=with spaces.bin\r\n"
+            ."=YpArT BeGiN=4 EnD=6\r\n";
+        yield 'mixed case multipart and filename resembling fields' => [
+            $prefix."klm\r\n=YeNd SiZe=3 PaRt=2 PcRc32=a3830348 CrC32=deadbeef",
+            ['part' => '2', 'total' => '3', 'line' => '128', 'size' => '9', 'name' => 'a size=999 name=with spaces.bin'],
+            ['begin' => '4', 'end' => '6'],
+            ['size' => '3', 'part' => '2', 'pcrc32' => 'a3830348', 'crc32' => 'deadbeef'],
+            strlen($prefix),
+            "klm\r\n",
+        ];
+
+        $prefix = "=ybegin line=128 name=invalid\nnoise\n=ybegin line=128 size=3 name=valid.bin\n";
+        yield 'invalid initial header followed by a valid frame' => [
+            $prefix."klm\n=yend size=3 crc32=a3830348\nignored suffix",
+            ['line' => '128', 'size' => '3', 'name' => 'valid.bin'],
+            null,
+            ['size' => '3', 'crc32' => 'a3830348'],
+            strlen($prefix),
+            "klm\n",
+        ];
+
+        $prefix = "=ybegin line=128 size=9 name=truncated.bin\nunfinished\n"
+            ."=ybegin line=128 size=3 name=recovered.bin\n";
+        yield 'a subsequent header replaces a truncated frame' => [
+            $prefix."klm\n=yend size=3 crc32=a3830348",
+            ['line' => '128', 'size' => '3', 'name' => 'recovered.bin'],
+            null,
+            ['size' => '3', 'crc32' => 'a3830348'],
+            strlen($prefix),
+            "klm\n",
+        ];
+
+        $prefix = "=ybegin line=128 size=0 name=empty.bin\n";
+        yield 'empty payload and trailer without a final newline' => [
+            $prefix.'=yend size=0 crc32=0',
+            ['line' => '128', 'size' => '0', 'name' => 'empty.bin'],
+            null,
+            ['size' => '0', 'crc32' => '0'],
+            strlen($prefix),
+            '',
+        ];
+
+        $prefix = "=ybegin\tline=64 LINE=128 size=9 size=3 extra-field= unknown_2=v NaMe= first name=second size=999\r\r\n";
+        yield 'first filename consumes remainder and duplicate values retain last occurrence' => [
+            $prefix."klm\r\n=yend size=9 SIZE=3 crc32=a3830348 name=trailer ignored=after\r\r\n",
+            ['line' => '128', 'size' => '3', 'extra-field' => '', 'unknown_2' => 'v', 'name' => ' first name=second size=999'],
+            null,
+            ['size' => '3', 'crc32' => 'a3830348', 'name' => 'trailer', 'ignored' => 'after'],
+            strlen($prefix),
+            "klm\r\n",
+        ];
+
+        $prefix = "=ybegin line=128 size=3 names=other NAME=\r\n=ypart begin=9 BEGIN=1 end=3 name=part after=\r\n";
+        yield 'empty filename and nonheader name remain ordinary fields' => [
+            $prefix."klm\n=yend size=3 crc32=a3830348\n",
+            ['line' => '128', 'size' => '3', 'names' => 'other', 'name' => ''],
+            ['begin' => '1', 'end' => '3', 'name' => 'part', 'after' => ''],
+            ['size' => '3', 'crc32' => 'a3830348'],
+            strlen($prefix),
+            "klm\n",
+        ];
+
+        $prefix = "=ybegin line=128 size=3 name=\x00\xff\tfile\rinside.bin\r\n";
+        yield 'filename retains binary bytes tabs and internal carriage returns' => [
+            $prefix."klm\n=yend size=3 crc32=a3830348",
+            ['line' => '128', 'size' => '3', 'name' => "\x00\xff\tfile\rinside.bin"],
+            null,
+            ['size' => '3', 'crc32' => 'a3830348'],
+            strlen($prefix),
+            "klm\n",
+        ];
+    }
+
+    /**
+     * @param  array<string, string>  $header
+     * @param  array<string, string>|null  $part
+     * @param  array<string, string>  $trailer
+     */
+    #[DataProvider('framesWithOptionalTrailerFields')]
+    public function test_optional_trailer_parsing_preserves_frame_selection_and_payload_range(
+        string $article,
+        array $header,
+        ?array $part,
+        array $trailer,
+        int $payloadOffset,
+        string $payload,
+    ): void {
+        $fullFrame = ArticleFrame::parse($article);
+        $payloadFrame = ArticleFrame::parse($article, false);
+
+        foreach ([$fullFrame, $payloadFrame] as $frame) {
+            self::assertNotNull($frame);
+            self::assertSame($header, $frame->header);
+            self::assertSame($part, $frame->part);
+            self::assertSame($payloadOffset, $frame->payloadOffset);
+            self::assertSame(strlen($payload), $frame->payloadLength);
+            self::assertSame($payload, substr($article, $frame->payloadOffset, $frame->payloadLength));
+        }
+        self::assertSame($trailer, $fullFrame->trailer);
+        self::assertSame([], $payloadFrame->trailer);
+    }
+
+    public function test_multipart_accepts_a_missing_trailer_part_with_valid_header_range_and_checksum(): void
+    {
+        $raw = YencArticles::part('abc', 'movie.mkv', 6, 1, 1, 2);
+        $raw = str_replace('=yend size=3 part=1 ', '=yend size=3 ', $raw);
+        $this->assertSame('abc', $this->service()->decode($raw));
+    }
+
+    public function test_missing_trailer_part_does_not_skip_the_part_checksum(): void
+    {
+        $raw = YencArticles::part('abc', 'movie.mkv', 6, 1, 1, 2);
+        $raw = str_replace('=yend size=3 part=1 ', '=yend size=3 ', $raw);
+        $raw = preg_replace('/pcrc32=[0-9a-f]+/', 'pcrc32=00000000', $raw);
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('CRC32 checksums do not match.');
+        $this->service()->decode($raw);
+    }
+
+    public function test_present_trailer_part_must_still_match_the_header(): void
+    {
+        $raw = YencArticles::part('abc', 'movie.mkv', 6, 1, 1, 2);
+        $raw = str_replace('=yend size=3 part=1 ', '=yend size=3 part=2 ', $raw);
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Invalid yEnc multipart range or part number.');
+        $this->service()->decode($raw);
     }
 
     public function test_multipart_uses_part_size_and_part_checksum(): void

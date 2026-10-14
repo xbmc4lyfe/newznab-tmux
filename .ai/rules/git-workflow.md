@@ -1,3 +1,8 @@
+---
+paths:
+  - '**'
+---
+
 # Agents never commit or push
 
 NNTmux agents must not run `git commit` or `git push` (including `--amend`, tags, or force pushes). The maintainer reviews, commits, and pushes.

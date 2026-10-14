@@ -301,10 +301,15 @@ final class CollectionHandler
             }
         }
 
+        // Concurrent header workers upsert overlapping cross-posted collections; inserting in
+        // unique-key order makes them take those locks in the same sequence instead of deadlocking.
+        $sortedRows = $rowsByCollectionKey;
+        uasort($sortedRows, static fn (array $a, array $b): int => strcmp((string) $a['collectionhash'], (string) $b['collectionhash']));
+
         if (DB::getDriverName() === 'sqlite') {
-            $this->bulkInsertCollectionsSqlite($rowsByCollectionKey);
+            $this->bulkInsertCollectionsSqlite($sortedRows);
         } else {
-            $this->bulkInsertCollectionsMysql($rowsByCollectionKey);
+            $this->bulkInsertCollectionsMysql($sortedRows);
         }
 
         // Only resolve ids for the hashes we couldn't satisfy from the
@@ -432,6 +437,8 @@ final class CollectionHandler
                 $rows[] = ['collections_id' => $collectionId, 'group_name' => $groupName];
             }
         }
+        // Primary-key order, so concurrent workers lock shared rows in the same sequence.
+        usort($rows, static fn (array $a, array $b): int => [$a['collections_id'], $a['group_name']] <=> [$b['collections_id'], $b['group_name']]);
 
         foreach (array_chunk($rows, $this->sqlChunkSize) as $chunk) {
             if (DB::getDriverName() === 'sqlite') {
@@ -646,29 +653,58 @@ final class CollectionHandler
                 return true;
             }
 
+            // As in BinaryHandler::refreshAggregates(): lock the collections rows in id
+            // order, so concurrent writers to the same collection serialize, then read the
+            // binaries totals with a plain SELECT and write them back by primary key.
+            sort($collectionIds);
+            $statusPlaceholders = implode(',', array_fill(0, \count($inProgressStatuses), '?'));
             foreach (array_chunk($collectionIds, $chunkSize) as $chunk) {
-                $idPlaceholders = implode(',', array_fill(0, \count($chunk), '?'));
-                $statusPlaceholders = implode(',', array_fill(0, \count($inProgressStatuses), '?'));
+                // A covering secondary scan can lock tentative duplicate inserts outside this ID set.
+                DB::table('collections')->forceIndex('PRIMARY')->whereIn('id', $chunk)->orderBy('id')->lockForUpdate()->pluck('id');
+                $aggregates = DB::table('binaries')
+                    ->whereIn('collections_id', $chunk)
+                    ->groupBy('collections_id')
+                    ->orderBy('collections_id')
+                    ->selectRaw('collections_id, COUNT(*) AS currentfiles,
+                        SUM(CASE WHEN partcheck = 1 THEN 1 ELSE 0 END) AS completefiles,
+                        COALESCE(SUM(partsize), 0) AS filesize')
+                    ->get();
+                if ($aggregates->isEmpty()) {
+                    continue;
+                }
+
+                $fileSize = $currentFiles = $completeFiles = '';
+                $bindings = ['filesize' => [], 'currentfiles' => [], 'completefiles' => [], 'ids' => []];
+                foreach ($aggregates as $aggregate) {
+                    $id = (int) $aggregate->collections_id;
+                    $fileSize .= ' WHEN ? THEN ?';
+                    $currentFiles .= ' WHEN ? THEN ?';
+                    $completeFiles .= ' WHEN ? THEN ?';
+                    array_push($bindings['filesize'], $id, (int) $aggregate->filesize);
+                    array_push($bindings['currentfiles'], $id, (int) $aggregate->currentfiles);
+                    array_push($bindings['completefiles'], $id, (int) $aggregate->completefiles);
+                    $bindings['ids'][] = $id;
+                }
+                $idPlaceholders = implode(',', array_fill(0, \count($bindings['ids']), '?'));
                 DB::update(
-                    "UPDATE collections c
-                     INNER JOIN (
-                         SELECT b.collections_id,
-                                COUNT(*) AS currentfiles,
-                                SUM(CASE WHEN b.partcheck = 1 THEN 1 ELSE 0 END) AS completefiles,
-                                COALESCE(SUM(b.partsize), 0) AS filesize
-                         FROM binaries b
-                         WHERE b.collections_id IN ({$idPlaceholders})
-                         GROUP BY b.collections_id
-                     ) a ON a.collections_id = c.id
-                     SET c.filesize = a.filesize,
-                         c.last_seen_at = NOW(),
-                         c.filecheck = CASE
-                             WHEN c.filecheck IN ({$statusPlaceholders})
-                              AND c.totalfiles > 0
-                              AND a.currentfiles IN (c.totalfiles, c.totalfiles + 1)
-                              AND a.completefiles >= c.totalfiles
-                             THEN ? ELSE c.filecheck END",
-                    [...$chunk, ...$inProgressStatuses, CollectionFileCheckStatus::Sized->value]
+                    "UPDATE collections
+                     SET filesize = CASE id{$fileSize} END,
+                         last_seen_at = NOW(),
+                         filecheck = CASE
+                             WHEN filecheck IN ({$statusPlaceholders})
+                              AND totalfiles > 0
+                              AND (CASE id{$currentFiles} END) IN (totalfiles, totalfiles + 1)
+                              AND (CASE id{$completeFiles} END) >= totalfiles
+                             THEN ? ELSE filecheck END
+                     WHERE id IN ({$idPlaceholders})",
+                    [
+                        ...$bindings['filesize'],
+                        ...$inProgressStatuses,
+                        ...$bindings['currentfiles'],
+                        ...$bindings['completefiles'],
+                        CollectionFileCheckStatus::Sized->value,
+                        ...$bindings['ids'],
+                    ]
                 );
             }
 
