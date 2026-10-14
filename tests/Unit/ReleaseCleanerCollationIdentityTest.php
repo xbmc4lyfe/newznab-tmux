@@ -22,6 +22,7 @@ final class ReleaseCleanerCollationIdentityTest extends TestCase
         $previousContainer = Container::getInstance();
         $previousFacade = Facade::getFacadeApplication();
         $previousResolver = Predb::getConnectionResolver();
+        $previousDispatcher = Predb::getEventDispatcher();
         try {
             $app = new Application(sys_get_temp_dir());
             $app->instance('config', new Repository);
@@ -60,6 +61,11 @@ final class ReleaseCleanerCollationIdentityTest extends TestCase
             $ordinaryResult = $cleaner->releaseCleaner('"'.$candidate.'.mkv" yEnc', 'synthetic@example.invalid', 'alt.binaries.test');
             self::assertSame($accepted ? $result : $cleaner->generic(), $ordinaryResult, 'Rejected identities must preserve the legacy generic-cleaning fallback.');
         } finally {
+            if ($previousDispatcher === null) {
+                Predb::unsetEventDispatcher();
+            } else {
+                Predb::setEventDispatcher($previousDispatcher);
+            }
             if ($previousResolver === null) {
                 Predb::unsetConnectionResolver();
             } else {
