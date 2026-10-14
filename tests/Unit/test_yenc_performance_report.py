@@ -30,6 +30,16 @@ class PerformanceReportTest(unittest.TestCase):
         self.assertAlmostEqual(1 / 0.9, metrics['speedup_interval'][0])
         self.assertAlmostEqual(1 / 0.75, metrics['speedup_interval'][1])
 
+    def test_cpu_clock_weights_are_nanoseconds_and_not_sample_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / 'native.folded').write_text('php;decode 4008016\n')
+            (path / 'perf.stacks').write_text('php 42 1.123456: 2004008 cpu-clock:\n\t123 decode (/lib.so)\n\n'
+                                            'php 42 1.125460: 2004008 cpu-clock:\n\t123 decode (/lib.so)\n\n')
+            result = self.report.native_measurements(path)
+            self.assertEqual(2, result['sample_records'])
+            self.assertEqual(4008016, result['folded_cpu_clock_nanoseconds'])
+
     def test_invalid_nonfinite_or_incomplete_results_never_get_a_gain(self):
         for row in [
             {'decision': 'invalid', 'median_rust_over_cpp': 0.1},

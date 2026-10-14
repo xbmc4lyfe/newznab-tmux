@@ -126,7 +126,7 @@ for backend in cpp rust; do
             fi
             if [[ "$postprocess_exit" == 0 && -s "$directory/native.folded" ]]; then
                 postprocess_stage=flamegraph
-                perl "$flamegraph/flamegraph.pl" --title "$backend / $density / $path — whole-process CPU samples" \
+                perl "$flamegraph/flamegraph.pl" --countname=nanoseconds --title "$backend / $density / $path — sampled CPU-clock weight" \
                     "$directory/native.folded" > "$directory/native.svg" 2> "$directory/flamegraph.stderr" || postprocess_exit=$?
                 if [[ "$postprocess_exit" == 0 ]]; then
                     postprocess_stage=complete

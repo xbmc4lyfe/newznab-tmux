@@ -51,6 +51,20 @@ def exit_cause(code, timed_out=False):
     return 'nonzero_exit'
 
 
+def native_measurements(directory):
+    """perf cpu-clock period weights are nanoseconds; count event records separately."""
+    directory = Path(directory)
+    records, weight = 0, 0
+    try:
+        with (directory / 'perf.stacks').open() as stream:
+            records = sum(bool(re.match(r'^\S.*\d+\.\d+:\s+\d+\s+cpu-clock:\s*$', line)) for line in stream)
+        with (directory / 'native.folded').open() as stream:
+            weight = sum(int(line.rsplit(' ', 1)[1]) for line in stream)
+    except (ValueError, OSError):
+        weight = 0
+    return {'sample_records': records, 'folded_cpu_clock_nanoseconds': max(0, weight)}
+
+
 def profile_status(directory, native_exit, php_exit, postprocess_exit, postprocess_stage, preflight_exit, preflight_stderr=None):
     directory = Path(directory)
 
@@ -64,12 +78,9 @@ def profile_status(directory, native_exit, php_exit, postprocess_exit, postproce
             return None
 
     php, native = workload('php-workload.json'), workload('native-workload.json')
-    callgrind, folded = directory / 'php.callgrind', directory / 'native.folded'
-    samples = 0
-    try:
-        samples = sum(int(line.rsplit(' ', 1)[1]) for line in folded.read_text().splitlines())
-    except (ValueError, OSError):
-        pass
+    callgrind = directory / 'php.callgrind'
+    measurements = native_measurements(directory)
+    samples = measurements['sample_records']
     matched = bool(php and native and all(key in php and key in native and php[key] == native[key] for key in
         ('input_sha256', 'output_sha256', 'wire_sha256', 'verified_calls', 'size', 'iterations'))
         and php.get('headers_sha256') == native.get('headers_sha256'))
@@ -80,11 +91,14 @@ def profile_status(directory, native_exit, php_exit, postprocess_exit, postproce
     if native_exit == 'unavailable' and exit_cause(preflight_exit, preflight_timed_out) == 'nonzero_exit':
         native_state = 'unavailable'
     elif (native_exit == 0 and postprocess_exit == 0 and postprocess_stage == 'complete'
-            and matched and samples > 0 and (directory / 'native.svg').is_file()):
+            and matched and samples > 0 and measurements['folded_cpu_clock_nanoseconds'] > 0
+            and (directory / 'native.svg').is_file()):
         native_state = 'captured'
     return {
         'php_profile': 'captured' if php_exit == 0 and php and callgrind.is_file() and callgrind.stat().st_size else 'invalid',
         'native_profile': native_state, 'native_samples': samples, 'workload_identity_matches': matched,
+        'native_folded_cpu_clock_nanoseconds': measurements['folded_cpu_clock_nanoseconds'],
+        'native_flamegraph_weight_unit': 'cpu-clock nanoseconds',
         'native_exit': native_exit, 'native_exit_cause': exit_cause(native_exit, native_timed_out), 'php_exit': php_exit,
         'native_timed_out': native_timed_out, 'php_timed_out': php_timed_out,
         'php_exit_cause': exit_cause(php_exit, php_timed_out),
@@ -281,8 +295,8 @@ def render(evidence, output):
             profile_records.append({'path': label, 'status': 'invalid', 'error': str(error)})
     if not profile_records:
         sections.append('<p>No executed PHP profile available. Check retained profiling logs; no hot-path conclusion.</p>')
-    sections.append('<h2>Native CPU sampling</h2><p>Searchable, zoomable sampled native stacks use separate optimized builds with debug information. Width represents CPU samples, not wall time. Whole-process samples include setup and correctness verification. Unavailable or invalid captures cannot identify native hot paths.</p>')
-    sections.append('<table><tr><th>Workload</th><th>Capture status</th><th>CPU samples</th><th>Flamegraph</th></tr>')
+    sections.append('<h2>Native CPU sampling</h2><p>Searchable, zoomable sampled native stacks use separate optimized builds with debug information. Width represents folded CPU-clock period weights in nanoseconds, not sample counts or elapsed wall time. Event records are counted separately. Whole-process samples include setup and correctness verification. Unavailable or invalid captures cannot identify native hot paths.</p>')
+    sections.append('<table><tr><th>Workload</th><th>Capture status</th><th>Sample records</th><th>CPU-clock weight (ms)</th><th>Flamegraph</th></tr>')
     for receipt_path in sorted((evidence / 'profiles').glob('*/status.json')):
         receipt = json.loads(receipt_path.read_text())
         graph = receipt_path.parent / 'native.svg'
@@ -292,6 +306,7 @@ def render(evidence, output):
             link = '<a href="' + html.escape(quote(relpath(graph, output))) + '">Open flamegraph</a>'
         sections.append('<tr><td>' + html.escape(receipt_path.parent.name) + '</td><td>'
                         + html.escape(str(state)) + '</td><td>' + html.escape(str(receipt.get('native_samples', 0)))
+                        + '</td><td>' + html.escape(f"{receipt.get('native_folded_cpu_clock_nanoseconds', 0) / 1000000:.3f}")
                         + '</td><td>' + link + '</td></tr>')
     sections.append('</table>')
     document = '<!doctype html><html lang="en"><meta charset="utf-8"><title>yEnc performance evidence</title><style>body{font:16px system-ui;background:#101827;color:#e5e7eb;margin:32px;max-width:1400px}table{border-collapse:collapse}td,th{padding:8px;text-align:left;border-bottom:1px solid #334155}img{width:100%;margin:20px 0}summary{cursor:pointer}</style><body>' + '\n'.join(sections) + '</body></html>'
