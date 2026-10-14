@@ -15,6 +15,12 @@ use Tests\TestCase;
 
 final class PredbFulltextTechnicalSuffixTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse()->byDefault();
+    }
+
     #[DataProvider('suffixes')]
     public function test_appended_suffixes_are_validated_without_cleaning_canonical_title(string $titleEnding, string $suffix, bool $accepted, bool $quoted = true): void
     {

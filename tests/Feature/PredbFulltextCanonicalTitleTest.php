@@ -19,6 +19,12 @@ use Tests\TestCase;
 
 final class PredbFulltextCanonicalTitleTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse()->byDefault();
+    }
+
     #[DataProvider('canonicalTitles')]
     public function test_wrapped_fulltext_match_writes_the_complete_canonical_title(string $title): void
     {

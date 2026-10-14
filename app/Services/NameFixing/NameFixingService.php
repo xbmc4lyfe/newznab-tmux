@@ -496,6 +496,12 @@ class NameFixingService
             $this->predbEvidenceCache = [];
         }
 
+        return $this->fileNameCleaner->withMatchingReuse(fn (): ?array => $this->resolvePredbMatch($fileName));
+    }
+
+    /** @return array<string, mixed>|null */
+    private function resolvePredbMatch(string $fileName): ?array
+    {
         $searchText = self::predbSearchText($fileName);
         $results = $searchText === '' ? [] : Search::searchPredb($searchText);
 
@@ -1231,19 +1237,24 @@ class NameFixingService
             throw new RuntimeException('The configured search backend is unavailable for PreDB matching.');
         }
 
-        $searchResults = Search::searchReleases(['name' => $title, 'searchname' => $title], self::PREDB_CANDIDATE_PAGE_SIZE);
-        $candidateIds = [];
-        foreach ($searchResults as $key => $value) {
-            $candidateId = is_numeric($value) ? (int) $value : (is_numeric($key) ? (int) $key : 0);
-            if ($candidateId > 0) {
-                $candidateIds[$candidateId] = $candidateId;
-            }
-        }
-
-        $matches = $this->literalPredbCandidates(array_values($candidateIds), $title);
-        $matched = $matches === [] && $this->hasLinkedPredbCandidate(array_values($candidateIds), (int) $pre->predb_id, $title);
-        if (count($searchResults) >= self::PREDB_CANDIDATE_PAGE_SIZE && count($matches) < 16) {
+        $matched = false;
+        if (Search::supportsReleaseCandidatePaging()) {
             $matches = $this->pagedLiteralPredbCandidates($title, (int) $pre->predb_id, $matched);
+        } else {
+            $searchResults = Search::searchReleases(['name' => $title, 'searchname' => $title], self::PREDB_CANDIDATE_PAGE_SIZE);
+            $candidateIds = [];
+            foreach ($searchResults as $key => $value) {
+                $candidateId = is_numeric($value) ? (int) $value : (is_numeric($key) ? (int) $key : 0);
+                if ($candidateId > 0) {
+                    $candidateIds[$candidateId] = $candidateId;
+                }
+            }
+
+            $matches = $this->literalPredbCandidates(array_values($candidateIds), $title);
+            $matched = $matches === [] && $this->hasLinkedPredbCandidate(array_values($candidateIds), (int) $pre->predb_id, $title);
+            if (count($searchResults) >= self::PREDB_CANDIDATE_PAGE_SIZE && count($matches) < 16) {
+                throw new IncompletePredbMatchException('PreDB fulltext matching is incomplete: the search driver does not support candidate paging.');
+            }
         }
         if (count($matches) >= 16) {
             $linked = $matched ? ['matched' => true, 'retry' => false] : $this->predbLinkCompletion((int) $pre->predb_id, $title);
@@ -1335,10 +1346,6 @@ class NameFixingService
     /** @return list<object> */
     private function pagedLiteralPredbCandidates(string $title, int $predbId, bool &$matched): array
     {
-        if (! Search::supportsReleaseCandidatePaging()) {
-            throw new IncompletePredbMatchException('PreDB fulltext matching is incomplete: the search driver does not support candidate paging.');
-        }
-
         $matches = [];
         $afterId = 0;
         for ($pageNumber = 0; $pageNumber < self::PREDB_CANDIDATE_MAX_PAGES; $pageNumber++) {

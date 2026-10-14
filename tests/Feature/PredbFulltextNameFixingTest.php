@@ -14,6 +14,12 @@ use Tests\TestCase;
 
 class PredbFulltextNameFixingTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse()->byDefault();
+    }
+
     public function test_it_attaches_predb_id_when_the_confirmed_title_is_already_correct(): void
     {
         $title = 'Valid.Scene.Release.2026-GROUP';
