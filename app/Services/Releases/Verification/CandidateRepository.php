@@ -426,9 +426,9 @@ final class CandidateRepository
      *
      * @phpstan-impure
      */
-    public function claim(?callable $acquireCandidate = null): ?object
+    public function claim(?callable $acquireCandidate = null, ?bool $preferReady = null): ?object
     {
-        $preferReady = ++$this->claimSelections % 5 !== 0;
+        $preferReady ??= ++$this->claimSelections % 5 !== 0;
         // Keep legacy/stale leases progressing even while ready candidates are arriving.
         foreach ($preferReady ? [['ready'], ['pending', 'unknown', 'verifying']] : [['pending', 'unknown', 'verifying'], ['ready']] as $statuses) {
             $ids = $this->claimQueueIds($statuses);

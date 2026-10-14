@@ -216,4 +216,29 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
         config(['release_verification.scheduled' => true]);
         $this->assertTrue($events[0]->filtersPass($this->app));
     }
+
+    public function test_single_candidate_worker_runs_preserve_legacy_fairness_across_restarts(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->enqueue($this->manifest('legacy'));
+        DB::table('release_verification_candidates')->update(['status' => 'pending', 'next_attempt_at' => now()->subHour()]);
+        for ($i = 0; $i < 5; $i++) {
+            $repository->enqueue($this->manifest('ready'.$i));
+        }
+        $claims = [];
+        DB::listen(static function (QueryExecuted $query) use (&$claims): void {
+            if (str_starts_with($query->sql, 'update "release_verification_candidates"') && ($query->bindings[0] ?? null) === 'verifying') {
+                $claims[] = end($query->bindings);
+            }
+        });
+        $this->mock(NNTPService::class, static function ($mock): void {
+            $mock->shouldReceive('doConnect')->times(5)->with(false)->andReturn(false);
+            $mock->shouldReceive('doQuit')->andReturn(null);
+            $mock->shouldNotReceive('verificationArticle');
+        });
+        for ($run = 0; $run < 5; $run++) {
+            $this->assertSame(0, Artisan::call('releases:verify-candidates', ['--limit' => 1, '--slot' => 1]));
+        }
+        $this->assertSame([2, 3, 4, 5, 1], $claims);
+    }
 }
