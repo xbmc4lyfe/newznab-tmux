@@ -58,6 +58,9 @@ final class NzbArticleCoverage
                 }
             }
         }
+        if ($this->proofBoundsExhausted(count($seen), $budget)) {
+            return null;
+        }
         foreach ($this->releaseDuplicateFinder->candidates($name, $searchName, $predbId, self::COVERAGE_CANDIDATES, $publishedOnly) as $candidate) {
             if ($verify($candidate)) {
                 return $candidate;
@@ -75,6 +78,11 @@ final class NzbArticleCoverage
         }
 
         return null;
+    }
+
+    private function proofBoundsExhausted(int $candidates, int $decodedBytesRemaining): bool
+    {
+        return $candidates >= self::COVERAGE_CANDIDATES || $decodedBytesRemaining <= 0;
     }
 
     public function parseXml(string $contents): ?\SimpleXMLElement

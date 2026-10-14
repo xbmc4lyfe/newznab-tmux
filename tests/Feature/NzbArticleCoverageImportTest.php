@@ -7,9 +7,11 @@ namespace Tests\Feature;
 use App\Enums\NzbImportStatus;
 use App\Facades\Search;
 use App\Services\BlacklistService;
+use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbService;
+use App\Services\Releases\ReleaseDuplicateFinder;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Cache;
@@ -21,6 +23,54 @@ use Tests\TestCase;
 
 final class NzbArticleCoverageImportTest extends TestCase
 {
+    public static function exhaustedProofBounds(): array
+    {
+        return ['candidate count' => [false], 'decoded byte budget' => [true]];
+    }
+
+    #[DataProvider('exhaustedProofBounds')]
+    public function test_exhausted_fingerprint_proof_skips_metadata_nomination_queries(bool $bytes): void
+    {
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+            foreach (['guid', 'name', 'searchname', 'fromname'] as $column) {
+                $table->string($column)->default('');
+            }
+            $table->integer('size')->default(0);
+            $table->integer('predb_id')->default(0);
+            $table->integer('nzbstatus')->default(1);
+            $table->char('article_fingerprint', 40)->nullable();
+        });
+        $fingerprint = str_repeat('a', 40);
+        $reads = $bytes ? 2 : 128;
+        for ($i = 1; $i <= $reads; $i++) {
+            DB::table('releases')->insert(['guid' => 'fingerprint-'.$i, 'article_fingerprint' => $fingerprint]);
+        }
+        // Overlapping metadata nominations would run all three eager queries.
+        for ($i = 1; $i <= 127; $i++) {
+            DB::table('releases')->insert(['guid' => 'metadata-'.$i, 'name' => 'fixture', 'searchname' => 'fixture', 'predb_id' => 42]);
+        }
+        $nzb = $this->getMockBuilder(NzbService::class)->disableOriginalConstructor()->onlyMethods(['readNzbContentsBounded'])->getMock();
+        $nzb->expects(self::exactly($reads))->method('readNzbContentsBounded')->willReturnCallback(static function (string $guid, int $compressed, int $decoded, int &$used) use ($bytes): false {
+            $used = $bytes ? $decoded : 0;
+
+            return false;
+        });
+        $incoming = simplexml_load_string('<nzb><file><segments><segment bytes="1" number="1">incoming@example.test</segment></segments></file></nzb>');
+        self::assertNotFalse($incoming);
+        $connection = DB::connection();
+        $connection->enableQueryLog();
+        try {
+            $coverage = new NzbArticleCoverage($nzb, new ReleaseDuplicateFinder);
+            self::assertNull($coverage->findCoveredUpload(0, $fingerprint, $incoming, 'fixture', 'fixture', 42));
+            $metadataQueries = array_filter($connection->getQueryLog(), static fn (array $query): bool => preg_match('/where "(?:predb_id|searchname|name)" =/', $query['query']) === 1);
+            self::assertCount(0, $metadataQueries, 'Exhausted proof bounds must skip eager metadata SQL.');
+        } finally {
+            $connection->disableQueryLog();
+            $connection->flushQueryLog();
+        }
+    }
+
     /** @return array<string, array{list<string>, bool, int, NzbImportStatus, bool, string}> */
     public static function articleSetCases(): array
     {
