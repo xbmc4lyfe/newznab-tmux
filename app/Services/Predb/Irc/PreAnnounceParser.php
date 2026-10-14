@@ -55,28 +55,28 @@ final class PreAnnounceParser
      */
     private const PATTERNS = [
         'corruptnet' => [
-            '/^(?<type>PRE):\s*\[(?<section>[^\]]+)\]\s+(?<title>\S+)$/',
-            '/^(?<type>INFO):\s*(?<title>\S+)\s+\[(?<files>\d+)F\s+(?<size>[\d.]+)MB\]/',
-            '/^(?<type>[A-Z]+):\s*(?<title>\S+)\s+\[(?<reason>[^\]]*)\]/',
+            '/^(?<type>PRE):\s*\[(?<section>[^\]]+)\]\s+(?<title>\S+)\z/',
+            '/^(?<type>INFO):\s*(?<title>\S+)\s+\[(?<files>\d+)F\s+(?<size>\d+(?:\.\d+)?)MB\]\z/',
+            '/^(?<type>NUKE|UNNUKE|MODNUKE|RENUKE|OLDNUKE):\s*(?<title>\S+)\s+\[(?<reason>[^\]]*)\](?:\s+\[NUKENET\])?\z/',
         ],
         'zenet' => [
-            '/^\((?<type>PRE)\)\s*\((?<section>[^)]+)\)\s*\((?<title>\S+)\)$/i',
-            '/^\((?<type>INFO)\)\s*\((?<title>\S+?)\)\s*\((?<files>\d+) Files?\)\s*\((?<size>[\d.]+) MB\)/i',
-            '/^\((?<type>(?!PRE\)|INFO\)|GENRE\)|URL\)|MUSIC-INFO\))[A-Z]+)\)\s*\((?<title>\S+?)\)\s*\((?<reason>[^)]*)\)/i',
+            '/^\((?<type>PRE)\)\s*\((?<section>[^)]+)\)\s*\((?<title>\S+)\)\z/i',
+            '/^\((?<type>INFO)\)\s*\((?<title>\S+?)\)\s*\((?<files>\d+) Files?\)\s*\((?<size>\d+(?:\.\d+)?) MB\)\z/i',
+            '/^\((?<type>NUKE|UNNUKE|MODNUKE|RENUKE|OLDNUKE)\)\s*\((?<title>\S+?)\)\s*\((?<reason>[^)]*)\)\z/i',
         ],
         'predatabase' => [
-            '/^(?<type>pre)\s*\|\s*(?<section>[^|]+?)\s*\|\s*(?<title>\S+)$/i',
-            '/^(?<type>info)\s*\|\s*(?<title>\S+)\s+-\s+(?<files>\d+)\s+F\s+&\s+(?<size>[\d.]+)\s+MB$/i',
+            '/^(?<type>pre)\s*\|\s*(?<section>[^|]+?)\s*\|\s*(?<title>\S+)\z/i',
+            '/^(?<type>info)\s*\|\s*(?<title>\S+)\s+-\s+(?<files>\d+)\s+F\s+&\s+(?<size>\d+(?:\.\d+)?)\s+MB\z/i',
             // Only the first site to get a P2P release announces "#1 ... WIN!"; later lines repeat it.
-            '/^(?<type>p2p)\s*\|\s*#1\s*\|\s*\S+\s*\|\s*(?<title>\S+?),\s*WIN!$/i',
+            '/^(?<type>p2p)\s*\|\s*#1\s*\|\s*\S+\s*\|\s*(?<title>\S+?),\s*WIN!\z/i',
         ],
         'ngp' => [
-            '/^\.:::\s*(?<type>[A-Z]+)\s*:::\s*(?<section>\S+)\s*:::\s*(?<title>\S+)\s*:::\.$/',
-            '/^\[(?<type>INFO)\]\s*FOR\s+(?<title>\S+)\s+with\s+(?<files>\d+)F\s+(?<size>[\d.]+)MB added\.?$/',
+            '/^\.:::\s*(?<type>[A-Z]+)\s*:::\s*(?<section>\S+)\s*:::\s*(?<title>\S+)\s*:::\.\z/',
+            '/^\[(?<type>INFO)\]\s*FOR\s+(?<title>\S+)\s+with\s+(?<files>\d+)F\s+(?<size>\d+(?:\.\d+)?)MB added\.?\z/',
         ],
         'rizon' => [
-            '/^\[(?<type>PRE)\]\s*\[(?<section>[^\]]+)\]\s*(?<title>\S+)$/',
-            '/^\[(?<type>[A-Z]+)\]\s+(?<title>\S+)\s+\[(?<reason>[^\]]*)\]/',
+            '/^\[(?<type>PRE)\]\s*\[(?<section>[^\]]+)\]\s*(?<title>\S+)\z/',
+            '/^\[(?<type>NUKE|UNNUKE|MODNUKE|RENUKE|OLDNUKE)\]\s+(?<title>\S+)\s+\[(?<reason>[^\]]*)\](?:\s+\[NUKENET\])?\z/',
         ],
     ];
 
@@ -91,6 +91,10 @@ final class PreAnnounceParser
 
     public function parse(string $message, ?CarbonImmutable $receivedAt = null): ?PredbFeedEntry
     {
+        if (str_contains($message, "\r") || str_contains($message, "\n")) {
+            return null;
+        }
+
         if ($this->format === 'opentrackers') {
             return $this->parseRelay($message, $receivedAt);
         }
@@ -119,9 +123,7 @@ final class PreAnnounceParser
         $matches = [];
         foreach (self::RELAY_FORMATS as $format) {
             foreach (self::PATTERNS[$format] as $pattern) {
-                $delimiter = strrpos($pattern, '/');
-                $completePattern = substr($pattern, 0, $delimiter).'\\z'.substr($pattern, $delimiter);
-                if (preg_match($completePattern, $message, $groups) !== 1) {
+                if (preg_match($pattern, $message, $groups) !== 1) {
                     continue;
                 }
                 if (strtoupper($groups['type']) === 'PRE' && ! isset($groups['section'])) {
@@ -160,7 +162,7 @@ final class PreAnnounceParser
     private function entry(array $m, ?CarbonImmutable $receivedAt): ?PredbFeedEntry
     {
         $type = strtoupper($m['type']);
-        $title = rtrim($m['title'], ',');
+        $title = $m['title'];
 
         if (! isset(self::TYPES[$type]) || ! self::isReleaseName($title)) {
             return null;
@@ -170,6 +172,10 @@ final class PreAnnounceParser
         $reason = trim($m['reason'] ?? '');
         $section = trim($m['section'] ?? '');
         $info = $type === 'INFO';
+
+        if ($type === 'PRE' && $section === '') {
+            return null;
+        }
 
         // An INFO line only counts when it carries both the file count and the size.
         if ($info && (($m['files'] ?? '') === '' || ($m['size'] ?? '') === '')) {
@@ -195,6 +201,6 @@ final class PreAnnounceParser
      */
     private static function isReleaseName(string $title): bool
     {
-        return strlen($title) <= 255 && preg_match('/^[\w.()&\'+,-]+-[\w]+$/u', $title) === 1;
+        return strlen($title) <= 255 && preg_match('/^[\w.()&\'+,-]+-[\w]+\z/u', $title) === 1;
     }
 }
