@@ -146,22 +146,16 @@ unsafe fn decode_neon_block(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[inline]
+#[inline(never)]
 unsafe fn decode_neon_regular_lane(
     bytes: std::arch::aarch64::uint8x16_t,
     equals: std::arch::aarch64::uint8x16_t,
     special: std::arch::aarch64::uint8x16_t,
     destination: *mut u8,
-    escaped: &mut bool,
-) -> usize {
+    mut escaped: bool,
+) -> (usize, bool) {
     use std::arch::aarch64::*;
     unsafe {
-        // A neighbouring lane can contain specials without this lane needing
-        // compaction. Pending escapes bypass this shortcut and qualify below.
-        if !*escaped && vmaxvq_u8(special) == 0 {
-            vst1q_u8(destination, vsubq_u8(bytes, vdupq_n_u8(42)));
-            return 16;
-        }
         let weights =
             vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
         let newlines = vbicq_u8(special, equals);
@@ -170,7 +164,7 @@ unsafe fn decode_neon_regular_lane(
         let masks = vgetq_lane_u32(vreinterpretq_u32_u8(vpaddq_u8(quads, quads)), 0);
         let equals_mask = masks as u16;
         let newline_mask = (masks >> 16) as u16;
-        let incoming = *escaped;
+        let incoming = escaped;
         let following = equals_mask.wrapping_shl(1);
         let remove = equals_mask | newline_mask;
         let first_removed = remove.trailing_zeros() as usize;
@@ -179,9 +173,10 @@ unsafe fn decode_neon_regular_lane(
         if !sparse || following & remove != 0 || (incoming && remove & 1 != 0) {
             // Keep the incoming state intact for malformed escapes or general
             // compaction. The dense decoder and tails also use this helper.
-            return decode_neon_block(bytes, equals, special, destination, escaped);
+            let count = decode_neon_block(bytes, equals, special, destination, &mut escaped);
+            return (count, escaped);
         }
-        *escaped = equals_mask & 0x8000 != 0;
+        escaped = equals_mask & 0x8000 != 0;
         let adjustment = vorrq_u8(
             vandq_u8(vextq_u8(vdupq_n_u8(0), equals, 15), vdupq_n_u8(64)),
             vsetq_lane_u8::<0>(u8::from(incoming) << 6, vdupq_n_u8(0)),
@@ -189,7 +184,7 @@ unsafe fn decode_neon_regular_lane(
         let decoded = vsubq_u8(bytes, vaddq_u8(vdupq_n_u8(42), adjustment));
         if remove == 0 {
             vst1q_u8(destination, decoded);
-            return 16;
+            return (16, escaped);
         }
         let (indexes, count) = if single {
             (SINGLE_REMOVAL_INDEXES[first_removed].as_ptr(), 15)
@@ -209,62 +204,7 @@ unsafe fn decode_neon_regular_lane(
                 vget_low_u8(vextq_u8(compact, compact, 6)),
             );
         }
-        count
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-#[inline(never)]
-unsafe fn decode_neon_regular_slow_group(
-    a: std::arch::aarch64::uint8x16_t,
-    b: std::arch::aarch64::uint8x16_t,
-    c: std::arch::aarch64::uint8x16_t,
-    d: std::arch::aarch64::uint8x16_t,
-    destination: *mut u8,
-    escaped: &mut bool,
-) -> usize {
-    use std::arch::aarch64::*;
-    unsafe {
-        let lookup = vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr());
-        let marker = vdupq_n_u8(b'=');
-        let mut written = 0;
-        // All payload vectors were loaded before entering this helper. Keep
-        // mask recomputation here so the caller's clean path needs no lane
-        // masks across its branch; never reread overlapping source memory.
-        let equals = vceqq_u8(a, marker);
-        written += decode_neon_regular_lane(
-            a,
-            equals,
-            vqtbx1q_u8(equals, lookup, a),
-            destination,
-            escaped,
-        );
-        let equals = vceqq_u8(b, marker);
-        written += decode_neon_regular_lane(
-            b,
-            equals,
-            vqtbx1q_u8(equals, lookup, b),
-            destination.add(written),
-            escaped,
-        );
-        let equals = vceqq_u8(c, marker);
-        written += decode_neon_regular_lane(
-            c,
-            equals,
-            vqtbx1q_u8(equals, lookup, c),
-            destination.add(written),
-            escaped,
-        );
-        let equals = vceqq_u8(d, marker);
-        written += decode_neon_regular_lane(
-            d,
-            equals,
-            vqtbx1q_u8(equals, lookup, d),
-            destination.add(written),
-            escaped,
-        );
-        written
+        (count, escaped)
     }
 }
 
@@ -280,59 +220,35 @@ unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: u
     unsafe {
         let offset = vdupq_n_u8(42);
         let lookup = vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr());
-        while length - read >= 64 {
-            // Encoders commonly wrap after a multiple of 64 encoded bytes.
+        while length - read >= 16 {
             // Consume leading CR/LF without consuming escape state. A lone LF
             // also restores alignment after a line with an odd encoded length.
-            while length - read >= 64 && matches!(source.add(read).read(), b'\r' | b'\n') {
+            while length - read >= 16 && matches!(source.add(read).read(), b'\r' | b'\n') {
                 read += 1;
             }
-            if length - read < 64 {
+            if length - read < 16 {
                 break;
             }
-            // Load the entire group before writing any output, including when
-            // the destination overlaps the source at or below its cursor.
-            let a = vld1q_u8(source.add(read));
-            let b = vld1q_u8(source.add(read + 16));
-            let c = vld1q_u8(source.add(read + 32));
-            let d = vld1q_u8(source.add(read + 48));
-            let special_a = vqtbx1q_u8(vceqq_u8(a, vdupq_n_u8(b'=')), lookup, a);
-            let special_b = vqtbx1q_u8(vceqq_u8(b, vdupq_n_u8(b'=')), lookup, b);
-            let special_c = vqtbx1q_u8(vceqq_u8(c, vdupq_n_u8(b'=')), lookup, c);
-            let special_d = vqtbx1q_u8(vceqq_u8(d, vdupq_n_u8(b'=')), lookup, d);
-            let any_special = vorrq_u8(
-                vorrq_u8(special_a, special_b),
-                vorrq_u8(special_c, special_d),
-            );
-            if !escaped && !neon_mask_has_nonzero(any_special) {
-                vst1q_u8(destination.add(written), vsubq_u8(a, offset));
-                vst1q_u8(destination.add(written + 16), vsubq_u8(b, offset));
-                vst1q_u8(destination.add(written + 32), vsubq_u8(c, offset));
-                vst1q_u8(destination.add(written + 48), vsubq_u8(d, offset));
-                written += 64;
-            } else {
-                written += decode_neon_regular_slow_group(
-                    a,
-                    b,
-                    c,
-                    d,
-                    destination.add(written),
-                    &mut escaped,
-                );
-            }
-            read += 64;
-        }
-        while length - read >= 16 {
+            // Preload this entire lane before writing. Output never exceeds
+            // sixteen bytes, so in-place/behind stores cannot reach the next
+            // unread lane. Destination-ahead overlap uses decode_into's copy.
             let bytes = vld1q_u8(source.add(read));
             let equals = vceqq_u8(bytes, vdupq_n_u8(b'='));
             let special = vqtbx1q_u8(equals, lookup, bytes);
-            written += decode_neon_block(
-                bytes,
-                equals,
-                special,
-                destination.add(written),
-                &mut escaped,
-            );
+            if !escaped && !neon_mask_has_nonzero(special) {
+                vst1q_u8(destination.add(written), vsubq_u8(bytes, offset));
+                written += 16;
+            } else {
+                let (count, next_escaped) = decode_neon_regular_lane(
+                    bytes,
+                    equals,
+                    special,
+                    destination.add(written),
+                    escaped,
+                );
+                written += count;
+                escaped = next_escaped;
+            }
             read += 16;
         }
         scalar_tail(source, destination, length, read, written, escaped)
@@ -657,6 +573,46 @@ mod tests {
             expected.extend(std::iter::repeat_n(byte, 16));
         }
         expected.extend(std::iter::repeat_n(65, 64));
+        verify_regular_guards(&payload, &expected);
+    }
+
+    #[test]
+    fn ordinary_short_newline_prefix_and_tail_carry_preserve_literal_guards() {
+        for prefix in [0, 1, 2, 15, 16, 17] {
+            for split in [0, 1, 2, 15, 16, 17] {
+                let mut payload = vec![b'\n'; prefix];
+                payload.extend(std::iter::repeat_n(b'k', 15));
+                payload.push(b'=');
+                payload.extend(std::iter::repeat_n(b'\r', split));
+                let mut expected = vec![65; 15];
+                expected.push(19);
+                verify_regular_guards(&payload, &expected);
+                for (value, decoded) in [(b'k', 1), (b'=', 211)] {
+                    for tail in [0, 1, 15, 16, 17] {
+                        let mut with_value = payload.clone();
+                        with_value.push(value);
+                        with_value.extend(std::iter::repeat_n(b'k', tail));
+                        let mut expected = vec![65; 15];
+                        expected.push(decoded);
+                        expected.extend(std::iter::repeat_n(65, tail));
+                        verify_regular_guards(&with_value, &expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_single_output_lane_carries_into_dangling_final_marker() {
+        let mut payload = vec![b'k'; 15];
+        payload.extend_from_slice(b"=@");
+        payload.extend(std::iter::repeat_n(b'\n', 15));
+        payload.extend(std::iter::repeat_n(b'l', 15));
+        payload.push(b'=');
+        let mut expected = vec![65; 15];
+        expected.push(214);
+        expected.extend(std::iter::repeat_n(66, 15));
+        expected.push(19);
         verify_regular_guards(&payload, &expected);
     }
 
