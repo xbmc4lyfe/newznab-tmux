@@ -158,33 +158,7 @@ jobs:
       - name: Require execution of the designated SIMD kernel
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json, pathlib, shutil
-          directory = pathlib.Path('benchmark-evidence/build')
-          manifest = json.loads((directory / 'runtime.json').read_text())
-          expected = {'X64': 3, 'ARM64': 4}.get(manifest['runner_arch'])
-          observed = manifest['rust_payload_kernel']['id']
-          qualified = expected is not None and observed == expected
-          for source, name in [
-              ('storage/app/rapidyenc/librapidyenc.so', 'cpp.so'),
-              ('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so', 'rust.so'),
-          ]:
-              shutil.copyfile(source, directory / name)
-          qualification = {
-              'status': 'qualified' if qualified else 'unsupported_hardware',
-              'runner_arch': manifest['runner_arch'],
-              'required_kernel_id': expected, 'observed_kernel': manifest['rust_payload_kernel'],
-              'git_head': manifest['git_head'],
-              'rust_library_sha256': manifest['rust_library_sha256'],
-              'cpp_library_sha256': manifest['cpp_library_sha256'],
-              'basis': 'Same runtime selector used by the tested decoder; x86 requires VBMI2, ARM requires NEON.',
-              'conclusion': 'Hardware qualified for the paired comparison.' if qualified else
-                  'Required SIMD kernel was not exercised; no eligible performance comparison.',
-          }
-          (directory / 'kernel-qualification.json').write_text(json.dumps(qualification, indent=2) + '\n')
-          if not qualified:
-              raise SystemExit(f'Unsupported hardware: required kernel {expected}, observed {observed}; evidence retained.')
-          PY
+          docker/app/nzb-yenc-ffi/target/release/nntmux-evidence-utility --mode qualify
 
       - name: Capture CPU counters before native comparison
         run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output benchmark-evidence/build/cpu-before.json
@@ -227,26 +201,12 @@ jobs:
         if: always()
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json, os, pathlib
-          path = pathlib.Path('benchmark-evidence/paired/observations.jsonl')
-          rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write('## Native yEnc paired fixture comparison\n\n')
-              qualification_path = pathlib.Path('benchmark-evidence/build/kernel-qualification.json')
-              if qualification_path.exists():
-                  qualification = json.loads(qualification_path.read_text())
-                  summary.write('Kernel qualification: `' + qualification['status'] + '`. ' + qualification['conclusion'] + '\n\n')
-              summary.write('Scope: identical synthetic fixtures through the same PHP decoder service and memory-backed NNTP BODY harness. No archive-metadata or production-capacity claim.\n\n')
-              summary.write('| Bytes | Density | Path | Decision | Rust / C++ median | 95% interval | Eligible / invalid pairs |\n|---:|---|---|---|---:|---|---|\n')
-              for row in rows:
-                  if row.get('type') != 'stratum_summary':
-                      continue
-                  summary.write(f"| {row['size']} | {row['density']} | {row['path']} | {row['decision']} | {row.get('median_rust_over_cpp', 'unavailable')} | {row.get('bootstrap_95_percent_interval', 'unavailable')} | {row['eligible_pairs']} / {row['invalid_pairs']} |\n")
-              final = next((row for row in reversed(rows) if row.get('type') in ('run_summary', 'run_failure')), None)
-              summary.write('\nRun result: `' + (final['status'] if final else 'setup incomplete; no performance conclusion') + '`.\n\n')
-              summary.write('Intervals use a simultaneous 95% bootstrap rule across the predeclared fixture groups. Inconclusive strata do not demonstrate a Rust speed advantage. Failed or timed-out pairs are retained and make the affected stratum invalid.\n')
-          PY
+          utility=docker/app/nzb-yenc-ffi/target/release/nntmux-evidence-utility
+          if [[ -x "$utility" ]]; then
+            "$utility" --mode cpp-summary
+          else
+            printf '## Native yEnc paired fixture comparison\n\nEvidence utility unavailable; setup incomplete; no performance conclusion.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Retain fixtures, libraries, identities and every observation
         if: always()
@@ -351,19 +311,12 @@ jobs:
         if: always()
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json, os, pathlib
-          path = pathlib.Path('benchmark-evidence/php-paired/observations.jsonl')
-          rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write('## Rust versus PHP fallback\n\nSame PHP service, exact byte/CRC correctness, randomized fresh-process pairs. Includes FFI overhead. Synthetic decoder fixtures only; no production throughput claim.\n\n')
-              summary.write('| Bytes | Density | Path | Decision | Rust / PHP | 95% interval | Eligible / invalid |\n|---:|---|---|---|---:|---|---|\n')
-              for row in rows:
-                  if row.get('type') == 'stratum_summary':
-                      summary.write(f"| {row['size']} | {row['density']} | {row['path']} | {row['decision']} | {row.get('median_rust_over_php', 'unavailable')} | {row.get('bootstrap_95_percent_interval', 'unavailable')} | {row['eligible_pairs']} / {row['invalid_pairs']} |\n")
-              final = next((row for row in reversed(rows) if row.get('type') in ('run_summary', 'run_failure')), None)
-              summary.write('\nResult: `' + (final['status'] if final else 'setup incomplete; no performance conclusion') + '`. Inconclusive results do not qualify a Rust replacement. Failures are retained and invalidate their stratum.\n')
-          PY
+          utility=docker/app/nzb-yenc-ffi/target/release/nntmux-evidence-utility
+          if [[ -x "$utility" ]]; then
+            "$utility" --mode php-summary
+          else
+            printf '## Rust versus PHP fallback\n\nEvidence utility unavailable; setup incomplete; no performance conclusion.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Retain PHP comparison evidence
         if: always()
