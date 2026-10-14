@@ -55,26 +55,45 @@ pub unsafe fn decode_into(source: *const u8, destination: *mut u8, length: usize
     unsafe { decode_forward(source, destination, length) }
 }
 
-unsafe fn decode_forward(source: *const u8, destination: *mut u8, length: usize) -> usize {
+/// Runtime dispatch identity: 0 scalar, 1 SSSE3, 2 AVX2, 3 VBMI2, 4 NEON.
+/// Every optional feature required by a kernel is checked independently.
+pub(crate) fn selected_kernel() -> u32 {
     #[cfg(target_arch = "aarch64")]
     {
-        // AArch64 requires Advanced SIMD; no optional ISA is assumed here.
-        return unsafe { crate::payload_decoder_arm::decode_neon(source, destination, length) };
+        return 4;
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("avx512vbmi2")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("popcnt")
+        {
+            return 3;
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
-            return unsafe { crate::payload_decoder_x86::decode_avx2(source, destination, length) };
+            return 2;
         }
         if is_x86_feature_detected!("ssse3") {
-            return unsafe {
-                crate::payload_decoder_x86::decode_ssse3(source, destination, length)
-            };
+            return 1;
         }
     }
     #[allow(unreachable_code)]
-    unsafe {
-        scalar_tail(source, destination, length, 0, 0, false)
+    0
+}
+
+unsafe fn decode_forward(source: *const u8, destination: *mut u8, length: usize) -> usize {
+    match selected_kernel() {
+        #[cfg(target_arch = "aarch64")]
+        4 => unsafe { crate::payload_decoder_arm::decode_neon(source, destination, length) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        3 => unsafe { crate::payload_decoder_x86::decode_vbmi2(source, destination, length) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        2 => unsafe { crate::payload_decoder_x86::decode_avx2(source, destination, length) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        1 => unsafe { crate::payload_decoder_x86::decode_ssse3(source, destination, length) },
+        _ => unsafe { scalar_tail(source, destination, length, 0, 0, false) },
     }
 }
 

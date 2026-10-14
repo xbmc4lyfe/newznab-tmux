@@ -102,20 +102,27 @@ jobs:
         run: |
           YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
             php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
-              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines' \
+              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines|it_withholds_integrity_for_trailer_only_multipart_declarations' \
               2>&1 | tee benchmark-evidence/build/framing-budget-integration.log
 
       - name: Record build and runtime identities
         shell: bash
         run: |
           python3 - <<'PY'
-          import hashlib, json, os, pathlib, subprocess
+          import ctypes, hashlib, json, os, pathlib, subprocess
           root = pathlib.Path.cwd()
           def run(*args):
               return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
           def digest(path):
               return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
           sources = sorted((root / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs'))
+          decoder = ctypes.CDLL(str(root / 'docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so'))
+          decoder.nntmux_yenc_payload_kernel_v1.argtypes = []
+          decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          kernel = decoder.nntmux_yenc_payload_kernel_v1()
+          kernel_names = {0: 'scalar', 1: 'ssse3', 2: 'avx2', 3: 'avx512-vbmi2', 4: 'neon'}
+          if kernel not in kernel_names:
+              raise RuntimeError('Unknown Rust runtime payload kernel identity')
           manifest = {
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'runner_image_os': os.environ.get('ImageOS'),
@@ -135,6 +142,8 @@ jobs:
               'cpp_source_archive_sha256': {path.name: digest(path) for path in pathlib.Path('storage/app/rapidyenc').glob('rapidyenc-*.tar.gz')},
               'cpp_library_sha256': digest('storage/app/rapidyenc/librapidyenc.so'),
               'rust_library_sha256': digest('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so'),
+              'rust_payload_kernel': {'id': kernel, 'name': kernel_names[kernel],
+                  'basis': 'untimed export from the same runtime selector used by payload decoding'},
           }
           pathlib.Path('benchmark-evidence/build/runtime.json').write_text(json.dumps(manifest, indent=2) + '\n')
           PY

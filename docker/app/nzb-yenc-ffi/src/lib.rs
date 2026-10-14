@@ -693,6 +693,14 @@ pub unsafe extern "C" fn nntmux_yenc_decode_span_v1(
 #[unsafe(no_mangle)]
 pub extern "C" fn rapidyenc_crc_init() {}
 
+/// Identity from the same runtime selector used by payload decoding.
+/// 0 scalar, 1 SSSE3, 2 AVX2, 3 AVX-512 VBMI2, 4 AArch64 NEON.
+/// This is decoder provenance, not evidence about the posting application.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_yenc_payload_kernel_v1() -> u32 {
+    payload_decoder::selected_kernel()
+}
+
 /// CRC-32 (the same digest as PHP's `crc32b`), continuing from `init_crc`.
 ///
 /// # Safety
@@ -718,6 +726,45 @@ pub unsafe extern "C" fn rapidyenc_crc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_kernel_export_reports_the_runtime_selector_without_decoding() {
+        let selected = nntmux_yenc_payload_kernel_v1();
+        assert!(selected <= 4);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(selected, 4);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if selected == 3 {
+            assert!(is_x86_feature_detected!("avx2"));
+            assert!(is_x86_feature_detected!("avx512vbmi2"));
+            assert!(is_x86_feature_detected!("avx512bw"));
+            assert!(is_x86_feature_detected!("avx512vl"));
+            assert!(is_x86_feature_detected!("popcnt"));
+        }
+        assert_eq!(decode_payload(b"klm").unwrap(), b"ABC");
+        assert_eq!(nntmux_yenc_payload_kernel_v1(), selected);
+    }
+
+    #[test]
+    fn framing_export_retains_trailer_only_part_without_single_part_authority() {
+        let body =
+            b"=ybegin line=128 size=3 name=x.rar\r\nklm\r\n=yend size=3 part=1 pcrc32=a3830348\r\n";
+        let output = unsafe { nntmux_yenc_framing_metadata_json(body.as_ptr(), body.len()) };
+        assert!(!output.is_null());
+        let json: serde_json::Value = unsafe {
+            let text = std::ffi::CStr::from_ptr(output).to_bytes();
+            let parsed = serde_json::from_slice(text);
+            nntmux_metadata_string_free(output);
+            parsed.unwrap()
+        };
+        assert_eq!(json["frames"][0]["yend_part_number"], 1);
+        assert_eq!(json["frames"][0]["multipart_pcrc32_status"], "present-hex");
+        assert_eq!(json["frames"][0]["size_relationship_status"], "incomplete");
+        assert_eq!(
+            json["frames"][0]["expected_segment_size"],
+            serde_json::Value::Null
+        );
+    }
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     use std::ffi::CStr;

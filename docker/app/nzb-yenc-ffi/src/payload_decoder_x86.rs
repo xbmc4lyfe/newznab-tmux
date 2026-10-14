@@ -404,9 +404,221 @@ pub(crate) unsafe fn decode_avx2(source: *const u8, destination: *mut u8, length
     }
 }
 
+// Register compression avoids a memory-form compress-store. The final masked
+// store writes only the contiguous decoded prefix, never the unused suffix.
+#[target_feature(enable = "avx2,avx512vbmi2,avx512bw,avx512vl,popcnt")]
+#[inline]
+unsafe fn compact_vbmi2(
+    bytes: x86::__m256i,
+    specials: u32,
+    destination: *mut u8,
+    escaped: &mut bool,
+) -> usize {
+    use x86::*;
+    unsafe {
+        if !*escaped && specials == 0 {
+            _mm256_storeu_si256(
+                destination.cast(),
+                _mm256_sub_epi8(bytes, _mm256_set1_epi8(42)),
+            );
+            return 32;
+        }
+        let equals =
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'=' as i8))) as u32;
+        let newlines = specials & !equals;
+        let incoming = *escaped;
+        if newlines == 0
+            && ((!incoming && equals == 0x5555_5555) || (incoming && equals == 0xaaaa_aaaa))
+        {
+            let packed =
+                _mm256_maskz_compress_epi8(!equals, _mm256_sub_epi8(bytes, _mm256_set1_epi8(106)));
+            _mm_storeu_si128(destination.cast(), _mm256_castsi256_si128(packed));
+            return 16;
+        }
+        let following = equals.wrapping_shl(1);
+        let (remove, adjust) = if following & (equals | newlines) == 0
+            && (!incoming || (equals | newlines) & 1 == 0)
+        {
+            *escaped = equals & 0x8000_0000 != 0;
+            (equals | newlines, following | u32::from(incoming))
+        } else {
+            let (lo_remove, lo_adjust) = block_masks(equals as u16, newlines as u16, escaped);
+            let (hi_remove, hi_adjust) =
+                block_masks((equals >> 16) as u16, (newlines >> 16) as u16, escaped);
+            (
+                u32::from(lo_remove) | (u32::from(hi_remove) << 16),
+                u32::from(lo_adjust) | (u32::from(hi_adjust) << 16),
+            )
+        };
+        // Expand the full 32-bit mask instead of a lane-local byte shift:
+        // an escape marker in byte 15 still adjusts its value in byte 16.
+        let offsets = _mm256_add_epi8(
+            _mm256_set1_epi8(42),
+            _mm256_and_si256(_mm256_movm_epi8(adjust), _mm256_set1_epi8(64)),
+        );
+        let keep = !remove;
+        let count = keep.count_ones() as usize;
+        if count != 0 {
+            let packed = _mm256_maskz_compress_epi8(keep, _mm256_sub_epi8(bytes, offsets));
+            let prefix = if count == 32 {
+                u32::MAX
+            } else {
+                (1u32 << count) - 1
+            };
+            _mm256_mask_storeu_epi8(destination.cast(), prefix, packed);
+        }
+        count
+    }
+}
+
+#[target_feature(enable = "avx2,avx512vbmi2,avx512bw,avx512vl,popcnt")]
+#[inline]
+unsafe fn vbmi2_specials(bytes: x86::__m256i) -> u32 {
+    use x86::*;
+    unsafe {
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(
+            bytes,
+            _mm256_shuffle_epi8(
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(SPECIAL_BYTES.as_ptr().cast())),
+                _mm256_min_epu8(bytes, _mm256_set1_epi8(46)),
+            ),
+        )) as u32
+    }
+}
+
+#[target_feature(enable = "avx2,avx512vbmi2,avx512bw,avx512vl,popcnt")]
+pub(crate) unsafe fn decode_vbmi2(source: *const u8, destination: *mut u8, length: usize) -> usize {
+    use x86::*;
+    let mut read = 0;
+    let mut written = 0;
+    let mut escaped = false;
+    unsafe {
+        while length - read >= 64 {
+            if matches!(source.add(read).read(), b'\r' | b'\n') {
+                read += 1;
+                continue;
+            }
+            // Load both vectors before any store, including overlapping output.
+            let low = _mm256_loadu_si256(source.add(read).cast());
+            let high = _mm256_loadu_si256(source.add(read + 32).cast());
+            let low_specials = vbmi2_specials(low);
+            let high_specials = vbmi2_specials(high);
+            if !escaped && low_specials | high_specials == 0 {
+                _mm256_storeu_si256(
+                    destination.add(written).cast(),
+                    _mm256_sub_epi8(low, _mm256_set1_epi8(42)),
+                );
+                _mm256_storeu_si256(
+                    destination.add(written + 32).cast(),
+                    _mm256_sub_epi8(high, _mm256_set1_epi8(42)),
+                );
+                written += 64;
+            } else {
+                written += compact_vbmi2(low, low_specials, destination.add(written), &mut escaped);
+                written +=
+                    compact_vbmi2(high, high_specials, destination.add(written), &mut escaped);
+            }
+            read += 64;
+        }
+        while length - read >= 32 {
+            let bytes = _mm256_loadu_si256(source.add(read).cast());
+            written += compact_vbmi2(
+                bytes,
+                vbmi2_specials(bytes),
+                destination.add(written),
+                &mut escaped,
+            );
+            read += 32;
+        }
+        scalar_tail(source, destination, length, read, written, escaped)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vbmi2_kernel_preserves_escape_carry_and_exact_output_for_every_boundary() {
+        if !is_x86_feature_detected!("avx2")
+            || !is_x86_feature_detected!("avx512vbmi2")
+            || !is_x86_feature_detected!("avx512bw")
+            || !is_x86_feature_detected!("avx512vl")
+            || !is_x86_feature_detected!("popcnt")
+        {
+            return;
+        }
+        assert_eq!(crate::payload_decoder::selected_kernel(), 3);
+        // Byte 31 carries an escape into a completely ordinary second vector:
+        // its full 32-byte prefix store must adjust byte zero and touch no tail.
+        let mut carry_input = [b'k'; 64];
+        carry_input[31] = b'=';
+        let mut carry_output = [0xa5; 96];
+        let carry_written = unsafe {
+            decode_vbmi2(
+                carry_input.as_ptr(),
+                carry_output.as_mut_ptr(),
+                carry_input.len(),
+            )
+        };
+        assert_eq!(carry_written, 63);
+        assert!(carry_output[..31].iter().all(|&byte| byte == b'A'));
+        assert_eq!(carry_output[31], 1);
+        assert!(carry_output[32..63].iter().all(|&byte| byte == b'A'));
+        assert!(carry_output[63..].iter().all(|&byte| byte == 0xa5));
+        let tails: &[&[u8]] = &[b"", b"=", b"==", b"=\r\n@", b"\r\n\r\n", b"===\n=\r="];
+        for boundary in 0..=65 {
+            for special in [b"=@".as_slice(), b"==", b"\r\n", b"=\r\n@"] {
+                for tail in tails {
+                    let mut input = vec![b'k'; boundary];
+                    input.extend_from_slice(special);
+                    input.extend_from_slice(&[b'\n'; 64]);
+                    input.extend_from_slice(b"=@=J=M=}==");
+                    input.extend_from_slice(&[b'k'; 67]);
+                    input.extend_from_slice(tail);
+                    let mut expected = vec![0; input.len()];
+                    let count = unsafe {
+                        scalar_tail(
+                            input.as_ptr(),
+                            expected.as_mut_ptr(),
+                            input.len(),
+                            0,
+                            0,
+                            false,
+                        )
+                    };
+                    for alignment in 0..32 {
+                        let mut output = vec![0xa5; input.len() + 64];
+                        let written = unsafe {
+                            decode_vbmi2(
+                                input.as_ptr(),
+                                output.as_mut_ptr().add(alignment),
+                                input.len(),
+                            )
+                        };
+                        assert_eq!(written, count);
+                        assert_eq!(&output[alignment..alignment + count], &expected[..count]);
+                        assert!(output[..alignment].iter().all(|&byte| byte == 0xa5));
+                        assert!(output[alignment + count..].iter().all(|&byte| byte == 0xa5));
+                    }
+                    for behind in [0, 1, 7, 15, 31] {
+                        let mut overlap = vec![0xa5; input.len() + behind + 32];
+                        overlap[behind..behind + input.len()].copy_from_slice(&input);
+                        let before = overlap.clone();
+                        let written = unsafe {
+                            decode_vbmi2(
+                                overlap.as_ptr().add(behind),
+                                overlap.as_mut_ptr(),
+                                input.len(),
+                            )
+                        };
+                        assert_eq!(&overlap[..written], &expected[..count]);
+                        assert_eq!(&overlap[written..], &before[written..]);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn compact_word_pairs_preserve_all_bytes_after_the_result() {
@@ -451,6 +663,14 @@ mod tests {
         }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
             kernels.push(decode_avx2);
+        }
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("avx512vbmi2")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("popcnt")
+        {
+            kernels.push(decode_vbmi2);
         }
         for kernel in kernels {
             for value in 0..=u8::MAX {

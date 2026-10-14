@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 22;
+    public const SCHEMA_VERSION = 23;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 
@@ -1395,7 +1395,8 @@ final class ReleaseFingerprintCollector
                 $crcValuesMatch = false;
             }
         }
-        $crcValid = ($yenc['declared_crc32_matches'] ?? null) === true && ($multipart || $crcValuesMatch);
+        $crcValid = Par2MetadataParser::declaredYencCrc32Valid($yenc)
+            && ($yenc['declared_crc32_matches'] ?? null) === true && ($multipart || $crcValuesMatch);
         $crcDeclared = ($yenc['segment_crc32_basis'] ?? null) !== 'missing-pcrc32'
             && ($yenc['segment_crc32_basis'] ?? null) !== 'missing-crc32';
         $integrityValid = $sizeMatches && $totalMatches && $crcSyntaxValid

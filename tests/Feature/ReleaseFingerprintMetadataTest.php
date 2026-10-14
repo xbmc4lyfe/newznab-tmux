@@ -266,6 +266,80 @@ final class ReleaseFingerprintMetadataTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('trailerOnlyMultipartDeclarations')]
+    public function it_withholds_integrity_for_trailer_only_multipart_declarations(string $part, bool $nativeEnabled): void
+    {
+        $body = "=ybegin line=128 size=3 name=x.rar\r\nklm\r\n=yend size=3 part={$part} pcrc32=a3830348\r\n";
+        if (! $nativeEnabled) {
+            config(['yenc.native_library' => '']);
+        }
+        $native = (new NativeMetadataParser)->parseYencFraming($body);
+        if ($nativeEnabled && $native === null) {
+            self::markTestSkipped('Native yEnc framing library is required for trailer-only multipart integration.');
+        }
+        if (! $nativeEnabled) {
+            self::assertNull($native);
+        }
+
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        $article = $analysis['metadata'];
+        $yenc = $article['yenc'];
+
+        self::assertSame('ABC', $analysis['decoded_bytes']);
+        self::assertSame(hash('sha256', $body), $article['article_body_sha256']);
+        self::assertSame(hash('sha256', 'ABC'), $yenc['decoded_segment_sha256']);
+        self::assertSame(3, $yenc['decoded_segment_size']);
+        self::assertSame('A3830348', $yenc['observed_decoded_crc32']);
+        self::assertSame('a3830348', $yenc['pcrc32']);
+        self::assertSame('pcrc32', $yenc['observed_crc32_declaration_field']);
+        self::assertTrue($yenc['observed_crc32_matches_selected_declaration']);
+        self::assertSame($part, $yenc['trailer_fields']['part']);
+        self::assertNull($yenc['part_fields']);
+        self::assertArrayNotHasKey('part', $yenc['header_fields']);
+        self::assertCount(2, $yenc['raw_control_lines']);
+        self::assertTrue($yenc['multipart']);
+        self::assertFalse($yenc['header_numeric_fields_valid']);
+        self::assertNull($yenc['expected_decoded_segment_size']);
+        self::assertNull($yenc['decoded_size_matches_yenc']);
+        self::assertNull($yenc['ypart_range_valid']);
+        self::assertNull($yenc['declared_crc32_matches']);
+        self::assertNull($yenc['par2_first_16k_md5_candidate']);
+        self::assertFalse(Par2MetadataParser::declaredYencCrc32Valid($yenc));
+        $rangeMetadata = $article;
+        $rangeMetadata['article_identity'] = [
+            'parser_engine' => 'nntmux-rust-article-identity',
+            'schema_version' => 3,
+            'relations' => ['body_response_matches_request' => true],
+        ];
+        $range = (new \ReflectionMethod(ReleaseFingerprintCollector::class, 'decodedFileRange'))
+            ->invoke((new \ReflectionClass(ReleaseFingerprintCollector::class))->newInstanceWithoutConstructor(), $rangeMetadata, 'ABC');
+        self::assertSame('invalid', $range['mapping_status']);
+        self::assertSame('range_or_size_mismatch', $range['integrity_status']);
+        if ($nativeEnabled) {
+            self::assertSame($native, $article['yenc_framing_metadata']);
+            self::assertSame('present-hex', $native['frames'][0]['multipart_pcrc32_status']);
+            self::assertNull($native['frames'][0]['expected_segment_size']);
+            self::assertNull($native['frames'][0]['yend_size_matches_expected']);
+            if ($part === '1') {
+                self::assertSame(1, $native['frames'][0]['yend_part_number']);
+                self::assertSame('incomplete', $native['frames'][0]['size_relationship_status']);
+            }
+        }
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function trailerOnlyMultipartDeclarations(): array
+    {
+        $cases = [];
+        foreach (['valid_part' => '1', 'zero_part' => '0', 'empty_part' => '', 'nondecimal_part' => 'invalid'] as $name => $part) {
+            $cases[$name.'_fallback'] = [$part, false];
+            $cases[$name.'_native'] = [$part, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
     public function it_withholds_fallback_integrity_for_conflicting_or_unbounded_framing(): void
     {
         config(['yenc.native_library' => '']);
@@ -1253,6 +1327,60 @@ final class ReleaseFingerprintMetadataTest extends TestCase
             'declared_crc32_is_hex' => null,
             'declared_crc32_matches' => null,
         ]));
+    }
+
+    #[Test]
+    public function it_never_restores_crc_authority_from_unavailable_multipart_metadata(): void
+    {
+        foreach ([null, 'aabbccdd'] as $declaredCrc) {
+            self::assertFalse(Par2MetadataParser::declaredYencCrc32Valid([
+                'crc32' => $declaredCrc,
+                'pcrc32' => $declaredCrc,
+                'segment_crc32_basis' => 'unavailable-multipart-structure',
+                'declared_crc32_is_hex' => true,
+                'declared_crc32_matches' => true,
+            ]));
+        }
+    }
+
+    #[Test]
+    public function it_reports_partial_multipart_structure_for_conflicting_or_invalid_fields(): void
+    {
+        config(['yenc.native_library' => '']);
+        foreach ([
+            [' total=2', 'part=1 part=2', 'ambiguous'],
+            [' total=2', 'part=1 total=1 total=2', 'ambiguous'],
+            ['', 'part=1 total=invalid', 'invalid'],
+        ] as [$headerTotal, $trailerFields, $status]) {
+            $body = "=ybegin part=1{$headerTotal} line=128 size=3 name=x.rar\r\n=ypart begin=1 end=3\r\nklm\r\n=yend size=3 {$trailerFields} pcrc32=a3830348\r\n";
+            $yenc = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $body)['yenc'];
+            self::assertSame($status, $yenc['multipart_structure_status']);
+            self::assertNull($yenc['declared_crc32_matches']);
+            self::assertNull($yenc['par2_first_16k_md5_candidate']);
+            self::assertSame('A3830348', $yenc['observed_decoded_crc32']);
+        }
+    }
+
+    #[Test]
+    public function it_never_restores_file_range_authority_from_an_unavailable_crc_basis(): void
+    {
+        config(['yenc.native_library' => '']);
+        $body = "=ybegin line=128 size=3 name=x.7z\r\nklm\r\n=yend size=3 crc32=a3830348\r\n";
+        $metadata = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticle([], $body);
+        $metadata['article_identity'] = [
+            'parser_engine' => 'nntmux-rust-article-identity', 'schema_version' => 3,
+            'relations' => ['body_response_matches_request' => true],
+        ];
+        $collector = (new \ReflectionClass(ReleaseFingerprintCollector::class))->newInstanceWithoutConstructor();
+        $method = new \ReflectionMethod($collector, 'decodedFileRange');
+        self::assertSame('valid', $method->invoke($collector, $metadata, 'ABC')['mapping_status']);
+        $metadata['yenc']['segment_crc32_basis'] = 'unavailable-multipart-structure';
+        // The retained CRC syntax/match observations are deliberately still true.
+        self::assertTrue($metadata['yenc']['declared_crc32_matches']);
+        $range = $method->invoke($collector, $metadata, 'ABC');
+        self::assertSame('invalid', $range['mapping_status']);
+        self::assertArrayNotHasKey('start_offset', $range);
+        self::assertArrayNotHasKey('end_offset_exclusive', $range);
     }
 
     #[Test]

@@ -567,7 +567,7 @@ fn derive_frame_size_relationship(frame: &mut YencFrame, lines: &[ControlLine]) 
     let mut malformed = false;
     let mut incomplete = false;
 
-    let has_part_field = begin_line.is_some_and(|line| {
+    let has_part_field = begin_line.into_iter().chain(end_line).any(|line| {
         line.fields.iter().any(|field| field.name == "part")
             || line.duplicate_field_names.iter().any(|name| name == "part")
     });
@@ -728,6 +728,51 @@ fn hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::parse;
+
+    #[test]
+    fn trailer_only_part_declarations_cannot_establish_single_part_size() {
+        for (part, expected_part) in [
+            ("1", Some(1)),
+            ("0", Some(0)),
+            ("", None),
+            ("invalid", None),
+        ] {
+            let input = format!(
+                "=ybegin line=128 size=3 name=x.rar\r\nklm\r\n=yend size=3 part={part} pcrc32=a3830348\r\n"
+            );
+            let metadata = parse(input.as_bytes());
+            let json = serde_json::to_value(metadata).unwrap();
+            let frame = &json["frames"][0];
+
+            assert_eq!(json["control_line_count"], 2);
+            assert_eq!(json["frame_count"], 1);
+            assert_eq!(json["control_lines_truncated"], false);
+            assert_eq!(json["frames_truncated"], false);
+            assert_eq!(frame["part_control_line_count"], 0);
+            assert_eq!(frame["yend_part_number"], serde_json::json!(expected_part));
+            assert_eq!(frame["multipart_pcrc32_status"], "present-hex");
+            assert_eq!(frame["expected_segment_size"], serde_json::Value::Null);
+            assert_eq!(
+                frame["expected_segment_size_decimal"],
+                serde_json::Value::Null
+            );
+            assert_eq!(frame["part_range_valid"], serde_json::Value::Null);
+            assert_eq!(frame["yend_size_matches_expected"], serde_json::Value::Null);
+            if part == "1" {
+                assert_eq!(frame["size_relationship_status"], "incomplete");
+            } else {
+                assert_ne!(frame["size_relationship_status"], "complete");
+            }
+            let trailer = &json["lines"][1];
+            assert_eq!(trailer["kind"], "yend");
+            assert_eq!(trailer["frame_index"], 1);
+            assert_eq!(trailer["field_occurrences_truncated"], false);
+            assert_eq!(trailer["fields"][1]["name"], "part");
+            assert_eq!(trailer["fields"][1]["value_utf8"], part);
+            assert_eq!(trailer["fields"][2]["name"], "pcrc32");
+            assert_eq!(trailer["fields"][2]["value_utf8"], "a3830348");
+        }
+    }
 
     #[test]
     fn relates_multipart_range_file_size_and_trailer_size() {

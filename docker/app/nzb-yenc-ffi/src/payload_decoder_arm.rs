@@ -5,14 +5,14 @@
 
 use crate::payload_decoder::{COMPACT, ESCAPE_OFFSETS, block_masks, scalar_tail, store_word};
 
-const fn single_marker_indexes() -> [[u8; 16]; 16] {
-    let mut table = [[255; 16]; 16];
+const fn removal_indexes<const POSITIONS: usize>(removed: usize) -> [[u8; 16]; POSITIONS] {
+    let mut table = [[255; 16]; POSITIONS];
     let mut marker = 0;
-    while marker < 16 {
+    while marker < POSITIONS {
         let mut input = 0;
         let mut output = 0;
         while input < 16 {
-            if input != marker {
+            if input < marker || input >= marker + removed {
                 table[marker][output] = input as u8;
                 output += 1;
             }
@@ -23,7 +23,8 @@ const fn single_marker_indexes() -> [[u8; 16]; 16] {
     table
 }
 
-static SINGLE_MARKER_INDEXES: [[u8; 16]; 16] = single_marker_indexes();
+static SINGLE_REMOVAL_INDEXES: [[u8; 16]; 16] = removal_indexes::<16>(1);
+static PAIR_REMOVAL_INDEXES: [[u8; 16]; 15] = removal_indexes::<15>(2);
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
@@ -51,40 +52,72 @@ unsafe fn decode_neon_block(
         let masks = vgetq_lane_u32(vreinterpretq_u32_u8(vpaddq_u8(quads, quads)), 0);
         let equals_mask = masks as u16;
         let newline_mask = (masks >> 16) as u16;
-        if !*escaped
-            && newline_mask == 0
-            && equals_mask != 0
-            && equals_mask & equals_mask.wrapping_sub(1) == 0
+        let incoming = *escaped;
+        let following = equals_mask.wrapping_shl(1);
+        let (remove, decoded) = if following & (equals_mask | newline_mask) == 0
+            && (!incoming || (equals_mask | newline_mask) & 1 == 0)
         {
-            // One ordinary escape needs a single full-vector shuffle, with no
-            // per-half adjustment tables or variable-length output stores.
-            let adjustment = vandq_u8(vextq_u8(vdupq_n_u8(0), equals, 15), vdupq_n_u8(64));
-            let decoded = vsubq_u8(vsubq_u8(bytes, vdupq_n_u8(42)), adjustment);
-            let indexes =
-                vld1q_u8(SINGLE_MARKER_INDEXES[equals_mask.trailing_zeros() as usize].as_ptr());
-            let compact = vqtbl1q_u8(decoded, indexes);
-            vst1_u8(destination, vget_low_u8(compact));
-            store_word(
-                vgetq_lane_u64(vreinterpretq_u64_u8(compact), 1),
-                destination.add(8),
-                7,
-            );
+            // Ordinary escapes can form their adjustment directly from the
+            // comparison, including a pending value at byte zero. Adjacent
+            // markers and newlines inside an escape retain the lenient path.
             *escaped = equals_mask & 0x8000 != 0;
+            let adjustment = vorrq_u8(
+                vandq_u8(vextq_u8(vdupq_n_u8(0), equals, 15), vdupq_n_u8(64)),
+                vsetq_lane_u8::<0>(u8::from(incoming) << 6, vdupq_n_u8(0)),
+            );
+            (
+                equals_mask | newline_mask,
+                vsubq_u8(bytes, vaddq_u8(vdupq_n_u8(42), adjustment)),
+            )
+        } else {
+            let (remove, adjust) = block_masks(equals_mask, newline_mask, escaped);
+            let adjustment = vcombine_u8(
+                vld1_u8(ESCAPE_OFFSETS[(adjust & 255) as usize].as_ptr()),
+                vld1_u8(ESCAPE_OFFSETS[(adjust >> 8) as usize].as_ptr()),
+            );
+            (
+                remove,
+                vsubq_u8(bytes, vaddq_u8(vdupq_n_u8(42), adjustment)),
+            )
+        };
+        if remove == 0 {
+            vst1q_u8(destination, decoded);
+            return 16;
+        }
+        let first_removed = remove.trailing_zeros() as usize;
+        if remove.is_power_of_two() {
+            let indexes = vld1q_u8(SINGLE_REMOVAL_INDEXES[first_removed].as_ptr());
+            let compact = vqtbl1q_u8(decoded, indexes);
+            // Two overlapping stores cover exactly fifteen output bytes.
+            // All source bytes are already loaded before either store.
+            vst1_u8(destination, vget_low_u8(compact));
+            vst1_u8(
+                destination.add(7),
+                vget_low_u8(vextq_u8(compact, compact, 7)),
+            );
             return 15;
         }
-        let (remove, adjust) = block_masks(equals_mask, newline_mask, escaped);
-        let low = vsub_u8(
-            vsub_u8(vget_low_u8(bytes), vdup_n_u8(42)),
-            vld1_u8(ESCAPE_OFFSETS[(adjust & 255) as usize].as_ptr()),
-        );
-        let high = vsub_u8(
-            vsub_u8(vget_high_u8(bytes), vdup_n_u8(42)),
-            vld1_u8(ESCAPE_OFFSETS[(adjust >> 8) as usize].as_ptr()),
-        );
+        if remove >> first_removed == 3 {
+            let indexes = vld1q_u8(PAIR_REMOVAL_INDEXES[first_removed].as_ptr());
+            let compact = vqtbl1q_u8(decoded, indexes);
+            // Both eight-byte ranges remain within the fourteen-byte result.
+            vst1_u8(destination, vget_low_u8(compact));
+            vst1_u8(
+                destination.add(6),
+                vget_low_u8(vextq_u8(compact, compact, 6)),
+            );
+            return 14;
+        }
         let low_count = 8 - (remove & 255).count_ones() as usize;
         let high_count = 8 - (remove >> 8).count_ones() as usize;
-        let low = vtbl1_u8(low, vld1_u8(COMPACT[(remove & 255) as usize].as_ptr()));
-        let high = vtbl1_u8(high, vld1_u8(COMPACT[(remove >> 8) as usize].as_ptr()));
+        let low = vtbl1_u8(
+            vget_low_u8(decoded),
+            vld1_u8(COMPACT[(remove & 255) as usize].as_ptr()),
+        );
+        let high = vtbl1_u8(
+            vget_high_u8(decoded),
+            vld1_u8(COMPACT[(remove >> 8) as usize].as_ptr()),
+        );
         store_word(
             vget_lane_u64(vreinterpret_u64_u8(low), 0),
             destination,
@@ -273,6 +306,135 @@ pub(crate) unsafe fn decode_neon(source: *const u8, destination: *mut u8, length
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verify_regular_guards(payload: &[u8], expected: &[u8]) {
+        for kernel in [
+            decode_neon_regular as unsafe fn(*const u8, *mut u8, usize) -> usize,
+            decode_neon,
+        ] {
+            for destination_offset in 0..16 {
+                let mut output = vec![0xa5; payload.len() + 32];
+                let written = unsafe {
+                    kernel(
+                        payload.as_ptr(),
+                        output.as_mut_ptr().add(destination_offset),
+                        payload.len(),
+                    )
+                };
+                assert_eq!(written, expected.len(), "payload {payload:?}");
+                assert_eq!(
+                    &output[destination_offset..destination_offset + written],
+                    expected,
+                    "payload {payload:?}"
+                );
+                assert!(
+                    output[..destination_offset]
+                        .iter()
+                        .all(|&byte| byte == 0xa5)
+                );
+                assert!(
+                    output[destination_offset + written..]
+                        .iter()
+                        .all(|&byte| byte == 0xa5)
+                );
+            }
+            // Exercise in-place decoding and destination-behind overlap. The
+            // complete suffix must retain its original bytes, including input.
+            for destination_start in [64, 63, 57, 49, 33, 0] {
+                let mut storage = vec![0xa5; payload.len() + 128];
+                storage[64..64 + payload.len()].copy_from_slice(payload);
+                let original = storage.clone();
+                let written = unsafe {
+                    kernel(
+                        storage.as_ptr().add(64),
+                        storage.as_mut_ptr().add(destination_start),
+                        payload.len(),
+                    )
+                };
+                assert_eq!(written, expected.len(), "payload {payload:?}");
+                assert_eq!(
+                    &storage[destination_start..destination_start + written],
+                    expected
+                );
+                assert_eq!(
+                    &storage[..destination_start],
+                    &original[..destination_start]
+                );
+                assert_eq!(
+                    &storage[destination_start + written..],
+                    &original[destination_start + written..],
+                    "payload {payload:?}, destination {destination_start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_sparse_removals_preserve_literal_output_and_all_guards() {
+        for position in 0..64 {
+            for tail in 0..17 {
+                let length = 96 + tail;
+                let mut escape = vec![b'k'; length];
+                escape[position] = b'=';
+                let mut expected = vec![65; length - 1];
+                expected[position] = 1;
+                verify_regular_guards(&escape, &expected);
+
+                for newline in *b"\r\n" {
+                    let mut payload = vec![b'k'; length];
+                    payload[position] = newline;
+                    verify_regular_guards(&payload, &vec![65; length - 1]);
+                }
+                for pair in [b"\r\n", b"\n\r"] {
+                    let mut payload = vec![b'k'; length];
+                    payload[position..position + 2].copy_from_slice(pair);
+                    verify_regular_guards(&payload, &vec![65; length - 2]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_escape_carry_survives_split_crlf_and_dangling_markers() {
+        for marker in [15, 31, 47, 63] {
+            for newlines in [0, 1, 2, 15, 16, 17, 31, 32, 33] {
+                for tail in 0..17 {
+                    let mut payload = vec![b'k'; marker];
+                    payload.push(b'=');
+                    payload.extend(
+                        (0..newlines).map(|index| if index % 2 == 0 { b'\r' } else { b'\n' }),
+                    );
+                    let mut dangling = vec![65; marker];
+                    dangling.push(19);
+                    verify_regular_guards(&payload, &dangling);
+                    for (value, decoded) in [(b'k', 1), (b'=', 211)] {
+                        let mut with_value = payload.clone();
+                        with_value.push(value);
+                        with_value.extend(std::iter::repeat_n(b'k', tail));
+                        let mut expected = vec![65; marker];
+                        expected.push(decoded);
+                        expected.extend(std::iter::repeat_n(65, tail));
+                        verify_regular_guards(&with_value, &expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_multiple_escapes_preserve_literal_output_during_overlap() {
+        for prefix in 0..16 {
+            for repeats in [1, 2, 5, 8] {
+                let mut payload = vec![b'k'; prefix];
+                let mut expected = vec![65; prefix];
+                for _ in 0..repeats {
+                    payload.extend_from_slice(b"k=@k=Jk=Mk=}k\r\n");
+                    expected.extend_from_slice(&[65, 214, 65, 224, 65, 227, 65, 19, 65]);
+                }
+                verify_regular_guards(&payload, &expected);
+            }
+        }
+    }
 
     fn verify_dense(payload: &[u8]) {
         let mut expected = vec![0xcc; payload.len() + 32];

@@ -383,13 +383,26 @@ final class NzbFingerprintAnalyzer
                     $headerNumericFieldsValid = false;
                 }
             }
-            if ((isset($frame->header['part']) && $frame->part === null)
+            $multipart = isset($frame->header['part']) || isset($frame->trailer['part']) || $frame->part !== null;
+            if (($multipart && ($frame->part === null || ! isset($frame->header['part'])))
                 || (isset($frame->header['part'], $frame->header['total'])
                     && $headerPartNumber !== null && $headerTotalNumber !== null
                     && $headerPartNumber > $headerTotalNumber)) {
                 $headerNumericFieldsValid = false;
             }
-            $multipart = $frame->part !== null;
+            $multipartStructureAmbiguous = $framingEvidenceIncomplete || array_intersect(
+                ['ybegin.line', 'ybegin.size', 'ybegin.part', 'ybegin.total', 'ypart.begin', 'ypart.end',
+                    'yend.size', 'yend.part', 'yend.total'],
+                $conflictingYencFields,
+            ) !== [];
+            $multipartStructureValid = ! $multipartStructureAmbiguous && (! $multipart || ($frame->part !== null
+                && $headerPartNumber !== null && $headerPartNumber >= 1
+                && $rangeIsValid === true && $headerNumericFieldsValid && $trailerNumericFieldsValid
+                && $trailerPartMatchesHeader !== false && $trailerTotalMatchesHeader !== false));
+            $multipartStructureStatus = $multipartStructureAmbiguous ? 'ambiguous'
+                : (! $multipart ? 'single-part'
+                    : (($frame->part === null || ! isset($frame->header['part'])) ? 'incomplete'
+                        : ($multipartStructureValid ? 'complete' : 'invalid')));
             $expectedDecodedSize = $multipart ? $ypartExpectedDecodedSize : $headerExpectedDecodedSize;
             $crcField = $multipart ? 'pcrc32' : (isset($frame->trailer['crc32']) ? 'crc32' : 'pcrc32');
             $crcFieldConflict = $framingEvidenceIncomplete || in_array('yend.'.$crcField, $conflictingYencFields, true);
@@ -408,6 +421,9 @@ final class NzbFingerprintAnalyzer
                 }
             }
             $observedCrc = hash('crc32b', $decoded[0]);
+            $expectedCrcIsHex = is_string($expectedCrc) && preg_match('/\A[0-9a-f]{1,8}\z/i', $expectedCrc) === 1;
+            $observedDeclaredCrcMatches = $expectedCrcIsHex
+                ? strcasecmp(str_pad($expectedCrc, 8, '0', STR_PAD_LEFT), $observedCrc) === 0 : null;
             $knownHeaderFields = ['line', 'size', 'part', 'total', 'name'];
             $knownPartFields = ['begin', 'end'];
             $knownTrailerFields = ['size', 'part', 'total', 'pcrc32', 'crc32'];
@@ -415,7 +431,7 @@ final class NzbFingerprintAnalyzer
             preg_match_all('/^(?:=ybegin|=ypart|=yend)[^\r\n]*/mi', $rawBody, $controlMatches);
             $controlLines = $controlMatches[0] ?? [];
             $par2PrefixLength = min($headerExpectedDecodedSize ?? 16_384, 16_384);
-            $prefixCoverageIsValid = ! $integrityChecksAmbiguous && $payloadEscapeStateValid && $par2PrefixLength > 0
+            $prefixCoverageIsValid = $multipartStructureValid && ! $integrityChecksAmbiguous && $payloadEscapeStateValid && $par2PrefixLength > 0
                 && $decodedSize >= $par2PrefixLength
                 && (! $multipart
                     ? $headerExpectedDecodedSize === null || $decodedSize === $headerExpectedDecodedSize
@@ -431,6 +447,7 @@ final class NzbFingerprintAnalyzer
                 'line_length' => isset($frame->header['line']) ? self::metadataNumber($frame->header['line']) : null,
                 'part' => $headerPartNumber,
                 'multipart' => $multipart,
+                'multipart_structure_status' => $multipartStructureStatus,
                 'total_parts' => $headerTotalNumber,
                 'header_numeric_fields_valid' => $headerNumericFieldsValid,
                 'conflicting_control_fields' => $conflictingYencFields,
@@ -479,11 +496,15 @@ final class NzbFingerprintAnalyzer
                 'decoded_size_matches_yend_size' => $trailerExpectedDecodedSize === null ? null : $trailerExpectedDecodedSize === $decodedSize,
                 'observed_decoded_crc32' => strtoupper($observedCrc),
                 'segment_crc32_basis' => $crcFieldConflict ? 'unavailable-conflicting-yenc-field'
-                    : ($multipart ? ($expectedCrc === null ? 'missing-pcrc32' : 'pcrc32') : ($expectedCrc === null ? 'missing-crc32' : $crcField)),
-                'declared_crc32_is_hex' => is_string($expectedCrc) ? preg_match('/\A[0-9a-f]{1,8}\z/i', $expectedCrc) === 1 : null,
+                    : (! $multipartStructureValid ? 'unavailable-multipart-structure'
+                        : ($multipart ? ($expectedCrc === null ? 'missing-pcrc32' : 'pcrc32') : ($expectedCrc === null ? 'missing-crc32' : $crcField))),
+                'observed_crc32_declaration_field' => $crcFieldConflict ? null : $crcField,
+                'observed_crc32_matches_selected_declaration' => $observedDeclaredCrcMatches,
+                'observed_crc32_comparison_basis' => 'Unambiguous selected declared CRC value versus lenient decoded bytes; does not establish file bounds or framing validity.',
+                'declared_crc32_is_hex' => is_string($expectedCrc) ? $expectedCrcIsHex : null,
                 'all_declared_crc32_fields_are_hex' => $allDeclaredCrc32FieldsAreHex,
-                'declared_crc32_matches' => is_string($expectedCrc) && preg_match('/\A[0-9a-f]{1,8}\z/i', $expectedCrc) === 1
-                    ? $payloadEscapeStateValid && strcasecmp(str_pad($expectedCrc, 8, '0', STR_PAD_LEFT), $observedCrc) === 0 : null,
+                'declared_crc32_matches' => $multipartStructureValid && $observedDeclaredCrcMatches !== null
+                    ? $payloadEscapeStateValid && $observedDeclaredCrcMatches : null,
                 'escape_sequence_count' => substr_count($payload, '='),
             ];
         }

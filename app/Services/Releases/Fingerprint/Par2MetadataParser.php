@@ -421,7 +421,7 @@ final class Par2MetadataParser
     public static function declaredYencCrc32Valid(array $yenc): bool
     {
         $basis = $yenc['segment_crc32_basis'] ?? null;
-        if ($basis === 'unavailable-conflicting-yenc-field') {
+        if (in_array($basis, ['unavailable-conflicting-yenc-field', 'unavailable-multipart-structure'], true)) {
             return false;
         }
 
