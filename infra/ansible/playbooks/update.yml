@@ -8,14 +8,18 @@
     nntmux_operation: update
   roles:
     - role: nntmux
-    - role: base
-      when: nntmux_operation in ['install', 'restore']
-    - role: packages
-      when: nntmux_operation in ['install', 'restore']
-    - role: services
-      when: nntmux_operation in ['install', 'restore']
-    - role: application
-      when: nntmux_operation in ['install', 'update']
-    - role: tls
-      when: nntmux_operation == 'install'
-    - role: lifecycle
+  tasks:
+    - name: Provision native build prerequisites for the candidate release
+      ansible.builtin.import_role:
+        name: packages
+        tasks_from: native.yml
+    - name: Refresh lifecycle helpers before preparing the candidate release
+      ansible.builtin.import_role:
+        name: base
+        tasks_from: lifecycle-helpers.yml
+    - name: Prepare and activate the candidate release
+      ansible.builtin.import_role:
+        name: application
+    - name: Verify the updated release
+      ansible.builtin.import_role:
+        name: lifecycle

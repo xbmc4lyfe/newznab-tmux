@@ -7,7 +7,8 @@ COPY docker/app/nzb-yenc-ffi/ /src/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo test --release --locked \
     && cargo build --release --locked \
-    && install -D -m 0644 target/release/libnzbyenc.so /out/libnzbyenc.so
+    && install -D -m 0644 target/release/libnzbyenc.so /out/libnzbyenc.so \
+    && install -D -m 0755 target/release/nntmux-article-fingerprint /out/nntmux-article-fingerprint
 
 FROM dunglas/frankenphp:1-php8.5-bookworm AS build
 WORKDIR /app
@@ -44,6 +45,7 @@ RUN install-php-extensions bcmath exif gd intl mbstring pdo_mysql pdo_sqlite soc
 RUN install-php-extensions ffi
 COPY --from=yenc /out/libnzbyenc.so /usr/local/lib/nntmux/libnzbyenc.so
 COPY docker/app/php/release-presentation.h docker/app/php/release-presentation-preload.php /usr/local/lib/nntmux/
+COPY --from=yenc /out/nntmux-article-fingerprint /usr/local/bin/nntmux-article-fingerprint
 COPY --from=build --chown=www-data:www-data /app /app
 COPY docker/8.5/php.ini /usr/local/etc/php/conf.d/99-nntmux.ini
 COPY docker/app/php/yenc-ffi.ini /usr/local/etc/php/indexer-conf.d/99-yenc-ffi.ini

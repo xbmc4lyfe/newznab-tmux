@@ -3,6 +3,7 @@ ARG BUN_VERSION=1
 
 FROM node:${NODE_VERSION} AS node
 FROM oven/bun:${BUN_VERSION} AS bun
+FROM rust:1.98-bookworm AS rust
 FROM ubuntu:24.04
 
 LABEL maintainer="Fossil01"
@@ -16,10 +17,16 @@ ARG MYSQL_CLIENT="mariadb-client"
 WORKDIR /var/www/html
 
 ENV DEBIAN_FRONTEND noninteractive
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:$PATH
+
+COPY --from=rust /usr/local/cargo /usr/local/cargo
+COPY --from=rust /usr/local/rustup /usr/local/rustup
 
 # Install base packages and add repositories
 RUN apt-get update \
-    && apt-get install -y gnupg gosu curl ca-certificates zip unzip unrar lame git supervisor sqlite3 libcap2-bin libpng-dev python3 dnsutils \
+    && apt-get install -y gnupg gosu curl ca-certificates zip unzip unrar lame git supervisor sqlite3 libcap2-bin libpng-dev python3 dnsutils build-essential \
     && curl -sS 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x14aa40ec0831756756d7f66c4f4ea0aae5267a6c' | gpg --dearmor | tee /etc/apt/keyrings/ppa_ondrej_php.gpg > /dev/null \
     && echo "deb [signed-by=/etc/apt/keyrings/ppa_ondrej_php.gpg] https://ppa.launchpadcontent.net/ondrej/php/ubuntu noble main" > /etc/apt/sources.list.d/ppa_ondrej_php.list \
     && curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | gpg --dearmor | tee /etc/apt/keyrings/yarn.gpg >/dev/null \
@@ -91,11 +98,13 @@ RUN chmod 0644 /etc/cron.d/scheduler \
     && crontab /etc/cron.d/scheduler
 
 COPY start-container /usr/local/bin/start-container
+COPY build-native.sh /usr/local/bin/build-native.sh
 COPY nginx.conf /etc/nginx/sites-available/default
 COPY supervisord.conf /etc/supervisor/supervisord.conf
 COPY php.ini /etc/php/8.5/cli/conf.d/99-sail.ini
 
 RUN chmod +x /usr/local/bin/start-container \
+    && chmod +x /usr/local/bin/build-native.sh \
     && nginx -t
 
 EXPOSE 80
