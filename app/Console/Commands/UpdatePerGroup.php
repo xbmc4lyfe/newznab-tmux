@@ -9,6 +9,7 @@ use App\Services\AdditionalProcessing\AdditionalProcessingOrchestrator;
 use App\Services\Backfill\BackfillService;
 use App\Services\Binaries\BinariesService;
 use App\Services\Configuration\ConfigurationProvider;
+use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NfoService;
 use App\Services\NNTP\NNTPService;
 use App\Services\ReleaseProcessingService;
@@ -53,6 +54,9 @@ class UpdatePerGroup extends Command
         }
 
         try {
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                return self::SUCCESS;
+            }
             $group = UsenetGroup::find($groupId);
 
             if ($group === null) {
@@ -68,14 +72,23 @@ class UpdatePerGroup extends Command
             // Update the group for new binaries
             $this->info("Updating binaries for group: {$groupMySQL['name']}");
             (new BinariesService)->updateGroup($groupMySQL);
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                return self::SUCCESS;
+            }
 
             // BackFill the group with 20k articles
             $this->info("Backfilling group: {$groupMySQL['name']}");
             $backfillService->backfillAllGroups($groupMySQL['name'], 20000, 'normal');
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                return self::SUCCESS;
+            }
 
             // Create releases
             $this->info("Processing releases for group: {$groupMySQL['name']}");
             $this->processReleases((string) $groupId);
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                return self::SUCCESS;
+            }
 
             // Post process the releases
             $this->info("Post-processing additional for group: {$groupMySQL['name']}");
@@ -84,6 +97,9 @@ class UpdatePerGroup extends Command
                 $orchestrator->start($groupId);
             } finally {
                 $orchestrator->finish();
+            }
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                return self::SUCCESS;
             }
 
             $this->info("Processing NFO files for group: {$groupMySQL['name']}");
@@ -113,7 +129,9 @@ class UpdatePerGroup extends Command
     {
         $this->releaseProcessingService->processCollectionsAndReleases($groupID);
 
-        $this->releaseProcessingService->deleteCollections($groupID);
+        if (! app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            $this->releaseProcessingService->deleteCollections($groupID);
+        }
     }
 
     /**

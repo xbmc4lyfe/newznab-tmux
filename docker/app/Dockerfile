@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
-# Overlay for the self-hosted docker/ stack, built FROM the repository's production image
-# (root Dockerfile, tagged nntmux/base:local by `make -C docker build`).
+# Compatibility overlay for external base images. The docker/ stack builds the root
+# Dockerfile selfhosted target so runtime layers stay cached before application COPY.
+# Overlay built FROM the repository's production image
+# (root Dockerfile production target, explicitly tagged nntmux/base:local).
 # Build context: repository root.
 ARG BASE_IMAGE=nntmux/base:local
 

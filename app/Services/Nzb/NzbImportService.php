@@ -219,7 +219,14 @@ class NzbImportService
                 // Legacy publication serializes identity checks and NZB writes under every metadata setting.
                 // Queued verification uses its own transactional candidate-admission protections.
                 $nzbFileName = $useNzbName === true ? $this->deriveReleaseNameFromNzbPath($nzbFilePath) : '';
-                $lockFingerprint = config('release_verification.required', true) ? null : NzbArticleFingerprint::fromXml($nzbXML);
+                try {
+                    $lockFingerprint = config('release_verification.required', true) ? null : NzbArticleFingerprint::fromXml($nzbXML);
+                } catch (NzbArticleFingerprintUnavailable|NzbArticleFingerprintTransportFailure) {
+                    $this->echoOut('Native fingerprint backend is unavailable; leaving it for a retry: '.$nzbFilePath);
+                    $nzbsSkipped++;
+
+                    continue;
+                }
                 $stored = false;
                 $path = null;
                 try {
@@ -233,6 +240,11 @@ class NzbImportService
                                 : [$status, false, null];
                         }
                     );
+                } catch (NzbArticleFingerprintUnavailable|NzbArticleFingerprintTransportFailure) {
+                    $this->echoOut('Native fingerprint backend is unavailable; leaving it for a retry: '.$nzbFilePath);
+                    $nzbsSkipped++;
+
+                    continue;
                 } catch (LockTimeoutException) {
                     // Another worker is importing the same articles: not a failure, so never delete it.
                     $this->echoOut('Another import of the same articles is in progress; leaving it for a retry: '.$nzbFilePath);
@@ -651,6 +663,7 @@ class NzbImportService
      * @return TResult
      *
      * @throws LockTimeoutException When another import holds the lock for longer than the wait.
+     * @throws \Throwable When the identity callback or cache backend fails.
      */
     protected function withArticleIdentityLock(?string $fingerprint, callable $callback): mixed
     {

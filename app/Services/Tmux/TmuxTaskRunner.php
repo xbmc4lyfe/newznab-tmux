@@ -6,6 +6,7 @@ namespace App\Services\Tmux;
 
 use App\Enums\TmuxPaneRole;
 use App\Services\Configuration\ConfigurationProvider;
+use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -51,6 +52,9 @@ class TmuxTaskRunner
      */
     public function runTask(string $taskName, array $config): bool
     {
+        if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            return true;
+        }
         $role = $config['role'] ?? null;
         $command = $config['command'] ?? null;
         $enabled = $config['enabled'] ?? true;
@@ -102,12 +106,12 @@ class TmuxTaskRunner
      */
     public function buildCommand(string $baseCommand, array $options = []): string
     {
-        $command = self::CANCELLATION_TRAPS.'( '.$baseCommand.' ); nntmux_status=$?';
+        $command = self::CANCELLATION_TRAPS.'nntmux_status=0; '.$this->drainGuard('nntmux_status').'( '.$baseCommand.' ); nntmux_status=$?; '.$this->drainGuard('nntmux_status');
         if (isset($options['sleep'])) {
-            $command .= '; date +"%Y-%m-%d %T"; '.$this->buildSleepCommand((int) $options['sleep']);
+            $command .= 'date +"%Y-%m-%d %T"; '.$this->buildSleepCommand((int) $options['sleep']).'; ';
         }
 
-        return $command.'; exit "$nntmux_status"';
+        return $command.'exit "$nntmux_status"';
     }
 
     public function beginCycle(): void
@@ -127,6 +131,9 @@ class TmuxTaskRunner
     /** @param array<string, mixed> $options */
     private function launch(string $pane, string $command, array $options = []): bool
     {
+        if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            return true;
+        }
         if ($this->paneManager->isAlive($pane)) {
             return true;
         }
@@ -147,10 +154,19 @@ class TmuxTaskRunner
     {
         $script = self::CANCELLATION_TRAPS.'nntmux_batch_status=0; ';
         foreach ($commands as $command) {
-            $script .= '( '.$command.' ); nntmux_child_status=$?; if [ "$nntmux_batch_status" -eq 0 ]; then nntmux_batch_status=$nntmux_child_status; fi; ';
+            $script .= $this->drainGuard('nntmux_batch_status').'( '.$command.' ); nntmux_child_status=$?; if [ "$nntmux_batch_status" -eq 0 ]; then nntmux_batch_status=$nntmux_child_status; fi; ';
         }
 
         return $script.'exit "$nntmux_batch_status"';
+    }
+
+    private function drainGuard(string $statusVariable): string
+    {
+        $query = implode(' ', array_map('escapeshellarg', TmuxCommand::arguments([
+            'display-message', '-p', '-t', '='.$this->sessionName.':', '#{@nntmux_draining}',
+        ])));
+
+        return 'nntmux_draining=$('.$query.' 2>/dev/null); if [ "$nntmux_draining" = "1" ]; then exit "$'.$statusVariable.'"; fi; ';
     }
 
     /**
@@ -162,7 +178,7 @@ class TmuxTaskRunner
         $sleepScript = base_path('app/Services/Tmux/Scripts/showsleep.php');
 
         if (file_exists($sleepScript)) {
-            return "nice -n{$niceness} ".escapeshellarg(PHP_BINARY).' '.escapeshellarg($sleepScript)." {$seconds}";
+            return "nice -n{$niceness} ".escapeshellarg(PHP_BINARY).' '.escapeshellarg($sleepScript)." {$seconds} ".escapeshellarg($this->sessionName).' '.escapeshellarg((string) config('tmux.socket_name', ''));
         }
 
         return "sleep {$seconds}";

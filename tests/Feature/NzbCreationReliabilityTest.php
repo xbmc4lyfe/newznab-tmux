@@ -98,6 +98,55 @@ class NzbCreationReliabilityTest extends TestCase
         }
     }
 
+    public function test_runtime_death_custody_red(): void
+    {
+        $this->runtimeCustodyProbe('death');
+    }
+
+    public function test_truncated_digest_custody_red(): void
+    {
+        $this->runtimeCustodyProbe('truncated');
+    }
+
+    private function runtimeCustodyProbe(string $mode): void
+    {
+        Bus::fake();
+        Event::fake(['eloquent.updated: '.Release::class]);
+        $this->insertRelease(1, 'a', attempts: 2);
+        $this->insertWritableCbp(200, 2000, 1);
+        DB::table('releases')->where('id', 1)->update(['article_fingerprint' => str_repeat('f', 40)]);
+        $worker = $this->tempNzbPath.'/worker';
+        copy(__DIR__.'/../Fixtures/runtime-'.$mode.'.php', $worker);
+        chmod($worker, 0700);
+        $this->app->bind(NzbArticleFingerprint::class, static fn (): NzbArticleFingerprint => new NzbArticleFingerprint(workerPath: $worker));
+        $nzb = new NzbService(app(CollectionCleanupService::class));
+        $path = $nzb->getNzbPath(str_repeat('a', 36), createIfNotExist: true);
+        file_put_contents($path, 'prior-artifact');
+        $service = (new ReleaseProcessingService(nzb: $nzb, releaseManagement: new DatabaseOnlyReleaseManagementService, collectionCleanupService: app(CollectionCleanupService::class)))->setEchoCLI(false);
+        $releaseBefore = (array) DB::table('releases')->first();
+        $failureBefore = (array) DB::table('release_nzb_creation_failures')->first();
+        $added = $service->createNZBs(null);
+        $state = ['added' => $added, 'artifact_preserved' => file_get_contents($path) === 'prior-artifact', 'status' => DB::table('releases')->value('nzbstatus'), 'fingerprint' => DB::table('releases')->value('article_fingerprint'), 'collections' => DB::table('collections')->count(), 'binaries' => DB::table('binaries')->count(), 'parts' => DB::table('parts')->count(), 'failures' => DB::table('release_nzb_creation_failures')->count(), 'temporary' => count($nzb->findStaleTemporaryNzbPaths(0))];
+        fwrite(STDERR, json_encode(['mode' => $mode, 'observed' => $state]).PHP_EOL);
+        $this->assertSame(0, $added, 'Runtime backend failure must defer publication and preserve custody');
+        $this->assertSame('prior-artifact', file_get_contents($path));
+        $this->assertSame(1, DB::table('collections')->count());
+        $this->assertSame(1, DB::table('binaries')->count());
+        $this->assertSame(1, DB::table('parts')->count());
+        $this->assertSame($releaseBefore, (array) DB::table('releases')->first());
+        $this->assertSame($failureBefore, (array) DB::table('release_nzb_creation_failures')->first());
+        for ($pass = 0; $pass < 3; $pass++) {
+            $this->assertSame(0, $service->createNZBs(null));
+            $this->assertSame($releaseBefore, (array) DB::table('releases')->first());
+            $this->assertSame($failureBefore, (array) DB::table('release_nzb_creation_failures')->first());
+            $this->assertSame('prior-artifact', file_get_contents($path));
+            $this->assertSame(1, DB::table('collections')->count());
+            $this->assertSame(1, DB::table('binaries')->count());
+            $this->assertSame(1, DB::table('parts')->count());
+        }
+        Bus::assertNothingDispatched();
+    }
+
     public function test_backend_restoration_replays_actual_writer_after_four_deferrals(): void
     {
         Bus::fake();

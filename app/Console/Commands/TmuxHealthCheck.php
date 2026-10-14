@@ -165,7 +165,9 @@ class TmuxHealthCheck extends Command
 
     private function shouldBeRunning(): bool
     {
-        return filter_var(app(ProcessingRuntimeStateRepository::class)->isTmuxRunning(), FILTER_VALIDATE_BOOL);
+        $runtime = app(ProcessingRuntimeStateRepository::class);
+
+        return ! $runtime->stopRequested() && $runtime->isTmuxRunning();
     }
 
     /**
