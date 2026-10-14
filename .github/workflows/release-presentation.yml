@@ -51,12 +51,7 @@ jobs:
       - name: Compare complete rendering integration with PHP
         run: |
           mkdir -p benchmark-evidence
-          python3 - <<'PY'
-          import pathlib
-          root = pathlib.Path.cwd()
-          header = (root / 'docker/app/php/release-presentation.h').read_text()
-          (root / 'benchmark-evidence/presentation.h').write_text(header.replace('/usr/local/lib/nntmux/libnzbyenc.so', str(root / 'docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')))
-          PY
+          docker/app/nzb-yenc-ffi/target/release/nntmux-evidence-utility --mode presentation-header
           php -d opcache.enable_cli=1 -d ffi.enable=preload \
             -d ffi.preload="$PWD/benchmark-evidence/presentation.h" \
             -d opcache.preload="$PWD/docker/app/php/release-presentation-preload.php" \
@@ -67,7 +62,7 @@ jobs:
           container=$(docker run -d -p 127.0.0.1::80 release-presentation-fixture)
           trap 'docker logs "$container"; docker rm -f "$container"' EXIT
           address=$(docker port "$container" 80/tcp)
-          for attempt in $(seq 1 60); do
+          for _attempt in $(seq 1 60); do
             if curl -fsS "http://$address" >/dev/null; then break; fi
             sleep 1
           done
