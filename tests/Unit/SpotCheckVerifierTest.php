@@ -343,6 +343,107 @@ final class SpotCheckVerifierTest extends TestCase
     }
 
     #[Test]
+    public function only_a_sole_quoted_32_hex_posting_token_has_unknown_filename_identity(): void
+    {
+        $token = str_repeat('a1', 16);
+        foreach (['"'.$token.'"' => 'sampled', "'".strtoupper($token)."'" => 'sampled',
+            '"'.substr($token, 1).'"' => 'unknown', '"'.$token.'a"' => 'unknown',
+            '"'.str_repeat('g', 32).'"' => 'unknown', '"'.$token.'.rar"' => 'unknown',
+            '"literal-extensionless-name"' => 'unknown', '"'.$token.'" "other.rar"' => 'unknown'] as $subject => $verdict) {
+            $articles = ['first@article' => YencArticles::part('hello', 'actual.rar', 10, 1, 1, 2),
+                'last@article' => YencArticles::part('world', 'actual.rar', 10, 2, 6, 2)];
+            $source = new class($articles) implements ArticleSource
+            {
+                public array $requests = [];
+
+                public function __construct(private readonly array $articles) {}
+
+                public function fetch(string $messageId): string
+                {
+                    $this->requests[] = $messageId;
+
+                    return $this->articles[$messageId];
+                }
+            };
+            $files = [['key' => 'file', 'subject' => $subject, 'totalparts' => 2, 'segments' => [
+                ['number' => 1, 'messageid' => 'first@article', 'bytes' => 5],
+                ['number' => 2, 'messageid' => 'last@article', 'bytes' => 5],
+            ]]];
+            $manifest = ['identity' => sha1('opaque-subject'), 'expected_files' => 1, 'files' => $files,
+                'fromname' => 'poster', 'date' => '2026-10-14', 'groups' => ['alt.test']];
+            $result = (new SpotCheckVerifier($source, [], new YencService))->verify($manifest, static function (): void {});
+
+            self::assertSame($verdict, $result->verdict, $result->reason);
+            self::assertCount(1, $source->requests);
+            if ($result->passed()) {
+                self::assertSame($files, $result->manifest['files']);
+                $writer = (new \ReflectionClass(VerifiedNzbWriter::class))->newInstanceWithoutConstructor();
+                $xml = simplexml_load_string($writer->document($result->manifest));
+                $emittedIds = [];
+                foreach ($xml->file->segments->segment as $segment) {
+                    $emittedIds[] = (string) $segment;
+                }
+                self::assertSame(['first@article', 'last@article'], $emittedIds);
+            }
+        }
+    }
+
+    #[Test]
+    public function opaque_posting_tokens_preserve_article_integrity_and_dimension_checks(): void
+    {
+        $good = (new YencService)->encode('hello', 'actual.rar');
+        $articles = [preg_replace('/crc32=[0-9a-f]+/i', 'crc32=00000000', $good),
+            YencArticles::part('hello', 'actual.rar', 5, 2, 1, 2),
+            YencArticles::part('hello', 'actual.rar', 5, 1, 1, 2),
+            YencArticles::part('hello', 'actual.rar', 10, 1, 6, 1)];
+        foreach ($articles as $raw) {
+            $source = new class($raw) implements ArticleSource
+            {
+                public function __construct(private readonly string $raw) {}
+
+                public function fetch(string $messageId): string
+                {
+                    return $this->raw;
+                }
+            };
+            $manifest = ['identity' => sha1('opaque-invalid'), 'expected_files' => 1, 'files' => [
+                ['key' => 'file', 'subject' => '"'.str_repeat('a1', 16).'"', 'totalparts' => 1,
+                    'segments' => [['number' => 1, 'messageid' => 'sample@article', 'bytes' => 5]]],
+            ]];
+            $result = (new SpotCheckVerifier($source, [], new YencService))->verify($manifest, static function (): void {});
+
+            self::assertSame('unknown', $result->verdict);
+            self::assertFalse($result->passed());
+        }
+    }
+
+    #[Test]
+    public function opaque_posting_tokens_do_not_allow_conflicting_sampled_file_names(): void
+    {
+        $articles = ['first@article' => YencArticles::part('hello', 'actual.rar', 10, 1, 1, 2),
+            'last@article' => YencArticles::part('world', 'other.rar', 10, 2, 6, 2)];
+        $source = new class($articles) implements ArticleSource
+        {
+            public function __construct(private readonly array $articles) {}
+
+            public function fetch(string $messageId): string
+            {
+                return $this->articles[$messageId];
+            }
+        };
+        $manifest = ['identity' => sha1('opaque-conflict'), 'expected_files' => 1, 'files' => [
+            ['key' => 'file', 'subject' => '"'.str_repeat('a1', 16).'"', 'totalparts' => 2, 'segments' => [
+                ['number' => 1, 'messageid' => 'first@article', 'bytes' => 5],
+                ['number' => 2, 'messageid' => 'last@article', 'bytes' => 5],
+            ]],
+        ]];
+        $result = (new SpotCheckVerifier($source, ['spot_check_articles' => 2], new YencService))->verify($manifest, static function (): void {});
+
+        self::assertSame('unknown', $result->verdict);
+        self::assertSame('Spot-check articles have conflicting file identities.', $result->reason);
+    }
+
+    #[Test]
     public function it_rejects_quoted_subject_filename_mismatch(): void
     {
         $raw = (new YencService)->encode('hello', 'unexpected.mkv');
