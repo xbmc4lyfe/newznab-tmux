@@ -1,0 +1,79 @@
+name: Rust release presentation
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'app/Support/AdminReleaseNames.php'
+      - 'app/Support/ReleaseNameDisplay.php'
+      - 'docker/app/nzb-yenc-ffi/**'
+      - 'docker/app/php/release-presentation*'
+      - 'docker/app/Caddyfile'
+      - 'deploy/cloud/Frankenphp.Caddyfile'
+      - 'resources/views/admin/releases/index.blade.php'
+      - 'resources/views/components/admin/release-name.blade.php'
+      - 'tests/**/AdminReleaseNames*'
+      - 'tests/Fixtures/*release*'
+      - 'tests/Fixtures/ReleasePresentation.Dockerfile*'
+      - 'resources/css/app.css'
+      - 'scripts/*release*'
+      - '.github/workflows/release-presentation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-presentation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: bcmath, dom, curl, exif, ffi, gd, intl, mbstring, pdo, sqlite, pdo_sqlite, sockets, zip
+          coverage: none
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.98.0'
+      - name: Install locked PHP dependencies
+        env:
+          COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ secrets.GITHUB_TOKEN }}"}}'
+        run: |
+          composer install --prefer-dist --no-interaction --no-progress --no-scripts
+          cp .env.test .env
+      - name: Test and build Rust library
+        run: |
+          cargo test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml
+          cargo build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml
+      - name: Verify native parity and restricted web scope
+        run: php vendor/bin/phpunit --fail-on-skipped tests/Unit/AdminReleaseNamesNativeTest.php tests/Unit/AdminReleaseNamesTest.php tests/Feature/AdminReleaseNameViewTest.php
+      - name: Compare complete rendering integration with PHP
+        run: |
+          mkdir -p benchmark-evidence
+          python3 - <<'PY'
+          import pathlib
+          root = pathlib.Path.cwd()
+          header = (root / 'docker/app/php/release-presentation.h').read_text()
+          (root / 'benchmark-evidence/presentation.h').write_text(header.replace('/usr/local/lib/nntmux/libnzbyenc.so', str(root / 'docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')))
+          PY
+          php -d opcache.enable_cli=1 -d ffi.enable=preload \
+            -d ffi.preload="$PWD/benchmark-evidence/presentation.h" \
+            -d opcache.preload="$PWD/docker/app/php/release-presentation-preload.php" \
+            scripts/benchmark-release-names.php | tee benchmark-evidence/results.jsonl
+      - name: Exercise production web runtime with concurrent requests
+        run: |
+          docker build -f tests/Fixtures/ReleasePresentation.Dockerfile -t release-presentation-fixture .
+          container=$(docker run -d -p 127.0.0.1::80 release-presentation-fixture)
+          trap 'docker logs "$container"; docker rm -f "$container"' EXIT
+          address=$(docker port "$container" 80/tcp)
+          for attempt in $(seq 1 60); do
+            if curl -fsS "http://$address" >/dev/null; then break; fi
+            sleep 1
+          done
+          python3 scripts/test-release-presentation-web.py "http://$address"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-presentation-evidence
+          path: benchmark-evidence

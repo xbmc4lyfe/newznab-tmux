@@ -43,6 +43,7 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
 RUN install-php-extensions bcmath exif gd intl mbstring pdo_mysql pdo_sqlite sockets pcntl redis imagick zip
 RUN install-php-extensions ffi
 COPY --from=yenc /out/libnzbyenc.so /usr/local/lib/nntmux/libnzbyenc.so
+COPY docker/app/php/release-presentation.h docker/app/php/release-presentation-preload.php /usr/local/lib/nntmux/
 COPY --from=build --chown=www-data:www-data /app /app
 COPY docker/8.5/php.ini /usr/local/etc/php/conf.d/99-nntmux.ini
 COPY docker/app/php/yenc-ffi.ini /usr/local/etc/php/indexer-conf.d/99-yenc-ffi.ini
