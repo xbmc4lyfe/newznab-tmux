@@ -194,38 +194,42 @@ function yencBenchmarkRandom(int &$state): int
 
 /**
  * @param  list<float>  $ratios  Correct matched observations only, Rust time / baseline time.
+ * @param  array{worker?: string, prefix?: string}  $bootstrap
  * @return array<string, mixed>
  */
-function yencBenchmarkDecision(array $ratios, int $invalidPairs, float $improvementPercent, float $regressionPercent, int $seed, int $familySize = 1, string $baseline = 'cpp'): array
+function yencBenchmarkDecision(array $ratios, int $invalidPairs, float $improvementPercent, float $regressionPercent, int $seed, int $familySize = 1, string $baseline = 'cpp', array $bootstrap = []): array
 {
     if ($invalidPairs > 0 || count($ratios) < 3) {
         return ['decision' => 'invalid', 'eligible_pairs' => count($ratios), 'invalid_pairs' => $invalidPairs,
             'invalid_reason' => $invalidPairs > 0 ? 'failed_or_incorrect_pair_retained' : 'insufficient_matching_pairs'];
     }
-    $state = $seed ?: 1;
-    $medians = [];
-    for ($replicate = 0; $replicate < 10000; $replicate++) {
-        $resample = [];
-        foreach ($ratios as $_) {
-            $resample[] = $ratios[yencBenchmarkRandom($state) % count($ratios)];
-        }
-        $medians[] = yencBenchmarkMedian($resample);
+    $prefix = $bootstrap['prefix'] ?? tempnam(sys_get_temp_dir(), 'yenc-bootstrap-');
+    if ($prefix === false) {
+        throw new RuntimeException('Unable to allocate bootstrap input.');
     }
-    sort($medians, SORT_NUMERIC);
-    $tail = 0.025 / max(1, $familySize);
-    $lower = $medians[(int) floor(count($medians) * $tail)];
-    $upper = $medians[(int) ceil(count($medians) * (1 - $tail)) - 1];
-    $decision = $lower > 1 + $regressionPercent / 100 ? 'regression'
-        : ($upper < 1 - $improvementPercent / 100 ? 'useful_improvement' : 'inconclusive');
+    $input = pack('PPee', $seed, $familySize, $improvementPercent, $regressionPercent).pack('e*', ...$ratios);
+    $worker = $bootstrap['worker'] ?? dirname(__DIR__).'/docker/app/nzb-yenc-ffi/target/release/nntmux-yenc-bootstrap';
+    if (file_put_contents($prefix, $input) !== strlen($input) || ! is_executable($worker)) {
+        throw new RuntimeException('Unable to prepare bootstrap worker; build native release artifacts; input retained at '.$prefix);
+    }
+    $child = yencBenchmarkRunChild([$worker, $prefix], $prefix, PHP_FLOAT_MAX, true);
+    $result = $child['result']['result'] ?? null;
+    if ($child['status'] !== 'ok' || ! is_array($result) || array_keys($result) !== ['decision', 'eligible_pairs', 'invalid_pairs', 'median', 'bootstrap_95_percent_interval', 'bootstrap_replicates', 'confidence_family_size', 'confidence_scope']
+        || ! in_array($result['decision'], ['regression', 'useful_improvement', 'inconclusive'], true)
+        || $result['eligible_pairs'] !== count($ratios) || $result['invalid_pairs'] !== 0 || $result['bootstrap_replicates'] !== 10000
+        || $result['confidence_family_size'] !== $familySize || ! is_float($result['median'])
+        || ! is_array($result['bootstrap_95_percent_interval']) || ! array_is_list($result['bootstrap_95_percent_interval']) || count($result['bootstrap_95_percent_interval']) !== 2
+        || ! array_all($result['bootstrap_95_percent_interval'], static fn (mixed $value): bool => is_float($value))
+        || $result['confidence_scope'] !== 'Bonferroni simultaneous 95 percent intervals across the predeclared stratum family') {
+        throw new RuntimeException('Bootstrap worker '.$child['status'].'; build native release artifacts; input and output retained at '.$prefix);
+    }
+    if (! isset($bootstrap['prefix'])) {
+        foreach ([$prefix, $prefix.'.stdout', $prefix.'.stderr'] as $file) {
+            unlink($file);
+        }
+    }
 
-    return [
-        'decision' => $decision, 'eligible_pairs' => count($ratios), 'invalid_pairs' => 0,
-        'median_rust_over_'.$baseline => yencBenchmarkMedian($ratios),
-        'bootstrap_95_percent_interval' => [$lower, $upper],
-        'bootstrap_replicates' => 10000,
-        'confidence_family_size' => $familySize,
-        'confidence_scope' => 'Bonferroni simultaneous 95 percent intervals across the predeclared stratum family',
-    ];
+    return array_combine(array_map(static fn (string $key): string => $key === 'median' ? 'median_rust_over_'.$baseline : $key, array_keys($result)), array_values($result));
 }
 
 /**
@@ -249,7 +253,7 @@ function yencBenchmarkBackends(array $options): array
  * @param  list<string>  $command
  * @return array<string, mixed>
  */
-function yencBenchmarkRunChild(array $command, string $prefix, float $timeout): array
+function yencBenchmarkRunChild(array $command, string $prefix, float $timeout, bool $statistics = false): array
 {
     $stdoutPath = $prefix.'.stdout';
     $stderrPath = $prefix.'.stderr';
@@ -262,7 +266,7 @@ function yencBenchmarkRunChild(array $command, string $prefix, float $timeout): 
     $timedOut = false;
     do {
         $state = proc_get_status($process);
-        if (! $state['running']) {
+        if (! $state['running'] || $timeout === PHP_FLOAT_MAX) {
             break;
         }
         if ((hrtime(true) - $started) / 1e9 > $timeout) {
@@ -288,7 +292,7 @@ function yencBenchmarkRunChild(array $command, string $prefix, float $timeout): 
         $parseError = $exception->getMessage();
     }
     $validResult = is_array($result) && ($result['status'] ?? null) === 'ok'
-        && is_numeric($result['median_ms'] ?? null) && $result['median_ms'] > 0;
+        && ($statistics ? is_array($result['result'] ?? null) : (is_numeric($result['median_ms'] ?? null) && $result['median_ms'] > 0));
 
     return [
         'status' => $timedOut ? 'timeout' : ($exitCode !== 0 ? 'child_failed'
@@ -365,6 +369,12 @@ function runPairedYencBenchmark(array $options, int $samples): int
     };
     $root = dirname(__DIR__);
     try {
+        $bootstrapPath = $directory.'/nntmux-yenc-bootstrap';
+        $bootstrapSource = $root.'/docker/app/nzb-yenc-ffi/target/release/nntmux-yenc-bootstrap';
+        if (is_file($bootstrapSource) && (! copy($bootstrapSource, $bootstrapPath) || ! chmod($bootstrapPath, 0700))) {
+            throw new RuntimeException('Unable to freeze bootstrap worker; build the native release artifacts.');
+        }
+        $bootstrapArtifact = ['path' => $bootstrapPath, 'sha256' => is_file($bootstrapPath) ? hash_file('sha256', $bootstrapPath) : null];
         $libraries = [];
         foreach ($backends['library_options'] as $backend => $option) {
             $frozenPath = $directory.'/'.$backend.'.so';
@@ -418,6 +428,7 @@ function runPairedYencBenchmark(array $options, int $samples): int
             'timed_boundary' => 'service decode/fetch call only; initialization, fixture creation, rewind and independent byte/hash verification outside timing',
             'resource_counter_scope' => 'getrusage around each service call; workflow OS/cgroup snapshots bracket the whole comparison including worker setup and verification',
             'source_sha256' => $sourceHashes, 'libraries' => $libraries, 'runtime' => $runtime,
+            'bootstrap_worker' => $bootstrapArtifact,
             'library_source_parity' => 'library bytes frozen; source-build correspondence must be established by the build manifest',
         ];
         $protocol['protocol_sha256'] = hash('sha256', json_encode($protocol, JSON_THROW_ON_ERROR));
@@ -475,7 +486,7 @@ function runPairedYencBenchmark(array $options, int $samples): int
                     }
                     $decisionSeed = ($seed ^ crc32($size.'-'.$density.'-'.$path)) & 0xFFFFFFFF;
                     $summary = ['type' => 'stratum_summary', 'size' => $size, 'density' => $density, 'path' => $path]
-                        + yencBenchmarkDecision($ratios, $invalidPairs, $improvement, $regression, $decisionSeed, count($sizes) * 6, $baseline);
+                        + yencBenchmarkDecision($ratios, $invalidPairs, $improvement, $regression, $decisionSeed, count($sizes) * 6, $baseline, ['worker' => $bootstrapPath, 'prefix' => $directory.'/bootstrap-'.$size.'-'.$density.'-'.$path]);
                     $summaries[] = $summary;
                     $emit($summary);
                 }

@@ -527,11 +527,12 @@ function articleBenchmarkProfile(array $options, array $validated): int
 
 /**
  * @param  list<float>  $ratios
+ * @param  array{worker?: string, prefix?: string}  $bootstrap
  * @return array<string, mixed>
  */
-function articleBenchmarkScreenStratum(array $ratios, int $invalidPairs, int $seed, float $minSpeedup): array
+function articleBenchmarkScreenStratum(array $ratios, int $invalidPairs, int $seed, float $minSpeedup, array $bootstrap = []): array
 {
-    $decision = yencBenchmarkDecision($ratios, $invalidPairs, 100 * (1 - 1 / $minSpeedup), 5, $seed, 6, 'baseline');
+    $decision = yencBenchmarkDecision($ratios, $invalidPairs, 100 * (1 - 1 / $minSpeedup), 5, $seed, 6, 'baseline', $bootstrap);
     if ($decision['decision'] !== 'invalid') {
         [$lower, $upper] = $decision['bootstrap_95_percent_interval'];
         $decision['decision'] = $lower > 1.05 ? 'regression' : ($upper <= 1 / $minSpeedup ? 'useful_improvement' : 'inconclusive');
@@ -660,6 +661,12 @@ function articleBenchmarkPaired(array $options, array $validated): int
     $sourceBuildIdentityVerified = false;
     try {
         $instrumentation = articleBenchmarkInstrumentationHashes();
+        $bootstrapPath = $directory.'/nntmux-yenc-bootstrap';
+        $bootstrapSource = dirname(__DIR__).'/docker/app/nzb-yenc-ffi/target/release/nntmux-yenc-bootstrap';
+        if (is_file($bootstrapSource) && (! copy($bootstrapSource, $bootstrapPath) || ! chmod($bootstrapPath, 0700))) {
+            throw new RuntimeException('Unable to freeze bootstrap worker; build the native release artifacts.');
+        }
+        $bootstrapArtifact = ['path' => $bootstrapPath, 'sha256' => is_file($bootstrapPath) ? hash_file('sha256', $bootstrapPath) : null];
         if (! isset($options['runtime-manifest'])) {
             throw new InvalidArgumentException('Paired mode requires --runtime-manifest linking both built libraries to their source trees.');
         }
@@ -704,6 +711,7 @@ function articleBenchmarkPaired(array $options, array $validated): int
             'order_seed' => $seed, 'timeout_seconds' => $validated['timeout'], 'output_dir' => $directory,
             'source_build_identity_verified' => $sourceBuildIdentityVerified,
             'source_sha256' => $sources, 'source_snapshots' => $snapshotEvidence, 'instrumentation' => $instrumentation, 'libraries' => $libraries,
+            'bootstrap_worker' => $bootstrapArtifact,
             'runtime' => ['php' => PHP_VERSION, 'php_binary_sha256' => hash_file('sha256', PHP_BINARY), 'os' => php_uname(),
                 'extensions' => get_loaded_extensions(), 'opcache_cli' => ini_get('opcache.enable_cli'), 'jit' => ini_get('opcache.jit'),
                 'pcre_jit' => ini_get('pcre.jit'), 'memory_limit' => ini_get('memory_limit'), 'ffi' => ini_get('ffi.enable'), 'build_manifest' => $runtimeManifest],
@@ -774,7 +782,8 @@ function articleBenchmarkPaired(array $options, array $validated): int
                         'eligible' => $eligible, 'candidate_over_baseline' => $ratio,
                         'invalid_reason' => $eligible ? null : 'failed_worker_or_fixture_identity_or_exact_result_parity']);
                 }
-                $decision = articleBenchmarkScreenStratum($ratios, $invalidPairs, ($seed ^ crc32($size.'-'.$density)) & 0xFFFFFFFF, $validated['min_speedup']);
+                $decision = articleBenchmarkScreenStratum($ratios, $invalidPairs, ($seed ^ crc32($size.'-'.$density)) & 0xFFFFFFFF, $validated['min_speedup'],
+                    ['worker' => $bootstrapPath, 'prefix' => $directory.'/bootstrap-'.$size.'-'.$density]);
                 if (isset($decision['median_rust_over_baseline'])) {
                     $decision['median_candidate_over_baseline'] = $decision['median_rust_over_baseline'];
                     unset($decision['median_rust_over_baseline']);
@@ -785,7 +794,8 @@ function articleBenchmarkPaired(array $options, array $validated): int
                 $emit($stratum);
             }
         }
-        $identitiesStable = hash_file('sha256', $manifestPath) === $runtimeManifest['sha256']
+        $identitiesStable = (is_file($bootstrapPath) ? hash_file('sha256', $bootstrapPath) : null) === $bootstrapArtifact['sha256']
+            && hash_file('sha256', $manifestPath) === $runtimeManifest['sha256']
             && articleBenchmarkSourceHashes($root) === $sources['candidate']
             && articleBenchmarkSourceHashes($baselineRoot) === $sources['baseline'];
         foreach ($snapshots as $backend => $snapshot) {

@@ -639,6 +639,72 @@ PHP);
         }
     }
 
+    public function test_screen_retains_bootstrap_input_and_process_outputs_at_declared_prefix(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-article-bootstrap-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        try {
+            $prefix = $directory.'/bootstrap-4096-ordinary';
+            $decision = articleBenchmarkScreenStratum(array_fill(0, 31, 0.5), 0, 123, 1.5,
+                ['worker' => dirname(__DIR__, 2).'/docker/app/nzb-yenc-ffi/target/release/nntmux-yenc-bootstrap', 'prefix' => $prefix]);
+            self::assertSame('useful_improvement', $decision['decision']);
+            self::assertFileExists($prefix);
+            self::assertFileExists($prefix.'.stdout');
+            self::assertFileExists($prefix.'.stderr');
+            self::assertSame(pack('PPee', 123, 6, 100 * (1 - 1 / 1.5), 5).pack('e*', ...array_fill(0, 31, 0.5)), file_get_contents($prefix));
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
+    public function test_screen_retains_failure_from_the_selected_bootstrap_worker(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-article-bootstrap-failure-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        $worker = $directory.'/worker';
+        $prefix = $directory.'/bootstrap';
+        file_put_contents($worker, "#!/bin/sh\nprintf 'selected worker failure' >&2\nexit 9\n");
+        chmod($worker, 0700);
+        try {
+            try {
+                articleBenchmarkScreenStratum([0.5, 0.5, 0.5], 0, 123, 1.5, ['worker' => $worker, 'prefix' => $prefix]);
+                self::fail('Selected bootstrap worker failure was accepted.');
+            } catch (\RuntimeException $exception) {
+                self::assertStringContainsString('Bootstrap worker', $exception->getMessage());
+            }
+            self::assertFileExists($prefix);
+            self::assertFileExists($prefix.'.stdout');
+            self::assertSame('selected worker failure', file_get_contents($prefix.'.stderr'));
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
+    public function test_paired_run_freezes_bootstrap_identity_and_detects_frozen_worker_tampering(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-article-bootstrap-identity-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/source', 'bootstrap');
+        file_put_contents($directory.'/fake.so', 'invalid library');
+        try {
+            foreach ([false, true] as $tamper) {
+                $options = ['paired' => false, 'native' => $directory.'/fake.so', 'candidate-dir' => $directory.'/source',
+                    'baseline-native' => $directory.'/fake.so', 'baseline-dir' => $directory.'/source',
+                    'samples' => 1, 'output-dir' => $directory.'/evidence-'.(int) $tamper];
+                $options['runtime-manifest'] = self::createSyntheticBuildManifest($directory, $options);
+                $rows = self::runCopiedCoordinator($directory.'/coordinator-'.(int) $tamper, $options, false, $tamper);
+                $artifact = $rows[0]['bootstrap_worker'];
+                self::assertSame(realpath($options['output-dir']).'/nntmux-yenc-bootstrap', $artifact['path']);
+                self::assertSame(hash('sha256', 'frozen bootstrap fixture'), $artifact['sha256']);
+                self::assertSame(0700, fileperms($artifact['path']) & 0777);
+                self::assertSame(! $tamper, $artifact['sha256'] === hash_file('sha256', $artifact['path']));
+                self::assertSame(! $tamper, $rows[array_key_last($rows)]['source_library_and_fixture_identities_stable']);
+            }
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
     public function test_paired_run_retains_all_failed_pairs_and_frozen_setup_evidence(): void
     {
         $directory = sys_get_temp_dir().'/nntmux-article-paired-failure-'.bin2hex(random_bytes(8));
@@ -750,7 +816,7 @@ PHP);
      * @param  array<string, mixed>  $options
      * @return list<array<string, mixed>>
      */
-    private static function runCopiedCoordinator(string $directory, array $options, bool $drift): array
+    private static function runCopiedCoordinator(string $directory, array $options, bool $drift, ?bool $bootstrapTamper = null): array
     {
         mkdir($directory.'/scripts', 0700, true);
         mkdir($directory.'/tests/Fixtures', 0700, true);
@@ -758,6 +824,10 @@ PHP);
             copy(dirname(__DIR__, 2).'/scripts/'.$script, $directory.'/scripts/'.$script);
         }
         copy(dirname(__DIR__).'/Fixtures/YencArticles.php', $directory.'/tests/Fixtures/YencArticles.php');
+        if ($bootstrapTamper !== null) {
+            mkdir($directory.'/docker/app/nzb-yenc-ffi/target/release', 0700, true);
+            file_put_contents($directory.'/docker/app/nzb-yenc-ffi/target/release/nntmux-yenc-bootstrap', 'frozen bootstrap fixture');
+        }
         $runner = <<<'PHP'
 <?php
 require $argv[1];
@@ -765,7 +835,12 @@ define('NNTMUX_ARTICLE_BENCHMARK_FUNCTIONS_ONLY', true);
 require __DIR__.'/scripts/benchmark-article-processing.php';
 $options = json_decode($argv[2], true, flags: JSON_THROW_ON_ERROR);
 $drift = $argv[3] === '1';
-ob_start(static function (string $chunk) use (&$drift): string {
+$bootstrapTamper = $argv[4] === '1';
+ob_start(static function (string $chunk) use (&$drift, &$bootstrapTamper, $options): string {
+    if ($bootstrapTamper && str_contains($chunk, '"type":"protocol"')) {
+        file_put_contents($options['output-dir'].'/nntmux-yenc-bootstrap', 'tampered bootstrap fixture');
+        $bootstrapTamper = false;
+    }
     if ($drift && str_contains($chunk, '"type":"protocol"')) {
         file_put_contents(__DIR__.'/scripts/benchmark-yenc.php', "\n// Persistent test instrumentation edit.\n", FILE_APPEND);
         $drift = false;
@@ -777,7 +852,7 @@ exit(isset($options['paired']) ? articleBenchmarkPaired($options, articleBenchma
 PHP;
         file_put_contents($directory.'/run.php', $runner);
         $process = new Process(array_merge(articleBenchmarkPhpCommand(), [$directory.'/run.php',
-            dirname(__DIR__, 2).'/vendor/autoload.php', json_encode($options, JSON_THROW_ON_ERROR), $drift ? '1' : '0']));
+            dirname(__DIR__, 2).'/vendor/autoload.php', json_encode($options, JSON_THROW_ON_ERROR), $drift ? '1' : '0', $bootstrapTamper ? '1' : '0']));
         $process->setTimeout(180);
         $process->run();
         self::assertContains($process->getExitCode(), [0, 2], $process->getErrorOutput());

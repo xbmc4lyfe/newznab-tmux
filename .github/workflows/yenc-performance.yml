@@ -91,11 +91,6 @@ jobs:
       - name: Install locked PHP dependencies without application boot
         run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
 
-      - name: Test benchmark decisions and failure retention
-        run: |
-          php vendor/bin/phpunit --filter=YencBenchmarkTest
-          python3 tests/Unit/test_yenc_abi_benchmark.py
-
       - name: Build pinned C++ baseline
         shell: bash
         run: |
@@ -108,6 +103,11 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-build.log
+
+      - name: Test benchmark decisions and failure retention
+        run: |
+          php vendor/bin/phpunit --filter=YencBenchmarkTest
+          python3 tests/Unit/test_yenc_abi_benchmark.py
 
       - name: Verify each native decoder through the same PHP services
         shell: bash
@@ -501,10 +501,6 @@ jobs:
       - name: Install locked PHP dependencies without application boot
         run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
 
-      - name: Test benchmark correctness and failure retention
-        run: |
-          php vendor/bin/phpunit tests/Unit/YencBenchmarkTest.php
-
       - name: Build locked Rust candidate and verify PHP service parity
         shell: bash
         run: |
@@ -516,6 +512,10 @@ jobs:
             php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
               --filter='YencNativeDecoderTest|YencServiceTest|NNTPBodyDecodingTest' \
               2>&1 | tee benchmark-evidence/build/parity.log
+
+      - name: Test benchmark correctness and failure retention
+        run: |
+          php vendor/bin/phpunit tests/Unit/YencBenchmarkTest.php
 
       - name: Record Rust build and runtime identities
         shell: bash
