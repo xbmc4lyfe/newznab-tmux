@@ -108,15 +108,52 @@ final class NativePayloadDecoder implements RawPayloadDecoder
             throw new RuntimeException('Invalid yEnc payload span.');
         }
 
-        if ($this->spanBuffersBorrowed) {
-            return $this->decodeSpanWithLibrary($this->spanLibrary, $source, $payloadOffset, $payloadLength, $withCrc);
+        $cacheBuffers = ! $this->spanBuffersBorrowed;
+        if ($cacheBuffers) {
+            $this->spanBuffersBorrowed = true;
         }
-        $this->spanBuffersBorrowed = true;
         try {
-            // Signal handlers can reenter between native decode and PHP copyout.
-            return $this->decodeSpanWithLibrary($this->spanLibrary, $source, $payloadOffset, $payloadLength, $withCrc, true);
+            // Keep verified calls here to avoid a helper frame and repeated strlen.
+            // Signal handlers can reenter before copyout; nested buffers stay transient.
+            $output = null;
+            if ($payloadLength > 0) {
+                if ($cacheBuffers && $payloadLength <= self::MAX_SPAN_OUTPUT_CAPACITY) {
+                    if ($this->spanOutputCapacity < $payloadLength) {
+                        $capacity = max(256, $this->spanOutputCapacity);
+                        while ($capacity < $payloadLength) {
+                            $capacity *= 2;
+                        }
+                        $this->spanOutput = $this->spanLibrary->new("char[{$capacity}]");
+                        $this->spanOutputCapacity = $capacity;
+                    }
+                    $output = $this->spanOutput;
+                } else {
+                    $output = $this->spanLibrary->new("char[{$payloadLength}]");
+                }
+            }
+            $crc = null;
+            if ($withCrc) {
+                $crc = $cacheBuffers
+                    ? ($this->spanCrc ??= $this->spanLibrary->new('uint32_t[1]'))
+                    : $this->spanLibrary->new('uint32_t[1]');
+            }
+            /** @var int $written */
+            $written = $this->spanLibrary->nntmux_yenc_decode_span_v1( // @phpstan-ignore method.notFound
+                $source, $sourceLength, $payloadOffset, $payloadLength, $output, $payloadLength,
+                $crc,
+            );
+            if ($written < 0 || $written > $payloadLength) {
+                throw new RuntimeException('RapidYenc returned an invalid decoded length.');
+            }
+
+            return [
+                'decoded' => $output === null ? '' : FFI::string($output, $written),
+                'crc32' => $crc === null ? null : str_pad(dechex($crc[0]), 8, '0', STR_PAD_LEFT),
+            ];
         } finally {
-            $this->spanBuffersBorrowed = false;
+            if ($cacheBuffers) {
+                $this->spanBuffersBorrowed = false;
+            }
         }
     }
 
@@ -213,30 +250,11 @@ final class NativePayloadDecoder implements RawPayloadDecoder
     }
 
     /** @return array{decoded: string, crc32: string|null} */
-    private function decodeSpanWithLibrary(FFI $library, string $source, int $payloadOffset, int $payloadLength, bool $withCrc, bool $cacheBuffers = false): array
+    private function decodeSpanWithLibrary(FFI $library, string $source, int $payloadOffset, int $payloadLength, bool $withCrc): array
     {
-        $output = null;
-        if ($payloadLength > 0) {
-            if ($cacheBuffers && $payloadLength <= self::MAX_SPAN_OUTPUT_CAPACITY) {
-                if ($this->spanOutputCapacity < $payloadLength) {
-                    $capacity = max(256, $this->spanOutputCapacity);
-                    while ($capacity < $payloadLength) {
-                        $capacity *= 2;
-                    }
-                    $this->spanOutput = $library->new("char[{$capacity}]");
-                    $this->spanOutputCapacity = $capacity;
-                }
-                $output = $this->spanOutput;
-            } else {
-                $output = $library->new("char[{$payloadLength}]");
-            }
-        }
-        $crc = null;
-        if ($withCrc) {
-            $crc = $cacheBuffers
-                ? ($this->spanCrc ??= $library->new('uint32_t[1]'))
-                : $library->new('uint32_t[1]');
-        }
+        // Cold capability probes never publish or borrow mutable instance storage.
+        $output = $payloadLength > 0 ? $library->new("char[{$payloadLength}]") : null;
+        $crc = $withCrc ? $library->new('uint32_t[1]') : null;
         /** @var int $written */
         $written = $library->nntmux_yenc_decode_span_v1( // @phpstan-ignore method.notFound
             $source, strlen($source), $payloadOffset, $payloadLength, $output, $payloadLength,
