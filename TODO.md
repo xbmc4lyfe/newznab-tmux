@@ -1,5 +1,12 @@
 # To do
 
+## Retest scheduled verification without global summaries (2026-10-14)
+
+Scheduled candidate workers skip the terminal global status aggregate; direct commands retain it by default. This removes an unused whole-table query while a worker slot is held. Query elimination is separate from Docker runtime recovery and does not establish sustained backlog throughput.
+
+- [ ] Run the full PHPUnit/native suites on the final integrated master, including worker draining, duration limits, connection reuse, lease recovery, audit/reset exclusion and default manual summaries.
+- [ ] After guarded deployment, verify reviewed source parity, scheduled `--no-summary` arguments, service health and M4 TLS connectivity. Observe natural worker turnover and fresh complete NZB-bearing releases; retain downtime, slow windows and workload changes when comparing sustained backlog throughput.
+
 ## Qualify mapped standalone video article reuse (2026-10-14)
 
 Reuse a freshly checksum-qualified primary first article that matched an ambiguous PAR2 main-video entry. Return its original yEnc metadata through an opt-in single-article path after the existing connection gate. Keep normal aggregate results first, mapped archives ahead of video receipts, and pending receipts within the shared limits. Preserve the ordinary media byte/deadline/offset checks, thumbnail inputs and filename evidence; mapping itself still obtains fresh internal receipts. No publication or main-video eligibility change is included.

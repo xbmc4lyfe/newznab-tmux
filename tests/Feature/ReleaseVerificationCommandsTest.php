@@ -13,14 +13,100 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NzbManifestReader;
 use App\Services\Releases\Verification\ScratchInventory;
+use App\Services\Releases\Verification\VerificationWorkerLocks;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 
 class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
 {
+    private int $summaryQueries = 0;
+
+    public function test_manual_worker_reports_global_status_counts_by_default(): void
+    {
+        foreach (['complete', 'complete', 'filtered'] as $index => $status) {
+            DB::table('release_verification_candidates')->insert([
+                'identity' => sha1('summary-'.$index), 'groups_id' => 1, 'manifest_path' => '',
+                'manifest_hash' => str_repeat('a', 64), 'manifest_bytes' => 0, 'status' => $status,
+                'last_unique_at' => now(), 'next_attempt_at' => now(),
+            ]);
+        }
+        $this->recordSummaryQueries();
+
+        $this->assertSame(0, Artisan::call('releases:verify-candidates', ['--slot' => 1]));
+
+        $output = Artisan::output();
+        $this->assertStringContainsString('complete: 2', $output);
+        $this->assertStringContainsString('filtered: 1', $output);
+        $this->assertSame(1, $this->summaryQueries);
+        $this->assertWorkerLocksReleased();
+    }
+
+    public function test_worker_can_skip_global_summary_when_queue_is_empty(): void
+    {
+        $this->recordSummaryQueries();
+
+        $this->assertSame(0, Artisan::call('releases:verify-candidates', ['--slot' => 1, '--no-summary' => true]));
+
+        $this->assertSame(0, $this->summaryQueries);
+        $this->assertWorkerLocksReleased();
+    }
+
+    public function test_worker_without_summary_finishes_candidates_and_keeps_individual_results(): void
+    {
+        $this->freezeTime();
+        foreach (['one', 'two'] as $name) {
+            app(CandidateRepository::class)->enqueue(['identity' => sha1('no-summary-'.$name), 'groups_id' => 1, 'files' => []]);
+        }
+        $this->recordSummaryQueries();
+
+        $this->assertSame(0, Artisan::call('releases:verify-candidates', ['--limit' => 2, '--slot' => 1, '--no-summary' => true]));
+
+        $output = Artisan::output();
+        $this->assertSame(0, $this->summaryQueries);
+        $candidates = DB::table('release_verification_candidates')->orderBy('id')->get();
+        $this->assertCount(2, $candidates);
+        foreach ($candidates as $candidate) {
+            $this->assertSame('unknown', $candidate->status);
+            $this->assertNull($candidate->lease_token);
+            $this->assertNull($candidate->lease_until);
+            $this->assertNull($candidate->release_id);
+            $this->assertSame(now()->addSeconds((int) config('release_verification.retry_seconds'))->format('Y-m-d H:i:s'), $candidate->next_attempt_at);
+            $this->assertStringContainsString($candidate->id.': unknown — '.$candidate->reason, $output);
+        }
+        $this->assertStringNotContainsString('unknown: 2', $output);
+        $status = json_decode(file_get_contents(config('release_verification.storage_path').'/status.json'), true, flags: JSON_THROW_ON_ERROR);
+        $this->assertSame(0, $status['verified_bytes_per_second']);
+        $this->assertSame('unknown', $status['scratch_bytes_status']);
+        $this->assertWorkerLocksReleased();
+    }
+
+    private function recordSummaryQueries(): void
+    {
+        DB::listen(function (QueryExecuted $query): void {
+            $sql = strtolower($query->sql);
+            if (str_contains($sql, 'release_verification_candidates') && str_contains($sql, 'count(') && str_contains($sql, 'group by')) {
+                $this->summaryQueries++;
+            }
+        });
+    }
+
+    private function assertWorkerLocksReleased(): void
+    {
+        $locks = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue($locks->start(1));
+            $locks->close();
+            $this->assertTrue($locks->tryExclusive());
+        } finally {
+            $locks->close();
+        }
+    }
+
     public function test_worker_is_discovered_and_does_not_publish_when_queue_is_empty(): void
     {
         $this->artisan('releases:verify-candidates', ['--limit' => 1])->assertSuccessful();
