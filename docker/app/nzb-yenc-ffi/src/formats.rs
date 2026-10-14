@@ -731,6 +731,10 @@ pub struct Rar5FileExtraRecords {
     pub encryption_record_count: usize,
     pub hash_record_count: usize,
     pub redirection_record_count: usize,
+    pub time_record_count: usize,
+    pub time: Option<Rar5FileTimeRecord>,
+    pub mtime_comparison_status: &'static str,
+    pub base_header_mtime_seconds_matches: Option<bool>,
     pub encryption: Option<Rar5FileEncryptionRecord>,
     pub hash: Option<Rar5FileHashRecord>,
     pub unambiguous_stored_blake2sp_hex: Option<String>,
@@ -749,6 +753,7 @@ pub struct Rar5FileExtraRecord {
     pub record_size: u64,
     pub record_size_vint_byte_length: usize,
     pub record_type: u64,
+    pub payload_offset: usize,
     pub payload_byte_length: usize,
     pub payload_sha256: String,
     pub payload_preview_hex: String,
@@ -757,6 +762,41 @@ pub struct Rar5FileExtraRecord {
     pub encryption: Option<Rar5FileEncryptionRecord>,
     pub hash: Option<Rar5FileHashRecord>,
     pub redirection: Option<Rar5RedirectionRecord>,
+    pub time: Option<Rar5FileTimeRecord>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct Rar5FileTimeRecord {
+    pub status: &'static str,
+    pub interpretation_status: &'static str,
+    pub evidence_basis: &'static str,
+    pub coordinate_basis: &'static str,
+    pub source_coordinate_basis: &'static str,
+    pub source_record_index: usize,
+    pub source_record_offset: usize,
+    pub source_payload_offset: usize,
+    pub source_payload_byte_length: usize,
+    pub source_payload_sha256: String,
+    pub flags: Option<u64>,
+    pub unknown_flags: Option<u64>,
+    pub storage_format: Option<&'static str>,
+    pub times: Vec<Rar5TimeValue>,
+    pub trailing_byte_count: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct Rar5TimeValue {
+    pub kind: &'static str,
+    pub base_value_byte_offset: Option<usize>,
+    pub base_value: Option<u64>,
+    pub base_value_raw_hex: String,
+    pub base_value_bytes_available: usize,
+    pub nanoseconds_declared: bool,
+    pub nanoseconds_byte_offset: Option<usize>,
+    pub nanoseconds: Option<u32>,
+    pub nanoseconds_raw_hex: String,
+    pub nanoseconds_bytes_available: usize,
+    pub nanoseconds_range_valid: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2295,6 +2335,7 @@ fn parse_rar5_file_header(
         }
     }
     derive_rar5_file_checksum_relations(&mut result);
+    derive_rar5_file_time_relations(&mut result, name_end == fields_end);
 
     result
 }
@@ -2316,6 +2357,10 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
         encryption_record_count: 0,
         hash_record_count: 0,
         redirection_record_count: 0,
+        time_record_count: 0,
+        time: None,
+        mtime_comparison_status: "file_header_fields_incomplete",
+        base_header_mtime_seconds_matches: None,
         encryption: None,
         hash: None,
         unambiguous_stored_blake2sp_hex: None,
@@ -2358,6 +2403,30 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
         let payload = &bounded[cursor..record_end];
         let encryption = (kind == 1).then(|| parse_rar5_file_encryption_record(payload));
         let hash = (kind == 2).then(|| parse_rar5_file_hash_record(payload));
+        let payload_sha256 = (result.records.len() < MAX_RAR5_FILE_EXTRA_RECORD_OBSERVATIONS
+            || (kind == 3 && result.time.is_none()))
+        .then(|| hex(&Sha256::digest(payload)));
+        // Count every scanned record, including occurrences beyond the observation budget.
+        let time = (kind == 3
+            && (result.time.is_none()
+                || result.records.len() < MAX_RAR5_FILE_EXTRA_RECORD_OBSERVATIONS))
+            .then(|| {
+                parse_rar5_file_time_record(
+                    payload,
+                    result.record_count,
+                    record_start,
+                    cursor,
+                    payload_sha256
+                        .as_deref()
+                        .expect("retained time payload hash"),
+                )
+            });
+        if kind == 3 {
+            result.time_record_count += 1;
+            if result.time.is_none() {
+                result.time = time.clone();
+            }
+        }
         if kind == 5 {
             result.redirection_record_count += 1;
         }
@@ -2383,8 +2452,9 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
                 record_size: size,
                 record_size_vint_byte_length: size_length,
                 record_type: kind,
+                payload_offset: cursor,
                 payload_byte_length: payload.len(),
-                payload_sha256: hex(&Sha256::digest(payload)),
+                payload_sha256: payload_sha256.expect("retained record payload hash"),
                 payload_preview_hex: hex(preview),
                 payload_preview_truncated: preview.len() != payload.len(),
                 status: encryption
@@ -2392,10 +2462,12 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
                     .map(|value| value.status)
                     .or_else(|| hash.as_ref().map(|value| value.status))
                     .or_else(|| redirection.as_ref().map(|value| value.status))
+                    .or_else(|| time.as_ref().map(|value| value.status))
                     .unwrap_or("unknown_record_type_skipped"),
                 encryption,
                 hash,
                 redirection,
+                time,
             });
         } else {
             result.records_truncated = true;
@@ -2408,6 +2480,169 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
         result.stopped_offset = Some(cursor);
     }
     result
+}
+
+fn parse_rar5_file_time_record(
+    payload: &[u8],
+    index: usize,
+    record_offset: usize,
+    payload_offset: usize,
+    payload_sha256: &str,
+) -> Rar5FileTimeRecord {
+    let mut result = Rar5FileTimeRecord {
+        status: "payload_truncated",
+        interpretation_status: "file_header_fields_incomplete",
+        evidence_basis: "RAR5 file/service extra record 3 timestamp declarations; writer-controlled, not upload time or identity",
+        coordinate_basis: "record-payload-relative",
+        source_coordinate_basis: "decoded-sample-relative",
+        source_record_index: index,
+        source_record_offset: record_offset,
+        source_payload_offset: payload_offset,
+        source_payload_byte_length: payload.len(),
+        source_payload_sha256: payload_sha256.to_owned(),
+        flags: None,
+        unknown_flags: None,
+        storage_format: None,
+        times: Vec::with_capacity(3),
+        trailing_byte_count: payload.len(),
+    };
+    let mut cursor = 0;
+    let Some(flags) = read_vint(payload, &mut cursor) else {
+        return result;
+    };
+    result.flags = Some(flags);
+    result.unknown_flags = Some(flags & !0x1f);
+    let unix = flags & 1 != 0;
+    let nanos = unix && flags & 0x10 != 0;
+    result.storage_format = Some(if unix {
+        "unix_seconds"
+    } else {
+        "windows_filetime_100ns"
+    });
+    let width = if unix { 4 } else { 8 };
+    for (flag, kind) in [(2, "modification"), (4, "creation"), (8, "access")] {
+        if flags & flag != 0 {
+            result.times.push(Rar5TimeValue {
+                kind,
+                base_value_byte_offset: None,
+                base_value: None,
+                base_value_raw_hex: String::new(),
+                base_value_bytes_available: 0,
+                nanoseconds_declared: nanos,
+                nanoseconds_byte_offset: None,
+                nanoseconds: None,
+                nanoseconds_raw_hex: String::new(),
+                nanoseconds_bytes_available: 0,
+                nanoseconds_range_valid: None,
+            });
+        }
+    }
+    // The complete sequence of base timestamps precedes every precision field.
+    for time in &mut result.times {
+        time.base_value_byte_offset = Some(cursor);
+        let available = payload.len().saturating_sub(cursor).min(width);
+        time.base_value_bytes_available = available;
+        time.base_value_raw_hex = hex(&payload[cursor..cursor + available]);
+        let Some(bytes) = take_rar5_extra_bytes(payload, &mut cursor, width) else {
+            result.trailing_byte_count = available;
+            return result;
+        };
+        time.base_value = Some(if unix {
+            u64::from(u32::from_le_bytes(
+                bytes.try_into().expect("four-byte Unix time"),
+            ))
+        } else {
+            u64::from_le_bytes(bytes.try_into().expect("eight-byte FILETIME"))
+        });
+    }
+    if nanos {
+        for time in &mut result.times {
+            time.nanoseconds_byte_offset = Some(cursor);
+            let available = payload.len().saturating_sub(cursor).min(4);
+            time.nanoseconds_bytes_available = available;
+            time.nanoseconds_raw_hex = hex(&payload[cursor..cursor + available]);
+            let Some(bytes) = take_rar5_extra_bytes(payload, &mut cursor, 4) else {
+                result.trailing_byte_count = available;
+                return result;
+            };
+            let value = u32::from_le_bytes(bytes.try_into().expect("four-byte Unix nanoseconds"));
+            time.nanoseconds = Some(value);
+            // Retain raw values. Do not mask or silently carry malformed precision into seconds.
+            time.nanoseconds_range_valid = Some(value < 1_000_000_000);
+        }
+    }
+    result.trailing_byte_count = payload.len().saturating_sub(cursor);
+    result.status = if flags & !0x1f != 0 {
+        "unknown_flags"
+    } else if result
+        .times
+        .iter()
+        .any(|time| time.nanoseconds_range_valid == Some(false))
+    {
+        "nanoseconds_out_of_range"
+    } else if result.trailing_byte_count != 0 {
+        "trailing_bytes"
+    } else {
+        "parsed"
+    };
+    result
+}
+
+fn derive_rar5_file_time_relations(file: &mut Rar5FileHeaderObservation, fields_complete: bool) {
+    let extras = &mut file.file_extra_records;
+    let status = if file.header_crc32_valid != Some(true) {
+        "header_checksum_unconfirmed"
+    } else if !fields_complete {
+        "file_header_fields_trailing_bytes"
+    } else if file.file_flags.is_none_or(|flags| flags & !0x0f != 0) {
+        "file_flags_unsupported"
+    } else if extras.status != "complete" {
+        "extra_framing_incomplete"
+    } else if extras.time_record_count == 0 {
+        "time_record_absent"
+    } else if extras.time_record_count != 1 {
+        "duplicate_time_records"
+    } else if extras.records_truncated {
+        "record_observation_limit"
+    } else if extras
+        .time
+        .as_ref()
+        .is_none_or(|time| time.status != "parsed")
+    {
+        "time_record_not_interpretable"
+    } else {
+        "validated_header_declaration"
+    };
+    for time in extras
+        .records
+        .iter_mut()
+        .filter_map(|record| record.time.as_mut())
+    {
+        time.interpretation_status = status;
+    }
+    if let Some(time) = &mut extras.time {
+        time.interpretation_status = status;
+    }
+    extras.mtime_comparison_status = status;
+    if status != "validated_header_declaration" {
+        return;
+    }
+    let time = extras.time.as_ref().expect("unique parsed time record");
+    let Some(modified) = time.times.iter().find(|value| value.kind == "modification") else {
+        extras.mtime_comparison_status = "modification_time_not_declared";
+        return;
+    };
+    let Some(base) = file.modification_time_unix_seconds else {
+        extras.mtime_comparison_status = "base_header_mtime_absent";
+        return;
+    };
+    if time.storage_format != Some("unix_seconds") {
+        extras.mtime_comparison_status = "filetime_epoch_conversion_not_performed";
+        return;
+    }
+    extras.base_header_mtime_seconds_matches =
+        modified.base_value.map(|value| value == u64::from(base));
+    extras.mtime_comparison_status = "declared_base_seconds_consistency_only";
 }
 
 fn parse_rar5_redirection_record(payload: &[u8]) -> Rar5RedirectionRecord {
@@ -7659,6 +7894,198 @@ mod tests {
         }
         let (observation, _, _) = read_rar5_block_observation(&block, 0, 0);
         serde_json::to_value(observation.file_header.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn rar5_file_time_literal_ffi_preserves_all_base_times_before_nanoseconds() {
+        let sample = [
+            0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00, 0xc5, 0x1a, 0x33, 0x32, 0x03, 0x01,
+            0x00, 0x00, 0xaf, 0x35, 0xbf, 0x2f, 0x29, 0x02, 0x01, 0x1b, 0x02, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x78, 0x1a, 0x03, 0x1f, 0x01, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x05, 0x00,
+            0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x19, 0xb2, 0x3a, 0x35, 0x03, 0x05, 0x00, 0x00,
+        ];
+        let pointer = unsafe { crate::nntmux_format_metadata_json(sample.as_ptr(), sample.len()) };
+        assert!(!pointer.is_null());
+        let json: serde_json::Value =
+            serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(pointer).to_bytes() })
+                .unwrap();
+        unsafe { crate::nntmux_metadata_string_free(pointer) };
+        let extras = &json["headers"][0]["visible_block_walk"]["blocks"][1]["file_header"]["file_extra_records"];
+        assert_eq!(extras["time_record_count"], 1);
+        assert_eq!(extras["base_header_mtime_seconds_matches"], true);
+        let time = &extras["records"][0]["time"];
+        assert_eq!(time["status"], "parsed");
+        assert_eq!(
+            time["interpretation_status"],
+            "validated_header_declaration"
+        );
+        assert_eq!(time["storage_format"], "unix_seconds");
+        assert_eq!(time["source_payload_offset"], 37);
+        assert_eq!(
+            time["source_payload_offset"],
+            extras["records"][0]["payload_offset"]
+        );
+        for (index, base, nanos) in [(0, 1, 4), (1, 2, 5), (2, 3, 6)] {
+            assert_eq!(time["times"][index]["base_value"], base);
+            assert_eq!(time["times"][index]["nanoseconds"], nanos);
+            assert_eq!(
+                time["times"][index]["base_value_byte_offset"],
+                1 + index * 4
+            );
+            assert_eq!(
+                time["times"][index]["nanoseconds_byte_offset"],
+                13 + index * 4
+            );
+        }
+    }
+
+    #[test]
+    fn rar5_file_time_partial_precision_keeps_complete_base_observations() {
+        let extra = [
+            0x12, 0x03, 0x1f, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0,
+        ];
+        let file = rar5_test_file_extra_json(&extra, 0, false);
+        let time = &file["file_extra_records"]["time"];
+        assert_eq!(time["status"], "payload_truncated");
+        assert_eq!(time["times"][2]["base_value"], 3);
+        assert_eq!(time["times"][0]["nanoseconds"], 4);
+        assert!(time["times"][1]["nanoseconds"].is_null());
+        assert!(file["file_extra_records"]["base_header_mtime_seconds_matches"].is_null());
+    }
+
+    #[test]
+    fn rar5_file_time_filetime_precision_flag_does_not_require_unix_nanoseconds() {
+        let extra = [0x0a, 0x03, 0x12, 0, 0, 0, 0, 0, 0, 0, 0];
+        let file = rar5_test_file_extra_json(&extra, 0, false);
+        let time = &file["file_extra_records"]["time"];
+        assert_eq!(time["status"], "parsed");
+        assert_eq!(time["storage_format"], "windows_filetime_100ns");
+        assert_eq!(time["times"][0]["base_value"], 0);
+        assert_eq!(time["times"][0]["nanoseconds_declared"], false);
+    }
+
+    #[test]
+    fn rar5_file_time_first_late_observation_retains_its_source_identity() {
+        let mut extra = [1, 11].repeat(64);
+        extra.extend([6, 3, 3, 1, 0, 0, 0]);
+        let file = rar5_test_file_extra_json(&extra, 0, false);
+        let extras = &file["file_extra_records"];
+        let time = &extras["time"];
+        assert_eq!(time["source_record_index"], 64);
+        let first = extras["records"][0]["offset"].as_u64().unwrap();
+        assert_eq!(time["source_record_offset"], first + 128);
+        assert_eq!(time["source_payload_offset"], first + 130);
+        assert_eq!(time["source_payload_byte_length"], 5);
+        assert_eq!(
+            time["source_payload_sha256"],
+            hex(&Sha256::digest([3, 1, 0, 0, 0]))
+        );
+        assert_eq!(time["interpretation_status"], "record_observation_limit");
+        assert_eq!(time["times"][0]["base_value"], 1);
+    }
+
+    #[test]
+    fn rar5_file_time_partial_scalar_bytes_never_borrow_from_following_records() {
+        for available in 1..4 {
+            let mut payload = vec![3];
+            payload.extend(vec![0xaa; available]);
+            let mut extra = rar5_test_file_extra_record(3, &payload);
+            extra.extend(rar5_test_file_extra_record(11, &[0xbb; 8]));
+            let file = rar5_test_file_extra_json(&extra, 0, false);
+            let time = &file["file_extra_records"]["time"];
+            assert_eq!(time["status"], "payload_truncated");
+            assert_eq!(time["times"][0]["base_value_bytes_available"], available);
+            assert!(time["times"][0]["base_value"].is_null());
+            assert_eq!(
+                time["times"][0]["base_value_raw_hex"],
+                "aa".repeat(available)
+            );
+
+            let mut payload = vec![0x13, 1, 0, 0, 0];
+            payload.extend(vec![0xaa; available]);
+            let mut extra = rar5_test_file_extra_record(3, &payload);
+            extra.extend(rar5_test_file_extra_record(11, &[0xbb; 8]));
+            let file = rar5_test_file_extra_json(&extra, 0, false);
+            let time = &file["file_extra_records"]["time"];
+            assert_eq!(time["times"][0]["base_value"], 1);
+            assert_eq!(time["times"][0]["nanoseconds_bytes_available"], available);
+            assert!(time["times"][0]["nanoseconds"].is_null());
+            assert_eq!(
+                time["times"][0]["nanoseconds_raw_hex"],
+                "aa".repeat(available)
+            );
+        }
+    }
+
+    #[test]
+    fn rar5_file_time_malformed_precision_and_flags_preserve_raw_evidence() {
+        for (extra, status) in [
+            (
+                vec![0x0a, 3, 0x13, 1, 0, 0, 0, 0, 0xca, 0x9a, 0x3b],
+                "nanoseconds_out_of_range",
+            ),
+            (vec![6, 3, 0x23, 1, 0, 0, 0], "unknown_flags"),
+            (vec![7, 3, 3, 1, 0, 0, 0, 0xff], "trailing_bytes"),
+        ] {
+            let file = rar5_test_file_extra_json(&extra, 0, false);
+            let time = &file["file_extra_records"]["time"];
+            assert_eq!(time["status"], status);
+            assert_eq!(time["times"][0]["base_value"], 1);
+            assert_eq!(
+                time["interpretation_status"],
+                "time_record_not_interpretable"
+            );
+            assert!(file["file_extra_records"]["base_header_mtime_seconds_matches"].is_null());
+            if status == "nanoseconds_out_of_range" {
+                assert_eq!(time["times"][0]["nanoseconds"], 1_000_000_000);
+                assert_eq!(time["times"][0]["nanoseconds_range_valid"], false);
+            }
+        }
+    }
+
+    #[test]
+    fn rar5_file_time_duplicates_after_retention_and_scan_limits_withhold_interpretation() {
+        let time = [6, 3, 3, 1, 0, 0, 0];
+        let mut extra = time.to_vec();
+        extra.extend([1, 11].repeat(63));
+        extra.extend(time);
+        let file = rar5_test_file_extra_json(&extra, 0, false);
+        let extras = &file["file_extra_records"];
+        assert_eq!(extras["time_record_count"], 2);
+        assert_eq!(extras["records_truncated"], true);
+        assert_eq!(extras["mtime_comparison_status"], "duplicate_time_records");
+        assert_eq!(extras["time"]["times"][0]["base_value"], 1);
+
+        let limited = rar5_test_file_extra_json(&time.repeat(4097), 0, false);
+        assert_eq!(limited["file_extra_records"]["time_record_count"], 4096);
+        assert_eq!(
+            limited["file_extra_records"]["mtime_comparison_status"],
+            "extra_framing_incomplete"
+        );
+        assert!(limited["file_extra_records"]["base_header_mtime_seconds_matches"].is_null());
+    }
+
+    #[test]
+    fn rar5_file_time_rejected_and_partial_headers_keep_observations_without_authority() {
+        let time = [6, 3, 3, 1, 0, 0, 0];
+        let invalid = rar5_test_file_extra_json(&time, 0, true);
+        assert_eq!(invalid["file_extra_records"]["time"]["status"], "parsed");
+        assert_eq!(
+            invalid["file_extra_records"]["time"]["interpretation_status"],
+            "header_checksum_unconfirmed"
+        );
+        let partial = parse_rar5_file_header(&time, 0, 0..time.len(), 1, None, Some(true));
+        let partial = serde_json::to_value(partial).unwrap();
+        assert_eq!(
+            partial["file_extra_records"]["time"]["times"][0]["base_value"],
+            1
+        );
+        assert_eq!(
+            partial["file_extra_records"]["time"]["interpretation_status"],
+            "file_header_fields_incomplete"
+        );
+        assert!(partial["file_extra_records"]["base_header_mtime_seconds_matches"].is_null());
     }
 
     #[test]

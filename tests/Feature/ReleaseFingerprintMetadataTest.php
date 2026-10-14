@@ -22,6 +22,29 @@ use Tests\TestCase;
 final class ReleaseFingerprintMetadataTest extends TestCase
 {
     #[Test]
+    public function it_exposes_rar5_file_times_in_native_release_metadata(): void
+    {
+        $sample = hex2bin('526172211a070100c51a333203010000af35bf2f2902011b0200000100000000010178'
+            .'1a031f01000000020000000300000004000000050000000600000019b23a3503050000');
+        self::assertIsString($sample);
+        if ((new NativeMetadataParser)->parseFormats($sample) === null) {
+            self::markTestSkipped('Native Rust format metadata is required for RAR5 time integration.');
+        }
+        $body = YencArticles::article($sample);
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        self::assertSame(hash('sha256', $body), $analysis['metadata']['article_body_sha256']);
+        $extras = $analysis['metadata']['decoded_format_metadata']['headers'][0]['visible_block_walk']['blocks'][1]['file_header']['file_extra_records'];
+        self::assertSame(1, $extras['time_record_count']);
+        self::assertTrue($extras['base_header_mtime_seconds_matches']);
+        self::assertSame('declared_base_seconds_consistency_only', $extras['mtime_comparison_status']);
+        self::assertSame('validated_header_declaration', $extras['time']['interpretation_status']);
+        self::assertSame(37, $extras['time']['source_payload_offset']);
+        self::assertSame([1, 2, 3], array_column($extras['time']['times'], 'base_value'));
+        self::assertSame([4, 5, 6], array_column($extras['time']['times'], 'nanoseconds'));
+    }
+
+    #[Test]
     public function it_excludes_unconfirmed_head_dates_from_effective_timeline_statistics(): void
     {
         $observations = [
