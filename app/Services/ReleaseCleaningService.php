@@ -7,6 +7,7 @@ namespace App\Services;
 use App\Models\Predb;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\NzbSplitUnwrapper;
+use App\Support\PredbSearchDocument;
 
 /**
  * Cleans names for releases/imports/namefixer.
@@ -106,6 +107,9 @@ class ReleaseCleaningService
             foreach ($hits as $hit) {
                 foreach ($hit as $val) {
                     $title = Predb::query()->where('title', trim($val))->first(['title', 'id']);
+                    if ($title !== null && PredbSearchDocument::exactValue((string) $title['title']) !== PredbSearchDocument::exactValue(trim($val))) {
+                        $title = null;
+                    }
                     // don't match against ab.teevee if title is for just the season
                     if (! empty($title) && $groupName === 'alt.binaries.teevee' && preg_match('/\.S\d\d\./', $title['title'], $hit)) {
                         $title = null;
