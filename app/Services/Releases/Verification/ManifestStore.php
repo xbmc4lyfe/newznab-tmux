@@ -9,6 +9,8 @@ use RuntimeException;
 
 final class ManifestStore
 {
+    private ?PreparationRunDiagnostics $readDiagnostics = null;
+
     /** @param array<string, mixed> $manifest */
     public function write(array $manifest): string
     {
@@ -66,17 +68,43 @@ final class ManifestStore
         if (preg_match('/\A[0-9a-f]{64}\.json\.gz\z/', $name) !== 1) {
             throw new RuntimeException('Invalid manifest reference.');
         }
-        $body = file_get_contents($this->path($name));
-        $json = $body === false ? false : gzdecode($body);
-        if ($json === false || hash('sha256', $json).'.json.gz' !== $name) {
+        $diagnostics = $this->readDiagnostics;
+        $body = $diagnostics === null ? file_get_contents($this->path($name))
+            : $diagnostics->measurePhase('file_read', fn () => file_get_contents($this->path($name)));
+        if ($diagnostics !== null && $body !== false) {
+            $diagnostics->recordSize('compressed_bytes', strlen($body));
+        }
+        $json = $body === false ? false : ($diagnostics === null ? gzdecode($body)
+            : $diagnostics->measurePhase('gzip_decode', fn () => gzdecode($body)));
+        if ($diagnostics !== null && $json !== false) {
+            $diagnostics->recordSize('json_bytes', strlen($json));
+        }
+        if ($json === false || ! ($diagnostics === null ? hash('sha256', $json).'.json.gz' === $name
+            : $diagnostics->measurePhase('hash', fn () => hash('sha256', $json).'.json.gz' === $name))) {
             throw new RuntimeException('Manifest integrity check failed.');
         }
-        $result = json_decode($json, true, flags: JSON_THROW_ON_ERROR);
+        $result = $diagnostics === null ? json_decode($json, true, flags: JSON_THROW_ON_ERROR)
+            : $diagnostics->measurePhase('json_decode', fn () => json_decode($json, true, flags: JSON_THROW_ON_ERROR));
         if (! is_array($result)) {
             throw new RuntimeException('Invalid manifest contents.');
         }
+        if ($diagnostics !== null && is_array($result['files'] ?? null)) {
+            $diagnostics->recordSize('files', count($result['files']));
+        }
 
         return $result;
+    }
+
+    /** @return array<string, mixed> */
+    public function readWithDiagnostics(string $name, PreparationRunDiagnostics $diagnostics): array
+    {
+        $previous = $this->readDiagnostics;
+        $this->readDiagnostics = $diagnostics;
+        try {
+            return $this->read($name);
+        } finally {
+            $this->readDiagnostics = $previous;
+        }
     }
 
     public function path(string $name): string
