@@ -122,6 +122,12 @@ Approved approach:
 - [x] Deploy through the shared guard and validate live bounded batches, retained retry state, recovered names, and search-index synchronization.
 - [ ] Assess sustained actual rename yield and net backlog trend against incoming releases before raising concurrency.
 
+Historical PAR2 traversal follow-up (2026-10-14): a real parser/processor fixture with 301 noncontiguous fragments before a recoverable release reproduced the 300-release quota stopping without downloads or a rename. Streaming bounded keyset pages with a separate local-retry allowance recovered the exact title with one article read, while retaining all 301 blocked checkpoints and pending flags. The regular attempt quota, deadline, article limits, ownership checks, and frozen cohort remain in force; this fixture does not establish production names per second.
+
+- [ ] Obtain current-head Codex clearance and green CI for the streaming traversal, then squash merge and deploy through the shared guard.
+- [ ] Retest the deployed zero-allowance compatibility setting, total inspection bound, deadline and lease loss between pages, cursor wrap under new arrivals, and unchanged multipart/volume fallback behavior.
+- [ ] Compare actual recovered names and elapsed time against arrivals and net backlog over a stable live window; local skips and checked releases are separate from successful identifications.
+
 Evidence from the investigation: the separate database-only catch-up reported 33 changed names. The two supplemental experimental workers were stopped before redesign; the existing production rename worker continued. The redesign was validated in an isolated container without production mounts or network access.
 
 Validation: the complete PHPUnit suite ran 2,633 tests and 20,987 assertions with no failures, 93 skips, and 54 PHPUnit notices. Pint and PHP syntax checks passed. Full-project PHPStan reported the same ten findings reproduced on the unmodified base revision; no new findings remain. Independent review findings were fixed and regression-tested, including the real checker completing an unmatched release too early, stale success state between releases, unavailable candidates blocking recovery volumes, and retry starvation. Shared claims were also exercised across separate PHP processes.
@@ -157,6 +163,14 @@ Monitor baseline for the next comparison (2026-10-11 22:46:54 UTC): the Renames 
 Monitor comparison captured 2026-10-11 22:52:44 UTC: 465,869 unmatched (+34 versus baseline) and 24,334 matched (+17). In this short window names continue to recover, but unmatched rename work is still growing; measuring arrival rate and historical probe efficiency remains the next operational priority.
 
 Follow-up correction verification: all ten PHPStan findings are cleared; full analysis of 849 files reports zero errors with no added baseline entries. The complete local PHPUnit suite passes 2,671 tests and 21,108 assertions, with 93 existing skips and 54 PHPUnit notices. Pint, PHP syntax lint, and independent source review pass. The correction batch is prepared on `codex/phpstan-backlog-cleanup` and remains separate from the deployed rename redesign. The correction batch is published in [PR #59](https://github.com/xbmc4lyfe/newznab-tmux/pull/59); current-head CI/review and release delivery are tracked above.
+
+## PreDB search coverage and naming throughput (2026-10-14)
+
+The live PreDB index contained 160,869 documents while SQL held 1,523,091 records. Eight missing middle-range records could not be matched by their exact titles; additive indexing restored all eight matches without changing their `searched` values. The guarded additive worker subsequently processed the frozen 1,523,091-row catalog in 61.42 seconds with zero reported errors. An independent ID-by-ID audit found zero missing source IDs. This proves catalog recovery, not release-identification throughput.
+
+- [ ] Retest PR #117's bounded launcher count against dense and sparse MariaDB catalogs and natural worker scheduling; preserve worker partitions and record actual recovered names.
+- [ ] Review, merge, deploy, and qualify the new `nntmux:search-reconcile --predb --all` recovery path, including dry-run, missing-only bulk writes, index-read/write failures, post-write ID checks, and unchanged SQL naming state.
+- [ ] Measure sustained recovered names, incoming releases, and net rename backlog after catalog recovery. A sample of 64 eligible releases with 961 cleaned file names had no literal SQL PreDB matches; catalog coverage alone does not prove useful evidence exists for every pending release.
 
 ## Retest SQL contention repairs (2026-10-12)
 

@@ -15,8 +15,11 @@ use Carbon\CarbonImmutable;
 use DariusIII\NetNntp\Error;
 use Illuminate\Cache\ArrayStore;
 use Illuminate\Contracts\Cache\LockProvider;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
 use SimpleXMLElement;
 use Tests\Support\Par2RenameTestDatabase;
@@ -35,6 +38,7 @@ class Par2RenameBatchTest extends TestCase
         config([
             'tmux.fix_names.cache_store' => 'array',
             'tmux.fix_names.par2_max_releases' => 2,
+            'tmux.fix_names.par2_max_local_skips' => 0,
             'tmux.fix_names.par2_budget_seconds' => 30,
         ]);
         Cache::store('array')->flush();
@@ -185,6 +189,160 @@ class Par2RenameBatchTest extends TestCase
         $this->runBatch();
         $this->assertSame(['guid-1', 'guid-2', 'guid-3', 'guid-1', 'guid-2'], $this->visited);
         $this->assertSame(2, Release::query()->where('proc_par2', 0)->count());
+    }
+
+    #[DataProvider('localSkipBounds')]
+    public function test_zero_probe_retries_have_a_bounded_extra_allowance(int $bonus, int $expectedInspected): void
+    {
+        config(['tmux.fix_names.par2_max_local_skips' => $bonus]);
+        $guids = [];
+        $ids = [];
+        for ($index = 0; $index < 8; $index++) {
+            $guids[] = 'missing-'.$index;
+            $ids[] = $this->pendingPar2Release(['guid' => 'missing-'.$index])->id;
+        }
+        $this->bindNzb($guids);
+
+        $this->runBatch();
+
+        $this->assertSame(array_slice($guids, 0, $expectedInspected), $this->visited);
+        $this->assertSame($ids[$expectedInspected - 1], Cache::store('array')->get('rename:par2:sweep:2:1')['after_id']);
+        $this->assertSame(8, Release::query()->where('proc_par2', 0)->count());
+    }
+
+    /** @return array<string, array{int, int}> */
+    public static function localSkipBounds(): array
+    {
+        return ['disabled' => [0, 2], 'negative is disabled' => [-1, 2], 'one extra rejection' => [1, 3], 'three extra rejections' => [3, 5]];
+    }
+
+    public function test_local_retries_do_not_wrap_twice_or_extend_the_frozen_cohort(): void
+    {
+        config(['tmux.fix_names.par2_max_local_skips' => 10]);
+        $this->pendingPar2Release(['guid' => 'old-1']);
+        $lastOld = $this->pendingPar2Release(['guid' => 'old-2']);
+        $this->bindNzb(['old-1', 'old-2'], onLoad: function (string $guid): void {
+            if ($guid === 'old-1' && Release::query()->where('guid', 'new-3')->doesntExist()) {
+                $this->pendingPar2Release(['guid' => 'new-3']);
+            }
+        });
+
+        $this->runBatch();
+
+        $this->assertSame(['old-1', 'old-2'], $this->visited);
+        $this->assertSame($lastOld->id, Cache::store('array')->get('rename:par2:sweep:2:1')['through_id']);
+        $this->assertSame(3, Release::query()->where('proc_par2', 0)->count());
+
+        $this->runBatch();
+
+        $this->assertSame(['old-1', 'old-2', 'old-1', 'old-2', 'new-3'], $this->visited);
+        $this->assertSame(2, Release::query()->where('proc_par2', 0)->count());
+    }
+
+    public function test_streamed_pages_remain_small_without_adding_overflowing_quotas(): void
+    {
+        config(['tmux.fix_names.par2_max_releases' => PHP_INT_MAX, 'tmux.fix_names.par2_max_local_skips' => PHP_INT_MAX]);
+        for ($index = 1; $index <= 3; $index++) {
+            $this->pendingPar2Release(['guid' => 'missing-'.$index]);
+        }
+        $this->bindNzb(['missing-1', 'missing-2', 'missing-3']);
+        $pages = [];
+        $this->observePar2Pages($pages);
+
+        $this->runBatch();
+
+        $this->assertSame(['missing-1', 'missing-2', 'missing-3'], $this->visited);
+        $this->assertNotEmpty($pages);
+        foreach ($pages as $page) {
+            $this->assertLessThanOrEqual(1000, $page['limit']);
+            $this->assertGreaterThan(0, $page['limit']);
+        }
+        $this->assertSame(3, Release::query()->where('proc_par2', 0)->count());
+    }
+
+    public function test_deadline_after_a_local_retry_stops_before_fetching_another_page(): void
+    {
+        $this->freezeTime();
+        config(['tmux.fix_names.par2_max_local_skips' => 10]);
+        for ($index = 1; $index <= 3; $index++) {
+            $this->pendingPar2Release(['guid' => 'missing-'.$index]);
+        }
+        $this->bindNzb(['missing-1', 'missing-2', 'missing-3'], onLoad: function (string $guid): void {
+            if ($guid === 'missing-2') {
+                $this->travel(31)->seconds();
+            }
+        });
+        $pages = [];
+        $this->observePar2Pages($pages);
+
+        $this->runBatch();
+
+        $this->assertSame(['missing-1', 'missing-2'], $this->visited);
+        $this->assertCount(1, $pages);
+        $this->assertSame(3, Release::query()->where('proc_par2', 0)->count());
+        $this->bindNzb(['missing-1', 'missing-2', 'missing-3']);
+        $this->runBatch();
+        $this->assertSame(['missing-1', 'missing-2', 'missing-3'], $this->visited);
+    }
+
+    public function test_lease_loss_at_the_page_boundary_preserves_the_last_owned_cursor(): void
+    {
+        config(['tmux.fix_names.par2_max_local_skips' => 10]);
+        $first = $this->pendingPar2Release(['guid' => 'missing-1']);
+        $this->pendingPar2Release(['guid' => 'missing-2']);
+        $this->pendingPar2Release(['guid' => 'missing-3']);
+        $store = Cache::store('array')->getStore();
+        $this->assertInstanceOf(ArrayStore::class, $store);
+        $this->bindNzb(['missing-1', 'missing-2', 'missing-3'], onLoad: static function (string $guid) use ($store): void {
+            if ($guid === 'missing-2') {
+                $store->locks['rename:par2:sweep:2:1:lock']['owner'] = 'replacement-owner';
+            }
+        });
+        $pages = [];
+        $this->observePar2Pages($pages);
+
+        $this->runBatch();
+
+        $this->assertSame(['missing-1', 'missing-2'], $this->visited);
+        $this->assertCount(1, $pages);
+        $this->assertSame($first->id, Cache::store('array')->get('rename:par2:sweep:2:1')['after_id']);
+        $this->assertSame('replacement-owner', $store->locks['rename:par2:sweep:2:1:lock']['owner']);
+        $this->assertSame(3, Release::query()->where('proc_par2', 0)->count());
+    }
+
+    #[DataProvider('initialSweepStops')]
+    public function test_an_expired_deadline_or_lost_lease_prevents_the_first_page_fetch(string $stop): void
+    {
+        $this->freezeTime();
+        config(['tmux.fix_names.par2_max_local_skips' => 10]);
+        $this->pendingPar2Release(['guid' => 'missing']);
+        $this->bindNzb(['missing']);
+        $store = Cache::store('array')->getStore();
+        $this->assertInstanceOf(ArrayStore::class, $store);
+        DB::listen(function (QueryExecuted $query) use ($stop, $store): void {
+            if ($query->sql === 'SELECT MAX(id) AS highest_id FROM releases') {
+                if ($stop === 'deadline') {
+                    $this->travel(31)->seconds();
+                } else {
+                    $store->locks['rename:par2:sweep:2:1:lock']['owner'] = 'replacement-owner';
+                }
+            }
+        });
+        $pages = [];
+        $this->observePar2Pages($pages);
+
+        $this->runBatch();
+
+        $this->assertSame([], $pages);
+        $this->assertSame([], $this->visited);
+        $this->assertNull(Cache::store('array')->get('rename:par2:sweep:2:1'));
+        $this->assertSame(1, Release::query()->where('proc_par2', 0)->count());
+    }
+
+    /** @return array<string, array{string}> */
+    public static function initialSweepStops(): array
+    {
+        return ['deadline' => ['deadline'], 'lease ownership' => ['lease']];
     }
 
     public function test_new_arrivals_do_not_extend_the_current_sweep_and_starve_retries(): void
@@ -368,6 +526,17 @@ class Par2RenameBatchTest extends TestCase
             public function loadNzb(string $guid): SimpleXMLElement|false
             {
                 return ($this->load)($guid);
+            }
+        });
+    }
+
+    /** @param list<array{limit:int, after:int, through:int}> $pages */
+    private function observePar2Pages(array &$pages): void
+    {
+        DB::listen(static function (QueryExecuted $query) use (&$pages): void {
+            if (str_contains($query->sql, 'r.nzbstatus = 1') && str_contains($query->sql, 'ORDER BY r.id ASC')) {
+                $count = count($query->bindings);
+                $pages[] = ['limit' => (int) $query->bindings[$count - 1], 'after' => (int) $query->bindings[$count - 3], 'through' => (int) $query->bindings[$count - 2]];
             }
         });
     }
