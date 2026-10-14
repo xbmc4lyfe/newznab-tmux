@@ -29,7 +29,7 @@
 - 80+ auto-registered in `app/Console/Commands/`
 - Create with `php artisan make:` + `--no-interaction`
 - Prefer host `php artisan …` / `./vendor/bin/…` (see Command execution precedence). Use `Makefile` / Sail only for Compose lifecycle or when the user asks for containerized runs (`make artisan cmd="..."`, `make test filter=TestName`, etc.)
-- On WSL2, Docker may come from **Windows Docker Desktop** (not a Linux Docker package in the distro). If `docker` is missing or the daemon is unreachable, start Desktop / enable WSL integration before installing Docker inside WSL
+- Use macOS or Linux host tools. If Docker is unavailable, check Docker Desktop or the configured Linux VM on macOS. Check the Docker service and socket access on Linux.
 - This workspace may have cached routes under `bootstrap/cache/routes-*.php`; after adding/changing routes, refresh with `php artisan route:cache` if a route appears missing
 
 ### Admin Content
