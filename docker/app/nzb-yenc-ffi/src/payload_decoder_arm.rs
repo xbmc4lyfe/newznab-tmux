@@ -29,6 +29,18 @@ static PAIR_REMOVAL_INDEXES: [[u8; 16]; 15] = removal_indexes::<15>(2);
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
+unsafe fn neon_mask_has_nonzero(bytes: std::arch::aarch64::uint8x16_t) -> bool {
+    use std::arch::aarch64::*;
+    // Unsigned saturation preserves zero in each 64-bit lane. Combining the
+    // narrowed lanes tests all bytes without a horizontal byte reduction.
+    vget_lane_u64::<0>(vreinterpret_u64_u32(vqmovn_u64(vreinterpretq_u64_u8(
+        bytes,
+    )))) != 0
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
 unsafe fn decode_neon_block(
     bytes: std::arch::aarch64::uint8x16_t,
     equals: std::arch::aarch64::uint8x16_t,
@@ -241,7 +253,7 @@ unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: u
                 vorrq_u8(special_a, special_b),
                 vorrq_u8(special_c, special_d),
             );
-            if !escaped && vmaxvq_u8(any_special) == 0 {
+            if !escaped && !neon_mask_has_nonzero(any_special) {
                 vst1q_u8(destination.add(written), vsubq_u8(a, offset));
                 vst1q_u8(destination.add(written + 16), vsubq_u8(b, offset));
                 vst1q_u8(destination.add(written + 32), vsubq_u8(c, offset));
@@ -395,6 +407,32 @@ pub(crate) unsafe fn decode_neon(source: *const u8, destination: *mut u8, length
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_nonzero_check_preserves_every_byte_position_and_value() {
+        use std::arch::aarch64::*;
+        unsafe {
+            assert!(!neon_mask_has_nonzero(vld1q_u8([0; 16].as_ptr())));
+            assert!(neon_mask_has_nonzero(vld1q_u8([255; 16].as_ptr())));
+            for position in 0..16 {
+                for value in 0..=255 {
+                    let mut bytes = [0; 16];
+                    bytes[position] = value;
+                    assert_eq!(neon_mask_has_nonzero(vld1q_u8(bytes.as_ptr())), value != 0);
+                }
+                let mut bytes = [255; 16];
+                bytes[position] = 0;
+                assert!(neon_mask_has_nonzero(vld1q_u8(bytes.as_ptr())));
+            }
+            for value in [0xffff_ffff_u64, 0x1_0000_0000, 1 << 63, u64::MAX] {
+                for lane in 0..2 {
+                    let mut bytes = [0; 16];
+                    bytes[lane * 8..lane * 8 + 8].copy_from_slice(&value.to_ne_bytes());
+                    assert!(neon_mask_has_nonzero(vld1q_u8(bytes.as_ptr())));
+                }
+            }
+        }
+    }
 
     fn verify_regular_guards(payload: &[u8], expected: &[u8]) {
         for kernel in [
