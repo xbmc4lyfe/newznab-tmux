@@ -132,6 +132,8 @@ def bar_svg(title, rows, unit, reference=None):
 def render(evidence, output):
     evidence, output = Path(evidence), Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    for previous in output.glob('hotpaths-*.svg'):
+        previous.unlink()
     observations = evidence / 'paired' / 'observations.jsonl'
     records = [json.loads(line) for line in observations.read_text().splitlines()] if observations.exists() else []
     summaries = [row for row in records if row.get('type') == 'stratum_summary']
@@ -160,6 +162,14 @@ def render(evidence, output):
     for index, path in enumerate(sorted((evidence / 'profiles').rglob('*.callgrind'))):
         label = str(path.relative_to(evidence))
         try:
+            receipt = json.loads((path.parent / 'status.json').read_text())
+            workload = json.loads((path.parent / 'php-workload.json').read_text())
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if (receipt.get('php_profile') != 'captured' or receipt.get('php_profile_sha256') != digest
+                    or workload.get('status') != 'ok' or workload.get('warmups') != 1
+                    or not isinstance(workload.get('iterations'), int) or workload['iterations'] < 1
+                    or workload.get('verified_calls') != workload['iterations'] + 1):
+                raise ValueError('Missing, failed or mismatched workload/profile verification receipt')
             profile = read_callgrind(path)
             total = profile['total_self_cost']
             rows = sorted(profile['functions'].items(), key=lambda item: item[1], reverse=True)[:20]

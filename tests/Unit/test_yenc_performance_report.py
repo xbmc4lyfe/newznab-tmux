@@ -1,4 +1,6 @@
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -81,6 +83,31 @@ calls=2 10
         svg = self.report.bar_svg('a < b', [('decode<script>', 4.0)], 'self cost')
         self.assertNotIn('<script>', svg)
         self.assertIn('decode&lt;script&gt;', svg)
+
+    def test_failed_or_unmatched_workload_receipts_cannot_produce_valid_hotpaths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            profile_dir = evidence / 'profiles' / 'cpp-strict'
+            profile_dir.mkdir(parents=True)
+            profile = profile_dir / 'php.callgrind'
+            profile.write_text('events: Time_(10ns)\nfl=/app.php\nfn=decode\n1 200\n')
+            receipt = {'php_profile': 'captured', 'php_profile_sha256': hashlib.sha256(profile.read_bytes()).hexdigest()}
+            (profile_dir / 'status.json').write_text(json.dumps(receipt))
+            workload = {'status': 'ok', 'verified_calls': 3, 'iterations': 2, 'warmups': 1}
+            for bad in [dict(workload, status='invalid'), dict(workload, verified_calls=2)]:
+                (profile_dir / 'php-workload.json').write_text(json.dumps(bad))
+                output = evidence / 'visualization'
+                self.report.render(evidence, output)
+                self.assertEqual('invalid', json.loads((output / 'status.json').read_text())['profiles'][0]['status'])
+                self.assertFalse((output / 'hotpaths-0.svg').exists())
+            (profile_dir / 'php-workload.json').write_text(json.dumps(workload))
+            self.report.render(evidence, output)
+            self.assertEqual('ok', json.loads((output / 'status.json').read_text())['profiles'][0]['status'])
+            self.assertTrue((output / 'hotpaths-0.svg').exists())
+            profile.write_text(profile.read_text() + '2 100\n')
+            self.report.render(evidence, output)
+            self.assertEqual('invalid', json.loads((output / 'status.json').read_text())['profiles'][0]['status'])
+            self.assertFalse((output / 'hotpaths-0.svg').exists())
 
 
 if __name__ == '__main__':

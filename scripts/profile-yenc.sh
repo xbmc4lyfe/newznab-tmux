@@ -32,6 +32,17 @@ git -C "$flamegraph" rev-parse HEAD > "$profile_build/flamegraph-revision.txt"
 XDEBUG_MODE=off php --ri xdebug > "$profile_build/xdebug-version.txt"
 sha256sum "$profile_build/cpp/librapidyenc.so" "$profile_build/rust/release/libnzbyenc.so" \
     scripts/profile-yenc.php scripts/profile-yenc.sh > "$profile_build/profile-identities.sha256"
+# A harmless separate preflight distinguishes unavailable kernel sampling from
+# a crash/timeout of an admitted workload. Preserve both stdout and exit status.
+perf_available=0
+if timeout --kill-after=5s 15s sudo -n "$perf_binary" record -e cpu-clock -F 99 \
+    -o "$profile_build/perf-preflight.data" -- /bin/sleep 0.1 \
+    > "$profile_build/perf-preflight.stdout" 2> "$profile_build/perf-preflight.stderr"; then
+    perf_available=1
+fi
+if [[ -f "$profile_build/perf-preflight.data" ]]; then
+    sudo -n chmod a+r "$profile_build/perf-preflight.data"
+fi
 invalid=0
 for backend in cpp rust; do
     if [[ "$backend" == cpp ]]; then
@@ -45,19 +56,24 @@ for backend in cpp rust; do
             mkdir -p "$directory"
             args=(scripts/profile-yenc.php "--native=$library" "--path=$path" \
                 --size=524288 "--density=$density" --iterations=400)
-            if ! timeout --kill-after=5s 90s env XDEBUG_MODE=profile php -d ffi.enable=true \
+            php_exit=0
+            timeout --kill-after=5s 90s env XDEBUG_MODE=profile php -d ffi.enable=true \
                 -d memory_limit=1G -d xdebug.start_with_request=yes -d xdebug.use_compression=0 \
                 "-d xdebug.output_dir=$directory" -d xdebug.profiler_output_name=php.callgrind \
-                "${args[@]}" > "$directory/php-workload.json" 2> "$directory/php.stderr"; then
-                invalid=1
-            fi
+                "${args[@]}" > "$directory/php-workload.json" 2> "$directory/php.stderr" || php_exit=$?
             # perf needs kernel access on hosted runners. sudo is confined to this
             # disposable job; unavailable counters are retained as such, never a pass.
-            if timeout --kill-after=5s 90s sudo -n env XDEBUG_MODE=off "$perf_binary" record \
+            native_exit=unavailable
+            if [[ "$perf_available" == 1 ]]; then
+              native_exit=0
+              timeout --kill-after=5s 90s sudo -n env XDEBUG_MODE=off "$perf_binary" record \
                 -e cpu-clock -F 99 --call-graph dwarf,16384 -o "$directory/perf.data" -- \
                 "$(command -v php)" -d ffi.enable=true -d memory_limit=1G "${args[@]}" \
-                > "$directory/native-workload.json" 2> "$directory/perf.stderr"; then
-                sudo -n chmod a+r "$directory/perf.data"
+                > "$directory/native-workload.json" 2> "$directory/perf.stderr" || native_exit=$?
+              if [[ -f "$directory/perf.data" ]]; then
+                  sudo -n chmod a+r "$directory/perf.data"
+              fi
+              if [[ "$native_exit" == 0 ]]; then
                 # Caller owns the redirected stack output; sudo only reads perf.data.
                 # shellcheck disable=SC2024
                 sudo -n "$perf_binary" script -i "$directory/perf.data" > "$directory/perf.stacks" 2> "$directory/perf-script.stderr"
@@ -66,11 +82,14 @@ for backend in cpp rust; do
                     perl "$flamegraph/flamegraph.pl" --title "$backend / $density / $path — whole-process CPU samples" \
                         "$directory/native.folded" > "$directory/native.svg"
                 fi
+              fi
             fi
             # Keep workload correctness distinct from sampler availability.
-            if ! python3 - "$directory" <<'PY'
-import json, pathlib, sys
+            if ! python3 - "$directory" "$native_exit" "$php_exit" <<'PY'
+import hashlib, json, pathlib, sys
 directory = pathlib.Path(sys.argv[1])
+native_exit = sys.argv[2]
+php_exit = sys.argv[3]
 def workload(name):
     try:
         result = json.loads((directory / name).read_text())
@@ -85,15 +104,18 @@ samples = sum(int(line.rsplit(' ', 1)[1]) for line in folded.read_text().splitli
 matched = bool(php and native and all(php[key] == native[key] for key in
     ('input_sha256', 'output_sha256', 'wire_sha256', 'verified_calls', 'size', 'iterations')))
 status = {
-    'php_profile': 'captured' if php and callgrind.is_file() and callgrind.stat().st_size else 'invalid',
-    'native_profile': 'captured' if matched and samples and (directory / 'native.svg').is_file() else 'unavailable',
+    'php_profile': 'captured' if php_exit == '0' and php and callgrind.is_file() and callgrind.stat().st_size else 'invalid',
+    'native_profile': 'unavailable' if native_exit == 'unavailable' else (
+        'captured' if native_exit == '0' and matched and samples and (directory / 'native.svg').is_file() else 'invalid'),
     'native_samples': samples, 'workload_identity_matches': matched,
+    'native_exit': native_exit, 'php_exit': php_exit,
+    'php_profile_sha256': hashlib.sha256(callgrind.read_bytes()).hexdigest() if callgrind.is_file() else None,
     'boundary': 'Whole-process profiles include setup and exact-output verification; diagnostic builds differ from timed builds.',
     'claim': 'Call-cost attribution only. No latency or production-capacity conclusion from instrumented runs.',
 }
 (directory / 'status.json').write_text(json.dumps(status, indent=2) + '\n')
 # perf failure can be a platform restriction; a decoded correctness failure is fatal.
-if status['php_profile'] == 'invalid' or (native is None and (directory / 'native-workload.json').stat().st_size):
+if status['php_profile'] == 'invalid' or (native_exit != 'unavailable' and (native_exit != '0' or not matched)):
     raise SystemExit(1)
 PY
             then
