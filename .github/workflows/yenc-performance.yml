@@ -438,7 +438,7 @@ jobs:
           PY
 
       - name: Capture CPU counters before caller profile
-        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/profile-cpu-before.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output processing-evidence/build/profile-cpu-before.json
 
       - name: Profile actual BODY assembly and metadata callers
         shell: bash
@@ -451,11 +451,11 @@ jobs:
 
       - name: Capture CPU counters after caller profile
         if: always() && hashFiles('processing-evidence/build/profile-cpu-before.json') != ''
-        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/profile-cpu-after.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output processing-evidence/build/profile-cpu-after.json
 
       - name: Capture CPU counters before paired caller comparison
         if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
-        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/paired-cpu-before.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output processing-evidence/build/paired-cpu-before.json
 
       - name: Compare full fingerprint caller against frozen baseline
         if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
@@ -475,7 +475,7 @@ jobs:
 
       - name: Capture CPU counters after paired caller comparison
         if: always() && hashFiles('processing-evidence/build/paired-cpu-before.json') != ''
-        run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/paired-cpu-after.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output processing-evidence/build/paired-cpu-after.json
 
       - name: Summarize caller screen without claiming adoption
         if: always()
