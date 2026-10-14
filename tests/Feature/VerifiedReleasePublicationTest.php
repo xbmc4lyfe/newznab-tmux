@@ -11,6 +11,7 @@ use App\Services\ReleaseCreationService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\PublicationTiming;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedNzbWriter;
@@ -18,12 +19,49 @@ use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\DataProvider;
 
 class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
 {
+    public function test_timing_does_not_log_after_a_failed_commit_leaves_pdo_in_a_transaction(): void
+    {
+        config(['release_verification.publication_timing_sample_every' => 1]);
+        DB::statement('PRAGMA foreign_keys = ON');
+        DB::statement('CREATE TABLE timing_parents (id INTEGER PRIMARY KEY)');
+        DB::statement('CREATE TABLE timing_children (parent_id INTEGER REFERENCES timing_parents(id) DEFERRABLE INITIALLY DEFERRED)');
+        $pdo = DB::connection()->getPdo();
+        $timing = PublicationTiming::sample();
+        $this->assertNotNull($timing);
+        Log::spy();
+
+        try {
+            try {
+                DB::transaction(function () use ($timing): void {
+                    $timing->beginAttempt();
+                    $timing->nextPhase('sql_accounting');
+                    DB::statement('INSERT INTO timing_children (parent_id) VALUES (123)');
+                    $timing->endAttempt(true);
+                }, 5);
+                $this->fail('The deferred foreign key must fail at commit.');
+            } catch (\PDOException $exception) {
+                $this->assertStringContainsString('FOREIGN KEY constraint failed', $exception->getMessage());
+            } finally {
+                $timing->report('threw');
+            }
+
+            $this->assertSame(0, DB::transactionLevel());
+            $this->assertTrue($pdo->inTransaction());
+            Log::shouldNotHaveReceived('info');
+        } finally {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+        }
+    }
+
     public function test_sized_headers_are_archived_instead_of_published(): void
     {
         config(['release_verification.required' => true]);
@@ -42,7 +80,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         $this->assertFalse(DB::table('collections')->where('id', $id)->exists());
     }
 
-    /** @return array<string, array{0: ?int, 1: int, 2: ?string, 3?: ?string, 4?: list<string>}> */
+    /** @return array<string, array{0: ?int, 1: int, 2: ?string, 3?: ?string, 4?: list<string>, 5?: ?string}> */
     public static function verifiedSizes(): array
     {
         return [
@@ -72,12 +110,19 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             'database insert failure removes new NZB' => [12345, 12345, null, 'insert'],
             'database retry removes rolled-back NZB' => [12345, 12345, null, 'retry'],
             'after commit failure preserves published NZB' => [12345, 12345, null, 'after_commit'],
+            'disabled publication timing emits nothing' => [12345, 12345, null, null, ['alt.test'], 'disabled'],
+            'sampled publication timing separates ordered phases outside transaction' => [12345, 12345, null, null, ['alt.test'], 'enabled'],
+            'sampled duplicate retains publication behavior' => [12345, 12345, 'exact', null, ['alt.test'], 'enabled'],
+            'sampled retry records distinct attempts' => [12345, 12345, null, 'retry', ['alt.test'], 'enabled'],
+            'timing logger failure preserves committed publication' => [12345, 12345, null, null, ['alt.test'], 'throw_logger'],
+            'timing logger failure preserves after commit exception' => [12345, 12345, null, 'after_commit', ['alt.test'], 'throw_logger'],
+            'publication timing skips outer transactions' => [12345, 12345, null, null, ['alt.test'], 'nested'],
         ];
     }
 
     /** @param list<string> $groupNames */
     #[DataProvider('verifiedSizes')]
-    public function test_successful_download_publishes_exact_verified_nzb_once(?int $verifiedBytes, int $expectedSize, ?string $duplicateKind, ?string $failure = null, array $groupNames = ['alt.test']): void
+    public function test_successful_download_publishes_exact_verified_nzb_once(?int $verifiedBytes, int $expectedSize, ?string $duplicateKind, ?string $failure = null, array $groupNames = ['alt.test'], ?string $timingMode = null): void
     {
         config(['nntmux.release_dedupe_enabled' => $duplicateKind !== null, 'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
         app('files')->ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
@@ -260,8 +305,44 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 }
             });
         }
+        $timingReports = [];
+        $stateAcquiredAt = null;
+        $afterCommitStartedAt = null;
+        $afterCommitDuration = null;
+        if ($timingMode !== null) {
+            config(['release_verification.publication_timing_sample_every' => $timingMode === 'disabled' ? 0 : 1]);
+            if ($timingMode === 'enabled' && $duplicateKind === null && $failure === null) {
+                DB::listen(function (QueryExecuted $event) use (&$stateAcquiredAt, &$afterCommitStartedAt, &$afterCommitDuration): void {
+                    if ($stateAcquiredAt !== null || ! str_starts_with($event->sql, 'select * from "release_verification_state"')) {
+                        return;
+                    }
+                    usleep(2000);
+                    $stateAcquiredAt = hrtime(true);
+                    DB::afterCommit(function () use (&$afterCommitStartedAt, &$afterCommitDuration): void {
+                        $afterCommitStartedAt = hrtime(true);
+                        usleep(10000);
+                        $afterCommitDuration = hrtime(true) - $afterCommitStartedAt;
+                    });
+                });
+            }
+            Log::shouldReceive('warning')->andReturnNull();
+            Log::shouldReceive('info')->andReturnUsing(function (string $message, array $context) use (&$timingReports, $timingMode): void {
+                $this->assertSame('Verified release publication timing.', $message);
+                $this->assertSame(0, DB::transactionLevel(), 'Timing logs must be emitted after the publication transaction ends.');
+                $timingReports[] = $context;
+                if ($timingMode === 'throw_logger') {
+                    throw new \RuntimeException('forced timing logger failure');
+                }
+            });
+            if ($timingMode === 'nested') {
+                DB::beginTransaction();
+            }
+        }
         try {
             $id = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
+            if ($timingMode === 'nested') {
+                DB::commit();
+            }
             $this->assertNotContains($failure, ['insert', 'after_commit', 'legacy_changed', 'legacy_missing', 'legacy_update', 'legacy_forged', 'legacy_omitted', 'scan_lease_lost']);
         } catch (\Throwable $error) {
             if ($failure === 'scan_lease_lost') {
@@ -339,8 +420,50 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(1, (int) $release->nzbstatus);
         $this->assertSame($expectedSize, (int) $release->size);
         $this->assertSame($id, (int) DB::table('release_verification_candidates')->value('release_id'));
+        if ($timingMode !== null) {
+            if (in_array($timingMode, ['disabled', 'nested'], true)) {
+                $this->assertSame([], $timingReports);
+            } else {
+                $this->assertCount(1, $timingReports);
+                $report = $timingReports[0];
+                $this->assertSame(['status', 'total_ns', 'attempts'], array_keys($report));
+                $this->assertSame($failure === 'after_commit' ? 'threw' : 'returned', $report['status']);
+                $this->assertCount($failure === 'retry' ? 2 : 1, $report['attempts']);
+                $attempt = $report['attempts'][array_key_last($report['attempts'])];
+                $this->assertSame(['state_lock_acquisition', 'candidate_policy', 'metadata_size', 'archive_legacy',
+                    'incoming_xml_fingerprint', 'duplicate_search_revalidation', ...($duplicateKind === 'exact' ? [] : ['final_xml_gzip', 'durable_install']),
+                    'sql_accounting'], array_keys($attempt['phases_ns']));
+                $this->assertSame('returned', $attempt['callback_status']);
+                $this->assertGreaterThanOrEqual(0, $attempt['transaction_finalization_ns']);
+                $this->assertGreaterThanOrEqual(array_sum($attempt['phases_ns']), $report['total_ns']);
+                if ($afterCommitDuration !== null) {
+                    $this->assertGreaterThanOrEqual(2000000, $attempt['phases_ns']['state_lock_acquisition']);
+                    $this->assertGreaterThanOrEqual($afterCommitDuration, $attempt['transaction_finalization_ns']);
+                    $this->assertLessThanOrEqual($afterCommitStartedAt - $stateAcquiredAt, $attempt['callback_after_state_lock_ns'],
+                        'After-commit work must not be attributed to the callback span following state lock acquisition.');
+                }
+                if ($failure === 'retry') {
+                    $this->assertSame('threw', $report['attempts'][0]['callback_status']);
+                    $this->assertArrayHasKey('sql_accounting', $report['attempts'][0]['phases_ns']);
+                }
+                $this->assertStringNotContainsString('Movie', json_encode($report, JSON_THROW_ON_ERROR));
+                $this->assertStringNotContainsString('verified@article', json_encode($report, JSON_THROW_ON_ERROR));
+                $this->assertStringNotContainsString($release->guid, json_encode($report, JSON_THROW_ON_ERROR));
+            }
+        }
         $this->expectException(\RuntimeException::class);
-        app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Duplicate stale claim', $manifest));
+        try {
+            app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Duplicate stale claim', $manifest));
+        } catch (\RuntimeException $error) {
+            if ($timingMode === 'enabled') {
+                $this->assertCount(2, $timingReports);
+                $this->assertSame('threw', $timingReports[1]['status']);
+                $this->assertSame(['state_lock_acquisition', 'candidate_policy'], array_keys($timingReports[1]['attempts'][0]['phases_ns']));
+            }
+            $this->assertSame('Stale verification result cannot publish.', $error->getMessage());
+
+            throw $error;
+        }
     }
 
     public function test_published_candidate_scan_uses_fixed_upper_id_when_new_matches_arrive(): void

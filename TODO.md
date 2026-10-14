@@ -1,5 +1,14 @@
 # To do
 
+## Retest publication phase timing (2026-10-14)
+
+Publication timing is opt-in and reports aggregate durations after the outer transaction. State-lock acquisition includes query/network overhead; callback time after acquisition excludes commit/after-commit finalization. These measurements identify candidates for optimization, not a proven throughput improvement.
+
+- [ ] Run the full PHPUnit suite, native parity and required CI checks on the final synchronized fork master. Focused publication checks do not replace the full retest.
+- [ ] Retest real MariaDB retries, lock waits, nested transactions, rollback and after-commit failure with timing both enabled and disabled in an isolated runtime. Confirm diagnostic failures cannot change publication, artifact ownership or accounting.
+- [ ] Compare natural publication phase distributions with queue, collection/capacity wait graphs and fresh NZB-bearing release counts under comparable load. Retain slow windows, workload changes and deployment downtime; distinguish callback duration from actual server lock hold and separately account for manifest cleanup transactions.
+- [ ] After any optimization, independently verify newly emitted complete article inventories and source/image parity, service health and M4 TLS connectivity. Keep full payload reconstruction qualification separate from bounded spot checks.
+
 ## Qualify mapped archive article reuse (2026-10-14)
 
 Avoid downloading a mapped archive's first article twice within one additional-processing release scope. Retain only complete primary-provider BODY results with checksum-qualified yEnc framing and an independently matched PAR2 file entry. Preserve ordered prefix/error behavior, provider fallback, release scope and group binding, aggregate-cache priority, and the shared cache limits. Cache admission failure must retain the existing download path. Publication remains on the approved bounded spot-check contract.
