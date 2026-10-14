@@ -473,10 +473,26 @@ fn article_float_py(n: f64) -> String {
 }
 fn article_summary(root: &Path, output: impl FnOnce() -> Result<std::path::PathBuf>) -> Result<()> {
     let input = root.join("processing-evidence/paired/observations.jsonl");
-    let text = if input.exists() {
-        fs::read_to_string(input)?
-    } else {
-        String::new()
+    let text = match fs::metadata(&input) {
+        Ok(_) => fs::read_to_string(input)?,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            String::new()
+        }
+        // Python 3.11 Path.exists also treats EBADF and ELOOP as absence.
+        // ELOOP is 40 on the workflow's Linux and 62 on local macOS/BSD.
+        Err(error)
+            if error.raw_os_error() == Some(9)
+                || error.raw_os_error()
+                    == Some(if cfg!(target_os = "linux") { 40 } else { 62 }) =>
+        {
+            String::new()
+        }
+        Err(error) => return Err(error.into()),
     };
     let rows = splitlines(&text)
         .into_iter()
@@ -1135,6 +1151,47 @@ mod tests {
             (f64::NAN, "nan"),
         ] {
             assert_eq!(article_float_py(number), text);
+        }
+    }
+
+    #[test]
+    fn article_unsearchable_input_parent_fails_without_opening_summary() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.write("processing-evidence/paired/observations.jsonl", ARTICLE_ROW);
+        f.write("article-summary", "keep\n");
+        let parent = f.0.join("processing-evidence");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root-capable build runners can traverse mode-000 directories. The
+        // separate non-root caller oracle must exercise this failure branch.
+        let denied = fs::metadata(parent.join("paired/observations.jsonl"))
+            .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied);
+        if !denied {
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let result = article_report(&f, None);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(f.read("article-summary"), "keep\n");
+    }
+    #[test]
+    fn article_missing_paths_keep_python_nondirectory_and_symlink_loop_semantics() {
+        use std::os::unix::fs::symlink;
+        for case in 0..3 {
+            let f = Fixture::new();
+            match case {
+                0 => f.write("processing-evidence", "regular file, not directory"),
+                1 => symlink("absent", f.0.join("processing-evidence")).unwrap(),
+                _ => symlink("processing-evidence", f.0.join("processing-evidence")).unwrap(),
+            }
+            article_report(&f, None).unwrap();
+            assert_eq!(
+                f.read("article-summary"),
+                format!(
+                    "{ARTICLE_HEADER}\nResult: `profile only or setup incomplete`{ARTICLE_FOOTER}"
+                )
+            );
         }
     }
 }
