@@ -26,6 +26,176 @@ const fn removal_indexes<const POSITIONS: usize>(removed: usize) -> [[u8; 16]; P
 static SINGLE_REMOVAL_INDEXES: [[u8; 16]; 16] = removal_indexes::<16>(1);
 static PAIR_REMOVAL_INDEXES: [[u8; 16]; 15] = removal_indexes::<15>(2);
 
+const fn double_removal_indexes() -> [[u8; 16]; 256] {
+    let mut table = [[255; 16]; 256];
+    let mut first = 0;
+    while first < 15 {
+        let mut second = first + 1;
+        while second < 16 {
+            let mut input = 0;
+            let mut output = 0;
+            while input < 16 {
+                if input != first && input != second {
+                    table[first * 16 + second][output] = input as u8;
+                    output += 1;
+                }
+                input += 1;
+            }
+            second += 1;
+        }
+        first += 1;
+    }
+    table
+}
+
+static DOUBLE_REMOVAL_INDEXES: [[u8; 16]; 256] = double_removal_indexes();
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn neon_pairwise_add(
+    left: std::arch::aarch64::uint8x16_t,
+    right: std::arch::aarch64::uint8x16_t,
+) -> std::arch::aarch64::uint8x16_t {
+    let result;
+    // Keep each reduction as one ADDP. LLVM otherwise replaces additions of
+    // disjoint mask bits with two unzips and OR, tripling this reduction chain.
+    // SAFETY: NEON is enabled. ADDP reads both inputs before writing its result,
+    // touches no memory or flags, and initializes all sixteen output bytes.
+    unsafe {
+        std::arch::asm!(
+            "addp {result:v}.16b, {left:v}.16b, {right:v}.16b",
+            result = lateout(vreg) result,
+            left = in(vreg) left,
+            right = in(vreg) right,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn neon_group_masks(
+    special: [std::arch::aarch64::uint8x16_t; 4],
+    equals: [std::arch::aarch64::uint8x16_t; 4],
+) -> (u64, u64) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let weights =
+            vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+        let pack = |masks: [uint8x16_t; 4]| {
+            neon_pairwise_add(
+                neon_pairwise_add(vandq_u8(masks[0], weights), vandq_u8(masks[1], weights)),
+                neon_pairwise_add(vandq_u8(masks[2], weights), vandq_u8(masks[3], weights)),
+            )
+        };
+        // The last reduction packs four independent little-endian u16 masks
+        // in each u64. No addition crosses an eight-byte mask boundary.
+        let combined = vreinterpretq_u64_u8(neon_pairwise_add(pack(special), pack(equals)));
+        (vgetq_lane_u64::<0>(combined), vgetq_lane_u64::<1>(combined))
+    }
+}
+
+#[inline]
+fn ordinary_sparse_mask(remove: u16) -> bool {
+    let remainder = remove & remove.wrapping_sub(1);
+    remainder == 0 || remainder.is_power_of_two()
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn decode_neon_group_sparse_lane(
+    bytes: std::arch::aarch64::uint8x16_t,
+    equals: std::arch::aarch64::uint8x16_t,
+    remove: u16,
+    destination: *mut u8,
+    incoming: bool,
+    final_lane: bool,
+) -> usize {
+    use std::arch::aarch64::*;
+    unsafe {
+        let adjustment = vorrq_u8(
+            vandq_u8(vextq_u8(vdupq_n_u8(0), equals, 15), vdupq_n_u8(64)),
+            vsetq_lane_u8::<0>(u8::from(incoming) << 6, vdupq_n_u8(0)),
+        );
+        let decoded = vsubq_u8(bytes, vaddq_u8(vdupq_n_u8(42), adjustment));
+        if remove == 0 {
+            vst1q_u8(destination, decoded);
+            return 16;
+        }
+        let position = remove.trailing_zeros() as usize;
+        let single = remove.is_power_of_two();
+        // SAFETY: the group qualifies every nonzero mask before any store.
+        // Single masks have position <= 15. Two-bit masks have distinct ordered
+        // positions 0 <= first < second <= 15, making first * 16 + second < 256.
+        let (indexes, count) = if single {
+            (SINGLE_REMOVAL_INDEXES.get_unchecked(position).as_ptr(), 15)
+        } else {
+            let second = (remove & remove.wrapping_sub(1)).trailing_zeros() as usize;
+            (
+                DOUBLE_REMOVAL_INDEXES
+                    .get_unchecked(position * 16 + second)
+                    .as_ptr(),
+                14,
+            )
+        };
+        let compact = vqtbl1q_u8(decoded, vld1q_u8(indexes));
+        if !final_lane {
+            // Every qualified lane emits 14..16 bytes. These first three full
+            // stores lie inside the final group prefix, and later lanes replace
+            // their surplus bytes. The final lane must store exactly its count.
+            vst1q_u8(destination, compact);
+        } else {
+            vst1_u8(destination, vget_low_u8(compact));
+            if single {
+                vst1_u8(
+                    destination.add(7),
+                    vget_low_u8(vextq_u8(compact, compact, 7)),
+                );
+            } else {
+                vst1_u8(
+                    destination.add(6),
+                    vget_low_u8(vextq_u8(compact, compact, 6)),
+                );
+            }
+        }
+        count
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+unsafe fn decode_neon_group_fallback(
+    first: std::arch::aarch64::uint8x16_t,
+    second: std::arch::aarch64::uint8x16_t,
+    third: std::arch::aarch64::uint8x16_t,
+    fourth: std::arch::aarch64::uint8x16_t,
+    destination: *mut u8,
+    mut escaped: bool,
+) -> (usize, bool) {
+    use std::arch::aarch64::*;
+    let mut written = 0;
+    unsafe {
+        let lookup = vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr());
+        for bytes in [first, second, third, fourth] {
+            let equals = vceqq_u8(bytes, vdupq_n_u8(b'='));
+            let special = vqtbx1q_u8(equals, lookup, bytes);
+            written += decode_neon_block(
+                bytes,
+                equals,
+                special,
+                destination.add(written),
+                &mut escaped,
+            );
+        }
+    }
+    (written, escaped)
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
@@ -235,6 +405,81 @@ unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: u
     unsafe {
         let offset = vdupq_n_u8(42);
         let lookup = vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr());
+        while length - read >= 64 {
+            while length - read >= 64 && matches!(source.add(read).read(), b'\r' | b'\n') {
+                read += 1;
+            }
+            if length - read < 64 {
+                break;
+            }
+            // Preload all four lanes before any write. Output <= 64 preserves
+            // in-place/behind overlap; destination-ahead still uses the caller's
+            // snapshot. The sparse path qualifies the whole group before writes.
+            let bytes = [
+                vld1q_u8(source.add(read)),
+                vld1q_u8(source.add(read + 16)),
+                vld1q_u8(source.add(read + 32)),
+                vld1q_u8(source.add(read + 48)),
+            ];
+            let equals = bytes.map(|lane| vceqq_u8(lane, vdupq_n_u8(b'=')));
+            let special = std::array::from_fn(|lane| vqtbx1q_u8(equals[lane], lookup, bytes[lane]));
+            let any_special = vorrq_u8(
+                vorrq_u8(special[0], special[1]),
+                vorrq_u8(special[2], special[3]),
+            );
+            if !escaped && !neon_mask_has_nonzero(any_special) {
+                for (lane, value) in bytes.into_iter().enumerate() {
+                    vst1q_u8(
+                        destination.add(written + lane * 16),
+                        vsubq_u8(value, offset),
+                    );
+                }
+                written += 64;
+            } else {
+                let (remove, markers) = neon_group_masks(special, equals);
+                let masks = [
+                    remove as u16,
+                    (remove >> 16) as u16,
+                    (remove >> 32) as u16,
+                    (remove >> 48) as u16,
+                ];
+                // Whole-word adjacency also checks carries between lanes.
+                // Keep real carry and destination unchanged until all four
+                // masks qualify; rejected groups use the original state.
+                if remove & ((markers << 1) | u64::from(escaped)) == 0
+                    && masks.into_iter().all(ordinary_sparse_mask)
+                {
+                    for lane in 0..4 {
+                        let incoming = if lane == 0 {
+                            escaped
+                        } else {
+                            (markers >> (lane * 16 - 1)) & 1 != 0
+                        };
+                        written += decode_neon_group_sparse_lane(
+                            bytes[lane],
+                            equals[lane],
+                            masks[lane],
+                            destination.add(written),
+                            incoming,
+                            lane == 3,
+                        );
+                    }
+                    escaped = markers >> 63 != 0;
+                } else {
+                    let (count, next_escaped) = decode_neon_group_fallback(
+                        bytes[0],
+                        bytes[1],
+                        bytes[2],
+                        bytes[3],
+                        destination.add(written),
+                        escaped,
+                    );
+                    written += count;
+                    escaped = next_escaped;
+                }
+            }
+            read += 64;
+        }
         while length - read >= 16 {
             // Consume leading CR/LF without consuming escape state. A lone LF
             // also restores alignment after a line with an odd encoded length.
@@ -645,6 +890,194 @@ mod tests {
         expected.extend_from_slice(&[66; 15]);
         expected.push(19);
         verify_regular_guards(&payload, &expected);
+    }
+
+    #[test]
+    fn ordinary_group_qualifies_only_masks_with_at_most_two_removed_bytes() {
+        for mask in 0..=u16::MAX {
+            assert_eq!(
+                ordinary_sparse_mask(mask),
+                mask.count_ones() <= 2,
+                "{mask:04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_group_two_separated_removals_preserve_literal_guards() {
+        for lane in 0..4 {
+            for first in 0..15 {
+                for second in first + 1..16 {
+                    let mut payload = b"klmnopqrstuvwxyz".repeat(4);
+                    payload[lane * 16 + first] = b'\r';
+                    payload[lane * 16 + second] = b'\n';
+                    // Distinct literal output positions catch dropped, repeated
+                    // or reordered indexes that uniform bytes cannot detect.
+                    let mut expected = b"ABCDEFGHIJKLMNOP".repeat(4);
+                    expected.remove(lane * 16 + second);
+                    expected.remove(lane * 16 + first);
+                    verify_regular_guards(&payload, &expected);
+                    for destination_start in [65, 71, 80, 96, 127] {
+                        let mut storage = vec![0xa5; 192];
+                        storage[64..128].copy_from_slice(&payload);
+                        let original = storage.clone();
+                        let written = unsafe {
+                            crate::payload_decoder::decode_into(
+                                storage.as_ptr().add(64),
+                                storage.as_mut_ptr().add(destination_start),
+                                payload.len(),
+                            )
+                        };
+                        assert_eq!(written, expected.len());
+                        assert_eq!(
+                            &storage[destination_start..destination_start + written],
+                            expected,
+                        );
+                        assert_eq!(
+                            &storage[..destination_start],
+                            &original[..destination_start]
+                        );
+                        assert_eq!(
+                            &storage[destination_start + written..],
+                            &original[destination_start + written..],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_group_mask_positions_match_literal_byte_offsets() {
+        use std::arch::aarch64::*;
+        for byte in *b"=\r\n" {
+            for position in 0..64 {
+                let mut payload = [b'k'; 64];
+                payload[position] = byte;
+                unsafe {
+                    let lookup =
+                        vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr());
+                    let bytes = std::array::from_fn::<_, 4, _>(|lane| {
+                        vld1q_u8(payload.as_ptr().add(lane * 16))
+                    });
+                    let equals = bytes.map(|lane| vceqq_u8(lane, vdupq_n_u8(b'=')));
+                    let special =
+                        std::array::from_fn(|lane| vqtbx1q_u8(equals[lane], lookup, bytes[lane]));
+                    let (remove, markers) = neon_group_masks(special, equals);
+                    assert_eq!(remove, 1u64 << position, "byte {byte}, offset {position}");
+                    assert_eq!(markers, if byte == b'=' { 1u64 << position } else { 0 });
+                }
+            }
+        }
+
+        let mut mixed = [b'k'; 64];
+        for (position, byte) in [
+            (7, b'='),
+            (8, b'\n'),
+            (15, b'\r'),
+            (16, b'='),
+            (31, b'='),
+            (32, b'\n'),
+            (47, b'\r'),
+            (48, b'='),
+            (63, b'='),
+        ] {
+            mixed[position] = byte;
+        }
+        for (payload, expected_remove, expected_markers) in [
+            ([b'k'; 64], 0, 0),
+            ([b'='; 64], u64::MAX, u64::MAX),
+            ([b'\n'; 64], u64::MAX, 0),
+            (mixed, 0x8001_8001_8001_8180, 0x8001_0000_8001_0080),
+        ] {
+            unsafe {
+                let lookup =
+                    vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr());
+                let bytes = std::array::from_fn::<_, 4, _>(|lane| {
+                    vld1q_u8(payload.as_ptr().add(lane * 16))
+                });
+                let equals = bytes.map(|lane| vceqq_u8(lane, vdupq_n_u8(b'=')));
+                let special =
+                    std::array::from_fn(|lane| vqtbx1q_u8(equals[lane], lookup, bytes[lane]));
+                assert_eq!(
+                    neon_group_masks(special, equals),
+                    (expected_remove, expected_markers)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_group_sparse_stores_preserve_literal_prefix_and_suffix() {
+        let lanes = b"kk\r\nkkkkkkkkkkkklllllllllllllll=mmmmmmmm\r\nmmmmmmnnnnnnnnnnnnnnn\n";
+        assert_eq!(lanes.len(), 64);
+        for incoming in [false, true] {
+            for prefix_newlines in [0, 1, 15] {
+                for tail in 0..18 {
+                    let mut payload = vec![b'\n'; prefix_newlines];
+                    let mut expected = Vec::new();
+                    if incoming {
+                        payload.extend_from_slice(&[b'k'; 63]);
+                        payload.push(b'=');
+                        expected.extend_from_slice(&[65; 63]);
+                    }
+                    payload.extend_from_slice(lanes);
+                    if incoming {
+                        expected.push(1);
+                        expected.extend_from_slice(&[65; 13]);
+                    } else {
+                        expected.extend_from_slice(&[65; 14]);
+                    }
+                    expected.extend_from_slice(&[66; 15]);
+                    expected.push(3);
+                    expected.extend_from_slice(&[67; 13]);
+                    expected.extend_from_slice(&[68; 15]);
+                    payload.extend_from_slice(&vec![b'k'; tail]);
+                    expected.extend_from_slice(&vec![65; tail]);
+                    verify_regular_guards(&payload, &expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_group_last_lane_rejection_preserves_original_carry_and_guards() {
+        let mut zero_tail = b"kkkkkkkkkkkkkk\r\n".repeat(3);
+        zero_tail.extend_from_slice(&[b'\n'; 16]);
+        verify_regular_guards(&zero_tail, &[65; 42]);
+
+        let mut pending_into_rejection = vec![b'k'; 63];
+        pending_into_rejection.push(b'=');
+        pending_into_rejection.extend_from_slice(&zero_tail);
+        let mut pending_expected = vec![65; 63];
+        pending_expected.push(1);
+        pending_expected.extend_from_slice(&[65; 41]);
+        verify_regular_guards(&pending_into_rejection, &pending_expected);
+
+        let mut consumed_final_marker = vec![b'k'; 62];
+        consumed_final_marker.extend_from_slice(b"==");
+        let mut consumed_expected = vec![65; 62];
+        consumed_expected.push(211);
+        verify_regular_guards(&consumed_final_marker, &consumed_expected);
+
+        let mut incoming_value = b"kkkkkkkkkkkkkk\r\nllllllllllllllllmmmmmmmmmmmmmmm=".to_vec();
+        incoming_value.extend_from_slice(b"=nnnnnnnnnnnnnnn");
+        let mut expected = vec![65; 14];
+        expected.extend_from_slice(&[66; 16]);
+        expected.extend_from_slice(&[67; 15]);
+        expected.push(211);
+        expected.extend_from_slice(&[68; 15]);
+        verify_regular_guards(&incoming_value, &expected);
+
+        let mut scattered = b"kkkkkkkkkkkkkk\r\n".repeat(3);
+        scattered.extend_from_slice(b"kkkk\nkkkkk\rkkkkk");
+        verify_regular_guards(&scattered, &[65; 56]);
+
+        // Two separated removals now qualify. Three in the final lane must
+        // still reject before any of the preceding full stores can occur.
+        let mut three_removed = b"kkkkkkkkkkkkkk\r\n".repeat(3);
+        three_removed.extend_from_slice(b"kkk\nkkkk\rkkkk\nkk");
+        verify_regular_guards(&three_removed, &[65; 55]);
     }
 
     fn verify_dense(payload: &[u8]) {
