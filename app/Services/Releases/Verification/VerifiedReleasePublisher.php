@@ -13,6 +13,7 @@ use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
+use App\Support\NzbPasswordMetadata;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -100,6 +101,17 @@ final class VerifiedReleasePublisher
                     $duplicateId = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing) : null;
                     if ($duplicateId !== null) {
                         $timing?->nextPhase('sql_accounting');
+                        if (! $this->duplicatePreservesPasswordMetadata($duplicateId, $manifest)) {
+                            // Article reuse must not discard uploader assertions or create the same articles again.
+                            DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
+                                'status' => 'metadata_review', 'reason' => 'Covered release does not preserve supplied metadata; review retained candidate.',
+                                'lease_token' => null, 'lease_until' => null, 'verified_at' => null,
+                            ]);
+
+                            $returned = true;
+
+                            return null;
+                        }
                         $this->recordGroups($duplicateId, $manifest['groups']);
                         app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
                         $this->markPublished($candidate->id, $duplicateId, $result);
@@ -199,6 +211,39 @@ final class VerifiedReleasePublisher
         $repository->heartbeat((int) $claim->id, $claim->lease_token);
 
         return null;
+    }
+
+    /** @param array<string, mixed> $manifest */
+    private function duplicatePreservesPasswordMetadata(int $releaseId, array $manifest): bool
+    {
+        $passwords = $manifest['passwords'] ?? [];
+        if ($passwords === []) {
+            return true;
+        }
+        if (! NzbPasswordMetadata::isValid($passwords)) {
+            return false;
+        }
+        $guid = DB::table('releases')->where('id', $releaseId)->value('guid');
+        if (! is_string($guid) || $guid === '') {
+            return false;
+        }
+        $coverage = new NzbArticleCoverage(app(NzbService::class), $this->duplicates);
+        $incoming = $coverage->parseXml($this->writer->document($manifest));
+        $snapshot = $incoming === null ? null : $coverage->coveredSnapshot($incoming, $guid);
+        $contents = $snapshot?->asXML();
+        if (! is_string($contents)) {
+            return false;
+        }
+        try {
+            $retained = app(NzbManifestReader::class)->read($contents, (object) [
+                'groups_id' => $manifest['groups_id'], 'searchname' => $manifest['subject'],
+                'fromname' => $manifest['fromname'], 'postdate' => $manifest['date'],
+            ]);
+
+            return ($retained['passwords'] ?? []) === $passwords;
+        } catch (Throwable) {
+            return false;
+        }
     }
 
     /** @param list<string> $names */

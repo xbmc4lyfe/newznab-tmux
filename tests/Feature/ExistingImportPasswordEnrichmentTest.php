@@ -1,0 +1,354 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Enums\NzbImportStatus;
+use App\Services\BlacklistService;
+use App\Services\Nzb\NzbImportService;
+use App\Services\Nzb\NzbService;
+use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Services\Releases\Verification\CandidateHeaderInventory;
+use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\ReleaseMetadataResolver;
+use App\Services\Releases\Verification\VerificationResult;
+use App\Services\Releases\Verification\VerifiedNzbWriter;
+use App\Services\Releases\Verification\VerifiedReleasePublisher;
+use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use PHPUnit\Framework\Attributes\DataProvider;
+use Tests\Fixtures\ManifestCompressionProbe;
+
+class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidatesTest
+{
+    public static function scenarios(): array
+    {
+        return array_map(static fn ($mode) => [$mode], ['exact', 'exact-spot', 'appeared-after-advisory', 'appeared-changed-after-advisory', 'capacity', 'password-order', 'changed-date', 'changed-mode', 'changed-subject', 'changed-subject-after-advisory', 'changed-groups', 'changed-bytes', 'changed-file-key', 'conflict', 'stored-conflict', 'corrupt']);
+    }
+
+    #[DataProvider('scenarios')]
+    public function test_actual_public_import_preserves_assertion_on_same_identity(string $mode): void
+    {
+        config(['logging.default' => 'stderr']);
+        $blacklist = $this->createStub(BlacklistService::class);
+        $blacklist->method('isBlackListed')->willReturn(false);
+        $blacklist->method('getAndClearIdsToUpdate')->willReturn([]);
+        $service = new class($blacklist) extends NzbImportService
+        {
+            public function __construct($blacklist)
+            {
+                parent::__construct(['Browser' => true]);
+                $this->blacklistService = $blacklist;
+            }
+
+            protected function getAllGroups(): bool
+            {
+                $this->allGroups = ['alt.test' => 1];
+
+                return true;
+            }
+        };
+        $path = config('release_verification.storage_path').'/incoming.nzb';
+        app('files')->ensureDirectoryExists(dirname($path));
+        $xml = '<nzb><head>%s</head><file poster="poster" date="1" subject="fixture.bin (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">fixture@example.test</segment></segments></file></nzb>';
+        $head = $mode === 'exact-spot' ? '<meta type="nntmux:verification-mode">spot-check</meta>' : '';
+        file_put_contents($path, sprintf($xml, $head));
+        $statuses = [];
+        $callback = static function (array $r) use (&$statuses) {
+            $statuses[] = $r['status'];
+        };
+        $service->beginImport([$path], resultCallback: $callback);
+        $first = DB::table('release_verification_candidates')->first();
+        self::assertNotNull($first);
+        $store = app(ManifestStore::class);
+        $original = $store->read($first->manifest_path);
+        $stored = $original;
+        if ($mode === 'password-order') {
+            $stored['passwords'] = ['second assertion', 'synthetic assertion'];
+        }
+        if ($mode === 'changed-date') {
+            $stored['date'] = '2001-01-01 00:00:00';
+        }
+        if ($mode === 'changed-mode') {
+            $stored['verification_mode'] = 'spot_check';
+        }
+        if (in_array($mode, ['changed-subject', 'changed-subject-after-advisory', 'appeared-changed-after-advisory'], true)) {
+            $stored['subject'] = 'different fixture';
+        }
+        if ($mode === 'changed-groups') {
+            $stored['groups'] = ['alt.other'];
+        }
+        if ($mode === 'changed-bytes') {
+            $stored['files'][0]['segments'][0]['bytes'] = 6;
+        }
+        if ($mode === 'changed-file-key') {
+            $stored['files'][0]['key'] = 'different';
+        }
+        if ($mode === 'stored-conflict') {
+            $stored['conflict'] = true;
+        }
+        $storedPath = $store->write($stored);
+        $storedBytes = filesize($store->path($storedPath));
+        DB::table('release_verification_candidates')->where('id', $first->id)->update(['manifest_path' => $storedPath, 'manifest_hash' => substr($storedPath, 0, 64), 'manifest_bytes' => $storedBytes, 'lease_token' => 'fixture-lease', 'lease_until' => now()->addHour()]);
+        DB::table('release_verification_state')->update(['pending_bytes' => $storedBytes]);
+        if ($mode === 'corrupt') {
+            file_put_contents($store->path($storedPath), 'broken');
+        }
+        if ($mode === 'capacity') {
+            config(['release_verification.pending_bytes' => $storedBytes]);
+        }
+        if ($mode === 'conflict') {
+            $xml = str_replace('</segments>', '<segment bytes="5" number="1">fixture@example.test</segment></segments>', $xml);
+        }
+        file_put_contents($path, sprintf($xml, $head.'<meta type="password">synthetic assertion</meta>'));
+        $capacityReads = 0;
+        $compressions = 0;
+        $lockedCompressions = 0;
+        $preparations = 0;
+        $swapped = false;
+        $appeared = false;
+        $restoreCandidate = (array) DB::table('release_verification_candidates')->first();
+        if (in_array($mode, ['appeared-after-advisory', 'appeared-changed-after-advisory'], true)) {
+            DB::table('release_verification_candidates')->delete();
+        }
+        if ($mode === 'changed-subject-after-advisory') {
+            DB::table('release_verification_candidates')->where('id', $first->id)->update([
+                'manifest_path' => $first->manifest_path, 'manifest_hash' => $first->manifest_hash,
+                'manifest_bytes' => $first->manifest_bytes,
+            ]);
+            DB::table('release_verification_state')->update(['pending_bytes' => $first->manifest_bytes]);
+        }
+        DB::listen(static function (QueryExecuted $query) use (&$capacityReads, &$swapped, &$appeared, $restoreCandidate, $mode, $first, $storedPath, $storedBytes): void {
+            if (str_starts_with($query->sql, 'select') && str_contains($query->sql, 'release_verification_state')) {
+                $capacityReads++;
+                if (in_array($mode, ['appeared-after-advisory', 'appeared-changed-after-advisory'], true) && ! $appeared) {
+                    $appeared = true;
+                    DB::table('release_verification_candidates')->insert($restoreCandidate);
+                }
+                if ($mode === 'changed-subject-after-advisory' && ! $swapped) {
+                    $swapped = true;
+                    // Deterministic interleaving at the real repository's shared-row read.
+                    // SQLite proves current-row selection, not concurrent lock behavior.
+                    DB::table('release_verification_candidates')->where('id', $first->id)->update([
+                        'manifest_path' => $storedPath, 'manifest_hash' => substr($storedPath, 0, 64),
+                        'manifest_bytes' => $storedBytes, 'version' => $first->version,
+                    ]);
+                    DB::table('release_verification_state')->update(['pending_bytes' => $storedBytes]);
+                }
+            }
+        });
+        ManifestCompressionProbe::$onCompress = static function () use (&$compressions, &$lockedCompressions, &$capacityReads, &$preparations): void {
+            $compressions++;
+            foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS) as $frame) {
+                if (($frame['class'] ?? null) === ManifestStore::class && ($frame['function'] ?? null) === 'prepare') {
+                    $preparations++;
+                }
+            }
+            if ($capacityReads > 0 && DB::transactionLevel() > 0) {
+                $lockedCompressions++;
+            }
+        };
+        try {
+            $service->beginImport([$path], delete: true, deleteFailed: true, resultCallback: $callback);
+        } finally {
+            ManifestCompressionProbe::$onCompress = null;
+        }
+        $expectedCompressions = 1;
+        self::assertSame($expectedCompressions, $preparations, 'Preparation calls must not create unused comparison pairs.');
+        self::assertSame($expectedCompressions, $compressions, 'Incoming assertions are prepared once before authoritative admission.');
+        self::assertSame(0, $lockedCompressions, 'Admission must prepare outside shared capacity ownership.');
+        if ($mode === 'changed-subject-after-advisory') {
+            self::assertTrue($swapped);
+        }
+        if (in_array($mode, ['appeared-after-advisory', 'appeared-changed-after-advisory'], true)) {
+            self::assertTrue($appeared);
+        }
+        $expected = in_array($mode, ['exact', 'exact-spot', 'appeared-after-advisory'], true) ? NzbImportStatus::Queued : (in_array($mode, ['capacity', 'corrupt'], true) ? NzbImportStatus::MetadataDeferred : NzbImportStatus::MetadataIgnored);
+        self::assertSame([NzbImportStatus::Queued, $expected], $statuses);
+        self::assertSame(1, DB::table('release_verification_candidates')->count());
+        $candidate = DB::table('release_verification_candidates')->first();
+        if ($mode === 'corrupt') {
+            self::assertFileExists($path);
+            self::assertSame($storedPath, $candidate->manifest_path);
+            self::assertSame($storedBytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+
+            return;
+        }
+        $manifest = app(ManifestStore::class)->read($candidate->manifest_path);
+        if (in_array($mode, ['exact', 'exact-spot', 'appeared-after-advisory'], true)) {
+            self::assertSame(['synthetic assertion'], $manifest['passwords'] ?? [], 'Accepted replay must preserve newly asserted uploader metadata before deletion.');
+            self::assertFileDoesNotExist($path);
+            self::assertFileDoesNotExist($store->path($storedPath), 'Old artifact cleanup follows the committed candidate swap.');
+            self::assertSame((int) $first->version + 1, (int) $candidate->version);
+            self::assertNull($candidate->lease_token);
+            self::assertNull($candidate->lease_until);
+            $assessment = (new CandidateHeaderInventory)->assessment($manifest);
+            self::assertSame($assessment['status'], $candidate->status);
+            self::assertSame($assessment['reason'], $candidate->reason);
+            self::assertSame(filesize($store->path($candidate->manifest_path)), (int) DB::table('release_verification_state')->value('pending_bytes'));
+        } else {
+            self::assertFileExists($path);
+            self::assertSame($stored, $manifest);
+            self::assertSame($storedBytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+            if ($mode === 'capacity') {
+                self::assertSame([$store->path($storedPath)], glob(config('release_verification.storage_path').'/manifests/*.json.gz'), 'Rejected reservation leaves no enriched artifact orphan.');
+                self::assertSame('metadata_deferred', $candidate->status);
+                self::assertNull($candidate->lease_token);
+                self::assertNull($candidate->lease_until);
+                self::assertSame((int) $first->version + 1, (int) $candidate->version);
+                self::assertNull(app(CandidateRepository::class)->claim());
+                app(CandidateRepository::class)->expire();
+                self::assertSame($storedPath, DB::table('release_verification_candidates')->value('manifest_path'));
+                config(['release_verification.pending_bytes' => 1000000]);
+                $service->beginImport([$path], delete: true, deleteFailed: true, resultCallback: $callback);
+                self::assertSame(NzbImportStatus::Queued, end($statuses));
+                $replayed = DB::table('release_verification_candidates')->first();
+                self::assertSame(['synthetic assertion'], $store->read($replayed->manifest_path)['passwords']);
+            } else {
+                self::assertSame((int) $first->version, (int) $candidate->version);
+            }
+        }
+    }
+
+    public static function orderedReplayScenarios(): array
+    {
+        return [
+            'identical repeated ordered list' => [['first assertion', 'first assertion', 'second assertion'], NzbImportStatus::Queued],
+            'reversed same length' => [['second assertion', 'first assertion', 'first assertion'], NzbImportStatus::MetadataIgnored],
+            'dropped duplicate' => [['first assertion', 'second assertion'], NzbImportStatus::MetadataIgnored],
+        ];
+    }
+
+    /** @param list<string> $incoming */
+    #[DataProvider('orderedReplayScenarios')]
+    public function test_actual_import_requires_exact_order_and_multiplicity(array $incoming, NzbImportStatus $expected): void
+    {
+        $service = $this->offlineImportService();
+        $path = config('release_verification.storage_path').'/ordered-replay.nzb';
+        app('files')->ensureDirectoryExists(dirname($path));
+        $originalPasswords = ['first assertion', 'first assertion', 'second assertion'];
+        file_put_contents($path, $this->passwordFixture($originalPasswords));
+        $statuses = [];
+        $callback = static function (array $result) use (&$statuses): void {
+            $statuses[] = $result['status'];
+        };
+        $service->beginImport([$path], resultCallback: $callback);
+        DB::table('release_verification_candidates')->update(['lease_token' => 'ordered-replay-lease', 'lease_until' => now()->addHour()]);
+        $before = DB::table('release_verification_candidates')->first();
+        $store = app(ManifestStore::class);
+        $retained = $store->read($before->manifest_path);
+        self::assertSame($originalPasswords, $retained['passwords']);
+        $retainedBytes = file_get_contents($store->path($before->manifest_path));
+        $pendingBytes = DB::table('release_verification_state')->value('pending_bytes');
+        $source = $this->passwordFixture($incoming);
+        file_put_contents($path, $source);
+        $service->beginImport([$path], delete: true, deleteFailed: true, resultCallback: $callback);
+        self::assertSame([NzbImportStatus::Queued, $expected], $statuses);
+        self::assertSame((array) $before, (array) DB::table('release_verification_candidates')->first(), 'A metadata replay must preserve manifest hash, version, and current lease.');
+        self::assertSame($retained, $store->read($before->manifest_path));
+        self::assertSame($retainedBytes, file_get_contents($store->path($before->manifest_path)));
+        self::assertSame($pendingBytes, DB::table('release_verification_state')->value('pending_bytes'));
+        self::assertSame([$store->path($before->manifest_path)], glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
+        if ($expected === NzbImportStatus::Queued) {
+            self::assertFileDoesNotExist($path);
+        } else {
+            self::assertSame($source, file_get_contents($path), 'Rejected metadata must retain the exact incoming source.');
+        }
+    }
+
+    public static function stalePublicationScenarios(): array
+    {
+        return ['successful enrichment' => [false], 'capacity deferred' => [true]];
+    }
+
+    #[DataProvider('stalePublicationScenarios')]
+    public function test_actual_publisher_rejects_claim_invalidated_by_password_enrichment(bool $capacityDeferred): void
+    {
+        $service = $this->offlineImportService();
+        $path = config('release_verification.storage_path').'/stale-publication.nzb';
+        app('files')->ensureDirectoryExists(dirname($path));
+        file_put_contents($path, $this->passwordFixture([]));
+        $statuses = [];
+        $callback = static function (array $result) use (&$statuses): void {
+            $statuses[] = $result['status'];
+        };
+        $service->beginImport([$path], resultCallback: $callback);
+        $claim = app(CandidateRepository::class)->claim();
+        self::assertNotNull($claim);
+        $store = app(ManifestStore::class);
+        $verifiedManifest = $store->read($claim->manifest_path);
+        if ($capacityDeferred) {
+            config(['release_verification.pending_bytes' => $claim->manifest_bytes]);
+        }
+        file_put_contents($path, $this->passwordFixture(['synthetic assertion']));
+        $service->beginImport([$path], delete: true, deleteFailed: true, resultCallback: $callback);
+        self::assertSame([NzbImportStatus::Queued, $capacityDeferred ? NzbImportStatus::MetadataDeferred : NzbImportStatus::Queued], $statuses);
+        $candidate = DB::table('release_verification_candidates')->first();
+        self::assertSame((int) $claim->version + 1, (int) $candidate->version);
+        self::assertNull($candidate->lease_token);
+        self::assertNull($candidate->lease_until);
+        if ($capacityDeferred) {
+            self::assertSame('metadata_deferred', $candidate->status);
+            self::assertSame($claim->manifest_hash, $candidate->manifest_hash);
+            self::assertFileExists($path);
+        } else {
+            self::assertNotSame($claim->manifest_hash, $candidate->manifest_hash);
+            self::assertFileDoesNotExist($path);
+        }
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->id();
+        });
+        // The actual publisher must reject at its custody gate before metadata or final NZB writing.
+        $nzb = $this->createMock(NzbService::class);
+        $nzb->expects(self::never())->method('getNzbPath');
+        $metadata = $this->createMock(ReleaseMetadataResolver::class);
+        $metadata->expects(self::never())->method('resolve');
+        $publisher = new VerifiedReleasePublisher(new VerifiedNzbWriter($nzb), $metadata, new ReleaseDuplicateFinder);
+        $before = (array) $candidate;
+        $artifacts = glob(config('release_verification.storage_path').'/manifests/*.json.gz');
+        $pendingBytes = DB::table('release_verification_state')->value('pending_bytes');
+        try {
+            $publisher->publish($claim, new VerificationResult('complete', 'Synthetic offline verified result.', $verifiedManifest));
+            self::fail('The old claim must not publish after metadata invalidates its lease.');
+        } catch (\RuntimeException $exception) {
+            self::assertSame('Stale verification result cannot publish.', $exception->getMessage());
+        }
+        self::assertSame(0, DB::table('releases')->count());
+        self::assertSame($before, (array) DB::table('release_verification_candidates')->first());
+        self::assertSame($pendingBytes, DB::table('release_verification_state')->value('pending_bytes'));
+        self::assertSame($artifacts, glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
+    }
+
+    private function offlineImportService(): NzbImportService
+    {
+        $blacklist = $this->createStub(BlacklistService::class);
+        $blacklist->method('isBlackListed')->willReturn(false);
+        $blacklist->method('getAndClearIdsToUpdate')->willReturn([]);
+
+        return new class($blacklist) extends NzbImportService
+        {
+            public function __construct($blacklist)
+            {
+                parent::__construct(['Browser' => true]);
+                $this->blacklistService = $blacklist;
+            }
+
+            protected function getAllGroups(): bool
+            {
+                $this->allGroups = ['alt.test' => 1];
+
+                return true;
+            }
+        };
+    }
+
+    /** @param list<string> $passwords */
+    private function passwordFixture(array $passwords): string
+    {
+        $head = implode('', array_map(static fn (string $password): string => '<meta type="password">'.$password.'</meta>', $passwords));
+
+        return '<nzb><head>'.$head.'</head><file poster="poster" date="1" subject="fixture.bin (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">fixture@example.test</segment></segments></file></nzb>';
+    }
+}

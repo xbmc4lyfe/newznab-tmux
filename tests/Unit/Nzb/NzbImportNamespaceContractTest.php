@@ -43,9 +43,11 @@ final class NzbImportNamespaceContractTest extends TestCase
             private array $items = [];
 
             /** @param array<string, mixed> $manifest */
-            public function enqueue(array $manifest): void
+            public function enqueue(array $manifest): bool
             {
                 $this->items[] = $manifest;
+
+                return true;
             }
 
             public function clear(): void

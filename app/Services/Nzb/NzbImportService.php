@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Nzb;
 
 use App\Enums\NzbImportStatus;
+use App\Exceptions\NzbPasswordMetadataRejected;
 use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Category;
 use App\Models\Predb;
@@ -24,6 +25,7 @@ use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -177,6 +179,16 @@ class NzbImportService
 
         // Loop over the NZB file names only.
         foreach ($nzbFiles as $nzbFilePath) {
+            // Admission must commit before source custody can be relinquished.
+            // A nested transaction cannot establish that durable boundary.
+            if (config('release_verification.required', true) && DB::transactionLevel() > 0) {
+                $reportResult($nzbFilePath, NzbImportStatus::MetadataDeferred);
+                $this->echoOut('Verification admission deferred by an active transaction; retaining source for retry.');
+                $nzbsSkipped++;
+
+                continue;
+            }
+
             // Check if the file is really there.
             if (File::isFile($nzbFilePath)) {
                 $this->relGuid = '';
@@ -230,6 +242,9 @@ class NzbImportService
                 $stored = false;
                 $path = null;
                 try {
+                    if (config('release_verification.required', true)) {
+                        (new NzbXmlElements($nzbXML))->assertUnambiguousPasswordMetadata();
+                    }
                     [$importStatus, $stored, $path] = $this->withArticleIdentityLock(
                         $lockFingerprint,
                         function () use ($nzbXML, $nzbFileName, $source, $nzbString): array {
@@ -251,6 +266,8 @@ class NzbImportService
                     $nzbsSkipped++;
 
                     continue;
+                } catch (NzbPasswordMetadataRejected) {
+                    $importStatus = NzbImportStatus::MetadataIgnored;
                 } catch (\Throwable $exception) {
                     Log::error('NZB import failed while scanning or inserting a release.', [
                         'path' => $nzbFilePath,
@@ -266,7 +283,13 @@ class NzbImportService
                     $importStatus = NzbImportStatus::Failed;
                 }
 
-                if ($importStatus === NzbImportStatus::Queued) {
+                if (in_array($importStatus, [NzbImportStatus::MetadataIgnored, NzbImportStatus::MetadataDeferred], true)) {
+                    $reportResult($nzbFilePath, $importStatus);
+                    $this->echoOut($importStatus === NzbImportStatus::MetadataDeferred
+                        ? 'Verification admission deferred; retaining source for retry.'
+                        : 'Uploader metadata requires review; retaining source.');
+                    $nzbsSkipped++;
+                } elseif ($importStatus === NzbImportStatus::Queued) {
                     $reportResult($nzbFilePath, $importStatus, candidateIdentity: $this->verificationCandidateIdentity);
                     $nzbsImported++;
                     if ($delete) {
@@ -701,9 +724,20 @@ class NzbImportService
                 && Category::query()->where('id', $categoryId)->where('status', Category::STATUS_ACTIVE)->exists()) {
                 $info->categories_id = $categoryId;
             }
-            $manifest = app(NzbManifestReader::class)->read($nzbDetails['verificationXml'], $info);
+            try {
+                $manifest = app(NzbManifestReader::class)->read($nzbDetails['verificationXml'], $info);
+            } catch (NzbPasswordMetadataRejected) {
+                return NzbImportStatus::MetadataIgnored;
+            }
             $manifest['identity'] = sha1('import:'.($nzbDetails['articleFingerprint'] ?? $nzbDetails['verificationXml']));
-            app(CandidateRepository::class)->enqueue($manifest);
+            try {
+                $admitted = app(CandidateRepository::class)->enqueue($manifest);
+            } catch (\Throwable) {
+                return NzbImportStatus::MetadataDeferred;
+            }
+            if (! $admitted) {
+                return NzbImportStatus::MetadataIgnored;
+            }
             $this->verificationCandidateIdentity = $manifest['identity'];
             $this->echoOut('NZB queued for download verification.');
 

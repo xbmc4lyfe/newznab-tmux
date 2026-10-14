@@ -109,6 +109,23 @@ final class NzbArticleCoverage
         return $required !== null && $this->coversIds($required, $guid, $budget);
     }
 
+    /** Use one bounded retained generation for article and companion metadata evidence. */
+    public function coveredSnapshot(\SimpleXMLElement $incoming, string $guid): ?\SimpleXMLElement
+    {
+        $required = $this->coverageIds($incoming);
+        if ($required === null) {
+            return null;
+        }
+        $used = 0;
+        $contents = $this->nzb->readNzbContentsBounded($guid, self::COVERAGE_COMPRESSED_BYTES, self::COVERAGE_DECODED_BYTES, $used);
+        if ($contents === false || ($xml = $this->parseXml($contents)) === null) {
+            return null;
+        }
+        $available = $this->coverageIds($xml);
+
+        return $available !== null && array_diff_key($required, $available) === [] ? $xml : null;
+    }
+
     /** @param array<string, true> $required */
     private function coversIds(array $required, string $guid, int &$budget): bool
     {

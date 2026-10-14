@@ -32,7 +32,9 @@ final class ManifestStore
         $name = $prepared->name;
         $path = $directory.'/'.$name;
         $compressed = $prepared->compressed;
-        if (! is_file($path)) {
+        if (is_file($path)) {
+            $this->validateOccupiedTarget($path, $prepared);
+        } else {
             $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
             $handle = fopen($temporary, 'xb');
             if ($handle === false) {
@@ -60,6 +62,34 @@ final class ManifestStore
         }
 
         return $name;
+    }
+
+    /** Validate reuse before admission can relinquish the uploader source. */
+    private function validateOccupiedTarget(string $path, PreparedManifest $prepared): void
+    {
+        // Allow alternate compression and bounded optional gzip headers. Incoming
+        // JSON length was recorded during preparation, before capacity ownership.
+        $compressedCap = $prepared->jsonBytes * 2 + 65536;
+        $body = @file_get_contents($path, false, null, 0, $compressedCap + 1);
+        if ($body === false || strlen($body) > $compressedCap) {
+            throw new RuntimeException('Manifest integrity check failed.');
+        }
+        if ($body === $prepared->compressed) {
+            return;
+        }
+        $json = @gzdecode($body, $prepared->jsonBytes + 1);
+        if ($json === false || strlen($json) !== $prepared->jsonBytes
+            || hash('sha256', $json).'.json.gz' !== $prepared->name) {
+            throw new RuntimeException('Manifest integrity check failed.');
+        }
+        // The bounded decode above establishes the first member's output size.
+        // Check complete consumption without accepting trailing or extra members.
+        $inflater = inflate_init(ZLIB_ENCODING_GZIP);
+        if ($inflater === false || @inflate_add($inflater, $body, ZLIB_FINISH) !== $json
+            || inflate_get_status($inflater) !== ZLIB_STREAM_END
+            || inflate_get_read_len($inflater) !== strlen($body)) {
+            throw new RuntimeException('Manifest integrity check failed.');
+        }
     }
 
     /** @return array<string, mixed> */
