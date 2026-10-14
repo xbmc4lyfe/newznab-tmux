@@ -211,6 +211,91 @@ final class NNTPBoundedArticleTest extends TestCase
         self::assertNotNull($result->error);
     }
 
+    #[DataProvider('missingThenFoundResponses')]
+    public function test_complete_missing_statuses_reuse_the_socket_and_preserve_the_next_body(string $missing, int $count, bool $yenc): void
+    {
+        $data = "PAR2\0PKT".YencArticles::bytes()."\r\n";
+        $body = $yenc ? $this->wire(YencArticles::article($data)) : $this->wire(rtrim($data, "\r\n"));
+        $client = $this->socketClient(str_repeat($missing, $count)."222 0 <found@example> body follows\r\n".$body);
+
+        for ($index = 0; $index < $count; $index++) {
+            $result = $client->getMessageBounded('alt.test', 'missing'.$index.'@example', strlen($data));
+            self::assertNull($result->body);
+            self::assertNotNull($result->error);
+            self::assertTrue($client->isConnected());
+            self::assertSame('alt.test', $client->currentGroup());
+        }
+
+        $result = $client->getMessageBounded('alt.test', 'found@example', strlen($data));
+
+        self::assertSame($data, $result->body);
+        self::assertNull($result->error);
+        self::assertSame([], $client->connections);
+        $commands = array_map(static fn (int $index): string => 'BODY <missing'.$index.'@example>', range(0, $count - 1));
+        $commands[] = 'BODY <found@example>';
+        self::assertSame($commands, $client->sentCommands());
+    }
+
+    /** @return iterable<string, array{string, int, bool}> */
+    public static function missingThenFoundResponses(): iterable
+    {
+        yield 'plain PAR2' => ["430 No article with that message-id\r\n", 1, false];
+        yield 'yenc PAR2 after repeated misses' => ["430 No article with that message-id\r\n", 3, true];
+        yield 'no optional comment' => ["430\r\n", 1, true];
+        yield 'maximum status line' => ['430 '.str_repeat('x', 506)."\r\n", 1, true];
+    }
+
+    #[DataProvider('unsafeBodyStatuses')]
+    public function test_unsafe_statuses_discard_the_socket_without_returning_a_body(string $status): void
+    {
+        $client = $this->socketClient($status);
+
+        $result = $client->getMessageBounded('alt.test', 'test@example', 100);
+
+        self::assertNull($result->body);
+        self::assertNotNull($result->error);
+        self::assertFalse($client->isConnected());
+        self::assertSame($status === '' ? [] : ['BODY <test@example>'], $client->sentCommands());
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function unsafeBodyStatuses(): iterable
+    {
+        yield 'disconnecting' => ["400 Service unavailable\r\n"];
+        yield 'number-only failure' => ["423 No article with that number\r\n"];
+        yield 'unexpected response' => ["500 Unknown command\r\n"];
+        yield 'missing CRLF' => ['430 No article'];
+        yield 'LF only' => ["430 No article\n"];
+        yield 'leading whitespace' => [" 430 No article\r\n"];
+        yield 'garbage after code' => ["430garbage\r\n"];
+        yield 'tab after code' => ["430\tNo article\r\n"];
+        yield 'embedded CR' => ["430 No\rarticle\r\n"];
+        yield 'embedded NUL' => ["430 No\0article\r\n"];
+        yield 'overlong complete status' => ['430 '.str_repeat('x', 507)."\r\n"];
+        yield 'vendor read truncation' => ['430 '.str_repeat('x', 5000)."\r\n"];
+        yield 'malformed body success' => ["222garbage\r\nnot a body\r\n.\r\n"];
+        yield 'no status' => [''];
+    }
+
+    public function test_missing_primary_can_fall_back_without_losing_its_next_article(): void
+    {
+        $primary = "PAR2\0PKTprimary\r\n";
+        $alternate = "PAR2\0PKTalternate";
+        $client = $this->socketClient("430 No article\r\n222 0 <next@example> body follows\r\n".$primary.".\r\n");
+        $client->alternate = $this->socketClient("222 0 <missing@example> body follows\r\n".$this->wire(YencArticles::article($alternate)));
+
+        $result = $client->getMessageBounded('alt.test', 'missing@example', 100, true);
+
+        self::assertSame($alternate, $result->body);
+        self::assertTrue($client->isConnected());
+        self::assertSame([true], $client->alternate->connections);
+        self::assertFalse($client->alternate->isConnected());
+        self::assertSame($primary, $client->getMessageBounded('alt.test', 'next@example', 100)->body);
+        self::assertSame([], $client->connections);
+        self::assertSame(['BODY <missing@example>', 'BODY <next@example>'], $client->sentCommands());
+        self::assertSame(['BODY <missing@example>'], $client->alternate->sentCommands());
+    }
+
     public function test_rejects_nonpositive_ceiling_before_network_access(): void
     {
         $client = $this->client('');
@@ -254,10 +339,19 @@ final class NNTPBoundedArticleTest extends TestCase
 
     private function client(string $wire): BoundedArticleHarness
     {
-        $library = getenv('YENC_NATIVE_LIBRARY');
-        $decoder = $library ? new YencService(new NativePayloadDecoder($library)) : new YencService;
+        return new BoundedArticleHarness($wire, $this->decoder());
+    }
 
-        return new BoundedArticleHarness($wire, $decoder);
+    private function socketClient(string $wire): BoundedArticleSocketHarness
+    {
+        return new BoundedArticleSocketHarness($wire, $this->decoder());
+    }
+
+    private function decoder(): YencService
+    {
+        $library = getenv('YENC_NATIVE_LIBRARY');
+
+        return $library ? new YencService(new NativePayloadDecoder($library)) : new YencService;
     }
 
     private function wire(string $article): string
@@ -344,5 +438,70 @@ final class BoundedArticleHarness extends NNTPService
             $this->discardedAt = ftell($this->_socket);
         }
         parent::discardBoundedArticleConnection();
+    }
+}
+
+/** Exercises the production command writer, status parser, connection check and group cache. */
+final class BoundedArticleSocketHarness extends NNTPService
+{
+    /** @var resource */
+    private mixed $peer;
+
+    /** @var list<bool> */
+    public array $connections = [];
+
+    public ?self $alternate = null;
+
+    public function __construct(string $wire, YencService $decoder)
+    {
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        if ($pair === false) {
+            throw new \RuntimeException('Could not create fixture socket pair.');
+        }
+        [$this->_socket, $this->peer] = $pair;
+        if ($wire !== '') {
+            fwrite($this->peer, $wire);
+        }
+        stream_socket_shutdown($this->peer, STREAM_SHUT_WR);
+        stream_set_blocking($this->peer, false);
+        stream_set_timeout($this->_socket, 1);
+        $this->_yencService = $decoder;
+        $this->_currentServer = $this->_configServer = 'primary';
+        $this->_configAlternateServer = 'alternate';
+        $this->_currentGroup = 'alt.test';
+        $this->_selectedGroupSummary = [];
+    }
+
+    public function __destruct()
+    {
+        if (is_resource($this->_socket)) {
+            fclose($this->_socket);
+        }
+        fclose($this->peer);
+    }
+
+    public function currentGroup(): string
+    {
+        return $this->_currentGroup;
+    }
+
+    /** @return list<string> */
+    public function sentCommands(): array
+    {
+        $commands = stream_get_contents($this->peer);
+
+        return $commands === false || $commands === '' ? [] : explode("\r\n", rtrim($commands, "\r\n"));
+    }
+
+    public function doConnect(bool $compression = true, bool $alternate = false): mixed
+    {
+        $this->connections[] = $alternate;
+
+        return $this->isConnected() ? true : $this->throwError('Unexpected reconnect.');
+    }
+
+    protected function createBoundedArticleClient(): NNTPService
+    {
+        return $this->alternate ?? throw new \LogicException('Unexpected alternate connection');
     }
 }

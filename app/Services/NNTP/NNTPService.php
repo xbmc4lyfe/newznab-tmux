@@ -22,6 +22,8 @@ use DariusIII\NetNntp\Protocol\ResponseCode;
  */
 class NNTPService extends NntpClient
 {
+    private bool $readingBoundedArticleStatus = false;
+
     public static function verificationMessageId(string $messageId, int $maximumBytes): string
     {
         $messageId = trim($messageId, '<>');
@@ -885,9 +887,17 @@ class NNTPService extends NntpClient
 
                 return BoundedArticleResult::failure('The article group could not be selected.');
             }
-            $response = $this->_sendCommand('BODY '.$identifier);
+            $this->readingBoundedArticleStatus = true;
+            try {
+                $response = $this->_sendCommand('BODY '.$identifier);
+            } finally {
+                $this->readingBoundedArticleStatus = false;
+            }
             if ($response !== ResponseCode::BodyFollows->value) {
-                $this->discardBoundedArticleConnection();
+                // A complete 430 has no BODY; the authenticated socket and group remain usable.
+                if ($response !== ResponseCode::NoSuchArticleId->value) {
+                    $this->discardBoundedArticleConnection();
+                }
 
                 return BoundedArticleResult::failure('The article provider did not return a BODY.');
             }
@@ -898,6 +908,28 @@ class NNTPService extends NntpClient
 
             return BoundedArticleResult::failure('The article could not be read: '.$exception->getMessage());
         }
+    }
+
+    /** Validate bounded BODY status framing before allowing a missing article to reuse the socket. */
+    protected function _getStatusResponse(): mixed
+    {
+        if (! $this->readingBoundedArticleStatus) {
+            return parent::_getStatusResponse();
+        }
+
+        $this->_currentStatusResponse = null;
+        $this->_clearOpensslErrors();
+        $response = @fgets($this->_socket, 513);
+        $this->_clearOpensslErrors();
+        if ($response === false || preg_match('/\A[1-5][0-9]{2}(?: [\x09\x20-\x7e\x80-\xff]*)?\r\n\z/', $response) !== 1) {
+            return $this->throwError('Invalid or incomplete bounded article status line.');
+        }
+
+        $line = substr($response, 0, -2);
+        $this->_logger?->debug('S: '.$line);
+        $this->_currentStatusResponse = [(int) substr($line, 0, 3), substr($line, 4)];
+
+        return $this->_currentStatusResponse[0];
     }
 
     /**
