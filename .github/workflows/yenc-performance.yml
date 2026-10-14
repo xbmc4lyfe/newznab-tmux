@@ -1,9 +1,13 @@
 name: Paired native yEnc performance
 
 on:
+  push:
+    branches: [master]
   pull_request:
     paths:
       - '.github/workflows/yenc-performance.yml'
+      - 'scripts/export-benchmark-summary.py'
+      - 'tests/Unit/test_benchmark_summary_export.py'
       - 'scripts/benchmark-yenc.php'
       - 'scripts/benchmark-article-processing.php'
       - 'tests/Unit/ArticleProcessingBenchmarkTest.php'
@@ -226,6 +230,16 @@ jobs:
           else
             printf '## Native yEnc paired fixture comparison\n\nEvidence utility unavailable; setup incomplete; no performance conclusion.\n' >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Export compact public benchmark summary
+        if: always()
+        run: python3 scripts/export-benchmark-summary.py --kind=cpp --runner=${{ matrix.runner }} --output=public-summary/summary.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-benchmark-cpp-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public-summary/summary.json
+          retention-days: 14
 
       - name: Retain fixtures, libraries, identities and every observation
         if: always()
@@ -463,6 +477,16 @@ jobs:
               summary.write('\nResult: `' + (final['status'] if final else 'profile only or setup incomplete') + '`. Exact serialized caller metadata and independently expected decoded bytes must match for every pair.\n')
           PY_SUMMARY
 
+      - name: Export compact public benchmark summary
+        if: always()
+        run: python3 scripts/export-benchmark-summary.py --kind=profile --runner=${{ matrix.runner }} --output=public-summary/summary.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-benchmark-profile-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public-summary/summary.json
+          retention-days: 14
+
       - name: Retain all processing profile evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -574,6 +598,16 @@ jobs:
           else
             printf '## Rust versus PHP fallback\n\nEvidence utility unavailable; setup incomplete; no performance conclusion.\n' >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Export compact public benchmark summary
+        if: always()
+        run: python3 scripts/export-benchmark-summary.py --kind=php --runner=${{ matrix.runner }} --output=public-summary/summary.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-benchmark-php-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public-summary/summary.json
+          retention-days: 14
 
       - name: Retain PHP comparison evidence
         if: always()

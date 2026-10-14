@@ -1,0 +1,98 @@
+name: Benchmark Pages
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    paths:
+      - '.github/workflows/benchmark-pages.yml'
+      - '.github/workflows/yenc-performance.yml'
+      - '.github/workflows/release-presentation.yml'
+      - 'scripts/*benchmark*'
+      - 'tests/Unit/test_benchmark*'
+  workflow_run:
+    workflows: ['Paired native yEnc performance', 'Rust release presentation', 'Run tests', 'rust-clippy analyze']
+    types: [in_progress, completed]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize collection as well as deployment. Old completion events refresh the
+# current master, and cannot publish an older rendered snapshot after a new one.
+concurrency:
+  group: benchmark-pages-${{ github.event_name == 'pull_request' && github.ref || 'master' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: |
+          python3 tests/Unit/test_benchmark_pages.py
+          python3 tests/Unit/test_benchmark_summary_export.py
+
+  build:
+    needs: test
+    if: >-
+      github.repository == 'xbmc4lyfe/newznab-tmux' &&
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        github.event.workflow_run.head_branch == 'master')) &&
+      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha: ${{ steps.identity.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: master
+          persist-credentials: false
+      - id: identity
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Collect current commit and attempt summaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_SHA: ${{ steps.identity.outputs.sha }}
+        run: python3 scripts/benchmark-pages.py --sha="$BUILD_SHA" --output=benchmark-site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: benchmark-site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check that master still matches the rendered build
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          current=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/master --jq .object.sha)
+          if [[ "$current" == "$BUILD_SHA" ]]; then
+            echo 'matches=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Master advanced; its queued refresh will publish the new build.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/configure-pages@v5
+        if: steps.current.outputs.matches == 'true'
+      - uses: actions/deploy-pages@v4
+        if: steps.current.outputs.matches == 'true'
+        id: deployment
