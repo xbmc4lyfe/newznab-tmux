@@ -461,12 +461,54 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
         $this->assertSame($bytes, DB::table('release_verification_state')->value('pending_bytes'));
         $this->assertSame('unknown', DB::table('release_verification_candidates')->where('identity', 'bad-reference')->value('status'));
         $this->assertSame(now()->addSeconds(900)->format('Y-m-d H:i:s'), DB::table('release_verification_candidates')->where('identity', 'bad-reference')->value('next_attempt_at'));
-        $this->assertSame(['limit', 'max_seconds', 'inspected', 'assessments', 'updated', 'ready_promotions', 'zero_row_updates', 'read_assessment_failures', 'stop_reason', 'limit_reached', 'deadline_reached', 'queues_exhausted', 'durations_ms'], array_keys($report));
+        $this->assertSame(['limit', 'max_seconds', 'inspected', 'assessments', 'updated', 'ready_promotions', 'zero_row_updates', 'read_assessment_failures', 'stop_reason', 'limit_reached', 'deadline_reached', 'queues_exhausted', 'durations_ms', 'read_phases_ms', 'cpu_milliseconds'], array_keys($report));
         $this->assertSame(['selection', 'read_assessment', 'update', 'total'], array_keys($report['durations_ms']));
+        $this->assertSame(['file_read', 'gzip_decode', 'integrity', 'json_decode', 'inventory'], array_keys($report['read_phases_ms']));
+        foreach ($report['read_phases_ms'] as $duration) {
+            $this->assertGreaterThan(0, $duration);
+        }
+        $this->assertGreaterThanOrEqual(array_sum($report['read_phases_ms']), $report['durations_ms']['read_assessment']);
+        $this->assertGreaterThanOrEqual(0, $report['cpu_milliseconds']);
         foreach ($report['durations_ms'] as $duration) {
             $this->assertGreaterThanOrEqual(0, $duration);
         }
         $this->assertGreaterThanOrEqual(array_sum(array_slice($report['durations_ms'], 0, 3)), $report['durations_ms']['total']);
+    }
+
+    public function test_preparation_integrity_failure_records_only_completed_read_phases(): void
+    {
+        $this->freezeTime();
+        app(CandidateRepository::class)->enqueue($this->manifest('tampered'));
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $name = DB::table('release_verification_candidates')->value('manifest_path');
+        $path = app(ManifestStore::class)->path($name);
+        file_put_contents($path, gzencode('{"private":"must not be reported"}'));
+        $tamperedHash = hash_file('sha256', $path);
+        $bytes = DB::table('release_verification_state')->value('pending_bytes');
+        $reports = [];
+
+        $this->assertSame(1, app(CandidatePreparationService::class)->prepare(10, 30, null,
+            static function (array $report) use (&$reports): void {
+                $reports[] = $report;
+            }));
+
+        $this->assertCount(1, $reports);
+        $report = $reports[0];
+        $this->assertSame(1, $report['read_assessment_failures']);
+        $this->assertSame(['ready' => 0, 'waiting_upload' => 0, 'unknown' => 1], $report['updated']);
+        foreach (['file_read', 'gzip_decode', 'integrity'] as $phase) {
+            $this->assertGreaterThan(0, $report['read_phases_ms'][$phase]);
+        }
+        $this->assertSame(0.0, $report['read_phases_ms']['json_decode']);
+        $this->assertSame(0.0, $report['read_phases_ms']['inventory']);
+        $this->assertGreaterThanOrEqual(array_sum($report['read_phases_ms']), $report['durations_ms']['read_assessment']);
+        $this->assertSame('unknown', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame('Manifest integrity check failed.', DB::table('release_verification_candidates')->value('reason'));
+        $this->assertSame(now()->addSeconds(900)->format('Y-m-d H:i:s'), DB::table('release_verification_candidates')->value('next_attempt_at'));
+        $this->assertSame($bytes, DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame($tamperedHash, hash_file('sha256', $path));
+        $this->assertStringNotContainsString('private', json_encode($report, JSON_THROW_ON_ERROR));
+        $this->assertStringNotContainsString($name, json_encode($report, JSON_THROW_ON_ERROR));
     }
 
     public function test_preparation_diagnostics_distinguish_cap_from_queue_exhaustion(): void

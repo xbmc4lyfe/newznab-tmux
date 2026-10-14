@@ -34,6 +34,7 @@ final class CandidatePreparationService
         };
         $deadline = hrtime(true) + max(1, $seconds) * 1_000_000_000;
         $diagnostics = $observer === null ? null : new PreparationRunDiagnostics($deadline - max(1, $seconds) * 1_000_000_000);
+        $readObserver = $diagnostics === null ? null : $diagnostics->observeReadPhase(...);
         $inspected = 0;
         $changed = 0;
         $cursors = [];
@@ -85,7 +86,7 @@ final class CandidatePreparationService
                         $cursors[$status] = [$row->next_attempt_at, $row->id];
                         $assessmentStarted = $diagnostics?->start();
                         try {
-                            $assessment = $this->inventory->assessment($this->store->read($row->manifest_path));
+                            $assessment = $this->assess($row->manifest_path, $diagnostics, $readObserver);
                             $diagnostics?->assessed($assessment['status']);
                         } catch (Throwable $readError) {
                             $diagnostics?->readAssessmentFailed();
@@ -148,6 +149,25 @@ final class CandidatePreparationService
                 } catch (Throwable) {
                     // Diagnostics must not change database outcomes or hide the original failure.
                 }
+            }
+        }
+    }
+
+    /**
+     * Keep the decoded manifest local to this call so the next read cannot retain it.
+     *
+     * @param  (callable(string, float): void)|null  $observer
+     * @return array{status: 'ready'|'waiting_upload'|'unknown', reason: ?string}
+     */
+    private function assess(string $path, ?PreparationRunDiagnostics $diagnostics, ?callable $observer): array
+    {
+        $manifest = $this->store->read($path, $observer);
+        $started = $diagnostics?->start();
+        try {
+            return $this->inventory->assessment($manifest);
+        } finally {
+            if ($started !== null) {
+                $diagnostics?->observeReadPhase('inventory', (hrtime(true) - $started) / 1_000_000);
             }
         }
     }

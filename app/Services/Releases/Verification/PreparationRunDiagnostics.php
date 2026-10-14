@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use Throwable;
+
 /** Bounded per-run counters; never retain candidate metadata or exception text. */
 final class PreparationRunDiagnostics
 {
@@ -22,7 +24,40 @@ final class PreparationRunDiagnostics
 
     private int $uninspectedSelected = 0;
 
-    public function __construct(private readonly int $started) {}
+    /** @var array{file_read: float, gzip_decode: float, integrity: float, json_decode: float, inventory: float} */
+    private array $readPhases = ['file_read' => 0.0, 'gzip_decode' => 0.0, 'integrity' => 0.0, 'json_decode' => 0.0, 'inventory' => 0.0];
+
+    private readonly ?float $cpuStarted;
+
+    public function __construct(private readonly int $started)
+    {
+        $this->cpuStarted = $this->cpuMilliseconds();
+    }
+
+    public function observeReadPhase(string $phase, float $milliseconds): void
+    {
+        if (array_key_exists($phase, $this->readPhases) && is_finite($milliseconds) && $milliseconds >= 0) {
+            $this->readPhases[$phase] += $milliseconds;
+        }
+    }
+
+    private function cpuMilliseconds(): ?float
+    {
+        try {
+            if (! function_exists('getrusage')) {
+                return null;
+            }
+            $usage = getrusage();
+            if ($usage === false) {
+                return null;
+            }
+
+            return ($usage['ru_utime.tv_sec'] + $usage['ru_stime.tv_sec']) * 1000.0
+                + ($usage['ru_utime.tv_usec'] + $usage['ru_stime.tv_usec']) / 1000.0;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 
     public function start(): int
     {
@@ -73,6 +108,7 @@ final class PreparationRunDiagnostics
     public function report(int $limit, int $seconds, int $inspected, int $deadline, bool $exhausted, bool $error): array
     {
         $finished = hrtime(true);
+        $cpuFinished = $this->cpuMilliseconds();
         $limitReached = $inspected >= $limit;
         $deadlineReached = $finished >= $deadline;
         $queuesExhausted = $exhausted && $this->uninspectedSelected === 0;
@@ -98,6 +134,8 @@ final class PreparationRunDiagnostics
             'deadline_reached' => $deadlineReached,
             'queues_exhausted' => $queuesExhausted,
             'durations_ms' => [...$this->durations, 'total' => ($finished - $this->started) / 1_000_000],
+            'read_phases_ms' => $this->readPhases,
+            'cpu_milliseconds' => $this->cpuStarted === null || $cpuFinished === null ? null : max(0.0, $cpuFinished - $this->cpuStarted),
         ];
     }
 }

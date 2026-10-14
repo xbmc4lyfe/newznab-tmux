@@ -6,6 +6,7 @@ namespace App\Services\Releases\Verification;
 
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
+use Throwable;
 
 final class ManifestStore
 {
@@ -60,23 +61,53 @@ final class ManifestStore
         return $name;
     }
 
-    /** @return array<string, mixed> */
-    public function read(string $name): array
+    /**
+     * @param  (callable(string, float): void)|null  $observer
+     * @return array<string, mixed>
+     */
+    public function read(string $name, ?callable $observer = null): array
     {
         if (preg_match('/\A[0-9a-f]{64}\.json\.gz\z/', $name) !== 1) {
             throw new RuntimeException('Invalid manifest reference.');
         }
-        $body = file_get_contents($this->path($name));
-        $json = $body === false ? false : gzdecode($body);
-        if ($json === false || hash('sha256', $json).'.json.gz' !== $name) {
-            throw new RuntimeException('Manifest integrity check failed.');
-        }
-        $result = json_decode($json, true, flags: JSON_THROW_ON_ERROR);
+        $body = $this->measured('file_read', $observer, fn () => file_get_contents($this->path($name)));
+        $json = $body === false ? false : $this->measured('gzip_decode', $observer, fn () => gzdecode($body));
+        $this->measured('integrity', $observer, static function () use ($json, $name): void {
+            if ($json === false || hash('sha256', $json).'.json.gz' !== $name) {
+                throw new RuntimeException('Manifest integrity check failed.');
+            }
+        });
+        $result = $this->measured('json_decode', $observer, fn () => json_decode($json, true, flags: JSON_THROW_ON_ERROR));
         if (! is_array($result)) {
             throw new RuntimeException('Invalid manifest contents.');
         }
 
         return $result;
+    }
+
+    /**
+     * @template T
+     *
+     * @param  (callable(string, float): void)|null  $observer
+     * @param  callable(): T  $operation
+     * @return T
+     */
+    private function measured(string $phase, ?callable $observer, callable $operation): mixed
+    {
+        if ($observer === null) {
+            return $operation();
+        }
+        $started = hrtime(true);
+        try {
+            return $operation();
+        } finally {
+            $milliseconds = (hrtime(true) - $started) / 1_000_000;
+            try {
+                $observer($phase, $milliseconds);
+            } catch (Throwable) {
+                // Diagnostics must never change manifest read results or failures.
+            }
+        }
     }
 
     public function path(string $name): string

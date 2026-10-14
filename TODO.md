@@ -1,5 +1,14 @@
 # To do
 
+## Locate preparation metadata read stalls (2026-10-14)
+
+Following the waiting-row update optimization, a natural 269-row pass spent 29.3 seconds in read/assessment and reached its deadline. Bounded read-only samples of 32 eligible manifests and the 32 largest among 2,000 eligible rows did not reproduce the stall. Add opt-in aggregate file-read, gzip, integrity, JSON and inventory durations plus process CPU time to the existing scheduled report, without new queries or retained candidate data. A slow phase still includes scheduling and I/O waits; process CPU time is whole-run CPU, not a per-phase attribution.
+
+- [x] Reproduce missing phase attribution through the real preparer, preserve retry/classification, capacity and immutable storage on failures, and retain original manifest exceptions even when timing observers throw. Default reads skip clock calls; diagnostic overhead remains measurable.
+- [x] Attempt a dependency-free local Rust timer through the actual manifest reader: ten workloads, 25 warmups and 1,000 randomized triplets per workload passed output/error/storage parity. Common mean speedups were 0.145× and 0.783×; representative uncommon p99 speedups were 0.154–0.697×. Retain PHP. Its observed median overhead was 626 ns for 1 KiB, while 128 KiB timing differences were within shared-host uncertainty. This measures diagnostic overhead, not release throughput.
+- [ ] Run final integrated checks, obtain independent local and current-head GitHub Codex clearance, verify xbmc4lyfe signatures and squash merge.
+- [ ] Verify guarded owner deployment and observe natural slow runs before choosing a parser, storage or CPU fix. Preserve fast and slow windows and measure useful publication separately. The 5,000-record/minute cap and low ready yield remain distinct limits.
+
 ## Qualify bounded waiting-inventory updates (2026-10-14)
 
 Natural preparation diagnostics identified database updates as a material cost: the initial 5,000-record passes spent 6.7–12.9 seconds updating rows, while ready yield stayed below one percent. Batch at most 25 consecutive identical `waiting_upload` classifications within each existing page. Ready promotions and unknown retry updates remain immediate. Preserve every snapshot and ownership predicate, manifests, article IDs, capacity, fairness and the approved publication spot-check contract.

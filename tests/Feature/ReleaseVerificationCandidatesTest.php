@@ -243,6 +243,121 @@ class ReleaseVerificationCandidatesTest extends TestCase
         $this->assertGreaterThan($claim->version, DB::table('release_verification_candidates')->value('version'));
     }
 
+    public function test_manifest_read_observes_actual_phases_without_changing_storage_or_queries(): void
+    {
+        $store = app(ManifestStore::class);
+        $manifest = ['files' => [['subject' => 'movie.mkv', 'segments' => [['messageid' => 'private@article']]]]];
+        $name = $store->write($manifest);
+        $bytes = file_get_contents($store->path($name));
+        $inventory = app('files')->allFiles((string) config('release_verification.storage_path'));
+        $queries = [];
+        DB::listen(static function (QueryExecuted $query) use (&$queries): void {
+            $queries[] = $query->sql;
+        });
+        $phases = [];
+
+        $result = $store->read($name, function (string $phase, float $milliseconds) use (&$phases): void {
+            $this->assertGreaterThanOrEqual(0.0, $milliseconds);
+            $this->assertTrue(is_finite($milliseconds));
+            $phases[] = $phase;
+        });
+
+        $this->assertSame($manifest, $result);
+        $this->assertSame(['file_read', 'gzip_decode', 'integrity', 'json_decode'], $phases);
+        $this->assertSame($manifest, $store->read($name));
+        $this->assertSame($bytes, file_get_contents($store->path($name)));
+        $this->assertEquals($inventory, app('files')->allFiles((string) config('release_verification.storage_path')));
+        $this->assertSame([], $queries);
+    }
+
+    public function test_manifest_read_observer_errors_do_not_mask_success_or_digest_failure(): void
+    {
+        $store = app(ManifestStore::class);
+        $manifest = ['files' => []];
+        $name = $store->write($manifest);
+        $phases = [];
+        $observer = static function (string $phase, float $milliseconds) use (&$phases): void {
+            $phases[] = $phase;
+            throw new \Error('Observer failed.');
+        };
+        $this->assertSame($manifest, $store->read($name, $observer));
+        $this->assertSame(['file_read', 'gzip_decode', 'integrity', 'json_decode'], $phases);
+        file_put_contents($store->path($name), gzencode('{"files":[1]}'));
+        $phases = [];
+
+        try {
+            $store->read($name, $observer);
+            $this->fail('A mismatched digest must fail.');
+        } catch (\RuntimeException $exception) {
+            $this->assertSame('Manifest integrity check failed.', $exception->getMessage());
+        }
+        $this->assertSame(['file_read', 'gzip_decode', 'integrity'], $phases);
+    }
+
+    public function test_manifest_read_reports_failed_json_decode_and_preserves_content_validation(): void
+    {
+        $store = app(ManifestStore::class);
+        $store->write(['files' => []]);
+        foreach (['{' => \JsonException::class, '"scalar"' => \RuntimeException::class] as $json => $exceptionClass) {
+            $name = hash('sha256', $json).'.json.gz';
+            file_put_contents($store->path($name), gzencode($json));
+            $phases = [];
+            try {
+                $store->read($name, static function (string $phase, float $milliseconds) use (&$phases): void {
+                    $phases[] = $phase;
+                });
+                $this->fail('Invalid manifest contents must fail.');
+            } catch (\Throwable $exception) {
+                $this->assertInstanceOf($exceptionClass, $exception);
+                $this->assertSame($json === '{' ? 'Syntax error' : 'Invalid manifest contents.', $exception->getMessage());
+            }
+            $this->assertSame(['file_read', 'gzip_decode', 'integrity', 'json_decode'], $phases);
+        }
+    }
+
+    public function test_manifest_read_reports_failed_file_and_gzip_operations(): void
+    {
+        $store = app(ManifestStore::class);
+        $name = $store->write(['files' => []]);
+        foreach (['file_read', 'gzip_decode'] as $failedPhase) {
+            if ($failedPhase === 'file_read') {
+                unlink($store->path($name));
+            } else {
+                file_put_contents($store->path($name), 'invalid gzip');
+            }
+            $phases = [];
+            set_error_handler(static function (int $severity, string $message, string $file, int $line): never {
+                throw new \ErrorException($message, 0, $severity, $file, $line);
+            });
+            try {
+                $store->read($name, static function (string $phase, float $milliseconds) use (&$phases): void {
+                    $phases[] = $phase;
+                    throw new \Error('Observer failed.');
+                });
+                $this->fail('The failed storage operation must throw.');
+            } catch (\ErrorException $exception) {
+                $this->assertStringContainsString($failedPhase === 'file_read' ? 'file_get_contents' : 'gzdecode', $exception->getMessage());
+            } finally {
+                restore_error_handler();
+            }
+            $this->assertSame($failedPhase === 'file_read' ? ['file_read'] : ['file_read', 'gzip_decode'], $phases);
+        }
+    }
+
+    public function test_invalid_manifest_reference_is_rejected_before_observation(): void
+    {
+        $phases = [];
+        try {
+            app(ManifestStore::class)->read('../private.json.gz', static function (string $phase, float $milliseconds) use (&$phases): void {
+                $phases[] = $phase;
+            });
+            $this->fail('Invalid manifest references must fail.');
+        } catch (\RuntimeException $exception) {
+            $this->assertSame('Invalid manifest reference.', $exception->getMessage());
+        }
+        $this->assertSame([], $phases);
+    }
+
     private function collection(string $messageId, int $part = 1): int
     {
         $id = DB::table('collections')->insertGetId(['collectionhash' => sha1('test', true), 'subject' => 'Movie', 'fromname' => 'poster',
