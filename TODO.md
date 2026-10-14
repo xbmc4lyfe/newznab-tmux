@@ -158,6 +158,14 @@ Monitor comparison captured 2026-10-11 22:52:44 UTC: 465,869 unmatched (+34 vers
 
 Follow-up correction verification: all ten PHPStan findings are cleared; full analysis of 849 files reports zero errors with no added baseline entries. The complete local PHPUnit suite passes 2,671 tests and 21,108 assertions, with 93 existing skips and 54 PHPUnit notices. Pint, PHP syntax lint, and independent source review pass. The correction batch is prepared on `codex/phpstan-backlog-cleanup` and remains separate from the deployed rename redesign. The correction batch is published in [PR #59](https://github.com/xbmc4lyfe/newznab-tmux/pull/59); current-head CI/review and release delivery are tracked above.
 
+## PreDB search coverage and naming throughput (2026-10-14)
+
+The live PreDB index contained 160,869 documents while SQL held 1,523,091 records. Eight missing middle-range records could not be matched by their exact titles; additive indexing restored all eight matches without changing their `searched` values. The guarded additive worker subsequently processed the frozen 1,523,091-row catalog in 61.42 seconds with zero reported errors. An independent ID-by-ID audit found zero missing source IDs. This proves catalog recovery, not release-identification throughput.
+
+- [ ] Retest PR #117's bounded launcher count against dense and sparse MariaDB catalogs and natural worker scheduling; preserve worker partitions and record actual recovered names.
+- [ ] Review, merge, deploy, and qualify the new `nntmux:search-reconcile --predb --all` recovery path, including dry-run, missing-only bulk writes, index-read/write failures, post-write ID checks, and unchanged SQL naming state.
+- [ ] Measure sustained recovered names, incoming releases, and net rename backlog after catalog recovery. A sample of 64 eligible releases with 961 cleaned file names had no literal SQL PreDB matches; catalog coverage alone does not prove useful evidence exists for every pending release.
+
 ## Retest SQL contention repairs (2026-10-12)
 
 Expedited shipping was requested with GitHub CI/CD skipped. Run the full regression suite and deployment qualification later; focused checks and live observations are recorded on each repair PR.
