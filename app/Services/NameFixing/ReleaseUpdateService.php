@@ -202,6 +202,12 @@ class ReleaseUpdateService
             }
 
             if (strtolower($newName) !== strtolower($release->searchname)) {
+                if ($this->renamesSeasonPackToEpisode((string) $release->searchname, $newName)) {
+                    $this->done = true;
+
+                    return;
+                }
+
                 if ($type === 'PAR2, ' && ! $literalSceneName) {
                     $newName = ucwords($newName);
                     if (preg_match('/(.+?)\.[a-z0-9]{2,3}(PAR2)?$/i', $name, $hit)) {
@@ -265,6 +271,11 @@ class ReleaseUpdateService
                 return;
             }
             $title = $currentTitle;
+        }
+        if ($this->renamesSeasonPackToEpisode((string) $release->searchname, $title)) {
+            $this->done = true;
+
+            return;
         }
         if (PredbSearchDocument::exactValue($title) === PredbSearchDocument::exactValue((string) $release->searchname)) {
             if ($update) {
@@ -985,6 +996,16 @@ class ReleaseUpdateService
         }
 
         return null;
+    }
+
+    /**
+     * A release named as a whole season is never renamed to a single episode of it.
+     */
+    private function renamesSeasonPackToEpisode(string $currentName, string $newName): bool
+    {
+        return SeasonPackDetector::isSeasonPack($currentName)
+            && SeasonPackDetector::isEpisodeName($newName)
+            && ! SeasonPackDetector::isSeasonPack($newName);
     }
 
     /**
