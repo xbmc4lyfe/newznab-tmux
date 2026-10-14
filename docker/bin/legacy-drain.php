@@ -30,10 +30,7 @@ $option = static function (string $key, ?string $value = null) use ($session): s
 
     return trim($result->output());
 };
-$restore = static function () use ($option, $runtime, $panes): void {
-    $running = $option('@nntmux_legacy_running');
-    $stopped = $option('@nntmux_legacy_stopped');
-    $monitorAlive = $option('@nntmux_legacy_monitor_alive');
+$restore = static function (string $running, string $stopped, string $monitorAlive, bool $wasDraining = false) use ($option, $runtime, $panes): void {
     foreach ([$running, $stopped, $monitorAlive] as $value) {
         if (! in_array($value, ['0', '1'], true)) {
             throw new RuntimeException('Missing legacy pre-drain state; refusing to guess.');
@@ -60,7 +57,7 @@ $restore = static function () use ($option, $runtime, $panes): void {
         && ! $panes->respawnPane($monitor, TmuxCommand::monitor('nntmux'))) {
         throw new RuntimeException('Runtime flags restored, but the legacy monitor could not restart.');
     }
-    $option('@nntmux_legacy_draining', '0');
+    $option('@nntmux_legacy_draining', $wasDraining ? '1' : '0');
 };
 $paused = false;
 $interrupted = false;
@@ -75,21 +72,41 @@ foreach ([SIGTERM, SIGINT, SIGHUP] as $signal) {
     });
 }
 try {
+    $lock = fopen(sys_get_temp_dir().'/nntmux-drain-'.hash('sha256', json_encode(TmuxCommand::arguments(['nntmux']), JSON_THROW_ON_ERROR)).'.lock', 'ce');
+    if ($lock === false || ! flock($lock, LOCK_EX | LOCK_NB)) {
+        throw new RuntimeException('Another drain control operation is active; processing state was preserved.');
+    }
+    $token = $argv[4] ?? '';
+    if (isset($argv[4]) && ! preg_match('/\A[A-Za-z0-9_-]{1,128}\z/', $token)) {
+        throw new RuntimeException('Invalid legacy drain operation token.');
+    }
     if (! $session->sessionExists()) {
         throw new RuntimeException('Legacy transition requires an existing, role-tagged tmux session.');
     }
     if (($argv[2] ?? '') === 'resume') {
-        $restore();
+        if ($token !== '' && ($option('@nntmux_legacy_draining') !== '1' || $option('@nntmux_legacy_token') !== $token)) {
+            fwrite(STDOUT, "This operation owns no active legacy drain; processing state was preserved.\n");
+            exit(0);
+        }
+        $restore($option('@nntmux_legacy_running'), $option('@nntmux_legacy_stopped'), $option('@nntmux_legacy_monitor_alive'));
         exit(0);
     }
     if (($argv[2] ?? '') !== 'drain' || ! ctype_digit($argv[3] ?? '')) {
         throw new RuntimeException('Expected drain with a nonnegative timeout, or resume.');
     }
+    $panes->refresh();
     $monitor = $panes->paneForRole(TmuxPaneRole::Monitor);
-    if ($option('@nntmux_legacy_draining') !== '1') {
-        $option('@nntmux_legacy_running', $runtime->isTmuxRunning() ? '1' : '0');
-        $option('@nntmux_legacy_stopped', $runtime->stopRequested() ? '1' : '0');
-        $option('@nntmux_legacy_monitor_alive', $panes->isAlive($monitor) ? '1' : '0');
+    $running = $runtime->isTmuxRunning() ? '1' : '0';
+    $stopped = $runtime->stopRequested() ? '1' : '0';
+    $monitorAlive = $panes->isAlive($monitor) ? '1' : '0';
+    $wasDraining = $option('@nntmux_legacy_draining') === '1';
+    if (! $wasDraining) {
+        $option('@nntmux_legacy_running', $running);
+        $option('@nntmux_legacy_stopped', $stopped);
+        $option('@nntmux_legacy_monitor_alive', $monitorAlive);
+        $option('@nntmux_legacy_token', $token);
+    } elseif ($token === '') {
+        $option('@nntmux_legacy_token', '');
     }
     $option('@nntmux_legacy_draining', '1');
     $paused = true;
@@ -125,7 +142,7 @@ try {
 } catch (Throwable $error) {
     if ($paused) {
         try {
-            $restore();
+            $restore($running, $stopped, $monitorAlive, $wasDraining);
         } catch (Throwable $restoreError) {
             fwrite(STDERR, $restoreError->getMessage()."\n");
         }

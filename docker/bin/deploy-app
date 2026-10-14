@@ -23,23 +23,23 @@ scheduler_timeout="${DEPLOY_SCHEDULER_DRAIN_TIMEOUT:-1800}"
 case "$scheduler_timeout" in
     ''|*[!0-9]*) echo "DEPLOY_SCHEDULER_DRAIN_TIMEOUT must be a nonnegative integer." >&2; exit 1 ;;
 esac
-scheduler_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
-legacy_drain() { compose exec -T indexer php -- /app "$1" "${DEPLOY_LEGACY_DRAIN_TIMEOUT:-1800}" < "$DIR/bin/legacy-drain.php"; }
-legacy_scheduler() { compose exec -T scheduler python3 - "$1" "$scheduler_timeout" "$scheduler_token" < "$DIR/bin/legacy-scheduler-drain.py"; }
+operation_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+legacy_drain() { compose exec -T indexer php -- /app "$1" "${DEPLOY_LEGACY_DRAIN_TIMEOUT:-1800}" "$operation_token" < "$DIR/bin/legacy-drain.php"; }
+legacy_scheduler() { compose exec -T scheduler python3 - "$1" "$scheduler_timeout" "$operation_token" < "$DIR/bin/legacy-scheduler-drain.py"; }
 scheduler_command() { compose exec -T scheduler python3 /app/docker/app/bin/scheduler.py "$@"; }
 resume() {
     if [ "$scheduler_drained" = 1 ]; then
         if [ "$scheduler_legacy" = 1 ]; then
             legacy_scheduler resume || echo "Legacy scheduler restoration failed; inspect its admission state before retrying." >&2
         else
-            scheduler_command restore --token="$scheduler_token" || echo "Scheduler restoration failed; admission may remain paused." >&2
+            scheduler_command restore --token="$operation_token" || echo "Scheduler restoration failed; admission may remain paused." >&2
         fi
     fi
     if [ "$drained" = 1 ]; then
         if [ "$legacy" = 1 ]; then
             legacy_drain resume || echo "Legacy indexer restoration failed; scheduling may remain paused." >&2
         else
-            compose exec -T indexer php artisan tmux:drain --resume --session=nntmux --no-interaction || echo "Indexer restoration failed; scheduling may remain paused." >&2
+            compose exec -T indexer php artisan tmux:drain --resume --session=nntmux --token="$operation_token" --no-interaction || echo "Indexer restoration failed; scheduling may remain paused." >&2
         fi
     fi
 }
@@ -51,7 +51,7 @@ scheduler=$(compose ps -q scheduler)
 if [ -n "$scheduler" ]; then
     capability=$(compose exec -T scheduler python3 -c 'from pathlib import Path; print("native" if Path("/app/docker/app/bin/scheduler.py").is_file() else "legacy")')
     case "$capability" in
-        native) scheduler_drained=1; scheduler_command drain --timeout="$scheduler_timeout" --token="$scheduler_token" ;;
+        native) scheduler_drained=1; scheduler_command drain --timeout="$scheduler_timeout" --token="$operation_token" ;;
         legacy)
             if [ "${DEPLOY_LEGACY_DRAIN:-0}" != 1 ]; then
                 echo "Old scheduler requires the authorized DEPLOY_LEGACY_DRAIN=1 transition." >&2
@@ -69,7 +69,7 @@ if [ -n "$indexer" ]; then
     commands=$(compose exec -T indexer php artisan list --raw --no-interaction)
     if printf '%s\n' "$commands" | grep -q '^tmux:drain[[:space:]]'; then
         drained=1
-        compose exec -T indexer php artisan tmux:drain --timeout="${DEPLOY_DRAIN_TIMEOUT:-90}" --session=nntmux --no-interaction
+        compose exec -T indexer php artisan tmux:drain --timeout="${DEPLOY_DRAIN_TIMEOUT:-90}" --session=nntmux --token="$operation_token" --no-interaction
     else
         if [ "${DEPLOY_LEGACY_DRAIN:-0}" != 1 ]; then
             echo "Old image lacks tmux:drain. Authorized first upgrades require DEPLOY_LEGACY_DRAIN=1; legacy IRC disconnects at final stop." >&2

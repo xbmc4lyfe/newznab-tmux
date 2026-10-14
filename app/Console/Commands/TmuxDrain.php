@@ -20,15 +20,17 @@ class TmuxDrain extends Command
     protected $signature = 'tmux:drain
                             {--session= : Tmux session name}
                             {--timeout=90 : Maximum seconds to wait for active processing workers}
-                            {--resume : Resume scheduling after a successful drain}';
+                            {--resume : Resume scheduling after a successful drain}
+                            {--token= : Restore only the drain owned by this operation}';
 
     protected $description = 'Pause new processing work and wait for active workers to finish';
 
     public function handle(): int
     {
         $runtime = app(ProcessingRuntimeStateRepository::class);
-        $running = $runtime->isTmuxRunning();
-        $stopped = $runtime->stopRequested();
+        $running = false;
+        $stopped = false;
+        $lock = null;
         $paused = false;
         $session = null;
         $panes = null;
@@ -50,10 +52,26 @@ class TmuxDrain extends Command
         }
         try {
             $name = $this->option('session') ?? app(ConfigurationProvider::class)->tmux()->sessionName;
+            $lock = fopen(sys_get_temp_dir().'/nntmux-drain-'.hash('sha256', json_encode(TmuxCommand::arguments([$name]), JSON_THROW_ON_ERROR)).'.lock', 'ce');
+            if ($lock === false || ! flock($lock, LOCK_EX | LOCK_NB)) {
+                throw new RuntimeException('Another drain control operation is active; processing state was preserved.');
+            }
+            $running = $runtime->isTmuxRunning();
+            $stopped = $runtime->stopRequested();
+            $token = (string) ($this->option('token') ?? '');
+            if ($this->option('token') !== null && ! preg_match('/\A[A-Za-z0-9_-]{1,128}\z/', $token)) {
+                throw new RuntimeException('The operation token must contain 1–128 letters, digits, underscores or hyphens.');
+            }
             $session = new TmuxSessionManager($name);
             $exists = $session->sessionExists();
             $panes = new TmuxPaneManager($name);
             if ($this->option('resume')) {
+                if ($token !== '' && (! $exists || $this->sessionOption($session, '@nntmux_draining') !== '1'
+                    || $this->sessionOption($session, '@nntmux_drain_token') !== $token)) {
+                    $this->info('This operation owns no active drain; processing state was preserved.');
+
+                    return self::SUCCESS;
+                }
                 if (! $exists) {
                     throw new RuntimeException('Cannot resume a missing tmux session.');
                 }
@@ -90,6 +108,11 @@ class TmuxDrain extends Command
                 $this->setSessionOption($session, '@nntmux_drain_was_stopped', $stopped ? '1' : '0');
                 $this->setSessionOption($session, '@nntmux_drain_monitor_pane', $monitorPane);
                 $this->setSessionOption($session, '@nntmux_drain_monitor_alive', $monitorAlive ? '1' : '0');
+                $this->setSessionOption($session, '@nntmux_drain_token', $token);
+            }
+            if ($wasDraining && $token === '') {
+                // An explicit operator pause supersedes automated restoration ownership.
+                $this->setSessionOption($session, '@nntmux_drain_token', '');
             }
             $this->setDrainFlag($session, true);
             $paused = true;
@@ -136,6 +159,9 @@ class TmuxDrain extends Command
 
             return self::FAILURE;
         } finally {
+            if (is_resource($lock)) {
+                fclose($lock);
+            }
             foreach ($handlers as $signal => $handler) {
                 pcntl_signal($signal, $handler);
             }

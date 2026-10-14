@@ -91,6 +91,30 @@ SH);
         $this->assertFileExists($this->directory.'/docker/.deploy.time');
     }
 
+    public function test_native_indexer_abort_uses_the_same_unique_operation_token_as_its_drain(): void
+    {
+        $process = $this->deploy(['NNTMUX_HORIZON_STOP_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $events = $this->events();
+        $this->assertSame(1, preg_match('/scheduler.py drain --timeout=1800 --token=([a-f0-9]{32})/', $events, $matches));
+        $token = $matches[1];
+        $this->assertStringContainsString('tmux:drain --timeout=90 --session=nntmux --token='.$token, $events);
+        $this->assertStringContainsString('tmux:drain --resume --session=nntmux --token='.$token, $events);
+    }
+
+    public function test_legacy_indexer_abort_uses_the_same_unique_operation_token_as_its_drain(): void
+    {
+        $process = $this->deploy(['NNTMUX_LEGACY_IMAGE' => '1', 'DEPLOY_LEGACY_DRAIN' => '1', 'NNTMUX_DRAIN_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $events = $this->events();
+        $this->assertSame(1, preg_match('/scheduler.py drain --timeout=1800 --token=([a-f0-9]{32})/', $events, $matches));
+        $token = $matches[1];
+        $this->assertStringContainsString('php -- /app drain 1800 '.$token, $events);
+        $this->assertStringContainsString('php -- /app resume 1800 '.$token, $events);
+    }
+
     public function test_unchanged_healthy_rollout_skips_build_drain_migration_and_restart(): void
     {
         $this->deploy()->mustRun();

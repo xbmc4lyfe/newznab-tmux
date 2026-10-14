@@ -468,6 +468,68 @@ PHP;
         $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
     }
 
+    public function test_drain_ownership_preserves_prior_pauses_and_rejected_attempts_on_a_real_socket(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true, 'stop_requested' => false]);
+        $session = new TmuxSessionManager('ownership');
+        $pane = $session->createSession();
+        $this->assertNotNull($pane);
+        $panes = new TmuxPaneManager('ownership');
+        $this->assertTrue($panes->setPaneRole($pane, TmuxPaneRole::Binaries));
+        $this->await(function () use ($panes, $pane): bool {
+            $panes->refresh();
+
+            return ! $panes->isAlive($pane);
+        });
+        $this->artisan('tmux:drain --session=ownership --timeout=0')->assertExitCode(0);
+        $this->artisan('tmux:drain --session=ownership --timeout=0 --token=deployment')->assertExitCode(0);
+        $this->artisan('tmux:drain --session=ownership --resume --token=deployment')->assertExitCode(0);
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->assertTrue($panes->respawnPane($pane, ['sleep', '30']));
+        $this->artisan('tmux:drain --session=ownership --timeout=0 --token=rejected')->assertExitCode(1);
+        $this->artisan('tmux:drain --session=ownership --resume --token=rejected')->assertExitCode(0);
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('stop_requested'));
+        $panes->refresh();
+        $this->assertTrue($panes->isAlive($pane));
+        $this->artisan('tmux:drain --session=ownership --resume')->assertExitCode(0);
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+    }
+
+    public function test_concurrent_drain_control_is_rejected_and_process_death_releases_the_lock(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => true, 'stop_requested' => false]);
+        $session = new TmuxSessionManager('locked');
+        $pane = $session->createSession();
+        $this->assertNotNull($pane);
+        $panes = new TmuxPaneManager('locked');
+        $this->await(function () use ($panes, $pane): bool {
+            $panes->refresh();
+
+            return ! $panes->isAlive($pane);
+        });
+        $this->artisan('tmux:drain --session=locked --timeout=0 --token=owner')->assertExitCode(0);
+        $path = sys_get_temp_dir().'/nntmux-drain-'.hash('sha256', json_encode(TmuxCommand::arguments(['locked']), JSON_THROW_ON_ERROR)).'.lock';
+        $holder = new Process([PHP_BINARY, '-r', '$lock = fopen($argv[1], "c"); flock($lock, LOCK_EX); echo "locked"; fflush(STDOUT); sleep(30);', $path]);
+        $holder->start();
+        try {
+            $this->await(static fn (): bool => $holder->getOutput() === 'locked');
+            $this->artisan('tmux:drain --session=locked --timeout=0 --token=rejected')->assertExitCode(1);
+            $this->artisan('tmux:drain --session=locked --resume --token=owner')->assertExitCode(1);
+            $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        } finally {
+            $holder->stop(0);
+        }
+        $this->artisan('tmux:drain --session=locked --resume --token=rejected')->assertExitCode(0);
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->artisan('tmux:drain --session=locked --resume --token=owner')->assertExitCode(0);
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+    }
+
     public function test_drain_timeout_preserves_a_real_active_worker_and_restores_processing(): void
     {
         config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);

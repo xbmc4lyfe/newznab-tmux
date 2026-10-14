@@ -26,6 +26,86 @@ class TmuxDrainTest extends TestCase
         ConfigurationTestBuilder::updateRuntime(['tmux_running' => true, 'stop_requested' => false]);
     }
 
+    public function test_deployment_abort_preserves_a_prior_operator_drain(): void
+    {
+        $options = [];
+        $this->fakeDrainState($options);
+        $this->artisan('tmux:drain --session=nntmux --timeout=0')->assertExitCode(0);
+        $this->artisan('tmux:drain --session=nntmux --timeout=0 --token=deployment')->assertExitCode(0);
+        $this->artisan('tmux:drain --session=nntmux --resume --token=deployment')->assertExitCode(0);
+        $this->assertRuntimePaused();
+        $this->artisan('tmux:drain --session=nntmux --resume')->assertExitCode(0);
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+    }
+
+    public function test_only_the_accepted_drain_owner_can_abort_and_stale_cleanup_cannot_undo_a_new_pause(): void
+    {
+        $options = [];
+        $this->fakeDrainState($options);
+        $this->artisan('tmux:drain --session=nntmux --timeout=0 --token=first')->assertExitCode(0);
+        $this->artisan('tmux:drain --session=nntmux --resume --token=rejected')->assertExitCode(0);
+        $this->assertRuntimePaused();
+        $this->artisan('tmux:drain --session=nntmux --resume --token=first')->assertExitCode(0);
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->artisan('tmux:drain --session=nntmux --timeout=0 --token=second')->assertExitCode(0);
+        $this->artisan('tmux:drain --session=nntmux --resume --token=first')->assertExitCode(0);
+        $this->assertRuntimePaused();
+    }
+
+    public function test_scoped_resume_without_an_accepted_snapshot_preserves_runtime(): void
+    {
+        $options = [];
+        $this->fakeDrainState($options);
+        $this->artisan('tmux:drain --session=nntmux --resume --token=rejected')->assertExitCode(0);
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('stop_requested'));
+    }
+
+    public function test_operator_pause_revokes_an_existing_deployment_restore_token(): void
+    {
+        $options = [];
+        $this->fakeDrainState($options);
+        $this->artisan('tmux:drain --session=nntmux --timeout=0 --token=deployment')->assertExitCode(0);
+        $this->artisan('tmux:drain --session=nntmux --timeout=0')->assertExitCode(0);
+        $this->artisan('tmux:drain --session=nntmux --resume --token=deployment')->assertExitCode(0);
+        $this->assertRuntimePaused();
+    }
+
+    public function test_owned_resume_with_an_incomplete_snapshot_fails_without_changing_runtime(): void
+    {
+        $options = [];
+        $this->fakeDrainState($options);
+        $this->artisan('tmux:drain --session=nntmux --timeout=0 --token=deployment')->assertExitCode(0);
+        unset($options['@nntmux_drain_was_running']);
+        $this->artisan('tmux:drain --session=nntmux --resume --token=deployment')->assertExitCode(1);
+        $this->assertRuntimePaused();
+    }
+
+    /** @param array<string, string> $options */
+    private function fakeDrainState(array &$options): void
+    {
+        Process::fake(function (PendingProcess $process) use (&$options) {
+            $arguments = $process->command;
+            if (in_array('#{session_id}', $arguments, true)) {
+                return Process::result('$1');
+            }
+            if (in_array('set-option', $arguments, true)) {
+                $options[$arguments[count($arguments) - 2]] = $arguments[array_key_last($arguments)];
+            }
+            if (in_array('show-options', $arguments, true)) {
+                return Process::result(($options[$arguments[array_key_last($arguments)]] ?? '')."\n");
+            }
+
+            return Process::result();
+        });
+    }
+
+    private function assertRuntimePaused(): void
+    {
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
+        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('stop_requested'));
+    }
+
     public function test_drain_waits_for_owned_workers_and_preserves_the_paused_session(): void
     {
         $lists = 0;

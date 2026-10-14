@@ -43,6 +43,85 @@ class LegacyDrainRuntimeTest extends TestCase
         }
     }
 
+    public function test_deployment_abort_and_repeated_failure_preserve_an_operator_pause(): void
+    {
+        $this->exec(['php', '/tmp/runtime.php', 'init', '0', 'irc_scraper', '0'])->mustRun();
+        $this->drain(10)->mustRun();
+        $this->drain(0, 'deployment')->mustRun();
+        $this->resume('deployment')->mustRun();
+        $this->assertFalse($this->state()['running']);
+        $this->assertTrue($this->state()['stopped']);
+        $this->exec(['tmux', 'split-window', '-d', '-t', 'nntmux:0', 'sleep', '30'])->mustRun();
+        $failed = $this->drain(0, 'rejected');
+        $failed->run();
+        $this->assertFalse($failed->isSuccessful());
+        $this->resume('rejected')->mustRun();
+        $this->assertFalse($this->state()['running']);
+        $this->assertTrue($this->state()['stopped']);
+        $this->resume()->mustRun();
+        $this->assertTrue($this->state()['running']);
+        $this->assertFalse($this->state()['stopped']);
+    }
+
+    public function test_only_the_accepted_legacy_drain_owner_can_restore_running_state(): void
+    {
+        $this->exec(['php', '/tmp/runtime.php', 'init', '0', 'irc_scraper', '0'])->mustRun();
+        $this->resume('never-accepted')->mustRun();
+        $this->assertTrue($this->state()['running']);
+        $this->drain(10, 'first')->mustRun();
+        $this->resume('wrong')->mustRun();
+        $this->assertFalse($this->state()['running']);
+        $this->resume('first')->mustRun();
+        $this->assertTrue($this->state()['running']);
+        $this->assertFalse($this->state()['stopped']);
+        $this->drain(10, 'second')->mustRun();
+        $this->resume('first')->mustRun();
+        $this->assertFalse($this->state()['running']);
+        $this->resume('second')->mustRun();
+        $this->assertTrue($this->state()['running']);
+    }
+
+    public function test_concurrent_legacy_controls_cannot_replace_the_owner_or_restore_its_pause(): void
+    {
+        $this->exec(['php', '/tmp/runtime.php', 'init', '5', 'irc_scraper', '0'])->mustRun();
+        $owner = $this->drain(15, 'owner');
+        $owner->start();
+        $this->awaitMonitorStopping();
+        $rejected = $this->drain(0, 'rejected');
+        $rejected->run();
+        $this->assertFalse($rejected->isSuccessful());
+        $this->assertStringContainsString('Another drain control operation is active', $rejected->getErrorOutput());
+        $restore = $this->resume('owner');
+        $restore->run();
+        $this->assertFalse($restore->isSuccessful());
+        $this->assertFalse($this->state()['running']);
+        $owner->wait();
+        $this->assertTrue($owner->isSuccessful(), $owner->getErrorOutput());
+        $this->resume('rejected')->mustRun();
+        $this->assertFalse($this->state()['running']);
+        $this->resume('owner')->mustRun();
+        $this->assertTrue($this->state()['running']);
+        $this->assertSame(1, $this->state()['committed']);
+    }
+
+    public function test_operator_pause_revokes_legacy_owner_and_incomplete_snapshots_fail_closed(): void
+    {
+        $this->exec(['php', '/tmp/runtime.php', 'init', '0', 'irc_scraper', '0'])->mustRun();
+        $this->drain(10, 'deployment')->mustRun();
+        $this->drain(0)->mustRun();
+        $this->resume('deployment')->mustRun();
+        $this->assertFalse($this->state()['running']);
+        $this->resume()->mustRun();
+        $this->drain(10, 'next')->mustRun();
+        $this->exec(['tmux', 'set-option', '-u', '-t', 'nntmux', '@nntmux_legacy_running'])->mustRun();
+        $resume = $this->resume('next');
+        $resume->run();
+        $this->assertFalse($resume->isSuccessful());
+        $this->assertStringContainsString('Missing legacy pre-drain state', $resume->getErrorOutput());
+        $this->assertFalse($this->state()['running']);
+        $this->assertTrue($this->state()['stopped']);
+    }
+
     public function test_old_wrapper_finishes_its_transaction_before_legacy_irc_disconnect(): void
     {
         $this->exec(['php', '/tmp/runtime.php', 'init', '3', 'irc_scraper'])->mustRun();
@@ -175,9 +254,14 @@ class LegacyDrainRuntimeTest extends TestCase
         return new Process(['docker', 'exec', '-i', $this->container, ...$command], null, null, $input, 60);
     }
 
-    private function drain(int $timeout): Process
+    private function drain(int $timeout, ?string $token = null): Process
     {
-        return $this->exec(['php', '--', '/app', 'drain', (string) $timeout], file_get_contents(__DIR__.'/../../docker/bin/legacy-drain.php'));
+        return $this->exec(['php', '--', '/app', 'drain', (string) $timeout, ...($token === null ? [] : [$token])], file_get_contents(__DIR__.'/../../docker/bin/legacy-drain.php'));
+    }
+
+    private function resume(?string $token = null): Process
+    {
+        return $this->exec(['php', '--', '/app', 'resume', '0', ...($token === null ? [] : [$token])], file_get_contents(__DIR__.'/../../docker/bin/legacy-drain.php'));
     }
 
     /** @return array{running: bool, stopped: bool, committed: int, panes: array<string, array{role: string, dead: bool}>} */
