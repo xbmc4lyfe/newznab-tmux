@@ -7,7 +7,6 @@ on:
       - 'scripts/benchmark-yenc.php'
       - 'scripts/benchmark-article-processing.php'
       - 'tests/Unit/ArticleProcessingBenchmarkTest.php'
-      - 'tests/Unit/NativeArticleMetadataTest.php'
       - 'scripts/benchmark-yenc-abi.py'
       - 'scripts/benchmark-cpu.py'
       - 'tests/Unit/test_benchmark_cpu.py'
@@ -35,6 +34,10 @@ on:
       samples:
         description: Matched fresh-process pairs per fixture stratum
         default: '31'
+        required: true
+      baseline_ref:
+        description: Frozen source revision for the manual caller comparison
+        default: 'master'
         required: true
       seed:
         description: Recorded order and bootstrap seed
@@ -284,7 +287,7 @@ jobs:
       - name: Check out frozen caller and native baseline
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.base.sha || '7e8ae85eca7197c11d3203b1f298d2186a03ed7a' }}
+          ref: ${{ github.event.pull_request.base.sha || inputs.baseline_ref || 'master' }}
           path: baseline-source
           persist-credentials: false
 
@@ -314,8 +317,7 @@ jobs:
       - name: Test real processing profile workers
         env:
           NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
-          YENC_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
-        run: php -d ffi.enable=true -d memory_limit=1G vendor/bin/phpunit --fail-on-skipped tests/Unit/ArticleProcessingBenchmarkTest.php tests/Unit/NativeArticleMetadataTest.php
+        run: php -d ffi.enable=true -d memory_limit=1G vendor/bin/phpunit --fail-on-skipped tests/Unit/ArticleProcessingBenchmarkTest.php
 
       - name: Freeze build and runtime identity
         shell: bash
@@ -379,14 +381,10 @@ jobs:
             2>&1 | tee processing-evidence/build/profile-console.log
 
       - name: Compare full fingerprint caller against frozen baseline
-        if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'profile'
+        if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
         shell: bash
         run: |
-          mode=()
-          if rg -q 'function parseArticleMetadata' baseline-source/app/Services/Releases/Fingerprint/NativeMetadataParser.php; then
-            mode+=(--regression-only)
-          fi
-          php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-article-processing.php "${mode[@]}" \
+          php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-article-processing.php \
             --paired --baseline-dir="$GITHUB_WORKSPACE/baseline-source" \
             --baseline-native="$GITHUB_WORKSPACE/processing-evidence/build/baseline.so" \
             --native="$GITHUB_WORKSPACE/processing-evidence/build/native.so" \

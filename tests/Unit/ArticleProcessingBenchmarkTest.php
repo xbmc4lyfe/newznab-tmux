@@ -199,6 +199,34 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         }
     }
 
+    public function test_paired_combined_qualification_is_explicit_and_candidate_only(): void
+    {
+        self::assertSame([], articleBenchmarkPairOptions('candidate', '/snapshot', false));
+        self::assertSame(['--require-combined'], articleBenchmarkPairOptions('candidate', '/snapshot', true));
+        self::assertSame(['--baseline-dir=/snapshot'], articleBenchmarkPairOptions('baseline', '/snapshot', true));
+    }
+
+    public function test_requested_missing_combined_method_cannot_silently_fall_back(): void
+    {
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Candidate requires the combined article metadata ABI');
+        articleBenchmarkQualifyCombined(new \stdClass, 'headers', 'body');
+    }
+
+    public function test_requested_unavailable_combined_result_cannot_silently_fall_back(): void
+    {
+        $parser = new class
+        {
+            public function parseArticleMetadata(string $headers, string $body): null
+            {
+                return null;
+            }
+        };
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Candidate combined article metadata ABI returned unavailable or invalid metadata');
+        articleBenchmarkQualifyCombined($parser, 'headers', 'body');
+    }
+
     public function test_build_manifest_requires_matching_source_and_library_identities(): void
     {
         $manifest = ['baseline_library_sha256' => 'old-library', 'candidate_library_sha256' => 'new-library',
@@ -226,6 +254,12 @@ final class ArticleProcessingBenchmarkTest extends TestCase
                 file($directory.'/paired/observations.jsonl', FILE_IGNORE_NEW_LINES));
             self::assertSame(6, $rows[0]['confidence_family_size']);
             self::assertSame(1, $rows[0]['timed_samples_per_worker']);
+            self::assertFalse($rows[0]['candidate_combined_required']);
+            foreach ($rows as $row) {
+                if ($row['type'] === 'observation' && $row['backend'] === 'candidate') {
+                    self::assertNotContains('--require-combined', $row['command']);
+                }
+            }
             self::assertFalse($rows[array_key_last($rows)]['performance_advantage_demonstrated']);
             self::assertSame('invalid', $rows[array_key_last($rows)]['status']);
             self::assertCount(36, glob($directory.'/paired/*.stderr'));

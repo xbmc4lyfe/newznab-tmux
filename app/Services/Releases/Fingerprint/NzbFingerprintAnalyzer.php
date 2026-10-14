@@ -250,21 +250,14 @@ final class NzbFingerprintAnalyzer
         }
 
         $frame = ArticleFrame::parse($rawBody);
-        $headerBlock = implode('', $rawHeaders);
-        $parser = new NativeMetadataParser;
-        $articleMetadata = $parser->parseArticleMetadata($headerBlock, $rawBody);
-        if ($articleMetadata !== null) {
-            $yencFramingMetadata = $articleMetadata['yenc_framing_metadata'];
-            $nntpHeaderMetadata = $articleMetadata['nntp_header_metadata'];
-            $nntpBodyMetadata = $articleMetadata['nntp_body_metadata'];
-            $nntpLinesBodyRelationship = $articleMetadata['nntp_lines_body_relationship'];
-        } else {
-            $yencFramingMetadata = $parser->parseYencFraming($rawBody);
-            $nntpHeaderMetadata = $parser->parseNntpHeaders($headerBlock);
-            $nntpBodyMetadata = $parser->parseNntpBody($rawBody)
-                ?? self::fallbackNntpBodyMetadata($rawBody);
-            $nntpLinesBodyRelationship = $parser->compareNntpLinesToBody($headerBlock, $rawBody);
-        }
+        $yencFramingMetadata = (new NativeMetadataParser)->parseYencFraming($rawBody);
+        $nntpHeaderMetadata = (new NativeMetadataParser)->parseNntpHeaders(implode('', $rawHeaders));
+        $nntpBodyMetadata = (new NativeMetadataParser)->parseNntpBody($rawBody)
+            ?? self::fallbackNntpBodyMetadata($rawBody);
+        $nntpLinesBodyRelationship = (new NativeMetadataParser)->compareNntpLinesToBody(
+            implode('', $rawHeaders),
+            $rawBody,
+        );
         $conflictingYencFields = [];
         $framingEvidenceIncomplete = self::yencFramingEvidenceIncomplete($yencFramingMetadata, $rawBody);
         $framingLines = is_array($yencFramingMetadata['lines'] ?? null) ? $yencFramingMetadata['lines'] : [];

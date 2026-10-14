@@ -9,6 +9,7 @@ declare(strict_types=1);
  * Every phase uses a fresh process, one untimed reference and one recorded warmup.
  * Profile results are diagnostic only. Paired mode uses --paired --baseline-dir=ROOT
  * --baseline-native=LIB --native=LIB [--samples=31] [--order-seed=20261014].
+ * [--require-combined] explicitly qualifies the candidate combined API before warmup.
  * Paired mode currently screens median speedups only; p99/adoption is unqualified.
  */
 use App\Services\NNTP\NNTPService;
@@ -244,22 +245,11 @@ function articleBenchmarkMeasure(string $phase, array $fixture, string $native, 
         unset($reference);
         $combinedAvailable = false;
         if ($requireCombined) {
-            $parserReflection = new ReflectionClass($parser);
-            if ($phase !== 'full-analyzer' || ! $parserReflection->hasMethod('parseArticleMetadata')) {
-                throw new RuntimeException('Candidate requires the combined article metadata ABI.');
+            if ($phase !== 'full-analyzer') {
+                throw new RuntimeException('Combined metadata qualification requires the full analyzer phase.');
             }
-            $combined = $parserReflection->getMethod('parseArticleMetadata');
-            if (! $combined->isPublic()) {
-                throw new RuntimeException('Candidate combined article metadata method must be public.');
-            }
-            $combinedResult = $combined->invoke($parser, $headers, $fixture['body']);
-            $combinedAvailable = is_array($combinedResult)
-                && array_keys($combinedResult) === ['yenc_framing_metadata', 'nntp_header_metadata', 'nntp_body_metadata', 'nntp_lines_body_relationship']
-                && array_all($combinedResult, static fn (mixed $value): bool => is_array($value));
-            if (! $combinedAvailable) {
-                throw new RuntimeException('Candidate combined article metadata ABI returned unavailable or invalid metadata.');
-            }
-            unset($combinedResult);
+            articleBenchmarkQualifyCombined($parser, $headers, $fixture['body']);
+            $combinedAvailable = true;
         }
         for ($sample = -1; $sample < $samples; $sample++) {
             rewind($stream);
@@ -313,6 +303,31 @@ function articleBenchmarkMeasure(string $phase, array $fixture, string $native, 
     } finally {
         fclose($stream);
     }
+}
+
+/** Require the requested candidate API to exist and return all four metadata arrays. */
+function articleBenchmarkQualifyCombined(object $parser, string $headers, string $body): void
+{
+    $parserReflection = new ReflectionClass($parser);
+    if (! $parserReflection->hasMethod('parseArticleMetadata')) {
+        throw new RuntimeException('Candidate requires the combined article metadata ABI.');
+    }
+    $combined = $parserReflection->getMethod('parseArticleMetadata');
+    if (! $combined->isPublic()) {
+        throw new RuntimeException('Candidate combined article metadata method must be public.');
+    }
+    $combinedResult = $combined->invoke($parser, $headers, $body);
+    if (! is_array($combinedResult)
+        || array_keys($combinedResult) !== ['yenc_framing_metadata', 'nntp_header_metadata', 'nntp_body_metadata', 'nntp_lines_body_relationship']
+        || ! array_all($combinedResult, static fn (mixed $value): bool => is_array($value))) {
+        throw new RuntimeException('Candidate combined article metadata ABI returned unavailable or invalid metadata.');
+    }
+}
+
+/** @return list<string> */
+function articleBenchmarkPairOptions(string $backend, string $baselineSnapshot, bool $requireCombined): array
+{
+    return $backend === 'baseline' ? ['--baseline-dir='.$baselineSnapshot] : ($requireCombined ? ['--require-combined'] : []);
 }
 
 /** Call a symbol from the qualified FFI declaration; FFI exposes C functions dynamically. */
@@ -628,11 +643,13 @@ function articleBenchmarkPaired(array $options, array $validated): int
             copy($manifestPath, $directory.'/runtime-manifest.json');
             $runtimeManifest = ['path' => $directory.'/runtime-manifest.json', 'sha256' => hash_file('sha256', $manifestPath), 'contents' => $manifest];
         }
+        $requireCombined = isset($options['require-combined']);
         $protocol = ['type' => 'protocol', 'version' => 'paired-article-processing-v1', 'phase' => 'full-analyzer',
             'comparison_mode' => isset($options['regression-only']) ? 'regression_only' : 'median_screen',
             'pairs_per_stratum' => $validated['samples'], 'warmups_per_worker' => 1, 'timed_samples_per_worker' => 1,
             'cold_reference_calls_per_worker' => 1, 'cold_reference_scope' => 'first real analyzer call after decoder construction; reported separately from warm comparison',
-            'combined_qualification' => 'candidate combined metadata call must succeed after cold reference and before warmup',
+            'candidate_combined_required' => $requireCombined,
+            'combined_qualification' => $requireCombined ? 'candidate combined metadata call must succeed after cold reference and before warmup' : 'not_requested',
             'sizes' => [4096, 524288, 1048576], 'densities' => ['ordinary', 'heavy'], 'confidence_family_size' => 6,
             'target_minimum_size' => 524288, 'min_latency_speedup' => $validated['min_speedup'], 'max_regression_percent' => 5,
             'evidence' => 'paired_median_screen', 'adoption_not_qualified_p99_missing' => true,
@@ -671,9 +688,9 @@ function articleBenchmarkPaired(array $options, array $validated): int
                         $metadataPath = $prefix.'.metadata.serialized';
                         $command = array_merge(articleBenchmarkPhpCommand(), [__FILE__, '--worker=full-analyzer', '--samples=1',
                             '--native='.$libraries[$backend]['path'], '--fixture-path='.$fixturePath, '--result-output='.$metadataPath]);
-                        $command[] = $backend === 'baseline' ? '--baseline-dir='.$baselineSnapshot : '--require-combined';
+                        array_push($command, ...articleBenchmarkPairOptions($backend, $baselineSnapshot, $requireCombined));
                         $child = yencBenchmarkRunChild($command, $prefix, $validated['timeout']);
-                        $eligible = articleBenchmarkPairedEligible($child, $decodedHash, $libraries[$backend]['sha256'], $metadataPath, $backend === 'candidate');
+                        $eligible = articleBenchmarkPairedEligible($child, $decodedHash, $libraries[$backend]['sha256'], $metadataPath, $backend === 'candidate' && $requireCombined);
                         $results[$backend] = ['eligible' => $eligible, 'child' => $child, 'metadata_path' => $metadataPath];
                         $emit(['type' => 'observation', 'size' => $size, 'density' => $density, 'pair' => $pair,
                             'backend' => $backend, 'order' => $order, 'position' => $position, 'command' => $command, 'eligible' => $eligible] + $child);
