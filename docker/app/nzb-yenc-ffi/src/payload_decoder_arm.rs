@@ -215,6 +215,61 @@ unsafe fn decode_neon_regular_lane(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[inline(never)]
+unsafe fn decode_neon_regular_slow_group(
+    a: std::arch::aarch64::uint8x16_t,
+    b: std::arch::aarch64::uint8x16_t,
+    c: std::arch::aarch64::uint8x16_t,
+    d: std::arch::aarch64::uint8x16_t,
+    destination: *mut u8,
+    escaped: &mut bool,
+) -> usize {
+    use std::arch::aarch64::*;
+    unsafe {
+        let lookup = vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr());
+        let marker = vdupq_n_u8(b'=');
+        let mut written = 0;
+        // All payload vectors were loaded before entering this helper. Keep
+        // mask recomputation here so the caller's clean path needs no lane
+        // masks across its branch; never reread overlapping source memory.
+        let equals = vceqq_u8(a, marker);
+        written += decode_neon_regular_lane(
+            a,
+            equals,
+            vqtbx1q_u8(equals, lookup, a),
+            destination,
+            escaped,
+        );
+        let equals = vceqq_u8(b, marker);
+        written += decode_neon_regular_lane(
+            b,
+            equals,
+            vqtbx1q_u8(equals, lookup, b),
+            destination.add(written),
+            escaped,
+        );
+        let equals = vceqq_u8(c, marker);
+        written += decode_neon_regular_lane(
+            c,
+            equals,
+            vqtbx1q_u8(equals, lookup, c),
+            destination.add(written),
+            escaped,
+        );
+        let equals = vceqq_u8(d, marker);
+        written += decode_neon_regular_lane(
+            d,
+            equals,
+            vqtbx1q_u8(equals, lookup, d),
+            destination.add(written),
+            escaped,
+        );
+        written
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 // Keep dense-loop branches out of the ordinary loop's register allocation.
 #[inline(never)]
 unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: usize) -> usize {
@@ -241,14 +296,10 @@ unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: u
             let b = vld1q_u8(source.add(read + 16));
             let c = vld1q_u8(source.add(read + 32));
             let d = vld1q_u8(source.add(read + 48));
-            let eq_a = vceqq_u8(a, vdupq_n_u8(b'='));
-            let eq_b = vceqq_u8(b, vdupq_n_u8(b'='));
-            let eq_c = vceqq_u8(c, vdupq_n_u8(b'='));
-            let eq_d = vceqq_u8(d, vdupq_n_u8(b'='));
-            let special_a = vqtbx1q_u8(eq_a, lookup, a);
-            let special_b = vqtbx1q_u8(eq_b, lookup, b);
-            let special_c = vqtbx1q_u8(eq_c, lookup, c);
-            let special_d = vqtbx1q_u8(eq_d, lookup, d);
+            let special_a = vqtbx1q_u8(vceqq_u8(a, vdupq_n_u8(b'=')), lookup, a);
+            let special_b = vqtbx1q_u8(vceqq_u8(b, vdupq_n_u8(b'=')), lookup, b);
+            let special_c = vqtbx1q_u8(vceqq_u8(c, vdupq_n_u8(b'=')), lookup, c);
+            let special_d = vqtbx1q_u8(vceqq_u8(d, vdupq_n_u8(b'=')), lookup, d);
             let any_special = vorrq_u8(
                 vorrq_u8(special_a, special_b),
                 vorrq_u8(special_c, special_d),
@@ -260,31 +311,11 @@ unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: u
                 vst1q_u8(destination.add(written + 48), vsubq_u8(d, offset));
                 written += 64;
             } else {
-                written += decode_neon_regular_lane(
+                written += decode_neon_regular_slow_group(
                     a,
-                    eq_a,
-                    special_a,
-                    destination.add(written),
-                    &mut escaped,
-                );
-                written += decode_neon_regular_lane(
                     b,
-                    eq_b,
-                    special_b,
-                    destination.add(written),
-                    &mut escaped,
-                );
-                written += decode_neon_regular_lane(
                     c,
-                    eq_c,
-                    special_c,
-                    destination.add(written),
-                    &mut escaped,
-                );
-                written += decode_neon_regular_lane(
                     d,
-                    eq_d,
-                    special_d,
                     destination.add(written),
                     &mut escaped,
                 );
@@ -592,6 +623,41 @@ mod tests {
             }
             verify_regular_guards(&payload, &expected);
         }
+    }
+
+    #[test]
+    fn ordinary_group_carry_crosses_repeated_newline_boundaries_and_final_marker() {
+        let mut payload = vec![b'k'; 256];
+        for marker in [63, 127, 191, 255] {
+            payload[marker] = b'=';
+        }
+        for boundary in [64, 128, 192] {
+            payload[boundary..boundary + 2].copy_from_slice(b"\r\n");
+        }
+        let mut expected = vec![65; 247];
+        for position in [63, 124, 185] {
+            expected[position] = 1;
+        }
+        expected[246] = 19;
+        verify_regular_guards(&payload, &expected);
+    }
+
+    #[test]
+    fn ordinary_incoming_only_group_keeps_distinct_lane_order_then_resumes_clean() {
+        let mut payload = vec![b'k'; 63];
+        payload.push(b'=');
+        for byte in *b"klmn" {
+            payload.extend(std::iter::repeat_n(byte, 16));
+        }
+        payload.extend(std::iter::repeat_n(b'k', 64));
+        let mut expected = vec![65; 63];
+        expected.push(1);
+        expected.extend(std::iter::repeat_n(65, 15));
+        for byte in [66, 67, 68] {
+            expected.extend(std::iter::repeat_n(byte, 16));
+        }
+        expected.extend(std::iter::repeat_n(65, 64));
+        verify_regular_guards(&payload, &expected);
     }
 
     fn verify_dense(payload: &[u8]) {
