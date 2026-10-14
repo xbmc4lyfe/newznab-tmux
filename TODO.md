@@ -1,5 +1,14 @@
 # To do
 
+## Qualify filename work reopened by additional processing (2026-10-14)
+
+New persisted filenames reopen the ordinary filename pass for unrenamed, unlinked releases. A no-match consumer completes that pass only while its release identity and exact inspected filename inventory remain current. Duplicate-only replays do not reopen completed work, and external lookups remain outside the short completion transaction.
+
+- [x] Qualify the core interleavings on an isolated local MariaDB 11.4.8 with the imported 121-table schema and the composite `release_files` key without an `id`. Both READ COMMITTED and REPEATABLE READ passed actual producer-first and consumer-first insertions; both also rejected a simulated same-count case-only filename replacement. Locking reads saw newly committed filenames even when ordinary REPEATABLE READ reads retained the older snapshot. The same isolated run passed six renamed/category completion cases; these fixtures do not establish production contention or throughput.
+- [ ] Extend MariaDB qualification to duplicate replay, GUID replacement, claim loss, rollback, XXX mixed inventories and linked direct filename checks. Those cases currently have focused SQLite regression coverage; the core MariaDB interleavings do not qualify every lifecycle case.
+- [ ] After current-head Codex clearance, green CI and a guarded rollout by the deployment owner, verify deployed source parity and observe natural filename additions reopening work. Record actual useful identities recovered and sustained naming yield; the exact-title regression fixture and queue eligibility alone do not establish production speedup.
+- [ ] Qualify existing stranded filename work before any bounded historical requeue. A read-only sample of 16 completed, unrenamed releases with 357 stored filenames produced zero matches through the real ordinary consumer; syntactic filename candidates alone are not sufficient identity evidence.
+
 ## Qualify equivalent PAR2 source-proof reuse (2026-10-13)
 
 Equivalent complete volumes reuse a successful source proof only within one verification invocation. Every volume still receives packet checksum, filename, alias, conflict and scratch checks. Mixed, incomplete or inconsistent metadata retains the original proof path. Any repair invalidates all earlier cached proofs; final source MD5 and whole-file CRC checks remain authoritative.

@@ -28,6 +28,7 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\CollectionCleanupService;
 use App\Services\NameFixing\Extractors\FileNameExtractor;
 use App\Services\NameFixing\FileNameCleaner;
+use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\NfoService;
@@ -777,7 +778,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $this->prepareFullPar2Evidence();
         Schema::table('releases', function (Blueprint $table): void {
-            foreach (['videos_id', 'tv_episodes_id', 'book_lookup_attempts', 'iscategorized', 'proc_par2', 'proc_files'] as $column) {
+            foreach (['videos_id', 'tv_episodes_id', 'book_lookup_attempts', 'iscategorized', 'proc_par2'] as $column) {
                 $table->integer($column)->default(0);
             }
             foreach (['imdbid', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'book_lookup_retry_at', 'book_name_normalized_at', 'anidbid'] as $column) {
@@ -816,8 +817,6 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $table->dateTime('postdate')->nullable();
             $table->integer('proc_pp')->default(1);
             $table->integer('proc_hash16k')->default(1);
-            $table->integer('predb_id')->default(0);
-            $table->integer('isrenamed')->default(0);
         });
         (require database_path('migrations/2026_10_12_010315_create_par_file_hash_evidence_tables.php'))->up();
         (require database_path('migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->up();
@@ -884,6 +883,385 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->assertSame(1, DB::table('releases')->where('id', 1)->value('rarinnerfilecount'));
         $this->assertNull(DB::table('releases')->where('id', 1)->value('additional_pp_claimed_at'));
         $this->assertNull(DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
+    }
+
+    public function test_late_archive_filename_reopens_the_real_filename_pass_and_recovers_its_exact_title(): void
+    {
+        $this->prepareFilenameNaming();
+        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
+        Search::shouldReceive('searchPredb')->andReturn([]);
+        Search::shouldReceive('updateRelease')->twice()->with(1);
+        $updater = new ReleaseUpdateService($this->createStub(CategorizationService::class));
+        $fixer = new NameFixingService($updater);
+        $queries = new NameFixingQueryService;
+        $fixer->fixNamesWithFiles(0, true, 1, true, false);
+        self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+        self::assertSame([], $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
+        $manager = $this->makeManager($fixer);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+
+        self::assertTrue($manager->addFileInfo(['name' => $title.'.mkv', 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
+        $manager->finalizeRelease($context, false);
+
+        self::assertCount(1, $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
+        $fixer->fixNamesWithFiles(0, true, 1, true, false);
+        $release = Release::query()->findOrFail(1);
+        self::assertSame($title, $release->searchname);
+        self::assertSame(1, (int) $release->isrenamed);
+        self::assertSame(0, (int) $release->predb_id);
+        self::assertSame(1, (int) $release->proc_files);
+    }
+
+    #[DataProvider('filenamePassHandlers')]
+    public function test_an_old_filename_pass_cannot_complete_after_the_producer_adds_a_new_filename(string $handler): void
+    {
+        $this->prepareFilenameNaming();
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
+        $manager = $this->makeManager();
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
+        self::assertTrue($manager->addFileInfo(['name' => $title.'.mkv', 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
+        $inserted = false;
+        Search::shouldReceive('updateRelease')->twice()->with(1);
+        Search::shouldReceive('searchPredb')->andReturnUsing(function () use (&$inserted, $manager, $context): array {
+            self::assertSame(0, DB::transactionLevel(), 'Filename discovery must not hold the completion lock.');
+            if (! $inserted) {
+                $inserted = true;
+                $manager->finalizeRelease($context, false);
+            }
+
+            return [];
+        });
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+
+        if ($handler === 'files') {
+            $fixer->fixNamesWithFiles(0, true, 1, true, false);
+        } else {
+            $input = (new NameFixingQueryService)->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1)[0];
+            $input->textstring = str_repeat('a', 32).'.bin';
+            $fixer->checkName($input, true, 'Filenames, ', true, false);
+        }
+
+        self::assertTrue($inserted);
+        self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+        self::assertCount(1, (new NameFixingQueryService)->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
+        $fixer->fixNamesWithFiles(0, true, 1, true, false);
+        self::assertSame($title, DB::table('releases')->where('id', 1)->value('searchname'));
+        self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('isrenamed'));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function filenamePassHandlers(): array
+    {
+        return ['ordinary batch' => ['files'], 'legacy direct check' => ['checkName']];
+    }
+
+    #[DataProvider('directFilenameInventories')]
+    public function test_direct_filename_completion_requires_the_persisted_inventory_to_be_fully_inspected(int $fileCount): void
+    {
+        $this->prepareFilenameNaming();
+        $name = str_repeat('a', 32).'.bin';
+        for ($index = 0; $index < $fileCount; $index++) {
+            DB::table('release_files')->insert(['releases_id' => 1, 'name' => $index === 0 ? $name : str_repeat('b', 32).'.bin']);
+        }
+        Search::shouldReceive('searchPredb')->once()->andReturn([]);
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        $input = Release::query()->findOrFail(1);
+        $input->releases_id = 1;
+        $input->textstring = $name;
+
+        $fixer->checkName($input, true, 'Filenames, ', true, false);
+
+        self::assertSame($fileCount === 1 ? 1 : 0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+    }
+
+    /** @return array<string, array{int}> */
+    public static function directFilenameInventories(): array
+    {
+        return ['unpersisted external text' => [0], 'inspected singleton' => [1], 'uninspected sibling' => [2]];
+    }
+
+    #[DataProvider('renamedFallbackCategories')]
+    public function test_a_stable_no_match_filename_pass_completes_an_eligible_renamed_fallback(int $category): void
+    {
+        $this->prepareFilenameNaming();
+        DB::table('releases')->where('id', 1)->update(['isrenamed' => 1, 'categories_id' => $category]);
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
+        $queries = new NameFixingQueryService;
+        self::assertCount(1, $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
+        Search::shouldReceive('searchPredb')->once()->andReturn([]);
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+
+        $fixer->fixNamesWithFiles(0, true, 1, true, false);
+
+        self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+        self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('isrenamed'));
+        self::assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
+        self::assertSame([], $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
+        $fixer->fixNamesWithFiles(0, true, 1, true, false);
+    }
+
+    #[DataProvider('renamedFallbackCategories')]
+    public function test_filename_completion_preserves_a_renamed_fallback_reclassified_during_discovery(int $category): void
+    {
+        $this->prepareFilenameNaming();
+        DB::table('releases')->where('id', 1)->update(['isrenamed' => 1, 'categories_id' => $category]);
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
+        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function (): array {
+            DB::table('releases')->where('id', 1)->update(['categories_id' => Category::MOVIE_HD]);
+
+            return [];
+        });
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+
+        $fixer->fixNamesWithFiles(0, true, 1, true, false);
+
+        self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+        self::assertSame(Category::MOVIE_HD, (int) DB::table('releases')->where('id', 1)->value('categories_id'));
+    }
+
+    /** @return array<string, array{int}> */
+    public static function renamedFallbackCategories(): array
+    {
+        return ['OTHER_MISC' => [Category::OTHER_MISC], 'OTHER_HASHED' => [Category::OTHER_HASHED]];
+    }
+
+    #[DataProvider('renamedResolvedFilenameHandlers')]
+    public function test_stable_renamed_resolved_filename_completion_preserves_explicit_caller_modes(string $handler): void
+    {
+        $this->prepareFilenameNaming();
+        DB::table('releases')->where('id', 1)->update(['isrenamed' => 1, 'categories_id' => Category::MOVIE_HD]);
+        $name = str_repeat('a', 32).'.bin';
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => $name]);
+        $queries = new NameFixingQueryService;
+        self::assertSame([], $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 0));
+        $candidates = $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 3);
+        self::assertCount(1, $candidates);
+        Search::shouldReceive('searchPredb')->once()->andReturn([]);
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+
+        if ($handler === 'categories3') {
+            $fixer->fixNamesWithFiles(0, true, 3, true, false);
+        } else {
+            $input = $candidates[0];
+            $input->textstring = $name;
+            $fixer->checkName($input, true, 'Filenames, ', true, false);
+        }
+
+        self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+        self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('isrenamed'));
+        self::assertSame(Category::MOVIE_HD, (int) DB::table('releases')->where('id', 1)->value('categories_id'));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function renamedResolvedFilenameHandlers(): array
+    {
+        return ['category 3 batch' => ['categories3'], 'direct persisted singleton' => ['checkName']];
+    }
+
+    #[DataProvider('directFilenamePredbStates')]
+    public function test_direct_filename_completion_preserves_the_exact_observed_predb_link(int $observedPredb, int $currentPredb, bool $completed): void
+    {
+        $this->prepareFilenameNaming();
+        DB::table('releases')->where('id', 1)->update(['predb_id' => $observedPredb]);
+        $name = str_repeat('a', 32).'.bin';
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => $name]);
+        $input = Release::query()->findOrFail(1);
+        $input->releases_id = 1;
+        $input->textstring = $name;
+        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function () use ($currentPredb): array {
+            DB::table('releases')->where('id', 1)->update(['predb_id' => $currentPredb]);
+
+            return [];
+        });
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+
+        $fixer->checkName($input, true, 'Filenames, ', true, false);
+
+        self::assertSame($completed ? 1 : 0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+        self::assertSame($currentPredb, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+    }
+
+    /** @return array<string, array{int, int, bool}> */
+    public static function directFilenamePredbStates(): array
+    {
+        return [
+            'stable unlinked singleton' => [0, 0, true],
+            'stable linked singleton' => [7, 7, true],
+            'new link during discovery' => [0, 7, false],
+            'link replacement during discovery' => [7, 8, false],
+        ];
+    }
+
+    public function test_generic_snapshot_status_updates_remain_restricted_to_unlinked_releases(): void
+    {
+        $this->prepareFilenameNaming();
+        DB::table('releases')->where('id', 1)->update(['predb_id' => 7, 'proc_nfo' => 0]);
+        $input = Release::query()->findOrFail(1);
+        $input->releases_id = 1;
+        $updater = new ReleaseUpdateService($this->createStub(CategorizationService::class));
+
+        self::assertFalse($updater->updateSnapshotColumn($input, 'proc_nfo', NameFixingService::PROC_NFO_DONE));
+
+        self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('proc_nfo'));
+    }
+
+    #[DataProvider('filenameCompletionIdentityChanges')]
+    public function test_filename_completion_preserves_a_changed_release_identity(string $column, string|int $value): void
+    {
+        $this->prepareFilenameNaming();
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
+        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function () use ($column, $value): array {
+            DB::table('releases')->where('id', 1)->update([$column => $value]);
+
+            return [];
+        });
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+
+        $fixer->fixNamesWithFiles(0, true, 1, true, false);
+
+        self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+        self::assertSame($value, DB::table('releases')->where('id', 1)->value($column));
+    }
+
+    /** @return array<string, array{string, string|int}> */
+    public static function filenameCompletionIdentityChanges(): array
+    {
+        return [
+            'GUID replacement' => ['guid', 'new-guid'],
+            'subject reset' => ['name', 'New.Subject'],
+            'searchname reset' => ['searchname', 'New.Searchname'],
+            'already renamed' => ['isrenamed', 1],
+            'PreDB linked' => ['predb_id', 7],
+        ];
+    }
+
+    #[DataProvider('filenameWakeupScenarios')]
+    public function test_only_new_rows_on_an_unrenamed_unlinked_release_reopen_filename_processing(
+        bool $renamed, bool $linked, bool $duplicate,
+    ): void {
+        $this->prepareFilenameNaming();
+        DB::table('releases')->where('id', 1)->update(['proc_files' => 1, 'isrenamed' => (int) $renamed, 'predb_id' => $linked ? 7 : 0]);
+        Search::shouldReceive('updateRelease')->once()->with(1);
+        $manager = $this->makeManager();
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $name = 'Example.Movie.2026.1080p.BluRay.x264-TARGET.mkv';
+        self::assertTrue($manager->addFileInfo(['name' => $name, 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
+        if ($duplicate) {
+            DB::table('release_files')->insert(['releases_id' => 1, 'name' => $name]);
+        }
+
+        $manager->finalizeRelease($context, false);
+
+        self::assertSame($renamed || $linked || $duplicate ? 1 : 0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+        self::assertSame(1, DB::table('release_files')->count());
+        self::assertSame(! $duplicate, $context->releaseFilesChanged);
+    }
+
+    /** @return array<string, array{bool, bool, bool}> */
+    public static function filenameWakeupScenarios(): array
+    {
+        return [
+            'new filename' => [false, false, false],
+            'already renamed' => [true, false, false],
+            'PreDB linked' => [false, true, false],
+            'duplicate-only concurrent replay' => [false, false, true],
+        ];
+    }
+
+    #[DataProvider('lateFilenameOwnershipChanges')]
+    public function test_late_filename_admission_preserves_a_lost_claim_or_replaced_identity(string $column, string $value): void
+    {
+        $this->prepareFilenameNaming();
+        DB::table('releases')->where('id', 1)->update(['proc_files' => 1]);
+        $manager = $this->makeManager();
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        self::assertTrue($manager->addFileInfo(['name' => 'Example.Movie.2026.1080p.BluRay.x264-TARGET.mkv', 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
+        DB::table('releases')->where('id', 1)->update([$column => $value]);
+        Search::shouldReceive('updateRelease')->never();
+
+        $manager->finalizeRelease($context, false);
+
+        self::assertTrue($context->fullPar2EvidenceDeferred);
+        self::assertSame(0, DB::table('release_files')->count());
+        self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+        self::assertSame($value, DB::table('releases')->where('id', 1)->value($column));
+    }
+
+    /** @return array<string, array{string, string}> */
+    public static function lateFilenameOwnershipChanges(): array
+    {
+        return [
+            'GUID replacement' => ['guid', 'new-guid'],
+            'subject reset' => ['name', 'New.Subject'],
+            'searchname reset' => ['searchname', 'New.Searchname'],
+            'claim replacement' => ['additional_pp_claim_token', 'new-owner'],
+            'claim expiry' => ['additional_pp_claimed_at', '2000-01-01 00:00:00'],
+        ];
+    }
+
+    #[DataProvider('xxxFilenameInterleavings')]
+    public function test_xxx_filename_completion_compares_the_full_observed_inventory(bool $addLateFile): void
+    {
+        $this->prepareFilenameNaming();
+        DB::table('release_files')->insert([
+            ['releases_id' => 1, 'name' => 'SDPORN.bin'],
+            ['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin'],
+        ]);
+        $manager = $this->makeManager();
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        self::assertTrue($manager->addFileInfo(['name' => 'Example.Movie.2026.1080p.BluRay.x264-TARGET.mkv', 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
+        Search::shouldReceive('updateRelease')->times($addLateFile ? 1 : 0)->with(1);
+        $inserted = false;
+        DB::listen(function (QueryExecuted $query) use ($addLateFile, &$inserted, $manager, $context): void {
+            if ($addLateFile && ! $inserted && str_contains($query->sql, 'SELECT rf.releases_id')) {
+                $inserted = true;
+                self::assertSame(0, DB::transactionLevel());
+                $manager->finalizeRelease($context, false);
+            }
+        });
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+
+        $fixer->fixXXXNamesWithFiles(0, true, 1, true, false);
+
+        self::assertSame($addLateFile ? 0 : 1, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+        self::assertSame($addLateFile ? 3 : 2, DB::table('release_files')->count());
+        self::assertSame($addLateFile, $inserted);
+    }
+
+    /** @return array<string, array{bool}> */
+    public static function xxxFilenameInterleavings(): array
+    {
+        return ['unchanged mixed inventory completes' => [false], 'late file preserves wake-up' => [true]];
+    }
+
+    public function test_filename_completion_requires_the_exact_bytes_not_just_the_same_row_count(): void
+    {
+        $this->prepareFilenameNaming();
+        $name = str_repeat('a', 32).'.bin';
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => $name]);
+        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function () use ($name): array {
+            DB::table('release_files')->where('releases_id', 1)->update(['name' => strtoupper($name)]);
+
+            return [];
+        });
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+
+        $fixer->fixNamesWithFiles(0, true, 1, true, false);
+
+        self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+    }
+
+    private function prepareFilenameNaming(): void
+    {
+        $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
+        Schema::table('releases', function (Blueprint $table): void {
+            $table->string('fromname')->default('');
+            foreach (['proc_nfo', 'proc_uid', 'proc_srr', 'proc_crc32'] as $column) {
+                $table->integer($column)->default(1);
+            }
+        });
     }
 
     public function test_finalization_flushes_rows_and_synchronizes_search_immediately(): void
@@ -1043,8 +1421,6 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $table->dateTime('postdate')->nullable();
             $table->integer('proc_pp')->default(0);
             $table->integer('proc_par2')->default(0);
-            $table->integer('predb_id')->default(0);
-            $table->integer('isrenamed')->default(0);
         });
         Schema::create('predb', function (Blueprint $table): void {
             $table->integer('id')->primary();
@@ -1103,7 +1479,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
 
     public function test_failed_finalization_rolls_back_buffered_rows_and_keeps_them_for_retry(): void
     {
-        DB::table('releases')->insert($this->releaseRow());
+        DB::table('releases')->insert([...$this->releaseRow(), 'proc_files' => 1]);
 
         Search::shouldReceive('updateRelease')->never();
 
@@ -1127,6 +1503,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         }
 
         $this->assertSame(0, DB::table('release_files')->count());
+        $this->assertSame(1, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
         $this->assertArrayHasKey('Example.Movie.2026.mkv', $context->pendingReleaseFiles);
     }
 
@@ -1495,6 +1872,9 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $table->integer('nzbstatus')->default(1);
             $table->integer('rarinnerfilecount')->default(0);
             $table->integer('pp_timeout_count')->default(0);
+            $table->integer('proc_files')->default(0);
+            $table->integer('predb_id')->default(0);
+            $table->integer('isrenamed')->default(0);
             $table->integer('tv_lookup_attempts')->default(0);
             $table->timestamp('additional_pp_claimed_at')->nullable();
             $table->string('additional_pp_claim_token', 64)->nullable();
