@@ -85,7 +85,7 @@ class VerifyReleaseCandidates extends Command
                         ->where('version', $claim->version)->value('id');
                     $scratchBudget->reconcile($scratchEntryId, $locks, $progressHeartbeat);
                     $verificationOptions = (array) config('release_verification');
-                    $source = new NntpArticleSource(app(NNTPService::class), decoder: $decoder,
+                    $source ??= new NntpArticleSource(app(NNTPService::class), decoder: $decoder,
                         maximumBytes: min((int) $verificationOptions['spot_check_bytes'], (int) $verificationOptions['spot_check_article_bytes']),
                         allowAlternateFallback: false);
                     $verifier = new SpotCheckVerifier($source, $verificationOptions, $decoder);
@@ -137,7 +137,7 @@ class VerifyReleaseCandidates extends Command
                         $this->warn($claim->id.': retry pending — '.$error->getMessage());
                     }
                 } finally {
-                    unset($source, $verifier, $manifest, $result, $progressHeartbeat, $heartbeat);
+                    unset($verifier, $manifest, $result, $progressHeartbeat, $heartbeat);
                     $locks->releaseCandidate();
                 }
             }
@@ -146,6 +146,7 @@ class VerifyReleaseCandidates extends Command
                 $this->line($count->status.': '.$count->count);
             }
         } finally {
+            unset($source);
             $locks->close();
         }
 
