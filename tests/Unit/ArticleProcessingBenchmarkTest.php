@@ -346,6 +346,70 @@ final class ArticleProcessingBenchmarkTest extends TestCase
         }
     }
 
+    public function test_snapshot_materializes_tracked_internal_directory_symlink_descendants(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-directory-link-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/source', 'directory-link');
+        mkdir($directory.'/source/.ai/skills/fixture/references', 0700, true);
+        mkdir($directory.'/source/.agents/skills', 0700, true);
+        file_put_contents($directory.'/source/.ai/skills/fixture/SKILL.md', 'fixture guidance');
+        file_put_contents($directory.'/source/.ai/skills/fixture/references/check.md', 'nested fixture guidance');
+        file_put_contents($directory.'/source/.ai/skills/fixture/.env', 'private fixture');
+        file_put_contents($directory.'/source/.ai/skills/fixture/auth.json', 'private fixture');
+        symlink('../../.ai/skills/fixture', $directory.'/source/.agents/skills/fixture');
+        articleBenchmarkGit($directory.'/source', ['add', '.ai', '.agents']);
+        try {
+            $snapshot = articleBenchmarkFreezeGraph($directory.'/source', $directory.'/snapshot');
+            self::assertTrue(is_link($directory.'/source/.agents/skills/fixture'));
+            self::assertFalse(is_link($snapshot['root'].'/.agents/skills/fixture'));
+            self::assertSame('fixture guidance', file_get_contents($snapshot['root'].'/.agents/skills/fixture/SKILL.md'));
+            self::assertSame('nested fixture guidance', file_get_contents($snapshot['root'].'/.agents/skills/fixture/references/check.md'));
+            self::assertSame($snapshot['files']['.ai/skills/fixture/SKILL.md'], $snapshot['files']['.agents/skills/fixture/SKILL.md']);
+            self::assertArrayNotHasKey('.agents/skills/fixture', $snapshot['files']);
+            self::assertFileDoesNotExist($snapshot['root'].'/.agents/skills/fixture/.env');
+            self::assertFileDoesNotExist($snapshot['root'].'/.agents/skills/fixture/auth.json');
+            self::assertTrue(articleBenchmarkGraphStable($snapshot, $directory.'/source'));
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
+    public function test_snapshot_rejects_tracked_external_directory_symlinks(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-directory-escape-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/source', 'directory-escape');
+        mkdir($directory.'/outside', 0700);
+        file_put_contents($directory.'/outside/secret.txt', 'outside fixture');
+        symlink($directory.'/outside', $directory.'/source/escaped-directory');
+        articleBenchmarkGit($directory.'/source', ['add', 'escaped-directory']);
+        try {
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('Source directory escapes selected source');
+            articleBenchmarkFreezeGraph($directory.'/source', $directory.'/snapshot');
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
+    public function test_snapshot_rejects_cycles_in_internal_directory_symlinks(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-directory-cycle-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/source', 'directory-cycle');
+        mkdir($directory.'/source/linked-tree', 0700);
+        symlink('.', $directory.'/source/linked-tree/back');
+        articleBenchmarkGit($directory.'/source', ['add', 'linked-tree/back']);
+        try {
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('contains a symlink cycle');
+            articleBenchmarkFreezeGraph($directory.'/source', $directory.'/snapshot');
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
     public function test_snapshot_rejects_tracked_symlinks_to_external_source(): void
     {
         $directory = sys_get_temp_dir().'/nntmux-symlink-escape-'.bin2hex(random_bytes(8));
@@ -595,7 +659,7 @@ PHP);
             return;
         }
         foreach (new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS), \RecursiveIteratorIterator::CHILD_FIRST) as $file) {
-            $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
+            $file->isDir() && ! $file->isLink() ? rmdir($file->getPathname()) : unlink($file->getPathname());
         }
         rmdir($directory);
     }

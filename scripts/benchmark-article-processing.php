@@ -836,18 +836,26 @@ function articleBenchmarkGraphFiles(string $root): array
             throw new InvalidArgumentException('Selected source needs its own installed Composer graph: '.$path);
         }
     }
-    $paths = array_values(array_filter(explode("\0", (string) articleBenchmarkGit($root, ['ls-files', '-z'])),
+    $tracked = array_values(array_filter(explode("\0", (string) articleBenchmarkGit($root, ['ls-files', '-z'])),
         static fn (string $path): bool => $path !== '' && ! articleBenchmarkPrivatePath($path)));
+    $paths = [];
     $pending = [['path' => 'vendor', 'ancestors' => []]];
+    foreach ($tracked as $path) {
+        if (is_dir($root.'/'.$path)) {
+            $pending[] = ['path' => $path, 'ancestors' => []];
+        } else {
+            $paths[] = $path;
+        }
+    }
     while ($pending !== []) {
         $entry = array_pop($pending);
         $realDirectory = realpath($root.'/'.$entry['path']);
         if ($realDirectory === false || ! str_starts_with($realDirectory, $root.'/') || in_array($realDirectory, $entry['ancestors'], true)) {
-            throw new RuntimeException('Vendor directory escapes selected source or contains a symlink cycle.');
+            throw new RuntimeException('Source directory escapes selected source or contains a symlink cycle.');
         }
         $names = scandir($root.'/'.$entry['path']);
         if ($names === false) {
-            throw new RuntimeException('Cannot inspect selected vendor graph.');
+            throw new RuntimeException('Cannot inspect selected source directory.');
         }
         foreach ($names as $name) {
             if ($name === '.' || $name === '..') {
