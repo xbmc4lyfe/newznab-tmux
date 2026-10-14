@@ -79,3 +79,10 @@ jobs:
           PAR2_DONOR_TEST_USERNAME: root
           PAR2_DONOR_TEST_PASSWORD: donor-fixture-only
         run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/Par2DonorInventoryMariaDbTest.php
+
+      - name: Qualify verification queue preparation against MariaDB
+        env:
+          PAR2_DONOR_TEST_HOST: 127.0.0.1
+          PAR2_DONOR_TEST_USERNAME: root
+          PAR2_DONOR_TEST_PASSWORD: donor-fixture-only
+        run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/VerificationReadyQueueMariaDbTest.php

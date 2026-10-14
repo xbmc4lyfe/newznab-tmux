@@ -146,6 +146,8 @@ class ReleaseVerificationCandidatesTest extends TestCase
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->collection('a@b'));
+        // Reproduce an unclassified candidate admitted by the previous version.
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $repository->archive($this->collection('c@d', 2));
         $candidate = DB::table('release_verification_candidates')->first();
@@ -197,6 +199,8 @@ class ReleaseVerificationCandidatesTest extends TestCase
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->collection('a@b'));
+        // Reproduce an unclassified candidate admitted by the previous version.
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $this->travel(1)->hours();
         $id = $this->collection('a@b');
@@ -210,6 +214,8 @@ class ReleaseVerificationCandidatesTest extends TestCase
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->collection('a@b'));
+        // Reproduce an unclassified candidate admitted by the previous version.
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $id = $this->collection('new@article', 2);
         DB::table('collections')->where('id', $id)->update(['filecheck' => 0]);
@@ -217,13 +223,18 @@ class ReleaseVerificationCandidatesTest extends TestCase
         $this->assertSame(3, (int) DB::table('collections')->where('id', $id)->value('filecheck'));
         $this->assertNull(DB::table('release_verification_candidates')->value('lease_token'));
         $repository->archive($id);
-        $this->assertNotNull($repository->claim());
+        $manifest = app(ManifestStore::class)->read(DB::table('release_verification_candidates')->value('manifest_path'));
+        $this->assertCount(2, $manifest['files'][0]['segments']);
+        $this->assertSame('waiting_upload', DB::table('release_verification_candidates')->value('status'));
+        $this->assertNull($repository->claim(), 'The second declared file is still absent.');
     }
 
     public function test_conflicting_declared_part_count_invalidates_lease_without_a_new_article(): void
     {
         $repository = app(CandidateRepository::class);
         $repository->archive($this->collection('a@b'));
+        // Reproduce an unclassified candidate admitted by the previous version.
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
         $claim = $repository->claim();
         $id = $this->collection('a@b');
         DB::table('binaries')->where('collections_id', $id)->update(['totalparts' => 3]);

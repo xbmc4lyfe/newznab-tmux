@@ -71,7 +71,7 @@ class VerifyReleaseCandidates extends Command
                 if ($index > 0 && $maxSeconds > 0 && (hrtime(true) - $runStarted) / 1e9 >= $maxSeconds) {
                     break;
                 }
-                $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id));
+                $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $locks->preferReady());
                 if ($claim === null) {
                     break;
                 }
