@@ -1,17 +1,10 @@
 #!/bin/bash
-# Quick Font Installation Script for Tmux
+# Linux font installation for tmux
 # Installs powerline fonts for better tmux appearance
 
 echo "🎨 Tmux Font Installer"
 echo "====================="
 echo ""
-
-# Check if running in WSL or native Linux
-if grep -qi microsoft /proc/version; then
-    echo "ℹ️  Detected WSL environment"
-    echo "⚠️  Note: You'll also need to configure your Windows Terminal font"
-    echo ""
-fi
 
 # Function to install powerline fonts
 install_powerline() {
@@ -130,11 +123,6 @@ echo ""
 echo "📋 Next steps:"
 echo ""
 echo "1. Configure your terminal to use 'FiraCode Nerd Font Mono'"
-echo ""
-echo "   Windows Terminal (WSL):"
-echo "   - Open Settings (Ctrl+,)"
-echo "   - Select your WSL profile"
-echo "   - Appearance → Font face → FiraCode Nerd Font Mono"
 echo ""
 echo "   Gnome Terminal:"
 echo "   - Preferences → Profile → Text → Custom font"

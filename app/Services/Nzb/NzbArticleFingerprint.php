@@ -83,7 +83,7 @@ final class NzbArticleFingerprint
                 }
             }
         }
-        throw new \RuntimeException('Rust article fingerprint is unavailable. Build it with scripts/build-nntmux-native.sh.');
+        throw new NzbArticleFingerprintUnavailable('Rust article fingerprint is unavailable. Build it with scripts/build-nntmux-native.sh.');
     }
 
     private function __clone(): void {}
