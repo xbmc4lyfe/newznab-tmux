@@ -11,6 +11,7 @@ mod article_dates;
 pub mod article_fingerprint;
 mod article_identity;
 mod article_xref;
+pub mod cpu_snapshot;
 mod formats;
 mod nntp_body;
 mod nntp_headers;

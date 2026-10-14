@@ -6,8 +6,6 @@ on:
       - '.github/workflows/yenc-performance.yml'
       - 'scripts/benchmark-yenc.php'
       - 'scripts/benchmark-yenc-abi.py'
-      - 'scripts/benchmark-cpu.py'
-      - 'tests/Unit/test_benchmark_cpu.py'
       - 'tests/Unit/test_yenc_abi_benchmark.py'
       - 'tests/Feature/ReleaseFingerprintMetadataTest.php'
       - 'scripts/build-rapidyenc.sh'
@@ -78,7 +76,6 @@ jobs:
         run: |
           php vendor/bin/phpunit --filter=YencBenchmarkTest
           python3 tests/Unit/test_yenc_abi_benchmark.py
-          python3 tests/Unit/test_benchmark_cpu.py
 
       - name: Build pinned C++ baseline
         shell: bash
@@ -190,7 +187,7 @@ jobs:
           PY
 
       - name: Capture CPU counters before native comparison
-        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-before.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output benchmark-evidence/build/cpu-before.json
 
       - name: Run randomized paired decoder comparison
         shell: bash
@@ -206,7 +203,7 @@ jobs:
 
       - name: Capture CPU counters after native comparison
         if: always() && hashFiles('benchmark-evidence/build/cpu-before.json') != ''
-        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-after.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output benchmark-evidence/build/cpu-after.json
 
       - name: Explain native decode and CRC costs without changing the caller gate
         if: always()
@@ -290,7 +287,6 @@ jobs:
       - name: Test benchmark correctness and failure retention
         run: |
           php vendor/bin/phpunit tests/Unit/YencBenchmarkTest.php
-          python3 tests/Unit/test_benchmark_cpu.py
 
       - name: Build locked Rust candidate and verify PHP service parity
         shell: bash
@@ -334,7 +330,7 @@ jobs:
           PY
 
       - name: Capture CPU counters before PHP comparison
-        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-before.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output benchmark-evidence/build/cpu-before.json
 
       - name: Compare Rust against the real PHP fallback
         shell: bash
@@ -349,7 +345,7 @@ jobs:
 
       - name: Capture CPU counters after PHP comparison
         if: always() && hashFiles('benchmark-evidence/build/cpu-before.json') != ''
-        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-after.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output benchmark-evidence/build/cpu-after.json
 
       - name: Summarize PHP replacement evidence
         if: always()
