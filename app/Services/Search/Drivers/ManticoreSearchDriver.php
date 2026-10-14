@@ -688,7 +688,7 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidate
     /**
      * Bulk insert multiple predb records into the index.
      *
-     * @param  array<string, mixed>  $predbRecords  Array of predb data arrays
+     * @param  array<array<string, mixed>>  $predbRecords  Array of predb data arrays
      * @return array<string, mixed> Results with 'success' and 'errors' counts
      */
     public function bulkInsertPredb(array $predbRecords): array

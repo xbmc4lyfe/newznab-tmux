@@ -5,28 +5,39 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Facades\Search;
+use App\Models\Predb;
 use App\Models\Release;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use Carbon\Carbon;
 use Illuminate\Console\Command;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
+use Manticoresearch\Endpoints\Sql;
+use RuntimeException;
 use Throwable;
 
 class NntmuxSearchReconcile extends Command
 {
     protected $signature = 'nntmux:search-reconcile
+                            {--predb : Reconcile PreDB documents; requires --all}
                             {--since=24h : Only releases with adddate after this window (e.g. 24h, 7d)}
-                            {--all : Scan every release row instead of applying --since}
-                            {--chunk=1000 : MySQL chunk size when scanning releases}
+                            {--all : Scan every row instead of applying --since; required for --predb}
+                            {--chunk=1000 : MySQL chunk size when scanning rows}
                             {--in-batch=500 : Max ids per Manticore IN() query}
                             {--orphans : Also remove indexed ids that no longer exist in MySQL}
-                            {--reindex : Call Search::updateRelease for each missing id}
+                            {--reindex : Repair missing release or PreDB documents}
                             {--dry-run : Report only; do not write to the index}';
 
-    protected $description = 'Find releases rows missing from Manticore releases_rt and optionally reindex them';
+    protected $description = 'Find release or PreDB rows missing from Manticore and optionally reindex them';
 
     public function handle(ManticoreSearchDriver $manticore): int
     {
+        if ($this->option('predb') && (! $this->option('all') || $this->option('orphans'))) {
+            $this->error('--predb requires --all and does not support --orphans.');
+
+            return self::FAILURE;
+        }
+
         if (config('search.default') !== 'manticore') {
             $this->error('This command only supports SEARCH_DRIVER=manticore.');
 
@@ -37,6 +48,10 @@ class NntmuxSearchReconcile extends Command
             $this->error('Manticore is not reachable.');
 
             return self::FAILURE;
+        }
+
+        if ($this->option('predb')) {
+            return $this->reconcilePredb($manticore);
         }
 
         $since = (string) $this->option('since');
@@ -136,6 +151,113 @@ class NntmuxSearchReconcile extends Command
         $this->info("Reindexed {$done} release(s).");
 
         return self::SUCCESS;
+    }
+
+    private function reconcilePredb(ManticoreSearchDriver $driver): int
+    {
+        $chunk = max(50, min(5000, (int) $this->option('chunk')));
+        $inBatch = max(50, min(1000, (int) $this->option('in-batch')));
+        $reindex = $this->option('reindex') && ! $this->option('dry-run');
+        $maxId = 0;
+        $lastCompletedId = 0;
+        $scanned = 0;
+        $missingTotal = 0;
+        $repaired = 0;
+        $sample = [];
+
+        try {
+            $maxId = (int) Predb::query()->max('id');
+            $index = $driver->getPredbIndex();
+            Predb::query()->select(['id', 'title', 'filename', 'source'])
+                ->where('id', '<=', $maxId)
+                ->chunkById($chunk, function (Collection $rows) use ($driver, $index, $inBatch, $reindex, &$scanned, &$missingTotal, &$repaired, &$sample, &$lastCompletedId): void {
+                    foreach ($rows->chunk($inBatch) as $batch) {
+                        $ids = $batch->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+                        $indexed = $this->fetchPredbIndexedIds($driver, $index, $ids);
+                        $missing = array_values(array_diff($ids, $indexed));
+                        $scanned += count($ids);
+                        $missingTotal += count($missing);
+                        $sample = array_slice([...$sample, ...array_slice($missing, 0, 20)], 0, 20);
+
+                        if ($reindex && $missing !== []) {
+                            $documents = $batch->whereIn('id', $missing)->map(static fn (Predb $row): array => $row->getAttributes())->values()->all();
+                            // REPLACE is idempotent by ID. A normal concurrent reindex of
+                            // the same ID may race this repair; SQL state is never changed.
+                            $result = $driver->bulkInsertPredb($documents);
+                            if (($result['success'] ?? null) !== count($missing) || ($result['errors'] ?? null) !== 0) {
+                                throw new RuntimeException('PreDB bulk write failed.');
+                            }
+                            if (array_diff($missing, $this->fetchPredbIndexedIds($driver, $index, $missing)) !== []) {
+                                throw new RuntimeException('PreDB write verification failed.');
+                            }
+                            $repaired += count($missing);
+                        }
+                    }
+                    $lastCompletedId = (int) $rows->last()->id;
+                });
+        } catch (Throwable $error) {
+            $this->error('PreDB reconciliation failed ('.get_class($error).').');
+            $this->line("Last completed ID: {$lastCompletedId}; frozen max ID: {$maxId}");
+
+            return self::FAILURE;
+        }
+
+        $this->info("Scanned {$scanned} PreDB row(s); missing in Manticore index: {$missingTotal}");
+        $this->line("Last completed ID: {$lastCompletedId}; frozen max ID: {$maxId}");
+        if ($sample !== []) {
+            $this->line('Sample ids: '.implode(', ', $sample));
+        }
+        if ($reindex) {
+            $this->info("Reindexed {$repaired} PreDB row(s).");
+        } elseif ($missingTotal > 0) {
+            $this->comment('Run with --predb --all --reindex to repair missing documents.');
+        }
+
+        return self::SUCCESS;
+    }
+
+    /**
+     * Fail closed: an empty successful result is distinct from an invalid response.
+     *
+     * @param  list<int>  $ids
+     * @return list<int>
+     */
+    private function fetchPredbIndexedIds(ManticoreSearchDriver $driver, string $index, array $ids): array
+    {
+        $safeIndex = str_replace('`', '``', $index);
+        $list = implode(',', $ids);
+        $limit = count($ids);
+        // Client::sql() uses SqlToArray, which discards warnings when flattening
+        // rows. Keep the raw envelope so partial results cannot trigger repairs.
+        $request = new Sql(['body' => ['query' => "SELECT id FROM `{$safeIndex}` WHERE id IN ({$list}) LIMIT {$limit} OPTION max_matches={$limit}"]]);
+        $request->setMode('raw');
+        $response = $driver->manticoreSearch->request($request)->getResponse();
+        if (is_array($response) && array_is_list($response) && count($response) === 1 && is_array($response[0]) && array_key_exists('data', $response[0])) {
+            $response = $response[0];
+        }
+        if (! is_array($response)
+            || ! is_array($response['data'] ?? null)
+            || ! is_int($response['total'] ?? null)
+            || $response['total'] < 0
+            || ($response['error'] ?? null) !== ''
+            || ($response['warning'] ?? null) !== ''
+            || $response['total'] !== count($response['data'])) {
+            throw new RuntimeException('Invalid PreDB index response.');
+        }
+
+        $out = [];
+        foreach ($response['data'] as $row) {
+            if (! is_array($row) || ! isset($row['id'])) {
+                throw new RuntimeException('Invalid PreDB index row.');
+            }
+            $value = $row['id'];
+            if ((! is_int($value) && (! is_string($value) || ! ctype_digit($value))) || ! in_array((int) $value, $ids, true)) {
+                throw new RuntimeException('Invalid PreDB index ID.');
+            }
+            $out[(int) $value] = (int) $value;
+        }
+
+        return array_values($out);
     }
 
     /**
