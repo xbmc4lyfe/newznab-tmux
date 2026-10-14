@@ -3,11 +3,11 @@
 <p><a class="button" href="performance-current.html">Current build dashboard</a> <a class="button secondary" href="benchmarks/">Historical charts and flamegraphs</a> <a href="results.json">Current results as JSON</a></p>
 <div class="notice">The current dashboard follows the checked-out master revision and the most recent eligible run attempt for that revision. A pending, failed, cancelled, invalid, or unavailable result isn't a pass. Historical results retain their original identities and don't qualify later code.</div>
 <h2 id="overview">What the published historical comparison shows</h2>
-<p>The frozen <a href="https://github.com/xbmc4lyfe/newznab-tmux/actions/runs/38593212508">run 38593212508</a> compares Rust with the C++ RapidYenc baseline through PHP callers. It'sn't a PHP-versus-Rust comparison. Each of 24 workload groups on each architecture has 31 eligible pairs and zero invalid pairs. The report retains simultaneous 95% intervals.</p>
+<p>The frozen <a href="https://github.com/xbmc4lyfe/newznab-tmux/actions/runs/38593212508">run 38593212508</a> compares Rust with the C++ RapidYenc baseline through PHP callers. It isn't a PHP-versus-Rust comparison. Each of 24 workload groups on each architecture has 31 eligible pairs and zero invalid pairs. The report retains simultaneous 95% intervals.</p>
 <table><thead><tr><th>Example workload</th><th>x86 C++ / Rust</th><th>ARM C++ / Rust</th><th>Meaning</th></tr></thead><tbody>
-<tr><td>4 KiB, ordinary escaping, strict</td><td>1.146×. 1.101–1.182×</td><td>1.089×. 1.020–1.138×</td><td>The ARM result is inconclusive under this screen.</td></tr>
-<tr><td>512 KiB, heavy escaping, strict</td><td>1.554×. 1.479–1.576×</td><td>1.915×. 1.874–1.950×</td><td>Both show an improvement for this workload.</td></tr>
-<tr><td>8 MiB, ordinary escaping, whole article body</td><td>1.066×. 1.059–1.080×</td><td>1.131×. 1.124–1.144×</td><td>The complete caller has a smaller gain than decoding alone.</td></tr>
+<tr><td>4 KiB, ordinary escaping, strict</td><td>1.146×<br>1.101–1.182×</td><td>1.089×<br>1.020–1.138×</td><td>The ARM result is inconclusive under this screen.</td></tr>
+<tr><td>512 KiB, heavy escaping, strict</td><td>1.554×<br>1.479–1.576×</td><td>1.915×<br>1.874–1.950×</td><td>Both show an improvement for this workload.</td></tr>
+<tr><td>8 MiB, ordinary escaping, whole article body</td><td>1.066×<br>1.059–1.080×</td><td>1.131×<br>1.124–1.144×</td><td>The complete caller has a smaller gain than decoding alone.</td></tr>
 <tr><td>Overall screen</td><td>Useful improvement</td><td>Inconclusive</td><td>A favorable row doesn't replace the whole result.</td></tr>
 </tbody></table>
 <p>Across this run, x86 point estimates range from 1.066× to 1.554×. ARM estimates range from 1.089× to 1.939×. These are separate workload results, not an aggregate multiplier. See every row in the <a href="benchmarks/runs/38593212508/x86/visualization/report.html">x86 report</a> and <a href="benchmarks/runs/38593212508/arm/visualization/report.html">ARM report</a>, including charts, profiles, and capture status.</p>
