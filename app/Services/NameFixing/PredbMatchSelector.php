@@ -107,9 +107,7 @@ class PredbMatchSelector
     /** @param array<string, mixed> $hit */
     private function hasLiteralFilename(string $queryIdentity, array $hit): bool
     {
-        $filename = $this->fileNameCleaner->cleanForMatching((string) ($hit['filename'] ?? ''), preserveLeadingNumber: true);
-
-        return $filename !== false && PredbSearchDocument::exactValue($filename) === $queryIdentity;
+        return $this->fileNameCleaner->matchesPredbFilenameEvidence((string) ($hit['filename'] ?? ''), $queryIdentity);
     }
 
     /**
