@@ -83,7 +83,7 @@ return [
     | Boost uses. While configured, they take precedence over the automatic
     | discovery mechanism (including Sail prefixes when sail is enabled).
     |
-    | NNTmux defaults to WSL-host binaries so generated Boost guidelines and
+    | NNTmux defaults to macOS or Linux host binaries so generated Boost guidelines and
     | agent command examples are NOT forced through Sail. Override via env if
     | you intentionally want Sail-prefixed guidance again.
     |

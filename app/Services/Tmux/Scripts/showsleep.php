@@ -13,8 +13,20 @@ if ($sleepTime <= 0) {
 }
 
 $endTime = time() + $sleepTime;
+$session = $argv[2] ?? '';
+$socket = $argv[3] ?? '';
+$command = array_merge(['tmux', '-u'], $socket === '' ? [] : ['-L', $socket], ['display-message', '-p', '-t', '='.$session.':', '#{@nntmux_draining}']);
 
 while (time() < $endTime) {
+    if ($session !== '') {
+        $state = [];
+        exec(implode(' ', array_map('escapeshellarg', $command)).' 2>/dev/null', $state);
+        if (trim(implode('', $state)) === '1') {
+            echo "\r⏸ Draining; countdown stopped".PHP_EOL;
+
+            exit(0);
+        }
+    }
     $remaining = $endTime - time();
     $hours = floor($remaining / 3600);
     $minutes = floor(($remaining % 3600) / 60);

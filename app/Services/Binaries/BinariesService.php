@@ -9,6 +9,8 @@ use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Tmux\CollectionDowntimeCompensator;
+use DariusIII\NetNntp\Error as NntpError;
+use DariusIII\NetNntp\Protocol\ResponseCode;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -61,6 +63,8 @@ class BinariesService
     private int $first = 0;
 
     private int $last = 0;
+
+    private ?int $completedRangeEnd = null;
 
     private int $notYEnc = 0;
 
@@ -124,6 +128,12 @@ class BinariesService
     public function getMessageBuffer(): int
     {
         return $this->config->messageBuffer;
+    }
+
+    /** The requested range was fully downloaded and stored (or durably queued for repair). */
+    public function completedRangeEnd(): ?int
+    {
+        return $this->completedRangeEnd;
     }
 
     /**
@@ -279,6 +289,7 @@ class BinariesService
      */
     public function scan(array $groupMySQL, int $first, int $last, string $type = 'update', ?array $missingParts = null): array
     {
+        $this->completedRangeEnd = null;
         if (! app(CandidateRepository::class)->capacityAvailable()) {
             if ($type !== 'partrepair') {
                 $this->missedPartHandler->addMissingRange($first, $last, (int) $groupMySQL['id']);
@@ -311,6 +322,8 @@ class BinariesService
 
         $msgCount = \count($headers);
         if ($msgCount < 1) {
+            $this->completedRangeEnd = $last;
+
             return $returnArray;
         }
 
@@ -369,6 +382,10 @@ class BinariesService
         }
         unset($headers);
 
+        if ($headersNotInserted !== [] && ! $this->config->partRepair && ! $partRepair) {
+            throw new \RuntimeException('Header storage did not complete and part repair is disabled; retry this range.');
+        }
+
         if ($this->config->echoCli && ! $partRepair) {
             $this->outputHeaderInitial();
         }
@@ -393,6 +410,8 @@ class BinariesService
         }
 
         $this->outputHeaderDuration();
+
+        $this->completedRangeEnd = $last;
 
         return $returnArray;
     }
@@ -525,16 +544,37 @@ class BinariesService
      */
     public function daytopost(int $days, array $data): string
     {
+        foreach (['first', 'last'] as $bound) {
+            $value = $data[$bound] ?? null;
+            $number = (\is_int($value) || \is_string($value))
+                ? filter_var($value, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]])
+                : false;
+            if ($number === false) {
+                throw new \RuntimeException('Invalid NNTP article bounds for date targeting.');
+            }
+            $data[$bound] = $number;
+        }
+        if ($data['first'] > $data['last']) {
+            throw new \RuntimeException('Invalid NNTP article bounds for date targeting.');
+        }
+        $group = $data['group'] ?? null;
+        if (! \is_string($group) || $group === '') {
+            throw new \RuntimeException('Cannot resolve a date target without an NNTP group.');
+        }
+        $selected = $this->getNntp()->selectGroup($group);
+        if (NNTPService::isError($selected) || ! \is_array($selected)) {
+            throw new \RuntimeException('Cannot select the NNTP group for date targeting.');
+        }
         $goalTime = now()->subDays($days)->timestamp;
 
-        $firstDate = $this->postdate($data['first'], $data);
+        $firstDate = $this->targetPostdate($data['first']);
         if ($goalTime < $firstDate) {
-            return $data['first'];
+            return (string) $data['first'];
         }
 
-        $lastDate = $this->postdate($data['last'], $data);
+        $lastDate = $this->targetPostdate($data['last']);
         if ($goalTime > $lastDate) {
-            return $data['last'];
+            return (string) $data['last'];
         }
 
         if ($this->config->echoCli) {
@@ -544,6 +584,28 @@ class BinariesService
         }
 
         return $this->binarySearchArticleByDate($goalTime, $data);
+    }
+
+    /**
+     * Admission needs the requested article's date on the selected provider/group.
+     * Stored part numbers and neighboring probes cannot establish that identity.
+     */
+    private function targetPostdate(int|string $post): int
+    {
+        $header = $this->getNntp()->getXOVER((string) $post);
+        if (\is_array($header)
+            && isset($header[0]['Number'], $header[0]['Date'])
+            && (\is_int($header[0]['Number']) || \is_string($header[0]['Number']))
+            && (string) $header[0]['Number'] === (string) $post
+            && \is_string($header[0]['Date'])
+            && trim($header[0]['Date']) !== '') {
+            $timestamp = strtotime($header[0]['Date']);
+            if ($timestamp !== false) {
+                return $timestamp;
+            }
+        }
+
+        throw new \RuntimeException('NNTP article date is unavailable; defer date-based indexing.');
     }
 
     // ==================== Private Helper Methods ====================
@@ -579,7 +641,13 @@ class BinariesService
     private function calculateArticleRange(array $groupMySQL, array $groupNNTP, int $maxHeaders): array
     {
         if ((int) $groupMySQL['last_record'] === 0) {
-            return $this->calculateNewGroupRange($groupNNTP);
+            $range = $this->calculateNewGroupRange($groupNNTP);
+            if ($maxHeaders > 0 && $range['total'] > $maxHeaders) {
+                $range['last'] = $range['groupLast'] = $range['first'] + $maxHeaders;
+                $range['total'] = $maxHeaders;
+            }
+
+            return $range;
         }
 
         return $this->calculateExistingGroupRange($groupMySQL, $groupNNTP, $maxHeaders);
@@ -675,6 +743,10 @@ class BinariesService
         $done = false;
 
         while (! $done) {
+            if ($this->runtimeState->stopRequested()) {
+                return;
+            }
+
             // Calculate chunk bounds
             if ($range['total'] > $this->config->messageBuffer) {
                 $last = (int) min($first + $this->config->messageBuffer, $groupLast);
@@ -692,6 +764,9 @@ class BinariesService
 
             // Scan this chunk
             $scanSummary = $this->scan($groupMySQL, $first, $last);
+            if ($scanSummary === [] && $this->completedRangeEnd === null) {
+                return;
+            }
 
             // Update group record
             $this->updateGroupAfterScan($groupMySQL, $groupNNTP, $scanSummary, $last);
@@ -732,7 +807,7 @@ class BinariesService
             $lastArticleDate = $lastArticleTimestamp !== false ? $lastArticleTimestamp : time();
 
             UsenetGroup::query()->where('id', $groupMySQL['id'])->update([
-                'last_record' => $scanSummary['lastArticleNumber'],
+                'last_record' => $this->completedRangeEnd ?? $scanSummary['lastArticleNumber'],
                 'last_record_postdate' => Carbon::createFromTimestamp($lastArticleDate, date_default_timezone_get()),
                 'last_updated' => now(),
             ]);
@@ -757,20 +832,31 @@ class BinariesService
             $headers = $nntp->getXOVER($this->first.'-'.$this->last);
         }
 
+        // For an overview range, 423 confirms that no articles exist in that window.
+        if ($headers instanceof NntpError && $headers->getCode() === ResponseCode::NoSuchArticleNumber->value) {
+            return [];
+        }
+
         if (NNTPService::isError($headers) || ! \is_array($headers)) {
             if ($partRepair) {
                 return null;
             }
 
             // Retry without compression
-            $nntp->doQuit();
-            if ($nntp->doConnect(false) !== true) {
+            if ($nntp->reconnect(false) !== true) {
                 return null;
             }
 
-            $nntp->selectGroup($this->groupMySQL['name']);
+            $selected = $nntp->selectGroup($this->groupMySQL['name']);
+            if (NNTPService::isError($selected) || ! \is_array($selected)) {
+                return null;
+            }
             $headers = $nntp->getXOVER($this->first.'-'.$this->last);
             $nntp->enableCompression();
+
+            if ($headers instanceof NntpError && $headers->getCode() === ResponseCode::NoSuchArticleNumber->value) {
+                return [];
+            }
 
             if (NNTPService::isError($headers) || ! \is_array($headers)) {
                 if (\is_object($headers) && isset($headers->code, $headers->message)) {
@@ -888,10 +974,11 @@ class BinariesService
      */
     private function binarySearchArticleByDate(int $goalTime, array $data): string
     {
-        $wantedArticle = (int) round(($data['last'] + $data['first']) / 2);
+        $wantedArticle = $this->articleMidpoint($data['first'], $data['last']);
         $aMax = $data['last'];
         $aMin = $data['first'];
         $oldArticle = $articleTime = null;
+        $remainingProbes = 64;
 
         while (true) {
             if ($wantedArticle <= $data['first'] || $wantedArticle >= $data['last']) {
@@ -901,22 +988,20 @@ class BinariesService
             $reallyOldArticle = $oldArticle;
             $oldArticle = $wantedArticle;
 
-            $articleTime = $this->postdate($wantedArticle, $data);
-
-            if (! $articleTime) {
-                $wantedArticle = random_int($aMin, $aMax);
-                $articleTime = $this->postdate($wantedArticle, $data);
+            if ($remainingProbes-- === 0) {
+                throw new \RuntimeException('NNTP date target did not converge; defer date-based indexing.');
             }
+            $articleTime = $this->targetPostdate($wantedArticle);
 
             if ($articleTime < $goalTime) {
                 $aMin = $oldArticle;
-                $wantedArticle = (int) round(($aMax + $oldArticle) / 2);
+                $wantedArticle = $this->articleMidpoint($oldArticle, $aMax);
                 if ($this->config->echoCli) {
                     echo '-';
                 }
             } elseif ($articleTime > $goalTime) {
                 $aMax = $oldArticle;
-                $wantedArticle = (int) round(($aMin + $oldArticle) / 2);
+                $wantedArticle = $this->articleMidpoint($aMin, $oldArticle);
                 if ($this->config->echoCli) {
                     echo '+';
                 }
@@ -929,7 +1014,7 @@ class BinariesService
             }
         }
 
-        if ($this->config->echoCli) {
+        if ($this->config->echoCli && $articleTime !== null) {
             $goalCarbon = Carbon::createFromTimestamp($goalTime, date_default_timezone_get());
             $articleCarbon = Carbon::createFromTimestamp($articleTime, date_default_timezone_get());
             $diffDays = $goalCarbon->diffInDays($articleCarbon, true);
@@ -940,6 +1025,13 @@ class BinariesService
         }
 
         return (string) $wantedArticle;
+    }
+
+    private function articleMidpoint(int $minimum, int $maximum): int
+    {
+        $distance = $maximum - $minimum;
+
+        return $minimum + intdiv($distance, 2) + ($distance % 2);
     }
 
     // ==================== Output Methods ====================

@@ -305,7 +305,7 @@ function yencBenchmarkRunChild(array $command, string $prefix, float $timeout): 
 function yencBenchmarkSourceHashes(string $root): array
 {
     $paths = [
-        'scripts/benchmark-yenc.php', 'scripts/benchmark-cpu.py', 'scripts/build-rapidyenc.sh', 'composer.lock',
+        'scripts/benchmark-yenc.php', 'scripts/build-rapidyenc.sh', 'composer.lock',
         'app/Services/YencService.php', 'app/Services/NNTP/NNTPService.php',
         'tests/Fixtures/YencArticles.php', 'tests/Support/YencNntpHarness.php',
         'docker/app/nzb-yenc-ffi/Cargo.toml', 'docker/app/nzb-yenc-ffi/Cargo.lock',

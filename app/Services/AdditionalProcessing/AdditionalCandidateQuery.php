@@ -9,6 +9,7 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Runners\PostProcessRunner;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
+use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -107,13 +108,41 @@ final class AdditionalCandidateQuery
         ?int $maxSizeBytes = null,
         bool $includeClaimed = false,
     ): Builder {
+        self::applyPasswordStatus($query);
+
+        return self::applyProcessingPredicates($query, $groupID, $guidChar, $minSizeBytes, $maxSizeBytes, $includeClaimed);
+    }
+
+    /**
+     * @param  Builder<Release>  $query
+     * @return Builder<Release>
+     */
+    private static function applyProcessingPredicates(
+        Builder $query,
+        int|string $groupID = '',
+        string $guidChar = '',
+        ?int $minSizeBytes = null,
+        ?int $maxSizeBytes = null,
+        bool $includeClaimed = false,
+        bool $joinedCategory = true,
+    ): Builder {
         $min = $minSizeBytes ?? self::minSizeBytes();
         $max = $maxSizeBytes ?? self::maxSizeBytes();
         $query
-            ->where('r.passwordstatus', -1)
             ->where('r.haspreview', -1)
-            ->where('r.nzbstatus', 1)
-            ->where('c.disablepreview', 0);
+            ->where('r.nzbstatus', 1);
+        if ($joinedCategory) {
+            $query->where('c.disablepreview', 0);
+        } else {
+            // A scalar primary-key lookup cannot reorder the release queue via
+            // a block nested-loop category join before the prefix LIMIT.
+            $query->where(
+                static function (QueryBuilder $categoryQuery): void {
+                    $categoryQuery->select('c.disablepreview')->from('categories as c')->whereColumn('c.id', 'r.categories_id');
+                },
+                0,
+            );
+        }
         self::applyArchiveRetryWindow($query);
         if ($min > 0) {
             $query->where('r.size', '>', $min);
@@ -147,11 +176,15 @@ final class AdditionalCandidateQuery
         ?int $maxSizeBytes = null,
         bool $includeClaimed = false,
     ): Builder {
-        $query = Release::query()
+        return self::applyPredicates(self::joinedBuilder(), $groupID, $guidChar, $minSizeBytes, $maxSizeBytes, $includeClaimed);
+    }
+
+    /** @return Builder<Release> */
+    private static function joinedBuilder(): Builder
+    {
+        return Release::query()
             ->from('releases as r')
             ->leftJoin('categories as c', 'c.id', '=', 'r.categories_id');
-
-        return self::applyPredicates($query, $groupID, $guidChar, $minSizeBytes, $maxSizeBytes, $includeClaimed);
     }
 
     /**
@@ -304,10 +337,15 @@ final class AdditionalCandidateQuery
 
         return DB::transaction(function () use ($guidChar, $effectiveLimit, $token, $groupID, $minSizeBytes, $maxSizeBytes, $columns, $excludedReleaseIds): EloquentCollection {
             $supportsClaims = self::supportsClaims();
+            $passwordChecksEnabled = config('nntmux_settings.check_passworded_rars') === true;
             // Pick candidates without a lock: FOR UPDATE would also lock the joined
             // category rows, which every release shares, and serialize all workers.
-            $query = self::baseBuilder($groupID, $guidChar, $minSizeBytes, $maxSizeBytes)
-                ->select('r.id')
+            $query = self::applyProcessingPredicates(
+                $passwordChecksEnabled ? self::joinedBuilder() : Release::query()->from('releases as r'),
+                $groupID, $guidChar, $minSizeBytes, $maxSizeBytes,
+                joinedCategory: $passwordChecksEnabled,
+            )
+                ->select('r.id', 'r.postdate')
                 ->orderByDesc('r.postdate')
                 ->orderBy('r.id')
                 ->limit($effectiveLimit * self::CLAIM_CANDIDATE_FACTOR);
@@ -316,8 +354,22 @@ final class AdditionalCandidateQuery
                 $query->whereNotIn('r.id', $excludedReleaseIds);
             }
 
-            $candidateIds = $query
-                ->pluck('r.id')
+            if ($passwordChecksEnabled) {
+                $candidateIds = $query->where('r.passwordstatus', -1)->pluck('r.id');
+            } else {
+                // Each equality range can retain the queue index's ordering. Sort
+                // only two bounded prefixes, rather than the entire combined backlog.
+                $unchecked = (clone $query)->where('r.passwordstatus', -1)->toBase();
+                $passwordDisabled = (clone $query)->where('r.passwordstatus', 0)->toBase();
+                $candidateIds = DB::query()
+                    ->fromSub($unchecked->unionAll($passwordDisabled), 'additional_candidates')
+                    ->orderByDesc('postdate')
+                    ->orderBy('id')
+                    ->limit($effectiveLimit * self::CLAIM_CANDIDATE_FACTOR)
+                    ->pluck('id');
+            }
+
+            $candidateIds = $candidateIds
                 ->map(static fn (mixed $id): int => (int) $id)
                 ->all();
             if ($candidateIds === []) {
@@ -331,8 +383,9 @@ final class AdditionalCandidateQuery
                 $lockQuery = Release::query()
                     ->from('releases as r')
                     ->select('r.id')
-                    ->whereIn('r.id', $chunk)
-                    ->where('r.passwordstatus', -1)
+                    ->whereIn('r.id', $chunk);
+                self::applyPasswordStatus($lockQuery);
+                $lockQuery
                     ->where('r.haspreview', -1)
                     ->where('r.nzbstatus', 1);
                 self::applyArchiveRetryWindow($lockQuery);
@@ -419,6 +472,20 @@ final class AdditionalCandidateQuery
 
         return self::$supportsClaims = Schema::hasColumn('releases', self::CLAIMED_AT_COLUMN)
             && Schema::hasColumn('releases', self::CLAIM_TOKEN_COLUMN);
+    }
+
+    /**
+     * Insertion uses zero when password checks are disabled; pending media still needs processing.
+     *
+     * @param  Builder<Release>  $query
+     */
+    private static function applyPasswordStatus(Builder $query): void
+    {
+        if (config('nntmux_settings.check_passworded_rars') === true) {
+            $query->where('r.passwordstatus', -1);
+        } else {
+            $query->whereIn('r.passwordstatus', [-1, 0]);
+        }
     }
 
     /**

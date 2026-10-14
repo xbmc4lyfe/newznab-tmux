@@ -8,14 +8,18 @@ use std::ptr;
 use std::slice;
 
 mod article_dates;
+pub mod article_fingerprint;
 mod article_identity;
 mod article_xref;
+pub mod cpu_snapshot;
 mod formats;
 mod nntp_body;
 mod nntp_headers;
 mod par2;
 mod par2_source_ranges;
 mod payload_decoder;
+mod release_names;
+
 #[cfg(target_arch = "aarch64")]
 mod payload_decoder_arm;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -37,6 +41,173 @@ const MAX_PAR2_SOURCE_RANGE_INPUT_BYTES: usize = 16 * 1024 * 1024 + 16 * 1024;
 const MAX_ARTICLE_IDENTITY_INPUT_BYTES: usize = 131_072;
 const MAX_ARTICLE_XREF_INPUT_BYTES: usize = 196_608;
 const MAX_NNTP_HEADER_INPUT_BYTES: usize = 131_072;
+
+/// Render bounded UTF-8 HTML rows separated by 0xFF (impossible inside UTF-8).
+/// The explicit byte length preserves embedded NULs. Free through the matching
+/// export from this library; no allocator ownership crosses into PHP.
+///
+/// # Safety
+/// `data` is readable for `length` bytes; `output_length` is writable. The caller
+/// must release the returned pointer with its exact returned length once only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_names_html(
+    data: *const u8,
+    length: usize,
+    output_length: *mut usize,
+) -> *mut u8 {
+    if output_length.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { *output_length = 0 };
+    if length > 8 * 1024 * 1024 || data.is_null() {
+        return ptr::null_mut();
+    }
+    let input = unsafe { slice::from_raw_parts(data, length) };
+    match catch_unwind(|| release_names::render(input)) {
+        Ok(Some(rows)) => {
+            let mut output = Vec::new();
+            for (index, row) in rows.iter().enumerate() {
+                if index > 0 {
+                    output.push(0xff);
+                }
+                output.extend_from_slice(row.as_bytes());
+            }
+            let mut output = output.into_boxed_slice();
+            unsafe { *output_length = output.len() };
+            let pointer = output.as_mut_ptr();
+            std::mem::forget(output);
+            pointer
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
+/// # Safety
+/// `data` and `length` must be exactly the live pair returned by
+/// `nntmux_release_names_html`, and must not have been freed already.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_names_free(data: *mut u8, length: usize) {
+    if !data.is_null() {
+        unsafe { drop(Box::from_raw(ptr::slice_from_raw_parts_mut(data, length))) };
+    }
+}
+
+#[cfg(test)]
+mod release_names_abi_tests {
+    #[test]
+    fn rejects_null_and_over_budget_inputs_without_reading_them() {
+        unsafe {
+            let mut length = 999;
+            assert!(super::nntmux_release_names_html(std::ptr::null(), 1, &mut length).is_null());
+            assert_eq!(length, 0);
+            assert!(
+                super::nntmux_release_names_html(
+                    std::ptr::null(),
+                    8 * 1024 * 1024 + 1,
+                    &mut length
+                )
+                .is_null()
+            );
+            let input = br#"{"url_prefix":"/details/","url_suffix":"","releases":[]}"#;
+            assert!(
+                super::nntmux_release_names_html(input.as_ptr(), input.len(), std::ptr::null_mut())
+                    .is_null()
+            );
+            let output = super::nntmux_release_names_html(input.as_ptr(), input.len(), &mut length);
+            assert!(!output.is_null());
+            assert_eq!(length, 0);
+            super::nntmux_release_names_free(output, length);
+        }
+    }
+}
+
+/// Create an independently owned, bounded article identity accumulator.
+/// Release it exactly once with `nntmux_article_fingerprint_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_article_fingerprint_new() -> *mut c_void {
+    catch_unwind(|| Box::into_raw(Box::new(article_fingerprint::Accumulator::new())).cast())
+        .unwrap_or(ptr::null_mut())
+}
+
+/// Add a raw Message-ID; invalid input permanently invalidates the identity.
+///
+/// # Safety
+/// `state` must be a live accumulator returned by the constructor, exclusively
+/// borrowed for this call. `data` must be readable for `length` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_article_fingerprint_add(
+    state: *mut c_void,
+    data: *const u8,
+    length: usize,
+) -> c_int {
+    if state.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller owns this live, exclusively borrowed accumulator.
+    let accumulator = unsafe { &mut *state.cast::<article_fingerprint::Accumulator>() };
+    if length > 0 && data.is_null() {
+        accumulator.invalidate();
+        return 0;
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees a readable span of exactly `length`.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    match catch_unwind(std::panic::AssertUnwindSafe(|| accumulator.add(input))) {
+        Ok(success) => c_int::from(success),
+        Err(_) => {
+            accumulator.invalidate();
+            0
+        }
+    }
+}
+
+/// Write the persisted digest's 40-byte big-endian count/lane preimage.
+/// Empty or invalid state returns zero and leaves the destination unchanged.
+///
+/// # Safety
+/// `state` must be a live, exclusively borrowed accumulator. `output` must be
+/// writable for 40 bytes; it must not overlap the accumulator's storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_article_fingerprint_value(
+    state: *mut c_void,
+    output: *mut u8,
+) -> c_int {
+    if state.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller owns this live, exclusively borrowed accumulator.
+    let accumulator = unsafe { &mut *state.cast::<article_fingerprint::Accumulator>() };
+    match catch_unwind(std::panic::AssertUnwindSafe(|| accumulator.value())) {
+        Ok(Some(value)) => {
+            // SAFETY: the caller guarantees a disjoint, writable 40-byte output.
+            unsafe { ptr::copy_nonoverlapping(value.as_ptr(), output, value.len()) };
+            1
+        }
+        Ok(None) => 0,
+        Err(_) => {
+            accumulator.invalidate();
+            0
+        }
+    }
+}
+
+/// Release an accumulator and its owned temporary files. Null is accepted.
+///
+/// # Safety
+/// `state` must be null or a live constructor result, with no active borrows.
+/// It must not be used or freed again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_article_fingerprint_free(state: *mut c_void) {
+    if !state.is_null() {
+        let _ = catch_unwind(|| {
+            // SAFETY: ownership of the live constructor result returns here.
+            drop(unsafe { Box::from_raw(state.cast::<article_fingerprint::Accumulator>()) });
+        });
+    }
+}
 
 /// Decode a yEnc payload (CR/LF line endings are skipped, `=X` escapes resolved).
 pub fn decode_payload(payload: &[u8]) -> Option<Vec<u8>> {
@@ -1337,6 +1508,68 @@ mod tests {
             assert!(!result.is_null());
             assert_eq!(std::ffi::CStr::from_ptr(result).to_bytes(), br#"[{"file_key":"f","totalparts":0,"totalparts_inferred":false,"number":1,"messageid":"m","bytes":2}]"#);
             nntmux_metadata_string_free(result);
+        }
+    }
+}
+
+#[cfg(test)]
+mod article_fingerprint_ffi_tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_ffi_owns_state_and_never_returns_partial_identity() {
+        unsafe {
+            let state = nntmux_article_fingerprint_new();
+            assert!(!state.is_null());
+            let mut output = [0xa5; 40];
+            assert_eq!(
+                nntmux_article_fingerprint_value(state, output.as_mut_ptr()),
+                0
+            );
+            assert_eq!(output, [0xa5; 40]);
+            assert_eq!(
+                nntmux_article_fingerprint_add(state, b"a1@x".as_ptr(), 4),
+                1
+            );
+            assert_eq!(
+                nntmux_article_fingerprint_value(state, output.as_mut_ptr()),
+                1
+            );
+            assert_eq!(&output[..8], &1u64.to_be_bytes());
+            assert_eq!(
+                nntmux_article_fingerprint_add(state, b"bad id".as_ptr(), 6),
+                0
+            );
+            output.fill(0xa5);
+            assert_eq!(
+                nntmux_article_fingerprint_value(state, output.as_mut_ptr()),
+                0
+            );
+            assert_eq!(output, [0xa5; 40]);
+            assert_eq!(
+                nntmux_article_fingerprint_add(state, b"later@x".as_ptr(), 7),
+                0
+            );
+            nntmux_article_fingerprint_free(state);
+            nntmux_article_fingerprint_free(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn fingerprint_ffi_rejects_null_arguments() {
+        unsafe {
+            assert_eq!(
+                nntmux_article_fingerprint_add(ptr::null_mut(), ptr::null(), 0),
+                0
+            );
+            assert_eq!(
+                nntmux_article_fingerprint_value(ptr::null_mut(), ptr::null_mut()),
+                0
+            );
+            let state = nntmux_article_fingerprint_new();
+            assert_eq!(nntmux_article_fingerprint_add(state, ptr::null(), 1), 0);
+            assert_eq!(nntmux_article_fingerprint_value(state, ptr::null_mut()), 0);
+            nntmux_article_fingerprint_free(state);
         }
     }
 }

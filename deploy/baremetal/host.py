@@ -3,6 +3,7 @@
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -251,6 +252,66 @@ def link_shared(path, name, destination):
     source.symlink_to(destination)
 
 
+def build_native(path):
+    crate = path / "docker/app/nzb-yenc-ffi"
+    if not (crate / "Cargo.lock").is_file():
+        raise DeploymentError("The committed native dependency lock is required.")
+    toolchain = Path("/opt/nntmux-rust/1.98.0/bin")
+    # storage is shared across releases. Both build output and Cargo's writable
+    # cache must stay in this checkout so preparation cannot change live code.
+    target = crate / "target"
+    run(
+        [
+            "runuser",
+            "-u",
+            "nntmux",
+            "--",
+            "env",
+            f"RUSTC={toolchain / 'rustc'}",
+            f"CARGO_HOME={target / 'cargo-home'}",
+            toolchain / "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "--manifest-path",
+            crate / "Cargo.toml",
+            "--target-dir",
+            target,
+        ],
+        cwd=path,
+    )
+    artifacts = target / "release"
+    checksums = {}
+    for filename in ["libnzbyenc.so", "nntmux-article-fingerprint"]:
+        artifact = artifacts / filename
+        if not artifact.is_file() or artifact.stat().st_size == 0:
+            raise DeploymentError("Native build produced no runtime artifact.")
+        checksums[filename] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    # FPM may disable FFI. Exercise the actual PHP process-worker integration
+    # and persisted digest, without booting Laravel or touching the database.
+    result = run(
+        [
+            "runuser",
+            "-u",
+            "nntmux",
+            "--",
+            "/usr/bin/php8.5",
+            "-d",
+            "ffi.enable=false",
+            "-r",
+            "require 'vendor/autoload.php'; "
+            "$f = new App\\Services\\Nzb\\NzbArticleFingerprint(null, $argv[1]); "
+            "foreach (['<a@host>', 'b@host', 'a@host'] as $id) { $f->add($id); } "
+            "echo $f->value();",
+            artifacts / "nntmux-article-fingerprint",
+        ],
+        cwd=path,
+    )
+    if result.stdout.strip() != "6f7698b1ec74b32ce9471482301220fc5c104ebe":
+        raise DeploymentError("Native article fingerprint verification failed.")
+    return checksums
+
+
 def prepare(commit):
     path = release_path(commit)
     values = environment(read_json(CONFIG / "candidates" / (commit + ".json")), host())
@@ -343,6 +404,7 @@ def prepare(commit):
         ],
         cwd=path,
     )
+    native = build_native(path)
     artisan(commit, "package:discover")
     run(
         ["runuser", "-u", "nntmux", "--", "npm", "ci", "--no-audit", "--no-fund"],
@@ -352,7 +414,9 @@ def prepare(commit):
     if not (path / "public/build/manifest.json").is_file():
         raise DeploymentError("Frontend build produced no Vite manifest.")
     shutil.rmtree(path / "node_modules")
-    atomic_json(manifest, {"commit": commit, "built_at": time.time()}, 0o644)
+    atomic_json(
+        manifest, {"commit": commit, "built_at": time.time(), "native": native}, 0o644
+    )
     run(["chown", "nntmux:nntmux", manifest])
 
 

@@ -1,5 +1,59 @@
 # To do
 
+## Qualify authoritative backfill date targets (2026-10-14)
+
+Use the same selected NNTP connection for backfill targeting and storage. Date-based admission requires the requested article's parseable date from that provider/group; unrelated local part numbers, neighboring article dates and the current clock cannot supply it. Missing endpoint or midpoint metadata defers the attempt. Successful exact probes retain the approximate date search with bounded, integer-safe arithmetic; article Date ordering is still not guaranteed. Failed overview ranges must retain their cursor, while successful empty ranges remain completed work.
+
+- [ ] Run the full PHPUnit/native retest and required CI on final integrated master, including default/reused multi-group callers, initial forward indexing, large article numbers, missing/mismatched dates, failed and empty ranges, storage repair and cooperative drain/retry boundaries.
+- [ ] Verify a guarded rollout, reviewed source/image parity, service health and M4 TLS connectivity. The already-loaded legacy workers lack the new stop checks; source fixes alone do not establish a safe interruption/replay procedure.
+- [ ] Observe natural date targets, range spans, cursor continuity, useful release creation and backlog change. Fixture prevention of excess work is not a measured production throughput gain; preserve unknown/sparse-date deferrals and failed observations.
+
+## Qualify bounded waiting-inventory updates (2026-10-14)
+
+Natural preparation diagnostics identified database updates as a material cost: the initial 5,000-record passes spent 6.7–12.9 seconds updating rows, while ready yield stayed below one percent. Batch at most 25 consecutive identical `waiting_upload` classifications within each existing page. Ready promotions and unknown retry updates remain immediate. Preserve every snapshot and ownership predicate, manifests, article IDs, capacity, fairness and the approved publication spot-check contract.
+
+Multirow MariaDB updates first acquire only available guarded primary-key rows using `FOR UPDATE SKIP LOCKED` in a short transaction. Skipped rows stay eligible for a later pass. An earlier prototype without that selection reproduced deadlock 1213 against real ingestion invalidation in reversed collection/candidate order; retain that failed observation. A failed statement now leaves at most 25 waiting classifications uncommitted, and an outer caller transaction still controls its own commit or rollback. Singletons retain a single update. This prevents the reproduced candidate-lock cycle, not every secondary-index, gap, metadata or commit wait.
+
+- [x] Reproduce the individual-update overhead through the real preparer; cover page/limit boundaries, both waiting reasons, ready/retry ordering, changed snapshots, diagnostics, deadline flushing and failed-statement recovery without per-row fallback. SQLite preparation coverage passed 38 cases and 1,405 assertions.
+- [x] Compare frozen identical full-schema fixtures in randomized order with exact candidate-state, immutable manifest/article inventory and capacity parity. Five paired observations per workload produced median paired latency speedups of 7.91× for 1,000 consecutive waiting rows and 1.41× for the 75-percent-waiting mixed fixture; alternating reasons were 0.98×. Candidate update statements fell from 1,000 to 40 or 500 respectively. All observations, including wide timing variation, are retained. This local single-worker screen measures preparation latency, not production capacity or publication throughput.
+- [x] Attempt an optimized dependency-free Rust grouping planner through the real PHP FFI caller. The full-service screen did not establish the required 1.5× improvement across common paths or reliable uncommon p99 gains. A separate 1,000-pair planner screen was slower through FFI on every workload. Retain PHP; do not promote small full-service timing differences into Rust adoption evidence.
+- [x] Qualify full-schema MariaDB guards, empty/partial subsets, rollback, durable-prefix statement failure/recovery and dense/sparse generated SELECT/UPDATE EXPLAIN plus executed ANALYZE evidence: 41 cases and 423 assertions passed. The final explicit READ COMMITTED/REPEATABLE READ invalidation overlap rerun passed two cases and 24 assertions. The broader identification/verification domain suite passed 2,650 cases with 23 skips and 14,410 assertions; changed service PHPStan reported zero errors.
+- [ ] Repeat final integrated PHPUnit/native suites and static checks; obtain clean local and current-head GitHub Codex approval and green CI before a verified signed squash.
+- [ ] Let the existing deployment owner perform the guarded rollout. Verify reviewed source/image parity, health and provider connectivity, then compare natural preparation phases, stop reasons and ready promotions with retained slow windows and workload changes. Measure fresh NZB-bearing publication and useful naming separately: the unchanged 5,000-record/minute schedule cap and metadata-read outliers can still limit throughput.
+
+## Qualify preparation run diagnostics (2026-10-14)
+
+Opt-in preparation diagnostics report bounded per-run outcomes and phase durations from the existing metadata pass. Scheduled preparation enables them without additional candidate scans. Inspected rows, affected updates and ready promotions are distinct; a diagnostic record does not establish faster publication or backlog throughput.
+
+- [ ] Run the full PHPUnit/native suites on final integrated master, including preparation fairness, deadlines, claim/version/backoff races, manifest read failures and diagnostics that throw. Preserve the original return values, exceptions, retry policy, inventory evidence and worker-lock lifetime.
+- [ ] After current-head Codex approval, green CI and guarded rollout by the deployment owner, verify source parity, scheduled diagnostics, service health and M4 TLS connectivity. Observe natural runs and classify the actual stop reason, ready yield and selection/read-assessment/update costs before choosing another throughput change.
+- [ ] Retain deployment transitions, worker-limit changes, empty cohorts and failed observations when comparing useful work. Use isolated MariaDB qualification for any later query or transaction optimization; these aggregate timings alone do not prove server lock hold time or production capacity.
+
+## Retest additional admission with password checks disabled (2026-10-14)
+
+Password checks disabled at insertion produce passwordstatus=0 while media remains pending. Share the disabled-mode password-state gate across scheduling, worker selection and locked claim revalidation. Merge two individually ordered, bounded status prefixes to retain indexed claim selection. Keep enabled-mode selection, size/category/NZB/preview gates, claims and retry windows unchanged. No publication or runtime-setting change is included.
+
+Local qualification passed 27 focused tests (85 assertions), 1,029 broader tests (eight skips, 4,939 assertions), and 24 full-schema MariaDB cases (198 assertions). The MariaDB matrix covers both isolation levels, competing locks, committed state transitions and six actual generated-query plans across dense/sparse/ineligible inputs and small/seeded category tables. Status-prefix branches avoid filesort without hints; only the at-most-2K merged prefix is sorted. Rejected rows can still increase index scan work, and these results do not establish production throughput.
+
+- [x] Reproduce skipped pending-media rows in the existing SQLite fixture; cover selection, bucket/backlog counts, claims, enabled mode and admission exclusions.
+- [ ] Run focused/broader suites, static analysis and current-head Codex review. Retest disabled-mode MariaDB access plans and concurrent ownership with dedicated fixtures before making capacity claims.
+- [ ] Verify guarded deployment, eligible live processing and useful filename/media evidence. The initial idle window had only arrivals below the configured 1 GiB minimum. At 16:47 UTC, a bounded read captured 21 fresh status-zero releases passing all the other admission gates; compare that exact cohort after rollout. Retain the existing input filters and do not report an elapsed speedup without paired evidence.
+
+## Retest scheduled verification without global summaries (2026-10-14)
+
+Scheduled candidate workers skip the terminal global status aggregate; direct commands retain it by default. This removes an unused whole-table query while a worker slot is held. Query elimination is separate from Docker runtime recovery and does not establish sustained backlog throughput.
+
+- [ ] Run the full PHPUnit/native suites on the final integrated master, including worker draining, duration limits, connection reuse, lease recovery, audit/reset exclusion and default manual summaries.
+- [ ] After guarded deployment, verify reviewed source parity, scheduled `--no-summary` arguments, service health and M4 TLS connectivity. Observe natural worker turnover and fresh complete NZB-bearing releases; retain downtime, slow windows and workload changes when comparing sustained backlog throughput.
+
+## Qualify mapped standalone video article reuse (2026-10-14)
+
+Reuse a freshly checksum-qualified primary first article that matched an ambiguous PAR2 main-video entry. Return its original yEnc metadata through an opt-in single-article path after the existing connection gate. Keep normal aggregate results first, mapped archives ahead of video receipts, and pending receipts within the shared limits. Preserve the ordinary media byte/deadline/offset checks, thumbnail inputs and filename evidence; mapping itself still obtains fresh internal receipts. No publication or main-video eligibility change is included.
+
+- [x] Reproduce mapping followed by video-head fetching with the same bytes, genuine offsets, metadata and thumbnail inputs, then verify one fewer BODY read. Cover strict admission exclusions, first failure, connection failure, alternate fallback, scope reset and unchanged offered-byte budgets.
+- [x] Qualify full-video-cache admission of a later archive, full archive/aggregate rejection of video receipts, and pending/video eviction before protected entries. Measure all retained payloads against the four-entry, 8 MiB per-entry and 16 MiB total limits.
+- [ ] Run final reviewed focused/native suites and required CI; obtain current-head Codex clearance, verified signed squash and guarded deployment by the existing owner. Observe actual reuse and useful naming, and attribute network versus decoding/probe/extraction costs before reporting an elapsed-time speedup.
+
 ## Retest publication phase timing (2026-10-14)
 
 Publication timing is opt-in and reports aggregate durations after the outer transaction. State-lock acquisition includes query/network overhead; callback time after acquisition excludes commit/after-commit finalization. These measurements identify candidates for optimization, not a proven throughput improvement.

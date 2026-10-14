@@ -5,14 +5,14 @@ on:
     paths:
       - '.github/workflows/yenc-performance.yml'
       - 'scripts/benchmark-yenc.php'
+      - 'scripts/benchmark-article-processing.php'
+      - 'tests/Unit/ArticleProcessingBenchmarkTest.php'
       - 'scripts/benchmark-yenc-abi.py'
       - 'scripts/yenc-performance-report.py'
       - 'scripts/profile-yenc.php'
       - 'scripts/profile-yenc.sh'
       - 'tests/Unit/test_yenc_performance_report.py'
       - 'tests/Unit/YencProfileTest.php'
-      - 'scripts/benchmark-cpu.py'
-      - 'tests/Unit/test_benchmark_cpu.py'
       - 'tests/Unit/test_yenc_abi_benchmark.py'
       - 'tests/Feature/ReleaseFingerprintMetadataTest.php'
       - 'scripts/build-rapidyenc.sh'
@@ -32,12 +32,29 @@ on:
       comparison:
         description: Baseline to compare against Rust
         type: choice
-        options: [all, php, cpp]
+        options: [all, php, cpp, profile, processing]
         default: all
       samples:
         description: Matched fresh-process pairs per fixture stratum
         default: '31'
         required: true
+      baseline_ref:
+        description: Ancestor commit SHA for the caller baseline, or master
+        default: 'master'
+        required: true
+      candidate_ref:
+        description: Optional ancestor SHA for all/processing; profile rejects candidates
+        default: ''
+        required: false
+      caller_mode:
+        description: Require 1.5x median screening gains or only reject regressions
+        type: choice
+        options: [screen, regression]
+        default: screen
+      combined_qualification:
+        description: Require the candidate combined metadata API in a separate process
+        type: boolean
+        default: false
       seed:
         description: Recorded order and bootstrap seed
         default: '20261013'
@@ -52,7 +69,7 @@ concurrency:
 
 jobs:
   paired-decoding:
-    if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'php'
+    if: github.event_name != 'workflow_dispatch' || inputs.comparison == 'all' || inputs.comparison == 'cpp'
     # PR code runs only on disposable GitHub-hosted workers.
     strategy:
       fail-fast: false
@@ -85,7 +102,6 @@ jobs:
           php vendor/bin/phpunit --filter='YencBenchmarkTest|YencProfileTest'
           python3 tests/Unit/test_yenc_abi_benchmark.py
           python3 tests/Unit/test_yenc_performance_report.py
-          python3 tests/Unit/test_benchmark_cpu.py
 
       - name: Build pinned C++ baseline
         shell: bash
@@ -119,7 +135,7 @@ jobs:
         run: |
           YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
             php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
-              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines|it_withholds_integrity_for_trailer_only_multipart_declarations|it_accepts_identical_control_fields_in_native_and_fallback_metadata|it_requires_multipart_footer_fields_before_granting_integrity|it_exposes_rar5_file_times_in_native_release_metadata' \
+              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines|it_withholds_integrity_for_trailer_only_multipart_declarations|it_accepts_identical_control_fields_in_native_and_fallback_metadata|it_requires_multipart_footer_fields_before_granting_integrity|it_exposes_rar5_file_times_in_native_release_metadata|it_exposes_archived_revision_declarations_without_replacing_stored_names|it_exposes_quick_open_cache_relationships_in_native_release_metadata' \
               2>&1 | tee benchmark-evidence/build/framing-budget-integration.log
 
       - name: Record build and runtime identities
@@ -168,36 +184,10 @@ jobs:
       - name: Require execution of the designated SIMD kernel
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json, pathlib, shutil
-          directory = pathlib.Path('benchmark-evidence/build')
-          manifest = json.loads((directory / 'runtime.json').read_text())
-          expected = {'X64': 3, 'ARM64': 4}.get(manifest['runner_arch'])
-          observed = manifest['rust_payload_kernel']['id']
-          qualified = expected is not None and observed == expected
-          for source, name in [
-              ('storage/app/rapidyenc/librapidyenc.so', 'cpp.so'),
-              ('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so', 'rust.so'),
-          ]:
-              shutil.copyfile(source, directory / name)
-          qualification = {
-              'status': 'qualified' if qualified else 'unsupported_hardware',
-              'runner_arch': manifest['runner_arch'],
-              'required_kernel_id': expected, 'observed_kernel': manifest['rust_payload_kernel'],
-              'git_head': manifest['git_head'],
-              'rust_library_sha256': manifest['rust_library_sha256'],
-              'cpp_library_sha256': manifest['cpp_library_sha256'],
-              'basis': 'Same runtime selector used by the tested decoder; x86 requires VBMI2, ARM requires NEON.',
-              'conclusion': 'Hardware qualified for the paired comparison.' if qualified else
-                  'Required SIMD kernel was not exercised; no eligible performance comparison.',
-          }
-          (directory / 'kernel-qualification.json').write_text(json.dumps(qualification, indent=2) + '\n')
-          if not qualified:
-              raise SystemExit(f'Unsupported hardware: required kernel {expected}, observed {observed}; evidence retained.')
-          PY
+          docker/app/nzb-yenc-ffi/target/release/nntmux-evidence-utility --mode qualify
 
       - name: Capture CPU counters before native comparison
-        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-before.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output benchmark-evidence/build/cpu-before.json
 
       - name: Run randomized paired decoder comparison
         shell: bash
@@ -213,7 +203,7 @@ jobs:
 
       - name: Capture CPU counters after native comparison
         if: always() && hashFiles('benchmark-evidence/build/cpu-before.json') != ''
-        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-after.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output benchmark-evidence/build/cpu-after.json
 
       - name: Explain native decode and CRC costs without changing the caller gate
         if: always()
@@ -309,26 +299,12 @@ jobs:
         if: always()
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json, os, pathlib
-          path = pathlib.Path('benchmark-evidence/paired/observations.jsonl')
-          rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write('## Native yEnc paired fixture comparison\n\n')
-              qualification_path = pathlib.Path('benchmark-evidence/build/kernel-qualification.json')
-              if qualification_path.exists():
-                  qualification = json.loads(qualification_path.read_text())
-                  summary.write('Kernel qualification: `' + qualification['status'] + '`. ' + qualification['conclusion'] + '\n\n')
-              summary.write('Scope: identical synthetic fixtures through the same PHP decoder service and memory-backed NNTP BODY harness. No archive-metadata or production-capacity claim.\n\n')
-              summary.write('| Bytes | Density | Path | Decision | Rust / C++ median | 95% interval | Eligible / invalid pairs |\n|---:|---|---|---|---:|---|---|\n')
-              for row in rows:
-                  if row.get('type') != 'stratum_summary':
-                      continue
-                  summary.write(f"| {row['size']} | {row['density']} | {row['path']} | {row['decision']} | {row.get('median_rust_over_cpp', 'unavailable')} | {row.get('bootstrap_95_percent_interval', 'unavailable')} | {row['eligible_pairs']} / {row['invalid_pairs']} |\n")
-              final = next((row for row in reversed(rows) if row.get('type') in ('run_summary', 'run_failure')), None)
-              summary.write('\nRun result: `' + (final['status'] if final else 'setup incomplete; no performance conclusion') + '`.\n\n')
-              summary.write('Intervals use a simultaneous 95% bootstrap rule across the predeclared fixture groups. Inconclusive strata do not demonstrate a Rust speed advantage. Failed or timed-out pairs are retained and make the affected stratum invalid.\n')
-          PY
+          utility=docker/app/nzb-yenc-ffi/target/release/nntmux-evidence-utility
+          if [[ -x "$utility" ]]; then
+            "$utility" --mode cpp-summary
+          else
+            printf '## Native yEnc paired fixture comparison\n\nEvidence utility unavailable; setup incomplete; no performance conclusion.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Retain fixtures, libraries, identities and every observation
         if: always()
@@ -339,9 +315,247 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  article-processing:
+    name: Article processing comparison (${{ matrix.runner }})
+    if: github.event_name != 'workflow_dispatch' || inputs.comparison == 'all' || inputs.comparison == 'profile' || inputs.comparison == 'processing'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      RUST_TOOLCHAIN: '1.98.0'
+      BENCHMARK_SAMPLES: ${{ inputs.samples || '31' }}
+      BENCHMARK_SEED: ${{ inputs.seed || '20261014' }}
+      CANDIDATE_SOURCE: ${{ github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing') && inputs.candidate_ref != '' && 'candidate-source' || '.' }}
+      CALLER_MODE: ${{ inputs.caller_mode || 'screen' }}
+      REQUIRE_COMBINED: ${{ inputs.combined_qualification || false }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Prepare ancestor-only caller snapshots on the feature branch
+        if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
+        shell: bash
+        env:
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/codex/* || "$GITHUB_REF" == "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo 'Caller comparisons require a non-default codex/* feature branch.' >&2
+            exit 1
+          fi
+          verify_commit() {
+            local caller_sha="$1"
+            if [[ ! "$caller_sha" =~ ^[0-9a-f]{40}$ ]] || ! git cat-file -e "$caller_sha^{commit}" || ! git merge-base --is-ancestor "$caller_sha" "$GITHUB_SHA"; then
+              echo 'Caller revisions must be full commit SHAs in the fetched workflow ancestry.' >&2
+              return 1
+            fi
+          }
+          if [[ "$BASELINE_REF" == master ]]; then
+            baseline_sha=$(git rev-parse --verify 'refs/remotes/origin/master^{commit}')
+          else
+            baseline_sha="$BASELINE_REF"
+          fi
+          verify_commit "$baseline_sha"
+          if [[ -n "$CANDIDATE_REF" ]]; then verify_commit "$CANDIDATE_REF"; fi
+          git worktree add --detach "$GITHUB_WORKSPACE/baseline-source" "$baseline_sha"
+          if [[ -n "$CANDIDATE_REF" ]]; then
+            git worktree add --detach "$GITHUB_WORKSPACE/candidate-source" "$CANDIDATE_REF"
+          fi
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: dom, curl, ffi, intl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite
+          coverage: none
+
+      - name: Install locked PHP dependencies without application boot
+        run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
+        env:
+          COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ secrets.GITHUB_TOKEN }}"}}'
+
+      - name: Build and test locked native parsers
+        shell: bash
+        run: |
+          mkdir -p processing-evidence/build
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-test.log
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-build.log
+          cp docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so processing-evidence/build/native.so
+
+      - name: Build frozen baseline with identical locked PHP dependencies
+        if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
+        shell: bash
+        run: |
+          cmp "$CANDIDATE_SOURCE/composer.lock" baseline-source/composer.lock
+          composer install --working-dir=baseline-source --prefer-dist --no-interaction --no-progress --no-scripts
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path baseline-source/docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/baseline-build.log
+          cp baseline-source/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so processing-evidence/build/baseline.so
+          if [[ "$CANDIDATE_SOURCE" != . ]]; then
+            composer install --working-dir="$CANDIDATE_SOURCE" --prefer-dist --no-interaction --no-progress --no-scripts
+            cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path "$CANDIDATE_SOURCE/docker/app/nzb-yenc-ffi/Cargo.toml" 2>&1 | tee processing-evidence/build/candidate-build.log
+          fi
+          cp "$CANDIDATE_SOURCE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" processing-evidence/build/candidate.so
+        env:
+          COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ secrets.GITHUB_TOKEN }}"}}'
+
+      - name: Test real processing profile workers
+        env:
+          NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
+        run: php -d ffi.enable=true -d memory_limit=1G vendor/bin/phpunit --fail-on-skipped tests/Unit/ArticleProcessingBenchmarkTest.php
+
+      - name: Freeze build and runtime identity
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ctypes, hashlib, json, os, pathlib, subprocess
+          def run(*args):
+              return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
+          def digest(path):
+              return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+          def optional_kernel(library_path):
+              decoder = ctypes.CDLL(str(library_path.resolve()))
+              try:
+                  function = decoder.nntmux_yenc_payload_kernel_v1
+              except AttributeError:
+                  return None
+              function.restype = ctypes.c_uint32
+              return function()
+          library = pathlib.Path('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')
+          decoder = ctypes.CDLL(str(library.resolve()))
+          decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          manifest = {
+              'git_head': run('git', 'rev-parse', 'HEAD'),
+              'runner_arch': os.environ.get('RUNNER_ARCH'),
+              'runner_image_os': os.environ.get('ImageOS'),
+              'runner_image_version': os.environ.get('ImageVersion'),
+              'github_run_id': os.environ.get('GITHUB_RUN_ID'),
+              'cpu': run('lscpu'), 'uname': run('uname', '-a'), 'php': run('php', '-v'),
+              'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
+              'rust_source_sha256': {str(path): digest(path) for path in sorted(pathlib.Path('docker/app/nzb-yenc-ffi/src').rglob('*.rs'))},
+              'cargo_lock_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.lock'),
+              'cargo_toml_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.toml'),
+              'rust_library_sha256': digest(library),
+              'rust_payload_kernel_id': decoder.nntmux_yenc_payload_kernel_v1(),
+          }
+          callers = ['app/Services/NNTP/NNTPService.php',
+              'app/Services/Releases/Fingerprint/NativeMetadataParser.php',
+              'app/Services/Releases/Fingerprint/NzbFingerprintAnalyzer.php',
+              'app/Services/YencService.php', 'composer.lock']
+          native = ['docker/app/nzb-yenc-ffi/Cargo.toml', 'docker/app/nzb-yenc-ffi/Cargo.lock']
+          def sources(root):
+              return {str(path.relative_to(root)): digest(path) for path in
+                  [root / name for name in callers + native] + sorted(path for directory in
+                      ['app/Services/Yenc', 'docker/app/nzb-yenc-ffi/src'] for path in (root / directory).rglob('*') if path.is_file())}
+          candidate_library = pathlib.Path(os.environ['CANDIDATE_SOURCE']) / library
+          candidate_kernel_id = optional_kernel(candidate_library)
+          manifest.update({
+              'candidate_payload_kernel_id': candidate_kernel_id,
+              'candidate_payload_kernel_status': 'available' if candidate_kernel_id is not None else 'diagnostic_export_unavailable',
+              'candidate_library_sha256': digest(pathlib.Path(os.environ['CANDIDATE_SOURCE']) / library),
+              'candidate_source_sha256': sources(pathlib.Path(os.environ['CANDIDATE_SOURCE'])),
+              'candidate_git_head': run('git', '-C', os.environ['CANDIDATE_SOURCE'], 'rev-parse', 'HEAD'),
+              'build_command': 'cargo +1.98.0 build --release --locked',
+          })
+          baseline = pathlib.Path('baseline-source')
+          if baseline.is_dir():
+              baseline_library = baseline / library
+              baseline_kernel_id = optional_kernel(baseline_library)
+              manifest.update({
+                  'baseline_git_head': run('git', '-C', str(baseline), 'rev-parse', 'HEAD'),
+                  'baseline_library_sha256': digest(baseline_library),
+                  'baseline_source_sha256': sources(baseline),
+                  'baseline_payload_kernel_id': baseline_kernel_id,
+                  'baseline_payload_kernel_status': 'available' if baseline_kernel_id is not None else 'diagnostic_export_unavailable',
+              })
+          pathlib.Path('processing-evidence/build/runtime.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+
+      - name: Capture CPU counters before caller profile
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output processing-evidence/build/profile-cpu-before.json
+
+      - name: Profile actual BODY assembly and metadata callers
+        shell: bash
+        run: |
+          if [[ "$COMPARISON_MODE" == profile && -n "$REQUESTED_CANDIDATE_REF" ]]; then
+            printf 'candidate_ref requires comparison=all or processing.\n' >&2
+            exit 1
+          fi
+          php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-article-processing.php \
+            --profile --candidate-dir="$GITHUB_WORKSPACE/$CANDIDATE_SOURCE" \
+            --native="$GITHUB_WORKSPACE/$CANDIDATE_SOURCE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            --samples=7 --runtime-manifest="$GITHUB_WORKSPACE/processing-evidence/build/runtime.json" \
+            --output-dir="$GITHUB_WORKSPACE/processing-evidence/profile" \
+            2>&1 | tee processing-evidence/build/profile-console.log
+        env:
+          COMPARISON_MODE: ${{ inputs.comparison || 'profile' }}
+          REQUESTED_CANDIDATE_REF: ${{ inputs.candidate_ref || '' }}
+
+      - name: Capture CPU counters after caller profile
+        if: always() && hashFiles('processing-evidence/build/profile-cpu-before.json') != ''
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output processing-evidence/build/profile-cpu-after.json
+
+      - name: Capture CPU counters before paired caller comparison
+        if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output processing-evidence/build/paired-cpu-before.json
+
+      - name: Compare full fingerprint caller against frozen baseline
+        if: github.event_name == 'workflow_dispatch' && (inputs.comparison == 'all' || inputs.comparison == 'processing')
+        shell: bash
+        run: |
+          caller_flags=()
+          if [[ "$CALLER_MODE" == regression ]]; then caller_flags+=(--regression-only); fi
+          if [[ "$REQUIRE_COMBINED" == true ]]; then caller_flags+=(--require-combined); fi
+          php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-article-processing.php "${caller_flags[@]}" \
+            --candidate-dir="$GITHUB_WORKSPACE/$CANDIDATE_SOURCE" --paired --baseline-dir="$GITHUB_WORKSPACE/baseline-source" \
+            --baseline-native="$GITHUB_WORKSPACE/processing-evidence/build/baseline.so" \
+            --native="$GITHUB_WORKSPACE/processing-evidence/build/candidate.so" \
+            --samples="$BENCHMARK_SAMPLES" --order-seed="$BENCHMARK_SEED" --timeout=30 \
+            --runtime-manifest="$GITHUB_WORKSPACE/processing-evidence/build/runtime.json" \
+            --output-dir="$GITHUB_WORKSPACE/processing-evidence/paired" \
+            2>&1 | tee processing-evidence/build/paired-console.log
+
+      - name: Capture CPU counters after paired caller comparison
+        if: always() && hashFiles('processing-evidence/build/paired-cpu-before.json') != ''
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output processing-evidence/build/paired-cpu-after.json
+
+      - name: Summarize caller screen without claiming adoption
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY_SUMMARY'
+          import json, os, pathlib
+          path = pathlib.Path('processing-evidence/paired/observations.jsonl')
+          rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## Fingerprint caller screen\n\nBODY and FFI/JSON diagnostics are retained separately. This median screen does not qualify a Rust replacement: the 1.5x common-path and uncommon p99 policy remains the adoption gate.\n\n')
+              summary.write('| Bytes | Density | Decision | Candidate / baseline median | Simultaneous interval | Eligible / invalid |\n|---:|---|---|---:|---|---|\n')
+              for row in rows:
+                  if row.get('type') == 'stratum_summary':
+                      summary.write(f"| {row['size']} | {row['density']} | {row['decision']} | {row.get('median_candidate_over_baseline', 'unavailable')} | {row.get('bootstrap_95_percent_interval', 'unavailable')} | {row['eligible_pairs']} / {row['invalid_pairs']} |\n")
+              final = next((row for row in reversed(rows) if row.get('type') in ('run_summary', 'run_failure')), None)
+              summary.write('\nResult: `' + (final['status'] if final else 'profile only or setup incomplete') + '`. Exact serialized caller metadata and independently expected decoded bytes must match for every pair.\n')
+          PY_SUMMARY
+
+      - name: Retain all processing profile evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: article-processing-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: processing-evidence/
+          # Snapshots already exclude Git internals and private environment/auth files.
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
   php-decoding:
     name: Rust versus PHP (${{ matrix.runner }})
-    if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'cpp'
+    if: github.event_name != 'workflow_dispatch' || inputs.comparison == 'all' || inputs.comparison == 'php'
     strategy:
       fail-fast: false
       matrix:
@@ -369,7 +583,6 @@ jobs:
       - name: Test benchmark correctness and failure retention
         run: |
           php vendor/bin/phpunit tests/Unit/YencBenchmarkTest.php
-          python3 tests/Unit/test_benchmark_cpu.py
 
       - name: Build locked Rust candidate and verify PHP service parity
         shell: bash
@@ -413,7 +626,7 @@ jobs:
           PY
 
       - name: Capture CPU counters before PHP comparison
-        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-before.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output benchmark-evidence/build/cpu-before.json
 
       - name: Compare Rust against the real PHP fallback
         shell: bash
@@ -428,25 +641,18 @@ jobs:
 
       - name: Capture CPU counters after PHP comparison
         if: always() && hashFiles('benchmark-evidence/build/cpu-before.json') != ''
-        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-after.json
+        run: docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output benchmark-evidence/build/cpu-after.json
 
       - name: Summarize PHP replacement evidence
         if: always()
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json, os, pathlib
-          path = pathlib.Path('benchmark-evidence/php-paired/observations.jsonl')
-          rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write('## Rust versus PHP fallback\n\nSame PHP service, exact byte/CRC correctness, randomized fresh-process pairs. Includes FFI overhead. Synthetic decoder fixtures only; no production throughput claim.\n\n')
-              summary.write('| Bytes | Density | Path | Decision | Rust / PHP | 95% interval | Eligible / invalid |\n|---:|---|---|---|---:|---|---|\n')
-              for row in rows:
-                  if row.get('type') == 'stratum_summary':
-                      summary.write(f"| {row['size']} | {row['density']} | {row['path']} | {row['decision']} | {row.get('median_rust_over_php', 'unavailable')} | {row.get('bootstrap_95_percent_interval', 'unavailable')} | {row['eligible_pairs']} / {row['invalid_pairs']} |\n")
-              final = next((row for row in reversed(rows) if row.get('type') in ('run_summary', 'run_failure')), None)
-              summary.write('\nResult: `' + (final['status'] if final else 'setup incomplete; no performance conclusion') + '`. Inconclusive results do not qualify a Rust replacement. Failures are retained and invalidate their stratum.\n')
-          PY
+          utility=docker/app/nzb-yenc-ffi/target/release/nntmux-evidence-utility
+          if [[ -x "$utility" ]]; then
+            "$utility" --mode php-summary
+          else
+            printf '## Rust versus PHP fallback\n\nEvidence utility unavailable; setup incomplete; no performance conclusion.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Retain PHP comparison evidence
         if: always()

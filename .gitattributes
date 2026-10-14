@@ -66,5 +66,19 @@ docker/Makefile		-binary text eol=lf
 /docker/app/nzb-yenc-ffi/Cargo.toml	-binary text eol=lf
 /docker/app/nzb-yenc-ffi/Cargo.lock	-binary text eol=lf
 /docker/app/nzb-yenc-ffi/src/*.rs	-binary text eol=lf
+/docker/app/nzb-yenc-ffi/src/**/*.rs -binary text eol=lf
 
 /tests/Fixtures/NativeSpotCheckPlannerInvalidLibrary.c -binary text eol=lf
+
+# Native release presentation and its runtime fixtures must be reviewable.
+/docker/app/Caddyfile -binary text eol=lf
+/docker/app/php/release-presentation.h -binary text eol=lf
+/tests/Fixtures/ReleasePresentation.Dockerfile -binary text eol=lf
+/scripts/test-release-presentation-web.py -binary text eol=lf
+/tests/Fixtures/ReleasePresentation.Dockerfile.dockerignore -binary text eol=lf
+
+# Guarded application rollout helpers are source, not binary artifacts.
+/docker/bin/compose -binary text eol=lf
+/docker/bin/deploy-app -binary text eol=lf
+/docker/bin/deploy-current -binary text eol=lf
+/docker/bin/up-app -binary text eol=lf

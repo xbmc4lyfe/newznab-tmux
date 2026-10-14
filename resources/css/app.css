@@ -2,6 +2,7 @@
 @import "tailwindcss" source(none);
 @source "../views";
 @source "../js";
+@source "../../app/Support/AdminReleaseNames.php";
 
 /* Tailwind v4 plugins */
 @plugin "@tailwindcss/forms";

@@ -4,7 +4,8 @@ Path-scoped and standing agent rules for NNTmux. Hand-written entries live here;
 
 | Glob | File | Summary |
 |------|------|---------|
-| `**` | [command-execution.md](./command-execution.md) | Host WSL commands overrule Boost Sail “must use Sail” |
-| `**` | [git-workflow.md](./git-workflow.md) | Agents never commit or push; stage new and modified files, not temp files |
+| `**` | [command-execution.md](./command-execution.md) | Host commands, behavior reproduction, evidence labels, and search validation |
+| `**` | [git-workflow.md](./git-workflow.md) | Task branches, local Codex review, PR review, and squash merges |
+| `**` | [rust-performance.md](./rust-performance.md) | Try Rust first; require correctness and 1.5× common-path and p99 gains |
 
-Before editing, also `grep -rin 'keyword' .ai/rules` for related notes.
+Before editing, also run `rg -n -i 'keyword' .ai/rules` for related notes.

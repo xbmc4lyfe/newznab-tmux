@@ -691,6 +691,98 @@ final class Par2FullHashMatchingTest extends TestCase
         self::assertSame(0, DB::table('par2_hash_retry')->count());
     }
 
+    public function test_anchor_invalid_first_row_fails_closed_for_all_validation_variants(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 7, 'Synthetic.Release.2026-GRP');
+        foreach ([42, 20] as $id) {
+            $this->remember($id, md5('first'), md5('prefix first'), '20000');
+            $this->remember($id, md5('second'), md5('prefix second'), '30000');
+        }
+        $first = DB::table('par_file_hashes')->where('releases_id', 42)->orderBy('id')->first();
+        foreach ([['release_guid', 'TARGET'], ['full_md5', str_repeat('G', 32)], ['hash16k', strtoupper(md5('prefix first'))], ['file_size', '020000'], ['file_size', '18446744073709551616'], ['file_size', '-1'], ['file_size', ''], ['file_size', '1e3']] as [$field, $bad]) {
+            DB::table('par_file_hashes')->where('id', $first->id)->update([$field => $bad]);
+            $result = $this->lookup();
+            self::assertFalse($result['usable'], $field.':'.$bad);
+            self::assertSame([], $result['donors']);
+            DB::table('par_file_hashes')->where('id', $first->id)->update([$field => $first->$field]);
+        }
+    }
+
+    public function test_anchor_skips_zero_first_row_and_keeps_duplicate_positive_evidence(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 7, 'Synthetic.Release.2026-GRP');
+        foreach ([42, 20] as $id) {
+            $this->remember($id, md5('empty'), md5('empty'), '0');
+            $this->remember($id, md5('first'), md5('prefix first'), '20000');
+            $this->remember($id, md5('first'), md5('different prefix'), '20000');
+            $this->remember($id, md5('second'), md5('prefix second'), '30000');
+        }
+        self::assertCount(1, $this->lookup()['donors']);
+    }
+
+    public function test_lowest_positive_tuple_missing_from_donor_cannot_be_replaced_by_a_later_shared_tuple(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 7, 'Synthetic.Release.2026-GRP');
+        $this->remember(42, md5('first'), md5('prefix first'), '20000');
+        foreach ([42, 20] as $id) {
+            $this->remember($id, md5('second'), md5('prefix second'), '30000');
+            $this->remember($id, md5('third'), md5('prefix third'), '40000');
+        }
+        self::assertSame([], $this->lookup()['donors']);
+    }
+
+    public function test_anchor_inventory_counter_and_proof_variants_fail_closed(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 7, 'Synthetic.Release.2026-GRP');
+        foreach ([42, 20] as $id) {
+            $this->remember($id, md5('first'), md5('prefix first'), '20000');
+            $this->remember($id, md5('second'), md5('prefix second'), '30000');
+        }
+        foreach ([42, 20] as $id) {
+            $original = DB::table('par_file_hash_inventories')->where('releases_id', $id)->first();
+            foreach ([['release_guid', strtoupper($original->release_guid)], ['proof_version', 0], ['evidence_last_id', 0], ['evidence_count', 1], ['evidence_count', 3]] as [$field, $bad]) {
+                DB::table('par_file_hash_inventories')->where('releases_id', $id)->update([$field => $bad]);
+                self::assertSame([], $this->lookup()['donors'], $id.':'.$field);
+                DB::table('par_file_hash_inventories')->where('releases_id', $id)->update([$field => $original->$field]);
+            }
+        }
+        self::assertCount(1, $this->lookup()['donors']);
+    }
+
+    public function test_uint64_maximum_anchor_remains_an_exact_text_tuple(): void
+    {
+        $this->pendingPar2Release(['id' => 42, 'guid' => 'target']);
+        $this->donor(20, 7, 'Synthetic.Release.2026-GRP');
+        foreach ([42, 20] as $id) {
+            self::assertTrue($this->remember($id, md5('first'), md5('prefix first'), '18446744073709551615'));
+            self::assertTrue($this->remember($id, md5('second'), md5('prefix second'), '9223372036854775808'));
+        }
+        self::assertCount(1, $this->lookup()['donors']);
+        DB::table('par_file_hashes')->where('releases_id', 20)->where('file_size', '18446744073709551615')->update(['file_size' => '18446744073709551614']);
+        self::assertSame([], $this->lookup()['donors']);
+    }
+
+    public function test_complete_128_file_inventory_renames_through_hash_handler(): void
+    {
+        $title = 'Synthetic.Release.2026-GRP';
+        $release = $this->pendingPar2Release(['id' => 42, 'guid' => 'target', 'categories_id' => 2000, 'searchname' => 'obfuscated']);
+        $this->donor(20, 7, $title);
+        for ($i = 0; $i < 128; $i++) {
+            foreach ([42, 20] as $id) {
+                self::assertTrue($this->remember($id, md5('payload-'.$i), md5('prefix-'.$i), (string) (20000 + $i)));
+            }
+        }
+        $input = (object) array_merge($release->getAttributes(), ['releases_id' => 42, 'relsize' => 1]);
+        $service = new NameFixingService;
+        self::assertTrue((new \ReflectionMethod($service, 'processPar2HashCandidate'))->invoke($service, $input, [], [], true, true, false));
+        self::assertSame($title, DB::table('releases')->where('id', 42)->value('searchname'));
+        self::assertSame(7, DB::table('releases')->where('id', 42)->value('predb_id'));
+    }
+
     /** @return array{id: int, guid: string, name: ?string, searchname: ?string} */
     private function snapshot(int $id): array
     {

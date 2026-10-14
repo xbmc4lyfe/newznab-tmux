@@ -220,7 +220,7 @@ class TmuxHealthCheckCommandTest extends TestCase
         $command->assertExitCode(0);
         $command->run();
         $this->assertSame('0', (string) $this->app['db']->table('processing_runtime_states')->value('tmux_running'));
-        $this->assertSame('1', (string) $this->app['db']->table('processing_runtime_states')->value('stop_requested'));
+        $this->assertSame('0', (string) $this->app['db']->table('processing_runtime_states')->value('stop_requested'));
         Process::assertRanTimes(fn (PendingProcess $process): bool => $this->isTmuxCommand($process, 'kill-session'), 1);
         Process::assertRanTimes(fn (PendingProcess $process): bool => $this->isTmuxCommand($process, 'send-keys'), 2);
     }
@@ -331,7 +331,7 @@ class TmuxHealthCheckCommandTest extends TestCase
 
     private function fakeMissingSession(): void
     {
-        Process::fake(fn () => Process::result('', '', 1));
+        Process::fake(fn () => Process::result('', 'no server running on /tmp/nntmux-test-tmux.sock', 1));
     }
 
     private function fakeMissingSessionWithSuccessfulStart(): void

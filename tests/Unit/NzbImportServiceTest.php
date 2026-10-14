@@ -6,6 +6,8 @@ namespace Tests\Unit;
 
 use App\Enums\NzbImportStatus;
 use App\Models\Category;
+use App\Services\Nzb\NzbArticleFingerprintTransportFailure;
+use App\Services\Nzb\NzbArticleFingerprintUnavailable;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbService;
 use Illuminate\Contracts\Cache\LockTimeoutException;
@@ -365,6 +367,63 @@ final class NzbImportServiceTest extends TestCase
         $this->assertStringNotContainsString('Problem inserting', $result);
         $this->assertFileExists($file);
         unlink($file);
+    }
+
+    /** @return array<string, array{bool, class-string<\RuntimeException>}> */
+    public static function unavailableFingerprintImports(): array
+    {
+        return [
+            'verified transport failure' => [true, NzbArticleFingerprintTransportFailure::class],
+            'legacy transport failure' => [false, NzbArticleFingerprintTransportFailure::class],
+            'verified constructor failure' => [true, NzbArticleFingerprintUnavailable::class],
+            'legacy constructor failure' => [false, NzbArticleFingerprintUnavailable::class],
+        ];
+    }
+
+    #[DataProvider('unavailableFingerprintImports')]
+    public function test_backend_failure_preserves_import_source_even_when_failed_deletion_is_enabled(bool $required, string $exceptionClass): void
+    {
+        config(['release_verification.required' => $required]);
+        $file = $this->makeNzbFile('backend-retry');
+        $original = file_get_contents($file);
+        $results = [];
+        $service = new class(['Browser' => true], new $exceptionClass('Synthetic backend outage')) extends NzbImportService
+        {
+            public int $scanCalls = 0;
+
+            public function __construct(array $options, private readonly \RuntimeException $failure)
+            {
+                parent::__construct($options);
+            }
+
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function scanNZBFile(mixed &$nzbXML, mixed $nzbFileName = '', mixed $source = ''): NzbImportStatus
+            {
+                $this->scanCalls++;
+                throw $this->failure;
+            }
+        };
+
+        try {
+            $result = $service->beginImport([$file], delete: true, deleteFailed: true, resultCallback: static function (array $result) use (&$results): void {
+                $results[] = $result;
+            });
+
+            $this->assertFileExists($file);
+            $this->assertSame($original, file_get_contents($file));
+            $this->assertSame(1, $service->scanCalls);
+            $this->assertSame([], $results);
+            $this->assertStringContainsString('leaving it for a retry', $result);
+            $this->assertStringNotContainsString('Problem inserting', $result);
+        } finally {
+            if (is_file($file)) {
+                unlink($file);
+            }
+        }
     }
 
     public function test_temporary_nzb_names_are_recognised_by_the_stale_temp_cleanup(): void
