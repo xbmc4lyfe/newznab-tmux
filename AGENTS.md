@@ -63,6 +63,13 @@ Try Rust first for new app logic. When fixing or upgrading code in another langu
 - If Pint changes PHP files, retain the fixes and rerun until clean. Fix new PHPStan errors; document any baseline addition.
 - CaptainHook runs lint, Composer lock validation, and Pint. Commit limits are a 200-character subject and 72-character body.
 
+## Standing authorization for project session coordination
+
+- The user explicitly authorizes agents to send deployment handoffs, status messages, and related coordination messages to other sessions associated with this repository/folder without asking again.
+- Identify the deployment owner using the session's title, project association, and recent context. Names such as "Redeploy on upstream master changes" and "Deployment manager" are examples, not required exact matches.
+- If a recipient identifies another session as the deployment owner or an appropriate contact, agents may follow that referral and message that session or any other session associated with this repository/folder without renewed confirmation.
+- This standing authorization covers session messages only. It does not itself authorize deployment, restarts, processing jobs, other production changes, or external communications. Preserve the single deployment owner and all deployment guards.
+
 ## Shared runtime
 
 - Feature sessions don't deploy or restart the shared stack. The deployment owner uses `make -C docker deploy DEPLOY_BY=<session name>` and the deploy guard.
