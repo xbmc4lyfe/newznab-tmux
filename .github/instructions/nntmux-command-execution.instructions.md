@@ -1,6 +1,6 @@
 ---
 applyTo: "**"
-description: Override Boost Sail — prefer WSL host commands for Artisan/tests/tooling
+description: Use macOS or Linux host tools for development, builds, and tests
 ---
 
 # Command execution (overrides Laravel Boost Sail)
@@ -9,7 +9,7 @@ This project's instructions **overrule** Boost's built-in Sail guideline that sa
 
 ## Default
 
-Run PHP, Artisan, Composer, npm, Pint, PHPStan, and tests on the **WSL host**:
+Use macOS or Linux for development, builds, tests, CI, runtime, and deployment. Run PHP, Artisan, Composer, npm, Pint, PHPStan, and tests on the host:
 
 ```bash
 php artisan test --compact --filter=TestName
@@ -25,8 +25,8 @@ Do **not** prefix routine commands with `vendor/bin/sail` or `./sail`.
 
 Use Sail or `make …` for stack lifecycle (`make up` / `make down`) or when the user explicitly asks for containerized commands.
 
-## WSL2 + Windows Docker Desktop
+## Docker diagnostics
 
-If `docker` is missing or the daemon is unreachable, check that **Windows Docker Desktop** is running and WSL integration is enabled for this distro. Do not assume Docker must be apt-installed inside WSL. Host Artisan/tests remain valid when Docker is down.
+Check Docker Desktop or the configured Linux VM on macOS. Check the Docker service and socket access on Linux. Host tools can run without Docker if their required services are reachable.
 
 Canonical override source: `.ai/guidelines/sail/core.blade.php` (consumed by `php artisan boost:update`).

@@ -1,5 +1,23 @@
 # To do
 
+## Qualify preparation run diagnostics (2026-10-14)
+
+Opt-in preparation diagnostics report bounded per-run outcomes and phase durations from the existing metadata pass. Scheduled preparation enables them without additional candidate scans. Inspected rows, affected updates and ready promotions are distinct; a diagnostic record does not establish faster publication or backlog throughput.
+
+- [ ] Run the full PHPUnit/native suites on final integrated master, including preparation fairness, deadlines, claim/version/backoff races, manifest read failures and diagnostics that throw. Preserve the original return values, exceptions, retry policy, inventory evidence and worker-lock lifetime.
+- [ ] After current-head Codex approval, green CI and guarded rollout by the deployment owner, verify source parity, scheduled diagnostics, service health and M4 TLS connectivity. Observe natural runs and classify the actual stop reason, ready yield and selection/read-assessment/update costs before choosing another throughput change.
+- [ ] Retain deployment transitions, worker-limit changes, empty cohorts and failed observations when comparing useful work. Use isolated MariaDB qualification for any later query or transaction optimization; these aggregate timings alone do not prove server lock hold time or production capacity.
+
+## Retest additional admission with password checks disabled (2026-10-14)
+
+Password checks disabled at insertion produce passwordstatus=0 while media remains pending. Share the disabled-mode password-state gate across scheduling, worker selection and locked claim revalidation. Merge two individually ordered, bounded status prefixes to retain indexed claim selection. Keep enabled-mode selection, size/category/NZB/preview gates, claims and retry windows unchanged. No publication or runtime-setting change is included.
+
+Local qualification passed 27 focused tests (85 assertions), 1,029 broader tests (eight skips, 4,939 assertions), and 24 full-schema MariaDB cases (198 assertions). The MariaDB matrix covers both isolation levels, competing locks, committed state transitions and six actual generated-query plans across dense/sparse/ineligible inputs and small/seeded category tables. Status-prefix branches avoid filesort without hints; only the at-most-2K merged prefix is sorted. Rejected rows can still increase index scan work, and these results do not establish production throughput.
+
+- [x] Reproduce skipped pending-media rows in the existing SQLite fixture; cover selection, bucket/backlog counts, claims, enabled mode and admission exclusions.
+- [ ] Run focused/broader suites, static analysis and current-head Codex review. Retest disabled-mode MariaDB access plans and concurrent ownership with dedicated fixtures before making capacity claims.
+- [ ] Verify guarded deployment, eligible live processing and useful filename/media evidence. The initial idle window had only arrivals below the configured 1 GiB minimum. At 16:47 UTC, a bounded read captured 21 fresh status-zero releases passing all the other admission gates; compare that exact cohort after rollout. Retain the existing input filters and do not report an elapsed speedup without paired evidence.
+
 ## Retest scheduled verification without global summaries (2026-10-14)
 
 Scheduled candidate workers skip the terminal global status aggregate; direct commands retain it by default. This removes an unused whole-table query while a worker slot is held. Query elimination is separate from Docker runtime recovery and does not establish sustained backlog throughput.

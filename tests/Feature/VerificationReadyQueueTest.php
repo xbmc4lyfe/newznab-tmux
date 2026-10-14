@@ -14,6 +14,8 @@ use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use RuntimeException;
 
 class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
 {
@@ -209,7 +211,7 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
             && str_contains($event->command, 'releases:prepare-candidates')));
         $this->assertCount(1, $events);
         $this->assertStringContainsString('memory_limit=256M', $events[0]->command);
-        $this->assertStringContainsString('--limit=5000 --max-seconds=30', $events[0]->command);
+        $this->assertStringContainsString('--limit=5000 --max-seconds=30 --diagnostics', $events[0]->command);
         $this->assertSame('* * * * *', $events[0]->expression);
         config(['release_verification.scheduled' => false]);
         $this->assertFalse($events[0]->filtersPass($this->app));
@@ -274,6 +276,278 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, Artisan::call('releases:prepare-candidates', ['--limit' => 100]));
         $this->assertSame(400, DB::table('release_verification_candidates')->where('status', 'ready')->where('identity', 'like', 'pending-%')->count());
         $this->assertSame(100, DB::table('release_verification_candidates')->where('status', 'ready')->where('identity', 'like', 'unknown-%')->count());
+    }
+
+    public function test_preparation_diagnostics_count_real_classifications_and_read_failures(): void
+    {
+        $this->freezeTime();
+        $repository = app(CandidateRepository::class);
+        $repository->enqueue($this->manifest('complete'));
+        $repository->enqueue($this->manifest('partial', 2));
+        $repository->enqueue(array_replace($this->manifest('conflict'), ['conflict' => true]));
+        $repository->enqueue($this->manifest('bad-reference'));
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        DB::table('release_verification_candidates')->where('identity', 'bad-reference')->update(['manifest_path' => 'invalid-private-reference']);
+        $bytes = DB::table('release_verification_state')->value('pending_bytes');
+        $reports = [];
+
+        $this->assertSame(4, app(CandidatePreparationService::class)->prepare(10, 30, null,
+            static function (array $report) use (&$reports): void {
+                $reports[] = $report;
+            }));
+
+        $this->assertCount(1, $reports);
+        $report = $reports[0];
+        $this->assertSame(4, $report['inspected']);
+        $this->assertSame(['ready' => 1, 'waiting_upload' => 1, 'unknown' => 1], $report['assessments']);
+        $this->assertSame(['ready' => 1, 'waiting_upload' => 1, 'unknown' => 2], $report['updated']);
+        $this->assertSame(1, $report['ready_promotions']);
+        $this->assertSame(1, $report['read_assessment_failures']);
+        $this->assertSame(0, $report['zero_row_updates']);
+        $this->assertSame('exhausted', $report['stop_reason']);
+        $this->assertFalse($report['limit_reached']);
+        $this->assertFalse($report['deadline_reached']);
+        $this->assertTrue($report['queues_exhausted']);
+        $this->assertSame($bytes, DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame('unknown', DB::table('release_verification_candidates')->where('identity', 'bad-reference')->value('status'));
+        $this->assertSame(now()->addSeconds(900)->format('Y-m-d H:i:s'), DB::table('release_verification_candidates')->where('identity', 'bad-reference')->value('next_attempt_at'));
+        $this->assertSame(['limit', 'max_seconds', 'inspected', 'assessments', 'updated', 'ready_promotions', 'zero_row_updates', 'read_assessment_failures', 'stop_reason', 'limit_reached', 'deadline_reached', 'queues_exhausted', 'durations_ms'], array_keys($report));
+        $this->assertSame(['selection', 'read_assessment', 'update', 'total'], array_keys($report['durations_ms']));
+        foreach ($report['durations_ms'] as $duration) {
+            $this->assertGreaterThanOrEqual(0, $duration);
+        }
+        $this->assertGreaterThanOrEqual(array_sum(array_slice($report['durations_ms'], 0, 3)), $report['durations_ms']['total']);
+    }
+
+    public function test_preparation_diagnostics_distinguish_cap_from_queue_exhaustion(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->enqueue($this->manifest('first'));
+        $repository->enqueue($this->manifest('second'));
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $reports = [];
+        $observer = static function (array $report) use (&$reports): void {
+            $reports[] = $report;
+        };
+
+        $this->assertSame(1, app(CandidatePreparationService::class)->prepare(1, 30, null, $observer));
+        $this->assertSame(1, app(CandidatePreparationService::class)->prepare(10, 30, null, $observer));
+
+        $this->assertSame(['limit', 'exhausted'], array_column($reports, 'stop_reason'));
+        $this->assertTrue($reports[0]['limit_reached']);
+        $this->assertFalse($reports[0]['queues_exhausted']);
+        $this->assertSame(1, $reports[0]['inspected']);
+        $this->assertSame(1, DB::table('release_verification_candidates')->where('identity', 'first')->where('status', 'ready')->count());
+        $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'ready')->count());
+    }
+
+    public function test_preparation_diagnostics_deadline_before_first_read_preserves_fairness(): void
+    {
+        app(CandidateRepository::class)->enqueue($this->manifest('deadline'));
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $once = false;
+        $advances = 0;
+        $reports = [];
+        DB::listen(static function (QueryExecuted $query) use (&$once): void {
+            if (! $once && str_starts_with($query->sql, 'select') && str_contains($query->sql, '"manifest_path"') && str_contains($query->sql, 'order by')) {
+                $once = true;
+                usleep(1100000);
+            }
+        });
+        $this->assertSame(0, app(CandidatePreparationService::class)->prepare(2, 1,
+            static function (bool $advance) use (&$advances): bool {
+                $advances += (int) $advance;
+
+                return true;
+            },
+            static function (array $report) use (&$reports): void {
+                $reports[] = $report;
+            }));
+        $this->assertTrue($once);
+        $this->assertSame(0, $advances);
+        $this->assertCount(1, $reports);
+        $this->assertSame(0, $reports[0]['inspected']);
+        $this->assertSame('deadline', $reports[0]['stop_reason']);
+        $this->assertTrue($reports[0]['deadline_reached']);
+        $this->assertGreaterThanOrEqual(1000, $reports[0]['durations_ms']['selection']);
+        $this->assertSame('pending', DB::table('release_verification_candidates')->value('status'));
+    }
+
+    public function test_preparation_diagnostics_do_not_count_a_lost_cas_as_a_ready_promotion(): void
+    {
+        app(CandidateRepository::class)->enqueue($this->manifest('race'));
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $once = false;
+        $reports = [];
+        DB::listen(static function (QueryExecuted $query) use (&$once): void {
+            if (! $once && str_starts_with($query->sql, 'select') && str_contains($query->sql, '"manifest_path"') && str_contains($query->sql, 'order by')) {
+                $once = true;
+                DB::table('release_verification_candidates')->increment('version');
+            }
+        });
+        $this->assertSame(0, app(CandidatePreparationService::class)->prepare(1, 30, null,
+            static function (array $report) use (&$reports): void {
+                $reports[] = $report;
+            }));
+        $this->assertCount(1, $reports);
+        $this->assertSame(1, $reports[0]['assessments']['ready']);
+        $this->assertSame(0, $reports[0]['updated']['ready']);
+        $this->assertSame(0, $reports[0]['ready_promotions']);
+        $this->assertSame(1, $reports[0]['zero_row_updates']);
+        $this->assertSame('pending', DB::table('release_verification_candidates')->value('status'));
+    }
+
+    public function test_preparation_observer_failure_preserves_success_and_original_exception(): void
+    {
+        app(CandidateRepository::class)->enqueue($this->manifest('success'));
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $reports = [];
+        $observer = static function (array $report) use (&$reports): void {
+            $reports[] = $report;
+            throw new RuntimeException('Observer failed');
+        };
+        $this->assertSame(1, app(CandidatePreparationService::class)->prepare(1, 30, null, $observer));
+        $this->assertSame('ready', DB::table('release_verification_candidates')->value('status'));
+        $original = new RuntimeException('Original selection failure');
+        try {
+            app(CandidatePreparationService::class)->prepare(1, 30, static function (bool $advance) use ($original): bool {
+                throw $original;
+            }, $observer);
+            $this->fail('The original exception must escape.');
+        } catch (RuntimeException $error) {
+            $this->assertSame($original, $error);
+        }
+        $this->assertCount(2, $reports);
+        $this->assertSame('error', $reports[1]['stop_reason']);
+    }
+
+    public function test_preparation_diagnostics_preserve_the_query_transcript_without_global_counts(): void
+    {
+        $this->freezeTime();
+        for ($number = 0; $number < 115; $number++) {
+            app(CandidateRepository::class)->enqueue($this->manifest('parity'.$number));
+        }
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $queries = [];
+        $capture = true;
+        DB::listen(static function (QueryExecuted $query) use (&$queries, &$capture): void {
+            if ($capture) {
+                $queries[] = [$query->sql, $query->connection->prepareBindings($query->bindings)];
+            }
+        });
+        $this->assertSame(115, app(CandidatePreparationService::class)->prepare(200, 30));
+        $plain = $queries;
+        $capture = false;
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $capture = true;
+        $queries = [];
+        $reports = [];
+        $this->assertSame(115, app(CandidatePreparationService::class)->prepare(200, 30, null,
+            static function (array $report) use (&$reports): void {
+                $reports[] = $report;
+            }));
+        $capture = false;
+        $this->assertCount(1, $reports);
+        $this->assertSame($plain, $queries);
+        foreach ($queries as [$sql]) {
+            $this->assertStringNotContainsString('count(', strtolower($sql));
+        }
+    }
+
+    public function test_preparation_command_logs_only_opted_in_runs_after_releasing_locks(): void
+    {
+        $reports = [];
+        $lockReleased = false;
+        Log::shouldReceive('info')->once()->andReturnUsing(static function (string $message, array $report) use (&$reports, &$lockReleased): void {
+            $reports[] = $report;
+            $exclusive = new VerificationWorkerLocks;
+            try {
+                $lockReleased = $exclusive->tryExclusive();
+            } finally {
+                $exclusive->close();
+            }
+            throw new RuntimeException('Logger failed');
+        });
+        $this->assertTrue(Artisan::all()['releases:prepare-candidates']->getDefinition()->hasOption('diagnostics'));
+        $this->assertSame(0, Artisan::call('releases:prepare-candidates'));
+        app(CandidateRepository::class)->enqueue($this->manifest('logged-success'));
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $this->assertSame(0, Artisan::call('releases:prepare-candidates', ['--diagnostics' => true]));
+        $this->assertTrue($lockReleased);
+        $this->assertCount(1, $reports);
+        $this->assertSame(1, $reports[0]['ready_promotions']);
+        $this->assertSame('ready', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame('exhausted', $reports[0]['stop_reason']);
+        $this->assertStringContainsString('Classified 1 candidate header inventories.', Artisan::output());
+        $preparer = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue($preparer->startPreparation());
+            $this->assertSame(0, Artisan::call('releases:prepare-candidates', ['--diagnostics' => true]));
+            $this->assertCount(1, $reports, 'A lock-skipped invocation is not a preparation run.');
+        } finally {
+            $preparer->close();
+        }
+    }
+
+    public function test_preparation_command_reports_errors_without_masking_them_or_retaining_locks(): void
+    {
+        app(CandidateRepository::class)->enqueue($this->manifest('update-error'));
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $original = new RuntimeException('Original update listener error');
+        $once = false;
+        $reports = [];
+        DB::listen(static function (QueryExecuted $query) use ($original, &$once): void {
+            if (! $once && str_starts_with($query->sql, 'update "release_verification_candidates"') && ($query->bindings[0] ?? null) === 'ready') {
+                $once = true;
+                throw $original;
+            }
+        });
+        $lockReleased = false;
+        Log::shouldReceive('info')->once()->andReturnUsing(static function (string $message, array $report) use (&$reports, &$lockReleased): void {
+            $reports[] = $report;
+            $exclusive = new VerificationWorkerLocks;
+            try {
+                $lockReleased = $exclusive->tryExclusive();
+            } finally {
+                $exclusive->close();
+            }
+            throw new RuntimeException('Logger failed during error reporting');
+        });
+        try {
+            Artisan::call('releases:prepare-candidates', ['--diagnostics' => true]);
+            $this->fail('The original update exception must escape.');
+        } catch (RuntimeException $error) {
+            $this->assertSame($original, $error);
+        }
+        $this->assertTrue($lockReleased);
+        $this->assertCount(1, $reports);
+        $this->assertSame('error', $reports[0]['stop_reason']);
+        $this->assertSame(1, $reports[0]['inspected']);
+        $this->assertSame(1, $reports[0]['assessments']['ready']);
+        $this->assertSame(0, $reports[0]['ready_promotions'], 'A throwing update did not provide an affected-row result.');
+        $this->assertSame('ready', DB::table('release_verification_candidates')->value('status'), 'Error reporting must not imply rollback of this autocommitted update.');
+    }
+
+    public function test_preparation_diagnostics_report_simultaneous_limit_and_deadline_boundaries(): void
+    {
+        app(CandidateRepository::class)->enqueue($this->manifest('both-boundaries'));
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $reports = [];
+        DB::listen(static function (QueryExecuted $query): void {
+            if (str_starts_with($query->sql, 'update "release_verification_candidates"') && ($query->bindings[0] ?? null) === 'ready') {
+                usleep(1100000);
+            }
+        });
+        $this->assertSame(1, app(CandidatePreparationService::class)->prepare(1, 1, null,
+            static function (array $report) use (&$reports): void {
+                $reports[] = $report;
+            }));
+        $this->assertCount(1, $reports);
+        $this->assertSame('limit_and_deadline', $reports[0]['stop_reason']);
+        $this->assertTrue($reports[0]['limit_reached']);
+        $this->assertTrue($reports[0]['deadline_reached']);
+        $this->assertSame(1, $reports[0]['ready_promotions']);
+        $this->assertGreaterThanOrEqual(1000, $reports[0]['durations_ms']['update']);
     }
 
     private function seedPreparationQueues(): int

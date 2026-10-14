@@ -67,6 +67,17 @@ jobs:
           YENC_NATIVE_LIBRARY: ${{ github.workspace }}/storage/app/rapidyenc/librapidyenc.so
         run: php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter='YencNativeDecoderTest|YencNativeLibraryTest|YencServiceTest|YencDoctorCommandTest|NNTPBodyDecodingTest|NNTPBoundedArticleTest'
 
+      - name: Install the pinned Rust build toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Build Rust article identity runtime
+        env:
+          RUSTUP_TOOLCHAIN: 1.98.0
+        run: bash scripts/build-nntmux-native.sh
+
+      - name: Test article identity without PHP FFI
+        run: php -d ffi.enable=false vendor/bin/phpunit --fail-on-skipped tests/Unit/Nzb/NzbArticleFingerprintTest.php
+
       - name: Deployment configuration parser tests
         run: python3 deploy/cloud/tests/test_configuration.py
 
@@ -86,3 +97,11 @@ jobs:
           PAR2_DONOR_TEST_USERNAME: root
           PAR2_DONOR_TEST_PASSWORD: donor-fixture-only
         run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/VerificationReadyQueueMariaDbTest.php
+
+      - name: Qualify disabled-password additional admission against MariaDB
+        env:
+          ADDITIONAL_ADMISSION_TEST_HOST: 127.0.0.1
+          ADDITIONAL_ADMISSION_TEST_PORT: 3306
+          ADDITIONAL_ADMISSION_TEST_USERNAME: root
+          ADDITIONAL_ADMISSION_TEST_PASSWORD: donor-fixture-only
+        run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/AdditionalPasswordDisabledMariaDbTest.php

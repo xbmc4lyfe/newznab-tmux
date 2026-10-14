@@ -1,0 +1,54 @@
+---
+- name: Install native compilation dependencies
+  ansible.builtin.apt:
+    update_cache: true
+    state: present
+    policy_rc_d: 101
+    name: [ca-certificates, build-essential, pkg-config, libssl-dev, xz-utils]
+
+# Ubuntu Noble's packaged compiler cannot build the crate's Rust 2024 edition.
+# Match the Docker toolchain and verify the official archive before extraction.
+- name: Create native toolchain download directory
+  ansible.builtin.file:
+    path: /var/cache/nntmux-rust
+    state: directory
+    mode: '0755'
+
+- name: Download Rust 1.98.0 for the supported amd64 host
+  ansible.builtin.get_url:
+    url: https://static.rust-lang.org/dist/rust-1.98.0-x86_64-unknown-linux-gnu.tar.xz
+    dest: /var/cache/nntmux-rust/rust-1.98.0-x86_64-unknown-linux-gnu.tar.xz
+    checksum: sha256:https://static.rust-lang.org/dist/rust-1.98.0-x86_64-unknown-linux-gnu.tar.xz.sha256
+    mode: '0644'
+
+- name: Extract verified Rust toolchain
+  ansible.builtin.unarchive:
+    src: /var/cache/nntmux-rust/rust-1.98.0-x86_64-unknown-linux-gnu.tar.xz
+    dest: /var/cache/nntmux-rust
+    remote_src: true
+    creates: /var/cache/nntmux-rust/rust-1.98.0-x86_64-unknown-linux-gnu/install.sh
+
+- name: Install pinned Rust build tools outside application runtime paths
+  ansible.builtin.command:
+    argv:
+      - /var/cache/nntmux-rust/rust-1.98.0-x86_64-unknown-linux-gnu/install.sh
+      - --prefix=/opt/nntmux-rust/1.98.0
+      - --disable-ldconfig
+      - --without=rust-docs
+    creates: /opt/nntmux-rust/1.98.0/.nntmux-installed
+  register: packages_rust_install
+
+- name: Record successful Rust toolchain installation
+  ansible.builtin.file:
+    path: /opt/nntmux-rust/1.98.0/.nntmux-installed
+    state: touch
+    mode: '0644'
+  when: packages_rust_install.changed and not ansible_check_mode
+
+- name: Verify pinned Rust compiler
+  ansible.builtin.command:
+    argv: [/opt/nntmux-rust/1.98.0/bin/rustc, --version]
+  register: packages_rust_version
+  changed_when: false
+  failed_when: packages_rust_version.rc != 0 or not packages_rust_version.stdout.startswith('rustc 1.98.0 ')
+  when: not ansible_check_mode

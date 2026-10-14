@@ -1,7 +1,56 @@
-# Agents never commit or push
+---
+paths:
+  - '**'
+---
 
-NNTmux agents must not run `git commit` or `git push` (including `--amend`, tags, or force pushes). The maintainer reviews, commits, and pushes.
+# Git workflow and review gates
 
-- When a task is done, stage every project file you created or modified with `git add <path>` (list paths explicitly; no `git add -A` / `git add .`).
-- Never stage temporary files you created (scratch scripts, debug output, logs, planning documents), and do not stage unrelated pre-existing changes.
-- Commit or push only when the user explicitly asks in the current conversation; that approval covers that one request only.
+A human prompt or goal authorizes agents to commit task changes, push feature branches, open pull requests, and squash-merge reviewed feature pull requests into `master` in `xbmc4lyfe/newznab-tmux`. Stay within the task. Deployment, production changes, dependency changes, force pushes, and changes to repository protections need separate authorization.
+
+## Prepare the branch
+
+- Work on a feature branch. Keep `master` as the PR base. Don't push directly to it.
+- Update the branch against the current destination `master` before review. Preserve unrelated work and resolve conflicts before verification.
+- Stage files with explicit paths. Exclude scratch files, logs, and unrelated changes.
+- Run the checks required for the changed files. Documentation changes need prose and consistency checks. App changes also need relevant tests and lint.
+
+## Review locally before opening a PR
+
+1. Commit the changes and record the head commit hash and destination base commit hash.
+2. Obtain an independent local Codex review of the complete diff against that base. Use a Codex subagent when a slot is available. Use a separate Codex command-line process when all Codex subagent slots have active tasks or the current harness isn't Codex. The implementation agent can't approve its own work.
+3. Address all findings, repeat relevant checks, and obtain another review. Open the PR only when the final review reports no findings and gives an explicit go-ahead for the committed head.
+
+You may push the feature branch before review. Opening a PR still requires a clean local review.
+
+For a command-line review, use the installed command's supported flags. For example:
+
+```bash
+codex exec --model gpt-6.1-sol \
+  -c model_reasoning_effort=high -c service_tier=default \
+  --sandbox read-only --ephemeral review --base origin/master
+```
+
+Record the reviewer, model, effort, speed, base commit hash, head commit hash, findings, and final verdict. Read the result. A successful process exit doesn't prove a clean review.
+
+## Review the PR before merging
+
+1. Open the PR against `xbmc4lyfe/newznab-tmux:master` and comment `@codex review`.
+2. Check every finding against the code. Reproduce bugs when practical. Fix valid findings and run relevant checks. Reply in each finding's thread with the fix and evidence, or explain with evidence why the finding doesn't apply. Resolve the thread after replying.
+3. Request `@codex review` again after fixes or replies that explain why a finding doesn't apply. Repeat until Codex gives an explicit approval or go-ahead for the current head. Require no unresolved findings or review threads.
+4. Wait for required checks to pass. Verify that the remote PR head and destination base still match the reviewed revisions, then squash-merge the feature PR. If the destination base has changed, update the branch, rerun relevant checks, and repeat both reviews before merging.
+
+Every content change after a review invalidates that review. Make the needed changes, rerun checks, and obtain a fresh review with no findings before opening or merging the PR. This applies to documentation and review fixes too.
+
+### When GitHub review credits run out
+
+Use this fallback only when the GitHub Codex app reports that review credits have run out. Other review failures don't qualify.
+
+- After the PR is open, obtain a fresh independent local Codex review of its current head against its current destination base. The earlier review before PR creation isn't a substitute.
+- Use `gpt-6.1-sol` or a stronger model, `high` reasoning effort, and normal speed. For the Codex command-line tool, set `service_tier=default`. Verify the resolved settings. Use a separate process if a subagent can't select normal speed. Don't silently downgrade the model or effort.
+- Require no findings and an explicit go-ahead. After any change, repeat the review on the new head.
+- Record the credit-exhaustion notice, reviewed base and head commit hashes, model, effort, speed, and full review result in the PR. Address existing GitHub findings and resolve their threads before merging.
+- Required checks and repository protections still apply. If an approval requirement blocks the fallback, report the blocker. Don't bypass it.
+
+## Upstream synchronization
+
+Upstream is `NNTmux/newznab-tmux:master`. A separate request to synchronize upstream authorizes that workflow. Preserve upstream history with a merge commit. Feature work in this fork uses a squash merge. Apply the same review and verification gates.
