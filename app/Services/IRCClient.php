@@ -688,11 +688,14 @@ class IRCClient
             [
                 '/\x03\d{1,2}(?:,\d{1,2})?/', // Color code with foreground and optional background
                 '/\x03/', // Color code without parameters (reset)
+                '/\x04[0-9A-Fa-f]{6}(?:,[0-9A-Fa-f]{6})?/', // Hex foreground and optional background
+                '/\x04/', // Hex color reset
                 '/\x02/', // Bold
                 '/\x0F/', // Reset/Normal
                 '/\x16/', // Reverse/Italic
                 '/\x1F/', // Underline
                 '/\x1D/', // Italic
+                '/\x1E/', // Strikethrough
                 '/\x11/', // Monospace
             ],
             '',
