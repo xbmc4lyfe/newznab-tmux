@@ -7,6 +7,8 @@ namespace Tests\Feature;
 use App\Enums\ServiceStatusEnum;
 use App\Services\Monitoring\Collectors\MetricsCollector;
 use App\Services\Monitoring\TmuxMetricsSnapshot;
+use Illuminate\Console\Scheduling\Event;
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request;
@@ -109,6 +111,45 @@ class ExportMonitoringMetricsCommandTest extends TestCase
         $this->artisan('monitoring:export-metrics')->assertSuccessful();
 
         Http::assertNothingSent();
+    }
+
+    public function test_an_abandoned_exporter_lock_expires_after_five_minutes(): void
+    {
+        Http::fake([self::PUSH_URL => Http::response('', 200)]);
+        $event = $this->exportEvent();
+
+        $this->assertTrue($event->mutex->create($event));
+        $this->travel(4)->minutes();
+        $this->assertFalse($event->filtersPass($this->app));
+        $this->assertTrue($event->shouldSkipDueToOverlapping());
+        Http::assertNothingSent();
+
+        $this->travel(1)->minutes();
+        $this->assertTrue($event->filtersPass($this->app));
+        $this->assertFalse($event->mutex->exists($event));
+        $this->artisan('monitoring:export-metrics')->assertSuccessful();
+
+        Http::assertSent(static fn (Request $request): bool => $request->method() === 'PUT'
+            && $request->url() === self::PUSH_URL
+            && str_contains($request->body(), "nntmux_up 1\n"));
+    }
+
+    public function test_the_export_schedule_respects_monitoring_being_disabled(): void
+    {
+        config(['monitoring.enabled' => false]);
+
+        $this->assertFalse($this->exportEvent()->filtersPass($this->app));
+    }
+
+    private function exportEvent(): Event
+    {
+        foreach (app(Schedule::class)->events() as $event) {
+            if (is_string($event->command) && str_contains($event->command, 'monitoring:export-metrics')) {
+                return $event;
+            }
+        }
+
+        $this->fail('The monitoring export schedule must be registered.');
     }
 
     private function createSchema(): void
