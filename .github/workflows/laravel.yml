@@ -13,6 +13,19 @@ jobs:
 
     name: PHP ${{ matrix.php }}
 
+    services:
+      donor-mariadb:
+        image: mariadb:11.4.8
+        env:
+          MARIADB_ROOT_PASSWORD: donor-fixture-only
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
     steps:
       - uses: actions/checkout@v5
 
@@ -20,7 +33,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: dom, curl, ffi, intl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite
+          extensions: dom, curl, ffi, intl, libxml, mbstring, zip, pcntl, pdo, pdo_mysql, sqlite, pdo_sqlite
           coverage: none
 
       - name: Install archive and PAR2 verification tools
@@ -59,3 +72,10 @@ jobs:
 
       - name: Run tests
         run: php -d memory_limit=2G vendor/bin/phpunit
+
+      - name: Qualify PAR2 donor matching against full-schema MariaDB
+        env:
+          PAR2_DONOR_TEST_HOST: 127.0.0.1
+          PAR2_DONOR_TEST_USERNAME: root
+          PAR2_DONOR_TEST_PASSWORD: donor-fixture-only
+        run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/Par2DonorInventoryMariaDbTest.php
