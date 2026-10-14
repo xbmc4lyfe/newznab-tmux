@@ -62,7 +62,7 @@ services:
       - 'sail-grafana:/var/lib/grafana'
     networks:
       - sail
-  # On WSL2 / Docker Desktop this measures the Docker VM, not Windows.
+  # On macOS with Docker Desktop, this measures the Linux VM.
   node-exporter:
     image: 'prom/node-exporter:v1.12.1'
     pid: host

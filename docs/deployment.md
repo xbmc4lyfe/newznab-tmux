@@ -229,7 +229,7 @@ Provide SSH key/agent access with verified host keys, sudo, at least 8 GiB RAM a
 
 ### Control-node setup and configuration
 
-Use a Linux/WSL control node with Python 3.12 and Terraform >=1.10,<2.0. Install the pinned tools in a virtual environment:
+Use a macOS or Linux control node with Python 3.12 and Terraform >=1.10,<2.0. Install the pinned tools in a virtual environment:
 
 ```bash
 python3 -m venv .venv-ansible
