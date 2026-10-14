@@ -12,6 +12,7 @@ use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -90,6 +91,155 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
     {
         return ['identity' => $identity, 'groups_id' => 1, 'expected_files' => 1,
             'files' => [['key' => 'movie', 'totalparts' => $total, 'segments' => [['number' => 1, 'messageid' => $identity.'@article', 'bytes' => 5]]]]];
+    }
+
+    public function test_preparation_batches_waiting_classifications_without_changing_inventories_or_capacity(): void
+    {
+        $repository = app(CandidateRepository::class);
+        for ($i = 0; $i < 151; $i++) {
+            $repository->enqueue($this->manifest('partial'.$i, 2));
+        }
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $before = DB::table('release_verification_candidates')->orderBy('id')->get()->toArray();
+        $bytes = DB::table('release_verification_state')->value('pending_bytes');
+        $writes = [];
+        DB::listen(static function (QueryExecuted $query) use (&$writes): void {
+            if (str_starts_with($query->sql, 'update') && str_contains($query->sql, 'release_verification_candidates')) {
+                $writes[] = $query;
+            }
+        });
+        $report = [];
+        $changed = app(CandidatePreparationService::class)->prepare(151, 30, observer: static function (array $value) use (&$report): void {
+            $report = $value;
+        });
+
+        $this->assertSame(151, $changed);
+        $this->assertCount(7, $writes);
+        $this->assertSame(151, $report['updated']['waiting_upload']);
+        $this->assertSame(0, $report['zero_row_updates']);
+        $this->assertSame($bytes, DB::table('release_verification_state')->value('pending_bytes'));
+        foreach (DB::table('release_verification_candidates')->orderBy('id')->get() as $index => $row) {
+            $this->assertSame('waiting_upload', $row->status);
+            $this->assertSame('Declared article inventory is still uploading; publication deferred.', $row->reason);
+            $this->assertSame($before[$index]->manifest_path, $row->manifest_path);
+            $this->assertSame($before[$index]->version, $row->version);
+            $this->assertSame($before[$index]->next_attempt_at, $row->next_attempt_at);
+            $this->assertSame('partial'.$index.'@article', app(ManifestStore::class)->read($row->manifest_path)['files'][0]['segments'][0]['messageid']);
+            $this->assertNull($row->release_id);
+        }
+    }
+
+    public function test_waiting_batch_rejects_changed_snapshots_and_counts_each_unmatched_row(): void
+    {
+        $this->freezeTime();
+        foreach (['claim', 'version', 'unchanged'] as $identity) {
+            app(CandidateRepository::class)->enqueue($this->manifest($identity, 2));
+        }
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $once = false;
+        DB::listen(static function (QueryExecuted $query) use (&$once): void {
+            if (! $once && str_starts_with($query->sql, 'select') && str_contains($query->sql, '"manifest_path"') && str_contains($query->sql, 'order by')) {
+                $once = true;
+                DB::table('release_verification_candidates')->where('identity', 'claim')->update(['lease_token' => 'other']);
+                DB::table('release_verification_candidates')->where('identity', 'version')->increment('version');
+            }
+        });
+        $report = [];
+        $this->assertSame(1, app(CandidatePreparationService::class)->prepare(3, 30, observer: static function (array $value) use (&$report): void {
+            $report = $value;
+        }));
+        $this->assertTrue($once);
+        $this->assertSame(2, $report['zero_row_updates']);
+        $this->assertSame(1, $report['updated']['waiting_upload']);
+        $this->assertSame(['pending', 'pending', 'waiting_upload'], DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+    }
+
+    public function test_failed_waiting_batch_retains_a_durable_prefix_and_recovers_without_row_fallback(): void
+    {
+        for ($i = 0; $i < 51; $i++) {
+            app(CandidateRepository::class)->enqueue($this->manifest('failure'.$i, 2));
+        }
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $bytes = DB::table('release_verification_state')->value('pending_bytes');
+        $id = (int) DB::table('release_verification_candidates')->where('identity', 'failure27')->value('id');
+        DB::unprepared("CREATE TRIGGER fail_waiting_batch BEFORE UPDATE ON release_verification_candidates WHEN NEW.status = 'waiting_upload' AND NEW.id = {$id} BEGIN SELECT RAISE(ABORT, 'qualification batch failure'); END");
+        $report = [];
+        try {
+            app(CandidatePreparationService::class)->prepare(51, 30, observer: static function (array $value) use (&$report): void {
+                $report = $value;
+            });
+            $this->fail('A failed statement must propagate without per-row fallback.');
+        } catch (QueryException $failure) {
+            $this->assertStringContainsString('qualification batch failure', $failure->getMessage());
+        } finally {
+            DB::unprepared('DROP TRIGGER fail_waiting_batch');
+        }
+        $this->assertSame('error', $report['stop_reason']);
+        $this->assertSame(50, $report['inspected']);
+        $this->assertSame(25, $report['updated']['waiting_upload']);
+        $this->assertSame(25, DB::table('release_verification_candidates')->where('status', 'waiting_upload')->count());
+        $this->assertSame(26, DB::table('release_verification_candidates')->where('status', 'pending')->count());
+        $this->assertSame(26, app(CandidatePreparationService::class)->prepare(51, 30));
+        $this->assertSame(51, DB::table('release_verification_candidates')->where('status', 'waiting_upload')->count());
+        $this->assertSame($bytes, DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('release_id')->count());
+    }
+
+    public function test_deadline_flushes_admitted_waiting_rows_without_reading_another_manifest(): void
+    {
+        foreach (['first', 'unread'] as $identity) {
+            app(CandidateRepository::class)->enqueue($this->manifest($identity, 2));
+        }
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $advances = 0;
+        $report = [];
+        $this->assertSame(1, app(CandidatePreparationService::class)->prepare(2, 1, static function (bool $advance) use (&$advances): bool {
+            if ($advance) {
+                $advances++;
+                usleep(1100000);
+            }
+
+            return true;
+        }, static function (array $value) use (&$report): void {
+            $report = $value;
+        }));
+        $this->assertSame(1, $advances);
+        $this->assertSame('deadline', $report['stop_reason']);
+        $this->assertSame(1, $report['inspected']);
+        $this->assertSame(['waiting_upload', 'pending'], DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+    }
+
+    public function test_waiting_batches_preserve_reason_boundaries_and_immediate_ready_and_retry_updates(): void
+    {
+        $this->freezeTime();
+        $manifests = [
+            $this->manifest('article-one', 2), $this->manifest('article-two', 2),
+            array_replace($this->manifest('file-one'), ['expected_files' => 2]),
+            array_replace($this->manifest('file-two'), ['expected_files' => 2]),
+            $this->manifest('complete'),
+            array_replace($this->manifest('conflict'), ['conflict' => true]),
+            $this->manifest('article-three', 2),
+        ];
+        foreach ($manifests as $manifest) {
+            app(CandidateRepository::class)->enqueue($manifest);
+        }
+        DB::table('release_verification_candidates')->update(['status' => 'pending', 'reason' => 'old reason']);
+        $originalRetry = DB::table('release_verification_candidates')->where('identity', 'complete')->value('next_attempt_at');
+        $updates = [];
+        DB::listen(static function (QueryExecuted $query) use (&$updates): void {
+            if (str_starts_with($query->sql, 'update') && str_contains($query->sql, 'release_verification_candidates')) {
+                $updates[] = $query->bindings[0];
+            }
+        });
+        $this->assertSame(7, app(CandidatePreparationService::class)->prepare(7, 30));
+        $this->assertSame(['waiting_upload', 'waiting_upload', 'ready', 'unknown', 'waiting_upload'], $updates);
+        $rows = DB::table('release_verification_candidates')->orderBy('id')->get();
+        $this->assertSame($rows[0]->reason, $rows[1]->reason);
+        $this->assertSame($rows[2]->reason, $rows[3]->reason);
+        $this->assertNotSame($rows[0]->reason, $rows[2]->reason);
+        $this->assertSame('old reason', $rows[4]->reason);
+        $this->assertSame($originalRetry, $rows[4]->next_attempt_at);
+        $this->assertSame(now()->addSeconds((int) config('release_verification.retry_seconds'))->format('Y-m-d H:i:s'), $rows[5]->next_attempt_at);
     }
 
     public function test_late_header_archival_promotes_the_merged_inventory_and_preserves_every_article(): void

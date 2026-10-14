@@ -155,12 +155,10 @@ final class PreparationRunDiagnostics
      *
      * @param  'ready'|'waiting_upload'|'unknown'  $status
      */
-    public function updated(string $status, int $affected): void
+    public function updated(string $status, int $affected, int $attempted = 1): void
     {
         $this->updated[$status] += $affected;
-        if ($affected === 0) {
-            $this->zeroRowUpdates++;
-        }
+        $this->zeroRowUpdates += max(0, $attempted - $affected);
     }
 
     /** @return array<string, mixed> */

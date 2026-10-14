@@ -4,12 +4,16 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use stdClass;
 use Throwable;
 
 /** Classify immutable header metadata without opening an NNTP connection. */
 final class CandidatePreparationService
 {
+    private const WAITING_BATCH_SIZE = 25;
+
     public function __construct(private readonly ManifestStore $store, private readonly CandidateHeaderInventory $inventory) {}
 
     /**
@@ -37,6 +41,8 @@ final class CandidatePreparationService
         $error = false;
         try {
             $cutoff = now();
+            $waiting = [];
+            $waitingReason = '';
             while ($inspected < $limit && count($exhausted) < 2 && hrtime(true) < $deadline) {
                 // Peek before selection; spend a turn only when its first metadata read is admitted.
                 $statuses = $preferPending(false) ? ['pending', 'unknown'] : ['unknown', 'pending'];
@@ -67,6 +73,7 @@ final class CandidatePreparationService
                     $phaseCommitted = false;
                     foreach ($rows as $row) {
                         if (hrtime(true) >= $deadline) {
+                            $changed += $this->flushWaiting($waiting, $waitingReason, $cutoff, $diagnostics);
                             break 2;
                         }
                         if (! $phaseCommitted) {
@@ -90,6 +97,21 @@ final class CandidatePreparationService
                             unset($manifest);
                             $diagnostics?->finish('read_assessment', $assessmentStarted);
                         }
+                        if ($assessment['status'] === 'waiting_upload') {
+                            $reason = mb_strcut($assessment['reason'] ?? '', 0, 2000, 'UTF-8');
+                            if ($waitingReason !== $reason) {
+                                $changed += $this->flushWaiting($waiting, $waitingReason, $cutoff, $diagnostics);
+                                $waitingReason = $reason;
+                            }
+                            $waiting[] = $row;
+                            if (count($waiting) === self::WAITING_BATCH_SIZE) {
+                                $changed += $this->flushWaiting($waiting, $waitingReason, $cutoff, $diagnostics);
+                            }
+
+                            continue;
+                        }
+                        // Keep ready promotions and retry timestamps immediate and ordered.
+                        $changed += $this->flushWaiting($waiting, $waitingReason, $cutoff, $diagnostics);
                         $updateStarted = $diagnostics?->start();
                         try {
                             $values = ['status' => $assessment['status']];
@@ -112,6 +134,7 @@ final class CandidatePreparationService
                             $diagnostics?->finish('update', $updateStarted);
                         }
                     }
+                    $changed += $this->flushWaiting($waiting, $waitingReason, $cutoff, $diagnostics);
                     if ($rows->isNotEmpty()) {
                         break;
                     }
@@ -131,5 +154,60 @@ final class CandidatePreparationService
                 }
             }
         }
+    }
+
+    /** @param list<stdClass> $rows */
+    private function flushWaiting(array &$rows, string $reason, Carbon $cutoff, ?PreparationRunDiagnostics $diagnostics): int
+    {
+        if ($rows === []) {
+            return 0;
+        }
+        $started = $diagnostics?->start();
+        try {
+            $affected = $this->updateWaiting($rows, $reason, $cutoff);
+            $diagnostics?->updated('waiting_upload', $affected, count($rows));
+            $rows = [];
+
+            return $affected;
+        } finally {
+            $diagnostics?->finish('update', $started);
+        }
+    }
+
+    /** @param list<stdClass> $rows */
+    private function updateWaiting(array $rows, string $reason, Carbon $cutoff): int
+    {
+        $connection = DB::connection();
+        // UPDATE ignores Query Builder's SELECT index hint. Bound its physical scan
+        // to the primary-key list, including when other status indexes look cheaper.
+        $table = in_array($connection->getDriverName(), ['mysql', 'mariadb'], true)
+            ? DB::raw($connection->getQueryGrammar()->wrapTable('release_verification_candidates').' FORCE INDEX (PRIMARY)')
+            : 'release_verification_candidates';
+
+        $query = $connection->table($table)->whereIn('id', array_column($rows, 'id'))
+            ->whereNull('release_id')->whereNull('lease_token')
+            ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', $cutoff))
+            ->where(function ($query) use ($rows): void {
+                foreach ($rows as $row) {
+                    $query->orWhere(fn ($snapshot) => $snapshot->where('id', $row->id)
+                        ->where('version', $row->version)->where('manifest_path', $row->manifest_path)
+                        ->where('status', $row->status)->where('next_attempt_at', $row->next_attempt_at));
+                }
+            });
+        $values = ['status' => 'waiting_upload', 'reason' => $reason];
+        if (count($rows) === 1 || ! in_array($connection->getDriverName(), ['mysql', 'mariadb'], true)) {
+            return $query->update($values);
+        }
+
+        // Ingestion can own candidates in collection order. Acquire only available
+        // candidate locks so a multirow update cannot wait while holding its prefix.
+        return $connection->transaction(static function () use ($query, $values): int {
+            $ids = (clone $query)->lock('FOR UPDATE SKIP LOCKED')->pluck('id')->all();
+            if ($ids === []) {
+                return 0;
+            }
+
+            return $query->whereIn('id', $ids)->update($values);
+        });
     }
 }
