@@ -38,7 +38,7 @@ on:
         default: 'master'
         required: true
       candidate_ref:
-        description: Optional ancestor commit SHA for the application candidate
+        description: Optional ancestor SHA for all/processing; profile rejects candidates
         default: ''
         required: false
       caller_mode:
@@ -403,12 +403,19 @@ jobs:
       - name: Profile actual BODY assembly and metadata callers
         shell: bash
         run: |
+          if [[ "$COMPARISON_MODE" == profile && -n "$REQUESTED_CANDIDATE_REF" ]]; then
+            printf 'candidate_ref requires comparison=all or processing.\n' >&2
+            exit 1
+          fi
           php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-article-processing.php \
             --profile --candidate-dir="$GITHUB_WORKSPACE/$CANDIDATE_SOURCE" \
             --native="$GITHUB_WORKSPACE/$CANDIDATE_SOURCE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
             --samples=7 --runtime-manifest="$GITHUB_WORKSPACE/processing-evidence/build/runtime.json" \
             --output-dir="$GITHUB_WORKSPACE/processing-evidence/profile" \
             2>&1 | tee processing-evidence/build/profile-console.log
+        env:
+          COMPARISON_MODE: ${{ inputs.comparison || 'profile' }}
+          REQUESTED_CANDIDATE_REF: ${{ inputs.candidate_ref || '' }}
 
       - name: Capture CPU counters after caller profile
         if: always() && hashFiles('processing-evidence/build/profile-cpu-before.json') != ''

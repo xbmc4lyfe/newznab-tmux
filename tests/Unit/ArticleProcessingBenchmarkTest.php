@@ -56,13 +56,22 @@ PHP);
                 file_put_contents($directory.'/'.$source.'/.profile-marker', $marker);
                 file_put_contents($directory.'/'.$source.'/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so', $marker.'-library');
                 $process = new Process(['bash', '-e', '-o', 'pipefail', '-c', $match['script']], $directory,
-                    ['PATH' => $directory.'/bin:'.(string) getenv('PATH'), 'GITHUB_WORKSPACE' => $directory, 'CANDIDATE_SOURCE' => $source]);
+                    ['PATH' => $directory.'/bin:'.(string) getenv('PATH'), 'GITHUB_WORKSPACE' => $directory, 'CANDIDATE_SOURCE' => $source,
+                        'COMPARISON_MODE' => $source === '.' ? 'profile' : 'processing',
+                        'REQUESTED_CANDIDATE_REF' => $source === '.' ? '' : str_repeat('a', 40)]);
                 $process->run();
                 self::assertSame(0, $process->getExitCode(), $process->getErrorOutput());
                 $result = json_decode($process->getOutput(), true, flags: JSON_THROW_ON_ERROR);
                 self::assertSame($marker, $result['source_marker']);
                 self::assertSame(hash('sha256', $marker.'-library'), $result['library_sha256']);
             }
+            $rejected = new Process(['bash', '-e', '-o', 'pipefail', '-c', $match['script']], $directory,
+                ['PATH' => $directory.'/bin:'.(string) getenv('PATH'), 'GITHUB_WORKSPACE' => $directory, 'CANDIDATE_SOURCE' => '.',
+                    'COMPARISON_MODE' => 'profile', 'REQUESTED_CANDIDATE_REF' => str_repeat('a', 40)]);
+            $rejected->run();
+            self::assertSame(1, $rejected->getExitCode());
+            self::assertSame('', $rejected->getOutput());
+            self::assertStringContainsString('candidate_ref requires comparison=all or processing', $rejected->getErrorOutput());
         } finally {
             self::removeOwnedDirectory($directory);
         }
