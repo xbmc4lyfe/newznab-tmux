@@ -1825,6 +1825,16 @@ class NNTPService extends NntpClient
 
                 return $this->throwError('NNTP article read stopped after processing lock ownership was lost.', null);
             }
+            // Most reads contain a complete line. Keep the accumulator for
+            // fragmented lines, without copying/resetting it on ordinary reads.
+            if ($line === '' && str_ends_with($fragment, "\n")) {
+                if ($fragment === ".\r\n") {
+                    return $body;
+                }
+                $body .= str_starts_with($fragment, '..') ? substr($fragment, 1) : $fragment;
+
+                continue;
+            }
             $line .= $fragment;
             if (! str_ends_with($line, "\n")) {
                 continue;

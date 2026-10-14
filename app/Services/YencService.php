@@ -65,7 +65,7 @@ class YencService
 
     public function decodeIgnore(string &$text): string
     {
-        $frame = ArticleFrame::parse($text);
+        $frame = ArticleFrame::parse($text, parseTrailerFields: false);
         if ($frame !== null) {
             $text = $this->decodeFramePayload($text, $frame)['decoded'];
         }
@@ -80,7 +80,7 @@ class YencService
      */
     public function decodeWithFrame(string $text): array
     {
-        $frame = ArticleFrame::parse($text);
+        $frame = ArticleFrame::parse($text, parseTrailerFields: false);
         if ($frame === null) {
             return [$text, null];
         }

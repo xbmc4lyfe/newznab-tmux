@@ -226,10 +226,57 @@ final class NNTPBodyDecodingTest extends TestCase
         }
     }
 
-    public function test_ownership_cancellation_closes_the_session_without_returning_partial_body(): void
+    /** @return iterable<string, array{string, string, int}> */
+    public static function fragmentedRawBodies(): iterable
+    {
+        $splitCrLf = str_repeat('x', 8190)."\r\n";
+        yield 'CR and LF split at the read limit' => [$splitCrLf, $splitCrLf, 3];
+
+        $prefix = str_repeat('x', 8191);
+        yield 'dot prefix on continuation remains literal' => [
+            $prefix."..continued\r\n...leading\r\n",
+            $prefix."..continued\r\n..leading\r\n",
+            4,
+        ];
+    }
+
+    #[DataProvider('fragmentedRawBodies')]
+    public function test_fragmented_raw_body_preserves_bytes_read_count_and_next_response(string $wire, string $expected, int $expectedReads): void
     {
         $stream = fopen('php://memory', 'w+');
-        fwrite($stream, "accepted line\r\n".str_repeat('x', 8191)."tail\r\n.\r\nNEXT\r\n");
+        fwrite($stream, $wire.".\r\nNEXT\r\n");
+        rewind($stream);
+        $reads = 0;
+        try {
+            $result = (new ReflectionMethod(NNTPService::class, 'readRawBody'))->invoke(
+                new YencNntpHarness($stream),
+                static function () use (&$reads): bool {
+                    $reads++;
+
+                    return true;
+                },
+            );
+
+            self::assertSame($expected, $result);
+            self::assertSame($expectedReads, $reads);
+            self::assertSame("NEXT\r\n", fgets($stream));
+        } finally {
+            fclose($stream);
+        }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function ownershipCancellationBodies(): iterable
+    {
+        yield 'cancel on an incomplete line fragment' => ["accepted line\r\n".str_repeat('x', 8191)."tail\r\n.\r\nNEXT\r\n"];
+        yield 'cancel on the DOT terminator read' => ["accepted line\r\n.\r\nNEXT\r\n"];
+    }
+
+    #[DataProvider('ownershipCancellationBodies')]
+    public function test_ownership_cancellation_closes_the_session_without_returning_partial_body(string $wire): void
+    {
+        $stream = fopen('php://memory', 'w+');
+        fwrite($stream, $wire);
         rewind($stream);
         $harness = new class($stream) extends NNTPService
         {

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use App\Services\Yenc\ArticleFrame;
 use App\Services\Yenc\PayloadDecoder;
 use App\Services\YencService;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -51,6 +52,81 @@ class YencDecoderTest extends TestCase
         $this->assertSame([
             'name' => 'a size=999 name=file with spaces.bin', 'size' => 3, 'line' => 128, 'crc32' => 'A3830348',
         ], $this->service()->extractMetadata($article));
+    }
+
+    /** @return iterable<string, array{string, array<string, string>, array<string, string>|null, array<string, string>, int, string}> */
+    public static function framesWithOptionalTrailerFields(): iterable
+    {
+        $prefix = "=YbEgIn PaRt=2 ToTaL=3 LiNe=128 SiZe=9 NaMe=a size=999 name=with spaces.bin\r\n"
+            ."=YpArT BeGiN=4 EnD=6\r\n";
+        yield 'mixed case multipart and filename resembling fields' => [
+            $prefix."klm\r\n=YeNd SiZe=3 PaRt=2 PcRc32=a3830348 CrC32=deadbeef",
+            ['part' => '2', 'total' => '3', 'line' => '128', 'size' => '9', 'name' => 'a size=999 name=with spaces.bin'],
+            ['begin' => '4', 'end' => '6'],
+            ['size' => '3', 'part' => '2', 'pcrc32' => 'a3830348', 'crc32' => 'deadbeef'],
+            strlen($prefix),
+            "klm\r\n",
+        ];
+
+        $prefix = "=ybegin line=128 name=invalid\nnoise\n=ybegin line=128 size=3 name=valid.bin\n";
+        yield 'invalid initial header followed by a valid frame' => [
+            $prefix."klm\n=yend size=3 crc32=a3830348\nignored suffix",
+            ['line' => '128', 'size' => '3', 'name' => 'valid.bin'],
+            null,
+            ['size' => '3', 'crc32' => 'a3830348'],
+            strlen($prefix),
+            "klm\n",
+        ];
+
+        $prefix = "=ybegin line=128 size=9 name=truncated.bin\nunfinished\n"
+            ."=ybegin line=128 size=3 name=recovered.bin\n";
+        yield 'a subsequent header replaces a truncated frame' => [
+            $prefix."klm\n=yend size=3 crc32=a3830348",
+            ['line' => '128', 'size' => '3', 'name' => 'recovered.bin'],
+            null,
+            ['size' => '3', 'crc32' => 'a3830348'],
+            strlen($prefix),
+            "klm\n",
+        ];
+
+        $prefix = "=ybegin line=128 size=0 name=empty.bin\n";
+        yield 'empty payload and trailer without a final newline' => [
+            $prefix.'=yend size=0 crc32=0',
+            ['line' => '128', 'size' => '0', 'name' => 'empty.bin'],
+            null,
+            ['size' => '0', 'crc32' => '0'],
+            strlen($prefix),
+            '',
+        ];
+    }
+
+    /**
+     * @param  array<string, string>  $header
+     * @param  array<string, string>|null  $part
+     * @param  array<string, string>  $trailer
+     */
+    #[DataProvider('framesWithOptionalTrailerFields')]
+    public function test_optional_trailer_parsing_preserves_frame_selection_and_payload_range(
+        string $article,
+        array $header,
+        ?array $part,
+        array $trailer,
+        int $payloadOffset,
+        string $payload,
+    ): void {
+        $fullFrame = ArticleFrame::parse($article);
+        $payloadFrame = ArticleFrame::parse($article, false);
+
+        foreach ([$fullFrame, $payloadFrame] as $frame) {
+            self::assertNotNull($frame);
+            self::assertSame($header, $frame->header);
+            self::assertSame($part, $frame->part);
+            self::assertSame($payloadOffset, $frame->payloadOffset);
+            self::assertSame(strlen($payload), $frame->payloadLength);
+            self::assertSame($payload, substr($article, $frame->payloadOffset, $frame->payloadLength));
+        }
+        self::assertSame($trailer, $fullFrame->trailer);
+        self::assertSame([], $payloadFrame->trailer);
     }
 
     public function test_multipart_accepts_a_missing_trailer_part_with_valid_header_range_and_checksum(): void

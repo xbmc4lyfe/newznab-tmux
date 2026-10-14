@@ -19,7 +19,8 @@ final readonly class ArticleFrame
         public int $payloadLength,
     ) {}
 
-    public static function parse(string $text): ?self
+    /** Payload-only callers can omit trailer fields; metadata and strict callers retain them. */
+    public static function parse(string $text, bool $parseTrailerFields = true): ?self
     {
         $offset = 0;
         while (($begin = self::findControl($text, '=ybegin', $offset)) !== false) {
@@ -53,12 +54,16 @@ final readonly class ArticleFrame
 
                 continue;
             }
-            $trailerEnd = strpos($text, "\n", $end);
+            $trailer = [];
+            if ($parseTrailerFields) {
+                $trailerEnd = strpos($text, "\n", $end);
+                $trailer = self::fields(substr($text, $end + 5, ($trailerEnd === false ? strlen($text) : $trailerEnd) - $end - 5));
+            }
 
             return new self(
                 $header,
                 $part,
-                self::fields(substr($text, $end + 5, ($trailerEnd === false ? strlen($text) : $trailerEnd) - $end - 5)),
+                $trailer,
                 $offset,
                 $end - $offset,
             );
