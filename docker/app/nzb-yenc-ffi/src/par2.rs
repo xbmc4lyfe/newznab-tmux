@@ -1376,6 +1376,8 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
             "unavailable-source-block-size-not-in-this-volume"
         } else if !source_inventory_complete || !source_block_count.is_some_and(|count| count > 0) {
             "unavailable-source-block-denominator"
+        } else if recovery_percent.is_none() {
+            "unavailable-invalid-or-incomplete-packets"
         } else {
             "unique-valid-recovery-exponents-over-recoverable-source-blocks"
         };
@@ -2267,6 +2269,29 @@ mod tests {
             assert_eq!(
                 metadata.recovery_percentage_basis,
                 "unavailable-source-block-denominator"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_packets_and_scan_limits_never_report_a_success_basis() {
+        let valid = single_file_set([b'F'; 16], 4, 4, b"payload.rar", Some(0));
+        let mut broken = packet(b"PAR 2.0\0Creator", b"test");
+        broken[16] ^= 1;
+        let invalid = [&valid[..], &broken].concat();
+        let limited = [
+            valid,
+            packet(b"PAR 2.0\0Creator", b"test").repeat(MAX_PACKETS),
+        ]
+        .concat();
+        for sample in [invalid, limited] {
+            let metadata = parse(&sample);
+            assert_eq!(metadata.source_block_count, Some(1));
+            assert!(metadata.source_inventory_complete);
+            assert_eq!(metadata.recovery_to_source_percent, None);
+            assert_eq!(
+                metadata.recovery_percentage_basis,
+                "unavailable-invalid-or-incomplete-packets"
             );
         }
     }

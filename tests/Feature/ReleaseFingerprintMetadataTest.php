@@ -542,6 +542,90 @@ final class ReleaseFingerprintMetadataTest extends TestCase
     }
 
     #[Test]
+    public function it_reports_fallback_par2_source_byte_overflow_with_a_representable_denominator(): void
+    {
+        $firstId = str_repeat('F', 16);
+        $secondId = str_repeat('N', 16);
+        $main = pack('V2', 0xFFFF_FFFC, 0x7FFF_FFFF).pack('V', 2).$firstId.$secondId;
+        $length = pack('V2', 0xFFFF_FFFF, 0x7FFF_FFFF);
+        $binary = $this->par2Packet("PAR 2.0\0Main", $main)
+            .$this->par2Packet("PAR 2.0\0FileDesc", $firstId.str_repeat('M', 32).$length."first.rar\0\0\0")
+            .$this->par2Packet("PAR 2.0\0FileDesc", $secondId.str_repeat('N', 32).$length."second.rar\0\0");
+        config(['yenc.native_library' => '']);
+
+        $metadata = (new Par2MetadataParser)->parse($binary);
+
+        self::assertSame('php-fallback', $metadata['parser_engine']);
+        self::assertSame(PHP_INT_MAX - 3, $metadata['source_block_size']);
+        self::assertSame(4, $metadata['source_block_count']);
+        self::assertTrue($metadata['source_block_count_within_current_v2_limit']);
+        self::assertTrue($metadata['source_file_bytes_overflow']);
+        self::assertNull($metadata['source_file_bytes']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertCount(2, $metadata['source_files']);
+        self::assertSame([PHP_INT_MAX, PHP_INT_MAX], array_column($metadata['source_files'], 'file_length'));
+        self::assertSame('unavailable-source-file-byte-total-overflow', $metadata['recovery_percentage_basis']);
+    }
+
+    #[Test]
+    public function it_preserves_fallback_par2_source_conflict_precedence_over_byte_total_overflow(): void
+    {
+        $firstId = str_repeat('F', 16);
+        $secondId = str_repeat('N', 16);
+        $main = pack('V2', 0xFFFF_FFFC, 0x7FFF_FFFF).pack('V', 2).$firstId.$secondId;
+        $conflictingMain = pack('V2', 0xFFFF_FFF8, 0x7FFF_FFFF).pack('V', 2).$firstId.$secondId;
+        $length = pack('V2', 0xFFFF_FFFF, 0x7FFF_FFFF);
+        $binary = $this->par2Packet("PAR 2.0\0Main", $main)
+            .$this->par2Packet("PAR 2.0\0FileDesc", $firstId.str_repeat('M', 32).$length."first.rar\0\0\0")
+            .$this->par2Packet("PAR 2.0\0FileDesc", $secondId.str_repeat('N', 32).$length."second.rar\0\0")
+            .$this->par2Packet("PAR 2.0\0Main", $conflictingMain);
+        config(['yenc.native_library' => '']);
+
+        $metadata = (new Par2MetadataParser)->parse($binary);
+
+        self::assertTrue($metadata['main_definition_conflict']);
+        self::assertTrue($metadata['source_file_bytes_overflow']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertSame([PHP_INT_MAX, PHP_INT_MAX], array_column($metadata['source_files'], 'file_length'));
+        self::assertSame('unavailable-conflicting-source-definition-packets', $metadata['recovery_percentage_basis']);
+    }
+
+    #[Test]
+    public function it_withholds_the_fallback_par2_success_basis_for_an_invalid_packet(): void
+    {
+        $invalid = $this->par2Packet("PAR 2.0\0Creator", 'bad!');
+        $invalid[16] = chr(ord($invalid[16]) ^ 1);
+        config(['yenc.native_library' => '']);
+
+        $metadata = (new Par2MetadataParser)->parse($this->par2SourceBlockLimitFixture(32768).$invalid);
+
+        self::assertSame(32768, $metadata['source_block_count']);
+        self::assertTrue($metadata['source_inventory_complete']);
+        self::assertSame(1, $metadata['invalid_packet_count']);
+        self::assertFalse($metadata['packet_summaries'][3]['checksum_valid']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertStringStartsWith('unavailable-', $metadata['recovery_percentage_basis']);
+    }
+
+    #[Test]
+    public function it_withholds_the_fallback_par2_success_basis_when_the_packet_budget_is_exhausted(): void
+    {
+        $binary = $this->par2SourceBlockLimitFixture(32768)
+            .str_repeat($this->par2Packet("PAR 2.0\0Creator", 'unit'), 19998);
+        config(['yenc.native_library' => '']);
+
+        $metadata = (new Par2MetadataParser)->parse($binary);
+
+        self::assertSame(32768, $metadata['source_block_count']);
+        self::assertTrue($metadata['source_inventory_complete']);
+        self::assertSame(0, $metadata['invalid_packet_count']);
+        self::assertTrue($metadata['packet_limit_reached']);
+        self::assertGreaterThan(0, $metadata['trailing_unparsed_bytes']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertStringStartsWith('unavailable-', $metadata['recovery_percentage_basis']);
+    }
+
+    #[Test]
     public function it_withholds_fallback_par2_percentage_above_the_current_v2_source_block_limit(): void
     {
         config(['yenc.native_library' => '']);
@@ -1642,6 +1726,72 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertNull($metadata['source_block_count_within_current_v2_limit']);
         self::assertNull($metadata['recovery_to_source_percent']);
         self::assertSame('unavailable-source-block-denominator', $metadata['recovery_percentage_basis']);
+    }
+
+    #[Test]
+    public function it_withholds_a_legacy_native_percentage_when_the_source_byte_total_overflowed(): void
+    {
+        $metadata = (new \ReflectionMethod(Par2MetadataParser::class, 'normalizeNativeIntegerRanges'))->invoke(null, [
+            'source_block_count' => 4,
+            'source_inventory_complete' => true,
+            'source_file_bytes' => null,
+            'source_file_bytes_overflow' => true,
+            'recovery_to_source_percent' => 25.0,
+            'recovery_percentage_basis' => 'unique-valid-recovery-exponents-over-recoverable-source-blocks',
+            'source_files' => [
+                ['file_length' => PHP_INT_MAX],
+                ['file_length' => PHP_INT_MAX],
+            ],
+        ]);
+
+        self::assertSame(4, $metadata['source_block_count']);
+        self::assertTrue($metadata['source_block_count_within_current_v2_limit']);
+        self::assertTrue($metadata['source_file_bytes_overflow']);
+        self::assertSame([PHP_INT_MAX, PHP_INT_MAX], array_column($metadata['source_files'], 'file_length'));
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertSame('unavailable-source-file-byte-total-overflow', $metadata['recovery_percentage_basis']);
+    }
+
+    #[Test]
+    #[DataProvider('par2ConflictPercentageBases')]
+    public function it_preserves_native_par2_conflict_precedence_while_withholding_byte_overflow_percentages(string $conflictBasis): void
+    {
+        foreach ([4, 32769] as $count) {
+            $metadata = (new \ReflectionMethod(Par2MetadataParser::class, 'normalizeNativeIntegerRanges'))->invoke(null, [
+                'source_block_count' => $count,
+                'source_inventory_complete' => true,
+                'source_file_bytes' => null,
+                'source_file_bytes_overflow' => true,
+                'recovery_to_source_percent' => 25.0,
+                'recovery_percentage_basis' => $conflictBasis,
+            ]);
+
+            self::assertSame($count, $metadata['source_block_count']);
+            self::assertTrue($metadata['source_file_bytes_overflow']);
+            self::assertNull($metadata['recovery_to_source_percent']);
+            self::assertSame($conflictBasis, $metadata['recovery_percentage_basis']);
+        }
+    }
+
+    #[Test]
+    public function it_preserves_recovery_conflict_precedence_when_the_source_slice_capacity_is_exceeded(): void
+    {
+        config(['yenc.native_library' => '']);
+        $bytes = $this->par2SourceBlockLimitFixture(32769)
+            .$this->par2Packet("PAR 2.0\0RecvSlic", pack('V', 0).'SSSS');
+        $metadata = (new Par2MetadataParser)->parse($bytes);
+
+        self::assertSame(32769, $metadata['source_block_count']);
+        self::assertFalse($metadata['source_block_count_within_current_v2_limit']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertSame('unavailable-conflicting-recovery-exponent-packets', $metadata['recovery_percentage_basis']);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function par2ConflictPercentageBases(): iterable
+    {
+        yield 'source definition conflict' => ['unavailable-conflicting-source-definition-packets'];
+        yield 'recovery exponent conflict' => ['unavailable-conflicting-recovery-exponent-packets'];
     }
 
     #[Test]

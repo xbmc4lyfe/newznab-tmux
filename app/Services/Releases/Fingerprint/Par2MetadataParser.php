@@ -1159,6 +1159,12 @@ final class Par2MetadataParser
         );
         $packedLayoutPresent = isset($optionalPackets["PAR 2.0\0PkdMain"]) || isset($optionalPackets["PAR 2.0\0PkdRecvS"]);
         $sourceBlockCountWithinLimit = $sourceBlockCount === null ? null : $sourceBlockCount <= self::MAX_SOURCE_BLOCKS;
+        $recoveryPercent = is_int($recoveryCount) && is_int($sourceBlockCount) && $sourceBlockCount > 0
+            && $main !== null && $sourceInventoryComplete && $ifscRelationshipsValid
+            && ! $hasConflictingRecoveryExponents && $invalidPacketCount === 0
+            && $sourceBlockCountWithinLimit === true && ! $sourceBytesOverflow
+            && ! ($packetCount >= $maximumPackets && $offset < $length) && ! $packedLayoutPresent
+            ? round($recoveryCount / $sourceBlockCount * 100, 3) : null;
         $recoveryPercentageBasis = $mainDefinitionConflict || $conflictingFileDescriptionIds !== []
             ? 'unavailable-conflicting-source-definition-packets'
             : ($hasConflictingRecoveryExponents
@@ -1170,12 +1176,21 @@ final class Par2MetadataParser
                 : ($blockSize === null && $recoveryCount > 0
                     ? 'unavailable-source-block-size-not-in-this-volume'
                     : 'unique-valid-recovery-exponents-over-recoverable-source-blocks'))));
-        if ($sourceBlockCountWithinLimit === false && ! $packedLayoutPresent) {
+        $hasSourceOrRecoveryConflicts = $mainDefinitionConflict || $conflictingFileDescriptionIds !== [] || $hasConflictingRecoveryExponents;
+        if ($sourceBlockCountWithinLimit === false && ! $packedLayoutPresent && ! $hasSourceOrRecoveryConflicts) {
             $recoveryPercentageBasis = 'unavailable-source-block-count-exceeds-current-v2-limit';
         }
         if ($recoveryPercentageBasis === 'unique-valid-recovery-exponents-over-recoverable-source-blocks'
             && (! $sourceInventoryComplete || ! is_int($sourceBlockCount) || $sourceBlockCount <= 0)) {
             $recoveryPercentageBasis = 'unavailable-source-block-denominator';
+        }
+        if ($sourceBytesOverflow && ! $hasSourceOrRecoveryConflicts) {
+            $recoveryPercentageBasis = 'unavailable-source-file-byte-total-overflow';
+        } elseif (($singleSet['source_block_count_overflow'] ?? false) === true && ! $hasSourceOrRecoveryConflicts) {
+            $recoveryPercentageBasis = 'unavailable-source-block-count-overflow';
+        } elseif ($recoveryPercent === null
+            && $recoveryPercentageBasis === 'unique-valid-recovery-exponents-over-recoverable-source-blocks') {
+            $recoveryPercentageBasis = 'unavailable-invalid-or-incomplete-packets';
         }
 
         return [
@@ -1221,10 +1236,7 @@ final class Par2MetadataParser
             'recovery_exponents' => $singleSet === null ? null : $singleSet['recovery_exponents'],
             'recovery_slice_conflict_count' => $recoverySliceConflictCount,
             'recovery_slice_length_unvalidated_count' => $recoverySliceLengthUnvalidatedCount,
-            'recovery_to_source_percent' => is_int($recoveryCount) && is_int($sourceBlockCount) && $sourceBlockCount > 0 && $main !== null && $sourceInventoryComplete && $ifscRelationshipsValid && ! $hasConflictingRecoveryExponents && $invalidPacketCount === 0
-                && $sourceBlockCountWithinLimit === true
-                && ! ($packetCount >= $maximumPackets && $offset < $length) && ! $packedLayoutPresent
-                ? round($recoveryCount / $sourceBlockCount * 100, 3) : null,
+            'recovery_to_source_percent' => $recoveryPercent,
             'packed_layout_present' => $packedLayoutPresent,
             'recovery_percentage_basis' => $recoveryPercentageBasis,
             'conflicting_recovery_exponents' => $conflictingRecoveryExponents,
@@ -1265,9 +1277,13 @@ final class Par2MetadataParser
             $metadata['recovery_sets'][$index]['source_block_count_within_current_v2_limit'] = is_int($count) && $count > 0
                 ? $count <= self::MAX_SOURCE_BLOCKS : null;
         }
+        $hasConflictBasis = in_array($metadata['recovery_percentage_basis'] ?? null, [
+            'unavailable-conflicting-source-definition-packets',
+            'unavailable-conflicting-recovery-exponent-packets',
+        ], true);
         if ($metadata['source_block_count_within_current_v2_limit'] === false) {
             $metadata['recovery_to_source_percent'] = null;
-            if ($unsupportedRangeCount === 0 && ($metadata['packed_layout_present'] ?? false) !== true) {
+            if ($unsupportedRangeCount === 0 && ($metadata['packed_layout_present'] ?? false) !== true && ! $hasConflictBasis) {
                 $metadata['recovery_percentage_basis'] = 'unavailable-source-block-count-exceeds-current-v2-limit';
             }
         }
@@ -1276,6 +1292,15 @@ final class Par2MetadataParser
                 || ! is_int($metadata['source_block_count'] ?? null) || $metadata['source_block_count'] <= 0)) {
             $metadata['recovery_percentage_basis'] = 'unavailable-source-block-denominator';
             $metadata['recovery_to_source_percent'] = null;
+        }
+        if (($metadata['source_file_bytes_overflow'] ?? false) === true) {
+            $metadata['recovery_to_source_percent'] = null;
+            if ($unsupportedRangeCount === 0 && ! $hasConflictBasis) {
+                $metadata['recovery_percentage_basis'] = 'unavailable-source-file-byte-total-overflow';
+            }
+        } elseif (($metadata['recovery_to_source_percent'] ?? null) === null
+            && ($metadata['recovery_percentage_basis'] ?? null) === 'unique-valid-recovery-exponents-over-recoverable-source-blocks') {
+            $metadata['recovery_percentage_basis'] = 'unavailable-invalid-or-incomplete-packets';
         }
 
         return $metadata;
