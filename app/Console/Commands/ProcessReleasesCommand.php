@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\ReleaseProcessingService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -61,6 +62,9 @@ class ProcessReleasesCommand extends Command
         }
 
         try {
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                return self::SUCCESS;
+            }
             if ($this->option('ready-only')) {
                 $this->releaseProcessingService->processReadyReleaseWindow((int) $groupId);
             } elseif ($this->option('maintenance-only')) {
@@ -88,7 +92,9 @@ class ProcessReleasesCommand extends Command
     {
         $this->releaseProcessingService->processCollectionsAndReleases($groupID);
 
-        $this->releaseProcessingService->deleteCollections($groupID);
+        if (! app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            $this->releaseProcessingService->deleteCollections($groupID);
+        }
     }
 
     /**
@@ -96,8 +102,17 @@ class ProcessReleasesCommand extends Command
      */
     private function runPostProcessingTasks(): void
     {
+        if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            return;
+        }
         $this->releaseProcessingService->deletedReleasesByGroup();
+        if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            return;
+        }
         $this->releaseProcessingService->deleteReleases();
+        if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            return;
+        }
         $this->releaseProcessingService->categorizeReleases(2);
     }
 }

@@ -187,7 +187,7 @@ class NzbService
 
             $cursor = ['collection_id' => 0, 'name' => '', 'binary_id' => 0, 'partnumber' => 0];
             $openBinaryId = 0;
-            $fingerprintAccumulator = new NzbArticleFingerprint;
+            $fingerprintAccumulator = app(NzbArticleFingerprint::class);
             do {
                 $page = $this->loadNzbRowPage((int) $release->id, $cursor);
                 foreach ($page as $row) {
@@ -260,6 +260,8 @@ class NzbService
                 return NzbCreationResult::transient("Failed to close temporary NZB file: {$tempPath}", $collectionIds, $path);
             }
 
+            $fingerprint = $fingerprintAccumulator->value();
+
             if (! $this->moveTemporaryNzbIntoPlace($tempPath, $path)) {
                 return NzbCreationResult::transient("Failed to move temporary NZB into place: {$tempPath} -> {$path}", $collectionIds, $path);
             }
@@ -268,8 +270,6 @@ class NzbService
             if (! File::isFile($path) || ! is_readable($path)) {
                 return NzbCreationResult::transient("Final NZB file is missing or unreadable: {$path}", $collectionIds, $path);
             }
-
-            $fingerprint = $fingerprintAccumulator->value();
 
             DB::transaction(function () use ($release, $fingerprint): void {
                 $release->update($this->successfulReleaseUpdateValues($fingerprint));
@@ -289,6 +289,8 @@ class NzbService
                     'exception' => $dispatchException::class,
                 ]);
             }
+        } catch (NzbArticleFingerprintUnavailable|NzbArticleFingerprintTransportFailure $e) {
+            return NzbCreationResult::deferred($e->getMessage(), $collectionIds, $path);
         } catch (Throwable $e) {
             return NzbCreationResult::transient('Failed to write NZB file: '.$e->getMessage(), $collectionIds, $path);
         } finally {

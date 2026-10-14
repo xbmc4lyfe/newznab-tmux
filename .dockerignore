@@ -64,3 +64,7 @@ docker/.deploy.stamp
 
 # Agent research, live samples and validation artifacts are never runtime assets.
 .superpowers/
+
+# Separate successful image builds from healthy application rollouts.
+docker/.build.stamp
+docker/.deploy.time

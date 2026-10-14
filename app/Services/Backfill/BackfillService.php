@@ -6,6 +6,7 @@ namespace App\Services\Backfill;
 
 use App\Models\UsenetGroup;
 use App\Services\Binaries\BinariesService;
+use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
 use Illuminate\Support\Carbon;
@@ -66,6 +67,9 @@ final class BackfillService
         $startTime = now();
 
         foreach ($groups as $index => $group) {
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                break;
+            }
             $this->logGroupProgress($groupName, $index + 1, $groupCount); // @phpstan-ignore binaryOp.invalid
             $this->backfillGroup($group->toArray(), $groupCount - $index - 1, $articles); // @phpstan-ignore binaryOp.invalid
         }
@@ -84,7 +88,7 @@ final class BackfillService
      */
     public function backfillGroup(array $groupArr, int $remainingGroups, int|string $articles = ''): void
     {
-        if (! app(CandidateRepository::class)->capacityAvailable()) {
+        if (app(ProcessingRuntimeStateRepository::class)->stopRequested() || ! app(CandidateRepository::class)->capacityAvailable()) {
             return;
         }
         $startTime = now();
@@ -273,7 +277,7 @@ final class BackfillService
         $first = max($last - $messageBuffer + 1, $targetPost);
 
         while (true) {
-            if (! app(CandidateRepository::class)->capacityAvailable()) {
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested() || ! app(CandidateRepository::class)->capacityAvailable()) {
                 return;
             }
             $this->logChunkProgress($first, $last, $shortGroupName, $remainingGroups, $targetPost);

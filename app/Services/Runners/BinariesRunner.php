@@ -5,10 +5,16 @@ declare(strict_types=1);
 namespace App\Services\Runners;
 
 use App\Services\Configuration\ConfigurationProvider;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
 class BinariesRunner extends BaseRunner
 {
+    private const string ROTATION_KEY = 'binaries:rotation:last-group';
+
+    /** @var array<string|int, int> */
+    private array $scheduledGroups = [];
+
     public function binaries(int $maxPerGroup): void
     {
         $work = DB::select(
@@ -74,11 +80,11 @@ class BinariesRunner extends BaseRunner
 
         $groups = DB::select(
             '
-            SELECT g.name AS groupname, g.last_record AS our_last,
+            SELECT g.id, g.name AS groupname, g.last_record AS our_last,
                 a.last_record AS their_last
             FROM usenet_groups g
             INNER JOIN short_groups a ON g.active = 1 AND g.name = a.name
-            ORDER BY a.last_record DESC'
+            ORDER BY g.id'
         );
 
         if (empty($groups)) {
@@ -87,67 +93,65 @@ class BinariesRunner extends BaseRunner
             return;
         }
 
-        $i = 1;
-        $queues = [];
+        $lastGroup = (int) Cache::get(self::ROTATION_KEY, 0);
+        $groups = [...array_filter($groups, static fn (object $group): bool => (int) $group->id > $lastGroup),
+            ...array_filter($groups, static fn (object $group): bool => (int) $group->id <= $lastGroup)];
+        $perGroup = [];
         foreach ($groups as $group) {
+            $groupId = (int) $group->id;
+            $perGroup[$groupId] = [];
             if ((int) $group->our_last === 0) {
-                $queues[$i] = sprintf('update_group_headers  %s', $group->groupname);
-                $i++;
+                $perGroup[$groupId][] = [...$this->buildDnrCommand('update_group_headers  '.$group->groupname), '--max='.$maxMessages];
             } else {
                 $count = $group->their_last - $group->our_last - 20000; // skip first 20k
                 if ($count <= $maxMessages * 2) {
-                    $queues[$i] = sprintf('update_group_headers  %s', $group->groupname);
-                    $i++;
+                    $perGroup[$groupId][] = [...$this->buildDnrCommand('update_group_headers  '.$group->groupname), '--max='.$maxMessages];
                 } else {
-                    $queues[$i] = sprintf('part_repair  %s', $group->groupname);
-                    $i++;
-                    $getEach = (int) floor(min($count, $maxHeaders) / $maxMessages);
-                    $remaining = (int) (min($count, $maxHeaders) - $getEach * $maxMessages);
-                    for ($j = 0; $j < $getEach; $j++) {
-                        $queues[$i] = sprintf('get_range  binaries  %s  %s  %s  %s', $group->groupname, $group->our_last + $j * $maxMessages + 1, $group->our_last + $j * $maxMessages + $maxMessages, $i);
-                        $i++;
-                    }
-                    if ($remaining > 0) {
-                        $start = $group->our_last + $getEach * $maxMessages + 1;
-                        $end = $start + $remaining;
-                        $queues[$i] = sprintf('get_range  binaries  %s  %s  %s  %s', $group->groupname, $start, $end, $i);
-                        $i++;
+                    $end = (int) $group->our_last + min($count, $maxHeaders);
+                    for ($first = (int) $group->our_last + 1; $first <= $end; $first = $last + 1) {
+                        $last = min($first + $maxMessages - 1, $end);
+                        $perGroup[$groupId][] = [...$this->buildDnrCommand(sprintf('get_range  binaries  %s  %d  %d', $group->groupname, $first, $last)), '--contiguous',
+                            ...($first === (int) $group->our_last + 1 ? ['--repair'] : [])];
                     }
                 }
             }
         }
 
-        // Streaming mode
-        if ((bool) config('nntmux.stream_fork_output', false) === true) {
-            $commands = [];
-            foreach ($queues as $queue) {
-                $commands[] = $this->buildDnrCommand($queue);
+        // Interleave bounded work while the pool serializes commands belonging to one group.
+        $commands = [];
+        $this->scheduledGroups = [];
+        $rounds = max(array_map(count(...), $perGroup));
+        for ($round = 0; $round < $rounds; $round++) {
+            foreach ($perGroup as $groupId => $groupCommands) {
+                if (isset($groupCommands[$round])) {
+                    $key = $groupId.':'.$round;
+                    $commands[$key] = $groupCommands[$round];
+                    $this->scheduledGroups[$key] = $groupId;
+                }
             }
+        }
+
+        if ((bool) config('nntmux.stream_fork_output', false) === true) {
             $this->runStreamingCommands($commands, $maxProcesses, 'safe_binaries');
 
             return;
         }
 
-        $this->headerStart('safe_binaries', count($queues), $maxProcesses);
+        $this->headerStart('safe_binaries', count($commands), $maxProcesses);
+        $this->runParallelCommandsWithCompletion($commands, $maxProcesses, static function (string|int $key, string $output): void {
+            echo $output;
+        });
+    }
 
-        // Build commands array with group info for parallel execution
-        $commands = [];
-        $groupMapping = [];
-        foreach ($queues as $idx => $queue) {
-            preg_match('/alt\..+/i', $queue, $hit);
-            $commands[$idx] = $this->buildDnrCommand($queue);
-            $groupMapping[$idx] = $hit[0] ?? '';
-        }
+    protected function workerConcurrencyKey(string|int $key): string|int|null
+    {
+        return $this->scheduledGroups[$key] ?? null;
+    }
 
-        // Process using parallel commands with configurable timeout
-        $results = $this->runParallelCommands($commands, $maxProcesses);
-
-        foreach ($results as $idx => $output) {
-            $group = $groupMapping[$idx] ?? '';
-            if (! empty($group)) {
-                echo $output;
-                cli()->primary('Updated group '.$group);
-            }
+    protected function workerStarting(string|int $key): void
+    {
+        if (isset($this->scheduledGroups[$key])) {
+            Cache::forever(self::ROTATION_KEY, $this->scheduledGroups[$key]);
         }
     }
 }
