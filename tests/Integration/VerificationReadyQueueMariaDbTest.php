@@ -6,6 +6,7 @@ namespace Tests\Integration;
 
 use App\Services\Releases\Verification\CandidatePreparationService;
 use App\Services\Releases\Verification\CandidateRepository;
+use Database\Seeders\ConfigurationSeeder;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
@@ -65,7 +66,7 @@ final class VerificationReadyQueueMariaDbTest extends TestCase
             DB::table('root_categories')->insertOrIgnore(['id' => 2000, 'title' => 'Movies']);
             DB::table('categories')->insertOrIgnore(['id' => 2040, 'title' => 'HD', 'root_categories_id' => 2000]);
             DB::table('usenet_groups')->insertOrIgnore(['id' => 1, 'name' => 'alt.binaries.donor.test']);
-            DB::table('ingestion_configurations')->insertOrIgnore(['id' => 1, 'safe_backfill_date' => '2000-01-01']);
+            (new ConfigurationSeeder)->run();
             $this->directory = storage_path('framework/testing/ready-mariadb-'.bin2hex(random_bytes(8)));
             config(['release_verification.storage_path' => $this->directory]);
         } catch (\Throwable $exception) {
