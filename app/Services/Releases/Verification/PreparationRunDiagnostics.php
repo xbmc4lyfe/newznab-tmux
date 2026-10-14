@@ -64,7 +64,8 @@ final class PreparationRunDiagnostics
         $failed = true;
         try {
             $result = $operation();
-            $failed = $result === false;
+            // JSON false is a successful decode; manifest shape is checked by the reader.
+            $failed = $result === false && $phase !== 'json_decode';
 
             return $result;
         } finally {

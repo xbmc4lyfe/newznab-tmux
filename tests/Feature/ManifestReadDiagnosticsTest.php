@@ -172,6 +172,23 @@ class ManifestReadDiagnosticsTest extends TestCase
         }
     }
 
+    public function test_valid_json_scalars_are_shape_failures_without_decode_failures(): void
+    {
+        foreach (['false', 'null', '42'] as $json) {
+            $diagnostics = new PreparationRunDiagnostics(hrtime(true));
+            try {
+                (new ManifestStore)->readWithDiagnostics($this->fixture($json), $diagnostics);
+                $this->fail('Scalar JSON must remain rejected as manifest contents.');
+            } catch (RuntimeException $error) {
+                $this->assertSame('Invalid manifest contents.', $error->getMessage());
+            }
+            $decode = $this->report($diagnostics)['phase_distributions']['json_decode'];
+            $this->assertSame(1, $decode['count']);
+            $this->assertSame(0, $decode['failures']);
+            $this->assertSame(0, array_sum($this->report($diagnostics)['manifest_sizes']['files']));
+        }
+    }
+
     public function test_latency_buckets_and_maxima_remain_bounded_for_failures(): void
     {
         $diagnostics = new PreparationRunDiagnostics(hrtime(true));
