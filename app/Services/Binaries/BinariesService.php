@@ -843,12 +843,14 @@ class BinariesService
             }
 
             // Retry without compression
-            $nntp->doQuit();
-            if ($nntp->doConnect(false) !== true) {
+            if ($nntp->reconnect(false) !== true) {
                 return null;
             }
 
-            $nntp->selectGroup($this->groupMySQL['name']);
+            $selected = $nntp->selectGroup($this->groupMySQL['name']);
+            if (NNTPService::isError($selected) || ! \is_array($selected)) {
+                return null;
+            }
             $headers = $nntp->getXOVER($this->first.'-'.$this->last);
             $nntp->enableCompression();
 

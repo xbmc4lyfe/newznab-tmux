@@ -17,6 +17,7 @@ use App\Services\CollectionCleanupService;
 use App\Services\CollectionsCleaningService;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
+use App\Services\Tmux\Tmux;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
@@ -1021,6 +1022,105 @@ class BinariesStorageInternalsTest extends TestCase
     public static function backfillRangeResults(): array
     {
         return ['successful empty range' => [true], 'failed download' => [false]];
+    }
+
+    #[DataProvider('providerRetryResults')]
+    public function test_backfill_retry_keeps_provider_and_requires_group_selection(bool $alternate, bool $rangeSucceeds, bool $groupSucceeds, bool $automaticReconnect, bool $initialGroupFailure = false): void
+    {
+        $this->backfillTables(0);
+        config(['nntmux_nntp.server' => '127.0.0.1', 'nntmux_nntp.alternate_server' => '127.0.0.1',
+            'nntmux_nntp.port' => 1119, 'nntmux_nntp.alternate_server_port' => 2119,
+            'nntmux_nntp.username' => 'primary-fixture', 'nntmux_nntp.password' => 'fixture',
+            'nntmux_nntp.alternate_server_username' => 'alternate-fixture', 'nntmux_nntp.alternate_server_password' => 'fixture',
+            'nntmux_nntp.compressed_headers' => false]);
+        $tmux = $this->getMockBuilder(Tmux::class)->disableOriginalConstructor()->onlyMethods(['getUSPConnections'])->getMock();
+        $tmux->expects($this->atLeastOnce())->method('getUSPConnections')->willReturn(['primary' => ['active' => 0], 'alternate' => ['active' => 0]]);
+        $nntp = new class($tmux, $rangeSucceeds, $groupSucceeds, $initialGroupFailure) extends NNTPService
+        {
+            /** @var list<string|null> */
+            public array $users = [];
+
+            public int $ranges = 0;
+
+            public function __construct(Tmux $tmux, private bool $rangeSucceeds, private bool $groupSucceeds, private bool $initialGroupFailure)
+            {
+                parent::__construct($tmux);
+            }
+
+            public function connect(?string $host = null, mixed $encryption = null, ?int $port = null, ?int $timeout = 15, int $socketTimeout = 120): mixed
+            {
+                return true;
+            }
+
+            public function authenticate(?string $user = null, ?string $pass = null, bool $encryption = false): mixed
+            {
+                $this->users[] = $user;
+
+                return true;
+            }
+
+            public function selectGroup(string $group, mixed $articles = false, bool $force = false): mixed
+            {
+                if ($this->initialGroupFailure) {
+                    $this->initialGroupFailure = false;
+
+                    return $this->throwError('Fixture initial group selection failed');
+                }
+
+                return $this->ranges > 0 && ! $this->groupSucceeds
+                    ? $this->throwError('Fixture group selection failed')
+                    : ['group' => $group, 'first' => '1', 'last' => '1001'];
+            }
+
+            public function getXOVER(string $range): mixed
+            {
+                if (! str_contains($range, '-')) {
+                    return [['Number' => $range, 'Date' => 'Wed, 14 Oct 2026 12:00:00 +0000']];
+                }
+                if (++$this->ranges === 1) {
+                    return false;
+                }
+
+                // An unrelated primary provider can report a valid empty window.
+                return $this->getCurrentPort() === 1119 || $this->rangeSucceeds ? [] : false;
+            }
+        };
+        $this->assertTrue($nntp->doConnect(false, $alternate));
+        if ($automaticReconnect) {
+            $check = new \ReflectionMethod(NNTPService::class, '_checkConnection');
+            $this->assertTrue($check->invoke($nntp, false));
+        }
+        $binaries = $this->backfillBinaries($nntp);
+        $service = new BackfillService(new BackfillConfig, $binaries, $nntp);
+        $error = null;
+        try {
+            $service->backfillGroup($this->backfillGroup(), 0, 100);
+        } catch (\RuntimeException $failure) {
+            $error = $failure;
+        }
+
+        $successful = $rangeSucceeds && $groupSucceeds;
+        $this->assertSame($successful ? 401 : 501, (int) DB::table('usenet_groups')->value('first_record'));
+        $this->assertSame(array_fill(0, 2 + (int) $automaticReconnect + (int) $initialGroupFailure, $alternate ? 'alternate-fixture' : 'primary-fixture'), $nntp->users);
+        $this->assertSame($groupSucceeds ? 2 : 1, $nntp->ranges);
+        $this->assertSame($successful ? 500 : null, $binaries->completedRangeEnd());
+        if ($successful) {
+            $this->assertNull($error);
+        } else {
+            $this->assertInstanceOf(\RuntimeException::class, $error);
+        }
+    }
+
+    public static function providerRetryResults(): array
+    {
+        return [
+            'alternate failure cannot use primary empty range' => [true, false, true, false],
+            'alternate empty range completes' => [true, true, true, false],
+            'retry group failure remains pending' => [true, true, false, false],
+            'primary retry stays primary' => [false, true, true, false],
+            'automatic reconnect keeps alternate on same hostname' => [true, true, true, true],
+            'group selection retry keeps alternate' => [true, true, true, false, true],
+        ];
     }
 
     private function dateBackfillNntp(mixed $date = null, mixed $rangeResult = null): NNTPService
