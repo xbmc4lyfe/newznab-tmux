@@ -241,4 +241,58 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
         }
         $this->assertSame([2, 3, 4, 5, 1], $claims);
     }
+
+    public function test_preparation_prioritizes_unclassified_backlog_without_starving_retries(): void
+    {
+        $bytes = $this->seedPreparationQueues();
+
+        $this->assertSame(500, app(CandidatePreparationService::class)->prepare(500, 30));
+
+        $this->assertSame(400, DB::table('release_verification_candidates')->where('status', 'ready')->where('identity', 'like', 'pending-%')->count());
+        $this->assertSame(100, DB::table('release_verification_candidates')->where('status', 'ready')->where('identity', 'like', 'unknown-%')->count());
+        $this->assertSame(500, DB::table('release_verification_candidates')->where('status', 'ready')->count());
+        $this->assertSame($bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    public function test_short_preparation_runs_preserve_retry_turns_and_an_expired_deadline_does_not_spend_one(): void
+    {
+        $this->seedPreparationQueues();
+        for ($run = 0; $run < 4; $run++) {
+            $this->assertSame(0, Artisan::call('releases:prepare-candidates', ['--limit' => 100]));
+        }
+        $once = false;
+        DB::listen(static function (QueryExecuted $query) use (&$once): void {
+            if (! $once && str_starts_with($query->sql, 'select') && str_contains($query->sql, 'manifest_path')
+                && in_array('unknown', $query->bindings, true)) {
+                $once = true;
+                usleep(1100000);
+            }
+        });
+        $this->assertSame(0, Artisan::call('releases:prepare-candidates', ['--limit' => 100, '--max-seconds' => 1]));
+        $this->assertTrue($once, 'The fifth invocation must select the retry queue.');
+        $this->assertSame(400, DB::table('release_verification_candidates')->where('status', 'ready')->count());
+        $this->assertSame(0, Artisan::call('releases:prepare-candidates', ['--limit' => 100]));
+        $this->assertSame(400, DB::table('release_verification_candidates')->where('status', 'ready')->where('identity', 'like', 'pending-%')->count());
+        $this->assertSame(100, DB::table('release_verification_candidates')->where('status', 'ready')->where('identity', 'like', 'unknown-%')->count());
+    }
+
+    private function seedPreparationQueues(): int
+    {
+        $this->freezeTime();
+        app(CandidateRepository::class)->enqueue($this->manifest('seed'));
+        $template = (array) DB::table('release_verification_candidates')->sole();
+        unset($template['id']);
+        DB::table('release_verification_candidates')->delete();
+        $rows = [];
+        foreach (['pending', 'unknown'] as $status) {
+            for ($number = 0; $number < 500; $number++) {
+                $rows[] = array_replace($template, ['identity' => $status.'-'.$number,
+                    'source_identity' => sha1($status.':'.$number), 'status' => $status]);
+            }
+        }
+        DB::table('release_verification_candidates')->insert($rows);
+        DB::table('release_verification_state')->update(['pending_bytes' => $template['manifest_bytes'] * count($rows)]);
+
+        return (int) DB::table('release_verification_state')->value('pending_bytes');
+    }
 }
