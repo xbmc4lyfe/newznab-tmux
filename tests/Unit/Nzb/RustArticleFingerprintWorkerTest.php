@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit\Nzb;
 
+use App\Services\Nzb\NzbArticleFingerprintTransportFailure;
 use App\Services\Nzb\RustArticleFingerprintWorker;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
@@ -11,6 +12,16 @@ use RuntimeException;
 
 final class RustArticleFingerprintWorkerTest extends TestCase
 {
+    private function assertTransportFailure(RustArticleFingerprintWorker $worker): void
+    {
+        try {
+            $worker->value();
+            $this->fail('Expected detectable fingerprint transport failure.');
+        } catch (NzbArticleFingerprintTransportFailure $exception) {
+            $this->assertNotSame('', $exception->getMessage());
+        }
+    }
+
     private function worker(): RustArticleFingerprintWorker
     {
         $binary = dirname(__DIR__, 3).'/docker/app/nzb-yenc-ffi/target/release/nntmux-article-fingerprint';
@@ -97,9 +108,9 @@ final class RustArticleFingerprintWorkerTest extends TestCase
         try {
             $worker = new RustArticleFingerprintWorker($path);
             $worker->add('valid@x');
-            $this->assertNull($worker->value());
+            $this->assertTransportFailure($worker);
             $worker->add('later@x');
-            $this->assertNull($worker->value());
+            $this->assertTransportFailure($worker);
         } finally {
             unlink($path);
         }
@@ -114,8 +125,8 @@ final class RustArticleFingerprintWorkerTest extends TestCase
         chmod($path, 0700);
         try {
             $worker = new RustArticleFingerprintWorker($path);
-            $this->assertNull($worker->value());
-            $this->assertNull($worker->value());
+            $this->assertTransportFailure($worker);
+            $this->assertTransportFailure($worker);
         } finally {
             unset($worker);
             unlink($path);
