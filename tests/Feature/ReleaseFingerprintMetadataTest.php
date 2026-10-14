@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use Tests\Fixtures\YencArticles;
 use Tests\TestCase;
 
 final class ReleaseFingerprintMetadataTest extends TestCase
@@ -337,6 +338,96 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         }
 
         return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('framingParserBackends')]
+    public function it_accepts_identical_control_fields_in_native_and_fallback_metadata(bool $nativeEnabled): void
+    {
+        $data = str_repeat('A', 16_384);
+        $body = YencArticles::part($data, 'x.rar', 32_768, 1, 1, 2);
+        $body = str_replace(['part=1', 'size=32768', 'begin=1', 'end=16384', 'pcrc32='.hash('crc32b', $data)],
+            ['part=1 part=1', 'size=32768 size=32768', 'begin=1 begin=1', 'end=16384 end=16384', 'pcrc32='.hash('crc32b', $data).' pcrc32='.hash('crc32b', $data)], $body);
+        $native = $this->framingBackend($body, $nativeEnabled);
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        $yenc = $analysis['metadata']['yenc'];
+        self::assertSame($data, $analysis['decoded_bytes']);
+        self::assertFalse($yenc['integrity_checks_ambiguous']);
+        self::assertSame('complete', $yenc['multipart_structure_status']);
+        self::assertTrue($yenc['declared_crc32_matches']);
+        self::assertSame(hash('md5', $data), $yenc['par2_first_16k_md5_candidate']);
+        if ($nativeEnabled) {
+            self::assertSame('complete', $native['frames'][0]['size_relationship_status']);
+            self::assertContains('part', $native['lines'][0]['duplicate_field_names']);
+            self::assertSame([], $native['lines'][0]['conflicting_duplicate_field_names']);
+        }
+    }
+
+    #[Test]
+    #[DataProvider('framingParserBackends')]
+    public function it_requires_multipart_footer_fields_before_granting_integrity(bool $nativeEnabled): void
+    {
+        $data = str_repeat('A', 16_384);
+        $normal = YencArticles::part($data, 'x.rar', 32_768, 1, 1, 2);
+        $this->framingBackend($normal, $nativeEnabled);
+        $analyzer = new NzbFingerprintAnalyzer(new YencService);
+        self::assertSame(hash('md5', $data), $analyzer->analyzeArticle([], $normal)['yenc']['par2_first_16k_md5_candidate']);
+        $crc = hash('crc32b', $data);
+        foreach ([
+            [str_replace(' part=1 pcrc32=', ' pcrc32=', $normal), 'incomplete'],
+            [str_replace(' pcrc32='.$crc, '', $normal), 'incomplete'],
+            [str_replace('=yend size=16384', '=yend', $normal), 'incomplete'],
+            [str_replace(' pcrc32='.$crc, ' pcrc32=', $normal), 'invalid'],
+            [str_replace(' pcrc32='.$crc, ' pcrc32=1', $normal), 'invalid'],
+            [str_replace(' pcrc32='.$crc, ' pcrc32=not-hex', $normal), 'invalid'],
+            [str_replace(' part=1 pcrc32='.$crc, ' pcrc32=', $normal), 'invalid'],
+        ] as [$body, $status]) {
+            $analysis = $analyzer->analyzeArticleAndDecodedBytes([], $body);
+            $metadata = $analysis['metadata'];
+            $yenc = $metadata['yenc'];
+            self::assertSame($data, $analysis['decoded_bytes']);
+            self::assertSame(hash('sha256', $body), $metadata['article_body_sha256']);
+            self::assertSame(hash('sha256', $data), $yenc['decoded_segment_sha256']);
+            self::assertSame(strtoupper($crc), $yenc['observed_decoded_crc32']);
+            self::assertSame($status, $yenc['multipart_structure_status']);
+            self::assertNull($yenc['declared_crc32_matches']);
+            self::assertNull($yenc['par2_first_16k_md5_candidate']);
+            self::assertFalse(Par2MetadataParser::declaredYencCrc32Valid($yenc));
+            $metadata['article_identity'] = ['parser_engine' => 'nntmux-rust-article-identity', 'schema_version' => 3,
+                'relations' => ['body_response_matches_request' => true]];
+            $range = (new \ReflectionMethod(ReleaseFingerprintCollector::class, 'decodedFileRange'))
+                ->invoke((new \ReflectionClass(ReleaseFingerprintCollector::class))->newInstanceWithoutConstructor(), $metadata, $data);
+            self::assertSame('invalid', $range['mapping_status']);
+        }
+        $legacy = str_replace(' total=2', '', $normal);
+        self::assertSame('complete', $analyzer->analyzeArticle([], $legacy)['yenc']['multipart_structure_status']);
+        $wrongCrc = $analyzer->analyzeArticle([], str_replace(' pcrc32='.$crc, ' pcrc32=00000000', $normal))['yenc'];
+        self::assertSame('complete', $wrongCrc['multipart_structure_status']);
+        self::assertFalse($wrongCrc['declared_crc32_matches']);
+        self::assertNull($wrongCrc['par2_first_16k_md5_candidate']);
+    }
+
+    /** @return array<string, array{bool}> */
+    public static function framingParserBackends(): array
+    {
+        return ['fallback' => [false], 'native' => [true]];
+    }
+
+    /** @return array<string, mixed>|null */
+    private function framingBackend(string $body, bool $nativeEnabled): ?array
+    {
+        if (! $nativeEnabled) {
+            config(['yenc.native_library' => '']);
+        }
+        $native = (new NativeMetadataParser)->parseYencFraming($body);
+        if ($nativeEnabled && $native === null) {
+            self::markTestSkipped('Native yEnc framing library is required for field authority integration.');
+        }
+        if (! $nativeEnabled) {
+            self::assertNull($native);
+        }
+
+        return $native;
     }
 
     #[Test]

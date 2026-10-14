@@ -246,7 +246,7 @@ fn parse_control_line(
     prefix_len: usize,
 ) -> Option<ControlLine> {
     let mut fields = Vec::new();
-    let mut first_values = BTreeMap::<String, String>::new();
+    let mut first_values = BTreeMap::<String, (usize, String)>::new();
     let mut duplicate_field_names = Vec::new();
     let mut conflicting_duplicate_field_names = Vec::new();
     let mut malformed_token_count = 0usize;
@@ -320,14 +320,14 @@ fn parse_control_line(
         };
         let value = &line[value_start..value_end];
         let value_hash = sha256_hex(value);
-        if let Some(previous_hash) = first_values.get(&name) {
+        if let Some((previous_bytes, previous_hash)) = first_values.get(&name) {
             if !duplicate_field_names
                 .iter()
                 .any(|candidate| candidate == &name)
             {
                 duplicate_field_names.push(name.clone());
             }
-            if previous_hash != &value_hash
+            if (*previous_bytes != value.len() || previous_hash != &value_hash)
                 && !conflicting_duplicate_field_names
                     .iter()
                     .any(|candidate| candidate == &name)
@@ -335,7 +335,7 @@ fn parse_control_line(
                 conflicting_duplicate_field_names.push(name.clone());
             }
         } else {
-            first_values.insert(name.clone(), value_hash.clone());
+            first_values.insert(name.clone(), (value.len(), value_hash.clone()));
         }
 
         if fields.len() < MAX_FIELDS_PER_LINE {
@@ -444,24 +444,12 @@ fn valid_field_name(name: &[u8]) -> bool {
 }
 
 fn unique_part_number(control_line: &ControlLine) -> Option<u64> {
-    if control_line.field_occurrences_truncated
-        || control_line
-            .duplicate_field_names
-            .iter()
-            .any(|name| name == "part")
-    {
-        return None;
+    match unique_field(Some(control_line), "part") {
+        FieldLookup::Found(field) if field.decimal_status == "valid-u64-decimal" => {
+            field.decimal_u64
+        }
+        _ => None,
     }
-
-    let mut matching_fields = control_line
-        .fields
-        .iter()
-        .filter(|field| field.name == "part");
-    let field = matching_fields.next()?;
-    if matching_fields.next().is_some() || field.decimal_status != "valid-u64-decimal" {
-        return None;
-    }
-    field.decimal_u64
 }
 
 enum FieldLookup<'a> {
@@ -476,7 +464,7 @@ fn unique_field<'a>(control_line: Option<&'a ControlLine>, name: &str) -> FieldL
     };
     if control_line.field_occurrences_truncated
         || control_line
-            .duplicate_field_names
+            .conflicting_duplicate_field_names
             .iter()
             .any(|candidate| candidate == name)
     {
@@ -490,7 +478,11 @@ fn unique_field<'a>(control_line: Option<&'a ControlLine>, name: &str) -> FieldL
     let Some(field) = matching_fields.next() else {
         return FieldLookup::Missing;
     };
-    if matching_fields.next().is_some() {
+    // Occurrences remain visible. Equality uses full-value evidence, never the bounded preview
+    // or a normalized numeric value (e.g. "1" and "01" are different declarations).
+    if matching_fields.any(|other| {
+        other.value_bytes != field.value_bytes || other.value_sha256 != field.value_sha256
+    }) {
         return FieldLookup::Ambiguous;
     }
 
@@ -728,6 +720,79 @@ fn hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::parse;
+
+    #[test]
+    fn accepts_byte_identical_fields_and_preserves_every_occurrence() {
+        let metadata = parse(b"=ybegin part=1 part=1 total=2 total=2 line=128 size=10 size=10 name=file.bin\r\n=ypart begin=1 begin=1 end=5 end=5\r\ndata\r\n=yend size=5 size=5 part=1 part=1 pcrc32=abcdef12 pcrc32=abcdef12\r\n");
+        let json = serde_json::to_value(metadata).unwrap();
+        let frame = &json["frames"][0];
+        assert_eq!(frame["size_relationship_status"], "complete");
+        assert_eq!(frame["ybegin_part_number"], 1);
+        assert_eq!(frame["yend_part_number"], 1);
+        assert_eq!(frame["expected_segment_size"], 5);
+        assert_eq!(frame["multipart_pcrc32_status"], "present-hex");
+        for line in json["lines"].as_array().unwrap() {
+            assert!(!line["duplicate_field_names"].as_array().unwrap().is_empty());
+            assert!(
+                line["conflicting_duplicate_field_names"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(json["lines"][2]["fields"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn byte_distinct_equivalent_numbers_and_crc_case_remain_ambiguous() {
+        let normal = "=ybegin part=1 total=2 line=128 size=10 name=file.bin\r\n=ypart begin=1 end=5\r\ndata\r\n=yend size=5 part=1 pcrc32=abcdef12\r\n";
+        for input in [
+            normal.replacen("part=1", "part=1 part=01", 1),
+            normal.replace("begin=1", "begin=1 begin=01"),
+            normal.replace("pcrc32=abcdef12", "pcrc32=abcdef12 pcrc32=ABCDEF12"),
+        ] {
+            let json = serde_json::to_value(parse(input.as_bytes())).unwrap();
+            assert_eq!(json["frames"][0]["size_relationship_status"], "ambiguous");
+        }
+    }
+
+    #[test]
+    fn identical_duplicates_cannot_override_a_truncated_occurrence_scan() {
+        for (occurrences, expected_status) in [(63, "complete"), (64, "ambiguous")] {
+            let input = format!(
+                "=ybegin {}size=10\r\n=ypart begin=1 end=5\r\ndata\r\n=yend size=5 part=1 pcrc32=abcdef12\r\n",
+                "part=1 ".repeat(occurrences)
+            );
+            let json = serde_json::to_value(parse(input.as_bytes())).unwrap();
+            assert_eq!(
+                json["frames"][0]["size_relationship_status"],
+                expected_status
+            );
+            assert_eq!(json["lines"][0]["fields"].as_array().unwrap().len(), 64);
+            assert_eq!(
+                json["lines"][0]["field_occurrences_truncated"],
+                occurrences == 64
+            );
+        }
+    }
+
+    #[test]
+    fn compares_duplicate_values_beyond_the_retained_preview() {
+        let prefix = "0".repeat(129);
+        for (last_digits, expected_status) in [("10", "complete"), ("11", "ambiguous")] {
+            let input = format!(
+                "=ybegin part=1 size={prefix}10 size={prefix}{last_digits}\r\n=ypart begin=1 end=5\r\ndata\r\n=yend size=5 part=1 pcrc32=abcdef12\r\n"
+            );
+            let json = serde_json::to_value(parse(input.as_bytes())).unwrap();
+            assert_eq!(
+                json["frames"][0]["size_relationship_status"],
+                expected_status
+            );
+            let fields = json["lines"][0]["fields"].as_array().unwrap();
+            assert_eq!(fields[1]["value_utf8"], fields[2]["value_utf8"]);
+            assert_eq!(fields[1]["value_hex_truncated"], true);
+        }
+    }
 
     #[test]
     fn trailer_only_part_declarations_cannot_establish_single_part_size() {
