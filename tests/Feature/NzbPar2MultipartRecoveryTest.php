@@ -31,6 +31,7 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Mockery;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -436,6 +437,87 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
         self::assertSame(['one', 'two'], $this->fetched);
     }
 
+    public function test_historical_sweep_reaches_a_real_rename_after_three_hundred_local_rejections(): void
+    {
+        $logs = Log::spy();
+        config([
+            'tmux.fix_names.par2_max_releases' => 300,
+            'tmux.fix_names.par2_max_local_skips' => 350,
+            'tmux.fix_names.par2_budget_seconds' => 60,
+        ]);
+        $blockedIds = [];
+        for ($index = 0; $index < 301; $index++) {
+            $blockedIds[] = $this->release(['guid' => 'fragment-'.$index])->id;
+        }
+        $recoverable = $this->release(['guid' => 'recoverable']);
+        $fragment = new SimpleXMLElement('<nzb><file subject="hidden fragment yEnc"><segments><segment number="1" bytes="100">fragment-one</segment><segment number="3" bytes="100">fragment-three</segment></segments></file></nzb>');
+        $metadata = implode('', $this->metadata());
+        $complete = $this->nzb([$metadata]);
+        $loaded = [];
+        $load = static function (string $guid) use ($fragment, $complete, &$loaded): SimpleXMLElement {
+            $loaded[] = $guid;
+
+            return $guid === 'recoverable' ? $complete : $fragment;
+        };
+        $this->app->instance(NzbContentsService::class, $this->service($load, []));
+        $reads = 0;
+        $nntp = $this->createMock(NNTPService::class);
+        $nntp->expects($this->never())->method('getMessages');
+        $nntp->method('getMessageBounded')->with('alt.binaries.test', 'one', 2097152, false, self::isType('callable'))
+            ->willReturnCallback(static function (string $group, string $messageId, int $maximumBytes, bool $alternate, callable $onRead) use ($metadata, &$reads): BoundedArticleResult {
+                $reads++;
+                if (! $onRead()) {
+                    return BoundedArticleResult::failure('Fixture processing lock ownership was lost.');
+                }
+
+                return BoundedArticleResult::success($metadata);
+            });
+        $names = new NameFixingService;
+        $started = hrtime(true);
+        $names->fixNamesWithPar2(2, true, 1, true, false, $nntp);
+        $elapsed = (hrtime(true) - $started) / 1000000000;
+        $checkpoints = DB::table('par2_rename_candidate_progress')->whereIn('releases_id', $blockedIds)->count();
+        $diagnostic = sprintf('Mechanism fixture: loaded=%d NNTP_reads=%d blocked_checkpoints=%d elapsed=%.3fs', count($loaded), $reads, $checkpoints, $elapsed);
+
+        self::assertSame(0, Release::query()->whereIn('id', $blockedIds)->where('proc_par2', 1)->count(), $diagnostic);
+        self::assertSame(0, Release::query()->whereIn('id', $blockedIds)->where('isrenamed', 1)->count(), $diagnostic);
+        self::assertGreaterThanOrEqual(300, $checkpoints, $diagnostic);
+        self::assertSame($checkpoints, DB::table('par2_rename_candidate_progress')->whereIn('releases_id', $blockedIds)->where('blocked_reason', 'article_limit')->count(), $diagnostic);
+        self::assertSame(self::TITLE, $recoverable->fresh()->searchname, $diagnostic);
+        self::assertSame(301, $checkpoints, $diagnostic);
+        self::assertSame(1, $recoverable->fresh()->isrenamed, $diagnostic);
+        self::assertSame(1, $recoverable->fresh()->proc_par2, $diagnostic);
+        self::assertSame(1, $reads, $diagnostic);
+        $logs->shouldHaveReceived('info')->with('PAR2 rename batch finished', Mockery::on(static fn (array $context): bool => $context['local_skips'] === 301 && $context['regular_attempted'] === 1 && $context['inspected'] === 302
+            && $context['candidates_probed'] === 1 && $context['articles_received'] === 1));
+    }
+
+    public function test_failed_provider_probes_still_use_the_regular_sweep_quota(): void
+    {
+        config(['tmux.fix_names.par2_max_releases' => 2, 'tmux.fix_names.par2_max_local_skips' => 10]);
+        $first = $this->release(['guid' => 'provider-failure-1']);
+        $second = $this->release(['guid' => 'provider-failure-2']);
+        $third = $this->release(['guid' => 'provider-failure-3']);
+        $this->app->instance(NzbContentsService::class, $this->service($this->nzb([implode('', $this->metadata())]), []));
+        $reads = 0;
+        $nntp = $this->createMock(NNTPService::class);
+        $nntp->expects($this->never())->method('getMessages');
+        $nntp->method('getMessageBounded')->with('alt.binaries.test', 'one', 2097152, false, self::isType('callable'))
+            ->willReturnCallback(static function () use (&$reads): BoundedArticleResult {
+                $reads++;
+
+                return BoundedArticleResult::failure('Temporary fixture provider failure');
+            });
+
+        (new NameFixingService)->fixNamesWithPar2(2, true, 1, true, false, $nntp);
+
+        self::assertSame(2, $reads);
+        self::assertSame($second->id, Cache::store('array')->get('rename:par2:sweep:2:1')['after_id']);
+        self::assertSame(2, DB::table('par2_rename_candidate_progress')->whereIn('releases_id', [$first->id, $second->id])->count());
+        self::assertSame(0, DB::table('par2_rename_candidate_progress')->where('releases_id', $third->id)->count());
+        self::assertSame(3, Release::query()->where('proc_par2', 0)->count());
+    }
+
     /** @return array<string,array{string}> */
     public static function changedYencNames(): array
     {
@@ -521,7 +603,7 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
     }
 
     /** @param array<string,BoundedArticleResult|\Closure> $responses */
-    private function service(SimpleXMLElement $xml, array $responses, bool $failLoad = false, ?callable $beforeRead = null): NzbContentsService
+    private function service(SimpleXMLElement|\Closure $xml, array $responses, bool $failLoad = false, ?callable $beforeRead = null): NzbContentsService
     {
         $nntp = Mockery::mock(NNTPService::class);
         $nntp->shouldNotReceive('getMessages');
@@ -546,7 +628,7 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
 
         return new class($xml, $nntp, $post, $failLoad) extends NzbContentsService
         {
-            public function __construct(private SimpleXMLElement $xml, NNTPService $nntp, PostProcessService $post, private bool $failLoad)
+            public function __construct(private SimpleXMLElement|\Closure $xml, NNTPService $nntp, PostProcessService $post, private bool $failLoad)
             {
                 $this->nntp = $nntp;
                 $this->postProcessService = $post;
@@ -560,7 +642,7 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
                     throw new \RuntimeException('A mismatched GUID must never select an NZB');
                 }
 
-                return $this->xml;
+                return $this->xml instanceof \Closure ? ($this->xml)($guid) : $this->xml;
             }
         };
     }
