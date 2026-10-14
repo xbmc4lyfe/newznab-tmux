@@ -10,21 +10,22 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/export-benchmark-summary.py"
 INPUTS = {"cpp": "benchmark-evidence/paired/observations.jsonl", "php": "benchmark-evidence/php-paired/observations.jsonl", "profile": "processing-evidence/profile/observations.jsonl", "presentation": "benchmark-evidence/results.jsonl"}
-SECRET = "private-password-and-source-content"
+# Literal test sentinel; no credentials or runtime configuration are read.
+UNPUBLISHED_MARKER = "synthetic-unpublished-fixture"
 
 
 def paired(kind="cpp"):
-    records = [{"type": "protocol", "source_sha256": {"composer.lock": "a" * 64, SECRET: "b" * 64}, "libraries": {"rust": {"sha256": "c" * 64, "path": SECRET}}, "runtime": {"secret": SECRET}}]
+    records = [{"type": "protocol", "source_sha256": {"composer.lock": "a" * 64, UNPUBLISHED_MARKER: "b" * 64}, "libraries": {"rust": {"sha256": "c" * 64, "path": UNPUBLISHED_MARKER}}, "runtime": {"unpublished_fixture": UNPUBLISHED_MARKER}}]
     for size, density, path in itertools.product((4096, 524288, 1048576, 8388608), ("ordinary", "heavy"), ("tolerant", "strict", "body")):
-        records.append({"type": "stratum_summary", "size": size, "density": density, "path": path, "decision": "useful_improvement", "eligible_pairs": 31, "invalid_pairs": 0, "median_rust_over_" + kind: 0.7, "bootstrap_95_percent_interval": [0.6, 0.8], "command": SECRET})
-    records.append({"type": "run_summary", "status": "useful_improvement", "strata": 24, "claim_limit": SECRET})
+        records.append({"type": "stratum_summary", "size": size, "density": density, "path": path, "decision": "useful_improvement", "eligible_pairs": 31, "invalid_pairs": 0, "median_rust_over_" + kind: 0.7, "bootstrap_95_percent_interval": [0.6, 0.8], "command": UNPUBLISHED_MARKER})
+    records.append({"type": "run_summary", "status": "useful_improvement", "strata": 24, "claim_limit": UNPUBLISHED_MARKER})
     return records
 
 
 def profile():
-    records = [{"type": "protocol", "command": SECRET}]
+    records = [{"type": "protocol", "command": UNPUBLISHED_MARKER}]
     for size, density, phase in itertools.product((4096, 524288, 1048576), ("ordinary", "heavy"), ("full-analyzer", "framing", "headers", "body-metadata", "relationship", "raw-body", "whole-body")):
-        records.append({"type": "observation", "size": size, "density": density, "phase": phase, "eligible": True, "status": "ok", "result": {"status": "ok", "median_ms": 2.5, "min_ms": 2, "max_ms": 3, "metadata": SECRET}, "command": [SECRET]})
+        records.append({"type": "observation", "size": size, "density": density, "phase": phase, "eligible": True, "status": "ok", "result": {"status": "ok", "median_ms": 2.5, "min_ms": 2, "max_ms": 3, "metadata": UNPUBLISHED_MARKER}, "command": [UNPUBLISHED_MARKER]})
     records.append({"type": "summary", "status": "ok", "invalid_observations": 0, "source_and_library_identities_stable": True, "instrumentation_identities_stable": True})
     return records
 
@@ -32,7 +33,7 @@ def profile():
 def presentation():
     records = []
     for scenario, rows in itertools.product(("clean", "wrapped", "escaped"), (1, 2, 5, 10, 16, 50, 100)):
-        record = {"scenario": scenario, "rows": rows, "candidate_backend": "php-small-batch" if rows < 16 else "rust", "source_sha256": {"composer.lock": "a" * 64}, "observations": [SECRET]}
+        record = {"scenario": scenario, "rows": rows, "candidate_backend": "php-small-batch" if rows < 16 else "rust", "source_sha256": {"composer.lock": "a" * 64}, "observations": [UNPUBLISHED_MARKER]}
         if rows < 16:
             record.update(correctness_passed=True, performance_gate="not_applicable_same_php_path")
         else:
@@ -53,7 +54,7 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             result = subprocess.run(["python3", str(SCRIPT), "--kind", kind, "--runner", "linux-x64", "--output", "summary.json"], cwd=root, env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             content = (root / "summary.json").read_text()
-            self.assertNotIn(SECRET, content)
+            self.assertNotIn(UNPUBLISHED_MARKER, content)
             summary = json.loads(content)
             self.assertIs(summary["adoption_qualified"], False)
             self.assertEqual(summary["head_sha"], "d" * 40)
@@ -103,7 +104,7 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
         rows = paired()
         rows.insert(2, dict(rows[1]))
         self.assertEqual(self.run_export("cpp", rows)["status"], "invalid")
-        rows[1]["density"] = SECRET
+        rows[1]["density"] = UNPUBLISHED_MARKER
         self.assertEqual(self.run_export("cpp", rows)["status"], "invalid")
 
     def test_profile_complete_and_stability_gate(self):
@@ -127,14 +128,14 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
         result = body["result"]
         result["observations"] = [
             {"warmup": True, "elapsed_ms": 900},
-            {"warmup": False, "elapsed_ms": 1.0, "metadata": SECRET},
+            {"warmup": False, "elapsed_ms": 1.0, "metadata": UNPUBLISHED_MARKER},
             {"warmup": False, "elapsed_ms": 2.0},
             {"warmup": False, "elapsed_ms": "3.0"},
             {"warmup": False, "elapsed_ms": -1},
         ]
         stages = ("allocate_and_memcpy", "native_parse_and_serialize", "ffi_string_and_free", "json_decode")
         result["body_ffi_breakdown"] = [
-            {"warmup": False, "correct": True, "stages_ms": dict.fromkeys(stages, value) | {SECRET: 123}, "source": SECRET}
+            {"warmup": False, "correct": True, "stages_ms": dict.fromkeys(stages, value) | {UNPUBLISHED_MARKER: 123}, "source": UNPUBLISHED_MARKER}
             for value in (1, 3, 7)
         ]
         result["body_ffi_breakdown"] += [
