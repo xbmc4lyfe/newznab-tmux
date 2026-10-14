@@ -431,8 +431,9 @@ class NzbImportService
         $isBlackListed = $groupName = $firstName = $posterName = $postDate = false;
 
         // Go through the NZB, get the details, look if it's blacklisted, look if we have the groups.
-        foreach ($nzbXML->file as $file) {
-            $binary_names[] = $file['subject'];
+        $elements = new NzbXmlElements($nzbXML);
+        foreach ($elements->files() as $file) {
+            $binary_names[] = $file->attributes()['subject'];
             $totalFiles++;
             $groupID = -1;
 
@@ -452,7 +453,7 @@ class NzbImportService
 
             // Get the group names, group_id, check if it's blacklisted.
             $groupArr = [];
-            foreach ($file->groups->group as $group) {
+            foreach ($elements->groups($file) as $group) {
                 $group = $this->normalizeGroupName($group);
 
                 // If group_id is -1 try to get a group_id.
@@ -495,10 +496,8 @@ class NzbImportService
             // If we found a group and it's not blacklisted.
             if ($groupID !== -1 && ! $isBlackListed) {
                 // Get the size of the release.
-                if (\count($file->segments->segment) > 0) {
-                    foreach ($file->segments->segment as $segment) {
-                        $totalSize += (int) $segment->attributes()->bytes;
-                    }
+                foreach ($elements->segments($file) as $segment) {
+                    $totalSize += (int) $segment->attributes()->bytes;
                 }
             } else {
                 if ($isBlackListed) {
@@ -597,8 +596,8 @@ class NzbImportService
         }
 
         $categoryMetadata = [];
-        foreach ($nzbXML->head->meta ?? [] as $meta) {
-            if (mb_strtolower(trim((string) $meta['type'])) !== 'category') {
+        foreach ((new NzbXmlElements($nzbXML))->metadata() as $meta) {
+            if (mb_strtolower(trim((string) $meta->attributes()['type'])) !== 'category') {
                 continue;
             }
 
