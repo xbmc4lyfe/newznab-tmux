@@ -105,7 +105,7 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
         $this->artisan('releases:verify-candidates')->assertFailed();
 
         $this->assertCount(4, glob($directory.'/*'));
-        $this->assertSame('pending', DB::table('release_verification_candidates')->where('id', $id)->value('status'));
+        $this->assertSame('unknown', DB::table('release_verification_candidates')->where('id', $id)->value('status'));
         $this->assertSame(1, DB::table('release_verification_scratch')->count());
     }
 

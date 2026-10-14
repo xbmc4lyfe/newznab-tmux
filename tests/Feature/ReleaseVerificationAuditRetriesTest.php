@@ -231,7 +231,7 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
 
         $this->assertSame([1], array_column($this->records(), 'id'));
         $this->assertSame(1, (int) DB::table('release_verification_state')->value('audit_cursor'));
-        $this->assertSame('pending', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame('unknown', DB::table('release_verification_candidates')->value('status'));
         $lock = fopen($this->directory.'/worker.lock', 'c');
         $this->assertTrue(flock($lock, LOCK_EX | LOCK_NB));
         flock($lock, LOCK_UN);

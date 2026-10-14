@@ -16,7 +16,9 @@ use RuntimeException;
 
 final class CandidateRepository
 {
-    private const array CLAIMABLE_STATUSES = ['pending', 'unknown', 'verifying'];
+    private const array CLAIMABLE_STATUSES = ['ready', 'pending', 'unknown', 'verifying'];
+
+    private int $claimSelections = 0;
 
     public function __construct(private readonly ManifestStore $store, private readonly CollectionCleanupService $cleanup) {}
 
@@ -45,6 +47,7 @@ final class CandidateRepository
                 $filtered = $observed?->status === 'filtered';
                 $manifest = null;
                 $prepared = null;
+                $headerAssessment = null;
                 $snapshotFailure = null;
                 if (! $filtered) {
                     try {
@@ -54,6 +57,7 @@ final class CandidateRepository
                         if ((int) $collection->filecheck !== 4
                             && ($observed === null || $observed->manifest_path === '' || $observed->release_id !== null)) {
                             $prepared = $this->store->prepare($manifest);
+                            $headerAssessment = (new CandidateHeaderInventory)->assessment($manifest);
                         }
                     } catch (CandidateMetadataBudgetExceeded $error) {
                         // A stale read view can hide a committed filtered replay; validate it first.
@@ -97,6 +101,7 @@ final class CandidateRepository
                     $newArticles = $this->articleIdentity($oldManifest) !== $this->articleIdentity($manifest);
                     // A candidate may have appeared since the advisory read; persist its merge.
                     $prepared = null;
+                    $headerAssessment = null;
                 }
                 $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
                 $size = filesize($this->store->path($path));
@@ -118,8 +123,9 @@ final class CandidateRepository
                 $values = ['identity' => $identity, 'source_identity' => $sourceIdentity, 'groups_id' => (int) $collection->groups_id, 'manifest_path' => $path,
                     'manifest_bytes' => $size, 'manifest_hash' => substr($path, 0, 64)];
                 if ($changed || $dirty) {
+                    $assessment = $headerAssessment ?? (new CandidateHeaderInventory)->assessment($manifest);
                     $values += ['version' => (int) ($existing->version ?? 0) + 1, 'last_unique_at' => $lastUniqueAt,
-                        'next_attempt_at' => now(), 'status' => 'pending', 'lease_token' => null, 'lease_until' => null, 'reason' => null];
+                        'next_attempt_at' => now(), 'status' => $assessment['status'], 'lease_token' => null, 'lease_until' => null, 'reason' => $assessment['reason']];
                 }
                 if ($expired) {
                     $values = array_replace($values, ['status' => 'expired', 'last_unique_at' => $lastUniqueAt,
@@ -166,7 +172,8 @@ final class CandidateRepository
             // Avoid preparing known replays; the locked read remains authoritative below.
             $prepared = DB::table('release_verification_candidates')->where('identity', (string) $manifest['identity'])->exists()
                 ? null : $this->store->prepare($manifest);
-            DB::transaction(function () use ($manifest, $prepared): void {
+            $headerAssessment = $prepared === null ? null : (new CandidateHeaderInventory)->assessment($manifest);
+            DB::transaction(function () use ($manifest, $prepared, $headerAssessment): void {
                 $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                 $identity = (string) $manifest['identity'];
                 $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
@@ -186,10 +193,11 @@ final class CandidateRepository
                     }
                     throw new RuntimeException('Candidate capacity is full; import retained for retry.');
                 }
+                $assessment = $headerAssessment ?? (new CandidateHeaderInventory)->assessment($manifest);
                 $values = ['identity' => $identity, 'source_identity' => $identity,
                     'groups_id' => (int) $manifest['groups_id'], 'manifest_path' => $path, 'manifest_bytes' => $bytes,
                     'manifest_hash' => substr($path, 0, 64), 'last_unique_at' => now(), 'next_attempt_at' => now(),
-                    'version' => (int) ($existing->version ?? 0) + 1, 'status' => 'pending', 'reason' => null,
+                    'version' => (int) ($existing->version ?? 0) + 1, 'status' => $assessment['status'], 'reason' => $assessment['reason'],
                     'release_id' => null, 'verified_at' => null, 'lease_token' => null, 'lease_until' => null];
                 if ($existing === null) {
                     DB::table('release_verification_candidates')->insert($values);
@@ -389,7 +397,7 @@ final class CandidateRepository
     public function expire(): void
     {
         $ids = DB::table('release_verification_candidates')->whereNull('release_id')
-            ->whereIn('status', ['pending', 'unknown', 'unrepairable', 'verifying', 'dirty'])
+            ->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'unrepairable', 'verifying', 'dirty'])
             ->where('last_unique_at', '<', now()->subHours((int) config('release_verification.expiry_hours')))
             ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
             ->orderBy('id')->limit(100)->pluck('id');
@@ -398,7 +406,7 @@ final class CandidateRepository
                 DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                 $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
                 if ($row === null || $row->release_id !== null
-                    || ! in_array($row->status, ['pending', 'unknown', 'unrepairable', 'verifying', 'dirty'], true)
+                    || ! in_array($row->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'unrepairable', 'verifying', 'dirty'], true)
                     || $row->last_unique_at >= now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s')
                     || ($row->lease_until !== null && $row->lease_until >= now()->format('Y-m-d H:i:s'))) {
                     return;
@@ -420,51 +428,57 @@ final class CandidateRepository
      */
     public function claim(?callable $acquireCandidate = null): ?object
     {
-        $ids = $this->claimQueueIds();
-        foreach ($ids as $id) {
-            $acquired = false;
-            $claimed = DB::transaction(function () use ($id, $acquireCandidate, &$acquired): ?object {
-                $query = $this->claimableCandidates()->where('id', $id);
-                if (in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
-                    $query->forceIndex('PRIMARY')->lock('for update skip locked');
-                } else {
-                    $query->lockForUpdate();
-                }
-                $row = $query->first();
-                if ($row === null) {
-                    return null;
-                }
-                if ($acquireCandidate !== null) {
-                    if (! $acquireCandidate((int) $row->id)) {
+        $preferReady = ++$this->claimSelections % 5 !== 0;
+        // Keep legacy/stale leases progressing even while ready candidates are arriving.
+        foreach ($preferReady ? [['ready'], ['pending', 'unknown', 'verifying']] : [['pending', 'unknown', 'verifying'], ['ready']] as $statuses) {
+            $ids = $this->claimQueueIds($statuses);
+            foreach ($ids as $id) {
+                $acquired = false;
+                $claimed = DB::transaction(function () use ($id, $acquireCandidate, &$acquired): ?object {
+                    $query = $this->claimableCandidates()->where('id', $id);
+                    if (in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
+                        $query->forceIndex('PRIMARY')->lock('for update skip locked');
+                    } else {
+                        $query->lockForUpdate();
+                    }
+                    $row = $query->first();
+                    if ($row === null) {
                         return null;
                     }
-                    $acquired = true;
-                }
-                $token = (string) Str::uuid();
-                DB::table('release_verification_candidates')->where('id', $row->id)->update([
-                    'status' => 'verifying', 'lease_token' => $token,
-                    'lease_until' => now()->addSeconds((int) config('release_verification.lease_seconds')),
-                ]);
-                $row->lease_token = $token;
+                    if ($acquireCandidate !== null) {
+                        if (! $acquireCandidate((int) $row->id)) {
+                            return null;
+                        }
+                        $acquired = true;
+                    }
+                    $token = (string) Str::uuid();
+                    DB::table('release_verification_candidates')->where('id', $row->id)->update([
+                        'status' => 'verifying', 'lease_token' => $token,
+                        'lease_until' => now()->addSeconds((int) config('release_verification.lease_seconds')),
+                    ]);
+                    $row->lease_token = $token;
 
-                return $row;
-            }, 5);
-            // A rolled-back lease may still own its file mutex; let the caller release it.
-            if ($claimed !== null || $acquired) {
-                return $claimed;
+                    return $row;
+                }, 5);
+                // A rolled-back lease may still own its file mutex; let the caller release it.
+                if ($claimed !== null || $acquired) {
+                    return $claimed;
+                }
             }
         }
 
         return null;
     }
 
-    /** @return list<int> */
-    private function claimQueueIds(): array
+    /** @param list<string> $statuses
+     * @return list<int>
+     */
+    private function claimQueueIds(array $statuses): array
     {
         $cutoff = now();
         $rows = [];
         // Fixing the leading status key lets verification_due serve each ORDER BY / LIMIT.
-        foreach (self::CLAIMABLE_STATUSES as $status) {
+        foreach ($statuses as $status) {
             foreach ($this->claimableCandidates($status, $cutoff)->orderBy('next_attempt_at')->orderBy('id')
                 ->limit(100)->get(['id', 'next_attempt_at']) as $row) {
                 // A status change between reads must not consume two slots in the claim window.
@@ -503,7 +517,7 @@ final class CandidateRepository
     public function finish(object $claim, VerificationResult $result): void
     {
         DB::table('release_verification_candidates')->where('id', $claim->id)->where('lease_token', $claim->lease_token)
-            ->where('version', $claim->version)->update(['status' => $result->verdict === 'unrepairable' ? 'unrepairable' : 'unknown', 'reason' => mb_strcut($result->reason, 0, 2000, 'UTF-8'),
+            ->where('version', $claim->version)->update(['status' => $result->waitingForHeaders ? 'waiting_upload' : ($result->verdict === 'unrepairable' ? 'unrepairable' : 'unknown'), 'reason' => mb_strcut($result->reason, 0, 2000, 'UTF-8'),
                 'lease_token' => null, 'lease_until' => null, 'next_attempt_at' => now()->addSeconds((int) config('release_verification.retry_seconds'))]);
     }
 

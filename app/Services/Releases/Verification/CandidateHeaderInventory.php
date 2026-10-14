@@ -10,26 +10,37 @@ final class CandidateHeaderInventory
     /** @param array<string, mixed> $manifest */
     public function rejection(array $manifest): ?string
     {
+        return $this->assessment($manifest)['reason'];
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @return array{status: 'ready'|'waiting_upload'|'unknown', reason: ?string}
+     */
+    public function assessment(array $manifest): array
+    {
+        if (($manifest['conflict'] ?? false) === true) {
+            return ['status' => 'unknown', 'reason' => 'Conflicting header identities require resolution.'];
+        }
         $files = $manifest['files'] ?? null;
         if (! is_array($files) || $files === []) {
-            return 'Candidate has no file inventory to spot check.';
+            return ['status' => 'unknown', 'reason' => 'Candidate has no file inventory to spot check.'];
         }
         $expected = max(0, (int) ($manifest['expected_files'] ?? 0));
-        if ($expected > count($files)) {
-            return 'Declared file inventory is still uploading; publication deferred.';
-        }
+        $missingParts = false;
         $keys = [];
         $ids = [];
         foreach ($files as $file) {
             if (! is_array($file) || ! is_string($file['key'] ?? null) || $file['key'] === ''
                 || isset($keys[$file['key']]) || ! is_array($file['segments'] ?? null)) {
-                return 'Invalid or duplicate file identity in candidate headers.';
+                return ['status' => 'unknown', 'reason' => 'Invalid or duplicate file identity in candidate headers.'];
             }
             $keys[$file['key']] = true;
             $total = (int) ($file['totalparts'] ?? 0);
-            if ($total < 1 || count($file['segments']) !== $total) {
-                return 'Declared article inventory is still uploading; publication deferred.';
+            if ($total < 1 || count($file['segments']) > $total) {
+                return ['status' => 'unknown', 'reason' => 'Invalid declared article count in candidate headers.'];
             }
+            $missingParts = $missingParts || count($file['segments']) < $total;
             $numbers = [];
             foreach ($file['segments'] as $segment) {
                 if (! is_array($segment) || ! is_int($segment['number'] ?? null) || $segment['number'] < 1
@@ -38,14 +49,21 @@ final class CandidateHeaderInventory
                     || ! is_string($segment['messageid'] ?? null)
                     || preg_match('/\A[^\s<>\x00-\x1f\x7f]+\z/D', trim($segment['messageid'], '<>')) !== 1
                     || isset($ids[trim($segment['messageid'], '<>')])) {
-                    return 'Invalid or duplicate article reference in candidate headers.';
+                    return ['status' => 'unknown', 'reason' => 'Invalid or duplicate article reference in candidate headers.'];
                 }
                 $numbers[$segment['number']] = true;
                 $ids[trim($segment['messageid'], '<>')] = true;
             }
         }
 
-        return null;
+        if ($expected > count($files)) {
+            return ['status' => 'waiting_upload', 'reason' => 'Declared file inventory is still uploading; publication deferred.'];
+        }
+        if ($missingParts) {
+            return ['status' => 'waiting_upload', 'reason' => 'Declared article inventory is still uploading; publication deferred.'];
+        }
+
+        return ['status' => 'ready', 'reason' => null];
     }
 
     /** @param array<string, mixed> $manifest */

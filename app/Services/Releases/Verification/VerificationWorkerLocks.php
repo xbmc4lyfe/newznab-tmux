@@ -48,6 +48,21 @@ final class VerificationWorkerLocks
         return false;
     }
 
+    public function startPreparation(): bool
+    {
+        $this->close();
+        $this->global = $this->acquire('worker.lock', LOCK_SH);
+        if ($this->global !== null) {
+            $this->slot = $this->acquire('locks/preparation.lock', LOCK_EX);
+            if ($this->slot !== null) {
+                return true;
+            }
+        }
+        $this->close();
+
+        return false;
+    }
+
     public function tryExclusive(): bool
     {
         $this->close();

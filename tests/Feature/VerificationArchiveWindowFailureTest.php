@@ -55,13 +55,13 @@ class VerificationArchiveWindowFailureTest extends ReleaseVerificationCandidates
         $this->assertSame(1, DB::table('binaries')->where('collections_id', $failed)->count());
         $this->assertSame(1, DB::table('parts')->count());
         $this->assertFalse(DB::table('collections')->where('id', $tail)->exists());
-        $this->assertSame(1, DB::table('release_verification_candidates')->where('status', 'pending')->count());
+        $this->assertSame(1, DB::table('release_verification_candidates')->where('status', 'ready')->count());
         $this->assertNull(Cache::get('cbp:release-window:cursor:group:1'), 'Completing the snapshot must wrap to retained failed rows.');
         $wrapper->failureActive = false;
         app(ReleaseProcessingService::class)->processReleaseCreationBatches(1);
         $this->assertSame([$failed, $tail, $failed], $wrapper->attempts);
         $this->assertFalse(DB::table('collections')->where('id', $failed)->exists());
-        $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'pending')->count());
+        $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'ready')->count());
         $this->assertSame(0, DB::table('releases')->count());
     }
 
