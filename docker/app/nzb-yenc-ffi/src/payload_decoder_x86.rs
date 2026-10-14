@@ -486,79 +486,7 @@ unsafe fn vbmi2_specials(bytes: x86::__m256i) -> u32 {
     }
 }
 
-// One 64-byte compression handles removals across byte 31 without joining
-// two outputs. The complete source block is loaded before overlapping stores.
-#[target_feature(enable = "avx2,avx512f,avx512vbmi2,avx512bw,avx512vl,popcnt")]
-#[inline]
-unsafe fn compact_wide_vbmi2(
-    bytes: x86::__m512i,
-    specials: u64,
-    destination: *mut u8,
-    escaped: &mut bool,
-) -> usize {
-    use x86::*;
-    unsafe {
-        let equals = _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(b'=' as i8));
-        let newlines = specials & !equals;
-        let incoming = *escaped;
-        if newlines == 0
-            && ((!incoming && equals == 0x5555_5555_5555_5555)
-                || (incoming && equals == 0xaaaa_aaaa_aaaa_aaaa))
-        {
-            let packed =
-                _mm512_maskz_compress_epi8(!equals, _mm512_sub_epi8(bytes, _mm512_set1_epi8(106)));
-            _mm256_storeu_si256(destination.cast(), _mm512_castsi512_si256(packed));
-            return 32;
-        }
-        let following = equals.wrapping_shl(1);
-        let (remove, adjust) = if following & (equals | newlines) == 0
-            && (!incoming || (equals | newlines) & 1 == 0)
-        {
-            *escaped = equals & (1u64 << 63) != 0;
-            (equals | newlines, following | u64::from(incoming))
-        } else {
-            let mut remove = 0u64;
-            let mut adjust = 0u64;
-            for shift in [0, 16, 32, 48] {
-                let (lane_remove, lane_adjust) = block_masks(
-                    (equals >> shift) as u16,
-                    (newlines >> shift) as u16,
-                    escaped,
-                );
-                remove |= u64::from(lane_remove) << shift;
-                adjust |= u64::from(lane_adjust) << shift;
-            }
-            (remove, adjust)
-        };
-        let keep = !remove;
-        let count = keep.count_ones() as usize;
-        if count != 0 {
-            let decoded = _mm512_sub_epi8(bytes, _mm512_set1_epi8(42));
-            let decoded = _mm512_mask_sub_epi8(decoded, adjust, decoded, _mm512_set1_epi8(64));
-            // Memory compression writes exactly the selected bytes as a
-            // contiguous prefix, without constructing a second output mask.
-            _mm512_mask_compressstoreu_epi8(destination.cast(), keep, decoded);
-        }
-        count
-    }
-}
-
-#[target_feature(enable = "avx2,avx512f,avx512vbmi2,avx512bw,avx512vl,popcnt")]
-#[inline]
-unsafe fn wide_vbmi2_specials(bytes: x86::__m512i) -> u64 {
-    use x86::*;
-    unsafe {
-        _mm512_cmpeq_epi8_mask(
-            bytes,
-            _mm512_shuffle_epi8(
-                _mm512_broadcast_i32x4(_mm_loadu_si128(SPECIAL_BYTES.as_ptr().cast())),
-                _mm512_min_epu8(bytes, _mm512_set1_epi8(46)),
-            ),
-        )
-    }
-}
-
-#[target_feature(enable = "avx2,avx512f,avx512vbmi2,avx512bw,avx512vl,popcnt")]
+#[target_feature(enable = "avx2,avx512vbmi2,avx512bw,avx512vl,popcnt")]
 pub(crate) unsafe fn decode_vbmi2(source: *const u8, destination: *mut u8, length: usize) -> usize {
     use x86::*;
     let mut read = 0;
@@ -570,18 +498,25 @@ pub(crate) unsafe fn decode_vbmi2(source: *const u8, destination: *mut u8, lengt
                 read += 1;
                 continue;
             }
-            // Read all 64 bytes before any store, including overlapping output.
-            let bytes = _mm512_loadu_si512(source.add(read).cast());
-            let specials = wide_vbmi2_specials(bytes);
-            if !escaped && specials == 0 {
-                _mm512_storeu_si512(
+            // Load both vectors before any store, including overlapping output.
+            let low = _mm256_loadu_si256(source.add(read).cast());
+            let high = _mm256_loadu_si256(source.add(read + 32).cast());
+            let low_specials = vbmi2_specials(low);
+            let high_specials = vbmi2_specials(high);
+            if !escaped && low_specials | high_specials == 0 {
+                _mm256_storeu_si256(
                     destination.add(written).cast(),
-                    _mm512_sub_epi8(bytes, _mm512_set1_epi8(42)),
+                    _mm256_sub_epi8(low, _mm256_set1_epi8(42)),
+                );
+                _mm256_storeu_si256(
+                    destination.add(written + 32).cast(),
+                    _mm256_sub_epi8(high, _mm256_set1_epi8(42)),
                 );
                 written += 64;
             } else {
+                written += compact_vbmi2(low, low_specials, destination.add(written), &mut escaped);
                 written +=
-                    compact_wide_vbmi2(bytes, specials, destination.add(written), &mut escaped);
+                    compact_vbmi2(high, high_specials, destination.add(written), &mut escaped);
             }
             read += 64;
         }
@@ -606,7 +541,6 @@ mod tests {
     #[test]
     fn vbmi2_kernel_preserves_escape_carry_and_exact_output_for_every_boundary() {
         if !is_x86_feature_detected!("avx2")
-            || !is_x86_feature_detected!("avx512f")
             || !is_x86_feature_detected!("avx512vbmi2")
             || !is_x86_feature_detected!("avx512bw")
             || !is_x86_feature_detected!("avx512vl")
@@ -653,7 +587,7 @@ mod tests {
                             false,
                         )
                     };
-                    for alignment in 0..64 {
+                    for alignment in 0..32 {
                         let mut output = vec![0xa5; input.len() + 64];
                         let written = unsafe {
                             decode_vbmi2(
@@ -667,7 +601,7 @@ mod tests {
                         assert!(output[..alignment].iter().all(|&byte| byte == 0xa5));
                         assert!(output[alignment + count..].iter().all(|&byte| byte == 0xa5));
                     }
-                    for behind in [0, 1, 7, 15, 31, 63] {
+                    for behind in [0, 1, 7, 15, 31] {
                         let mut overlap = vec![0xa5; input.len() + behind + 32];
                         overlap[behind..behind + input.len()].copy_from_slice(&input);
                         let before = overlap.clone();
@@ -731,7 +665,6 @@ mod tests {
             kernels.push(decode_avx2);
         }
         if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("avx512f")
             && is_x86_feature_detected!("avx512vbmi2")
             && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512vl")
@@ -743,28 +676,11 @@ mod tests {
             for value in 0..=u8::MAX {
                 for alignment in 0..32 {
                     let mut input = vec![b'k'; alignment];
-                    for _ in 0..80 {
+                    for _ in 0..40 {
                         input.extend_from_slice(&[b'=', value]);
                     }
                     input.extend_from_slice(b"=\r\n@==\n=\r=");
-                    for length in [
-                        0,
-                        1,
-                        15,
-                        16,
-                        17,
-                        31,
-                        32,
-                        33,
-                        63,
-                        64,
-                        65,
-                        127,
-                        128,
-                        129,
-                        input.len() - 1,
-                        input.len(),
-                    ] {
+                    for length in [0, 1, 15, 16, 17, 31, 32, 33, input.len() - 1, input.len()] {
                         let mut expected = vec![0; length];
                         let expected_length = unsafe {
                             scalar_tail(input.as_ptr(), expected.as_mut_ptr(), length, 0, 0, false)

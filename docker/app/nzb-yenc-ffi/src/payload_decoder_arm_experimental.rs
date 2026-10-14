@@ -1,0 +1,737 @@
+//! ARM payload decoding with separate ordinary and dense-escape loops.
+//! The CR/LF lookup technique follows RapidYenc's CC0/Public Domain decoder:
+//! https://github.com/animetosho/rapidyenc/blob/480bd7b5896f8b3edecc721d23f1384d767ffe2f/src/decoder_neon64.cc
+//! Mask packing and all lenient state handling here use the existing Rust contract.
+
+use crate::payload_decoder::{COMPACT, ESCAPE_OFFSETS, block_masks, scalar_tail, store_word};
+
+const fn removal_indexes<const POSITIONS: usize>(removed: usize) -> [[u8; 16]; POSITIONS] {
+    let mut table = [[255; 16]; POSITIONS];
+    let mut marker = 0;
+    while marker < POSITIONS {
+        let mut input = 0;
+        let mut output = 0;
+        while input < 16 {
+            if input < marker || input >= marker + removed {
+                table[marker][output] = input as u8;
+                output += 1;
+            }
+            input += 1;
+        }
+        marker += 1;
+    }
+    table
+}
+
+static SINGLE_REMOVAL_INDEXES: [[u8; 16]; 16] = removal_indexes::<16>(1);
+static PAIR_REMOVAL_INDEXES: [[u8; 16]; 15] = removal_indexes::<15>(2);
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn neon_mask_has_nonzero(bytes: std::arch::aarch64::uint8x16_t) -> bool {
+    use std::arch::aarch64::*;
+    // Unsigned saturation preserves zero in each 64-bit lane. Combining the
+    // narrowed lanes tests all bytes without a horizontal byte reduction.
+    vget_lane_u64::<0>(vreinterpret_u64_u32(vqmovn_u64(vreinterpretq_u64_u8(
+        bytes,
+    )))) != 0
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn decode_neon_block(
+    bytes: std::arch::aarch64::uint8x16_t,
+    equals: std::arch::aarch64::uint8x16_t,
+    special: std::arch::aarch64::uint8x16_t,
+    destination: *mut u8,
+    escaped: &mut bool,
+) -> usize {
+    use std::arch::aarch64::*;
+    unsafe {
+        if !*escaped && vmaxvq_u8(special) == 0 {
+            vst1q_u8(destination, vsubq_u8(bytes, vdupq_n_u8(42)));
+            return 16;
+        }
+        let weights =
+            vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+        let newlines = vbicq_u8(special, equals);
+        // Pairwise additions retain the low/high eight-byte masks of both
+        // comparisons in one scalar word, avoiding four horizontal reductions.
+        let pairs = vpaddq_u8(vandq_u8(equals, weights), vandq_u8(newlines, weights));
+        let quads = vpaddq_u8(pairs, pairs);
+        let masks = vgetq_lane_u32(vreinterpretq_u32_u8(vpaddq_u8(quads, quads)), 0);
+        let equals_mask = masks as u16;
+        let newline_mask = (masks >> 16) as u16;
+        let incoming = *escaped;
+        let following = equals_mask.wrapping_shl(1);
+        let (remove, decoded) = if following & (equals_mask | newline_mask) == 0
+            && (!incoming || (equals_mask | newline_mask) & 1 == 0)
+        {
+            // Ordinary escapes can form their adjustment directly from the
+            // comparison, including a pending value at byte zero. Adjacent
+            // markers and newlines inside an escape retain the lenient path.
+            *escaped = equals_mask & 0x8000 != 0;
+            let adjustment = vorrq_u8(
+                vandq_u8(vextq_u8(vdupq_n_u8(0), equals, 15), vdupq_n_u8(64)),
+                vsetq_lane_u8::<0>(u8::from(incoming) << 6, vdupq_n_u8(0)),
+            );
+            (
+                equals_mask | newline_mask,
+                vsubq_u8(bytes, vaddq_u8(vdupq_n_u8(42), adjustment)),
+            )
+        } else {
+            let (remove, adjust) = block_masks(equals_mask, newline_mask, escaped);
+            let adjustment = vcombine_u8(
+                vld1_u8(ESCAPE_OFFSETS[(adjust & 255) as usize].as_ptr()),
+                vld1_u8(ESCAPE_OFFSETS[(adjust >> 8) as usize].as_ptr()),
+            );
+            (
+                remove,
+                vsubq_u8(bytes, vaddq_u8(vdupq_n_u8(42), adjustment)),
+            )
+        };
+        if remove == 0 {
+            vst1q_u8(destination, decoded);
+            return 16;
+        }
+        let first_removed = remove.trailing_zeros() as usize;
+        if remove.is_power_of_two() {
+            let indexes = vld1q_u8(SINGLE_REMOVAL_INDEXES[first_removed].as_ptr());
+            let compact = vqtbl1q_u8(decoded, indexes);
+            // Two overlapping stores cover exactly fifteen output bytes.
+            // All source bytes are already loaded before either store.
+            vst1_u8(destination, vget_low_u8(compact));
+            vst1_u8(
+                destination.add(7),
+                vget_low_u8(vextq_u8(compact, compact, 7)),
+            );
+            return 15;
+        }
+        if remove >> first_removed == 3 {
+            let indexes = vld1q_u8(PAIR_REMOVAL_INDEXES[first_removed].as_ptr());
+            let compact = vqtbl1q_u8(decoded, indexes);
+            // Both eight-byte ranges remain within the fourteen-byte result.
+            vst1_u8(destination, vget_low_u8(compact));
+            vst1_u8(
+                destination.add(6),
+                vget_low_u8(vextq_u8(compact, compact, 6)),
+            );
+            return 14;
+        }
+        let low_count = 8 - (remove & 255).count_ones() as usize;
+        let high_count = 8 - (remove >> 8).count_ones() as usize;
+        let low = vtbl1_u8(
+            vget_low_u8(decoded),
+            vld1_u8(COMPACT[(remove & 255) as usize].as_ptr()),
+        );
+        let high = vtbl1_u8(
+            vget_high_u8(decoded),
+            vld1_u8(COMPACT[(remove >> 8) as usize].as_ptr()),
+        );
+        store_word(
+            vget_lane_u64(vreinterpret_u64_u8(low), 0),
+            destination,
+            low_count,
+        );
+        store_word(
+            vget_lane_u64(vreinterpret_u64_u8(high), 0),
+            destination.add(low_count),
+            high_count,
+        );
+        low_count + high_count
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+unsafe fn decode_neon_regular_fallback(
+    bytes: std::arch::aarch64::uint8x16_t,
+    equals: std::arch::aarch64::uint8x16_t,
+    special: std::arch::aarch64::uint8x16_t,
+    destination: *mut u8,
+    mut escaped: bool,
+) -> (usize, bool) {
+    // Keep general compaction outside the ordinary loop without changing the
+    // dense decoder's use of decode_neon_block or its register allocation.
+    let count = unsafe { decode_neon_block(bytes, equals, special, destination, &mut escaped) };
+    (count, escaped)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn decode_neon_regular_lane(
+    bytes: std::arch::aarch64::uint8x16_t,
+    equals: std::arch::aarch64::uint8x16_t,
+    special: std::arch::aarch64::uint8x16_t,
+    destination: *mut u8,
+    mut escaped: bool,
+) -> (usize, bool) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let weights =
+            vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+        let newlines = vbicq_u8(special, equals);
+        let pairs = vpaddq_u8(vandq_u8(equals, weights), vandq_u8(newlines, weights));
+        let quads = vpaddq_u8(pairs, pairs);
+        let masks = vgetq_lane_u32(vreinterpretq_u32_u8(vpaddq_u8(quads, quads)), 0);
+        let equals_mask = masks as u16;
+        let newline_mask = (masks >> 16) as u16;
+        let incoming = escaped;
+        let following = equals_mask.wrapping_shl(1);
+        let remove = equals_mask | newline_mask;
+        let first_removed = remove.trailing_zeros() as usize;
+        let single = remove.is_power_of_two();
+        let sparse = remove == 0 || single || remove >> first_removed == 3;
+        if !sparse || following & remove != 0 || (incoming && remove & 1 != 0) {
+            // Keep the incoming state intact for malformed escapes or general
+            // compaction. Only this fallback crosses a function boundary.
+            return decode_neon_regular_fallback(bytes, equals, special, destination, escaped);
+        }
+        escaped = equals_mask & 0x8000 != 0;
+        let adjustment = vorrq_u8(
+            vandq_u8(vextq_u8(vdupq_n_u8(0), equals, 15), vdupq_n_u8(64)),
+            vsetq_lane_u8::<0>(u8::from(incoming) << 6, vdupq_n_u8(0)),
+        );
+        let decoded = vsubq_u8(bytes, vaddq_u8(vdupq_n_u8(42), adjustment));
+        if remove == 0 {
+            vst1q_u8(destination, decoded);
+            return (16, escaped);
+        }
+        let (indexes, count) = if single {
+            (SINGLE_REMOVAL_INDEXES[first_removed].as_ptr(), 15)
+        } else {
+            (PAIR_REMOVAL_INDEXES[first_removed].as_ptr(), 14)
+        };
+        let compact = vqtbl1q_u8(decoded, vld1q_u8(indexes));
+        vst1_u8(destination, vget_low_u8(compact));
+        if single {
+            vst1_u8(
+                destination.add(7),
+                vget_low_u8(vextq_u8(compact, compact, 7)),
+            );
+        } else {
+            vst1_u8(
+                destination.add(6),
+                vget_low_u8(vextq_u8(compact, compact, 6)),
+            );
+        }
+        (count, escaped)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+// Keep dense-loop branches out of the ordinary loop's register allocation.
+#[inline(never)]
+unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: usize) -> usize {
+    use std::arch::aarch64::*;
+    let mut read = 0;
+    let mut written = 0;
+    let mut escaped = false;
+    unsafe {
+        let offset = vdupq_n_u8(42);
+        let lookup = vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr());
+        while length - read >= 16 {
+            // Consume leading CR/LF without consuming escape state. A lone LF
+            // also restores alignment after a line with an odd encoded length.
+            while length - read >= 16 && matches!(source.add(read).read(), b'\r' | b'\n') {
+                read += 1;
+            }
+            if length - read < 16 {
+                break;
+            }
+            // Preload this entire lane before writing. Output never exceeds
+            // sixteen bytes, so in-place/behind stores cannot reach the next
+            // unread lane. Destination-ahead overlap uses decode_into's copy.
+            let bytes = vld1q_u8(source.add(read));
+            let equals = vceqq_u8(bytes, vdupq_n_u8(b'='));
+            let special = vqtbx1q_u8(equals, lookup, bytes);
+            if !escaped && !neon_mask_has_nonzero(special) {
+                vst1q_u8(destination.add(written), vsubq_u8(bytes, offset));
+                written += 16;
+            } else {
+                let (count, next_escaped) = decode_neon_regular_lane(
+                    bytes,
+                    equals,
+                    special,
+                    destination.add(written),
+                    escaped,
+                );
+                written += count;
+                escaped = next_escaped;
+            }
+            read += 16;
+        }
+        scalar_tail(source, destination, length, read, written, escaped)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+unsafe fn decode_neon_dense(source: *const u8, destination: *mut u8, length: usize) -> usize {
+    use std::arch::aarch64::*;
+    let mut read = 0;
+    let mut written = 0;
+    let mut escaped = false;
+    unsafe {
+        let lookup = vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr());
+        let marker = vdupq_n_u8(b'=');
+        let offset = vdupq_n_u8(106);
+        while length - read >= 16 {
+            // A line boundary does not consume a pending escape. Skipping only
+            // leading CR/LF also restores pair alignment after a wrapped line.
+            while read < length && matches!(source.add(read).read(), b'\r' | b'\n') {
+                read += 1;
+            }
+            if length - read < 16 {
+                break;
+            }
+            if length - read >= 64 {
+                let first = vld2q_u8(source.add(read));
+                let second = vld2q_u8(source.add(read + 32));
+                let (markers_a, values_a, markers_b, values_b) = if escaped {
+                    (first.1, first.0, second.1, second.0)
+                } else {
+                    (first.0, first.1, second.0, second.1)
+                };
+                let invalid_markers = vmvnq_u8(vandq_u8(
+                    vceqq_u8(markers_a, marker),
+                    vceqq_u8(markers_b, marker),
+                ));
+                let invalid_values =
+                    vorrq_u8(vqtbl1q_u8(lookup, values_a), vqtbl1q_u8(lookup, values_b));
+                if vmaxvq_u8(vorrq_u8(invalid_markers, invalid_values)) == 0 {
+                    // Both interleaved loads precede these exact 32 output
+                    // bytes. Values may themselves be '=', as scalar decoding
+                    // consumes them rather than treating them as new markers.
+                    vst1q_u8(destination.add(written), vsubq_u8(values_a, offset));
+                    vst1q_u8(destination.add(written + 16), vsubq_u8(values_b, offset));
+                    written += 32;
+                    read += 64;
+                    continue;
+                }
+            } else if length - read >= 32 {
+                let pairs = vld2q_u8(source.add(read));
+                let (markers, values) = if escaped {
+                    (pairs.1, pairs.0)
+                } else {
+                    (pairs.0, pairs.1)
+                };
+                let invalid = vorrq_u8(
+                    vmvnq_u8(vceqq_u8(markers, marker)),
+                    vqtbl1q_u8(lookup, values),
+                );
+                if vmaxvq_u8(invalid) == 0 {
+                    vst1q_u8(destination.add(written), vsubq_u8(values, offset));
+                    written += 16;
+                    read += 32;
+                    continue;
+                }
+            }
+            let bytes = vld1q_u8(source.add(read));
+            let equals = vceqq_u8(bytes, marker);
+            let special = vqtbx1q_u8(equals, lookup, bytes);
+            written += decode_neon_block(
+                bytes,
+                equals,
+                special,
+                destination.add(written),
+                &mut escaped,
+            );
+            read += 16;
+        }
+        scalar_tail(source, destination, length, read, written, escaped)
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn decode_neon(source: *const u8, destination: *mut u8, length: usize) -> usize {
+    use std::arch::aarch64::*;
+    unsafe {
+        // This bounded classifier only chooses a kernel. Both kernels accept every
+        // payload byte and retain the same CR/LF, dangling-escape and store semantics.
+        if length >= 16 {
+            let bytes = vld1q_u8(source);
+            let even = vandq_u16(vreinterpretq_u16_u8(bytes), vdupq_n_u16(255));
+            if vminvq_u16(vceqq_u16(even, vdupq_n_u16(u16::from(b'=')))) == u16::MAX {
+                return decode_neon_dense(source, destination, length);
+            }
+        }
+        decode_neon_regular(source, destination, length)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_nonzero_check_preserves_every_byte_position_and_value() {
+        use std::arch::aarch64::*;
+        unsafe {
+            assert!(!neon_mask_has_nonzero(vld1q_u8([0; 16].as_ptr())));
+            assert!(neon_mask_has_nonzero(vld1q_u8([255; 16].as_ptr())));
+            for position in 0..16 {
+                for value in 0..=255 {
+                    let mut bytes = [0; 16];
+                    bytes[position] = value;
+                    assert_eq!(neon_mask_has_nonzero(vld1q_u8(bytes.as_ptr())), value != 0);
+                }
+                let mut bytes = [255; 16];
+                bytes[position] = 0;
+                assert!(neon_mask_has_nonzero(vld1q_u8(bytes.as_ptr())));
+            }
+            for value in [0xffff_ffff_u64, 0x1_0000_0000, 1 << 63, u64::MAX] {
+                for lane in 0..2 {
+                    let mut bytes = [0; 16];
+                    bytes[lane * 8..lane * 8 + 8].copy_from_slice(&value.to_ne_bytes());
+                    assert!(neon_mask_has_nonzero(vld1q_u8(bytes.as_ptr())));
+                }
+            }
+        }
+    }
+
+    fn verify_regular_guards(payload: &[u8], expected: &[u8]) {
+        for kernel in [
+            decode_neon_regular as unsafe fn(*const u8, *mut u8, usize) -> usize,
+            decode_neon,
+        ] {
+            for destination_offset in 0..16 {
+                let mut output = vec![0xa5; payload.len() + 32];
+                let written = unsafe {
+                    kernel(
+                        payload.as_ptr(),
+                        output.as_mut_ptr().add(destination_offset),
+                        payload.len(),
+                    )
+                };
+                assert_eq!(written, expected.len(), "payload {payload:?}");
+                assert_eq!(
+                    &output[destination_offset..destination_offset + written],
+                    expected,
+                    "payload {payload:?}"
+                );
+                assert!(
+                    output[..destination_offset]
+                        .iter()
+                        .all(|&byte| byte == 0xa5)
+                );
+                assert!(
+                    output[destination_offset + written..]
+                        .iter()
+                        .all(|&byte| byte == 0xa5)
+                );
+            }
+            // Exercise in-place decoding and destination-behind overlap. The
+            // complete suffix must retain its original bytes, including input.
+            for destination_start in [64, 63, 57, 49, 33, 0] {
+                let mut storage = vec![0xa5; payload.len() + 128];
+                storage[64..64 + payload.len()].copy_from_slice(payload);
+                let original = storage.clone();
+                let written = unsafe {
+                    kernel(
+                        storage.as_ptr().add(64),
+                        storage.as_mut_ptr().add(destination_start),
+                        payload.len(),
+                    )
+                };
+                assert_eq!(written, expected.len(), "payload {payload:?}");
+                assert_eq!(
+                    &storage[destination_start..destination_start + written],
+                    expected
+                );
+                assert_eq!(
+                    &storage[..destination_start],
+                    &original[..destination_start]
+                );
+                assert_eq!(
+                    &storage[destination_start + written..],
+                    &original[destination_start + written..],
+                    "payload {payload:?}, destination {destination_start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_sparse_removals_preserve_literal_output_and_all_guards() {
+        for position in 0..64 {
+            for tail in 0..17 {
+                let length = 96 + tail;
+                let mut escape = vec![b'k'; length];
+                escape[position] = b'=';
+                let mut expected = vec![65; length - 1];
+                expected[position] = 1;
+                verify_regular_guards(&escape, &expected);
+
+                for newline in *b"\r\n" {
+                    let mut payload = vec![b'k'; length];
+                    payload[position] = newline;
+                    verify_regular_guards(&payload, &vec![65; length - 1]);
+                }
+                for pair in [b"\r\n", b"\n\r"] {
+                    let mut payload = vec![b'k'; length];
+                    payload[position..position + 2].copy_from_slice(pair);
+                    verify_regular_guards(&payload, &vec![65; length - 2]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_escape_carry_survives_split_crlf_and_dangling_markers() {
+        for marker in [15, 31, 47, 63] {
+            for newlines in [0, 1, 2, 15, 16, 17, 31, 32, 33] {
+                for tail in 0..17 {
+                    let mut payload = vec![b'k'; marker];
+                    payload.push(b'=');
+                    payload.extend(
+                        (0..newlines).map(|index| if index % 2 == 0 { b'\r' } else { b'\n' }),
+                    );
+                    let mut dangling = vec![65; marker];
+                    dangling.push(19);
+                    verify_regular_guards(&payload, &dangling);
+                    for (value, decoded) in [(b'k', 1), (b'=', 211)] {
+                        let mut with_value = payload.clone();
+                        with_value.push(value);
+                        with_value.extend(std::iter::repeat_n(b'k', tail));
+                        let mut expected = vec![65; marker];
+                        expected.push(decoded);
+                        expected.extend(std::iter::repeat_n(65, tail));
+                        verify_regular_guards(&with_value, &expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_multiple_escapes_preserve_literal_output_during_overlap() {
+        for prefix in 0..16 {
+            for repeats in [1, 2, 5, 8] {
+                let mut payload = vec![b'k'; prefix];
+                let mut expected = vec![65; prefix];
+                for _ in 0..repeats {
+                    payload.extend_from_slice(b"k=@k=Jk=Mk=}k\r\n");
+                    expected.extend_from_slice(&[65, 214, 65, 224, 65, 227, 65, 19, 65]);
+                }
+                verify_regular_guards(&payload, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_incoming_escape_and_sparse_removals_preserve_literal_guards() {
+        for (replacements, length, adjusted) in [
+            (vec![(15, b'='), (23, b'\n')], 190, Some(1)),
+            (vec![(15, b'='), (23, b'\r'), (24, b'\n')], 189, Some(1)),
+            (vec![(15, b'='), (16, b'=')], 191, Some(211)),
+            (vec![(15, b'='), (16, b'\r'), (17, b'\n')], 189, Some(1)),
+            (
+                std::iter::once((15, b'='))
+                    .chain(
+                        (16..32).map(|index| (index, if index % 2 == 0 { b'\r' } else { b'\n' })),
+                    )
+                    .chain(std::iter::once((40, b'\n')))
+                    .collect(),
+                174,
+                Some(1),
+            ),
+            (vec![(20, b'\n'), (24, b'\n')], 190, None),
+        ] {
+            let mut payload = vec![b'k'; 192];
+            for (index, byte) in replacements {
+                payload[index] = byte;
+            }
+            let mut expected = vec![65; length];
+            if let Some(byte) = adjusted {
+                expected[15] = byte;
+            }
+            verify_regular_guards(&payload, &expected);
+        }
+    }
+
+    #[test]
+    fn ordinary_group_carry_crosses_repeated_newline_boundaries_and_final_marker() {
+        let mut payload = vec![b'k'; 256];
+        for marker in [63, 127, 191, 255] {
+            payload[marker] = b'=';
+        }
+        for boundary in [64, 128, 192] {
+            payload[boundary..boundary + 2].copy_from_slice(b"\r\n");
+        }
+        let mut expected = vec![65; 247];
+        for position in [63, 124, 185] {
+            expected[position] = 1;
+        }
+        expected[246] = 19;
+        verify_regular_guards(&payload, &expected);
+    }
+
+    #[test]
+    fn ordinary_incoming_only_group_keeps_distinct_lane_order_then_resumes_clean() {
+        let mut payload = vec![b'k'; 63];
+        payload.push(b'=');
+        for byte in *b"klmn" {
+            payload.extend(std::iter::repeat_n(byte, 16));
+        }
+        payload.extend(std::iter::repeat_n(b'k', 64));
+        let mut expected = vec![65; 63];
+        expected.push(1);
+        expected.extend(std::iter::repeat_n(65, 15));
+        for byte in [66, 67, 68] {
+            expected.extend(std::iter::repeat_n(byte, 16));
+        }
+        expected.extend(std::iter::repeat_n(65, 64));
+        verify_regular_guards(&payload, &expected);
+    }
+
+    #[test]
+    fn ordinary_short_newline_prefix_and_tail_carry_preserve_literal_guards() {
+        for prefix in [0, 1, 2, 15, 16, 17] {
+            for split in [0, 1, 2, 15, 16, 17] {
+                let mut payload = vec![b'\n'; prefix];
+                payload.extend(std::iter::repeat_n(b'k', 15));
+                payload.push(b'=');
+                payload.extend(std::iter::repeat_n(b'\r', split));
+                let mut expected = vec![65; 15];
+                expected.push(19);
+                verify_regular_guards(&payload, &expected);
+                for (value, decoded) in [(b'k', 1), (b'=', 211)] {
+                    for tail in [0, 1, 15, 16, 17] {
+                        let mut with_value = payload.clone();
+                        with_value.push(value);
+                        with_value.extend(std::iter::repeat_n(b'k', tail));
+                        let mut expected = vec![65; 15];
+                        expected.push(decoded);
+                        expected.extend(std::iter::repeat_n(65, tail));
+                        verify_regular_guards(&with_value, &expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_single_output_lane_carries_into_dangling_final_marker() {
+        let mut payload = vec![b'k'; 15];
+        payload.extend_from_slice(b"=@");
+        payload.extend(std::iter::repeat_n(b'\n', 15));
+        payload.extend(std::iter::repeat_n(b'l', 15));
+        payload.push(b'=');
+        let mut expected = vec![65; 15];
+        expected.push(214);
+        expected.extend(std::iter::repeat_n(66, 15));
+        expected.push(19);
+        verify_regular_guards(&payload, &expected);
+    }
+
+    #[test]
+    fn ordinary_general_lane_carry_reaches_sparse_lane_and_scalar_tail() {
+        // Three separated escapes force general compaction. The last marker
+        // remains pending across CR/LF and then across the next lane boundary.
+        let mut payload = b"=@kk=Jkk=}kkkkk=\r\nkkkkkkkkkkkkk=".to_vec();
+        payload.extend_from_slice(b"llllllllllllllll\r\n=");
+        let mut expected = vec![214, 65, 65, 224, 65, 65, 19];
+        expected.extend_from_slice(&[65; 5]);
+        expected.push(1);
+        expected.extend_from_slice(&[65; 12]);
+        expected.push(2);
+        expected.extend_from_slice(&[66; 15]);
+        expected.push(19);
+        verify_regular_guards(&payload, &expected);
+    }
+
+    fn verify_dense(payload: &[u8]) {
+        let mut expected = vec![0xcc; payload.len() + 32];
+        let expected_len = unsafe {
+            scalar_tail(
+                payload.as_ptr(),
+                expected.as_mut_ptr().add(16),
+                payload.len(),
+                0,
+                0,
+                false,
+            )
+        };
+        for kernel in [
+            decode_neon_dense as unsafe fn(*const u8, *mut u8, usize) -> usize,
+            decode_neon_regular,
+            decode_neon,
+        ] {
+            let mut actual = vec![0xcc; payload.len() + 32];
+            let actual_len =
+                unsafe { kernel(payload.as_ptr(), actual.as_mut_ptr().add(16), payload.len()) };
+            assert_eq!(actual_len, expected_len, "payload {payload:?}");
+            assert_eq!(actual, expected, "payload {payload:?}");
+        }
+    }
+
+    #[test]
+    fn dense_loop_matches_scalar_for_all_values_alignments_and_escape_carries() {
+        for value in 0..=255u8 {
+            for alignment in 0..32 {
+                let mut payload = vec![b'k'; alignment];
+                for _ in 0..40 {
+                    payload.extend_from_slice(&[b'=', value]);
+                }
+                payload.extend_from_slice(b"=\r\n=\r\n=\r\n");
+                verify_dense(&payload);
+            }
+        }
+        // The first vector leaves a marker pending; subsequent alternating
+        // vectors contain values in even lanes and markers in odd lanes.
+        let mut carry = vec![b'k'; 15];
+        carry.push(b'=');
+        for _ in 0..40 {
+            carry.extend_from_slice(b"@=");
+        }
+        verify_dense(&carry);
+        carry.extend_from_slice(b"\r\n\r\n");
+        verify_dense(&carry);
+    }
+
+    #[test]
+    fn dense_loop_matches_scalar_for_seeded_arbitrary_payloads() {
+        let mut state = 0x8618_72bd_2354_f09au64;
+        for length in 0..513 {
+            let mut payload = Vec::with_capacity(length);
+            for _ in 0..length {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                payload.push(match state as u8 % 8 {
+                    0 => b'=',
+                    1 => b'\r',
+                    2 => b'\n',
+                    _ => state as u8,
+                });
+            }
+            verify_dense(&payload);
+        }
+    }
+
+    #[test]
+    fn neon_groups_preserve_escape_carry_across_wrapped_pairs_and_short_tails() {
+        let encoded = b"=@=J=M=}==".repeat(40);
+        for width in [1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129] {
+            let mut wrapped = Vec::new();
+            for line in encoded.chunks(width) {
+                wrapped.extend_from_slice(line);
+                wrapped.extend_from_slice(b"\r\n");
+            }
+            for prefix in 0..32 {
+                let mut payload = vec![b'k'; prefix];
+                payload.extend_from_slice(&wrapped);
+                for tail in 0..65 {
+                    verify_dense(&payload[..payload.len() - tail]);
+                }
+            }
+        }
+    }
+}

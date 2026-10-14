@@ -16,12 +16,28 @@ mod nntp_body;
 mod nntp_headers;
 mod par2;
 mod par2_source_ranges;
+#[cfg(not(feature = "experimental-payload-kernels"))]
+mod payload_decoder;
+#[cfg(feature = "experimental-payload-kernels")]
+#[path = "payload_decoder_experimental.rs"]
 mod payload_decoder;
 mod release_names;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(feature = "experimental-payload-kernels")))]
 mod payload_decoder_arm;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(target_arch = "aarch64", feature = "experimental-payload-kernels"))]
+#[path = "payload_decoder_arm_experimental.rs"]
+mod payload_decoder_arm;
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(feature = "experimental-payload-kernels")
+))]
+mod payload_decoder_x86;
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "experimental-payload-kernels"
+))]
+#[path = "payload_decoder_x86_experimental.rs"]
 mod payload_decoder_x86;
 mod sample_plan;
 mod seven_zip_ranges;
@@ -907,6 +923,7 @@ mod tests {
         if selected == 3 {
             assert!(is_x86_feature_detected!("avx2"));
             assert!(is_x86_feature_detected!("avx512vbmi2"));
+            #[cfg(feature = "experimental-payload-kernels")]
             assert!(is_x86_feature_detected!("avx512f"));
             assert!(is_x86_feature_detected!("avx512bw"));
             assert!(is_x86_feature_detected!("avx512vl"));

@@ -6,6 +6,10 @@ description = "C ABI shim exposing nzb-decode's yEnc decoder under RapidYenc's s
 license = "GPL-3.0-only"
 publish = false
 
+[features]
+# Benchmark-only opt-in; production builds retain the incumbent kernels.
+experimental-payload-kernels = []
+
 [lib]
 name = "nzbyenc"
 crate-type = ["cdylib", "rlib"]

@@ -86,12 +86,13 @@ jobs:
           mkdir -p benchmark-evidence/build
           bash scripts/build-rapidyenc.sh 2>&1 | tee benchmark-evidence/build/cpp-build.log
 
-      - name: Build and test locked Rust candidate
+      - name: Build and test explicitly enabled experimental Rust candidate
         shell: bash
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-test.log
-          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-build.log
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --no-default-features --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/default-rust-test.log
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --features experimental-payload-kernels --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-test.log
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --features experimental-payload-kernels --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-build.log
 
       - name: Verify each native decoder through the same PHP services
         shell: bash
@@ -147,7 +148,8 @@ jobs:
               'rust_source_sha256': {str(path.relative_to(root)): digest(path) for path in sources},
               'cargo_lock_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.lock'),
               'cargo_toml_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.toml'),
-              'rust_build_command': 'cargo +1.98.0 build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml',
+              'rust_build_command': 'cargo +1.98.0 build --release --locked --features experimental-payload-kernels --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml',
+              'rust_payload_mode': 'experimental',
               'cpp_build_script_sha256': digest('scripts/build-rapidyenc.sh'),
               'cpp_source_archive_sha256': {path.name: digest(path) for path in pathlib.Path('storage/app/rapidyenc').glob('rapidyenc-*.tar.gz')},
               'cpp_library_sha256': digest('storage/app/rapidyenc/librapidyenc.so'),
@@ -235,7 +237,7 @@ jobs:
           path = pathlib.Path('benchmark-evidence/paired/observations.jsonl')
           rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write('## Native yEnc paired fixture comparison\n\n')
+              summary.write('## Experimental native yEnc paired fixture comparison\n\nBuild feature: `experimental-payload-kernels`. Default production kernels are retained.\n\n')
               qualification_path = pathlib.Path('benchmark-evidence/build/kernel-qualification.json')
               if qualification_path.exists():
                   qualification = json.loads(qualification_path.read_text())
@@ -292,13 +294,13 @@ jobs:
           php vendor/bin/phpunit tests/Unit/YencBenchmarkTest.php
           python3 tests/Unit/test_benchmark_cpu.py
 
-      - name: Build locked Rust candidate and verify PHP service parity
+      - name: Build locked incumbent Rust kernels and verify PHP service parity
         shell: bash
         run: |
           mkdir -p benchmark-evidence/build
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-test.log
-          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-build.log
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --no-default-features --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-test.log
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --no-default-features --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-build.log
           YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
             php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
               --filter='YencNativeDecoderTest|YencServiceTest|NNTPBodyDecodingTest' \
@@ -324,6 +326,8 @@ jobs:
               'github_run_id': os.environ.get('GITHUB_RUN_ID'),
               'cpu': run('lscpu'), 'uname': run('uname', '-a'), 'php': run('php', '-v'),
               'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
+              'rust_payload_mode': 'incumbent',
+              'rust_build_command': 'cargo +1.98.0 build --release --locked --no-default-features --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml',
               'rust_source_sha256': {str(path): digest(path) for path in sorted(pathlib.Path('docker/app/nzb-yenc-ffi/src').rglob('*.rs'))},
               'cargo_lock_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.lock'),
               'cargo_toml_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.toml'),
@@ -336,7 +340,7 @@ jobs:
       - name: Capture CPU counters before PHP comparison
         run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-before.json
 
-      - name: Compare Rust against the real PHP fallback
+      - name: Compare incumbent Rust against the real PHP fallback
         shell: bash
         run: |
           php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-yenc.php \
@@ -351,7 +355,7 @@ jobs:
         if: always() && hashFiles('benchmark-evidence/build/cpu-before.json') != ''
         run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-after.json
 
-      - name: Summarize PHP replacement evidence
+      - name: Summarize incumbent PHP replacement evidence
         if: always()
         shell: bash
         run: |
@@ -360,7 +364,7 @@ jobs:
           path = pathlib.Path('benchmark-evidence/php-paired/observations.jsonl')
           rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write('## Rust versus PHP fallback\n\nSame PHP service, exact byte/CRC correctness, randomized fresh-process pairs. Includes FFI overhead. Synthetic decoder fixtures only; no production throughput claim.\n\n')
+              summary.write('## Incumbent Rust versus PHP fallback\n\nDefault kernels without experimental features. These results do not qualify experimental payload kernels. Same PHP service, exact byte/CRC correctness, randomized fresh-process pairs. Includes FFI overhead. Synthetic decoder fixtures only; no production throughput claim.\n\n')
               summary.write('| Bytes | Density | Path | Decision | Rust / PHP | 95% interval | Eligible / invalid |\n|---:|---|---|---|---:|---|---|\n')
               for row in rows:
                   if row.get('type') == 'stratum_summary':
