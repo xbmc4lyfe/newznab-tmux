@@ -104,6 +104,7 @@ final class BackfillService
         if ($serverData === null) {
             return;
         }
+        $this->binaries->setNntp($this->nntp);
 
         $this->log("Processing {$shortGroupName}", 'primary');
 
@@ -284,6 +285,9 @@ final class BackfillService
 
             flush();
             $scanResult = $this->binaries->scan($groupArr, $first, $last, $this->config->safePartRepair);
+            if ($scanResult === [] && $this->binaries->completedRangeEnd() === null) {
+                throw new \RuntimeException('Backfill overview failed; the range must be retried.');
+            }
 
             $this->updateGroupRecord($groupArr, $first, $scanResult);
 

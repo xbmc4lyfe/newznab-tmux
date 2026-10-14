@@ -87,8 +87,7 @@ class GetArticleRangeContiguousTest extends TestCase
         $nntp = Mockery::mock(NNTPService::class);
         $nntp->shouldReceive('selectGroup')->with('alt.test')->once()->andReturn(['first' => 1001, 'last' => 1006]);
         $nntp->shouldReceive('getXOVER')->with('1001-1003')->once()->andReturn(false);
-        $nntp->shouldReceive('doQuit')->once();
-        $nntp->shouldReceive('doConnect')->with(false)->once()->andReturn(false);
+        $nntp->shouldReceive('reconnect')->with(false)->once()->andReturn(false);
         $this->useNntp($nntp);
 
         $this->runRange(1001, 1003)->assertFailed();
