@@ -66,16 +66,28 @@ final class VerificationWorkerLocks
     /** Persist claim-selection fairness in the already exclusively held worker slot. */
     public function preferReady(): bool
     {
+        return $this->preferPrimaryQueue(true);
+    }
+
+    public function preferPending(bool $advance): bool
+    {
+        return $this->preferPrimaryQueue($advance);
+    }
+
+    private function preferPrimaryQueue(bool $advance): bool
+    {
         if ($this->slot === null || $this->global === null) {
-            throw new RuntimeException('Queue selection requires an active worker slot.');
+            throw new RuntimeException('Queue selection requires an active slot.');
         }
         rewind($this->slot);
         $stored = stream_get_contents($this->slot, 16);
         $phase = is_string($stored) && preg_match('/\A[0-4]\z/D', $stored) === 1 ? (int) $stored : 0;
         $next = ($phase + 1) % 5;
-        rewind($this->slot);
-        if (fwrite($this->slot, (string) $next) !== 1 || ! ftruncate($this->slot, 1) || ! fflush($this->slot)) {
-            throw new RuntimeException('Cannot persist verification queue selection.');
+        if ($advance) {
+            rewind($this->slot);
+            if (fwrite($this->slot, (string) $next) !== 1 || ! ftruncate($this->slot, 1) || ! fflush($this->slot)) {
+                throw new RuntimeException('Cannot persist verification queue selection.');
+            }
         }
 
         return $next !== 0;
