@@ -52,6 +52,18 @@ class PredbMatchSelector
      */
     public function selectBestMatch(string $query, array $hits): ?array
     {
+        return $this->fileNameCleaner->withMatchingReuse(
+            fn (): ?array => $this->selectWithinLookup($query, $hits),
+            joinActiveLookup: true
+        );
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>|object>  $hits
+     * @return array<string, mixed>|null
+     */
+    private function selectWithinLookup(string $query, array $hits): ?array
+    {
         if (! mb_check_encoding($query, 'UTF-8')) {
             return null;
         }

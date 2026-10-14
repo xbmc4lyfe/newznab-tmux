@@ -20,6 +20,12 @@ use Tests\TestCase;
 
 final class PredbAuthoritativeIdentityTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse()->byDefault();
+    }
+
     use Par2RenameTestDatabase;
 
     /** @return array<string, array{string}> */
