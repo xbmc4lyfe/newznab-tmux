@@ -507,6 +507,32 @@ final class NameFixingQueryService
         }
     }
 
+    /** Count only enough eligible titles to fill the launcher's worker capacity. */
+    public function countPredbLauncherCandidates(int $maxPerRun, int $maxWorkers): int
+    {
+        if ($maxPerRun <= 0 || $maxWorkers <= 0) {
+            return 0;
+        }
+
+        $limit = $maxPerRun > intdiv(PHP_INT_MAX, $maxWorkers)
+            ? PHP_INT_MAX
+            : $maxPerRun * $maxWorkers;
+        $cutoff = CarbonImmutable::now()->subDay()->toDateTimeString();
+        $rows = $this->database->select(
+            'SELECT COUNT(*) AS num FROM (
+                SELECT p.id FROM predb p
+                WHERE LENGTH(p.title) >= 15
+                AND p.title NOT REGEXP \'["<> ]\'
+                AND p.searched = 0
+                AND (p.predate < ? OR (p.predate IS NULL AND p.imported_at < ?))
+                LIMIT ?
+             ) AS eligible',
+            [$cutoff, $cutoff, $limit]
+        );
+
+        return (int) ($rows[0]->num ?? 0);
+    }
+
     /**
      * @return list<object>
      */
