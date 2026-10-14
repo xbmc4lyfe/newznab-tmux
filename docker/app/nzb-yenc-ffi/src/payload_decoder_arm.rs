@@ -134,6 +134,29 @@ unsafe fn decode_neon_block(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[inline]
+unsafe fn decode_neon_regular_lane(
+    bytes: std::arch::aarch64::uint8x16_t,
+    equals: std::arch::aarch64::uint8x16_t,
+    special: std::arch::aarch64::uint8x16_t,
+    destination: *mut u8,
+    escaped: &mut bool,
+) -> usize {
+    use std::arch::aarch64::*;
+    unsafe {
+        // A neighbouring lane can contain specials without this lane needing
+        // compaction. Pending escape state still requires the full helper.
+        if !*escaped && vmaxvq_u8(special) == 0 {
+            vst1q_u8(destination, vsubq_u8(bytes, vdupq_n_u8(42)));
+            16
+        } else {
+            decode_neon_block(bytes, equals, special, destination, escaped)
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 // Keep dense-loop branches out of the ordinary loop's register allocation.
 #[inline(never)]
 unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: usize) -> usize {
@@ -179,14 +202,34 @@ unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: u
                 vst1q_u8(destination.add(written + 48), vsubq_u8(d, offset));
                 written += 64;
             } else {
-                written +=
-                    decode_neon_block(a, eq_a, special_a, destination.add(written), &mut escaped);
-                written +=
-                    decode_neon_block(b, eq_b, special_b, destination.add(written), &mut escaped);
-                written +=
-                    decode_neon_block(c, eq_c, special_c, destination.add(written), &mut escaped);
-                written +=
-                    decode_neon_block(d, eq_d, special_d, destination.add(written), &mut escaped);
+                written += decode_neon_regular_lane(
+                    a,
+                    eq_a,
+                    special_a,
+                    destination.add(written),
+                    &mut escaped,
+                );
+                written += decode_neon_regular_lane(
+                    b,
+                    eq_b,
+                    special_b,
+                    destination.add(written),
+                    &mut escaped,
+                );
+                written += decode_neon_regular_lane(
+                    c,
+                    eq_c,
+                    special_c,
+                    destination.add(written),
+                    &mut escaped,
+                );
+                written += decode_neon_regular_lane(
+                    d,
+                    eq_d,
+                    special_d,
+                    destination.add(written),
+                    &mut escaped,
+                );
             }
             read += 64;
         }
