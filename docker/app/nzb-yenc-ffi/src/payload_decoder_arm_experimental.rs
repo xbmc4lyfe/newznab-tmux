@@ -98,10 +98,18 @@ unsafe fn neon_group_masks(
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 #[inline]
-fn ordinary_sparse_mask(remove: u16) -> bool {
-    let remainder = remove & remove.wrapping_sub(1);
-    remainder == 0 || remainder.is_power_of_two()
+unsafe fn ordinary_sparse_group_mask(remove: u64) -> bool {
+    use std::arch::aarch64::*;
+    // Each wrapping subtraction stays within its u16 lane. Packed u64
+    // subtraction could borrow from another lane and change qualification.
+    let masks = vreinterpret_u16_u64(vcreate_u64(remove));
+    let one = vdup_n_u16(1);
+    let once = vand_u16(masks, vsub_u16(masks, one));
+    let twice = vand_u16(once, vsub_u16(once, one));
+    vget_lane_u64::<0>(vreinterpret_u64_u16(twice)) == 0
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -206,6 +214,20 @@ unsafe fn neon_mask_has_nonzero(bytes: std::arch::aarch64::uint8x16_t) -> bool {
     vget_lane_u64::<0>(vreinterpret_u64_u32(vqmovn_u64(vreinterpretq_u64_u8(
         bytes,
     )))) != 0
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn neon_group_needs_compaction(
+    bytes: std::arch::aarch64::uint8x16_t,
+    pending_escape: bool,
+) -> bool {
+    use std::arch::aarch64::*;
+    let special = vget_lane_u64::<0>(vreinterpret_u64_u32(vqmovn_u64(vreinterpretq_u64_u8(
+        bytes,
+    ))));
+    (special | u64::from(pending_escape)) != 0
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -427,7 +449,7 @@ unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: u
                 vorrq_u8(special[0], special[1]),
                 vorrq_u8(special[2], special[3]),
             );
-            if !escaped && !neon_mask_has_nonzero(any_special) {
+            if !neon_group_needs_compaction(any_special, escaped) {
                 for (lane, value) in bytes.into_iter().enumerate() {
                     vst1q_u8(
                         destination.add(written + lane * 16),
@@ -447,7 +469,7 @@ unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: u
                 // Keep real carry and destination unchanged until all four
                 // masks qualify; rejected groups use the original state.
                 if remove & ((markers << 1) | u64::from(escaped)) == 0
-                    && masks.into_iter().all(ordinary_sparse_mask)
+                    && ordinary_sparse_group_mask(remove)
                 {
                     for lane in 0..4 {
                         let incoming = if lane == 0 {
@@ -641,6 +663,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ordinary_group_compaction_check_keeps_pending_escape_and_every_special_byte() {
+        use std::arch::aarch64::*;
+        unsafe {
+            for pending in [false, true] {
+                assert_eq!(
+                    neon_group_needs_compaction(vld1q_u8([0; 16].as_ptr()), pending),
+                    pending
+                );
+                for position in 0..16 {
+                    for value in 0..=255 {
+                        let mut bytes = [0; 16];
+                        bytes[position] = value;
+                        assert_eq!(
+                            neon_group_needs_compaction(vld1q_u8(bytes.as_ptr()), pending),
+                            pending || value != 0
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn verify_regular_guards(payload: &[u8], expected: &[u8]) {
         for kernel in [
             decode_neon_regular as unsafe fn(*const u8, *mut u8, usize) -> usize,
@@ -750,6 +795,69 @@ mod tests {
                         expected.extend(std::iter::repeat_n(65, tail));
                         verify_regular_guards(&with_value, &expected);
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_full_newline_groups_preserve_pending_escape_and_exact_writes() {
+        for newline_count in [63, 64, 65, 127, 128, 129] {
+            let newlines: Vec<_> = (0..newline_count)
+                .map(|index| if index % 2 == 0 { b'\r' } else { b'\n' })
+                .collect();
+            let mut pending = vec![b'k'; 63];
+            pending.push(b'=');
+            pending.extend_from_slice(&newlines);
+            let mut dangling = vec![65; 63];
+            dangling.push(19);
+            let mut resumed = pending.clone();
+            resumed.extend_from_slice(b"l=");
+            let mut resumed_expected = vec![65; 63];
+            resumed_expected.extend_from_slice(&[2, 19]);
+
+            for (payload, expected) in [
+                (newlines, vec![]),
+                (pending, dangling),
+                (resumed, resumed_expected),
+            ] {
+                verify_regular_guards(&payload, &expected);
+                for source_offset in 0..16 {
+                    let mut source = vec![0xa5; payload.len() + 32];
+                    source[source_offset..source_offset + payload.len()].copy_from_slice(&payload);
+                    for destination_offset in [0, 7, 15] {
+                        let mut output = vec![0xa5; payload.len() + 32];
+                        let written = unsafe {
+                            decode_neon_regular(
+                                source.as_ptr().add(source_offset),
+                                output.as_mut_ptr().add(destination_offset),
+                                payload.len(),
+                            )
+                        };
+                        let mut expected_output = vec![0xa5; output.len()];
+                        expected_output[destination_offset..destination_offset + expected.len()]
+                            .copy_from_slice(&expected);
+                        assert_eq!(written, expected.len());
+                        assert_eq!(output, expected_output);
+                    }
+                }
+                // Destination-ahead overlap belongs to the common entry point,
+                // whose snapshot must also preserve zero-output group guards.
+                for (source_offset, destination_offset) in [(0, 1), (1, 63), (0, 64)] {
+                    let mut storage = vec![0xa5; payload.len() + 160];
+                    storage[source_offset..source_offset + payload.len()].copy_from_slice(&payload);
+                    let mut expected_storage = storage.clone();
+                    expected_storage[destination_offset..destination_offset + expected.len()]
+                        .copy_from_slice(&expected);
+                    let written = unsafe {
+                        crate::payload_decoder::decode_into(
+                            storage.as_ptr().add(source_offset),
+                            storage.as_mut_ptr().add(destination_offset),
+                            payload.len(),
+                        )
+                    };
+                    assert_eq!(written, expected.len());
+                    assert_eq!(storage, expected_storage);
                 }
             }
         }
@@ -894,11 +1002,28 @@ mod tests {
 
     #[test]
     fn ordinary_group_qualifies_only_masks_with_at_most_two_removed_bytes() {
-        for mask in 0..=u16::MAX {
+        for lane in 0..4 {
+            for mask in 0..=u16::MAX {
+                assert_eq!(
+                    unsafe { ordinary_sparse_group_mask(u64::from(mask) << (lane * 16)) },
+                    mask.count_ones() <= 2,
+                    "lane {lane}: {mask:04x}"
+                );
+            }
+        }
+        for masks in [
+            [1, 1, 1, 1],
+            [0, 0x8001, 0, 0xc000],
+            [0, 7, 0, 0],
+            [0xffff, 0, 0, 0],
+        ] {
+            let packed = masks
+                .iter()
+                .enumerate()
+                .fold(0u64, |n, (i, &m)| n | (u64::from(m as u16) << (i * 16)));
             assert_eq!(
-                ordinary_sparse_mask(mask),
-                mask.count_ones() <= 2,
-                "{mask:04x}"
+                unsafe { ordinary_sparse_group_mask(packed) },
+                masks.iter().all(|&m| (m as u16).count_ones() <= 2)
             );
         }
     }
