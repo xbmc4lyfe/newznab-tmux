@@ -277,6 +277,8 @@ class NNTPService extends NntpClient
      */
     protected string $_currentServer = 'NNTP_SERVER';
 
+    protected bool $_usingAlternateServer = false;
+
     /**
      * Are we allowed to post to usenet?
      */
@@ -447,11 +449,12 @@ class NNTPService extends NntpClient
         ];
         $primaryConnections = $this->_tmux->getUSPConnections('primary', $primaryUSP);
         $alternateConnections = $this->_tmux->getUSPConnections('alternate', $alternateUSP);
-        if ($this->_isConnected() && (($alternate && $this->_currentServer === $this->_configAlternateServer && ($this->_primaryNntpConnections < $alternateConnections['alternate']['active'])) || (! $alternate && $this->_currentServer === $this->_configServer && ($this->_primaryNntpConnections < $primaryConnections['primary']['active'])))) {
+        if ($this->_isConnected() && $this->_usingAlternateServer === $alternate && (($alternate && $this->_currentServer === $this->_configAlternateServer && ($this->_primaryNntpConnections < $alternateConnections['alternate']['active'])) || (! $alternate && $this->_currentServer === $this->_configServer && ($this->_primaryNntpConnections < $primaryConnections['primary']['active'])))) {
             return true;
         }
 
         $this->doQuit();
+        $this->_usingAlternateServer = $alternate;
 
         $ret = $connected = $cError = $aError = false;
 
@@ -620,6 +623,16 @@ class NNTPService extends NntpClient
         }
 
         return true;
+    }
+
+    /**
+     * Retain the configured provider slot, including shared hostnames with different accounts.
+     */
+    public function reconnect(bool $compression = true): mixed
+    {
+        $this->doQuit(\is_resource($this->_socket));
+
+        return $this->doConnect($compression, $this->_usingAlternateServer);
     }
 
     /**
@@ -1647,10 +1660,8 @@ class NNTPService extends NntpClient
      */
     public function dataError(NNTPService $nntp, string $group, bool $comp = true): mixed
     {
-        // Disconnect.
-        $nntp->doQuit();
         // Try reconnecting. This uses another round of max retries.
-        if ($nntp->doConnect($comp) !== true) {
+        if ($nntp->reconnect($comp) !== true) {
             return $this->throwError('Unable to reconnect to usenet!');
         }
 
@@ -1956,22 +1967,7 @@ class NNTPService extends NntpClient
         if (parent::_isConnected()) {
             $retVal = true;
         } else {
-            switch ($this->_currentServer) {
-                case $this->_configServer:
-                    if (\is_resource($this->_socket)) {
-                        $this->doQuit(true);
-                    }
-                    $retVal = $this->doConnect();
-                    break;
-                case $this->_configAlternateServer:
-                    if (\is_resource($this->_socket)) {
-                        $this->doQuit(true);
-                    }
-                    $retVal = $this->doConnect(true, true);
-                    break;
-                default:
-                    $retVal = $this->throwError('Wrong server constant used in NNTP checkConnection()!');
-            }
+            $retVal = $this->reconnect();
 
             if ($retVal === true && $reSelectGroup) {
                 $group = $this->selectGroup($currentGroup);

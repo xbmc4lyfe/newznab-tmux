@@ -85,8 +85,7 @@ class BinariesServiceDrainTest extends TestCase
             return $successful ? [] : false;
         });
         if (! $successful) {
-            $nntp->shouldReceive('doQuit')->once();
-            $nntp->shouldReceive('doConnect')->with(false)->once()->andReturn(false);
+            $nntp->shouldReceive('reconnect')->with(false)->once()->andReturn(false);
         }
         $service = new BinariesService(new BinariesConfig(messageBuffer: 3, echoCli: false), nntp: $nntp);
         $group = ['id' => 1, 'name' => 'alt.test', 'first_record' => 1, 'first_record_postdate' => '2026-10-01 00:00:00'];

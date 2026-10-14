@@ -6,6 +6,7 @@ namespace Tests\Feature;
 
 use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\ReleaseFingerprintMetadata;
+use App\Services\Nzb\NzbService;
 use App\Services\Releases\Fingerprint\NativeMetadataParser;
 use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
 use App\Services\Releases\Fingerprint\Par2MetadataParser;
@@ -21,6 +22,172 @@ use Tests\TestCase;
 
 final class ReleaseFingerprintMetadataTest extends TestCase
 {
+    #[Test]
+    public function it_recollects_prior_schema_metadata_for_new_archive_evidence(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.url' => null]);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('guid');
+        });
+        $migration = require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php');
+        $migration->up();
+        DB::table('releases')->insert(['id' => 1, 'guid' => 'qo-schema-fixture']);
+        ReleaseFingerprintMetadata::query()->create([
+            'releases_id' => 1, 'status' => 'complete', 'metadata' => ['schema_version' => 27],
+        ]);
+        $nzb = \Mockery::mock(NzbService::class);
+        $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
+        $yenc = new YencService;
+        $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
+        (new CollectReleaseFingerprintMetadata(1))->handle($collector);
+        self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
+        ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => 28]]);
+        $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
+        (new CollectReleaseFingerprintMetadata(1))->handle($collector);
+        self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
+    }
+
+    #[Test]
+    public function it_exposes_empty_rar5_file_copy_checksums_without_hashing_target_contents(): void
+    {
+        $sample = hex2bin('526172211a070100c51a333203010000ab8240160e0202010401008b9ed9d30000016141'
+            .'b72e581d1502030600040100000000000000016205050500016119b23a3503050000');
+        self::assertIsString($sample);
+        if ((new NativeMetadataParser)->parseFormats($sample) === null) {
+            self::markTestSkipped('Native Rust format metadata is required for file-copy checksum integration.');
+        }
+        $body = YencArticles::article($sample);
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        self::assertSame(hash('sha256', $body), $analysis['metadata']['article_body_sha256']);
+        $blocks = $analysis['metadata']['decoded_format_metadata']['headers'][0]['visible_block_walk']['blocks'];
+        self::assertSame(0xD3D99E8B, $blocks[1]['file_header']['data_crc32']);
+        self::assertSame('unpacked_file_data', $blocks[1]['file_header']['checksum_domain']);
+        $copy = $blocks[2]['file_header'];
+        self::assertSame('b', $copy['filename']);
+        self::assertSame(0, $copy['packed_size']);
+        self::assertSame(1, $copy['unpacked_size_effective']);
+        self::assertSame('empty_file_copy_entry_data', $copy['checksum_domain']);
+        self::assertSame('empty_file_copy_entry_data', $copy['data_crc32_scope']);
+        $relationship = $copy['redirection_checksum_relationship'];
+        self::assertSame('qualified_empty_entry_domain', $relationship['status']);
+        self::assertTrue($relationship['stored_crc32_matches_empty_data']);
+        self::assertSame('CRC32', $relationship['reference_selected_checksum']);
+        self::assertSame(36, $relationship['source_header_offset']);
+        self::assertSame(48, $relationship['source_crc32_byte_offset']);
+        self::assertSame(56, $relationship['source_record_offset']);
+        self::assertSame(62, $relationship['source_record_end_offset']);
+        self::assertFalse($relationship['target_resolution_performed']);
+
+        $blake = hex2bin('526172211a070100c51a33320301000024c3ca09340203290000010000000162'
+            .'050505000161220200dd0e891776933f43c7d032b08a917e25741f8aa9a12c12e1cac8801500f2ca4f19b23a3503050000');
+        self::assertIsString($blake);
+        $blakeAnalysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], YencArticles::article($blake));
+        $blakeCopy = $blakeAnalysis['metadata']['decoded_format_metadata']['headers'][0]['visible_block_walk']['blocks'][1]['file_header'];
+        self::assertTrue($blakeCopy['redirection_checksum_relationship']['stored_blake2sp_matches_empty_data']);
+        self::assertSame('BLAKE2sp', $blakeCopy['redirection_checksum_relationship']['reference_selected_checksum']);
+        self::assertNull($blakeCopy['redirection_checksum_relationship']['stored_crc32_matches_empty_data']);
+        self::assertSame(38, $blakeCopy['redirection_checksum_relationship']['source_hash_record_offset']);
+        self::assertSame(73, $blakeCopy['redirection_checksum_relationship']['source_hash_record_end_offset']);
+        self::assertSame(41, $blakeCopy['redirection_checksum_relationship']['source_hash_digest_offset']);
+    }
+
+    #[Test]
+    public function it_exposes_quick_open_cache_relationships_in_native_release_metadata(): void
+    {
+        $sample = hex2bin('526172211a070100fec2942c08010104000301011bb50bc71209020000000000000161'
+            .'28a2c30a0b030216001600000002514f67a54b8b11000e0e0f5ace8b0902000000000000016219b23a3503050000');
+        self::assertIsString($sample);
+        if ((new NativeMetadataParser)->parseFormats($sample) === null) {
+            self::markTestSkipped('Native Rust format metadata is required for Quick Open integration.');
+        }
+        $body = YencArticles::article($sample);
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        self::assertSame(hash('sha256', $body), $analysis['metadata']['article_body_sha256']);
+        $blocks = $analysis['metadata']['decoded_format_metadata']['headers'][0]['visible_block_walk']['blocks'];
+        self::assertSame('a', $blocks[1]['file_header']['filename']);
+        $cache = $blocks[2]['quick_open_cache'];
+        self::assertSame('complete', $cache['status']);
+        self::assertTrue($cache['declared_data_fully_scanned']);
+        self::assertSame(1, $cache['record_count']);
+        $record = $cache['records'][0];
+        self::assertTrue($record['structure_crc32_valid']);
+        self::assertFalse($record['cached_bytes_match_original']);
+        self::assertSame('mismatch', $record['comparison_status']);
+        self::assertSame([51, 73, 59, 73, 21, 35], array_map(
+            static fn (string $field): int => $record[$field],
+            ['structure_start_offset', 'structure_end_offset', 'cached_data_start_offset', 'cached_data_end_offset', 'original_start_offset', 'original_end_offset'],
+        ));
+        self::assertSame('b', $record['cached_header']['filename']);
+        self::assertSame('0f5ace8b09020000000000000162', $record['cached_data_preview_hex']);
+        self::assertSame(hash('sha256', substr($sample, 59, 14)), $record['cached_data_sha256']);
+        self::assertSame(hash('sha256', substr($sample, 21, 14)), $record['original_data_sha256']);
+
+        $large = hex2bin('526172211a070100fec2942c08010104000301011bb50bc71209020000000000000161'
+            .'37d760a30b030212001200000002514fd31cdf840d00ffffffffffffffffff01016119b23a3503050000');
+        self::assertIsString($large);
+        $largeAnalysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], YencArticles::article($large));
+        $largeRecord = $largeAnalysis['metadata']['decoded_format_metadata']['headers'][0]['visible_block_walk']['blocks'][2]['quick_open_cache']['records'][0];
+        self::assertSame('18446744073709551615', $largeRecord['backward_offset']);
+        self::assertSame('original_precedes_sample', $largeRecord['comparison_status']);
+        self::assertNull($largeRecord['cached_bytes_match_original']);
+    }
+
+    #[Test]
+    public function it_renders_persisted_quick_open_evidence_with_escaped_names_and_endpoint_provenance(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.url' => null]);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+        });
+        $migration = require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php');
+        $migration->up();
+        DB::table('releases')->insert(['id' => 1]);
+        ReleaseFingerprintMetadata::query()->create([
+            'releases_id' => 1,
+            'status' => 'partial',
+            'metadata' => ['schema_version' => 28, 'article_observations' => [[
+                'file_index' => 3, 'kind' => 'rar', 'message_id' => '<qo-fixture@example.invalid>',
+                'segment_number' => 1, 'sample_role' => 'first',
+                'server' => 'fixture.example', 'provider_label' => 'fixture', 'server_port' => 563,
+                'server_tls' => true, 'server_role' => 'primary',
+                'metadata' => ['decoded_format_metadata' => ['headers' => [['visible_block_walk' => ['blocks' => [[
+                    'header_start_offset' => 35,
+                    'quick_open_cache' => ['status' => 'service_data_partial', 'service_data_crc32_status' => 'data_partial',
+                        'records' => [['comparison_status' => 'mismatch', 'original_start_offset' => 21,
+                            'cached_data_start_offset' => 59, 'cached_header' => ['filename' => '<script>bad()</script>']]]],
+                ]]]]]]],
+            ]]],
+        ]);
+        $persisted = ReleaseFingerprintMetadata::query()->findOrFail(1);
+        $observation = $persisted->metadata['article_observations'][0];
+        self::assertSame('<qo-fixture@example.invalid>', $observation['message_id']);
+        self::assertSame([3, 1, 'first', 'fixture.example', 563, true, 'primary'], array_map(
+            static fn (string $field): mixed => $observation[$field],
+            ['file_index', 'segment_number', 'sample_role', 'server', 'server_port', 'server_tls', 'server_role'],
+        ));
+        self::assertSame(21, $observation['metadata']['decoded_format_metadata']['headers'][0]['visible_block_walk']['blocks'][0]['quick_open_cache']['records'][0]['original_start_offset']);
+        $html = view('details.partials.fingerprint-metadata', ['fingerprintMetadata' => $persisted])->render();
+        self::assertStringContainsString('quick_open_cache', $html);
+        self::assertStringContainsString('mismatch', $html);
+        self::assertStringContainsString('fixture.example', $html);
+        self::assertStringContainsString('&lt;qo-fixture@example.invalid&gt;', $html);
+        foreach (['file_index', 'segment_number', 'sample_role', 'server_port', 'server_tls', 'server_role',
+            'decoded_format_metadata', 'original_start_offset', 'cached_data_start_offset', 'data_partial'] as $field) {
+            self::assertStringContainsString($field, $html);
+        }
+        self::assertStringContainsString('&lt;script&gt;bad()&lt;/script&gt;', $html);
+        self::assertStringNotContainsString('<script>bad()</script>', $html);
+    }
+
     #[Test]
     public function it_exposes_archived_revision_declarations_without_replacing_stored_names(): void
     {

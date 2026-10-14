@@ -2,6 +2,11 @@ use md5::Md5;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+#[path = "rar5_copy_checksums.rs"]
+mod rar5_copy_checksums;
+#[path = "rar5_quick_open.rs"]
+mod rar5_quick_open;
+
 const SAMPLE_PREFIX_IDENTITY_LIMIT_BYTES: usize = 16_384;
 
 #[derive(Debug, Serialize)]
@@ -607,6 +612,8 @@ pub struct Rar5VisibleBlock {
     pub service_name_utf8_valid: Option<bool>,
     pub file_header: Option<Rar5FileHeaderObservation>,
     pub service_header: Option<Rar5FileHeaderObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quick_open_cache: Option<rar5_quick_open::Metadata>,
 }
 
 #[derive(Debug, Serialize)]
@@ -624,12 +631,16 @@ pub struct Rar5FileHeaderObservation {
     pub attributes: Option<u64>,
     pub modification_time_unix_seconds: Option<u32>,
     pub data_crc32: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_crc32_byte_offset: Option<usize>,
     pub data_crc32_scope: Option<&'static str>,
     pub data_crc32_scope_basis: Option<&'static str>,
     pub checksum_domain: &'static str,
     pub checksum_transformation: &'static str,
     pub checksum_transformation_status: &'static str,
     pub encryption_presence: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirection_checksum_relationship: Option<rar5_copy_checksums::Relationship>,
     pub file_extra_records: Rar5FileExtraRecords,
     pub compression_info: Option<u64>,
     pub compression_version: Option<u8>,
@@ -951,6 +962,7 @@ pub fn parse(data: &[u8]) -> FormatMetadata {
     let mut signatures = Vec::new();
     let mut headers = Vec::new();
     let mut candidate_scan_truncated_formats = Vec::new();
+    let mut quick_open_budget = rar5_quick_open::Budget::default();
 
     for (format, signature) in [
         ("RAR 5", RAR5),
@@ -982,7 +994,7 @@ pub fn parse(data: &[u8]) -> FormatMetadata {
             });
             match format {
                 "RAR 4" => headers.push(parse_rar4(data, offset)),
-                "RAR 5" => headers.push(parse_rar5(data, offset)),
+                "RAR 5" => headers.push(parse_rar5(data, offset, &mut quick_open_budget)),
                 "7-Zip" => headers.push(parse_7z(data, offset)),
                 "ZIP" => headers.push(parse_zip(data, offset)),
                 "gzip" => headers.push(parse_gzip(data, offset)),
@@ -1546,7 +1558,11 @@ fn parse_zip_extra_ids(extra: &[u8]) -> (Vec<u16>, usize, usize) {
     (ids, count, 0)
 }
 
-fn parse_rar5(data: &[u8], offset: usize) -> FormatHeader {
+fn parse_rar5(
+    data: &[u8],
+    offset: usize,
+    quick_open_budget: &mut rar5_quick_open::Budget,
+) -> FormatHeader {
     let block_start = offset + RAR5.len();
     let Some(crc_bytes) = data.get(block_start..block_start + 4) else {
         return empty_rar5(offset);
@@ -1694,6 +1710,7 @@ fn parse_rar5(data: &[u8], offset: usize) -> FormatHeader {
             block_start,
             calculated_crc_is_valid && typed_header_complete,
             main_extra_records.as_deref(),
+            quick_open_budget,
         )
     });
 
@@ -1811,6 +1828,7 @@ fn read_rar5_visible_block_walk(
     main_header_start: usize,
     main_header_trusted: bool,
     main_extra_records: Option<&Rar5MainExtraRecords>,
+    quick_open_budget: &mut rar5_quick_open::Budget,
 ) -> Rar5VisibleBlockWalk {
     let (quick_open_offset, recovery_record_offset, locator_status) = match main_extra_records {
         None => (None, None, "locator_unavailable"),
@@ -1863,8 +1881,18 @@ fn read_rar5_visible_block_walk(
             walk.stopped_offset = Some(cursor);
             break;
         }
-        let (observation, descriptor, status) =
+        let (mut observation, descriptor, status) =
             read_rar5_block_observation(data, cursor, block_index);
+        if observation.header_type == Some(3)
+            && observation.service_name_bytes_hex.as_deref() == Some("514f")
+        {
+            observation.quick_open_cache = Some(rar5_quick_open::parse(
+                data,
+                &observation,
+                &walk.blocks,
+                quick_open_budget,
+            ));
+        }
         walk.inspected_block_count += 1;
         walk.blocks.push(observation);
         let Some(block) = descriptor else {
@@ -2045,6 +2073,7 @@ fn read_rar5_block_observation(
         service_name_utf8_valid: None,
         file_header: None,
         service_header: None,
+        quick_open_cache: None,
     };
     let Some(size_start) = start.checked_add(4) else {
         return (observation, None, "header_offset_overflow");
@@ -2140,6 +2169,7 @@ fn read_rar5_block_observation(
             observation.header_crc32_valid,
         );
         if header_type == 2 {
+            rar5_copy_checksums::derive(&mut header, start, header_type, header_flags);
             observation.file_header = Some(header);
         } else {
             header.name_interpretation = "service_identifier_not_archived_file_name";
@@ -2205,6 +2235,7 @@ fn read_rar5_block_observation(
                     set_rar5_version_authority(extras, status);
                 }
             }
+            rar5_copy_checksums::derive(&mut header, start, header_type, header_flags);
             observation.service_header = Some(header);
         }
     }
@@ -2288,6 +2319,7 @@ fn parse_rar5_file_header(
         attributes: None,
         modification_time_unix_seconds: None,
         data_crc32: None,
+        data_crc32_byte_offset: None,
         data_crc32_scope: None,
         data_crc32_scope_basis: None,
         checksum_domain: if header_flags & 0x10 != 0 {
@@ -2298,6 +2330,7 @@ fn parse_rar5_file_header(
         checksum_transformation: "unknown",
         checksum_transformation_status: "file_header_fields_unavailable",
         encryption_presence: "unknown",
+        redirection_checksum_relationship: None,
         file_extra_records: parse_rar5_file_extra_records(data, fields_end, header_end),
         compression_info: None,
         compression_version: None,
@@ -2357,6 +2390,7 @@ fn parse_rar5_file_header(
         result.data_crc32 = Some(u32::from_le_bytes(
             bytes.try_into().expect("four-byte RAR5 file CRC32"),
         ));
+        result.data_crc32_byte_offset = Some(cursor);
         result.data_crc32_scope = Some(if result.split_after {
             "packed_current_volume_data"
         } else {
@@ -8412,6 +8446,68 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn rar5_file_copy_literal_ffi_distinguishes_empty_entry_from_target_crc() {
+        let sample: Vec<u8> = "526172211a070100c51a333203010000ab8240160e0202010401008b9ed9d30000016141b72e581d1502030600040100000000000000016205050500016119b23a3503050000"
+            .as_bytes().as_chunks::<2>().0.iter()
+            .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap()).collect();
+        let pointer = unsafe { crate::nntmux_format_metadata_json(sample.as_ptr(), sample.len()) };
+        assert!(!pointer.is_null());
+        let json: serde_json::Value =
+            serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(pointer).to_bytes() })
+                .unwrap();
+        unsafe { crate::nntmux_metadata_string_free(pointer) };
+        let blocks = &json["headers"][0]["visible_block_walk"]["blocks"];
+        let source = &blocks[1]["file_header"];
+        let copy = &blocks[2]["file_header"];
+        assert_eq!(source["data_crc32"], 0xd3d99e8bu32);
+        assert_eq!(source["checksum_domain"], "unpacked_file_data");
+        assert_eq!(copy["data_crc32"], 0);
+        assert_eq!(copy["unpacked_size_effective"], 1);
+        assert_eq!(copy["packed_size"], 0);
+        assert_eq!(copy["checksum_domain"], "empty_file_copy_entry_data");
+        assert_eq!(copy["data_crc32_scope"], "empty_file_copy_entry_data");
+        let relationship = &copy["redirection_checksum_relationship"];
+        assert_eq!(relationship["status"], "qualified_empty_entry_domain");
+        assert_eq!(relationship["stored_crc32_matches_empty_data"], true);
+        assert_eq!(relationship["source_header_offset"], 36);
+        assert_eq!(relationship["source_record_offset"], 56);
+        assert_eq!(relationship["source_record_end_offset"], 62);
+        assert_eq!(relationship["target_resolution_performed"], false);
+    }
+
+    #[test]
+    fn rar5_quick_open_literal_ffi_compares_cache_with_original_sample_bytes() {
+        let sample = [
+            0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00, 0xfe, 0xc2, 0x94, 0x2c, 0x08, 0x01,
+            0x01, 0x04, 0x00, 0x03, 0x01, 0x01, 0x1b, 0xb5, 0x0b, 0xc7, 0x12, 0x09, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x61, 0x28, 0xa2, 0xc3, 0x0a, 0x0b, 0x03, 0x02,
+            0x16, 0x00, 0x16, 0x00, 0x00, 0x00, 0x02, 0x51, 0x4f, 0xa4, 0x9e, 0x3f, 0x03, 0x11,
+            0x00, 0x0e, 0x0e, 0xb5, 0x0b, 0xc7, 0x12, 0x09, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x61, 0x19, 0xb2, 0x3a, 0x35, 0x03, 0x05, 0x00, 0x00,
+        ];
+        let pointer = unsafe { crate::nntmux_format_metadata_json(sample.as_ptr(), sample.len()) };
+        assert!(!pointer.is_null());
+        let json: serde_json::Value =
+            serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(pointer).to_bytes() })
+                .unwrap();
+        unsafe { crate::nntmux_metadata_string_free(pointer) };
+        let cache = &json["headers"][0]["visible_block_walk"]["blocks"][2]["quick_open_cache"];
+        assert_eq!(cache["status"], "complete");
+        let record = &cache["records"][0];
+        assert_eq!(record["structure_start_offset"], 51);
+        assert_eq!(record["structure_end_offset"], 73);
+        assert_eq!(record["cached_data_start_offset"], 59);
+        assert_eq!(record["cached_data_end_offset"], 73);
+        assert_eq!(record["backward_offset"], 14);
+        assert_eq!(record["original_start_offset"], 21);
+        assert_eq!(record["original_end_offset"], 35);
+        assert_eq!(record["structure_crc32_valid"], true);
+        assert_eq!(record["cached_bytes_match_original"], true);
+        assert_eq!(record["cached_header"]["filename"], "a");
+        assert_eq!(record["original_block_index"], 1);
     }
 
     #[test]
