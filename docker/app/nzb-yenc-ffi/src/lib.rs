@@ -57,6 +57,13 @@ pub extern "C" fn rapidyenc_version() -> c_int {
     VERSION
 }
 
+/// Return 1 when raw payload decoding skips CR/LF inside escape pairs.
+/// This optional NNTmux capability leaves the RapidYenc compatibility ABI intact.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_yenc_supports_split_escapes() -> c_int {
+    1
+}
+
 /// Return PAR2 packet metadata as a newly allocated UTF-8 JSON C string.
 /// The caller must release it with `nntmux_metadata_string_free`.
 ///
@@ -803,6 +810,19 @@ mod tests {
     #[test]
     fn joins_escapes_split_across_a_line_break() {
         assert_eq!(decode_via_abi(b"k=\r\n@").unwrap(), b"A\xd6");
+    }
+
+    #[test]
+    fn advertised_split_escape_capability_matches_abi_decoding() {
+        assert_eq!(nntmux_yenc_supports_split_escapes(), 1);
+        for payload in [b"=\n@".as_slice(), b"=\r@", b"=\r\n\r\n@", b"=\r\n=\n=\r="] {
+            let expected = if payload.ends_with(b"@") {
+                b"\xd6".as_slice()
+            } else {
+                b"\xd3\xd3".as_slice()
+            };
+            assert_eq!(decode_via_abi(payload).unwrap(), expected);
+        }
     }
 
     #[test]

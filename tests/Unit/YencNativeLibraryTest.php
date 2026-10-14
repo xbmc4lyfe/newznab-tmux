@@ -96,6 +96,17 @@ final class YencNativeLibraryTest extends TestCase
         new NativePayloadDecoder($path);
     }
 
+    public function test_split_escape_capability_is_cached_for_the_loaded_library(): void
+    {
+        $path = $this->compile(['WITH_SPLIT_ESCAPE_CAPABILITY', 'SPLIT_ESCAPE_DECODER']);
+        $first = new NativePayloadDecoder($path);
+        $second = new NativePayloadDecoder($path);
+        $this->assertTrue($first->supportsSplitEscapes());
+        $this->assertTrue($second->supportsSplitEscapes());
+        $probe = \FFI::cdef('int fixture_split_escape_capability_calls(void);', $path);
+        $this->assertSame(1, $probe->fixture_split_escape_capability_calls()); // @phpstan-ignore method.notFound
+    }
+
     /** @param list<string> $defines */
     private function compile(array $defines): string
     {

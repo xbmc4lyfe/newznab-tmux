@@ -2,11 +2,16 @@
 
 namespace Tests\Unit;
 
+use App\Services\Yenc\NativePayloadDecoder;
 use App\Services\Yenc\PhpPayloadDecoder;
 use App\Services\Yenc\RawPayloadDecoder;
 use App\Services\YencService;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use ReflectionClass;
 use RuntimeException;
+use Symfony\Component\Process\ExecutableFinder;
+use Symfony\Component\Process\Process;
 use Tests\Fixtures\YencArticles;
 
 class YencServiceTest extends TestCase
@@ -256,6 +261,104 @@ class YencServiceTest extends TestCase
         $this->assertSame("ABC\xe3", (new YencService($decoder))->decode($article));
         $this->assertNull($decoder->receivedRaw);
         $this->assertSame('klm=M', $decoder->receivedStripped);
+    }
+
+    /** @return iterable<string, array{list<string>, bool}> */
+    public static function splitEscapeCapabilities(): iterable
+    {
+        yield 'supported' => [['WITH_SPLIT_ESCAPE_CAPABILITY', 'SPLIT_ESCAPE_DECODER'], true];
+        yield 'absent with capable decoder' => [['SPLIT_ESCAPE_DECODER'], false];
+        yield 'legacy decoder' => [[], false];
+        yield 'explicit zero' => [['WITH_SPLIT_ESCAPE_CAPABILITY', 'SPLIT_ESCAPE_CAPABILITY=0', 'SPLIT_ESCAPE_DECODER'], false];
+        yield 'unsupported positive' => [['WITH_SPLIT_ESCAPE_CAPABILITY', 'SPLIT_ESCAPE_CAPABILITY=2', 'SPLIT_ESCAPE_DECODER'], false];
+        yield 'unsupported negative' => [['WITH_SPLIT_ESCAPE_CAPABILITY', 'SPLIT_ESCAPE_CAPABILITY=-1', 'SPLIT_ESCAPE_DECODER'], false];
+        yield 'false advertisement' => [['WITH_SPLIT_ESCAPE_CAPABILITY'], false];
+        yield 'invalid known-answer length' => [['WITH_SPLIT_ESCAPE_CAPABILITY', 'SPLIT_ESCAPE_DECODER', 'BAD_SPLIT_LENGTH'], false];
+    }
+
+    /** @param list<string> $defines */
+    #[DataProvider('splitEscapeCapabilities')]
+    public function test_only_verified_native_capability_receives_split_escapes(array $defines, bool $supported): void
+    {
+        $this->withNativeFixture($defines, function (NativePayloadDecoder $decoder, \FFI $probe) use ($supported): void {
+            $this->assertSame($supported, $decoder->supportsSplitEscapes());
+            foreach (["=\n@", "=\r@", "=\r\n\r\n@", "=\r\n=\n=\r="] as $payload) {
+                $expected = str_ends_with($payload, '@') ? "\xd6" : "\xd3\xd3";
+                $article = '=ybegin line=128 size='.strlen($expected)." name=x\n".$payload
+                    ."\n=yend size=".strlen($expected).' crc32='.hash('crc32b', $expected);
+                $service = new YencService($decoder);
+                $this->assertSame($expected, $service->decode($article));
+                $this->assertSame($supported ? 1 : 0, $probe->fixture_last_payload_had_split_escape()); // @phpstan-ignore method.notFound
+                $this->assertSame($expected, $service->decodeIgnore($article));
+                $this->assertSame($supported ? 1 : 0, $probe->fixture_last_payload_had_split_escape()); // @phpstan-ignore method.notFound
+            }
+        });
+    }
+
+    public function test_verified_split_escape_decoder_preserves_strict_validation_and_dangling_recovery(): void
+    {
+        $this->withNativeFixture(['WITH_SPLIT_ESCAPE_CAPABILITY', 'SPLIT_ESCAPE_DECODER'], function (NativePayloadDecoder $decoder): void {
+            $service = new YencService($decoder);
+            foreach ([
+                "=ybegin line=128 size=2 name=x\n=\n@\n=yend size=2",
+                "=ybegin line=128 size=1 name=x\n=\n@\n=yend size=1 crc32=deadbeef",
+                "=ybegin line=128 size=1 name=x\n=\n==\n=yend size=1",
+            ] as $article) {
+                try {
+                    $service->decode($article);
+                    $this->fail('Strict native decoding must reject corrupt size, checksum, or dangling escape.');
+                } catch (RuntimeException) {
+                    $this->addToAssertionCount(1);
+                }
+            }
+            $dangling = "=ybegin line=128 size=1 name=x\n=\n==\n=yend size=1";
+            $this->assertSame("\xd3", $service->decodeIgnore($dangling));
+        });
+    }
+
+    /**
+     * Exercise the real FFI adapter on non-Linux test hosts without changing its production platform guard.
+     *
+     * @param  list<string>  $defines
+     * @param  callable(NativePayloadDecoder, \FFI): void  $assertions
+     */
+    private function withNativeFixture(array $defines, callable $assertions): void
+    {
+        if (! extension_loaded('FFI') || in_array(strtolower((string) ini_get('ffi.enable')), ['', '0', 'false', 'off'], true)) {
+            $this->markTestSkipped('Native capability probes require CLI FFI.');
+        }
+        $compiler = (new ExecutableFinder)->find('cc');
+        if ($compiler === null) {
+            $this->markTestSkipped('Native capability probes require a C compiler.');
+        }
+        $directory = sys_get_temp_dir().'/nntmux-yenc-capability-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        $path = $directory.'/library.so';
+        try {
+            $command = [$compiler, '-shared', '-fPIC', '-O2'];
+            foreach ($defines as $define) {
+                $command[] = '-D'.$define;
+            }
+            (new Process([...$command, __DIR__.'/../Fixtures/rapidyenc-abi.c', '-o', $path]))->mustRun();
+            if (PHP_OS_FAMILY === 'Linux') {
+                $decoder = new NativePayloadDecoder($path);
+            } else {
+                $reflection = new ReflectionClass(NativePayloadDecoder::class);
+                $decoder = $reflection->newInstanceWithoutConstructor();
+                $library = \FFI::cdef('size_t rapidyenc_decode_ex(int, const void*, void*, size_t, int*);', $path);
+                $reflection->getProperty('library')->setValue($decoder, $library);
+                $reflection->getProperty('crcLibrary')->setValue($decoder, null);
+                $supported = $reflection->getMethod('detectSplitEscapeSupport')->invoke($decoder, $path);
+                $reflection->getProperty('splitEscapesSupported')->setValue($decoder, $supported);
+            }
+            $probe = \FFI::cdef('int fixture_last_payload_had_split_escape(void);', $path);
+            $assertions($decoder, $probe);
+        } finally {
+            if (is_file($path)) {
+                unlink($path);
+            }
+            rmdir($directory);
+        }
     }
 
     public function test_decode_with_frame_reports_where_a_part_sits_in_its_file(): void

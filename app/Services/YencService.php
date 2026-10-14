@@ -184,6 +184,9 @@ class YencService
 
     private function decodePayload(string $slice): string
     {
+        if ($this->decoder instanceof NativePayloadDecoder && $this->decoder->supportsSplitEscapes()) {
+            return $this->decoder->decodeRaw($slice);
+        }
         if ($this->decoder instanceof RawPayloadDecoder) {
             // Search line endings rather than every escape; split escapes need stripped recovery.
             $splitEscape = preg_match('/(?<==)[\r\n]/', $slice);

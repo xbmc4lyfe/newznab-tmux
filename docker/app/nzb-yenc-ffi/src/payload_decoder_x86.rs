@@ -43,6 +43,64 @@ const fn removal_shuffles<const POSITIONS: usize>(removed: usize) -> [[u8; 16]; 
     table
 }
 
+// Each AVX2 lane gathers one sixteen-byte output window. The windows
+// overlap by one or two bytes, so both full stores remain inside the result.
+// The second mask gathers bytes from the opposite source lane.
+const SPARSE_ONE: [[[u8; 32]; 2]; 32] = sparse_shuffles::<32>(1);
+const SPARSE_PAIR: [[[u8; 32]; 2]; 31] = sparse_shuffles::<31>(2);
+
+const fn sparse_shuffles<const POSITIONS: usize>(removed: usize) -> [[[u8; 32]; 2]; POSITIONS] {
+    let mut table = [[[0x80; 32]; 2]; POSITIONS];
+    let mut position = 0;
+    while position < POSITIONS {
+        let mut output_lane = 0;
+        while output_lane < 2 {
+            let start = if output_lane == 0 { 0 } else { 16 - removed };
+            let mut offset = 0;
+            while offset < 16 {
+                let output_index = start + offset;
+                let source_index = if output_index < position {
+                    output_index
+                } else {
+                    output_index + removed
+                };
+                let opposite = (source_index / 16 != output_lane) as usize;
+                table[position][opposite][output_lane * 16 + offset] = (source_index % 16) as u8;
+                offset += 1;
+            }
+            output_lane += 1;
+        }
+        position += 1;
+    }
+    table
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn store_sparse_avx2(
+    decoded: x86::__m256i,
+    masks: &[[u8; 32]; 2],
+    count: usize,
+    destination: *mut u8,
+) {
+    use x86::*;
+    unsafe {
+        let packed = _mm256_or_si256(
+            _mm256_shuffle_epi8(decoded, _mm256_loadu_si256(masks[0].as_ptr().cast())),
+            _mm256_shuffle_epi8(
+                _mm256_permute4x64_epi64::<0x4e>(decoded),
+                _mm256_loadu_si256(masks[1].as_ptr().cast()),
+            ),
+        );
+        _mm_storeu_si128(destination.cast(), _mm256_castsi256_si128(packed));
+        _mm_storeu_si128(
+            destination.add(count - 16).cast(),
+            _mm256_extracti128_si256::<1>(packed),
+        );
+    }
+}
+
 /// Join two zero-padded compacted words and write exactly their retained bytes.
 #[inline]
 unsafe fn store_pair(
@@ -238,6 +296,16 @@ pub(crate) unsafe fn decode_avx2(source: *const u8, destination: *mut u8, length
     let mut escaped = false;
     unsafe {
         while length - read >= 32 {
+            // Keep wrapped payloads aligned after full encoded lines. CR/LF
+            // are ignored even while an escape value is pending; preserve
+            // that state and leave a short remaining span to the scalar tail.
+            if matches!(source.add(read).read(), b'\r' | b'\n') {
+                read += 1;
+                while read < length && matches!(source.add(read).read(), b'\r' | b'\n') {
+                    read += 1;
+                }
+                continue;
+            }
             let bytes = _mm256_loadu_si256(source.add(read).cast());
             let specials = _mm256_movemask_epi8(_mm256_cmpeq_epi8(
                 bytes,
@@ -282,6 +350,36 @@ pub(crate) unsafe fn decode_avx2(source: *const u8, destination: *mut u8, length
                     written += 16;
                     read += 32;
                     continue;
+                }
+                if !escaped {
+                    // A single special cannot contain a malformed escape. An
+                    // escape in lane 15 needs a cross-lane value adjustment;
+                    // retain the established general path for that boundary.
+                    let position = specials.trailing_zeros() as usize;
+                    let single = specials.is_power_of_two() && equals & 0x8000 == 0;
+                    let newline_pair = equals == 0 && specials >> position == 3;
+                    if single || newline_pair {
+                        let decoded = _mm256_sub_epi8(
+                            _mm256_sub_epi8(bytes, _mm256_set1_epi8(42)),
+                            _mm256_and_si256(
+                                _mm256_slli_si256::<1>(equals_vector),
+                                _mm256_set1_epi8(64),
+                            ),
+                        );
+                        let (masks, count) = if single {
+                            (&SPARSE_ONE[position], 31)
+                        } else {
+                            (&SPARSE_PAIR[position], 30)
+                        };
+                        // Both input lanes are already loaded. The overlapping
+                        // stores are safe for in-place and destination-behind
+                        // decoding, and neither store reaches beyond count.
+                        store_sparse_avx2(decoded, masks, count, destination.add(written));
+                        escaped = equals & 0x8000_0000 != 0;
+                        written += count;
+                        read += 32;
+                        continue;
+                    }
                 }
                 written += compact_ssse3(
                     _mm256_castsi256_si128(bytes),
@@ -373,6 +471,122 @@ mod tests {
                         assert_eq!(&output[..written], &expected[..expected_length]);
                         assert!(output[written..].iter().all(|&byte| byte == 0xa5));
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_avx2_blocks_preserve_exact_output_for_every_removal_and_tail() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("ssse3") {
+            return;
+        }
+        for position in 0..32 {
+            for special in [b"=".as_slice(), b"\r", b"\n", b"\r\n", b"\n\r"] {
+                let tails: Vec<Vec<u8>> = (0..32)
+                    .map(|length| vec![b'k'; length])
+                    .chain([
+                        b"=".to_vec(),
+                        b"\r\n".to_vec(),
+                        b"=\r\n@".to_vec(),
+                        b"==".to_vec(),
+                    ])
+                    .collect();
+                for tail in tails {
+                    let mut payload = vec![b'k'; 32];
+                    payload.splice(position..position + 1, special.iter().copied());
+                    payload.extend_from_slice(&tail);
+                    let mut reference = vec![0; payload.len()];
+                    let expected = unsafe {
+                        scalar_tail(
+                            payload.as_ptr(),
+                            reference.as_mut_ptr(),
+                            payload.len(),
+                            0,
+                            0,
+                            false,
+                        )
+                    };
+                    for destination_offset in 0..32 {
+                        let mut output = vec![0xa5; payload.len() + 64];
+                        let written = unsafe {
+                            decode_avx2(
+                                payload.as_ptr(),
+                                output.as_mut_ptr().add(destination_offset),
+                                payload.len(),
+                            )
+                        };
+                        assert_eq!(
+                            written, expected,
+                            "position {position}, special {special:?}, tail {tail:?}"
+                        );
+                        assert_eq!(
+                            &output[destination_offset..destination_offset + written],
+                            &reference[..expected]
+                        );
+                        assert!(
+                            output[..destination_offset]
+                                .iter()
+                                .all(|&byte| byte == 0xa5)
+                        );
+                        assert!(
+                            output[destination_offset + written..]
+                                .iter()
+                                .all(|&byte| byte == 0xa5)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_avx2_payloads_preserve_escape_carry_and_unused_storage() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("ssse3") {
+            return;
+        }
+        for width in [31, 32, 33, 63, 64, 65, 127, 128, 129] {
+            for tail_length in 0..32 {
+                for prefix in [b"".as_slice(), b"=", b"\r\n", b"=\r\n"] {
+                    let mut payload = prefix.to_vec();
+                    for _ in 0..5 {
+                        payload.extend(
+                            (0..width).map(|index| if index % 2 == 0 { b'=' } else { b'@' }),
+                        );
+                        payload.extend_from_slice(b"\r\n");
+                    }
+                    payload.extend(std::iter::repeat_n(b'k', tail_length));
+                    payload.extend_from_slice(b"=\r\n");
+                    let mut reference = vec![0; payload.len()];
+                    let expected = unsafe {
+                        scalar_tail(
+                            payload.as_ptr(),
+                            reference.as_mut_ptr(),
+                            payload.len(),
+                            0,
+                            0,
+                            false,
+                        )
+                    };
+                    let mut output = vec![0xa5; payload.len() + 32];
+                    let written = unsafe {
+                        decode_avx2(payload.as_ptr(), output.as_mut_ptr(), payload.len())
+                    };
+                    assert_eq!(
+                        written, expected,
+                        "width {width}, tail {tail_length}, prefix {prefix:?}"
+                    );
+                    assert_eq!(&output[..written], &reference[..expected]);
+                    assert!(output[written..].iter().all(|&byte| byte == 0xa5));
+                    let mut in_place = payload.clone();
+                    in_place.extend_from_slice(&[0xa5; 32]);
+                    let untouched = in_place[expected..].to_vec();
+                    let written = unsafe {
+                        decode_avx2(in_place.as_ptr(), in_place.as_mut_ptr(), payload.len())
+                    };
+                    assert_eq!(written, expected);
+                    assert_eq!(&in_place[..written], &reference[..expected]);
+                    assert_eq!(&in_place[written..], &untouched);
                 }
             }
         }

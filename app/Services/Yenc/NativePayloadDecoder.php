@@ -10,12 +10,14 @@ use RuntimeException;
 
 final class NativePayloadDecoder implements RawPayloadDecoder
 {
-    /** @var array<string, array{decoder: FFI, crc: FFI|null}> */
+    /** @var array<string, array{decoder: FFI, crc: FFI|null, split_escapes: bool}> */
     private static array $libraries = [];
 
     private readonly FFI $library;
 
     private readonly ?FFI $crcLibrary;
+
+    private readonly bool $splitEscapesSupported;
 
     public function __construct(string $path)
     {
@@ -32,6 +34,7 @@ final class NativePayloadDecoder implements RawPayloadDecoder
         if (isset(self::$libraries[$key])) {
             $this->library = self::$libraries[$key]['decoder'];
             $this->crcLibrary = self::$libraries[$key]['crc'];
+            $this->splitEscapesSupported = self::$libraries[$key]['split_escapes'];
 
             return;
         }
@@ -49,12 +52,22 @@ final class NativePayloadDecoder implements RawPayloadDecoder
         if ($this->crcLibrary !== null && $this->crc32('ABC') !== 'a3830348') {
             throw new RuntimeException('RapidYenc failed its CRC32 known-answer check.');
         }
-        self::$libraries[$key] = ['decoder' => $this->library, 'crc' => $this->crcLibrary];
+        $this->splitEscapesSupported = $this->detectSplitEscapeSupport($resolved);
+        self::$libraries[$key] = [
+            'decoder' => $this->library,
+            'crc' => $this->crcLibrary,
+            'split_escapes' => $this->splitEscapesSupported,
+        ];
     }
 
     public function decode(string $payload): string
     {
         return $this->decodeRaw($payload);
+    }
+
+    public function supportsSplitEscapes(): bool
+    {
+        return $this->splitEscapesSupported;
     }
 
     public function decodeRaw(string $payload): string
@@ -96,6 +109,27 @@ final class NativePayloadDecoder implements RawPayloadDecoder
         $version = $this->library->rapidyenc_version(); // @phpstan-ignore method.notFound
 
         return sprintf('%d.%d.%d', ($version >> 16) & 0xFF, ($version >> 8) & 0xFF, $version & 0xFF);
+    }
+
+    private function detectSplitEscapeSupport(string $path): bool
+    {
+        try {
+            $capability = FFI::cdef('int nntmux_yenc_supports_split_escapes(void);', $path);
+        } catch (FfiException $exception) {
+            if ($exception->getMessage() !== "Failed resolving C function 'nntmux_yenc_supports_split_escapes'") {
+                throw $exception;
+            }
+
+            return false;
+        }
+        if ($capability->nntmux_yenc_supports_split_escapes() !== 1) { // @phpstan-ignore method.notFound
+            return false;
+        }
+        try {
+            return $this->decodeRaw("k=\r\n\r\n@l=\nJm=\rM=\r\n=\n=\r=") === "A\xd6B\xe0C\xe3\xd3\xd3";
+        } catch (RuntimeException) {
+            return false;
+        }
     }
 
     private function loadCrcLibrary(string $path): ?FFI
