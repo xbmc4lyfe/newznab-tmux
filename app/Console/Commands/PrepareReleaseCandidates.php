@@ -23,7 +23,8 @@ class PrepareReleaseCandidates extends Command
             return self::SUCCESS;
         }
         try {
-            $changed = $service->prepare(max(1, (int) $this->option('limit')), max(1, (int) $this->option('max-seconds')));
+            $changed = $service->prepare(max(1, (int) $this->option('limit')), max(1, (int) $this->option('max-seconds')),
+                fn (bool $advance): bool => $locks->preferPending($advance));
             $this->info('Classified '.$changed.' candidate header inventories.');
 
             return self::SUCCESS;

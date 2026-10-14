@@ -12,16 +12,29 @@ final class CandidatePreparationService
 {
     public function __construct(private readonly ManifestStore $store, private readonly CandidateHeaderInventory $inventory) {}
 
-    public function prepare(int $limit, int $seconds): int
+    /** @param (callable(bool): bool)|null $preferPending */
+    public function prepare(int $limit, int $seconds, ?callable $preferPending = null): int
     {
+        $limit = max(1, $limit);
+        $phase = 0;
+        $preferPending ??= static function (bool $advance) use (&$phase): bool {
+            $next = ($phase + 1) % 5;
+            if ($advance) {
+                $phase = $next;
+            }
+
+            return $next !== 0;
+        };
         $deadline = hrtime(true) + max(1, $seconds) * 1_000_000_000;
         $cutoff = now();
         $inspected = 0;
         $changed = 0;
         $cursors = [];
         $exhausted = [];
-        while ($inspected < max(1, $limit) && count($exhausted) < 2 && hrtime(true) < $deadline) {
-            foreach (['pending', 'unknown'] as $status) {
+        while ($inspected < $limit && count($exhausted) < 2 && hrtime(true) < $deadline) {
+            // Peek before selection; spend a turn only when its first metadata read is admitted.
+            $statuses = $preferPending(false) ? ['pending', 'unknown'] : ['unknown', 'pending'];
+            foreach ($statuses as $status) {
                 if (isset($exhausted[$status]) || hrtime(true) >= $deadline || $inspected >= $limit) {
                     continue;
                 }
@@ -39,9 +52,14 @@ final class CandidatePreparationService
                 if ($rows->count() < $pageSize) {
                     $exhausted[$status] = true;
                 }
+                $phaseCommitted = false;
                 foreach ($rows as $row) {
                     if (hrtime(true) >= $deadline) {
                         break 2;
+                    }
+                    if (! $phaseCommitted) {
+                        $preferPending(true);
+                        $phaseCommitted = true;
                     }
                     $inspected++;
                     $cursors[$status] = [$row->next_attempt_at, $row->id];
@@ -64,6 +82,9 @@ final class CandidatePreparationService
                         ->whereNull('release_id')->whereNull('lease_token')
                         ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', $cutoff))
                         ->update($values);
+                }
+                if ($rows->isNotEmpty()) {
+                    break;
                 }
             }
         }
