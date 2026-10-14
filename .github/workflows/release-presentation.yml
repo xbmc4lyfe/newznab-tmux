@@ -1,6 +1,8 @@
 name: Rust release presentation
 
 on:
+  push:
+    branches: [master]
   pull_request:
     branches: [master]
     paths:
@@ -17,6 +19,8 @@ on:
       - 'tests/Fixtures/ReleasePresentation.Dockerfile*'
       - 'resources/css/app.css'
       - 'scripts/*release*'
+      - 'scripts/export-benchmark-summary.py'
+      - 'tests/Unit/test_benchmark_summary_export.py'
       - '.github/workflows/release-presentation.yml'
   workflow_dispatch:
 
@@ -49,6 +53,7 @@ jobs:
       - name: Verify native parity and restricted web scope
         run: php vendor/bin/phpunit --fail-on-skipped tests/Unit/AdminReleaseNamesNativeTest.php tests/Unit/AdminReleaseNamesTest.php tests/Feature/AdminReleaseNameViewTest.php
       - name: Compare complete rendering integration with PHP
+        shell: bash
         run: |
           mkdir -p benchmark-evidence
           docker/app/nzb-yenc-ffi/target/release/nntmux-evidence-utility --mode presentation-header
@@ -62,11 +67,20 @@ jobs:
           container=$(docker run -d -p 127.0.0.1::80 release-presentation-fixture)
           trap 'docker logs "$container"; docker rm -f "$container"' EXIT
           address=$(docker port "$container" 80/tcp)
-          for attempt in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl -fsS "http://$address" >/dev/null; then break; fi
             sleep 1
           done
           python3 scripts/test-release-presentation-web.py "http://$address"
+      - name: Export compact public benchmark summary
+        if: always()
+        run: python3 scripts/export-benchmark-summary.py --kind=presentation --runner=ubuntu-latest --output=public-summary/summary.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-benchmark-presentation-ubuntu-latest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public-summary/summary.json
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         if: always()
         with:

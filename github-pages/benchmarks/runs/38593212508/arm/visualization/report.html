@@ -1,0 +1,490 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>yEnc performance evidence</title><style>body{font:16px system-ui;background:#101827;color:#e5e7eb;margin:32px;max-width:1400px}table{border-collapse:collapse}td,th{padding:8px;text-align:left;border-bottom:1px solid #334155}img{width:100%;margin:20px 0}summary{cursor:pointer}</style><body><h1>Native yEnc performance evidence</h1><p>Run result: <strong>inconclusive</strong>.</p>
+<p>C++ is the pinned RapidYenc baseline; Rust is the built candidate. Identical synthetic article fixtures execute real YencService and memory-backed NNTP BODY calls. This paired comparison does not measure network, database, archive metadata or production throughput.</p>
+<p>Speedup = C++ time / Rust time. 1× means equal time. Time saved = 100 × (1 − Rust time / C++ time). Decisions and simultaneous confidence intervals come from the uninstrumented paired benchmark; inconclusive estimates do not establish a gain.</p>
+<table><tr><th>Stratum</th><th>Decision</th><th>Speedup</th><th>95% speedup interval</th><th>Time saved</th><th>Eligible / invalid</th></tr>
+<tr><td>4096 B / ordinary / tolerant</td><td>useful_improvement</td><td>1.125×</td><td>1.081–1.167×</td><td>11.08%</td><td>31 / 0</td></tr>
+<tr><td>4096 B / ordinary / strict</td><td>inconclusive</td><td>1.089×</td><td>1.020–1.138×</td><td>8.18%</td><td>31 / 0</td></tr>
+<tr><td>4096 B / ordinary / body</td><td>inconclusive</td><td>1.105×</td><td>1.020–1.139×</td><td>9.51%</td><td>31 / 0</td></tr>
+<tr><td>4096 B / heavy / tolerant</td><td>useful_improvement</td><td>1.318×</td><td>1.263–1.383×</td><td>24.14%</td><td>31 / 0</td></tr>
+<tr><td>4096 B / heavy / strict</td><td>useful_improvement</td><td>1.253×</td><td>1.191–1.312×</td><td>20.22%</td><td>31 / 0</td></tr>
+<tr><td>4096 B / heavy / body</td><td>useful_improvement</td><td>1.159×</td><td>1.113–1.187×</td><td>13.72%</td><td>31 / 0</td></tr>
+<tr><td>524288 B / ordinary / tolerant</td><td>useful_improvement</td><td>1.496×</td><td>1.465–1.560×</td><td>33.14%</td><td>31 / 0</td></tr>
+<tr><td>524288 B / ordinary / strict</td><td>useful_improvement</td><td>1.461×</td><td>1.429–1.516×</td><td>31.55%</td><td>31 / 0</td></tr>
+<tr><td>524288 B / ordinary / body</td><td>useful_improvement</td><td>1.218×</td><td>1.212–1.234×</td><td>17.87%</td><td>31 / 0</td></tr>
+<tr><td>524288 B / heavy / tolerant</td><td>useful_improvement</td><td>1.939×</td><td>1.891–1.989×</td><td>48.42%</td><td>31 / 0</td></tr>
+<tr><td>524288 B / heavy / strict</td><td>useful_improvement</td><td>1.915×</td><td>1.874–1.950×</td><td>47.78%</td><td>31 / 0</td></tr>
+<tr><td>524288 B / heavy / body</td><td>useful_improvement</td><td>1.248×</td><td>1.234–1.263×</td><td>19.89%</td><td>31 / 0</td></tr>
+<tr><td>1048576 B / ordinary / tolerant</td><td>useful_improvement</td><td>1.487×</td><td>1.467–1.508×</td><td>32.77%</td><td>31 / 0</td></tr>
+<tr><td>1048576 B / ordinary / strict</td><td>useful_improvement</td><td>1.465×</td><td>1.435–1.492×</td><td>31.72%</td><td>31 / 0</td></tr>
+<tr><td>1048576 B / ordinary / body</td><td>useful_improvement</td><td>1.168×</td><td>1.151–1.175×</td><td>14.39%</td><td>31 / 0</td></tr>
+<tr><td>1048576 B / heavy / tolerant</td><td>useful_improvement</td><td>1.850×</td><td>1.828–1.872×</td><td>45.95%</td><td>31 / 0</td></tr>
+<tr><td>1048576 B / heavy / strict</td><td>useful_improvement</td><td>1.820×</td><td>1.783–1.849×</td><td>45.06%</td><td>31 / 0</td></tr>
+<tr><td>1048576 B / heavy / body</td><td>useful_improvement</td><td>1.203×</td><td>1.190–1.214×</td><td>16.90%</td><td>31 / 0</td></tr>
+<tr><td>8388608 B / ordinary / tolerant</td><td>useful_improvement</td><td>1.501×</td><td>1.479–1.522×</td><td>33.37%</td><td>31 / 0</td></tr>
+<tr><td>8388608 B / ordinary / strict</td><td>useful_improvement</td><td>1.477×</td><td>1.443–1.519×</td><td>32.32%</td><td>31 / 0</td></tr>
+<tr><td>8388608 B / ordinary / body</td><td>useful_improvement</td><td>1.131×</td><td>1.124–1.144×</td><td>11.55%</td><td>31 / 0</td></tr>
+<tr><td>8388608 B / heavy / tolerant</td><td>useful_improvement</td><td>1.859×</td><td>1.840–1.886×</td><td>46.22%</td><td>31 / 0</td></tr>
+<tr><td>8388608 B / heavy / strict</td><td>useful_improvement</td><td>1.814×</td><td>1.791–1.846×</td><td>44.86%</td><td>31 / 0</td></tr>
+<tr><td>8388608 B / heavy / body</td><td>useful_improvement</td><td>1.180×</td><td>1.163–1.206×</td><td>15.23%</td><td>31 / 0</td></tr>
+</table>
+<img src="speedup.svg" alt="Paired speedup estimates by fixture and call path">
+<h2>Executed PHP hot paths</h2><p>The separate Rust-only metadata workload executes NzbFingerprintAnalyzer and native RAR5/NNTP metadata parsing over a fixed verified archive-header fixture. It has no C++ counterpart and supplies no migration speedup estimate.</p><p>Xdebug profiles include process bootstrap, fixture setup, warmup, decoding and correctness checks. Exclusive function time is shown below; inclusive call-edge cost is listed separately and must not be added across edges. FFI calls are opaque here; native internals appear in the separate CPU sampling flamegraphs. Instrumentation changes cost and these numbers are not speedup measurements.</p>
+<p>Profiling setup/run receipt: {&quot;exit_code&quot;: 0, &quot;phase&quot;: &quot;native-build-and-capture&quot;, &quot;script_receipt&quot;: {&quot;exit_code&quot;: 0, &quot;phase&quot;: &quot;capture-summary&quot;, &quot;status&quot;: &quot;complete&quot;}, &quot;status&quot;: &quot;complete&quot;}</p>
+<details open><summary>profiles/cpp-heavy-body/php.callgrind</summary>
+<p>Total exclusive profiled cost: 1891.115 ms.</p><img src="hotpaths-0.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>1789.963</td></tr>
+<tr><td>yencProfileExecute → Tests\Support\YencNntpHarness-&gt;fetch</td><td>101</td><td>1755.684</td></tr>
+<tr><td>Tests\Support\YencNntpHarness-&gt;fetch → App\Services\NNTP\NNTPService-&gt;_getMessageByMessageID</td><td>101</td><td>1754.932</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;_getMessageByMessageID → App\Services\NNTP\NNTPService-&gt;readBody</td><td>101</td><td>1752.689</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readBody → App\Services\NNTP\NNTPService-&gt;readRawBody</td><td>101</td><td>1289.335</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readBody → App\Services\YencService-&gt;decodeIgnore</td><td>101</td><td>150.242</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>116.097</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::fgets</td><td>827695</td><td>107.005</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;decodePayload</td><td>101</td><td>76.730</td></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>72.423</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::str_ends_with</td><td>827695</td><td>50.852</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::str_starts_with</td><td>827594</td><td>50.850</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw</td><td>101</td><td>48.219</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;payloadSlice</td><td>101</td><td>32.245</td></tr>
+<tr><td>App\Services\YencService-&gt;payloadSlice → php::substr</td><td>101</td><td>31.930</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw → php::FFI-&gt;new</td><td>102</td><td>29.274</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>25.967</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>21.611</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>21.522</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>20.741</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → php::preg_match</td><td>101</td><td>20.287</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>18.623</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>3</td><td>16.115</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>25</td><td>10.436</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>9.930</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>9.661</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.621</td></tr>
+<tr><td>yencProfileExecute → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>2.638</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/tests/Support/YencNntpHarness.php</td><td>1</td><td>2.537</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/tests/Support/YencNntpHarness.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>2.530</td></tr>
+</table></details>
+<details open><summary>profiles/cpp-heavy-strict/php.callgrind</summary>
+<p>Total exclusive profiled cost: 264.292 ms.</p><img src="hotpaths-1.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>163.249</td></tr>
+<tr><td>yencProfileExecute → App\Services\YencService-&gt;decode</td><td>101</td><td>132.814</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>103.332</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;decodePayload</td><td>101</td><td>77.456</td></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>72.323</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw</td><td>101</td><td>49.960</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;payloadSlice</td><td>101</td><td>24.685</td></tr>
+<tr><td>App\Services\YencService-&gt;payloadSlice → php::substr</td><td>101</td><td>24.465</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>22.742</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>22.268</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>22.179</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw → php::FFI-&gt;new</td><td>102</td><td>21.490</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → php::preg_match</td><td>101</td><td>20.334</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>19.060</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>17.967</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw → php::FFI::string</td><td>102</td><td>11.885</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>10.016</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>9.689</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>2</td><td>9.651</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.775</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>23</td><td>7.780</td></tr>
+<tr><td>{main} → php::ReflectionClass-&gt;__construct</td><td>9</td><td>4.195</td></tr>
+<tr><td>php::ReflectionClass-&gt;__construct → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>5</td><td>4.177</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\YencService-&gt;crc32</td><td>101</td><td>2.892</td></tr>
+<tr><td>App\Services\YencService-&gt;crc32 → App\Services\Yenc\NativePayloadDecoder-&gt;crc32</td><td>101</td><td>2.637</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\YencService-&gt;number</td><td>202</td><td>1.474</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::fields</td><td>202</td><td>1.306</td></tr>
+<tr><td>{main} → App\Services\Yenc\DecoderFactory-&gt;make</td><td>1</td><td>1.301</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php</td><td>1</td><td>1.142</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>1.133</td></tr>
+</table></details>
+<details open><summary>profiles/cpp-heavy-tolerant/php.callgrind</summary>
+<p>Total exclusive profiled cost: 257.860 ms.</p><img src="hotpaths-2.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>156.683</td></tr>
+<tr><td>yencProfileExecute → App\Services\YencService-&gt;decodeIgnore</td><td>101</td><td>126.882</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>103.375</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;decodePayload</td><td>101</td><td>77.519</td></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>72.431</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw</td><td>101</td><td>50.031</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;payloadSlice</td><td>101</td><td>24.657</td></tr>
+<tr><td>App\Services\YencService-&gt;payloadSlice → php::substr</td><td>101</td><td>24.383</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>22.189</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>22.111</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>22.078</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw → php::FFI-&gt;new</td><td>102</td><td>21.621</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → php::preg_match</td><td>101</td><td>20.466</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>19.427</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>18.154</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw → php::FFI::string</td><td>102</td><td>11.982</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>9.993</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>2</td><td>9.677</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>9.676</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.816</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>23</td><td>7.971</td></tr>
+<tr><td>{main} → php::ReflectionClass-&gt;__construct</td><td>9</td><td>4.251</td></tr>
+<tr><td>php::ReflectionClass-&gt;__construct → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>5</td><td>4.231</td></tr>
+<tr><td>{main} → App\Services\Yenc\DecoderFactory-&gt;make</td><td>1</td><td>1.311</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php</td><td>1</td><td>1.152</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>1.143</td></tr>
+<tr><td>App\Services\Yenc\DecoderFactory-&gt;make → App\Services\Yenc\NativePayloadDecoder-&gt;__construct</td><td>1</td><td>0.998</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::fields</td><td>101</td><td>0.810</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php</td><td>1</td><td>0.784</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>0.773</td></tr>
+</table></details>
+<details open><summary>profiles/cpp-ordinary-body/php.callgrind</summary>
+<p>Total exclusive profiled cost: 964.468 ms.</p><img src="hotpaths-3.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>865.393</td></tr>
+<tr><td>yencProfileExecute → Tests\Support\YencNntpHarness-&gt;fetch</td><td>101</td><td>841.991</td></tr>
+<tr><td>Tests\Support\YencNntpHarness-&gt;fetch → App\Services\NNTP\NNTPService-&gt;_getMessageByMessageID</td><td>101</td><td>841.516</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;_getMessageByMessageID → App\Services\NNTP\NNTPService-&gt;readBody</td><td>101</td><td>839.623</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readBody → App\Services\NNTP\NNTPService-&gt;readRawBody</td><td>101</td><td>639.806</td></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>72.332</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::fgets</td><td>420463</td><td>55.602</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readBody → App\Services\YencService-&gt;decodeIgnore</td><td>101</td><td>42.648</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>27.249</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::str_starts_with</td><td>420362</td><td>25.794</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::str_ends_with</td><td>420463</td><td>25.629</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;decodePayload</td><td>101</td><td>23.941</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>22.017</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>21.928</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>14.042</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw</td><td>101</td><td>12.983</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>10.778</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>25</td><td>10.570</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → php::preg_match</td><td>101</td><td>10.035</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>3</td><td>9.760</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>9.367</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.842</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>6.739</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>6.493</td></tr>
+<tr><td>yencProfileExecute → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>2.651</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/tests/Support/YencNntpHarness.php</td><td>1</td><td>2.552</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/tests/Support/YencNntpHarness.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>2.545</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw → php::FFI-&gt;new</td><td>102</td><td>2.397</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw → php::FFI::string</td><td>102</td><td>2.373</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;payloadSlice</td><td>101</td><td>2.103</td></tr>
+</table></details>
+<details open><summary>profiles/cpp-ordinary-strict/php.callgrind</summary>
+<p>Total exclusive profiled cost: 162.180 ms.</p><img src="hotpaths-4.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>72.326</td></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>62.211</td></tr>
+<tr><td>yencProfileExecute → App\Services\YencService-&gt;decode</td><td>101</td><td>45.720</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>25.290</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;decodePayload</td><td>101</td><td>22.599</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>21.235</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>21.147</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>13.811</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw</td><td>101</td><td>11.928</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>10.350</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → php::preg_match</td><td>101</td><td>10.003</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>9.275</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.369</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>23</td><td>7.779</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>6.776</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>6.539</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>2</td><td>6.461</td></tr>
+<tr><td>{main} → php::ReflectionClass-&gt;__construct</td><td>9</td><td>4.153</td></tr>
+<tr><td>php::ReflectionClass-&gt;__construct → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>5</td><td>4.135</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\YencService-&gt;crc32</td><td>101</td><td>2.799</td></tr>
+<tr><td>App\Services\YencService-&gt;crc32 → App\Services\Yenc\NativePayloadDecoder-&gt;crc32</td><td>101</td><td>2.575</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw → php::FFI::string</td><td>102</td><td>2.277</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw → php::FFI-&gt;new</td><td>102</td><td>1.929</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;payloadSlice</td><td>101</td><td>1.775</td></tr>
+<tr><td>App\Services\YencService-&gt;payloadSlice → php::substr</td><td>101</td><td>1.636</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\YencService-&gt;number</td><td>202</td><td>1.496</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::fields</td><td>202</td><td>1.290</td></tr>
+<tr><td>{main} → App\Services\Yenc\DecoderFactory-&gt;make</td><td>1</td><td>1.249</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php</td><td>1</td><td>1.135</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>1.126</td></tr>
+</table></details>
+<details open><summary>profiles/cpp-ordinary-tolerant/php.callgrind</summary>
+<p>Total exclusive profiled cost: 156.833 ms.</p><img src="hotpaths-5.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>72.342</td></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>56.435</td></tr>
+<tr><td>yencProfileExecute → App\Services\YencService-&gt;decodeIgnore</td><td>101</td><td>40.209</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>25.795</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;decodePayload</td><td>101</td><td>22.832</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>21.605</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>21.519</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>13.211</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw</td><td>101</td><td>11.967</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>10.388</td></tr>
+<tr><td>App\Services\YencService-&gt;decodePayload → php::preg_match</td><td>101</td><td>9.967</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>9.260</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.600</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>23</td><td>7.798</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>6.749</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>6.511</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>2</td><td>6.468</td></tr>
+<tr><td>{main} → php::ReflectionClass-&gt;__construct</td><td>9</td><td>4.150</td></tr>
+<tr><td>php::ReflectionClass-&gt;__construct → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>5</td><td>4.132</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw → php::FFI::string</td><td>102</td><td>2.224</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeRaw → php::FFI-&gt;new</td><td>102</td><td>1.951</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\YencService-&gt;payloadSlice</td><td>101</td><td>1.914</td></tr>
+<tr><td>App\Services\YencService-&gt;payloadSlice → php::substr</td><td>101</td><td>1.770</td></tr>
+<tr><td>{main} → App\Services\Yenc\DecoderFactory-&gt;make</td><td>1</td><td>1.282</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php</td><td>1</td><td>1.177</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>1.168</td></tr>
+<tr><td>App\Services\Yenc\DecoderFactory-&gt;make → App\Services\Yenc\NativePayloadDecoder-&gt;__construct</td><td>1</td><td>0.966</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::fields</td><td>101</td><td>0.821</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php</td><td>1</td><td>0.778</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>0.767</td></tr>
+</table></details>
+<details open><summary>profiles/rust-heavy-body/php.callgrind</summary>
+<p>Total exclusive profiled cost: 1954.888 ms.</p><img src="hotpaths-6.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>1701.168</td></tr>
+<tr><td>yencProfileExecute → Tests\Support\YencNntpHarness-&gt;fetch</td><td>101</td><td>1667.523</td></tr>
+<tr><td>Tests\Support\YencNntpHarness-&gt;fetch → App\Services\NNTP\NNTPService-&gt;_getMessageByMessageID</td><td>101</td><td>1666.935</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;_getMessageByMessageID → App\Services\NNTP\NNTPService-&gt;readBody</td><td>101</td><td>1664.901</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readBody → App\Services\NNTP\NNTPService-&gt;readRawBody</td><td>101</td><td>1282.421</td></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>225.052</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::fgets</td><td>827695</td><td>110.362</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readBody → App\Services\YencService-&gt;decodeIgnore</td><td>101</td><td>78.417</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::str_starts_with</td><td>827594</td><td>50.859</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::str_ends_with</td><td>827695</td><td>50.777</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>47.458</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan</td><td>101</td><td>39.633</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI-&gt;new</td><td>101</td><td>28.552</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>24.367</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>21.436</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>21.349</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>20.184</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>18.451</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>3</td><td>16.090</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>25</td><td>10.314</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>9.920</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>9.650</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.515</td></tr>
+<tr><td>yencProfileExecute → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>2.555</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/tests/Support/YencNntpHarness.php</td><td>1</td><td>2.450</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/tests/Support/YencNntpHarness.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>2.444</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI::string</td><td>101</td><td>1.679</td></tr>
+<tr><td>{main} → php::ReflectionClass-&gt;__construct</td><td>9</td><td>1.600</td></tr>
+<tr><td>php::ReflectionClass-&gt;__construct → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>3</td><td>1.584</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::fields</td><td>101</td><td>1.541</td></tr>
+</table></details>
+<details open><summary>profiles/rust-heavy-strict/php.callgrind</summary>
+<p>Total exclusive profiled cost: 317.517 ms.</p><img src="hotpaths-7.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>223.863</td></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>65.773</td></tr>
+<tr><td>yencProfileExecute → App\Services\YencService-&gt;decode</td><td>101</td><td>42.739</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>22.688</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>21.856</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>21.753</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>19.112</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>17.995</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>16.581</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan</td><td>101</td><td>15.890</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>9.942</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>9.676</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>2</td><td>9.656</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.817</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>23</td><td>7.852</td></tr>
+<tr><td>{main} → php::ReflectionClass-&gt;__construct</td><td>9</td><td>4.187</td></tr>
+<tr><td>php::ReflectionClass-&gt;__construct → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>5</td><td>4.166</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI-&gt;new</td><td>102</td><td>3.119</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI::string</td><td>101</td><td>2.124</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\YencService-&gt;number</td><td>202</td><td>1.542</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::fields</td><td>202</td><td>1.306</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php</td><td>1</td><td>1.162</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>1.152</td></tr>
+<tr><td>App\Services\YencService-&gt;number → App\Services\YencService-&gt;metadataNumber</td><td>202</td><td>0.850</td></tr>
+<tr><td>{main} → App\Services\Yenc\DecoderFactory-&gt;make</td><td>1</td><td>0.807</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php</td><td>1</td><td>0.772</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>0.742</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/nunomaduro/collision/src/Adapters/Phpunit/Autoload.php</td><td>1</td><td>0.543</td></tr>
+<tr><td>App\Services\Yenc\DecoderFactory-&gt;make → App\Services\Yenc\NativePayloadDecoder-&gt;__construct</td><td>1</td><td>0.479</td></tr>
+<tr><td>{main} → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>2</td><td>0.436</td></tr>
+</table></details>
+<details open><summary>profiles/rust-heavy-tolerant/php.callgrind</summary>
+<p>Total exclusive profiled cost: 311.980 ms.</p><img src="hotpaths-8.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>224.488</td></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>59.982</td></tr>
+<tr><td>yencProfileExecute → App\Services\YencService-&gt;decodeIgnore</td><td>101</td><td>37.264</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>22.073</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>21.611</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>21.526</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>19.342</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>18.034</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>14.030</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan</td><td>101</td><td>13.367</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>9.922</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>9.680</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>2</td><td>9.637</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.581</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>23</td><td>7.858</td></tr>
+<tr><td>{main} → php::ReflectionClass-&gt;__construct</td><td>9</td><td>4.212</td></tr>
+<tr><td>php::ReflectionClass-&gt;__construct → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>5</td><td>4.192</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI-&gt;new</td><td>101</td><td>3.100</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI::string</td><td>101</td><td>2.238</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php</td><td>1</td><td>1.161</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>1.152</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::fields</td><td>101</td><td>0.820</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php</td><td>1</td><td>0.796</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>0.786</td></tr>
+<tr><td>{main} → App\Services\Yenc\DecoderFactory-&gt;make</td><td>1</td><td>0.724</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/nunomaduro/collision/src/Adapters/Phpunit/Autoload.php</td><td>1</td><td>0.518</td></tr>
+<tr><td>{main} → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>2</td><td>0.387</td></tr>
+<tr><td>App\Services\Yenc\DecoderFactory-&gt;make → App\Services\Yenc\NativePayloadDecoder-&gt;__construct</td><td>1</td><td>0.381</td></tr>
+<tr><td>App\Services\Yenc\DecoderFactory-&gt;make → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>0.326</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/nunomaduro/collision/src/Adapters/Phpunit/Autoload.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>0.321</td></tr>
+</table></details>
+<details open><summary>profiles/rust-ordinary-body/php.callgrind</summary>
+<p>Total exclusive profiled cost: 1104.252 ms.</p><img src="hotpaths-9.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>852.213</td></tr>
+<tr><td>yencProfileExecute → Tests\Support\YencNntpHarness-&gt;fetch</td><td>101</td><td>828.566</td></tr>
+<tr><td>Tests\Support\YencNntpHarness-&gt;fetch → App\Services\NNTP\NNTPService-&gt;_getMessageByMessageID</td><td>101</td><td>828.006</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;_getMessageByMessageID → App\Services\NNTP\NNTPService-&gt;readBody</td><td>101</td><td>826.036</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readBody → App\Services\NNTP\NNTPService-&gt;readRawBody</td><td>101</td><td>636.916</td></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>224.576</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::fgets</td><td>420463</td><td>55.068</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readBody → App\Services\YencService-&gt;decodeIgnore</td><td>101</td><td>32.017</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::str_starts_with</td><td>420362</td><td>25.812</td></tr>
+<tr><td>App\Services\NNTP\NNTPService-&gt;readRawBody → php::str_ends_with</td><td>420463</td><td>25.740</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>22.258</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>22.167</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>16.161</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan</td><td>101</td><td>15.250</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>14.494</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>10.915</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>25</td><td>10.668</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>3</td><td>9.754</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>9.433</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.834</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>6.719</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>6.503</td></tr>
+<tr><td>yencProfileExecute → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>2.748</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/tests/Support/YencNntpHarness.php</td><td>1</td><td>2.612</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/tests/Support/YencNntpHarness.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>2.605</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI::string</td><td>101</td><td>2.554</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI-&gt;new</td><td>101</td><td>1.653</td></tr>
+<tr><td>{main} → php::ReflectionClass-&gt;__construct</td><td>9</td><td>1.563</td></tr>
+<tr><td>php::ReflectionClass-&gt;__construct → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>3</td><td>1.547</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::fields</td><td>101</td><td>1.407</td></tr>
+</table></details>
+<details open><summary>profiles/rust-ordinary-strict/php.callgrind</summary>
+<p>Total exclusive profiled cost: 303.454 ms.</p><img src="hotpaths-10.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>224.181</td></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>50.921</td></tr>
+<tr><td>yencProfileExecute → App\Services\YencService-&gt;decode</td><td>101</td><td>34.613</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>22.269</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>22.176</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>17.063</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan</td><td>101</td><td>16.340</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>14.043</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>10.489</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>9.347</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.937</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>23</td><td>7.889</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>6.695</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>6.488</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>2</td><td>6.467</td></tr>
+<tr><td>{main} → php::ReflectionClass-&gt;__construct</td><td>9</td><td>4.260</td></tr>
+<tr><td>php::ReflectionClass-&gt;__construct → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>5</td><td>4.240</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI::string</td><td>101</td><td>2.296</td></tr>
+<tr><td>App\Services\YencService-&gt;decode → App\Services\YencService-&gt;number</td><td>202</td><td>1.512</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::fields</td><td>202</td><td>1.254</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php</td><td>1</td><td>1.168</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>1.158</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI-&gt;new</td><td>102</td><td>1.111</td></tr>
+<tr><td>App\Services\YencService-&gt;number → App\Services\YencService-&gt;metadataNumber</td><td>202</td><td>0.894</td></tr>
+<tr><td>{main} → App\Services\Yenc\DecoderFactory-&gt;make</td><td>1</td><td>0.807</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php</td><td>1</td><td>0.792</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>0.782</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/nunomaduro/collision/src/Adapters/Phpunit/Autoload.php</td><td>1</td><td>0.507</td></tr>
+<tr><td>App\Services\Yenc\DecoderFactory-&gt;make → App\Services\Yenc\NativePayloadDecoder-&gt;__construct</td><td>1</td><td>0.459</td></tr>
+<tr><td>{main} → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>2</td><td>0.392</td></tr>
+</table></details>
+<details open><summary>profiles/rust-ordinary-tolerant/php.callgrind</summary>
+<p>Total exclusive profiled cost: 296.528 ms.</p><img src="hotpaths-11.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>224.066</td></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>44.396</td></tr>
+<tr><td>yencProfileExecute → App\Services\YencService-&gt;decodeIgnore</td><td>101</td><td>28.433</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>22.067</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>21.977</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\YencService-&gt;decodeFramePayload</td><td>101</td><td>14.088</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeFramePayload → App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan</td><td>101</td><td>13.433</td></tr>
+<tr><td>App\Services\YencService-&gt;decodeIgnore → App\Services\Yenc\ArticleFrame::parse</td><td>101</td><td>13.246</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::findControl</td><td>303</td><td>10.504</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::findControl → php::stripos</td><td>202</td><td>9.346</td></tr>
+<tr><td>ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43}</td><td>51</td><td>8.906</td></tr>
+<tr><td>Composer\Autoload\ClassLoader-&gt;loadClass → {closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577}</td><td>23</td><td>7.916</td></tr>
+<tr><td>yencProfileExecute → yencProfileLoadFixture</td><td>1</td><td>6.699</td></tr>
+<tr><td>yencProfileLoadFixture → php::hash</td><td>2</td><td>6.469</td></tr>
+<tr><td>yencProfileExecute → php::hash</td><td>2</td><td>6.467</td></tr>
+<tr><td>{main} → php::ReflectionClass-&gt;__construct</td><td>9</td><td>4.238</td></tr>
+<tr><td>php::ReflectionClass-&gt;__construct → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>5</td><td>4.218</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI::string</td><td>101</td><td>2.231</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php</td><td>1</td><td>1.182</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/app/Services/NNTP/NNTPService.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>1.172</td></tr>
+<tr><td>App\Services\Yenc\NativePayloadDecoder-&gt;decodeSpan → php::FFI-&gt;new</td><td>101</td><td>0.956</td></tr>
+<tr><td>App\Services\Yenc\ArticleFrame::parse → App\Services\Yenc\ArticleFrame::fields</td><td>101</td><td>0.866</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/ClassLoader.php:575-577} → include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php</td><td>1</td><td>0.806</td></tr>
+<tr><td>{main} → App\Services\Yenc\DecoderFactory-&gt;make</td><td>1</td><td>0.799</td></tr>
+<tr><td>include::/home/runner/work/newznab-tmux/newznab-tmux/vendor/dariusiii/net_nntp/src/Client.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>0.796</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/nunomaduro/collision/src/Adapters/Phpunit/Autoload.php</td><td>1</td><td>0.533</td></tr>
+<tr><td>App\Services\Yenc\DecoderFactory-&gt;make → App\Services\Yenc\NativePayloadDecoder-&gt;__construct</td><td>1</td><td>0.447</td></tr>
+<tr><td>{main} → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>2</td><td>0.392</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/nunomaduro/collision/src/Adapters/Phpunit/Autoload.php → Composer\Autoload\ClassLoader-&gt;loadClass</td><td>1</td><td>0.329</td></tr>
+<tr><td>{closure:/home/runner/work/newznab-tmux/newznab-tmux/vendor/composer/autoload_real.php:37-43} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/symfony/polyfill-mbstring/bootstrap.php</td><td>1</td><td>0.317</td></tr>
+</table></details>
+<details open><summary>profiles/rust-rar5-metadata/php.callgrind</summary>
+<p>Total exclusive profiled cost: 696.013 ms.</p><img src="hotpaths-12.svg" alt="Top executed PHP functions">
+<table><tr><th>Caller → callee</th><th>Calls</th><th>Inclusive cost (ms)</th></tr>
+<tr><td>{main} → yencProfileExecute</td><td>1</td><td>444.857</td></tr>
+<tr><td>yencProfileExecute → yencProfileExecuteMetadata</td><td>1</td><td>444.466</td></tr>
+<tr><td>yencProfileExecuteMetadata → App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer-&gt;analyzeArticleAndDecodedBytes</td><td>501</td><td>411.901</td></tr>
+<tr><td>{main} → php::hash_file</td><td>14</td><td>224.685</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer-&gt;analyzeArticleAndDecodedBytes → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseFormats</td><td>501</td><td>67.838</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseFormats → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseJson</td><td>501</td><td>66.027</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer-&gt;analyzeArticleAndDecodedBytes → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseYencFraming</td><td>501</td><td>53.466</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseYencFraming → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseJson</td><td>501</td><td>51.757</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseJson → php::json_decode</td><td>2505</td><td>51.247</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer-&gt;analyzeArticleAndDecodedBytes → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseNntpHeaders</td><td>501</td><td>49.051</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseNntpHeaders → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseJson</td><td>501</td><td>47.274</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseJson → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;library</td><td>1002</td><td>47.208</td></tr>
+<tr><td>config → Illuminate\Config\Repository-&gt;get</td><td>2505</td><td>45.350</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer-&gt;analyzeArticleAndDecodedBytes → php::finfo-&gt;buffer</td><td>1002</td><td>43.249</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseJson → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;headerLibrary</td><td>1002</td><td>39.630</td></tr>
+<tr><td>Illuminate\Config\Repository-&gt;get → Illuminate\Support\Arr::get</td><td>2505</td><td>35.499</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;library → config</td><td>1002</td><td>34.693</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer-&gt;analyzeArticleAndDecodedBytes → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;compareNntpLinesToBody</td><td>501</td><td>31.558</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;headerLibrary → config</td><td>1002</td><td>31.548</td></tr>
+<tr><td>config → app</td><td>2505</td><td>30.045</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;compareNntpLinesToBody → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseJson</td><td>501</td><td>28.895</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer-&gt;analyzeArticleAndDecodedBytes → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseNntpBody</td><td>501</td><td>28.506</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseNntpBody → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseJson</td><td>501</td><td>26.864</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer-&gt;analyzeArticleAndDecodedBytes → App\Services\YencService-&gt;decodeWithFrame</td><td>501</td><td>24.633</td></tr>
+<tr><td>app → Illuminate\Container\Container-&gt;make</td><td>2505</td><td>24.429</td></tr>
+<tr><td>{main} → require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php</td><td>1</td><td>21.723</td></tr>
+<tr><td>require::/home/runner/work/newznab-tmux/newznab-tmux/vendor/autoload.php → ComposerAutoloaderInit062bd1ff39b33ab38c7b9edf8166ecd6::getLoader</td><td>1</td><td>21.637</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;parseJson → App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;bodyLibrary</td><td>501</td><td>19.858</td></tr>
+<tr><td>Illuminate\Container\Container-&gt;make → Illuminate\Container\Container-&gt;resolve</td><td>2505</td><td>19.369</td></tr>
+<tr><td>App\Services\Releases\Fingerprint\NativeMetadataParser-&gt;bodyLibrary → config</td><td>501</td><td>15.772</td></tr>
+</table></details>
+<h2>Native CPU sampling</h2><p>Searchable, zoomable sampled native stacks use separate optimized builds with debug information. Width represents folded CPU-clock period weights in nanoseconds, not sample counts or elapsed wall time. Event records are counted separately. Whole-process samples include setup and correctness verification. Unavailable or invalid captures cannot identify native hot paths.</p>
+<table><tr><th>Workload</th><th>Capture status</th><th>Sample records</th><th>CPU-clock weight (ms)</th><th>Flamegraph</th></tr>
+<tr><td>cpp-heavy-body</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>cpp-heavy-strict</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>cpp-heavy-tolerant</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>cpp-ordinary-body</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>cpp-ordinary-strict</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>cpp-ordinary-tolerant</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>rust-heavy-body</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>rust-heavy-strict</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>rust-heavy-tolerant</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>rust-ordinary-body</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>rust-ordinary-strict</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>rust-ordinary-tolerant</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+<tr><td>rust-rar5-metadata</td><td>unavailable</td><td>0</td><td>0.000</td><td>unavailable</td></tr>
+</table></body></html>
