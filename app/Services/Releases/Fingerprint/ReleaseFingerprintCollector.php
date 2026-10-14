@@ -1044,6 +1044,8 @@ final class ReleaseFingerprintCollector
         $par2SourceBlocks = null;
         $par2SourceBlocksOverflow = false;
         $par2SourceBlocksWithinLimit = null;
+        $par2SourceBlockBasis = $multiplePar2Sets
+            ? 'unavailable-multiple-recovery-sets' : 'unavailable-source-block-denominator';
         if (! $multiplePar2Sets && $par2SetIds !== []) {
             $singleSetId = array_key_first($par2SetIds);
             $main = $par2SetMainPackets[$singleSetId] ?? null;
@@ -1059,6 +1061,7 @@ final class ReleaseFingerprintCollector
             $par2SourceBlocks = $layout['source_block_count'];
             $par2SourceBlocksOverflow = $layout['source_block_count_overflow'];
             $par2SourceBlocksWithinLimit = $layout['source_block_count_within_current_v2_limit'];
+            $par2SourceBlockBasis = $layout['recovery_percentage_basis'];
             if (! $layout['complete']) {
                 $par2Complete = false;
             }
@@ -1273,13 +1276,9 @@ final class ReleaseFingerprintCollector
                     'source_block_limit' => Par2MetadataParser::MAX_SOURCE_BLOCKS,
                     'source_block_count_within_current_v2_limit' => $par2SourceBlocksWithinLimit,
                     'source_block_count_overflow' => $par2SourceBlocksOverflow,
-                    'recovery_percentage_basis' => $par2PackedLayout
-                        ? 'unavailable-packed-recovery-layout'
-                        : ($par2SourceBlocksWithinLimit === false
-                            ? 'unavailable-source-block-count-exceeds-current-v2-limit'
-                        : ($par2RecoveryPercent !== null
-                            ? 'unique-valid-recovery-exponents-over-recoverable-source-blocks'
-                            : 'unavailable-incomplete-or-unsupported-par2-layout')),
+                    'recovery_percentage_basis' => $this->par2RecoveryPercentageBasis(
+                        $par2SourceBlockBasis, $par2SourceBlocksWithinLimit, $par2PackedLayout, $par2RecoveryPercent,
+                    ),
                     'nzb_file_prefix_relationships' => $par2SourcePrefixRelationships,
                     'recovery_percent' => $par2RecoveryPercent,
                     'cross_volume_recovery_conflicts' => $crossVolumeRecoveryConflicts,
@@ -2827,6 +2826,27 @@ final class ReleaseFingerprintCollector
                 : 'unavailable-zero-source-block-count');
 
         return $layout;
+    }
+
+    private function par2RecoveryPercentageBasis(?string $denominatorBasis, ?bool $withinLimit, bool $packedLayout, ?float $recoveryPercent): string
+    {
+        if ($packedLayout) {
+            return 'unavailable-packed-recovery-layout';
+        }
+        if ($denominatorBasis === 'unavailable-source-block-count-overflow') {
+            return $denominatorBasis;
+        }
+        if ($withinLimit === false) {
+            return 'unavailable-source-block-count-exceeds-current-v2-limit';
+        }
+        if ($withinLimit === true && $recoveryPercent !== null) {
+            return 'unique-valid-recovery-exponents-over-recoverable-source-blocks';
+        }
+        if ($denominatorBasis !== null && str_starts_with($denominatorBasis, 'unavailable-')) {
+            return $denominatorBasis;
+        }
+
+        return 'unavailable-incomplete-or-unsupported-par2-layout';
     }
 
     private function checkedNonNegativeIntegerAdd(?int $total, mixed $value): ?int

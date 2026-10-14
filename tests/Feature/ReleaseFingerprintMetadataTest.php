@@ -602,6 +602,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
 
         self::assertFalse($metadata['source_inventory_complete']);
         self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertSame('unavailable-source-block-denominator', $metadata['recovery_percentage_basis']);
         foreach ([$metadata, $metadata['recovery_sets'][0]] as $scope) {
             self::assertArrayHasKey('source_block_limit', $scope);
             self::assertArrayHasKey('source_block_count_within_current_v2_limit', $scope);
@@ -655,6 +656,69 @@ final class ReleaseFingerprintMetadataTest extends TestCase
             ['first' => ['file_length' => 65536]],
             null, null, false,
         ];
+    }
+
+    #[Test]
+    public function it_preserves_collector_source_block_overflow_in_the_public_percentage_basis(): void
+    {
+        $collector = (new \ReflectionClass(ReleaseFingerprintCollector::class))->newInstanceWithoutConstructor();
+        $layout = (new \ReflectionMethod($collector, 'computePar2SourceBlockLayout'))->invoke(
+            $collector,
+            ['recoverable_file_ids' => ['first', 'second', 'third', 'fourth', 'fifth']],
+            4,
+            array_fill_keys(['first', 'second', 'third', 'fourth', 'fifth'], ['file_length' => PHP_INT_MAX]),
+            [],
+        );
+
+        self::assertTrue($layout['source_block_count_overflow']);
+        self::assertNull($layout['source_block_count']);
+        self::assertNull($layout['source_block_count_within_current_v2_limit']);
+        self::assertFalse($layout['complete']);
+        $basis = (new \ReflectionMethod($collector, 'par2RecoveryPercentageBasis'))->invoke(
+            $collector,
+            $layout['recovery_percentage_basis'],
+            $layout['source_block_count_within_current_v2_limit'],
+            false,
+            null,
+        );
+        self::assertSame('unavailable-source-block-count-overflow', $basis);
+    }
+
+    #[Test]
+    public function it_preserves_missing_collector_source_descriptions_in_the_public_percentage_basis(): void
+    {
+        $collector = (new \ReflectionClass(ReleaseFingerprintCollector::class))->newInstanceWithoutConstructor();
+        $layout = (new \ReflectionMethod($collector, 'computePar2SourceBlockLayout'))->invoke(
+            $collector,
+            ['recoverable_file_ids' => ['missing']],
+            4,
+            [],
+            [],
+        );
+
+        self::assertNull($layout['source_block_count']);
+        self::assertNull($layout['source_block_count_within_current_v2_limit']);
+        self::assertFalse($layout['complete']);
+        $basis = (new \ReflectionMethod($collector, 'par2RecoveryPercentageBasis'))->invoke(
+            $collector,
+            $layout['recovery_percentage_basis'],
+            $layout['source_block_count_within_current_v2_limit'],
+            false,
+            null,
+        );
+        self::assertSame('unavailable-source-block-denominator', $basis);
+    }
+
+    #[Test]
+    public function it_uses_the_collector_success_basis_only_for_an_eligible_percentage(): void
+    {
+        $collector = (new \ReflectionClass(ReleaseFingerprintCollector::class))->newInstanceWithoutConstructor();
+        $method = new \ReflectionMethod($collector, 'par2RecoveryPercentageBasis');
+        $successBasis = 'unique-valid-recovery-exponents-over-recoverable-source-blocks';
+
+        self::assertSame('unavailable-incomplete-or-unsupported-par2-layout', $method->invoke($collector, $successBasis, true, false, null));
+        self::assertSame($successBasis, $method->invoke($collector, $successBasis, true, false, 0.0));
+        self::assertSame('unavailable-packed-recovery-layout', $method->invoke($collector, 'unavailable-source-block-count-overflow', null, true, null));
     }
 
     private function par2SourceBlockLimitFixture(int $recoverableSlices, ?int $nonrecoverableSlices = null, bool $includeRecoverableDescription = true): string
@@ -1560,6 +1624,24 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $unknown = $method->invoke(null, ['source_block_count_within_current_v2_limit' => true]);
         self::assertSame(32768, $unknown['source_block_limit']);
         self::assertNull($unknown['source_block_count_within_current_v2_limit']);
+    }
+
+    #[Test]
+    public function it_withholds_a_legacy_native_success_basis_without_a_source_block_denominator(): void
+    {
+        $metadata = (new \ReflectionMethod(Par2MetadataParser::class, 'normalizeNativeIntegerRanges'))->invoke(null, [
+            'source_block_size' => 4,
+            'source_block_count' => null,
+            'unique_recovery_slice_count' => 1,
+            'source_inventory_complete' => false,
+            'recovery_to_source_percent' => null,
+            'recovery_percentage_basis' => 'unique-valid-recovery-exponents-over-recoverable-source-blocks',
+        ]);
+
+        self::assertNull($metadata['source_block_count']);
+        self::assertNull($metadata['source_block_count_within_current_v2_limit']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertSame('unavailable-source-block-denominator', $metadata['recovery_percentage_basis']);
     }
 
     #[Test]

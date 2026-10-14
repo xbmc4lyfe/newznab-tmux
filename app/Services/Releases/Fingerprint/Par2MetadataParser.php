@@ -1173,6 +1173,10 @@ final class Par2MetadataParser
         if ($sourceBlockCountWithinLimit === false && ! $packedLayoutPresent) {
             $recoveryPercentageBasis = 'unavailable-source-block-count-exceeds-current-v2-limit';
         }
+        if ($recoveryPercentageBasis === 'unique-valid-recovery-exponents-over-recoverable-source-blocks'
+            && (! $sourceInventoryComplete || ! is_int($sourceBlockCount) || $sourceBlockCount <= 0)) {
+            $recoveryPercentageBasis = 'unavailable-source-block-denominator';
+        }
 
         return [
             'parser_engine' => 'php-fallback',
@@ -1266,6 +1270,12 @@ final class Par2MetadataParser
             if ($unsupportedRangeCount === 0 && ($metadata['packed_layout_present'] ?? false) !== true) {
                 $metadata['recovery_percentage_basis'] = 'unavailable-source-block-count-exceeds-current-v2-limit';
             }
+        }
+        if (($metadata['recovery_percentage_basis'] ?? null) === 'unique-valid-recovery-exponents-over-recoverable-source-blocks'
+            && (($metadata['source_inventory_complete'] ?? false) !== true
+                || ! is_int($metadata['source_block_count'] ?? null) || $metadata['source_block_count'] <= 0)) {
+            $metadata['recovery_percentage_basis'] = 'unavailable-source-block-denominator';
+            $metadata['recovery_to_source_percent'] = null;
         }
 
         return $metadata;

@@ -1374,6 +1374,8 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
             "unavailable-ifsc-source-slice-relationship-conflict"
         } else if source_block_size.is_none() && recovery_count.is_some_and(|count| count > 0) {
             "unavailable-source-block-size-not-in-this-volume"
+        } else if !source_inventory_complete || !source_block_count.is_some_and(|count| count > 0) {
+            "unavailable-source-block-denominator"
         } else {
             "unique-valid-recovery-exponents-over-recoverable-source-blocks"
         };
@@ -2245,6 +2247,27 @@ mod tests {
             let metadata = parse(&input);
             assert_eq!(metadata.source_block_count, Some(expected_count));
             assert_eq!(metadata.recovery_to_source_percent.is_some(), within);
+        }
+    }
+
+    #[test]
+    fn missing_and_zero_source_denominators_never_report_a_success_basis() {
+        let input = single_file_set([b'F'; 16], 4, 4, b"payload.rar", Some(0));
+        let desc_offset = packet_offset_of(&input, b"PAR 2.0\0FileDesc");
+        let desc_end = desc_offset + read_u64(&input, desc_offset + 8).unwrap() as usize;
+        let missing_description = [&input[..desc_offset], &input[desc_end..]].concat();
+        for sample in [
+            missing_description,
+            single_file_set([b'F'; 16], 4, 0, b"empty.rar", Some(0)),
+        ] {
+            let metadata = parse(&sample);
+            assert_eq!(metadata.source_block_size, Some(4));
+            assert_eq!(metadata.source_block_count, None);
+            assert_eq!(metadata.recovery_to_source_percent, None);
+            assert_eq!(
+                metadata.recovery_percentage_basis,
+                "unavailable-source-block-denominator"
+            );
         }
     }
 
