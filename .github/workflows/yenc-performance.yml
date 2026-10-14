@@ -6,6 +6,11 @@ on:
       - '.github/workflows/yenc-performance.yml'
       - 'scripts/benchmark-yenc.php'
       - 'scripts/benchmark-yenc-abi.py'
+      - 'scripts/yenc-performance-report.py'
+      - 'scripts/profile-yenc.php'
+      - 'scripts/profile-yenc.sh'
+      - 'tests/Unit/test_yenc_performance_report.py'
+      - 'tests/Unit/YencProfileTest.php'
       - 'tests/Unit/test_yenc_abi_benchmark.py'
       - 'tests/Feature/ReleaseFingerprintMetadataTest.php'
       - 'scripts/build-rapidyenc.sh'
@@ -68,8 +73,9 @@ jobs:
 
       - name: Test benchmark decisions and failure retention
         run: |
-          php vendor/bin/phpunit --filter=YencBenchmarkTest
+          php vendor/bin/phpunit --filter='YencBenchmarkTest|YencProfileTest'
           python3 tests/Unit/test_yenc_abi_benchmark.py
+          python3 tests/Unit/test_yenc_performance_report.py
 
       - name: Build pinned C++ baseline
         shell: bash
@@ -209,6 +215,46 @@ jobs:
             mkdir -p benchmark-evidence/abi-diagnostic
             echo '{"type":"run_summary","status":"skipped","reason":"paired native libraries/fixtures unavailable","claim":"no ABI performance conclusion"}' > benchmark-evidence/abi-diagnostic/observations.jsonl
           fi
+
+      # Install/enable instrumentation only after uninstrumented observations finish.
+      - name: Set up isolated PHP call profiling
+        if: always()
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: dom, curl, ffi, intl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite
+          coverage: xdebug
+
+      - name: Capture executed PHP and native hot paths
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p benchmark-evidence/profiles
+          if [[ ! -f benchmark-evidence/build/runtime.json ]]; then
+            echo '{"status":"skipped","reason":"native build/runtime identity unavailable","claim":"no hot-path conclusion"}' > benchmark-evidence/profiles/status.json
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y linux-tools-generic
+          perf_binary=$(find /usr/lib/linux-tools -type f -name perf | sort | tail -n 1)
+          if [[ -z "$perf_binary" ]]; then
+            echo 'No perf executable installed.' >&2
+            exit 1
+          fi
+          git clone https://github.com/brendangregg/FlameGraph.git "$RUNNER_TEMP/nntmux-flamegraph"
+          git -C "$RUNNER_TEMP/nntmux-flamegraph" checkout --detach 41fee1f99f9276008b7cd112fca19dc3ea84ac32
+          bash scripts/profile-yenc.sh "$GITHUB_WORKSPACE/benchmark-evidence" \
+            "$RUNNER_TEMP/nntmux-flamegraph" "$perf_binary" \
+            2>&1 | tee benchmark-evidence/build/profile-console.log
+
+      - name: Render paired speedups and executed call-cost visualizations
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/yenc-performance-report.py --evidence-dir=benchmark-evidence \
+            --output-dir=benchmark-evidence/visualization
+          echo '### Performance visualizations' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Download the evidence artifact and open visualization/report.html for per-stratum speedup estimates and executed PHP call costs. Open profiles/*/native.svg for zoomable native CPU stacks. Profile status and failures are retained; instrumented costs are separate from paired timings.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summarize every measured stratum
         if: always()
