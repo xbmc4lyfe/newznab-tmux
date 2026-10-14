@@ -471,6 +471,7 @@ function articleBenchmarkProfile(array $options, array $validated): int
         echo $line;
     };
     try {
+        $instrumentation = articleBenchmarkInstrumentationHashes();
         $manifest = isset($options['runtime-manifest']) ? articleBenchmarkReadManifest((string) $options['runtime-manifest']) : null;
         $root = realpath((string) ($options['candidate-dir'] ?? dirname(__DIR__))) ?: throw new InvalidArgumentException('Source directory does not exist.');
         $sources = articleBenchmarkSourceHashes($root);
@@ -481,7 +482,7 @@ function articleBenchmarkProfile(array $options, array $validated): int
             'untimed_reference_calls' => 1, 'sizes' => $validated['sizes'], 'densities' => ['ordinary', 'heavy'],
             'phases' => articleBenchmarkPhases(), 'timeout_seconds' => $validated['timeout'], 'output_dir' => $directory,
             'library' => $library, 'sources' => $sources, 'source_manifest_path' => $directory.'/source-manifest.json',
-            'instrumentation' => articleBenchmarkInstrumentationHashes(),
+            'instrumentation' => $instrumentation,
             'runtime' => ['php' => PHP_VERSION, 'os' => php_uname(), 'opcache_cli' => ini_get('opcache.enable_cli'),
                 'jit' => ini_get('opcache.jit'), 'memory_limit' => ini_get('memory_limit'), 'ffi' => ini_get('ffi.enable'),
                 'extensions' => get_loaded_extensions(), 'fileinfo' => extension_loaded('fileinfo')],
@@ -511,10 +512,11 @@ function articleBenchmarkProfile(array $options, array $validated): int
         }
         $stable = articleBenchmarkGraphStable($snapshot) && articleBenchmarkGraphStable($snapshot, $root)
             && hash_file('sha256', $library['path']) === $library['sha256'] && articleBenchmarkSourceHashes($root) === $sources;
-        $write(['type' => 'summary', 'status' => $invalid === 0 && $stable ? 'ok' : 'invalid', 'invalid_observations' => $invalid,
-            'source_and_library_identities_stable' => $stable, 'evidence' => 'diagnostic_only', 'performance_advantage_demonstrated' => false]);
+        $instrumentationStable = articleBenchmarkInstrumentationHashes() === $instrumentation;
+        $write(['type' => 'summary', 'status' => $invalid === 0 && $stable && $instrumentationStable ? 'ok' : 'invalid', 'invalid_observations' => $invalid,
+            'source_and_library_identities_stable' => $stable, 'instrumentation_identities_stable' => $instrumentationStable, 'evidence' => 'diagnostic_only', 'performance_advantage_demonstrated' => false]);
 
-        return $invalid === 0 && $stable ? 0 : 2;
+        return $invalid === 0 && $stable && $instrumentationStable ? 0 : 2;
     } catch (Throwable $exception) {
         $write(['type' => 'failure', 'status' => 'invalid', 'phase' => 'setup_or_run', 'exception' => $exception::class, 'reason' => $exception->getMessage()]);
         $write(['type' => 'summary', 'status' => 'invalid', 'evidence' => 'diagnostic_only', 'performance_advantage_demonstrated' => false]);
@@ -657,6 +659,7 @@ function articleBenchmarkPaired(array $options, array $validated): int
     };
     $sourceBuildIdentityVerified = false;
     try {
+        $instrumentation = articleBenchmarkInstrumentationHashes();
         if (! isset($options['runtime-manifest'])) {
             throw new InvalidArgumentException('Paired mode requires --runtime-manifest linking both built libraries to their source trees.');
         }
@@ -700,7 +703,7 @@ function articleBenchmarkPaired(array $options, array $validated): int
             'decision_rule' => 'Four target strata screen for simultaneous median speedup >= declared threshold; small controls may be inconclusive but no stratum may regress. Zero invalid pairs and at least 31 pairs required. No p99/adoption qualification is possible in this screen.',
             'order_seed' => $seed, 'timeout_seconds' => $validated['timeout'], 'output_dir' => $directory,
             'source_build_identity_verified' => $sourceBuildIdentityVerified,
-            'source_sha256' => $sources, 'source_snapshots' => $snapshotEvidence, 'instrumentation' => articleBenchmarkInstrumentationHashes(), 'libraries' => $libraries,
+            'source_sha256' => $sources, 'source_snapshots' => $snapshotEvidence, 'instrumentation' => $instrumentation, 'libraries' => $libraries,
             'runtime' => ['php' => PHP_VERSION, 'php_binary_sha256' => hash_file('sha256', PHP_BINARY), 'os' => php_uname(),
                 'extensions' => get_loaded_extensions(), 'opcache_cli' => ini_get('opcache.enable_cli'), 'jit' => ini_get('opcache.jit'),
                 'pcre_jit' => ini_get('pcre.jit'), 'memory_limit' => ini_get('memory_limit'), 'ffi' => ini_get('ffi.enable'), 'build_manifest' => $runtimeManifest],
@@ -795,7 +798,9 @@ function articleBenchmarkPaired(array $options, array $validated): int
         foreach ($fixtureHashes as $path => $digest) {
             $identitiesStable = $identitiesStable && hash_file('sha256', $path) === $digest;
         }
-        $summary = articleBenchmarkPairedDecision($strata, $identitiesStable, $validated['samples'], isset($options['regression-only']));
+        $instrumentationStable = articleBenchmarkInstrumentationHashes() === $instrumentation;
+        $summary = articleBenchmarkPairedDecision($strata, $identitiesStable && $instrumentationStable, $validated['samples'], isset($options['regression-only']));
+        $summary['instrumentation_identities_stable'] = $instrumentationStable;
         $summary['source_build_identity_verified'] = $sourceBuildIdentityVerified;
         $emit($summary);
 

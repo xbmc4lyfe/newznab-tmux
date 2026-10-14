@@ -681,6 +681,117 @@ PHP);
         }
     }
 
+    public function test_copied_coordinator_reports_persistent_instrumentation_drift_in_both_modes(): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-instrumentation-drift-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        self::createSyntheticSource($directory.'/source', 'instrumentation');
+        file_put_contents($directory.'/fake.so', 'invalid library');
+        try {
+            foreach (['profile', 'paired'] as $mode) {
+                foreach ([true, false] as $drift) {
+                    $options = ['native' => $directory.'/fake.so', 'candidate-dir' => $directory.'/source',
+                        'baseline-native' => $directory.'/fake.so', 'baseline-dir' => $directory.'/source',
+                        'samples' => 1, 'output-dir' => $directory.'/'.$mode.'-'.(int) $drift.'-evidence'];
+                    if ($mode === 'profile') {
+                        $options['size'] = 64;
+                    } else {
+                        $options['paired'] = false;
+                        $options['runtime-manifest'] = self::createSyntheticBuildManifest($directory, $options);
+                    }
+                    $rows = self::runCopiedCoordinator($directory.'/'.$mode.'-'.(int) $drift, $options, $drift);
+                    $summary = $rows[array_key_last($rows)];
+                    self::assertSame(! $drift, $summary['instrumentation_identities_stable'] ?? null);
+                    self::assertSame('invalid', $summary['status']);
+                    if ($mode === 'paired') {
+                        self::assertSame(! $drift, $summary['source_library_and_fixture_identities_stable']);
+                        self::assertFalse($summary['acceptance_criteria_met']);
+                    } else {
+                        self::assertTrue($summary['source_and_library_identities_stable']);
+                    }
+                }
+            }
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
+    public function test_real_native_profile_rejects_instrumentation_drift_with_all_workers_eligible(): void
+    {
+        $library = getenv('NNTMUX_TEST_NATIVE_LIBRARY');
+        if (PHP_OS_FAMILY !== 'Linux' || ! is_string($library) || ! is_file($library)) {
+            self::markTestSkipped('Set NNTMUX_TEST_NATIVE_LIBRARY on Linux for the instrumentation drift test.');
+        }
+        $directory = sys_get_temp_dir().'/nntmux-native-instrumentation-drift-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        try {
+            foreach ([false, true] as $drift) {
+                $rows = self::runCopiedCoordinator($directory.'/coordinator-'.(int) $drift,
+                    ['native' => $library, 'candidate-dir' => dirname(__DIR__, 2), 'samples' => 1, 'size' => 64,
+                        'output-dir' => $directory.'/evidence-'.(int) $drift], $drift);
+                self::assertCount(14, array_filter($rows, static fn (array $row): bool => $row['type'] === 'observation'));
+                foreach ($rows as $row) {
+                    if ($row['type'] === 'observation') {
+                        self::assertTrue($row['eligible'], json_encode($row, JSON_THROW_ON_ERROR));
+                    }
+                }
+                $summary = $rows[array_key_last($rows)];
+                self::assertSame(0, $summary['invalid_observations']);
+                self::assertTrue($summary['source_and_library_identities_stable']);
+                self::assertSame(! $drift, $summary['instrumentation_identities_stable'] ?? null);
+                self::assertSame($drift ? 'invalid' : 'ok', $summary['status']);
+            }
+        } finally {
+            self::removeOwnedDirectory($directory);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $options
+     * @return list<array<string, mixed>>
+     */
+    private static function runCopiedCoordinator(string $directory, array $options, bool $drift): array
+    {
+        mkdir($directory.'/scripts', 0700, true);
+        mkdir($directory.'/tests/Fixtures', 0700, true);
+        foreach (['benchmark-article-processing.php', 'benchmark-yenc.php'] as $script) {
+            copy(dirname(__DIR__, 2).'/scripts/'.$script, $directory.'/scripts/'.$script);
+        }
+        copy(dirname(__DIR__).'/Fixtures/YencArticles.php', $directory.'/tests/Fixtures/YencArticles.php');
+        $runner = <<<'PHP'
+<?php
+require $argv[1];
+define('NNTMUX_ARTICLE_BENCHMARK_FUNCTIONS_ONLY', true);
+require __DIR__.'/scripts/benchmark-article-processing.php';
+$options = json_decode($argv[2], true, flags: JSON_THROW_ON_ERROR);
+$drift = $argv[3] === '1';
+ob_start(static function (string $chunk) use (&$drift): string {
+    if ($drift && str_contains($chunk, '"type":"protocol"')) {
+        file_put_contents(__DIR__.'/scripts/benchmark-yenc.php', "\n// Persistent test instrumentation edit.\n", FILE_APPEND);
+        $drift = false;
+    }
+    return $chunk;
+}, 1);
+exit(isset($options['paired']) ? articleBenchmarkPaired($options, articleBenchmarkOptions($options))
+    : articleBenchmarkProfile($options, articleBenchmarkOptions($options)));
+PHP;
+        file_put_contents($directory.'/run.php', $runner);
+        $process = new Process(array_merge(articleBenchmarkPhpCommand(), [$directory.'/run.php',
+            dirname(__DIR__, 2).'/vendor/autoload.php', json_encode($options, JSON_THROW_ON_ERROR), $drift ? '1' : '0']));
+        $process->setTimeout(180);
+        $process->run();
+        self::assertContains($process->getExitCode(), [0, 2], $process->getErrorOutput());
+        $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
+            file($options['output-dir'].'/observations.jsonl', FILE_IGNORE_NEW_LINES));
+        self::assertSame('protocol', $rows[0]['type'], $process->getErrorOutput());
+        if ($drift) {
+            self::assertSame(2, $process->getExitCode());
+        }
+        self::assertSame($drift, $rows[0]['instrumentation']['benchmark-yenc.php'] !== hash_file('sha256', $directory.'/scripts/benchmark-yenc.php'));
+
+        return $rows;
+    }
+
     public function test_real_native_worker_checks_every_phase_and_retains_cpu_observations(): void
     {
         $library = getenv('NNTMUX_TEST_NATIVE_LIBRARY');
