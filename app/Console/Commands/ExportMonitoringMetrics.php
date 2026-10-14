@@ -15,7 +15,8 @@ class ExportMonitoringMetrics extends Command
      * @var string
      */
     protected $signature = 'monitoring:export-metrics
-                            {--print : Print the metrics instead of pushing them to the Pushgateway}';
+                            {--print : Print the metrics instead of pushing them to the Pushgateway}
+                            {--scheduled : Limit the scheduled export runtime to four minutes}';
 
     /**
      * @var string
@@ -36,12 +37,34 @@ class ExportMonitoringMetrics extends Command
             return self::SUCCESS;
         }
 
-        if (! $exporter->push()) {
-            $this->components->error('Could not push metrics to '.config('monitoring.pushgateway.url').'. See the application log for details.');
+        $scheduled = (bool) $this->option('scheduled');
+        if ($scheduled && ! function_exists('pcntl_alarm')) {
+            $this->components->error('Scheduled monitoring exports require the PCNTL extension for their runtime limit.');
 
             return self::FAILURE;
         }
 
-        return self::SUCCESS;
+        $previousHandler = null;
+        if ($scheduled) {
+            $previousHandler = pcntl_signal_get_handler(SIGALRM);
+            // The OS default terminates even when PHP is blocked inside database or Redis I/O.
+            pcntl_signal(SIGALRM, SIG_DFL);
+            pcntl_alarm(240);
+        }
+
+        try {
+            if (! $exporter->push()) {
+                $this->components->error('Could not push metrics to '.config('monitoring.pushgateway.url').'. See the application log for details.');
+
+                return self::FAILURE;
+            }
+
+            return self::SUCCESS;
+        } finally {
+            if ($scheduled) {
+                pcntl_alarm(0);
+                pcntl_signal(SIGALRM, $previousHandler);
+            }
+        }
     }
 }

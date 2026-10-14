@@ -7,6 +7,8 @@ namespace Tests\Feature;
 use App\Enums\ServiceStatusEnum;
 use App\Services\Monitoring\Collectors\MetricsCollector;
 use App\Services\Monitoring\TmuxMetricsSnapshot;
+use Illuminate\Console\Scheduling\Event;
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request;
@@ -14,6 +16,8 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
+use Symfony\Component\Process\Exception\ProcessSignaledException;
+use Symfony\Component\Process\Process;
 use Tests\Support\Monitoring\FailingMetricsCollector;
 use Tests\TestCase;
 
@@ -109,6 +113,119 @@ class ExportMonitoringMetricsCommandTest extends TestCase
         $this->artisan('monitoring:export-metrics')->assertSuccessful();
 
         Http::assertNothingSent();
+    }
+
+    public function test_an_abandoned_exporter_lock_expires_after_five_minutes(): void
+    {
+        Http::fake([self::PUSH_URL => Http::response('', 200)]);
+        $event = $this->exportEvent();
+
+        $this->assertTrue($event->mutex->create($event));
+        $this->travel(4)->minutes();
+        $this->assertFalse($event->filtersPass($this->app));
+        $this->assertTrue($event->shouldSkipDueToOverlapping());
+        Http::assertNothingSent();
+
+        $this->travel(1)->minutes();
+        $this->assertTrue($event->filtersPass($this->app));
+        $this->assertFalse($event->mutex->exists($event));
+        $this->artisan('monitoring:export-metrics')->assertSuccessful();
+
+        Http::assertSent(static fn (Request $request): bool => $request->method() === 'PUT'
+            && $request->url() === self::PUSH_URL
+            && str_contains($request->body(), "nntmux_up 1\n"));
+    }
+
+    public function test_the_export_schedule_respects_monitoring_being_disabled(): void
+    {
+        config(['monitoring.enabled' => false]);
+
+        $this->assertFalse($this->exportEvent()->filtersPass($this->app));
+    }
+
+    public function test_scheduled_exports_arm_a_process_deadline_and_restore_signal_state(): void
+    {
+        if (! function_exists('pcntl_alarm')) {
+            $this->markTestSkipped('Scheduled export deadlines require PCNTL.');
+        }
+        $handler = pcntl_signal_get_handler(SIGALRM);
+        $remaining = 0;
+        Http::fake([self::PUSH_URL => function () use (&$remaining) {
+            $this->assertSame(SIG_DFL, pcntl_signal_get_handler(SIGALRM));
+            $remaining = pcntl_alarm(0);
+
+            return Http::response('', 200);
+        }]);
+
+        $this->assertStringContainsString('--scheduled', (string) $this->exportEvent()->command);
+        $this->artisan('monitoring:export-metrics', ['--scheduled' => true])->assertSuccessful();
+
+        $this->assertGreaterThan(0, $remaining);
+        $this->assertLessThanOrEqual(240, $remaining);
+        $this->assertSame(0, pcntl_alarm(0));
+        $this->assertSame($handler, pcntl_signal_get_handler(SIGALRM));
+    }
+
+    public function test_scheduled_exports_release_the_deadline_after_push_failure(): void
+    {
+        if (! function_exists('pcntl_alarm')) {
+            $this->markTestSkipped('Scheduled export deadlines require PCNTL.');
+        }
+        $handler = pcntl_signal_get_handler(SIGALRM);
+        Http::fake([self::PUSH_URL => Http::response('', 400)]);
+
+        $this->artisan('monitoring:export-metrics', ['--scheduled' => true])->assertFailed();
+
+        $this->assertSame(0, pcntl_alarm(0));
+        $this->assertSame($handler, pcntl_signal_get_handler(SIGALRM));
+    }
+
+    public function test_the_process_deadline_terminates_a_blocked_exporter(): void
+    {
+        if (! function_exists('pcntl_alarm')) {
+            $this->markTestSkipped('Scheduled export deadlines require PCNTL.');
+        }
+        $script = <<<'PHP'
+require 'vendor/autoload.php';
+$app = require 'bootstrap/app.php';
+$app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+config(['monitoring.enabled' => true]);
+$exporter = new class([], new App\Services\Monitoring\Prometheus\TextFormatter) extends App\Services\Monitoring\PrometheusMetricsExporter {
+    public function push(): bool
+    {
+        // Accelerate the already armed deadline instead of waiting four minutes in the test.
+        pcntl_alarm(1);
+        sleep(10);
+        echo 'exporter survived';
+        return true;
+    }
+};
+$app->instance(App\Services\Monitoring\PrometheusMetricsExporter::class, $exporter);
+Illuminate\Support\Facades\Artisan::call('monitoring:export-metrics', ['--scheduled' => true]);
+echo 'command survived';
+PHP;
+        $process = new Process([PHP_BINARY, '-r', $script], base_path(), ['APP_ENV' => 'testing']);
+        $process->setTimeout(5);
+        try {
+            $process->run();
+        } catch (ProcessSignaledException $exception) {
+            $this->assertSame(SIGALRM, $exception->getSignal());
+        }
+
+        $this->assertTrue($process->hasBeenSignaled());
+        $this->assertSame(SIGALRM, $process->getTermSignal());
+        $this->assertStringNotContainsString('survived', $process->getOutput());
+    }
+
+    private function exportEvent(): Event
+    {
+        foreach (app(Schedule::class)->events() as $event) {
+            if (is_string($event->command) && str_contains($event->command, 'monitoring:export-metrics')) {
+                return $event;
+            }
+        }
+
+        $this->fail('The monitoring export schedule must be registered.');
     }
 
     private function createSchema(): void
