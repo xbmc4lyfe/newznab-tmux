@@ -3,7 +3,10 @@
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
 
-DC       := docker compose --project-directory $(CURDIR) -f $(CURDIR)/docker-compose.yml
+COMPOSE_FILE ?= $(CURDIR)/docker-compose.yml
+export COMPOSE_FILE
+DC       := docker compose --project-directory "$(CURDIR)"
+export DC
 APP_RUN  := $(DC) run --rm --no-deps web
 ARTISAN  := $(DC) exec -T web php artisan
 REPO     := $(abspath $(CURDIR)/..)
@@ -41,22 +44,31 @@ perms: dirs ## Linux hosts: let the app containers' user (33:33) use their bind 
 
 # Deploys (build, up) share one stack, so they go through bin/deploy-guard: one at a time, logged to
 # .deploy.log with DEPLOY_BY, and a rebuild is skipped while nothing changed (FORCE=1 overrides).
+APP_IMAGE ?= nntmux/app:local
+DEPLOY_MIN_INTERVAL ?= 900
+DEPLOY_DRAIN_TIMEOUT ?= 90
+DEPLOY_HEALTH_TIMEOUT ?= 240
 DEPLOY_BY ?=
 GUARD     := DEPLOY_BY="$(DEPLOY_BY)" $(CURDIR)/bin/deploy-guard
 
 .PHONY: build
-build: ## Build nntmux/base:local and nntmux/app:local; skipped when nothing changed (FORCE=1, DEPLOY_BY=name)
-	@SKIP_IF_UNCHANGED=1 STAMP_ON_SUCCESS=1 REQUIRE_IMAGE=nntmux/app:local FORCE="$(FORCE)" \
+build: ## Build the cached selfhosted app image; skipped when nothing changed (FORCE=1, DEPLOY_BY=name)
+	@SKIP_IF_UNCHANGED=1 STAMP_ON_SUCCESS=1 REQUIRE_IMAGE="$(APP_IMAGE)" DEPLOY_STAMP="$(CURDIR)/.build.stamp" FORCE="$(FORCE)" \
+		DEPLOY_MIN_INTERVAL=0 RECORD_DEPLOY_TIME=0 DEPLOY_CONFIG_COMMAND= CHECK_UNCHANGED_COMMAND= CHECK_HEALTH_COMMAND= \
 		$(GUARD) run build -- $(MAKE) --no-print-directory -C $(CURDIR) build-images
 
 .PHONY: build-images
 build-images:
-	docker build -t nntmux/base:local -f $(REPO)/Dockerfile $(REPO)
-	docker build -t nntmux/app:local -f $(CURDIR)/app/Dockerfile $(REPO)
+	docker build --target selfhosted -t "$(APP_IMAGE)" -f $(REPO)/Dockerfile $(REPO)
 
 .PHONY: deploy
-deploy: ## Build, pause app writers, migrate, then recreate the stack under one lock (DEPLOY_BY=name)
-	@FORCE="$(FORCE)" $(GUARD) run deploy -- sh -c '$(MAKE) --no-print-directory -C $(CURDIR) build && $(CURDIR)/bin/deploy-guard verify && $(DC) stop web scheduler indexer horizon && $(APP_RUN) php artisan migrate --force --no-interaction && $(MAKE) --no-print-directory -C $(CURDIR) up'
+deploy: ## Batch changes, build while live, drain writers, migrate, and wait for healthy app services (FORCE=1)
+	@SKIP_IF_UNCHANGED=1 STAMP_ON_SUCCESS=1 RECORD_DEPLOY_TIME=1 REQUIRE_IMAGE="$(APP_IMAGE)" \
+		DEPLOY_CONFIG_COMMAND="$(CURDIR)/bin/deploy-current" \
+		CHECK_UNCHANGED_COMMAND="$(CURDIR)/bin/deploy-current" CHECK_HEALTH_COMMAND="$(CURDIR)/bin/deploy-current" \
+		DEPLOY_MIN_INTERVAL="$(DEPLOY_MIN_INTERVAL)" DEPLOY_DRAIN_TIMEOUT="$(DEPLOY_DRAIN_TIMEOUT)" \
+		DEPLOY_HEALTH_TIMEOUT="$(DEPLOY_HEALTH_TIMEOUT)" APP_IMAGE="$(APP_IMAGE)" FORCE="$(FORCE)" \
+		$(GUARD) run deploy -- $(CURDIR)/bin/deploy-app
 
 .PHONY: init
 init: env dirs build ## First-time install: build, migrate+seed, indexes, groups, tuning, predb seed, start
@@ -81,8 +93,8 @@ seed: seed-db ## Re-seed groups/tuning and restart the indexer to pick it up
 	$(DC) restart indexer
 
 .PHONY: up
-up: ## Start the whole stack (one deploy at a time; DEPLOY_BY=name)
-	@$(GUARD) run up -- $(DC) up -d
+up: ## First bringup, or safe guarded deploy when app containers already exist
+	@$(GUARD) run up -- $(CURDIR)/bin/up-app
 
 .PHONY: down
 down: ## Stop the stack (tmux session stops cleanly)

@@ -42,6 +42,32 @@ class ViteDockerConfigurationTest extends TestCase
         );
     }
 
+    public function test_self_hosted_shutdown_signals_and_grace_allow_active_workers_to_finish(): void
+    {
+        $services = Yaml::parse($this->projectFile('docker/docker-compose.yml'))['services'];
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $service) {
+            $this->assertTrue($services[$service]['init']);
+            $this->assertSame('SIGTERM', $services[$service]['stop_signal']);
+        }
+        $this->assertSame('120s', $services['indexer']['stop_grace_period']);
+        $this->assertSame('${INDEXER_DRAIN_TIMEOUT:-90}', $services['indexer']['environment']['INDEXER_DRAIN_TIMEOUT']);
+        $this->assertStringContainsString('INDEXER_DRAIN_TIMEOUT=90', $this->projectFile('docker/.env.example'));
+        $this->assertStringContainsString('INDEXER_DRAIN_TIMEOUT=90', $this->projectFile('.env.example'));
+
+        preg_match_all("/'timeout' => ([0-9]+)/", $this->projectFile('config/horizon.php'), $timeouts);
+        $this->assertNotEmpty($timeouts[1]);
+        $this->assertGreaterThan(max(array_map('intval', $timeouts[1])), (int) $services['horizon']['stop_grace_period']);
+    }
+
+    public function test_self_hosted_indexer_requires_completed_startup_before_reporting_healthy(): void
+    {
+        $service = Yaml::parse($this->projectFile('docker/docker-compose.yml'))['services']['indexer'];
+        $this->assertSame([
+            'CMD-SHELL',
+            'test -f /var/tmp/nntmux/indexer.ready && php artisan tmux:health-check --session=nntmux --require-session --quiet',
+        ], $service['healthcheck']['test']);
+    }
+
     public function test_compose_uses_latest_tags_for_services_that_publish_them(): void
     {
         $this->assertServicesUseLatestTags('docker-compose.yml.prod-dist');

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Services\Configuration\ProcessingRuntimeStateRepository;
+
 /**
  * Basic IRC client for fetching IRCScraper.
  *
@@ -342,7 +344,12 @@ class IRCClient
      */
     public function readIncoming(): void
     {
-        while (true) { // @phpstan-ignore while.alwaysTrue
+        while (true) {
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                $this->quit('Processing drained');
+
+                return;
+            }
             $this->_readSocket();
 
             // If the server pings us, return it a pong.

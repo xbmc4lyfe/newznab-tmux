@@ -615,6 +615,39 @@ class BinariesStorageInternalsTest extends TestCase
         $this->assertSame([1301, 1302], DB::table('missed_parts')->orderBy('numberid')->pluck('numberid')->all());
     }
 
+    public function test_storage_rollback_without_repair_cannot_complete_a_range_and_retry_preserves_all_parts(): void
+    {
+        $this->createHeaderStorageTables();
+        DB::statement("CREATE TRIGGER reject_parts BEFORE INSERT ON parts WHEN NEW.number = 1302 BEGIN SELECT RAISE(ABORT, 'test storage failure'); END");
+        $nntp = Mockery::mock(NNTPService::class);
+        $nntp->shouldReceive('getXOVER')->twice()->andReturn([
+            $this->rawHeader(1301, 'First.Retry.Release (1/1)'),
+            $this->rawHeader(1302, 'Second.Retry.Release (1/1)'),
+        ]);
+        $config = new BinariesConfig(partRepair: false, headerChunkSize: 1, sqlChunkSize: 1);
+        $service = new BinariesService($config, new HeaderParser(new class extends BlacklistService
+        {
+            public function isBlackListed(array $msg, string $groupName): bool
+            {
+                return false;
+            }
+        }), new HeaderStorageService($this->deterministicCollectionHandler(), config: $config), nntp: $nntp);
+
+        try {
+            $service->scan(['id' => 1, 'name' => 'alt.test'], 1301, 1303);
+            $this->fail('A range with untracked storage failures cannot advance its cursor.');
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString('storage', $error->getMessage());
+        }
+        $this->assertNull($service->completedRangeEnd());
+        $this->assertSame([1301], DB::table('parts')->orderBy('number')->pluck('number')->all());
+
+        DB::statement('DROP TRIGGER reject_parts');
+        $service->scan(['id' => 1, 'name' => 'alt.test'], 1301, 1303);
+        $this->assertSame(1303, $service->completedRangeEnd());
+        $this->assertSame([1301, 1302], DB::table('parts')->orderBy('number')->pluck('number')->all());
+    }
+
     /** @return iterable<string, array{int}> */
     public static function lockFailures(): iterable
     {

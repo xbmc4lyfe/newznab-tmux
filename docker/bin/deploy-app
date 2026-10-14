@@ -1,0 +1,57 @@
+#!/bin/sh
+# Run only through deploy-guard. Build first, then quiesce the old singleton indexer.
+set -eu
+DIR=$(cd "$(dirname "$0")/.." && pwd)
+COMPOSE_FILE="${COMPOSE_FILE:-$DIR/docker-compose.yml}"
+export COMPOSE_FILE
+compose() { "$DIR/bin/compose" "$@"; }
+verify() {
+    DEPLOY_CONFIG_COMMAND= DEPLOY_STAMP="$DIR/.build.stamp" "$DIR/bin/deploy-guard" verify
+    "$DIR/bin/deploy-guard" verify-expected
+}
+make --no-print-directory -C "$DIR" build
+verify
+
+# A stopped/missing indexer has no writers to drain. A running one must understand the
+# drain command; do not silently continue if preflight fails (including old images).
+indexer=$(compose ps -q indexer)
+drained=0
+legacy=0
+legacy_drain() { compose exec -T indexer php -- /app "$1" "${DEPLOY_LEGACY_DRAIN_TIMEOUT:-1800}" < "$DIR/bin/legacy-drain.php"; }
+resume() {
+    if [ "$drained" = 1 ]; then
+        if [ "$legacy" = 1 ]; then
+            legacy_drain resume || true
+        else
+            compose exec -T indexer php artisan tmux:drain --resume --session=nntmux --no-interaction || true
+        fi
+    fi
+}
+trap 'resume' EXIT
+trap 'exit 130' INT TERM
+if [ -n "$indexer" ]; then
+    commands=$(compose exec -T indexer php artisan list --raw --no-interaction)
+    if printf '%s\n' "$commands" | grep -q '^tmux:drain[[:space:]]'; then
+        compose exec -T indexer php artisan tmux:drain --timeout="${DEPLOY_DRAIN_TIMEOUT:-90}" --session=nntmux --no-interaction
+    else
+        if [ "${DEPLOY_LEGACY_DRAIN:-0}" != 1 ]; then
+            echo "Old image lacks tmux:drain. Authorized first upgrades require DEPLOY_LEGACY_DRAIN=1; legacy IRC disconnects at final stop." >&2
+            exit 1
+        fi
+        legacy=1
+        legacy_drain drain
+    fi
+    drained=1
+fi
+verify
+# Let active Horizon jobs finish while the existing web service remains available.
+# Explicit timeout also protects containers created before the longer Compose grace.
+compose stop --timeout 1920 horizon
+verify
+# Stop the remaining database writers before migration; persistent services stay running.
+compose stop web scheduler indexer
+drained=0
+verify
+compose run --rm --no-deps web php artisan migrate --force --no-interaction
+verify
+compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" web horizon scheduler indexer

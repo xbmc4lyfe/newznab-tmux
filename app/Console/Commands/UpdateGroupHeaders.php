@@ -17,7 +17,7 @@ class UpdateGroupHeaders extends Command
      *
      * @var string
      */
-    protected $signature = 'group:update-headers {group : Group name}';
+    protected $signature = 'group:update-headers {group : Group name} {--max=0 : Maximum headers for this group visit}';
 
     /**
      * The console command description.
@@ -35,7 +35,7 @@ class UpdateGroupHeaders extends Command
 
         try {
             $nntp = $this->getNntp();
-            $groupMySQL = UsenetGroup::getByName($groupName)->toArray();
+            $groupMySQL = UsenetGroup::getByName($groupName)?->toArray();
 
             if ($groupMySQL === null) {
                 $this->error("Group not found: {$groupName}");
@@ -45,7 +45,7 @@ class UpdateGroupHeaders extends Command
 
             $binaries = new BinariesService;
             $binaries->setNntp($nntp);
-            $binaries->updateGroup($groupMySQL);
+            $binaries->updateGroup($groupMySQL, max(0, (int) $this->option('max')));
 
             return self::SUCCESS;
         } catch (\Throwable $e) {
