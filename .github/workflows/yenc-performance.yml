@@ -502,6 +502,8 @@ jobs:
         with:
           name: article-processing-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: processing-evidence/
+          # Snapshots already exclude Git internals and private environment/auth files.
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
 
