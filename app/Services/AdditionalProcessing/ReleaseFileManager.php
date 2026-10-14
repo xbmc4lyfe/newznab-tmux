@@ -307,7 +307,8 @@ class ReleaseFileManager
             $updateRows['jpgstatus'] = 1;
         }
 
-        $passwordStatus = $context->passwordStatus;
+        $passwordStatus = $context->archivePasswordCheckIncomplete && ! $context->releaseHasPassword
+            ? -1 : $context->passwordStatus;
 
         // Set to no password if processing is off
         if (! $processPasswords) {

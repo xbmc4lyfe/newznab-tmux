@@ -13,6 +13,7 @@ use App\Services\AdditionalProcessing\Enums\DownloadKind;
 use App\Services\AdditionalProcessing\Enums\ProcessingOutcome;
 use App\Services\AdditionalProcessing\Enums\ProcessingStage;
 use App\Services\AdditionalProcessing\MediaExtractionService;
+use App\Services\AdditionalProcessing\NativeSevenZipListing;
 use App\Services\AdditionalProcessing\NzbContentParser;
 use App\Services\AdditionalProcessing\ReleaseFileManager;
 use App\Services\AdditionalProcessing\ReleaseFilesArchiveFallback;
@@ -458,10 +459,12 @@ class ReleaseProcessorTest extends TestCase
     }
 
     #[Test]
-    public function it_reads_a_7z_file_list_from_the_last_volume_tail(): void
+    #[DataProvider('sevenZipHeaderKinds')]
+    public function it_reads_a_7z_file_list_from_the_last_volume_tail(bool $compressedHeader): void
     {
         $config = $this->makeConfig(['processPasswords' => true, 'processJPGSample' => true]);
-        $archive = $this->sevenZip('release.nfo', str_repeat('x', 100));
+        $archive = $this->sevenZip('release.nfo', str_repeat('x', 100), compressedHeader: $compressedHeader);
+        $native = $compressedHeader ? $this->nativeListing($archive, 'release.nfo', 40) : null;
         $nzbParser = Mockery::mock(NzbContentParser::class);
         $nzbParser->shouldReceive('parseNzb')->once()->andReturn([
             'error' => null,
@@ -503,7 +506,7 @@ class ReleaseProcessorTest extends TestCase
             $config,
             $nzbParser,
             new AdditionalWorkPlanner($config),
-            new ArchiveExtractionService($config),
+            new ArchiveExtractionService($config, nativeSevenZipListing: $native),
             Mockery::mock(MediaExtractionService::class),
             $downloadService,
             $releaseManager,
@@ -795,8 +798,9 @@ class ReleaseProcessorTest extends TestCase
         $archive = match ($type) {
             'rar' => $this->rar('Movie.2026.1080p.mkv', str_repeat('x', 100)),
             'zip' => $this->zip('Movie.2026.1080p.mkv', str_repeat('x', 100)),
-            default => $this->sevenZip('Movie.2026.1080p.mkv', str_repeat('x', 100)),
+            default => $this->sevenZip('Movie.2026.1080p.mkv', str_repeat('x', 100), compressedHeader: $type === '7z-native'),
         };
+        $native = $type === '7z-native' ? $this->nativeListing($archive, 'Movie.2026.1080p.mkv', 80) : null;
         $nzbParser = Mockery::mock(NzbContentParser::class);
         $nzbParser->shouldReceive('parseNzb')->once()->andReturn([
             'error' => null,
@@ -834,7 +838,7 @@ class ReleaseProcessorTest extends TestCase
             $config,
             $nzbParser,
             new AdditionalWorkPlanner($config),
-            new ArchiveExtractionService($config),
+            new ArchiveExtractionService($config, nativeSevenZipListing: $native),
             Mockery::mock(MediaExtractionService::class),
             $downloadService,
             $releaseManager,
@@ -1451,6 +1455,7 @@ class ReleaseProcessorTest extends TestCase
             'RAR' => ['rar', []],
             'ZIP' => ['zip', []],
             '7z' => ['7z', ['<last>']],
+            '7z native compressed header' => ['7z-native', ['<last>']],
         ];
     }
 
@@ -1510,6 +1515,26 @@ class ReleaseProcessorTest extends TestCase
         $this->temporaryDirectories[] = $tmpPath;
 
         return $tmpPath;
+    }
+
+    /** @return array<string, array{bool}> */
+    public static function sevenZipHeaderKinds(): array
+    {
+        return ['plain header fallback' => [false], 'native compressed header' => [true]];
+    }
+
+    private function nativeListing(string $archive, string $name, int $headLength): NativeSevenZipListing
+    {
+        $native = Mockery::mock(NativeSevenZipListing::class);
+        $native->shouldReceive('listing')->once()
+            ->with(substr($archive, 0, $headLength), substr($archive, -80), 1024)
+            ->andReturn([
+                'schema_version' => 1, 'status' => 'complete',
+                'files' => [['name' => $name, 'size' => 100, 'date' => 0, 'pass' => 0, 'compressed' => 1]],
+                'listing_complete' => true, 'encryption' => 'unencrypted', 'reason' => null,
+            ]);
+
+        return $native;
     }
 
     private function makeContext(): ReleaseProcessingContext

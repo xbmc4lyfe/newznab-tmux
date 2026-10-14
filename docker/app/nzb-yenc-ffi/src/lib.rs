@@ -23,6 +23,7 @@ mod payload_decoder_arm;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod payload_decoder_x86;
 mod sample_plan;
+mod seven_zip_listing;
 mod seven_zip_ranges;
 mod yenc_framing;
 
@@ -251,6 +252,54 @@ pub unsafe extern "C" fn nntmux_seven_zip_ranges_json(
     });
     match encoded {
         Ok(Some(json)) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Read bounded 7z encoded-header metadata from a prefix and a suffix ending
+/// at the archive end declared by its verified start header. A nonzero release
+/// size is an upper bound. The caller owns the returned JSON string and must
+/// release it with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// Each nonempty input pointer must be readable for its corresponding length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_seven_zip_listing_v1_json(
+    head: *const u8,
+    head_length: usize,
+    tail: *const u8,
+    tail_length: usize,
+    known_release_size: u64,
+) -> *mut c_char {
+    if head_length > 16 * 1024 * 1024
+        || tail_length > 16 * 1024 * 1024 - head_length
+        || (head_length > 0 && head.is_null())
+        || (tail_length > 0 && tail.is_null())
+    {
+        return ptr::null_mut();
+    }
+    let head_bytes = if head_length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees this pointer is readable for head_length.
+        unsafe { slice::from_raw_parts(head, head_length) }
+    };
+    let tail_bytes = if tail_length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees this pointer is readable for tail_length.
+        unsafe { slice::from_raw_parts(tail, tail_length) }
+    };
+    match catch_unwind(|| {
+        serde_json::to_string(&seven_zip_listing::parse(
+            head_bytes,
+            tail_bytes,
+            known_release_size,
+        ))
+    }) {
+        Ok(Ok(json)) if json.len() <= 4 * 1024 * 1024 => CString::new(json)
             .map(CString::into_raw)
             .unwrap_or(ptr::null_mut()),
         _ => ptr::null_mut(),

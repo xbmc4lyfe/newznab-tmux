@@ -76,6 +76,9 @@ class ReleaseProcessingContext
      */
     public bool $archiveRetryable = false;
 
+    /** A prefix file list or an unknown coder cannot prove absence of encryption. */
+    public bool $archivePasswordCheckIncomplete = false;
+
     /**
      * @var list<array<string, mixed>>
      */
@@ -300,6 +303,7 @@ class ReleaseProcessingContext
         $this->archiveInspectionAttempted = false;
         $this->archiveListingUndecodable = false;
         $this->archiveRetryable = false;
+        $this->archivePasswordCheckIncomplete = false;
         $this->groupUnavailable = false;
         $this->workPlan = null;
         $this->mediaPlan = null;

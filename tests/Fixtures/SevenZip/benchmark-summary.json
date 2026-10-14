@@ -1,0 +1,104 @@
+{
+  "decision": "pass",
+  "publication_eligible": true,
+  "finished_epoch": 1791993118.3985112,
+  "minimum_required_speedup": 2,
+  "results": [
+    {
+      "fixture": "compact",
+      "eligible_pairs": 31,
+      "invalid_or_unexecuted_pairs": 0,
+      "baseline_median_us": 4687.862950000001,
+      "rust_median_us": 19.5667,
+      "baseline_cold_median_us": 7968.917,
+      "rust_cold_median_us": 1732.542,
+      "paired_median_speedup": 251.50784578820787,
+      "paired_geomean_speedup": 254.33942178014436,
+      "bootstrap95_geomean_speedup": [
+        221.97605313002737,
+        290.8784193772791
+      ],
+      "min_speedup": 119.65671910905485,
+      "max_speedup": 548.8699638118214
+    },
+    {
+      "fixture": "basic",
+      "eligible_pairs": 31,
+      "invalid_or_unexecuted_pairs": 0,
+      "baseline_median_us": 4491.0421,
+      "rust_median_us": 31.1188,
+      "baseline_cold_median_us": 7947.709,
+      "rust_cold_median_us": 1851.834,
+      "paired_median_speedup": 150.6254048575043,
+      "paired_geomean_speedup": 145.84995366473748,
+      "bootstrap95_geomean_speedup": [
+        127.88242795401027,
+        166.25816107061576
+      ],
+      "min_speedup": 64.21821319024288,
+      "max_speedup": 341.7275748004227
+    },
+    {
+      "fixture": "encrypted-files",
+      "eligible_pairs": 31,
+      "invalid_or_unexecuted_pairs": 0,
+      "baseline_median_us": 4833.7109,
+      "rust_median_us": 31.18545,
+      "baseline_cold_median_us": 8120.751,
+      "rust_cold_median_us": 1968.208,
+      "paired_median_speedup": 163.27760034454514,
+      "paired_geomean_speedup": 169.3913333681766,
+      "bootstrap95_geomean_speedup": [
+        147.03387954516697,
+        196.7252947611638
+      ],
+      "min_speedup": 72.33374822401721,
+      "max_speedup": 419.5325551339582
+    },
+    {
+      "fixture": "many",
+      "eligible_pairs": 31,
+      "invalid_or_unexecuted_pairs": 0,
+      "baseline_median_us": 5350.8525,
+      "rust_median_us": 162.37914999999998,
+      "baseline_cold_median_us": 8492.543,
+      "rust_cold_median_us": 2396.209,
+      "paired_median_speedup": 32.77212196536157,
+      "paired_geomean_speedup": 34.799241348542594,
+      "bootstrap95_geomean_speedup": [
+        29.23676726442571,
+        42.36775065489466
+      ],
+      "min_speedup": 13.052095985534391,
+      "max_speedup": 202.3204785726868
+    },
+    {
+      "fixture": "lzma2-header",
+      "eligible_pairs": 31,
+      "invalid_or_unexecuted_pairs": 0,
+      "baseline_median_us": 4980.477650000001,
+      "rust_median_us": 33.0021,
+      "baseline_cold_median_us": 8100.209,
+      "rust_cold_median_us": 1925.583,
+      "paired_median_speedup": 157.01449843260187,
+      "paired_geomean_speedup": 159.1150705237356,
+      "bootstrap95_geomean_speedup": [
+        136.2190869747301,
+        186.41976064231233
+      ],
+      "min_speedup": 68.02374385993798,
+      "max_speedup": 371.00314058273835
+    }
+  ],
+  "failures": [],
+  "aggregate_geomean_speedup": 128.321211347236,
+  "aggregate_stratified_bootstrap95": [
+    120.01449161118212,
+    137.2514407936332
+  ],
+  "limitations": [
+    "One Linux runtime; no production throughput claim",
+    "Speed gate covers warmed header listing; cold service-call binding costs are separate",
+    "Known-invalid baseline capped/password cases require separate correctness regression evidence"
+  ]
+}

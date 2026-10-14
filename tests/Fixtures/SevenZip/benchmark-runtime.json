@@ -1,0 +1,435 @@
+{
+  "protocol_version": 2,
+  "time_ns": 1791993072077831410,
+  "publication_gate": true,
+  "deadline_epoch": 1791996376,
+  "baseline_commit": "9af5f7c18eac862485ab9c736b65e282d5a3cede",
+  "cases": [
+    "compact",
+    "basic",
+    "encrypted-files",
+    "many",
+    "lzma2-header"
+  ],
+  "samples": 31,
+  "iterations": 20,
+  "seed": 188820261014,
+  "warmups": 5,
+  "additional_cold_calls": 1,
+  "scope": "Warmed header listing service, excluding network, PHP startup and database finalization; first-call binding cost reported separately",
+  "runtime": {
+    "platform": "linux",
+    "architecture": "aarch64",
+    "image_id": "sha256:c605e7506d179f1034123fe9bb32cd56da0fde4544c518c75ebb009091e1fd28",
+    "php": "PHP 8.5.11 (cli) (built: Oct  6 2026 01:26:34) (ZTS)",
+    "sevenzip": [
+      "",
+      "7-Zip [64] 26.02 : Copyright (c) 1999-2026 Igor Pavlov : 2026-06-25",
+      "p7zip Version 16.02 (locale=C.UTF-8,Utf16=on,HugeFiles=on,64 bits,10 CPUs arm64  (LP))",
+      ""
+    ]
+  },
+  "frozen_inputs": {
+    "/baseline/app/Services/AdditionalProcessing/ArchiveExtractionService.php": {
+      "sha256": "83daf245e121d3c7aec60f74b416ddf9b54a6e2d491232a0814d78b487ac2dfc",
+      "resolved_path": "/baseline/app/Services/AdditionalProcessing/ArchiveExtractionService.php"
+    },
+    "/baseline/app/Services/AdditionalProcessing/Config/ProcessingConfiguration.php": {
+      "sha256": "ca65a9d2214633d658642dead6c26a7ca81ede239797d0076c5bc02d02be7189",
+      "resolved_path": "/baseline/app/Services/AdditionalProcessing/Config/ProcessingConfiguration.php"
+    },
+    "/baseline/app/Services/AdditionalProcessing/State/ReleaseProcessingContext.php": {
+      "sha256": "abac695764f6991241755200146e6156921bcd893afd803381f8ad57d582daef",
+      "resolved_path": "/baseline/app/Services/AdditionalProcessing/State/ReleaseProcessingContext.php"
+    },
+    "/baseline/app/Services/Releases/ReleaseBrowseService.php": {
+      "sha256": "f61e14afb5775353d5797d5083feca8b4abfb7ec34fb25c8ef92349cb9972695",
+      "resolved_path": "/baseline/app/Services/Releases/ReleaseBrowseService.php"
+    },
+    "/baseline/app/Models/Release.php": {
+      "sha256": "35cd6276cd1e2dc657c13b65e34f94c9292253f6cd126ff7bef6e50819387a08",
+      "resolved_path": "/baseline/app/Models/Release.php"
+    },
+    "/baseline/tests/Unit/AdditionalProcessing/CreatesProcessingConfiguration.php": {
+      "sha256": "df92391bd8f99fef2175ad0a7f752b6493d1377dbbf2e6cadd61071d2c5e929e",
+      "resolved_path": "/baseline/tests/Unit/AdditionalProcessing/CreatesProcessingConfiguration.php"
+    },
+    "/candidate/app/Services/AdditionalProcessing/ArchiveExtractionService.php": {
+      "sha256": "115af295a064a6b26d063ea5eeadf2def9c332ed1252e54b6c25702675ce9aa6",
+      "resolved_path": "/candidate/app/Services/AdditionalProcessing/ArchiveExtractionService.php"
+    },
+    "/candidate/app/Services/AdditionalProcessing/Config/ProcessingConfiguration.php": {
+      "sha256": "5922a5c200d83127357dfbb5bd68211f15fa73efd9f89a8bee508c918302a2fc",
+      "resolved_path": "/candidate/app/Services/AdditionalProcessing/Config/ProcessingConfiguration.php"
+    },
+    "/candidate/app/Services/AdditionalProcessing/State/ReleaseProcessingContext.php": {
+      "sha256": "76a7def89953a43e8fb5ffd798e34333a25453f3fb0995dd61cb232b28a76cd2",
+      "resolved_path": "/candidate/app/Services/AdditionalProcessing/State/ReleaseProcessingContext.php"
+    },
+    "/candidate/app/Services/Releases/ReleaseBrowseService.php": {
+      "sha256": "5f2343e33cfdd586b366e019b9eeee65017ae73a9ad99df4857ff355e53040dc",
+      "resolved_path": "/candidate/app/Services/Releases/ReleaseBrowseService.php"
+    },
+    "/candidate/app/Models/Release.php": {
+      "sha256": "ce29541025c7f8c240d18db7de1bd2ba6b1cb8dec1a38c83f927b6eaf4096f67",
+      "resolved_path": "/candidate/app/Models/Release.php"
+    },
+    "/candidate/tests/Unit/AdditionalProcessing/CreatesProcessingConfiguration.php": {
+      "sha256": "5e49a365d5320fd2b79a540603f01a48ff2cd7b450dafd81580a1f26b9408fa3",
+      "resolved_path": "/candidate/tests/Unit/AdditionalProcessing/CreatesProcessingConfiguration.php"
+    },
+    "/candidate/app/Services/AdditionalProcessing/NativeSevenZipListing.php": {
+      "sha256": "bbbe336192f602024a05adcd4fa00c7f662d81917a0adddcd1bd0f8dbfaec9fb",
+      "resolved_path": "/candidate/app/Services/AdditionalProcessing/NativeSevenZipListing.php"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/Cargo.toml": {
+      "sha256": "748dfccd7eff95f5cc13d4b86a84ecd020c2f0f8b80eb472ff2d8e2b3822e062",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/Cargo.toml"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/Cargo.lock": {
+      "sha256": "e22972721dbde9cfdb013ad38945091db545bafbefa38bc699d851f1ea5de7de",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/Cargo.lock"
+    },
+    "/candidate/scripts/benchmark-sevenzip.py": {
+      "sha256": "3b9c8efc024c4cb75b855d233ab54d00f3116eae3f4e6e66b080bc57520d15c3",
+      "resolved_path": "/candidate/scripts/benchmark-sevenzip.py"
+    },
+    "/candidate/scripts/benchmark-sevenzip-worker.php": {
+      "sha256": "4a703d83c34326d1e64109a099323227bb85deff258cefa2319fde864a178f1f",
+      "resolved_path": "/candidate/scripts/benchmark-sevenzip-worker.php"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/article_dates.rs": {
+      "sha256": "5e55074a66d1afc84b04ae1abbd4da24211d2ad7483fcdab2ed2cde6b6b298d4",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/article_dates.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/article_identity.rs": {
+      "sha256": "488c16b992d9765676e12ebd4ee4d61f961edde440717eed9c09b8daf9b550fa",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/article_identity.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/article_xref.rs": {
+      "sha256": "be7158c50797d35a24ffeef05e8e87f1f1e2c2b2d00ade183d839af8d7f66c24",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/article_xref.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/formats.rs": {
+      "sha256": "b34a0f53533e1d8395220ceffb113910e51f825c4057978e411239e12ce1045f",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/formats.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/lib.rs": {
+      "sha256": "fb0e89e0827777708740287dceb13c3ca59d892636d51a5e6046ad28df549fac",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/lib.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/nntp_body.rs": {
+      "sha256": "29a5861aaddfb7c9bbc0f47252f9cc07f20e67c18a9d4b979eb61b69c3b91c82",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/nntp_body.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/nntp_headers.rs": {
+      "sha256": "888bcab042e072154196db0cabc72c2300f08f1f4d8f0c1ba656bf2162429b1c",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/nntp_headers.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/par2.rs": {
+      "sha256": "50e4506ac4a003c6279425170b5c83a79485679b6c4e54d2f6888dc3d739981c",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/par2.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/par2_source_ranges.rs": {
+      "sha256": "e5f95b98a99fa577a875f8b293c571ef97e15c96aad95fd4e74a269f1ebfe756",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/par2_source_ranges.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/payload_decoder.rs": {
+      "sha256": "a3e5521fd902d9ee953b0655867387d7642573a329cbb7dc4cec2ee9b3a064f5",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/payload_decoder.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/payload_decoder_arm.rs": {
+      "sha256": "355be6ce2b69457deb144f13f32a1b3b1c93e195b10eb144c13a26098e9ebc56",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/payload_decoder_arm.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/payload_decoder_x86.rs": {
+      "sha256": "4639cccf7884ea0e240fbaf55de9ded696fd309aa16d63a351eccaeb8c62ee33",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/payload_decoder_x86.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/release_names.rs": {
+      "sha256": "5f16c3cd04a0706492e7577a6d7832bd06f8675713258c046624764aa3ef3087",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/release_names.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/sample_plan.rs": {
+      "sha256": "516bb888e1177c4426e67a656adad189d49a496cd6745ae906c321692aa76700",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/sample_plan.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/seven_zip_listing.rs": {
+      "sha256": "9f7a1f55f5df2a566bb2b69802a2bf74b960e2f5c18c7362a742e8d8161fc374",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/seven_zip_listing.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/seven_zip_ranges.rs": {
+      "sha256": "d4a0803b53e7ad52e77e46518fd6440bdf68d2ee5b17d9924685dff284aba4e4",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/seven_zip_ranges.rs"
+    },
+    "/candidate/docker/app/nzb-yenc-ffi/src/yenc_framing.rs": {
+      "sha256": "390b434056e743a380b7d008974b038f0aaa0fbce71e985ef062d6e859d9294a",
+      "resolved_path": "/candidate/docker/app/nzb-yenc-ffi/src/yenc_framing.rs"
+    },
+    "/baseline/composer.lock": {
+      "sha256": "ee1360f9ab65dbd1d3435cc2d986a2d4a3f2069ba8e129222df3889facdd5be8",
+      "resolved_path": "/baseline/composer.lock"
+    },
+    "/baseline/vendor/autoload.php": {
+      "sha256": "b0bec16682b214a20dad30d632d180efbbc65186d115d805e05122dabb37c4fc",
+      "resolved_path": "/baseline/vendor/autoload.php"
+    },
+    "/baseline/vendor/composer/installed.json": {
+      "sha256": "73f5afcf1a606040619d1ade614c700bcf2651785d3462e7ce287e86c00e5d26",
+      "resolved_path": "/baseline/vendor/composer/installed.json"
+    },
+    "/baseline/vendor/composer/autoload_classmap.php": {
+      "sha256": "09a70967673dd23719e39b60ce4f616cf36766295fac335eb4a127db2a2458c9",
+      "resolved_path": "/baseline/vendor/composer/autoload_classmap.php"
+    },
+    "/baseline/vendor/composer/autoload_files.php": {
+      "sha256": "b2be8ce42f47639a8b4ed755d3097905612989fad17307b7a1f4b0651c89ff1b",
+      "resolved_path": "/baseline/vendor/composer/autoload_files.php"
+    },
+    "/baseline/vendor/composer/autoload_namespaces.php": {
+      "sha256": "c80ec79c9a4e542d4d522df86a94dc328b57452d4116b919d7872aa4b7aa4fc8",
+      "resolved_path": "/baseline/vendor/composer/autoload_namespaces.php"
+    },
+    "/baseline/vendor/composer/autoload_psr4.php": {
+      "sha256": "6adf53ed2098f6f5e1d4a9beea3b93a3bebd9d1585bcc0247853cc9a6f82ce01",
+      "resolved_path": "/baseline/vendor/composer/autoload_psr4.php"
+    },
+    "/baseline/vendor/composer/autoload_real.php": {
+      "sha256": "2da16048cf3890b0cfef27902472bcfc45212fefc68f866a634a5b1fbfd194cd",
+      "resolved_path": "/baseline/vendor/composer/autoload_real.php"
+    },
+    "/baseline/vendor/composer/autoload_static.php": {
+      "sha256": "52e8d13dd4a457381ecc5e641fa0a10539158766a8377918fe3c0d10bf0698fc",
+      "resolved_path": "/baseline/vendor/composer/autoload_static.php"
+    },
+    "/candidate/composer.lock": {
+      "sha256": "ee1360f9ab65dbd1d3435cc2d986a2d4a3f2069ba8e129222df3889facdd5be8",
+      "resolved_path": "/candidate/composer.lock"
+    },
+    "/candidate/vendor/autoload.php": {
+      "sha256": "b0bec16682b214a20dad30d632d180efbbc65186d115d805e05122dabb37c4fc",
+      "resolved_path": "/candidate/vendor/autoload.php"
+    },
+    "/candidate/vendor/composer/installed.json": {
+      "sha256": "73f5afcf1a606040619d1ade614c700bcf2651785d3462e7ce287e86c00e5d26",
+      "resolved_path": "/candidate/vendor/composer/installed.json"
+    },
+    "/candidate/vendor/composer/autoload_classmap.php": {
+      "sha256": "09a70967673dd23719e39b60ce4f616cf36766295fac335eb4a127db2a2458c9",
+      "resolved_path": "/candidate/vendor/composer/autoload_classmap.php"
+    },
+    "/candidate/vendor/composer/autoload_files.php": {
+      "sha256": "b2be8ce42f47639a8b4ed755d3097905612989fad17307b7a1f4b0651c89ff1b",
+      "resolved_path": "/candidate/vendor/composer/autoload_files.php"
+    },
+    "/candidate/vendor/composer/autoload_namespaces.php": {
+      "sha256": "c80ec79c9a4e542d4d522df86a94dc328b57452d4116b919d7872aa4b7aa4fc8",
+      "resolved_path": "/candidate/vendor/composer/autoload_namespaces.php"
+    },
+    "/candidate/vendor/composer/autoload_psr4.php": {
+      "sha256": "6adf53ed2098f6f5e1d4a9beea3b93a3bebd9d1585bcc0247853cc9a6f82ce01",
+      "resolved_path": "/candidate/vendor/composer/autoload_psr4.php"
+    },
+    "/candidate/vendor/composer/autoload_real.php": {
+      "sha256": "2da16048cf3890b0cfef27902472bcfc45212fefc68f866a634a5b1fbfd194cd",
+      "resolved_path": "/candidate/vendor/composer/autoload_real.php"
+    },
+    "/candidate/vendor/composer/autoload_static.php": {
+      "sha256": "52e8d13dd4a457381ecc5e641fa0a10539158766a8377918fe3c0d10bf0698fc",
+      "resolved_path": "/candidate/vendor/composer/autoload_static.php"
+    },
+    "/candidate/tests/Fixtures/SevenZip/basic.head": {
+      "sha256": "41048af6287023e1cd57c1652ba8e3078d9153766dc39aa81820407143f5dc2d",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/basic.head"
+    },
+    "/candidate/tests/Fixtures/SevenZip/basic.tail": {
+      "sha256": "4bc2524703426610ff530f9860b80fa193824f5aaf22ae48b8481d089e74e4c6",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/basic.tail"
+    },
+    "/candidate/tests/Fixtures/SevenZip/benchmark-observations.jsonl": {
+      "sha256": "07ef527bcbb2f32123b40ad32a959b6ec8c6e6c8eeb5e16640988236c7097924",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/benchmark-observations.jsonl"
+    },
+    "/candidate/tests/Fixtures/SevenZip/benchmark-runtime.json": {
+      "sha256": "5b262fe69d1e118f4e52b4e5b3e6004e0590d561f9552258a2421a90680845f2",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/benchmark-runtime.json"
+    },
+    "/candidate/tests/Fixtures/SevenZip/benchmark-summary.json": {
+      "sha256": "134dc0b676240a114306e7f4fccbdc270820fbcfa730d7767b738de428aacd13",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/benchmark-summary.json"
+    },
+    "/candidate/tests/Fixtures/SevenZip/capped-encrypted.head": {
+      "sha256": "e2d7301e47613862d1c189de4545632814109787252ccaef331d5aeb36337760",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/capped-encrypted.head"
+    },
+    "/candidate/tests/Fixtures/SevenZip/capped-plain.head": {
+      "sha256": "2fb9836e8e1ee4bbed530805dbfa8a452d93e7269d83df2abee392da9493a72c",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/capped-plain.head"
+    },
+    "/candidate/tests/Fixtures/SevenZip/compact.head": {
+      "sha256": "169d60263f16d12686a8ad26464d6610694e091c885d701b08679bae28972207",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/compact.head"
+    },
+    "/candidate/tests/Fixtures/SevenZip/encrypted-files.head": {
+      "sha256": "d6bbd81dbb25cc34b70eefe487f180df548430b7561eac0c2146e9c98d695524",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/encrypted-files.head"
+    },
+    "/candidate/tests/Fixtures/SevenZip/encrypted-files.tail": {
+      "sha256": "81819f5d59f888deebf986da1b73f338346d08cfefc439fcb167d959657a3c45",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/encrypted-files.tail"
+    },
+    "/candidate/tests/Fixtures/SevenZip/encrypted-header.head": {
+      "sha256": "f743ab1af2b49a4ce226c150f1dc4e2b92bf28dd22004765432e4f30f9e5af31",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/encrypted-header.head"
+    },
+    "/candidate/tests/Fixtures/SevenZip/encrypted-header.tail": {
+      "sha256": "b2f500cbe2194d427d8a0122f2a53881725d9ef944ac35839c80ed8cf84bac98",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/encrypted-header.tail"
+    },
+    "/candidate/tests/Fixtures/SevenZip/lzma2-header.head": {
+      "sha256": "a6bb816fdd81d3256a9c44be3fce6cc37f60fcea088ddaa8b80f3f77fc9b7034",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/lzma2-header.head"
+    },
+    "/candidate/tests/Fixtures/SevenZip/lzma2-header.tail": {
+      "sha256": "ffedc5c743137a48e7915efcd460af1ff59c27639cb2bebc02ebf66bb953e621",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/lzma2-header.tail"
+    },
+    "/candidate/tests/Fixtures/SevenZip/manifest.json": {
+      "sha256": "8c9459365a1111ef4a461c0eb47f4ea11567bba250d6303f3466e466ab253d32",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/manifest.json"
+    },
+    "/candidate/tests/Fixtures/SevenZip/many.head": {
+      "sha256": "16dc50ee82d53e0c0633878b9235a9468e95c465f55607b49ad1d5676d89f931",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/many.head"
+    },
+    "/candidate/tests/Fixtures/SevenZip/plain-header.head": {
+      "sha256": "adcdb86452d0e2d801e0d89d9f27d8bf6e12538e8d230f80e6234014ca4c823e",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/plain-header.head"
+    },
+    "/candidate/tests/Fixtures/SevenZip/plain-header.tail": {
+      "sha256": "0515aaa6d6ba364030c75367318c4d6e2000e12f0ad11f94b2c09f7db8fbcafa",
+      "resolved_path": "/candidate/tests/Fixtures/SevenZip/plain-header.tail"
+    },
+    "/evidence/linux-target198/release/libnzbyenc.so": {
+      "sha256": "a7bbc4c3dca5cf41fe9b5906ac4132cfd7049095e6882e2af6159f704b6f37b8",
+      "resolved_path": "/evidence/linux-target198/release/libnzbyenc.so"
+    },
+    "/evidence/7z-bin": {
+      "sha256": "63735033cd0e12fdb75ebd84d7058359ca7460a717066cb475edf9744f4761ed",
+      "resolved_path": "/evidence/7z-bin"
+    },
+    "/evidence/7z.so": {
+      "sha256": "dca32393e7f36db5ab12ede3482dd972ebe672380085c14138ccfefce1e5cc19",
+      "resolved_path": "/evidence/7z.so"
+    }
+  },
+  "fixture_inventory": [
+    "basic.head",
+    "basic.tail",
+    "benchmark-observations.jsonl",
+    "benchmark-runtime.json",
+    "benchmark-summary.json",
+    "capped-encrypted.head",
+    "capped-plain.head",
+    "compact.head",
+    "encrypted-files.head",
+    "encrypted-files.tail",
+    "encrypted-header.head",
+    "encrypted-header.tail",
+    "lzma2-header.head",
+    "lzma2-header.tail",
+    "manifest.json",
+    "many.head",
+    "plain-header.head",
+    "plain-header.tail"
+  ],
+  "baseline_vendor_identity": {
+    "composer.lock": "ee1360f9ab65dbd1d3435cc2d986a2d4a3f2069ba8e129222df3889facdd5be8",
+    "vendor/autoload.php": "b0bec16682b214a20dad30d632d180efbbc65186d115d805e05122dabb37c4fc",
+    "vendor/composer/installed.json": "73f5afcf1a606040619d1ade614c700bcf2651785d3462e7ce287e86c00e5d26",
+    "vendor/composer/autoload_classmap.php": "09a70967673dd23719e39b60ce4f616cf36766295fac335eb4a127db2a2458c9",
+    "vendor/composer/autoload_files.php": "b2be8ce42f47639a8b4ed755d3097905612989fad17307b7a1f4b0651c89ff1b",
+    "vendor/composer/autoload_namespaces.php": "c80ec79c9a4e542d4d522df86a94dc328b57452d4116b919d7872aa4b7aa4fc8",
+    "vendor/composer/autoload_psr4.php": "6adf53ed2098f6f5e1d4a9beea3b93a3bebd9d1585bcc0247853cc9a6f82ce01",
+    "vendor/composer/autoload_real.php": "2da16048cf3890b0cfef27902472bcfc45212fefc68f866a634a5b1fbfd194cd",
+    "vendor/composer/autoload_static.php": "52e8d13dd4a457381ecc5e641fa0a10539158766a8377918fe3c0d10bf0698fc"
+  },
+  "candidate_vendor_identity": {
+    "composer.lock": "ee1360f9ab65dbd1d3435cc2d986a2d4a3f2069ba8e129222df3889facdd5be8",
+    "vendor/autoload.php": "b0bec16682b214a20dad30d632d180efbbc65186d115d805e05122dabb37c4fc",
+    "vendor/composer/installed.json": "73f5afcf1a606040619d1ade614c700bcf2651785d3462e7ce287e86c00e5d26",
+    "vendor/composer/autoload_classmap.php": "09a70967673dd23719e39b60ce4f616cf36766295fac335eb4a127db2a2458c9",
+    "vendor/composer/autoload_files.php": "b2be8ce42f47639a8b4ed755d3097905612989fad17307b7a1f4b0651c89ff1b",
+    "vendor/composer/autoload_namespaces.php": "c80ec79c9a4e542d4d522df86a94dc328b57452d4116b919d7872aa4b7aa4fc8",
+    "vendor/composer/autoload_psr4.php": "6adf53ed2098f6f5e1d4a9beea3b93a3bebd9d1585bcc0247853cc9a6f82ce01",
+    "vendor/composer/autoload_real.php": "2da16048cf3890b0cfef27902472bcfc45212fefc68f866a634a5b1fbfd194cd",
+    "vendor/composer/autoload_static.php": "52e8d13dd4a457381ecc5e641fa0a10539158766a8377918fe3c0d10bf0698fc"
+  },
+  "fixture_manifest": {
+    "basic": {
+      "archive_size": 300268,
+      "archive_sha256": "00b673b08b0c562925ded98a684890abee97ff3e7c6c3c76dfe339f5baa7c359",
+      "head": "basic.head",
+      "tail": "basic.tail"
+    },
+    "encrypted-files": {
+      "archive_size": 300297,
+      "archive_sha256": "acc20a9d7256b33ba1ec216abfc02442d51ef3a2ca4fdd71565009071fc8136d",
+      "head": "encrypted-files.head",
+      "tail": "encrypted-files.tail"
+    },
+    "encrypted-header": {
+      "archive_size": 300336,
+      "archive_sha256": "66ec56dc781daada1ca4a0e5041ccdd1e3bc0b007fe590f525032174aacbcdd6",
+      "head": "encrypted-header.head",
+      "tail": "encrypted-header.tail"
+    },
+    "plain-header": {
+      "archive_size": 300282,
+      "archive_sha256": "9cf5e13a0992cffbb4b2832a959e30a62b63d74db8e4e63bb0ea4440ad428de0",
+      "head": "plain-header.head",
+      "tail": "plain-header.tail"
+    },
+    "compact": {
+      "archive_size": 233,
+      "archive_sha256": "169d60263f16d12686a8ad26464d6610694e091c885d701b08679bae28972207",
+      "head": "compact.head",
+      "tail": null
+    },
+    "many": {
+      "archive_size": 893,
+      "archive_sha256": "16dc50ee82d53e0c0633878b9235a9468e95c465f55607b49ad1d5676d89f931",
+      "head": "many.head",
+      "tail": null
+    },
+    "capped-encrypted": {
+      "archive_size": 854,
+      "archive_sha256": "e2d7301e47613862d1c189de4545632814109787252ccaef331d5aeb36337760",
+      "head": "capped-encrypted.head",
+      "tail": null
+    },
+    "lzma2-header": {
+      "archive_size": 300269,
+      "archive_sha256": "1f76ba2a7296ef9d48acf76013e2abb27fcc0a8fb334800ecd964c420572d711",
+      "head": "lzma2-header.head",
+      "tail": "lzma2-header.tail"
+    },
+    "capped-plain": {
+      "archive_size": 826,
+      "archive_sha256": "2fb9836e8e1ee4bbed530805dbfa8a452d93e7269d83df2abee392da9493a72c",
+      "head": "capped-plain.head",
+      "tail": null
+    }
+  },
+  "executor": {
+    "rust_image_id": "sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e",
+    "php_image_id": "sha256:c605e7506d179f1034123fe9bb32cd56da0fde4544c518c75ebb009091e1fd28",
+    "cpus": 2,
+    "memory_bytes": 2147483648,
+    "network": "none",
+    "rust_version": "1.98.0",
+    "rust_library_build": "cargo test --release --locked --offline && cargo build --release --locked --offline",
+    "branch_base": "7a32a2349dcd7b3d5a1709fce0edae08e6e4760b",
+    "performance_scope": "Header listing service, excluding PHP process startup, network downloads and database finalization"
+  }
+}

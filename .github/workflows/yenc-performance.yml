@@ -12,6 +12,11 @@ on:
       - 'tests/Feature/ReleaseFingerprintMetadataTest.php'
       - 'scripts/build-rapidyenc.sh'
       - 'app/Services/Yenc/**'
+      - 'app/Services/AdditionalProcessing/**'
+      - 'tests/Unit/AdditionalProcessing/**'
+      - 'tests/Feature/AdditionalProcessingReleaseFileManagerTest.php'
+      - 'tests/Fixtures/SevenZip/**'
+      - 'scripts/benchmark-sevenzip*'
       - 'app/Services/Releases/Fingerprint/**'
       - 'app/Services/YencService.php'
       - 'app/Services/NNTP/NNTPService.php'
@@ -106,6 +111,17 @@ jobs:
               --filter='YencNativeDecoderTest|YencServiceTest|NNTPBodyDecodingTest' \
               2>&1 | tee "benchmark-evidence/build/parity-$backend.log"
           done
+
+      - name: Verify native 7z listings and password finalization on Linux
+        shell: bash
+        run: |
+          YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
+              tests/Unit/AdditionalProcessing/NativeSevenZipListingTest.php
+          YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
+              tests/Feature/AdditionalProcessingReleaseFileManagerTest.php \
+              --filter='test_native_7z_prefix_listing_preserves_password_uncertainty|test_real_native_7z_'
 
       - name: Verify native framing budget integration on Linux
         shell: bash

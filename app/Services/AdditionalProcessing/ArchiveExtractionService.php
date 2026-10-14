@@ -25,13 +25,19 @@ class ArchiveExtractionService
 
     private Par2Info $par2Info;
 
+    private NativeSevenZipListing $nativeSevenZipListing;
+
+    private const int MAX_SEVEN_ZIP_ARCHIVE_BYTES = 1_099_511_627_776;
+
     public function __construct(
         private readonly ProcessingConfiguration $config,
         ?ArchiveInfo $archiveInfo = null,
-        ?Par2Info $par2Info = null
+        ?Par2Info $par2Info = null,
+        ?NativeSevenZipListing $nativeSevenZipListing = null
     ) {
         $this->archiveInfo = $archiveInfo ?? new ArchiveInfo;
         $this->par2Info = $par2Info ?? new Par2Info;
+        $this->nativeSevenZipListing = $nativeSevenZipListing ?? new NativeSevenZipListing;
 
         // Configure external clients for ArchiveInfo
         if ($this->config->unrarPath) {
@@ -47,9 +53,15 @@ class ArchiveExtractionService
     public function processCompressedData(
         string $compressedData,
         ReleaseProcessingContext $context,
-        string $tmpPath
+        string $tmpPath,
+        ?string $sevenZipTail = null,
     ): array {
-        $result = $this->inspectCompressedData($compressedData, $context, $tmpPath);
+        $result = $this->listEncodedSevenZip($compressedData, $sevenZipTail, $context, $tmpPath)
+            ?? $this->inspectCompressedData(
+                $sevenZipTail === null ? $compressedData : ($this->withSevenZipEndHeader($compressedData, $sevenZipTail) ?? $compressedData),
+                $context,
+                $tmpPath,
+            );
 
         if (! $result['success'] && ! $result['hasPassword']) {
             if ($result['undecodable'] ?? false) {
@@ -163,6 +175,93 @@ class ArchiveExtractionService
             'archiveMarker' => $archiveMarker,
             'dataSummary' => $dataSummary,
             'listingOnly' => $listingOnly,
+        ];
+    }
+
+    /**
+     * List an encoded 7z header from original head/tail bytes; null selects rarinfo.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function listEncodedSevenZip(
+        string $head,
+        ?string $tail,
+        ReleaseProcessingContext $context,
+        string $tmpPath,
+    ): ?array {
+        $start = $this->sevenZipStartHeader($head);
+        if ($start === null) {
+            if (! str_starts_with($head, SzipInfo::MARKER_SIGNATURE) || strlen($head) < 32) {
+                return null;
+            }
+            $context->archivePasswordCheckIncomplete = true;
+            $context->archiveListingUndecodable = true;
+
+            return $this->nativeListingResult([], false, false, true);
+        }
+        $archiveEnd = 32 + $start['next_offset'] + $start['next_size'];
+        $knownReleaseSize = max(0, (int) $context->release->size);
+        if ($knownReleaseSize > 0 && $archiveEnd > $knownReleaseSize) {
+            $context->archivePasswordCheckIncomplete = true;
+            $context->archiveListingUndecodable = true;
+
+            return $this->nativeListingResult([], false, false, true);
+        }
+        $header = strlen($head) >= $archiveEnd
+            ? substr($head, 32 + $start['next_offset'], $start['next_size'])
+            : ($tail !== null && strlen($tail) >= $start['next_size'] ? substr($tail, -$start['next_size']) : null);
+        if ($header !== null) {
+            if (crc32($header) !== $start['next_crc']) {
+                $context->archivePasswordCheckIncomplete = true;
+                $context->archiveListingUndecodable = true;
+
+                return $this->nativeListingResult([], false, false, true);
+            }
+            if (! str_starts_with($header, "\x17")) {
+                return null;
+            }
+        }
+
+        $listing = $this->nativeSevenZipListing->listing($head, $tail, $knownReleaseSize);
+        if ($listing === null) {
+            return null;
+        }
+        $status = $listing['status'];
+        $encrypted = $listing['encryption'] === 'encrypted' || $status === 'encrypted';
+        $complete = $status === 'complete' && $listing['listing_complete'] === true;
+        if (! $encrypted && (! $complete || $listing['encryption'] !== 'unencrypted')) {
+            $context->archivePasswordCheckIncomplete = true;
+        }
+        if (! $encrypted && in_array($status, ['unsupported', 'missing_bytes'], true)) {
+            if ($status === 'missing_bytes') {
+                $context->archiveRetryable = true;
+            }
+
+            return null;
+        }
+        $context->compressedFilesChecked++;
+        if (! $complete) {
+            $context->archiveListingUndecodable = true;
+        }
+
+        return $this->nativeListingResult($listing['files'], $encrypted, $complete, ! $complete);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $files
+     * @return array<string, mixed>
+     */
+    private function nativeListingResult(array $files, bool $encrypted, bool $complete, bool $undecodable): array
+    {
+        return [
+            'success' => $complete || $files !== [],
+            'files' => $files,
+            'hasPassword' => $encrypted,
+            'passwordStatus' => $encrypted ? ReleaseBrowseService::PASSWD_RAR : ReleaseBrowseService::PASSWD_NONE,
+            'archiveMarker' => '7',
+            'dataSummary' => ['main_type' => ArchiveInfo::TYPE_SZIP],
+            'listingOnly' => true,
+            'undecodable' => $undecodable,
         ];
     }
 
@@ -323,11 +422,13 @@ class ArchiveExtractionService
     /**
      * True when the data starts a 7z archive whose end header (file list) lies beyond it.
      */
-    public function needsSevenZipEndHeader(string $data): bool
+    public function needsSevenZipEndHeader(string $data, int $knownReleaseSize = 0): bool
     {
         $start = $this->sevenZipStartHeader($data);
 
-        return $start !== null && 32 + $start['next_offset'] + $start['next_size'] > strlen($data);
+        return $start !== null
+            && ($knownReleaseSize <= 0 || 32 + $start['next_offset'] + $start['next_size'] <= $knownReleaseSize)
+            && 32 + $start['next_offset'] + $start['next_size'] > strlen($data);
     }
 
     /**
@@ -365,7 +466,15 @@ class ArchiveExtractionService
         /** @var array{next_offset: int, next_size: int, next_crc: int} $start */
         $start = unpack('Pnext_offset/Pnext_size/Vnext_crc', $data, 12);
 
-        return $start['next_offset'] >= 0 && $start['next_size'] >= 0 ? $start : null;
+        if (crc32(substr($data, 12, 20)) !== unpack('Vcrc', $data, 8)['crc']
+            || $start['next_offset'] < 0 || $start['next_size'] <= 0
+            || $start['next_offset'] > self::MAX_SEVEN_ZIP_ARCHIVE_BYTES - 32
+            || $start['next_size'] > self::MAX_SEVEN_ZIP_ARCHIVE_BYTES - 32 - $start['next_offset']
+        ) {
+            return null;
+        }
+
+        return $start;
     }
 
     /**

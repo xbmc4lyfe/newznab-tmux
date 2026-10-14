@@ -4,6 +4,7 @@ namespace Tests\Unit\AdditionalProcessing;
 
 use App\Models\Release;
 use App\Services\AdditionalProcessing\ArchiveExtractionService;
+use App\Services\AdditionalProcessing\NativeSevenZipListing;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\Releases\ReleaseBrowseService;
 use dariusiii\rarinfo\ArchiveInfo;
@@ -285,6 +286,79 @@ class ArchiveExtractionServiceTest extends TestCase
 
         $this->assertTrue($result['success']);
         $this->assertSame(1, $result['files'][0]['pass']);
+    }
+
+    #[Test]
+    public function it_keeps_missing_native_bytes_retryable_when_the_fallback_is_undecodable(): void
+    {
+        $native = Mockery::mock(NativeSevenZipListing::class);
+        $native->shouldReceive('listing')->once()->andReturn([
+            'schema_version' => 1, 'status' => 'missing_bytes', 'files' => [],
+            'listing_complete' => false, 'encryption' => 'unknown', 'reason' => 'packed_header_missing',
+        ]);
+        $service = new ArchiveExtractionService($this->makeConfig(), nativeSevenZipListing: $native);
+        $archive = $this->sevenZip('Movie.mkv', str_repeat('x', 100), compressedHeader: true);
+        $context = $this->sevenZipContext();
+
+        $result = $service->processCompressedData($archive, $context, '/unused/');
+
+        $this->assertFalse($result['success']);
+        $this->assertTrue($context->archiveRetryable);
+        $this->assertTrue($context->archiveListingUndecodable);
+        $this->assertTrue($context->archivePasswordCheckIncomplete);
+    }
+
+    #[Test]
+    public function it_rejects_overflowing_7z_offsets_before_requesting_a_tail(): void
+    {
+        $service = new ArchiveExtractionService($this->makeConfig());
+        foreach ([PHP_INT_MAX, 1_099_511_627_776] as $offset) {
+            $start = pack('PPV', $offset, 40, 0);
+            $head = "7z\xBC\xAF\x27\x1C\x00\x04".pack('V', crc32($start)).$start;
+            $this->assertFalse($service->needsSevenZipEndHeader($head));
+            $this->assertNull($service->withSevenZipEndHeader($head, str_repeat('x', 40)));
+        }
+    }
+
+    #[Test]
+    public function it_checks_the_release_size_before_requesting_a_7z_tail(): void
+    {
+        $native = Mockery::mock(NativeSevenZipListing::class);
+        $native->shouldNotReceive('listing');
+        $service = new ArchiveExtractionService($this->makeConfig(), nativeSevenZipListing: $native);
+        $archive = $this->sevenZip('Movie.mkv', str_repeat('x', 100), compressedHeader: true);
+        $context = $this->sevenZipContext();
+        $context->release->size = strlen($archive) - 1;
+
+        $this->assertFalse($service->needsSevenZipEndHeader(substr($archive, 0, 40), (int) $context->release->size));
+        $result = $service->processCompressedData(substr($archive, 0, 40), $context, '/unused/');
+
+        $this->assertFalse($result['success']);
+        $this->assertTrue($context->archivePasswordCheckIncomplete);
+        $this->assertTrue($context->archiveListingUndecodable);
+        $this->assertFalse($context->archiveRetryable);
+    }
+
+    #[Test]
+    public function it_keeps_a_resource_limited_listing_unknown_without_retrying(): void
+    {
+        $native = Mockery::mock(NativeSevenZipListing::class);
+        $native->shouldReceive('listing')->once()->andReturn([
+            'schema_version' => 1, 'status' => 'incomplete', 'files' => [],
+            'listing_complete' => false, 'encryption' => 'unknown', 'reason' => 'decoded_header_limit',
+        ]);
+        $service = new ArchiveExtractionService($this->makeConfig(), nativeSevenZipListing: $native);
+        $archive = $this->sevenZip('Movie.mkv', str_repeat('x', 100), compressedHeader: true);
+        $context = $this->sevenZipContext();
+
+        $result = $service->processCompressedData($archive, $context, '/unused/');
+
+        $this->assertFalse($result['success']);
+        $this->assertTrue($result['listingOnly']);
+        $this->assertSame(['main_type' => ArchiveInfo::TYPE_SZIP], $result['dataSummary']);
+        $this->assertTrue($context->archivePasswordCheckIncomplete);
+        $this->assertTrue($context->archiveListingUndecodable);
+        $this->assertFalse($context->archiveRetryable);
     }
 
     #[Test]

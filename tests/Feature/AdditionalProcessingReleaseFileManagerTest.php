@@ -17,6 +17,7 @@ use App\Services\AdditionalProcessing\Enums\DownloadKind;
 use App\Services\AdditionalProcessing\Enums\ProcessingOutcome;
 use App\Services\AdditionalProcessing\Media\MediaSourceResolver;
 use App\Services\AdditionalProcessing\MediaExtractionService;
+use App\Services\AdditionalProcessing\NativeSevenZipListing;
 use App\Services\AdditionalProcessing\NzbContentParser;
 use App\Services\AdditionalProcessing\ReleaseFileManager;
 use App\Services\AdditionalProcessing\ReleaseFilesArchiveFallback;
@@ -1640,6 +1641,131 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->assertSame(ReleaseBrowseService::PASSWD_NONE, (int) $release->passwordstatus);
         $this->assertSame(1, (int) $release->rarinnerfilecount);
         $this->assertSame('Example.Show.S01E01.mkv', DB::table('release_files')->value('name'));
+    }
+
+    #[DataProvider('nativeSevenZipPasswordScenarios')]
+    public function test_native_7z_prefix_listing_preserves_password_uncertainty(
+        string $status,
+        string $encryption,
+        int $expectedPasswordStatus,
+    ): void {
+        DB::table('releases')->insert($this->releaseRow());
+        Search::shouldReceive('updateRelease')->once()->with(1);
+        $native = Mockery::mock(NativeSevenZipListing::class);
+        $native->shouldReceive('listing')->once()->andReturn([
+            'schema_version' => 1,
+            'status' => $status,
+            'files' => [['name' => 'Example.Show.S01E01.mkv', 'size' => 100, 'date' => 0, 'pass' => 0, 'compressed' => 1]],
+            'listing_complete' => $status === 'complete',
+            'encryption' => $encryption,
+            'reason' => $status === 'incomplete' ? 'file_limit' : null,
+        ]);
+        $service = new ArchiveExtractionService($this->makeConfig(), nativeSevenZipListing: $native);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context->nzbHasCompressedFile = true;
+        $context->archiveInspectionAttempted = true;
+        $archive = $this->sevenZip('ignored.mkv', str_repeat('x', 100), compressedHeader: true);
+        $result = $service->listEncodedSevenZip($archive, null, $context, '/unused/');
+        $this->assertNotNull($result);
+        $manager = $this->makeManager();
+        if ($result['hasPassword']) {
+            $context->releaseHasPassword = true;
+            $context->passwordStatus = $result['passwordStatus'];
+        }
+        foreach ($result['files'] as $file) {
+            $manager->addFileInfo($file, $context, '\\.(?:par2|sfv|nzb)');
+        }
+        $manager->finalizeRelease($context, true);
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame($expectedPasswordStatus, (int) $release->passwordstatus);
+        $this->assertSame(1, (int) $release->rarinnerfilecount);
+        $this->assertNull($release->archive_retry_at);
+        $this->assertSame('Example.Show.S01E01.mkv', DB::table('release_files')->value('name'));
+    }
+
+    public static function nativeSevenZipPasswordScenarios(): array
+    {
+        return [
+            'truncated listing has unknown encryption' => ['incomplete', 'unknown', -1],
+            'incomplete listing cannot establish no password' => ['incomplete', 'unencrypted', -1],
+            'positive encryption survives a prefix listing' => ['incomplete', 'encrypted', ReleaseBrowseService::PASSWD_RAR],
+            'complete unencrypted listing' => ['complete', 'unencrypted', ReleaseBrowseService::PASSWD_NONE],
+        ];
+    }
+
+    public function test_real_native_7z_encryption_after_the_file_cap_stays_passworded(): void
+    {
+        $root = dirname(__DIR__).'/Fixtures/SevenZip/';
+        $manifest = json_decode(file_get_contents($root.'manifest.json'), true, flags: JSON_THROW_ON_ERROR);
+        $fixture = $manifest['capped-encrypted'];
+        $head = file_get_contents($root.$fixture['head']);
+        $native = new NativeSevenZipListing;
+        if ($native->listing($head, null, $fixture['archive_size']) === null) {
+            if (getenv('YENC_NATIVE_LIBRARY')) {
+                $this->fail('The explicitly configured native library did not provide the 7z listing ABI.');
+            }
+            $this->markTestSkipped('The Linux native 7z listing library is unavailable.');
+        }
+        DB::table('releases')->insert([...$this->releaseRow(), 'size' => $fixture['archive_size']]);
+        Search::shouldReceive('updateRelease')->once()->with(1);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context->nzbHasCompressedFile = true;
+        $context->archiveInspectionAttempted = true;
+        $result = (new ArchiveExtractionService($this->makeConfig(), nativeSevenZipListing: $native))
+            ->processCompressedData($head, $context, '/unused/');
+        $this->assertTrue($result['hasPassword']);
+        $this->assertCount(1000, $result['files']);
+        $context->releaseHasPassword = true;
+        $context->passwordStatus = $result['passwordStatus'];
+        $this->makeManager()->finalizeRelease($context, true);
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame(ReleaseBrowseService::PASSWD_RAR, (int) $release->passwordstatus);
+        $this->assertSame(0, (int) $release->rarinnerfilecount);
+        $this->assertNull($release->archive_retry_at);
+    }
+
+    public function test_real_native_7z_capped_file_prefix_is_persisted_with_unknown_password_status(): void
+    {
+        $root = dirname(__DIR__).'/Fixtures/SevenZip/';
+        $manifest = json_decode(file_get_contents($root.'manifest.json'), true, flags: JSON_THROW_ON_ERROR);
+        $fixture = $manifest['capped-plain'];
+        $head = file_get_contents($root.$fixture['head']);
+        $native = new NativeSevenZipListing;
+        if ($native->listing($head, null, $fixture['archive_size']) === null) {
+            if (getenv('YENC_NATIVE_LIBRARY')) {
+                $this->fail('The explicitly configured native library did not provide the 7z listing ABI.');
+            }
+            $this->markTestSkipped('The Linux native 7z listing library is unavailable.');
+        }
+        DB::table('releases')->insert([...$this->releaseRow(), 'size' => $fixture['archive_size']]);
+        Search::shouldReceive('updateRelease')->once()->with(1);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context->nzbHasCompressedFile = true;
+        $context->archiveInspectionAttempted = true;
+        $result = (new ArchiveExtractionService($this->makeConfig(), nativeSevenZipListing: $native))
+            ->processCompressedData($head, $context, '/unused/');
+        $this->assertTrue($result['success']);
+        $this->assertTrue($result['listingOnly']);
+        $this->assertFalse($result['hasPassword']);
+        $this->assertCount(1000, $result['files']);
+        $this->assertTrue($context->archivePasswordCheckIncomplete);
+        $this->assertTrue($context->archiveListingUndecodable);
+        $this->assertFalse($context->archiveRetryable);
+        $manager = $this->makeManager();
+        foreach ($result['files'] as $file) {
+            $manager->addFileInfo($file, $context, '\\.(?:par2|sfv|nzb)');
+        }
+        $manager->finalizeRelease($context, true);
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame(-1, (int) $release->passwordstatus);
+        $this->assertSame(11, (int) $release->rarinnerfilecount);
+        $this->assertSame(11, DB::table('release_files')->count());
+        $this->assertSame(1000, $context->totalFileInfo);
+        $this->assertSame(0, (int) $release->haspreview);
+        $this->assertNull($release->archive_retry_at);
     }
 
     public function test_an_unreadable_archive_is_queued_for_one_retry_after_the_delay(): void

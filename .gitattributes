@@ -73,3 +73,6 @@ docker/Makefile		-binary text eol=lf
 /tests/Fixtures/ReleasePresentation.Dockerfile -binary text eol=lf
 /scripts/test-release-presentation-web.py -binary text eol=lf
 /tests/Fixtures/ReleasePresentation.Dockerfile.dockerignore -binary text eol=lf
+/scripts/benchmark-sevenzip.py -binary text eol=lf
+/tests/Unit/test_sevenzip_benchmark.py -binary text eol=lf
+/tests/Fixtures/SevenZip/benchmark-observations.jsonl -binary text eol=lf
