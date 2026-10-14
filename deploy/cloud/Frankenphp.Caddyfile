@@ -1,7 +1,11 @@
 {
     auto_https off
     admin off
-    frankenphp
+    frankenphp {
+        php_ini ffi.enable preload
+        php_ini ffi.preload /usr/local/lib/nntmux/release-presentation.h
+        php_ini opcache.preload /usr/local/lib/nntmux/release-presentation-preload.php
+    }
 }
 :80 {
     root * /app/public

@@ -102,6 +102,7 @@
                     <x-admin.th>Actions</x-admin.th>
                 </x-slot:head>
 
+                @php($releaseNames = app(\App\Support\AdminReleaseNames::class)->render($releaselist))
                 @foreach($releaselist as $release)
                     <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
                         <td class="px-6 py-4 whitespace-nowrap">
@@ -114,7 +115,7 @@
                         </td>
                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">{{ $release->id }}</td>
                         <td class="px-6 py-4 text-sm">
-                            <x-admin.release-name :release="$release" />
+                            {{ $releaseNames[$loop->index] }}
                         </td>
                         <td class="px-6 py-4 whitespace-nowrap">
                             <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-blue-100 dark:bg-blue-900/20 text-blue-800 dark:text-blue-300">
