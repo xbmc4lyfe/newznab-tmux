@@ -397,6 +397,9 @@ final class NameFixingQueryService
                     WHERE donor_generation.releases_id = r.id AND HEX(donor_generation.release_guid) = HEX(r.guid))
             INNER JOIN predb p ON p.id = r.predb_id
             WHERE t.releases_id = ? AND HEX(t.release_guid) = ? AND r.id <> ?
+                AND t.id = (SELECT MIN(anchor.id) FROM par_file_hashes anchor
+                    WHERE anchor.releases_id = t.releases_id AND HEX(anchor.release_guid) = HEX(t.release_guid)
+                        AND anchor.file_size NOT IN (\'\', \'0\'))
                 AND t.file_size NOT IN (?, ?)
                 AND NOT EXISTS (
                     SELECT 1 FROM par_file_hashes wanted
