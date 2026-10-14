@@ -75,6 +75,9 @@
       - certbot
       - logrotate
 
+- name: Install native build toolchain
+  ansible.builtin.import_tasks: native.yml
+
 - name: Fetch Manticore signing key
   ansible.builtin.get_url:
     url: https://repo.manticoresearch.com/GPG-KEY-SHA256-manticore
