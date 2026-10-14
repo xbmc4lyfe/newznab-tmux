@@ -45,7 +45,8 @@ def exit_cause(code, timed_out=False):
         return 'timeout'
     if code in (125, 126, 127):
         return 'invocation_failure'
-    if code >= 128:
+    # Linux signals occupy 1..64; perf may return -1 as shell status 255.
+    if 128 < code <= 192:
         return 'signal'
     return 'nonzero_exit'
 

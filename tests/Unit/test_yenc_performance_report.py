@@ -117,7 +117,7 @@ calls=2 10
     def test_profile_status_retains_postprocessing_and_preflight_failures(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            for code, cause in [(124, 'timeout'), (127, 'invocation_failure'), (139, 'signal'), (1, 'nonzero_exit')]:
+            for code, cause in [(124, 'timeout'), (127, 'invocation_failure'), (139, 'signal'), (255, 'nonzero_exit'), (1, 'nonzero_exit')]:
                 self.assertEqual(cause, self.report.exit_cause(code))
             status = self.report.profile_status(path, 'unavailable', 0, 0, 'not_run', 124)
             self.assertEqual(124, status['perf_preflight_exit'])
@@ -125,6 +125,9 @@ calls=2 10
             self.assertEqual('invalid', status['native_profile'])
             status = self.report.profile_status(path, 'unavailable', 0, 0, 'not_run', 1)
             self.assertEqual('unavailable', status['native_profile'])
+            status = self.report.profile_status(path, 'unavailable', 0, 0, 'not_run', 255)
+            self.assertEqual('unavailable', status['native_profile'])
+            self.assertEqual(255, status['perf_preflight_exit'])
             status = self.report.profile_status(path, 139, 0, 0, 'not_run', 0)
             self.assertEqual('invalid', status['native_profile'])
             self.assertEqual('signal', status['native_exit_cause'])

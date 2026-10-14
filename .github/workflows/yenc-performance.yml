@@ -11,6 +11,8 @@ on:
       - 'scripts/profile-yenc.sh'
       - 'tests/Unit/test_yenc_performance_report.py'
       - 'tests/Unit/YencProfileTest.php'
+      - 'scripts/benchmark-cpu.py'
+      - 'tests/Unit/test_benchmark_cpu.py'
       - 'tests/Unit/test_yenc_abi_benchmark.py'
       - 'tests/Feature/ReleaseFingerprintMetadataTest.php'
       - 'scripts/build-rapidyenc.sh'
@@ -27,6 +29,11 @@ on:
       - 'composer.lock'
   workflow_dispatch:
     inputs:
+      comparison:
+        description: Baseline to compare against Rust
+        type: choice
+        options: [all, php, cpp]
+        default: all
       samples:
         description: Matched fresh-process pairs per fixture stratum
         default: '31'
@@ -45,6 +52,7 @@ concurrency:
 
 jobs:
   paired-decoding:
+    if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'php'
     # PR code runs only on disposable GitHub-hosted workers.
     strategy:
       fail-fast: false
@@ -77,6 +85,7 @@ jobs:
           php vendor/bin/phpunit --filter='YencBenchmarkTest|YencProfileTest'
           python3 tests/Unit/test_yenc_abi_benchmark.py
           python3 tests/Unit/test_yenc_performance_report.py
+          python3 tests/Unit/test_benchmark_cpu.py
 
       - name: Build pinned C++ baseline
         shell: bash
@@ -187,6 +196,9 @@ jobs:
               raise SystemExit(f'Unsupported hardware: required kernel {expected}, observed {observed}; evidence retained.')
           PY
 
+      - name: Capture CPU counters before native comparison
+        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-before.json
+
       - name: Run randomized paired decoder comparison
         shell: bash
         run: |
@@ -198,6 +210,10 @@ jobs:
             --runtime-manifest="$GITHUB_WORKSPACE/benchmark-evidence/build/runtime.json" \
             --output-dir="$GITHUB_WORKSPACE/benchmark-evidence/paired" \
             2>&1 | tee benchmark-evidence/build/paired-console.log
+
+      - name: Capture CPU counters after native comparison
+        if: always() && hashFiles('benchmark-evidence/build/cpu-before.json') != ''
+        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-after.json
 
       - name: Explain native decode and CRC costs without changing the caller gate
         if: always()
@@ -319,6 +335,124 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: yenc-performance-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: benchmark-evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
+  php-decoding:
+    name: Rust versus PHP (${{ matrix.runner }})
+    if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'cpp'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      RUST_TOOLCHAIN: '1.98.0'
+      BENCHMARK_SAMPLES: ${{ inputs.samples || '31' }}
+      BENCHMARK_SEED: ${{ inputs.seed || '20261013' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: dom, curl, ffi, intl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite
+          coverage: none
+
+      - name: Install locked PHP dependencies without application boot
+        run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
+
+      - name: Test benchmark correctness and failure retention
+        run: |
+          php vendor/bin/phpunit tests/Unit/YencBenchmarkTest.php
+          python3 tests/Unit/test_benchmark_cpu.py
+
+      - name: Build locked Rust candidate and verify PHP service parity
+        shell: bash
+        run: |
+          mkdir -p benchmark-evidence/build
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-test.log
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-build.log
+          YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
+              --filter='YencNativeDecoderTest|YencServiceTest|NNTPBodyDecodingTest' \
+              2>&1 | tee benchmark-evidence/build/parity.log
+
+      - name: Record Rust build and runtime identities
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ctypes, hashlib, json, os, pathlib, subprocess
+          def run(*args):
+              return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
+          def digest(path):
+              return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+          library = pathlib.Path('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')
+          decoder = ctypes.CDLL(str(library.resolve()))
+          decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          manifest = {
+              'git_head': run('git', 'rev-parse', 'HEAD'),
+              'runner_arch': os.environ.get('RUNNER_ARCH'),
+              'runner_image_os': os.environ.get('ImageOS'),
+              'runner_image_version': os.environ.get('ImageVersion'),
+              'github_run_id': os.environ.get('GITHUB_RUN_ID'),
+              'cpu': run('lscpu'), 'uname': run('uname', '-a'), 'php': run('php', '-v'),
+              'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
+              'rust_source_sha256': {str(path): digest(path) for path in sorted(pathlib.Path('docker/app/nzb-yenc-ffi/src').rglob('*.rs'))},
+              'cargo_lock_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.lock'),
+              'cargo_toml_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.toml'),
+              'rust_library_sha256': digest(library),
+              'rust_payload_kernel_id': decoder.nntmux_yenc_payload_kernel_v1(),
+          }
+          pathlib.Path('benchmark-evidence/build/runtime.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+
+      - name: Capture CPU counters before PHP comparison
+        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-before.json
+
+      - name: Compare Rust against the real PHP fallback
+        shell: bash
+        run: |
+          php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-yenc.php \
+            --php-baseline --rust-native="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            --samples="$BENCHMARK_SAMPLES" --order-seed="$BENCHMARK_SEED" --timeout=30 \
+            --min-improvement-percent=5 --max-regression-percent=5 \
+            --runtime-manifest="$GITHUB_WORKSPACE/benchmark-evidence/build/runtime.json" \
+            --output-dir="$GITHUB_WORKSPACE/benchmark-evidence/php-paired" \
+            2>&1 | tee benchmark-evidence/build/php-paired-console.log
+
+      - name: Capture CPU counters after PHP comparison
+        if: always() && hashFiles('benchmark-evidence/build/cpu-before.json') != ''
+        run: python3 scripts/benchmark-cpu.py --output benchmark-evidence/build/cpu-after.json
+
+      - name: Summarize PHP replacement evidence
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path('benchmark-evidence/php-paired/observations.jsonl')
+          rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## Rust versus PHP fallback\n\nSame PHP service, exact byte/CRC correctness, randomized fresh-process pairs. Includes FFI overhead. Synthetic decoder fixtures only; no production throughput claim.\n\n')
+              summary.write('| Bytes | Density | Path | Decision | Rust / PHP | 95% interval | Eligible / invalid |\n|---:|---|---|---|---:|---|---|\n')
+              for row in rows:
+                  if row.get('type') == 'stratum_summary':
+                      summary.write(f"| {row['size']} | {row['density']} | {row['path']} | {row['decision']} | {row.get('median_rust_over_php', 'unavailable')} | {row.get('bootstrap_95_percent_interval', 'unavailable')} | {row['eligible_pairs']} / {row['invalid_pairs']} |\n")
+              final = next((row for row in reversed(rows) if row.get('type') in ('run_summary', 'run_failure')), None)
+              summary.write('\nResult: `' + (final['status'] if final else 'setup incomplete; no performance conclusion') + '`. Inconclusive results do not qualify a Rust replacement. Failures are retained and invalidate their stratum.\n')
+          PY
+
+      - name: Retain PHP comparison evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-php-performance-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: benchmark-evidence/
           if-no-files-found: warn
           retention-days: 14
