@@ -37,6 +37,8 @@ jobs:
         with:
           toolchain: '1.98.0'
       - name: Install locked PHP dependencies
+        env:
+          COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ secrets.GITHUB_TOKEN }}"}}'
         run: |
           composer install --prefer-dist --no-interaction --no-progress --no-scripts
           cp .env.test .env
