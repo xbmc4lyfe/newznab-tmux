@@ -35,6 +35,11 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
         $this->assertStringContainsString('-d ffi.enable=true -d memory_limit=256M', $events[0]->command);
         $this->assertStringContainsString('--slot=1', $events[0]->command);
         $this->assertStringContainsString('--slot=2', $events[1]->command);
+        foreach ($events as $event) {
+            $this->assertStringContainsString('--no-summary', $event->command);
+            $this->assertTrue($event->runInBackground);
+            $this->assertFalse($event->withoutOverlapping);
+        }
         $repository = app(CandidateRepository::class);
         foreach (['one', 'two'] as $name) {
             $repository->enqueue(['identity' => sha1($name), 'groups_id' => 1, 'files' => []]);

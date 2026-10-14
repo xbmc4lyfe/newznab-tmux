@@ -25,7 +25,7 @@ use Throwable;
 
 class VerifyReleaseCandidates extends Command
 {
-    protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the active candidate}';
+    protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the active candidate} {--no-summary : Skip global candidate status counts}';
 
     protected $description = 'Spot check bounded articles before publishing complete candidate NZBs';
 
@@ -151,9 +151,11 @@ class VerifyReleaseCandidates extends Command
                     $locks->releaseCandidate();
                 }
             }
-            $counts = DB::table('release_verification_candidates')->selectRaw('status, COUNT(*) AS count')->groupBy('status')->get();
-            foreach ($counts as $count) {
-                $this->line($count->status.': '.$count->count);
+            if (! $this->option('no-summary')) {
+                $counts = DB::table('release_verification_candidates')->selectRaw('status, COUNT(*) AS count')->groupBy('status')->get();
+                foreach ($counts as $count) {
+                    $this->line($count->status.': '.$count->count);
+                }
             }
         } finally {
             unset($source);

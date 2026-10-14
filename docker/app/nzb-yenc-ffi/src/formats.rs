@@ -734,6 +734,11 @@ pub struct Rar5FileExtraRecords {
     pub hash_record_count: usize,
     pub redirection_record_count: usize,
     pub time_record_count: usize,
+    pub version_record_count: usize,
+    pub version: Option<Rar5ArchivedVersionRecord>,
+    pub reference_interpreted_name: Option<String>,
+    pub reference_name_relationship_status: &'static str,
+    pub reference_name_relationship_basis: &'static str,
     pub time: Option<Rar5FileTimeRecord>,
     pub mtime_comparison_status: &'static str,
     pub base_header_mtime_seconds_matches: Option<bool>,
@@ -765,6 +770,29 @@ pub struct Rar5FileExtraRecord {
     pub hash: Option<Rar5FileHashRecord>,
     pub redirection: Option<Rar5RedirectionRecord>,
     pub time: Option<Rar5FileTimeRecord>,
+    pub version: Option<Rar5ArchivedVersionRecord>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct Rar5ArchivedVersionRecord {
+    pub status: &'static str,
+    pub interpretation_status: &'static str,
+    pub evidence_basis: &'static str,
+    pub coordinate_basis: &'static str,
+    pub source_coordinate_basis: &'static str,
+    pub source_record_index: usize,
+    pub source_record_offset: usize,
+    pub source_payload_offset: usize,
+    pub source_payload_byte_length: usize,
+    pub source_payload_sha256: String,
+    pub flags: Option<u64>,
+    pub flags_encoding_status: &'static str,
+    pub flags_raw_hex: String,
+    pub version_number: Option<u64>,
+    pub version_number_byte_offset: Option<usize>,
+    pub version_number_encoding_status: &'static str,
+    pub version_number_raw_hex: String,
+    pub trailing_byte_count: usize,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -2171,6 +2199,11 @@ fn read_rar5_block_observation(
                 {
                     extras.mtime_comparison_status = status;
                 }
+                if extras.version.as_ref().is_some_and(|version| {
+                    version.interpretation_status == "validated_header_declaration"
+                }) {
+                    set_rar5_version_authority(extras, status);
+                }
             }
             observation.service_header = Some(header);
         }
@@ -2408,6 +2441,7 @@ fn parse_rar5_file_header(
     }
     derive_rar5_file_checksum_relations(&mut result);
     derive_rar5_file_time_relations(&mut result, name_end == fields_end);
+    derive_rar5_archived_version_relations(&mut result, name_end == fields_end, header_flags);
 
     result
 }
@@ -2430,6 +2464,11 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
         hash_record_count: 0,
         redirection_record_count: 0,
         time_record_count: 0,
+        version_record_count: 0,
+        version: None,
+        reference_interpreted_name: None,
+        reference_name_relationship_status: "file_header_fields_incomplete",
+        reference_name_relationship_basis: "Supported-format, bounded UTF-8 name plus unique version: ordinary 32-bit UnRAR 7.3.1 header-name append only; not stored-name mutation, extraction/version-selection compatibility, archiver version or uploader identity",
         time: None,
         mtime_comparison_status: "file_header_fields_incomplete",
         base_header_mtime_seconds_matches: None,
@@ -2476,7 +2515,8 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
         let encryption = (kind == 1).then(|| parse_rar5_file_encryption_record(payload));
         let hash = (kind == 2).then(|| parse_rar5_file_hash_record(payload));
         let payload_sha256 = (result.records.len() < MAX_RAR5_FILE_EXTRA_RECORD_OBSERVATIONS
-            || (kind == 3 && result.time.is_none()))
+            || (kind == 3 && result.time.is_none())
+            || (kind == 4 && result.version.is_none()))
         .then(|| hex(&Sha256::digest(payload)));
         // Count every scanned record, including occurrences beyond the observation budget.
         let time = (kind == 3
@@ -2497,6 +2537,26 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
             result.time_record_count += 1;
             if result.time.is_none() {
                 result.time = time.clone();
+            }
+        }
+        let version = (kind == 4
+            && (result.version.is_none()
+                || result.records.len() < MAX_RAR5_FILE_EXTRA_RECORD_OBSERVATIONS))
+            .then(|| {
+                parse_rar5_archived_version_record(
+                    payload,
+                    result.record_count,
+                    record_start,
+                    cursor,
+                    payload_sha256
+                        .as_deref()
+                        .expect("retained version payload hash"),
+                )
+            });
+        if kind == 4 {
+            result.version_record_count += 1;
+            if result.version.is_none() {
+                result.version = version.clone();
             }
         }
         if kind == 5 {
@@ -2535,11 +2595,13 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
                     .or_else(|| hash.as_ref().map(|value| value.status))
                     .or_else(|| redirection.as_ref().map(|value| value.status))
                     .or_else(|| time.as_ref().map(|value| value.status))
+                    .or_else(|| version.as_ref().map(|value| value.status))
                     .unwrap_or("unknown_record_type_skipped"),
                 encryption,
                 hash,
                 redirection,
                 time,
+                version,
             });
         } else {
             result.records_truncated = true;
@@ -2552,6 +2614,165 @@ fn parse_rar5_file_extra_records(data: &[u8], start: usize, end: usize) -> Rar5F
         result.stopped_offset = Some(cursor);
     }
     result
+}
+
+fn observe_rar5_version_vint(
+    payload: &[u8],
+    cursor: &mut usize,
+) -> (Option<u64>, String, &'static str) {
+    let start = *cursor;
+    let value = read_vint_with_length(payload, cursor).map(|(value, _)| value);
+    let observed = &payload[start..*cursor];
+    let status = if value.is_some() {
+        "complete"
+    } else if observed.len() == 10 && observed[9] & 0x7f > 1 {
+        "numeric_overflow"
+    } else if observed.len() == 10 {
+        "vint_length_exceeds_64bit"
+    } else {
+        "truncated"
+    };
+    (value, hex(observed), status)
+}
+
+fn parse_rar5_archived_version_record(
+    payload: &[u8],
+    index: usize,
+    record_offset: usize,
+    payload_offset: usize,
+    payload_sha256: &str,
+) -> Rar5ArchivedVersionRecord {
+    let mut result = Rar5ArchivedVersionRecord {
+        status: "payload_not_interpretable",
+        interpretation_status: "file_header_fields_incomplete",
+        evidence_basis: "RAR5 file/service extra record 4 archived revision declaration; consistent with archive -ver feature, not software version or uploader identity",
+        coordinate_basis: "record-payload-relative",
+        source_coordinate_basis: "decoded-sample-relative",
+        source_record_index: index,
+        source_record_offset: record_offset,
+        source_payload_offset: payload_offset,
+        source_payload_byte_length: payload.len(),
+        source_payload_sha256: payload_sha256.to_owned(),
+        flags: None,
+        flags_encoding_status: "not_observed",
+        flags_raw_hex: String::new(),
+        version_number: None,
+        version_number_byte_offset: None,
+        version_number_encoding_status: "not_observed",
+        version_number_raw_hex: String::new(),
+        trailing_byte_count: payload.len(),
+    };
+    let mut cursor = 0;
+    (
+        result.flags,
+        result.flags_raw_hex,
+        result.flags_encoding_status,
+    ) = observe_rar5_version_vint(payload, &mut cursor);
+    result.trailing_byte_count = payload.len().saturating_sub(cursor);
+    if result.flags.is_none() {
+        return result;
+    }
+    result.version_number_byte_offset = Some(cursor);
+    (
+        result.version_number,
+        result.version_number_raw_hex,
+        result.version_number_encoding_status,
+    ) = observe_rar5_version_vint(payload, &mut cursor);
+    result.trailing_byte_count = payload.len().saturating_sub(cursor);
+    if result.version_number.is_none() {
+        return result;
+    }
+    result.status = if result.flags != Some(0) {
+        "unknown_flags"
+    } else if result.trailing_byte_count != 0 {
+        "trailing_bytes"
+    } else {
+        "parsed"
+    };
+    result
+}
+
+fn set_rar5_version_authority(extras: &mut Rar5FileExtraRecords, status: &'static str) {
+    for version in extras
+        .records
+        .iter_mut()
+        .filter_map(|record| record.version.as_mut())
+        .chain(extras.version.iter_mut())
+    {
+        version.interpretation_status = status;
+    }
+    extras.reference_interpreted_name = None;
+    extras.reference_name_relationship_status = status;
+}
+
+fn derive_rar5_archived_version_relations(
+    file: &mut Rar5FileHeaderObservation,
+    fields_complete: bool,
+    header_flags: u64,
+) {
+    let extras = &mut file.file_extra_records;
+    let status = if file.header_crc32_valid != Some(true) {
+        "header_checksum_unconfirmed"
+    } else if !fields_complete {
+        "file_header_fields_trailing_bytes"
+    } else if header_flags & !0x7f != 0 {
+        "common_header_flags_unsupported"
+    } else if file.file_flags.is_none_or(|flags| flags & !0x0f != 0) {
+        "file_flags_unsupported"
+    } else if extras.status != "complete" {
+        "extra_framing_incomplete"
+    } else if extras.version_record_count == 0 {
+        "version_record_absent"
+    } else if extras.version_record_count != 1 {
+        "duplicate_version_records"
+    } else if extras.records_truncated {
+        "record_observation_limit"
+    } else if extras
+        .version
+        .as_ref()
+        .is_none_or(|version| version.status != "parsed")
+    {
+        "version_record_not_interpretable"
+    } else {
+        "validated_header_declaration"
+    };
+    set_rar5_version_authority(extras, status);
+    if status != "validated_header_declaration" {
+        return;
+    }
+    let version = extras
+        .version
+        .as_ref()
+        .and_then(|version| version.version_number)
+        .expect("unique parsed version");
+    let Ok(version) = u32::try_from(version) else {
+        extras.reference_name_relationship_status = "version_outside_32bit_reference_range";
+        return;
+    };
+    let Some(name) = file.filename.as_ref() else {
+        extras.reference_name_relationship_status = "filename_not_retained_as_utf8";
+        return;
+    };
+    if name.contains('\0') {
+        extras.reference_name_relationship_status = "filename_contains_nul";
+        return;
+    }
+    let suffix = if version == 0 {
+        String::new()
+    } else {
+        format!(";{version}")
+    };
+    if name
+        .len()
+        .checked_add(suffix.len())
+        .is_none_or(|size| size > MAX_RAR5_FILENAME_RETAIN_BYTES)
+    {
+        extras.reference_name_relationship_status = "reference_name_exceeds_observation_budget";
+        return;
+    }
+    extras.reference_interpreted_name = Some(format!("{name}{suffix}"));
+    extras.reference_name_relationship_status =
+        "qualified_32bit_unrar_header_name_interpretation_only";
 }
 
 fn parse_rar5_file_time_record(
@@ -8229,6 +8450,313 @@ mod tests {
             "declared_epoch_arithmetic_only"
         );
         assert_eq!(time["times"], extras["records"][0]["time"]["times"]);
+    }
+
+    #[test]
+    fn rar5_archived_version_incomplete_and_trailing_file_fields_withhold_name_relationships() {
+        let extra = [3, 4, 0, 7];
+        let partial = parse_rar5_file_header(&extra, 0, 0..extra.len(), 1, None, Some(true));
+        let mut trailing = vec![0, 0, 0, 0, 1, 1, b'x', 0xff];
+        trailing.extend(extra);
+        let trailing = parse_rar5_file_header(&trailing, 0, 8..trailing.len(), 1, None, Some(true));
+        let mut unsupported = vec![0x10, 0, 0, 0, 1, 1, b'x'];
+        unsupported.extend(extra);
+        let unsupported =
+            parse_rar5_file_header(&unsupported, 0, 7..unsupported.len(), 1, None, Some(true));
+        for (file, status) in [
+            (partial, "file_header_fields_incomplete"),
+            (trailing, "file_header_fields_trailing_bytes"),
+            (unsupported, "file_flags_unsupported"),
+        ] {
+            let file = serde_json::to_value(file).unwrap();
+            let extras = &file["file_extra_records"];
+            assert_eq!(extras["version_record_count"], 1);
+            assert!(extras["reference_interpreted_name"].is_null());
+            for version in [&extras["version"], &extras["records"][0]["version"]] {
+                assert_eq!(version["version_number"], 7);
+                assert_eq!(version["interpretation_status"], status);
+            }
+        }
+    }
+
+    #[test]
+    fn rar5_archived_version_unknown_common_flags_withhold_name_authority() {
+        let block = rar5_test_file_block(0x81, 0, 0, 0, None, None, 0, 1, b"x", &[3, 4, 0, 7], &[]);
+        let (observation, _, _) = read_rar5_block_observation(&block, 0, 0);
+        let file = serde_json::to_value(observation.file_header.unwrap()).unwrap();
+        let extras = &file["file_extra_records"];
+        assert_eq!(extras["version"]["version_number"], 7);
+        assert_eq!(
+            extras["version"]["interpretation_status"],
+            "common_header_flags_unsupported"
+        );
+        assert!(extras["reference_interpreted_name"].is_null());
+    }
+
+    #[test]
+    fn rar5_archived_version_late_summary_preserves_nonzero_sample_coordinates() {
+        let mut extra = [1, 11].repeat(64);
+        extra.extend([3, 4, 0, 7]);
+        let block = rar5_test_file_block(1, 0, 0, 0, None, None, 0, 1, b"x", &extra, &[]);
+        let mut sample = vec![0xaa; 9];
+        sample.extend(block);
+        let (observation, _, _) = read_rar5_block_observation(&sample, 9, 0);
+        let file = serde_json::to_value(observation.file_header.unwrap()).unwrap();
+        let extras = &file["file_extra_records"];
+        let version = &extras["version"];
+        assert_eq!(version["source_record_index"], 64);
+        assert_eq!(version["source_record_offset"], 154);
+        assert_eq!(version["source_payload_offset"], 156);
+        assert_eq!(version["source_payload_byte_length"], 2);
+        assert_eq!(
+            version["source_payload_sha256"],
+            hex(&Sha256::digest([0, 7]))
+        );
+        assert_eq!(version["version_number_byte_offset"], 1);
+        assert_eq!(version["version_number"], 7);
+        assert_eq!(version["interpretation_status"], "record_observation_limit");
+        assert!(extras["reference_interpreted_name"].is_null());
+    }
+
+    #[test]
+    fn rar5_archived_version_invalid_flags_never_borrow_the_next_record() {
+        for (payload, status) in [
+            (vec![], "truncated"),
+            (vec![0x80], "truncated"),
+            (
+                {
+                    let mut v = vec![0xff; 9];
+                    v.push(2);
+                    v
+                },
+                "numeric_overflow",
+            ),
+            (vec![0x80; 10], "vint_length_exceeds_64bit"),
+        ] {
+            let mut extra = rar5_test_file_extra_record(4, &payload);
+            extra.extend([3, 4, 0, 7]);
+            let file = rar5_test_file_extra_json(&extra, 0, false);
+            let extras = &file["file_extra_records"];
+            let version = &extras["version"];
+            assert_eq!(version["flags_encoding_status"], status);
+            assert_eq!(version["flags_raw_hex"], hex(&payload));
+            assert!(version["flags"].is_null());
+            assert!(version["version_number"].is_null());
+            assert_eq!(extras["records"][1]["version"]["version_number"], 7);
+            assert_eq!(extras["version_record_count"], 2);
+            assert!(extras["reference_interpreted_name"].is_null());
+        }
+    }
+
+    #[test]
+    fn rar5_archived_version_vints_preserve_overflow_and_partial_bytes_without_borrowing() {
+        for (bytes, expected, encoding_status, relation_status) in [
+            (
+                vec![0xff, 0xff, 0xff, 0xff, 0x0f],
+                Some(4_294_967_295u64),
+                "complete",
+                "qualified_32bit_unrar_header_name_interpretation_only",
+            ),
+            (
+                vec![0x80, 0x80, 0x80, 0x80, 0x10],
+                Some(4_294_967_296),
+                "complete",
+                "version_outside_32bit_reference_range",
+            ),
+            (
+                {
+                    let mut v = vec![0xff; 9];
+                    v.push(1);
+                    v
+                },
+                Some(u64::MAX),
+                "complete",
+                "version_outside_32bit_reference_range",
+            ),
+            (
+                {
+                    let mut v = vec![0xff; 9];
+                    v.push(2);
+                    v
+                },
+                None,
+                "numeric_overflow",
+                "version_record_not_interpretable",
+            ),
+            (
+                vec![0x80; 10],
+                None,
+                "vint_length_exceeds_64bit",
+                "version_record_not_interpretable",
+            ),
+            (
+                vec![0x80],
+                None,
+                "truncated",
+                "version_record_not_interpretable",
+            ),
+        ] {
+            let mut payload = vec![0];
+            payload.extend(&bytes);
+            let mut extra = rar5_test_file_extra_record(4, &payload);
+            extra.extend([1, 11]);
+            let file = rar5_test_file_extra_json(&extra, 0, false);
+            let extras = &file["file_extra_records"];
+            let version = &extras["version"];
+            assert_eq!(version["version_number"].as_u64(), expected);
+            assert_eq!(version["version_number_encoding_status"], encoding_status);
+            assert_eq!(version["version_number_raw_hex"], hex(&bytes));
+            assert_eq!(version["version_number_byte_offset"], 1);
+            assert_eq!(version["coordinate_basis"], "record-payload-relative");
+            assert_eq!(
+                extras["reference_name_relationship_status"],
+                relation_status
+            );
+            assert_eq!(extras["records"][1]["record_type"], 11);
+        }
+    }
+
+    #[test]
+    fn rar5_archived_version_names_respect_text_and_output_bounds() {
+        for (name, status) in [
+            (vec![0xff], "filename_not_retained_as_utf8"),
+            (b"a\0b".to_vec(), "filename_contains_nul"),
+            (
+                vec![b'x'; 4096],
+                "reference_name_exceeds_observation_budget",
+            ),
+        ] {
+            let block =
+                rar5_test_file_block(1, 0, 0, 0, None, None, 0, 1, &name, &[3, 4, 0, 7], &[]);
+            let (observation, _, _) = read_rar5_block_observation(&block, 0, 0);
+            let file = serde_json::to_value(observation.file_header.unwrap()).unwrap();
+            let extras = &file["file_extra_records"];
+            assert_eq!(extras["version"]["version_number"], 7);
+            assert_eq!(
+                extras["version"]["interpretation_status"],
+                "validated_header_declaration"
+            );
+            assert_eq!(extras["reference_name_relationship_status"], status);
+            assert!(extras["reference_interpreted_name"].is_null());
+        }
+        let name = vec![b'x'; 4094];
+        let block = rar5_test_file_block(1, 0, 0, 0, None, None, 0, 1, &name, &[3, 4, 0, 7], &[]);
+        let (observation, _, _) = read_rar5_block_observation(&block, 0, 0);
+        let file = serde_json::to_value(observation.file_header.unwrap()).unwrap();
+        let name = file["file_extra_records"]["reference_interpreted_name"]
+            .as_str()
+            .unwrap();
+        assert_eq!(name.len(), 4096);
+        assert!(name.ends_with(";7"));
+    }
+
+    #[test]
+    fn rar5_archived_service_versions_preserve_identifier_and_checksum_authority() {
+        for (flags, compression, bad_crc, status) in [
+            (0, 0, false, "validated_header_declaration"),
+            (1, 0, false, "service_file_flags_unsupported"),
+            (0, 0x40, false, "service_compression_flags_unsupported"),
+            (1, 0, true, "header_checksum_unconfirmed"),
+        ] {
+            let mut block = rar5_test_file_block(
+                1,
+                flags,
+                0,
+                0,
+                None,
+                None,
+                compression,
+                1,
+                b"CMT",
+                &[3, 4, 0, 7],
+                &[],
+            );
+            block[5] = 3;
+            recalculate_rar5_header_crc(&mut block, 0);
+            if bad_crc {
+                block[0] ^= 1;
+            }
+            let (observation, _, _) = read_rar5_block_observation(&block, 0, 0);
+            let json = serde_json::to_value(observation).unwrap();
+            assert!(json["file_header"].is_null());
+            let service = &json["service_header"];
+            assert_eq!(service["filename"], "CMT");
+            let extras = &service["file_extra_records"];
+            assert_eq!(extras["version"]["interpretation_status"], status);
+            assert_eq!(extras["version"], extras["records"][0]["version"]);
+            if status == "validated_header_declaration" {
+                assert_eq!(extras["reference_interpreted_name"], "CMT;7");
+            } else {
+                assert!(extras["reference_interpreted_name"].is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn rar5_archived_versions_preserve_raw_declarations_and_reference_name_relationships() {
+        for (extra, name, expected_version, expected_name) in [
+            (&[3, 4, 0, 7][..], &b"report.txt"[..], 7, "report.txt;7"),
+            (&[3, 4, 0, 0][..], &b"report.txt"[..], 0, "report.txt"),
+            (&[3, 4, 0, 7][..], &b"report.txt;2"[..], 7, "report.txt;2;7"),
+            (&[4, 4, 0, 0xe8, 7][..], &b"x"[..], 1000, "x;1000"),
+        ] {
+            let block = rar5_test_file_block(1, 0, 0, 0, None, None, 0, 1, name, extra, &[]);
+            let (observation, _, _) = read_rar5_block_observation(&block, 0, 0);
+            let file = serde_json::to_value(observation.file_header.unwrap()).unwrap();
+            let extras = &file["file_extra_records"];
+            assert_eq!(file["filename"], std::str::from_utf8(name).unwrap());
+            assert_eq!(extras["version_record_count"], 1);
+            assert_eq!(extras["version"]["flags"], 0);
+            assert_eq!(extras["version"]["version_number"], expected_version);
+            assert_eq!(
+                extras["version"]["interpretation_status"],
+                "validated_header_declaration"
+            );
+            assert_eq!(
+                extras["reference_name_relationship_status"],
+                "qualified_32bit_unrar_header_name_interpretation_only"
+            );
+            assert_eq!(extras["reference_interpreted_name"], expected_name);
+            assert_eq!(extras["version"], extras["records"][0]["version"]);
+        }
+    }
+
+    #[test]
+    fn rar5_archived_version_partial_or_ambiguous_records_withhold_reference_names() {
+        let version = [3, 4, 0, 7];
+        let mut late_duplicate = version.to_vec();
+        late_duplicate.extend([1, 11].repeat(63));
+        late_duplicate.extend(version);
+        let mut first_late = [1, 11].repeat(64);
+        first_late.extend(version);
+        for (extra, bad_crc, status) in [
+            (version.to_vec(), true, "header_checksum_unconfirmed"),
+            (
+                [3, 4, 1, 7].to_vec(),
+                false,
+                "version_record_not_interpretable",
+            ),
+            (
+                [2, 4, 0].to_vec(),
+                false,
+                "version_record_not_interpretable",
+            ),
+            (
+                [4, 4, 0, 7, 0xff].to_vec(),
+                false,
+                "version_record_not_interpretable",
+            ),
+            (version.repeat(2), false, "duplicate_version_records"),
+            (late_duplicate, false, "duplicate_version_records"),
+            (first_late, false, "record_observation_limit"),
+            (version.repeat(4097), false, "extra_framing_incomplete"),
+        ] {
+            let file = rar5_test_file_extra_json(&extra, 0, bad_crc);
+            let extras = &file["file_extra_records"];
+            assert!(extras["reference_interpreted_name"].is_null());
+            assert_eq!(extras["reference_name_relationship_status"], status);
+            assert_eq!(extras["version"]["interpretation_status"], status);
+        }
     }
 
     #[test]
