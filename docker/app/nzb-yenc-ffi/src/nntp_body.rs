@@ -16,6 +16,14 @@ pub struct LinesBodyRelationship {
 
 pub fn compare_lines_to_body(headers: &[u8], body: &[u8]) -> LinesBodyRelationship {
     let parsed_headers = crate::nntp_headers::parse(headers);
+    let parsed_body = parse(body);
+    compare_parsed_lines_to_body(&parsed_headers, &parsed_body)
+}
+
+pub fn compare_parsed_lines_to_body(
+    parsed_headers: &crate::nntp_headers::HeaderMetadata,
+    parsed_body: &NntpBodyMetadata,
+) -> LinesBodyRelationship {
     let fields_complete = parsed_headers.status == "complete"
         && !parsed_headers.field_occurrences_truncated
         && parsed_headers.malformed_line_count == 0
@@ -33,7 +41,7 @@ pub fn compare_lines_to_body(headers: &[u8], body: &[u8]) -> LinesBodyRelationsh
         lines_field_occurrence_count: lines_fields.len(),
         field_occurrences_complete: fields_complete,
         declared_body_line_count: None,
-        observed_body_line_count: parse(body).body_line_count,
+        observed_body_line_count: parsed_body.body_line_count,
         matches: None,
         absolute_difference: None,
     };

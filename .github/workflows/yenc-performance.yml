@@ -29,7 +29,7 @@ on:
       comparison:
         description: Baseline to compare against Rust
         type: choice
-        options: [all, php, cpp, profile]
+        options: [all, php, cpp, profile, processing]
         default: all
       samples:
         description: Matched fresh-process pairs per fixture stratum
@@ -263,19 +263,28 @@ jobs:
           retention-days: 14
 
   article-processing:
-    name: Article processing profile (${{ matrix.runner }})
-    if: github.event_name == 'workflow_dispatch' && inputs.comparison == 'profile'
+    name: Article processing comparison (${{ matrix.runner }})
+    if: github.event_name != 'workflow_dispatch' || inputs.comparison == 'all' || inputs.comparison == 'profile' || inputs.comparison == 'processing'
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    timeout-minutes: 35
     env:
       RUST_TOOLCHAIN: '1.98.0'
+      BENCHMARK_SAMPLES: ${{ inputs.samples || '31' }}
+      BENCHMARK_SEED: ${{ inputs.seed || '20261014' }}
     steps:
       - uses: actions/checkout@v5
         with:
+          persist-credentials: false
+
+      - name: Check out frozen caller and native baseline
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha || '7e8ae85eca7197c11d3203b1f298d2186a03ed7a' }}
+          path: baseline-source
           persist-credentials: false
 
       - uses: shivammathur/setup-php@v2
@@ -297,11 +306,15 @@ jobs:
           cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-build.log
           cp docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so processing-evidence/build/native.so
+          cmp composer.lock baseline-source/composer.lock
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path baseline-source/docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/baseline-build.log
+          cp baseline-source/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so processing-evidence/build/baseline.so
 
       - name: Test real processing profile workers
         env:
           NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
-        run: php -d ffi.enable=true -d memory_limit=1G vendor/bin/phpunit --fail-on-skipped tests/Unit/ArticleProcessingBenchmarkTest.php
+          YENC_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
+        run: php -d ffi.enable=true -d memory_limit=1G vendor/bin/phpunit --fail-on-skipped tests/Unit/ArticleProcessingBenchmarkTest.php tests/Unit/NativeArticleMetadataTest.php
 
       - name: Freeze build and runtime identity
         shell: bash
@@ -329,6 +342,26 @@ jobs:
               'rust_library_sha256': digest(library),
               'rust_payload_kernel_id': decoder.nntmux_yenc_payload_kernel_v1(),
           }
+          callers = ['app/Services/NNTP/NNTPService.php',
+              'app/Services/Releases/Fingerprint/NativeMetadataParser.php',
+              'app/Services/Releases/Fingerprint/NzbFingerprintAnalyzer.php']
+          native = ['docker/app/nzb-yenc-ffi/Cargo.toml', 'docker/app/nzb-yenc-ffi/Cargo.lock']
+          def sources(root):
+              return {str(path.relative_to(root)): digest(path) for path in
+                  [root / name for name in callers + native] + sorted((root / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs'))}
+          baseline = pathlib.Path('baseline-source')
+          baseline_library = baseline / library
+          baseline_decoder = ctypes.CDLL(str(baseline_library.resolve()))
+          baseline_decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          manifest.update({
+              'baseline_git_head': run('git', '-C', str(baseline), 'rev-parse', 'HEAD'),
+              'baseline_library_sha256': digest(baseline_library),
+              'candidate_library_sha256': digest(library),
+              'baseline_source_sha256': sources(baseline),
+              'candidate_source_sha256': sources(pathlib.Path('.')),
+              'baseline_payload_kernel_id': baseline_decoder.nntmux_yenc_payload_kernel_v1(),
+              'build_command': 'cargo +1.98.0 build --release --locked',
+          })
           pathlib.Path('processing-evidence/build/runtime.json').write_text(json.dumps(manifest, indent=2) + '\n')
           PY
 
@@ -344,9 +377,44 @@ jobs:
             --output-dir="$GITHUB_WORKSPACE/processing-evidence/profile" \
             2>&1 | tee processing-evidence/build/profile-console.log
 
+      - name: Compare full fingerprint caller against frozen baseline
+        if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'profile'
+        shell: bash
+        run: |
+          mode=()
+          if rg -q 'function parseArticleMetadata' baseline-source/app/Services/Releases/Fingerprint/NativeMetadataParser.php; then
+            mode+=(--regression-only)
+          fi
+          php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-article-processing.php "${mode[@]}" \
+            --paired --baseline-dir="$GITHUB_WORKSPACE/baseline-source" \
+            --baseline-native="$GITHUB_WORKSPACE/processing-evidence/build/baseline.so" \
+            --native="$GITHUB_WORKSPACE/processing-evidence/build/native.so" \
+            --samples="$BENCHMARK_SAMPLES" --order-seed="$BENCHMARK_SEED" --timeout=30 \
+            --runtime-manifest="$GITHUB_WORKSPACE/processing-evidence/build/runtime.json" \
+            --output-dir="$GITHUB_WORKSPACE/processing-evidence/paired" \
+            2>&1 | tee processing-evidence/build/paired-console.log
+
       - name: Capture CPU counters after caller profile
         if: always() && hashFiles('processing-evidence/build/cpu-before.json') != ''
         run: python3 scripts/benchmark-cpu.py --output processing-evidence/build/cpu-after.json
+
+      - name: Summarize caller screen without claiming adoption
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY_SUMMARY'
+          import json, os, pathlib
+          path = pathlib.Path('processing-evidence/paired/observations.jsonl')
+          rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## Fingerprint caller screen\n\nBODY and FFI/JSON diagnostics are retained separately. This median screen does not qualify a Rust replacement: the 1.5x common-path and uncommon p99 policy remains the adoption gate.\n\n')
+              summary.write('| Bytes | Density | Decision | Candidate / baseline median | Simultaneous interval | Eligible / invalid |\n|---:|---|---|---:|---|---|\n')
+              for row in rows:
+                  if row.get('type') == 'stratum_summary':
+                      summary.write(f"| {row['size']} | {row['density']} | {row['decision']} | {row.get('median_candidate_over_baseline', 'unavailable')} | {row.get('bootstrap_95_percent_interval', 'unavailable')} | {row['eligible_pairs']} / {row['invalid_pairs']} |\n")
+              final = next((row for row in reversed(rows) if row.get('type') in ('run_summary', 'run_failure')), None)
+              summary.write('\nResult: `' + (final['status'] if final else 'profile only or setup incomplete') + '`. Exact serialized caller metadata and independently expected decoded bytes must match for every pair.\n')
+          PY_SUMMARY
 
       - name: Retain all processing profile evidence
         if: always()
