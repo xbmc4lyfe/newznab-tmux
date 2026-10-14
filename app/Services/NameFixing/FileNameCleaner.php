@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\NameFixing;
 
+use App\Support\PredbSearchDocument;
 use App\Traits\DetectsHashedNames;
 
 /**
@@ -196,6 +197,16 @@ class FileNameCleaner
         }
 
         return $fileName;
+    }
+
+    /** Numeric-only aliases cannot establish a canonical release identity. */
+    public function matchesPredbFilenameEvidence(string $fileName, string $query): bool
+    {
+        $cleaned = $this->cleanForMatching($fileName, preserveLeadingNumber: true);
+
+        return $cleaned !== false
+            && preg_match('/^[\p{N}\p{P}\p{Z}\s]+$/uD', $cleaned) === 0
+            && PredbSearchDocument::exactValue($cleaned) === PredbSearchDocument::exactValue($query);
     }
 
     /**

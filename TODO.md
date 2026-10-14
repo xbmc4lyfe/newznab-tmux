@@ -171,6 +171,7 @@ The live PreDB index contained 160,869 documents while SQL held 1,523,091 record
 - [ ] Retest PR #117's bounded launcher count against dense and sparse MariaDB catalogs and natural worker scheduling; preserve worker partitions and record actual recovered names.
 - [ ] Review, merge, deploy, and qualify the new `nntmux:search-reconcile --predb --all` recovery path, including dry-run, missing-only bulk writes, index-read/write failures, post-write ID checks, and unchanged SQL naming state.
 - [ ] Measure sustained recovered names, incoming releases, and net rename backlog after catalog recovery. A sample of 64 eligible releases with 961 cleaned file names had no literal SQL PreDB matches; catalog coverage alone does not prove useful evidence exists for every pending release.
+- [ ] Retest bounded PAR2 article connection reuse after complete `430` replies: repeated misses followed by a valid article, exact response pairing, alternate fallback, malformed/truncated status lines, unread BODY interruption, CRC rejection and decoded/wire ceilings. Compare reconnects, received metadata and actual recovered names over a stable live window; avoided handshakes alone do not establish identification throughput.
 
 ## Retest SQL contention repairs (2026-10-12)
 

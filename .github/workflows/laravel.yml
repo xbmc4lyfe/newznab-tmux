@@ -65,7 +65,7 @@ jobs:
       - name: Run native yEnc parity tests
         env:
           YENC_NATIVE_LIBRARY: ${{ github.workspace }}/storage/app/rapidyenc/librapidyenc.so
-        run: php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter='YencNativeDecoderTest|YencNativeLibraryTest|YencServiceTest|YencDoctorCommandTest|NNTPBodyDecodingTest'
+        run: php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter='YencNativeDecoderTest|YencNativeLibraryTest|YencServiceTest|YencDoctorCommandTest|NNTPBodyDecodingTest|NNTPBoundedArticleTest'
 
       - name: Deployment configuration parser tests
         run: python3 deploy/cloud/tests/test_configuration.py

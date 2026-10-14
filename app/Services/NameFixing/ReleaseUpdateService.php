@@ -921,9 +921,8 @@ class ReleaseUpdateService
         if ($filenameEvidence === null || PredbSearchDocument::exactValue($title) === PredbSearchDocument::exactValue($filenameEvidence)) {
             return (string) $row->title;
         }
-        $filename = $this->fileNameCleaner->cleanForMatching((string) ($row->filename ?? ''), preserveLeadingNumber: true);
 
-        return $filename !== false && PredbSearchDocument::exactValue($filename) === PredbSearchDocument::exactValue($filenameEvidence)
+        return $this->fileNameCleaner->matchesPredbFilenameEvidence((string) ($row->filename ?? ''), $filenameEvidence)
             ? (string) $row->title : null;
     }
 
