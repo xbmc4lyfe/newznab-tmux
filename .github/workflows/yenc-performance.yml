@@ -7,6 +7,7 @@ on:
       - 'scripts/benchmark-yenc.php'
       - 'scripts/benchmark-article-processing.php'
       - 'tests/Unit/ArticleProcessingBenchmarkTest.php'
+      - 'tests/Unit/NativeArticleMetadataTest.php'
       - 'scripts/benchmark-yenc-abi.py'
       - 'scripts/benchmark-cpu.py'
       - 'tests/Unit/test_benchmark_cpu.py'

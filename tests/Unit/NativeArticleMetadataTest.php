@@ -174,9 +174,15 @@ final class NativeArticleMetadataTest extends TestCase
         foreach (['return strdup("{}");', 'return strdup("invalid json");', 'return NULL;'] as $result) {
             $path = $this->compileLibrary('char* nntmux_article_metadata_v1_json(const char* h, size_t hl, const char* b, size_t bl) { '.$result.' }');
             config(['yenc.native_library' => $path]);
-            self::assertNull((new NativeMetadataParser)->parseArticleMetadata('Lines: 1\r\n', 'x'));
+            // Keep the fixture loaded: a rejected probe releases its FFI scope and can reset C statics.
             $ffi = \FFI::cdef('int freed_count(void);', $path);
-            self::assertSame(str_contains($result, 'NULL') ? 0 : 1, $ffi->freed_count());
+            self::assertSame(0, $ffi->freed_count());
+            $parser = new NativeMetadataParser;
+            self::assertNull($parser->parseArticleMetadata("Lines: 1\r\n", "x\r\n"));
+            $expectedFrees = str_contains($result, 'NULL') ? 0 : 1;
+            self::assertSame($expectedFrees, $ffi->freed_count());
+            self::assertNull($parser->parseArticleMetadata("Lines: 1\r\n", "x\r\n"));
+            self::assertSame($expectedFrees, $ffi->freed_count());
         }
     }
 
