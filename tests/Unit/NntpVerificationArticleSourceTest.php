@@ -22,6 +22,81 @@ use Tests\Fixtures\YencArticles;
 
 final class NntpVerificationArticleSourceTest extends TestCase
 {
+    /** @return iterable<string, array{int}> */
+    public static function sessionFailures(): iterable
+    {
+        yield 'authentication required' => [480];
+        yield 'connection closing' => [400];
+        yield 'encryption required' => [483];
+        yield 'access denied' => [502];
+    }
+
+    #[DataProvider('sessionFailures')]
+    public function test_session_failure_reply_closes_transport_for_reauthentication(int $status): void
+    {
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], $status." session requires reset\r\n");
+        $primary = new PipelineSocketNntpHarness($pair[0]);
+        $source = new NntpArticleSource($primary, maximumBytes: 64, allowAlternateFallback: false);
+        try {
+            try {
+                $source->fetchBounded('next@example', 64);
+                $this->fail('A session failure cannot verify an article.');
+            } catch (RuntimeException) {
+                $this->assertSame("BODY <next@example>\r\n", fgets($pair[1]));
+                $this->assertFalse($primary->isConnected(), 'The next candidate must reconnect and authenticate.');
+            }
+        } finally {
+            unset($source);
+            $primary->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
+    public function test_body_status_timeout_closes_an_open_transport_before_session_reuse(): void
+    {
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        stream_set_timeout($pair[0], 0, 1000);
+        $primary = new PipelineSocketNntpHarness($pair[0]);
+        $source = new NntpArticleSource($primary, maximumBytes: 64, allowAlternateFallback: false);
+        try {
+            try {
+                $source->fetchBounded('late@example', 64);
+                $this->fail('An unanswered BODY command must not verify an article.');
+            } catch (RuntimeException) {
+                $this->assertSame("BODY <late@example>\r\n", fgets($pair[1]));
+                $this->assertFalse($primary->isConnected(), 'A timed-out socket cannot be reused for another candidate.');
+            }
+        } finally {
+            unset($source);
+            $primary->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
+    public function test_article_unavailable_response_keeps_the_session_aligned_for_the_next_request(): void
+    {
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], "430 missing\r\n222 0 <next@example> body\r\nnext-body\r\n.\r\n");
+        $primary = new PipelineSocketNntpHarness($pair[0]);
+        $source = new NntpArticleSource($primary, maximumBytes: 64, allowAlternateFallback: false);
+        try {
+            try {
+                $source->fetchBounded('missing@example', 64);
+                $this->fail('An unavailable article must remain unverified.');
+            } catch (RuntimeException) {
+                $this->assertTrue($primary->isConnected());
+            }
+            $this->assertSame("next-body\r\n", $source->fetchBounded('next@example', 64));
+            $this->assertSame("BODY <missing@example>\r\n", fgets($pair[1]));
+            $this->assertSame("BODY <next@example>\r\n", fgets($pair[1]));
+        } finally {
+            unset($source);
+            $primary->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
     public function test_bounded_sample_fetch_honours_remaining_budget_and_never_retries_another_provider(): void
     {
         $primary = new VerificationNntpHarness("too-large-body\r\n.\r\n");
