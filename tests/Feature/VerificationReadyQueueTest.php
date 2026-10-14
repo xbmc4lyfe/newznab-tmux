@@ -461,8 +461,15 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
         $this->assertSame($bytes, DB::table('release_verification_state')->value('pending_bytes'));
         $this->assertSame('unknown', DB::table('release_verification_candidates')->where('identity', 'bad-reference')->value('status'));
         $this->assertSame(now()->addSeconds(900)->format('Y-m-d H:i:s'), DB::table('release_verification_candidates')->where('identity', 'bad-reference')->value('next_attempt_at'));
-        $this->assertSame(['limit', 'max_seconds', 'inspected', 'assessments', 'updated', 'ready_promotions', 'zero_row_updates', 'read_assessment_failures', 'stop_reason', 'limit_reached', 'deadline_reached', 'queues_exhausted', 'durations_ms'], array_keys($report));
+        $this->assertSame(['limit', 'max_seconds', 'inspected', 'assessments', 'updated', 'ready_promotions', 'zero_row_updates', 'read_assessment_failures', 'stop_reason', 'limit_reached', 'deadline_reached', 'queues_exhausted', 'durations_ms', 'phase_distributions', 'manifest_sizes'], array_keys($report));
         $this->assertSame(['selection', 'read_assessment', 'update', 'total'], array_keys($report['durations_ms']));
+        foreach (['file_read', 'gzip_decode', 'hash', 'json_decode', 'assessment'] as $phase) {
+            $this->assertSame(3, $report['phase_distributions'][$phase]['count']);
+            $this->assertSame(0, $report['phase_distributions'][$phase]['failures']);
+            $this->assertSame(3, array_sum($report['phase_distributions'][$phase]['latency_buckets']));
+        }
+        $this->assertSame(3, array_sum($report['manifest_sizes']['compressed_bytes']));
+        $this->assertSame(3, $report['manifest_sizes']['files']['le_1']);
         foreach ($report['durations_ms'] as $duration) {
             $this->assertGreaterThanOrEqual(0, $duration);
         }
