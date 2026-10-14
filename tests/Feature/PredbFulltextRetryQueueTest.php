@@ -30,14 +30,14 @@ final class PredbFulltextRetryQueueTest extends TestCase
         $database->insert('INSERT INTO releases (id, name, searchname, fromname, groups_id, categories_id, predb_id, guid) VALUES (500, ?, ?, "poster", 1, 7010, 0, "guid-500")', [$nextTitle, $nextTitle]);
         $attempted = [];
         Search::shouldReceive('isAvailable')->andReturnTrue();
-        Search::shouldReceive('searchReleases')->andReturnUsing(static function (array $phrases, int $limit) use ($title, &$attempted): array {
-            $attempted[] = $phrases['name'];
-
-            return $phrases['name'] === $title ? array_slice(range(1, 211), 0, $limit) : [500];
-        });
+        Search::shouldReceive('searchReleases')->never();
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnTrue();
-        Search::shouldReceive('searchReleaseCandidatesPage')->andReturnUsing(static function (string $title, int $limit, int $afterId): array {
-            $remaining = array_values(array_filter(range(1, 211), static fn (int $id): bool => $id > $afterId));
+        Search::shouldReceive('searchReleaseCandidatesPage')->andReturnUsing(static function (string $queryTitle, int $limit, int $afterId) use ($title, &$attempted): array {
+            if ($afterId === 0) {
+                $attempted[] = $queryTitle;
+            }
+            $ids = $queryTitle === $title ? range(1, 211) : [500];
+            $remaining = array_values(array_filter($ids, static fn (int $id): bool => $id > $afterId));
 
             return ['ids' => array_slice($remaining, 0, $limit), 'available' => true, 'has_more' => count($remaining) > $limit];
         });

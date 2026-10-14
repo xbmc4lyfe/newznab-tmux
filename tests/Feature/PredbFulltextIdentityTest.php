@@ -20,6 +20,12 @@ use Tests\TestCase;
 
 final class PredbFulltextIdentityTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse()->byDefault();
+    }
+
     #[DataProvider('identities')]
     public function test_fulltext_confirmation_requires_a_literal_title_token(string $title, string $candidate, bool $accepted, bool $alreadyNamed = false): void
     {
@@ -109,25 +115,35 @@ final class PredbFulltextIdentityTest extends TestCase
         }
         $rows[] = [22, $title, $title];
         Search::shouldReceive('isAvailable')->once()->andReturnTrue();
-        Search::shouldReceive('searchReleases')->once()->with(['name' => $title, 'searchname' => $title], 21)
-            ->andReturnUsing(static fn (array $phrases, int $limit): array => array_slice(range(1, 22), 0, $limit));
+        $initialQueries = 0;
+        Search::shouldReceive('searchReleases')->andReturnUsing(static function (array $phrases, int $limit) use (&$initialQueries): array {
+            $initialQueries++;
+
+            return array_slice(range(1, 22), 0, $limit);
+        });
         $updates = $this->createMock(ReleaseUpdateService::class);
         $cursors = [];
         $this->mockPager(range(1, 22), $cursors);
         $updates->expects($this->exactly($visibleExact ? 2 : 1))->method('updatePredbCandidate')
-            ->willReturnCallback(function (object $release, string $title, int $predbId) use ($visibleExact, &$cursors): bool {
+            ->willReturnCallback(function (object $release, string $title, int $predbId) use ($visibleExact, &$cursors, &$database): bool {
                 $id = (int) $release->releases_id;
                 $this->assertContains($id, $visibleExact ? [1, 22] : [22]);
                 $this->assertSame(7, $predbId);
                 $this->assertSame([0, 21], $cursors);
 
-                return true;
+                return $database->update('UPDATE releases SET predb_id = 7 WHERE id = ?', [$id]) === 1;
             });
         $updates->expects($this->never())->method('updateRelease');
-        $service = new NameFixingService(updateService: $updates, queries: new NameFixingQueryService($this->database($rows)));
+        $database = $this->database($rows);
+        $database->enableQueryLog();
+        $service = new NameFixingService(updateService: $updates, queries: new NameFixingQueryService($database));
 
         $this->assertSame($visibleExact ? 2 : 1, $service->matchPredbFulltext((object) ['predb_id' => 7, 'title' => $title, 'source' => 'synthetic']));
         $this->assertSame([0, 21], $cursors);
+        $linkedIds = array_map(static fn (object $row): int => (int) $row->id, $database->select('SELECT id FROM releases WHERE predb_id = 7 ORDER BY id'));
+        $this->assertSame($visibleExact ? [1, 22] : [22], $linkedIds);
+        $confirmations = count(array_filter($database->getQueryLog(), static fn (array $query): bool => str_contains($query['query'], 'r.predb_id = 0')));
+        $this->assertSame(['initial' => 0, 'ordered' => 2, 'confirmation' => 2], ['initial' => $initialQueries, 'ordered' => count($cursors), 'confirmation' => $confirmations], 'Identical outcomes require only the two ordered pages.');
     }
 
     public function test_incomplete_scan_does_not_starve_a_later_exact_command_entry(): void
@@ -151,9 +167,10 @@ final class PredbFulltextIdentityTest extends TestCase
         $pdo->sqliteCreateFunction('regexp', static fn (string $pattern, string $subject): int => (int) preg_match('~'.$pattern.'~', $subject), 2);
         $pdo->sqliteCreateFunction('MOD', static fn (int $value, int $divisor): int => $value % $divisor, 2);
         Search::shouldReceive('isAvailable')->andReturnTrue();
-        Search::shouldReceive('searchReleases')->andReturnUsing(static fn (array $phrases, int $limit): array => $phrases['name'] === $title ? array_slice(range(1, 211), 0, $limit) : [500]);
+        Search::shouldReceive('searchReleases')->never();
         $cursors = [];
         $this->mockPager(range(1, 211), $cursors);
+        Search::shouldReceive('searchReleaseCandidatesPage')->with($nextTitle, 21, 0)->once()->andReturn(['ids' => [500], 'available' => true, 'has_more' => false]);
         $updates = $this->createMock(ReleaseUpdateService::class);
         $updates->expects($this->once())->method('updatePredbCandidate')->with($this->callback(static fn (object $release): bool => (int) $release->releases_id === 500), $nextTitle, 8, 'synthetic', false)->willReturn(true);
         $updates->expects($this->never())->method('updateRelease');
@@ -180,7 +197,7 @@ final class PredbFulltextIdentityTest extends TestCase
         }
         $rows[] = [211, $title, $title];
         Search::shouldReceive('isAvailable')->once()->andReturnTrue();
-        Search::shouldReceive('searchReleases')->once()->andReturn(range(1, 21));
+        Search::shouldReceive('searchReleases')->never();
         $cursors = [];
         $this->mockPager(range(1, 211), $cursors);
         $updates = $this->createMock(ReleaseUpdateService::class);
@@ -195,6 +212,57 @@ final class PredbFulltextIdentityTest extends TestCase
         } finally {
             $this->assertSame(range(0, 189, 21), $cursors);
         }
+    }
+
+    public function test_unsaturated_ordered_page_links_the_literal_candidate_without_legacy_discovery(): void
+    {
+        $title = 'Valid.Scene.Release.2026-GROUP';
+        Search::shouldReceive('isAvailable')->once()->andReturnTrue();
+        Search::shouldReceive('searchReleases')->never();
+        $cursors = [];
+        $this->mockPager([42], $cursors);
+        $database = $this->database([[42, $title, $title]]);
+        $updates = $this->createMock(ReleaseUpdateService::class);
+        $updates->expects($this->once())->method('updatePredbCandidate')->willReturnCallback(static function (object $release) use ($database): bool {
+            return $database->update('UPDATE releases SET predb_id = 7 WHERE id = ?', [(int) $release->releases_id]) === 1;
+        });
+        $service = new NameFixingService(updateService: $updates, queries: new NameFixingQueryService($database));
+
+        $this->assertSame(['updated' => 1, 'matched' => true, 'retry' => false], $service->matchPredbFulltextWithCompletion((object) ['predb_id' => 7, 'title' => $title]));
+        $this->assertSame([0], $cursors);
+        $this->assertSame(7, (int) $database->scalar('SELECT predb_id FROM releases WHERE id = 42'));
+    }
+
+    public function test_unsaturated_ordered_page_retains_existing_canonical_link_completion(): void
+    {
+        $title = 'Valid.Scene.Release.2026-GROUP';
+        Search::shouldReceive('isAvailable')->once()->andReturnTrue();
+        Search::shouldReceive('searchReleases')->never();
+        $cursors = [];
+        $this->mockPager([42], $cursors);
+        $database = $this->database([[42, $title, $title]]);
+        $database->update('UPDATE releases SET predb_id = 7 WHERE id = 42');
+        $updates = $this->createMock(ReleaseUpdateService::class);
+        $updates->expects($this->never())->method('updatePredbCandidate');
+        $service = new NameFixingService(updateService: $updates, queries: new NameFixingQueryService($database));
+
+        $this->assertSame(['updated' => 0, 'matched' => true, 'retry' => false], $service->matchPredbFulltextWithCompletion((object) ['predb_id' => 7, 'title' => $title]));
+        $this->assertSame([0], $cursors);
+    }
+
+    public function test_empty_ordered_page_is_a_complete_no_match(): void
+    {
+        $title = 'Valid.Scene.Release.2026-GROUP';
+        Search::shouldReceive('isAvailable')->once()->andReturnTrue();
+        Search::shouldReceive('searchReleases')->never();
+        $cursors = [];
+        $this->mockPager([], $cursors);
+        $updates = $this->createMock(ReleaseUpdateService::class);
+        $updates->expects($this->never())->method('updatePredbCandidate');
+        $service = new NameFixingService(updateService: $updates, queries: new NameFixingQueryService($this->database([])));
+
+        $this->assertSame(['updated' => 0, 'matched' => false, 'retry' => false], $service->matchPredbFulltextWithCompletion((object) ['predb_id' => 7, 'title' => $title]));
+        $this->assertSame([0], $cursors);
     }
 
     /** @return array<string, array{bool}> */
@@ -226,7 +294,7 @@ final class PredbFulltextIdentityTest extends TestCase
             $rows[] = [$id, $name, $name];
         }
         Search::shouldReceive('isAvailable')->once()->andReturnTrue();
-        Search::shouldReceive('searchReleases')->once()->andReturn(range(1, 21));
+        Search::shouldReceive('searchReleases')->never();
         $cursors = [];
         $this->mockPager(range(1, 22), $cursors);
         $updates = $this->createMock(ReleaseUpdateService::class);
@@ -260,7 +328,7 @@ final class PredbFulltextIdentityTest extends TestCase
     {
         $title = 'Valid.Scene.Release.2026-GROUP';
         Search::shouldReceive('isAvailable')->once()->andReturnTrue();
-        Search::shouldReceive('searchReleases')->once()->andReturn(range(1, 21));
+        Search::shouldReceive('searchReleases')->never();
         Search::shouldReceive('supportsReleaseCandidatePaging')->once()->andReturnTrue();
         Search::shouldReceive('searchReleaseCandidatesPage')->once()->andReturn(['ids' => [], 'available' => false, 'has_more' => false]);
         $updates = $this->createMock(ReleaseUpdateService::class);
@@ -286,7 +354,7 @@ final class PredbFulltextIdentityTest extends TestCase
     {
         $title = 'Valid.Scene.Release.2026-GROUP';
         Search::shouldReceive('isAvailable')->once()->andReturnTrue();
-        Search::shouldReceive('searchReleases')->once()->andReturn(range(1, 21));
+        Search::shouldReceive('searchReleases')->never();
         Search::shouldReceive('supportsReleaseCandidatePaging')->once()->andReturnTrue();
         Search::shouldReceive('searchReleaseCandidatesPage')->once()->andReturn($page);
         $updates = $this->createMock(ReleaseUpdateService::class);
@@ -315,7 +383,7 @@ final class PredbFulltextIdentityTest extends TestCase
     {
         $title = 'Valid.Scene.Release.2026-GROUP';
         Search::shouldReceive('isAvailable')->once()->andReturnTrue();
-        Search::shouldReceive('searchReleases')->once()->andReturn(range(1, 21));
+        Search::shouldReceive('searchReleases')->never();
         Search::shouldReceive('supportsReleaseCandidatePaging')->once()->andReturnTrue();
         Search::shouldReceive('searchReleaseCandidatesPage')->twice()->andReturn(
             ['ids' => range(1, 21), 'available' => true, 'has_more' => true],
@@ -344,7 +412,7 @@ final class PredbFulltextIdentityTest extends TestCase
             $remaining = array_values(array_filter($ids, static fn (int $id): bool => $id > $afterId));
 
             return ['ids' => array_slice($remaining, 0, $limit), 'available' => true, 'has_more' => count($remaining) > $limit];
-        });
+        })->byDefault();
     }
 
     /** @param list<array{int, string, string}> $rows */

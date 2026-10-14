@@ -75,7 +75,10 @@ final class PredbUnicodeIdentityTest extends TestCase
         self::assertSame(0, $release->fresh()->predb_id);
         DB::table('predb')->insert(['id' => 7, 'title' => $title]);
         Search::shouldReceive('isAvailable')->once()->andReturnTrue();
-        Search::shouldReceive('searchReleases')->once()->andReturn([$release->id]);
+        Search::shouldReceive('supportsReleaseCandidatePaging')->once()->andReturnTrue();
+        Search::shouldReceive('searchReleases')->never();
+        Search::shouldReceive('searchReleaseCandidatesPage')->once()->with($title, 21, 0)
+            ->andReturn(['ids' => [$release->id], 'available' => true, 'has_more' => false]);
 
         $result = $service->matchPredbFulltextWithCompletion((object) ['title' => $title, 'predb_id' => 7, 'source' => 'later-arrival']);
 
