@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 return [
     'required' => env('RELEASE_VERIFICATION_REQUIRED', true),
+    'publication_timing_sample_every' => (int) env('RELEASE_VERIFICATION_PUBLICATION_TIMING_SAMPLE_EVERY', 0),
     'spot_check_articles' => (int) env('RELEASE_VERIFICATION_SPOT_CHECK_ARTICLES', 1),
     'spot_check_bytes' => (int) env('RELEASE_VERIFICATION_SPOT_CHECK_BYTES', 1048576),
     'spot_check_article_bytes' => (int) env('RELEASE_VERIFICATION_SPOT_CHECK_ARTICLE_BYTES', 1048576),
