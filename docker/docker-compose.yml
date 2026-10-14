@@ -7,6 +7,8 @@ x-app: &app
   init: true
   user: "33:33"
   restart: unless-stopped
+  stop_signal: SIGTERM
+  # Indexer SIGTERM trap drains for 90s, leaving time to close tmux before Docker kills it.
   stop_grace_period: 120s
   environment:
     TZ: ${TZ:-UTC}
@@ -68,6 +70,8 @@ services:
 
   horizon:
     <<: *app
+    # Fingerprint jobs can run for 1800s; Horizon allows 1860s before worker timeout.
+    stop_grace_period: 1920s
     command: ["php", "artisan", "horizon"]
     healthcheck:
       test: ["CMD", "php", "artisan", "horizon:status"]
@@ -79,9 +83,11 @@ services:
 
   scheduler:
     <<: *app
-    command: ["php", "artisan", "schedule:work"]
+    # Detached scheduled tasks remain owned by the subreaper through shutdown.
+    stop_grace_period: 1920s
+    command: ["python3", "/app/docker/app/bin/scheduler.py"]
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "schedule:work"]
+      test: ["CMD", "python3", "/app/docker/app/bin/scheduler.py", "status"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -102,8 +108,10 @@ services:
       # Native decoding/planning belongs to CLI processing; web retains ffi.enable=false.
       PHP_INI_SCAN_DIR: /usr/local/etc/php/conf.d:/usr/local/etc/php/indexer-conf.d
       INDEXER_MAX_FAILURES: ${INDEXER_MAX_FAILURES:-10}
+      # Keep below the 120s container stop grace period.
+      INDEXER_DRAIN_TIMEOUT: ${INDEXER_DRAIN_TIMEOUT:-90}
     healthcheck:
-      test: ["CMD", "php", "artisan", "tmux:health-check", "--session=nntmux", "--require-session", "--quiet"]
+      test: ["CMD-SHELL", "test -f /var/tmp/nntmux/indexer.ready && php artisan tmux:health-check --session=nntmux --require-session --quiet"]
       interval: 60s
       timeout: 20s
       retries: 5
