@@ -164,4 +164,23 @@ class PredbMatchSelectorTest extends TestCase
         $this->assertNotNull($bestMatch);
         $this->assertSame(2, $bestMatch['id'], 'Should select the result that shares meaningful tokens with the query');
     }
+
+    public function test_numbered_and_unnumbered_aliases_select_distinct_canonical_titles(): void
+    {
+        $selector = new PredbMatchSelector;
+        $hits = [
+            ['id' => 91, 'title' => 'Fixture.Canonical.Alpha.2026-GRP', 'filename' => '123.Fixture.Alias.2026-GRP.mkv'],
+            ['id' => 92, 'title' => 'Fixture.Canonical.Beta.2026-GRP', 'filename' => 'Fixture.Alias.2026-GRP.mkv'],
+        ];
+        self::assertSame(91, $selector->selectBestMatch('123.Fixture.Alias.2026-GRP', $hits)['id'] ?? null);
+        self::assertSame(92, $selector->selectBestMatch('Fixture.Alias.2026-GRP', $hits)['id'] ?? null);
+    }
+
+    public function test_same_numbered_alias_for_different_titles_remains_ambiguous(): void
+    {
+        self::assertNull((new PredbMatchSelector)->selectBestMatch('123.Fixture.Alias.2026-GRP', [
+            ['id' => 91, 'title' => 'Fixture.Canonical.Alpha.2026-GRP', 'filename' => '123.Fixture.Alias.2026-GRP.mkv'],
+            ['id' => 92, 'title' => 'Fixture.Canonical.Beta.2026-GRP', 'filename' => '123.Fixture.Alias.2026-GRP.mkv'],
+        ]));
+    }
 }

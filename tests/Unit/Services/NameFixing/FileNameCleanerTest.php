@@ -48,4 +48,18 @@ class FileNameCleanerTest extends TestCase
             $cleaner->formatSearchName('Southern Charm S11E12 Even Further South 720p AMZN WEB-DL DDP2 0 H 264-NTb.mkv')
         );
     }
+
+    public function test_numeric_prefix_can_be_preserved_for_predb_identity(): void
+    {
+        $cleaner = new FileNameCleaner;
+        self::assertSame('123.Fixture.Alias.2026-GRP', $cleaner->cleanForMatching('123.Fixture.Alias.2026-GRP.mkv', preserveLeadingNumber: true));
+        self::assertSame('123.Fixture.Alias.2026-GRP', $cleaner->cleanForMatching('123.Fixture.Alias.2026-GRP.part01.rar', preserveLeadingNumber: true));
+    }
+
+    public function test_default_music_track_number_cleanup_remains_unchanged(): void
+    {
+        $cleaner = new FileNameCleaner;
+        self::assertSame('Artist.Track', $cleaner->cleanForMatching('01.Artist.Track.flac'));
+        self::assertSame('01.Artist.Track', $cleaner->cleanForMatching('01.Artist.Track.flac', preserveLeadingNumber: true));
+    }
 }
