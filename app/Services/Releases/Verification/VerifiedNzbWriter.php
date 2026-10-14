@@ -13,13 +13,14 @@ final class VerifiedNzbWriter
     public function __construct(private readonly NzbService $nzb) {}
 
     /** @param array<string, mixed> $manifest */
-    public function write(array $manifest, string $guid): string
+    public function write(array $manifest, string $guid, ?PublicationTiming $timing = null): string
     {
         $path = $this->nzb->getNzbPath($guid, createIfNotExist: true);
         $body = gzencode($this->document($manifest));
         if ($body === false) {
             throw new RuntimeException('Cannot compress verified NZB.');
         }
+        $timing?->nextPhase('durable_install');
         $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
         $handle = fopen($temporary, 'xb');
         if ($handle === false) {

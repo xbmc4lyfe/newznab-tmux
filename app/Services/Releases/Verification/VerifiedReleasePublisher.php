@@ -31,117 +31,146 @@ final class VerifiedReleasePublisher
             return null;
         }
 
-        return DB::transaction(function () use ($claim, $result): ?int {
-            DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
-            $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->lockForUpdate()->first();
-            if ($candidate === null || $candidate->version !== $claim->version
-                || $candidate->manifest_hash !== $claim->manifest_hash || $candidate->lease_token !== $claim->lease_token
-                || $candidate->lease_until === null || $candidate->lease_until < now()->format('Y-m-d H:i:s')) {
-                throw new RuntimeException('Stale verification result cannot publish.');
-            }
-            if ($candidate->release_id !== null) {
-                return (int) $candidate->release_id;
-            }
-            $manifest = $result->manifest;
-            if ($result->verdict === 'sampled') {
-                if (($manifest['verification_mode'] ?? null) !== 'spot_check') {
-                    throw new RuntimeException('Sampled verdict has no spot-check evidence.');
-                }
-                if (($rejection = (new CandidateHeaderInventory)->rejection($manifest)) !== null) {
-                    throw new RuntimeException($rejection);
-                }
-            }
-            $filteredReason = app(CollectionReleasePolicy::class)->verifiedRejection($manifest);
-            if ($filteredReason !== null) {
-                app(CandidateRepository::class)->rejectByPolicy($claim, $filteredReason);
-
-                return null;
-            }
-            $metadata = $this->metadata->resolve($manifest);
-            if (($manifest['verification_mode'] ?? null) === 'spot_check') {
-                $size = (new CandidateHeaderInventory)->bytes($manifest);
-                if ($size < 1) {
-                    throw new RuntimeException('Spot-checked release has no positive declared size.');
-                }
-            } else {
-                $size = 0;
-                foreach ($manifest['files'] as $file) {
-                    $size += (int) ($file['decoded_size'] ?? array_sum(array_column($file['segments'], 'bytes')));
-                }
-                $size = (int) ($manifest['verified_bytes'] ?? $size);
-            }
-            $legacy = null;
-            $archived = app(ManifestStore::class)->read($candidate->manifest_path);
-            $legacyId = $archived['legacy_release_id'] ?? null;
-            if ($legacyId !== ($manifest['legacy_release_id'] ?? null)
-                || ($legacyId !== null && ($archived['metadata_source'] ?? null) === 'import')) {
-                throw new RuntimeException('Legacy release identity is not trusted.');
-            }
-            if ($legacyId !== null) {
-                $legacy = DB::table('releases')->where('id', $legacyId)->lockForUpdate()->first();
-                if ($legacy === null || (int) $legacy->nzbstatus !== NzbService::NZB_NONE
-                    || (int) $legacy->groups_id !== (int) $manifest['groups_id']) {
-                    throw new RuntimeException('Legacy release identity changed before publication.');
-                }
-            }
-            $duplicateId = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size) : null;
-            if ($duplicateId !== null) {
-                $this->recordGroups($duplicateId, $manifest['groups']);
-                app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
-                $this->markPublished($candidate->id, $duplicateId, $result);
-
-                return $duplicateId;
-            }
-            $guid = $legacy === null ? (string) Str::uuid() : (string) $legacy->guid;
-            $path = $this->writer->write($manifest, $guid);
-            DB::afterRollBack(static function () use ($path): void {
-                if (is_file($path)) {
-                    unlink($path);
-                }
-            });
-            $parameters = $metadata + [
-                'totalpart' => ($manifest['verification_mode'] ?? null) === 'spot_check'
-                    ? max(0, (int) ($manifest['publication_file_count'] ?? $manifest['expected_files'] ?? count($manifest['files'])))
-                    : (($manifest['metadata_source'] ?? null) !== 'import'
-                        ? count(array_unique($manifest['verified_file_names'])) : max((int) $manifest['expected_files'], count($manifest['files']))),
-                'groups_id' => (int) $manifest['groups_id'], 'guid' => $guid, 'postdate' => $manifest['date'],
-                'size' => $size, 'nzbstatus' => NzbService::NZB_ADDED];
-            if ($legacy === null) {
-                $id = Release::insertRelease($parameters);
-            } else {
-                $id = (int) $legacy->id;
-                unset($parameters['naming_regex_id']);
-                DB::table('releases')->where('id', $id)->update($parameters + ['iscategorized' => 1]);
-                DB::afterCommit(static fn () => Search::updateRelease($id));
-            }
-            if ($id === null) {
-                throw new RuntimeException('Verified release insertion failed.');
-            }
-            ReleaseRegex::insertOrIgnore(['releases_id' => $id, 'collection_regex_id' => $manifest['regex_id'],
-                'naming_regex_id' => $metadata['naming_regex_id']]);
-            DB::afterCommit(static function () use ($id): void {
+        $timing = PublicationTiming::sample();
+        $status = 'threw';
+        try {
+            $id = DB::transaction(function () use ($claim, $result, $timing): ?int {
+                $timing?->beginAttempt();
+                $returned = false;
                 try {
-                    CollectReleaseFingerprintMetadata::dispatch((int) $id);
-                } catch (Throwable $dispatchException) {
-                    Log::warning('Could not queue verified release fingerprint metadata collection.', [
-                        'release_id' => $id,
-                        'exception' => $dispatchException::class,
-                    ]);
-                }
-            });
-            $this->recordGroups((int) $id, $manifest['groups']);
-            app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
-            $this->markPublished($candidate->id, (int) $id, $result);
+                    DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                    $timing?->nextPhase('candidate_policy');
+                    $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->lockForUpdate()->first();
+                    if ($candidate === null || $candidate->version !== $claim->version
+                        || $candidate->manifest_hash !== $claim->manifest_hash || $candidate->lease_token !== $claim->lease_token
+                        || $candidate->lease_until === null || $candidate->lease_until < now()->format('Y-m-d H:i:s')) {
+                        throw new RuntimeException('Stale verification result cannot publish.');
+                    }
+                    if ($candidate->release_id !== null) {
+                        $returned = true;
 
-            return (int) $id;
-        }, 5);
+                        return (int) $candidate->release_id;
+                    }
+                    $manifest = $result->manifest;
+                    if ($result->verdict === 'sampled') {
+                        if (($manifest['verification_mode'] ?? null) !== 'spot_check') {
+                            throw new RuntimeException('Sampled verdict has no spot-check evidence.');
+                        }
+                        if (($rejection = (new CandidateHeaderInventory)->rejection($manifest)) !== null) {
+                            throw new RuntimeException($rejection);
+                        }
+                    }
+                    $filteredReason = app(CollectionReleasePolicy::class)->verifiedRejection($manifest);
+                    if ($filteredReason !== null) {
+                        app(CandidateRepository::class)->rejectByPolicy($claim, $filteredReason);
+
+                        $returned = true;
+
+                        return null;
+                    }
+                    $timing?->nextPhase('metadata_size');
+                    $metadata = $this->metadata->resolve($manifest);
+                    if (($manifest['verification_mode'] ?? null) === 'spot_check') {
+                        $size = (new CandidateHeaderInventory)->bytes($manifest);
+                        if ($size < 1) {
+                            throw new RuntimeException('Spot-checked release has no positive declared size.');
+                        }
+                    } else {
+                        $size = 0;
+                        foreach ($manifest['files'] as $file) {
+                            $size += (int) ($file['decoded_size'] ?? array_sum(array_column($file['segments'], 'bytes')));
+                        }
+                        $size = (int) ($manifest['verified_bytes'] ?? $size);
+                    }
+                    $timing?->nextPhase('archive_legacy');
+                    $legacy = null;
+                    $archived = app(ManifestStore::class)->read($candidate->manifest_path);
+                    $legacyId = $archived['legacy_release_id'] ?? null;
+                    if ($legacyId !== ($manifest['legacy_release_id'] ?? null)
+                        || ($legacyId !== null && ($archived['metadata_source'] ?? null) === 'import')) {
+                        throw new RuntimeException('Legacy release identity is not trusted.');
+                    }
+                    if ($legacyId !== null) {
+                        $legacy = DB::table('releases')->where('id', $legacyId)->lockForUpdate()->first();
+                        if ($legacy === null || (int) $legacy->nzbstatus !== NzbService::NZB_NONE
+                            || (int) $legacy->groups_id !== (int) $manifest['groups_id']) {
+                            throw new RuntimeException('Legacy release identity changed before publication.');
+                        }
+                    }
+                    $duplicateId = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing) : null;
+                    if ($duplicateId !== null) {
+                        $timing?->nextPhase('sql_accounting');
+                        $this->recordGroups($duplicateId, $manifest['groups']);
+                        app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
+                        $this->markPublished($candidate->id, $duplicateId, $result);
+
+                        $returned = true;
+
+                        return $duplicateId;
+                    }
+                    $guid = $legacy === null ? (string) Str::uuid() : (string) $legacy->guid;
+                    $timing?->nextPhase('final_xml_gzip');
+                    $path = $this->writer->write($manifest, $guid, $timing);
+                    $timing?->nextPhase('sql_accounting');
+                    DB::afterRollBack(static function () use ($path): void {
+                        if (is_file($path)) {
+                            unlink($path);
+                        }
+                    });
+                    $parameters = $metadata + [
+                        'totalpart' => ($manifest['verification_mode'] ?? null) === 'spot_check'
+                            ? max(0, (int) ($manifest['publication_file_count'] ?? $manifest['expected_files'] ?? count($manifest['files'])))
+                            : (($manifest['metadata_source'] ?? null) !== 'import'
+                                ? count(array_unique($manifest['verified_file_names'])) : max((int) $manifest['expected_files'], count($manifest['files']))),
+                        'groups_id' => (int) $manifest['groups_id'], 'guid' => $guid, 'postdate' => $manifest['date'],
+                        'size' => $size, 'nzbstatus' => NzbService::NZB_ADDED];
+                    if ($legacy === null) {
+                        $id = Release::insertRelease($parameters);
+                    } else {
+                        $id = (int) $legacy->id;
+                        unset($parameters['naming_regex_id']);
+                        DB::table('releases')->where('id', $id)->update($parameters + ['iscategorized' => 1]);
+                        DB::afterCommit(static fn () => Search::updateRelease($id));
+                    }
+                    if ($id === null) {
+                        throw new RuntimeException('Verified release insertion failed.');
+                    }
+                    ReleaseRegex::insertOrIgnore(['releases_id' => $id, 'collection_regex_id' => $manifest['regex_id'],
+                        'naming_regex_id' => $metadata['naming_regex_id']]);
+                    DB::afterCommit(static function () use ($id): void {
+                        try {
+                            CollectReleaseFingerprintMetadata::dispatch((int) $id);
+                        } catch (Throwable $dispatchException) {
+                            Log::warning('Could not queue verified release fingerprint metadata collection.', [
+                                'release_id' => $id,
+                                'exception' => $dispatchException::class,
+                            ]);
+                        }
+                    });
+                    $this->recordGroups((int) $id, $manifest['groups']);
+                    app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
+                    $this->markPublished($candidate->id, (int) $id, $result);
+
+                    $returned = true;
+
+                    return (int) $id;
+                } finally {
+                    $timing?->endAttempt($returned);
+                }
+            }, 5);
+            $status = 'returned';
+
+            return $id;
+        } finally {
+            $timing?->report($status);
+        }
     }
 
     /**
      * @param  array<string, mixed>  $manifest
      * @param  array<string, mixed>  $metadata
      */
-    private function findCoveredDuplicate(object $claim, array $manifest, array $metadata, int $size): ?int
+    private function findCoveredDuplicate(object $claim, array $manifest, array $metadata, int $size, ?PublicationTiming $timing): ?int
     {
         $lastHeartbeat = 0.0;
         $repository = app(CandidateRepository::class);
@@ -152,8 +181,11 @@ final class VerifiedReleasePublisher
             }
         };
         $coverage = new NzbArticleCoverage(app(NzbService::class), $this->duplicates);
+        $timing?->nextPhase('incoming_xml_fingerprint');
         $xml = $coverage->parseXml($this->writer->document($manifest));
-        $duplicate = $xml === null ? null : $coverage->findCoveredUpload($size, NzbArticleFingerprint::fromXml($xml), $xml,
+        $fingerprint = $xml === null ? null : NzbArticleFingerprint::fromXml($xml);
+        $timing?->nextPhase('duplicate_search_revalidation');
+        $duplicate = $xml === null ? null : $coverage->findCoveredUpload($size, $fingerprint, $xml,
             $metadata['name'], $metadata['searchname'], $metadata['predb_id'], publishedOnly: true, onCandidate: $heartbeat);
         if ($duplicate !== null && $xml !== null) {
             $current = DB::table('releases')->where('id', $duplicate->id)->where('nzbstatus', NzbService::NZB_ADDED)
