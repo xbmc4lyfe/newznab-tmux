@@ -27,11 +27,9 @@ class YencService
         if ($frame === null) {
             return false;
         }
-        $slice = $this->payloadSlice($text, $frame);
-        if ($this->hasDanglingEscape($slice)) {
-            throw new RuntimeException('Unmatched yEnc escape marker. The file is probably corrupt.');
-        }
-        $decoded = $this->decodePayload($slice);
+        $isMultipart = isset($frame->header['part']) || isset($frame->trailer['part']) || $frame->part !== null;
+        $payload = $this->decodeFramePayload($text, $frame, true, isset($frame->trailer[$isMultipart ? 'pcrc32' : 'crc32']));
+        $decoded = $payload['decoded'];
         $size = $this->number($frame->header, 'size');
         $trailerSize = $this->number($frame->trailer, 'size');
         $checksum = $frame->trailer['crc32'] ?? null;
@@ -58,7 +56,7 @@ class YencService
             throw new RuntimeException('Declared and decoded yEnc sizes do not match. The file is probably corrupt.');
         }
         if ($checksum !== null && (! preg_match('/\A[0-9a-f]{1,8}\z/i', $checksum)
-            || strcasecmp(str_pad($checksum, 8, '0', STR_PAD_LEFT), $this->crc32($decoded)) !== 0)) {
+            || strcasecmp(str_pad($checksum, 8, '0', STR_PAD_LEFT), $payload['crc32'] ?? $this->crc32($decoded)) !== 0)) {
             throw new RuntimeException('CRC32 checksums do not match. The file is probably corrupt.');
         }
 
@@ -69,10 +67,7 @@ class YencService
     {
         $frame = ArticleFrame::parse($text);
         if ($frame !== null) {
-            $slice = $this->payloadSlice($text, $frame);
-            $text = $this->hasDanglingEscape($slice)
-                ? (new PhpPayloadDecoder)->decode($this->stripLineEndings($slice))
-                : $this->decodePayload($slice);
+            $text = $this->decodeFramePayload($text, $frame)['decoded'];
         }
 
         return $text;
@@ -90,10 +85,7 @@ class YencService
             return [$text, null];
         }
 
-        $slice = $this->payloadSlice($text, $frame);
-        $decoded = $this->hasDanglingEscape($slice)
-            ? (new PhpPayloadDecoder)->decode($this->stripLineEndings($slice))
-            : $this->decodePayload($slice);
+        $decoded = $this->decodeFramePayload($text, $frame)['decoded'];
 
         $part = new YencPart(
             name: trim($frame->header['name']),
@@ -182,6 +174,29 @@ class YencService
         return substr($text, $frame->payloadOffset, $frame->payloadLength);
     }
 
+    /** @return array{decoded: string, crc32: string|null} */
+    private function decodeFramePayload(string $text, ArticleFrame $frame, bool $strict = false, bool $withCrc = false): array
+    {
+        if ($this->hasDanglingEscape($text, $frame->payloadOffset, $frame->payloadLength)) {
+            if ($strict) {
+                throw new RuntimeException('Unmatched yEnc escape marker. The file is probably corrupt.');
+            }
+
+            return [
+                'decoded' => (new PhpPayloadDecoder)->decode($this->stripLineEndings($this->payloadSlice($text, $frame))),
+                'crc32' => null,
+            ];
+        }
+        if ($this->decoder instanceof NativePayloadDecoder) {
+            $decoded = $this->decoder->decodeSpan($text, $frame->payloadOffset, $frame->payloadLength, $withCrc);
+            if ($decoded !== null) {
+                return $decoded;
+            }
+        }
+
+        return ['decoded' => $this->decodePayload($this->payloadSlice($text, $frame)), 'crc32' => null];
+    }
+
     private function decodePayload(string $slice): string
     {
         if ($this->decoder instanceof NativePayloadDecoder && $this->decoder->supportsSplitEscapes()) {
@@ -218,13 +233,13 @@ class YencService
         return hash('crc32b', $decoded);
     }
 
-    private function hasDanglingEscape(string $payload): bool
+    private function hasDanglingEscape(string $source, int $payloadOffset, int $payloadLength): bool
     {
         $count = 0;
-        for ($offset = strlen($payload) - 1; $offset >= 0; $offset--) {
-            if ($payload[$offset] === '=') {
+        for ($offset = $payloadOffset + $payloadLength - 1; $offset >= $payloadOffset; $offset--) {
+            if ($source[$offset] === '=') {
                 $count++;
-            } elseif ($payload[$offset] !== "\r" && $payload[$offset] !== "\n") {
+            } elseif ($source[$offset] !== "\r" && $source[$offset] !== "\n") {
                 break;
             }
         }

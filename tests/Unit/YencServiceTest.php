@@ -316,6 +316,96 @@ class YencServiceTest extends TestCase
         });
     }
 
+    /** @return iterable<string, array{list<string>, bool}> */
+    public static function spanDecoderCapabilities(): iterable
+    {
+        yield 'supported' => [['WITH_SPAN_DECODER', 'SPLIT_ESCAPE_DECODER', 'WITH_CRC'], true];
+        yield 'absent' => [['SPLIT_ESCAPE_DECODER', 'WITH_CRC'], false];
+        yield 'bad checksum' => [['WITH_SPAN_DECODER', 'SPLIT_ESCAPE_DECODER', 'WITH_CRC', 'BAD_SPAN_CRC'], false];
+        yield 'invalid length' => [['WITH_SPAN_DECODER', 'SPLIT_ESCAPE_DECODER', 'WITH_CRC', 'BAD_SPAN_LENGTH'], false];
+    }
+
+    /** @param list<string> $defines */
+    #[DataProvider('spanDecoderCapabilities')]
+    public function test_verified_span_decoder_handles_all_frame_paths_and_reuses_its_checksum(array $defines, bool $supported): void
+    {
+        $this->withNativeFixture($defines, function (NativePayloadDecoder $decoder, \FFI $probe) use ($supported): void {
+            $probe->fixture_reset_span_decode_calls(); // @phpstan-ignore method.notFound
+            $probe->fixture_reset_crc_calls(); // @phpstan-ignore method.notFound
+            $article = "preamble=\n=ybegin line=128 size=4 name=span.bin\r\nk=\r\n@lm\r\n=yend size=4 crc32=a672946b\n=\nsuffix";
+            $original = $article;
+            $service = new YencService($decoder);
+            $this->assertSame("A\xd6BC", $service->decode($article));
+            $this->assertSame($original, $article);
+            $this->assertSame($supported ? 1 : 0, $probe->fixture_span_decode_calls()); // @phpstan-ignore method.notFound
+            $this->assertSame($supported ? 1 : 0, $probe->fixture_span_crc_requests()); // @phpstan-ignore method.notFound
+            $this->assertSame($supported ? 0 : 1, $probe->fixture_crc_calls()); // @phpstan-ignore method.notFound
+            $this->assertSame("A\xd6BC", $service->decodeIgnore($article));
+            [$decoded, $part] = $service->decodeWithFrame($original);
+            $this->assertSame("A\xd6BC", $decoded);
+            $this->assertSame('span.bin', $part?->name);
+            $this->assertSame($supported ? 3 : 0, $probe->fixture_span_decode_calls()); // @phpstan-ignore method.notFound
+            $this->assertSame($supported ? 1 : 0, $probe->fixture_span_crc_requests()); // @phpstan-ignore method.notFound
+            $multipart = "=ybegin part=2 total=3 line=128 size=9 name=span.bin\n=ypart begin=4 end=7\nk=\r\n@lm\n=yend size=4 part=2 pcrc32=a672946b crc32=deadbeef";
+            $this->assertSame("A\xd6BC", $service->decode($multipart));
+            $withoutChecksum = "=ybegin line=128 size=4 name=span.bin\nk=\r\n@lm\n=yend size=4";
+            $this->assertSame("A\xd6BC", $service->decode($withoutChecksum));
+            $this->assertSame($supported ? 5 : 0, $probe->fixture_span_decode_calls()); // @phpstan-ignore method.notFound
+            $this->assertSame($supported ? 2 : 0, $probe->fixture_span_crc_requests()); // @phpstan-ignore method.notFound
+        });
+    }
+
+    public function test_span_decode_bounds_and_optional_checksums(): void
+    {
+        $this->withNativeFixture(['WITH_SPAN_DECODER', 'SPLIT_ESCAPE_DECODER'], function (NativePayloadDecoder $decoder, \FFI $probe): void {
+            $probe->fixture_reset_span_decode_calls(); // @phpstan-ignore method.notFound
+            $source = "left|k=\r\n@lm|right";
+            $this->assertSame(['decoded' => "A\xd6BC", 'crc32' => 'a672946b'], $decoder->decodeSpan($source, 5, 7, true));
+            $this->assertSame(['decoded' => "A\xd6BC", 'crc32' => null], $decoder->decodeSpan($source, 5, 7, false));
+            $this->assertSame(['decoded' => '', 'crc32' => '00000000'], $decoder->decodeSpan('', 0, 0, true));
+            $this->assertSame(['decoded' => '', 'crc32' => null], $decoder->decodeSpan($source, strlen($source), 0, false));
+            $calls = $probe->fixture_span_decode_calls(); // @phpstan-ignore method.notFound
+            foreach ([[-1, 0], [0, -1], [strlen($source) + 1, 0], [1, strlen($source)], [PHP_INT_MAX, 1], [1, PHP_INT_MAX]] as [$offset, $length]) {
+                try {
+                    $decoder->decodeSpan($source, $offset, $length, true);
+                    $this->fail('An invalid span must be rejected before the native call.');
+                } catch (RuntimeException) {
+                    $this->addToAssertionCount(1);
+                }
+            }
+            $this->assertSame($calls, $probe->fixture_span_decode_calls()); // @phpstan-ignore method.notFound
+        });
+    }
+
+    public function test_span_path_preserves_corruption_checks_and_bounded_dangling_recovery(): void
+    {
+        $this->withNativeFixture(['WITH_SPAN_DECODER', 'SPLIT_ESCAPE_DECODER'], function (NativePayloadDecoder $decoder, \FFI $probe): void {
+            $service = new YencService($decoder);
+            foreach (YencDecoderTest::corruptArticles() as [$article]) {
+                $original = $article;
+                $this->assertSame('ABC', $service->decodeIgnore($article));
+                try {
+                    $service->decode($original);
+                    $this->fail('The span path must preserve all strict frame checks.');
+                } catch (RuntimeException) {
+                    $this->addToAssertionCount(1);
+                }
+            }
+            $probe->fixture_reset_span_decode_calls(); // @phpstan-ignore method.notFound
+            $article = "prefix\n=ybegin line=128 size=1 name=x\n=\n==\n=yend size=1\n=\nsuffix";
+            $original = $article;
+            $this->assertSame("\xd3", $service->decodeIgnore($article));
+            $this->assertSame("\xd3", $service->decodeWithFrame($original)[0]);
+            try {
+                $service->decode($original);
+                $this->fail('Strict decoding must reject a dangling escape.');
+            } catch (RuntimeException $exception) {
+                $this->assertStringContainsString('Unmatched yEnc escape marker', $exception->getMessage());
+            }
+            $this->assertSame(0, $probe->fixture_span_decode_calls()); // @phpstan-ignore method.notFound
+        });
+    }
+
     /**
      * Exercise the real FFI adapter on non-Linux test hosts without changing its production platform guard.
      *
@@ -347,11 +437,19 @@ class YencServiceTest extends TestCase
                 $decoder = $reflection->newInstanceWithoutConstructor();
                 $library = \FFI::cdef('size_t rapidyenc_decode_ex(int, const void*, void*, size_t, int*);', $path);
                 $reflection->getProperty('library')->setValue($decoder, $library);
-                $reflection->getProperty('crcLibrary')->setValue($decoder, null);
+                $reflection->getProperty('crcLibrary')->setValue($decoder, $reflection->getMethod('loadCrcLibrary')->invoke($decoder, $path));
                 $supported = $reflection->getMethod('detectSplitEscapeSupport')->invoke($decoder, $path);
                 $reflection->getProperty('splitEscapesSupported')->setValue($decoder, $supported);
+                $reflection->getProperty('spanLibrary')->setValue($decoder, $reflection->getMethod('loadSpanLibrary')->invoke($decoder, $path));
             }
-            $probe = \FFI::cdef('int fixture_last_payload_had_split_escape(void);', $path);
+            $probe = \FFI::cdef(<<<'C'
+                int fixture_last_payload_had_split_escape(void);
+                int fixture_span_decode_calls(void);
+                void fixture_reset_span_decode_calls(void);
+                int fixture_span_crc_requests(void);
+                int fixture_crc_calls(void);
+                void fixture_reset_crc_calls(void);
+                C, $path);
             $assertions($decoder, $probe);
         } finally {
             if (is_file($path)) {

@@ -621,6 +621,75 @@ pub unsafe extern "C" fn rapidyenc_decode_ex(
     }
 }
 
+/// Decode a bounded payload span from a larger source buffer.
+///
+/// CR/LF and escape handling match `rapidyenc_decode_ex`. Only the returned
+/// number of destination bytes are written. A nonnull `crc32_output` receives
+/// the CRC-32 of those decoded bytes; null skips CRC computation.
+/// Invalid ranges, capacity, or required null pointers return `usize::MAX`
+/// without modifying the destination or CRC output. Valid empty spans return
+/// zero and set a supplied CRC output to zero.
+///
+/// # Safety
+///
+/// For nonzero `source_length`, `src` must point to an allocation readable for
+/// the whole `source_length`. For nonzero `payload_length`, `dest` must point
+/// to an allocation writable for `destination_capacity` bytes. Source and
+/// destination allocations may overlap, including in-place decoding.
+/// A nonnull `crc32_output` must be writable for four bytes, and its four-byte
+/// range must not overlap either source or destination allocation. Alignment
+/// is not required. These pointer requirements apply when validation succeeds;
+/// invalid argument combinations are rejected before any pointer access.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_yenc_decode_span_v1(
+    src: *const c_void,
+    source_length: usize,
+    payload_offset: usize,
+    payload_length: usize,
+    dest: *mut c_void,
+    destination_capacity: usize,
+    crc32_output: *mut u32,
+) -> usize {
+    if source_length > isize::MAX as usize
+        || payload_offset > source_length
+        || payload_length > source_length - payload_offset
+        || destination_capacity < payload_length
+        || (source_length > 0 && src.is_null())
+        || (payload_length > 0 && dest.is_null())
+    {
+        return DECODE_FAILED;
+    }
+    match catch_unwind(|| {
+        if payload_length == 0 {
+            if !crc32_output.is_null() {
+                // SAFETY: the caller provides four writable, disjoint bytes.
+                unsafe { crc32_output.write_unaligned(0) };
+            }
+            return 0;
+        }
+        // SAFETY: validation bounds this nonempty span within the readable
+        // source allocation and ensures sufficient writable destination space.
+        let written = unsafe {
+            payload_decoder::decode_into(
+                src.cast::<u8>().add(payload_offset),
+                dest.cast(),
+                payload_length,
+            )
+        };
+        if !crc32_output.is_null() {
+            // SAFETY: the decoder initialized exactly `written` bytes, and
+            // the disjoint CRC output remains writable during this shared read.
+            let decoded = unsafe { slice::from_raw_parts(dest.cast::<u8>(), written) };
+            let crc = crc32fast::hash(decoded);
+            unsafe { crc32_output.write_unaligned(crc) };
+        }
+        written
+    }) {
+        Ok(written) => written,
+        Err(_) => DECODE_FAILED,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rapidyenc_crc_init() {}
 
@@ -733,6 +802,282 @@ mod tests {
         output.truncate(written);
 
         Ok(output)
+    }
+
+    #[test]
+    fn span_abi_decodes_all_values_from_nonzero_offsets_with_optional_crc_and_exact_writes() {
+        let original: Vec<u8> = (0..=255).cycle().take(4096).collect();
+        let mut payload = Vec::new();
+        for &byte in &original {
+            let encoded = byte.wrapping_add(42);
+            if matches!(encoded, 0 | 10 | 13 | 61) {
+                payload.extend_from_slice(&[b'=', b'\r', b'\n', encoded.wrapping_add(64)]);
+            } else {
+                payload.push(encoded);
+            }
+            if payload.len() % 31 == 0 {
+                payload.extend_from_slice(b"\r\n");
+            }
+        }
+        let mut source = b"unselected prefix=".to_vec();
+        let offset = source.len();
+        source.extend_from_slice(&payload);
+        source.extend_from_slice(b"unselected suffix=");
+        for alignment in 0..32 {
+            for with_crc in [false, true] {
+                let mut output = vec![0xa5; payload.len() + 64];
+                let mut crc = 0xa1b2_c3d4;
+                let written = unsafe {
+                    nntmux_yenc_decode_span_v1(
+                        source.as_ptr().cast(),
+                        source.len(),
+                        offset,
+                        payload.len(),
+                        output.as_mut_ptr().add(alignment).cast(),
+                        payload.len(),
+                        if with_crc { &mut crc } else { ptr::null_mut() },
+                    )
+                };
+                assert_eq!(written, original.len());
+                assert_eq!(&output[alignment..alignment + written], &original);
+                assert!(output[..alignment].iter().all(|&byte| byte == 0xa5));
+                assert!(
+                    output[alignment + written..]
+                        .iter()
+                        .all(|&byte| byte == 0xa5)
+                );
+                assert_eq!(
+                    crc,
+                    if with_crc {
+                        crc32fast::hash(&original)
+                    } else {
+                        0xa1b2_c3d4
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn span_abi_rejects_invalid_arguments_without_writing_destination_or_crc() {
+        let source = b"klm";
+        let cases = [
+            (
+                source.len(),
+                source.len() + 1,
+                0,
+                source.len(),
+                false,
+                false,
+            ),
+            (source.len(), source.len(), 1, source.len(), false, false),
+            (source.len(), 1, source.len(), source.len(), false, false),
+            (
+                source.len(),
+                0,
+                source.len(),
+                source.len() - 1,
+                false,
+                false,
+            ),
+            (source.len(), usize::MAX, 0, source.len(), false, false),
+            (source.len(), 0, usize::MAX, usize::MAX, false, false),
+            (usize::MAX, 0, 0, 0, false, false),
+            (isize::MAX as usize + 1, 0, 0, 0, false, false),
+            (source.len(), 0, 0, 0, true, false),
+            (source.len(), 0, source.len(), source.len(), false, true),
+            (0, 1, 0, 0, true, true),
+            (0, 0, 1, 1, true, false),
+        ];
+        for (source_length, offset, length, capacity, null_source, null_destination) in cases {
+            let mut output = [0xa5; 8];
+            let mut crc = 0xa1b2_c3d4;
+            let written = unsafe {
+                nntmux_yenc_decode_span_v1(
+                    if null_source {
+                        ptr::null()
+                    } else {
+                        source.as_ptr().cast()
+                    },
+                    source_length,
+                    offset,
+                    length,
+                    if null_destination {
+                        ptr::null_mut()
+                    } else {
+                        output.as_mut_ptr().cast()
+                    },
+                    capacity,
+                    &mut crc,
+                )
+            };
+            assert_eq!(
+                written, DECODE_FAILED,
+                "source {source_length}, offset {offset}, length {length}, capacity {capacity}"
+            );
+            assert_eq!(output, [0xa5; 8]);
+            assert_eq!(crc, 0xa1b2_c3d4);
+        }
+    }
+
+    #[test]
+    fn span_abi_accepts_empty_spans_and_initializes_only_requested_crc() {
+        let source = b"prefix";
+        for (pointer, source_length, offset) in [
+            (ptr::null(), 0, 0),
+            (source.as_ptr().cast(), source.len(), 0),
+            (source.as_ptr().cast(), source.len(), source.len()),
+        ] {
+            let mut crc = 0xa1b2_c3d4;
+            let written = unsafe {
+                nntmux_yenc_decode_span_v1(
+                    pointer,
+                    source_length,
+                    offset,
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut crc,
+                )
+            };
+            assert_eq!(written, 0);
+            assert_eq!(crc, 0);
+            assert_eq!(
+                unsafe {
+                    nntmux_yenc_decode_span_v1(
+                        pointer,
+                        source_length,
+                        offset,
+                        0,
+                        ptr::null_mut(),
+                        0,
+                        ptr::null_mut(),
+                    )
+                },
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn span_abi_preserves_lenient_split_escape_and_dangling_marker_semantics() {
+        for (payload, expected) in [
+            (b"klm\r\n".as_slice(), b"ABC".as_slice()),
+            (b"k=\r\n@", b"A\xd6"),
+            (b"=\r\n=\n=\r=", b"\xd3\xd3"),
+            (b"k=\r\n", b"A\x13"),
+            (b"\r\n\r\n", b""),
+        ] {
+            let mut source = b"prefix".to_vec();
+            let offset = source.len();
+            source.extend_from_slice(payload);
+            source.extend_from_slice(b"suffix");
+            let mut output = [0xa5; 32];
+            let mut crc = 0;
+            let written = unsafe {
+                nntmux_yenc_decode_span_v1(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    offset,
+                    payload.len(),
+                    output.as_mut_ptr().cast(),
+                    output.len(),
+                    &mut crc,
+                )
+            };
+            assert_eq!(written, expected.len());
+            assert_eq!(&output[..written], expected);
+            assert!(output[written..].iter().all(|&byte| byte == 0xa5));
+            assert_eq!(crc, crc32fast::hash(expected));
+        }
+    }
+
+    #[test]
+    fn span_abi_supports_both_overlap_directions_and_in_place_exact_writes() {
+        let payload = [b"klm=@=J=M=}\r\n".repeat(9), b"=\r\n@===".to_vec()].concat();
+        let expected = decode_via_abi(&payload).unwrap();
+        for destination_start in [16, 40, 41, 63] {
+            let mut storage = vec![0xa5; payload.len() + 128];
+            storage[40..40 + payload.len()].copy_from_slice(&payload);
+            let before = storage.clone();
+            let mut crc = 0;
+            let written = unsafe {
+                nntmux_yenc_decode_span_v1(
+                    storage.as_ptr().cast(),
+                    storage.len(),
+                    40,
+                    payload.len(),
+                    storage.as_mut_ptr().add(destination_start).cast(),
+                    payload.len(),
+                    &mut crc,
+                )
+            };
+            assert_eq!(written, expected.len());
+            assert_eq!(
+                &storage[destination_start..destination_start + written],
+                &expected
+            );
+            assert_eq!(&storage[..destination_start], &before[..destination_start]);
+            assert_eq!(
+                &storage[destination_start + written..],
+                &before[destination_start + written..]
+            );
+            assert_eq!(crc, crc32fast::hash(&expected));
+        }
+    }
+
+    #[test]
+    fn span_abi_uses_no_heap_allocation_for_disjoint_buffers_even_with_crc() {
+        let payload = b"klm=@=J=M=}..\x0b==";
+        for with_crc in [false, true] {
+            let mut output = [0xa5; 32];
+            let mut crc = 0;
+            ALLOCATION_COUNT.with(|count| count.set(0));
+            COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
+            let written = unsafe {
+                nntmux_yenc_decode_span_v1(
+                    payload.as_ptr().cast(),
+                    payload.len(),
+                    0,
+                    payload.len(),
+                    output.as_mut_ptr().cast(),
+                    output.len(),
+                    if with_crc { &mut crc } else { ptr::null_mut() },
+                )
+            };
+            COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+            let allocations = ALLOCATION_COUNT.with(Cell::get);
+            assert_eq!(written, 11);
+            assert_eq!(allocations, 0);
+        }
+    }
+
+    #[test]
+    fn span_abi_writes_unaligned_crc_without_touching_adjacent_bytes() {
+        let payload = b"klm";
+        let mut output = [0xa5; 8];
+        let mut crc_storage = [0xa5; 8];
+        let crc_pointer = unsafe { crc_storage.as_mut_ptr().add(1).cast::<u32>() };
+        let written = unsafe {
+            nntmux_yenc_decode_span_v1(
+                payload.as_ptr().cast(),
+                payload.len(),
+                0,
+                payload.len(),
+                output.as_mut_ptr().cast(),
+                output.len(),
+                crc_pointer,
+            )
+        };
+        assert_eq!(written, 3);
+        assert_eq!(&output[..written], b"ABC");
+        assert!(output[written..].iter().all(|&byte| byte == 0xa5));
+        assert_eq!(
+            unsafe { crc_pointer.read_unaligned() },
+            crc32fast::hash(b"ABC")
+        );
+        assert_eq!(crc_storage[0], 0xa5);
+        assert_eq!(&crc_storage[5..], &[0xa5; 3]);
     }
 
     #[test]
