@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAGIC: &[u8; 8] = b"PAR2\0PKT";
 const MAX_PACKETS: usize = 20_000;
 const MAX_MAIN_FILE_IDS: usize = 32_768;
+// Current PAR2 GF(2^16) construction has 32,768 usable input constants.
+const MAX_SOURCE_BLOCKS: u64 = 32_768;
 const MAX_OPTIONAL_HEX_BYTES: usize = 256;
 const MAX_IFSC_PREVIEW_BYTES: usize = 4096;
 const MAX_FILESLICE_CHECKSUM_WORK_BYTES: u64 = 64 * 1024 * 1024;
@@ -25,6 +27,8 @@ pub struct Par2Metadata {
     pub integer_range_valid: bool,
     pub source_block_size: Option<u64>,
     pub source_block_count: Option<u64>,
+    pub source_block_limit: u64,
+    pub source_block_count_within_current_v2_limit: Option<bool>,
     pub main_packet: Option<MainPacket>,
     pub main_packet_set_id_derivations: Vec<RecoverySetIdDerivation>,
     pub main_file_id_limit: usize,
@@ -183,6 +187,8 @@ pub struct RecoverySetInventory {
     pub recovery_set_id: String,
     pub source_block_size: Option<u64>,
     pub source_block_count: Option<u64>,
+    pub source_block_limit: u64,
+    pub source_block_count_within_current_v2_limit: Option<bool>,
     pub source_block_count_overflow: bool,
     pub main_packet: Option<MainPacket>,
     pub source_inventory_complete: bool,
@@ -1208,6 +1214,9 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
                 recovery_set_id: set_id.clone(),
                 source_block_size: parsed.block_sizes_by_set.get(set_id).copied(),
                 source_block_count,
+                source_block_limit: MAX_SOURCE_BLOCKS,
+                source_block_count_within_current_v2_limit: source_block_count
+                    .map(|count| count <= MAX_SOURCE_BLOCKS),
                 source_block_count_overflow,
                 main_packet,
                 source_inventory_complete,
@@ -1313,6 +1322,8 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
         .flat_map(|set| set.source_files.iter().cloned())
         .collect::<Vec<_>>();
     let source_block_count = single_set.and_then(|set| set.source_block_count);
+    let source_block_count_within_current_v2_limit =
+        source_block_count.map(|count| count <= MAX_SOURCE_BLOCKS);
     let source_block_count_overflow = single_set.is_some_and(|set| set.source_block_count_overflow);
     let recovery_count = (!recovery_sets.is_empty()).then(|| {
         recovery_sets
@@ -1334,6 +1345,7 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
             .zip(source_block_count)
             .and_then(|(recovery_count, source_block_count)| {
                 (source_block_count > 0
+                    && source_block_count_within_current_v2_limit == Some(true)
                     && source_inventory_complete
                     && ifsc_relationships_valid
                     && !source_file_bytes_overflow
@@ -1354,10 +1366,12 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
             "unavailable-source-file-byte-total-overflow"
         } else if source_block_count_overflow {
             "unavailable-source-block-count-overflow"
-        } else if !ifsc_relationships_valid {
-            "unavailable-ifsc-source-slice-relationship-conflict"
         } else if packed_layout_present {
             "unavailable-packed-recovery-layout"
+        } else if source_block_count_within_current_v2_limit == Some(false) {
+            "unavailable-source-block-count-exceeds-current-v2-limit"
+        } else if !ifsc_relationships_valid {
+            "unavailable-ifsc-source-slice-relationship-conflict"
         } else if source_block_size.is_none() && recovery_count.is_some_and(|count| count > 0) {
             "unavailable-source-block-size-not-in-this-volume"
         } else {
@@ -1402,6 +1416,8 @@ pub fn parse(data: &[u8]) -> Par2Metadata {
         integer_range_valid: unsupported_integer_range_count == 0,
         source_block_size,
         source_block_count,
+        source_block_limit: MAX_SOURCE_BLOCKS,
+        source_block_count_within_current_v2_limit,
         main_packet,
         main_packet_set_id_derivations: parsed.main_packet_set_id_derivations,
         main_file_id_limit: MAX_MAIN_FILE_IDS,
@@ -2172,6 +2188,64 @@ mod tests {
         assert!(metadata.source_inventory_complete);
         assert_eq!(metadata.recovery_sets.len(), 1);
         assert_eq!(metadata.recovery_sets[0].unique_recovery_slice_count, 1);
+    }
+
+    #[test]
+    fn gates_recovery_percent_on_current_v2_source_slice_capacity() {
+        for (count, within) in [(32_768u64, true), (32_769, false)] {
+            let input = single_file_set([b'F'; 16], 4, count * 4, b"payload.rar", Some(65535));
+            let metadata = parse(&input);
+            assert_eq!(metadata.source_block_count, Some(count));
+            assert_eq!(metadata.invalid_packet_count, 0);
+            assert!(metadata.source_inventory_complete);
+            assert_eq!(metadata.recovery_exponents, Some(vec![0]));
+            assert_eq!(metadata.recovery_to_source_percent.is_some(), within);
+            let json = serde_json::to_value(metadata).unwrap();
+            assert_eq!(json["source_block_limit"], 32_768);
+            assert_eq!(json["source_block_count_within_current_v2_limit"], within);
+            assert_eq!(
+                json["recovery_sets"][0]["source_block_count_within_current_v2_limit"],
+                within
+            );
+            if !within {
+                assert_eq!(
+                    json["recovery_percentage_basis"],
+                    "unavailable-source-block-count-exceeds-current-v2-limit"
+                );
+            }
+        }
+        let input = single_file_set([b'F'; 16], 4, 4, b"payload.rar", None);
+        let main_length = read_u64(&input, 8).unwrap() as usize;
+        let json = serde_json::to_value(parse(&input[main_length..])).unwrap();
+        assert_eq!(
+            json["source_block_count_within_current_v2_limit"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn source_slice_capacity_sums_only_recoverable_files() {
+        for (recoverable_count, expected_count, within) in
+            [(1u32, 16_384u64, true), (2, 32_769, false)]
+        {
+            let mut main = 4u64.to_le_bytes().to_vec();
+            main.extend(recoverable_count.to_le_bytes());
+            main.extend([b'A'; 16]);
+            main.extend([b'B'; 16]);
+            let mut input = packet(b"PAR 2.0\0Main", &main);
+            for (id, length, name) in [(b'A', 65_536u64, b"a.rar"), (b'B', 65_540, b"b.rar")] {
+                let mut desc = vec![id; 16];
+                desc.extend([b'M'; 16]);
+                desc.extend([b'N'; 16]);
+                desc.extend(length.to_le_bytes());
+                desc.extend(name);
+                input.extend(packet(b"PAR 2.0\0FileDesc", &desc));
+            }
+            input.extend(packet(b"PAR 2.0\0RecvSlic", &[0; 8]));
+            let metadata = parse(&input);
+            assert_eq!(metadata.source_block_count, Some(expected_count));
+            assert_eq!(metadata.recovery_to_source_percent.is_some(), within);
+        }
     }
 
     #[test]

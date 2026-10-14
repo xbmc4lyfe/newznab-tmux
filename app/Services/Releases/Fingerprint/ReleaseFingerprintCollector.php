@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 21;
+    public const SCHEMA_VERSION = 22;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 
@@ -1043,37 +1043,23 @@ final class ReleaseFingerprintCollector
         $parsedRecoveryAcrossSets = array_sum(array_map('count', $par2RecoveryExponentsBySet));
         $par2SourceBlocks = null;
         $par2SourceBlocksOverflow = false;
+        $par2SourceBlocksWithinLimit = null;
         if (! $multiplePar2Sets && $par2SetIds !== []) {
             $singleSetId = array_key_first($par2SetIds);
             $main = $par2SetMainPackets[$singleSetId] ?? null;
             $blockSize = (int) ($par2SetBlockSizes[$singleSetId] ?? 0);
-            $denominatorIsDefined = is_array($main)
-                && ($par2SetMainPacketConflicts[$singleSetId] ?? false) !== true
-                && ($par2SetBlockSizeConflicts[$singleSetId] ?? false) !== true
-                && $blockSize > 0;
-            $sourceBlockCount = 0;
-            if ($denominatorIsDefined) {
-                foreach ($main['recoverable_file_ids'] ?? [] as $fileId) {
-                    if (! is_string($fileId)
-                        || ($par2SetSourceConflicts[$singleSetId][$fileId] ?? false) === true
-                        || ! is_int($par2SetSources[$singleSetId][$fileId]['file_length'] ?? null)
-                        || $par2SetSources[$singleSetId][$fileId]['file_length'] < 0) {
-                        $denominatorIsDefined = false;
-                        break;
-                    }
-                    $fileSize = $par2SetSources[$singleSetId][$fileId]['file_length'];
-                    $fileBlockCount = intdiv($fileSize, $blockSize) + (($fileSize % $blockSize) === 0 ? 0 : 1);
-                    $sourceBlockCount = $this->checkedNonNegativeIntegerAdd($sourceBlockCount, $fileBlockCount);
-                    if ($sourceBlockCount === null) {
-                        $par2SourceBlocksOverflow = true;
-                        $denominatorIsDefined = false;
-                        break;
-                    }
-                }
-            }
-            if ($denominatorIsDefined) {
-                $par2SourceBlocks = $sourceBlockCount;
-            } else {
+            $layout = $this->computePar2SourceBlockLayout(
+                is_array($main) ? $main : null,
+                $blockSize,
+                $par2SetSources[$singleSetId] ?? [],
+                $par2SetSourceConflicts[$singleSetId] ?? [],
+                ($par2SetMainPacketConflicts[$singleSetId] ?? false) === true
+                    || ($par2SetBlockSizeConflicts[$singleSetId] ?? false) === true,
+            );
+            $par2SourceBlocks = $layout['source_block_count'];
+            $par2SourceBlocksOverflow = $layout['source_block_count_overflow'];
+            $par2SourceBlocksWithinLimit = $layout['source_block_count_within_current_v2_limit'];
+            if (! $layout['complete']) {
                 $par2Complete = false;
             }
         }
@@ -1103,7 +1089,7 @@ final class ReleaseFingerprintCollector
             $par2SourceSampleRetainedBytes,
             $par2SourceSampleOmittedCount,
         );
-        $par2RecoveryPercent = $par2Complete && $par2RecoverySliceConflicts === [] && ! $multiplePar2Sets && is_int($par2SourceBlocks) && $par2SourceBlocks > 0 && ! $par2PackedLayout
+        $par2RecoveryPercent = $par2Complete && $par2RecoverySliceConflicts === [] && ! $multiplePar2Sets && is_int($par2SourceBlocks) && $par2SourceBlocks > 0 && $par2SourceBlocksWithinLimit === true && ! $par2PackedLayout
             ? round($recoveryCount / $par2SourceBlocks * 100, 3)
             : null;
         $yencFileLengthPercent = $yencSizeCounts['rar'] > 0 && $yencSizeCounts['par2'] > 0
@@ -1284,7 +1270,16 @@ final class ReleaseFingerprintCollector
                     'parsed_recovery_exponents_across_sets' => $multiplePar2Sets ? $parsedRecoveryAcrossSets : null,
                     'recovery_slice_conflicts' => array_values($par2RecoverySliceConflicts),
                     'source_block_count' => $par2SourceBlocks ?: null,
+                    'source_block_limit' => Par2MetadataParser::MAX_SOURCE_BLOCKS,
+                    'source_block_count_within_current_v2_limit' => $par2SourceBlocksWithinLimit,
                     'source_block_count_overflow' => $par2SourceBlocksOverflow,
+                    'recovery_percentage_basis' => $par2PackedLayout
+                        ? 'unavailable-packed-recovery-layout'
+                        : ($par2SourceBlocksWithinLimit === false
+                            ? 'unavailable-source-block-count-exceeds-current-v2-limit'
+                        : ($par2RecoveryPercent !== null
+                            ? 'unique-valid-recovery-exponents-over-recoverable-source-blocks'
+                            : 'unavailable-incomplete-or-unsupported-par2-layout')),
                     'nzb_file_prefix_relationships' => $par2SourcePrefixRelationships,
                     'recovery_percent' => $par2RecoveryPercent,
                     'cross_volume_recovery_conflicts' => $crossVolumeRecoveryConflicts,
@@ -1296,7 +1291,9 @@ final class ReleaseFingerprintCollector
                             ? 'Multiple PAR2 recovery sets were found; a single aggregate recovery percentage is unavailable.'
                         : ($crossVolumeRecoveryConflicts !== []
                             ? 'Conflicting copies of the same recovery exponent were found across PAR2 volumes; recovery percentage is unavailable.'
-                            : ($par2Complete ? null : 'PAR2 packets are incomplete; recovery percentage is unavailable.'))),
+                            : ($par2SourceBlocksWithinLimit === false
+                                ? 'Source slice count exceeds the current PAR2 v2 limit; recovery percentage is unavailable.'
+                                : ($par2Complete ? null : 'PAR2 packets are incomplete; recovery percentage is unavailable.')))),
                 ],
                 'yenc_file_lengths' => [
                     'rar_bytes' => $yencSizeCounts['rar'] > 0 ? $yencSizes['rar'] : null,
@@ -2781,6 +2778,55 @@ final class ReleaseFingerprintCollector
         }
 
         return $total;
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $main
+     * @param  array<string, array<string, mixed>>  $sources
+     * @param  array<string, bool>  $conflicts
+     * @return array{source_block_count: ?int, source_block_count_overflow: bool, source_block_count_within_current_v2_limit: ?bool, source_block_limit: int, complete: bool, recovery_percentage_basis: string}
+     */
+    private function computePar2SourceBlockLayout(?array $main, int $blockSize, array $sources, array $conflicts, bool $definitionConflict = false): array
+    {
+        $layout = [
+            'source_block_count' => null,
+            'source_block_count_overflow' => false,
+            'source_block_count_within_current_v2_limit' => null,
+            'source_block_limit' => Par2MetadataParser::MAX_SOURCE_BLOCKS,
+            'complete' => false,
+            'recovery_percentage_basis' => 'unavailable-source-block-denominator',
+        ];
+        if ($main === null || $definitionConflict || $blockSize <= 0
+            || ! is_array($main['recoverable_file_ids'] ?? null)) {
+            return $layout;
+        }
+        $count = 0;
+        foreach ($main['recoverable_file_ids'] as $fileId) {
+            if (! is_string($fileId) || ($conflicts[$fileId] ?? false) === true
+                || ! is_int($sources[$fileId]['file_length'] ?? null)
+                || $sources[$fileId]['file_length'] < 0) {
+                return $layout;
+            }
+            $length = $sources[$fileId]['file_length'];
+            $blocks = intdiv($length, $blockSize) + (($length % $blockSize) === 0 ? 0 : 1);
+            $count = $this->checkedNonNegativeIntegerAdd($count, $blocks);
+            if ($count === null) {
+                $layout['source_block_count_overflow'] = true;
+                $layout['recovery_percentage_basis'] = 'unavailable-source-block-count-overflow';
+
+                return $layout;
+            }
+        }
+        $withinLimit = $count <= Par2MetadataParser::MAX_SOURCE_BLOCKS;
+        $layout['source_block_count'] = $count > 0 ? $count : null;
+        $layout['source_block_count_within_current_v2_limit'] = $count > 0 ? $withinLimit : null;
+        $layout['complete'] = $withinLimit;
+        $layout['recovery_percentage_basis'] = ! $withinLimit
+            ? 'unavailable-source-block-count-exceeds-current-v2-limit'
+            : ($count > 0 ? 'unique-valid-recovery-exponents-over-recoverable-source-blocks'
+                : 'unavailable-zero-source-block-count');
+
+        return $layout;
     }
 
     private function checkedNonNegativeIntegerAdd(?int $total, mixed $value): ?int

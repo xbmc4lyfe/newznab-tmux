@@ -8,6 +8,8 @@ final class Par2MetadataParser
 {
     private const MAX_MAIN_FILE_IDS = 32_768;
 
+    public const MAX_SOURCE_BLOCKS = 32_768;
+
     /**
      * @param  list<array<string, mixed>>  $volumes
      * @return list<array<string, mixed>>
@@ -1084,6 +1086,8 @@ final class Par2MetadataParser
                 'recovery_set_id' => $setId,
                 'source_block_size' => $setBlockSize,
                 'source_block_count' => $setSourceBlockCount,
+                'source_block_limit' => self::MAX_SOURCE_BLOCKS,
+                'source_block_count_within_current_v2_limit' => $setSourceBlockCount === null ? null : $setSourceBlockCount <= self::MAX_SOURCE_BLOCKS,
                 'main_packet' => $setMain,
                 'source_inventory_complete' => $setInventoryComplete,
                 'missing_file_description_ids' => $setMissingFileIds,
@@ -1154,6 +1158,7 @@ final class Par2MetadataParser
             [],
         );
         $packedLayoutPresent = isset($optionalPackets["PAR 2.0\0PkdMain"]) || isset($optionalPackets["PAR 2.0\0PkdRecvS"]);
+        $sourceBlockCountWithinLimit = $sourceBlockCount === null ? null : $sourceBlockCount <= self::MAX_SOURCE_BLOCKS;
         $recoveryPercentageBasis = $mainDefinitionConflict || $conflictingFileDescriptionIds !== []
             ? 'unavailable-conflicting-source-definition-packets'
             : ($hasConflictingRecoveryExponents
@@ -1165,6 +1170,9 @@ final class Par2MetadataParser
                 : ($blockSize === null && $recoveryCount > 0
                     ? 'unavailable-source-block-size-not-in-this-volume'
                     : 'unique-valid-recovery-exponents-over-recoverable-source-blocks'))));
+        if ($sourceBlockCountWithinLimit === false && ! $packedLayoutPresent) {
+            $recoveryPercentageBasis = 'unavailable-source-block-count-exceeds-current-v2-limit';
+        }
 
         return [
             'parser_engine' => 'php-fallback',
@@ -1179,6 +1187,8 @@ final class Par2MetadataParser
             'integer_range_valid' => $unsupportedIntegerRangeCount === 0,
             'source_block_size' => $blockSize,
             'source_block_count' => $sourceBlockCount ?: null,
+            'source_block_limit' => self::MAX_SOURCE_BLOCKS,
+            'source_block_count_within_current_v2_limit' => $sourceBlockCountWithinLimit,
             'source_block_count_overflow' => ($singleSet['source_block_count_overflow'] ?? false) === true,
             'main_packet' => $main,
             'main_file_id_limit' => self::MAX_MAIN_FILE_IDS,
@@ -1208,6 +1218,7 @@ final class Par2MetadataParser
             'recovery_slice_conflict_count' => $recoverySliceConflictCount,
             'recovery_slice_length_unvalidated_count' => $recoverySliceLengthUnvalidatedCount,
             'recovery_to_source_percent' => is_int($recoveryCount) && is_int($sourceBlockCount) && $sourceBlockCount > 0 && $main !== null && $sourceInventoryComplete && $ifscRelationshipsValid && ! $hasConflictingRecoveryExponents && $invalidPacketCount === 0
+                && $sourceBlockCountWithinLimit === true
                 && ! ($packetCount >= $maximumPackets && $offset < $length) && ! $packedLayoutPresent
                 ? round($recoveryCount / $sourceBlockCount * 100, 3) : null,
             'packed_layout_present' => $packedLayoutPresent,
@@ -1234,6 +1245,27 @@ final class Par2MetadataParser
             $metadata['integer_range_valid'] = false;
             $metadata['recovery_to_source_percent'] = null;
             $metadata['recovery_percentage_basis'] = 'unavailable-unsupported-integer-range';
+        }
+        // Enforce the format dimension independently of the native library's
+        // reported validity flags, including libraries predating this field.
+        $metadata['source_block_limit'] = self::MAX_SOURCE_BLOCKS;
+        $count = $metadata['source_block_count'] ?? null;
+        $metadata['source_block_count_within_current_v2_limit'] = is_int($count) && $count > 0
+            ? $count <= self::MAX_SOURCE_BLOCKS : null;
+        foreach ($metadata['recovery_sets'] ?? [] as $index => $set) {
+            if (! is_array($set)) {
+                continue;
+            }
+            $count = $set['source_block_count'] ?? null;
+            $metadata['recovery_sets'][$index]['source_block_limit'] = self::MAX_SOURCE_BLOCKS;
+            $metadata['recovery_sets'][$index]['source_block_count_within_current_v2_limit'] = is_int($count) && $count > 0
+                ? $count <= self::MAX_SOURCE_BLOCKS : null;
+        }
+        if ($metadata['source_block_count_within_current_v2_limit'] === false) {
+            $metadata['recovery_to_source_percent'] = null;
+            if ($unsupportedRangeCount === 0 && ($metadata['packed_layout_present'] ?? false) !== true) {
+                $metadata['recovery_percentage_basis'] = 'unavailable-source-block-count-exceeds-current-v2-limit';
+            }
         }
 
         return $metadata;

@@ -14,6 +14,7 @@ use App\Services\YencService;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
 
@@ -538,6 +539,143 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertFalse($metadata['source_descriptions_valid']);
         self::assertFalse($metadata['recovery_sets'][0]['source_descriptions_valid']);
         self::assertNull($metadata['recovery_to_source_percent']);
+    }
+
+    #[Test]
+    public function it_withholds_fallback_par2_percentage_above_the_current_v2_source_block_limit(): void
+    {
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($this->par2SourceBlockLimitFixture(32769));
+
+        self::assertSame('php-fallback', $metadata['parser_engine']);
+        self::assertSame(32769, $metadata['source_block_count']);
+        self::assertTrue($metadata['source_inventory_complete']);
+        self::assertSame(0, $metadata['invalid_packet_count']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertSame('unavailable-source-block-count-exceeds-current-v2-limit', $metadata['recovery_percentage_basis']);
+        foreach ([$metadata, $metadata['recovery_sets'][0]] as $scope) {
+            self::assertArrayHasKey('source_block_limit', $scope);
+            self::assertArrayHasKey('source_block_count_within_current_v2_limit', $scope);
+            self::assertSame(32768, $scope['source_block_limit']);
+            self::assertFalse($scope['source_block_count_within_current_v2_limit']);
+            self::assertSame(32769, $scope['source_block_count']);
+            self::assertFalse($scope['source_block_count_overflow']);
+        }
+    }
+
+    #[Test]
+    public function it_allows_fallback_par2_percentage_at_the_current_v2_source_block_limit(): void
+    {
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($this->par2SourceBlockLimitFixture(32768));
+
+        self::assertSame(32768, $metadata['source_block_count']);
+        self::assertSame(0.003, $metadata['recovery_to_source_percent']);
+        foreach ([$metadata, $metadata['recovery_sets'][0]] as $scope) {
+            self::assertArrayHasKey('source_block_limit', $scope);
+            self::assertArrayHasKey('source_block_count_within_current_v2_limit', $scope);
+            self::assertSame(32768, $scope['source_block_limit']);
+            self::assertTrue($scope['source_block_count_within_current_v2_limit']);
+        }
+    }
+
+    #[Test]
+    public function it_excludes_nonrecoverable_slices_from_the_fallback_par2_source_block_limit(): void
+    {
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($this->par2SourceBlockLimitFixture(32768, 32769));
+
+        self::assertCount(2, $metadata['source_files']);
+        self::assertSame(32768, $metadata['source_block_count']);
+        self::assertSame(0.003, $metadata['recovery_to_source_percent']);
+        self::assertArrayHasKey('source_block_count_within_current_v2_limit', $metadata);
+        self::assertArrayHasKey('source_block_count_within_current_v2_limit', $metadata['recovery_sets'][0]);
+        self::assertTrue($metadata['source_block_count_within_current_v2_limit']);
+        self::assertTrue($metadata['recovery_sets'][0]['source_block_count_within_current_v2_limit']);
+    }
+
+    #[Test]
+    public function it_keeps_unknown_fallback_par2_source_block_limit_validity_unavailable(): void
+    {
+        config(['yenc.native_library' => '']);
+        $metadata = (new Par2MetadataParser)->parse($this->par2SourceBlockLimitFixture(32769, includeRecoverableDescription: false));
+
+        self::assertFalse($metadata['source_inventory_complete']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        foreach ([$metadata, $metadata['recovery_sets'][0]] as $scope) {
+            self::assertArrayHasKey('source_block_limit', $scope);
+            self::assertArrayHasKey('source_block_count_within_current_v2_limit', $scope);
+            self::assertSame(32768, $scope['source_block_limit']);
+            self::assertNull($scope['source_block_count']);
+            self::assertNull($scope['source_block_count_within_current_v2_limit']);
+        }
+    }
+
+    /**
+     * @param  array<string, list<string>>  $main
+     * @param  array<string, array{file_length: int}>  $sources
+     */
+    #[Test]
+    #[DataProvider('assembledPar2SourceBlockLayouts')]
+    public function it_gates_the_collector_par2_source_block_layout_after_cross_volume_merge(array $main, array $sources, ?int $expectedCount, ?bool $withinLimit, bool $complete): void
+    {
+        $collector = (new \ReflectionClass(ReleaseFingerprintCollector::class))->newInstanceWithoutConstructor();
+        $layout = (new \ReflectionMethod($collector, 'computePar2SourceBlockLayout'))->invoke($collector, $main, 4, $sources, []);
+
+        self::assertSame($expectedCount, $layout['source_block_count']);
+        self::assertSame($withinLimit, $layout['source_block_count_within_current_v2_limit']);
+        self::assertSame($complete, $layout['complete']);
+        self::assertSame(32768, $layout['source_block_limit']);
+        self::assertFalse($layout['source_block_count_overflow']);
+        if ($withinLimit === false) {
+            self::assertSame('unavailable-source-block-count-exceeds-current-v2-limit', $layout['recovery_percentage_basis']);
+        }
+    }
+
+    /** @return iterable<string, array{array<string, list<string>>, array<string, array{file_length: int}>, int|null, bool|null, bool}> */
+    public static function assembledPar2SourceBlockLayouts(): iterable
+    {
+        yield 'boundary source count' => [
+            ['recoverable_file_ids' => ['first', 'second']],
+            ['first' => ['file_length' => 65536], 'second' => ['file_length' => 65536]],
+            32768, true, true,
+        ];
+        yield 'limit exceeded only after merging two descriptions' => [
+            ['recoverable_file_ids' => ['first', 'second']],
+            ['first' => ['file_length' => 65536], 'second' => ['file_length' => 65540]],
+            32769, false, false,
+        ];
+        yield 'nonrecoverable description does not consume source constants' => [
+            ['recoverable_file_ids' => ['first'], 'all_file_ids' => ['first', 'nonrecoverable']],
+            ['first' => ['file_length' => 131072], 'nonrecoverable' => ['file_length' => 131076]],
+            32768, true, true,
+        ];
+        yield 'missing description leaves the denominator unknown' => [
+            ['recoverable_file_ids' => ['first', 'missing']],
+            ['first' => ['file_length' => 65536]],
+            null, null, false,
+        ];
+    }
+
+    private function par2SourceBlockLimitFixture(int $recoverableSlices, ?int $nonrecoverableSlices = null, bool $includeRecoverableDescription = true): string
+    {
+        $fileId = str_repeat('F', 16);
+        $nonrecoverableId = str_repeat('N', 16);
+        $main = pack('V2', 4, 0).pack('V', 1).$fileId;
+        if ($nonrecoverableSlices !== null) {
+            $main .= $nonrecoverableId;
+        }
+        $binary = $this->par2Packet("PAR 2.0\0Main", $main);
+        if ($includeRecoverableDescription) {
+            $description = $fileId.str_repeat('M', 32).pack('V2', $recoverableSlices * 4, 0)."payload.rar\0";
+            $binary .= $this->par2Packet("PAR 2.0\0FileDesc", $description);
+        }
+        if ($nonrecoverableSlices !== null) {
+            $description = $nonrecoverableId.str_repeat('N', 32).pack('V2', $nonrecoverableSlices * 4, 0)."nfo.txt\0";
+            $binary .= $this->par2Packet("PAR 2.0\0FileDesc", $description);
+        }
+
+        return $binary.$this->par2Packet("PAR 2.0\0RecvSlic", pack('V', 0).'RRRR');
     }
 
     #[Test]
@@ -1364,6 +1502,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $metadata = $method->invoke(null, $aggregate + [
             'source_block_count' => '9223372036854775808',
             'source_block_count_overflow' => false,
+            'source_block_count_within_current_v2_limit' => false,
             'recovery_to_source_percent' => 10.0,
             'recovery_percentage_basis' => 'unique-valid-recovery-exponents-over-recoverable-source-blocks',
             'recovery_sets' => [$aggregate],
@@ -1371,9 +1510,56 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertNull($metadata['source_file_bytes']);
         self::assertTrue($metadata['source_file_bytes_overflow']);
         self::assertTrue($metadata['source_block_count_overflow']);
+        self::assertNull($metadata['source_block_count_within_current_v2_limit']);
         self::assertTrue($metadata['recovery_sets'][0]['source_file_bytes_overflow']);
         self::assertNull($metadata['recovery_to_source_percent']);
         self::assertSame('unavailable-unsupported-integer-range', $metadata['recovery_percentage_basis']);
+    }
+
+    #[Test]
+    public function it_recomputes_native_par2_source_block_limit_validity_from_usable_counts(): void
+    {
+        $method = new \ReflectionMethod(Par2MetadataParser::class, 'normalizeNativeIntegerRanges');
+        $metadata = $method->invoke(null, [
+            'source_block_count' => 32769,
+            'source_block_count_within_current_v2_limit' => true,
+            'recovery_to_source_percent' => 0.003,
+            'recovery_percentage_basis' => 'unique-valid-recovery-exponents-over-recoverable-source-blocks',
+            'recovery_sets' => [
+                ['source_block_count' => 32768, 'source_block_count_within_current_v2_limit' => false],
+                ['source_block_count' => 32769, 'source_block_count_within_current_v2_limit' => true],
+                ['source_block_count_within_current_v2_limit' => false],
+                ['source_block_count' => '9223372036854775808', 'source_block_count_within_current_v2_limit' => true],
+            ],
+        ]);
+
+        self::assertSame(32769, $metadata['source_block_count']);
+        self::assertSame(32768, $metadata['source_block_limit']);
+        self::assertFalse($metadata['source_block_count_within_current_v2_limit']);
+        self::assertNull($metadata['recovery_to_source_percent']);
+        self::assertSame('unavailable-unsupported-integer-range', $metadata['recovery_percentage_basis']);
+        self::assertTrue($metadata['recovery_sets'][0]['source_block_count_within_current_v2_limit']);
+        self::assertFalse($metadata['recovery_sets'][1]['source_block_count_within_current_v2_limit']);
+        self::assertNull($metadata['recovery_sets'][2]['source_block_count_within_current_v2_limit']);
+        self::assertNull($metadata['recovery_sets'][3]['source_block_count_within_current_v2_limit']);
+        self::assertNull($metadata['recovery_sets'][3]['source_block_count']);
+        self::assertTrue($metadata['recovery_sets'][3]['source_block_count_overflow']);
+        foreach ($metadata['recovery_sets'] as $set) {
+            self::assertSame(32768, $set['source_block_limit']);
+        }
+
+        $oversized = $method->invoke(null, [
+            'source_block_count' => 32769,
+            'source_block_count_within_current_v2_limit' => true,
+            'recovery_to_source_percent' => 0.003,
+        ]);
+        self::assertFalse($oversized['source_block_count_within_current_v2_limit']);
+        self::assertNull($oversized['recovery_to_source_percent']);
+        self::assertSame('unavailable-source-block-count-exceeds-current-v2-limit', $oversized['recovery_percentage_basis']);
+
+        $unknown = $method->invoke(null, ['source_block_count_within_current_v2_limit' => true]);
+        self::assertSame(32768, $unknown['source_block_limit']);
+        self::assertNull($unknown['source_block_count_within_current_v2_limit']);
     }
 
     #[Test]
