@@ -61,6 +61,7 @@ if (isset($options['worker'])) {
             if ($stream !== null) {
                 rewind($stream);
             }
+            $cpuBefore = getrusage();
             $start = hrtime(true);
             $result = match ($path) {
                 'strict' => $service->decode($input),
@@ -68,8 +69,10 @@ if (isset($options['worker'])) {
                 default => $service->decodeIgnore($input),
             };
             $elapsed = (hrtime(true) - $start) / 1e6;
+            $cpuAfter = getrusage();
             $observations[] = [
                 'sample' => $sample, 'warmup' => $sample < 0, 'elapsed_ms' => $elapsed,
+                'process_cpu_before' => $cpuBefore, 'process_cpu_after' => $cpuAfter,
                 'correct' => $result === $data, 'decoded_bytes' => is_string($result) ? strlen($result) : null,
                 'decoded_sha256' => is_string($result) ? hash('sha256', $result) : null,
             ];
@@ -302,7 +305,7 @@ function yencBenchmarkRunChild(array $command, string $prefix, float $timeout): 
 function yencBenchmarkSourceHashes(string $root): array
 {
     $paths = [
-        'scripts/benchmark-yenc.php', 'scripts/build-rapidyenc.sh', 'composer.lock',
+        'scripts/benchmark-yenc.php', 'scripts/benchmark-cpu.py', 'scripts/build-rapidyenc.sh', 'composer.lock',
         'app/Services/YencService.php', 'app/Services/NNTP/NNTPService.php',
         'tests/Fixtures/YencArticles.php', 'tests/Support/YencNntpHarness.php',
         'docker/app/nzb-yenc-ffi/Cargo.toml', 'docker/app/nzb-yenc-ffi/Cargo.lock',
@@ -413,6 +416,7 @@ function runPairedYencBenchmark(array $options, int $samples): int
             'min_improvement_percent' => $improvement, 'max_regression_percent' => $regression,
             'decision_rule' => 'paired median Rust/'.$baseline.' ratios; 10000-resample simultaneous 95% bootstrap intervals across all predeclared strata; regression only if entire interval exceeds regression margin; useful improvement only if entire interval beats useful-effect margin; otherwise inconclusive',
             'timed_boundary' => 'service decode/fetch call only; initialization, fixture creation, rewind and independent byte/hash verification outside timing',
+            'resource_counter_scope' => 'getrusage around each service call; workflow OS/cgroup snapshots bracket the whole comparison including worker setup and verification',
             'source_sha256' => $sourceHashes, 'libraries' => $libraries, 'runtime' => $runtime,
             'library_source_parity' => 'library bytes frozen; source-build correspondence must be established by the build manifest',
         ];

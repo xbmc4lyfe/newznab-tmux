@@ -79,6 +79,10 @@ final class YencBenchmarkTest extends TestCase
                 $this->assertTrue($row['eligible']);
                 $this->assertNull($row['result']['library_sha256']);
                 $this->assertNull($row['result']['decoder_version']);
+                foreach ($row['result']['observations'] as $sample) {
+                    $this->assertArrayHasKey('ru_utime.tv_usec', $sample['process_cpu_before']);
+                    $this->assertArrayHasKey('ru_stime.tv_usec', $sample['process_cpu_after']);
+                }
             }
             $this->assertSame('invalid', $rows[array_key_last($rows)]['status']);
             $this->assertFalse($rows[array_key_last($rows)]['rust_speed_advantage_demonstrated_for_every_stratum']);
