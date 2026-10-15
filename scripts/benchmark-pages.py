@@ -148,7 +148,7 @@ def validate_summary(summary, run, kind, runner):
     if not isinstance(summary.get('rows'), list) or len(summary['rows']) > 100:
         raise ValueError('Invalid summary rows')
     allowed = set(expected) | {'rows', 'status', 'evidence_type', 'completeness', 'source_sha256',
-                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'uncertainty_method'}
+                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'uncertainty_method', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size'}
     if set(summary) - allowed:
         raise ValueError('Unexpected public summary fields')
     if summary.get('rust_payload_mode', 'unknown') not in ('incumbent', 'experimental', 'unknown'):
@@ -166,11 +166,50 @@ def validate_summary(summary, run, kind, runner):
                 'gate_passed', 'samples', 'iterations', 'php_median_ns', 'rust_median_ns', 'improvement_percent',
                 'body_ffi_median_ms', 'fixture', 'p99_sample_sufficient', 'baseline_median_ns', 'candidate_median_ns', 'median_ratio', 'paired_median_ratio', 'baseline_p99_ns', 'candidate_p99_ns', 'p99_ratio', 'median_ratio_ci95', 'p99_ratio_ci95', 'median_baseline_over_candidate_ratio', 'median_cold_baseline_over_candidate_ratio',
                 'category', 'comparison', 'metric', 'baseline_over_candidate', 'speedup_interval', 'baseline_latency_ms', 'candidate_latency_ms', 'native_median_ms', 'qualification_gate_passed', 'p99_threshold_met',
-                'baseline_latency_interval_ms', 'candidate_latency_interval_ms', 'marginal_alpha'}
+                'baseline_latency_interval_ms', 'candidate_latency_interval_ms', 'marginal_alpha', 'gate_statistic', 'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95'}
     if any(not isinstance(row, dict) or set(row) - row_keys for row in summary['rows']):
         raise ValueError('Unexpected public measurement fields')
-    if summary.get('uncertainty_method', 'not_reported') not in ('not_reported', 'mixed_output_bootstrap', 'legacy_stratified_bootstrap_unqualified'):
+    if summary.get('uncertainty_method', 'not_reported') not in ('not_reported', 'mixed_output_bootstrap', 'legacy_stratified_bootstrap_unqualified', 'paired_bootstrap_bonferroni'):
         raise ValueError('Unknown uncertainty protocol')
+
+    cpu_fields = {'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size'}
+    cpu_row_fields = {'gate_statistic', 'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95'}
+    if kind != 'cpu-snapshot' and (set(summary) & cpu_fields
+                                   or any(set(row) & cpu_row_fields for row in summary['rows'])):
+        raise ValueError('CPU confidence fields on a different comparison')
+
+    if kind == 'cpu-snapshot':
+        if summary.get('confidence_status', 'unqualified') not in ('historical_unqualified', 'simultaneous_gate_intervals', 'unqualified'):
+            raise ValueError('Invalid CPU confidence status')
+        version = summary.get('measurement_protocol_version', 0)
+        if type(version) is not int or version not in (0, 2, 3):
+            raise ValueError('Invalid CPU protocol version')
+        family = summary.get('confidence_family_size')
+        if family is not None and (type(family) is not int or family not in (3, 5)):
+            raise ValueError('Invalid CPU confidence family')
+        if summary.get('confidence_status') == 'simultaneous_gate_intervals' and (version != 3 or family not in (3, 5)):
+            raise ValueError('CPU confidence provenance mismatch')
+        host_status = summary.get('host_confidence_status', 'unqualified')
+        if host_status not in ('historical_unqualified', 'simultaneous_gate_intervals', 'unqualified'):
+            raise ValueError('Invalid exact live CPU confidence status')
+        host_family = summary.get('host_confidence_family_size')
+        if host_family is not None and (type(host_family) is not int or host_family != 2):
+            raise ValueError('Invalid exact live CPU confidence family')
+        if host_status == 'simultaneous_gate_intervals' and (version != 3 or host_family != 2):
+            raise ValueError('Exact live CPU confidence provenance mismatch')
+        for row in summary['rows']:
+            if 'gate_statistic' in row and row['gate_statistic'] not in ('median_ratio', 'p99_ratio'):
+                raise ValueError('Invalid CPU gate statistic')
+            for field in ('gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95'):
+                interval = row.get(field)
+                if interval is not None and (not isinstance(interval, list) or len(interval) != 2
+                                             or any(type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in interval)
+                                             or interval[0] > interval[1]):
+                    raise ValueError('Invalid CPU gate interval')
+            if 'host_median_speedup_simultaneous_ci95' in row and row.get('fixture') != 'rare-host-unavailable':
+                raise ValueError('Exact default median interval on a different fixture')
+            if any(field in row for field in ('live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95')) and row.get('fixture') != 'host-live':
+                raise ValueError('Exact live CPU bounds on a different fixture')
 
     if kind in ('sample-planning', 'archive-parsing', 'vendor-archive'):
         if set(summary.get('source_sha256', {})) - CALLER_SOURCES or set(summary.get('library_sha256', {})) - {'native'}:
@@ -584,7 +623,7 @@ def display_interval(value, unit):
 
 
 def measurement_table(rows):
-    table = ['<table><tr><th>Workload</th><th>Latency / ratio / uncertainty</th><th>Scope / samples / eligibility</th></tr>']
+    table = ['<table><tr><th>Workload</th><th>Latency / ratio</th><th>Diagnostic intervals</th><th>Simultaneous decision bounds</th><th>Scope / samples / eligibility</th></tr>']
     labels = ('size', 'density', 'path', 'phase', 'scenario', 'rows', 'fixture')
     latencies = {
         'php_median_ns': ('PHP median', 1000000), 'rust_median_ns': ('Rust median', 1000000),
@@ -623,7 +662,7 @@ def measurement_table(rows):
                    'iterations', 'marginal_alpha'}
     for row in rows:
         label = ' · '.join(str(row[key]) for key in labels if key in row)
-        values, states = [], []
+        values, diagnostics, bounds, states = [], [], [], []
         for key, value in row.items():
             if key in labels:
                 continue
@@ -632,9 +671,13 @@ def measurement_table(rows):
                 values.append(title + ': ' + ('unavailable' if value is None else latency_ms(value, divisor)))
             elif key in ratios:
                 values.append(ratios[key] + ': ' + ('unavailable' if value is None else compact_number(value, 2) + '×'))
+            elif key in ('gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95'):
+                bounds.append(key + ': ' + ('unavailable' if value is None else display_interval(value, 'ratio')))
+            elif key == 'gate_statistic':
+                bounds.append(key + ': ' + str(value))
             elif key in intervals:
                 title, unit = intervals[key]
-                values.append(title + ': ' + ('unavailable' if value is None else display_interval(value, unit)))
+                diagnostics.append(title + ': ' + ('unavailable' if value is None else display_interval(value, unit)))
             elif key == 'body_ffi_median_ms' and isinstance(value, dict):
                 values.extend('BODY ' + str(stage) + ': ' + latency_ms(duration) for stage, duration in value.items())
             elif key == 'improvement_percent':
@@ -653,6 +696,8 @@ def measurement_table(rows):
                 # Keep unfamiliar fields visible; the exact envelope remains below.
                 values.append(str(key) + ': ' + json.dumps(value, ensure_ascii=False))
         table.append('<tr><td>' + escape(label) + '</td><td>' + '<br>'.join(escape(value) for value in values)
+                     + '</td><td>' + '<br>'.join(escape(value) for value in diagnostics)
+                     + '</td><td>' + '<br>'.join(escape(value) for value in bounds)
                      + '</td><td>' + '<br>'.join(escape(value) for value in states) + '</td></tr>')
     table.append('</table>')
     return '\n'.join(table)
@@ -674,10 +719,41 @@ def render(report):
     for row in report['results']:
         body.append(f'<details><summary>{escape(row["kind"])} · {escape(row["runner"])} · {escape(row.get("status", "unknown"))}</summary><p>{run_link(row)}. Evidence: {escape(row.get("evidence_type", "unavailable"))}; adoption qualification: not established.</p>')
         if row.get('kind') == 'cpu-snapshot':
-            if row.get('uncertainty_method') == 'mixed_output_bootstrap':
-                body.append('<p>CPU intervals use corrected mixed-output resampling. Synthetic and exact host CLI evidence remain separate; neither establishes production throughput or adoption. <a href="performance.html#utility-results">Historical protocol limits</a>.</p>')
+            provenance = row.get('runtime_identity', {})
+            supported = (row.get('status') in ('measured', 'measured_gate_failed')
+                         and row.get('measurement_protocol_version') == 3
+                         and row.get('confidence_status') == 'simultaneous_gate_intervals'
+                         and row.get('confidence_family_size') in (3, 5)
+                         and isinstance(provenance, dict)
+                         and isinstance(row.get('head_sha'), str)
+                         and re.fullmatch('[0-9a-f]{40,64}', row['head_sha'])
+                         and provenance.get('executed_sha') == row['head_sha']
+                         and all(isinstance(row.get(key), str) and re.fullmatch('[0-9a-f]{64}', row[key])
+                                 for key in ('protocol_sha256', 'report_sha256')))
+            if supported:
+                body.append('<p>CPU protocol 3 uses independent paired bootstrap samples and simultaneous 95% intervals across its declared fixture gates. Other intervals are diagnostic per-statistic 95%; this does not establish production adoption qualification.</p>')
             else:
-                body.append('<p>CPU interval limitation: the legacy harness uses dependent bootstrap samples, or this result has no verified resampling identity. Its interval fields do not establish qualified uncertainty. Point estimates remain recorded measurements. <a href="performance.html#utility-results">Read the protocol limits</a>.</p>')
+                version = row.get('measurement_protocol_version')
+                if type(version) is int and version == 2:
+                    limitation = ('source-pinned protocol 2 uses corrected mixed-output resampling with pointwise intervals only.'
+                                  if row.get('uncertainty_method') == 'mixed_output_bootstrap'
+                                  else 'historical protocol 2 uses dependent bootstrap samples.')
+                elif type(version) is int and version == 3:
+                    limitation = 'CPU protocol 3 lacks complete qualified sample or runtime provenance.'
+                else:
+                    limitation = 'CPU measurement protocol provenance is unavailable.'
+                body.append('<p>CPU interval limitation: ' + limitation + ' Unqualified interval fields do not establish qualified uncertainty. Point estimates remain recorded measurements. <a href="performance.html#utility-results">Read the protocol limits</a>.</p>')
+            if (row.get('status') in ('measured', 'measured_gate_failed')
+                    and row.get('measurement_protocol_version') == 3
+                    and row.get('host_confidence_status') == 'simultaneous_gate_intervals'
+                    and row.get('host_confidence_family_size') == 2
+                    and isinstance(provenance, dict)
+                    and provenance.get('executed_sha') == row.get('head_sha')
+                    and isinstance(row.get('head_sha'), str)
+                    and re.fullmatch('[0-9a-f]{40,64}', row['head_sha'])
+                    and all(isinstance(row.get(key), str) and re.fullmatch('[0-9a-f]{64}', row[key])
+                            for key in ('protocol_sha256', 'report_sha256'))):
+                body.append('<p>Exact live-host CLI decision bounds form a separate two-gate simultaneous 95% family (median and p99). They are separate from the synthetic and absent-/proc fixture family and do not establish production throughput.</p>')
         if row.get('kind') in ('cpp', 'php', 'profile'):
             body.append('<p>Rust payload mode: ' + escape(measured_payload_mode(row)) + '.</p>')
         if 'workflow_status' in row:
