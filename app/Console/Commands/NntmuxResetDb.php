@@ -108,6 +108,7 @@ class NntmuxResetDb extends Command
                 'par_hashes',
                 'par_file_hashes',
                 'par_file_hash_inventories',
+                'par2_descriptor_evidence',
                 'par2_hash_retry',
                 'par2_rename_candidate_progress',
                 'par2_rename_progress',

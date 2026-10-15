@@ -47,6 +47,7 @@ trait Par2RenameTestDatabase
         }
         (require $hashPaths[0])->up();
         (require base_path('database/migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->up();
+        (require base_path('database/migrations/2026_10_15_190000_create_par2_descriptor_evidence_table.php'))->up();
         Schema::create('release_nfos', function (Blueprint $table): void {
             $table->integer('releases_id');
             $table->binary('nfo')->nullable();
