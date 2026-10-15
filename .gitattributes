@@ -116,3 +116,5 @@ docker/Makefile		-binary text eol=lf
 /tests/Unit/test_benchmark_pages_completeness.py -binary text eol=lf
 /scripts/benchmark-rust-toolchain.sh -binary text eol=lf
 /tests/Unit/test_benchmark_toolchain.py -binary text eol=lf
+
+/tests/Unit/test_benchmark_concurrency.py -binary text eol=lf

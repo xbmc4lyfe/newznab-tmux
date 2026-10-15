@@ -60,12 +60,15 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(b'{"latency": 42}').hexdigest(), files['benchmarks/summary.json']['sha256'])
         self.assertEqual(4, self.verify())
 
-    def test_only_pages_control_file_is_explicitly_excluded(self):
+    def test_only_both_pages_control_files_are_explicitly_excluded(self):
         (self.site / '.nojekyll').write_bytes(b'')
+        (self.site / 'benchmarks/.nojekyll').write_bytes(b'')
+        (self.site / 'benchmarks/ordinary.nojekyll').write_bytes(b'public content')
         (self.site / '.well-known').write_bytes(b'public content')
         manifest = publication.create_manifest(self.site, SHA)
-        self.assertEqual(['.nojekyll'], manifest.get('excluded_control_files'))
-        self.assertEqual(5, manifest['file_count'])
+        self.assertEqual(['.nojekyll', 'benchmarks/.nojekyll'], manifest.get('excluded_control_files'))
+        self.assertEqual(6, manifest['file_count'])
+        self.assertIn('benchmarks/ordinary.nojekyll', {row['path'] for row in manifest['files']})
         self.assertIn('.well-known', {row['path'] for row in manifest['files']})
         manifest['excluded_control_files'].append('results.json')
         with self.assertRaises(ValueError):
