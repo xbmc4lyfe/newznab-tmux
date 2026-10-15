@@ -1,5 +1,15 @@
 # To do
 
+## Qualify legacy scheduler STOP custody (2026-10-15)
+
+The isolated Linux baseline ran eight cases: five behavioral failures and three passes, with no errors or skips. Its original cleanup-parser failure and later exact-resource reconciliation remain retained. The repair adds durable STOP intent, confirmed or externally preserved pauses, exact protocol/operation/process checks and observed restoration. Evidence is under `/Users/allen/.codex/artifacts/nntmux-scheduler-stop-custody-20261015-v1/`.
+
+- [x] Run focused behavior and static checks. Literal `codex --yolo` execution reproduced the separate baseline confirmation failure, then passed all nine candidate mechanisms and all 14 runtime tests (84 assertions). Its wrapper rejected PHPUnit's JSON report and stopped before static analysis; that attempt remains unqualified as a whole. A separate 29.70-second host run passed full configured and explicit changed-test PHPStan, syntax, Pint and whitespace checks with unchanged source. All recorded host groups closed. Both mechanism fixtures have exact cleanup receipts; fresh owner/name queries reconciled the runtime fixtures absent, but their 14 historical IDs and planned Docker-shim enforcement were not captured. These evidence limits are preserved.
+- [ ] Run the full integrated PHPUnit/native retest on final synchronized master; focused checks do not complete that deferred gate. Require current-head Codex approval and applicable CI before squash merge. The rejected Rust journal subprocess prototype can outlive its Python parent's lock; no compiled performance or uncommon p99 qualification is claimed.
+- [ ] Before any separately authorized rollout, prove invocation source pins and exclusive signal authority. Linux stopped state cannot identify competing STOP senders. The legacy deploy-app EXIT restoration path does not reverify guard authority; passing private fixtures does not establish that caller safe after authority loss or authorize deployment.
+
+A surviving confirmation proves successful STOP plus matching stopped observation before encoding; it does not attest final directory-fsync acknowledgment. Helper errors remain failed drains.
+
 ## Qualify authoritative backfill date targets (2026-10-14)
 
 Use the same selected NNTP connection for backfill targeting and storage. Date-based admission requires the requested article's parseable date from that provider/group; unrelated local part numbers, neighboring article dates and the current clock cannot supply it. Missing endpoint or midpoint metadata defers the attempt. Successful exact probes retain the approximate date search with bounded, integer-safe arithmetic; article Date ordering is still not guaranteed. Failed overview ranges must retain their cursor, while successful empty ranges remain completed work.
