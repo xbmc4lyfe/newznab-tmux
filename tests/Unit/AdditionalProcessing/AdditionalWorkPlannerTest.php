@@ -14,6 +14,74 @@ class AdditionalWorkPlannerTest extends TestCase
     use CreatesProcessingConfiguration;
 
     #[Test]
+    public function it_groups_zip_volumes_after_leading_posting_counters_without_losing_the_filename(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+        foreach ([
+            ['Show.S01E01', 'Show.S01E02', 'show.s01e01', 'show.s01e02'],
+            ['Show.One S01E01', 'Show.Two S01E01', 'show.one s01e01', 'show.two s01e01'],
+            ['Show.zip Episode1', 'Show.zip Episode2', 'show.zip episode1', 'show.zip episode2'],
+            ['Show.zip-Episode1', 'Show.zip-Episode2', 'show.zip-episode1', 'show.zip-episode2'],
+        ] as [$one, $two, $oneKey, $twoKey]) {
+            $contents = [
+                ['title' => '[01/04] - '.$one.'.zip yEnc (1/4)', 'segments' => ['<one>']],
+                ['title' => "[02/04]\t-\t".$one.'.z01 yEnc (1/4)', 'segments' => ['<one-next>']],
+                ['title' => '[03/04] - '.$two.'.zip yEnc (1/4)', 'segments' => ['<two>']],
+                ['title' => '[04/04] - '.$two.'.z01 yEnc (1/4)', 'segments' => ['<two-next>']],
+            ];
+            $plan = $planner->plan($contents, 'alt.binaries.test');
+
+            self::assertSame([$oneKey, $oneKey, $twoKey, $twoKey], array_map(
+                static fn (ArchiveCandidate $candidate): string => $candidate->setKey,
+                $plan->archiveCandidates,
+            ));
+            self::assertSame(2, $plan->archiveSetCount());
+            self::assertSame(1, $planner->plan(array_slice($contents, 0, 2), 'alt.binaries.test')->archiveSetCount());
+            self::assertSame(array_column($contents, 'title'), array_map(
+                static fn (ArchiveCandidate $candidate): string => $candidate->title,
+                $plan->archiveCandidates,
+            ));
+        }
+    }
+
+    #[Test]
+    public function it_preserves_posting_counter_text_inside_quoted_zip_filenames(): void
+    {
+        $plan = (new AdditionalWorkPlanner($this->makeConfig()))->plan([
+            ['title' => '[01/04] - "[01/02] - Show.S01E01.zip" yEnc', 'segments' => ['<one>']],
+            ['title' => '[02/04] - "[01/02] - Show.S01E01.z01" yEnc', 'segments' => ['<one-next>']],
+            ['title' => '"[02/02] - Show.S01E01.zip" yEnc', 'segments' => ['<two>']],
+            ['title' => '"[02/02] - Show.S01E01.z01" yEnc', 'segments' => ['<two-next>']],
+        ], 'alt.binaries.test');
+
+        self::assertSame([
+            '[01/02] - show.s01e01', '[01/02] - show.s01e01',
+            '[02/02] - show.s01e01', '[02/02] - show.s01e01',
+        ], array_map(static fn (ArchiveCandidate $candidate): string => $candidate->setKey, $plan->archiveCandidates));
+        self::assertSame(2, $plan->archiveSetCount());
+    }
+
+    #[Test]
+    public function it_preserves_unrecognized_or_nonanchored_zip_posting_prefixes(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+        foreach ([
+            ['[part/04] - Show.S01E01.zip', '[part/04] - show.s01e01'],
+            ['[01/total] - Show.S01E01.zip', '[01/total] - show.s01e01'],
+            ['prefix [01/04] - Show.S01E01.zip', 'prefix [01/04] - show.s01e01'],
+            [' [01/04] - Show.S01E01.zip', ' [01/04] - show.s01e01'],
+            ['[01/04]-Show.S01E01.zip', '[01/04]-show.s01e01'],
+            ['[01/04] -Show.S01E01.zip', '[01/04] -show.s01e01'],
+        ] as [$title, $key]) {
+            $plan = $planner->plan([['title' => $title, 'segments' => ['<first>']]], 'alt.binaries.test');
+
+            self::assertCount(1, $plan->archiveCandidates);
+            self::assertSame($key, $plan->archiveCandidates[0]->setKey);
+            self::assertSame($title, $plan->archiveCandidates[0]->title);
+        }
+    }
+
+    #[Test]
     public function it_keeps_distinct_zip_names_with_spaces_separate(): void
     {
         $planner = new AdditionalWorkPlanner($this->makeConfig());

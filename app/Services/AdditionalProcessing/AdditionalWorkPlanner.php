@@ -415,7 +415,7 @@ final readonly class AdditionalWorkPlanner
 
         [$zipName, $zipPrefix] = preg_match('/"([^"\r\n]+)"/', $title, $quotedZip) === 1
             ? [$quotedZip[1], '^(.+)']
-            : [$title, '^([^"\r\n]+)'];
+            : [(string) preg_replace('/^\[[0-9]+\/[0-9]+\][ \t]+-[ \t]+(?=[^ \t])/', '', $title), '^([^"\r\n]+)'];
         if (preg_match('/'.$zipPrefix.'\.(?:zipx?|zipr\d{2,3}|z\d{2,3})(?:$|[ ")-])/i', $zipName, $zip) === 1) {
             return strtolower($zip[1]);
         }
