@@ -261,6 +261,8 @@ def utility_summary(kind, report):
         invalid |= type(report.get("adoption_gate_pass")) is not bool
     else:
         invalid |= report.get("invalid_observations") != [] or protocol.get("backend") != kind.removeprefix("fingerprint-")
+        if "candidate_status" in report:
+            invalid |= report["candidate_status"] != "experimental_withdrawn_from_production"
     rows = []
     for fixture in expected:
         if fixture not in measured:
@@ -305,11 +307,14 @@ def utility_summary(kind, report):
         if isinstance(entry, dict) and digest(entry.get("sha256")):
             identities[name] = entry["sha256"]
     complete = len(rows) == len(expected)
-    return dict(rows=rows, status="invalid" if invalid else "partial" if not complete else "measured_gate_failed" if cpu and not report["adoption_gate_pass"] else "measured",
+    result = dict(rows=rows, status="invalid" if invalid else "partial" if not complete else "measured_gate_failed" if cpu and not report["adoption_gate_pass"] else "measured",
                 completeness=dict(expected_rows=len(expected), observed_rows=len(rows), complete=complete),
                 baseline_revision=revision, source_sha256=identities,
                 protocol_sha256=hashlib.sha256(json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                 evidence_type="synthetic_cli_comparison" if cpu else "paired_public_operation_median_screen")
+    if not cpu and report.get("candidate_status") == "experimental_withdrawn_from_production":
+        result["candidate_status"] = "experimental_withdrawn_from_production"
+    return result
 
 
 def env_count(key):

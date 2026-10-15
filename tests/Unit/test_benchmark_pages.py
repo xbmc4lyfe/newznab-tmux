@@ -213,6 +213,17 @@ class PagesTest(unittest.TestCase):
         summary['runtime_identity'] = {'executed_sha': SHA}
         pages.validate_summary(summary, self.run_row(), 'cpu-snapshot', 'ubuntu-latest')
 
+    def test_withdrawn_fingerprint_status_is_validated_and_visible(self):
+        summary = dict(schema_version=1, kind='fingerprint-ffi', runner='ubuntu-latest', head_sha=SHA,
+                       run_id=12, run_attempt=2, repository=pages.REPOSITORY, rows=[], adoption_qualified=False,
+                       candidate_status='experimental_withdrawn_from_production')
+        pages.validate_summary(summary, self.run_row(), 'fingerprint-ffi', 'ubuntu-latest')
+        rendered = pages.render(dict(head_sha=SHA, generated_at='fixture', workflows=[], coverage=[], results=[summary]))
+        self.assertIn('withdrawn from the application runtime', rendered)
+        summary['candidate_status'] = 'production'
+        with self.assertRaises(ValueError):
+            pages.validate_summary(summary, self.run_row(), 'fingerprint-ffi', 'ubuntu-latest')
+
     def test_utility_family_coverage_and_new_auxiliary_remains_explicit_gap(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / 'docker/app/nzb-yenc-ffi/src'
