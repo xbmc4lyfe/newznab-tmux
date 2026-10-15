@@ -6,6 +6,7 @@ namespace App\Services\Nzb;
 
 use App\Enums\NzbImportStatus;
 use App\Exceptions\NfoPayloadRejected;
+use App\Exceptions\NzbCustodyCollision;
 use App\Models\Release;
 use App\Models\ReleaseNfo;
 use App\Services\NfoService;
@@ -175,12 +176,11 @@ final class NzbUploadManifestService
 
         return $this->withManifestLock($mp, function () use ($mp, $path): array {
             $m = $this->read($mp);
+            if (isset($m['custody_collision'])) {
+                return ['deferred' => true];
+            }
             if ($m['nzb']['filename'] !== basename($path)) {
                 throw new RuntimeException('Input filename mismatch');
-            }
-            if ($m['version'] === 1) {
-                $m['legacy_provenance'] ??= array_intersect_key($m, array_flip(['version', 'state', 'candidate_identity', 'release_id', 'release_guid']));
-                $m['version'] = 2;
             }
             if (isset($m['delete_input_pending']) || isset($m['delete_terminal_nfo']) || ! empty($m['custody_gc'])) {
                 return ['deferred' => true];
@@ -190,6 +190,20 @@ final class NzbUploadManifestService
                 // Do not replace the captured operation while its owned cleanup is pending.
                 // The ordinary reconciliation/companion loop retries that operation first.
                 return ['deferred' => true];
+            }
+            if (is_array($m['nfo'] ?? null) && ! is_array($m['nfo_capture'] ?? null)) {
+                // Historical identifiers cannot establish which companion bytes belong
+                // to a fresh admission. Restage both inputs through the normal v2 path.
+                $m['legacy_provenance'] ??= array_intersect_key($m, array_flip(['version', 'state', 'candidate_identity', 'release_id', 'release_guid']));
+                $m['state'] = self::STATE_METADATA_REVIEW;
+                $m['last_error'] = 'Uncaptured paired companion; restaging both inputs is required.';
+                $this->write($mp, $m);
+
+                return ['deferred' => true];
+            }
+            if ($m['version'] === 1) {
+                $m['legacy_provenance'] ??= array_intersect_key($m, array_flip(['version', 'state', 'candidate_identity', 'release_id', 'release_guid']));
+                $m['version'] = 2;
             }
             $accepted = $m['accepted_capture'] ?? null;
             if (is_array($accepted) && ($accepted['protocol'] ?? null) === 2
@@ -226,6 +240,9 @@ final class NzbUploadManifestService
 
         return $this->withManifestLock($mp, function () use ($mp, $path, $xml, $reservation): ?array {
             $m = $this->read($mp);
+            if (isset($m['custody_collision'])) {
+                return null;
+            }
             if (($m['input_reservation'] ?? null) !== $reservation || $reservation['source_identity'] === null
                 || $this->sourceIdentity($path) !== $reservation['source_identity']) {
                 return null;
@@ -253,6 +270,9 @@ final class NzbUploadManifestService
 
         $deleted = $this->withManifestLock($mp, function () use ($mp, $path, $capture, $retainForCompanion): bool {
             $m = $this->read($mp);
+            if (isset($m['custody_collision'])) {
+                return false;
+            }
             if ($capture === null || ($m['input_reservation']['attempt'] ?? null) !== $capture['attempt']
                 || (($m['accepted_capture'] ?? null) !== $capture && (($m['outcome_capture'] ?? null) !== $capture
                     || ! in_array($m['outcome_status'] ?? null, ['failed', 'blacklisted', 'nogroup', 'duplicate'], true)))
@@ -265,7 +285,7 @@ final class NzbUploadManifestService
                 // Metadata enrichment may change admission revision before publication.
                 // Reconciliation may already have advanced this upload. Always retire
                 // queued captures through the fenced publication or companion path.
-                $field = is_array($m['nfo_capture'] ?? null) ? 'delete_nzb_after_nfo' : 'delete_nzb_after_publication';
+                $field = is_array($m['nfo'] ?? null) || is_array($m['nfo_capture'] ?? null) ? 'delete_nzb_after_nfo' : 'delete_nzb_after_publication';
                 $m[$field] = array_intersect_key($capture, array_flip(['source_identity', 'digest']));
                 $this->write($mp, $m);
 
@@ -349,6 +369,9 @@ final class NzbUploadManifestService
 
         $this->withManifestLock($manifestPath, function () use ($manifestPath, $nzbPath, $status, $releaseId, $releaseGuid, $error, $candidateIdentity, $inputCapture, $candidateAdmission): void {
             $manifest = $this->read($manifestPath);
+            if (isset($manifest['custody_collision'])) {
+                return;
+            }
             if (! hash_equals($manifest['nzb']['filename'], basename($nzbPath))) {
                 throw new RuntimeException("NZB path does not match its upload manifest: {$nzbPath}");
             }
@@ -486,6 +509,9 @@ final class NzbUploadManifestService
     public function reconcilePending(string $manifestPath): array
     {
         $manifest = $this->read($manifestPath);
+        if (isset($manifest['custody_collision'])) {
+            return $manifest;
+        }
         if (! empty($manifest['custody_gc'])) {
             $this->withManifestLock($manifestPath, function () use ($manifestPath): void {
                 $current = $this->read($manifestPath);
@@ -508,6 +534,9 @@ final class NzbUploadManifestService
             || in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_FAILED], true))) {
             return $this->withManifestLock($manifestPath, function () use ($manifestPath): array {
                 $m = $this->read($manifestPath);
+                if (isset($m['custody_collision'])) {
+                    return $m;
+                }
                 if (! isset($m['accepted_capture'])) {
                     $m['legacy_provenance'] ??= array_intersect_key($m, array_flip(['version', 'state', 'candidate_identity', 'release_id', 'release_guid']));
                     $m['state'] = self::STATE_METADATA_REVIEW;
@@ -526,6 +555,9 @@ final class NzbUploadManifestService
 
         return $this->withManifestLock($manifestPath, function () use ($manifestPath): array {
             $manifest = $this->read($manifestPath);
+            if (isset($manifest['custody_collision'])) {
+                return $manifest;
+            }
             $accepted = $manifest['accepted_capture'] ?? null;
             $source = dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nzb']['filename'];
             if ($accepted !== null && in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_FAILED], true)
@@ -668,6 +700,9 @@ final class NzbUploadManifestService
     {
         return $this->withManifestLock($manifestPath, function () use ($manifestPath, $store, $delete): bool {
             $m = $this->read($manifestPath);
+            if (isset($m['custody_collision'])) {
+                throw new RuntimeException('Custody collision requires explicit restaging.');
+            }
             $receipt = $m['nfo_capture'] ?? null;
             $accepted = $m['accepted_capture'] ?? null;
             if (! is_array($receipt) || ($receipt['protocol'] ?? null) !== 1 || ! is_array($accepted) || ($accepted['companion_attempt'] ?? null) !== $receipt['attempt']
@@ -775,6 +810,9 @@ final class NzbUploadManifestService
     {
         return $this->withManifestLock($manifestPath, function () use ($manifestPath, $delete): bool {
             $manifest = $this->read($manifestPath);
+            if (isset($manifest['custody_collision'])) {
+                return false;
+            }
             $this->drainCustodyGc($manifestPath, $manifest);
             if (! in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
                 || ! $this->nfoCleanupCommitted($manifest)) {
@@ -797,6 +835,9 @@ final class NzbUploadManifestService
     private function finishCompanionDeletion(string $manifestPath, array &$manifest): bool
     {
         return $this->withRetirementAdmission(function () use ($manifestPath, &$manifest): bool {
+            if (isset($manifest['custody_collision'])) {
+                return false;
+            }
             $receipt = $manifest['nfo_capture'] ?? null;
             if (! is_array($receipt) || ($manifest['delete_nfo_after_import'] ?? null) !== $receipt['attempt']) {
                 return true;
@@ -853,6 +894,9 @@ final class NzbUploadManifestService
             return;
         }
         app(VerificationResetService::class)->withAdmission(function () use ($manifestPath, &$manifest, $publicationOnly): void {
+            if (isset($manifest['custody_collision'])) {
+                return;
+            }
             $field = $publicationOnly ? 'delete_nzb_after_publication' : 'delete_nzb_after_nfo';
             $requested = $manifest[$field] ?? null;
             $accepted = $manifest['accepted_capture'] ?? null;
@@ -861,7 +905,7 @@ final class NzbUploadManifestService
                 return;
             }
             if ($publicationOnly) {
-                if ($manifest['state'] !== self::STATE_NZB_IMPORTED || is_array($manifest['nfo_capture'] ?? null)
+                if ($manifest['state'] !== self::STATE_NZB_IMPORTED || is_array($manifest['nfo'] ?? null) || is_array($manifest['nfo_capture'] ?? null)
                     || ! $this->nfoCandidateCurrent($manifest)
                     || ! DB::table('releases')->where('id', $manifest['release_id'])->where('guid', $manifest['release_guid'])->exists()) {
                     return;
@@ -971,6 +1015,9 @@ final class NzbUploadManifestService
         return $this->withManifestLock($manifestPath, function () use ($manifestPath): bool {
             return $this->withRetirementAdmission(function () use ($manifestPath): bool {
                 $m = $this->read($manifestPath);
+                if (isset($m['custody_collision'])) {
+                    return false;
+                }
                 $receipt = $m['nfo_capture'] ?? null;
                 $outcome = $m['outcome_capture'] ?? $m['accepted_capture'] ?? null;
                 $failedCompanion = $m['state'] === self::STATE_NFO_FAILED
@@ -1137,7 +1184,10 @@ final class NzbUploadManifestService
         }
         $moved = $attempt.'/moved.json';
         if (file_exists($private) || is_link($private)) {
-            if (! $this->captureMatches($private, $receipt, renamed: true) || is_link($moved)) {
+            if (! $this->captureMatches($private, $receipt, renamed: true)) {
+                $this->rescueForeignCustody($source, $private, $receipt);
+            }
+            if (is_link($moved)) {
                 return false;
             }
             // Persist owned relocation before unlink. After unlink, this exact checkpoint
@@ -1159,6 +1209,79 @@ final class NzbUploadManifestService
         $this->write($complete, $expected);
 
         return DirectorySyncBridge::sync($attempt, 'complete_dir');
+    }
+
+    /**
+     * Publish at most one bounded independent recovery copy, never a writable alias
+     * of retained evidence. Unknown/oversized bytes stay in private review custody.
+     *
+     * @param  array<string, mixed>  $receipt
+     */
+    private function rescueForeignCustody(string $source, string $private, array $receipt): never
+    {
+        $entry = @lstat($private);
+        $recovered = null;
+        $limit = 16_777_216;
+        if (is_array($entry) && ($entry['mode'] & 0170000) === 0100000 && $entry['size'] <= $limit) {
+            $identity = $this->sourceIdentity($private);
+            $digest = $this->currentFileDigest($private);
+            $destination = $source.'.recovered-'.hash('sha256', $receipt['attempt']);
+            $mask = umask(0077);
+            try {
+                $output = @fopen($destination, 'x+b');
+            } finally {
+                umask($mask);
+            }
+            if ($output !== false) {
+                $input = @fopen($private, 'rb');
+                try {
+                    if ($input !== false) {
+                        stream_copy_to_stream($input, $output, $limit);
+                    }
+                    if (! fflush($output) || ! fsync($output)) {
+                        throw new RuntimeException('Rescued custody copy durability is uncertain; retry required.');
+                    }
+                } finally {
+                    if (is_resource($input)) {
+                        fclose($input);
+                    }
+                    fclose($output);
+                }
+            }
+            clearstatcache(true, $destination);
+            $delivered = @lstat($destination);
+            $deliveryIdentity = $this->sourceIdentity($destination);
+            if (is_array($delivered) && ($delivered['mode'] & 0170000) === 0100000
+                && $delivered['size'] === $entry['size'] && $delivered['ino'] !== $entry['ino']
+                && $identity === $this->sourceIdentity($private)
+                && hash_equals($digest, $this->currentFileDigest($destination))
+                && $deliveryIdentity === $this->sourceIdentity($destination)) {
+                // A prior copy may have reached its full length before file fsync failed.
+                // Re-establish file durability on every retry, not just directory entry durability.
+                $handle = @fopen($destination, 'rb');
+                $synced = false;
+                if ($handle !== false) {
+                    try {
+                        $opened = fstat($handle);
+                        $synced = is_array($opened) && $opened['dev'] === $delivered['dev'] && $opened['ino'] === $delivered['ino']
+                            && fsync($handle) && $deliveryIdentity === $this->sourceIdentity($destination);
+                    } finally {
+                        if (! fclose($handle)) {
+                            $synced = false;
+                        }
+                    }
+                }
+                if (! $synced) {
+                    throw new RuntimeException('Rescued custody copy durability is uncertain; retry required.');
+                }
+                if (! DirectorySyncBridge::sync(dirname($source), 'recovery_parent')) {
+                    throw new RuntimeException('Rescued custody destination durability is uncertain; retry required.');
+                }
+                $recovered = basename($destination);
+            }
+        }
+
+        throw new NzbCustodyCollision($receipt['attempt'], $recovered, basename(dirname($private)));
     }
 
     /** @param array<string, mixed> $expected */
@@ -1258,7 +1381,27 @@ final class NzbUploadManifestService
                 throw new RuntimeException('Cannot lock upload manifest.');
             }
 
-            return $callback();
+            try {
+                return $callback();
+            } catch (NzbCustodyCollision $collision) {
+                // The callback may have recorded a retryable failure while unwinding.
+                // Override it under the same manifest lock with an explicit review hold.
+                $manifest = $this->read($manifestPath);
+                $manifest['state'] = self::STATE_METADATA_REVIEW;
+                $manifest['custody_collision'] = ['attempt' => $collision->attempt,
+                    'recovered_filename' => $collision->recoveredFilename, 'private_directory' => $collision->privateDirectory];
+                $manifest['last_error'] = $collision->getMessage();
+                foreach (['delete_input_pending', 'delete_terminal_nfo'] as $field) {
+                    if (($manifest[$field]['attempt'] ?? null) === $collision->attempt) {
+                        unset($manifest[$field]);
+                    }
+                }
+                if (($manifest['delete_nfo_after_import'] ?? null) === $collision->attempt) {
+                    unset($manifest['delete_nfo_after_import']);
+                }
+                $this->write($manifestPath, $manifest);
+                throw $collision;
+            }
         } finally {
             flock($lock, LOCK_UN);
             fclose($lock);

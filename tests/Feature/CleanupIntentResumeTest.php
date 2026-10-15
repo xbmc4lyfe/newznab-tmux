@@ -3,8 +3,10 @@
 namespace Tests\Feature;
 
 use App\Enums\NzbImportStatus;
+use App\Exceptions\NzbCustodyCollision;
 use App\Services\NfoService;
 use App\Services\Nzb\DirectorySyncBridge;
+use App\Services\Nzb\NativeManifestIoProbe;
 use App\Services\Nzb\NfoImportService;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbUploadManifestService;
@@ -124,6 +126,249 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
             }
             config(['release_verification.storage_path' => $root]);
         }
+    }
+
+    public static function legacyPairedSchedules(): array
+    {
+        $cases = [];
+        foreach (['staged', 'nzb_failed', 'nzb_pending', 'nzb_imported'] as $state) {
+            foreach ([false, true] as $delete) {
+                foreach ([false, true] as $deleteFailed) {
+                    $cases[$state.' '.(int) $delete.(int) $deleteFailed] = [$state, $delete, $deleteFailed];
+                }
+            }
+        }
+
+        return $cases;
+    }
+
+    #[DataProvider('legacyPairedSchedules')]
+    public function test_legacy_pairs_require_restaging_before_new_admission(string $state, bool $delete, bool $deleteFailed): void
+    {
+        [$source, $mp, $uploads] = $this->upload(true);
+        $legacy = $uploads->read($mp);
+        $legacy['version'] = 1;
+        $legacy['state'] = $state;
+        unset($legacy['nfo_capture']);
+        file_put_contents($mp, json_encode($legacy, JSON_THROW_ON_ERROR));
+        $this->capturedFixtureImporter('legacy-paired-hold')->beginImport([$source], delete: $delete, deleteFailed: $deleteFailed);
+        $result = $uploads->read($mp);
+        self::assertSame(NzbUploadManifestService::STATE_METADATA_REVIEW, $result['state']);
+        self::assertStringContainsString('restag', $result['last_error']);
+        self::assertFileExists($source);
+        self::assertFileExists(dirname($source).'/info.nfo');
+        self::assertArrayNotHasKey('accepted_capture', $result);
+        self::assertArrayNotHasKey('nfo_capture', $result);
+        self::assertArrayNotHasKey('input_reservation', $result);
+        self::assertSame(0, DB::table('release_verification_candidates')->count());
+    }
+
+    public function test_uncaptured_declared_companion_cannot_be_retired_as_a_source_only_upload(): void
+    {
+        [$source, $mp, $uploads] = $this->upload(true);
+        $manifest = $uploads->read($mp);
+        unset($manifest['nfo_capture']);
+        // Reproduce the old faulty upgrade as a real admission of this capture shape.
+        $manifest['nfo'] = null;
+        file_put_contents($mp, json_encode($manifest, JSON_THROW_ON_ERROR));
+        $this->capturedFixtureImporter('uncaptured-companion')->beginImport([$source], delete: true);
+        $manifest = $uploads->read($mp);
+        $manifest['nfo'] = ['filename' => 'info.nfo'];
+        file_put_contents($mp, json_encode($manifest, JSON_THROW_ON_ERROR));
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'uncaptured-companion-guid']);
+        DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+        $uploads->reconcilePending($mp);
+        self::assertFileExists($source);
+        self::assertFileExists(dirname($source).'/info.nfo');
+        self::assertArrayNotHasKey('relinquished_attempt', $uploads->read($mp));
+    }
+
+    public static function custodyMoveRaces(): array
+    {
+        return ['vacant original' => [false, ''], 'third generation at original' => [true, ''],
+            'recovery sync interruption' => [false, 'recovery_parent'], 'file sync retry' => [false, 'recovery_file'],
+            'occupied recovery name' => [true, 'occupied']];
+    }
+
+    #[DataProvider('custodyMoveRaces')]
+    public function test_generation_swapped_at_move_is_rescued_without_overwriting_newer_input(bool $thirdGeneration, string $fault): void
+    {
+        [$source, $mp] = $this->upload(false);
+        $filesystem = new class($source, $thirdGeneration, $fault) extends Filesystem
+        {
+            public function __construct(private string $source, private bool $thirdGeneration, private string $fault) {}
+
+            public function move($path, $target)
+            {
+                if ($path !== $this->source) {
+                    return parent::move($path, $target);
+                }
+                file_put_contents($path.'.new', 'displaced producer generation');
+                rename($path.'.new', $path);
+                $moved = parent::move($path, $target);
+                if ($this->thirdGeneration) {
+                    file_put_contents($path, 'third producer generation');
+                }
+                if ($this->fault === 'recovery_parent') {
+                    DirectorySyncBridge::$fail = 'recovery_parent';
+                } elseif ($this->fault === 'recovery_file') {
+                    NativeManifestIoProbe::$failRecoverySyncs = 2;
+                    NativeManifestIoProbe::$recoverySyncs = 0;
+                } elseif ($this->fault === 'occupied') {
+                    $intent = json_decode(file_get_contents(dirname($target).'/intent.json'), true);
+                    file_put_contents($path.'.recovered-'.hash('sha256', $intent['receipt']['attempt']), 'unrelated recovery-name occupant');
+                }
+
+                return $moved;
+            }
+        };
+        $uploads = new NzbUploadManifestService($filesystem);
+        app()->instance(NzbUploadManifestService::class, $uploads);
+        $importer = new class(['Browser' => true]) extends NzbImportService
+        {
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function scanNZBFile(mixed &$nzbXML, mixed $nzbFileName = '', mixed $source = ''): NzbImportStatus
+            {
+                return NzbImportStatus::Failed;
+            }
+        };
+        try {
+            $importer->beginImport([$source], deleteFailed: true);
+        } catch (NzbCustodyCollision) {
+            // Explicit review is the intended outcome; never certify old retirement.
+        } catch (\RuntimeException $error) {
+            self::assertContains($fault, ['recovery_parent', 'recovery_file']);
+            self::assertStringContainsString('durability', $error->getMessage());
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        if ($fault === 'recovery_file') {
+            try {
+                $uploads->reconcilePending($mp);
+                self::fail('An existing recovery copy still requires a successful file sync.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('durability', $error->getMessage());
+            } finally {
+                NativeManifestIoProbe::$failRecoverySyncs = 0;
+            }
+            self::assertSame(2, NativeManifestIoProbe::$recoverySyncs);
+        }
+        if (in_array($fault, ['recovery_parent', 'recovery_file'], true)) {
+            self::assertArrayNotHasKey('custody_collision', $uploads->read($mp));
+            self::assertArrayHasKey('delete_input_pending', $uploads->read($mp));
+            try {
+                $uploads->reconcilePending($mp);
+            } catch (NzbCustodyCollision) {
+                // Resume completes rescue under the same old attempt.
+            }
+        }
+        if ($thirdGeneration) {
+            self::assertSame('third producer generation', file_get_contents($source));
+        } else {
+            self::assertFileDoesNotExist($source);
+        }
+        $result = $uploads->read($mp);
+        self::assertSame(NzbUploadManifestService::STATE_METADATA_REVIEW, $result['state']);
+        self::assertArrayHasKey('custody_collision', $result);
+        $rescued = dirname($source).'/'.($result['custody_collision']['recovered_filename'] ?? $result['custody_collision']['private_directory'].'/payload');
+        self::assertSame('displaced producer generation', file_get_contents($rescued));
+        if ($fault === 'occupied') {
+            $fallback = $source.'.recovered-'.hash('sha256', $result['custody_collision']['attempt']);
+            self::assertSame('unrelated recovery-name occupant', file_get_contents($fallback));
+        }
+        self::assertArrayNotHasKey('relinquished_attempt', $result);
+        self::assertSame(['deferred' => true], $uploads->reserveInput($source));
+        $uploads->reconcilePending($mp);
+        self::assertSame('displaced producer generation', file_get_contents($rescued));
+        self::assertSame(1, count(glob(dirname($source).'/.custody-*/payload')));
+        self::assertSame([], glob(dirname($source).'/.custody-*/complete.json'));
+        if ($result['custody_collision']['recovered_filename'] !== null) {
+            file_put_contents($rescued, 'producer later overwrite');
+            $private = dirname($source).'/'.$result['custody_collision']['private_directory'].'/payload';
+            self::assertSame('displaced producer generation', file_get_contents($private), 'Public recovery must not expose the retained evidence inode.');
+        }
+        $uploads->recordNzbOutcome($source, NzbImportStatus::Failed, null, null, inputCapture: $result['outcome_capture']);
+        self::assertSame($result, $uploads->read($mp));
+    }
+
+    public function test_source_only_legacy_manifest_can_still_take_fresh_admission(): void
+    {
+        [$source, $mp, $uploads] = $this->upload(false);
+        $legacy = $uploads->read($mp);
+        $legacy['version'] = 1;
+        file_put_contents($mp, json_encode($legacy, JSON_THROW_ON_ERROR));
+        $this->capturedFixtureImporter('legacy-source-only')->beginImport([$source], delete: true);
+        $result = $uploads->read($mp);
+        self::assertSame(2, $result['version']);
+        self::assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $result['state']);
+        self::assertSame(2, $result['accepted_capture']['protocol']);
+        self::assertSame(1, DB::table('release_verification_candidates')->count());
+        self::assertFileExists($source);
+    }
+
+    public function test_uncaptured_pair_does_not_reinterpret_a_pending_private_source(): void
+    {
+        [$source, $mp, $uploads] = $this->upload(false);
+        $this->capturedFixtureImporter('legacy-private-hold')->beginImport([$source], delete: true);
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'legacy-private-guid']);
+        DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+        DirectorySyncBridge::$fail = 'rename_custody';
+        try {
+            $uploads->reconcilePending($mp);
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        self::assertFileDoesNotExist($source);
+        $private = glob(dirname($source).'/.custody-*/payload');
+        self::assertCount(1, $private);
+        $original = file_get_contents($private[0]);
+        $manifest = $uploads->read($mp);
+        $manifest['nfo'] = ['filename' => 'info.nfo'];
+        file_put_contents($mp, json_encode($manifest, JSON_THROW_ON_ERROR));
+        file_put_contents($source, 'replacement public NZB');
+        file_put_contents(dirname($source).'/info.nfo', 'replacement public NFO');
+        self::assertSame(['deferred' => true], $uploads->reserveInput($source));
+        self::assertSame($manifest, $uploads->read($mp));
+        self::assertSame($original, file_get_contents($private[0]));
+        self::assertSame('replacement public NZB', file_get_contents($source));
+        self::assertSame('replacement public NFO', file_get_contents(dirname($source).'/info.nfo'));
+    }
+
+    public function test_waiting_reconciler_rechecks_collision_after_taking_manifest_lock(): void
+    {
+        [$source, $mp] = $this->upload(false);
+        $this->capturedFixtureImporter('waiting-collision')->beginImport([$source]);
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'waiting-collision-guid']);
+        DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+        $filesystem = new class($mp) extends Filesystem
+        {
+            private bool $armed = true;
+
+            public function __construct(private string $manifestPath) {}
+
+            public function get($path, $lock = false)
+            {
+                $observed = parent::get($path, $lock);
+                if ($this->armed && $path === $this->manifestPath) {
+                    $this->armed = false;
+                    // Another writer commits the hold after this reader's first observation.
+                    $held = json_decode($observed, true);
+                    $held['state'] = NzbUploadManifestService::STATE_METADATA_REVIEW;
+                    $held['custody_collision'] = ['attempt' => 'synthetic concurrent hold'];
+                    file_put_contents($path, json_encode($held, JSON_THROW_ON_ERROR));
+                }
+
+                return $observed;
+            }
+        };
+        $uploads = new NzbUploadManifestService($filesystem);
+        self::assertSame(NzbUploadManifestService::STATE_METADATA_REVIEW, $uploads->reconcilePending($mp)['state']);
+        self::assertSame(NzbUploadManifestService::STATE_METADATA_REVIEW, $uploads->read($mp)['state']);
+        self::assertFileExists($source);
     }
 
     public static function retirementResetBoundaries(): array

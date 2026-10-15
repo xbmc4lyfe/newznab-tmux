@@ -101,6 +101,40 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         self::assertFileDoesNotExist(dirname($path).'/info.nfo');
     }
 
+    public function test_inflight_companion_and_source_finalization_preserve_a_collision_hold(): void
+    {
+        [$path] = $this->directUpload();
+        $source = dirname($path).'/incoming.nzb';
+        $filesystem = new class extends Filesystem
+        {
+            public function move($source, $target)
+            {
+                if (basename($source) === 'info.nfo') {
+                    file_put_contents($source.'.replacement', 'new companion generation');
+                    rename($source.'.replacement', $source);
+                }
+
+                return parent::move($source, $target);
+            }
+        };
+        $uploads = new NzbUploadManifestService($filesystem);
+        $reservation = $uploads->reserveInput($source);
+        $nfos = new NfoImportService($filesystem, $uploads, new NfoService);
+        self::assertSame('failed', $nfos->importManifest($path, delete: true)['status']);
+        $held = $uploads->read($path);
+        self::assertSame(NzbUploadManifestService::STATE_METADATA_REVIEW, $held['state']);
+        self::assertSame('new companion generation', file_get_contents(dirname($path).'/'.$held['custody_collision']['recovered_filename']));
+        self::assertNull($uploads->finalizeInput($source, file_get_contents($source), $reservation));
+        try {
+            $uploads->consumeCompanion($path, new NfoService, false);
+            self::fail('Held companion cannot be consumed by an in-flight caller.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('restaging', $error->getMessage());
+        }
+        self::assertSame($held, $uploads->read($path));
+        self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
+    }
+
     public static function callbackCompanionStates(): array
     {
         return ['stored' => ['direct companion', 'imported'], 'failed' => ['', 'failed']];

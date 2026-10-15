@@ -7,6 +7,10 @@ final class NativeManifestIoProbe
     public static ?\Closure $beforeRename = null;
 
     public static bool $failWrite = false;
+
+    public static int $failRecoverySyncs = 0;
+
+    public static int $recoverySyncs = 0;
 }
 function rename(string $source, string $target): bool
 {
@@ -24,4 +28,19 @@ function fwrite($stream, string $bytes): int|false
     }
 
     return \fwrite($stream, $bytes);
+}
+
+function fsync($stream): bool
+{
+    $path = stream_get_meta_data($stream)['uri'] ?? '';
+    if (str_contains($path, '.recovered-')) {
+        NativeManifestIoProbe::$recoverySyncs++;
+        if (NativeManifestIoProbe::$failRecoverySyncs > 0) {
+            NativeManifestIoProbe::$failRecoverySyncs--;
+
+            return false;
+        }
+    }
+
+    return \fsync($stream);
 }
