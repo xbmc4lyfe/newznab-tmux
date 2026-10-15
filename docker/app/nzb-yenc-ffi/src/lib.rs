@@ -1036,6 +1036,23 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "experimental-xz-index")]
+    pub(crate) fn observed_allocations<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        struct StopCounting;
+        impl Drop for StopCounting {
+            fn drop(&mut self) {
+                COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+            }
+        }
+        COUNT_ALLOCATIONS.with(|enabled| assert!(!enabled.get()));
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
+        let stop = StopCounting;
+        let result = operation();
+        drop(stop);
+        (result, ALLOCATION_COUNT.with(Cell::get))
+    }
+
     #[test]
     fn abi_decodes_without_heap_allocation() {
         let payload = b"klm=@=J=M=}..\x0b==";
