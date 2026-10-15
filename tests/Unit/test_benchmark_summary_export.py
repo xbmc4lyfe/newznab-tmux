@@ -364,6 +364,56 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             self.assertEqual(summary["rows"][0]["samples"], 1000 if kind == "cpu-snapshot" else 31)
             self.assertIn("baseline_revision", summary)
 
+    def test_withdrawn_fingerprint_status_is_public_without_copying_freeform_scope(self):
+        for kind in ("fingerprint-ffi", "fingerprint-worker"):
+            report = self.utility(kind)
+            report["candidate_status"] = "experimental_withdrawn_from_production"
+            report["comparison_scope"] = UNPUBLISHED_MARKER
+            summary = self.run_export(kind, report)
+            self.assertEqual(summary["candidate_status"], "experimental_withdrawn_from_production")
+            self.assertFalse(summary["adoption_qualified"])
+            self.assertNotIn("comparison_scope", summary)
+            report["candidate_status"] = UNPUBLISHED_MARKER
+            self.assertEqual(self.run_export(kind, report)["status"], "invalid")
+
+    def test_full_fingerprint_withdrawal_preserves_metrics_and_unknown_historical_status(self):
+        spec = importlib.util.spec_from_file_location("withdrawn_fingerprint_fixture", Path(__file__).with_name("test_benchmark_utility_extended.py"))
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        for kind, tail in itertools.product(("fingerprint-ffi", "fingerprint-worker"), (None, 1000)):
+            with self.subTest(kind=kind, tail=tail):
+                report = fixture.fingerprint(tail)
+                report["protocol"]["backend"] = kind.removeprefix("fingerprint-")
+                historical = self.run_export(kind, report, resources="valid")
+                self.assertEqual(historical["status"], "measured")
+                self.assertNotIn("candidate_status", historical)
+                report["candidate_status"] = "experimental_withdrawn_from_production"
+                report["comparison_scope"] = UNPUBLISHED_MARKER
+                summary = self.run_export(kind, report, resources="valid")
+                self.assertEqual(summary["candidate_status"], "experimental_withdrawn_from_production")
+                self.assertEqual(summary["status"], "measured")
+                self.assertEqual(summary["rows"], historical["rows"])
+                self.assertEqual(len(summary["rows"]), 18)
+                self.assertEqual(sum(row["p99_sample_sufficient"] for row in summary["rows"]), 6 if tail else 0)
+                self.assertFalse(summary["adoption_qualified"])
+                self.assertNotIn("comparison_scope", summary)
+
+    def test_full_fingerprint_malformed_candidate_status_disqualifies_every_row(self):
+        spec = importlib.util.spec_from_file_location("malformed_withdrawal_fixture", Path(__file__).with_name("test_benchmark_utility_extended.py"))
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        for value in (None, [], {}, True, "production", UNPUBLISHED_MARKER):
+            with self.subTest(value=value):
+                report = fixture.fingerprint(1000)
+                report["candidate_status"] = value
+                summary = self.run_export("fingerprint-ffi", report, resources="valid")
+                self.assertEqual(summary["status"], "invalid")
+                self.assertFalse(summary["adoption_qualified"])
+                self.assertNotIn("candidate_status", summary)
+                self.assertFalse(any(row["eligible"] or row.get("p99_threshold_met") for row in summary["rows"]))
+                self.assertTrue(all(row["decision"] == "invalid" for row in summary["rows"]))
+                self.assertTrue(all(row["baseline_median_ns"] == 4 for row in summary["rows"]))
+
     def test_native_utility_wrong_baseline_backend_missing_fixture_and_failures(self):
         for kind in ("fingerprint-ffi", "fingerprint-worker", "cpu-snapshot"):
             report = self.utility(kind)

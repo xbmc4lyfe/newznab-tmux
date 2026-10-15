@@ -336,6 +336,8 @@ def utility_summary(kind, report):
         invalid |= type(report.get("adoption_gate_pass")) is not bool
     else:
         invalid |= report.get("invalid_observations") != [] or protocol.get("backend") != kind.removeprefix("fingerprint-")
+        if "candidate_status" in report:
+            invalid |= report["candidate_status"] != "experimental_withdrawn_from_production"
     rows = []
     for fixture in expected:
         if fixture not in measured:
@@ -423,6 +425,8 @@ def utility_summary(kind, report):
                 protocol_sha256=hashlib.sha256(json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                 uncertainty_method=("paired_bootstrap_bonferroni" if version == 3 else "mixed_output_bootstrap" if protocol.get("bootstrap_rng") == "LCG64 state with SplitMix64 output mixing and unbiased rejection sampling" else "legacy_stratified_bootstrap_unqualified") if cpu else "not_reported",
                 evidence_type="synthetic_and_exact_host_cli_comparison" if cpu and host_requested else "synthetic_cli_comparison" if cpu else "paired_public_operation_median_screen")
+    if not cpu and report.get("candidate_status") == "experimental_withdrawn_from_production":
+        result["candidate_status"] = "experimental_withdrawn_from_production"
     if cpu:
         result["measurement_protocol_version"] = version if type(version) is int and version in (2, 3) else 0
         result["confidence_status"] = ("historical_unqualified" if version == 2 else
@@ -458,6 +462,8 @@ def full_fingerprint_summary(kind, report):
                or report.get("invalid_observations") != [] or report.get("adoption_qualified") is not False
                or protocol.get("coverage") != "full" or protocol.get("backend") != kind.removeprefix("fingerprint-")
                or bool(set(measured) - set(FINGERPRINT_FIXTURES)))
+    if "candidate_status" in report:
+        invalid |= report["candidate_status"] != "experimental_withdrawn_from_production"
     ordinary, tail = protocol.get("pairs_per_fixture"), protocol.get("tail_pairs_per_uncommon_fixture")
     invalid |= not count(ordinary) or not 1 <= ordinary <= 5000
     invalid |= tail is not None and (not count(tail) or not 1000 <= tail <= 5000)
@@ -548,11 +554,14 @@ def full_fingerprint_summary(kind, report):
                               "coordinator_binary", "php_binary", "vendor_installed", "xml_elements")
                   and isinstance(entry, dict) and digest(entry.get("sha256"))}
     complete = len(rows) == 2 * len(FINGERPRINT_FIXTURES)
-    return dict(rows=rows, status="invalid" if invalid else "measured" if complete else "partial",
+    result = dict(rows=rows, status="invalid" if invalid else "measured" if complete else "partial",
                 completeness=dict(expected_rows=2 * len(FINGERPRINT_FIXTURES), observed_rows=len(rows), complete=complete),
                 baseline_revision=revision, source_sha256=identities,
                 protocol_sha256=hashlib.sha256(json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                 evidence_type="paired_public_fingerprint_median_and_tail_screen")
+    if report.get("candidate_status") == "experimental_withdrawn_from_production":
+        result["candidate_status"] = "experimental_withdrawn_from_production"
+    return result
 
 
 def resource_receipt():

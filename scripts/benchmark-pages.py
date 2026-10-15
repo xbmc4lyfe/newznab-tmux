@@ -148,11 +148,14 @@ def validate_summary(summary, run, kind, runner):
     if not isinstance(summary.get('rows'), list) or len(summary['rows']) > 100:
         raise ValueError('Invalid summary rows')
     allowed = set(expected) | {'rows', 'status', 'evidence_type', 'completeness', 'source_sha256',
-                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'uncertainty_method', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size'}
+                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'candidate_status', 'uncertainty_method', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size'}
     if set(summary) - allowed:
         raise ValueError('Unexpected public summary fields')
     if summary.get('rust_payload_mode', 'unknown') not in ('incumbent', 'experimental', 'unknown'):
         raise ValueError('Invalid Rust payload mode')
+    if 'candidate_status' in summary and (kind not in ('fingerprint-ffi', 'fingerprint-worker')
+            or summary['candidate_status'] != 'experimental_withdrawn_from_production'):
+        raise ValueError('Invalid fingerprint candidate status')
     for mapping in ('source_sha256', 'library_sha256'):
         hashes = summary.get(mapping, {})
         if not isinstance(hashes, dict) or any(not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value) for value in hashes.values()):
@@ -449,7 +452,7 @@ def coverage(root):
         elif name == 'lib':
             label, detail = 'Mixed coverage', 'FFI exports: decoding/rendering comparisons; metadata profiles; some APIs unbenchmarked.'
         elif name in ('article_fingerprint', 'nntmux-article-fingerprint', 'benchmark-article-fingerprint'):
-            label, detail = 'Comparative public operation benchmark', 'Nine PHP/FFI/worker caller strata, cold/repeated lifecycle costs; tail estimates require 1000 pairs via dispatch. PHP process startup excluded; Rust worker startup included.'
+            label, detail = 'Comparative archived-candidate benchmark', 'Application fingerprinting uses PHP. Nine archived Rust candidate PHP/FFI/worker strata, cold/repeated lifecycle costs; tail estimates require 1000 pairs via dispatch. PHP process startup excluded; Rust worker startup included.'
         elif name in ('cpu_snapshot', 'nntmux-cpu-snapshot', 'benchmark-cpu-snapshot'):
             label, detail = 'Comparative CLI benchmark', 'Python baseline vs Rust: synthetic proc/cgroup fixtures and 1000 exact Linux host CLI pairs with changing-counter witnesses; startup included, production load unverified.'
         rows.append({'target': str(path.relative_to(root)), 'coverage': label, 'detail': detail, 'payload_modes': modes, 'comparisons': comparisons})
@@ -730,6 +733,8 @@ def render(report):
         body.append('<p><a href="benchmarks/">Historical speedup charts, PHP call paths and native flamegraphs</a>. These frozen reports retain their own executed-commit and run provenance; they are separate from this build.</p>')
     for row in report['results']:
         body.append(f'<details><summary>{escape(row["kind"])} · {escape(row["runner"])} · {escape(row.get("status", "unknown"))}</summary><p>{run_link(row)}. Evidence: {escape(row.get("evidence_type", "unavailable"))}; adoption qualification: not established.</p>')
+        if row.get('candidate_status') == 'experimental_withdrawn_from_production':
+            body.append('<p>This archived Rust fingerprint candidate is withdrawn from the application runtime. The application uses PHP fingerprinting. These archived-candidate measurements do not select the production implementation or qualify adoption.</p>')
         if row.get('kind') == 'cpu-snapshot':
             provenance = row.get('runtime_identity', {})
             supported = (row.get('status') in ('measured', 'measured_gate_failed')

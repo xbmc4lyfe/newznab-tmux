@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 const SEED: u64 = 20261014;
+const CANDIDATE_STATUS: &str = "experimental_withdrawn_from_production";
 const BOOTSTRAP_RESAMPLES: usize = 2000;
 const MINIMUM_TAIL_PAIRS: usize = 1000;
 const BOOTSTRAP_RNG: &str =
@@ -76,7 +77,7 @@ const FULL_FIXTURES: [(&str, usize, &str, &str); 4] = [
 fn uncommon(fixture: &str) -> bool {
     fixture == "xml10000-fromXml" || fixture.contains("max255")
 }
-// These reviewed callers contain no PHP fallback. A source change requires a new
+// These reviewed archived callers contain no PHP fallback. A source change requires a new
 // native-path audit and deliberate pin update, rather than silent attribution.
 const NATIVE_CLASS_SHA256: &str =
     "d43ccd3c5528d56be1c93791745243fc057f514fbdde85877259cf0679627374";
@@ -110,8 +111,9 @@ fn generated_driver() -> String {
         "const NATIVE_CLASS_SHA256='{NATIVE_CLASS_SHA256}'; const NATIVE_WORKER_SHA256='{NATIVE_WORKER_SHA256}';{NATIVE_ASSERTIONS}{DRIVER}"
     )
 }
-// Measurement still calls the unmodified production public API. Dynamic object
-// inspection runs in a separate proof process, never inside an operation timer.
+// Measurement calls the archived integration through its original public API.
+// Production uses PHP. Dynamic object inspection runs in a separate proof
+// process, never inside an operation timer.
 const DRIVER: &str = r#"
 [$root,$baseline,$implementation,$fixture,$count,$method,$expected]=array_slice($argv,1);
 $ids=[]; for($i=($fixture==='ids10000-unique-plus-duplicates'?10000:(int)$count)-1;$i>=0;$i--) $ids[]=sprintf('fp-%05d@bench.invalid',$i);
@@ -122,9 +124,10 @@ if($method==='fromContents'||$method==='fromXml') { $payload='<nzb xmlns="http:/
 else foreach($ids as $id) hash_update($hash,pack('N',strlen($id)).$id);
 $class='App\\Services\\Nzb\\NzbArticleFingerprint';
 if($implementation==='baseline') require $baseline;
+else require $root.'/tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php';
 require $root.'/vendor/autoload.php'; if(!class_exists($class)) throw new RuntimeException('Fingerprint class missing');
 if($implementation==='candidate') foreach([
-    [$class,$root.'/app/Services/Nzb/NzbArticleFingerprint.php',NATIVE_CLASS_SHA256],
+    [$class,$root.'/tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php',NATIVE_CLASS_SHA256],
     ['App\\Services\\Nzb\\RustArticleFingerprintWorker',$root.'/app/Services/Nzb/RustArticleFingerprintWorker.php',NATIVE_WORKER_SHA256],
 ] as [$nativeClass,$source,$sourceHash]) assertFingerprintSource($nativeClass,$source,$sourceHash);
 $library=$root.'/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.'.(PHP_OS_FAMILY==='Darwin'?'dylib':'so');
@@ -491,10 +494,19 @@ fn observation_command(o: &Options, candidate: bool) -> Command {
     }
     cmd
 }
+fn comparison_scope(coverage: &str) -> &'static str {
+    if coverage == "full" {
+        "Archived experimental Rust integration versus frozen native PHP; nine synthetic fixtures across cold and repeated public operations with uncommon p99 tails when at least 1000 eligible pairs are retained per fixture. Production remains PHP; no runtime adoption qualification."
+    } else {
+        "Archived experimental Rust integration versus frozen native PHP; five synthetic fixture median screen across cold and repeated public operations. Production remains PHP; no runtime adoption qualification."
+    }
+}
 fn preflight_failure(o: &Options, sources: &Value, runtime: &Value, reason: &str) -> (Value, bool) {
     (
         json!({
             "benchmark":"nzb-article-fingerprint-paired-comparison",
+            "candidate_status":CANDIDATE_STATUS,
+            "comparison_scope":comparison_scope(&o.coverage),
             "adoption_qualified":false,
             "protocol":{"version":if o.coverage=="full" {4}else{3},"coverage":o.coverage,"backend":o.backend,"pairs_per_fixture":o.pairs,"tail_pairs_per_uncommon_fixture":o.tail_pairs},
             "sources":sources,
@@ -577,13 +589,14 @@ fn run(mut o: Options) -> Result<(Value, bool), String> {
     let fixtures:Vec<Value>=fixture_definitions.iter().zip(&pair_counts).map(|((name,count,operation,expected),pairs)|json!({"name":name,"input_count":count,"operation":operation,"uncommon":uncommon(name),"pairs":pairs,"expected_digest":expected,"fixture_sha256":fixture_hash(name,*count),"expected_digest_basis":"Independent Python hashlib/struct digest of normalized unique IDs"})).collect();
     journal_record(
         &mut journal,
-        json!({"type":"setup","protocol":{"version":4,"coverage":o.coverage,"backend":o.backend,"pairs":o.pairs,"tail_pairs":o.tail_pairs,"seed":SEED,"orders_candidate_first":orders,"bootstrap_rng":BOOTSTRAP_RNG,"bootstrap_resamples":BOOTSTRAP_RESAMPLES,"bootstrap_seed":SEED,"timeout_seconds_per_worker":30,"warmup_pairs_per_fixture":1,"minimum_p99_pairs":MINIMUM_TAIL_PAIRS,"median_minimum_pairs":11,"useful_median_ratio_ci_lower_gate":1.5,"uncommon_p99_ratio_ci_lower_gate":1.5,"timing_scope":TIMING_SCOPE,"journal_scope":"Every setup and observation record flushed outside operation timing; no fsync durability claim"},"project":o.project,"baseline":o.baseline,"fixtures":fixtures}),
+        json!({"type":"setup","candidate_status":CANDIDATE_STATUS,"comparison_scope":comparison_scope(&o.coverage),"protocol":{"version":4,"coverage":o.coverage,"backend":o.backend,"pairs":o.pairs,"tail_pairs":o.tail_pairs,"seed":SEED,"orders_candidate_first":orders,"bootstrap_rng":BOOTSTRAP_RNG,"bootstrap_resamples":BOOTSTRAP_RESAMPLES,"bootstrap_seed":SEED,"timeout_seconds_per_worker":30,"warmup_pairs_per_fixture":1,"minimum_p99_pairs":MINIMUM_TAIL_PAIRS,"median_minimum_pairs":11,"useful_median_ratio_ci_lower_gate":1.5,"uncommon_p99_ratio_ci_lower_gate":1.5,"timing_scope":TIMING_SCOPE,"journal_scope":"Every setup and observation record flushed outside operation timing; no fsync durability claim"},"project":o.project,"baseline":o.baseline,"fixtures":fixtures}),
     )?;
     let mut paths = vec![
         ("baseline", o.baseline.clone()),
         (
             "candidate",
-            o.project.join("app/Services/Nzb/NzbArticleFingerprint.php"),
+            o.project
+                .join("tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php"),
         ),
         ("composer_lock", o.project.join("composer.lock")),
         (
@@ -945,7 +958,7 @@ fn run(mut o: Options) -> Result<(Value, bool), String> {
         json!({"type":"run_summary","summary":summary,"invalid_observations":invalids,"temporary_filesystems_at_end":temporary_filesystems_at_end,"adoption_qualified":false}),
     )?;
     Ok((
-        json!({"benchmark":"nzb-article-fingerprint-paired-comparison","adoption_qualified":false,"protocol":{"version":if o.coverage=="full" {4}else{3},"coverage":o.coverage,"seed":SEED,"warmups_per_fixture":1,"warmups_per_observation":1,"pairs_per_fixture":o.pairs,"tail_pairs_per_uncommon_fixture":o.tail_pairs,"bootstrap_resamples":BOOTSTRAP_RESAMPLES,"bootstrap_seed":SEED,"bootstrap_rng":BOOTSTRAP_RNG,"median_minimum_pairs":11,"minimum_p99_pairs":MINIMUM_TAIL_PAIRS,"p99_estimator":"Separate baseline/candidate nearest rank ceil(0.99*N), then baseline/candidate ratio; never percentile of paired ratios","confidence_scope":"Pointwise paired bootstrap 95% intervals per fixture/lifecycle; not simultaneous or a production qualification","useful_median_ratio_ci_lower_gate":1.5,"uncommon_p99_ratio_ci_lower_gate":1.5,"timeout_seconds_per_worker":30,"backend":o.backend,"schedule":scheduled,"schedule_sha256":hash_bytes(serde_json::to_string(&scheduled).unwrap().as_bytes()),"timing_scope":TIMING_SCOPE,"limitations":["Synthetic workloads do not establish production indexing throughput or a production input distribution","Cold and repeated operation ratios must be read separately; a repeated-operation gain does not offset a cold regression","Uncommon tail estimates require at least 1000 independent eligible process pairs for that fixture; small-sample maxima are not p99 evidence","Warmup pairs warm OS caches; each observation uses a fresh PHP process. Complete PHP process latency is outside this caller-operation scope"],"correctness_gate":"Both literal independent digests, independent fixture hashes/counts, reviewed native-only caller source pins, separate-process live native state proof, FFI worker startup disabled or FFI disabled for worker, no unpinned backend alternative, unchanged sources/artifacts/runtime/temp filesystem identities"},"sources":sources,"runtime":{"php":runtime,"rust_compiler_available_version":compiler,"native_execution_proof":native_proof,"compiler_identity_note":"Available compiler version; build compiler identity not asserted","temporary_filesystems":temporary_filesystems,"temporary_filesystems_at_end":temporary_filesystems_at_end},"fixtures":fixtures,"observations":observations,"invalid_observations":invalids,"summary":summary,"completed_at_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()}),
+        json!({"benchmark":"nzb-article-fingerprint-paired-comparison","candidate_status":CANDIDATE_STATUS,"comparison_scope":comparison_scope(&o.coverage),"adoption_qualified":false,"protocol":{"version":if o.coverage=="full" {4}else{3},"coverage":o.coverage,"seed":SEED,"warmups_per_fixture":1,"warmups_per_observation":1,"pairs_per_fixture":o.pairs,"tail_pairs_per_uncommon_fixture":o.tail_pairs,"bootstrap_resamples":BOOTSTRAP_RESAMPLES,"bootstrap_seed":SEED,"bootstrap_rng":BOOTSTRAP_RNG,"median_minimum_pairs":11,"minimum_p99_pairs":MINIMUM_TAIL_PAIRS,"p99_estimator":"Separate baseline/candidate nearest rank ceil(0.99*N), then baseline/candidate ratio; never percentile of paired ratios","confidence_scope":"Pointwise paired bootstrap 95% intervals per fixture/lifecycle; not simultaneous or a production qualification","useful_median_ratio_ci_lower_gate":1.5,"uncommon_p99_ratio_ci_lower_gate":1.5,"timeout_seconds_per_worker":30,"backend":o.backend,"schedule":scheduled,"schedule_sha256":hash_bytes(serde_json::to_string(&scheduled).unwrap().as_bytes()),"timing_scope":TIMING_SCOPE,"limitations":["Synthetic workloads do not establish production indexing throughput or a production input distribution","Cold and repeated operation ratios must be read separately; a repeated-operation gain does not offset a cold regression","Uncommon tail estimates require at least 1000 independent eligible process pairs for that fixture; small-sample maxima are not p99 evidence","Warmup pairs warm OS caches; each observation uses a fresh PHP process. Complete PHP process latency is outside this caller-operation scope"],"correctness_gate":"Both literal independent digests, independent fixture hashes/counts, reviewed native-only caller source pins, separate-process live native state proof, FFI worker startup disabled or FFI disabled for worker, no unpinned backend alternative, unchanged sources/artifacts/runtime/temp filesystem identities"},"sources":sources,"runtime":{"php":runtime,"rust_compiler_available_version":compiler,"native_execution_proof":native_proof,"compiler_identity_note":"Available compiler version; build compiler identity not asserted","temporary_filesystems":temporary_filesystems,"temporary_filesystems_at_end":temporary_filesystems_at_end},"fixtures":fixtures,"observations":observations,"invalid_observations":invalids,"summary":summary,"completed_at_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()}),
         invalid,
     ))
 }
@@ -1056,7 +1069,10 @@ try {
     fn reviewed_native_only_source_hashes_match_current_callers() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         assert_eq!(
-            hash_file(&root.join("app/Services/Nzb/NzbArticleFingerprint.php")).unwrap(),
+            hash_file(
+                &root.join("tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php")
+            )
+            .unwrap(),
             NATIVE_CLASS_SHA256
         );
         assert_eq!(
@@ -1065,6 +1081,49 @@ try {
         );
     }
 
+    #[test]
+    fn archived_candidate_loads_before_autoload_and_pins_its_own_source() {
+        let fixture = "/tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php";
+        let driver = generated_driver();
+        assert!(
+            driver
+                .find(&format!("else require $root.'{fixture}'"))
+                .unwrap()
+                < driver.find("require $root.'/vendor/autoload.php'").unwrap()
+        );
+        assert!(driver.contains(&format!("[$class,$root.'{fixture}',NATIVE_CLASS_SHA256]")));
+        assert!(!driver.contains("/app/Services/Nzb/NzbArticleFingerprint.php"));
+    }
+    #[test]
+    fn archived_candidate_status_and_scope_survive_preflight_failure_for_both_coverages() {
+        let baseline = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        for coverage in ["screen", "full"] {
+            let options = parse(vec![
+                format!("--baseline={}", baseline.display()),
+                format!("--coverage={coverage}"),
+            ])
+            .unwrap();
+            let (report, invalid) =
+                preflight_failure(&options, &json!({}), &json!({}), "test_failure");
+            assert!(invalid);
+            assert_eq!(
+                report["candidate_status"],
+                "experimental_withdrawn_from_production"
+            );
+            assert_eq!(report["comparison_scope"], comparison_scope(coverage));
+            assert!(comparison_scope(coverage).contains("Production remains PHP"));
+            if coverage == "full" {
+                assert_eq!(report["protocol"]["version"], 4);
+                assert!(comparison_scope(coverage).contains("nine synthetic fixtures"));
+                assert!(comparison_scope(coverage).contains("p99 tails"));
+            } else {
+                assert_eq!(report["protocol"]["version"], 3);
+                assert!(
+                    comparison_scope(coverage).contains("five synthetic fixture median screen")
+                );
+            }
+        }
+    }
     #[test]
     fn ffi_candidate_disables_worker_startup_without_changing_baseline() {
         let baseline = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");

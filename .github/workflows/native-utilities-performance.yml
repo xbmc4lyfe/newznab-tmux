@@ -11,6 +11,7 @@ on:
       - 'docker/app/nzb-yenc-ffi/**'
       - 'app/Services/Nzb/NzbArticleFingerprint.php'
       - 'app/Services/Nzb/RustArticleFingerprintWorker.php'
+      - 'tests/Fixtures/nzb-article-fingerprint/**'
       - 'scripts/*benchmark*'
       - 'scripts/build-docs.py'
       - 'tests/Unit/test_docs_site.py'
@@ -21,11 +22,11 @@ on:
     inputs:
       pairs:
         default: '31'
-        description: Fingerprint common and uncommon screen pairs (1–5000)
+        description: Archived experimental fingerprint common and uncommon screen pairs (1–5000)
         required: true
       tail_pairs:
         default: ''
-        description: Optional uncommon fingerprint pairs (1000–5000); blank keeps the bounded screen
+        description: Optional archived experimental fingerprint uncommon pairs (1000–5000); blank keeps the bounded screen
         required: false
       cpu_pairs:
         default: '1000'
@@ -45,7 +46,7 @@ concurrency:
 
 jobs:
   compare:
-    name: ${{ matrix.kind }} (${{ matrix.runner }})
+    name: ${{ startsWith(matrix.kind, 'fingerprint-') && 'Experimental comparison' || 'CPU snapshot comparison' }} ${{ matrix.kind }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     strategy:
@@ -145,7 +146,7 @@ jobs:
             --hard-limits=utility-evidence/process-hard-limits.txt \
             --output=utility-evidence/resource-limits-before.json
           cp utility-evidence/resource-limits-before.json utility-evidence/resource-limits.json
-      - name: Compare complete public NZB fingerprint operation
+      - name: Compare archived experimental Rust fingerprint (withdrawn from production)
         if: startsWith(matrix.kind, 'fingerprint-')
         shell: bash
         run: |
@@ -165,7 +166,7 @@ jobs:
           set -e
           echo "$status" > "utility-evidence/$BENCHMARK_KIND-exit.txt"
           exit "$status"
-      - name: Compare synthetic CPU snapshot CLI including process startup
+      - name: Compare synthetic and exact Linux host CPU snapshot CLI including process startup
         if: matrix.kind == 'cpu-snapshot'
         shell: bash
         run: |
