@@ -91,7 +91,7 @@ REMAINING_SOURCES = {REMAINING_WRAPPER, "composer.json", "composer.lock", "docke
 
 CALLER_SOURCES |= VENDOR_SOURCE_PATHS | REMAINING_SOURCES | REMAINING_INSTRUMENTATION
 CALLER_SOURCES |= {'app/Services/Yenc/' + name + '.php' for name in (
-    'ArticleFrame', 'DecoderFactory', 'NativePayloadDecoder', 'PayloadDecoder',
+    'ArticleFrame', 'DecoderFactory', 'ExperimentalStrictArticleDecoder', 'NativePayloadDecoder', 'PayloadDecoder',
     'PhpPayloadDecoder', 'RawPayloadDecoder', 'YencPart')}
 LIMIT = 1024 * 1024
 

@@ -218,6 +218,10 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
         self.assertEqual(summary["provenance_status"], "verified_experiment")
         self.assertEqual(summary["status"], "experimental_measurement")
         self.assertEqual(summary["source_sha256"].get(strict_caller), "b" * 64)
+        spec = importlib.util.spec_from_file_location("pages_consumer", SCRIPT.with_name("benchmark-pages.py"))
+        pages = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pages)
+        pages.validate_summary(summary, {"head_sha": "d" * 40, "id": 123, "run_attempt": 2}, "profile", "linux-x64")
 
     def test_yenc_rejects_receipt_source_library_and_runtime_disagreements(self):
         bad_sources = dict(RUST_SOURCES)
