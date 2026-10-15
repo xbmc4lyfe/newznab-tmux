@@ -1,5 +1,6 @@
 # Written by bin/deploy-guard
 .deploy.lock
 .deploy.lock.claim/
+.deploy.lock.recovery-hold
 .deploy.log
 .deploy.stamp
