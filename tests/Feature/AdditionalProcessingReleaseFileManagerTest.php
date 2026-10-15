@@ -1513,7 +1513,9 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         self::assertSame(! $recoversMissingSet, $release->archive_retry_at !== null);
         self::assertSame($recoversMissingSet ? 0 : -1, (int) $release->haspreview);
         self::assertSame($recoversMissingSet ? 0 : -1, (int) $release->passwordstatus);
-        self::assertSame($recoversMissingSet ? 2 : 0, (int) $release->rarinnerfilecount);
+        self::assertSame(! $recoversMissingSet, $context->archiveSampleIncomplete);
+        self::assertCount($recoversMissingSet ? 2 : 1, $context->listedArchiveSets);
+        self::assertSame($recoversMissingSet ? 2 : 1, (int) $release->rarinnerfilecount);
         self::assertSame('Example', $release->searchname);
         self::assertNull($release->additional_pp_claim_token);
     }
@@ -1583,7 +1585,9 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         self::assertSame($expectRetry, $release->archive_retry_at !== null);
         self::assertSame($expectRetry ? -1 : 0, (int) $release->haspreview);
         self::assertSame($expectRetry ? -1 : 0, (int) $release->passwordstatus);
-        self::assertSame($expectRetry ? 0 : $target, (int) $release->rarinnerfilecount);
+        self::assertSame($expectRetry, $context->archiveSampleIncomplete);
+        self::assertCount($expectRetry ? $target - 1 : $target, $context->listedArchiveSets);
+        self::assertSame($expectRetry ? $target - 1 : $target, (int) $release->rarinnerfilecount);
         self::assertSame('Example', $release->searchname);
         self::assertNull($release->additional_pp_claim_token);
     }
