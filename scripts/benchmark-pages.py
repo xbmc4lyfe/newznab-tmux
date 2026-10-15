@@ -152,6 +152,13 @@ def validate_summary(summary, run, kind, runner):
 
 
 
+def measured_payload_mode(summary):
+    mode = summary.get('rust_payload_mode')
+    if summary.get('status') not in ('ok', 'useful_improvement', 'inconclusive', 'regression'):
+        return 'unknown'
+    return mode if mode in ('incumbent', 'experimental') else 'unknown'
+
+
 def coverage(root):
     payload_sources = {'payload_decoder', 'payload_decoder_x86', 'payload_decoder_arm'}
     diagnostic = {'nntp_body', 'nntp_headers', 'formats'}
@@ -296,6 +303,7 @@ def collect(sha, root, fetch=api, archive_download=download):
                         summary = read_summary(archive_download(artifact['id']))
                         validate_summary(summary, run, kind, runner)
                         result.update(summary)
+                        result['rust_payload_mode'] = measured_payload_mode(summary)
                         result['artifact_id'] = artifact['id']
                         result['workflow_status'] = info['status']
                     except (OSError, ValueError, KeyError, TypeError, RuntimeError, NotImplementedError, zipfile.BadZipFile):
@@ -343,7 +351,7 @@ def render(report):
     for row in report['results']:
         body.append(f'<details><summary>{escape(row["kind"])} · {escape(row["runner"])} · {escape(row.get("status", "unknown"))}</summary><p>{run_link(row)}. Evidence: {escape(row.get("evidence_type", "unavailable"))}; adoption qualification: not established.</p>')
         if row.get('kind') in ('cpp', 'php', 'profile'):
-            body.append('<p>Rust payload mode: ' + escape(row.get('rust_payload_mode', 'unknown')) + '.</p>')
+            body.append('<p>Rust payload mode: ' + escape(measured_payload_mode(row)) + '.</p>')
         if 'workflow_status' in row:
             body.append(f'<p>Overall workflow: {escape(row["workflow_status"])}</p>')
         body.append(measurement_table(row['rows']) if row['rows'] else '<p>No current measurement rows available.</p>')
@@ -356,7 +364,7 @@ def render(report):
         if historical.get('results'):
             body.append('<p>Executed source <code>' + escape(historical['head_sha']) + '</code>. ' + run_link(historical) + '.</p>')
             for row in historical['results']:
-                body.append('<h3>' + escape(row['runner']) + '</h3><p>Rust payload mode: ' + escape(row.get('rust_payload_mode', 'unknown')) + '.</p>' + measurement_table(row['rows']))
+                body.append('<h3>' + escape(row['runner']) + '</h3><p>Rust payload mode: ' + escape(measured_payload_mode(row)) + '.</p>' + measurement_table(row['rows']))
     body.append('<h2>Rust target coverage and priorities</h2><p>Next priorities: compare repeated native body/format scans through the full caller; extend NZB digest uncommon-tail coverage; then cover archive range parsers and sample planning. Newly added Rust source files appear automatically as gaps until their benchmark mapping is reviewed.</p><table><tr><th>Source target</th><th>Automated evidence</th><th>Scope / gap</th></tr>')
     for row in report['coverage']:
         body.append(f'<tr><td><code>{escape(row["target"])}</code></td><td>{escape(row["coverage"])}</td><td>{escape(row["detail"])}</td></tr>')

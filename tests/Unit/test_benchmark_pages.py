@@ -57,6 +57,12 @@ class PagesTest(unittest.TestCase):
             self.assertEqual(['php', 'cpp'], row['comparisons'])
             self.assertIn('separate from measured mode', row['detail'])
 
+    def test_failed_or_unsafe_mode_evidence_is_never_rendered_as_measured(self):
+        for status in ('invalid', 'partial', 'missing', 'failure', 'cancelled'):
+            self.assertEqual('unknown', pages.measured_payload_mode({'status': status, 'rust_payload_mode': 'incumbent'}))
+        self.assertEqual('unknown', pages.measured_payload_mode({'status': 'ok', 'rust_payload_mode': ['incumbent']}))
+        self.assertEqual('experimental', pages.measured_payload_mode({'status': 'inconclusive', 'rust_payload_mode': 'experimental'}))
+
     def run_row(self, **changes):
         return dict(id=12, run_attempt=2, head_sha=SHA, head_branch='master', event='push',
                     status='completed', conclusion='failure', head_repository={'full_name': pages.REPOSITORY}, **changes)
