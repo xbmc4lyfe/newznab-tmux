@@ -16,6 +16,7 @@ use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\Par2PacketAccumulator;
 use App\Services\Par2Processor;
+use App\Support\Par2DescriptorEvidence;
 use dariusiii\rarinfo\Par2Info;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
@@ -136,6 +137,128 @@ final class Par2InventoryPersistenceTest extends TestCase
         $processor->applyInventoryForRename($inventory, 42, 1, 0, static fn (): bool => true);
         $processor->applyInventoryForRename($inventory, 42, 1, 0, static fn (): bool => true);
         $this->assertSame(1, $this->database->getConnection()->table('releases')->where('id', 42)->value('rarinnerfilecount'));
+    }
+
+    #[DataProvider('descriptorBatchSizes')]
+    public function test_descriptor_sql_round_trips_are_bounded_by_chunks_and_replay(int $count): void
+    {
+        $this->seedRelease(42);
+        $snapshot = $this->snapshot();
+        $inventory = $this->inventory($count);
+        $connection = $this->database->getConnection();
+        $chunks = (int) ceil($count / 25);
+        $connection->enableQueryLog();
+        foreach ([false, true] as $replay) {
+            $connection->flushQueryLog();
+            $this->assertTrue(Par2DescriptorEvidence::remember($inventory, $snapshot));
+            $queries = $connection->getQueryLog();
+            $reads = array_values(array_filter($queries, static fn (array $query): bool => str_starts_with($query['query'], 'select * from "par2_descriptor_evidence"')));
+            $inserts = array_values(array_filter($queries, static fn (array $query): bool => str_starts_with($query['query'], 'insert into "par2_descriptor_evidence"')));
+            $this->assertCount($chunks, $reads);
+            $this->assertCount($replay ? 0 : $chunks, $inserts);
+            $this->assertCount(3 + ($replay ? 2 : 3) * $chunks, $queries);
+            foreach ($reads as $query) {
+                $this->assertStringContainsString('"release_guid" = ?', $query['query']);
+                $this->assertStringContainsString('HEX(release_guid) = ?', $query['query']);
+                $this->assertStringContainsString('"packet_checksum" in (', $query['query']);
+                $this->assertLessThanOrEqual(28, count($query['bindings']));
+            }
+            foreach ($inserts as $query) {
+                $this->assertLessThanOrEqual(25 * 13, count($query['bindings']));
+            }
+        }
+        $connection->disableQueryLog();
+        $this->assertSame($count, $connection->table('par2_descriptor_evidence')->count());
+    }
+
+    /** @return iterable<string, array{int}> */
+    public static function descriptorBatchSizes(): iterable
+    {
+        foreach ([0, 1, 25, 26, 51] as $count) {
+            yield (string) $count => [$count];
+        }
+    }
+
+    #[DataProvider('descriptorAbortCauses')]
+    public function test_descriptor_batch_abort_rolls_back_prior_chunks_and_stale_guid_cleanup(string $cause): void
+    {
+        $this->seedRelease(42);
+        $connection = $this->database->getConnection();
+        $this->assertTrue(Par2DescriptorEvidence::remember($this->inventory(), $this->snapshot()));
+        $before = $connection->table('par2_descriptor_evidence')->get()->all();
+        $connection->table('releases')->where('id', 42)->update(['guid' => 'replacement-guid']);
+        $snapshot = $this->snapshot();
+        $insertSizes = [];
+        $owned = true;
+        $connection->setEventDispatcher(new Dispatcher);
+        $connection->listen(function ($event) use ($connection, $cause, &$insertSizes, &$owned): void {
+            if (! str_starts_with($event->sql, 'insert into "par2_descriptor_evidence"')) {
+                return;
+            }
+            $insertSizes[] = count($event->bindings) / 13;
+            if (count($insertSizes) === 2) {
+                if ($cause === 'guard') {
+                    $owned = false;
+                } else {
+                    $connection->table('releases')->where('id', 42)->update(['name' => 'changed during append']);
+                }
+            }
+        });
+        $this->assertFalse(Par2DescriptorEvidence::remember($this->inventory(51), $snapshot, static function () use (&$owned): bool {
+            return $owned;
+        }));
+        $this->assertSame([25, 25], $insertSizes);
+        $this->assertEquals($before, $connection->table('par2_descriptor_evidence')->get()->all());
+        $this->assertSame($snapshot, $this->snapshot());
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function descriptorAbortCauses(): iterable
+    {
+        yield 'ownership loss' => ['guard'];
+        yield 'snapshot change' => ['snapshot'];
+    }
+
+    #[DataProvider('descriptorChecksumReuse')]
+    public function test_descriptor_checksum_reuse_is_checked_within_and_across_chunks(int $offset, bool $collision): void
+    {
+        $this->seedRelease(42);
+        $connection = $this->database->getConnection();
+        $this->assertTrue(Par2DescriptorEvidence::remember($this->inventory(), $this->snapshot()));
+        $before = $connection->table('par2_descriptor_evidence')->get()->all();
+        $connection->table('releases')->where('id', 42)->update(['guid' => 'replacement-guid']);
+        $inventory = $this->inventory(26);
+        // Fault injection bypasses accumulator validation to exercise checksum collision defence.
+        $packetsProperty = new \ReflectionProperty(Par2PacketAccumulator::class, 'packets');
+        $packets = $packetsProperty->getValue($inventory);
+        $descriptors = array_keys(array_filter($packets, static fn (string $packet): bool => substr($packet, 48, 16) === Par2Info::PACKET_FILEDESC));
+        $first = $descriptors[0];
+        $target = $descriptors[$offset];
+        $packets[$target] = $collision
+            ? substr_replace($packets[$target], substr($packets[$first], 16, 16), 16, 16)
+            : $packets[$first];
+        $packetsProperty->setValue($inventory, $packets);
+        if ($collision) {
+            try {
+                Par2DescriptorEvidence::remember($inventory, $this->snapshot());
+                $this->fail('A reused checksum with different descriptor bytes was accepted');
+            } catch (\RuntimeException $error) {
+                $this->assertStringContainsString('checksum identity', $error->getMessage());
+            }
+            $this->assertEquals($before, $connection->table('par2_descriptor_evidence')->get()->all());
+        } else {
+            $this->assertTrue(Par2DescriptorEvidence::remember($inventory, $this->snapshot()));
+            $this->assertSame(25, $connection->table('par2_descriptor_evidence')->count());
+        }
+    }
+
+    /** @return iterable<string, array{int, bool}> */
+    public static function descriptorChecksumReuse(): iterable
+    {
+        yield 'same chunk collision' => [1, true];
+        yield 'cross chunk collision' => [25, true];
+        yield 'same chunk exact replay' => [1, false];
+        yield 'cross chunk exact replay' => [25, false];
     }
 
     public function test_descriptor_evidence_persists_binary_padded_aliases_without_optional_collection_and_replays(): void
@@ -491,12 +614,12 @@ final class Par2InventoryPersistenceTest extends TestCase
         return $inventory;
     }
 
-    /** @return array{id:int,guid:string,name:?string,searchname:?string} */
+    /** @return array{id:int,guid:string,name:?string,searchname:?string,predb_id:int,isrenamed:int} */
     private function snapshot(): array
     {
         $row = (array) $this->database->getConnection()->table('releases')->where('id', 42)->first();
 
-        return array_intersect_key($row, array_flip(['id', 'guid', 'name', 'searchname']));
+        return array_intersect_key($row, array_flip(['id', 'guid', 'name', 'searchname', 'predb_id', 'isrenamed']));
     }
 
     private function countFiles(): int

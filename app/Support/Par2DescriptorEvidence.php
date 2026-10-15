@@ -33,28 +33,40 @@ final class Par2DescriptorEvidence
                 }
                 DB::table('par2_descriptor_evidence')->where('releases_id', $snapshot['id'])
                     ->whereRaw('HEX(release_guid) <> ?', [strtoupper(bin2hex($snapshot['guid']))])->delete();
-                foreach ($inventory->descriptors() as $descriptor) {
-                    if ($guard !== null && ! $guard()) {
-                        throw $aborted;
+                foreach (array_chunk($inventory->descriptors(), 25) as $descriptors) {
+                    $rows = [];
+                    foreach ($descriptors as $descriptor) {
+                        if ($guard !== null && ! $guard()) {
+                            throw $aborted;
+                        }
+                        $row = [
+                            'releases_id' => $snapshot['id'], 'release_guid' => $snapshot['guid'],
+                            'packet_checksum' => $descriptor['packet_checksum'],
+                            'recovery_set_id' => $descriptor['recovery_set_id'], 'file_id' => $descriptor['file_id'],
+                            'full_md5' => $descriptor['hash'], 'hash16k' => $descriptor['hash_16K'],
+                            'file_size' => $descriptor['size_decimal'],
+                            'raw_filename_base64' => base64_encode($descriptor['filename_bytes']),
+                            'descriptor_proof_version' => self::PROOF_VERSION, 'classification' => 'unknown',
+                            'classification_version' => 0, 'classification_provenance' => 'unclassified',
+                        ];
+                        $checksum = $descriptor['packet_checksum'];
+                        if (isset($rows[$checksum]) && $rows[$checksum] !== $row) {
+                            throw new RuntimeException('PAR2 descriptor checksum identity contains different evidence.');
+                        }
+                        $rows[$checksum] = $row;
                     }
-                    $row = [
-                        'releases_id' => $snapshot['id'], 'release_guid' => $snapshot['guid'],
-                        'packet_checksum' => $descriptor['packet_checksum'],
-                        'recovery_set_id' => $descriptor['recovery_set_id'], 'file_id' => $descriptor['file_id'],
-                        'full_md5' => $descriptor['hash'], 'hash16k' => $descriptor['hash_16K'],
-                        'file_size' => $descriptor['size_decimal'],
-                        'raw_filename_base64' => base64_encode($descriptor['filename_bytes']),
-                        'descriptor_proof_version' => self::PROOF_VERSION, 'classification' => 'unknown',
-                        'classification_version' => 0, 'classification_provenance' => 'unclassified',
-                    ];
                     $existing = DB::table('par2_descriptor_evidence')->where('releases_id', $snapshot['id'])
+                        ->where('release_guid', $snapshot['guid'])
                         ->whereRaw('HEX(release_guid) = ?', [strtoupper(bin2hex($snapshot['guid']))])
-                        ->where('packet_checksum', $descriptor['packet_checksum'])->first();
-                    if ($existing === null) {
-                        DB::table('par2_descriptor_evidence')->insert($row);
-                    } else {
+                        ->whereIn('packet_checksum', array_keys($rows))->get();
+                    foreach ($existing as $stored) {
+                        $checksum = strtolower($stored->packet_checksum);
+                        if (! isset($rows[$checksum])) {
+                            throw new RuntimeException('PAR2 descriptor checksum identity contains different evidence.');
+                        }
+                        $row = $rows[$checksum];
                         foreach ($row as $column => $value) {
-                            $actual = $existing->{$column};
+                            $actual = $stored->{$column};
                             if (is_int($value)) {
                                 $actual = (int) $actual;
                             }
@@ -62,6 +74,10 @@ final class Par2DescriptorEvidence
                                 throw new RuntimeException('PAR2 descriptor checksum identity contains different evidence.');
                             }
                         }
+                        unset($rows[$checksum]);
+                    }
+                    if ($rows !== []) {
+                        DB::table('par2_descriptor_evidence')->insert(array_values($rows));
                     }
                     if (($guard !== null && ! $guard()) || ! Par2FileHashEvidence::snapshotMatches(
                         DB::table('releases')->where('id', $snapshot['id'])->lockForUpdate()->first(), $snapshot,
