@@ -19,6 +19,8 @@ Modernization is incremental. The application currently uses Laravel 13, Livewir
 
 See the [fork's commit history](https://github.com/xbmc4lyfe/newznab-tmux/commits/master/) for individual changes.
 
+The [Rust benchmark dashboard](https://xbmc4lyfe.github.io/newznab-tmux/) refreshes on every master build and benchmark completion, including reruns. It reports current-commit yEnc comparisons, BODY/fingerprint profiles, release rendering and Rust target coverage gaps. Median screens and diagnostic profiles do not establish the project's 1.5× common-path and uncommon p99 adoption requirements. Failed, missing and inconclusive measurements remain visible; raw evidence is linked through Actions and retained for 14 days. Run the existing performance workflows for local/manual investigations; those experiments are excluded from the current-master dashboard.
+
 ## Run the local Docker Compose stack
 
 The stack in [`docker/docker-compose.yml`](docker/docker-compose.yml) includes the web app, tmux indexer, Horizon workers, scheduler, MariaDB, Redis, Manticore, Caddy, Mailpit, and Prometheus/Grafana monitoring. Images build the PHP dependencies, frontend assets, and native decoder for you.
