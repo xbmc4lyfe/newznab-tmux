@@ -37,8 +37,12 @@ fn digest(bytes: &[u8]) -> String {
 fn read_regular(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
     // Nonblocking avoids a swapped FIFO blocking open; NOFOLLOW rejects a
     // symlink at the final component. Metadata is checked on the opened file.
-    #[cfg(target_os = "linux")]
-    const FLAGS: i32 = 0x20000 | 0x800;
+    // Linux arm64 overrides the asm-generic O_NOFOLLOW bit for AArch32 ABI
+    // compatibility (arch/arm64/include/uapi/asm/fcntl.h).
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    const FLAGS: i32 = (1 << 15) | (1 << 11);
+    #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+    const FLAGS: i32 = (1 << 17) | (1 << 11);
     #[cfg(target_os = "macos")]
     const FLAGS: i32 = 0x100 | 0x4;
     let file = OpenOptions::new()
@@ -169,6 +173,8 @@ fn run_child_mode(
             break;
         },
     }
+    // Output-limit classification must retain the independent timeout cause.
+    let timed_out = status == "timeout";
     let stdout_bytes = fs::metadata(&stdout_path).map_err(|e| e.to_string())?.len();
     let stderr_bytes = fs::metadata(&stderr_path).map_err(|e| e.to_string())?.len();
     let oversized =
@@ -196,7 +202,7 @@ fn run_child_mode(
         };
     }
     Ok(
-        json!({"status":status,"exit_code":exit_code,"direct_child_reaped":reaped,
+        json!({"status":status,"timed_out":timed_out,"exit_code":exit_code,"direct_child_reaped":reaped,
         "cleanup_scope":"direct frozen worker only; no process-tree termination claim",
         "errors":errors,"command":argv,"result":result,"stdout_path":stdout_path,"stderr_path":stderr_path,
         "stdout_bytes":stdout_bytes,"stderr_bytes":stderr_bytes,"output_budget_exceeded":oversized,
@@ -751,6 +757,10 @@ where
 {
     let mut eligible_pairs = 0;
     let mut invalid_pairs = 0;
+    let mut stop_after_timeout = false;
+    let mut launched_observations = 0;
+    let mut unexecuted_observations = 0;
+    let mut first_unexecuted_observation_index = None;
     let mut groups = std::collections::BTreeMap::<(String, String), (Vec<f64>, usize)>::new();
     for step in steps {
         let fixture = context
@@ -784,9 +794,23 @@ where
         };
         let mut members = std::collections::BTreeMap::new();
         for (position, slot) in step.order.iter().enumerate() {
-            let record = runner(fixture, &step.operation, step.sample, slot).unwrap_or_else(
-                |error| json!({"status":"executor_error","error":error,"result":null}),
-            );
+            let record = if stop_after_timeout {
+                first_unexecuted_observation_index
+                    .get_or_insert(launched_observations + unexecuted_observations);
+                unexecuted_observations += 1;
+                json!({"status":"not_executed","reason":"earlier_child_timeout",
+                    "launched":false,"direct_child_reaped":null,"result":null})
+            } else {
+                launched_observations += 1;
+                runner(fixture, &step.operation, step.sample, slot).unwrap_or_else(
+                    |error| json!({"status":"executor_error","error":error,"result":null}),
+                )
+            };
+            // One timeout already makes this control incomplete. Preserve every
+            // remaining slot without launching more potentially hung children.
+            if record["timed_out"] == true || record["status"] == "timeout" {
+                stop_after_timeout = true;
+            }
             emit(
                 out,
                 &json!({"type":"observation","comparison_kind":"rust-aa-control","fixture":fixture.name,
@@ -825,7 +849,12 @@ where
             "paired_ratios":ratios,"noise_equivalence_qualified":false,
             "basis":"descriptive paired control observations only; no formal noise-band or adoption verdict"})
     }).collect();
-    Ok(json!({"eligible_pairs":eligible_pairs,"invalid_pairs":invalid_pairs,"summaries":summaries}))
+    Ok(
+        json!({"eligible_pairs":eligible_pairs,"invalid_pairs":invalid_pairs,"summaries":summaries,
+        "launched_observations":launched_observations,"unexecuted_observations":unexecuted_observations,
+        "first_unexecuted_observation_index":first_unexecuted_observation_index,
+        "timeout_failure_budget":1,"timeout_circuit_open":stop_after_timeout}),
+    )
 }
 
 fn kernel_verified(record: &Value, sha: &str) -> bool {
@@ -1141,6 +1170,8 @@ fn execute_owned(
         "counter_scope":"dedicated snapshots bracket control scheduling and subprocess overhead; worker getrusage separately brackets its timed batch",
         "cleanup_scope":"direct worker only; owned frozen worker has no subprocess spawning path",
         "per_child_retained_file_limit_bytes":RETAINED_OUTPUT_CAP,
+        "timeout_failure_budget":1,
+        "timeout_failure_policy":"after the first worker timeout, retain all remaining scheduled slots as unexecuted failures; final CPU and identity checks still run",
         "resource_limit_scope":"each child has RLIMIT_FSIZE and disabled core dumps; parent limits unchanged; includes child-written CPU endpoint files",
         "library_pairing":"both roles use the same library bytes and backend rust; each pair requires both observations",
         "fixture_label_basis":"ordinary/heavy labels and expected sizes are declarations from bound preparation manifests; bytes are frozen and independently checked by the worker",
@@ -2078,6 +2109,125 @@ mod tests {
             assert_eq!(failures.last().unwrap()["type"], "run_failure");
             assert!(failures.iter().all(|r| r["type"] != "observation"));
         }
+    }
+
+    #[test]
+    fn first_worker_timeout_stops_launches_but_retains_every_scheduled_slot() {
+        let scratch = Scratch::new();
+        let fixtures = vec![Fixture {
+            name: "fixture".into(),
+            data_path: "/data".into(),
+            article_path: "/article".into(),
+            preparation_manifest_sha256: "manifest".into(),
+            data_sha256: "data".into(),
+            article_sha256: "article".into(),
+            decoded_bytes: 8,
+            crc32: 0x12345678,
+            crc_seed: 0x11111111,
+        }];
+        let context = ScheduleContext {
+            fixtures: &fixtures,
+            library_sha: "library",
+            worker_sha: "worker",
+            iterations: 8,
+        };
+        let steps: Vec<_> = (0..3)
+            .map(|sample| Step {
+                fixture_index: 0,
+                operation: "decode-lined".into(),
+                sample,
+                order: ["control_a", "control_b"],
+            })
+            .collect();
+        let path = scratch.0.join("timeout-observations.jsonl");
+        let mut out = exclusive(&path).unwrap();
+        let mut calls = 0;
+        let summary = run_schedule(&steps, &context, &mut out, |_, _, _, _| {
+            calls += 1;
+            Ok(json!({"status":"timeout","direct_child_reaped":true,"result":null}))
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(summary["invalid_pairs"], 3);
+        assert_eq!(summary["eligible_pairs"], 0);
+        assert_eq!(summary["launched_observations"], 1);
+        assert_eq!(summary["unexecuted_observations"], 5);
+        let raw = fs::read_to_string(&path).unwrap();
+        let records: Vec<Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["type"] == "observation")
+                .count(),
+            6
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["receipt"]["status"] == "not_executed")
+                .count(),
+            5
+        );
+        assert!(
+            records
+                .iter()
+                .filter(|r| r["type"] == "pair")
+                .all(|r| r["eligible"] == false && r["latency_ratio_control_a_over_b"].is_null())
+        );
+    }
+
+    #[test]
+    fn output_cap_does_not_hide_timeout_from_schedule_circuit() {
+        let scratch = Scratch::new();
+        let fixtures = vec![Fixture {
+            name: "fixture".into(),
+            data_path: "/data".into(),
+            article_path: "/article".into(),
+            preparation_manifest_sha256: "manifest".into(),
+            data_sha256: "data".into(),
+            article_sha256: "article".into(),
+            decoded_bytes: 8,
+            crc32: 0x12345678,
+            crc_seed: 0x11111111,
+        }];
+        let context = ScheduleContext {
+            fixtures: &fixtures,
+            library_sha: "library",
+            worker_sha: "worker",
+            iterations: 8,
+        };
+        let steps = [Step {
+            fixture_index: 0,
+            operation: "decode-lined".into(),
+            sample: 0,
+            order: ["control_a", "control_b"],
+        }];
+        let mut out = exclusive(&scratch.0.join("observations.jsonl")).unwrap();
+        let mut calls = 0;
+        let mut receipts = Vec::new();
+        let summary = run_schedule(&steps, &context, &mut out, |_, _, _, _| {
+            let prefix = scratch.0.join(format!("worker-{calls}"));
+            calls += 1;
+            let receipt = run_child(
+                Command::new("/bin/sh").args(["-c", "head -c 65536 /dev/zero; exec sleep 10"]),
+                &prefix,
+                Duration::from_secs(1),
+            )?;
+            receipts.push(receipt.clone());
+            Ok(receipt)
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "an output cap must not hide an actual timeout");
+        assert_eq!(receipts[0]["status"], "output_limit_reached");
+        assert_eq!(receipts[0]["timed_out"], true);
+        assert_eq!(receipts[0]["stdout_bytes"], 65536);
+        assert_eq!(receipts[0]["direct_child_reaped"], true);
+        assert_eq!(summary["unexecuted_observations"], 1);
+        assert_eq!(summary["invalid_pairs"], 1);
+        assert_eq!(summary["eligible_pairs"], 0);
     }
 
     #[test]
