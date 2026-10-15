@@ -11,7 +11,9 @@ final readonly class OriginalFilenameEvidence
 
     public string $stem;
 
-    private string $literal;
+    private string $normalizedLiteral;
+
+    private bool $literalIsAscii;
 
     public function __construct(string $filename)
     {
@@ -24,7 +26,8 @@ final readonly class OriginalFilenameEvidence
             if ($payload === null || strpbrk($payload, '/\\') !== false) {
                 $this->basename = '';
                 $this->stem = '';
-                $this->literal = '';
+                $this->normalizedLiteral = '';
+                $this->literalIsAscii = false;
 
                 return;
             }
@@ -33,7 +36,9 @@ final readonly class OriginalFilenameEvidence
         $stem = (new FileNameCleaner)->stripFileSuffixes($this->basename);
         // Strip wrappers first, then decode only the protocol's separator encoding.
         $this->stem = (new NzbSplitUnwrapper)->literalPayload($stem) ?? $stem;
-        $this->literal = $unwrapper->literalPayload($this->basename) ?? $this->basename;
+        $literal = $unwrapper->literalPayload($this->basename) ?? $this->basename;
+        $this->literalIsAscii = preg_match('/\A[\x00-\x7f]*\z/D', $literal) === 1;
+        $this->normalizedLiteral = $this->literalIsAscii ? strtolower($literal) : PredbSearchDocument::exactValue($literal);
     }
 
     public function accepts(string $title, string $alias = ''): bool
@@ -74,8 +79,14 @@ final readonly class OriginalFilenameEvidence
     private function acceptsCanonical(string $title): bool
     {
         $identity = PredbSearchDocument::exactValue($title);
-        $literal = PredbSearchDocument::exactValue($this->literal);
-        if ($identity === '' || ! str_starts_with($literal, $identity)) {
+        $literal = $this->normalizedLiteral;
+        // Lowercasing the complete filename can change contextual characters in its title
+        // (Greek final sigma before an extension). Use it only to locate a candidate byte
+        // boundary; identity is checked on the isolated raw prefix below.
+        if ($identity === '' || strlen($literal) < strlen($identity)) {
+            return false;
+        }
+        if (! str_starts_with($literal, $identity) && $this->literalIsAscii) {
             return false;
         }
         $foldedSuffix = substr($literal, strlen($identity));
@@ -86,13 +97,15 @@ final readonly class OriginalFilenameEvidence
         }
         $suffixLength = strlen($foldedSuffix);
         $suffix = $suffixLength === 0 ? '' : substr($this->basename, -$suffixLength);
-        if (preg_match('/\A[\x00-\x7f]*\z/D', $suffix) !== 1
-            || (new FileNameCleaner)->stripFileSuffixes('Title'.$suffix) !== 'Title') {
+        if (preg_match('/\A[\x00-\x7f]*\z/D', $suffix) !== 1) {
             return false;
         }
         $prefix = $suffixLength === 0 ? $this->basename : substr($this->basename, 0, -$suffixLength);
         $prefix = (new NzbSplitUnwrapper)->literalPayload($prefix) ?? $prefix;
+        if (PredbSearchDocument::exactValue($prefix) !== $identity) {
+            return false;
+        }
 
-        return PredbSearchDocument::exactValue($prefix) === $identity;
+        return (new FileNameCleaner)->stripFileSuffixes('Title'.$suffix) === 'Title';
     }
 }

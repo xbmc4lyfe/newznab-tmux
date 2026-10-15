@@ -146,6 +146,12 @@ final class CompleteTitleSuffixTest extends TestCase
     public static function additionalRows(): array
     {
         return [
+            'contextual Greek sigma payload' => ['Exact.Release.ΟΣ.mkv', 'Exact.Release.ΟΣ', false, 8],
+            'contextual Greek sigma archive' => ['Exact.Release.ΟΣ.rar', 'Exact.Release.ΟΣ', false, 8],
+            'contextual Greek sigma lowercase canonical' => ['Exact.Release.ΟΣ.mkv', 'Exact.Release.Ος', false, 8],
+            'contextual Greek sigma distinguishes nonfinal canonical' => ['Exact.Release.ΟΣ.mkv', 'Exact.Release.Οσ', false, 0],
+            'contextual Greek sigma wrapped parity' => ['Outer__NZBSPLIT__abcdef01__NZBSPLIT__Exact_Release_ΟΣ.vol00+01.par2', 'Exact.Release.ΟΣ', false, 8],
+            'contextual Greek sigma wrapped transport' => ['Outer__NZBSPLIT__abcdef01__NZBSPLIT__Exact_Release_ΟΣ.rar yEnc (1)', 'Exact.Release.ΟΣ', false, 8],
             'archive trailer zip' => ['Outer__NZBSPLIT__abcdef01__NZBSPLIT__Exact_Release_2026-GRP.zip yEnc (1/42)', 'Exact.Release.2026-GRP', false, 8],
             'archive trailer z01' => ['Outer__NZBSPLIT__abcdef01__NZBSPLIT__Exact_Release_2026-GRP.z01 yEnc (1/42)', 'Exact.Release.2026-GRP', false, 8],
             'archive trailer gz' => ['Outer__NZBSPLIT__abcdef01__NZBSPLIT__Exact_Release_2026-GRP.gz yEnc (1/42)', 'Exact.Release.2026-GRP', false, 8],
@@ -248,5 +254,42 @@ final class CompleteTitleSuffixTest extends TestCase
         self::assertSame($long, $release->fresh()->searchname);
         self::assertSame([$filename], DB::table('release_files')->pluck('name')->all());
         self::assertNull($updates->lastCommittedIdentity());
+    }
+
+    public static function contextualCanonicalPriorityRows(): array
+    {
+        return [[false, false], [false, true], [true, false], [true, true]];
+    }
+
+    #[DataProvider('contextualCanonicalPriorityRows')]
+    public function test_contextual_casefold_keeps_canonical_priority_over_alias(bool $reverse, bool $opaque): void
+    {
+        $this->createPar2RenameSchema();
+        DB::statement('ALTER TABLE predb ADD COLUMN filename TEXT');
+        config(['nntmux.echocli' => false]);
+        Event::fake([ReleaseNameFixed::class]);
+        $title = 'Exact.Release.ΟΣ';
+        $filename = $title.'.mkv';
+        $release = $this->pendingPar2Release(['searchname' => $opaque ? 'Opaque.Original.Release' : $title, 'predb_id' => 0]);
+        $hits = [
+            ['id' => 7, 'title' => $title, 'filename' => ''],
+            ['id' => 8, 'title' => 'Unrelated.Canonical.Release', 'filename' => $filename.'.mkv'],
+        ];
+        if ($reverse) {
+            $hits = array_reverse($hits);
+        }
+        DB::table('predb')->insert($hits);
+        DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
+        Search::shouldReceive('searchPredb')->andReturn($hits);
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $category = $this->createStub(CategorizationService::class);
+        $category->method('determineCategory')->willReturn(['categories_id' => 8000]);
+        $updates = new ReleaseUpdateService($category, searchSyncCoordinator: $sync);
+        (new NameFixingService($updates))->getPreFileNames(['prefile', '1']);
+        self::assertSame(7, $release->fresh()->predb_id);
+        self::assertSame($title, $release->fresh()->searchname);
+        self::assertSame([$filename], DB::table('release_files')->pluck('name')->all());
+        self::assertNotNull($updates->lastCommittedIdentity());
     }
 }
