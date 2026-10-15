@@ -13,6 +13,11 @@ experimental-strict-article = []
 name = "nzbyenc"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "benchmark-strict-article-statistics"
+path = "src/bin/benchmark-strict-article-statistics.rs"
+required-features = ["experimental-strict-article"]
+
 [dependencies]
 md-5 = "0.10"
 nzb-decode = "=0.1.3"

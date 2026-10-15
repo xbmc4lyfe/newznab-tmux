@@ -36,7 +36,7 @@ on:
       comparison:
         description: Baseline to compare against Rust
         type: choice
-        options: [all, php, cpp, profile, processing]
+        options: [all, php, cpp, profile, processing, strict-article-experiment]
         default: all
       samples:
         description: Matched fresh-process pairs per fixture stratum
@@ -68,7 +68,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: yenc-performance-${{ github.ref }}
+  group: yenc-performance-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && inputs.comparison == 'strict-article-experiment' && '-strict-article-experiment' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -701,4 +701,230 @@ jobs:
           name: rust-php-performance-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: benchmark-evidence/
           if-no-files-found: warn
+          retention-days: 14
+
+  strict-article-experiment:
+    if: github.event_name == 'workflow_dispatch' && inputs.comparison == 'strict-article-experiment'
+    # Manual experiment only; these disposable runners never publish public results.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      RUST_TOOLCHAIN: '1.98.0'
+      STRICT_RUNNER: ${{ matrix.runner }}
+      STRICT_SAMPLES: ${{ inputs.samples || '31' }}
+      STRICT_SEED: ${{ inputs.seed || '20261013' }}
+      RUSTFLAGS: ''
+      CARGO_ENCODED_RUSTFLAGS: ''
+    steps:
+      - name: Reserve owned strict article evidence
+        shell: bash
+        run: |
+          strict_root="$RUNNER_TEMP/strict-article-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$STRICT_RUNNER"
+          mkdir -m 700 -- "$strict_root"
+          # Ownership is published only after exclusive reservation succeeds.
+          printf 'STRICT_ROOT=%s\nSTRICT_OWNED=true\n' "$strict_root" >> "$GITHUB_ENV"
+          mkdir -- "$strict_root/setup"
+          printf 'reserved\n' > "$strict_root/setup/last-phase"
+          cat > "$strict_root/setup/phase.sh" <<'SH'
+          strict_phase="$1"
+          printf '%s\n' "$strict_phase" > "$STRICT_ROOT/setup/last-phase"
+          trap 'strict_exit=$?; printf "%s\n" "$strict_exit" > "$STRICT_ROOT/setup/$strict_phase.exit-code"; exit "$strict_exit"' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          exec > >(tee "$STRICT_ROOT/setup/$strict_phase.stdout") 2> >(tee "$STRICT_ROOT/setup/$strict_phase.stderr" >&2)
+          SH
+
+      - name: Check out experiment source
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up isolated PHP CLI
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: dom, curl, ffi, intl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite
+          coverage: none
+
+      - name: Install locked experiment dependencies without application boot
+        shell: bash
+        run: |
+          source "$STRICT_ROOT/setup/phase.sh" dependencies
+          composer install --prefer-dist --no-interaction --no-progress --no-scripts
+          python3 tests/Unit/test_yenc_strict_article_workflow.py
+
+      - name: Build pinned strict article C++ baseline
+        shell: bash
+        run: |
+          source "$STRICT_ROOT/setup/phase.sh" cpp-build
+          bash scripts/build-rapidyenc.sh
+
+      - name: Build explicit strict article experiment
+        shell: bash
+        run: |
+          source "$STRICT_ROOT/setup/phase.sh" rust-build
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --features experimental-strict-article --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          argv = ['cargo', '+' + os.environ['RUST_TOOLCHAIN'], 'build', '--release', '--locked',
+                  '--features', 'experimental-strict-article', '--manifest-path', 'docker/app/nzb-yenc-ffi/Cargo.toml']
+          receipt = {'argv': argv, 'exit_code': None,
+                     'environment': {key: os.environ.get(key) for key in
+                                     ['RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_BUILD_RUSTFLAGS',
+                                      'CARGO_PROFILE_RELEASE_OPT_LEVEL', 'CARGO_PROFILE_RELEASE_LTO',
+                                      'CARGO_PROFILE_RELEASE_CODEGEN_UNITS', 'CARGO_PROFILE_RELEASE_DEBUG',
+                                      'CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS', 'CARGO_BUILD_TARGET', 'CARGO_TARGET_DIR',
+                                      'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'CARGO_PROFILE_RELEASE_PANIC']}}
+          try:
+              receipt['exit_code'] = subprocess.run(argv, check=False).returncode
+          finally:
+              with (pathlib.Path(os.environ['STRICT_ROOT']) / 'setup/rust-build.json').open('x') as output:
+                  json.dump(receipt, output, indent=2)
+                  output.write('\n')
+          sys.exit(receipt['exit_code'])
+          PY
+
+      - name: Record strict article runtime and require designated SIMD
+        shell: bash
+        run: |
+          source "$STRICT_ROOT/setup/phase.sh" runtime-preflight
+          python3 - <<'PY'
+          import ctypes, hashlib, json, os, pathlib, subprocess, sys
+          root = pathlib.Path.cwd()
+          setup = pathlib.Path(os.environ['STRICT_ROOT']) / 'setup'
+          def run(*argv):
+              return subprocess.check_output(argv, text=True, stderr=subprocess.STDOUT).strip()
+          def digest(path):
+              return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+          def save(name, data):
+              with (setup / name).open('x') as output:
+                  json.dump(data, output, indent=2)
+                  output.write('\n')
+          rust = root / 'docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so'
+          cpp = root / 'storage/app/rapidyenc/librapidyenc.so'
+          decoder = ctypes.CDLL(str(rust))
+          decoder.nntmux_yenc_payload_kernel_v1.argtypes = []
+          decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          kernel = decoder.nntmux_yenc_payload_kernel_v1()
+          # Symbol presence is followed by real PHP capability and guard tests.
+          strict_symbol = getattr(decoder, 'nntmux_yenc_decode_strict_article_v1', None) is not None
+          kernel_names = {0: 'scalar', 1: 'ssse3', 2: 'avx2', 3: 'avx512-vbmi2', 4: 'neon'}
+          expected = {'X64': 3, 'ARM64': 4}.get(os.environ.get('RUNNER_ARCH'))
+          archives = {path.name: digest(path) for path in sorted((root / 'storage/app/rapidyenc').glob('rapidyenc-*.tar.gz'))}
+          pinned_archives = {'rapidyenc-480bd7b5896f8b3edecc721d23f1384d767ffe2f.tar.gz':
+                             'bd5eff1e978672af4ebaacde837270a679808bbc12dc15bd6acf7c83d94baa16'}
+          manifest = {
+              'git_head': run('git', 'rev-parse', 'HEAD'),
+              'rust_features': ['experimental-strict-article'], 'rust_payload_mode': 'incumbent',
+              'rust_strict_article_mode': 'experimental', 'strict_article_symbol_present': strict_symbol,
+              'runner_arch': os.environ.get('RUNNER_ARCH'), 'runner_label': os.environ['STRICT_RUNNER'],
+              'runner_image_os': os.environ.get('ImageOS'), 'runner_image_version': os.environ.get('ImageVersion'),
+              'github_run_id': os.environ.get('GITHUB_RUN_ID'), 'github_run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
+              'uname': run('uname', '-a'), 'cpu': run('lscpu'), 'php': run('php', '-v'),
+              'cpp_compiler': run('c++', '--version'), 'cmake': run('cmake', '--version'),
+              'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
+              'cargo': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'cargo', '-V'),
+              'rust_build_receipt': json.loads((setup / 'rust-build.json').read_text()),
+              'rust_source_sha256': {str(path.relative_to(root)): digest(path) for path in sorted((root / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs'))},
+              'cargo_toml_sha256': digest(root / 'docker/app/nzb-yenc-ffi/Cargo.toml'),
+              'cargo_lock_sha256': digest(root / 'docker/app/nzb-yenc-ffi/Cargo.lock'),
+              'cpp_build_script_sha256': digest(root / 'scripts/build-rapidyenc.sh'),
+              'cpp_source_revision': '480bd7b5896f8b3edecc721d23f1384d767ffe2f',
+              'cpp_source_archive_sha256': archives,
+              'cpp_library_sha256': digest(cpp), 'rust_library_sha256': digest(rust),
+              'statistics_binary_sha256': digest(root / 'docker/app/nzb-yenc-ffi/target/release/benchmark-strict-article-statistics'),
+              'rust_payload_kernel': {'id': kernel, 'name': kernel_names.get(kernel, 'unknown')},
+              'cpu_context_scope': 'diagnostic_endpoints_only', 'adoption_qualified': False,
+          }
+          save('runtime.json', manifest)
+          qualified = expected is not None and kernel == expected and strict_symbol and archives == pinned_archives
+          save('hardware-qualification.json', {
+              'status': 'qualified' if qualified else 'unsupported_hardware_or_build',
+              'runner_arch': manifest['runner_arch'], 'required_kernel_id': expected,
+              'observed_kernel': manifest['rust_payload_kernel'], 'strict_article_symbol_present': strict_symbol,
+              'pinned_cpp_archive_verified': archives == pinned_archives,
+              'basis': 'Runtime selector witness only; CPU endpoints are diagnostic, not hardened host qualification.',
+              'adoption_qualified': False,
+          })
+          if not qualified:
+              sys.exit('Designated SIMD/strict capability/pinned source preflight failed; evidence retained.')
+          PY
+
+      - name: Verify strict capability and incumbent caller parity
+        shell: bash
+        run: |
+          source "$STRICT_ROOT/setup/phase.sh" php-parity
+          YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
+              --filter='YencStrictArticleExperimentTest|YencStrictArticleWorkerTest'
+          for backend in cpp rust; do
+            if [[ "$backend" == cpp ]]; then
+              library="$GITHUB_WORKSPACE/storage/app/rapidyenc/librapidyenc.so"
+            else
+              library="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so"
+            fi
+            YENC_NATIVE_LIBRARY="$library" php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
+              --filter='YencNativeDecoderTest|YencServiceTest|NNTPBodyDecodingTest'
+          done
+
+      - name: Capture diagnostic CPU endpoint before strict article comparison
+        shell: bash
+        run: |
+          source "$STRICT_ROOT/setup/phase.sh" cpu-before
+          docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output "$STRICT_ROOT/setup/cpu-before.json"
+
+      - name: Run isolated strict article comparison
+        shell: bash
+        run: |
+          source "$STRICT_ROOT/setup/phase.sh" comparison
+          timeout --signal=TERM --kill-after=10s 4500s \
+            php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-yenc-strict-article.php \
+              --cpp-native="$GITHUB_WORKSPACE/storage/app/rapidyenc/librapidyenc.so" \
+              --rust-native="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+              --runtime-manifest="$STRICT_ROOT/setup/runtime.json" --output-dir="$STRICT_ROOT/comparison" \
+              --samples="$STRICT_SAMPLES" --p99-samples=2000 --seed="$STRICT_SEED" --timeout=30 \
+              --statistics-bin="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/benchmark-strict-article-statistics"
+
+      - name: Capture diagnostic CPU endpoint after strict article comparison
+        if: always() && env.STRICT_OWNED == 'true' && env.STRICT_ROOT != ''
+        shell: bash
+        run: |
+          if [[ -f "$STRICT_ROOT/setup/cpu-before.json" ]]; then
+            source "$STRICT_ROOT/setup/phase.sh" cpu-after
+            docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot --output "$STRICT_ROOT/setup/cpu-after.json"
+          fi
+
+      - name: Retain strict article job status
+        if: always() && env.STRICT_OWNED == 'true' && env.STRICT_ROOT != ''
+        shell: bash
+        env:
+          STRICT_JOB_STATUS: ${{ job.status }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['STRICT_ROOT'])
+          phase_path = root / 'setup/last-phase'
+          phase = phase_path.read_text().strip() if phase_path.is_file() else None
+          exit_path = root / 'setup' / (phase + '.exit-code') if phase else None
+          code = int(exit_path.read_text()) if exit_path and exit_path.is_file() else None
+          with (root / 'job-status.json').open('x') as output:
+              json.dump({'job_status': os.environ['STRICT_JOB_STATUS'], 'last_recorded_phase': phase,
+                         'last_phase_exit_code': code, 'cpu_context_scope': 'diagnostic_endpoints_only',
+                         'adoption_qualified': False}, output, indent=2)
+              output.write('\n')
+          PY
+
+      - name: Retain strict article evidence
+        if: always() && env.STRICT_OWNED == 'true' && env.STRICT_ROOT != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: yenc-strict-article-experiment-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.STRICT_ROOT }}/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 14
