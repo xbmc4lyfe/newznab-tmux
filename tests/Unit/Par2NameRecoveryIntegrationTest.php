@@ -95,6 +95,7 @@ final class Par2NameRecoveryIntegrationTest extends TestCase
         $container->instance('db.schema', $schema);
         (require base_path('database/migrations/2026_10_12_010315_create_par_file_hash_evidence_tables.php'))->up();
         (require base_path('database/migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->up();
+        (require base_path('database/migrations/2026_10_15_190000_create_par2_descriptor_evidence_table.php'))->up();
         $this->database->getConnection()->table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.binaries.test']);
     }
 
