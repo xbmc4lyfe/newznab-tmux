@@ -45,6 +45,12 @@ jobs:
       - name: Check Rust formatting
         run: cargo +"$RUST_TOOLCHAIN" fmt --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --all -- --check
 
+      - name: Test incumbent default Rust library
+        run: cargo +"$RUST_TOOLCHAIN" test --locked --jobs 2 --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib
+
+      - name: Test experimental XZ Index library
+        run: cargo +"$RUST_TOOLCHAIN" test --locked --jobs 2 --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib --features experimental-xz-index
+
       - name: Install SARIF converter
         run: cargo +"$RUST_TOOLCHAIN" install --locked clippy-sarif --version 0.8.0
 
