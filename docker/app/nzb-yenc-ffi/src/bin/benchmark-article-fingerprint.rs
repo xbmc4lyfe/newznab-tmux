@@ -51,6 +51,7 @@ if($method==='fromContents') { $payload='<nzb xmlns="http://www.newzbin.com/DTD/
 else foreach($ids as $id) hash_update($hash,pack('N',strlen($id)).$id);
 $class='App\\Services\\Nzb\\NzbArticleFingerprint';
 if($implementation==='baseline') require $baseline;
+else require $root.'/tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php';
 require $root.'/vendor/autoload.php'; if(!class_exists($class)) throw new RuntimeException('Fingerprint class missing');
 $library=$root.'/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.'.(PHP_OS_FAMILY==='Darwin'?'dylib':'so');
 $worker=$root.'/docker/app/nzb-yenc-ffi/target/release/nntmux-article-fingerprint';
@@ -250,7 +251,8 @@ fn run(o: Options) -> Result<(Value, bool), String> {
         ("baseline", o.baseline.clone()),
         (
             "candidate",
-            o.project.join("app/Services/Nzb/NzbArticleFingerprint.php"),
+            o.project
+                .join("tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php"),
         ),
         ("composer_lock", o.project.join("composer.lock")),
         (
@@ -396,7 +398,7 @@ fn run(o: Options) -> Result<(Value, bool), String> {
     let invalid = !invalids.is_empty() || runtime.get("invalid_reason").is_some();
     let fixtures:Vec<Value>=FIXTURES.iter().map(|(name,count,operation,expected)|json!({"name":name,"input_count":count,"operation":operation,"expected_digest":expected,"fixture_sha256":fixture_hash(name,*count),"expected_digest_basis":"Independent Python hashlib/struct digest of normalized unique IDs"})).collect();
     Ok((
-        json!({"benchmark":"nzb-article-fingerprint-paired-comparison","protocol":{"version":3,"seed":SEED,"warmups_per_fixture":1,"warmups_per_observation":1,"pairs_per_fixture":o.pairs,"timeout_seconds_per_worker":30,"backend":o.backend,"schedule":scheduled,"schedule_sha256":hash_bytes(serde_json::to_string(&scheduled).unwrap().as_bytes()),"timing_scope":"Fresh PHP process: cold complete public operation then one repeated complete operation; fixture generation, autoload, artifact hashing and process startup excluded. Accumulator, XML parsing and Rust worker startup included.","correctness_gate":"Both literal independent digests, independent fixture hashes/counts, pinned backend and unchanged sources/artifacts"},"sources":sources,"runtime":{"php":runtime,"rust_compiler_available_version":compiler,"compiler_identity_note":"Available compiler version; build compiler identity not asserted"},"fixtures":fixtures,"observations":observations,"invalid_observations":invalids,"summary":summary,"completed_at_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()}),
+        json!({"benchmark":"nzb-article-fingerprint-paired-comparison","candidate_status":"experimental_withdrawn_from_production","comparison_scope":"Archived Rust integration versus frozen native PHP; median screen only, not runtime adoption qualification","protocol":{"version":3,"seed":SEED,"warmups_per_fixture":1,"warmups_per_observation":1,"pairs_per_fixture":o.pairs,"timeout_seconds_per_worker":30,"backend":o.backend,"schedule":scheduled,"schedule_sha256":hash_bytes(serde_json::to_string(&scheduled).unwrap().as_bytes()),"timing_scope":"Fresh PHP process: cold complete public operation then one repeated complete operation; fixture generation, autoload, artifact hashing and process startup excluded. Accumulator, XML parsing and Rust worker startup included.","correctness_gate":"Both literal independent digests, independent fixture hashes/counts, pinned backend and unchanged sources/artifacts"},"sources":sources,"runtime":{"php":runtime,"rust_compiler_available_version":compiler,"compiler_identity_note":"Available compiler version; build compiler identity not asserted"},"fixtures":fixtures,"observations":observations,"invalid_observations":invalids,"summary":summary,"completed_at_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()}),
         invalid,
     ))
 }

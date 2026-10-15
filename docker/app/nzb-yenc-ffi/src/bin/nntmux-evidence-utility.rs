@@ -10,6 +10,29 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn required<'a>(v: &'a Value, k: &str) -> Result<&'a Value> {
     v.get(k).ok_or_else(|| format!("missing key: {k}").into())
 }
+fn path_exists_py(path: &Path) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        // Python 3.11 Path.exists also treats EBADF and ELOOP as absence.
+        // ELOOP is 40 on the workflow's Linux and 62 on local macOS/BSD.
+        Err(error)
+            if error.raw_os_error() == Some(9)
+                || error.raw_os_error()
+                    == Some(if cfg!(target_os = "linux") { 40 } else { 62 }) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 fn py(v: &Value) -> String {
     match v {
         Value::Null => "None".into(),
@@ -36,16 +59,47 @@ fn py(v: &Value) -> String {
         _ => v.to_string(),
     }
 }
+// serde_json's existing formatter rounds shortest decimal ties like Python.
 fn float_py(n: f64) -> String {
-    let raw = n.to_string();
+    if !n.is_finite() {
+        return if n.is_nan() {
+            "nan"
+        } else if n.is_sign_negative() {
+            "-inf"
+        } else {
+            "inf"
+        }
+        .into();
+    }
+    let raw = serde_json::to_string(&n).expect("finite float serializes");
     if n != 0.0 && (n.abs() < 1e-4 || n.abs() >= 1e16) {
-        let sci = format!("{n:e}");
-        let (a, b) = sci.split_once('e').unwrap();
-        let exp: i32 = b.parse().unwrap();
+        let (mantissa, exponent) = if let Some((mantissa, exponent)) = raw.split_once('e') {
+            (
+                mantissa.to_owned(),
+                exponent.parse::<i32>().expect("formatted exponent"),
+            )
+        } else {
+            let unsigned = raw.trim_start_matches('-');
+            let point = unsigned.find('.').unwrap_or(unsigned.len());
+            let digits = unsigned.replace('.', "");
+            let leading = digits.len() - digits.trim_start_matches('0').len();
+            let significant = digits[leading..].trim_end_matches('0');
+            let mut mantissa = if n.is_sign_negative() {
+                "-".to_owned()
+            } else {
+                String::new()
+            };
+            mantissa.push_str(&significant[..1]);
+            if significant.len() > 1 {
+                mantissa.push('.');
+                mantissa.push_str(&significant[1..]);
+            }
+            (mantissa, point as i32 - leading as i32 - 1)
+        };
         format!(
-            "{a}e{}{exp:02}",
-            if exp < 0 { "-" } else { "+" },
-            exp = exp.abs()
+            "{mantissa}e{}{exponent:02}",
+            if exponent < 0 { "-" } else { "+" },
+            exponent = exponent.abs()
         )
     } else if !raw.contains('.') {
         format!("{raw}.0")
@@ -124,9 +178,6 @@ fn raw_field<'a>(s: &'a str, wanted: &str) -> Option<&'a str> {
     }
 }
 fn lexical_py(s: &str) -> Result<String> {
-    lexical_py_with(s, float_py)
-}
-fn lexical_py_with(s: &str, render_float: fn(f64) -> String) -> Result<String> {
     let s = s.trim();
     if s.starts_with('[') {
         let mut out = Vec::new();
@@ -139,7 +190,7 @@ fn lexical_py_with(s: &str, render_float: fn(f64) -> String) -> Result<String> {
                 break;
             }
             let end = value_end(s, i);
-            out.push(lexical_py_with(&s[i..end], render_float)?);
+            out.push(lexical_py(&s[i..end])?);
             i = end;
             if s.as_bytes().get(i) == Some(&b',') {
                 i += 1
@@ -150,7 +201,7 @@ fn lexical_py_with(s: &str, render_float: fn(f64) -> String) -> Result<String> {
     if s.starts_with(|c: char| c == '-' || c.is_ascii_digit())
         && (s.contains('.') || s.contains('e') || s.contains('E'))
     {
-        return Ok(render_float(s.parse()?));
+        return Ok(float_py(s.parse()?));
     }
     Ok(py(&serde_json::from_str(s)?))
 }
@@ -264,20 +315,20 @@ fn summary(root: &Path, cpp: bool, output: &Path) -> Result<()> {
         "benchmark-evidence/php-paired/observations.jsonl"
     };
     let p = root.join(p);
-    let mut rows = Vec::new();
-    let mut raw_rows = Vec::new();
-    if p.exists() {
-        let text = fs::read_to_string(&p)?;
-        for line in splitlines(&text) {
-            rows.push(serde_json::from_str::<Value>(line)?);
-            raw_rows.push(line.to_owned());
-        }
-    }
+    let text = if path_exists_py(&p)? {
+        fs::read_to_string(&p)?
+    } else {
+        String::new()
+    };
+    let rows = splitlines(&text)
+        .into_iter()
+        .map(|raw| -> Result<_> { Ok((serde_json::from_str::<SummaryRow<true>>(raw)?.0, raw)) })
+        .collect::<Result<Vec<_>>>()?;
     let mut out = OpenOptions::new().append(true).create(true).open(output)?;
     if cpp {
         write!(out, "## Native yEnc paired fixture comparison\n\n")?;
         let qp = root.join("benchmark-evidence/build/kernel-qualification.json");
-        if qp.exists() {
+        if path_exists_py(&qp)? {
             let q: Value = serde_json::from_str(&fs::read_to_string(&qp)?)?;
             writeln!(
                 out,
@@ -300,7 +351,7 @@ fn summary(root: &Path, cpp: bool, output: &Path) -> Result<()> {
             "## Rust versus PHP fallback\n\nSame PHP service, exact byte/CRC correctness, randomized fresh-process pairs. Includes FFI overhead. Synthetic decoder fixtures only; no production throughput claim.\n\n| Bytes | Density | Path | Decision | Rust / PHP | 95% interval | Eligible / invalid |\n|---:|---|---|---|---:|---|---|\n"
         )?;
     }
-    for (row, raw) in rows.iter().zip(&raw_rows) {
+    for (row, raw) in &rows {
         if !row.is_object() {
             return Err("row is not object".into());
         }
@@ -329,13 +380,13 @@ fn summary(root: &Path, cpp: bool, output: &Path) -> Result<()> {
         let invalid = py(required(row, "invalid_pairs")?);
         writeln!(out, "| {} | {eligible} / {invalid} |", vals.join(" | "))?;
     }
-    let final_row = rows.iter().rev().find(|r| {
+    let final_row = rows.iter().rev().find(|(r, _)| {
         matches!(
             r.get("type").and_then(Value::as_str),
             Some("run_summary" | "run_failure")
         )
     });
-    let status = if let Some(row) = final_row {
+    let status = if let Some((row, _)) = final_row {
         required(row, "status")?
             .as_str()
             .ok_or("status not string")?
@@ -355,16 +406,16 @@ fn summary(root: &Path, cpp: bool, output: &Path) -> Result<()> {
     }
     Ok(())
 }
-// Validate every value while retaining only fields the article summary reads.
+// Validate every value while retaining only fields the selected summary reads.
 // Observation metadata can be large and must not be materialized just to ignore it.
-struct ArticleRow(Value);
-impl<'de> serde::Deserialize<'de> for ArticleRow {
+struct SummaryRow<const LEGACY: bool>(Value);
+impl<'de, const LEGACY: bool> serde::Deserialize<'de> for SummaryRow<LEGACY> {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        struct Fields;
-        impl<'de> serde::de::Visitor<'de> for Fields {
-            type Value = ArticleRow;
+        struct Fields<const LEGACY: bool>;
+        impl<'de, const LEGACY: bool> serde::de::Visitor<'de> for Fields<LEGACY> {
+            type Value = SummaryRow<LEGACY>;
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                 formatter.write_str("a JSON value")
             }
@@ -382,121 +433,62 @@ impl<'de> serde::Deserialize<'de> for ArticleRow {
                             | "decision"
                             | "eligible_pairs"
                             | "invalid_pairs"
-                            | "median_candidate_over_baseline"
                             | "bootstrap_95_percent_interval"
                             | "status"
-                    ) {
+                    ) || if LEGACY {
+                        matches!(
+                            key.as_str(),
+                            "path" | "median_rust_over_cpp" | "median_rust_over_php"
+                        )
+                    } else {
+                        key == "median_candidate_over_baseline"
+                    } {
                         fields.insert(key, map.next_value::<Value>()?);
                     } else {
                         map.next_value::<serde::de::IgnoredAny>()?;
                     }
                 }
-                Ok(ArticleRow(Value::Object(fields)))
+                Ok(SummaryRow(Value::Object(fields)))
             }
             fn visit_seq<A: serde::de::SeqAccess<'de>>(
                 self,
                 mut sequence: A,
             ) -> std::result::Result<Self::Value, A::Error> {
                 while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-                Ok(ArticleRow(Value::Null))
+                Ok(SummaryRow(Value::Null))
             }
             fn visit_bool<E>(self, _value: bool) -> std::result::Result<Self::Value, E> {
-                Ok(ArticleRow(Value::Null))
+                Ok(SummaryRow(Value::Null))
             }
             fn visit_i64<E>(self, _value: i64) -> std::result::Result<Self::Value, E> {
-                Ok(ArticleRow(Value::Null))
+                Ok(SummaryRow(Value::Null))
             }
             fn visit_u64<E>(self, _value: u64) -> std::result::Result<Self::Value, E> {
-                Ok(ArticleRow(Value::Null))
+                Ok(SummaryRow(Value::Null))
             }
             fn visit_f64<E>(self, _value: f64) -> std::result::Result<Self::Value, E> {
-                Ok(ArticleRow(Value::Null))
+                Ok(SummaryRow(Value::Null))
             }
             fn visit_str<E>(self, _value: &str) -> std::result::Result<Self::Value, E> {
-                Ok(ArticleRow(Value::Null))
+                Ok(SummaryRow(Value::Null))
             }
             fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
-                Ok(ArticleRow(Value::Null))
+                Ok(SummaryRow(Value::Null))
             }
         }
-        deserializer.deserialize_any(Fields)
-    }
-}
-// serde_json's existing formatter rounds shortest decimal ties like Python.
-// Only the article mode uses it; existing summary modes retain their formatter.
-fn article_float_py(n: f64) -> String {
-    if !n.is_finite() {
-        return if n.is_nan() {
-            "nan"
-        } else if n.is_sign_negative() {
-            "-inf"
-        } else {
-            "inf"
-        }
-        .into();
-    }
-    let raw = serde_json::to_string(&n).expect("finite float serializes");
-    if n != 0.0 && (n.abs() < 1e-4 || n.abs() >= 1e16) {
-        let (mantissa, exponent) = if let Some((mantissa, exponent)) = raw.split_once('e') {
-            (
-                mantissa.to_owned(),
-                exponent.parse::<i32>().expect("formatted exponent"),
-            )
-        } else {
-            let unsigned = raw.trim_start_matches('-');
-            let point = unsigned.find('.').unwrap_or(unsigned.len());
-            let digits = unsigned.replace('.', "");
-            let leading = digits.len() - digits.trim_start_matches('0').len();
-            let significant = digits[leading..].trim_end_matches('0');
-            let mut mantissa = if n.is_sign_negative() {
-                "-".to_owned()
-            } else {
-                String::new()
-            };
-            mantissa.push_str(&significant[..1]);
-            if significant.len() > 1 {
-                mantissa.push('.');
-                mantissa.push_str(&significant[1..]);
-            }
-            (mantissa, point as i32 - leading as i32 - 1)
-        };
-        format!(
-            "{mantissa}e{}{exponent:02}",
-            if exponent < 0 { "-" } else { "+" },
-            exponent = exponent.abs()
-        )
-    } else if !raw.contains('.') {
-        format!("{raw}.0")
-    } else {
-        raw
+        deserializer.deserialize_any(Fields::<LEGACY>)
     }
 }
 fn article_summary(root: &Path, output: impl FnOnce() -> Result<std::path::PathBuf>) -> Result<()> {
     let input = root.join("processing-evidence/paired/observations.jsonl");
-    let text = match fs::metadata(&input) {
-        Ok(_) => fs::read_to_string(input)?,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            String::new()
-        }
-        // Python 3.11 Path.exists also treats EBADF and ELOOP as absence.
-        // ELOOP is 40 on the workflow's Linux and 62 on local macOS/BSD.
-        Err(error)
-            if error.raw_os_error() == Some(9)
-                || error.raw_os_error()
-                    == Some(if cfg!(target_os = "linux") { 40 } else { 62 }) =>
-        {
-            String::new()
-        }
-        Err(error) => return Err(error.into()),
+    let text = if path_exists_py(&input)? {
+        fs::read_to_string(input)?
+    } else {
+        String::new()
     };
     let rows = splitlines(&text)
         .into_iter()
-        .map(|raw| -> Result<_> { Ok((serde_json::from_str::<ArticleRow>(raw)?.0, raw)) })
+        .map(|raw| -> Result<_> { Ok((serde_json::from_str::<SummaryRow<false>>(raw)?.0, raw)) })
         .collect::<Result<Vec<_>>>()?;
     let mut out = OpenOptions::new()
         .append(true)
@@ -522,7 +514,7 @@ fn article_summary(root: &Path, output: impl FnOnce() -> Result<std::path::PathB
             "bootstrap_95_percent_interval",
         ] {
             values.push(match raw_field(raw, key) {
-                Some(token) => lexical_py_with(token, article_float_py)?,
+                Some(token) => lexical_py(token)?,
                 None => "unavailable".into(),
             });
         }
@@ -648,6 +640,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    struct RestoreDirectoryPermissions(std::path::PathBuf, fs::Permissions);
+    impl Drop for RestoreDirectoryPermissions {
+        fn drop(&mut self) {
+            fs::set_permissions(&self.0, self.1.clone()).unwrap();
+        }
+    }
+    fn deny_directory_search(path: &Path) -> RestoreDirectoryPermissions {
+        use std::os::unix::fs::PermissionsExt;
+        let restore =
+            RestoreDirectoryPermissions(path.to_owned(), fs::metadata(path).unwrap().permissions());
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        restore
     }
     const ROW: &str = r#"{"type":"stratum_summary","size":1024,"density":"dense","path":"decode","decision":"inconclusive","eligible_pairs":11,"invalid_pairs":0,"median_rust_over_cpp":0.9999999999999999,"median_rust_over_php":1.0,"bootstrap_95_percent_interval":[0.00001,1e20]}"#;
 
@@ -899,6 +904,123 @@ mod tests {
         }
     }
     #[test]
+    fn legacy_unsearchable_input_parent_fails_before_output() {
+        for cpp in [true, false] {
+            let f = Fixture::new();
+            f.observations(cpp, ROW);
+            f.write("summary", "keep\n");
+            let parent = f.0.join(if cpp {
+                "benchmark-evidence/paired"
+            } else {
+                "benchmark-evidence/php-paired"
+            });
+            let _restore = deny_directory_search(&parent);
+            // Root-capable runners need the separate non-root caller oracle.
+            if !fs::metadata(parent.join("observations.jsonl"))
+                .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+            {
+                continue;
+            }
+            assert!(f.summarize(cpp).is_err());
+            assert_eq!(f.read("summary"), "keep\n");
+        }
+    }
+    #[test]
+    fn legacy_unsearchable_qualification_parent_preserves_only_heading() {
+        let f = Fixture::new();
+        f.observations(true, ROW);
+        f.write("summary", "keep\n");
+        f.write(
+            "benchmark-evidence/build/kernel-qualification.json",
+            r#"{"status":"qualified","conclusion":"Evidence."}"#,
+        );
+        let parent = f.0.join("benchmark-evidence/build");
+        let _restore = deny_directory_search(&parent);
+        if !fs::metadata(parent.join("kernel-qualification.json"))
+            .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+        {
+            return;
+        }
+        assert!(f.summarize(true).is_err());
+        assert_eq!(
+            f.read("summary"),
+            "keep\n## Native yEnc paired fixture comparison\n\n"
+        );
+    }
+    #[test]
+    fn legacy_ignored_nested_metadata_is_validated_before_output() {
+        for cpp in [true, false] {
+            for invalid in [
+                r#"{"type":"observation","result":{"nested":[true,null,{"key":[1,]}]}}"#,
+                r#"{"type":"observation","result":{"nested":tru}}"#,
+            ] {
+                let f = Fixture::new();
+                f.write("summary", "keep\n");
+                f.observations(cpp, &format!("{ROW}\n{invalid}"));
+                assert!(f.summarize(cpp).is_err());
+                assert_eq!(f.read("summary"), "keep\n");
+            }
+        }
+    }
+    #[test]
+    fn legacy_nonobjects_preserve_heading_and_completed_rows_on_failure() {
+        for cpp in [true, false] {
+            for scalar in [
+                "true",
+                "false",
+                "-1",
+                "18446744073709551615",
+                "1.5",
+                r#""text""#,
+                "null",
+                "[1, {\"ignored\": [true,null]}]",
+            ] {
+                for prior_row in [false, true] {
+                    let f = Fixture::new();
+                    f.observations(
+                        cpp,
+                        &if prior_row {
+                            format!("{ROW}\n{scalar}")
+                        } else {
+                            scalar.to_owned()
+                        },
+                    );
+                    assert!(f.summarize(cpp).is_err(), "{cpp} {scalar}");
+                    let output = f.read("summary");
+                    assert!(output.starts_with("## "));
+                    assert!(!output.contains("setup incomplete"));
+                    assert!(output.ends_with(if prior_row {
+                        if cpp {
+                            "| 1024 | dense | decode | inconclusive | 0.9999999999999999 | [1e-05, 1e+20] | 11 / 0 |\n"
+                        } else {
+                            "| 1024 | dense | decode | inconclusive | 1.0 | [1e-05, 1e+20] | 11 / 0 |\n"
+                        }
+                    } else {
+                        "|---:|---|---|---|---:|---|---|\n"
+                    }));
+                }
+            }
+        }
+    }
+    #[test]
+    fn legacy_duplicate_fields_and_large_ignored_metadata_keep_last_values() {
+        for cpp in [true, false] {
+            let f = Fixture::new();
+            let payload = "x".repeat(262144);
+            f.observations(cpp, &format!(
+                r#"{{"type":"observation","result":{{"nested":[{{"payload":"{payload}"}}]}}}}
+{{"type":"observation","type":"stratum_summary","size":1,"size":4096,"density":"old","density":"ordinary","path":"old","path":"decode","decision":"invalid","decision":"inconclusive","eligible_pairs":0,"eligible_pairs":31,"invalid_pairs":1,"invalid_pairs":0,"median_rust_over_cpp":0.5,"median_rust_over_c\u0070p":0.10000991821289062,"median_rust_over_php":0.5,"median_rust_over_p\u0068p":0.10000991821289062,"bootstrap_95_percent_interval":null,"bootstrap_95_percent_interval":[0.10000991821289062,1],"ignored":{{"payload":"{payload}"}}}}
+{{"type":"run_summary","status":"old","status":"inconclusive"}}"#
+            ));
+            f.summarize(cpp).unwrap();
+            let output = f.read("summary");
+            assert!(output.contains("| 4096 | ordinary | decode | inconclusive | 0.10000991821289062 | [0.10000991821289062, 1] | 31 / 0 |\n"));
+            assert!(output.contains("`inconclusive`"));
+            assert!(!output.contains("old"));
+            assert!(!output.contains(&payload));
+        }
+    }
+    #[test]
     fn qualification_is_read_after_heading_append() {
         let f = Fixture::new();
         f.write("benchmark-evidence/build/kernel-qualification.json", "{bad");
@@ -1090,6 +1212,54 @@ mod tests {
     }
 
     #[test]
+    fn cpp_summary_renders_python_shortest_decimal_ties() {
+        assert_legacy_summary_shortest_decimal_ties(true);
+    }
+
+    #[test]
+    fn php_summary_renders_python_shortest_decimal_ties() {
+        assert_legacy_summary_shortest_decimal_ties(false);
+    }
+
+    fn assert_legacy_summary_shortest_decimal_ties(cpp: bool) {
+        let f = Fixture::new();
+        let tokens = [
+            "0.10000991821289062",
+            "2.9802322387695312e-08",
+            "-0.10000991821289062",
+            "-2.9802322387695312e-08",
+        ];
+        let ratio = if cpp {
+            "median_rust_over_cpp"
+        } else {
+            "median_rust_over_php"
+        };
+        let input = tokens
+            .iter()
+            .map(|token| format!(
+                r#"{{"type":"stratum_summary","size":4096,"density":"ordinary","path":"decode","decision":"inconclusive","eligible_pairs":31,"invalid_pairs":0,"{ratio}":{token},"bootstrap_95_percent_interval":[{token},1]}}"#
+            ))
+            .collect::<Vec<_>>()
+            .join("\n");
+        f.observations(cpp, &input);
+        f.summarize(cpp).unwrap();
+        let output = f.read("summary");
+        let rows = output
+            .lines()
+            .filter(|line| line.starts_with("| 4096 |"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                "| 4096 | ordinary | decode | inconclusive | 0.10000991821289062 | [0.10000991821289062, 1] | 31 / 0 |",
+                "| 4096 | ordinary | decode | inconclusive | 2.9802322387695312e-08 | [2.9802322387695312e-08, 1] | 31 / 0 |",
+                "| 4096 | ordinary | decode | inconclusive | -0.10000991821289062 | [-0.10000991821289062, 1] | 31 / 0 |",
+                "| 4096 | ordinary | decode | inconclusive | -2.9802322387695312e-08 | [-2.9802322387695312e-08, 1] | 31 / 0 |",
+            ]
+        );
+    }
+
+    #[test]
     fn article_numeric_rendering_matches_python_ties_to_even() {
         for token in ["0.10000991821289062", "2.9802322387695312e-08"] {
             let f = Fixture::new();
@@ -1150,28 +1320,25 @@ mod tests {
             (f64::NEG_INFINITY, "-inf"),
             (f64::NAN, "nan"),
         ] {
-            assert_eq!(article_float_py(number), text);
+            assert_eq!(float_py(number), text);
         }
     }
 
     #[test]
     fn article_unsearchable_input_parent_fails_without_opening_summary() {
-        use std::os::unix::fs::PermissionsExt;
         let f = Fixture::new();
         f.write("processing-evidence/paired/observations.jsonl", ARTICLE_ROW);
         f.write("article-summary", "keep\n");
         let parent = f.0.join("processing-evidence");
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = deny_directory_search(&parent);
         // Root-capable build runners can traverse mode-000 directories. The
         // separate non-root caller oracle must exercise this failure branch.
         let denied = fs::metadata(parent.join("paired/observations.jsonl"))
             .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied);
         if !denied {
-            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
             return;
         }
         let result = article_report(&f, None);
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
         assert_eq!(f.read("article-summary"), "keep\n");
     }
