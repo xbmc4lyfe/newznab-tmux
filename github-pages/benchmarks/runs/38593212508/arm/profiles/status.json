@@ -1,0 +1,10 @@
+{
+  "status": "complete",
+  "exit_code": 0,
+  "phase": "native-build-and-capture",
+  "script_receipt": {
+    "status": "complete",
+    "exit_code": 0,
+    "phase": "capture-summary"
+  }
+}

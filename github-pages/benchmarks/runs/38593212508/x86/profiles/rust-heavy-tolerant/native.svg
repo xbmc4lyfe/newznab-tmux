@@ -1,0 +1,1846 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="758" onload="init(evt)" viewBox="0 0 1200 758" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom(true);
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				// we have basically done a clearzoom so clear the url
+				var params = get_params();
+				if (params.x) delete params.x;
+				if (params.y) delete params.y;
+				history.replaceState(null, null, parse_params(params));
+				unzoombtn.classList.add("hide");
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		var sl = t.getSubStringLength(0, txt.length);
+		// check if only whitespace or if we can fit the entire string into width w
+		if (/^ *$/.test(txt) || sl < w)
+			return;
+
+		// this isn't perfect, but gives a good starting point
+		// and avoids calling getSubStringLength too often
+		var start = Math.floor((w/sl) * txt.length);
+		for (var x = start; x > 0; x = x-2) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom(dont_update_text) {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			if(!dont_update_text) update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+		if (currentSearchTerm === null) return;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="758.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >rust / heavy / tolerant â sampled CPU-clock weight</text>
+<text id="details" x="10.00" y="741" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="741" > </text>
+<g id="frames">
+<g >
+<title>[ld-linux-x86-64.so.2] (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="453" width="206.0" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="874.59" y="463.5" >[ld-linux-x86-64.so.2]</text>
+</g>
+<g >
+<title>[php8.5] (12,024,048 nanoseconds, 9.52%)</title><rect x="1077.6" y="581" width="112.4" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="1080.62" y="591.5" >[php8.5]</text>
+</g>
+<g >
+<title>zm_startup_imagick (2,004,008 nanoseconds, 1.59%)</title><rect x="1133.8" y="549" width="18.7" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="1136.81" y="559.5" ></text>
+</g>
+<g >
+<title>__x64_sys_munmap (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="389" width="37.4" height="15.0" fill="rgb(206,7,1)" rx="2" ry="2" />
+<text  x="799.67" y="399.5" >__x..</text>
+</g>
+<g >
+<title>zend_execute (16,032,064 nanoseconds, 12.70%)</title><rect x="159.8" y="613" width="149.9" height="15.0" fill="rgb(225,94,22)" rx="2" ry="2" />
+<text  x="162.84" y="623.5" >zend_execute</text>
+</g>
+<g >
+<title>mas_store_prealloc (2,004,008 nanoseconds, 1.59%)</title><rect x="1040.2" y="69" width="18.7" height="15.0" fill="rgb(223,85,20)" rx="2" ry="2" />
+<text  x="1043.16" y="79.5" ></text>
+</g>
+<g >
+<title>mas_node_count_gfp (2,004,008 nanoseconds, 1.59%)</title><rect x="1021.4" y="69" width="18.8" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="1024.43" y="79.5" ></text>
+</g>
+<g >
+<title>zend_binary_op_produces_error (2,004,008 nanoseconds, 1.59%)</title><rect x="159.8" y="293" width="18.8" height="15.0" fill="rgb(212,32,7)" rx="2" ry="2" />
+<text  x="162.84" y="303.5" ></text>
+</g>
+<g >
+<title>[php8.5] (38,076,152 nanoseconds, 30.16%)</title><rect x="440.8" y="533" width="355.9" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="443.79" y="543.5" >[php8.5]</text>
+</g>
+<g >
+<title>virtual_file_ex (2,004,008 nanoseconds, 1.59%)</title><rect x="309.7" y="517" width="18.7" height="15.0" fill="rgb(214,45,10)" rx="2" ry="2" />
+<text  x="312.68" y="527.5" ></text>
+</g>
+<g >
+<title>php_execute_script_ex (12,024,048 nanoseconds, 9.52%)</title><rect x="28.7" y="613" width="112.4" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="31.73" y="623.5" >php_execute_s..</text>
+</g>
+<g >
+<title>mas_alloc_nodes (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="405" width="18.7" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="13.00" y="415.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="549" width="37.4" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="799.67" y="559.5" >[li..</text>
+</g>
+<g >
+<title>malloc (2,004,008 nanoseconds, 1.59%)</title><rect x="1096.3" y="469" width="18.8" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1099.35" y="479.5" ></text>
+</g>
+<g >
+<title>zend_llist_apply (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="581" width="206.0" height="15.0" fill="rgb(220,70,16)" rx="2" ry="2" />
+<text  x="874.59" y="591.5" >zend_llist_apply</text>
+</g>
+<g >
+<title>alloc_pages_mpol (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="341" width="18.8" height="15.0" fill="rgb(254,227,54)" rx="2" ry="2" />
+<text  x="350.14" y="351.5" ></text>
+</g>
+<g >
+<title>__split_vma (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="101" width="37.5" height="15.0" fill="rgb(237,150,36)" rx="2" ry="2" />
+<text  x="1024.43" y="111.5" >__s..</text>
+</g>
+<g >
+<title>SSL_CTX_new_ex (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="469" width="18.8" height="15.0" fill="rgb(205,4,0)" rx="2" ry="2" />
+<text  x="1155.54" y="479.5" ></text>
+</g>
+<g >
+<title>handle_pte_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1133.8" y="421" width="18.7" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="1136.81" y="431.5" ></text>
+</g>
+<g >
+<title>vfs_read (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="373" width="93.6" height="15.0" fill="rgb(224,88,21)" rx="2" ry="2" />
+<text  x="50.46" y="383.5" >vfs_read</text>
+</g>
+<g >
+<title>filemap_map_pages (2,004,008 nanoseconds, 1.59%)</title><rect x="1133.8" y="389" width="18.7" height="15.0" fill="rgb(229,112,27)" rx="2" ry="2" />
+<text  x="1136.81" y="399.5" ></text>
+</g>
+<g >
+<title>execute_ex (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="357" width="18.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="331.41" y="367.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2,004,008 nanoseconds, 1.59%)</title><rect x="1096.3" y="453" width="18.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1099.35" y="463.5" ></text>
+</g>
+<g >
+<title>ffi_call (8,016,032 nanoseconds, 6.35%)</title><rect x="365.9" y="517" width="74.9" height="15.0" fill="rgb(242,171,41)" rx="2" ry="2" />
+<text  x="368.87" y="527.5" >ffi_call</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="389" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="399.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="1096.3" y="517" width="18.8" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="1099.35" y="527.5" ></text>
+</g>
+<g >
+<title>mas_preallocate (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="437" width="18.7" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="13.00" y="447.5" ></text>
+</g>
+<g >
+<title>folio_add_lru_vma (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="229" width="18.7" height="15.0" fill="rgb(252,216,51)" rx="2" ry="2" />
+<text  x="1061.89" y="239.5" ></text>
+</g>
+<g >
+<title>[php8.5] (4,008,016 nanoseconds, 3.17%)</title><rect x="1096.3" y="549" width="37.5" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="1099.35" y="559.5" >[ph..</text>
+</g>
+<g >
+<title>do_user_addr_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="453" width="18.8" height="15.0" fill="rgb(228,108,25)" rx="2" ry="2" />
+<text  x="350.14" y="463.5" ></text>
+</g>
+<g >
+<title>clear_page_erms (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="293" width="18.8" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="350.14" y="303.5" ></text>
+</g>
+<g >
+<title>[php8.5] (18,036,072 nanoseconds, 14.29%)</title><rect x="141.1" y="661" width="168.6" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="671.5" >[php8.5]</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="485" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="1118.08" y="495.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="645" width="18.7" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="13.00" y="655.5" ></text>
+</g>
+<g >
+<title>[libcrypto.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="277" width="18.8" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1155.54" y="287.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="325" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="335.5" ></text>
+</g>
+<g >
+<title>_dl_catch_exception (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="517" width="37.4" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="799.67" y="527.5" >_dl..</text>
+</g>
+<g >
+<title>mas_node_count_gfp (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="421" width="18.7" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="13.00" y="431.5" ></text>
+</g>
+<g >
+<title>php_load_extension (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="565" width="206.0" height="15.0" fill="rgb(241,166,39)" rx="2" ry="2" />
+<text  x="874.59" y="575.5" >php_load_extension</text>
+</g>
+<g >
+<title>vfs_fstatat (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="373" width="18.7" height="15.0" fill="rgb(232,127,30)" rx="2" ry="2" />
+<text  x="1118.08" y="383.5" ></text>
+</g>
+<g >
+<title>x64_sys_call (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="421" width="93.6" height="15.0" fill="rgb(247,194,46)" rx="2" ry="2" />
+<text  x="50.46" y="431.5" >x64_sys_call</text>
+</g>
+<g >
+<title>[php8.5] (6,012,024 nanoseconds, 4.76%)</title><rect x="159.8" y="421" width="56.2" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="431.5" >[php8..</text>
+</g>
+<g >
+<title>zend_call_known_function (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="229" width="18.7" height="15.0" fill="rgb(245,186,44)" rx="2" ry="2" />
+<text  x="331.41" y="239.5" ></text>
+</g>
+<g >
+<title>zend_hash_apply (12,024,048 nanoseconds, 9.52%)</title><rect x="1077.6" y="597" width="112.4" height="15.0" fill="rgb(222,82,19)" rx="2" ry="2" />
+<text  x="1080.62" y="607.5" >zend_hash_apply</text>
+</g>
+<g >
+<title>_dl_catch_exception (6,012,024 nanoseconds, 4.76%)</title><rect x="1002.7" y="357" width="56.2" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="1005.70" y="367.5" >_dl_c..</text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="453" width="37.4" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="799.67" y="463.5" >[ld..</text>
+</g>
+<g >
+<title>do_syscall_64 (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="421" width="37.4" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="799.67" y="431.5" >do_..</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="341" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="351.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2,004,008 nanoseconds, 1.59%)</title><rect x="309.7" y="469" width="18.7" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="312.68" y="479.5" ></text>
+</g>
+<g >
+<title>__do_huge_pmd_anonymous_page (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="389" width="18.8" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="350.14" y="399.5" ></text>
+</g>
+<g >
+<title>_RNvNtCslDdYbj3vjtA_7nzbyenc19payload_decoder_x8612decode_vbmi2 (8,016,032 nanoseconds, 6.35%)</title><rect x="365.9" y="389" width="74.9" height="15.0" fill="rgb(254,227,54)" rx="2" ry="2" />
+<text  x="368.87" y="399.5" >_RNvNtCs..</text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="677" width="18.7" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="13.00" y="687.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="501" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="1118.08" y="511.5" ></text>
+</g>
+<g >
+<title>vms_clear_ptes (2,004,008 nanoseconds, 1.59%)</title><rect x="796.7" y="309" width="18.7" height="15.0" fill="rgb(206,4,1)" rx="2" ry="2" />
+<text  x="799.67" y="319.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (8,016,032 nanoseconds, 6.35%)</title><rect x="478.3" y="517" width="74.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="481.25" y="527.5" >[libc.so..</text>
+</g>
+<g >
+<title>__pi_memset (2,004,008 nanoseconds, 1.59%)</title><rect x="1021.4" y="37" width="18.8" height="15.0" fill="rgb(215,47,11)" rx="2" ry="2" />
+<text  x="1024.43" y="47.5" ></text>
+</g>
+<g >
+<title>_RINvNtCs6ZjlLoI6YmX_3std9panicking12catch_unwindjNCNvCslDdYbj3vjtA_7nzbyenc26nntmux_yenc_decode_span_v10EBP_ (8,016,032 nanoseconds, 6.35%)</title><rect x="365.9" y="437" width="74.9" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="368.87" y="447.5" >_RINvNtC..</text>
+</g>
+<g >
+<title>wp_page_copy (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="245" width="18.7" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="1061.89" y="255.5" ></text>
+</g>
+<g >
+<title>exc_page_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1096.3" y="421" width="18.8" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="1099.35" y="431.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="437" width="93.6" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="50.46" y="447.5" >do_syscall_64</text>
+</g>
+<g >
+<title>zend_string_equal_val (4,008,016 nanoseconds, 3.17%)</title><rect x="759.2" y="517" width="37.5" height="15.0" fill="rgb(243,176,42)" rx="2" ry="2" />
+<text  x="762.21" y="527.5" >zen..</text>
+</g>
+<g >
+<title>[php8.5] (6,012,024 nanoseconds, 4.76%)</title><rect x="159.8" y="405" width="56.2" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="415.5" >[php8..</text>
+</g>
+<g >
+<title>[libc.so.6] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="229" width="18.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1155.54" y="239.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="453" width="18.7" height="15.0" fill="rgb(218,63,15)" rx="2" ry="2" />
+<text  x="1118.08" y="463.5" ></text>
+</g>
+<g >
+<title>[libcrypto.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="261" width="18.8" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1155.54" y="271.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="357" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="367.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="389" width="206.0" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="874.59" y="399.5" >[ld-linux-x86-64.so.2]</text>
+</g>
+<g >
+<title>_php_stream_open_wrapper_ex (2,004,008 nanoseconds, 1.59%)</title><rect x="309.7" y="565" width="18.7" height="15.0" fill="rgb(215,48,11)" rx="2" ry="2" />
+<text  x="312.68" y="575.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="517" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="1118.08" y="527.5" ></text>
+</g>
+<g >
+<title>link_path_walk (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="405" width="18.7" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="855.86" y="415.5" ></text>
+</g>
+<g >
+<title>zend_call_known_function (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="549" width="18.7" height="15.0" fill="rgb(245,186,44)" rx="2" ry="2" />
+<text  x="331.41" y="559.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (8,016,032 nanoseconds, 6.35%)</title><rect x="927.8" y="341" width="74.9" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="930.78" y="351.5" >[ld-linu..</text>
+</g>
+<g >
+<title>zend_startup_module_ex (12,024,048 nanoseconds, 9.52%)</title><rect x="1077.6" y="565" width="112.4" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="1080.62" y="575.5" >zend_startup_..</text>
+</g>
+<g >
+<title>execute_ex (48,096,192 nanoseconds, 38.10%)</title><rect x="347.1" y="549" width="449.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="350.14" y="559.5" >execute_ex</text>
+</g>
+<g >
+<title>PHP_SHA256Update (22,044,088 nanoseconds, 17.46%)</title><rect x="553.2" y="501" width="206.0" height="15.0" fill="rgb(218,63,15)" rx="2" ry="2" />
+<text  x="556.17" y="511.5" >PHP_SHA256Update</text>
+</g>
+<g >
+<title>handle_mm_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="437" width="18.8" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="350.14" y="447.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="277" width="37.5" height="15.0" fill="rgb(218,63,15)" rx="2" ry="2" />
+<text  x="1024.43" y="287.5" >ent..</text>
+</g>
+<g >
+<title>[php8.5] (12,024,048 nanoseconds, 9.52%)</title><rect x="28.7" y="629" width="112.4" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="31.73" y="639.5" >[php8.5]</text>
+</g>
+<g >
+<title>OSSL_PARAM_locate (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="245" width="18.8" height="15.0" fill="rgb(246,189,45)" rx="2" ry="2" />
+<text  x="1155.54" y="255.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="1096.3" y="485" width="18.8" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="1099.35" y="495.5" ></text>
+</g>
+<g >
+<title>__split_vma (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="453" width="18.7" height="15.0" fill="rgb(237,150,36)" rx="2" ry="2" />
+<text  x="13.00" y="463.5" ></text>
+</g>
+<g >
+<title>vm_mmap_pgoff (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="197" width="37.5" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="1024.43" y="207.5" >vm_..</text>
+</g>
+<g >
+<title>compile_filename (16,032,064 nanoseconds, 12.70%)</title><rect x="159.8" y="549" width="149.9" height="15.0" fill="rgb(206,5,1)" rx="2" ry="2" />
+<text  x="162.84" y="559.5" >compile_filename</text>
+</g>
+<g >
+<title>execute_ex (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="517" width="18.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="331.41" y="527.5" ></text>
+</g>
+<g >
+<title>__mmap_region (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="149" width="37.5" height="15.0" fill="rgb(253,225,53)" rx="2" ry="2" />
+<text  x="1024.43" y="159.5" >__m..</text>
+</g>
+<g >
+<title>_RINvNvNtCs6ZjlLoI6YmX_3std9panicking12catch_unwind7do_callNCNvCslDdYbj3vjtA_7nzbyenc26nntmux_yenc_decode_span_v10jEBY_ (8,016,032 nanoseconds, 6.35%)</title><rect x="365.9" y="421" width="74.9" height="15.0" fill="rgb(239,156,37)" rx="2" ry="2" />
+<text  x="368.87" y="431.5" >_RINvNvN..</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="405" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="331.41" y="415.5" ></text>
+</g>
+<g >
+<title>_php_stream_fill_read_buffer (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="501" width="93.6" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="50.46" y="511.5" >_php_stream..</text>
+</g>
+<g >
+<title>do_mmap (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="181" width="37.5" height="15.0" fill="rgb(228,107,25)" rx="2" ry="2" />
+<text  x="1024.43" y="191.5" >do_..</text>
+</g>
+<g >
+<title>php_module_startup (36,072,144 nanoseconds, 28.57%)</title><rect x="852.9" y="613" width="337.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="855.86" y="623.5" >php_module_startup</text>
+</g>
+<g >
+<title>[libc.so.6] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="517" width="18.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1155.54" y="527.5" ></text>
+</g>
+<g >
+<title>[libcrypto.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="309" width="18.8" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1155.54" y="319.5" ></text>
+</g>
+<g >
+<title>exc_page_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="341" width="18.7" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="1061.89" y="351.5" ></text>
+</g>
+<g >
+<title>lex_scan (4,008,016 nanoseconds, 3.17%)</title><rect x="272.2" y="437" width="37.5" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="275.22" y="447.5" >lex..</text>
+</g>
+<g >
+<title>[phar.so] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="597" width="18.7" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="144.11" y="607.5" ></text>
+</g>
+<g >
+<title>mas_preallocate (2,004,008 nanoseconds, 1.59%)</title><rect x="1021.4" y="85" width="18.8" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="1024.43" y="95.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="1171.3" y="485" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="1174.27" y="495.5" ></text>
+</g>
+<g >
+<title>_copy_to_iter (6,012,024 nanoseconds, 4.76%)</title><rect x="66.2" y="293" width="56.2" height="15.0" fill="rgb(227,105,25)" rx="2" ry="2" />
+<text  x="69.19" y="303.5" >_copy..</text>
+</g>
+<g >
+<title>vms_complete_munmap_vmas (2,004,008 nanoseconds, 1.59%)</title><rect x="796.7" y="325" width="18.7" height="15.0" fill="rgb(216,52,12)" rx="2" ry="2" />
+<text  x="799.67" y="335.5" ></text>
+</g>
+<g >
+<title>zend_fetch_class_by_name (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="437" width="18.7" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="331.41" y="447.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="309.7" y="501" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="312.68" y="511.5" ></text>
+</g>
+<g >
+<title>[php8.5] (24,048,096 nanoseconds, 19.05%)</title><rect x="852.9" y="597" width="224.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="855.86" y="607.5" >[php8.5]</text>
+</g>
+<g >
+<title>_dl_catch_exception (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="485" width="206.0" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="874.59" y="495.5" >_dl_catch_exception</text>
+</g>
+<g >
+<title>zend_execute_script (48,096,192 nanoseconds, 38.10%)</title><rect x="347.1" y="581" width="449.6" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="350.14" y="591.5" >zend_execute_script</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="309" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="319.5" ></text>
+</g>
+<g >
+<title>__handle_mm_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1133.8" y="437" width="18.7" height="15.0" fill="rgb(207,9,2)" rx="2" ry="2" />
+<text  x="1136.81" y="447.5" ></text>
+</g>
+<g >
+<title>php (126,252,504 nanoseconds, 100.00%)</title><rect x="10.0" y="693" width="1180.0" height="15.0" fill="rgb(244,182,43)" rx="2" ry="2" />
+<text  x="13.00" y="703.5" >php</text>
+</g>
+<g >
+<title>dlopen (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="533" width="206.0" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="874.59" y="543.5" >dlopen</text>
+</g>
+<g >
+<title>php_load_shlib (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="549" width="206.0" height="15.0" fill="rgb(206,5,1)" rx="2" ry="2" />
+<text  x="874.59" y="559.5" >php_load_shlib</text>
+</g>
+<g >
+<title>_erealloc (2,004,008 nanoseconds, 1.59%)</title><rect x="197.3" y="341" width="18.7" height="15.0" fill="rgb(230,115,27)" rx="2" ry="2" />
+<text  x="200.30" y="351.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (12,024,048 nanoseconds, 9.52%)</title><rect x="28.7" y="661" width="112.4" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="31.73" y="671.5" >[libc.so.6]</text>
+</g>
+<g >
+<title>vms_gather_munmap_vmas (2,004,008 nanoseconds, 1.59%)</title><rect x="815.4" y="325" width="18.7" height="15.0" fill="rgb(250,209,50)" rx="2" ry="2" />
+<text  x="818.40" y="335.5" ></text>
+</g>
+<g >
+<title>zend_execute_script (18,036,072 nanoseconds, 14.29%)</title><rect x="141.1" y="629" width="168.6" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="144.11" y="639.5" >zend_execute_script</text>
+</g>
+<g >
+<title>zend_execute (12,024,048 nanoseconds, 9.52%)</title><rect x="28.7" y="581" width="112.4" height="15.0" fill="rgb(225,94,22)" rx="2" ry="2" />
+<text  x="31.73" y="591.5" >zend_execute</text>
+</g>
+<g >
+<title>zend_execute_script (4,008,016 nanoseconds, 3.17%)</title><rect x="309.7" y="645" width="37.4" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="312.68" y="655.5" >zen..</text>
+</g>
+<g >
+<title>[php8.5] (6,012,024 nanoseconds, 4.76%)</title><rect x="159.8" y="453" width="56.2" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="463.5" >[php8..</text>
+</g>
+<g >
+<title>zend_bind_class_in_slot (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="309" width="18.7" height="15.0" fill="rgb(248,199,47)" rx="2" ry="2" />
+<text  x="331.41" y="319.5" ></text>
+</g>
+<g >
+<title>[libcrypto.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="325" width="18.8" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1155.54" y="335.5" ></text>
+</g>
+<g >
+<title>kmem_cache_alloc_noprof (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="389" width="18.7" height="15.0" fill="rgb(248,200,47)" rx="2" ry="2" />
+<text  x="13.00" y="399.5" ></text>
+</g>
+<g >
+<title>read (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="469" width="93.6" height="15.0" fill="rgb(252,216,51)" rx="2" ry="2" />
+<text  x="50.46" y="479.5" >read</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="373" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="383.5" ></text>
+</g>
+<g >
+<title>vma_modify_flags (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="485" width="18.7" height="15.0" fill="rgb(215,49,11)" rx="2" ry="2" />
+<text  x="13.00" y="495.5" ></text>
+</g>
+<g >
+<title>handle_mm_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="309" width="18.7" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="1061.89" y="319.5" ></text>
+</g>
+<g >
+<title>_dl_catch_exception (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="437" width="206.0" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="874.59" y="447.5" >_dl_catch_exception</text>
+</g>
+<g >
+<title>zendparse (10,020,040 nanoseconds, 7.94%)</title><rect x="216.0" y="469" width="93.7" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="219.03" y="479.5" >zendparse</text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="469" width="37.4" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="799.67" y="479.5" >[ld..</text>
+</g>
+<g >
+<title>do_wp_page (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="261" width="18.7" height="15.0" fill="rgb(212,36,8)" rx="2" ry="2" />
+<text  x="1061.89" y="271.5" ></text>
+</g>
+<g >
+<title>ksys_read (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="389" width="93.6" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="50.46" y="399.5" >ksys_read</text>
+</g>
+<g >
+<title>_start (90,180,360 nanoseconds, 71.43%)</title><rect x="347.1" y="677" width="842.9" height="15.0" fill="rgb(245,185,44)" rx="2" ry="2" />
+<text  x="350.14" y="687.5" >_start</text>
+</g>
+<g >
+<title>[libcrypto.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="389" width="18.8" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1155.54" y="399.5" ></text>
+</g>
+<g >
+<title>__x64_sys_openat (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="469" width="18.7" height="15.0" fill="rgb(251,215,51)" rx="2" ry="2" />
+<text  x="855.86" y="479.5" ></text>
+</g>
+<g >
+<title>[libcrypto.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="293" width="18.8" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1155.54" y="303.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="1077.6" y="517" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="1080.62" y="527.5" ></text>
+</g>
+<g >
+<title>do_filp_open (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="437" width="18.7" height="15.0" fill="rgb(211,28,6)" rx="2" ry="2" />
+<text  x="855.86" y="447.5" ></text>
+</g>
+<g >
+<title>asm_exc_page_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="357" width="18.7" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="1061.89" y="367.5" ></text>
+</g>
+<g >
+<title>[php8.5] (90,180,360 nanoseconds, 71.43%)</title><rect x="347.1" y="629" width="842.9" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="350.14" y="639.5" >[php8.5]</text>
+</g>
+<g >
+<title>init_op_array (2,004,008 nanoseconds, 1.59%)</title><rect x="178.6" y="357" width="18.7" height="15.0" fill="rgb(221,75,18)" rx="2" ry="2" />
+<text  x="181.57" y="367.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="517" width="18.7" height="15.0" fill="rgb(218,63,15)" rx="2" ry="2" />
+<text  x="855.86" y="527.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="293" width="37.5" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="1024.43" y="303.5" >[ld..</text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="453" width="93.6" height="15.0" fill="rgb(218,63,15)" rx="2" ry="2" />
+<text  x="50.46" y="463.5" >entry_SYSCA..</text>
+</g>
+<g >
+<title>ksys_mmap_pgoff (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="213" width="37.5" height="15.0" fill="rgb(245,185,44)" rx="2" ry="2" />
+<text  x="1024.43" y="223.5" >ksy..</text>
+</g>
+<g >
+<title>[libc.so.6] (2,004,008 nanoseconds, 1.59%)</title><rect x="197.3" y="325" width="18.7" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="200.30" y="335.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="629" width="18.7" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="13.00" y="639.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="565" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="331.41" y="575.5" ></text>
+</g>
+<g >
+<title>[libcrypto.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="373" width="18.8" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1155.54" y="383.5" ></text>
+</g>
+<g >
+<title>zend_register_internal_class_with_flags (2,004,008 nanoseconds, 1.59%)</title><rect x="1096.3" y="501" width="18.8" height="15.0" fill="rgb(213,37,8)" rx="2" ry="2" />
+<text  x="1099.35" y="511.5" ></text>
+</g>
+<g >
+<title>vma_alloc_folio_noprof (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="357" width="18.8" height="15.0" fill="rgb(218,61,14)" rx="2" ry="2" />
+<text  x="350.14" y="367.5" ></text>
+</g>
+<g >
+<title>handle_mm_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1133.8" y="453" width="18.7" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="1136.81" y="463.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="469" width="206.0" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="874.59" y="479.5" >[libc.so.6]</text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="613" width="18.7" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="13.00" y="623.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="437" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="447.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="501" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="331.41" y="511.5" ></text>
+</g>
+<g >
+<title>__do_sys_newfstatat (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="389" width="18.7" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="1118.08" y="399.5" ></text>
+</g>
+<g >
+<title>__x64_sys_read (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="405" width="93.6" height="15.0" fill="rgb(219,68,16)" rx="2" ry="2" />
+<text  x="50.46" y="415.5" >__x64_sys_r..</text>
+</g>
+<g >
+<title>flush_tlb_mm_range (2,004,008 nanoseconds, 1.59%)</title><rect x="796.7" y="277" width="18.7" height="15.0" fill="rgb(215,48,11)" rx="2" ry="2" />
+<text  x="799.67" y="287.5" ></text>
+</g>
+<g >
+<title>mongoc_init (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="533" width="18.8" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="1155.54" y="543.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (12,024,048 nanoseconds, 9.52%)</title><rect x="890.3" y="357" width="112.4" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="893.32" y="367.5" >[ld-linux-x86..</text>
+</g>
+<g >
+<title>do_syscall_64 (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="501" width="18.7" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="855.86" y="511.5" ></text>
+</g>
+<g >
+<title>do_user_addr_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="325" width="18.7" height="15.0" fill="rgb(228,108,25)" rx="2" ry="2" />
+<text  x="1061.89" y="335.5" ></text>
+</g>
+<g >
+<title>php_execute_script_ex (4,008,016 nanoseconds, 3.17%)</title><rect x="309.7" y="661" width="37.4" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="312.68" y="671.5" >php..</text>
+</g>
+<g >
+<title>generic_file_read_iter (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="341" width="93.6" height="15.0" fill="rgb(222,78,18)" rx="2" ry="2" />
+<text  x="50.46" y="351.5" >generic_fil..</text>
+</g>
+<g >
+<title>MagickCoreGenesis (2,004,008 nanoseconds, 1.59%)</title><rect x="1133.8" y="533" width="18.7" height="15.0" fill="rgb(238,152,36)" rx="2" ry="2" />
+<text  x="1136.81" y="543.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (90,180,360 nanoseconds, 71.43%)</title><rect x="347.1" y="645" width="842.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="350.14" y="655.5" >[libc.so.6]</text>
+</g>
+<g >
+<title>[php8.5] (6,012,024 nanoseconds, 4.76%)</title><rect x="159.8" y="469" width="56.2" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="479.5" >[php8..</text>
+</g>
+<g >
+<title>php_execute_script_ex (18,036,072 nanoseconds, 14.29%)</title><rect x="141.1" y="645" width="168.6" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="144.11" y="655.5" >php_execute_script_ex</text>
+</g>
+<g >
+<title>__x64_sys_mprotect (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="533" width="18.7" height="15.0" fill="rgb(209,21,5)" rx="2" ry="2" />
+<text  x="13.00" y="543.5" ></text>
+</g>
+<g >
+<title>[libffi.so.8.1.4] (8,016,032 nanoseconds, 6.35%)</title><rect x="365.9" y="485" width="74.9" height="15.0" fill="rgb(207,9,2)" rx="2" ry="2" />
+<text  x="368.87" y="495.5" >[libffi...</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="1096.3" y="533" width="18.8" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="1099.35" y="543.5" ></text>
+</g>
+<g >
+<title>x64_sys_call (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="245" width="37.5" height="15.0" fill="rgb(247,194,46)" rx="2" ry="2" />
+<text  x="1024.43" y="255.5" >x64..</text>
+</g>
+<g >
+<title>execute_ex (12,024,048 nanoseconds, 9.52%)</title><rect x="28.7" y="565" width="112.4" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="31.73" y="575.5" >execute_ex</text>
+</g>
+<g >
+<title>zend_fetch_class_by_name (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="277" width="18.7" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="331.41" y="287.5" ></text>
+</g>
+<g >
+<title>filemap_get_pages (2,004,008 nanoseconds, 1.59%)</title><rect x="122.4" y="309" width="18.7" height="15.0" fill="rgb(216,53,12)" rx="2" ry="2" />
+<text  x="125.38" y="319.5" ></text>
+</g>
+<g >
+<title>_RINvNtCsc36rpYXAlPq_4core3ptr15write_unalignedNtNtNtB4_9core_arch3x867___m128iECslDdYbj3vjtA_7nzbyenc (4,008,016 nanoseconds, 3.17%)</title><rect x="403.3" y="325" width="37.5" height="15.0" fill="rgb(222,81,19)" rx="2" ry="2" />
+<text  x="406.33" y="335.5" >_RI..</text>
+</g>
+<g >
+<title>[php8.5] (12,024,048 nanoseconds, 9.52%)</title><rect x="28.7" y="645" width="112.4" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="31.73" y="655.5" >[php8.5]</text>
+</g>
+<g >
+<title>__handle_mm_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="421" width="18.8" height="15.0" fill="rgb(207,9,2)" rx="2" ry="2" />
+<text  x="350.14" y="431.5" ></text>
+</g>
+<g >
+<title>[php8.5] (16,032,064 nanoseconds, 12.70%)</title><rect x="159.8" y="565" width="149.9" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="575.5" >[php8.5]</text>
+</g>
+<g >
+<title>fstatat64 (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="469" width="18.7" height="15.0" fill="rgb(225,95,22)" rx="2" ry="2" />
+<text  x="1118.08" y="479.5" ></text>
+</g>
+<g >
+<title>zend_lookup_class_ex (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="581" width="18.7" height="15.0" fill="rgb(245,187,44)" rx="2" ry="2" />
+<text  x="331.41" y="591.5" ></text>
+</g>
+<g >
+<title>php_execute_script_ex (48,096,192 nanoseconds, 38.10%)</title><rect x="347.1" y="597" width="449.6" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="350.14" y="607.5" >php_execute_script_ex</text>
+</g>
+<g >
+<title>zend_register_internal_class_with_flags (2,004,008 nanoseconds, 1.59%)</title><rect x="1171.3" y="501" width="18.7" height="15.0" fill="rgb(213,37,8)" rx="2" ry="2" />
+<text  x="1174.27" y="511.5" ></text>
+</g>
+<g >
+<title>[libcrypto.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="341" width="18.8" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1155.54" y="351.5" ></text>
+</g>
+<g >
+<title>[xdebug.so] (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="133" width="18.7" height="15.0" fill="rgb(239,160,38)" rx="2" ry="2" />
+<text  x="331.41" y="143.5" ></text>
+</g>
+<g >
+<title>do_vmi_munmap (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="357" width="37.4" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="799.67" y="367.5" >do_..</text>
+</g>
+<g >
+<title>path_openat (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="421" width="18.7" height="15.0" fill="rgb(249,202,48)" rx="2" ry="2" />
+<text  x="855.86" y="431.5" ></text>
+</g>
+<g >
+<title>__libc_start_main (90,180,360 nanoseconds, 71.43%)</title><rect x="347.1" y="661" width="842.9" height="15.0" fill="rgb(236,142,34)" rx="2" ry="2" />
+<text  x="350.14" y="671.5" >__libc_start_main</text>
+</g>
+<g >
+<title>pass_two (2,004,008 nanoseconds, 1.59%)</title><rect x="197.3" y="357" width="18.7" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="200.30" y="367.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="373" width="206.0" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="874.59" y="383.5" >[ld-linux-x86-64.so.2]</text>
+</g>
+<g >
+<title>get_page_from_freelist (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="309" width="18.8" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="350.14" y="319.5" ></text>
+</g>
+<g >
+<title>ext4_file_read_iter (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="357" width="93.6" height="15.0" fill="rgb(244,180,43)" rx="2" ry="2" />
+<text  x="50.46" y="367.5" >ext4_file_r..</text>
+</g>
+<g >
+<title>security_inode_getattr (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="341" width="18.7" height="15.0" fill="rgb(216,53,12)" rx="2" ry="2" />
+<text  x="1118.08" y="351.5" ></text>
+</g>
+<g >
+<title>[mongodb.so] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="501" width="18.8" height="15.0" fill="rgb(224,90,21)" rx="2" ry="2" />
+<text  x="1155.54" y="511.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="437" width="37.4" height="15.0" fill="rgb(218,63,15)" rx="2" ry="2" />
+<text  x="799.67" y="447.5" >ent..</text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (2,004,008 nanoseconds, 1.59%)</title><rect x="984.0" y="325" width="18.7" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="986.97" y="335.5" ></text>
+</g>
+<g >
+<title>execute_ex (16,032,064 nanoseconds, 12.70%)</title><rect x="159.8" y="597" width="149.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="162.84" y="607.5" >execute_ex</text>
+</g>
+<g >
+<title>_IO_file_open (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="549" width="18.7" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="855.86" y="559.5" ></text>
+</g>
+<g >
+<title>_php_stream_fopen (2,004,008 nanoseconds, 1.59%)</title><rect x="309.7" y="549" width="18.7" height="15.0" fill="rgb(229,111,26)" rx="2" ry="2" />
+<text  x="312.68" y="559.5" ></text>
+</g>
+<g >
+<title>[php8.5] (6,012,024 nanoseconds, 4.76%)</title><rect x="159.8" y="373" width="56.2" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="383.5" >[php8..</text>
+</g>
+<g >
+<title>_RNvNtCslDdYbj3vjtA_7nzbyenc19payload_decoder_x8613compact_vbmi2 (6,012,024 nanoseconds, 4.76%)</title><rect x="384.6" y="373" width="56.2" height="15.0" fill="rgb(251,215,51)" rx="2" ry="2" />
+<text  x="387.60" y="383.5" >_RNvN..</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="341" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="331.41" y="351.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="453" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="463.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="261" width="37.5" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="1024.43" y="271.5" >do_..</text>
+</g>
+<g >
+<title>[libffi.so.8.1.4] (8,016,032 nanoseconds, 6.35%)</title><rect x="365.9" y="501" width="74.9" height="15.0" fill="rgb(207,9,2)" rx="2" ry="2" />
+<text  x="368.87" y="511.5" >[libffi...</text>
+</g>
+<g >
+<title>[xdebug.so] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="613" width="18.7" height="15.0" fill="rgb(239,160,38)" rx="2" ry="2" />
+<text  x="144.11" y="623.5" ></text>
+</g>
+<g >
+<title>__x64_sys_newfstatat (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="405" width="18.7" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="1118.08" y="415.5" ></text>
+</g>
+<g >
+<title>do_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1133.8" y="405" width="18.7" height="15.0" fill="rgb(248,200,47)" rx="2" ry="2" />
+<text  x="1136.81" y="415.5" ></text>
+</g>
+<g >
+<title>execute_ex (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="197" width="18.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="331.41" y="207.5" ></text>
+</g>
+<g >
+<title>EVP_CIPHER_fetch (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="421" width="18.8" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="1155.54" y="431.5" ></text>
+</g>
+<g >
+<title>zend_register_ini_entries_ex (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="533" width="18.7" height="15.0" fill="rgb(230,118,28)" rx="2" ry="2" />
+<text  x="1118.08" y="543.5" ></text>
+</g>
+<g >
+<title>inode_permission (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="389" width="18.7" height="15.0" fill="rgb(208,18,4)" rx="2" ry="2" />
+<text  x="855.86" y="399.5" ></text>
+</g>
+<g >
+<title>asm_exc_page_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="485" width="18.8" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="350.14" y="495.5" ></text>
+</g>
+<g >
+<title>compile_file (16,032,064 nanoseconds, 12.70%)</title><rect x="159.8" y="501" width="149.9" height="15.0" fill="rgb(249,206,49)" rx="2" ry="2" />
+<text  x="162.84" y="511.5" >compile_file</text>
+</g>
+<g >
+<title>__vma_start_write (2,004,008 nanoseconds, 1.59%)</title><rect x="815.4" y="309" width="18.7" height="15.0" fill="rgb(225,96,23)" rx="2" ry="2" />
+<text  x="818.40" y="319.5" ></text>
+</g>
+<g >
+<title>do_huge_pmd_anonymous_page (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="405" width="18.8" height="15.0" fill="rgb(242,172,41)" rx="2" ry="2" />
+<text  x="350.14" y="415.5" ></text>
+</g>
+<g >
+<title>vma_alloc_anon_folio_pmd (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="373" width="18.8" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="350.14" y="383.5" ></text>
+</g>
+<g >
+<title>__folio_batch_add_and_move (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="197" width="18.7" height="15.0" fill="rgb(254,227,54)" rx="2" ry="2" />
+<text  x="1061.89" y="207.5" ></text>
+</g>
+<g >
+<title>x64_sys_call (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="549" width="18.7" height="15.0" fill="rgb(247,194,46)" rx="2" ry="2" />
+<text  x="13.00" y="559.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="309" width="37.5" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="1024.43" y="319.5" >[ld..</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="309.7" y="581" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="312.68" y="591.5" ></text>
+</g>
+<g >
+<title>zend_register_long_constant (2,004,008 nanoseconds, 1.59%)</title><rect x="1077.6" y="533" width="18.7" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="1080.62" y="543.5" ></text>
+</g>
+<g >
+<title>[redis.so] (2,004,008 nanoseconds, 1.59%)</title><rect x="1171.3" y="517" width="18.7" height="15.0" fill="rgb(211,31,7)" rx="2" ry="2" />
+<text  x="1174.27" y="527.5" ></text>
+</g>
+<g >
+<title>do_sys_openat2 (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="453" width="18.7" height="15.0" fill="rgb(253,221,52)" rx="2" ry="2" />
+<text  x="855.86" y="463.5" ></text>
+</g>
+<g >
+<title>open64 (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="533" width="18.7" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="855.86" y="543.5" ></text>
+</g>
+<g >
+<title>[php8.5] (22,044,088 nanoseconds, 17.46%)</title><rect x="553.2" y="517" width="206.0" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="556.17" y="527.5" >[php8.5]</text>
+</g>
+<g >
+<title>handle_pte_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="277" width="18.7" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="1061.89" y="287.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="533" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="543.5" ></text>
+</g>
+<g >
+<title>[php8.5] (6,012,024 nanoseconds, 4.76%)</title><rect x="159.8" y="437" width="56.2" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="447.5" >[php8..</text>
+</g>
+<g >
+<title>x64_sys_call (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="421" width="18.7" height="15.0" fill="rgb(247,194,46)" rx="2" ry="2" />
+<text  x="1118.08" y="431.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="159.8" y="309" width="18.8" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="319.5" ></text>
+</g>
+<g >
+<title>[php8.5] (4,008,016 nanoseconds, 3.17%)</title><rect x="309.7" y="597" width="37.4" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="312.68" y="607.5" >[ph..</text>
+</g>
+<g >
+<title>zend_lookup_class_ex (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="421" width="18.7" height="15.0" fill="rgb(245,187,44)" rx="2" ry="2" />
+<text  x="331.41" y="431.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="661" width="18.7" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="13.00" y="671.5" ></text>
+</g>
+<g >
+<title>vms_gather_munmap_vmas (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="117" width="37.5" height="15.0" fill="rgb(250,209,50)" rx="2" ry="2" />
+<text  x="1024.43" y="127.5" >vms..</text>
+</g>
+<g >
+<title>dlclose (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="565" width="37.4" height="15.0" fill="rgb(220,70,16)" rx="2" ry="2" />
+<text  x="799.67" y="575.5" >dlc..</text>
+</g>
+<g >
+<title>zend_do_link_class (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="453" width="18.7" height="15.0" fill="rgb(234,137,32)" rx="2" ry="2" />
+<text  x="331.41" y="463.5" ></text>
+</g>
+<g >
+<title>zend_register_functions (2,004,008 nanoseconds, 1.59%)</title><rect x="1171.3" y="469" width="18.7" height="15.0" fill="rgb(212,34,8)" rx="2" ry="2" />
+<text  x="1174.27" y="479.5" ></text>
+</g>
+<g >
+<title>exc_page_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1133.8" y="485" width="18.7" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="1136.81" y="495.5" ></text>
+</g>
+<g >
+<title>[libcrypto.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="357" width="18.8" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1155.54" y="367.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="469" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="479.5" ></text>
+</g>
+<g >
+<title>generic_permission (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="373" width="18.7" height="15.0" fill="rgb(228,107,25)" rx="2" ry="2" />
+<text  x="855.86" y="383.5" ></text>
+</g>
+<g >
+<title>__x64_sys_mmap (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="229" width="37.5" height="15.0" fill="rgb(223,83,19)" rx="2" ry="2" />
+<text  x="1024.43" y="239.5" >__x..</text>
+</g>
+<g >
+<title>zend_call_function (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="373" width="18.7" height="15.0" fill="rgb(207,11,2)" rx="2" ry="2" />
+<text  x="331.41" y="383.5" ></text>
+</g>
+<g >
+<title>asm_exc_page_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1133.8" y="501" width="18.7" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="1136.81" y="511.5" ></text>
+</g>
+<g >
+<title>PHP_SHA256Update (2,004,008 nanoseconds, 1.59%)</title><rect x="28.7" y="517" width="18.8" height="15.0" fill="rgb(218,63,15)" rx="2" ry="2" />
+<text  x="31.73" y="527.5" ></text>
+</g>
+<g >
+<title>zend_cpu_supports (2,004,008 nanoseconds, 1.59%)</title><rect x="28.7" y="485" width="18.8" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="31.73" y="495.5" ></text>
+</g>
+<g >
+<title>zend_bind_class_in_slot (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="469" width="18.7" height="15.0" fill="rgb(248,199,47)" rx="2" ry="2" />
+<text  x="331.41" y="479.5" ></text>
+</g>
+<g >
+<title>[php8.5] (16,032,064 nanoseconds, 12.70%)</title><rect x="159.8" y="581" width="149.9" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="591.5" >[php8.5]</text>
+</g>
+<g >
+<title>zend_execute (4,008,016 nanoseconds, 3.17%)</title><rect x="309.7" y="629" width="37.4" height="15.0" fill="rgb(225,94,22)" rx="2" ry="2" />
+<text  x="312.68" y="639.5" >zen..</text>
+</g>
+<g >
+<title>copy_page_to_iter (6,012,024 nanoseconds, 4.76%)</title><rect x="66.2" y="309" width="56.2" height="15.0" fill="rgb(209,22,5)" rx="2" ry="2" />
+<text  x="69.19" y="319.5" >copy_..</text>
+</g>
+<g >
+<title>zm_startup_redis (2,004,008 nanoseconds, 1.59%)</title><rect x="1171.3" y="549" width="18.7" height="15.0" fill="rgb(253,225,53)" rx="2" ry="2" />
+<text  x="1174.27" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (34,068,136 nanoseconds, 26.98%)</title><rect x="28.7" y="677" width="318.4" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="31.73" y="687.5" >[unknown]</text>
+</g>
+<g >
+<title>vma_complete (2,004,008 nanoseconds, 1.59%)</title><rect x="1040.2" y="85" width="18.7" height="15.0" fill="rgb(220,72,17)" rx="2" ry="2" />
+<text  x="1043.16" y="95.5" ></text>
+</g>
+<g >
+<title>[phar.so] (16,032,064 nanoseconds, 12.70%)</title><rect x="159.8" y="517" width="149.9" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="162.84" y="527.5" >[phar.so]</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="565" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="575.5" ></text>
+</g>
+<g >
+<title>execute_ex (4,008,016 nanoseconds, 3.17%)</title><rect x="309.7" y="613" width="37.4" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="312.68" y="623.5" >exe..</text>
+</g>
+<g >
+<title>[libcrypto.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="405" width="18.8" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1155.54" y="415.5" ></text>
+</g>
+<g >
+<title>_RINvNtCs6ZjlLoI6YmX_3std5panic12catch_unwindNCNvCslDdYbj3vjtA_7nzbyenc26nntmux_yenc_decode_span_v10jEBK_ (8,016,032 nanoseconds, 6.35%)</title><rect x="365.9" y="453" width="74.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="368.87" y="463.5" >_RINvNtC..</text>
+</g>
+<g >
+<title>_IO_file_fopen (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="565" width="18.7" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="855.86" y="575.5" ></text>
+</g>
+<g >
+<title>__vm_munmap (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="373" width="37.4" height="15.0" fill="rgb(231,121,28)" rx="2" ry="2" />
+<text  x="799.67" y="383.5" >__v..</text>
+</g>
+<g >
+<title>compile_filename (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="149" width="18.7" height="15.0" fill="rgb(206,5,1)" rx="2" ry="2" />
+<text  x="331.41" y="159.5" ></text>
+</g>
+<g >
+<title>zend_call_function (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="213" width="18.7" height="15.0" fill="rgb(207,11,2)" rx="2" ry="2" />
+<text  x="331.41" y="223.5" ></text>
+</g>
+<g >
+<title>[php8.5] (22,044,088 nanoseconds, 17.46%)</title><rect x="553.2" y="485" width="206.0" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="556.17" y="495.5" >[php8.5]</text>
+</g>
+<g >
+<title>do_user_addr_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1133.8" y="469" width="18.7" height="15.0" fill="rgb(228,108,25)" rx="2" ry="2" />
+<text  x="1136.81" y="479.5" ></text>
+</g>
+<g >
+<title>_mongoc_openssl_init (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="485" width="18.8" height="15.0" fill="rgb(215,47,11)" rx="2" ry="2" />
+<text  x="1155.54" y="495.5" ></text>
+</g>
+<g >
+<title>zend_lookup_class_ex (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="261" width="18.7" height="15.0" fill="rgb(245,187,44)" rx="2" ry="2" />
+<text  x="331.41" y="271.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="245" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="331.41" y="255.5" ></text>
+</g>
+<g >
+<title>do_vmi_align_munmap (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="341" width="37.4" height="15.0" fill="rgb(211,29,7)" rx="2" ry="2" />
+<text  x="799.67" y="351.5" >do_..</text>
+</g>
+<g >
+<title>[php8.5] (16,032,064 nanoseconds, 12.70%)</title><rect x="159.8" y="485" width="149.9" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="495.5" >[php8.5]</text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="501" width="37.4" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="799.67" y="511.5" >[ld..</text>
+</g>
+<g >
+<title>[php8.5] (12,024,048 nanoseconds, 9.52%)</title><rect x="28.7" y="533" width="112.4" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="31.73" y="543.5" >[php8.5]</text>
+</g>
+<g >
+<title>zend_execute_script (12,024,048 nanoseconds, 9.52%)</title><rect x="28.7" y="597" width="112.4" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="31.73" y="607.5" >zend_execute_..</text>
+</g>
+<g >
+<title>RandomComponentGenesis (2,004,008 nanoseconds, 1.59%)</title><rect x="1133.8" y="517" width="18.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1136.81" y="527.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="437" width="18.7" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="1118.08" y="447.5" ></text>
+</g>
+<g >
+<title>zendparse (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="69" width="18.7" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="331.41" y="79.5" ></text>
+</g>
+<g >
+<title>_RINvNtCsc36rpYXAlPq_4core3ptr5writeINtB2_6PackedNtNtNtB4_9core_arch3x867___m128iEECslDdYbj3vjtA_7nzbyenc (4,008,016 nanoseconds, 3.17%)</title><rect x="403.3" y="309" width="37.5" height="15.0" fill="rgb(241,166,39)" rx="2" ry="2" />
+<text  x="406.33" y="319.5" >_RI..</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="159.8" y="357" width="18.8" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="367.5" ></text>
+</g>
+<g >
+<title>[php8.5] (6,012,024 nanoseconds, 4.76%)</title><rect x="159.8" y="389" width="56.2" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="399.5" >[php8..</text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="485" width="37.4" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="799.67" y="495.5" >[ld..</text>
+</g>
+<g >
+<title>filemap_get_read_batch (2,004,008 nanoseconds, 1.59%)</title><rect x="122.4" y="293" width="18.7" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="125.38" y="303.5" ></text>
+</g>
+<g >
+<title>do_bind_class (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="485" width="18.7" height="15.0" fill="rgb(205,2,0)" rx="2" ry="2" />
+<text  x="331.41" y="495.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="501" width="206.0" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="874.59" y="511.5" >[ld-linux-x86-64.so.2]</text>
+</g>
+<g >
+<title>do_bind_class (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="325" width="18.7" height="15.0" fill="rgb(205,2,0)" rx="2" ry="2" />
+<text  x="331.41" y="335.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="517" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="527.5" ></text>
+</g>
+<g >
+<title>_php_stream_read (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="517" width="93.6" height="15.0" fill="rgb(230,116,27)" rx="2" ry="2" />
+<text  x="50.46" y="527.5" >_php_stream..</text>
+</g>
+<g >
+<title>[ffi.so] (10,020,040 nanoseconds, 7.94%)</title><rect x="347.1" y="533" width="93.7" height="15.0" fill="rgb(221,76,18)" rx="2" ry="2" />
+<text  x="350.14" y="543.5" >[ffi.so]</text>
+</g>
+<g >
+<title>filemap_read (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="325" width="93.6" height="15.0" fill="rgb(246,192,46)" rx="2" ry="2" />
+<text  x="50.46" y="335.5" >filemap_read</text>
+</g>
+<g >
+<title>_raw_spin_unlock_irqrestore (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="181" width="18.7" height="15.0" fill="rgb(228,106,25)" rx="2" ry="2" />
+<text  x="1061.89" y="191.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="565" width="18.7" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="13.00" y="575.5" ></text>
+</g>
+<g >
+<title>zend_hash_graceful_reverse_destroy (2,004,008 nanoseconds, 1.59%)</title><rect x="834.1" y="581" width="18.8" height="15.0" fill="rgb(254,228,54)" rx="2" ry="2" />
+<text  x="837.13" y="591.5" ></text>
+</g>
+<g >
+<title>nntmux_yenc_decode_span_v1 (8,016,032 nanoseconds, 6.35%)</title><rect x="365.9" y="469" width="74.9" height="15.0" fill="rgb(233,129,30)" rx="2" ry="2" />
+<text  x="368.87" y="479.5" >nntmux_y..</text>
+</g>
+<g >
+<title>zend_do_link_class (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="293" width="18.7" height="15.0" fill="rgb(234,137,32)" rx="2" ry="2" />
+<text  x="331.41" y="303.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="85" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="331.41" y="95.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="165" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="331.41" y="175.5" ></text>
+</g>
+<g >
+<title>[php8.5] (4,008,016 nanoseconds, 3.17%)</title><rect x="272.2" y="453" width="37.5" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="275.22" y="463.5" >[ph..</text>
+</g>
+<g >
+<title>zend_execute (48,096,192 nanoseconds, 38.10%)</title><rect x="347.1" y="565" width="449.6" height="15.0" fill="rgb(225,94,22)" rx="2" ry="2" />
+<text  x="350.14" y="575.5" >zend_execute</text>
+</g>
+<g >
+<title>mmap_region (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="165" width="37.5" height="15.0" fill="rgb(231,121,28)" rx="2" ry="2" />
+<text  x="1024.43" y="175.5" >mma..</text>
+</g>
+<g >
+<title>__alloc_frozen_pages_noprof (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="325" width="18.8" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="350.14" y="335.5" ></text>
+</g>
+<g >
+<title>vfs_statx (2,004,008 nanoseconds, 1.59%)</title><rect x="1115.1" y="357" width="18.7" height="15.0" fill="rgb(242,172,41)" rx="2" ry="2" />
+<text  x="1118.08" y="367.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="597" width="18.7" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="13.00" y="607.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="501" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="511.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="581" width="18.7" height="15.0" fill="rgb(218,63,15)" rx="2" ry="2" />
+<text  x="13.00" y="591.5" ></text>
+</g>
+<g >
+<title>zm_startup_redis_cluster (2,004,008 nanoseconds, 1.59%)</title><rect x="1171.3" y="533" width="18.7" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="1174.27" y="543.5" ></text>
+</g>
+<g >
+<title>fopen (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="581" width="18.7" height="15.0" fill="rgb(251,211,50)" rx="2" ry="2" />
+<text  x="855.86" y="591.5" ></text>
+</g>
+<g >
+<title>_dl_catch_exception (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="405" width="206.0" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="874.59" y="415.5" >_dl_catch_exception</text>
+</g>
+<g >
+<title>[php8.5] (6,012,024 nanoseconds, 4.76%)</title><rect x="796.7" y="597" width="56.2" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="799.67" y="607.5" >[php8..</text>
+</g>
+<g >
+<title>zm_startup_mongodb (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="549" width="18.8" height="15.0" fill="rgb(216,54,12)" rx="2" ry="2" />
+<text  x="1155.54" y="559.5" ></text>
+</g>
+<g >
+<title>exc_page_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="469" width="18.8" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="350.14" y="479.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="159.8" y="341" width="18.8" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="351.5" ></text>
+</g>
+<g >
+<title>__handle_mm_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="293" width="18.7" height="15.0" fill="rgb(207,9,2)" rx="2" ry="2" />
+<text  x="1061.89" y="303.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (6,012,024 nanoseconds, 4.76%)</title><rect x="1002.7" y="341" width="56.2" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="1005.70" y="351.5" >[ld-l..</text>
+</g>
+<g >
+<title>zend_call_known_function (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="389" width="18.7" height="15.0" fill="rgb(245,186,44)" rx="2" ry="2" />
+<text  x="331.41" y="399.5" ></text>
+</g>
+<g >
+<title>do_user_addr_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1096.3" y="405" width="18.8" height="15.0" fill="rgb(228,108,25)" rx="2" ry="2" />
+<text  x="1099.35" y="415.5" ></text>
+</g>
+<g >
+<title>all (126,252,504 nanoseconds, 100%)</title><rect x="10.0" y="709" width="1180.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="13.00" y="719.5" ></text>
+</g>
+<g >
+<title>php_module_shutdown (6,012,024 nanoseconds, 4.76%)</title><rect x="796.7" y="613" width="56.2" height="15.0" fill="rgb(232,124,29)" rx="2" ry="2" />
+<text  x="799.67" y="623.5" >php_m..</text>
+</g>
+<g >
+<title>expand_filepath_with_mode (2,004,008 nanoseconds, 1.59%)</title><rect x="309.7" y="533" width="18.7" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="312.68" y="543.5" ></text>
+</g>
+<g >
+<title>mprotect_fixup (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="501" width="18.7" height="15.0" fill="rgb(236,144,34)" rx="2" ry="2" />
+<text  x="13.00" y="511.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="405" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="415.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="28.7" y="501" width="18.8" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="31.73" y="511.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="485" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="495.5" ></text>
+</g>
+<g >
+<title>zend_call_function (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="533" width="18.7" height="15.0" fill="rgb(207,11,2)" rx="2" ry="2" />
+<text  x="331.41" y="543.5" ></text>
+</g>
+<g >
+<title>_RNvNtNtNtCsc36rpYXAlPq_4core9core_arch3x864sse216__mm_storeu_si128 (4,008,016 nanoseconds, 3.17%)</title><rect x="403.3" y="357" width="37.5" height="15.0" fill="rgb(219,65,15)" rx="2" ry="2" />
+<text  x="406.33" y="367.5" >_RN..</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="181" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="331.41" y="191.5" ></text>
+</g>
+<g >
+<title>malloc (2,004,008 nanoseconds, 1.59%)</title><rect x="309.7" y="485" width="18.7" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="312.68" y="495.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (6,012,024 nanoseconds, 4.76%)</title><rect x="1002.7" y="325" width="56.2" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="1005.70" y="335.5" >[ld-l..</text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="421" width="206.0" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="874.59" y="431.5" >[ld-linux-x86-64.so.2]</text>
+</g>
+<g >
+<title>[mysqli.so] (2,004,008 nanoseconds, 1.59%)</title><rect x="1077.6" y="549" width="18.7" height="15.0" fill="rgb(233,129,31)" rx="2" ry="2" />
+<text  x="1080.62" y="559.5" ></text>
+</g>
+<g >
+<title>do_mprotect_pkey (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="517" width="18.7" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="13.00" y="527.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (22,044,088 nanoseconds, 17.46%)</title><rect x="871.6" y="517" width="206.0" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="874.59" y="527.5" >[libc.so.6]</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="517" width="18.8" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="350.14" y="527.5" ></text>
+</g>
+<g >
+<title>compile_file (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="581" width="18.7" height="15.0" fill="rgb(249,206,49)" rx="2" ry="2" />
+<text  x="144.11" y="591.5" ></text>
+</g>
+<g >
+<title>_RNCNvCslDdYbj3vjtA_7nzbyenc26nntmux_yenc_decode_span_v10B3_ (8,016,032 nanoseconds, 6.35%)</title><rect x="365.9" y="405" width="74.9" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="368.87" y="415.5" >_RNCNvCs..</text>
+</g>
+<g >
+<title>tlb_finish_mmu (2,004,008 nanoseconds, 1.59%)</title><rect x="796.7" y="293" width="18.7" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="799.67" y="303.5" ></text>
+</g>
+<g >
+<title>asm_exc_page_fault (2,004,008 nanoseconds, 1.59%)</title><rect x="1096.3" y="437" width="18.8" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="1099.35" y="447.5" ></text>
+</g>
+<g >
+<title>[libssl.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="437" width="18.8" height="15.0" fill="rgb(248,201,48)" rx="2" ry="2" />
+<text  x="1155.54" y="447.5" ></text>
+</g>
+<g >
+<title>vma_modify (2,004,008 nanoseconds, 1.59%)</title><rect x="10.0" y="469" width="18.7" height="15.0" fill="rgb(220,72,17)" rx="2" ry="2" />
+<text  x="13.00" y="479.5" ></text>
+</g>
+<g >
+<title>folio_add_lru (2,004,008 nanoseconds, 1.59%)</title><rect x="1058.9" y="213" width="18.7" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="1061.89" y="223.5" ></text>
+</g>
+<g >
+<title>mas_alloc_nodes (2,004,008 nanoseconds, 1.59%)</title><rect x="1021.4" y="53" width="18.8" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="1024.43" y="63.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="549" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="559.5" ></text>
+</g>
+<g >
+<title>[ld-linux-x86-64.so.2] (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="533" width="37.4" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="799.67" y="543.5" >[ld..</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="159.8" y="325" width="18.8" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="162.84" y="335.5" ></text>
+</g>
+<g >
+<title>[php8.5] (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="581" width="37.4" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="799.67" y="591.5" >[ph..</text>
+</g>
+<g >
+<title>[libssl.so.3] (2,004,008 nanoseconds, 1.59%)</title><rect x="1152.5" y="453" width="18.8" height="15.0" fill="rgb(248,201,48)" rx="2" ry="2" />
+<text  x="1155.54" y="463.5" ></text>
+</g>
+<g >
+<title>compile_file (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="101" width="18.7" height="15.0" fill="rgb(249,206,49)" rx="2" ry="2" />
+<text  x="331.41" y="111.5" ></text>
+</g>
+<g >
+<title>__mmap_prepare (4,008,016 nanoseconds, 3.17%)</title><rect x="1021.4" y="133" width="37.5" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="1024.43" y="143.5" >__m..</text>
+</g>
+<g >
+<title>[phar.so] (2,004,008 nanoseconds, 1.59%)</title><rect x="328.4" y="117" width="18.7" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="331.41" y="127.5" ></text>
+</g>
+<g >
+<title>x64_sys_call (4,008,016 nanoseconds, 3.17%)</title><rect x="796.7" y="405" width="37.4" height="15.0" fill="rgb(247,194,46)" rx="2" ry="2" />
+<text  x="799.67" y="415.5" >x64..</text>
+</g>
+<g >
+<title>[xdebug.so] (16,032,064 nanoseconds, 12.70%)</title><rect x="159.8" y="533" width="149.9" height="15.0" fill="rgb(239,160,38)" rx="2" ry="2" />
+<text  x="162.84" y="543.5" >[xdebug.so]</text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="141.1" y="421" width="18.7" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="144.11" y="431.5" ></text>
+</g>
+<g >
+<title>[php8.5] (12,024,048 nanoseconds, 9.52%)</title><rect x="28.7" y="549" width="112.4" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="31.73" y="559.5" >[php8.5]</text>
+</g>
+<g >
+<title>x64_sys_call (2,004,008 nanoseconds, 1.59%)</title><rect x="852.9" y="485" width="18.7" height="15.0" fill="rgb(247,194,46)" rx="2" ry="2" />
+<text  x="855.86" y="495.5" ></text>
+</g>
+<g >
+<title>[php8.5] (2,004,008 nanoseconds, 1.59%)</title><rect x="347.1" y="501" width="18.8" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="350.14" y="511.5" ></text>
+</g>
+<g >
+<title>[php8.5] (10,020,040 nanoseconds, 7.94%)</title><rect x="47.5" y="485" width="93.6" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="50.46" y="495.5" >[php8.5]</text>
+</g>
+<g >
+<title>[php8.5] (48,096,192 nanoseconds, 38.10%)</title><rect x="347.1" y="613" width="449.6" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="350.14" y="623.5" >[php8.5]</text>
+</g>
+<g >
+<title>_RNvMNtNtCsc36rpYXAlPq_4core3ptr7mut_ptrONtNtNtB6_9core_arch3x867___m128i15write_unalignedCslDdYbj3vjtA_7nzbyenc (4,008,016 nanoseconds, 3.17%)</title><rect x="403.3" y="341" width="37.5" height="15.0" fill="rgb(228,108,25)" rx="2" ry="2" />
+<text  x="406.33" y="351.5" >_RN..</text>
+</g>
+</g>
+</svg>
