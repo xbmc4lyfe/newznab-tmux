@@ -98,7 +98,7 @@ Schedule::exec($preparationCommand)->everyMinute()->runInBackground()
 for ($slot = 1; $slot <= max(1, min(8, (int) config('release_verification.candidate_workers', 2))); $slot++) {
     $verificationCommand = escapeshellarg(PHP_BINARY).' -d ffi.enable=true -d memory_limit=256M '
         .escapeshellarg(base_path('artisan')).' releases:verify-candidates --limit='.max(1, (int) config('release_verification.worker_limit', 1000))
-        .' --max-seconds='.max(1, (int) config('release_verification.worker_seconds', 300)).' --slot='.$slot.' --no-summary';
+        .' --max-seconds='.max(1, (int) config('release_verification.worker_seconds', 300)).' --slot='.$slot.' --no-summary --diagnostics';
     Schedule::exec($verificationCommand)->everyMinute()->runInBackground()
         ->when(static fn (): bool => (bool) config('release_verification.scheduled'));
 }
