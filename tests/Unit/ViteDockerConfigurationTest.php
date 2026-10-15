@@ -20,7 +20,8 @@ class ViteDockerConfigurationTest extends TestCase
     {
         $dockerfile = $this->projectFile('Dockerfile');
 
-        $this->assertMatchesRegularExpression('/^FROM rust:1\.98-bookworm AS yenc$/m', $dockerfile);
+        $this->assertMatchesRegularExpression('/^FROM rust:1\.98-bookworm AS rust-toolchain$/m', $dockerfile);
+        $this->assertMatchesRegularExpression('/^FROM dunglas\/frankenphp:1-php8\.5-bookworm AS yenc$/m', $dockerfile);
         $this->assertStringContainsString('cargo test --release --locked', $dockerfile);
         $this->assertStringContainsString('COPY --from=yenc /out/libnzbyenc.so /usr/local/lib/nntmux/libnzbyenc.so', $dockerfile);
         $this->assertMatchesRegularExpression('/install-php-extensions[^\n]+\bffi\b/', $dockerfile);

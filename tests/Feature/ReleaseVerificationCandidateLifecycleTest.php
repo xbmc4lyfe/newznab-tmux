@@ -381,19 +381,33 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
         $manifests = new NzbUploadManifestService(new Filesystem);
         $manifests->create($directory, 'reimport', 'Release.nzb', null);
         $manifestPath = $directory.'/'.NzbUploadManifestService::FILENAME;
-        $service = app(NzbImportService::class);
-        $details = ['verificationXml' => $xml, 'groups_id' => 1, 'useFName' => 'Movie', 'subject' => 'Movie',
-            'from' => 'poster', 'postDate' => '2026-10-11 12:00:00', 'articleFingerprint' => sha1('same-articles')];
-        $insert = new \ReflectionMethod($service, 'insertNZB');
-        $this->assertSame(NzbImportStatus::Queued, $insert->invoke($service, $details));
+        $service = new class(['Browser' => true]) extends NzbImportService
+        {
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function scanNZBFile(mixed &$nzbXML, mixed $nzbFileName = '', mixed $source = ''): NzbImportStatus
+            {
+                return $this->insertNZB(['verificationXml' => $nzbXML->asXML(), 'groups_id' => 1, 'useFName' => 'Movie', 'subject' => 'Movie',
+                    'from' => 'poster', 'postDate' => '2026-10-11 12:00:00', 'articleFingerprint' => sha1('same-articles')]);
+            }
+        };
+        $reports = [];
+        $capture = static function (array $report) use (&$reports): void {
+            $reports[] = $report;
+        };
+        $service->beginImport([$path], resultCallback: $capture);
+        $this->assertSame(NzbImportStatus::Queued, $reports[0]['status']);
         $first = $repository->claim();
         $manifest = app(ManifestStore::class)->read($first->manifest_path);
         $firstId = app(VerifiedReleasePublisher::class)->publish($first, new VerificationResult('complete', 'Verified payload.', $manifest));
         DB::table('releases')->where('id', $firstId)->delete();
-        $this->assertSame(NzbImportStatus::Queued, $insert->invoke($service, $details));
+        $service->beginImport([$path], resultCallback: $capture);
+        $this->assertSame(NzbImportStatus::Queued, $reports[1]['status']);
         $identity = sha1('import:'.sha1('same-articles'));
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
-        unlink($path);
+        $this->assertTrue($manifests->deleteCapturedInput($path, $reports[1]['input_capture']));
         $second = $repository->claim();
         $this->assertNotNull($second);
         $this->assertSame($first->id, $second->id);

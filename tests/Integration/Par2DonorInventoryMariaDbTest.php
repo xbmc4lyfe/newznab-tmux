@@ -6,7 +6,10 @@ namespace Tests\Integration;
 
 use App\Services\NameFixing\DonorMatchSelector;
 use App\Services\NameFixing\NameFixingQueryService;
+use App\Services\Par2PacketAccumulator;
+use App\Support\Par2DescriptorEvidence;
 use App\Support\Par2FileHashEvidence;
+use dariusiii\rarinfo\Par2Info;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PDO;
@@ -99,6 +102,45 @@ final class Par2DonorInventoryMariaDbTest extends TestCase
     {
         yield 'read committed' => ['READ COMMITTED'];
         yield 'repeatable read' => ['REPEATABLE READ'];
+    }
+
+    #[DataProvider('isolationLevels')]
+    public function test_descriptor_provenance_preserves_large_binary_names_and_exact_guid_generations(string $isolation): void
+    {
+        $this->isolation($isolation);
+        $this->legacyGuids = true;
+        $this->inventory(42, 1, donor: false);
+        $name = "raw\xff\0".str_repeat('long-name.', 8_000);
+        $body = md5('descriptor identity', true).md5('whole payload', true).md5('first prefix', true)
+            .pack('V2', 0xFFFFFFFF, 0xFFFFFFFF).$name;
+        $body = str_pad($body, (int) (ceil(strlen($body) / 4) * 4), "\0");
+        $hashed = md5('recovery set', true).Par2Info::PACKET_FILEDESC.$body;
+        $packet = Par2Info::PACKET_MARKER.pack('V2', strlen($body) + 64, 0).md5($hashed, true).$hashed;
+        $inventory = new Par2PacketAccumulator;
+        $inventory->append($packet);
+        $snapshot = ['id' => 42, 'guid' => $this->guid(42), 'name' => 'obfuscated',
+            'searchname' => 'obfuscated', 'predb_id' => 0, 'isrenamed' => 0];
+
+        self::assertTrue(Par2DescriptorEvidence::remember($inventory, $snapshot));
+        $stored = DB::table('par2_descriptor_evidence')->first();
+        self::assertNotNull($stored);
+        self::assertSame(substr($packet, 120), base64_decode($stored->raw_filename_base64, true));
+        self::assertGreaterThan(65_535, strlen($stored->raw_filename_base64));
+        self::assertSame('18446744073709551615', $stored->file_size);
+        self::assertSame('unknown', $stored->classification);
+        self::assertSame(0, (int) $stored->classification_version);
+        self::assertSame('unclassified', $stored->classification_provenance);
+        self::assertTrue(Par2DescriptorEvidence::remember($inventory, $snapshot));
+        self::assertSame([$stored->id], DB::table('par2_descriptor_evidence')->pluck('id')->all());
+
+        $replacement = strtoupper($snapshot['guid']);
+        self::assertNotSame($snapshot['guid'], $replacement);
+        DB::table('releases')->where('id', 42)->update(['guid' => $replacement]);
+        self::assertFalse(Par2DescriptorEvidence::remember($inventory, $snapshot));
+        self::assertSame($snapshot['guid'], DB::table('par2_descriptor_evidence')->value('release_guid'));
+        $snapshot['guid'] = $replacement;
+        self::assertTrue(Par2DescriptorEvidence::remember($inventory, $snapshot));
+        self::assertSame([$replacement], DB::table('par2_descriptor_evidence')->pluck('release_guid')->all());
     }
 
     #[DataProvider('isolationLevels')]

@@ -1,0 +1,260 @@
+{
+  "schema_version": 1,
+  "kind": "sample-planning",
+  "runner": "ubuntu-latest",
+  "head_sha": "16301bd24e8f39dee3a1a5137e562b85052d549c",
+  "repository": "xbmc4lyfe/newznab-tmux",
+  "run_id": 38669727732,
+  "run_attempt": 1,
+  "adoption_qualified": false,
+  "rust_payload_mode": "unknown",
+  "status": "measured",
+  "rows": [
+    {
+      "fixture": "small-dispatch",
+      "phase": "cold",
+      "candidate_backend": "php",
+      "samples": 1000,
+      "category": "dispatch_control",
+      "p99_sample_sufficient": true,
+      "comparison": "same_php_control",
+      "metric": "not_applicable",
+      "baseline_latency_ms": 0.1965915,
+      "candidate_latency_ms": 0.196596,
+      "eligible": true
+    },
+    {
+      "fixture": "small-dispatch",
+      "phase": "warm",
+      "candidate_backend": "php",
+      "samples": 1000,
+      "category": "dispatch_control",
+      "p99_sample_sufficient": true,
+      "comparison": "same_php_control",
+      "metric": "not_applicable",
+      "baseline_latency_ms": 0.163635,
+      "candidate_latency_ms": 0.1635645,
+      "eligible": true
+    },
+    {
+      "fixture": "boundary-1024",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "median_latency",
+      "speedup_interval": [
+        1.2459872365113132,
+        1.2539409324838535
+      ],
+      "baseline_over_candidate": 1.25017578425246,
+      "baseline_latency_ms": 1.374392,
+      "candidate_latency_ms": 1.099359,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "boundary-1024",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "median_latency",
+      "speedup_interval": [
+        1.8509352060830973,
+        1.8625748296583975
+      ],
+      "baseline_over_candidate": 1.85643777285533,
+      "baseline_latency_ms": 1.2948374999999999,
+      "candidate_latency_ms": 0.697485,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "large-16384",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "median_latency",
+      "speedup_interval": [
+        2.908845134897132,
+        2.9231966227254205
+      ],
+      "baseline_over_candidate": 2.916659512156712,
+      "baseline_latency_ms": 35.2632185,
+      "candidate_latency_ms": 12.090276,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "large-16384",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "median_latency",
+      "speedup_interval": [
+        3.5203593031963796,
+        3.5367842350039598
+      ],
+      "baseline_over_candidate": 3.5270304601915594,
+      "baseline_latency_ms": 34.721346999999994,
+      "candidate_latency_ms": 9.844356999999999,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "duplicates-inferred",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "p99_latency",
+      "speedup_interval": [
+        3.4892912195969745,
+        3.954628190466104
+      ],
+      "baseline_over_candidate": 3.769581413178443,
+      "baseline_latency_ms": 47.948676,
+      "candidate_latency_ms": 12.719894,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "duplicates-inferred",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "p99_latency",
+      "speedup_interval": [
+        4.536828088998511,
+        4.8343324490072925
+      ],
+      "baseline_over_candidate": 4.661457739305389,
+      "baseline_latency_ms": 47.532796,
+      "candidate_latency_ms": 10.196981,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "tight-budget",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "p99_latency",
+      "speedup_interval": [
+        1.8849791495366852,
+        2.597531538611569
+      ],
+      "baseline_over_candidate": 2.4887818762998113,
+      "baseline_latency_ms": 31.181311,
+      "candidate_latency_ms": 12.528744,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "tight-budget",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "p99_latency",
+      "speedup_interval": [
+        2.54936960861699,
+        3.218978138678119
+      ],
+      "baseline_over_candidate": 2.9925228901501884,
+      "baseline_latency_ms": 30.435876,
+      "candidate_latency_ms": 10.170641,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "unsupported-coercion",
+      "phase": "cold",
+      "candidate_backend": "php",
+      "samples": 1000,
+      "category": "fallback_control",
+      "p99_sample_sufficient": true,
+      "comparison": "same_php_control",
+      "metric": "not_applicable",
+      "baseline_latency_ms": 1.3724889999999998,
+      "candidate_latency_ms": 1.7043970000000002,
+      "eligible": true
+    },
+    {
+      "fixture": "unsupported-coercion",
+      "phase": "warm",
+      "candidate_backend": "php",
+      "samples": 1000,
+      "category": "fallback_control",
+      "p99_sample_sufficient": true,
+      "comparison": "same_php_control",
+      "metric": "not_applicable",
+      "baseline_latency_ms": 1.2981455,
+      "candidate_latency_ms": 1.3101875,
+      "eligible": true
+    }
+  ],
+  "completeness": {
+    "expected_rows": 12,
+    "observed_rows": 12,
+    "complete": true
+  },
+  "evidence_type": "paired_public_caller_quantiles",
+  "protocol_sha256": "02e72a5e5e10d68d48315ac6d9f1e44355e6ae1bd10b29f936ba0e16b08f2ffe",
+  "source_sha256": {
+    "docker/app/nzb-yenc-ffi/src/formats.rs": "e09d61d14a79459daa0584a05a5e844719e61ba919e2d2d40dabc109c1f7bb09",
+    "app/Services/Releases/Verification/NativeSpotCheckPlanner.php": "aa43ff2b697dbdd91fef8d8de104579181828772a72a5db1bf0468e5950d8f42",
+    "docker/app/nzb-yenc-ffi/Cargo.lock": "77b88ca781e79d95668cb5cb2d8bb61b89d3b3c4dd0892cdc86d4b260dffb55d",
+    "docker/app/nzb-yenc-ffi/Cargo.toml": "bc7f6c7f61bd00bd978ae6f817666f544562f5aff72feac709fa5bf6fe36f02d",
+    "composer.json": "a3c76ac537f57efd3ecb6862db3e07332f901ad94e7c8ccc5db4c9c01be04b8f",
+    "docker/app/nzb-yenc-ffi/src/sample_plan.rs": "516bb888e1177c4426e67a656adad189d49a496cd6745ae906c321692aa76700",
+    "docker/app/nzb-yenc-ffi/src/par2.rs": "50e4506ac4a003c6279425170b5c83a79485679b6c4e54d2f6888dc3d739981c",
+    "docker/app/nzb-yenc-ffi/src/seven_zip_ranges.rs": "d4a0803b53e7ad52e77e46518fd6440bdf68d2ee5b17d9924685dff284aba4e4",
+    "docker/app/nzb-yenc-ffi/src/release_names.rs": "5f16c3cd04a0706492e7577a6d7832bd06f8675713258c046624764aa3ef3087",
+    "docker/app/nzb-yenc-ffi/src/par2_source_ranges.rs": "e5f95b98a99fa577a875f8b293c571ef97e15c96aad95fd4e74a269f1ebfe756",
+    "docker/app/nzb-yenc-ffi/src/lib.rs": "50c88c7f3fd5e6f481c6811c70652125116a60bbbf2b3504fd456a8b7f5ce76d",
+    "composer.lock": "ee1360f9ab65dbd1d3435cc2d986a2d4a3f2069ba8e129222df3889facdd5be8",
+    "app/Services/Releases/Verification/SpotCheckPlanner.php": "ac517ccfb463f6b2727f2158e78fdc1871bbe9d98f3fa18d40d5cbc7ca2d1a98",
+    "resource_limits_before": "68e34cfd8561cb13d31b63cefee8253f31b861320e99befeee53642600a88bcf",
+    "resource_limits_after": "cd6dad3f8fd62347b154eafa0c1cc14f083198187aaed90abf3e39aeccb42213",
+    "resource_limits_comparison": "f368959c87708b03f08f209a5d8d26931c8f5ad68353d8ee712e51ea7221480e"
+  },
+  "library_sha256": {
+    "native": "2778e59b86326d76beb14d4407ce179e0546e9efaf4c06eeebf24ae4baac549b"
+  },
+  "report_sha256": "8803e1f75e57b26654c827fd1c74d8bdfbd660019372c3bb7443ac68f79d83e7",
+  "runtime_identity": {
+    "executed_sha": "16301bd24e8f39dee3a1a5137e562b85052d549c",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "php": "8.5.11",
+    "python": "3.12.3",
+    "architecture": "x86_64",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "runner_image_os": "ubuntu24",
+    "runner_image_version": "20261012.334.1",
+    "build_profile": "release opt-level=3 lto=true codegen-units=1; cargo --locked; default features",
+    "logical_cpus": 4
+  }
+}

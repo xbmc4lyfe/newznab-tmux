@@ -94,3 +94,28 @@ docker/Makefile		-binary text eol=lf
 /tests/Unit/test_docs_links.py -binary text eol=lf
 /tests/Unit/test_docs_site.py -binary text eol=lf
 /github-pages/docs/vale/styles/Google/LICENSE -binary text eol=lf
+
+# Benchmark protocol exporters and fixture tests remain reviewable.
+/scripts/benchmark_callers_summary.py -binary text eol=lf
+/tests/Unit/test_benchmark_callers_export.py -binary text eol=lf
+/tests/Unit/test_benchmark_utility_extended.py -binary text eol=lf
+/scripts/benchmark-resource-limits.py -binary text eol=lf
+/tests/Unit/test_benchmark_resource_limits.py -binary text eol=lf
+/tests/Unit/test_benchmark_remaining_modules_export.py -binary text eol=lf
+
+# Custody benchmark protocol and Rust candidate are reviewable source.
+/benchmarks/nzb-custody/compare.py -binary text eol=lf
+/benchmarks/nzb-custody/sync.rs -binary text eol=lf
+# Clippy setup regression is reviewable Python source.
+/tests/Unit/test_clippy_toolchain.py -binary text eol=lf
+# Public benchmark inventory and deployment verification are reviewable source.
+/scripts/benchmark_rust_inventory.py -binary text eol=lf
+/scripts/verify-benchmark-pages.py -binary text eol=lf
+/tests/Unit/test_benchmark_rust_inventory.py -binary text eol=lf
+/tests/Unit/test_verify_benchmark_pages.py -binary text eol=lf
+/tests/Unit/test_benchmark_pages_completeness.py -binary text eol=lf
+/scripts/benchmark-rust-toolchain.sh -binary text eol=lf
+/tests/Unit/test_benchmark_toolchain.py -binary text eol=lf
+
+/tests/Unit/test_benchmark_concurrency.py -binary text eol=lf
+/tests/Unit/test_composer_install_retry.py -binary text eol=lf

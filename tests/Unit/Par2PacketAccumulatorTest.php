@@ -96,6 +96,87 @@ final class Par2PacketAccumulatorTest extends TestCase
         $this->assertSame($name, array_values(array_values($accumulator->filesBySet())[0])[0]['name']);
     }
 
+    public function test_descriptor_collection_projects_validated_real_fixture_packets_losslessly(): void
+    {
+        $packets = $this->fixturePackets();
+        $accumulator = new Par2PacketAccumulator;
+        $accumulator->append(implode('', $packets));
+        $before = $accumulator->exportState();
+        $descriptors = $accumulator->descriptors();
+        $expectedPackets = array_values(array_filter($packets, static fn (string $packet): bool => substr($packet, 48, 16) === Par2Info::PACKET_FILEDESC));
+
+        $this->assertCount(10, $descriptors);
+        foreach ($expectedPackets as $index => $packet) {
+            $descriptor = $descriptors[$index];
+            $this->assertSame(bin2hex(substr($packet, 32, 16)), $descriptor['recovery_set_id']);
+            $this->assertSame(bin2hex(substr($packet, 64, 16)), $descriptor['file_id']);
+            $this->assertSame(bin2hex(substr($packet, 80, 16)), $descriptor['hash']);
+            $this->assertSame(bin2hex(substr($packet, 96, 16)), $descriptor['hash_16K']);
+            $this->assertSame(substr($packet, 120), $descriptor['filename_bytes']);
+            $this->assertSame(md5(substr($packet, 32)), $descriptor['packet_checksum']);
+            $file = $accumulator->filesBySet()[$descriptor['recovery_set_id']][$descriptor['file_id']];
+            $this->assertSame((string) $file['size'], $descriptor['size_decimal']);
+        }
+        $this->assertSame($before, $accumulator->exportState());
+        $resumed = Par2PacketAccumulator::fromState(json_decode(json_encode($before, JSON_THROW_ON_ERROR), true, 512, JSON_THROW_ON_ERROR));
+        $this->assertSame($descriptors, $resumed->descriptors());
+    }
+
+    public function test_descriptor_collection_preserves_binary_padded_name_and_unsigned_size(): void
+    {
+        $body = str_repeat('i', 16).md5('whole file', true).md5('first 16K', true).pack('V2', 0xFFFFFFFE, 0xFFFFFFFF)."raw\xff\0name \t";
+        $packet = $this->packet(Par2Info::PACKET_FILEDESC, $body, str_repeat('s', 16));
+        $accumulator = new Par2PacketAccumulator;
+        $accumulator->append($packet);
+
+        $this->assertSame([[
+            'recovery_set_id' => bin2hex(str_repeat('s', 16)),
+            'file_id' => bin2hex(str_repeat('i', 16)),
+            'hash' => md5('whole file'),
+            'hash_16K' => md5('first 16K'),
+            'size_decimal' => '18446744073709551614',
+            'filename_bytes' => "raw\xff\0name \t\0",
+            'packet_checksum' => bin2hex(substr($packet, 16, 16)),
+        ]], $accumulator->descriptors());
+    }
+
+    public function test_descriptor_collection_keeps_aliases_and_equal_file_ids_in_distinct_sets(): void
+    {
+        $first = $this->descriptor('same.mkv', str_repeat('i', 16), str_repeat('s', 16));
+        $alias = $this->descriptor('same.mkv', str_repeat('j', 16), str_repeat('s', 16));
+        $otherSet = $this->descriptor('other.mkv', str_repeat('i', 16), str_repeat('t', 16));
+        $accumulator = new Par2PacketAccumulator;
+        $accumulator->append($first.$alias.$otherSet.$first);
+
+        $descriptors = $accumulator->descriptors();
+        $this->assertCount(3, $descriptors);
+        $this->assertSame([bin2hex(str_repeat('i', 16)), bin2hex(str_repeat('j', 16)), bin2hex(str_repeat('i', 16))], array_column($descriptors, 'file_id'));
+        $this->assertSame([bin2hex(str_repeat('s', 16)), bin2hex(str_repeat('s', 16)), bin2hex(str_repeat('t', 16))], array_column($descriptors, 'recovery_set_id'));
+        $this->assertSame(['same.mkv', 'same.mkv', "other.mkv\0\0\0"], array_column($descriptors, 'filename_bytes'));
+    }
+
+    public function test_descriptor_collection_never_exposes_partial_corrupt_or_conflicting_packets(): void
+    {
+        $packet = $this->descriptor('first.mkv', str_repeat('i', 16), str_repeat('s', 16));
+        $accumulator = new Par2PacketAccumulator;
+        $accumulator->append(substr($packet, 0, -1));
+        $this->assertSame([], $accumulator->descriptors());
+        $accumulator->append(substr($packet, -1));
+        $before = $accumulator->descriptors();
+        $corrupt = $this->descriptor('bad.mkv', str_repeat('j', 16), str_repeat('s', 16));
+        $corrupt[16] = chr(ord($corrupt[16]) ^ 1);
+        $conflicting = $this->descriptor('conflict.mkv', str_repeat('i', 16), str_repeat('s', 16));
+
+        foreach ([$corrupt, $conflicting] as $rejected) {
+            try {
+                $accumulator->append($rejected);
+                $this->fail('Invalid descriptor was accepted');
+            } catch (InvalidArgumentException) {
+                $this->assertSame($before, $accumulator->descriptors());
+            }
+        }
+    }
+
     public function test_database_json_key_reordering_is_accepted_and_export_is_canonical(): void
     {
         $accumulator = new Par2PacketAccumulator;

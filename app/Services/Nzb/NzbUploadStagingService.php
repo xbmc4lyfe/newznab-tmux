@@ -62,6 +62,7 @@ final class NzbUploadStagingService
                 $uploadId,
                 $nzbName,
                 $nfoDetails[0] ?? null,
+                $nfoDetails[2] ?? null,
             );
 
             $this->publish($stagingDirectory, $uploadDirectory);

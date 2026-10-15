@@ -45,8 +45,15 @@ final class Par2HashResetTest extends TestCase
             'evidence_last_id' => DB::table('par_file_hashes')->max('id'), 'evidence_count' => 1,
             'proof_version' => Par2FileHashEvidence::INVENTORY_PROOF_VERSION,
         ]);
+        DB::table('par2_descriptor_evidence')->insert([
+            'releases_id' => $release->id, 'release_guid' => $release->guid,
+            'packet_checksum' => str_repeat('e', 32), 'recovery_set_id' => str_repeat('f', 32),
+            'file_id' => str_repeat('a', 32), 'full_md5' => str_repeat('d', 32), 'hash16k' => str_repeat('c', 32),
+            'file_size' => '18446744073709551615', 'raw_filename_base64' => base64_encode("raw\xff\0\0"),
+            'descriptor_proof_version' => 1, 'classification' => 'unknown',
+        ]);
         DB::table('par2_hash_retry')->insert(['releases_id' => $release->id, 'release_guid' => $release->guid, 'retry_at' => now()]);
-        $tables = ['par_hashes', 'par_file_hashes', 'par_file_hash_inventories', 'par2_hash_retry', 'par2_rename_candidate_progress', 'par2_rename_progress', 'releases'];
+        $tables = ['par_hashes', 'par_file_hashes', 'par_file_hash_inventories', 'par2_descriptor_evidence', 'par2_hash_retry', 'par2_rename_candidate_progress', 'par2_rename_progress', 'releases'];
         $connection = DB::connection();
         DB::swap(Mockery::mock(DB::getFacadeRoot())->makePartial());
         DB::shouldReceive('statement')->andReturnUsing(static function (string $sql) use ($connection, $tables): bool {
