@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Unit;
 
 use App\Exceptions\NzbUploadException;
+use App\Services\Nzb\NativeManifestIoProbe;
 use App\Services\Nzb\NzbUploadManifestService;
 use App\Services\Nzb\NzbUploadStagingService;
 use Illuminate\Contracts\Console\Kernel;
@@ -58,6 +59,8 @@ final class NzbUploadStagingServiceTest extends TestCase
 
     protected function tearDown(): void
     {
+        NativeManifestIoProbe::$beforeRename = null;
+        NativeManifestIoProbe::$failWrite = false;
         (new Filesystem)->deleteDirectory($this->uploadFolder);
 
         if (file_exists($this->databasePath)) {
@@ -220,6 +223,13 @@ final class NzbUploadStagingServiceTest extends TestCase
 
             public function move($path, $target): bool
             {
+                $this->observe();
+
+                return parent::move($path, $target);
+            }
+
+            public function observe(): void
+            {
                 $this->snapshots[] = [
                     'files' => array_map(
                         static fn (\SplFileInfo $file): string => $file->getPathname(),
@@ -228,8 +238,11 @@ final class NzbUploadStagingServiceTest extends TestCase
                     'manifests' => (new NzbUploadManifestService(new Filesystem))->findManifests($this->uploadFolder),
                 ];
 
-                return parent::move($path, $target);
             }
+        };
+
+        NativeManifestIoProbe::$beforeRename = static function () use ($filesystem): void {
+            $filesystem->observe();
         };
 
         (new NzbUploadStagingService($filesystem))->stage(
@@ -268,6 +281,7 @@ final class NzbUploadStagingServiceTest extends TestCase
             }
         };
 
+        NativeManifestIoProbe::$failWrite = true;
         try {
             (new NzbUploadStagingService($filesystem))->stage(
                 $this->nzb('Release.nzb'),

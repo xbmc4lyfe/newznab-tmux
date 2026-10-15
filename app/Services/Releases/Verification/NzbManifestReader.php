@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Exceptions\NzbPasswordMetadataRejected;
 use App\Services\Nzb\NzbXmlElements;
 use RuntimeException;
 
@@ -17,7 +18,7 @@ final class NzbManifestReader
         }
         $previous = libxml_use_internal_errors(true);
         try {
-            $document = simplexml_load_string($xml, options: LIBXML_NONET | LIBXML_NOBLANKS);
+            $document = simplexml_load_string($xml, options: LIBXML_NONET);
             if ($document === false || $document->getName() !== 'nzb') {
                 throw new RuntimeException('Invalid NZB.');
             }
@@ -38,12 +39,14 @@ final class NzbManifestReader
             $expected = 0;
             $verificationMode = null;
             $conflict = false;
-            foreach ($document->head->meta ?? [] as $metadata) {
+            $elements = new NzbXmlElements($document);
+            $passwords = $this->passwordMetadata($elements);
+            foreach ($elements->metadata() as $metadata) {
                 $value = (string) $metadata;
-                if ((string) $metadata['type'] === 'nntmux:verification-mode' && $value === 'spot-check') {
+                if ((string) $metadata->attributes()['type'] === 'nntmux:verification-mode' && $value === 'spot-check') {
                     $verificationMode = 'spot_check';
                 }
-                if (in_array((string) $metadata['type'], ['nntmux:verified-file-count', 'nntmux:declared-file-count'], true)
+                if (in_array((string) $metadata->attributes()['type'], ['nntmux:verified-file-count', 'nntmux:declared-file-count'], true)
                     && preg_match('/^[1-9][0-9]{0,6}$/D', $value) === 1) {
                     $expected = max($expected, (int) $value);
                 }
@@ -81,6 +84,9 @@ final class NzbManifestReader
             $manifest = ['subject' => $release->searchname, 'fromname' => $release->fromname, 'date' => $release->postdate,
                 'groups_id' => (int) $release->groups_id, 'regex_id' => 0, 'expected_files' => $expected,
                 'groups' => array_keys($groups), 'files' => $files, 'metadata_source' => $metadataSource];
+            if ($passwords !== []) {
+                $manifest['passwords'] = $passwords;
+            }
             if ($conflict) {
                 $manifest['conflict'] = true;
             }
@@ -113,6 +119,7 @@ final class NzbManifestReader
         $verificationMode = null;
         $conflict = false;
         $elements = new NzbXmlElements($document);
+        $passwords = $this->passwordMetadata($elements);
         foreach ($elements->metadata() as $metadata) {
             $value = (string) $metadata;
             if ((string) $metadata->attributes()['type'] === 'nntmux:verification-mode' && $value === 'spot-check') {
@@ -158,6 +165,9 @@ final class NzbManifestReader
         $manifest = ['subject' => $release->searchname, 'fromname' => $release->fromname, 'date' => $release->postdate,
             'groups_id' => (int) $release->groups_id, 'regex_id' => 0, 'expected_files' => $expected,
             'groups' => array_keys($groups), 'files' => $files, 'metadata_source' => $metadataSource];
+        if ($passwords !== []) {
+            $manifest['passwords'] = $passwords;
+        }
         if ($conflict) {
             $manifest['conflict'] = true;
         }
@@ -175,6 +185,38 @@ final class NzbManifestReader
         }
 
         return $manifest;
+    }
+
+    /** Validate the complete metadata boundary before callers make terminal decisions.
+     * @return list<string>
+     */
+    public function passwordMetadata(NzbXmlElements $elements): array
+    {
+        $elements->assertUnambiguousPasswordMetadata();
+        $passwords = [];
+        foreach ($elements->metadata() as $metadata) {
+            $this->appendPassword($metadata, $passwords);
+        }
+
+        return $passwords;
+    }
+
+    /** @param list<string> $passwords */
+    private function appendPassword(\SimpleXMLElement $metadata, array &$passwords): void
+    {
+        if ((string) $metadata->attributes()['type'] !== 'password') {
+            return;
+        }
+        foreach (dom_import_simplexml($metadata)->childNodes as $child) {
+            if (in_array($child->nodeType, [XML_ELEMENT_NODE, XML_ENTITY_REF_NODE], true)) {
+                throw new NzbPasswordMetadataRejected('Invalid NZB password metadata structure.');
+            }
+        }
+        $value = (string) $metadata;
+        if (strlen($value) > 4096 || count($passwords) >= 64) {
+            throw new NzbPasswordMetadataRejected('NZB password metadata exceeds the supported limit.');
+        }
+        $passwords[] = $value;
     }
 
     public static function declaredFileCount(string $subject): int

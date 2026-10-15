@@ -22,6 +22,7 @@ class ReleaseVerificationResetTest extends ReleaseVerificationCandidatesTest
     {
         $this->prepareCommandDatabase();
         $this->seedVerification();
+        $this->seedCleanupReceipt();
         $root = (string) config('release_verification.storage_path');
         $lock = fopen($root.'/worker.lock', 'c');
         $inode = fileinode($root.'/worker.lock');
@@ -35,6 +36,7 @@ class ReleaseVerificationResetTest extends ReleaseVerificationCandidatesTest
         $this->assertDirectoryDoesNotExist($root.'/manifests');
         $this->assertFileDoesNotExist($root.'/status.json');
         $this->assertSame(1, DB::table('releases')->where('id', 1)->count());
+        $this->assertSame(1, DB::table('nfo_cleanup_commits')->count());
         app(CandidateRepository::class)->enqueue(['identity' => sha1('after-reset'), 'groups_id' => 1, 'files' => []]);
         $this->assertNotNull(app(CandidateRepository::class)->claim());
     }
@@ -43,6 +45,7 @@ class ReleaseVerificationResetTest extends ReleaseVerificationCandidatesTest
     {
         $this->prepareCommandDatabase();
         $this->seedVerification();
+        $this->seedCleanupReceipt();
         $this->app->detectEnvironment(static fn (): string => 'local');
         $nzbs = config('release_verification.storage_path').'/nzbs';
         mkdir($nzbs);
@@ -56,6 +59,7 @@ class ReleaseVerificationResetTest extends ReleaseVerificationCandidatesTest
 
         $this->assertResetState();
         $this->assertSame(0, DB::table('releases')->count());
+        $this->assertSame(0, DB::table('nfo_cleanup_commits')->count());
         $this->assertSame(0, DB::table('usenet_groups')->value('last_record'));
     }
 
@@ -251,6 +255,15 @@ class ReleaseVerificationResetTest extends ReleaseVerificationCandidatesTest
         $this->assertFalse((bool) $state->audit_retry_turn);
     }
 
+    private function seedCleanupReceipt(): void
+    {
+        (require database_path('migrations/2026_10_15_034000_create_nfo_cleanup_commits_table.php'))->up();
+        DB::table('nfo_cleanup_commits')->insert([
+            'binding' => str_repeat('a', 64), 'release_id' => 1, 'release_guid' => 'synthetic-reset-guid',
+            'candidate_identity' => null, 'stored_digest' => str_repeat('b', 64),
+        ]);
+    }
+
     private function prepareCommandDatabase(): void
     {
         Schema::table('usenet_groups', function (Blueprint $table): void {
@@ -269,7 +282,7 @@ class ReleaseVerificationResetTest extends ReleaseVerificationCandidatesTest
         DB::swap($manager = \Mockery::mock(DB::getFacadeRoot()));
         $manager->shouldReceive('statement')->andReturnUsing(static function (string $sql) use ($connection): bool {
             if (str_starts_with($sql, 'SET FOREIGN_KEY_CHECKS')) {
-                return true;
+                return $connection->statement(str_contains($sql, '= 0') ? 'PRAGMA foreign_keys = OFF' : 'PRAGMA foreign_keys = ON');
             }
             if (preg_match('/\ATRUNCATE TABLE ([a-z0-9_]+)\z/', $sql, $match) === 1) {
                 if (Schema::hasTable($match[1])) {
