@@ -1,3 +1,0 @@
-bucket = "YOUR-ENCRYPTED-STATE-BUCKET"
-key    = "nntmux/baremetal/production.tfstate"
-region = "us-east-1"
