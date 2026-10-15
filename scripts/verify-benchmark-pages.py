@@ -151,16 +151,19 @@ def fetch_bytes(url, limit, timeout):
     return b''.join(chunks)
 
 
-def verify_publication(manifest, sha, base_url, *, fetch=fetch_bytes, attempts=6,
-                       delay=10, timeout=10, deadline_seconds=300):
+def verify_publication(manifest, sha, base_url, *, fetch=fetch_bytes, attempts=25,
+                       delay=30, timeout=10, deadline_seconds=750):
     validate_manifest(manifest, sha)
     # The deployment URL must name this repository's public Pages site. This also
     # excludes credentials, custom ports, queries, fragments and private hosts.
     if base_url.rstrip('/') + '/' != SITE_URL:
         raise ValueError('Unexpected public Pages URL')
-    if (type(attempts) is not int or not 1 <= attempts <= 10 or not 0 <= delay <= 30
-            or not 0 < timeout <= 30 or not 0 < deadline_seconds <= 600):
+    if (type(attempts) is not int or not 1 <= attempts <= 25 or not 0 <= delay <= 30
+            or not 0 < timeout <= 30 or not 0 < deadline_seconds <= 750):
         raise ValueError('Invalid publication retry budget')
+    # Pages advertises a 600-second cache lifetime. Keep checking the exact
+    # trusted publication through that interval, with time left for file reads.
+    # Attempts and the monotonic deadline bound stale or unavailable sites.
     deadline = time.monotonic() + deadline_seconds
     last_error = 'Publication not checked'
     for attempt in range(attempts):
