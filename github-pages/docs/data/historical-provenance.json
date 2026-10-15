@@ -118,6 +118,50 @@
       "runner": "ubuntu-latest",
       "pr_head": "69374623316f09bf5f72acd4e57240427bfa2691",
       "executed_sha": "a2f4298201ca05d8a69a24688bac8ed2f3896285"
+    },
+    {
+      "file": "study-cpu-protocol3-x86.json",
+      "sha256": "28a24380b0dcdb82cd2e6854b3429fec5b5a139a73021a36b343ea69c4fd979d",
+      "public_artifact_id": 11947891024,
+      "public_artifact_zip_digest": "sha256:9701be6c7ba3bb13c25c0663001499c1ea565aef2c219636f78be826de9f5653",
+      "source_sha": "edf49c3f1ca417a6f6236757d54a8ad51998b8ad",
+      "run_id": 38679330159,
+      "runner": "ubuntu-latest",
+      "raw_artifact_id": 11948265680,
+      "raw_artifact_zip_digest": "sha256:d4459c8078d28c7fe376baf68b69aa72357fd27d206b0e9b92bea691c91bbba7",
+      "raw_artifact_expires_at": "2026-10-29T04:18:43Z",
+      "label": "Frozen CPU protocol 3 feature study; not current master",
+      "kind": "cpu-snapshot",
+      "executed_sha": "edf49c3f1ca417a6f6236757d54a8ad51998b8ad",
+      "run_attempt": 1
+    },
+    {
+      "file": "study-cpu-protocol3-arm.json",
+      "sha256": "aa0c4558a8c16f42b6fe2e2803c3f455c2208b7e55294f372044e5b61252793f",
+      "public_artifact_id": 11948305760,
+      "public_artifact_zip_digest": "sha256:8bec6954fe973641b978628e1268c2f5b9093efaa83d4af8ae8967b4ffdb3756",
+      "source_sha": "edf49c3f1ca417a6f6236757d54a8ad51998b8ad",
+      "run_id": 38679330159,
+      "runner": "ubuntu-24.04-arm",
+      "raw_artifact_id": 11948035993,
+      "raw_artifact_zip_digest": "sha256:4697d9d94ccb8034afbae4f720c4a8680eff3d2057d3b368bf2f6a3ce6a17571",
+      "raw_artifact_expires_at": "2026-10-29T04:19:14Z",
+      "label": "Frozen CPU protocol 3 feature study; not current master",
+      "kind": "cpu-snapshot",
+      "executed_sha": "edf49c3f1ca417a6f6236757d54a8ad51998b8ad",
+      "run_attempt": 1
     }
-  ]
+  ],
+  "cpu_protocol3_study": {
+    "source_sha": "edf49c3f1ca417a6f6236757d54a8ad51998b8ad",
+    "run_id": 38679330159,
+    "run_attempt": 1,
+    "summaries": 2,
+    "pairs_per_stratum": 1000,
+    "synthetic_confidence_family_size": 3,
+    "exact_live_host_confidence_family_size": 2,
+    "method": "SplitMix64 rejection; 4000 paired bootstrap replicates; separate simultaneous 95% Bonferroni gate families",
+    "scope": "Collector wall latency including startup/read/JSON/output; production CPU throughput unmeasured",
+    "adoption_qualified": false
+  }
 }
