@@ -85,7 +85,7 @@ final class Nima4kSource extends BoundedHttpFeedSource
         // This parser reports discarded controls, surrogates and overflowing references as code 9.
         foreach ($errors as $error) {
             // Fatal errors truncate the input; duplicate attributes discard values.
-            if ($error->level === LIBXML_ERR_FATAL || $error->code === 42) {
+            if ($error->level === LIBXML_ERR_FATAL || $error->code === 42 || $error->code === 800) {
                 throw new RuntimeException('NIMA4K returned invalid HTML.');
             }
             if ($error->code === 9) {

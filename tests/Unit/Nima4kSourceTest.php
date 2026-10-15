@@ -268,6 +268,49 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('wellFormedStructuralTags')]
+    public function well_formed_structural_tags_preserve_literal_names(string $tag): void
+    {
+        $attribute = ' data-marker="safe"';
+        $html = '<html'.($tag === 'html' ? $attribute : '').'><head'.($tag === 'head' ? $attribute : '').'></head><body'.($tag === 'body' ? $attribute : '').'>'.$this->card('First.Release-GRP').$this->card('Second.Release-GRP').'</body></html>';
+        $entries = (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+
+        $this->assertCount(1, $entries);
+        $this->assertSame('First.Release-GRP', $entries[0]->title);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function wellFormedStructuralTags(): array
+    {
+        return ['html' => ['html'], 'head' => ['head'], 'body' => ['body']];
+    }
+
+    #[Test]
+    #[DataProvider('misplacedStructuralFragments')]
+    public function misplaced_structural_tags_reject_the_whole_listing(string $fragment): void
+    {
+        $html = '<html><head></head><body>'.$this->card('First.Release-GRP').$fragment.$this->card('Second.Release-GRP').'</body></html>';
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function misplacedStructuralFragments(): array
+    {
+        $cases = [];
+        foreach (['html', 'body', 'head'] as $tag) {
+            foreach (['safe' => 'safe', 'C1' => '&#128;', 'noncharacter' => '&#xFDD0;', 'control' => '&#1;'] as $label => $value) {
+                $fragment = '<'.$tag.' data-marker="'.$value.'"></'.$tag.'>';
+                $cases[$tag.' repeated '.$label] = [$fragment];
+                $cases[$tag.' nested '.$label] = ['<div>'.$fragment.'</div>'];
+            }
+        }
+
+        return $cases;
+    }
+
+    #[Test]
     public function malformed_characters_after_the_record_limit_still_reject_the_listing(): void
     {
         $html = $this->card('First.Release-GRP').str_replace('Second.Release-GRP</span>', 'Second.&#1;Release-GRP</span>', $this->card('Second.Release-GRP'));
