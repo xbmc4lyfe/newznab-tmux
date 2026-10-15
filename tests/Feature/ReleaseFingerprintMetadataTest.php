@@ -53,6 +53,62 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
         (new CollectReleaseFingerprintMetadata(1))->handle($collector);
         self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
+        ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => 30]]);
+        $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
+        (new CollectReleaseFingerprintMetadata(1))->handle($collector);
+        self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
+    }
+
+    #[Test]
+    public function it_retains_conditional_iso_path_table_copy_evidence_through_yenc(): void
+    {
+        $sample = str_repeat("\0", 49_152);
+        $primary = "\x01CD001\x01".str_repeat("\0", 2041);
+        $primary = substr_replace($primary, pack('V', 32).pack('N', 32), 80, 8);
+        $primary = substr_replace($primary, pack('v', 2048).pack('n', 2048), 128, 4);
+        $primary = substr_replace($primary, pack('V', 10).pack('N', 10), 132, 8);
+        $primary = substr_replace($primary, pack('V2', 20, 21).pack('N2', 22, 23), 140, 16);
+        $primary[881] = "\x01";
+        $sample = substr_replace($sample, $primary, 32_768, 2048);
+        $sample = substr_replace($sample, "\xffCD001\x01".str_repeat("\0", 2041), 34_816, 2048);
+        $little = hex2bin('01001800000001000000');
+        $big = hex2bin('01000000001800010000');
+        self::assertIsString($little);
+        self::assertIsString($big);
+        foreach ([40_960, 43_008] as $offset) {
+            $sample = substr_replace($sample, $little, $offset, 10);
+        }
+        foreach ([45_056, 47_104] as $offset) {
+            $sample = substr_replace($sample, $big, $offset, 10);
+        }
+        $sample[43_010] = "\x19";
+        if ((new NativeMetadataParser)->parseFormats($sample) === null) {
+            self::markTestSkipped('Native Rust format metadata is required for ISO path-table integration.');
+        }
+        $body = YencArticles::article($sample);
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        self::assertSame(hash('sha256', $body), $analysis['metadata']['article_body_sha256']);
+        $copies = $analysis['metadata']['decoded_format_metadata']['iso_path_table_copies'];
+        self::assertFalse($copies['image_origin_known']);
+        self::assertFalse($copies['whole_image_validated']);
+        self::assertNull($copies['qualified_path_table_copy_agreement']);
+        self::assertStringContainsString('assumed', $copies['mapping_assumption']);
+        self::assertSame(hash('sha256', $primary), $copies['source_primary_descriptor_sha256']);
+        self::assertSame('terminated', $copies['sequence_status']);
+        self::assertCount(4, $copies['tables']);
+        self::assertCount(2, $copies['pairs']);
+        self::assertSame(hash('sha256', $little), $copies['tables'][0]['raw_sha256']);
+        self::assertSame(hash('sha256', $big), $copies['tables'][2]['raw_sha256']);
+        self::assertSame(10, $copies['tables'][0]['bytes_hashed']);
+        self::assertSame(32_912, $copies['tables'][1]['source_location_field_offset']);
+        self::assertFalse($copies['pairs'][0]['candidate_range_bytes_equal']);
+        self::assertSame(2, $copies['pairs'][0]['first_difference']['table_relative_offset']);
+        self::assertSame(40_962, $copies['pairs'][0]['first_difference']['required_sample_offset']);
+        self::assertSame(43_010, $copies['pairs'][0]['first_difference']['optional_sample_offset']);
+        self::assertSame(24, $copies['pairs'][0]['first_difference']['required_byte']);
+        self::assertSame(25, $copies['pairs'][0]['first_difference']['optional_byte']);
+        self::assertTrue($copies['pairs'][1]['candidate_range_bytes_equal']);
     }
 
     #[Test]
