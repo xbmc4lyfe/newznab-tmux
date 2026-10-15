@@ -8,6 +8,7 @@ use App\Enums\NzbImportStatus;
 use App\Services\BlacklistService;
 use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbImportService;
+use App\Services\Releases\Verification\CandidateAdmission;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\NzbManifestReader;
 use Illuminate\Config\Repository;
@@ -43,9 +44,11 @@ final class NzbImportNamespaceContractTest extends TestCase
             private array $items = [];
 
             /** @param array<string, mixed> $manifest */
-            public function enqueue(array $manifest): void
+            public function enqueueWithAdmission(array $manifest): CandidateAdmission
             {
                 $this->items[] = $manifest;
+
+                return new CandidateAdmission(1, $manifest['identity'], 1, hash('sha256', json_encode($manifest, JSON_THROW_ON_ERROR)));
             }
 
             public function clear(): void

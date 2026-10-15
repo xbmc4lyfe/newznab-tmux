@@ -359,7 +359,9 @@ class ProfileBuildTest(unittest.TestCase):
             block = workflow.split('  ' + name + ':\n', 1)[1]
             self.assertEqual(predicate, re.search(r'^    if: (.+)$', block, re.MULTILINE)[1])
         suffix = "github.event_name == 'workflow_dispatch' && inputs.comparison == 'rust-aa-control' && '-rust-aa-control' || ''"
-        self.assertIn('group: yenc-performance-${{ github.ref }}${{ ' + suffix + ' }}', workflow)
+        prefix = 'group: yenc-performance-${{ github.ref }}-${{ github.event_name }}'
+        self.assertIn(prefix + '${{ ' + suffix + ' }}', workflow)
+        concurrency_keys = set()
         for event in ['pull_request', 'push', 'workflow_dispatch']:
             for selection in ['all', 'php', 'cpp', 'profile', 'processing', 'rust-aa-control']:
                 context = {'event_name': event, 'comparison': selection}
@@ -373,7 +375,12 @@ class ProfileBuildTest(unittest.TestCase):
                     self.assertEqual(['rust-aa-control'], enabled)
                 else:
                     self.assertNotIn('rust-aa-control', enabled)
-                self.assertEqual('-rust-aa-control' if event == 'workflow_dispatch' and selection == 'rust-aa-control' else '', evaluate(suffix))
+                suffix_value = evaluate(suffix)
+                self.assertEqual('-rust-aa-control' if event == 'workflow_dispatch' and selection == 'rust-aa-control' else '', suffix_value)
+                if ((event, selection) in [('push', 'all'), ('pull_request', 'all'),
+                                          ('workflow_dispatch', 'all'), ('workflow_dispatch', 'rust-aa-control')]):
+                    concurrency_keys.add('yenc-performance-refs/heads/master-' + event + suffix_value)
+        self.assertEqual(4, len(concurrency_keys))
 
     def test_manual_control_wrapper_retains_integration_and_control_failures(self):
         workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()

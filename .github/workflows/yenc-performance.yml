@@ -7,6 +7,8 @@ on:
     paths:
       - '.github/workflows/yenc-performance.yml'
       - 'scripts/export-benchmark-summary.py'
+      - 'scripts/benchmark-rust-toolchain.sh'
+      - 'tests/Unit/test_benchmark_toolchain.py'
       - 'tests/Unit/test_benchmark_summary_export.py'
       - 'scripts/benchmark-yenc.php'
       - 'scripts/benchmark-article-processing.php'
@@ -67,8 +69,9 @@ on:
 permissions:
   contents: read
 
+# Keep manual measurements independent of automatic push coverage.
 concurrency:
-  group: yenc-performance-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && inputs.comparison == 'rust-aa-control' && '-rust-aa-control' || '' }}
+  group: yenc-performance-${{ github.ref }}-${{ github.event_name }}${{ github.event_name == 'workflow_dispatch' && inputs.comparison == 'rust-aa-control' && '-rust-aa-control' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -116,7 +119,8 @@ jobs:
       - name: Build and test explicitly enabled experimental Rust candidate
         shell: bash
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          python3 tests/Unit/test_benchmark_toolchain.py
+          source scripts/benchmark-rust-toolchain.sh
           cargo +"$RUST_TOOLCHAIN" test --release --locked --no-default-features --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/default-rust-test.log
           cargo +"$RUST_TOOLCHAIN" test --release --locked --features experimental-payload-kernels --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --features experimental-payload-kernels --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-build.log
@@ -140,8 +144,19 @@ jobs:
         run: |
           YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
             php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
-              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines|it_withholds_integrity_for_trailer_only_multipart_declarations|it_accepts_identical_control_fields_in_native_and_fallback_metadata|it_requires_multipart_footer_fields_before_granting_integrity|it_exposes_rar5_file_times_in_native_release_metadata|it_exposes_archived_revision_declarations_without_replacing_stored_names|it_exposes_quick_open_cache_relationships_in_native_release_metadata|it_exposes_empty_rar5_file_copy_checksums_without_hashing_target_contents|it_keeps_iso_primary_descriptor_byte_conflicts_and_sample_provenance' \
+              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines|it_withholds_integrity_for_trailer_only_multipart_declarations|it_accepts_identical_control_fields_in_native_and_fallback_metadata|it_requires_multipart_footer_fields_before_granting_integrity|it_exposes_rar5_file_times_in_native_release_metadata|it_exposes_archived_revision_declarations_without_replacing_stored_names|it_exposes_quick_open_cache_relationships_in_native_release_metadata|it_exposes_empty_rar5_file_copy_checksums_without_hashing_target_contents|it_keeps_iso_primary_descriptor_byte_conflicts_and_sample_provenance|it_exposes_zstandard_declarations_and_literal_size_relationships|it_exposes_bounded_xz_first_block_declarations_and_sample_ranges|it_retains_conditional_iso_path_table_copy_evidence_through_yenc|it_preserves_long_gzip_text_fields_through_yenc' \
               2>&1 | tee benchmark-evidence/build/framing-budget-integration.log
+
+      - name: Verify experimental XZ Footer propagation separately from the default library
+        shell: bash
+        run: |
+          source scripts/benchmark-rust-toolchain.sh
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml \
+            --features experimental-xz-index --lib --target-dir "$GITHUB_WORKSPACE/experimental-xz-target"
+          YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/experimental-xz-target/release/libnzbyenc.so" \
+            php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
+              --filter=it_preserves_experimental_xz_footer_evidence_through_yenc \
+              2>&1 | tee benchmark-evidence/build/experimental-xz-footer-integration.log
 
       - name: Record build and runtime identities
         shell: bash
@@ -401,7 +416,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p processing-evidence/build
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          python3 tests/Unit/test_benchmark_toolchain.py
+          source scripts/benchmark-rust-toolchain.sh
           cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-build.log
           cp docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so processing-evidence/build/native.so
@@ -618,7 +634,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p benchmark-evidence/build
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          python3 tests/Unit/test_benchmark_toolchain.py
+          source scripts/benchmark-rust-toolchain.sh
           cargo +"$RUST_TOOLCHAIN" test --release --locked --no-default-features --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --no-default-features --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-build.log
           YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
@@ -747,7 +764,8 @@ jobs:
         shell: bash
         run: |
           printf '%s\n' build > "$CONTROL_ROOT/setup/last-phase"
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          python3 tests/Unit/test_benchmark_toolchain.py
+          source scripts/benchmark-rust-toolchain.sh
           cargo +"$RUST_TOOLCHAIN" test --release --locked --features experimental-payload-kernels --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee "$CONTROL_ROOT/setup/rust-test.log"
           cargo +"$RUST_TOOLCHAIN" build --release --locked --features experimental-payload-kernels --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee "$CONTROL_ROOT/setup/rust-build.log"
 

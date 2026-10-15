@@ -1,9 +1,19 @@
 # syntax=docker/dockerfile:1
 FROM composer:2.8 AS composer
 FROM node:22-bookworm AS node
-FROM rust:1.98-bookworm AS yenc
-WORKDIR /src
-COPY docker/app/nzb-yenc-ffi/ /src/
+FROM rust:1.98-bookworm AS rust-toolchain
+
+# Run the complete Rust suite in the PHP runtime it exercises. The benchmark
+# binary's contract tests invoke PHP/FFI and inspect two reviewed source files.
+FROM dunglas/frankenphp:1-php8.5-bookworm AS yenc
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:$PATH
+RUN install-php-extensions ffi
+WORKDIR /src/docker/app/nzb-yenc-ffi
+COPY docker/app/nzb-yenc-ffi/ ./
+COPY app/Services/Nzb/RustArticleFingerprintWorker.php /src/app/Services/Nzb/RustArticleFingerprintWorker.php
+COPY tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php /src/tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo test --release --locked \
     && cargo build --release --locked \

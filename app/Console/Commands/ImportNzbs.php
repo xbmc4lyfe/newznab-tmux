@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
-use App\Enums\NzbImportStatus;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbUploadManifestService;
 use Illuminate\Console\Command;
@@ -23,7 +22,7 @@ class ImportNzbs extends Command
     protected $signature = 'nntmux:import-nzbs
         {--folder= : Import folder path}
         {--filename : Use filename true or false}
-        {--delete : Delete files after import}
+        {--delete : Delete files after import; verified imports require staged generation custody}
         {--delete-failed : Delete files after failed import}
         {--source= : Source of the NZB files}';
 
@@ -84,17 +83,6 @@ class ImportNzbs extends Command
                 $deleteNZB,
                 $deleteFailedNZB,
                 $source,
-                static function (array $result) use ($manifests): void {
-                    /** @var NzbImportStatus $status */
-                    $status = $result['status'];
-                    $manifests->recordNzbOutcome(
-                        $result['path'],
-                        $status,
-                        $result['release_id'],
-                        $result['release_guid'],
-                        candidateIdentity: $result['candidate_identity'] ?? null,
-                    );
-                }
             );
         } catch (Throwable $exception) {
             $this->error($exception->getMessage());

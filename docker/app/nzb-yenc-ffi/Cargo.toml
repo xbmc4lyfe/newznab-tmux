@@ -7,8 +7,11 @@ license = "GPL-3.0-only"
 publish = false
 
 [features]
+default = []
 # Benchmark-only opt-in; production builds retain the incumbent kernels.
 experimental-payload-kernels = []
+# Experimental only until full-caller correctness and performance gates pass.
+experimental-xz-index = []
 
 [lib]
 name = "nzbyenc"

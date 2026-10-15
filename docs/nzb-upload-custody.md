@@ -1,0 +1,11 @@
+# NZB upload custody
+
+Verified imports retain raw NZB inputs, including accepted replays of an already published release. Publication proves release identity; it does not prove ownership of the current uploader pathname. Automatic source deletion requires a staged upload with a captured generation. The command's `--delete` option follows this rule.
+
+Staged uploads bind the exact NZB bytes and paired NFO generation before admission. Source deletion waits for verified publication and, for paired uploads, committed NFO storage. SQL-authorized retirement excludes verification reset through durable retirement and journal cleanup. An open SQL transaction cannot authorize irreversible companion cleanup.
+
+Older paired manifests without a companion capture enter `metadata_review`. Restage both retained inputs through the normal uploader to create a new captured upload; existing release or candidate identifiers cannot supply missing historical authority. A declared companion is never interpreted as a source-only upload merely because its capture is absent.
+
+If a producer replaces a captured file during its move into private custody, the replacement is preserved. Recovery exclusively creates one independent `.recovered-…` copy, without overwriting a newer file. This copy is limited to 16 MiB; larger payloads and recovery-name conflicts retain private evidence for manual resolution. The displaced private payload is always retained and never hard-linked into a producer-writable pathname. The manifest records `custody_collision`, the private directory and any durable public recovery name, then holds the upload for explicit review and restaging. This is not successful retirement: no relinquishment or completion proof is created for the old capture. A recovery name deliberately does not end in an importable NZB or NFO extension.
+
+Keep the held upload and private files while resolving the collision. A recovered public pathname is advisory and can subsequently be replaced by its producer; the recorded private directory preserves the displaced generation. Restage recovered NZB/NFO pairs only after checking their intended association. Automatic retries do not reinterpret a replacement as the old upload's companion or admission.

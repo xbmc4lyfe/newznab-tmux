@@ -997,6 +997,23 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "experimental-xz-index")]
+    pub(crate) fn observed_allocations<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        struct StopCounting;
+        impl Drop for StopCounting {
+            fn drop(&mut self) {
+                COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+            }
+        }
+        COUNT_ALLOCATIONS.with(|enabled| assert!(!enabled.get()));
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
+        let stop = StopCounting;
+        let result = operation();
+        drop(stop);
+        (result, ALLOCATION_COUNT.with(Cell::get))
+    }
+
     #[test]
     fn abi_decodes_without_heap_allocation() {
         let payload = b"klm=@=J=M=}..\x0b==";
@@ -1314,6 +1331,50 @@ mod tests {
         );
         assert_eq!(crc_storage[0], 0xa5);
         assert_eq!(&crc_storage[5..], &[0xa5; 3]);
+    }
+
+    #[test]
+    #[cfg(not(feature = "experimental-xz-index"))]
+    fn default_format_abi_keeps_unqualified_index_extraction_inactive() {
+        let sample = [
+            253, 55, 122, 88, 90, 0, 0, 0, 255, 18, 217, 65, 2, 192, 5, 1, 33, 1, 0, 0, 240, 93,
+            251, 159, 1, 0, 0, 65, 0, 0, 0, 0, 0, 1, 17, 1, 173, 166, 88, 4,
+        ];
+        let pointer = unsafe { nntmux_format_metadata_json(sample.as_ptr(), sample.len()) };
+        assert!(!pointer.is_null());
+        let json = unsafe { CStr::from_ptr(pointer) }.to_bytes().to_owned();
+        unsafe { nntmux_metadata_string_free(pointer) };
+        let metadata: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let block = &metadata["headers"][0]["first_block"];
+        assert_eq!(block["compressed_size"]["value"], 5);
+        assert!(block.get("following_index").is_none());
+        assert!(block.get("following_footer").is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-xz-index")]
+    fn experimental_format_abi_exposes_bounded_footer_evidence() {
+        let sample = [
+            253, 55, 122, 88, 90, 0, 0, 0, 255, 18, 217, 65, 2, 192, 5, 1, 33, 1, 0, 0, 240, 93,
+            251, 159, 1, 0, 0, 65, 0, 0, 0, 0, 0, 1, 17, 1, 173, 166, 88, 4, 6, 114, 158, 122, 1,
+            0, 0, 0, 0, 0, 89, 90,
+        ];
+        let pointer = unsafe { nntmux_format_metadata_json(sample.as_ptr(), sample.len()) };
+        assert!(!pointer.is_null());
+        let json = unsafe { CStr::from_ptr(pointer) }.to_bytes().to_owned();
+        unsafe { nntmux_metadata_string_free(pointer) };
+        let metadata: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let block = &metadata["headers"][0]["first_block"];
+        let footer = &block["following_footer"];
+        assert_eq!(
+            footer["status"],
+            "footer_index_and_header_declarations_match"
+        );
+        assert_eq!(footer["observed_hex"], "06729e7a010000000000595a");
+        assert_eq!(footer["start_offset"], 40);
+        assert_eq!(footer["end_offset_exclusive"], 52);
+        assert_eq!(block["whole_stream_validated"], false);
+        assert_eq!(block["content_decompressed"], false);
     }
 
     #[test]

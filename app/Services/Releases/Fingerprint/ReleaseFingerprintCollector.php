@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 30;
+    public const SCHEMA_VERSION = 34;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 

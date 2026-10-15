@@ -2,12 +2,18 @@ use md5::Md5;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+#[path = "iso_path_tables.rs"]
+mod iso_path_tables;
 #[path = "iso_primary_copies.rs"]
 mod iso_primary_copies;
 #[path = "rar5_copy_checksums.rs"]
 mod rar5_copy_checksums;
 #[path = "rar5_quick_open.rs"]
 mod rar5_quick_open;
+#[path = "xz_first_block.rs"]
+mod xz_first_block;
+#[path = "zstd_frame.rs"]
+mod zstd_frame;
 
 const SAMPLE_PREFIX_IDENTITY_LIMIT_BYTES: usize = 16_384;
 
@@ -21,6 +27,7 @@ pub struct FormatMetadata {
     pub headers: Vec<FormatHeader>,
     pub iso_descriptor_sequence: Option<IsoDescriptorSequence>,
     pub iso_primary_volume_descriptor_copies: Option<iso_primary_copies::PrimaryDescriptorCopies>,
+    pub iso_path_table_copies: Option<iso_path_tables::PathTableCopies>,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,6 +224,10 @@ pub struct SevenZipPackedStream {
 #[derive(Debug, Serialize)]
 #[serde(tag = "format", rename_all = "snake_case")]
 pub enum FormatHeader {
+    Zstandard {
+        offset: usize,
+        frame: zstd_frame::Frame,
+    },
     Rar4 {
         offset: usize,
         main_header_available: bool,
@@ -512,6 +523,7 @@ pub enum FormatHeader {
     },
     Xz {
         offset: usize,
+        first_block: xz_first_block::FirstBlock,
         header_complete: bool,
         stream_flags_hex: Option<String>,
         reserved_bits_valid: Option<bool>,
@@ -927,7 +939,9 @@ const MAX_7Z_NEXT_HEADER_PREVIEW_BYTES: usize = 256;
 const MAX_RECORDED_RAR5_EXTRA_RECORD_TYPES: usize = 4_096;
 const MAX_RETAINED_RAR5_ARCHIVE_NAME_BYTES: usize = 4_096;
 const MAX_RECORDED_GZIP_FIELD_HEX_BYTES: usize = 256;
-const MAX_SCANNED_GZIP_TEXT_FIELD_BYTES: usize = 4_096;
+// Support this many non-NUL text bytes, with one bounded terminator/lookahead
+// byte. Retained previews are capped independently above.
+const MAX_GZIP_OPTIONAL_FIELD_BYTES: usize = 65_536;
 const MAX_RECORDED_GZIP_EXTRA_SUBFIELD_IDS: usize = 4_096;
 const MAX_RECORDED_ZIP_FIELD_HEX_BYTES: usize = 256;
 const MAX_RECORDED_ZIP_EXTRA_FIELD_IDS: usize = 4_096;
@@ -974,6 +988,7 @@ pub fn parse(data: &[u8]) -> FormatMetadata {
         ("ZIP", ZIP),
         ("gzip", GZIP),
         ("XZ", XZ),
+        ("Zstandard", b"\x28\xb5\x2f\xfd"),
     ] {
         let maximum_end = if matches!(format, "RAR 4" | "RAR 5") {
             1_048_576 + signature.len()
@@ -1002,6 +1017,10 @@ pub fn parse(data: &[u8]) -> FormatMetadata {
                 "ZIP" => headers.push(parse_zip(data, offset)),
                 "gzip" => headers.push(parse_gzip(data, offset)),
                 "XZ" => headers.push(parse_xz(data, offset)),
+                "Zstandard" => headers.push(FormatHeader::Zstandard {
+                    offset,
+                    frame: zstd_frame::parse(data, offset),
+                }),
                 _ => {}
             }
         }
@@ -1011,6 +1030,7 @@ pub fn parse(data: &[u8]) -> FormatMetadata {
     let iso_primary_volume_descriptor_copies = iso_descriptor_sequence
         .as_ref()
         .map(|sequence| iso_primary_copies::parse(data, sequence));
+    let mut iso_path_table_copies = None;
     if let Some(offset) = iso_descriptor_sequence
         .as_ref()
         .and_then(|sequence| sequence.first_primary_volume_descriptor_offset)
@@ -1020,12 +1040,17 @@ pub fn parse(data: &[u8]) -> FormatMetadata {
             offset,
             basis: "validated type-1 descriptor in the bounded ISO descriptor sequence",
         });
-        headers.push(parse_iso_pvd(data, offset));
+        let primary = parse_iso_pvd(data, offset);
+        if let Some(sequence) = iso_descriptor_sequence.as_ref() {
+            iso_path_table_copies = iso_path_tables::parse(data, &primary, sequence);
+        }
+        headers.push(primary);
     }
 
     FormatMetadata {
         parser_engine: "nntmux-rust-ffi",
         iso_primary_volume_descriptor_copies,
+        iso_path_table_copies,
         sample_prefix_identity,
         candidate_scan_limit_per_format: MAX_SIGNATURE_CANDIDATES_PER_FORMAT,
         candidate_scan_truncated_formats,
@@ -4384,7 +4409,7 @@ fn parse_gzip_extra_subfields(extra: &[u8]) -> GzipExtraSubfieldSummary {
 
 fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation {
     let Some(search_end) = cursor
-        .checked_add(MAX_SCANNED_GZIP_TEXT_FIELD_BYTES + 1)
+        .checked_add(MAX_GZIP_OPTIONAL_FIELD_BYTES + 1)
         .map(|end| end.min(data.len()))
     else {
         return GzipTextFieldObservation {
@@ -4413,7 +4438,7 @@ fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation
         };
     };
     let terminator = field.iter().position(|byte| *byte == 0);
-    let observed_length = terminator.unwrap_or(field.len().min(MAX_SCANNED_GZIP_TEXT_FIELD_BYTES));
+    let observed_length = terminator.unwrap_or(field.len().min(MAX_GZIP_OPTIONAL_FIELD_BYTES));
     let observed = &field[..observed_length];
     let retained = &observed[..observed.len().min(MAX_RECORDED_GZIP_FIELD_HEX_BYTES)];
     let terminated = terminator.is_some();
@@ -4473,6 +4498,7 @@ fn parse_xz(data: &[u8], offset: usize) -> FormatHeader {
         ..
     } = read_xz_local_observations(data, offset);
     FormatHeader::Xz {
+        first_block: xz_first_block::observe(data, offset, header_valid == Some(true), check_id),
         stream_header_available,
         structure_valid,
         check_id_supported,
@@ -5740,7 +5766,8 @@ fn read_gzip_local_observations(data: &[u8], offset: usize) -> GzipLocalObservat
             }
         }
         if optional_fields_valid && flags_value & 0x08 != 0 {
-            match take_nul_terminated(data, cursor, MAX_GZIP_OPTIONAL_FIELD_BYTES) {
+            // Match parse_gzip_text_field's content bound plus NUL lookahead.
+            match take_nul_terminated(data, cursor, MAX_GZIP_OPTIONAL_FIELD_BYTES + 1) {
                 Some((field, next)) => {
                     original_filename = Some(field);
                     cursor = next;
@@ -5749,7 +5776,7 @@ fn read_gzip_local_observations(data: &[u8], offset: usize) -> GzipLocalObservat
             }
         }
         if optional_fields_valid && flags_value & 0x10 != 0 {
-            match take_nul_terminated(data, cursor, MAX_GZIP_OPTIONAL_FIELD_BYTES) {
+            match take_nul_terminated(data, cursor, MAX_GZIP_OPTIONAL_FIELD_BYTES + 1) {
                 Some((field, next)) => {
                     comment = Some(field);
                     cursor = next;
@@ -6711,11 +6738,26 @@ const MAX_RAR5_ARCHIVE_NAME_HEX_BYTES: usize = 256;
 
 const MAX_SIGNATURE_CANDIDATES_PER_FORMAT: usize = 16;
 
-const MAX_GZIP_OPTIONAL_FIELD_BYTES: usize = 65_536;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_zstandard_literal_size_relationship_with_sample_provenance() {
+        let parsed = serde_json::to_value(parse(b"\x28\xb5\x2f\xfd\x20\x01\x09\x00\x00A")).unwrap();
+        assert_eq!(parsed["headers"][0]["format"], "zstandard");
+        let frame = &parsed["headers"][0]["frame"];
+        assert_eq!(frame["header_status"], "observed_supported_header");
+        assert_eq!(frame["header_end_offset"], 6);
+        assert_eq!(frame["content_size"]["value"], 1);
+        assert_eq!(frame["first_block"]["payload_start_offset"], 9);
+        assert_eq!(frame["first_block"]["payload_end_offset"], 10);
+        assert_eq!(frame["size_relationship"]["status"], "equal");
+        assert_eq!(frame["checksum"]["status"], "not_declared");
+        assert_eq!(frame["file_offset_known"], false);
+        assert_eq!(frame["whole_file_validated"], false);
+        assert_eq!(frame["content_decompressed"], false);
+    }
 
     #[test]
     fn parses_7z_header_and_iso_identifiers_from_sample_bytes() {
@@ -7100,6 +7142,317 @@ mod tests {
             metadata["iso_primary_volume_descriptor_copies"]["copies"][1]["offset"],
             34_816
         );
+    }
+
+    fn iso_path_table_sample() -> Vec<u8> {
+        let mut sample = vec![0; 49_152];
+        let mut pvd = iso_volume_descriptor(1, 1);
+        pvd[80..88].copy_from_slice(&[32, 0, 0, 0, 0, 0, 0, 32]);
+        pvd[128..132].copy_from_slice(&[0, 8, 8, 0]);
+        pvd[132..140].copy_from_slice(&[10, 0, 0, 0, 0, 0, 0, 10]);
+        pvd[140..156].copy_from_slice(&[20, 0, 0, 0, 21, 0, 0, 0, 0, 0, 0, 22, 0, 0, 0, 23]);
+        pvd[881] = 1;
+        sample[32_768..34_816].copy_from_slice(&pvd);
+        sample[34_816..36_864].copy_from_slice(&iso_volume_descriptor(255, 1));
+        for offset in [40_960, 43_008] {
+            sample[offset..offset + 10].copy_from_slice(&[1, 0, 24, 0, 0, 0, 1, 0, 0, 0]);
+        }
+        for offset in [45_056, 47_104] {
+            sample[offset..offset + 10].copy_from_slice(&[1, 0, 0, 0, 0, 24, 0, 1, 0, 0]);
+        }
+        sample
+    }
+
+    #[test]
+    fn iso_path_tables_compare_only_same_endian_conditional_candidate_ranges() {
+        let metadata = serde_json::to_value(parse(&iso_path_table_sample())).unwrap();
+        let copies = &metadata["iso_path_table_copies"];
+        assert_eq!(copies["status"], "conditional_candidate_ranges_observed");
+        assert_eq!(copies["source_primary_descriptor_offset"], 32_768);
+        assert_eq!(copies["sequence_status"], "terminated");
+        assert_eq!(copies["sampled_descriptor_sequence_terminated"], true);
+        assert_eq!(copies["image_origin_known"], false);
+        assert_eq!(copies["whole_image_validated"], false);
+        assert!(copies["qualified_path_table_copy_agreement"].is_null());
+        assert!(
+            copies["mapping_assumption"]
+                .as_str()
+                .unwrap()
+                .contains("assumed")
+        );
+        assert_eq!(copies["tables"].as_array().unwrap().len(), 4);
+        assert_eq!(copies["pairs"].as_array().unwrap().len(), 2);
+        for (index, start, end, field, order, digest) in [
+            (
+                0,
+                40_960,
+                40_970,
+                32_908,
+                "little_endian",
+                "57fa0495ccc913dcdb2fb3976b359de7f16080b01ee9a64d09d522c872206beb",
+            ),
+            (
+                1,
+                43_008,
+                43_018,
+                32_912,
+                "little_endian",
+                "57fa0495ccc913dcdb2fb3976b359de7f16080b01ee9a64d09d522c872206beb",
+            ),
+            (
+                2,
+                45_056,
+                45_066,
+                32_916,
+                "big_endian",
+                "b1248feaae11e6b0e2cba00df46e0b7bfb2176efa7dc48ef4da4a9620a7447a1",
+            ),
+            (
+                3,
+                47_104,
+                47_114,
+                32_920,
+                "big_endian",
+                "b1248feaae11e6b0e2cba00df46e0b7bfb2176efa7dc48ef4da4a9620a7447a1",
+            ),
+        ] {
+            let table = &copies["tables"][index];
+            assert_eq!(table["candidate_sample_offset"], start);
+            assert_eq!(table["candidate_sample_end_exclusive"], end);
+            assert_eq!(table["source_location_field_offset"], field);
+            assert_eq!(table["byte_order"], order);
+            assert_eq!(table["status"], "complete_candidate_range");
+            assert_eq!(table["bytes_hashed"], 10);
+            assert_eq!(table["available_bytes"], 10);
+            assert_eq!(table["raw_sha256"], digest);
+        }
+        for (index, order) in [(0, "little_endian"), (1, "big_endian")] {
+            let pair = &copies["pairs"][index];
+            assert_eq!(pair["byte_order"], order);
+            assert_eq!(pair["status"], "candidate_ranges_equal");
+            assert_eq!(pair["candidate_range_bytes_equal"], true);
+            assert_eq!(pair["compared_bytes"], 10);
+            assert!(pair["first_difference"].is_null());
+        }
+        let mut padding_changed = iso_path_table_sample();
+        padding_changed[43_018] = 255;
+        let after = serde_json::to_value(parse(&padding_changed)).unwrap();
+        assert_eq!(
+            after["iso_path_table_copies"]["tables"][1]["raw_sha256"],
+            copies["tables"][1]["raw_sha256"]
+        );
+        assert_eq!(
+            after["iso_path_table_copies"]["pairs"][0]["candidate_range_bytes_equal"],
+            true
+        );
+    }
+
+    #[test]
+    fn iso_path_tables_retain_byte_witnesses_and_descriptor_sequence_coverage() {
+        let mut sample = iso_path_table_sample();
+        sample[43_010] = 25;
+        sample[47_109] = 25;
+        // Later malformed descriptor does not erase the explicitly first-PVD
+        // declarations, nor grant a complete descriptor-sequence claim.
+        sample[34_817] = b'X';
+        let metadata = serde_json::to_value(parse(&sample)).unwrap();
+        let copies = &metadata["iso_path_table_copies"];
+        assert_eq!(copies["sequence_status"], "malformed");
+        assert_eq!(copies["sampled_descriptor_sequence_terminated"], false);
+        for (index, relative, required, optional) in
+            [(0, 2, 40_962, 43_010), (1, 5, 45_061, 47_109)]
+        {
+            let pair = &copies["pairs"][index];
+            assert_eq!(pair["status"], "candidate_ranges_differ");
+            assert_eq!(pair["candidate_range_bytes_equal"], false);
+            assert_eq!(pair["compared_bytes"], 10);
+            assert_eq!(pair["first_difference"]["table_relative_offset"], relative);
+            assert_eq!(pair["first_difference"]["required_sample_offset"], required);
+            assert_eq!(pair["first_difference"]["optional_sample_offset"], optional);
+            assert_eq!(pair["first_difference"]["required_byte"], 24);
+            assert_eq!(pair["first_difference"]["optional_byte"], 25);
+        }
+        assert_eq!(
+            copies["tables"][1]["raw_sha256"],
+            "17beacfa5fb7a68e2dc29f8aad02afc68e48a2698c1d8a4c696c1c19ec5350e9"
+        );
+        assert_eq!(
+            copies["tables"][3]["raw_sha256"],
+            "24b363ad2217b1d3133ff49b0a25a2eb656ca1d66a8840003736580cfbcab424"
+        );
+    }
+
+    #[test]
+    fn iso_path_tables_withhold_equality_for_absent_aliased_partial_or_unsupported_ranges() {
+        for (field, bytes, index, expected) in [
+            (144, [0, 0, 0, 0], 1, "absent"),
+            (140, [0, 0, 0, 0], 0, "required_location_zero_unqualified"),
+            (136, [0, 0, 0, 11], 1, "unavailable_declared_geometry"),
+            (140, [32, 0, 0, 0], 0, "outside_declared_volume"),
+        ] {
+            let mut sample = iso_path_table_sample();
+            sample[32_768 + field..32_772 + field].copy_from_slice(&bytes);
+            let metadata = serde_json::to_value(parse(&sample)).unwrap();
+            let copies = &metadata["iso_path_table_copies"];
+            assert_eq!(copies["tables"][index]["status"], expected);
+            assert!(copies["tables"][index]["raw_sha256"].is_null());
+            assert_eq!(copies["tables"][index]["bytes_hashed"], 0);
+            assert!(copies["pairs"][0]["candidate_range_bytes_equal"].is_null());
+        }
+        let mut alias = iso_path_table_sample();
+        alias[32_912..32_916].copy_from_slice(&[20, 0, 0, 0]);
+        let metadata = serde_json::to_value(parse(&alias)).unwrap();
+        assert_eq!(
+            metadata["iso_path_table_copies"]["pairs"][0]["status"],
+            "same_declared_extent"
+        );
+        assert!(
+            metadata["iso_path_table_copies"]["pairs"][0]["candidate_range_bytes_equal"].is_null()
+        );
+        let mut partial = iso_path_table_sample();
+        partial.truncate(43_017);
+        let metadata = serde_json::to_value(parse(&partial)).unwrap();
+        assert_eq!(
+            metadata["iso_path_table_copies"]["tables"][1]["status"],
+            "candidate_range_not_fully_sampled"
+        );
+        assert_eq!(
+            metadata["iso_path_table_copies"]["tables"][1]["available_bytes"],
+            9
+        );
+        assert!(metadata["iso_path_table_copies"]["tables"][1]["raw_sha256"].is_null());
+        assert!(
+            metadata["iso_path_table_copies"]["pairs"][0]["candidate_range_bytes_equal"].is_null()
+        );
+        let mut unsupported = iso_path_table_sample();
+        unsupported[33_649] = 2;
+        let metadata = serde_json::to_value(parse(&unsupported)).unwrap();
+        assert_eq!(
+            metadata["iso_path_table_copies"]["tables"][0]["status"],
+            "unsupported_file_structure"
+        );
+        assert!(
+            metadata["iso_path_table_copies"]["pairs"][0]["candidate_range_bytes_equal"].is_null()
+        );
+    }
+
+    #[test]
+    fn iso_path_tables_bound_hash_work_and_withhold_overlapping_copy_equality() {
+        for size in [0u32, 65_536, 65_537] {
+            let mut sample = iso_path_table_sample();
+            sample.resize(303_105, 0);
+            let pvd = &mut sample[32_768..34_816];
+            pvd[80..84].copy_from_slice(&200u32.to_le_bytes());
+            pvd[84..88].copy_from_slice(&200u32.to_be_bytes());
+            pvd[132..136].copy_from_slice(&size.to_le_bytes());
+            pvd[136..140].copy_from_slice(&size.to_be_bytes());
+            for (field, location, big) in [
+                (140, 20u32, false),
+                (144, 52, false),
+                (148, 84, true),
+                (152, 116, true),
+            ] {
+                pvd[field..field + 4].copy_from_slice(&if big {
+                    location.to_be_bytes()
+                } else {
+                    location.to_le_bytes()
+                });
+            }
+            // Exact bounded table payloads, with different endian encodings.
+            sample[40_960..303_105].fill(0);
+            for offset in [40_960, 106_496] {
+                sample[offset..offset + 10].copy_from_slice(&[1, 0, 24, 0, 0, 0, 1, 0, 0, 0]);
+            }
+            for offset in [172_032, 237_568] {
+                sample[offset..offset + 10].copy_from_slice(&[1, 0, 0, 0, 0, 24, 0, 1, 0, 0]);
+            }
+            let metadata = serde_json::to_value(parse(&sample)).unwrap();
+            let copies = &metadata["iso_path_table_copies"];
+            assert_eq!(copies["table_size_limit_bytes"], 65_536);
+            for (index, table) in copies["tables"].as_array().unwrap().iter().enumerate() {
+                if size == 65_536 {
+                    assert_eq!(table["status"], "complete_candidate_range");
+                    assert_eq!(table["bytes_hashed"], 65_536);
+                    assert_eq!(
+                        table["raw_sha256"],
+                        if index < 2 {
+                            "94eb97e11bcf0a5e73894b443959f0296cd6ec9603de03444d3b0958362d9b17"
+                        } else {
+                            "47003487573514d7300a1bee6e45039ede7b2aa76cc5f41e57a7bcfdba047f84"
+                        }
+                    );
+                } else {
+                    assert_eq!(
+                        table["status"],
+                        if size == 0 {
+                            "zero_length_unqualified"
+                        } else {
+                            "size_limit_exceeded"
+                        }
+                    );
+                    assert_eq!(table["bytes_hashed"], 0);
+                    assert!(table["raw_sha256"].is_null());
+                }
+            }
+            for pair in copies["pairs"].as_array().unwrap() {
+                if size == 65_536 {
+                    assert_eq!(pair["candidate_range_bytes_equal"], true);
+                    assert_eq!(pair["compared_bytes"], 65_536);
+                } else {
+                    assert!(pair["candidate_range_bytes_equal"].is_null());
+                    assert_eq!(pair["compared_bytes"], 0);
+                }
+            }
+        }
+        let mut sample = iso_path_table_sample();
+        sample[32_848..32_856].copy_from_slice(&[200, 0, 0, 0, 0, 0, 0, 200]);
+        sample[32_896..32_900].copy_from_slice(&[0, 2, 2, 0]);
+        sample[32_900..32_908].copy_from_slice(&[0, 4, 0, 0, 0, 0, 4, 0]);
+        sample[32_908..32_916].copy_from_slice(&[80, 0, 0, 0, 81, 0, 0, 0]);
+        let metadata = serde_json::to_value(parse(&sample)).unwrap();
+        let copies = &metadata["iso_path_table_copies"];
+        assert_eq!(copies["pairs"][0]["status"], "overlapping_declared_extents");
+        assert!(copies["pairs"][0]["candidate_range_bytes_equal"].is_null());
+        assert_eq!(copies["pairs"][0]["compared_bytes"], 0);
+        assert_eq!(copies["tables"][0]["bytes_hashed"], 1024);
+        assert_eq!(copies["tables"][1]["bytes_hashed"], 1024);
+        assert!(
+            serde_json::to_value(parse(b"not ISO")).unwrap()["iso_path_table_copies"].is_null()
+        );
+    }
+
+    #[test]
+    fn iso_path_tables_use_first_primary_descriptor_after_other_descriptor_types() {
+        for preceding_type in [0, 2] {
+            let mut sample = iso_path_table_sample();
+            let primary = sample[32_768..34_816].to_vec();
+            sample[32_768..34_816].copy_from_slice(&iso_volume_descriptor(preceding_type, 1));
+            sample[34_816..36_864].copy_from_slice(&primary);
+            let mut conflicting_primary = primary.clone();
+            conflicting_primary[140..144].copy_from_slice(&24u32.to_le_bytes());
+            sample[36_864..38_912].copy_from_slice(&conflicting_primary);
+            sample[38_912..40_960].copy_from_slice(&iso_volume_descriptor(255, 1));
+            let metadata = serde_json::to_value(parse(&sample)).unwrap();
+            let copies = &metadata["iso_path_table_copies"];
+            assert_eq!(copies["source_primary_descriptor_offset"], 34_816);
+            assert_eq!(
+                copies["source_primary_descriptor_sha256"],
+                hex(&Sha256::digest(&primary))
+            );
+            assert_eq!(copies["source_size_little_endian_field_offset"], 34_948);
+            assert_eq!(copies["source_size_big_endian_field_offset"], 34_952);
+            assert_eq!(copies["tables"][0]["source_location_field_offset"], 34_956);
+            assert_eq!(copies["tables"][0]["location_logical_block"], 20);
+            assert_eq!(copies["tables"][0]["candidate_sample_offset"], 40_960);
+            assert_eq!(copies["pairs"][0]["candidate_range_bytes_equal"], true);
+            assert_eq!(copies["sequence_status"], "terminated");
+            assert_eq!(copies["image_origin_known"], false);
+            assert!(copies["qualified_path_table_copy_agreement"].is_null());
+            assert_eq!(
+                metadata["iso_primary_volume_descriptor_copies"]["all_observed_copies_equal"],
+                false
+            );
+        }
     }
 
     fn iso_volume_descriptor(descriptor_type: u8, version: u8) -> Vec<u8> {
@@ -10459,6 +10812,226 @@ mod tests {
     }
 
     #[test]
+    fn gzip_public_parse_keeps_long_text_fields_and_fhcrc_consistent() {
+        // Literal header, 4097 'A' bytes, NUL, 4097 'B' bytes, NUL.
+        // Independent IEEE CRC32 low 16 bits: 0xa583 (little endian below).
+        let mut gzip = vec![0x1f, 0x8b, 8, 0x1a, 0, 0, 0, 0, 0, 3];
+        gzip.extend_from_slice(&[b'A'; 4097]);
+        gzip.push(0);
+        gzip.extend_from_slice(&[b'B'; 4097]);
+        gzip.push(0);
+        gzip.extend_from_slice(&[0x83, 0xa5]);
+        let mut sample = vec![0x55; 7];
+        sample.extend_from_slice(&gzip);
+        let json = serde_json::to_value(parse(&sample)).unwrap();
+        let header = &json["headers"][0];
+        assert_eq!(header["offset"], 7);
+        assert_eq!(header["structure_valid"], true);
+        assert_eq!(header["header_complete"], true);
+        assert_eq!(header["header_valid"], true);
+        assert_eq!(header["filename_terminated"], true);
+        assert_eq!(header["filename_full_byte_length"], 4097);
+        assert_eq!(header["filename_byte_length"], 4097);
+        assert_eq!(header["original_filename_bytes_length"], 4097);
+        assert_eq!(
+            header["filename_sha256"],
+            "225e68d4d9603bdfca93fe3896ba95ab8a10e6505172d8a386af21c5525b950a"
+        );
+        assert_eq!(
+            header["filename_sha256"],
+            header["original_filename_bytes_sha256"]
+        );
+        assert_eq!(
+            header["filename_sha256_basis"],
+            "complete-nul-terminated-field"
+        );
+        assert_eq!(header["comment_terminated"], true);
+        assert_eq!(header["comment_full_byte_length"], 4097);
+        assert_eq!(header["comment_byte_length"], 4097);
+        assert_eq!(header["comment_bytes_length"], 4097);
+        assert_eq!(
+            header["comment_sha256"],
+            "e9b66ae7cb510f0ad5cb78b88084b5769bd2d684204cb9293063923f7232c09c"
+        );
+        assert_eq!(header["comment_sha256"], header["comment_bytes_sha256"]);
+        assert_eq!(
+            header["comment_sha256_basis"],
+            "complete-nul-terminated-field"
+        );
+        assert_eq!(header["filename_bytes_hex"].as_str().unwrap().len(), 512);
+        assert_eq!(header["comment_bytes_hex"].as_str().unwrap().len(), 512);
+        assert_eq!(header["filename_bytes_hex_truncated"], true);
+        assert_eq!(header["comment_bytes_hex_truncated"], true);
+        assert_eq!(header["header_crc16_expected"], 0xa583);
+        assert_eq!(header["header_crc16_calculated"], 0xa583);
+        assert_eq!(header["header_crc16_valid"], true);
+        assert_eq!(header["header_bytes"], 8208);
+
+        // Header completion is independent of the CRC result.
+        *sample.last_mut().unwrap() ^= 1;
+        let corrupt = serde_json::to_value(parse(&sample)).unwrap();
+        assert_eq!(corrupt["headers"][0]["header_complete"], true);
+        assert_eq!(corrupt["headers"][0]["header_valid"], false);
+        assert_eq!(corrupt["headers"][0]["header_crc16_valid"], false);
+    }
+
+    #[test]
+    fn gzip_public_parse_never_admits_unsupported_compression_methods() {
+        for method in [0, 1, 2, 3, 4, 5, 6, 7, 9, 255] {
+            let candidate = [0x1f, 0x8b, method, 0, 0, 0, 0, 0, 0, 3];
+            let parsed = parse(&candidate);
+            assert!(parsed.signatures.iter().all(|item| item.format != "gzip"));
+            assert!(
+                parsed
+                    .headers
+                    .iter()
+                    .all(|header| !matches!(header, FormatHeader::Gzip { .. }))
+            );
+        }
+        let supported = parse(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
+        assert!(matches!(
+            supported.headers.as_slice(),
+            [FormatHeader::Gzip {
+                header_valid: Some(true),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn gzip_public_parse_text_boundaries_keep_exact_lengths_and_bounded_previews() {
+        for (flag, field, alias) in [
+            (0x08, "filename", "original_filename"),
+            (0x10, "comment", "comment"),
+        ] {
+            for length in [0, 255, 256, 257, 4095, 4096, 4097, 65535, 65536] {
+                let mut gzip = vec![0x1f, 0x8b, 8, flag | 2, 0, 0, 0, 0, 0, 3];
+                gzip.extend(std::iter::repeat_n(b'a', length));
+                gzip.push(0);
+                let crc = crc32fast::hash(&gzip) as u16;
+                gzip.extend_from_slice(&crc.to_le_bytes());
+                let json = serde_json::to_value(parse(&gzip)).unwrap();
+                let header = &json["headers"][0];
+                assert_eq!(header["header_complete"], true, "{field}: {length}");
+                assert_eq!(header["structure_valid"], true, "{field}: {length}");
+                assert_eq!(header["header_valid"], true, "{field}: {length}");
+                assert_eq!(header[format!("{field}_terminated")], true);
+                assert_eq!(header[format!("{field}_byte_length")], length);
+                assert_eq!(header[format!("{field}_full_byte_length")], length);
+                assert_eq!(header[format!("{alias}_bytes_length")], length);
+                assert_eq!(
+                    header[format!("{field}_sha256")],
+                    header[format!("{alias}_bytes_sha256")]
+                );
+                assert_eq!(
+                    header[format!("{field}_sha256_basis")],
+                    "complete-nul-terminated-field"
+                );
+                assert_eq!(
+                    header[format!("{field}_bytes_hex")],
+                    "61".repeat(length.min(256))
+                );
+                assert_eq!(header[format!("{field}_bytes_hex_truncated")], length > 256);
+                assert_eq!(header[format!("{alias}_hex_truncated")], length > 256);
+                assert_eq!(header["header_crc16_valid"], true);
+                assert_eq!(header["header_bytes"], length + 13);
+            }
+        }
+    }
+
+    #[test]
+    fn gzip_public_parse_distinguishes_sample_end_from_text_scan_exhaustion() {
+        for (flag, field, alias) in [
+            (0x08, "filename", "original_filename"),
+            (0x10, "comment", "comment"),
+        ] {
+            for (length, trailing_nul, observed, basis) in [
+                (0, false, 0, "observed-prefix-sample-ended"),
+                (4097, false, 4097, "observed-prefix-sample-ended"),
+                (65536, false, 65536, "observed-prefix-sample-ended"),
+                (65537, false, 65536, "observed-prefix-scan-limited"),
+                (65537, true, 65536, "observed-prefix-scan-limited"),
+            ] {
+                // FNAME also advertises a later comment. It must remain unavailable
+                // when the name has no supported terminator, as must FHCRC.
+                let flags = if flag == 0x08 { 0x1a } else { 0x12 };
+                let mut gzip = vec![0x1f, 0x8b, 8, flags, 0, 0, 0, 0, 0, 3];
+                gzip.extend(std::iter::repeat_n(b'a', length));
+                if trailing_nul {
+                    gzip.extend_from_slice(b"\0later\0\x12\x34");
+                }
+                let json = serde_json::to_value(parse(&gzip)).unwrap();
+                let header = &json["headers"][0];
+                assert_eq!(header["header_complete"], false);
+                assert_eq!(header["structure_valid"], false);
+                assert!(header["header_valid"].is_null());
+                assert_eq!(header[format!("{field}_terminated")], false);
+                assert_eq!(header[format!("{field}_byte_length")], observed);
+                assert!(header[format!("{field}_full_byte_length")].is_null());
+                assert_eq!(header[format!("{field}_sha256_basis")], basis);
+                assert!(header[format!("{alias}_bytes_length")].is_null());
+                assert!(header["header_bytes"].is_null());
+                assert!(header["header_crc16_expected"].is_null());
+                assert!(header["header_crc16_calculated"].is_null());
+                assert!(header["header_crc16_valid"].is_null());
+                if flag == 0x08 {
+                    assert!(header["comment_terminated"].is_null());
+                    assert!(header["comment_bytes_length"].is_null());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gzip_public_parse_keeps_long_field_evidence_when_fhcrc_is_truncated() {
+        for (flag, field, alias) in [
+            (0x08, "filename", "original_filename"),
+            (0x10, "comment", "comment"),
+        ] {
+            let mut gzip = vec![0x1f, 0x8b, 8, flag | 2, 0, 0, 0, 0, 0, 3];
+            gzip.extend_from_slice(&[b'a'; 4097]);
+            gzip.extend_from_slice(&[0, 0x42]);
+            let json = serde_json::to_value(parse(&gzip)).unwrap();
+            let header = &json["headers"][0];
+            assert_eq!(header[format!("{field}_terminated")], true);
+            assert_eq!(header[format!("{field}_full_byte_length")], 4097);
+            assert_eq!(header[format!("{alias}_bytes_length")], 4097);
+            assert_eq!(header["header_complete"], false);
+            assert_eq!(header["structure_valid"], false);
+            assert!(header["header_valid"].is_null());
+            assert!(header["header_crc16_valid"].is_null());
+        }
+    }
+
+    #[test]
+    fn gzip_public_parse_caps_raw_previews_without_splitting_into_lossy_text() {
+        for (flag, field, alias) in [
+            (0x08, "filename", "original_filename"),
+            (0x10, "comment", "comment"),
+        ] {
+            let mut gzip = vec![0x1f, 0x8b, 8, flag, 0, 0, 0, 0, 0, 3];
+            gzip.extend_from_slice(&[b'a'; 255]);
+            // Raw bytes resembling a UTF-8 multibyte character cross the preview
+            // boundary; gzip text is not interpreted as UTF-8 by this parser.
+            gzip.extend_from_slice(&[0xe2, 0x82, 0xac, 0]);
+            let json = serde_json::to_value(parse(&gzip)).unwrap();
+            let header = &json["headers"][0];
+            assert_eq!(
+                header[format!("{field}_bytes_hex")],
+                format!("{}e2", "61".repeat(255))
+            );
+            assert_eq!(
+                header[format!("{alias}_bytes_hex")],
+                header[format!("{field}_bytes_hex")]
+            );
+            assert_eq!(header[format!("{field}_full_byte_length")], 258);
+            assert_eq!(header[format!("{alias}_bytes_length")], 258);
+            assert_eq!(header[format!("{field}_bytes_hex_truncated")], true);
+            assert_eq!(header["header_complete"], true);
+        }
+    }
+
+    #[test]
     fn parses_gzip_optional_fields_and_header_crc() {
         let mut gzip = GZIP.to_vec();
         gzip.extend_from_slice(&[0x1e, 0x78, 0x56, 0x34, 0x12, 2, 3]);
@@ -10913,5 +11486,86 @@ mod tests {
         assert_eq!(*main_archive_flags, Some(0));
         assert!(*main_extra_records_complete);
         assert_eq!(main_extra_record_types, &[1]);
+    }
+    #[test]
+    fn xz_first_block_exposes_declared_ranges_without_decompression() {
+        let sample: Vec<u8> = "fd377a585a000000ff12d94102c0050121010000f05dfb9f010000410000000000011101ada6580406729e7a010000000000595a"
+            .as_bytes().as_chunks::<2>().0.iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
+        let metadata = serde_json::to_value(parse(&sample)).unwrap();
+        let block = &metadata["headers"][0]["first_block"];
+        assert_eq!(block["header_start_offset"], 12);
+        assert_eq!(block["header_crc32_valid"], true);
+        assert_eq!(block["compressed_size"]["value"], 5);
+        assert_eq!(block["compressed_data"]["start_offset"], 24);
+        assert_eq!(block["compressed_data"]["end_offset_exclusive"], 29);
+        assert_eq!(block["block_padding"]["end_offset_exclusive"], 32);
+        assert_eq!(block["block_padding_zero"], true);
+        assert_eq!(block["following_byte"], 0);
+        #[cfg(feature = "experimental-xz-index")]
+        {
+            assert_eq!(
+                block["following_index"]["unpadded_size_relationship"],
+                "equal"
+            );
+            assert_eq!(block["following_index"]["crc32_valid"], true);
+            assert_eq!(block["following_footer"]["crc32_valid"], true);
+            assert_eq!(
+                block["following_footer"]["status"],
+                "footer_index_and_header_declarations_match"
+            );
+            assert_eq!(block["whole_stream_validated"], false);
+        }
+        #[cfg(not(feature = "experimental-xz-index"))]
+        {
+            assert!(block.get("following_index").is_none());
+            assert!(block.get("following_footer").is_none());
+        }
+        assert_eq!(block["content_decompressed"], false);
+    }
+
+    #[test]
+    fn xz_first_block_metadata_keeps_existing_candidate_limit_and_crc_authority() {
+        let mut stream = XZ.to_vec();
+        stream.extend([0, 0]);
+        stream.extend(crc32fast::hash(&[0, 0]).to_le_bytes());
+        stream.push(0);
+        let many = stream.repeat(17);
+        let metadata = parse(&many);
+        assert_eq!(
+            metadata
+                .headers
+                .iter()
+                .filter(|header| matches!(header, FormatHeader::Xz { .. }))
+                .count(),
+            16
+        );
+        assert!(metadata.candidate_scan_truncated_formats.contains(&"XZ"));
+        let mut sample: Vec<u8> = "fd377a585a000000ff12d94102c0050121010000f05dfb9f"
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        sample[8] ^= 1;
+        let metadata = serde_json::to_value(parse(&sample)).unwrap();
+        assert_eq!(metadata["headers"][0]["structure_valid"], true);
+        let block = &metadata["headers"][0]["first_block"];
+        assert_eq!(block["stream_header_qualified"], false);
+        assert_eq!(block["header_crc32_valid"], true);
+        assert_eq!(block["compressed_size"]["value"], 5);
+        assert!(block["compressed_data"].is_null());
+        sample[6] = 1;
+        let crc = crc32fast::hash(&sample[6..8]);
+        sample[8..12].copy_from_slice(&crc.to_le_bytes());
+        let metadata = serde_json::to_value(parse(&sample)).unwrap();
+        assert_eq!(metadata["headers"][0]["header_crc32_valid"], true);
+        assert_eq!(metadata["headers"][0]["reserved_bits_valid"], false);
+        assert_eq!(
+            metadata["headers"][0]["first_block"]["stream_header_qualified"],
+            false
+        );
+        assert!(metadata["headers"][0]["first_block"]["compressed_data"].is_null());
     }
 }
