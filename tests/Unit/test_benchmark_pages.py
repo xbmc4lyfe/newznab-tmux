@@ -63,6 +63,11 @@ class PagesTest(unittest.TestCase):
         self.assertEqual('unknown', pages.measured_payload_mode({'status': 'ok', 'rust_payload_mode': ['incumbent']}))
         self.assertEqual('experimental', pages.measured_payload_mode({'status': 'inconclusive', 'rust_payload_mode': 'experimental'}))
 
+    def test_cpu_results_disclose_unqualified_resampling_intervals(self):
+        report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[],
+                      results=[dict(kind='cpu-snapshot', runner='ubuntu-latest', status='measured', rows=[])])
+        self.assertIn('dependent bootstrap samples', pages.render(report))
+
     def run_row(self, **changes):
         return dict(id=12, run_attempt=2, head_sha=SHA, head_branch='master', event='push',
                     status='completed', conclusion='failure', head_repository={'full_name': pages.REPOSITORY}, **changes)

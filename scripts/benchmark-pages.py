@@ -350,6 +350,8 @@ def render(report):
         body.append('<p><a href="benchmarks/">Historical speedup charts, PHP call paths and native flamegraphs</a>. These frozen reports retain their own executed-commit and run provenance; they are separate from this build.</p>')
     for row in report['results']:
         body.append(f'<details><summary>{escape(row["kind"])} · {escape(row["runner"])} · {escape(row.get("status", "unknown"))}</summary><p>{run_link(row)}. Evidence: {escape(row.get("evidence_type", "unavailable"))}; adoption qualification: not established.</p>')
+        if row.get('kind') == 'cpu-snapshot':
+            body.append('<p>CPU interval limitation: the current harness uses dependent bootstrap samples. Its interval fields do not establish qualified uncertainty. Point estimates remain recorded measurements. <a href="performance.html#utility-results">Read the protocol limits</a>.</p>')
         if row.get('kind') in ('cpp', 'php', 'profile'):
             body.append('<p>Rust payload mode: ' + escape(measured_payload_mode(row)) + '.</p>')
         if 'workflow_status' in row:
