@@ -7,6 +7,8 @@ use std::panic::catch_unwind;
 use std::ptr;
 use std::slice;
 
+mod abi_crc;
+mod abi_decoder;
 mod article_dates;
 pub mod article_fingerprint;
 mod article_identity;
@@ -222,18 +224,55 @@ pub fn decode_payload(payload: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rapidyenc_decode_init() {}
+pub extern "C" fn rapidyenc_decode_init() {
+    let _ = catch_unwind(abi_decoder::decode_init);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rapidyenc_decode_kernel() -> c_int {
+    catch_unwind(abi_decoder::decode_kernel).unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rapidyenc_encode_max_length(length: usize, line_size: c_int) -> usize {
+    catch_unwind(|| abi_decoder::encode_max_length(length, line_size)).unwrap_or(DECODE_FAILED)
+}
+
+/// # Safety
+/// The caller provides readable source and writable destination storage for length bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rapidyenc_decode(
+    src: *const c_void,
+    dest: *mut c_void,
+    length: usize,
+) -> usize {
+    catch_unwind(|| unsafe { abi_decoder::decode(src, dest, length) }).unwrap_or(DECODE_FAILED)
+}
+
+/// # Safety
+/// Pointer-storage objects are distinct, aligned and writable. The source and destination
+/// data allocations follow the decoder's capacity and supported-overlap contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rapidyenc_decode_incremental(
+    src: *mut *const c_void,
+    dest: *mut *mut c_void,
+    length: usize,
+    state: *mut c_int,
+) -> c_int {
+    catch_unwind(|| unsafe { abi_decoder::decode_incremental(src, dest, length, state) })
+        .unwrap_or(0)
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rapidyenc_version() -> c_int {
     VERSION
 }
 
-/// Return 1 when raw payload decoding skips CR/LF inside escape pairs.
-/// This optional NNTmux capability leaves the RapidYenc compatibility ABI intact.
+/// The canonical RapidYenc ABI treats escaped CR/LF as value bytes.
+/// Legacy callers normalize split escapes; the separate span export remains lenient.
 #[unsafe(no_mangle)]
 pub extern "C" fn nntmux_yenc_supports_split_escapes() -> c_int {
-    1
+    0
 }
 
 /// Return PAR2 packet metadata as a newly allocated UTF-8 JSON C string.
@@ -762,8 +801,7 @@ pub unsafe extern "C" fn nntmux_spot_check_sample_v1_json(
 
 /// Decode `src_length` bytes from `src` into `dest` and return the decoded length.
 ///
-/// `is_raw` and `state` exist for RapidYenc compatibility; NNTmux always passes
-/// 0 and NULL, and dot-unstuffing has already happened by then.
+/// Raw dot unstuffing and optional decoder state follow the complete RapidYenc ABI.
 ///
 /// # Safety
 ///
@@ -771,30 +809,20 @@ pub unsafe extern "C" fn nntmux_spot_check_sample_v1_json(
 /// yEnc is never longer than its input.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rapidyenc_decode_ex(
-    _is_raw: c_int,
+    is_raw: c_int,
     src: *const c_void,
     dest: *mut c_void,
     src_length: usize,
-    _state: *mut c_int,
+    state: *mut c_int,
 ) -> usize {
-    if src_length == 0 {
-        return 0;
-    }
-    if src.is_null() || dest.is_null() {
-        return DECODE_FAILED;
-    }
-    match catch_unwind(|| {
-        // SAFETY: the caller supplies readable/writable buffers of src_length.
-        unsafe { payload_decoder::decode_into(src.cast(), dest.cast(), src_length) }
-    }) {
-        Ok(written) => written,
-        Err(_) => DECODE_FAILED,
-    }
+    catch_unwind(|| unsafe { abi_decoder::decode_ex(is_raw, src, dest, src_length, state) })
+        .unwrap_or(DECODE_FAILED)
 }
 
 /// Decode a bounded payload span from a larger source buffer.
 ///
-/// CR/LF and escape handling match `rapidyenc_decode_ex`. Only the returned
+/// This application span API skips CR/LF inside escapes, retaining its lenient
+/// contract separately from the canonical RapidYenc ABI. Only the returned
 /// number of destination bytes are written. A nonnull `crc32_output` receives
 /// the CRC-32 of those decoded bytes; null skips CRC computation.
 /// Invalid ranges, capacity, or required null pointers return `usize::MAX`
@@ -862,7 +890,44 @@ pub unsafe extern "C" fn nntmux_yenc_decode_span_v1(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rapidyenc_crc_init() {}
+pub extern "C" fn rapidyenc_crc_init() {
+    let _ = catch_unwind(abi_crc::crc_init);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rapidyenc_crc_kernel() -> c_int {
+    catch_unwind(abi_crc::crc_kernel).unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rapidyenc_crc_combine(first: u32, second: u32, length: u64) -> u32 {
+    abi_crc::crc_combine(first, second, length)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rapidyenc_crc_zeros(initial: u32, length: u64) -> u32 {
+    abi_crc::crc_zeros(initial, length)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rapidyenc_crc_unzero(initial: u32, length: u64) -> u32 {
+    abi_crc::crc_unzero(initial, length)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rapidyenc_crc_multiply(first: u32, second: u32) -> u32 {
+    abi_crc::crc_multiply(first, second)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rapidyenc_crc_2pow(exponent: i64) -> u32 {
+    abi_crc::crc_2pow(exponent)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rapidyenc_crc_256pow(exponent: u64) -> u32 {
+    abi_crc::crc_256pow(exponent)
+}
 
 /// Identity from the same runtime selector used by payload decoding.
 /// 0 scalar, 1 SSSE3, 2 AVX2, 3 AVX-512 VBMI2, 4 AArch64 NEON.
@@ -883,15 +948,7 @@ pub unsafe extern "C" fn rapidyenc_crc(
     src_length: usize,
     init_crc: u32,
 ) -> u32 {
-    if src_length == 0 || src.is_null() {
-        return init_crc;
-    }
-    // SAFETY: the caller guarantees `src` is readable for `src_length` bytes.
-    let data = unsafe { slice::from_raw_parts(src.cast::<u8>(), src_length) };
-    let mut hasher = crc32fast::Hasher::new_with_initial(init_crc);
-    hasher.update(data);
-
-    hasher.finalize()
+    catch_unwind(|| unsafe { abi_crc::crc(src, src_length, init_crc) }).unwrap_or(init_crc)
 }
 
 #[cfg(test)]
@@ -1213,7 +1270,7 @@ mod tests {
     #[test]
     fn span_abi_supports_both_overlap_directions_and_in_place_exact_writes() {
         let payload = [b"klm=@=J=M=}\r\n".repeat(9), b"=\r\n@===".to_vec()].concat();
-        let expected = decode_via_abi(&payload).unwrap();
+        let expected = [b"ABC\xd6\xe0\xe3\x13".repeat(9), b"\xd6\xd3\x13".to_vec()].concat();
         for destination_start in [16, 40, 41, 63] {
             let mut storage = vec![0xa5; payload.len() + 128];
             storage[40..40 + payload.len()].copy_from_slice(&payload);
@@ -1442,20 +1499,22 @@ mod tests {
     }
 
     #[test]
-    fn joins_escapes_split_across_a_line_break() {
-        assert_eq!(decode_via_abi(b"k=\r\n@").unwrap(), b"A\xd6");
+    fn payload_helper_preserves_lenient_split_escapes() {
+        assert_eq!(decode_payload(b"k=\r\n@").unwrap(), b"A\xd6");
+        assert_eq!(decode_via_abi(b"k=\r\n@").unwrap(), b"A\xa3\x16");
     }
 
     #[test]
     fn advertised_split_escape_capability_matches_abi_decoding() {
-        assert_eq!(nntmux_yenc_supports_split_escapes(), 1);
+        let advertised = nntmux_yenc_supports_split_escapes() == 1;
         for payload in [b"=\n@".as_slice(), b"=\r@", b"=\r\n\r\n@", b"=\r\n=\n=\r="] {
             let expected = if payload.ends_with(b"@") {
                 b"\xd6".as_slice()
             } else {
                 b"\xd3\xd3".as_slice()
             };
-            assert_eq!(decode_via_abi(payload).unwrap(), expected);
+            assert_eq!(advertised, decode_via_abi(payload).unwrap() == expected);
+            assert_eq!(decode_payload(payload).unwrap(), expected);
         }
     }
 

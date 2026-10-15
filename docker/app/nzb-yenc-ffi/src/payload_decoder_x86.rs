@@ -142,7 +142,7 @@ mod x86 {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "ssse3")]
 #[inline]
-unsafe fn compact_ssse3(
+pub(crate) unsafe fn compact_ssse3(
     bytes: x86::__m128i,
     equals_vector: x86::__m128i,
     equals: u16,

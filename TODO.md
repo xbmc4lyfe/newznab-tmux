@@ -1,5 +1,17 @@
 # To do
 
+## Replace the RapidYenc C++ build path with qualified Rust
+
+Rust replacement is the user's standing priority. Compile on the local Mac;
+`192.168.1.93` is offline. The written design, including compatibility corrections
+and two PHP diagnostic text updates, was approved on 2026-10-14 after two
+GPT-6 Astra Max review passes.
+
+- [ ] Complete the full decoder/CRC ABI of the pinned decode-only C++ build in Rust, including raw/incremental state, in-place decoding and CRC field helpers. Preserve existing Rust metadata exports and application behavior. The incumbent backend includes Rust SIMD payload decoding; its five RapidYenc exports do not establish full sixteen-function ABI parity.
+- [ ] Freeze reference vectors and a paired benchmark protocol, then prove byte/state/CRC parity and the required measured speedup on the recorded local host/workloads. Retain failures and raw observations. The local Linux caller fixture must use no production credentials, mounts or jobs.
+- [ ] Remove the replaced C++ download/build/cache path after the gates pass, select the Rust artifact in native CI and qualify the actual Rust backend without unexpected decoder fallback. All new implementation and benchmark logic is Rust; the two existing PHP diagnostic text edits are approved.
+- [ ] Obtain local Codex validation with `--yolo`, current-head GitHub Codex clearance and green CI; include current upstream commits, squash merge with verified `xbmc4lyfe` identity, then verify the guarded deployment and fresh native decoding before checking this replacement complete and moving on.
+
 ## Qualify authoritative backfill date targets (2026-10-14)
 
 Use the same selected NNTP connection for backfill targeting and storage. Date-based admission requires the requested article's parseable date from that provider/group; unrelated local part numbers, neighboring article dates and the current clock cannot supply it. Missing endpoint or midpoint metadata defers the attempt. Successful exact probes retain the approximate date search with bounded, integer-safe arithmetic; article Date ordering is still not guaranteed. Failed overview ranges must retain their cursor, while successful empty ranges remain completed work.
