@@ -762,11 +762,12 @@ final class NzbUploadManifestService
     {
         return $this->withManifestLock($manifestPath, function () use ($manifestPath, $delete): bool {
             $manifest = $this->read($manifestPath);
+            $this->drainCustodyGc($manifestPath, $manifest);
             if (! in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
                 || ! $this->nfoCleanupCommitted($manifest)) {
                 return false;
             }
-            if ($delete) {
+            if ($delete && ($manifest['nfo_relinquished_attempt'] ?? null) !== $manifest['nfo_capture']['attempt']) {
                 $manifest['delete_nfo_after_import'] = $manifest['nfo_capture']['attempt'];
             }
             $manifest['state'] = self::STATE_NFO_IMPORTED;
@@ -793,6 +794,7 @@ final class NzbUploadManifestService
         if (! $this->quarantineDelete($path, $receipt, $this->nfoCommitBinding($manifest))) {
             return false;
         }
+        $manifest['nfo_relinquished_attempt'] = $receipt['attempt'];
         unset($manifest['delete_nfo_after_import']);
         $this->rememberCustodyGc($manifest, $path, $receipt, $this->nfoCommitBinding($manifest));
         $this->write($manifestPath, $manifest);

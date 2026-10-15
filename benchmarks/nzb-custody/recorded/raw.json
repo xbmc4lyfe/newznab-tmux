@@ -3,13 +3,13 @@
     "phase": "warm",
     "block": 0,
     "variant": "native",
-    "wall_ms": 273.205167,
+    "wall_ms": 125.877417,
     "flow_ms": [
-      14.957125,
-      19.486875,
-      20.083667,
-      14.094416,
-      11.822541
+      6.308791,
+      5.039166,
+      7.948625,
+      8.643042,
+      6.5905
     ],
     "parity": true
   },
@@ -17,13 +17,13 @@
     "phase": "warm",
     "block": 0,
     "variant": "rust",
-    "wall_ms": 4443.098208,
+    "wall_ms": 2337.857541,
     "flow_ms": [
-      674.594625,
-      633.103833,
-      635.722875,
-      583.4655,
-      617.464208
+      270.197042,
+      286.085,
+      261.870542,
+      252.2305,
+      495.540208
     ],
     "parity": true
   },
@@ -31,13 +31,13 @@
     "phase": "warm",
     "block": 1,
     "variant": "rust",
-    "wall_ms": 3851.944416,
+    "wall_ms": 1519.174208,
     "flow_ms": [
-      715.084334,
-      737.704,
-      514.473458,
-      515.758375,
-      555.191166
+      218.509792,
+      224.238,
+      257.60575,
+      238.490416,
+      251.145916
     ],
     "parity": true
   },
@@ -45,13 +45,13 @@
     "phase": "warm",
     "block": 1,
     "variant": "native",
-    "wall_ms": 256.18875,
+    "wall_ms": 127.293042,
     "flow_ms": [
-      19.558916,
-      31.975292,
-      16.127041,
-      24.32275,
-      20.254666
+      5.781708,
+      7.568959,
+      7.472334,
+      7.638875,
+      6.098
     ],
     "parity": true
   },
@@ -59,9 +59,9 @@
     "phase": "cold",
     "block": 0,
     "variant": "rust",
-    "wall_ms": 906.141167,
+    "wall_ms": 334.020667,
     "flow_ms": [
-      743.477625
+      254.586417
     ],
     "parity": true
   },
@@ -69,9 +69,9 @@
     "phase": "cold",
     "block": 0,
     "variant": "native",
-    "wall_ms": 157.969084,
+    "wall_ms": 106.90425,
     "flow_ms": [
-      31.672708
+      15.508084
     ],
     "parity": true
   },
@@ -79,9 +79,9 @@
     "phase": "cold",
     "block": 1,
     "variant": "native",
-    "wall_ms": 335.285083,
+    "wall_ms": 78.142666,
     "flow_ms": [
-      119.702708
+      16.742958
     ],
     "parity": true
   },
@@ -89,9 +89,9 @@
     "phase": "cold",
     "block": 1,
     "variant": "rust",
-    "wall_ms": 868.11525,
+    "wall_ms": 381.2975,
     "flow_ms": [
-      692.046959
+      285.14775
     ],
     "parity": true
   },
@@ -99,9 +99,9 @@
     "phase": "cold",
     "block": 2,
     "variant": "native",
-    "wall_ms": 156.552916,
+    "wall_ms": 102.072583,
     "flow_ms": [
-      21.779833
+      15.977458
     ],
     "parity": true
   },
@@ -109,9 +109,9 @@
     "phase": "cold",
     "block": 2,
     "variant": "rust",
-    "wall_ms": 769.437834,
+    "wall_ms": 379.510667,
     "flow_ms": [
-      651.806
+      300.068792
     ],
     "parity": true
   },
@@ -119,9 +119,9 @@
     "phase": "cold",
     "block": 3,
     "variant": "native",
-    "wall_ms": 126.360167,
+    "wall_ms": 102.368459,
     "flow_ms": [
-      24.618875
+      25.421959
     ],
     "parity": true
   },
@@ -129,9 +129,9 @@
     "phase": "cold",
     "block": 3,
     "variant": "rust",
-    "wall_ms": 683.9825,
+    "wall_ms": 372.675333,
     "flow_ms": [
-      566.20075
+      275.130625
     ],
     "parity": true
   },
@@ -139,9 +139,9 @@
     "phase": "cold",
     "block": 4,
     "variant": "rust",
-    "wall_ms": 1022.123,
+    "wall_ms": 385.468166,
     "flow_ms": [
-      875.124958
+      291.382625
     ],
     "parity": true
   },
@@ -149,9 +149,9 @@
     "phase": "cold",
     "block": 4,
     "variant": "native",
-    "wall_ms": 1011.47625,
+    "wall_ms": 282.2095,
     "flow_ms": [
-      609.018209
+      51.122583
     ],
     "parity": true
   },
@@ -159,9 +159,9 @@
     "phase": "cold",
     "block": 5,
     "variant": "rust",
-    "wall_ms": 1160.855459,
+    "wall_ms": 469.230666,
     "flow_ms": [
-      627.716959
+      286.878042
     ],
     "parity": true
   },
@@ -169,9 +169,9 @@
     "phase": "cold",
     "block": 5,
     "variant": "native",
-    "wall_ms": 125.041709,
+    "wall_ms": 91.218916,
     "flow_ms": [
-      21.692583
+      17.563958
     ],
     "parity": true
   },
@@ -179,9 +179,9 @@
     "phase": "cold",
     "block": 6,
     "variant": "rust",
-    "wall_ms": 799.566416,
+    "wall_ms": 335.1655,
     "flow_ms": [
-      652.747292
+      263.894833
     ],
     "parity": true
   },
@@ -189,9 +189,9 @@
     "phase": "cold",
     "block": 6,
     "variant": "native",
-    "wall_ms": 137.23525,
+    "wall_ms": 88.921292,
     "flow_ms": [
-      25.233
+      16.792916
     ],
     "parity": true
   },
@@ -199,9 +199,9 @@
     "phase": "cold",
     "block": 7,
     "variant": "rust",
-    "wall_ms": 744.859334,
+    "wall_ms": 390.844917,
     "flow_ms": [
-      586.035625
+      312.422875
     ],
     "parity": true
   },
@@ -209,9 +209,9 @@
     "phase": "cold",
     "block": 7,
     "variant": "native",
-    "wall_ms": 155.407292,
+    "wall_ms": 100.255917,
     "flow_ms": [
-      23.832333
+      13.946667
     ],
     "parity": true
   },
@@ -219,9 +219,9 @@
     "phase": "cold",
     "block": 8,
     "variant": "native",
-    "wall_ms": 134.493416,
+    "wall_ms": 82.591417,
     "flow_ms": [
-      35.544916
+      13.488625
     ],
     "parity": true
   },
@@ -229,9 +229,9 @@
     "phase": "cold",
     "block": 8,
     "variant": "rust",
-    "wall_ms": 687.218875,
+    "wall_ms": 359.6735,
     "flow_ms": [
-      560.122791
+      278.23675
     ],
     "parity": true
   },
@@ -239,9 +239,9 @@
     "phase": "cold",
     "block": 9,
     "variant": "rust",
-    "wall_ms": 664.5675,
+    "wall_ms": 359.088167,
     "flow_ms": [
-      501.881292
+      270.040291
     ],
     "parity": true
   },
@@ -249,9 +249,9 @@
     "phase": "cold",
     "block": 9,
     "variant": "native",
-    "wall_ms": 161.848833,
+    "wall_ms": 140.479083,
     "flow_ms": [
-      59.069542
+      34.6585
     ],
     "parity": true
   }

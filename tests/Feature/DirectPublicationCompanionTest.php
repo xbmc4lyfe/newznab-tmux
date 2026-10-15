@@ -90,6 +90,49 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         self::assertSame(0, DB::table('nfo_cleanup_commits')->count());
     }
 
+    public static function replacementModes(): array
+    {
+        return ['absent original' => [false], 'new independent original' => [true]];
+    }
+
+    #[DataProvider('replacementModes')]
+    public function test_repeated_delete_does_not_recreate_retired_journals(bool $replacement): void
+    {
+        [$path, $manifests, $service] = $this->directUpload();
+        self::assertSame('imported', $service->importManifest($path, true)['status']);
+        self::assertSame([], glob(dirname($path).'/.custody-*'));
+        if ($replacement) {
+            file_put_contents(dirname($path).'/info.nfo', 'independent replacement');
+        }
+        self::assertSame('skipped', $service->importManifest($path, true)['status']);
+        self::assertArrayNotHasKey('delete_nfo_after_import', $manifests->read($path));
+        self::assertSame([], glob(dirname($path).'/.custody-*'));
+        if ($replacement) {
+            self::assertSame('independent replacement', file_get_contents(dirname($path).'/info.nfo'));
+        }
+    }
+
+    public static function journalGcFaults(): array
+    {
+        return ['files' => ['custody_gc_files'], 'parent' => ['custody_gc_parent']];
+    }
+
+    #[DataProvider('journalGcFaults')]
+    public function test_nfo_only_replay_drains_pending_journal_gc(string $boundary): void
+    {
+        [$path, $manifests, $service] = $this->directUpload();
+        DirectorySyncBridge::$fail = $boundary;
+        try {
+            self::assertSame('imported', $service->importManifest($path, true)['status']);
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        self::assertArrayHasKey('custody_gc', $manifests->read($path));
+        self::assertSame('skipped', $service->importManifest($path)['status']);
+        self::assertArrayNotHasKey('custody_gc', $manifests->read($path));
+        self::assertSame([], glob(dirname($path).'/.custody-*'));
+    }
+
     public function test_direct_receipt_failure_rolls_back_nfo_and_retains_both_inputs_for_retry(): void
     {
         [$path, , $service] = $this->directUpload();

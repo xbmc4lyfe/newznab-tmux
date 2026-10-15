@@ -39,11 +39,9 @@ final class NzbManifestReader
             $expected = 0;
             $verificationMode = null;
             $conflict = false;
-            $passwords = [];
             $elements = new NzbXmlElements($document);
-            $elements->assertUnambiguousPasswordMetadata();
+            $passwords = $this->passwordMetadata($elements);
             foreach ($elements->metadata() as $metadata) {
-                $this->appendPassword($metadata, $passwords);
                 $value = (string) $metadata;
                 if ((string) $metadata->attributes()['type'] === 'nntmux:verification-mode' && $value === 'spot-check') {
                     $verificationMode = 'spot_check';
@@ -120,11 +118,9 @@ final class NzbManifestReader
         $expected = 0;
         $verificationMode = null;
         $conflict = false;
-        $passwords = [];
         $elements = new NzbXmlElements($document);
-        $elements->assertUnambiguousPasswordMetadata();
+        $passwords = $this->passwordMetadata($elements);
         foreach ($elements->metadata() as $metadata) {
-            $this->appendPassword($metadata, $passwords);
             $value = (string) $metadata;
             if ((string) $metadata->attributes()['type'] === 'nntmux:verification-mode' && $value === 'spot-check') {
                 $verificationMode = 'spot_check';
@@ -189,6 +185,20 @@ final class NzbManifestReader
         }
 
         return $manifest;
+    }
+
+    /** Validate the complete metadata boundary before callers make terminal decisions.
+     * @return list<string>
+     */
+    public function passwordMetadata(NzbXmlElements $elements): array
+    {
+        $elements->assertUnambiguousPasswordMetadata();
+        $passwords = [];
+        foreach ($elements->metadata() as $metadata) {
+            $this->appendPassword($metadata, $passwords);
+        }
+
+        return $passwords;
     }
 
     /** @param list<string> $passwords */

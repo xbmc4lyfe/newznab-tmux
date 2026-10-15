@@ -43,9 +43,9 @@ platform, raw observations and summaries are committed under
 
 | Current synthetic screen | PHP median ms | Rust process median ms | PHP / Rust |
 | --- | ---: | ---: | ---: |
-| Warm complete custody flow | 19.523 | 625.284 | 0.031 |
-| Cold complete custody flow | 28.453 | 639.761 | 0.044 |
-| Cold whole PHP process | 155.980 | 784.502 | 0.199 |
+| Warm complete custody flow | 7.031 | 254.918 | 0.028 |
+| Cold complete custody flow | 16.768 | 281.692 | 0.060 |
+| Cold whole PHP process | 101.164 | 376.093 | 0.269 |
 
 This fails the required1.5x common-path gate by a wide margin. The shared host
 was uncontrolled; the focused recovery run finished before this comparison;

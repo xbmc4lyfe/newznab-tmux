@@ -269,7 +269,7 @@ class NzbImportService
                 $path = null;
                 try {
                     if (config('release_verification.required', true)) {
-                        (new NzbXmlElements($nzbXML))->assertUnambiguousPasswordMetadata();
+                        (new NzbManifestReader)->passwordMetadata(new NzbXmlElements($nzbXML));
                     }
                     [$importStatus, $stored, $path] = $this->withArticleIdentityLock(
                         $lockFingerprint,

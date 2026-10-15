@@ -1,11 +1,11 @@
 {
-  "head": "9b183f40383abd565cb9d5fec98ae979ddab1ab2",
+  "head": "861593e87a96e2c1664419e28fcc0b8671ca1bcd",
   "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
   "machine": "arm64",
   "rustc": "rustc 1.99.0 (b940084d7 2026-09-28) (Homebrew)",
   "php": "8.5.11",
   "source_sha256": {
-    "app/Services/Nzb/NzbUploadManifestService.php": "27bbea95a0a3d85309508294aaef7630ef9c2778033d7f2dea84f2af8572e5ca",
+    "app/Services/Nzb/NzbUploadManifestService.php": "df043c81f7e294dc2fd1e7fb53f5f63190aecf3c11086859457164ef3fe9c16d",
     "app/Services/Nzb/DirectorySyncBridge.php": "bcaeed70365b8aba8ddf7e2556b9b6a9b82abeb55fc0bb8099a8abf5f621f74f",
     "benchmarks/nzb-custody/sync.rs": "85941d73300d45298e42e52c1e78700dd58025e743a76f0c327e847986de1718",
     "benchmarks/nzb-custody/flow.php": "07c4e38f83fcaded7dc3bd7ea6ce3ec13407cf63692fe86eda0bc330a70186d5",
