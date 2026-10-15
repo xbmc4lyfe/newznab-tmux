@@ -387,11 +387,39 @@ final class Nima4kSourceTest extends TestCase
         $cases = [];
         foreach (['safe' => 'safe', 'nul' => '&#0;', 'control' => '&#1;', 'C1' => '&#128;', 'noncharacter' => '&#xFDD0;'] as $label => $value) {
             $cases['malformed attribute name '.$label] = ['', '<div ="'.$value.'"></div>'];
-            $cases['malformed element name '.$label] = ['', '<1 data-marker="'.$value.'">'];
+            if ($label !== 'safe') {
+                $cases['malformed element name '.$label] = ['', '<1 data-marker="'.$value.'">'];
+            }
             $cases['malformed doctype '.$label] = ['<!DOCTYPE html junk="'.$value.'">', ''];
         }
 
         return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('numericLookingSubtitlePositions')]
+    public function numeric_looking_subtitle_markup_cannot_be_repaired_into_an_agreeing_name(bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.<1>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$card;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{bool}> */
+    public static function numericLookingSubtitlePositions(): array
+    {
+        return ['first card' => [false], 'after record limit' => [true]];
+    }
+
+    #[Test]
+    public function agreeing_escaped_numeric_looking_labels_are_decoded_exactly_once(): void
+    {
+        $html = $this->card('Exact.<1>Release-GRP').$this->card('Exact.&lt;1&gt;Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame(['Exact.<1>Release-GRP', 'Exact.&lt;1&gt;Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
     }
 
     #[Test]
