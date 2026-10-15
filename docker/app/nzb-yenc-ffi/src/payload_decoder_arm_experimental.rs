@@ -749,6 +749,78 @@ mod tests {
     }
 
     #[test]
+    fn sparse_group_clean_lanes_keep_literal_order_and_incoming_escape() {
+        let mut no_carry = b"=@".to_vec();
+        no_carry.extend_from_slice(&[b'k'; 14]);
+        no_carry.extend_from_slice(&[b'l'; 16]);
+        no_carry.extend_from_slice(&[b'm'; 16]);
+        no_carry.extend_from_slice(&[b'n'; 16]);
+        let mut no_carry_expected = vec![214];
+        no_carry_expected.extend_from_slice(&[65; 14]);
+        no_carry_expected.extend_from_slice(&[66; 16]);
+        no_carry_expected.extend_from_slice(&[67; 16]);
+        no_carry_expected.extend_from_slice(&[68; 16]);
+
+        let mut carry = vec![b'k'; 63];
+        carry.push(b'=');
+        carry.extend_from_slice(&[b'l'; 16]);
+        carry.extend_from_slice(&[b'm'; 16]);
+        carry.extend_from_slice(&[b'n'; 16]);
+        carry.extend_from_slice(&[b'o'; 16]);
+        let mut carry_expected = vec![65; 63];
+        carry_expected.push(2);
+        carry_expected.extend_from_slice(&[66; 15]);
+        carry_expected.extend_from_slice(&[67; 16]);
+        carry_expected.extend_from_slice(&[68; 16]);
+        carry_expected.extend_from_slice(&[69; 16]);
+
+        for (literal, expected_literal) in [(no_carry, no_carry_expected), (carry, carry_expected)]
+        {
+            for prefix in 0..16 {
+                for tail in 0..17 {
+                    let mut payload = vec![b'k'; prefix];
+                    payload.extend_from_slice(&literal);
+                    payload.extend_from_slice(&[b'o'; 16][..tail]);
+                    let mut expected = vec![65; prefix];
+                    expected.extend_from_slice(&expected_literal);
+                    expected.extend_from_slice(&[69; 16][..tail]);
+                    verify_regular_guards(&payload, &expected);
+                    // All source alignments and ahead-overlap snapshots use
+                    // the common entry point, with complete storage guards.
+                    for alignment in 0..16 {
+                        let source_offset = 96 + alignment;
+                        for destination_offset in [
+                            0,
+                            source_offset - 1,
+                            source_offset,
+                            source_offset + 1,
+                            source_offset + 63,
+                            source_offset + 64,
+                        ] {
+                            let mut storage = vec![0xa5; source_offset + payload.len() + 160];
+                            storage[source_offset..source_offset + payload.len()]
+                                .copy_from_slice(&payload);
+                            let mut expected_storage = storage.clone();
+                            expected_storage
+                                [destination_offset..destination_offset + expected.len()]
+                                .copy_from_slice(&expected);
+                            let written = unsafe {
+                                crate::payload_decoder::decode_into(
+                                    storage.as_ptr().add(source_offset),
+                                    storage.as_mut_ptr().add(destination_offset),
+                                    payload.len(),
+                                )
+                            };
+                            assert_eq!(written, expected.len());
+                            assert_eq!(storage, expected_storage);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ordinary_sparse_removals_preserve_literal_output_and_all_guards() {
         for position in 0..64 {
             for tail in 0..17 {
