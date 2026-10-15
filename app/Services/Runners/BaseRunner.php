@@ -19,14 +19,21 @@ abstract class BaseRunner
 
     private bool $drainRequested = false;
 
+    private ?\Throwable $drainStateFailure = null;
+
     private float $lastDrainCheckAt = 0.0;
 
     protected function hasDrainRequest(bool $refresh = false): bool
     {
         if (! $this->drainRequested && ($refresh || microtime(true) - $this->lastDrainCheckAt >= 0.25)) {
             $this->lastDrainCheckAt = microtime(true);
-            if (app()->bound('db') && app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            try {
+                if (app()->bound('db') && app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                    $this->drainRequested = true;
+                }
+            } catch (\Throwable $exception) {
                 $this->drainRequested = true;
+                $this->drainStateFailure = $exception;
             }
         }
 
@@ -151,6 +158,7 @@ abstract class BaseRunner
         $queue = $commands;
         $running = [];
         $results = [];
+        $completionFailure = null;
         $this->workerOutcomes = [];
         $this->cancellationRequested = false;
         $handlers = [];
@@ -174,10 +182,10 @@ abstract class BaseRunner
                 if ($this->isCancellationRequested()) {
                     break;
                 }
-                if ($this->hasDrainRequest() && $running === []) {
+                if (($this->hasDrainRequest() || $completionFailure !== null) && $running === []) {
                     break;
                 }
-                while (! $this->isCancellationRequested() && ! $this->hasDrainRequest(true) && count($running) < max(1, $maxProcesses) && $queue !== []) {
+                while (! $this->isCancellationRequested() && $completionFailure === null && ! $this->hasDrainRequest(true) && count($running) < max(1, $maxProcesses) && $queue !== []) {
                     $key = null;
                     $busy = [];
                     foreach (array_keys($running) as $runningKey) {
@@ -214,7 +222,9 @@ abstract class BaseRunner
                     $status = null;
                     try {
                         if ($process->isRunning()) {
-                            $process->checkTimeout();
+                            if (! $this->hasDrainRequest()) {
+                                $process->checkTimeout();
+                            }
 
                             continue;
                         }
@@ -232,10 +242,14 @@ abstract class BaseRunner
                     $this->recordWorkerOutcome($key, $status, $process->getExitCode(), $this->outputTail($process));
                     unset($running[$key]);
                     if ($status === 'success') {
-                        $this->workerCompleted($key, $output);
-                    }
-                    if ($onComplete !== null && $status === 'success') {
-                        $onComplete($key, $output);
+                        try {
+                            $this->workerCompleted($key, $output);
+                            if ($onComplete !== null) {
+                                $onComplete($key, $output);
+                            }
+                        } catch (\Throwable $exception) {
+                            $completionFailure ??= $exception;
+                        }
                     }
                 }
                 usleep(50000);
@@ -264,7 +278,12 @@ abstract class BaseRunner
                 }
                 $this->recordWorkerOutcome($key, 'cancellation', $process->getExitCode());
             }
-            $queuedOutcome = $this->drainRequested && ! $this->isCancellationRequested() ? 'drained' : 'cancellation';
+            $queuedOutcome = match (true) {
+                $this->isCancellationRequested() => 'cancellation',
+                $this->drainRequested => 'drained',
+                $completionFailure !== null => 'failure',
+                default => 'cancellation',
+            };
             foreach ($queue as $key => $command) {
                 $this->recordWorkerOutcome($key, $queuedOutcome, null);
             }
@@ -277,11 +296,22 @@ abstract class BaseRunner
         }
 
         $failed = array_filter($this->workerOutcomes, static fn (array $outcome): bool => ! in_array($outcome['status'], ['success', 'drained'], true));
+        $errors = [];
         if ($failed !== []) {
-            throw new RuntimeException('Worker batch did not succeed: '.implode(', ', array_map(
+            $errors[] = 'Worker batch did not succeed: '.implode(', ', array_map(
                 static fn (string|int $key, array $outcome): string => $key.' '.$outcome['status'].($outcome['status'] === 'timeout' ? ' exceeded the timeout' : '').' (exit '.($outcome['exit_code'] ?? 'none').')',
                 array_keys($failed), array_values($failed),
-            )));
+            ));
+        }
+
+        if ($completionFailure !== null) {
+            $errors[] = 'Worker completion failed: '.$completionFailure->getMessage();
+        }
+        if ($this->drainStateFailure !== null) {
+            $errors[] = 'Unable to determine worker drain state: '.$this->drainStateFailure->getMessage();
+        }
+        if ($errors !== []) {
+            throw new RuntimeException(implode('; ', $errors), 0, $completionFailure ?? $this->drainStateFailure);
         }
 
         return $results;
