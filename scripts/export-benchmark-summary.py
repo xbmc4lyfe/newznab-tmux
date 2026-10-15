@@ -254,7 +254,23 @@ def utility_summary(kind, report):
     baseline = baseline if isinstance(baseline, dict) else {}
     invalid = baseline.get("sha256") != baseline_hash
     invalid |= report.get("benchmark") != ("cpu-snapshot-cold-cli" if cpu else "nzb-article-fingerprint-paired-comparison")
-    invalid |= protocol.get("version") != (2 if cpu else 3)
+    version = protocol.get("version")
+    invalid |= (type(version) is not int or version not in (2, 3)) if cpu else version != 3
+    family_size = len(expected) + int("rare-host-unavailable" in expected)
+    confidence_valid = cpu and version == 3
+    if confidence_valid:
+        confidence_valid = (protocol.get("bootstrap_rng") == "splitmix64-rejection"
+                            and protocol.get("order_rng") == "splitmix64-rejection"
+                            and protocol.get("bootstrap_resamples") == 4000
+                            and protocol.get("confidence_method") == "paired_bootstrap_bonferroni"
+                            and type(protocol.get("confidence_family_size")) is int
+                            and protocol["confidence_family_size"] == family_size
+                            and type(protocol.get("bootstrap_seed")) is int
+                            and 0 <= protocol["bootstrap_seed"] < 2 ** 64)
+        if "rare-host-unavailable" in expected:
+            confidence_valid &= (protocol.get("host_absent_median_ratio_ci_lower_gate") == 2.0
+                                 and protocol.get("host_absent_p99_ratio_ci_lower_gate") == 1.5)
+        invalid |= not confidence_valid
     invalid |= bool(set(measured) - set(expected))
     if cpu:
         invalid |= report.get("correctness_pass") is not True or report.get("changed_artifacts") != []
@@ -285,7 +301,15 @@ def utility_summary(kind, report):
             else:
                 valid = False
         if cpu:
-            for key in ("median_ratio_ci95", "p99_ratio_ci95"):
+            interval_keys = ("median_ratio_ci95", "p99_ratio_ci95")
+            if version == 3:
+                interval_keys += ("gate_speedup_simultaneous_ci95",)
+                if fixture == "rare-host-unavailable":
+                    interval_keys += ("host_median_speedup_simultaneous_ci95",)
+                statistic = "median_ratio" if fixture == "common-mounted" else "p99_ratio"
+                valid &= metrics.get("gate_statistic") == statistic
+                row["gate_statistic"] = statistic
+            for key in interval_keys:
                 interval = metrics.get(key)
                 if isinstance(interval, list) and len(interval) == 2 and all(number(x) and x > 0 for x in interval) and interval[0] <= interval[1]:
                     row[key] = interval
@@ -293,6 +317,9 @@ def utility_summary(kind, report):
                     valid = False
             valid &= type(metrics.get("gate_pass")) is bool
             valid &= metrics.get("p99_sample_sufficient") is row["p99_sample_sufficient"]
+            confidence_valid &= (count(declared) and declared >= 1000
+                                 and row["p99_sample_sufficient"]
+                                 and metrics.get("p99_sample_sufficient") is True)
             row["gate_passed"] = metrics.get("gate_pass") is True
         else:
             pairs = metrics.get("pairs")
@@ -314,6 +341,12 @@ def utility_summary(kind, report):
                 evidence_type="synthetic_cli_comparison" if cpu else "paired_public_operation_median_screen")
     if not cpu and report.get("candidate_status") == "experimental_withdrawn_from_production":
         result["candidate_status"] = "experimental_withdrawn_from_production"
+    if cpu:
+        result["measurement_protocol_version"] = version if type(version) is int and version in (2, 3) else 0
+        result["confidence_status"] = ("historical_unqualified" if version == 2 else
+                                       "simultaneous_gate_intervals" if confidence_valid and not invalid else "unqualified")
+        if confidence_valid:
+            result["confidence_family_size"] = family_size
     return result
 
 
@@ -354,6 +387,9 @@ def export(kind, runner):
             pass
         except (OSError, UnicodeError, ValueError, TypeError, OverflowError):
             summary["status"] = "invalid"
+        if kind == "cpu-snapshot" and summary.get("confidence_status") == "simultaneous_gate_intervals":
+            if summary["status"] not in ("measured", "measured_gate_failed") or "runtime_identity" not in summary:
+                summary["confidence_status"] = "unqualified"
         return summary
     records, malformed = [], False
     try:
