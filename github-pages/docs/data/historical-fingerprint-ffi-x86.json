@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "kind": "fingerprint-ffi",
+  "runner": "ubuntu-latest",
+  "head_sha": "a2f4298201ca05d8a69a24688bac8ed2f3896285",
+  "run_id": 38657422002,
+  "run_attempt": 1,
+  "repository": "xbmc4lyfe/newznab-tmux",
+  "status": "measured",
+  "rows": [
+    {
+      "fixture": "ids16",
+      "candidate_backend": "ffi",
+      "samples": 31,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": false,
+      "median_baseline_over_candidate_ratio": 4.3926247288503255,
+      "median_cold_baseline_over_candidate_ratio": 0.39721739026831243,
+      "eligible": true
+    },
+    {
+      "fixture": "ids4096",
+      "candidate_backend": "ffi",
+      "samples": 31,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": false,
+      "median_baseline_over_candidate_ratio": 6.827548115865378,
+      "median_cold_baseline_over_candidate_ratio": 3.9561565418222955,
+      "eligible": true
+    },
+    {
+      "fixture": "ids10000-unique-plus-duplicates",
+      "candidate_backend": "ffi",
+      "samples": 31,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": false,
+      "median_baseline_over_candidate_ratio": 12.813097403806271,
+      "median_cold_baseline_over_candidate_ratio": 11.279776740895606,
+      "eligible": true
+    },
+    {
+      "fixture": "ids50000",
+      "candidate_backend": "ffi",
+      "samples": 31,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": false,
+      "median_baseline_over_candidate_ratio": 17.806302016510696,
+      "median_cold_baseline_over_candidate_ratio": 16.943009555588397,
+      "eligible": true
+    },
+    {
+      "fixture": "xml10000",
+      "candidate_backend": "ffi",
+      "samples": 31,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": false,
+      "median_baseline_over_candidate_ratio": 6.1978834462317804,
+      "median_cold_baseline_over_candidate_ratio": 4.828217300113017,
+      "eligible": true
+    }
+  ],
+  "evidence_type": "paired_public_operation_median_screen",
+  "adoption_qualified": false,
+  "completeness": {
+    "expected_rows": 5,
+    "observed_rows": 5,
+    "complete": true
+  },
+  "baseline_revision": "a1a9b0829610c3b62e7d0bdb418669a89c36c90b",
+  "source_sha256": {
+    "baseline": "2c24de1374bc2f734961d3a7159fb13eaca175839f565a14004bcd41d7f3a374",
+    "candidate": "d43ccd3c5528d56be1c93791745243fc057f514fbdde85877259cf0679627374",
+    "composer_lock": "ee1360f9ab65dbd1d3435cc2d986a2d4a3f2069ba8e129222df3889facdd5be8",
+    "benchmark": "9f49de7448bdba332228e58aa894fb812c8410233eab1cac329283fa3378d9cc",
+    "rust_cargo_lock": "77b88ca781e79d95668cb5cb2d8bb61b89d3b3c4dd0892cdc86d4b260dffb55d",
+    "rust_accumulator": "d58058936eb1e54af0e24c3527173f8847acedad7e756a22ec69d5279718b3d2",
+    "rust_abi": "50c88c7f3fd5e6f481c6811c70652125116a60bbbf2b3504fd456a8b7f5ce76d",
+    "rust_worker": "7af9177b1edf373b1269c72c57043e8ae70266ee8a9f0c5e3a272dc76e248090",
+    "php_worker": "e557cd759977a6ad4258b7fb0d1f90ab2bd51b00606f89fc155a1aceb5011c7f",
+    "native_library": "6db926bc9e55b913e2041a5deb7a3a589f39bfd2d1649f9fa1698a0c320f3422",
+    "native_worker": "e30f05e6563fa9fb202bf3be67639520dda186715b88e329c918e885b267345b"
+  },
+  "protocol_sha256": "aa3985dff775026398b3ce95f4e163f083603f1df96c76a65b5c3b6176c4fa01",
+  "report_sha256": "03fd91128fd978f555e46c2d0a4ee273244ae76f4338ca83702610f6df050dc4",
+  "runtime_identity": {
+    "executed_sha": "a2f4298201ca05d8a69a24688bac8ed2f3896285",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "php": "8.5.11",
+    "python": "3.12.3",
+    "architecture": "x86_64",
+    "cpu_model": "AMD EPYC 9V45 96-Core Processor",
+    "runner_image_os": "ubuntu24",
+    "runner_image_version": "20261004.327.1",
+    "build_profile": "release opt-level=3 lto=true codegen-units=1; cargo --locked",
+    "logical_cpus": 4
+  }
+}

@@ -16,11 +16,13 @@ class ProcessingPulseRecordingTest extends TestCase
     public static function commands(): iterable
     {
         foreach (['tmux:monitor', 'multiprocessing:binaries', 'postprocess:guid', 'update:postprocess',
-            'releases:verify-candidates', 'binaries:part-repair', 'backfill:group', 'group:update-all', 'predb:import-feed'] as $command) {
+            'articles:get-range', 'releases:verify-candidates', 'binaries:part-repair', 'backfill:group', 'group:update-all', 'predb:import-feed'] as $command) {
             yield $command => [$command, false];
         }
         yield 'separated environment option' => [['--env', 'production', 'tmux:monitor'], false];
         yield 'inline environment option' => [['--env=production', 'tmux:monitor'], false];
+        yield 'article range separated environment option' => [['--env', 'production', 'articles:get-range', '1', '2', 'alt.test'], false];
+        yield 'article range inline environment option' => [['--env=production', 'articles:get-range', '1', '2', 'alt.test'], false];
         yield 'queue worker environment option' => [['--env', 'production', 'queue:work'], true];
         foreach (['horizon', 'queue:work', 'schedule:work', 'pulse:check', 'monitoring:export-metrics', 'config:cache'] as $command) {
             yield $command => [$command, true];
@@ -43,12 +45,20 @@ class ProcessingPulseRecordingTest extends TestCase
         }
     }
 
-    public function test_web_requests_and_processing_opt_in_preserve_the_master_switch(): void
+    /** @return iterable<string, array{string}> */
+    public static function processingCommands(): iterable
+    {
+        yield 'monitor' => ['tmux:monitor'];
+        yield 'article range' => ['articles:get-range'];
+    }
+
+    #[DataProvider('processingCommands')]
+    public function test_web_requests_and_processing_opt_in_preserve_the_master_switch(string $command): void
     {
         $argv = $_SERVER['argv'] ?? null;
         $console = new ReflectionProperty($this->app, 'isRunningInConsole');
         try {
-            $_SERVER['argv'] = ['artisan', 'tmux:monitor'];
+            $_SERVER['argv'] = ['artisan', $command];
             config(['pulse.enabled' => true, 'pulse.processing_enabled' => false]);
             $console->setValue($this->app, false);
             (new AppServiceProvider($this->app))->register();
