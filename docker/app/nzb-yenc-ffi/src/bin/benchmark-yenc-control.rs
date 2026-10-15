@@ -1927,6 +1927,160 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicitly supplied disposable Linux ARM64 CLI/library/fixture inputs"]
+    fn real_linux_cli_retains_full_worker_evidence_and_rejects_invalid_inputs() {
+        assert_eq!(std::env::consts::OS, "linux");
+        assert_eq!(std::env::consts::ARCH, "aarch64");
+        let config_path = std::env::var("NNTMUX_RUST_AA_INTEGRATION").unwrap();
+        let config_path = Path::new(&config_path);
+        assert!(config_path.is_absolute());
+        let config: Value =
+            serde_json::from_slice(&read_regular(config_path, 16_384).unwrap()).unwrap();
+        let controller = config["controller"].as_str().unwrap();
+        assert!(Path::new(controller).is_absolute());
+        let arguments: Vec<String> = config["arguments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let admitted = options(&arguments).unwrap();
+        assert_eq!(admitted.samples, 1);
+        assert_eq!(admitted.iterations, 3);
+        let output = Path::new(&admitted.paths["output"]);
+        let setup = config_path.parent().unwrap();
+        let invoke = |name: &str, args: &[String]| {
+            let stdout_path = setup.join(format!("integration-{name}.stdout"));
+            let stderr_path = setup.join(format!("integration-{name}.stderr"));
+            // GNU timeout owns a separate process group and bounds the CLI plus
+            // its workers. Do not use run_child here: its inherited file-size
+            // limit would incorrectly cap the controller's full JSONL evidence.
+            let status = Command::new("/usr/bin/timeout")
+                .args(["--signal=TERM", "--kill-after=5s", "180s"])
+                .arg(controller)
+                .args(args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .stdout(exclusive(&stdout_path).unwrap())
+                .stderr(exclusive(&stderr_path).unwrap())
+                .status()
+                .unwrap();
+            (
+                status,
+                read_regular(&stdout_path, 1_048_576).unwrap(),
+                read_regular(&stderr_path, 65_536).unwrap(),
+            )
+        };
+        let (status, stdout, stderr) = invoke("positive", &arguments);
+        assert!(
+            status.success(),
+            "CLI failed; retained evidence at {setup:?}"
+        );
+        assert!(stderr.is_empty());
+        let summary: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(summary["status"], "control_observations_complete");
+        assert_eq!(summary["eligible_pairs"], 32);
+        assert_eq!(summary["invalid_pairs"], 0);
+        assert_eq!(summary["cpu_interval_qualified"], true);
+        assert_eq!(summary["all_identities_unchanged"], true);
+        assert_eq!(summary["noise_equivalence_qualified"], false);
+        assert_eq!(summary["adoption_qualified"], false);
+        let observations_path = output.join("observations.jsonl");
+        let raw = read_regular(&observations_path, 8_388_608).unwrap();
+        let records: Vec<Value> = raw
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(records.last().unwrap(), &summary);
+        let observations: Vec<_> = records
+            .iter()
+            .filter(|r| r["type"] == "observation")
+            .collect();
+        assert_eq!(observations.len(), 64);
+        for record in observations {
+            assert_eq!(record["backend"], "rust");
+            assert_eq!(record["receipt"]["status"], "ok");
+            assert_eq!(record["receipt"]["exit_code"], 0);
+            assert_eq!(record["receipt"]["direct_child_reaped"], true);
+        }
+        let pairs: Vec<_> = records.iter().filter(|r| r["type"] == "pair").collect();
+        assert_eq!(pairs.len(), 32);
+        assert!(pairs.iter().all(|r| r["eligible"] == true));
+        let probes: Vec<_> = records
+            .iter()
+            .filter(|r| r["type"] == "untimed_kernel_probe")
+            .collect();
+        assert_eq!(probes.len(), 2);
+        assert!(probes.iter().all(|r| r["verified"] == true));
+        for kind in ["identity_before", "identity_after"] {
+            let receipt = records.iter().find(|r| r["type"] == kind).unwrap();
+            assert!(
+                receipt["receipts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|r| r["matches"] == true)
+            );
+        }
+        let (status, _, stderr) = invoke("existing-output", &arguments);
+        assert_eq!(status.code(), Some(1));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&stderr).unwrap()["status"],
+            "invalid_control"
+        );
+        assert_eq!(read_regular(&observations_path, 8_388_608).unwrap(), raw);
+        let original: Value = serde_json::from_slice(
+            &read_regular(Path::new(&admitted.paths["manifest-a"]), 1_048_576).unwrap(),
+        )
+        .unwrap();
+        for stale_source in [false, true] {
+            let name = if stale_source {
+                "stale-source"
+            } else {
+                "mismatched-manifest"
+            };
+            let mut invalid = original.clone();
+            if stale_source {
+                let sources = invalid["rust_source_sha256"].as_object_mut().unwrap();
+                *sources.values_mut().next().unwrap() = json!("0".repeat(64));
+            } else {
+                invalid["library_sha256"] = json!("0".repeat(64));
+            }
+            let manifest = setup.join(format!("integration-{name}.json"));
+            frozen_file(&manifest, &serde_json::to_vec(&invalid).unwrap()).unwrap();
+            let failure_output = output.parent().unwrap().join(format!("cli-{name}"));
+            let mut args = arguments.clone();
+            for arg in &mut args {
+                if arg.starts_with("--output=") {
+                    *arg = format!("--output={}", failure_output.display());
+                } else if arg.starts_with("--manifest-b=")
+                    || (stale_source && arg.starts_with("--manifest-a="))
+                {
+                    *arg = format!("{}={}", arg.split_once('=').unwrap().0, manifest.display());
+                }
+            }
+            let (status, _, stderr) = invoke(name, &args);
+            assert_eq!(status.code(), Some(1));
+            assert_eq!(
+                serde_json::from_slice::<Value>(&stderr).unwrap()["status"],
+                "invalid_control"
+            );
+            let receipt =
+                read_regular(&failure_output.join("observations.jsonl"), 8_388_608).unwrap();
+            let failures: Vec<Value> = receipt
+                .split(|b| *b == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            assert_eq!(failures.last().unwrap()["type"], "run_failure");
+            assert!(failures.iter().all(|r| r["type"] != "observation"));
+        }
+    }
+
+    #[test]
     fn pair_ratio_requires_both_members_of_the_same_control_pair() {
         let left = observation();
         let mut right = left.clone();

@@ -36,7 +36,7 @@ on:
       comparison:
         description: Baseline to compare against Rust
         type: choice
-        options: [all, php, cpp, profile, processing]
+        options: [all, php, cpp, profile, processing, rust-aa-control]
         default: all
       samples:
         description: Matched fresh-process pairs per fixture stratum
@@ -68,7 +68,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: yenc-performance-${{ github.ref }}
+  group: yenc-performance-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && inputs.comparison == 'rust-aa-control' && '-rust-aa-control' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -704,5 +704,181 @@ jobs:
         with:
           name: rust-php-performance-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: benchmark-evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
+  rust-aa-control:
+    if: github.event_name == 'workflow_dispatch' && inputs.comparison == 'rust-aa-control'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    env:
+      RUST_TOOLCHAIN: '1.98.0'
+      CARGO_INCREMENTAL: '0'
+      CONTROL_SAMPLES: ${{ inputs.samples }}
+      CONTROL_SEED: ${{ inputs.seed }}
+      CONTROL_RESERVED: 'false'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Reserve separate owned control evidence
+        shell: bash
+        run: |
+          control_root="$RUNNER_TEMP/nntmux-rust-aa-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$control_root"
+          mkdir -m 700 "$control_root/setup" "$control_root/fixtures"
+          printf '%s\n' reserved > "$control_root/setup/last-phase"
+          printf 'CONTROL_ROOT=%s\nCONTROL_RESERVED=true\n' "$control_root" >> "$GITHUB_ENV"
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: ffi, mbstring
+          coverage: none
+
+      - name: Install locked fixture dependencies without application boot
+        shell: bash
+        run: |
+          printf '%s\n' composer > "$CONTROL_ROOT/setup/last-phase"
+          composer install --prefer-dist --no-interaction --no-progress --no-scripts
+
+      - name: Build and test the experimental control executable
+        shell: bash
+        run: |
+          printf '%s\n' build > "$CONTROL_ROOT/setup/last-phase"
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --features experimental-payload-kernels --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee "$CONTROL_ROOT/setup/rust-test.log"
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --features experimental-payload-kernels --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee "$CONTROL_ROOT/setup/rust-build.log"
+
+      - name: Prepare the complete fixed fixture matrix
+        shell: bash
+        run: |
+          printf '%s\n' fixtures > "$CONTROL_ROOT/setup/last-phase"
+          for size in 4096 524288 1048576 8388608; do
+            for density in ordinary heavy; do
+              php -d memory_limit=512M -d ffi.enable=true scripts/profile-yenc.php \
+                "--native=$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+                --path=strict "--size=$size" "--density=$density" \
+                "--prepare-dir=$CONTROL_ROOT/fixtures/$size-$density" \
+                > "$CONTROL_ROOT/setup/prepare-$size-$density.json" \
+                2> "$CONTROL_ROOT/setup/prepare-$size-$density.stderr"
+            done
+          done
+
+      - name: Bind the actual source build and library identities
+        shell: bash
+        run: |
+          printf '%s\n' manifest > "$CONTROL_ROOT/setup/last-phase"
+          python3 - <<'PY_CONTROL'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          crate = root / 'docker/app/nzb-yenc-ffi'
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          def run(*argv):
+              return subprocess.check_output(argv, text=True, timeout=15).strip()
+          toolchain = '+' + os.environ['RUST_TOOLCHAIN']
+          manifest = {
+              'comparison_kind': 'rust-aa-control', 'rust_payload_mode': 'experimental',
+              'git_head': run('git', 'rev-parse', 'HEAD'),
+              'library_sha256': digest(crate / 'target/release/libnzbyenc.so'),
+              'worker_sha256': digest(root / 'scripts/benchmark-yenc-abi.py'),
+              'cargo_lock_sha256': digest(crate / 'Cargo.lock'),
+              'cargo_toml_sha256': digest(crate / 'Cargo.toml'),
+              'fixture_generator_sha256': digest(root / 'scripts/profile-yenc.php'),
+              'fixture_encoder_sha256': digest(root / 'tests/Fixtures/YencArticles.php'),
+              'rust_source_sha256': {str(p.relative_to(crate)): digest(p) for p in sorted((crate / 'src').rglob('*.rs'))},
+              'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
+              'cargo': run('cargo', toolchain, '-V'),
+              'build_argv': ['cargo', toolchain, 'build', '--release', '--locked', '--features',
+                  'experimental-payload-kernels', '--manifest-path', 'docker/app/nzb-yenc-ffi/Cargo.toml'],
+              'build_env': {k: v for k, v in os.environ.items() if k.startswith('CARGO_PROFILE_') or k in
+                  ('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_INCREMENTAL', 'CARGO_BUILD_TARGET')},
+              'runner_identity': {'os': 'linux', 'arch': 'aarch64', 'uname': run('uname', '-a'),
+                  'image_os': os.environ.get('ImageOS'), 'image_version': os.environ.get('ImageVersion')},
+              'claim': 'Declared build receipt bound to retained source and library bytes; not independent build attestation',
+          }
+          output = pathlib.Path(os.environ['CONTROL_ROOT'])
+          path = output / 'setup/source-build.json'
+          with path.open('x') as handle:
+              json.dump(manifest, handle, indent=2)
+              handle.write('\n')
+          import sys
+          common = ['--fixtures=' + str(output / 'fixtures'),
+              '--library-a=' + str(crate / 'target/release/libnzbyenc.so'),
+              '--library-b=' + str(crate / 'target/release/libnzbyenc.so'),
+              '--manifest-a=' + str(path), '--manifest-b=' + str(path),
+              '--worker=' + str(root / 'scripts/benchmark-yenc-abi.py'), '--python=' + sys.executable,
+              '--cpu-snapshot=' + str(crate / 'target/release/nntmux-cpu-snapshot'),
+              '--source-root=' + str(root), '--output=' + str(output / 'cli-smoke'),
+              '--samples=1', '--iterations=3', '--seed=' + os.environ['CONTROL_SEED'], '--timeout=30']
+          with (output / 'setup/cli-integration.json').open('x') as handle:
+              json.dump({'controller': str(crate / 'target/release/benchmark-yenc-control'), 'arguments': common}, handle)
+              handle.write('\n')
+          PY_CONTROL
+
+      - name: Exercise the full CLI through the real frozen worker then collect controls
+        shell: bash
+        run: |
+          library="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so"
+          controller="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/benchmark-yenc-control"
+          common=("--fixtures=$CONTROL_ROOT/fixtures" "--library-a=$library" "--library-b=$library"
+            "--manifest-a=$CONTROL_ROOT/setup/source-build.json" "--manifest-b=$CONTROL_ROOT/setup/source-build.json"
+            "--worker=$GITHUB_WORKSPACE/scripts/benchmark-yenc-abi.py" "--python=$(command -v python3)"
+            "--cpu-snapshot=$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/nntmux-cpu-snapshot"
+            "--source-root=$GITHUB_WORKSPACE" "--seed=$CONTROL_SEED" --timeout=30)
+          printf '%s\n' cli-integration > "$CONTROL_ROOT/setup/last-phase"
+          NNTMUX_RUST_AA_INTEGRATION="$CONTROL_ROOT/setup/cli-integration.json" \
+            cargo +"$RUST_TOOLCHAIN" test --release --locked --features experimental-payload-kernels \
+              --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --bin benchmark-yenc-control \
+              tests::real_linux_cli_retains_full_worker_evidence_and_rejects_invalid_inputs \
+              -- --ignored --exact 2>&1 | tee "$CONTROL_ROOT/setup/cli-integration.log"
+          printf '%s\n' control > "$CONTROL_ROOT/setup/last-phase"
+          if timeout --signal=TERM --kill-after=5s 900s "$controller" "${common[@]}" \
+              "--output=$CONTROL_ROOT/control" "--samples=$CONTROL_SAMPLES" --iterations=8 \
+              > "$CONTROL_ROOT/setup/control.stdout" 2> "$CONTROL_ROOT/setup/control.stderr"; then
+            control_status=0
+          else
+            control_status=$?
+          fi
+          printf '%s\n' "$control_status" > "$CONTROL_ROOT/setup/control.exit-code"
+          if [[ "$control_status" != 0 ]]; then exit "$control_status"; fi
+          printf '%s\n' complete > "$CONTROL_ROOT/setup/last-phase"
+
+      - name: Retain the last observed setup and execution status
+        if: always() && env.CONTROL_RESERVED == 'true' && env.CONTROL_ROOT != ''
+        env:
+          CONTROL_JOB_STATUS: ${{ job.status }}
+        shell: bash
+        run: |
+          python3 - <<'PY_CONTROL_STATUS'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['CONTROL_ROOT'])
+          phase = root / 'setup/last-phase'
+          code = root / 'setup/control.exit-code'
+          record = {'comparison_kind': 'rust-aa-control', 'job_status': os.environ['CONTROL_JOB_STATUS'],
+              'last_recorded_phase': phase.read_text().strip() if phase.is_file() else None,
+              'control_exit_code': int(code.read_text()) if code.is_file() else None,
+              'measurement_cpu_endpoints': 'only the controller-owned before/after receipts qualify; missing remains unavailable',
+              'adoption_qualified': False}
+          with (root / 'job-status.json').open('x') as handle:
+              json.dump(record, handle, indent=2)
+              handle.write('\n')
+          PY_CONTROL_STATUS
+
+      - name: State the control evidence scope
+        if: always()
+        shell: bash
+        run: |
+          printf '%s\n' 'A/A control only; no C++ comparison or adoption verdict. Full CLI smoke and control receipts, including failures, are retained separately. No noise equivalence is assumed.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain all isolated Rust control evidence
+        if: always() && env.CONTROL_RESERVED == 'true' && env.CONTROL_ROOT != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: yenc-abi-rust-aa-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CONTROL_ROOT }}/
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14

@@ -296,6 +296,129 @@ class ProfileBuildTest(unittest.TestCase):
                 self.assertEqual(2, child.returncode)
                 self.assertFalse((evidence / 'profile-build').exists())
 
+    def test_rust_aa_control_job_is_manual_isolated_and_retains_failure_evidence(self):
+        workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()
+        self.assertIn('options: [all, php, cpp, profile, processing, rust-aa-control]', workflow)
+        job = workflow.split('  rust-aa-control:\n', 1)[1]
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.comparison == 'rust-aa-control'", job)
+        self.assertIn('runs-on: ubuntu-24.04-arm', job)
+        self.assertNotIn('export-benchmark-summary.py', job)
+        self.assertNotIn('public-benchmark-', job)
+        self.assertIn('name: yenc-abi-rust-aa-control-', job)
+        upload = job.split('      - name: Retain all isolated Rust control evidence\n', 1)[1]
+        self.assertIn("if: always() && env.CONTROL_RESERVED == 'true' && env.CONTROL_ROOT != ''", upload)
+        self.assertIn('if: always()', job)
+        self.assertIn('include-hidden-files: true', job)
+        self.assertIn('--features experimental-payload-kernels', job)
+        self.assertIn('--samples=1', job)
+        self.assertIn('--iterations=3', job)
+        self.assertIn('--worker=$GITHUB_WORKSPACE/scripts/benchmark-yenc-abi.py', job)
+        self.assertIn('--source-root=$GITHUB_WORKSPACE', job)
+        self.assertIn('A/A control only; no C++ comparison or adoption verdict', job)
+
+    def test_control_reservation_publishes_ownership_only_after_success(self):
+        workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()
+        job = workflow.split('  rust-aa-control:\n', 1)[1]
+        step = job.split('      - name: Reserve separate owned control evidence\n', 1)[1].split('      - ', 1)[0]
+        command = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        for collision in [False, True]:
+            with self.subTest(collision=collision), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                evidence = root / 'nntmux-rust-aa-123-1'
+                env_file = root / 'github-env'
+                env_file.touch()
+                if collision:
+                    evidence.mkdir()
+                    (evidence / 'sentinel').write_text('unowned')
+                env = dict(os.environ, RUNNER_TEMP=str(root), GITHUB_RUN_ID='123',
+                           GITHUB_RUN_ATTEMPT='1', GITHUB_ENV=str(env_file))
+                child = subprocess.run(['bash', '-e', '-c', command], env=env,
+                                       capture_output=True, text=True, timeout=10)
+                if collision:
+                    self.assertNotEqual(0, child.returncode)
+                    self.assertEqual('', env_file.read_text())
+                    self.assertEqual(['sentinel'], sorted(p.name for p in evidence.iterdir()))
+                else:
+                    self.assertEqual(0, child.returncode, child.stderr)
+                    self.assertIn('CONTROL_RESERVED=true\n', env_file.read_text())
+                    self.assertIn('CONTROL_ROOT=' + str(evidence) + '\n', env_file.read_text())
+        guard = "if: always() && env.CONTROL_RESERVED == 'true' && env.CONTROL_ROOT != ''"
+        for name in ['Retain the last observed setup and execution status', 'Retain all isolated Rust control evidence']:
+            block = job.split('      - name: ' + name + '\n', 1)[1].split('      - name:', 1)[0]
+            self.assertIn(guard, block)
+
+    def test_manual_control_selection_and_concurrency_leave_existing_jobs_unchanged(self):
+        workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()
+        predicates = {
+            'paired-decoding': "github.event_name != 'workflow_dispatch' || inputs.comparison == 'all' || inputs.comparison == 'cpp'",
+            'article-processing': "github.event_name != 'workflow_dispatch' || inputs.comparison == 'all' || inputs.comparison == 'profile' || inputs.comparison == 'processing'",
+            'php-decoding': "github.event_name != 'workflow_dispatch' || inputs.comparison == 'all' || inputs.comparison == 'php'",
+            'rust-aa-control': "github.event_name == 'workflow_dispatch' && inputs.comparison == 'rust-aa-control'",
+        }
+        for name, predicate in predicates.items():
+            block = workflow.split('  ' + name + ':\n', 1)[1]
+            self.assertEqual(predicate, re.search(r'^    if: (.+)$', block, re.MULTILINE)[1])
+        suffix = "github.event_name == 'workflow_dispatch' && inputs.comparison == 'rust-aa-control' && '-rust-aa-control' || ''"
+        self.assertIn('group: yenc-performance-${{ github.ref }}${{ ' + suffix + ' }}', workflow)
+        for event in ['pull_request', 'push', 'workflow_dispatch']:
+            for selection in ['all', 'php', 'cpp', 'profile', 'processing', 'rust-aa-control']:
+                context = {'event_name': event, 'comparison': selection}
+                def evaluate(expression):
+                    expression = expression.replace('github.event_name', 'event_name').replace('inputs.comparison', 'comparison')
+                    return eval(expression.replace('&&', ' and ').replace('||', ' or '), {'__builtins__': {}}, context)
+                enabled = [name for name, predicate in predicates.items() if evaluate(predicate)]
+                if event != 'workflow_dispatch':
+                    self.assertEqual(list(predicates)[:3], enabled)
+                elif selection == 'rust-aa-control':
+                    self.assertEqual(['rust-aa-control'], enabled)
+                else:
+                    self.assertNotIn('rust-aa-control', enabled)
+                self.assertEqual('-rust-aa-control' if event == 'workflow_dispatch' and selection == 'rust-aa-control' else '', evaluate(suffix))
+
+    def test_manual_control_wrapper_retains_integration_and_control_failures(self):
+        workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()
+        job = workflow.split('  rust-aa-control:\n', 1)[1]
+        step = job.split('      - name: Exercise the full CLI through the real frozen worker then collect controls\n', 1)[1].split('      - name:', 1)[0]
+        command = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        status_step = job.split('      - name: Retain the last observed setup and execution status\n', 1)[1].split('      - name:', 1)[0]
+        status_command = textwrap.dedent(status_step.split('        run: |\n', 1)[1])
+        source = (SCRIPT.parents[1] / 'docker/app/nzb-yenc-ffi/src/bin/benchmark-yenc-control.rs').read_text()
+        self.assertIn('fn real_linux_cli_retains_full_worker_evidence_and_rejects_invalid_inputs()', source)
+        for integration_code, control_code in [(12, 0), (0, 7), (0, 0)]:
+            with self.subTest(integration=integration_code, control=control_code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                evidence = root / 'evidence'
+                (evidence / 'setup').mkdir(parents=True)
+                (root / 'bin').mkdir()
+                for name, script in {
+                    'cargo': '#!/bin/sh\nexit "$FIXTURE_INTEGRATION_CODE"\n',
+                    'timeout': '#!/bin/sh\nshift 3\nexec "$@"\n',
+                }.items():
+                    tool = root / 'bin' / name
+                    tool.write_text(script)
+                    tool.chmod(0o700)
+                controller = root / 'docker/app/nzb-yenc-ffi/target/release/benchmark-yenc-control'
+                controller.parent.mkdir(parents=True)
+                controller.write_text('#!/bin/sh\nprintf "%s\\n" fixture-control\nexit "$FIXTURE_CONTROL_CODE"\n')
+                controller.chmod(0o700)
+                env = dict(os.environ, PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'],
+                           GITHUB_WORKSPACE=str(root), CONTROL_ROOT=str(evidence), CONTROL_SAMPLES='3',
+                           CONTROL_SEED='20261015', RUST_TOOLCHAIN='1.98.0',
+                           FIXTURE_INTEGRATION_CODE=str(integration_code), FIXTURE_CONTROL_CODE=str(control_code))
+                child = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', command], env=env,
+                                       capture_output=True, text=True, timeout=10)
+                self.assertEqual(integration_code or control_code, child.returncode)
+                env['CONTROL_JOB_STATUS'] = 'failure' if child.returncode else 'success'
+                receipt = subprocess.run(['bash', '-e', '-c', status_command], env=env,
+                                         capture_output=True, text=True, timeout=10)
+                self.assertEqual(0, receipt.returncode, receipt.stderr)
+                status = json.loads((evidence / 'job-status.json').read_text())
+                self.assertEqual('failure' if child.returncode else 'success', status['job_status'])
+                self.assertEqual('cli-integration' if integration_code else 'control' if control_code else 'complete', status['last_recorded_phase'])
+                self.assertEqual(None if integration_code else control_code, status['control_exit_code'])
+                self.assertFalse(status['adoption_qualified'])
+                self.assertFalse((evidence / 'control/cpu-before.json').exists())
+
     def test_runtime_manifests_declare_one_unambiguous_payload_mode(self):
         workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()
         modes = []
@@ -312,7 +435,7 @@ class ProfileBuildTest(unittest.TestCase):
                 if values:
                     self.assertEqual(1, len(values), 'Duplicate payload-mode declarations')
                     modes.append(ast.literal_eval(values[0]))
-        self.assertEqual(['experimental', 'incumbent', 'incumbent'], modes)
+        self.assertEqual(['experimental', 'incumbent', 'incumbent', 'experimental'], modes)
 
     def test_experimental_workflow_passes_its_payload_mode_to_the_profiling_handler(self):
         workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()
