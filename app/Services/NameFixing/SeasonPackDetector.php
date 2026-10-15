@@ -22,8 +22,8 @@ final class SeasonPackDetector
     /** Complete.Series, Complete.Season */
     private const string COMPLETE_REGEX = '/(?:^|[._ \-\[(])Complete[._ ](?:Series|Seasons?)(?=$|[._ \-\])])/i';
 
-    /** S01E01, S01.E05, S01E01E02, S2024E01, 1x05, Episode.5, EP06, standalone E05 */
-    private const string EPISODE_REGEX = '/(?:^|[^a-z0-9])(?:S\d{1,4}[._ ]?E\d{1,4}(?!\d)|\d{1,2}x\d{2,3}(?![0-9a-z])|Episode[._ ]?\d{1,4}(?!\d)|EP?\d{2,3}(?![0-9a-z]))/i';
+    /** S01E01, S01.E05, S01Episode.1, S01E01E02, S2024E01, 1x05, Episode.5, EP06, standalone E05 */
+    private const string EPISODE_REGEX = '/(?:^|[^a-z0-9])(?:S\d{1,4}[._ ]?E(?:pisode[._ ]?)?\d{1,4}(?!\d)|\d{1,2}x\d{2,3}(?![0-9a-z])|Episode[._ ]?\d{1,4}(?!\d)|EP?\d{2,3}(?![0-9a-z]))/i';
 
     /** Show prefix, explicit season, first episode (E01 or Episode.1), extra episodes and the rest */
     private const string EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)(?<sep>[._ \-]+)S(?<season>\d{1,4})[._ ]?E(?:pisode[._ ]?)?(?<episode>\d{1,4})(?:[._\-]?E\d{1,4}|-\d{1,4}(?=$|[._ ]))*(?!\d)(?<rest>.*)$/i';

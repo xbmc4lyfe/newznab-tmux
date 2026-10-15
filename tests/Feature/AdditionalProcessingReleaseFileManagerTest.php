@@ -2104,6 +2104,48 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Event::assertNotDispatched(ReleaseNameFixed::class);
     }
 
+    #[DataProvider('adjacentEpisodePredbCases')]
+    public function test_real_predb_writer_preserves_pack_evidence_for_adjacent_episode_words(?string $state, string $title, bool $expectedAccepted): void
+    {
+        $this->prepareFullPar2NamingEvidence($title);
+        $evidence = $state === null ? null : $this->packEvidenceFixture($state);
+        DB::table('releases')->where('id', 1)->update([
+            'additional_pack_evidence' => $evidence,
+            'additional_pp_claim_token' => null,
+            'additional_pp_claimed_at' => null,
+        ]);
+        $before = DB::table('releases')->where('id', 1)->first();
+        $entry = Release::query()->findOrFail(1);
+        $entry->releases_id = 1;
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
+        $writer = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
+
+        $accepted = $writer->updatePredbCandidate($entry, $title, 7, 'adjacent episode regression');
+
+        $after = DB::table('releases')->where('id', 1)->first();
+        self::assertNotNull($before);
+        self::assertNotNull($after);
+        self::assertSame($expectedAccepted, $accepted);
+        self::assertSame($expectedAccepted ? $title : 'Example', $after->searchname);
+        self::assertSame($expectedAccepted ? 7 : 0, (int) $after->predb_id);
+        self::assertSame($evidence, $after->additional_pack_evidence);
+        if (! $expectedAccepted) {
+            self::assertSame((array) $before, (array) $after);
+            self::assertNull($writer->lastCommittedIdentity());
+            Event::assertNotDispatched(ReleaseNameFixed::class);
+        }
+    }
+
+    public static function adjacentEpisodePredbCases(): array
+    {
+        return [
+            'confirmed pack rejects adjacent episode' => ['confirmed', 'Show.S01Episode.1.720p.WEB-GRP', false],
+            'probable pack defers adjacent episode' => ['probable', 'Show.S01Episode.1.720p.WEB-GRP', false],
+            'ordinary adjacent episode remains eligible' => [null, 'Show.S01Episode.1.720p.WEB-GRP', true],
+            'confirmed pack accepts season title' => ['confirmed', 'Show.S01.720p.WEB-GRP', true],
+        ];
+    }
+
     private function packEvidenceFixture(?string $state, string $epoch = 'a', int $id = 1, string $guid = 'guid-1'): string
     {
         return json_encode(['v' => 1, 'identity_sha256' => hash('sha256', json_encode([(string) $id, $guid], JSON_THROW_ON_ERROR)),

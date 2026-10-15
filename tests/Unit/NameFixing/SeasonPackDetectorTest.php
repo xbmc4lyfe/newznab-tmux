@@ -147,6 +147,19 @@ class SeasonPackDetectorTest extends TestCase
     }
 
     #[Test]
+    public function it_classifies_adjacent_episode_words_consistently_with_pack_parsing(): void
+    {
+        $first = 'Show.S01Episode.1.720p.WEB-GRP';
+        $second = 'Show.S01Episode.2.720p.WEB-GRP';
+
+        self::assertTrue(SeasonPackDetector::isMultiEpisodeSet([$first.'.mkv', $second.'.mkv']));
+        self::assertSame('Show.S01.720p.WEB-GRP', SeasonPackDetector::seasonNameFromEpisodes([$first.'.mkv', $second.'.mkv']));
+        self::assertTrue(SeasonPackDetector::isEpisodeName($first));
+        self::assertTrue(SeasonPackDetector::isEpisodeName($second));
+        self::assertFalse(SeasonPackDetector::isSeasonPack($first));
+    }
+
+    #[Test]
     public function it_derives_single_season_names_for_supported_season_notation(): void
     {
         self::assertSame('Show.S01.720p.WEB-GRP', SeasonPackDetector::seasonNameFromEpisode('Show.1x01.Pilot.720p.WEB-GRP.mkv'));

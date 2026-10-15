@@ -102,7 +102,7 @@ class NntmuxResetPostProcessing extends Command
                 $this->info('No releases to reset');
             }
         } else {
-            $normalized = $this->normalizeCategories($raw); // @phpstan-ignore argument.type
+            $normalized = $this->normalizeCategories($raw);
 
             // Validate
             $invalid = $this->invalidCategories($normalized);
