@@ -4,95 +4,54 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
-use FFI\CData;
-use FFI\Exception;
-use Illuminate\Container\Container;
 use SimpleXMLElement;
 
 /**
  * Order-independent fingerprint of unique normalized segment Message-IDs.
  *
- * Rust owns bounded sorted temporary runs and unique-ID SHA-256 lane sums.
- * PHP retains the persisted SHA-1 digest. Unsupported IDs or temporary I/O failures leave
- * identity unknown, so callers retain the upload instead of suppressing it.
+ * Sorted temporary runs bound memory while streaming. Unique IDs retain the original
+ * SHA-256 lane sum and count digest. Unsupported IDs leave identity unknown.
+ * Temporary I/O failures defer publication without replacing stored artifacts.
  */
 final class NzbArticleFingerprint
 {
     public const int MAX_MESSAGE_ID_BYTES = 255;
 
-    /** @var array<string, \FFI> */
-    private static array $libraries = [];
+    private const int BUFFER_IDS = 4096;
 
-    private ?\FFI $library = null;
+    private const int BUFFER_BYTES = 1_048_576;
 
-    private ?CData $state = null;
+    private const int MAX_RUN_LEVELS = 32;
 
-    private ?RustArticleFingerprintWorker $worker = null;
+    /** @var list<string> */
+    private array $buffer = [];
 
-    public function __construct(?string $libraryPath = null, ?string $workerPath = null)
+    private int $bufferBytes = 0;
+
+    /** @var array<int, resource> */
+    private array $runs = [];
+
+    private bool $failed = false;
+
+    private ?NzbArticleFingerprintTransportFailure $temporaryIoFailure = null;
+
+    private bool $dirty = false;
+
+    private ?string $fingerprint = null;
+
+    private ?\Closure $temporaryStreamFactory;
+
+    /** @param (callable(): (resource|false))|null $temporaryStreamFactory */
+    public function __construct(?callable $temporaryStreamFactory = null)
     {
-        $root = dirname(__DIR__, 3);
-        $suffix = PHP_OS_FAMILY === 'Darwin' ? 'dylib' : 'so';
-        $configured = class_exists(Container::class, false) && Container::getInstance()->bound('config')
-            ? (string) config('yenc.native_library', '') : '';
-        $paths = $libraryPath === null ? [
-            $root.'/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.'.$suffix,
-            $root.'/storage/app/nntmux-native/libnzbyenc.'.$suffix,
-            $configured,
-            '/usr/local/lib/nntmux/libnzbyenc.so',
-        ] : [$libraryPath];
-        foreach ($workerPath === null && extension_loaded('FFI') ? $paths : [] as $path) {
-            $resolved = realpath($path);
-            if ($resolved === false || ! is_file($resolved)) {
-                continue;
-            }
-            $key = getmypid().':'.$resolved;
-            try {
-                $library = self::$libraries[$key] ??= \FFI::cdef(<<<'C'
-                    void *nntmux_article_fingerprint_new(void);
-                    int nntmux_article_fingerprint_add(void *state, const char *data, size_t length);
-                    int nntmux_article_fingerprint_value(void *state, char *output);
-                    void nntmux_article_fingerprint_free(void *state);
-                    C, $resolved);
-                $state = $library->nntmux_article_fingerprint_new(); // @phpstan-ignore method.notFound
-                if (! \FFI::isNull($state)) {
-                    $this->library = $library;
-                    $this->state = $state;
-
-                    return;
-                }
-            } catch (Exception) {
-                continue;
-            }
-        }
-        if ($libraryPath === null) {
-            foreach ($workerPath === null ? [
-                $root.'/docker/app/nzb-yenc-ffi/target/release/nntmux-article-fingerprint',
-                $root.'/storage/app/nntmux-native/nntmux-article-fingerprint',
-                $configured === '' ? '' : dirname($configured).'/nntmux-article-fingerprint',
-                '/usr/local/bin/nntmux-article-fingerprint',
-            ] : [$workerPath] as $binary) {
-                if (is_file($binary) && is_executable($binary)) {
-                    try {
-                        $this->worker = new RustArticleFingerprintWorker($binary);
-
-                        return;
-                    } catch (\RuntimeException) {
-                        continue;
-                    }
-                }
-            }
-        }
-        throw new NzbArticleFingerprintUnavailable('Rust article fingerprint is unavailable. Build it with scripts/build-nntmux-native.sh.');
+        $this->temporaryStreamFactory = $temporaryStreamFactory === null ? null : \Closure::fromCallable($temporaryStreamFactory);
     }
 
     private function __clone(): void {}
 
     public function __destruct()
     {
-        if (isset($this->state)) {
-            $this->library->nntmux_article_fingerprint_free($this->state); // @phpstan-ignore method.notFound
-        }
+        $this->closeRuns();
     }
 
     /**
@@ -130,25 +89,221 @@ final class NzbArticleFingerprint
 
     public function add(string $messageId): void
     {
-        if ($this->worker !== null) {
-            $this->worker->add($messageId);
-        } else {
-            $this->library->nntmux_article_fingerprint_add($this->state, $messageId, strlen($messageId)); // @phpstan-ignore method.notFound
+        if ($this->temporaryIoFailure !== null) {
+            throw $this->temporaryIoFailure;
+        }
+        if ($this->failed) {
+            return;
+        }
+        $messageId = self::validatedMessageId($messageId);
+        if ($messageId === null) {
+            $this->invalidate();
+
+            return;
+        }
+        $this->dirty = true;
+        $this->buffer[] = $messageId;
+        $this->bufferBytes += strlen($messageId);
+        if (count($this->buffer) >= self::BUFFER_IDS || $this->bufferBytes >= self::BUFFER_BYTES) {
+            try {
+                $this->flushBuffer();
+            } catch (\RuntimeException $exception) {
+                $this->invalidate();
+                throw $this->temporaryIoFailure = new NzbArticleFingerprintTransportFailure($exception->getMessage(), previous: $exception);
+            }
         }
     }
 
     /** @phpstan-impure */
     public function value(): ?string
     {
-        if ($this->worker !== null) {
-            $value = $this->worker->value();
-
-            return $value === null ? null : sha1($value);
+        if ($this->temporaryIoFailure !== null) {
+            throw $this->temporaryIoFailure;
         }
-        $output = $this->library->new('char[40]');
-        $status = $this->library->nntmux_article_fingerprint_value($this->state, $output); // @phpstan-ignore method.notFound
+        if ($this->failed || ! $this->dirty) {
+            return $this->fingerprint;
+        }
+        try {
+            $this->flushBuffer();
+            $this->consolidateRuns();
+            $run = $this->runs[0] ?? null;
+            if ($run === null || ! @rewind($run)) {
+                throw new \RuntimeException('Cannot rewind article identity run.');
+            }
+            $lanes = [0, 0, 0, 0, 0, 0, 0, 0];
+            $count = 0;
+            while (($messageId = $this->readRecord($run)) !== null) {
+                /** @var array<int, int> $words */
+                $words = unpack('N8', hash('sha256', $messageId, true));
+                foreach (array_values($words) as $lane => $word) {
+                    $lanes[$lane] = ($lanes[$lane] + $word) & 0xFFFFFFFF;
+                }
+                $count++;
+            }
+            $this->fingerprint = $count === 0 ? null : sha1(pack('J', $count).pack('N8', ...$lanes));
+            $this->dirty = false;
+        } catch (\RuntimeException $exception) {
+            $this->invalidate();
+            throw $this->temporaryIoFailure = new NzbArticleFingerprintTransportFailure($exception->getMessage(), previous: $exception);
+        }
 
-        return $status === 1 ? sha1(\FFI::string($output, 40)) : null;
+        return $this->fingerprint;
+    }
+
+    private function flushBuffer(): void
+    {
+        if ($this->buffer === []) {
+            return;
+        }
+        sort($this->buffer, SORT_STRING);
+        $run = $this->createRun();
+        try {
+            $previous = null;
+            foreach ($this->buffer as $messageId) {
+                if ($messageId !== $previous) {
+                    $this->writeRecord($run, $messageId);
+                    $previous = $messageId;
+                }
+            }
+            $this->buffer = [];
+            $this->bufferBytes = 0;
+            $level = 0;
+            while (isset($this->runs[$level])) {
+                $other = $this->runs[$level];
+                unset($this->runs[$level]);
+                try {
+                    $merged = $this->mergeRuns($other, $run);
+                } finally {
+                    fclose($other);
+                }
+                fclose($run);
+                $run = $merged;
+                $level++;
+            }
+            if ($level >= self::MAX_RUN_LEVELS) {
+                throw new \RuntimeException('Article identity run limit exceeded.');
+            }
+            $this->runs[$level] = $run;
+        } catch (\RuntimeException $exception) {
+            fclose($run);
+            throw $exception;
+        }
+    }
+
+    private function consolidateRuns(): void
+    {
+        while (count($this->runs) > 1) {
+            $left = array_shift($this->runs);
+            $right = array_shift($this->runs);
+            try {
+                $merged = $this->mergeRuns($left, $right);
+            } finally {
+                fclose($left);
+                fclose($right);
+            }
+            $this->runs[] = $merged;
+        }
+        $this->runs = array_values($this->runs);
+    }
+
+    /** @return resource */
+    private function createRun(): mixed
+    {
+        $run = $this->temporaryStreamFactory === null ? @tmpfile() : ($this->temporaryStreamFactory)();
+        if (! is_resource($run) || get_resource_type($run) !== 'stream') {
+            throw new \RuntimeException('Cannot create article identity run.');
+        }
+
+        return $run;
+    }
+
+    /**
+     * @param  resource  $left
+     * @param  resource  $right
+     * @return resource
+     */
+    private function mergeRuns(mixed $left, mixed $right): mixed
+    {
+        $output = $this->createRun();
+        try {
+            if (! @rewind($left) || ! @rewind($right)) {
+                throw new \RuntimeException('Cannot rewind article identity runs.');
+            }
+            $a = $this->readRecord($left);
+            $b = $this->readRecord($right);
+            $previous = null;
+            while ($a !== null || $b !== null) {
+                if ($b === null || ($a !== null && strcmp($a, $b) <= 0)) {
+                    $next = $a;
+                    $a = $this->readRecord($left);
+                } else {
+                    $next = $b;
+                    $b = $this->readRecord($right);
+                }
+                if ($next !== $previous) {
+                    $this->writeRecord($output, $next);
+                    $previous = $next;
+                }
+            }
+        } catch (\RuntimeException $exception) {
+            fclose($output);
+            throw $exception;
+        }
+
+        return $output;
+    }
+
+    /** @param resource $run */
+    private function writeRecord(mixed $run, string $messageId): void
+    {
+        $record = pack('N', strlen($messageId)).$messageId;
+        $offset = 0;
+        while ($offset < strlen($record)) {
+            $written = @fwrite($run, substr($record, $offset));
+            if ($written === false || $written === 0) {
+                throw new \RuntimeException('Cannot write article identity run.');
+            }
+            $offset += $written;
+        }
+    }
+
+    /** @param resource $run */
+    private function readRecord(mixed $run): ?string
+    {
+        $header = @fread($run, 4);
+        if ($header === '' && feof($run)) {
+            return null;
+        }
+        if ($header === false || strlen($header) !== 4) {
+            throw new \RuntimeException('Cannot read article identity record.');
+        }
+        $length = unpack('Nlength', $header)['length'];
+        if ($length < 1 || $length > self::MAX_MESSAGE_ID_BYTES) {
+            throw new \RuntimeException('Invalid article identity record length.');
+        }
+        $messageId = @fread($run, $length);
+        if ($messageId === false || strlen($messageId) !== $length) {
+            throw new \RuntimeException('Truncated article identity record.');
+        }
+
+        return $messageId;
+    }
+
+    private function invalidate(): void
+    {
+        $this->failed = true;
+        $this->fingerprint = null;
+        $this->buffer = [];
+        $this->bufferBytes = 0;
+        $this->closeRuns();
+    }
+
+    private function closeRuns(): void
+    {
+        foreach ($this->runs as $run) {
+            fclose($run);
+        }
+        $this->runs = [];
     }
 
     /**

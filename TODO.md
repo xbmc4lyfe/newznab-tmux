@@ -1,5 +1,25 @@
 # To do
 
+## Qualify legacy scheduler STOP custody (2026-10-15)
+
+The isolated Linux baseline ran eight cases: five behavioral failures and three passes, with no errors or skips. Its original cleanup-parser failure and later exact-resource reconciliation remain retained. The repair adds durable STOP intent, confirmed or externally preserved pauses, exact protocol/operation/process checks and observed restoration. Evidence is under `/Users/allen/.codex/artifacts/nntmux-scheduler-stop-custody-20261015-v1/`.
+
+- [x] Run focused behavior and static checks. Literal `codex --yolo` execution reproduced the separate baseline confirmation failure, then passed all nine candidate mechanisms and all 14 runtime tests (84 assertions). Its wrapper rejected PHPUnit's JSON report and stopped before static analysis; that attempt remains unqualified as a whole. A separate 29.70-second host run passed full configured and explicit changed-test PHPStan, syntax, Pint and whitespace checks with unchanged source. All recorded host groups closed. Both mechanism fixtures have exact cleanup receipts; fresh owner/name queries reconciled the runtime fixtures absent, but their 14 historical IDs and planned Docker-shim enforcement were not captured. These evidence limits are preserved.
+- [ ] Run the full integrated PHPUnit/native retest on final synchronized master; focused checks do not complete that deferred gate. Require current-head Codex approval and applicable CI before squash merge. The rejected Rust journal subprocess prototype can outlive its Python parent's lock; no compiled performance or uncommon p99 qualification is claimed.
+- [ ] Before any separately authorized rollout, prove invocation source pins and exclusive signal authority. Linux stopped state cannot identify competing STOP senders. The legacy deploy-app EXIT restoration path does not reverify guard authority; passing private fixtures does not establish that caller safe after authority loss or authorize deployment.
+
+A surviving confirmation proves successful STOP plus matching stopped observation before encoding; it does not attest final directory-fsync acknowledgment. Helper errors remain failed drains.
+
+## Qualify actionable hash retry counts (2026-10-15)
+
+Exclude a future same-generation PAR2 hash retry only from the hash naming branch. Keep other ready naming sources actionable, preserve byte-sensitive GUID identity and the exact retry boundary, and retain the PAR2-first short circuit.
+
+- [x] Reproduce the count/worker disagreement through the real tmux aggregate in isolated SQLite: the future same-generation case expected zero actionable renames but counted one; six related admission cases passed before the fix.
+- [x] Local affected PHPUnit passed: backlog, PAR2 full-hash and book/TV tmux consumers, 86 tests and 724 assertions. Owned-path Pint and syntax lint passed; full configured PHPStan passed with zero errors. PHP source hashes remained unchanged after Pint.
+- [ ] Complete the full integrated PHPUnit/native suite; bounded local checks do not qualify MariaDB or production behavior.
+- [x] Reject the private Rust composer after actual tmux aggregate comparison including startup/IPC/reaping: both correctness modes passed 26 tests/91 assertions; 5 warmup pairs and 100 randomized pairs gave median native/Rust speedup 0.22057× and bootstrap median upper 99% screen 0.23117×, below 1.5×. Retain native PHP. Uncommon p99 remains unrun and unqualified; private receipts are in `nntmux-actionable-hash-retry-review-20261015-v1`.
+- [ ] Obtain current-head independent Codex approval, green required checks and verified signed squash. Any deployment and live queue verification remain with the designated deployment owner.
+
 ## Qualify authoritative backfill date targets (2026-10-14)
 
 Use the same selected NNTP connection for backfill targeting and storage. Date-based admission requires the requested article's parseable date from that provider/group; unrelated local part numbers, neighboring article dates and the current clock cannot supply it. Missing endpoint or midpoint metadata defers the attempt. Successful exact probes retain the approximate date search with bounded, integer-safe arithmetic; article Date ordering is still not guaranteed. Failed overview ranges must retain their cursor, while successful empty ranges remain completed work.

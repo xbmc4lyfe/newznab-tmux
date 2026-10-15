@@ -1,0 +1,543 @@
+{
+  "schema_version": 1,
+  "kind": "vendor-archive",
+  "runner": "ubuntu-24.04-arm",
+  "head_sha": "16301bd24e8f39dee3a1a5137e562b85052d549c",
+  "repository": "xbmc4lyfe/newznab-tmux",
+  "run_id": 38669727732,
+  "run_attempt": 1,
+  "adoption_qualified": false,
+  "rust_payload_mode": "unknown",
+  "status": "measured",
+  "rows": [
+    {
+      "fixture": "rar4-stored",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "median_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.10917793213881936,
+        0.114151962870852
+      ],
+      "baseline_latency_interval_ms": [
+        0.12409,
+        0.127922
+      ],
+      "candidate_latency_interval_ms": [
+        1.120629,
+        1.136585
+      ],
+      "baseline_over_candidate": 0.11156121897796958,
+      "baseline_latency_ms": 0.1258825,
+      "candidate_latency_ms": 1.1283715,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "rar4-stored",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "median_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.45789616908051883,
+        0.4687739287573892
+      ],
+      "baseline_latency_interval_ms": [
+        0.015144,
+        0.015305
+      ],
+      "candidate_latency_interval_ms": [
+        0.032649,
+        0.033073
+      ],
+      "baseline_over_candidate": 0.4625385867003239,
+      "baseline_latency_ms": 0.0152085,
+      "candidate_latency_ms": 0.0328805,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "rar5-mixed",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "median_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.0099409615920741,
+        0.01010854173877749
+      ],
+      "baseline_latency_interval_ms": [
+        0.404898,
+        0.411401
+      ],
+      "candidate_latency_interval_ms": [
+        40.698353,
+        40.730265
+      ],
+      "baseline_over_candidate": 0.010033421978741927,
+      "baseline_latency_ms": 0.4084865,
+      "candidate_latency_ms": 40.7125805,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "rar5-mixed",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "median_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.008998249739271628,
+        0.009132771280924564
+      ],
+      "baseline_latency_interval_ms": [
+        0.356802,
+        0.361936
+      ],
+      "candidate_latency_interval_ms": [
+        39.630468,
+        39.652378
+      ],
+      "baseline_over_candidate": 0.009066393075419043,
+      "baseline_latency_ms": 0.3594065,
+      "candidate_latency_ms": 39.641619000000006,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "zip-stored",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "median_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.1216353797484018,
+        0.12490212106870886
+      ],
+      "baseline_latency_interval_ms": [
+        0.142531,
+        0.145155
+      ],
+      "candidate_latency_interval_ms": [
+        1.16215,
+        1.171789
+      ],
+      "baseline_over_candidate": 0.12315697324318746,
+      "baseline_latency_ms": 0.1437785,
+      "candidate_latency_ms": 1.167441,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "zip-stored",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "median_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.46621993538351075,
+        0.4789356984478936
+      ],
+      "baseline_latency_interval_ms": [
+        0.019481,
+        0.019656
+      ],
+      "candidate_latency_interval_ms": [
+        0.041041,
+        0.041785
+      ],
+      "baseline_over_candidate": 0.4725306555952496,
+      "baseline_latency_ms": 0.019576,
+      "candidate_latency_ms": 0.041428,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "seven-stored",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "median_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.2984072277035813,
+        0.30703064375643363
+      ],
+      "baseline_latency_interval_ms": [
+        0.380266,
+        0.387749
+      ],
+      "candidate_latency_interval_ms": [
+        1.2629,
+        1.274319
+      ],
+      "baseline_over_candidate": 0.30229646459254306,
+      "baseline_latency_ms": 0.3836585,
+      "candidate_latency_ms": 1.2691465000000002,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "seven-stored",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "median_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.35751986941863834,
+        0.36476260785308917
+      ],
+      "baseline_latency_interval_ms": [
+        0.046873,
+        0.047433
+      ],
+      "candidate_latency_interval_ms": [
+        0.130038,
+        0.131106
+      ],
+      "baseline_over_candidate": 0.3616179885502325,
+      "baseline_latency_ms": 0.047185,
+      "candidate_latency_ms": 0.13048300000000002,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "rar4-solid",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "p99_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.12335516240943997,
+        0.15684710469806007
+      ],
+      "baseline_latency_interval_ms": [
+        0.177214,
+        0.206269
+      ],
+      "candidate_latency_interval_ms": [
+        1.315096,
+        1.436616
+      ],
+      "baseline_over_candidate": 0.13652804518995212,
+      "baseline_latency_ms": 0.182239,
+      "candidate_latency_ms": 1.33481,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "rar4-solid",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "p99_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.31823962212735035,
+        0.3943789664551223
+      ],
+      "baseline_latency_interval_ms": [
+        0.042042,
+        0.050025
+      ],
+      "candidate_latency_interval_ms": [
+        0.126845,
+        0.132108
+      ],
+      "baseline_over_candidate": 0.3678016889131027,
+      "baseline_latency_ms": 0.047257,
+      "candidate_latency_ms": 0.128485,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "rar5-encrypted-headers",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "p99_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.05890333814868639,
+        0.07410599522946044
+      ],
+      "baseline_latency_interval_ms": [
+        0.081794,
+        0.094323
+      ],
+      "candidate_latency_interval_ms": [
+        1.272812,
+        1.388614
+      ],
+      "baseline_over_candidate": 0.06539539638441831,
+      "baseline_latency_ms": 0.084058,
+      "candidate_latency_ms": 1.285381,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "rar5-encrypted-headers",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "p99_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.13658332680199597,
+        0.29354029101556667
+      ],
+      "baseline_latency_interval_ms": [
+        0.010456,
+        0.019649
+      ],
+      "candidate_latency_interval_ms": [
+        0.066938,
+        0.076554
+      ],
+      "baseline_over_candidate": 0.17483662397846628,
+      "baseline_latency_ms": 0.012601,
+      "candidate_latency_ms": 0.072073,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "zip-aes",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "p99_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.13440224755769653,
+        0.16918813706752914
+      ],
+      "baseline_latency_interval_ms": [
+        0.189444,
+        0.220957
+      ],
+      "candidate_latency_interval_ms": [
+        1.305984,
+        1.40953
+      ],
+      "baseline_over_candidate": 0.14771577366321748,
+      "baseline_latency_ms": 0.195316,
+      "candidate_latency_ms": 1.322242,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "zip-aes",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "p99_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.3014549916732404,
+        0.6515924461189245
+      ],
+      "baseline_latency_interval_ms": [
+        0.034393,
+        0.055689
+      ],
+      "candidate_latency_interval_ms": [
+        0.085466,
+        0.11409
+      ],
+      "baseline_over_candidate": 0.5617153161275781,
+      "baseline_latency_ms": 0.049841,
+      "candidate_latency_ms": 0.08873,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "seven-encrypted-headers",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "p99_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.0761982520395076,
+        0.10272766398640011
+      ],
+      "baseline_latency_interval_ms": [
+        0.115259,
+        0.142974
+      ],
+      "candidate_latency_interval_ms": [
+        1.391777,
+        1.51262
+      ],
+      "baseline_over_candidate": 0.08477112858158857,
+      "baseline_latency_ms": 0.118837,
+      "candidate_latency_ms": 1.401857,
+      "qualification_gate_passed": false,
+      "eligible": true
+    },
+    {
+      "fixture": "seven-encrypted-headers",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "shared_vendor_header_projection",
+      "metric": "p99_latency",
+      "confidence_family_size": 32,
+      "marginal_alpha": 0.0015625,
+      "speedup_interval": [
+        0.12302267380984801,
+        0.20697025643415007
+      ],
+      "baseline_latency_interval_ms": [
+        0.026201,
+        0.035537
+      ],
+      "candidate_latency_interval_ms": [
+        0.171701,
+        0.212977
+      ],
+      "baseline_over_candidate": 0.17816943213320346,
+      "baseline_latency_ms": 0.030914,
+      "candidate_latency_ms": 0.173509,
+      "qualification_gate_passed": false,
+      "eligible": true
+    }
+  ],
+  "completeness": {
+    "expected_rows": 16,
+    "observed_rows": 16,
+    "complete": true
+  },
+  "evidence_type": "shared_vendor_archive_header_projection",
+  "protocol_sha256": "76eb74aa62485be5d20d23ce690e89c47f600b99aabfd47cd4579a6ef4d5a372",
+  "source_sha256": {
+    "vendor/dariusiii/rarinfo/tests/fixtures/rar/rar50_encrypted_headers.rar": "f5db452c3d7dc351b1ff9971edfb0611893838affa369e31e209570e270cc2af",
+    "vendor/dariusiii/rarinfo/SzipInfo.php": "d39573c7a6f2f2cc2b29ad397146a78cec3649abb5684457374287c0f2bd540c",
+    "docker/app/nzb-yenc-ffi/src/seven_zip_ranges.rs": "d4a0803b53e7ad52e77e46518fd6440bdf68d2ee5b17d9924685dff284aba4e4",
+    "vendor/dariusiii/rarinfo/tests/fixtures/rar/store_method.rar": "c32c1bb9c65159df7a8cedd939e7e42d3fd424e334898e586c1558093bc89d37",
+    "vendor/dariusiii/rarinfo/composer.json": "9c036b61429561fbbad3c4a450f0788a50814503e34f817829928a2b66795eb3",
+    "scripts/benchmark-vendor-archive.php": "ec48b6cfb56e7dc9584c1c401d809db305895c5b361de80dd5fc6f33b542b75e",
+    "app/Services/Releases/Verification/NativeSpotCheckPlanner.php": "aa43ff2b697dbdd91fef8d8de104579181828772a72a5db1bf0468e5950d8f42",
+    "vendor/dariusiii/rarinfo/tests/fixtures/rar/rar50_quickopen.rar": "645f6a8adfae57ff04b3e2ff0fbf018101e623646b4396d3cd605437d3b5f882",
+    "scripts/benchmark-yenc.php": "33bb0b26ccd391650f9f099ef7a5d7951c5547e95c537977faea56e5ecc34843",
+    "docker/app/nzb-yenc-ffi/Cargo.toml": "bc7f6c7f61bd00bd978ae6f817666f544562f5aff72feac709fa5bf6fe36f02d",
+    "docker/app/nzb-yenc-ffi/src/par2.rs": "50e4506ac4a003c6279425170b5c83a79485679b6c4e54d2f6888dc3d739981c",
+    "docker/app/nzb-yenc-ffi/src/sample_plan.rs": "516bb888e1177c4426e67a656adad189d49a496cd6745ae906c321692aa76700",
+    "vendor/dariusiii/rarinfo/ZipInfo.php": "3d5583d734b4af1c48584ced7247cfbc080382435080ba15b0f3e97c6c2043cc",
+    "vendor/dariusiii/rarinfo/ArchiveReader.php": "b587946d39268f7735764c85fa962ef2b8b7389d1f9ba459f53b2ae7d8f230d4",
+    "scripts/benchmark-article-processing.php": "9c225269a06e261e05806fa240e18111e1fbfc4ac864a9d9c4a71efd872169a4",
+    "app/Services/Releases/Fingerprint/NativeMetadataParser.php": "13d871ed4647ca01f9e4457b9190c38add2987e269a7c7ae1ef8fe32d46b26b0",
+    "docker/app/nzb-yenc-ffi/src/par2_source_ranges.rs": "e5f95b98a99fa577a875f8b293c571ef97e15c96aad95fd4e74a269f1ebfe756",
+    "composer.lock": "ee1360f9ab65dbd1d3435cc2d986a2d4a3f2069ba8e129222df3889facdd5be8",
+    "app/Services/Releases/Verification/SpotCheckPlanner.php": "ac517ccfb463f6b2727f2158e78fdc1871bbe9d98f3fa18d40d5cbc7ca2d1a98",
+    "composer.json": "a3c76ac537f57efd3ecb6862db3e07332f901ad94e7c8ccc5db4c9c01be04b8f",
+    "docker/app/nzb-yenc-ffi/src/lib.rs": "50c88c7f3fd5e6f481c6811c70652125116a60bbbf2b3504fd456a8b7f5ce76d",
+    "vendor/dariusiii/rarinfo/tests/fixtures/rar/solid.rar": "05d39c43a4ba897ea358543aa5b700208eba307ee6e6379d8d7cbd978aa374e4",
+    "vendor/dariusiii/rarinfo/RarInfo.php": "8c896653ae194d5acb16b03897bebe1887756430dbff5f2cdb10b8cc9c30b49e",
+    "docker/app/nzb-yenc-ffi/src/release_names.rs": "5f16c3cd04a0706492e7577a6d7832bd06f8675713258c046624764aa3ef3087",
+    "tests/Fixtures/VendorArchiveBenchmarkFixtures.php": "c9ad61514a8bc96664948bd0c29161726cbfbdddc123d7775872ff3d0d01922a",
+    "scripts/benchmark-archive-parsing.php": "a1a9cb4bdfad6f3eda14164fa9b6271c66cba31d7d6422f6eaf96a831ee6c53f",
+    "vendor/composer/installed.json": "9cbae4e09630824e80bb17bf5470afaf2ac8a07ff6b933392ce96ec4b57a896c",
+    "vendor/dariusiii/rarinfo/tests/fixtures/szip/store_method.7z": "ec369e350984c9af3f5211f6cc20008abf29f7f331f8aa656604be05fafede5a",
+    "vendor/dariusiii/rarinfo/tests/fixtures/szip/encrypted_headers.7z": "4b7fdbb7b875847278e65bed4ce23fc29a149a7a7e93334304dbf34fb8d52f0d",
+    "docker/app/nzb-yenc-ffi/src/formats.rs": "e09d61d14a79459daa0584a05a5e844719e61ba919e2d2d40dabc109c1f7bb09",
+    "docker/app/nzb-yenc-ffi/Cargo.lock": "77b88ca781e79d95668cb5cb2d8bb61b89d3b3c4dd0892cdc86d4b260dffb55d",
+    "vendor/dariusiii/rarinfo/tests/fixtures/zip/encrypted_file_aes.zip": "7555457edd346b22c718e43d3409e1b9ae1dca1b118a26b1cdb960e58781238d",
+    "tests/Fixtures/ArchiveParsingBenchmarkFixtures.php": "770497b1922b83edacb4e5003af56448914d37005740a595cd5cff89f05d8336",
+    "tests/Fixtures/SamplePlanningBenchmarkFixtures.php": "aca917a649a79a53d6e4a1a6fdf761c01568806ff7b1f7bc835d1aabbfb82e12",
+    "vendor/dariusiii/rarinfo/tests/fixtures/zip/little_file.zip": "ababf71680cceb96c44ee04d69ab5dd99436c3b05c1d60242ffb8994e171ff09",
+    "scripts/benchmark-sample-planning.php": "f732a0e0b506067727c3a906a9204aea8639c4966f4278a941faa890c2004b5e",
+    "resource_limits_before": "7608a9f534cb184c59492d5ae7103cf0bf45f9eca2ce4690f316960135114689",
+    "resource_limits_after": "8dcf87d9fcf67660fe8a336d5bcdc4de95c8eb4d4484e09319b7ad04956ede81",
+    "resource_limits_comparison": "f368959c87708b03f08f209a5d8d26931c8f5ad68353d8ee712e51ea7221480e"
+  },
+  "library_sha256": {
+    "native": "96be1a5fe8b746188d09cf84f390bb918688721ac28ea4e5194a3912d47b183f"
+  },
+  "report_sha256": "6554036f3a6cd94a2dab569a217fce44ed318a3cd2858dcc305f12974cc55329",
+  "runtime_identity": {
+    "executed_sha": "16301bd24e8f39dee3a1a5137e562b85052d549c",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "php": "8.5.11",
+    "python": "3.12.3",
+    "architecture": "aarch64",
+    "cpu_model": "aarch64",
+    "runner_image_os": "ubuntu24-arm64",
+    "runner_image_version": "20261004.142.1",
+    "build_profile": "release opt-level=3 lto=true codegen-units=1; cargo --locked; default features",
+    "logical_cpus": 4
+  }
+}
