@@ -747,6 +747,310 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('semanticInertCards')]
+    public function semantic_inert_cards_are_rejected_without_closing_tag_diagnostics(string $tag, bool $afterLimit): void
+    {
+        $hidden = '<'.$tag.'>'.$this->card('Hidden.Release-GRP').'</'.$tag.'>';
+        $html = $afterLimit
+            ? $this->card('First.Release-GRP').$hidden
+            : $hidden.$this->card('Visible.Release-GRP');
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function semanticInertCards(): array
+    {
+        $cases = [];
+        foreach (['iframe', 'xmp', 'noembed', 'noframes', 'title', 'textarea', 'template'] as $tag) {
+            $cases[$tag.' before first record'] = [$tag, false];
+            $cases[$tag.' after record limit'] = [$tag, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('semanticInertNumericFragments')]
+    public function semantic_inert_numeric_text_preserves_exact_names(string $fragment): void
+    {
+        $html = $this->card('Léon.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame(['Léon.Release-GRP', 'Second.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function semanticInertNumericFragments(): array
+    {
+        return [
+            'iframe raw reference' => ['<iframe>&#1;</iframe>'],
+            'xmp raw reference' => ['<xmp>&#1;</xmp>'],
+            'noembed raw reference' => ['<noembed>&#1;</noembed>'],
+            'noframes raw reference' => ['<noframes>&#1;</noframes>'],
+            'title escaped reference' => ['<title>&amp;#1;</title>'],
+            'textarea escaped reference' => ['<textarea>&amp;#1;</textarea>'],
+            'foreign SVG script escaped reference' => ['<svg xmlns="http://www.w3.org/2000/svg"><script>&amp;#1;</script></svg>'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('semanticDecodedNumericFragments')]
+    public function semantic_decoded_numeric_controls_remain_rejected_after_record_limit(string $fragment): void
+    {
+        $html = $this->card('First.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function semanticDecodedNumericFragments(): array
+    {
+        $cases = [
+            'title decoded reference' => ['<title>&#1;</title>'],
+            'textarea decoded reference' => ['<textarea>&#1;</textarea>'],
+        ];
+        foreach (self::additionalRawTextElements() as [$tag]) {
+            $cases[$tag.' decoded attribute'] = ['<'.$tag.' data-marker="&#1;">safe</'.$tag.'>'];
+            $cases[$tag.' following decoded text'] = ['<'.$tag.'>safe</'.$tag.'><p>&#1;</p>'];
+        }
+        foreach (['null' => '&#0;', 'surrogate' => '&#xD800;', 'overflow' => '&#1114112;', 'noncharacter' => '&#xFDD0;', 'control' => '&#1;'] as $label => $reference) {
+            $cases['foreign SVG script '.$label] = ['<svg xmlns="http://www.w3.org/2000/svg"><script>'.$reference.'</script></svg>'];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('semanticQuotedUtf8Parameters')]
+    public function semantic_quoted_utf8_parameters_preserve_unicode_names(string $charset, bool $afterFirst): void
+    {
+        $meta = '<meta http-equiv="Content-Type" content="'.htmlspecialchars('text/html; charset='.$charset, ENT_QUOTES, 'UTF-8').'">';
+        $html = $afterFirst
+            ? $this->card('First.Release-GRP').$meta.$this->card('Léon.Release-GRP')
+            : '<html><head>'.$meta.'</head><body>'.$this->card('First.Release-GRP').$this->card('Léon.Release-GRP').'</body></html>';
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame(['First.Release-GRP', 'Léon.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function semanticQuotedUtf8Parameters(): array
+    {
+        return [
+            'double quoted before first' => ['" UTF-8 "', false],
+            'double quoted after first' => ['" UTF-8 "', true],
+            'single quoted before first' => ["' UTF-8 '", false],
+            'single quoted after first' => ["' UTF-8 '", true],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('semanticConflictingQuotedParameters')]
+    public function semantic_conflicting_quoted_parameters_reject_the_whole_listing(string $charset, bool $afterLimit): void
+    {
+        $meta = '<meta http-equiv="Content-Type" content="'.htmlspecialchars('text/html; charset='.$charset, ENT_QUOTES, 'UTF-8').'">';
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$meta.$this->card('Léon.Release-GRP');
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function semanticConflictingQuotedParameters(): array
+    {
+        return [
+            'padded legacy encoding first' => ['" ISO-8859-1 "', false],
+            'padded legacy encoding after limit' => ['" ISO-8859-1 "', true],
+            'padded UTF-8 prefix first' => ["' UTF-8-invalid '", false],
+            'padded UTF-8 prefix after limit' => ["' UTF-8-invalid '", true],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('semanticHtml5LabelReferences')]
+    public function semantic_html5_label_disagreement_rejects_the_whole_listing(string $reference, bool $afterLimit): void
+    {
+        $card = str_replace('Exact.Release-GRP', 'Exact'.$reference.'Release-GRP', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$card;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function semanticHtml5LabelReferences(): array
+    {
+        return [
+            'HTML5 period first' => ['&period;', false],
+            'HTML5 period after limit' => ['&period;', true],
+            'HTML5 tab first' => ['&Tab;', false],
+            'HTML5 tab after limit' => ['&Tab;', true],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('semanticLiteralReferenceLabels')]
+    public function semantic_escaped_reference_labels_are_decoded_once(string $literal): void
+    {
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($this->card($literal));
+
+        $this->assertSame([$literal], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function semanticLiteralReferenceLabels(): array
+    {
+        return [
+            'once escaped HTML5 reference' => ['Exact&period;Release-GRP'],
+            'twice escaped HTML5 reference' => ['Exact&amp;period;Release-GRP'],
+            'ordinary escaped ampersand' => ['Exact&Release-GRP'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('numericWhitespaceContexts')]
+    public function numeric_whitespace_outside_labels_preserves_exact_names(string $fragment): void
+    {
+        $html = $this->card('Léon.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame(['Léon.Release-GRP', 'Second.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function numericWhitespaceContexts(): array
+    {
+        $cases = [];
+        foreach (['decimal CR' => '&#13;', 'hexadecimal CR' => '&#x0D;', 'tab' => '&#9;', 'line feed' => '&#10;'] as $label => $reference) {
+            foreach (['p', 'script', 'iframe', 'title', 'textarea'] as $tag) {
+                $cases[$label.' in '.$tag] = ['<'.$tag.'>before'.$reference.'after</'.$tag.'>'];
+            }
+            $cases[$label.' in foreign SVG script'] = ['<svg xmlns="http://www.w3.org/2000/svg"><script>before'.$reference.'after</script></svg>'];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('numericWhitespaceEscapedLabels')]
+    public function numeric_whitespace_escaped_labels_remain_literal(string $literal): void
+    {
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($this->card($literal));
+
+        $this->assertSame([$literal], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function numericWhitespaceEscapedLabels(): array
+    {
+        return [
+            'escaped decimal CR' => ['Exact&#13;Release-GRP'],
+            'escaped hexadecimal CR' => ['Exact&#x0D;Release-GRP'],
+            'escaped tab' => ['Exact&#9;Release-GRP'],
+            'escaped line feed' => ['Exact&#10;Release-GRP'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('numericWhitespaceC1Controls')]
+    public function numeric_whitespace_allowance_cannot_admit_c1_references(string $fragment): void
+    {
+        $html = $this->card('First.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function numericWhitespaceC1Controls(): array
+    {
+        return [
+            'ordinary C1 text' => ['<p>&#128;</p>'],
+            'title C1 text' => ['<title>&#x80;</title>'],
+            'textarea C1 text' => ['<textarea>&#128;</textarea>'],
+            'foreign SVG script C1 text' => ['<svg xmlns="http://www.w3.org/2000/svg"><script>&#x80;</script></svg>'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('numericWhitespaceCrLabels')]
+    public function numeric_whitespace_inside_release_labels_remains_rejected(string $reference): void
+    {
+        $card = str_replace('Exact.Release-GRP', 'Exact'.$reference.'Release-GRP', $this->card('Exact.Release-GRP'));
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/'))->parseHtml($card);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function numericWhitespaceCrLabels(): array
+    {
+        return [
+            'decimal CR in labels' => ['&#13;'],
+            'hexadecimal CR in labels' => ['&#x0D;'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('numericCrTokenSpellings')]
+    public function numeric_cr_token_variants_preserve_exact_names(string $reference): void
+    {
+        $html = $this->card('Léon.Release-GRP').'<p>before'.$reference.' after</p>'.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame(['Léon.Release-GRP', 'Second.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function numericCrTokenSpellings(): array
+    {
+        return [
+            'leading decimal zeroes' => ['&#00013;'],
+            'leading hexadecimal zeroes and uppercase marker' => ['&#X000d;'],
+            'uppercase hexadecimal digit' => ['&#xD;'],
+            'decimal without semicolon' => ['&#13'],
+            'hexadecimal without semicolon' => ['&#x0d'],
+            'decimal before nondigit' => ['&#13z'],
+            'hexadecimal before nonhex digit' => ['&#xDg'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('numericCrMixedInvalidReferences')]
+    public function numeric_cr_token_allowance_preserves_other_reference_rejections(string $reference): void
+    {
+        $html = $this->card('First.Release-GRP').'<svg xmlns="http://www.w3.org/2000/svg"><script>&#13;'.$reference.'</script></svg>';
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function numericCrMixedInvalidReferences(): array
+    {
+        return [
+            'CR plus decimal C1' => ['&#128;'],
+            'CR plus hexadecimal C1' => ['&#x80;'],
+            'decimal 131 is not CR' => ['&#131;'],
+            'decimal 130 is not CR' => ['&#130;'],
+            'hexadecimal D800 is not CR' => ['&#xD800;'],
+        ];
+    }
+
+    #[Test]
+    public function numeric_cr_diagnostic_copy_never_changes_authoritative_labels(): void
+    {
+        $literal = 'Exact&#13;.&#X000d;.&#131;.&#xD0;Release-GRP';
+        $decoded = str_replace('Exact.Release-GRP', 'Exact&#xD0;Release-GRP', $this->card('Exact.Release-GRP'));
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($this->card($literal).'<p>&#13;</p>'.$decoded);
+
+        $this->assertSame([$literal, 'ExactÐRelease-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    #[Test]
     #[DataProvider('unterminatedCommentFragments')]
     public function unterminated_comments_cannot_hide_the_remaining_listing(string $fragment): void
     {
