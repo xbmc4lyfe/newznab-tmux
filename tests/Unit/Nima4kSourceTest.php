@@ -320,6 +320,102 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('wellFormedClosingFragments')]
+    public function well_formed_closing_tags_and_inert_text_remain_accepted(string $fragment): void
+    {
+        $html = $this->card('First.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+
+        $this->assertCount(1, $entries);
+        $this->assertSame('First.Release-GRP', $entries[0]->title);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function wellFormedClosingFragments(): array
+    {
+        $cases = [];
+        foreach (['div', 'script', 'style'] as $tag) {
+            $cases[$tag.' ordinary close'] = ['<'.$tag.'>safe</'.$tag.'>'];
+            $cases[$tag.' whitespace before close bracket'] = ['<'.$tag.'>safe</'.$tag." \t\r\n>"];
+        }
+
+        return $cases + [
+            'inert comment' => ['<!-- </div data-marker="&#0;"> -->'],
+            'inert script text' => ['<script>const x = "&#0; &#128; &#xFDD0;";</script>'],
+            'inert style text' => ['<style>.example { content: "&#0; &#128; &#xFDD0;"; }</style>'],
+            'script apparent markup' => ['<script>const x = "</scripted> &#0;";</script>'],
+            'single decoded literal' => ['<p>&amp;#0;</p>'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('malformedClosingFragments')]
+    public function malformed_closing_tags_reject_the_whole_listing(string $fragment): void
+    {
+        $html = $this->card('First.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function malformedClosingFragments(): array
+    {
+        $cases = [];
+        foreach (['div', 'script', 'style'] as $tag) {
+            foreach (['safe' => 'safe', 'nul' => '&#0;', 'control' => '&#1;', 'C1' => '&#128;', 'noncharacter' => '&#xFDD0;'] as $label => $value) {
+                $cases[$tag.' closing attribute '.$label] = ['<'.$tag.'>safe</'.$tag.' data-marker="'.$value.'">'];
+            }
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('malformedParserFragments')]
+    public function malformed_names_or_doctypes_reject_the_whole_listing(string $prolog, string $fragment): void
+    {
+        $html = $prolog.$this->card('First.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, string}> */
+    public static function malformedParserFragments(): array
+    {
+        $cases = [];
+        foreach (['safe' => 'safe', 'nul' => '&#0;', 'control' => '&#1;', 'C1' => '&#128;', 'noncharacter' => '&#xFDD0;'] as $label => $value) {
+            $cases['malformed attribute name '.$label] = ['', '<div ="'.$value.'"></div>'];
+            $cases['malformed element name '.$label] = ['', '<1 data-marker="'.$value.'">'];
+            $cases['malformed doctype '.$label] = ['<!DOCTYPE html junk="'.$value.'">', ''];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('parserDiagnosticCompatibility')]
+    public function recoverable_entity_and_html5_diagnostics_preserve_literal_names(string $prolog, string $fragment): void
+    {
+        $html = $prolog.$this->card('First.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+
+        $this->assertCount(1, $entries);
+        $this->assertSame('First.Release-GRP', $entries[0]->title);
+    }
+
+    /** @return array<string, array{string, string}> */
+    public static function parserDiagnosticCompatibility(): array
+    {
+        return [
+            'ordinary doctype' => ['<!DOCTYPE html>', ''],
+            'bare ampersand diagnostic 68' => ['', '<p>News & updates</p>'],
+            'HTML5 diagnostic 801' => ['', '<section data-marker="safe">safe</section>'],
+        ];
+    }
+
+    #[Test]
     public function supplied_oversized_html_is_rejected(): void
     {
         $this->expectException(RuntimeException::class);

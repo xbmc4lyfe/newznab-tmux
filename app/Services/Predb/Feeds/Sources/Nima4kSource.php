@@ -84,8 +84,12 @@ final class Nima4kSource extends BoundedHttpFeedSource
 
         // This parser reports discarded controls, surrogates and overflowing references as code 9.
         foreach ($errors as $error) {
-            // Fatal errors truncate the input; duplicate attributes discard values.
-            if ($error->level === LIBXML_ERR_FATAL || $error->code === 42 || $error->code === 800) {
+            // These malformed-markup recoveries discard bytes or values; fatal errors truncate input.
+            $discardedName = $error->code === 68 && in_array(trim($error->message), [
+                'htmlParseStartTag: invalid element name',
+                'error parsing attribute name',
+            ], true);
+            if ($error->level === LIBXML_ERR_FATAL || in_array($error->code, [42, 61, 73, 800], true) || $discardedName) {
                 throw new RuntimeException('NIMA4K returned invalid HTML.');
             }
             if ($error->code === 9) {
