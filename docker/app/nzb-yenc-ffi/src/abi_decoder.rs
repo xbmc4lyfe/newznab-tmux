@@ -71,7 +71,9 @@ mod tests {
         let mut dst = base.cast();
         let mut state = 0;
         unsafe {
+            let before = data;
             assert_eq!(decode_incremental(&mut src, &mut dst, 2, &mut state), 0);
+            assert_eq!(&data[2..], &before[2..]);
             assert_eq!(
                 (
                     src as usize - base as usize,
@@ -80,7 +82,9 @@ mod tests {
                 ),
                 (2, 1, 3)
             );
+            let before = data;
             assert_eq!(decode_incremental(&mut src, &mut dst, 3, &mut state), 0);
+            assert_eq!(&data[4..], &before[4..]);
             assert_eq!(
                 (
                     src as usize - base as usize,
@@ -193,6 +197,32 @@ mod tests {
     }
 
     #[test]
+    fn backward_overlap_snapshot_detects_writes_beyond_destination_capacity() {
+        let destination_start = 16;
+        let gap = 15;
+        let length = 64;
+        let source_start = destination_start + gap;
+        let capacity_end = destination_start + length;
+        let source_end = source_start + length;
+        let mut storage = vec![0xcc; source_end + 16];
+        storage[source_start..source_end].fill(b'k');
+        let before = storage.clone();
+
+        // Incidental writes inside input-length capacity remain permitted.
+        let mut within_capacity = before.clone();
+        within_capacity[capacity_end - 1] ^= 1;
+        assert_eq!(&within_capacity[capacity_end..], &before[capacity_end..]);
+
+        // Safely mutate allocated storage, without an out-of-bounds decoder
+        // call: the old source-end canary misses this destination overflow.
+        assert!(capacity_end < source_end);
+        storage[capacity_end] ^= 1;
+        assert_eq!(&storage[..destination_start], &before[..destination_start]);
+        assert_eq!(&storage[source_end..], &before[source_end..]);
+        assert_ne!(&storage[capacity_end..], &before[capacity_end..]);
+    }
+
+    #[test]
     fn every_state_and_special_vector_position_matches_scalar_with_overlap_guards() {
         // The scalar path is independently checked against frozen C++ receipts;
         // this matrix catches compaction, tail and state changes in SIMD kernels.
@@ -220,6 +250,7 @@ mod tests {
                             for gap in [0, 1, 15, 64] {
                                 let mut storage = vec![0xcc; length + gap + 32];
                                 storage[16 + gap..16 + gap + length].copy_from_slice(&input);
+                                let before = storage.clone();
                                 let mut state = initial;
                                 let actual = unsafe {
                                     decode_noend(
@@ -244,6 +275,7 @@ mod tests {
                                         expected
                                     };
                                 assert_eq!(&storage[16..16 + meaningful], &reference[..meaningful]);
+                                assert_eq!(&storage[16 + length..], &before[16 + length..]);
                                 assert!(storage[..16].iter().all(|&b| b == 0xcc));
                                 assert!(storage[16 + gap + length..].iter().all(|&b| b == 0xcc));
                             }
@@ -305,6 +337,7 @@ mod tests {
             for gap in [0, 1, 15, 64] {
                 let mut storage = vec![0xcc; 160 + gap];
                 storage[16 + gap..144 + gap].copy_from_slice(&input);
+                let before = storage.clone();
                 let (read, written) = unsafe {
                     arm::prefix::<true, true>(
                         storage.as_ptr().add(16 + gap),
@@ -314,6 +347,7 @@ mod tests {
                 };
                 assert_eq!((read, written), (128, n), "position={position} gap={gap}");
                 assert_eq!(&storage[16..16 + n], &expected[..n]);
+                assert_eq!(&storage[144..], &before[144..]);
                 assert!(storage[..16].iter().all(|&byte| byte == 0xcc));
                 assert!(storage[144 + gap..].iter().all(|&byte| byte == 0xcc));
             }
@@ -353,6 +387,7 @@ mod tests {
                             let source = start + gap;
                             let mut storage = vec![0xcc; source + input.len() + 16];
                             storage[source..source + input.len()].copy_from_slice(&input);
+                            let before = storage.clone();
                             let mut state = initial;
                             let mut src = unsafe { storage.as_ptr().add(source).cast() };
                             let mut dst = unsafe { storage.as_mut_ptr().add(start).cast() };
@@ -366,6 +401,10 @@ mod tests {
                                 (reference.0, reference.1, reference.2, expected_state)
                             );
                             assert_eq!(&storage[start..start + written], &expected[..written]);
+                            assert_eq!(
+                                &storage[start + input.len()..],
+                                &before[start + input.len()..]
+                            );
                             assert_eq!(
                                 &storage[source + consumed..source + input.len()],
                                 &input[consumed..]
@@ -407,17 +446,25 @@ mod tests {
             let source = 16 + gap;
             let mut storage = vec![0xcc; source + input.len() + 16];
             storage[source..source + input.len()].copy_from_slice(&input);
+            let before = storage.clone();
             let mut src = unsafe { storage.as_ptr().add(source).cast() };
             let mut dst = unsafe { storage.as_mut_ptr().add(16).cast() };
             let mut state = CRLF;
             unsafe {
                 assert_eq!(decode_incremental(&mut src, &mut dst, 16, &mut state), 0);
             }
+            assert_eq!(&storage[32..], &before[32..]);
             assert_eq!(src as usize - storage.as_ptr() as usize, source + 16);
             assert_eq!(&storage[source + 16..source + input.len()], &input[16..]);
+            let second_capacity_end = dst as usize - storage.as_ptr() as usize + 64;
+            let before_second = storage.clone();
             unsafe {
                 assert_eq!(decode_incremental(&mut src, &mut dst, 64, &mut state), 0);
             }
+            assert_eq!(
+                &storage[second_capacity_end..],
+                &before_second[second_capacity_end..]
+            );
             assert_eq!(dst as usize - storage.as_ptr() as usize, 16 + reference.1);
             assert_eq!(&storage[16..16 + reference.1], &expected[..reference.1]);
             assert_eq!(state, expected_state);
@@ -491,6 +538,7 @@ mod tests {
                         for gap in [0, 1, 15, 64] {
                             let mut storage = vec![0xcc; input.len() + gap + 32];
                             storage[16 + gap..16 + gap + input.len()].copy_from_slice(&input);
+                            let before = storage.clone();
                             let mut state = initial;
                             let actual = unsafe {
                                 decode_ex(
@@ -507,6 +555,7 @@ mod tests {
                                 "length={length} position={position} special={special:?} initial={initial} gap={gap}"
                             );
                             assert_eq!(&storage[16..16 + n], &expected[..n]);
+                            assert_eq!(&storage[16 + input.len()..], &before[16 + input.len()..]);
                             assert!(storage[..16].iter().all(|&byte| byte == 0xcc));
                             assert!(
                                 storage[16 + gap + input.len()..]
@@ -570,6 +619,7 @@ mod tests {
                             let source = start + gap;
                             let mut storage = vec![0xcc; source + input.len() + 16];
                             storage[source..source + input.len()].copy_from_slice(&input);
+                            let before = storage.clone();
                             let mut state = initial;
                             let actual = unsafe {
                                 decode_ex(
@@ -582,6 +632,10 @@ mod tests {
                             };
                             assert_eq!((actual, state), (n, expected_state));
                             assert_eq!(&storage[start..start + n], &expected[..n]);
+                            assert_eq!(
+                                &storage[start + input.len()..],
+                                &before[start + input.len()..]
+                            );
                             assert!(storage[..start].iter().all(|&byte| byte == 0xcc));
                             assert!(
                                 storage[source + input.len()..]
@@ -608,6 +662,7 @@ mod tests {
                         let source = start + gap;
                         let mut storage = vec![0xcc; source + input.len() + 16];
                         storage[source..source + input.len()].copy_from_slice(&input);
+                        let before = storage.clone();
                         let mut state = initial;
                         let mut src = unsafe { storage.as_ptr().add(source).cast() };
                         let mut dst = unsafe { storage.as_mut_ptr().add(start).cast() };
@@ -621,6 +676,10 @@ mod tests {
                             (reference.0, reference.1, reference.2, expected_state)
                         );
                         assert_eq!(&storage[start..start + written], &expected[..written]);
+                        assert_eq!(
+                            &storage[start + input.len()..],
+                            &before[start + input.len()..]
+                        );
                         assert_eq!(
                             &storage[source + consumed..source + input.len()],
                             &input[consumed..]
