@@ -697,6 +697,56 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('additionalRawTextElements')]
+    public function additional_raw_text_elements_preserve_exact_release_names(string $tag): void
+    {
+        $html = $this->card('Léon.Release-GRP').'<'.$tag.'>fallback </b> text</'.$tag.'>'.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame(['Léon.Release-GRP', 'Second.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function additionalRawTextElements(): array
+    {
+        return [
+            'iframe' => ['iframe'],
+            'xmp' => ['xmp'],
+            'noembed' => ['noembed'],
+            'noframes' => ['noframes'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('additionalRawTextCardBoundaries')]
+    public function additional_raw_text_elements_cannot_hide_malformed_release_cards(string $before, string $after, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.</b>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$before.$card.$after;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, string, bool}> */
+    public static function additionalRawTextCardBoundaries(): array
+    {
+        $cases = [];
+        foreach (self::additionalRawTextElements() as [$tag]) {
+            foreach ([
+                'after closing tag' => ['<'.$tag.'>fallback </b> text</'.$tag.'>', ''],
+                'inside raw text' => ['<'.$tag.'>', '</'.$tag.'>'],
+                'after apparent ancestor close' => ['<div><'.$tag.'></div>', '</'.$tag.'>'],
+            ] as $boundary => [$before, $after]) {
+                $cases[$tag.' '.$boundary.' before first record'] = [$before, $after, false];
+                $cases[$tag.' '.$boundary.' after record limit'] = [$before, $after, true];
+            }
+        }
+
+        return $cases;
+    }
+
+    #[Test]
     #[DataProvider('unterminatedCommentFragments')]
     public function unterminated_comments_cannot_hide_the_remaining_listing(string $fragment): void
     {

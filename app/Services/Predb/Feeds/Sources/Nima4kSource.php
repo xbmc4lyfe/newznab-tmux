@@ -216,7 +216,7 @@ final class Nima4kSource extends BoundedHttpFeedSource
                 break;
             }
             $offset = $end + 1;
-            if (preg_match('/\A<(script|style|title|textarea)(?=[\x20\t\r\n\/>])/i', substr($html, $start, $offset - $start), $opening) !== 1) {
+            if (preg_match('/\A<(script|style|title|textarea|iframe|xmp|noembed|noframes)(?=[\x20\t\r\n\/>])/i', substr($html, $start, $offset - $start), $opening) !== 1) {
                 continue;
             }
             if (preg_match('~</'.$opening[1].'(?=[\x20\t\r\n/>])~i', $html, $closing, PREG_OFFSET_CAPTURE, $offset) !== 1) {
