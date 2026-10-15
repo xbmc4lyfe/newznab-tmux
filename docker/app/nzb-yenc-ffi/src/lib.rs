@@ -16,6 +16,7 @@ mod formats;
 mod nntp_body;
 mod nntp_headers;
 mod par2;
+mod par2_php_integer_ranges;
 mod par2_source_ranges;
 mod payload_decoder;
 mod release_names;
@@ -259,6 +260,81 @@ pub unsafe extern "C" fn nntmux_par2_metadata_json(data: *const u8, length: usiz
             .map(CString::into_raw)
             .unwrap_or(ptr::null_mut()),
         _ => ptr::null_mut(),
+    }
+}
+
+/// Return PAR2 metadata with PHP 64-bit integer normalization applied.
+/// The separate count is the number of recursive replacements, not the parser's
+/// existing unsupported count. Top-level domain policy remains at the caller.
+/// Free the returned string with `nntmux_metadata_string_free`.
+///
+/// # Safety
+/// `data` is readable for `length` bytes and `unsupported_count` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_integer_ranges_v1_json(
+    data: *const u8,
+    length: usize,
+    unsupported_count: *mut u64,
+) -> *mut c_char {
+    if unsupported_count.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { *unsupported_count = 0 };
+    if length > MAX_METADATA_INPUT_BYTES || (length > 0 && data.is_null()) {
+        return ptr::null_mut();
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees the readable span above.
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    match catch_unwind(|| par2_php_integer_ranges::encode(&par2::parse(input))) {
+        Ok(Ok((json, count))) => match CString::new(json) {
+            Ok(encoded) => {
+                unsafe { *unsupported_count = count };
+                encoded.into_raw()
+            }
+            Err(_) => ptr::null_mut(),
+        },
+        _ => ptr::null_mut(),
+    }
+}
+
+#[cfg(test)]
+mod par2_integer_ranges_abi_tests {
+    #[test]
+    fn rejects_invalid_pointers_and_lengths_and_returns_owned_empty_metadata() {
+        unsafe {
+            let mut count = 99;
+            assert!(
+                super::nntmux_par2_integer_ranges_v1_json(std::ptr::null(), 1, &mut count)
+                    .is_null()
+            );
+            assert_eq!(count, 0);
+            assert!(
+                super::nntmux_par2_integer_ranges_v1_json(
+                    std::ptr::null(),
+                    super::MAX_METADATA_INPUT_BYTES + 1,
+                    &mut count
+                )
+                .is_null()
+            );
+            assert!(
+                super::nntmux_par2_integer_ranges_v1_json(
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut()
+                )
+                .is_null()
+            );
+            let value = super::nntmux_par2_integer_ranges_v1_json(std::ptr::null(), 0, &mut count);
+            assert!(!value.is_null());
+            assert_eq!(count, 0);
+            let json = std::ffi::CStr::from_ptr(value).to_str().unwrap();
+            assert!(json.starts_with("{\"parser_engine\":"));
+            super::nntmux_metadata_string_free(value);
+        }
     }
 }
 

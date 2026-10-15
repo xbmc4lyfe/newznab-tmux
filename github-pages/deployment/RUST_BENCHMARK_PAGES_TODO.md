@@ -1,6 +1,17 @@
 # Rust benchmark Pages handoff
 
-## Ownership and current scope
+## Current recurring coverage
+
+The shared `benchmark-pages.yml` publisher serves documentation and the current dashboard. It consumes only trusted master-push artifacts for the current SHA and attempt; feature and manual experiments remain separate. Existing historical reports retain their immutable URLs.
+
+- `native-utilities-performance.yml` runs both fingerprint backends with `--coverage=full` and the CPU collector's separate synthetic and exact-host protocols on x86 and ARM. Fingerprinting covers nine cold/repeated workloads, including parsed XML, incremental collection, maximum-length IDs and disk spill. Default 31-pair screens omit unreliable p99 metrics. Manual `tail_pairs=1000` collects uncommon tails; `pairs=1000` extends every stratum.
+- `archive-sample-performance.yml` measures actual PHP callers for six sample-planning strata, four PAR2 shared-projection comparisons and sixteen native archive/range diagnostics. Manual `mode=qualification`, `samples=1000` tests the predeclared common-median and uncommon-p99 criteria. Full-result differences are preserved: the PHP PAR2 fallback does not expose all native metadata.
+- Every measured job preserves source/build receipts, input/result hashes, randomized order, warmup, every failed observation and resource endpoints. Resource checks compare process limits, affinity and all namespace-visible cgroup ancestors before and after execution. Outer host limits remain unknown. Missing or changing endpoints invalidate public eligibility.
+- Public summaries expose bounded metrics and hashes, with controls and native-only diagnostics labeled separately. They do not publish raw payloads, source graphs, binaries or private configuration. Raw evidence has 14-day Actions retention.
+
+The following original handoff is historical. Its unchecked items and old harness limits describe the initial inventory, rather than the current implementation. Remaining all-module gaps stay explicit in the generated dashboard.
+
+## Original ownership and scope
 
 The Pages-owner session creates and deploys the site. This change **does not** enable Pages, create a live deployment workflow, run production jobs, or claim all Rust modules are benchmarked.
 

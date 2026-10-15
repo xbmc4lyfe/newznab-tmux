@@ -16,9 +16,25 @@ if (! defined('NNTMUX_ARCHIVE_BENCHMARK_FUNCTIONS_ONLY')) {
     define('NNTMUX_ARCHIVE_BENCHMARK_FUNCTIONS_ONLY', true);
 }
 require_once dirname(__DIR__, 2).'/scripts/benchmark-archive-parsing.php';
+define('NNTMUX_PAR2_NORMALIZATION_FUNCTIONS_ONLY', true);
+require_once dirname(__DIR__, 2).'/scripts/benchmark-par2-normalization.php';
 
 final class ArchiveParsingBenchmarkTest extends TestCase
 {
+    public function test_normalization_comparison_requires_full_types_order_and_all_phases(): void
+    {
+        $original = array_fill_keys(['cold', 'warmup', 'warm'], ['a' => 1, 'b' => 1.0]);
+        self::assertTrue(par2NormalizationFullParity($original, $original));
+        $candidate = $original;
+        $candidate['warm'] = ['b' => 1.0, 'a' => 1];
+        self::assertFalse(par2NormalizationFullParity($original, $candidate));
+        $candidate['warm'] = ['a' => 1, 'b' => 1];
+        self::assertFalse(par2NormalizationFullParity($original, $candidate));
+        unset($candidate['warmup']);
+        self::assertFalse(par2NormalizationFullParity($original, $candidate));
+        self::assertFalse(par2NormalizationFullParity(null, $original));
+    }
+
     public function test_public_fixture_identity_and_independent_inventory(): void
     {
         $fixture = ArchiveParsingBenchmarkFixtures::make('public-rename-index', dirname(__DIR__, 2));

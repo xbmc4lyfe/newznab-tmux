@@ -616,7 +616,12 @@ final class Par2MetadataParser
     /** @return array<string, mixed> */
     public function parse(string $data): array
     {
-        $native = (new NativeMetadataParser)->parsePar2($data);
+        $parser = new NativeMetadataParser;
+        $normalized = $parser->parsePar2WithIntegerRanges($data);
+        if ($normalized !== null) {
+            return self::normalizeNativeIntegerRanges($normalized['metadata'], $normalized['unsupported_range_count']);
+        }
+        $native = $parser->parsePar2($data);
         if ($native !== null) {
             return self::normalizeNativeIntegerRanges($native);
         }
@@ -1251,10 +1256,12 @@ final class Par2MetadataParser
      * @param  array<string, mixed>  $metadata
      * @return array<string, mixed>
      */
-    private static function normalizeNativeIntegerRanges(array $metadata): array
+    private static function normalizeNativeIntegerRanges(array $metadata, ?int $unsupportedRangeCount = null): array
     {
-        $unsupportedRangeCount = 0;
-        self::normalizeIntegerRangeValues($metadata, $unsupportedRangeCount);
+        if ($unsupportedRangeCount === null) {
+            $unsupportedRangeCount = 0;
+            self::normalizeIntegerRangeValues($metadata, $unsupportedRangeCount);
+        }
         $metadata['unsupported_integer_range_count'] = (int) ($metadata['unsupported_integer_range_count'] ?? 0) + $unsupportedRangeCount;
         if ($unsupportedRangeCount > 0) {
             $metadata['invalid_packet_count'] = (int) ($metadata['invalid_packet_count'] ?? 0) + $unsupportedRangeCount;

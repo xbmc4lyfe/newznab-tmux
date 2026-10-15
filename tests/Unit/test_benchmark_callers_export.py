@@ -2,6 +2,7 @@
 
 import copy
 import json
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -9,6 +10,9 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/benchmark_callers_summary.py"
+SPEC = importlib.util.spec_from_file_location('utility_fixture', Path(__file__).with_name('test_benchmark_utility_extended.py'))
+UTILITY_FIXTURE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(UTILITY_FIXTURE)
 MARKER = "unpublished-synthetic-payload"
 SAMPLE = {
     "small-dispatch": "dispatch_control", "boundary-1024": "common",
@@ -73,12 +77,13 @@ def fixture(kind, samples=31, mode="screen"):
 
 
 class CallerSummaryExportTest(unittest.TestCase):
-    def export(self, kind, records):
+    def export(self, kind, records, resources=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "utility-evidence" / kind / "observations.jsonl"
             source.parent.mkdir(parents=True)
             source.write_text("".join(json.dumps(row) + "\n" for row in records))
+            UTILITY_FIXTURE.write_resources(root, resources)
             (root / "utility-evidence/runtime.json").write_text(json.dumps({
                 "executed_sha": "e" * 40, "architecture": "aarch64", "php": "8.5", MARKER: MARKER}))
             env = dict(os.environ, GITHUB_SHA="e" * 40, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
@@ -91,6 +96,17 @@ class CallerSummaryExportTest(unittest.TestCase):
             summary = json.loads(text)
             self.assertIs(summary["adoption_qualified"], False)
             return summary
+
+    def test_current_caller_resource_receipt_cannot_be_missing_changed_or_forged(self):
+        for kind in ('sample-planning', 'archive-parsing'):
+            for mutation in ('missing', 'changed', 'forged'):
+                summary = self.export(kind, fixture(kind), resources=mutation)
+                self.assertEqual(summary['status'], 'invalid')
+                self.assertFalse(any(row['eligible'] for row in summary['rows']))
+                self.assertFalse(any(row.get('qualification_gate_passed') for row in summary['rows']))
+            summary = self.export(kind, fixture(kind))
+            self.assertEqual({key for key in summary['source_sha256'] if key.startswith('resource_limits_')},
+                             {'resource_limits_before', 'resource_limits_after', 'resource_limits_comparison'})
 
     def test_complete_sample_keeps_controls_and_unknown_tail(self):
         summary = self.export("sample-planning", fixture("sample-planning"))

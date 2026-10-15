@@ -76,7 +76,42 @@ const FULL_FIXTURES: [(&str, usize, &str, &str); 4] = [
 fn uncommon(fixture: &str) -> bool {
     fixture == "xml10000-fromXml" || fixture.contains("max255")
 }
-// Only fixture construction and calls to the public PHP API live in this driver.
+// These reviewed callers contain no PHP fallback. A source change requires a new
+// native-path audit and deliberate pin update, rather than silent attribution.
+const NATIVE_CLASS_SHA256: &str =
+    "d43ccd3c5528d56be1c93791745243fc057f514fbdde85877259cf0679627374";
+const NATIVE_WORKER_SHA256: &str =
+    "e557cd759977a6ad4258b7fb0d1f90ab2bd51b00606f89fc155a1aceb5011c7f";
+const NATIVE_ASSERTIONS: &str = r#"
+function assertFingerprintSource(string $class,string $source,string $expectedHash): void {
+    $resolved=realpath($source);
+    if($resolved===false || realpath((new ReflectionClass($class))->getFileName())!==$resolved || hash_file('sha256',$resolved)!==$expectedHash) throw new RuntimeException('Unreviewed native fingerprint caller source');
+}
+function assertFingerprintBackend(object $accumulator,bool $ffi,string $library,string $worker): array {
+    $class=get_class($accumulator);
+    $activeLibrary=(new ReflectionProperty($class,'library'))->getValue($accumulator);
+    $state=(new ReflectionProperty($class,'state'))->getValue($accumulator);
+    $activeWorker=(new ReflectionProperty($class,'worker'))->getValue($accumulator);
+    if($ffi) {
+        $libraries=(new ReflectionProperty($class,'libraries'))->getValue();
+        if(!$activeLibrary instanceof FFI || !$state instanceof FFI\CData || FFI::isNull($state) || $activeWorker!==null || ($libraries[getmypid().':'.realpath($library)]??null)!==$activeLibrary) throw new RuntimeException('Native FFI state was not initialized from pinned library');
+        return ['backend'=>'rust-ffi','state_nonnull'=>true,'library_cache_identity'=>true];
+    }
+    if($activeLibrary!==null || $state!==null || !is_object($activeWorker)) throw new RuntimeException('Native worker backend was not selected');
+    $process=(new ReflectionProperty(get_class($activeWorker),'process'))->getValue($activeWorker);
+    if(!is_resource($process)) throw new RuntimeException('Native worker process is unavailable');
+    $status=proc_get_status($process);
+    if(!$status['running'] || realpath($status['command'])!==realpath($worker)) throw new RuntimeException('Native worker process does not match pinned binary');
+    return ['backend'=>'rust-worker','process_running'=>true,'worker_path'=>realpath($status['command'])];
+}
+"#;
+fn generated_driver() -> String {
+    format!(
+        "const NATIVE_CLASS_SHA256='{NATIVE_CLASS_SHA256}'; const NATIVE_WORKER_SHA256='{NATIVE_WORKER_SHA256}';{NATIVE_ASSERTIONS}{DRIVER}"
+    )
+}
+// Measurement still calls the unmodified production public API. Dynamic object
+// inspection runs in a separate proof process, never inside an operation timer.
 const DRIVER: &str = r#"
 [$root,$baseline,$implementation,$fixture,$count,$method,$expected]=array_slice($argv,1);
 $ids=[]; for($i=($fixture==='ids10000-unique-plus-duplicates'?10000:(int)$count)-1;$i>=0;$i--) $ids[]=sprintf('fp-%05d@bench.invalid',$i);
@@ -88,19 +123,35 @@ else foreach($ids as $id) hash_update($hash,pack('N',strlen($id)).$id);
 $class='App\\Services\\Nzb\\NzbArticleFingerprint';
 if($implementation==='baseline') require $baseline;
 require $root.'/vendor/autoload.php'; if(!class_exists($class)) throw new RuntimeException('Fingerprint class missing');
+if($implementation==='candidate') foreach([
+    [$class,$root.'/app/Services/Nzb/NzbArticleFingerprint.php',NATIVE_CLASS_SHA256],
+    ['App\\Services\\Nzb\\RustArticleFingerprintWorker',$root.'/app/Services/Nzb/RustArticleFingerprintWorker.php',NATIVE_WORKER_SHA256],
+] as [$nativeClass,$source,$sourceHash]) assertFingerprintSource($nativeClass,$source,$sourceHash);
 $library=$root.'/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.'.(PHP_OS_FAMILY==='Darwin'?'dylib':'so');
 $worker=$root.'/docker/app/nzb-yenc-ffi/target/release/nntmux-article-fingerprint';
 Illuminate\Container\Container::getInstance()->instance('config',new Illuminate\Config\Repository(['yenc'=>['native_library'=>$library]]));
 $ffi=extension_loaded('FFI')&&!in_array(strtolower((string)ini_get('ffi.enable')),['','0','false','off'],true);
+if($implementation==='candidate'&&$ffi&&function_exists('proc_open')) throw new RuntimeException('FFI measurement must disable worker startup');
 $artifact=$ffi?$library:$worker; $artifactHash=is_file($artifact)?hash_file('sha256',$artifact):null;
 if($implementation==='candidate'&&!is_string($artifactHash)) throw new RuntimeException('Runtime artifact missing');
 if($implementation==='candidate'&&!$ffi) foreach([$root.'/storage/app/nntmux-native/nntmux-article-fingerprint','/usr/local/bin/nntmux-article-fingerprint'] as $alternative) if(is_file($alternative)&&is_executable($alternative)&&realpath($alternative)!==realpath($worker)) throw new RuntimeException('Unpinned fallback worker exists');
 $phpBinary=realpath(PHP_BINARY); $phpHash=hash_file('sha256',$phpBinary); $temp=sys_get_temp_dir(); $tempResolved=realpath($temp); $tempStat=stat($temp);
+if(($argv[8]??'')==='native-proof') {
+    $accumulator=app($class);
+    $before=assertFingerprintBackend($accumulator,$ffi,$library,$worker);
+    foreach($ids as $id) $accumulator->add($id);
+    $result=$accumulator->value();
+    $after=assertFingerprintBackend($accumulator,$ffi,$library,$worker);
+    unset($accumulator);
+    if($result!==$expected||hash_file('sha256',$artifact)!==$artifactHash) throw new RuntimeException('Native proof result or artifact changed');
+    echo json_encode(['native_execution_proven'=>true,'backend'=>$before['backend'],'before'=>$before,'after'=>$after,'fingerprint'=>$result,'artifact_path'=>realpath($artifact),'artifact_sha256'=>$artifactHash,'proc_open_available'=>function_exists('proc_open'),'ffi_enable'=>ini_get('ffi.enable'),'scope'=>'Separate process: actual constructor/add/value state inspection; measured static and incremental operations use reviewed native-only source with alternate backend disabled'],JSON_THROW_ON_ERROR);
+    return;
+}
 $measure=static function() use($class,$method,$payload) { $start=hrtime(true); if($method==='incremental') { $accumulator=app($class); foreach($payload as $id) $accumulator->add($id); $result=$accumulator->value(); unset($accumulator); } else $result=$class::$method($payload); return [$result,hrtime(true)-$start]; };
 [$cold,$coldTime]=$measure(); [$hot,$hotTime]=$measure();
-if($implementation==='candidate') { $libraries=(new ReflectionProperty($class,'libraries'))->getValue(); $used=isset($libraries[getmypid().':'.realpath($library)]); if($used!==$ffi||hash_file('sha256',$artifact)!==$artifactHash) throw new RuntimeException('Pinned backend or artifact changed'); }
+if($implementation==='candidate') { $libraries=(new ReflectionProperty($class,'libraries'))->getValue(); $used=isset($libraries[getmypid().':'.realpath($library)]); if($used!==$ffi||($ffi&&count($libraries)!==1)||hash_file('sha256',$artifact)!==$artifactHash) throw new RuntimeException('Pinned backend or artifact changed'); }
 if(realpath(PHP_BINARY)!==$phpBinary||hash_file('sha256',$phpBinary)!==$phpHash||sys_get_temp_dir()!==$temp||realpath($temp)!==$tempResolved) throw new RuntimeException('PHP executable or temporary directory changed');
-echo json_encode(['fixture_count'=>count($ids),'fixture_sha256'=>hash_final($hash),'cold_elapsed_ns'=>$coldTime,'elapsed_ns'=>$hotTime,'cold_fingerprint'=>$cold,'fingerprint'=>$hot,'correct'=>$cold===$expected&&$hot===$expected,'backend'=>$implementation==='baseline'?'php':($ffi?'rust-ffi':'rust-worker'),'artifact_path'=>$implementation==='candidate'?realpath($artifact):null,'artifact_sha256'=>$implementation==='candidate'?$artifactHash:null,'php_binary'=>$phpBinary,'php_binary_sha256'=>$phpHash,'php_temp_directory'=>['path'=>$temp,'canonical_path'=>$tempResolved,'device'=>$tempStat['dev'],'inode'=>$tempStat['ino']]],JSON_THROW_ON_ERROR);
+echo json_encode(['fixture_count'=>count($ids),'fixture_sha256'=>hash_final($hash),'cold_elapsed_ns'=>$coldTime,'elapsed_ns'=>$hotTime,'cold_fingerprint'=>$cold,'fingerprint'=>$hot,'correct'=>$cold===$expected&&$hot===$expected,'backend'=>$implementation==='baseline'?'php':($ffi?'rust-ffi':'rust-worker'),'native_only_source_verified'=>$implementation==='candidate','proc_open_available'=>function_exists('proc_open'),'ffi_enable'=>ini_get('ffi.enable'),'artifact_path'=>$implementation==='candidate'?realpath($artifact):null,'artifact_sha256'=>$implementation==='candidate'?$artifactHash:null,'php_binary'=>$phpBinary,'php_binary_sha256'=>$phpHash,'php_temp_directory'=>['path'=>$temp,'canonical_path'=>$tempResolved,'device'=>$tempStat['dev'],'inode'=>$tempStat['ino']]],JSON_THROW_ON_ERROR);
 "#;
 #[derive(Debug)]
 struct Options {
@@ -431,6 +482,15 @@ fn command(o: &Options) -> Command {
     ]);
     c
 }
+fn observation_command(o: &Options, candidate: bool) -> Command {
+    let mut cmd = command(o);
+    if candidate && o.backend == "ffi" {
+        // Constructor failure must not silently select the subprocess backend.
+        // The PHP baseline retains its original function configuration.
+        cmd.args(["-d", "disable_functions=proc_open"]);
+    }
+    cmd
+}
 fn preflight_failure(o: &Options, sources: &Value, runtime: &Value, reason: &str) -> (Value, bool) {
     (
         json!({
@@ -682,6 +742,38 @@ fn run(mut o: Options) -> Result<(Value, bool), String> {
             }
         }
     }
+    // Inspect live native state in an independent process so the timed process
+    // keeps its cold PHP/FFI cache and full constructor/add/value/destructor cost.
+    let driver = generated_driver();
+    let mut proof_command = observation_command(&o, true);
+    proof_command
+        .args(["-r", &driver, "--"])
+        .arg(&o.project)
+        .arg(&o.baseline)
+        .args([
+            "candidate",
+            "ids16",
+            "16",
+            "incremental",
+            FIXTURES[0].3,
+            "native-proof",
+        ]);
+    let native_proof = execute(proof_command);
+    journal_record(
+        &mut journal,
+        json!({"type":"native_execution_proof","proof":native_proof}),
+    )?;
+    if native_proof.get("invalid_reason").is_some()
+        || native_proof["native_execution_proven"] != true
+        || native_proof["backend"] != format!("rust-{}", o.backend)
+    {
+        return Ok(preflight_failure(
+            &o,
+            &sources,
+            &native_proof,
+            "native_execution_proof_failed",
+        ));
+    }
     let compiler = Command::new("rustc")
         .arg("--version")
         .output()
@@ -689,7 +781,7 @@ fn run(mut o: Options) -> Result<(Value, bool), String> {
         .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_owned());
     journal_record(
         &mut journal,
-        json!({"type":"preflight_complete","sources":sources,"runtime":{"php":runtime,"temporary_filesystems":temporary_filesystems,"rust_compiler_available_version":compiler}}),
+        json!({"type":"preflight_complete","sources":sources,"runtime":{"php":runtime,"temporary_filesystems":temporary_filesystems,"rust_compiler_available_version":compiler,"native_execution_proof":native_proof}}),
     )?;
     let mut order_offset = 0;
     let mut scheduled = Vec::new();
@@ -719,8 +811,8 @@ fn run(mut o: Options) -> Result<(Value, bool), String> {
             scheduled.push(json!({"fixture":fixture,"kind":kind,"pair":pair,"order":order}));
             let mut rows = json!({});
             for implementation in order {
-                let mut c = command(&o);
-                c.args(["-r", DRIVER, "--"])
+                let mut c = observation_command(&o, implementation == "candidate");
+                c.args(["-r", &driver, "--"])
                     .arg(&o.project)
                     .arg(&o.baseline)
                     .args([
@@ -853,7 +945,7 @@ fn run(mut o: Options) -> Result<(Value, bool), String> {
         json!({"type":"run_summary","summary":summary,"invalid_observations":invalids,"temporary_filesystems_at_end":temporary_filesystems_at_end,"adoption_qualified":false}),
     )?;
     Ok((
-        json!({"benchmark":"nzb-article-fingerprint-paired-comparison","adoption_qualified":false,"protocol":{"version":if o.coverage=="full" {4}else{3},"coverage":o.coverage,"seed":SEED,"warmups_per_fixture":1,"warmups_per_observation":1,"pairs_per_fixture":o.pairs,"tail_pairs_per_uncommon_fixture":o.tail_pairs,"bootstrap_resamples":BOOTSTRAP_RESAMPLES,"bootstrap_seed":SEED,"bootstrap_rng":BOOTSTRAP_RNG,"median_minimum_pairs":11,"minimum_p99_pairs":MINIMUM_TAIL_PAIRS,"p99_estimator":"Separate baseline/candidate nearest rank ceil(0.99*N), then baseline/candidate ratio; never percentile of paired ratios","confidence_scope":"Pointwise paired bootstrap 95% intervals per fixture/lifecycle; not simultaneous or a production qualification","useful_median_ratio_ci_lower_gate":1.5,"uncommon_p99_ratio_ci_lower_gate":1.5,"timeout_seconds_per_worker":30,"backend":o.backend,"schedule":scheduled,"schedule_sha256":hash_bytes(serde_json::to_string(&scheduled).unwrap().as_bytes()),"timing_scope":TIMING_SCOPE,"limitations":["Synthetic workloads do not establish production indexing throughput or a production input distribution","Cold and repeated operation ratios must be read separately; a repeated-operation gain does not offset a cold regression","Uncommon tail estimates require at least 1000 independent eligible process pairs for that fixture; small-sample maxima are not p99 evidence","Warmup pairs warm OS caches; each observation uses a fresh PHP process. Complete PHP process latency is outside this caller-operation scope"],"correctness_gate":"Both literal independent digests, independent fixture hashes/counts, actual requested backend with no unpinned worker alternative and unchanged sources/artifacts/runtime/temp filesystem identities"},"sources":sources,"runtime":{"php":runtime,"rust_compiler_available_version":compiler,"compiler_identity_note":"Available compiler version; build compiler identity not asserted","temporary_filesystems":temporary_filesystems,"temporary_filesystems_at_end":temporary_filesystems_at_end},"fixtures":fixtures,"observations":observations,"invalid_observations":invalids,"summary":summary,"completed_at_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()}),
+        json!({"benchmark":"nzb-article-fingerprint-paired-comparison","adoption_qualified":false,"protocol":{"version":if o.coverage=="full" {4}else{3},"coverage":o.coverage,"seed":SEED,"warmups_per_fixture":1,"warmups_per_observation":1,"pairs_per_fixture":o.pairs,"tail_pairs_per_uncommon_fixture":o.tail_pairs,"bootstrap_resamples":BOOTSTRAP_RESAMPLES,"bootstrap_seed":SEED,"bootstrap_rng":BOOTSTRAP_RNG,"median_minimum_pairs":11,"minimum_p99_pairs":MINIMUM_TAIL_PAIRS,"p99_estimator":"Separate baseline/candidate nearest rank ceil(0.99*N), then baseline/candidate ratio; never percentile of paired ratios","confidence_scope":"Pointwise paired bootstrap 95% intervals per fixture/lifecycle; not simultaneous or a production qualification","useful_median_ratio_ci_lower_gate":1.5,"uncommon_p99_ratio_ci_lower_gate":1.5,"timeout_seconds_per_worker":30,"backend":o.backend,"schedule":scheduled,"schedule_sha256":hash_bytes(serde_json::to_string(&scheduled).unwrap().as_bytes()),"timing_scope":TIMING_SCOPE,"limitations":["Synthetic workloads do not establish production indexing throughput or a production input distribution","Cold and repeated operation ratios must be read separately; a repeated-operation gain does not offset a cold regression","Uncommon tail estimates require at least 1000 independent eligible process pairs for that fixture; small-sample maxima are not p99 evidence","Warmup pairs warm OS caches; each observation uses a fresh PHP process. Complete PHP process latency is outside this caller-operation scope"],"correctness_gate":"Both literal independent digests, independent fixture hashes/counts, reviewed native-only caller source pins, separate-process live native state proof, FFI worker startup disabled or FFI disabled for worker, no unpinned backend alternative, unchanged sources/artifacts/runtime/temp filesystem identities"},"sources":sources,"runtime":{"php":runtime,"rust_compiler_available_version":compiler,"native_execution_proof":native_proof,"compiler_identity_note":"Available compiler version; build compiler identity not asserted","temporary_filesystems":temporary_filesystems,"temporary_filesystems_at_end":temporary_filesystems_at_end},"fixtures":fixtures,"observations":observations,"invalid_observations":invalids,"summary":summary,"completed_at_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()}),
         invalid,
     ))
 }
@@ -893,6 +985,100 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_proof_checks_live_state_and_rejects_backend_substitution() {
+        let script = format!(
+            "{}{}",
+            NATIVE_ASSERTIONS,
+            r#"
+class ProofAccumulator {
+    private static array $libraries=[];
+    private $library=null; private $state=null; private $worker=null;
+    public function __construct($library,$state,$worker,$path) { $this->library=$library; $this->state=$state; $this->worker=$worker; self::$libraries=[getmypid().':'.realpath($path)=>$library]; }
+}
+class ProofWorker { private $process; public function __construct($process) { $this->process=$process; } }
+function rejects($operation) { try { $operation(); } catch (RuntimeException) { return; } throw new RuntimeException('Invalid backend accepted'); }
+$path=PHP_BINARY; $ffi=FFI::cdef('int abs(int);'); $number=$ffi->new('int'); $state=FFI::addr($number);
+$valid=new ProofAccumulator($ffi,$state,null,$path);
+assertFingerprintBackend($valid,true,$path,$path);
+rejects(fn()=>assertFingerprintBackend(new ProofAccumulator($ffi,null,null,$path),true,$path,$path));
+rejects(fn()=>assertFingerprintBackend(new ProofAccumulator($ffi,$ffi->new('void *'),null,$path),true,$path,$path));
+rejects(fn()=>assertFingerprintBackend(new ProofAccumulator(null,null,null,$path),false,$path,$path));
+$process=proc_open([PHP_BINARY,'-r','sleep(5);'],[0=>['pipe','r'],1=>['pipe','w'],2=>['file','/dev/null','a']],$pipes);
+try {
+    $worker=new ProofWorker($process);
+    assertFingerprintBackend(new ProofAccumulator(null,null,$worker,$path),false,$path,$path);
+    rejects(fn()=>assertFingerprintBackend(new ProofAccumulator($ffi,$state,$worker,$path),true,$path,$path));
+    rejects(fn()=>assertFingerprintBackend(new ProofAccumulator(null,null,$worker,$path),false,$path,'/wrong-worker'));
+    proc_terminate($process,9); foreach($pipes as $pipe) fclose($pipe); proc_close($process);
+    rejects(fn()=>assertFingerprintBackend(new ProofAccumulator(null,null,$worker,$path),false,$path,$path));
+} finally { if(is_resource($process)) { proc_terminate($process,9); foreach($pipes as $pipe) if(is_resource($pipe)) fclose($pipe); proc_close($process); } }
+echo json_encode(['proof_assertions'=>true]);
+"#
+        );
+        let mut command = Command::new("php");
+        command.args(["-d", "ffi.enable=true", "-r", &script]);
+        let result = execute(command);
+        assert!(result.get("invalid_reason").is_none(), "{result}");
+        assert_eq!(result["proof_assertions"], true);
+    }
+
+    #[test]
+    fn native_source_guard_rejects_changed_or_substituted_class_files() {
+        let script = format!(
+            "{}{}",
+            NATIVE_ASSERTIONS,
+            r#"
+function rejects($operation) { try { $operation(); } catch (RuntimeException) { return; } throw new RuntimeException('Unreviewed source accepted'); }
+$file=tempnam(sys_get_temp_dir(),'nntmux-source-proof-');
+$other=tempnam(sys_get_temp_dir(),'nntmux-source-proof-');
+try {
+    $source='<?php class ProofNativeSource {}';
+    file_put_contents($file,$source); file_put_contents($other,$source); require $file;
+    $hash=hash_file('sha256',$file);
+    assertFingerprintSource(ProofNativeSource::class,$file,$hash);
+    rejects(fn()=>assertFingerprintSource(ProofNativeSource::class,$file,str_repeat('0',64)));
+    rejects(fn()=>assertFingerprintSource(ProofNativeSource::class,$other,$hash));
+    file_put_contents($file,$source.' // altered');
+    rejects(fn()=>assertFingerprintSource(ProofNativeSource::class,$file,$hash));
+    echo json_encode(['source_guard'=>true]);
+} finally { unlink($file); unlink($other); }
+"#
+        );
+        let mut cmd = Command::new("php");
+        cmd.args(["-r", &script]);
+        let result = execute(cmd);
+        assert!(result.get("invalid_reason").is_none(), "{result}");
+        assert_eq!(result["source_guard"], true);
+    }
+
+    #[test]
+    fn reviewed_native_only_source_hashes_match_current_callers() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        assert_eq!(
+            hash_file(&root.join("app/Services/Nzb/NzbArticleFingerprint.php")).unwrap(),
+            NATIVE_CLASS_SHA256
+        );
+        assert_eq!(
+            hash_file(&root.join("app/Services/Nzb/RustArticleFingerprintWorker.php")).unwrap(),
+            NATIVE_WORKER_SHA256
+        );
+    }
+
+    #[test]
+    fn ffi_candidate_disables_worker_startup_without_changing_baseline() {
+        let baseline = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let options = parse(vec![format!("--baseline={}", baseline.display())]).unwrap();
+        for (candidate, expected) in [(false, true), (true, false)] {
+            let mut cmd = observation_command(&options, candidate);
+            cmd.args([
+                "-r",
+                "echo json_encode(['proc_open_available'=>function_exists('proc_open')]);",
+            ]);
+            assert_eq!(execute(cmd)["proc_open_available"], expected);
+        }
+    }
+
     #[test]
     fn median_handles_empty_even_and_odd() {
         assert_eq!(median(vec![]), None);

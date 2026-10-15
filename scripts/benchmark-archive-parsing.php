@@ -142,6 +142,10 @@ function archiveBenchmarkWorker(string $backend, array $fixture, string $library
         $loaded = archiveBenchmarkLoadedLibraries();
         $key = getmypid().':'.realpath($library);
         $nativeLoaded = isset($loaded[$key]) && count($loaded) === 1;
+        $optional = (new ReflectionClass(NativeMetadataParser::class))->hasProperty('par2IntegerRangeLibraries')
+            ? (new ReflectionProperty(NativeMetadataParser::class, 'par2IntegerRangeLibraries'))->getValue() : [];
+        $normalizedLoaded = isset($optional[$key]) && count($optional) === 1;
+        $nativeLoaded = $nativeLoaded || $normalizedLoaded;
         $engine = is_array($result) ? ($result['parser_engine'] ?? null) : null;
         $engineExpected = $backend === 'php' ? 'php-fallback' : 'nntmux-rust-ffi';
         $proof = $backend === 'native' ? $nativeLoaded : $loaded === [];
@@ -151,6 +155,7 @@ function archiveBenchmarkWorker(string $backend, array $fixture, string $library
         $correct = ArchiveParsingBenchmarkFixtures::correct($fixture, $result) && $proof && ($serialized === null || $serialized === $encoded);
         $serialized ??= $encoded;
         $observations[$phase] = ['elapsed_ms' => $elapsed, 'correct' => $correct, 'native_library_loaded' => $nativeLoaded,
+            'integer_ranges_backend_proven' => $normalizedLoaded && $loaded === [] && $engine === 'nntmux-rust-ffi',
             'backend_proven' => $proof, 'parser_engine' => $engine, 'result_sha256' => hash('sha256', $encoded),
             'process_cpu_before' => $cpu, 'process_cpu_after' => $cpuAfter, 'cgroup_cpu_stat_before' => $throttling, 'cgroup_cpu_stat_after' => $throttlingAfter];
     }

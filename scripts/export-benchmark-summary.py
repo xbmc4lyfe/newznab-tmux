@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import itertools
 import json
 import math
@@ -240,6 +241,8 @@ def rust_payload_mode(kind, records, status):
 
 def utility_summary(kind, report):
     """Publish fixed fixture names and numeric metrics; never paths, commands or raw observations."""
+    if kind.startswith("fingerprint-") and isinstance(report.get("protocol"), dict) and report["protocol"].get("version") == 4:
+        return full_fingerprint_summary(kind, report)
     cpu = kind == "cpu-snapshot"
     revision, baseline_hash = UTILITY_BASELINES["cpu-snapshot" if cpu else "fingerprint"]
     expected = ("common-mounted", "rare-deep64", "rare-unavailable") if cpu else ("ids16", "ids4096", "ids10000-unique-plus-duplicates", "ids50000", "xml10000")
@@ -255,6 +258,42 @@ def utility_summary(kind, report):
     invalid = baseline.get("sha256") != baseline_hash
     invalid |= report.get("benchmark") != ("cpu-snapshot-cold-cli" if cpu else "nzb-article-fingerprint-paired-comparison")
     invalid |= protocol.get("version") != (2 if cpu else 3)
+    host_pairs = protocol.get("host_pairs_opt_in", 0) if cpu else 0
+    host = report.get("host_comparison", {}) if cpu else {}
+    host_requested = count(host_pairs) and host_pairs > 0
+    if cpu:
+        invalid |= not count(host_pairs) or host_pairs > 5000
+    if host_requested:
+        expected = (*expected, "host-live")
+        if not isinstance(host, dict):
+            raise ValueError("Invalid host comparison")
+        host_summary = host.get("summary")
+        if isinstance(host_summary, dict):
+            measured = dict(measured, **{"host-live": host_summary})
+        invalid |= (host.get("enabled") is not True or host.get("correctness_pass") is not True
+                    or host.get("source_integrity_pass") is not True or report.get("overall_adoption_qualified") is not False)
+        host_protocol = host.get("protocol", {})
+        invalid |= not isinstance(host_protocol, dict) or host_protocol.get("exact_default_cli") is not True or host_protocol.get("pairs") != host_pairs
+        observations = host.get("observations")
+        if not isinstance(observations, list):
+            invalid = True
+        else:
+            seen = set()
+            for observation in observations:
+                if not isinstance(observation, dict):
+                    invalid = True
+                    continue
+                pair, backend = observation.get("pair"), observation.get("implementation")
+                if not count(pair) or pair > host_pairs or backend not in ("baseline", "candidate"):
+                    invalid = True
+                    continue
+                key = (pair, backend)
+                invalid |= key in seen or observation.get("valid") is not True or observation.get("warmup") is not (pair == 0)
+                seen.add(key)
+                invalid |= not number(observation.get('elapsed_ns')) or observation.get('elapsed_ns', 0) <= 0
+                validation = observation.get('validation')
+                invalid |= not isinstance(validation, dict) or validation.get('valid') is not True
+            invalid |= seen != set(itertools.product(range(host_pairs + 1), ("baseline", "candidate")))
     invalid |= bool(set(measured) - set(expected))
     if cpu:
         invalid |= report.get("correctness_pass") is not True or report.get("changed_artifacts") != []
@@ -271,11 +310,13 @@ def utility_summary(kind, report):
             continue
         samples = metrics.get("valid_pairs" if cpu else "pairs_valid")
         required = metrics.get("required_pairs" if cpu else "pairs_total")
-        declared = protocol.get("pairs" if cpu else "pairs_per_fixture")
+        declared = host_pairs if fixture == "host-live" else protocol.get("pairs" if cpu else "pairs_per_fixture")
         valid = count(samples) and count(required) and samples > 0 and samples == required == declared
         row = dict(fixture=fixture, candidate_backend="rust-cli" if cpu else kind.removeprefix("fingerprint-"),
                    samples=samples if count(samples) else 0, invalid_pairs=max(0, required - samples) if count(required) and count(samples) else 0,
                    p99_sample_sufficient=cpu and count(samples) and samples >= 1000)
+        if cpu:
+            row["comparison"] = "exact_host_cli" if fixture == "host-live" else "synthetic_cli"
         scalar_keys = ("baseline_median_ns", "candidate_median_ns", "median_ratio", "paired_median_ratio", "baseline_p99_ns", "candidate_p99_ns", "p99_ratio") if cpu else ("median_baseline_over_candidate_ratio", "median_cold_baseline_over_candidate_ratio")
         for key in scalar_keys:
             if number(metrics.get(key)) and metrics[key] > 0:
@@ -292,6 +333,21 @@ def utility_summary(kind, report):
             valid &= type(metrics.get("gate_pass")) is bool
             valid &= metrics.get("p99_sample_sufficient") is row["p99_sample_sufficient"]
             row["gate_passed"] = metrics.get("gate_pass") is True
+            if fixture == "host-live":
+                valid &= host.get("host_gate_pass") is metrics.get("gate_pass") and report.get("host_gate_pass") is metrics.get("gate_pass")
+                values = {backend: [row.get('elapsed_ns') for row in host.get('observations', [])
+                                    if isinstance(row, dict) and row.get('implementation') == backend and row.get('warmup') is False]
+                          for backend in ('baseline', 'candidate')}
+                valid &= not invalid and all(len(value) == samples and all(number(item) and item > 0 for item in value) for value in values.values())
+                if valid:
+                    b, c = values['baseline'], values['candidate']
+                    rank = math.ceil(0.99 * samples) - 1
+                    expected_values = (statistics.median(b), statistics.median(c), statistics.median(b) / statistics.median(c),
+                                       statistics.median([left / right for left, right in zip(b, c)]),
+                                       sorted(b)[rank], sorted(c)[rank], sorted(b)[rank] / sorted(c)[rank])
+                    valid &= all(math.isclose(metrics[key], value, rel_tol=1e-12) for key, value in zip(scalar_keys, expected_values))
+                    expected_gate = (samples >= 1000 and metrics['median_ratio_ci95'][0] >= 1.5 and metrics['p99_ratio_ci95'][0] >= 1.5)
+                    valid &= metrics['gate_pass'] is expected_gate
         else:
             pairs = metrics.get("pairs")
             valid &= isinstance(pairs, list) and len(pairs) == samples and all(isinstance(pair, dict) and pair.get("eligible") is True for pair in pairs)
@@ -305,11 +361,139 @@ def utility_summary(kind, report):
         if isinstance(entry, dict) and digest(entry.get("sha256")):
             identities[name] = entry["sha256"]
     complete = len(rows) == len(expected)
-    return dict(rows=rows, status="invalid" if invalid else "partial" if not complete else "measured_gate_failed" if cpu and not report["adoption_gate_pass"] else "measured",
+    return dict(rows=rows, status="invalid" if invalid else "partial" if not complete else "measured_gate_failed" if cpu and (not report["adoption_gate_pass"] or host_requested and not report.get("host_gate_pass")) else "measured",
                 completeness=dict(expected_rows=len(expected), observed_rows=len(rows), complete=complete),
                 baseline_revision=revision, source_sha256=identities,
                 protocol_sha256=hashlib.sha256(json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-                evidence_type="synthetic_cli_comparison" if cpu else "paired_public_operation_median_screen")
+                uncertainty_method=("mixed_output_bootstrap" if protocol.get("bootstrap_rng") == "LCG64 state with SplitMix64 output mixing and unbiased rejection sampling" else "legacy_stratified_bootstrap_unqualified") if cpu else "not_reported",
+                evidence_type="synthetic_and_exact_host_cli_comparison" if cpu and host_requested else "synthetic_cli_comparison" if cpu else "paired_public_operation_median_screen")
+
+
+FINGERPRINT_FIXTURES = ("ids16", "ids4096", "ids10000-unique-plus-duplicates", "ids50000", "xml10000",
+                        "xml10000-fromXml", "incremental16", "ids16-max255", "incremental25000-max255-spill")
+FINGERPRINT_UNCOMMON = {"xml10000-fromXml", "ids16-max255", "incremental25000-max255-spill"}
+
+
+def positive_interval(value):
+    return (isinstance(value, list) and len(value) == 2 and all(number(item) and item > 0 for item in value)
+            and value[0] <= value[1])
+
+
+def full_fingerprint_summary(kind, report):
+    protocol, source, measured = (report.get(key, {}) for key in ("protocol", "sources", "summary"))
+    if not all(isinstance(value, dict) for value in (protocol, source, measured)):
+        raise ValueError("Invalid full fingerprint report")
+    revision, baseline = UTILITY_BASELINES["fingerprint"]
+    entry = source.get("baseline", {})
+    invalid = (not isinstance(entry, dict) or entry.get("sha256") != baseline
+               or report.get("benchmark") != "nzb-article-fingerprint-paired-comparison"
+               or report.get("invalid_observations") != [] or report.get("adoption_qualified") is not False
+               or protocol.get("coverage") != "full" or protocol.get("backend") != kind.removeprefix("fingerprint-")
+               or bool(set(measured) - set(FINGERPRINT_FIXTURES)))
+    ordinary, tail = protocol.get("pairs_per_fixture"), protocol.get("tail_pairs_per_uncommon_fixture")
+    invalid |= not count(ordinary) or not 1 <= ordinary <= 5000
+    invalid |= tail is not None and (not count(tail) or not 1000 <= tail <= 5000)
+    rows = []
+    for name in FINGERPRINT_FIXTURES:
+        summary = measured.get(name)
+        if summary is None:
+            continue
+        if not isinstance(summary, dict):
+            invalid = True
+            continue
+        expected = tail if name in FINGERPRINT_UNCOMMON and tail is not None else ordinary
+        pairs = summary.get("pairs")
+        valid = (count(expected) and summary.get("pairs_total") == expected and summary.get("pairs_valid") == expected
+                 and isinstance(pairs, list) and len(pairs) == expected
+                 and all(isinstance(pair, dict) and pair.get("eligible") is True for pair in pairs))
+        if valid:
+            valid &= {pair.get("pair") for pair in pairs if count(pair.get("pair"))} == set(range(1, expected + 1))
+        for phase, prefix, metric_key in (("cold", "cold_", "cold_metrics"), ("repeated", "", "repeated_metrics")):
+            metrics = summary.get(metric_key)
+            row = dict(fixture=name, phase=phase, candidate_backend=kind.removeprefix("fingerprint-"),
+                       samples=summary.get("pairs_valid") if count(summary.get("pairs_valid")) else 0,
+                       p99_sample_sufficient=count(expected) and expected >= 1000,
+                       comparison="exact_public_fingerprint_operation")
+            good = valid and isinstance(metrics, dict) and metrics.get("eligible") is True
+            if isinstance(metrics, dict):
+                for key in ("baseline_median_ns", "candidate_median_ns", "paired_median_ratio"):
+                    if number(metrics.get(key)) and metrics[key] > 0:
+                        row[key] = metrics[key]
+                    else:
+                        good = False
+                interval = metrics.get("median_ratio_ci95")
+                sufficient = count(expected) and expected >= 11
+                good &= metrics.get("median_sample_sufficient") is sufficient
+                if sufficient and positive_interval(interval):
+                    row["median_ratio_ci95"] = interval
+                elif sufficient or interval is not None:
+                    good = False
+                else:
+                    row["median_ratio_ci95"] = None
+                decision = metrics.get("median_decision")
+                if decision in ("useful_improvement", "regression", "inconclusive", "invalid"):
+                    row["decision"] = decision
+                else:
+                    good = False
+                expected_decision = ("useful_improvement" if positive_interval(interval) and interval[0] >= 1.5 else
+                                     "regression" if positive_interval(interval) and interval[1] < 1 else "inconclusive")
+                good &= decision == expected_decision
+                if positive_interval(interval) and number(metrics.get("paired_median_ratio")):
+                    good &= interval[0] <= metrics["paired_median_ratio"] <= interval[1]
+                good &= metrics.get("p99_sample_sufficient") is row["p99_sample_sufficient"]
+                if row["p99_sample_sufficient"]:
+                    for key in ("baseline_p99_ns", "candidate_p99_ns", "p99_ratio"):
+                        if number(metrics.get(key)) and metrics[key] > 0:
+                            row[key] = metrics[key]
+                        else:
+                            good = False
+                    interval = metrics.get("p99_ratio_ci95")
+                    if positive_interval(interval):
+                        row["p99_ratio_ci95"] = interval
+                        row["p99_threshold_met"] = interval[0] >= 1.5
+                        good &= metrics.get("p99_threshold_met") is row["p99_threshold_met"]
+                    else:
+                        good = False
+                else:
+                    row.update(p99_ratio=None, p99_ratio_ci95=None, p99_threshold_met=None)
+                    good &= all(metrics.get(key) is None for key in ("baseline_p99_ns", "candidate_p99_ns", "p99_ratio", "p99_ratio_ci95", "p99_threshold_met"))
+            if valid and good:
+                baseline_values = [pair.get(prefix + "baseline_ns") for pair in pairs]
+                candidate_values = [pair.get(prefix + "candidate_ns") for pair in pairs]
+                good &= all(number(value) and value > 0 for value in baseline_values + candidate_values)
+                if good:
+                    expected_values = (statistics.median(baseline_values), statistics.median(candidate_values),
+                                       statistics.median([b / c for b, c in zip(baseline_values, candidate_values)]))
+                    good &= all(math.isclose(row[key], value, rel_tol=1e-12) for key, value in zip(
+                        ("baseline_median_ns", "candidate_median_ns", "paired_median_ratio"), expected_values))
+                    if row["p99_sample_sufficient"]:
+                        rank = math.ceil(0.99 * expected) - 1
+                        b, c = sorted(baseline_values)[rank], sorted(candidate_values)[rank]
+                        good &= all(math.isclose(row[key], value, rel_tol=1e-12) for key, value in zip(
+                            ("baseline_p99_ns", "candidate_p99_ns", "p99_ratio"), (b, c, b / c)))
+            row["eligible"] = bool(good and not invalid)
+            invalid |= not good
+            rows.append(row)
+    identities = {name: entry["sha256"] for name, entry in source.items()
+                  if name in ("baseline", "candidate", "composer_lock", "benchmark", "rust_cargo_lock", "rust_cargo_toml",
+                              "rust_accumulator", "rust_abi", "rust_worker", "php_worker", "native_library", "native_worker",
+                              "coordinator_binary", "php_binary", "vendor_installed", "xml_elements")
+                  and isinstance(entry, dict) and digest(entry.get("sha256"))}
+    complete = len(rows) == 2 * len(FINGERPRINT_FIXTURES)
+    return dict(rows=rows, status="invalid" if invalid else "measured" if complete else "partial",
+                completeness=dict(expected_rows=2 * len(FINGERPRINT_FIXTURES), observed_rows=len(rows), complete=complete),
+                baseline_revision=revision, source_sha256=identities,
+                protocol_sha256=hashlib.sha256(json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                evidence_type="paired_public_fingerprint_median_and_tail_screen")
+
+
+def resource_receipt():
+    """Verify the current run's retained endpoints and export only their hashes."""
+    spec = importlib.util.spec_from_file_location('benchmark_resources', Path(__file__).with_name('benchmark-resource-limits.py'))
+    resources = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(resources)
+    return resources.verified_receipt(Path('utility-evidence'))
+
 
 
 def env_count(key):
@@ -334,6 +518,19 @@ def export(kind, runner):
                 raise ValueError("Expected report object")
             summary.update(utility_summary(kind, report))
             summary["report_sha256"] = hashlib.sha256(report_raw).hexdigest()
+            protocol = report.get('protocol', {})
+            current = (isinstance(protocol, dict) and (kind.startswith('fingerprint-') and protocol.get('version') == 4
+                       or kind == 'cpu-snapshot' and count(protocol.get('host_pairs_opt_in')) and protocol['host_pairs_opt_in'] > 0))
+            if current:
+                try:
+                    summary.setdefault('source_sha256', {}).update(resource_receipt())
+                except (OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+                    summary['status'] = 'invalid'
+                    for row in summary['rows']:
+                        row['eligible'] = False
+                        for gate in ('gate_passed', 'p99_threshold_met'):
+                            if row.get(gate) is True:
+                                row[gate] = False
             runtime_file = Path("utility-evidence/runtime.json")
             if not runtime_file.is_file():
                 summary["status"] = "partial" if summary["status"] != "invalid" else "invalid"

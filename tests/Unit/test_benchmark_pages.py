@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import io
 import json
@@ -223,6 +224,97 @@ class PagesTest(unittest.TestCase):
             self.assertIn('Comparative', rows['article_fingerprint']['coverage'])
             self.assertIn('Comparative', rows['cpu_snapshot']['coverage'])
             self.assertEqual(rows['new_auxiliary']['coverage'], 'No automated benchmark')
+
+    def caller_summary(self, kind='sample-planning'):
+        root = Path(__file__).parents[2]
+        spec = importlib.util.spec_from_file_location('caller_fixture', root / 'tests/Unit/test_benchmark_callers_export.py')
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        spec = importlib.util.spec_from_file_location('caller_export', root / 'scripts/benchmark_callers_summary.py')
+        exporter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(exporter)
+        summary = exporter.caller_summary(kind, fixture.fixture(kind))
+        summary['source_sha256'].update(dict.fromkeys(pages.RESOURCE_HASHES, 'f' * 64))
+        summary.update(schema_version=1, kind=kind, runner='ubuntu-latest', head_sha=SHA,
+                       run_id=12, run_attempt=2, repository=pages.REPOSITORY, adoption_qualified=False,
+                       report_sha256='e' * 64, runtime_identity={'executed_sha': SHA})
+        return summary
+
+    def test_new_caller_workflow_matrix_and_safe_nullable_tail_are_published(self):
+        self.assertEqual(set(pages.WORKFLOWS['archive-sample-performance.yml']),
+                         {(kind, runner) for kind in ('sample-planning', 'archive-parsing')
+                          for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')})
+        for kind in ('sample-planning', 'archive-parsing'):
+            summary = self.caller_summary(kind)
+            pages.validate_summary(summary, self.run_row(), kind, 'ubuntu-latest')
+            rendered = pages.render(dict(head_sha=SHA, generated_at='fixture', workflows=[], coverage=[], results=[summary]))
+            self.assertIn('p99_unavailable', rendered)
+            self.assertIn('null, null', rendered)
+            self.assertNotIn('unpublished-synthetic-payload', rendered)
+
+    def test_caller_diagnostics_controls_and_unmeasured_tails_cannot_claim_speedups(self):
+        for kind, category, patch in (
+                ('archive-parsing', 'diagnostic', {'baseline_latency_ms': 10}),
+                ('archive-parsing', 'diagnostic', {'baseline_over_candidate': 3}),
+                ('sample-planning', 'dispatch_control', {'baseline_over_candidate': 2}),
+                ('sample-planning', 'uncommon', {'qualification_gate_passed': True}),
+                ('sample-planning', 'uncommon', {'metric': 'p99_latency'}),
+                ('sample-planning', 'uncommon', {'speedup_interval': [1.5, 3]}),
+                ('sample-planning', 'uncommon', {'baseline_over_candidate': 2})):
+            summary = self.caller_summary(kind)
+            next(row for row in summary['rows'] if row['category'] == category).update(patch)
+            with self.subTest(kind=kind, category=category, patch=patch), self.assertRaises(ValueError):
+                pages.validate_summary(summary, self.run_row(), kind, 'ubuntu-latest')
+
+    def test_caller_provenance_schema_identity_and_fixture_checks_fail_closed(self):
+        valid = self.caller_summary()
+        mutations = (
+            lambda s: s.update(report_sha256='private path'),
+            lambda s: s.update(protocol_sha256=None),
+            lambda s: s.update(runtime_identity={'executed_sha': 'b' * 40}),
+            lambda s: s.pop('runtime_identity'),
+            lambda s: s.update(source_sha256={'../private': 'a' * 64}),
+            lambda s: s['source_sha256'].update({'private_name': 'a' * 64}),
+            lambda s: s['source_sha256'].pop('resource_limits_comparison'),
+            lambda s: s.update(schema_version=True),
+            lambda s: s.update(head_sha='b' * 40),
+            lambda s: s.update(run_attempt=1),
+            lambda s: s['rows'].append(copy.deepcopy(s['rows'][0])),
+            lambda s: s['rows'][0].update(category='common'),
+            lambda s: s['rows'][0].update(private='secret'),
+            lambda s: s['rows'][0].update(samples=True),
+            lambda s: s['rows'].pop(),
+        )
+        for mutation in mutations:
+            summary = copy.deepcopy(valid)
+            mutation(summary)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                pages.validate_summary(summary, self.run_row(), 'sample-planning', 'ubuntu-latest')
+
+    def test_extended_fingerprint_sub1000_p99_and_cpu_gate_cannot_qualify(self):
+        summary = dict(schema_version=1, kind='fingerprint-ffi', runner='ubuntu-latest', head_sha=SHA,
+                       run_id=12, run_attempt=2, repository=pages.REPOSITORY, adoption_qualified=False,
+                       baseline_revision='a1a9b0829610c3b62e7d0bdb418669a89c36c90b', rows=[dict(
+                           fixture='ids16', phase='cold', samples=31, p99_sample_sufficient=False,
+                           p99_ratio=None, p99_ratio_ci95=None, p99_threshold_met=None)])
+        pages.validate_summary(summary, self.run_row(), 'fingerprint-ffi', 'ubuntu-latest')
+        summary['rows'][0]['p99_ratio'] = 2
+        with self.assertRaises(ValueError):
+            pages.validate_summary(summary, self.run_row(), 'fingerprint-ffi', 'ubuntu-latest')
+        summary.update(kind='cpu-snapshot', baseline_revision='5cc5303b502e653d83bba1951dec2f5d2da1db35',
+                       rows=[dict(fixture='host-live', comparison='exact_host_cli', samples=31,
+                                  p99_sample_sufficient=False, gate_passed=True)])
+        with self.assertRaises(ValueError):
+            pages.validate_summary(summary, self.run_row(), 'cpu-snapshot', 'ubuntu-latest')
+
+    def test_corrected_cpu_intervals_keep_separate_historical_caveat(self):
+        report = dict(head_sha=SHA, generated_at='fixture', workflows=[], coverage=[], results=[
+            dict(kind='cpu-snapshot', runner='ubuntu-latest', status='measured', rows=[],
+                 uncertainty_method='mixed_output_bootstrap')])
+        rendered = pages.render(report)
+        self.assertIn('corrected mixed-output resampling', rendered)
+        self.assertIn('Historical protocol limits', rendered)
+        self.assertIn('neither establishes production throughput or adoption', rendered)
 
     def test_frozen_reports_link_remains_separate_from_current_results(self):
         report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[], results=[], frozen_reports_available=True)

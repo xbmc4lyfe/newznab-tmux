@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -229,6 +230,17 @@ def export(kind, runner):
     summary["report_sha256"] = hasher.hexdigest()
     if malformed:
         summary["status"] = "invalid"
+    try:
+        spec = importlib.util.spec_from_file_location('benchmark_resources', Path(__file__).with_name('benchmark-resource-limits.py'))
+        resources = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(resources)
+        summary.setdefault('source_sha256', {}).update(resources.verified_receipt(Path('utility-evidence')))
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        summary['status'] = 'invalid'
+        for row in summary['rows']:
+            row['eligible'] = False
+            if 'qualification_gate_passed' in row:
+                row['qualification_gate_passed'] = False
     try:
         runtime = json.loads(Path("utility-evidence/runtime.json").read_text(), parse_constant=reject_constant, parse_float=finite_float)
         if not isinstance(runtime, dict) or runtime.get("executed_sha") != summary["head_sha"]:
