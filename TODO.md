@@ -321,3 +321,11 @@ The integrated Linux caller matched 1,440 native oracle cases and passed the dec
 - [ ] Independently review the final current head before squash merge. Refresh production ownership/source parity and M4 TLS connectivity before any guarded deployment; local MariaDB stays stopped. Measure natural live verification/publication and backlog changes separately from synthetic planner CPU speed.
 
 - [ ] Verify the self-hosted indexer scans the existing `indexer-conf.d/99-yenc-ffi.ini`, CLI FFI is callable, and the configured native path contains the new sampler symbol. Scheduled verification already opts in through `php -d ffi.enable=true`; keep web, Horizon and scheduler parent processes on their existing disabled FFI configuration. Retest the previously shipped native yEnc/CRC, identity/xref/date and PAR2/format/range modules as they become active.
+
+## Retest NIMA4K literal-name validation (2026-10-15)
+
+Bounded offline macOS validation at efc67e5531460f28e1508e9faf1c5ebe91ba2046 with the working-tree candidate: retained actual-parseHtml probe passed 6 tests/7 assertions; standalone Nima4kSource, BoundedHttpFeedSource, PredbFeedSources and HdworldFeedSource suite passed 175 tests/500 assertions. Both changed PHP files passed syntax lint and owned-path Pint (no source changes); final Pint --test and diff --check passed. Full configured PHPStan completed with zero errors (exit 0, 11.57 seconds); no baseline changes.
+
+The std-only Rust preflight prototype matched 95 exact result/error cases. Each common path used 10 paired warmups and 100 randomized measured pairs around the actual PHP caller, including startup/IPC/copies/reaping and unchanged DOM. Median native/Rust ratios for one/ten/100 cards were 0.01605/0.14413/0.44248. All fail the required 1.5 threshold: Rust was rejected on common paths and was not adopted; uncommon p99 remains unqualified. Private raw evidence, command receipts, source/lock hashes and comparison JSON: `/Users/allen/.codex/artifacts/nntmux-nima-literal-review-20261015-v1/`. No production/feed/network/Docker validation was performed.
+
+- [ ] Run full integrated/native retesting for this NIMA4K literal-name change on the final reviewed head in an isolated authorized environment; the bounded standalone suite and rejected Rust prototype do not complete that gate.

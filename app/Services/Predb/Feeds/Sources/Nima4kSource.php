@@ -62,6 +62,10 @@ final class Nima4kSource extends BoundedHttpFeedSource
         if ($html === '' || preg_match('//u', $html) !== 1) {
             throw new RuntimeException('NIMA4K returned invalid HTML.');
         }
+        // libxml can discard malformed characters before the literal labels are compared.
+        if (preg_match('/[\x{0000}-\x{0008}\x{000B}\x{000C}\x{000E}-\x{001F}\x{007F}-\x{009F}\x{FDD0}-\x{FDEF}\x{FFFE}-\x{FFFF}\x{1FFFE}-\x{1FFFF}\x{2FFFE}-\x{2FFFF}\x{3FFFE}-\x{3FFFF}\x{4FFFE}-\x{4FFFF}\x{5FFFE}-\x{5FFFF}\x{6FFFE}-\x{6FFFF}\x{7FFFE}-\x{7FFFF}\x{8FFFE}-\x{8FFFF}\x{9FFFE}-\x{9FFFF}\x{AFFFE}-\x{AFFFF}\x{BFFFE}-\x{BFFFF}\x{CFFFE}-\x{CFFFF}\x{DFFFE}-\x{DFFFF}\x{EFFFE}-\x{EFFFF}\x{FFFFE}-\x{FFFFF}\x{10FFFE}-\x{10FFFF}]/u', $html) !== 0) {
+            throw new RuntimeException('NIMA4K returned invalid HTML.');
+        }
         $invalidNumericReference = false;
         preg_replace_callback('/&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));?/', static function (array $match) use (&$invalidNumericReference): string {
             $hexadecimal = $match[1] !== '';
@@ -72,7 +76,10 @@ final class Nima4kSource extends BoundedHttpFeedSource
             $tooLarge = strlen($normalized) > strlen($limit)
                 || (strlen($normalized) === strlen($limit) && strcmp($normalized, $limit) > 0);
             $codepoint = $tooLarge ? 0 : (int) ($hexadecimal ? hexdec($normalized) : $normalized);
-            if ($tooLarge || $codepoint === 0 || ($codepoint >= 0xD800 && $codepoint <= 0xDFFF)) {
+            if ($tooLarge || $codepoint <= 8 || $codepoint === 11 || $codepoint === 12
+                || ($codepoint >= 14 && $codepoint <= 31) || ($codepoint >= 127 && $codepoint <= 159)
+                || ($codepoint >= 0xD800 && $codepoint <= 0xDFFF) || ($codepoint >= 0xFDD0 && $codepoint <= 0xFDEF)
+                || ($codepoint & 0xFFFF) >= 0xFFFE) {
                 $invalidNumericReference = true;
             }
 

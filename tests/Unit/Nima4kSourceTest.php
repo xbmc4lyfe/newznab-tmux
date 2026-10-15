@@ -89,6 +89,91 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('malformedLiteralCharacters')]
+    public function malformed_characters_cannot_be_repaired_into_agreeing_names(string $character, bool $inCover): void
+    {
+        $card = $this->card('Exact.Release-GRP');
+        $html = $inCover
+            ? str_replace('alt="Exact.Release-GRP"', 'alt="Exact.'.$character.'Release-GRP"', $card)
+            : str_replace('>Exact.Release-GRP</span>', '>Exact.'.$character.'Release-GRP</span>', $card);
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function malformedLiteralCharacters(): array
+    {
+        $characters = [
+            'raw nul' => "\0",
+            'raw low control' => "\x01",
+            'raw backspace' => "\x08",
+            'raw vertical tab' => "\x0b",
+            'raw form feed fails closed' => "\x0c",
+            'raw shift out' => "\x0e",
+            'raw unit separator' => "\x1f",
+            'raw delete' => "\x7f",
+            'raw C1 start' => "\u{80}",
+            'raw C1 end' => "\u{9f}",
+            'raw noncharacter range start' => "\u{fdd0}",
+            'raw noncharacter range end' => "\u{fdef}",
+            'raw BMP plane end' => "\u{fffe}",
+            'raw BMP final codepoint' => "\u{ffff}",
+            'raw supplementary plane end' => "\u{1fffe}",
+            'raw final plane end' => "\u{10ffff}",
+            'decimal low control' => '&#1;',
+            'hex low control' => '&#x1;',
+            'padded uppercase control' => '&#X00001;',
+            'semicolonless control' => '&#1',
+            'numeric backspace' => '&#8;',
+            'numeric vertical tab' => '&#11;',
+            'numeric form feed fails closed' => '&#12;',
+            'numeric shift out' => '&#14;',
+            'numeric unit separator' => '&#31;',
+            'numeric C1 start' => '&#128;',
+            'numeric C1 end' => '&#159;',
+            'numeric noncharacter range start' => '&#xFDD0;',
+            'numeric noncharacter range end' => '&#xFDEF;',
+            'numeric BMP plane end' => '&#xFFFE;',
+            'numeric BMP final codepoint' => '&#65535;',
+            'numeric supplementary plane end' => '&#x1FFFE;',
+            'numeric final plane end' => '&#x10FFFF;',
+            'numeric surrogate' => '&#xD800;',
+            'numeric above Unicode maximum' => '&#1114112;',
+            'numeric integer overflow' => '&#999999999999999999999999999999;',
+        ];
+        $cases = [];
+        foreach ($characters as $label => $character) {
+            $cases[$label.' in subtitle'] = [$character, false];
+            $cases[$label.' in cover'] = [$character, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    public function valid_formatting_and_entities_preserve_single_pass_literal_names(): void
+    {
+        $html = "\t\r\n".$this->card('Léon_天空.&amp;&#1;.DD+5.1-GRP')."\r\n\t";
+        $html = str_replace('<h2>', "<h2>\r\n\t", $html);
+        $html = str_replace('>Léon_天空.', ">\t\r\nLéon_天空.", $html);
+        $html = str_replace('</span>', "\t\r\n</span>", $html);
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertCount(1, $entries);
+        $this->assertSame('Léon_天空.&amp;&#1;.DD+5.1-GRP', $entries[0]->title);
+    }
+
+    #[Test]
+    public function malformed_characters_after_the_record_limit_still_reject_the_listing(): void
+    {
+        $html = $this->card('First.Release-GRP').str_replace('Second.Release-GRP</span>', 'Second.&#1;Release-GRP</span>', $this->card('Second.Release-GRP'));
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    #[Test]
     public function supplied_oversized_html_is_rejected(): void
     {
         $this->expectException(RuntimeException::class);
