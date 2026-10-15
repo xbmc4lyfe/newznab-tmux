@@ -785,6 +785,7 @@ mod tests {
                             let source = 16 + gap;
                             let mut storage = vec![0xcc; source + width + 16];
                             storage[source..source + width].copy_from_slice(&input);
+                            let before = storage.clone();
                             let (read, written) = unsafe {
                                 if end {
                                     prefix::<true, true>(
@@ -803,6 +804,7 @@ mod tests {
                             assert!(read <= position, "width={width} position={position}");
                             assert_eq!(read, written);
                             assert!(storage[16..16 + written].iter().all(|&byte| byte == b'A'));
+                            assert_eq!(&storage[16 + width..], &before[16 + width..]);
                             assert_eq!(&storage[source + read..source + width], &input[read..]);
                             assert!(storage[..16].iter().all(|&byte| byte == 0xcc));
                             assert!(storage[source + width..].iter().all(|&byte| byte == 0xcc));
@@ -901,6 +903,7 @@ mod tests {
             let source = 16 + gap;
             let mut storage = vec![0xcc; source + input.len() + 16];
             storage[source..source + input.len()].copy_from_slice(&input);
+            let before = storage.clone();
             let (read, written) = unsafe {
                 prefix::<false, false>(
                     storage.as_ptr().add(source),
@@ -910,6 +913,7 @@ mod tests {
             };
             assert_eq!((read, written), (128, 64));
             assert!(storage[16..80].iter().all(|&byte| byte == b'A'));
+            assert_eq!(&storage[16 + input.len()..], &before[16 + input.len()..]);
             assert_eq!(&storage[source + read..source + input.len()], b"=");
             assert!(storage[..16].iter().all(|&byte| byte == 0xcc));
             assert!(
