@@ -79,6 +79,17 @@ class FileNameCleaner
         '/\.\d{3}$/i',
     ];
 
+    /** @return list<string> */
+    public static function archiveSuffixPatterns(): array
+    {
+        return [
+            '/\.7z\.\d{2,4}$/i',
+            '/\.part\d+\.rar$/i',
+            ...self::ARCHIVE_PATTERNS,
+            '/\.(zst|tgz|lz4|enc|rev)$/i',
+        ];
+    }
+
     /**
      * Video file extension pattern.
      */
@@ -131,10 +142,7 @@ class FileNameCleaner
     private function stripKnownFileSuffixes(string $fileName, bool $preserveCodecAfterWrapper): string
     {
         $wrappers = [
-            '/\.7z\.\d{2,4}$/i',
-            '/\.part\d+\.rar$/i',
-            ...self::ARCHIVE_PATTERNS,
-            '/\.(zst|tgz|lz4|enc|rev)$/i',
+            ...self::archiveSuffixPatterns(),
             '/\.vol\d+[+-]\d+$/i',
             '/\.part\d*$/i',
             '/\.(nfo|sfv|nzb|srr|srs)$/i',

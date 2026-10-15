@@ -60,7 +60,7 @@ final class NzbSplitUnwrapper
             return $value;
         }
         $filename = substr($value, 0, $trailer[0][1]);
-        foreach (self::TRAILING_ARCHIVE_PATTERNS as $pattern) {
+        foreach (FileNameCleaner::archiveSuffixPatterns() as $pattern) {
             if (preg_match($pattern, $filename) === 1) {
                 return $filename;
             }
