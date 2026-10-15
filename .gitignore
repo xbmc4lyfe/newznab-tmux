@@ -95,9 +95,9 @@ infra/terraform/**/backend.hcl
 # Generated deployment test bytecode
 deploy/**/__pycache__/
 
-# Native installs build from the committed frontend dependency lock.
+# Production image builds use the committed frontend dependency lock.
 !/package-lock.json
-# Operator inventories/settings and Vault files stay outside version control.
+# Keep legacy operator inventories and cached facts private after upgrades.
 /infra/ansible/inventory/*.yml
 /infra/ansible/inventory/*.json
 /infra/ansible/.cache/

@@ -1,0 +1,538 @@
+{
+  "schema_version": 1,
+  "kind": "profile",
+  "runner": "ubuntu-latest",
+  "head_sha": "57dfddcfd029b361e92c4d6ddae21b200b57323b",
+  "run_id": 38655034947,
+  "run_attempt": 1,
+  "repository": "xbmc4lyfe/newznab-tmux",
+  "status": "ok",
+  "rows": [
+    {
+      "size": 4096,
+      "density": "ordinary",
+      "phase": "full-analyzer",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.734119,
+      "min_ms": 0.701478,
+      "max_ms": 0.756732
+    },
+    {
+      "size": 4096,
+      "density": "ordinary",
+      "phase": "framing",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.037811,
+      "min_ms": 0.035627,
+      "max_ms": 0.048702
+    },
+    {
+      "size": 4096,
+      "density": "ordinary",
+      "phase": "headers",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.051938,
+      "min_ms": 0.048972,
+      "max_ms": 0.059051
+    },
+    {
+      "size": 4096,
+      "density": "ordinary",
+      "phase": "body-metadata",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "body_ffi_median_ms": {
+        "allocate_and_memcpy": 0.000711,
+        "native_parse_and_serialize": 0.011412,
+        "ffi_string_and_free": 0.000481,
+        "json_decode": 0.002044
+      },
+      "median_ms": 0.022873,
+      "min_ms": 0.020308,
+      "max_ms": 0.040075
+    },
+    {
+      "size": 4096,
+      "density": "ordinary",
+      "phase": "relationship",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.055925,
+      "min_ms": 0.049002,
+      "max_ms": 0.093055
+    },
+    {
+      "size": 4096,
+      "density": "ordinary",
+      "phase": "raw-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.006763,
+      "min_ms": 0.006462,
+      "max_ms": 0.007294
+    },
+    {
+      "size": 4096,
+      "density": "ordinary",
+      "phase": "whole-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.016221,
+      "min_ms": 0.014938,
+      "max_ms": 0.020127
+    },
+    {
+      "size": 4096,
+      "density": "heavy",
+      "phase": "full-analyzer",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 3.031084,
+      "min_ms": 3.015545,
+      "max_ms": 3.061571
+    },
+    {
+      "size": 4096,
+      "density": "heavy",
+      "phase": "framing",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.043431,
+      "min_ms": 0.037641,
+      "max_ms": 0.065082
+    },
+    {
+      "size": 4096,
+      "density": "heavy",
+      "phase": "headers",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.052578,
+      "min_ms": 0.049483,
+      "max_ms": 0.061275
+    },
+    {
+      "size": 4096,
+      "density": "heavy",
+      "phase": "body-metadata",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "body_ffi_median_ms": {
+        "allocate_and_memcpy": 0.000872,
+        "native_parse_and_serialize": 0.018484,
+        "ffi_string_and_free": 0.000511,
+        "json_decode": 0.002063
+      },
+      "median_ms": 0.03175,
+      "min_ms": 0.028574,
+      "max_ms": 0.049192
+    },
+    {
+      "size": 4096,
+      "density": "heavy",
+      "phase": "relationship",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.038783,
+      "min_ms": 0.03729,
+      "max_ms": 0.045695
+    },
+    {
+      "size": 4096,
+      "density": "heavy",
+      "phase": "raw-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.011602,
+      "min_ms": 0.011412,
+      "max_ms": 0.011892
+    },
+    {
+      "size": 4096,
+      "density": "heavy",
+      "phase": "whole-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.025458,
+      "min_ms": 0.023525,
+      "max_ms": 0.05298
+    },
+    {
+      "size": 524288,
+      "density": "ordinary",
+      "phase": "full-analyzer",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 14.729531,
+      "min_ms": 14.072477,
+      "max_ms": 15.121898
+    },
+    {
+      "size": 524288,
+      "density": "ordinary",
+      "phase": "framing",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.288492,
+      "min_ms": 0.283292,
+      "max_ms": 0.312608
+    },
+    {
+      "size": 524288,
+      "density": "ordinary",
+      "phase": "headers",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.054101,
+      "min_ms": 0.051096,
+      "max_ms": 0.071895
+    },
+    {
+      "size": 524288,
+      "density": "ordinary",
+      "phase": "body-metadata",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "body_ffi_median_ms": {
+        "allocate_and_memcpy": 0.029335,
+        "native_parse_and_serialize": 1.266029,
+        "ffi_string_and_free": 0.000932,
+        "json_decode": 0.002926
+      },
+      "median_ms": 1.312977,
+      "min_ms": 1.281047,
+      "max_ms": 1.355396
+    },
+    {
+      "size": 524288,
+      "density": "ordinary",
+      "phase": "relationship",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 1.345939,
+      "min_ms": 1.333265,
+      "max_ms": 1.367719
+    },
+    {
+      "size": 524288,
+      "density": "ordinary",
+      "phase": "raw-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.659188,
+      "min_ms": 0.645122,
+      "max_ms": 0.678575
+    },
+    {
+      "size": 524288,
+      "density": "ordinary",
+      "phase": "whole-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 1.008665,
+      "min_ms": 0.945687,
+      "max_ms": 1.051275
+    },
+    {
+      "size": 524288,
+      "density": "heavy",
+      "phase": "full-analyzer",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 21.700418,
+      "min_ms": 20.938396,
+      "max_ms": 21.74931
+    },
+    {
+      "size": 524288,
+      "density": "heavy",
+      "phase": "framing",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.56435,
+      "min_ms": 0.487967,
+      "max_ms": 0.582585
+    },
+    {
+      "size": 524288,
+      "density": "heavy",
+      "phase": "headers",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.049743,
+      "min_ms": 0.048542,
+      "max_ms": 0.059862
+    },
+    {
+      "size": 524288,
+      "density": "heavy",
+      "phase": "body-metadata",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "body_ffi_median_ms": {
+        "allocate_and_memcpy": 0.053,
+        "native_parse_and_serialize": 2.164256,
+        "ffi_string_and_free": 0.001001,
+        "json_decode": 0.003016
+      },
+      "median_ms": 2.323995,
+      "min_ms": 2.206916,
+      "max_ms": 2.373679
+    },
+    {
+      "size": 524288,
+      "density": "heavy",
+      "phase": "relationship",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 2.348552,
+      "min_ms": 2.249676,
+      "max_ms": 2.387966
+    },
+    {
+      "size": 524288,
+      "density": "heavy",
+      "phase": "raw-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 1.167022,
+      "min_ms": 1.103453,
+      "max_ms": 1.179155
+    },
+    {
+      "size": 524288,
+      "density": "heavy",
+      "phase": "whole-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 2.139599,
+      "min_ms": 2.101197,
+      "max_ms": 2.246289
+    },
+    {
+      "size": 1048576,
+      "density": "ordinary",
+      "phase": "full-analyzer",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 27.489583,
+      "min_ms": 27.400346,
+      "max_ms": 27.823623
+    },
+    {
+      "size": 1048576,
+      "density": "ordinary",
+      "phase": "framing",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.608694,
+      "min_ms": 0.530888,
+      "max_ms": 0.631696
+    },
+    {
+      "size": 1048576,
+      "density": "ordinary",
+      "phase": "headers",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.054372,
+      "min_ms": 0.049753,
+      "max_ms": 0.080782
+    },
+    {
+      "size": 1048576,
+      "density": "ordinary",
+      "phase": "body-metadata",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "body_ffi_median_ms": {
+        "allocate_and_memcpy": 0.061416,
+        "native_parse_and_serialize": 2.515947,
+        "ffi_string_and_free": 0.001071,
+        "json_decode": 0.003357
+      },
+      "median_ms": 2.671118,
+      "min_ms": 2.580418,
+      "max_ms": 2.723406
+    },
+    {
+      "size": 1048576,
+      "density": "ordinary",
+      "phase": "relationship",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 2.798357,
+      "min_ms": 2.781595,
+      "max_ms": 2.845866
+    },
+    {
+      "size": 1048576,
+      "density": "ordinary",
+      "phase": "raw-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 1.438573,
+      "min_ms": 1.413866,
+      "max_ms": 1.456536
+    },
+    {
+      "size": 1048576,
+      "density": "ordinary",
+      "phase": "whole-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 2.134189,
+      "min_ms": 2.097049,
+      "max_ms": 2.196125
+    },
+    {
+      "size": 1048576,
+      "density": "heavy",
+      "phase": "full-analyzer",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 37.612551,
+      "min_ms": 37.528333,
+      "max_ms": 39.217666
+    },
+    {
+      "size": 1048576,
+      "density": "heavy",
+      "phase": "framing",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 1.012543,
+      "min_ms": 0.956326,
+      "max_ms": 1.044282
+    },
+    {
+      "size": 1048576,
+      "density": "heavy",
+      "phase": "headers",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 0.050635,
+      "min_ms": 0.049603,
+      "max_ms": 0.061205
+    },
+    {
+      "size": 1048576,
+      "density": "heavy",
+      "phase": "body-metadata",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "body_ffi_median_ms": {
+        "allocate_and_memcpy": 0.103845,
+        "native_parse_and_serialize": 4.299347,
+        "ffi_string_and_free": 0.000882,
+        "json_decode": 0.002555
+      },
+      "median_ms": 4.532445,
+      "min_ms": 4.461241,
+      "max_ms": 4.592127
+    },
+    {
+      "size": 1048576,
+      "density": "heavy",
+      "phase": "relationship",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 4.703696,
+      "min_ms": 4.696152,
+      "max_ms": 4.726179
+    },
+    {
+      "size": 1048576,
+      "density": "heavy",
+      "phase": "raw-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 2.318536,
+      "min_ms": 2.288309,
+      "max_ms": 2.348192
+    },
+    {
+      "size": 1048576,
+      "density": "heavy",
+      "phase": "whole-body",
+      "eligible": true,
+      "status": "ok",
+      "samples": 7,
+      "median_ms": 4.176006,
+      "min_ms": 4.06148,
+      "max_ms": 4.208206
+    }
+  ],
+  "evidence_type": "diagnostic_only",
+  "adoption_qualified": false,
+  "completeness": {
+    "expected_rows": 42,
+    "observed_rows": 42,
+    "complete": true
+  },
+  "source_and_library_identities_stable": true,
+  "instrumentation_identities_stable": true,
+  "source_sha256": {
+    "vendor/composer/installed.json": "9cbae4e09630824e80bb17bf5470afaf2ac8a07ff6b933392ce96ec4b57a896c",
+    "app/Services/Releases/Fingerprint/NativeMetadataParser.php": "13d871ed4647ca01f9e4457b9190c38add2987e269a7c7ae1ef8fe32d46b26b0",
+    "app/Services/YencService.php": "f906e5ef85cff2ed4755fcea5a7690043daa38a818f0e6d4ee7d30c14a87706a",
+    "app/Services/NNTP/NNTPService.php": "ec94b2c96c07ea9958305f9959ec9c401af2386d71161ad388f9340b729d4fdd",
+    "tests/Fixtures/YencArticles.php": "b100f4567e5e722335f10d758d6872aa086e37d8689a5828d38634a14e9a5c2c",
+    "docker/app/nzb-yenc-ffi/src/lib.rs": "50c88c7f3fd5e6f481c6811c70652125116a60bbbf2b3504fd456a8b7f5ce76d",
+    "tests/Support/YencNntpHarness.php": "db660242d67eebe633cc972f59884d83ee2c37f2d04e7364e8e53a391188e8aa",
+    "composer.lock": "ee1360f9ab65dbd1d3435cc2d986a2d4a3f2069ba8e129222df3889facdd5be8",
+    "app/Services/Releases/Fingerprint/NzbFingerprintAnalyzer.php": "01fdcc1ae16bd1100e894610cbeaa5dea544001a988ed13f7fa4c18c9467a961",
+    "docker/app/nzb-yenc-ffi/Cargo.toml": "bc7f6c7f61bd00bd978ae6f817666f544562f5aff72feac709fa5bf6fe36f02d",
+    "docker/app/nzb-yenc-ffi/Cargo.lock": "77b88ca781e79d95668cb5cb2d8bb61b89d3b3c4dd0892cdc86d4b260dffb55d",
+    "scripts/benchmark-yenc.php": "33bb0b26ccd391650f9f099ef7a5d7951c5547e95c537977faea56e5ecc34843",
+    "docker/app/nzb-yenc-ffi/src/release_names.rs": "5f16c3cd04a0706492e7577a6d7832bd06f8675713258c046624764aa3ef3087",
+    "scripts/benchmark-article-processing.php": "9c225269a06e261e05806fa240e18111e1fbfc4ac864a9d9c4a71efd872169a4"
+  },
+  "library_sha256": {
+    "native": "6db926bc9e55b913e2041a5deb7a3a589f39bfd2d1649f9fa1698a0c320f3422"
+  }
+}
