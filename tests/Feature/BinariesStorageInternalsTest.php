@@ -857,7 +857,7 @@ class BinariesStorageInternalsTest extends TestCase
         $this->assertBackfillPosition(501, 0);
         $this->assertSame([], $nntp->ranges);
         $this->assertSame(100, DB::table('missed_parts')->count());
-        $this->assertSame(1, (int) DB::table('missed_parts')->value('attempts'));
+        $this->assertSame(0, (int) DB::table('missed_parts')->value('attempts'));
     }
 
     public function test_partrepair_capacity_pause_preserves_existing_attempts_and_queue(): void
@@ -880,8 +880,10 @@ class BinariesStorageInternalsTest extends TestCase
         try {
             $this->backfillBinaries($nntp)->scan($this->backfillGroup(), 401, 500, 'backfill');
             $this->fail('Repair persistence failure must propagate.');
-        } catch (QueryException $error) {
+        } catch (\RuntimeException $error) {
             $this->assertStringContainsString('repair storage unavailable', $error->getMessage());
+            $this->assertInstanceOf(\RuntimeException::class, $error->getPrevious());
+            $this->assertStringContainsString('Verification backlog', $error->getPrevious()->getMessage());
         }
         $this->assertBackfillPosition(501, 0);
         $this->assertSame([], $nntp->ranges);
@@ -1198,10 +1200,12 @@ class BinariesStorageInternalsTest extends TestCase
         return $header;
     }
 
+    /** @return NNTPService&object{ranges: list<string>, selections: int} */
     private function backfillNntp(): NNTPService
     {
         return new class(fn (int $number): array => $this->backfillHeader($number)) extends NNTPService
         {
+            /** @var list<string> */
             public array $ranges = [];
 
             public int $selections = 0;
