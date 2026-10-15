@@ -339,6 +339,99 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
         $this->assertSame($bytes, DB::table('release_verification_state')->value('pending_bytes'));
     }
 
+    public function test_unknown_preparation_updates_are_immediate_with_individual_retry_timestamps(): void
+    {
+        $this->freezeTime();
+        foreach (['first-unknown', 'second-unknown'] as $identity) {
+            app(CandidateRepository::class)->enqueue($this->manifest($identity));
+        }
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        foreach (DB::table('release_verification_candidates')->get() as $row) {
+            file_put_contents(app(ManifestStore::class)->path($row->manifest_path), 'invalid gzip');
+        }
+        $observed = [];
+        DB::listen(function (QueryExecuted $query) use (&$observed): void {
+            if (! str_starts_with($query->sql, 'update') || ! str_contains($query->sql, 'release_verification_candidates')) {
+                return;
+            }
+            $observed[] = DB::table('release_verification_candidates')->orderBy('id')->get(['status', 'next_attempt_at'])->toArray();
+            if (count($observed) === 1) {
+                $this->travel(1)->seconds();
+            }
+        });
+        $this->assertSame(2, app(CandidatePreparationService::class)->prepare(2, 30));
+        $this->assertCount(2, $observed);
+        $this->assertSame(['unknown', 'pending'], array_column($observed[0], 'status'));
+        $this->assertSame(['unknown', 'unknown'], array_column($observed[1], 'status'));
+        $this->assertSame($observed[0][0]->next_attempt_at, $observed[1][0]->next_attempt_at);
+        $this->assertSame(1, strtotime($observed[1][1]->next_attempt_at) - strtotime($observed[1][0]->next_attempt_at));
+    }
+
+    public function test_unknown_preparation_does_not_overwrite_a_new_generation_after_selection(): void
+    {
+        app(CandidateRepository::class)->enqueue($this->manifest('unknown-generation'));
+        DB::table('release_verification_candidates')->update(['status' => 'pending', 'reason' => 'retained']);
+        $before = DB::table('release_verification_candidates')->sole();
+        file_put_contents(app(ManifestStore::class)->path($before->manifest_path), 'invalid gzip');
+        $changedGeneration = false;
+        DB::listen(static function (QueryExecuted $query) use (&$changedGeneration): void {
+            if (! $changedGeneration && str_starts_with($query->sql, 'select') && str_contains($query->sql, '"manifest_path"') && str_contains($query->sql, 'order by')) {
+                $changedGeneration = true;
+                DB::table('release_verification_candidates')->increment('version');
+            }
+        });
+        $report = [];
+        $this->assertSame(0, app(CandidatePreparationService::class)->prepare(1, 30, observer: static function (array $value) use (&$report): void {
+            $report = $value;
+        }));
+        $after = DB::table('release_verification_candidates')->sole();
+        $this->assertTrue($changedGeneration);
+        $this->assertSame('pending', $after->status);
+        $this->assertSame('retained', $after->reason);
+        $this->assertSame($before->next_attempt_at, $after->next_attempt_at);
+        $this->assertSame(1, $report['zero_row_updates']);
+    }
+
+    public function test_failed_unknown_update_preserves_the_committed_prefix(): void
+    {
+        $this->assertUnknownUpdateFailureBoundary(false);
+    }
+
+    public function test_failed_unknown_update_preserves_the_callers_rollback_boundary(): void
+    {
+        $this->assertUnknownUpdateFailureBoundary(true);
+    }
+
+    private function assertUnknownUpdateFailureBoundary(bool $outerTransaction): void
+    {
+        foreach (['prefix-unknown', 'failure-unknown'] as $identity) {
+            app(CandidateRepository::class)->enqueue($this->manifest($identity));
+        }
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $rows = DB::table('release_verification_candidates')->orderBy('id')->get();
+        foreach ($rows as $row) {
+            file_put_contents(app(ManifestStore::class)->path($row->manifest_path), 'invalid gzip');
+        }
+        $failureId = (int) $rows[1]->id;
+        DB::unprepared("CREATE TRIGGER fail_unknown_update BEFORE UPDATE ON release_verification_candidates WHEN NEW.status = 'unknown' AND NEW.id = {$failureId} BEGIN SELECT RAISE(ABORT, 'qualification scalar failure'); END");
+        if ($outerTransaction) {
+            DB::beginTransaction();
+        }
+        try {
+            app(CandidatePreparationService::class)->prepare(2, 30);
+            $this->fail('The second update failure must propagate.');
+        } catch (QueryException $failure) {
+            $this->assertStringContainsString('qualification scalar failure', $failure->getMessage());
+            $this->assertSame(['unknown', 'pending'], DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+        } finally {
+            if ($outerTransaction) {
+                DB::rollBack();
+            }
+            DB::unprepared('DROP TRIGGER fail_unknown_update');
+        }
+        $this->assertSame($outerTransaction ? ['pending', 'pending'] : ['unknown', 'pending'], DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+    }
+
     public function test_preparation_deadline_stops_before_the_next_metadata_read(): void
     {
         app(CandidateRepository::class)->enqueue($this->manifest('deadline'));

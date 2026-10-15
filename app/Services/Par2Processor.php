@@ -11,6 +11,7 @@ use App\Models\ReleaseFile;
 use App\Models\UsenetGroup;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NNTP\NNTPService;
+use App\Support\Par2DescriptorEvidence;
 use App\Support\Par2FileHashEvidence;
 use dariusiii\rarinfo\Par2Info;
 use Illuminate\Support\Carbon;
@@ -152,6 +153,12 @@ class Par2Processor
         $aborted = new RuntimeException('PAR2 inventory ownership or release snapshot changed.');
         try {
             return DB::transaction(function () use ($query, $files, $evidence, $inventory, $complete, $show, $canPersist, $aborted): Par2RenameOutcome {
+                $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                if (! Par2DescriptorEvidence::remember($inventory,
+                    ['id' => (int) $query->id, 'guid' => (string) $query->guid, 'name' => $query->name,
+                        'searchname' => $query->searchname, 'predb_id' => 0, 'isrenamed' => 0], $canPersist)) {
+                    throw $aborted;
+                }
                 $this->assertInventorySnapshot($query, $canPersist, $aborted);
                 foreach ($evidence as $file) {
                     if (! isset($file['hash'], $file['hash_16K'])) {

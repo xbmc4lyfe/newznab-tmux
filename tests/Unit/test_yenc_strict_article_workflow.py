@@ -78,24 +78,31 @@ class StrictArticleWorkflowTest(unittest.TestCase):
         self.assertIn('runs-on: ${{ matrix.runner }}', job)
         self.assertIn('timeout-minutes: 90', job)
         group = re.search(r'^  group: (.+)$', self.workflow, re.MULTILINE)[1]
-        self.assertTrue(group.startswith('yenc-performance-${{ github.ref }}'))
-        suffix = group.split('}}', 1)[1]
+        prefix = 'yenc-performance-${{ github.ref }}-${{ github.event_name }}'
+        self.assertTrue(group.startswith(prefix))
+        suffix = group[len(prefix):]
         self.assertTrue(suffix.startswith('${{ ') and suffix.endswith(' }}'))
         suffix = suffix[4:-3]
         choices = ['all', 'php', 'cpp', 'profile', 'processing', JOB]
         self.assertIn('options: [' + ', '.join(choices) + ']', self.workflow)
         incumbent = ['paired-decoding', 'article-processing', 'php-decoding']
+        groups = {}
         for event in ['push', 'pull_request', 'workflow_dispatch']:
             for selection in choices:
                 wanted = event == 'workflow_dispatch' and selection == JOB
                 self.assertEqual(wanted, bool(self.evaluate(predicate, event, selection)))
                 self.assertEqual('-strict-article-experiment' if wanted else '',
                                  self.evaluate(suffix, event, selection))
+                groups[event, selection] = ('yenc-performance-refs/heads/example-' + event
+                                            + self.evaluate(suffix, event, selection))
                 if wanted:
                     for name in incumbent:
                         body = self.workflow.split('\n  ' + name + ':\n', 1)[1]
                         condition = re.search(r'^    if: (.+)$', body, re.MULTILINE)[1]
                         self.assertFalse(self.evaluate(condition, event, selection), name)
+        self.assertEqual(4, len({groups['push', 'all'], groups['pull_request', 'all'],
+                                 groups['workflow_dispatch', 'all'],
+                                 groups['workflow_dispatch', JOB]}))
 
     def test_reservation_collision_never_publishes_ownership_or_changes_existing_files(self):
         with tempfile.TemporaryDirectory() as directory:

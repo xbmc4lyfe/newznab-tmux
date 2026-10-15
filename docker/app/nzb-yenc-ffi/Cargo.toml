@@ -7,7 +7,10 @@ license = "GPL-3.0-only"
 publish = false
 
 [features]
+default = []
 experimental-strict-article = []
+# Experimental only until full-caller correctness and performance gates pass.
+experimental-xz-index = []
 
 [lib]
 name = "nzbyenc"

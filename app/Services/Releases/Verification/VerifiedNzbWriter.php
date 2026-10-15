@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Services\Nzb\NzbService;
+use App\Support\NzbPasswordMetadata;
 use RuntimeException;
 use XMLWriter;
 
@@ -64,7 +65,11 @@ final class VerifiedNzbWriter
         $xml->writeAttribute('xmlns', 'http://www.newzbin.com/DTD/2003/nzb');
         $inventory = max((int) ($manifest['expected_files'] ?? 0), (int) ($manifest['verified_file_count'] ?? 0),
             count(array_filter($manifest['files'], static fn (array $file): bool => $file['segments'] !== [])));
-        if ($inventory > 0 || ($manifest['verification_mode'] ?? null) === 'spot_check') {
+        $passwords = array_key_exists('passwords', $manifest) ? $manifest['passwords'] : [];
+        if (! NzbPasswordMetadata::isValid($passwords)) {
+            throw new RuntimeException('Invalid verified NZB password metadata.');
+        }
+        if ($inventory > 0 || ($manifest['verification_mode'] ?? null) === 'spot_check' || $passwords !== []) {
             $xml->startElement('head');
             if (($manifest['verification_mode'] ?? null) === 'spot_check') {
                 if ($inventory > 0) {
@@ -81,6 +86,12 @@ final class VerifiedNzbWriter
                 $xml->startElement('meta');
                 $xml->writeAttribute('type', 'nntmux:verified-file-count');
                 $xml->text((string) $inventory);
+                $xml->endElement();
+            }
+            foreach ($passwords as $password) {
+                $xml->startElement('meta');
+                $xml->writeAttribute('type', 'password');
+                $xml->text($password);
                 $xml->endElement();
             }
             $xml->endElement();

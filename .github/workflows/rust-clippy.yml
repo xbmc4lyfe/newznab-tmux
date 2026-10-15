@@ -35,11 +35,21 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify Rust setup failure handling
+        run: python3 tests/Unit/test_clippy_toolchain.py -v
+
       - name: Install Rust toolchain
-        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --component rustfmt
+        shell: bash
+        run: source scripts/clippy-rust-toolchain.sh
 
       - name: Check Rust formatting
         run: cargo +"$RUST_TOOLCHAIN" fmt --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --all -- --check
+
+      - name: Test incumbent default Rust library
+        run: cargo +"$RUST_TOOLCHAIN" test --locked --jobs 2 --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib
+
+      - name: Test experimental XZ Index library
+        run: cargo +"$RUST_TOOLCHAIN" test --locked --jobs 2 --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib --features experimental-xz-index
 
       - name: Install SARIF converter
         run: cargo +"$RUST_TOOLCHAIN" install --locked clippy-sarif --version 0.8.0
