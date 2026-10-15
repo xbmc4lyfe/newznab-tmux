@@ -45,7 +45,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
         (new CollectReleaseFingerprintMetadata(1))->handle($collector);
         self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
-        foreach ([28, 29, 30, 31] as $schemaVersion) {
+        foreach ([28, 29, 30, 31, 32] as $schemaVersion) {
             ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => $schemaVersion]]);
             $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
             (new CollectReleaseFingerprintMetadata(1))->handle($collector);
@@ -77,6 +77,38 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertSame([24, 29, 5], array_map(static fn (string $key): int => $block['compressed_data'][$key], ['start_offset', 'end_offset_exclusive', 'available_bytes']));
         self::assertTrue($block['block_padding_zero']);
         self::assertSame(32, $block['next_item_offset']);
+        self::assertSame('complete', $block['following_index']['status']);
+        self::assertTrue($block['following_index']['crc32_valid']);
+        self::assertSame(40, $block['following_index']['end_offset_exclusive']);
+        self::assertSame('equal', $block['following_index']['unpadded_size_relationship']);
+        self::assertSame('equal', $block['following_index']['uncompressed_size_relationship']);
+        $sizeDisagreement = substr_replace($sample, hex2bin('000112016ef5752f'), 32, 8);
+        $different = $analyzer->analyzeArticleAndDecodedBytes([], YencArticles::article($sizeDisagreement));
+        $index = $different['metadata']['decoded_format_metadata']['headers'][0]['first_block']['following_index'];
+        self::assertTrue($index['crc32_valid']);
+        self::assertSame('different', $index['unpadded_size_relationship']);
+        self::assertSame('equal', $index['uncompressed_size_relationship']);
+        $badIndex = $sample;
+        $badIndex[39] = chr(ord($badIndex[39]) ^ 1);
+        $bad = $analyzer->analyzeArticleAndDecodedBytes([], YencArticles::article($badIndex));
+        $index = $bad['metadata']['decoded_format_metadata']['headers'][0]['first_block']['following_index'];
+        self::assertFalse($index['crc32_valid']);
+        self::assertSame('unqualified', $index['unpadded_size_relationship']);
+        $partialIndex = $analyzer->analyzeArticleAndDecodedBytes([], YencArticles::article(substr($sample, 0, 39)));
+        $index = $partialIndex['metadata']['decoded_format_metadata']['headers'][0]['first_block']['following_index'];
+        self::assertSame('sample_truncated_index', $index['status']);
+        self::assertNull($index['crc32_valid']);
+        $maximumIndex = hex2bin('0001fcffffffffffffff7fffffffffffffffff7f3621c263');
+        self::assertIsString($maximumIndex);
+        $oversized = $analyzer->analyzeArticleAndDecodedBytes([], YencArticles::article(substr($sample, 0, 32).$maximumIndex));
+        $index = $oversized['metadata']['decoded_format_metadata']['headers'][0]['first_block']['following_index'];
+        self::assertTrue($index['crc32_valid']);
+        self::assertTrue($index['unpadded_size_domain_valid']);
+        self::assertFalse($index['declared_stream_size_limit_valid']);
+        self::assertSame('9223372036854775852', $index['declared_single_record_stream_bytes']);
+        self::assertSame('invalid_declared_stream_size', $index['status']);
+        self::assertSame('unqualified', $index['unpadded_size_relationship']);
+
         self::assertFalse($block['whole_stream_validated']);
         self::assertFalse($block['content_decompressed']);
         self::assertFalse($block['file_offset_known']);
@@ -92,6 +124,8 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $large = $analyzer->analyzeArticleAndDecodedBytes([], YencArticles::article($huge));
         $block = $large['metadata']['decoded_format_metadata']['headers'][0]['first_block'];
         self::assertSame('9223372036854775816', $block['next_item_offset']);
+        self::assertSame('9223372036854775816', $block['following_index']['start_offset']);
+        self::assertSame('not_sampled', $block['following_index']['status']);
         self::assertFalse($block['minimum_stream_size_lower_bound_fits']);
         self::assertFalse($block['compressed_data']['complete']);
         $sample[8] = chr(ord($sample[8]) ^ 1);

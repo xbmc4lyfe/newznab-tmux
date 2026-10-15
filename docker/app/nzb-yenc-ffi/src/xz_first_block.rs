@@ -31,6 +31,34 @@ pub struct Range {
     pub complete: bool,
 }
 
+/// Only an immediately following one-record Index; never a search for a stream end.
+#[derive(Debug, Default, Serialize)]
+pub struct IndexObservation {
+    pub locator_basis: &'static str,
+    pub offset_basis: &'static str,
+    pub start_offset: u64,
+    pub first_byte: Option<u8>,
+    pub status: &'static str,
+    pub candidate_preview_hex: String,
+    pub index_observed_hex: String,
+    pub record_count: Option<Integer>,
+    pub record_unpadded_size: Option<Integer>,
+    pub record_uncompressed_size: Option<Integer>,
+    pub unpadded_size_domain_valid: Option<bool>,
+    pub declared_single_record_stream_bytes: Option<u64>,
+    pub declared_stream_size_limit_valid: Option<bool>,
+    pub padding: Option<Range>,
+    pub padding_zero: Option<bool>,
+    pub crc32_offset: Option<u64>,
+    pub end_offset_exclusive: Option<u64>,
+    pub crc32_expected: Option<u32>,
+    pub crc32_calculated: Option<u32>,
+    pub crc32_valid: Option<bool>,
+    pub unpadded_size_relationship: &'static str,
+    pub uncompressed_size_relationship: &'static str,
+    pub relationship_basis: &'static str,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct FirstBlock {
     pub offset_basis: &'static str,
@@ -74,6 +102,7 @@ pub struct FirstBlock {
     pub check_observed_hex: String,
     pub next_item_offset: Option<u64>,
     pub following_byte: Option<u8>,
+    pub following_index: Option<IndexObservation>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -134,6 +163,142 @@ fn vli(header: &[u8], cursor: &mut usize, body_end: usize, base: usize) -> Optio
         }
     }
     None // A continuing ninth byte cannot fit an XZ VLI.
+}
+
+fn index_integer(data: &[u8], cursor: &mut usize, base: usize) -> Result<Integer, &'static str> {
+    let start = *cursor;
+    if start == data.len() {
+        return Err("sample_truncated_vli");
+    }
+    vli(data, cursor, data.len(), base).ok_or_else(|| {
+        if *cursor == data.len() && *cursor - start < 9 && data[*cursor - 1] & 0x80 != 0 {
+            "sample_truncated_vli"
+        } else {
+            "invalid_vli"
+        }
+    })
+}
+
+fn observe_index(data: &[u8], block: &FirstBlock, start: u64) -> IndexObservation {
+    let mut out = IndexObservation {
+        locator_basis: "first_block_declared_end; no forward search",
+        offset_basis: "decoded_parser_sample_relative; file origin is unknown",
+        start_offset: start,
+        status: "not_sampled",
+        unpadded_size_relationship: "unqualified",
+        uncompressed_size_relationship: "unqualified",
+        relationship_basis: "Checksummed declarations only: Index unpadded size versus Header+Compressed+Check (excluding Block Padding), and Index uncompressed size versus header declaration. Declared single-record stream bytes use rounded record size + observed Index length + 24 bytes for Stream Header/Footer. No decompression, stream/footer validation or actual decoded-size verification.",
+        ..IndexObservation::default()
+    };
+    // At most 24 bytes: indicator1 + count1 + two canonical VLIs<=9 each + padding + CRC4.
+    // Prove sample coverage before converting potentially huge declared offsets to usize.
+    if start >= data.len() as u64 {
+        return out;
+    }
+    let start = start as usize;
+    let candidate = &data[start..start + (data.len() - start).min(24)];
+    out.candidate_preview_hex = hex(candidate);
+    out.first_byte = candidate.first().copied();
+    if out.first_byte != Some(0) {
+        out.status = "next_item_not_index";
+        return out;
+    }
+    let mut cursor = 1;
+    match index_integer(candidate, &mut cursor, start) {
+        Ok(value) => out.record_count = Some(value),
+        Err(status) => {
+            out.status = status;
+            return out;
+        }
+    }
+    if out
+        .record_count
+        .as_ref()
+        .is_none_or(|value| value.value != 1)
+    {
+        out.status = "unsupported_record_count";
+        return out;
+    }
+    match index_integer(candidate, &mut cursor, start) {
+        Ok(value) => {
+            out.unpadded_size_domain_valid = Some((5..=UNPADDED_MAX).contains(&value.value));
+            out.record_unpadded_size = Some(value);
+        }
+        Err(status) => {
+            out.status = status;
+            return out;
+        }
+    }
+    match index_integer(candidate, &mut cursor, start) {
+        Ok(value) => out.record_uncompressed_size = Some(value),
+        Err(status) => {
+            out.status = status;
+            return out;
+        }
+    }
+    let crc_start = (cursor + 3) & !3; // Index-relative alignment, even in embedded samples.
+    let index_end = crc_start + 4;
+    out.declared_single_record_stream_bytes = out
+        .record_unpadded_size
+        .as_ref()
+        .and_then(|v| v.value.checked_add(3))
+        .map(|value| value & !3)
+        .and_then(|padded| padded.checked_add(index_end as u64 + 24));
+    out.declared_stream_size_limit_valid = out
+        .declared_single_record_stream_bytes
+        .map(|bytes| bytes < 1_u64 << 63);
+    let Some(end_offset) = out.start_offset.checked_add(index_end as u64) else {
+        out.status = "offset_overflow";
+        return out;
+    };
+    let crc_offset = end_offset - 4;
+    out.crc32_offset = Some(crc_offset);
+    out.end_offset_exclusive = Some(end_offset);
+    let padding = range(data, out.start_offset + cursor as u64, crc_offset);
+    out.padding_zero = zero_observation(data, &padding);
+    out.padding = Some(padding);
+    out.index_observed_hex = hex(&candidate[..candidate.len().min(index_end)]);
+    let Some(complete) = candidate.get(..index_end) else {
+        out.status = "sample_truncated_index";
+        return out;
+    };
+    let expected = u32::from_le_bytes(complete[crc_start..].try_into().expect("four CRC bytes"));
+    let calculated = crc32fast::hash(&complete[..crc_start]);
+    out.crc32_expected = Some(expected);
+    out.crc32_calculated = Some(calculated);
+    out.crc32_valid = Some(expected == calculated);
+    out.status = if expected != calculated {
+        "crc32_mismatch"
+    } else if out.padding_zero != Some(true) {
+        "nonzero_index_padding"
+    } else if out.unpadded_size_domain_valid != Some(true) {
+        "invalid_unpadded_size_domain"
+    } else if out.declared_stream_size_limit_valid != Some(true) {
+        "invalid_declared_stream_size"
+    } else {
+        "complete"
+    };
+    if out.status == "complete" {
+        out.unpadded_size_relationship =
+            if out.record_unpadded_size.as_ref().map(|v| v.value) == block.unpadded_block_bytes {
+                "equal"
+            } else {
+                "different"
+            };
+        out.uncompressed_size_relationship = match block.uncompressed_size.as_ref() {
+            None => "header_not_declared",
+            Some(header)
+                if out
+                    .record_uncompressed_size
+                    .as_ref()
+                    .is_some_and(|v| v.value == header.value) =>
+            {
+                "equal"
+            }
+            Some(_) => "different",
+        };
+    }
+    out
 }
 
 pub fn observe(
@@ -336,6 +501,7 @@ pub fn observe(
     out.check_observed_hex = hex(observed(data, &check));
     out.check = Some(check);
     out.next_item_offset = Some(check_end);
+    out.following_index = Some(observe_index(data, &out, check_end));
     out.following_byte = usize::try_from(check_end)
         .ok()
         .and_then(|offset| data.get(offset).copied());
@@ -627,6 +793,297 @@ mod tests {
                 observe(&data, 0, true, Some(255))
                     .check_size_bytes
                     .is_none()
+            );
+        }
+    }
+    #[test]
+    fn following_index_compares_checksummed_declarations_without_decoding() {
+        let data = bytes(
+            "fd377a585a000000ff12d94102c0050121010000f05dfb9f010000410000000000011101ada65804",
+        );
+        let out = serde_json::to_value(observe(&data, 0, true, Some(0))).unwrap();
+        let index = &out["following_index"];
+        assert_eq!(index["status"], "complete");
+        assert_eq!(index["crc32_valid"], true);
+        assert_eq!(index["start_offset"], 32);
+        assert_eq!(index["end_offset_exclusive"], 40);
+        assert_eq!(index["record_unpadded_size"]["value"], 17);
+        assert_eq!(index["record_uncompressed_size"]["value"], 1);
+        assert_eq!(index["unpadded_size_relationship"], "equal");
+        assert_eq!(index["uncompressed_size_relationship"], "equal");
+        assert_eq!(out["whole_stream_validated"], false);
+        assert_eq!(out["content_decompressed"], false);
+    }
+    fn with_index(index: &str) -> Vec<u8> {
+        let mut data = bytes("fd377a585a000000ff12d94102c0050121010000f05dfb9f0100004100000000");
+        data.extend(bytes(index));
+        data
+    }
+
+    #[test]
+    fn following_index_retains_checksummed_conflicts_and_independent_failures() {
+        for (literal, status, unpadded, unpacked) in [
+            ("00011101ada65804", "complete", "equal", "equal"),
+            ("000112016ef5752f", "complete", "different", "equal"),
+            ("0001110217f7519d", "complete", "equal", "different"),
+            ("00010501f871f62a", "complete", "different", "equal"),
+            (
+                "00010401b940ed33",
+                "invalid_unpadded_size_domain",
+                "unqualified",
+                "unqualified",
+            ),
+            (
+                "0001fdffffffffffffff7f01e8554633",
+                "invalid_unpadded_size_domain",
+                "unqualified",
+                "unqualified",
+            ),
+            (
+                "00011101ada65805",
+                "crc32_mismatch",
+                "unqualified",
+                "unqualified",
+            ),
+            (
+                "000111800101000023b84703",
+                "nonzero_index_padding",
+                "unqualified",
+                "unqualified",
+            ),
+            (
+                "000111800000000071b539ba",
+                "invalid_vli",
+                "unqualified",
+                "unqualified",
+            ),
+            (
+                "008100110100000078e77fae",
+                "invalid_vli",
+                "unqualified",
+                "unqualified",
+            ),
+            (
+                "0002110111010000036c30ee",
+                "unsupported_record_count",
+                "unqualified",
+                "unqualified",
+            ),
+            (
+                "0000000000000000",
+                "unsupported_record_count",
+                "unqualified",
+                "unqualified",
+            ),
+        ] {
+            let out = observe(&with_index(literal), 0, true, Some(0));
+            let index = out.following_index.unwrap();
+            assert_eq!(index.status, status, "{literal}");
+            assert_eq!(index.unpadded_size_relationship, unpadded, "{literal}");
+            assert_eq!(index.uncompressed_size_relationship, unpacked, "{literal}");
+            assert!(index.candidate_preview_hex.len() <= 48);
+            assert!(!out.content_decompressed);
+        }
+        let mut data = with_index("00011101ada65804");
+        data[29] = 1;
+        let out = observe(&data, 0, true, Some(0));
+        assert_eq!(out.block_padding_zero, Some(false));
+        assert_eq!(
+            out.following_index.unwrap().unpadded_size_relationship,
+            "equal"
+        );
+    }
+
+    #[test]
+    fn following_index_alignment_maximum_and_all_partial_prefixes_are_bounded() {
+        for (literal, expected_status) in [
+            ("00011101ada65804", "complete"),
+            ("000111800100000014d28502", "complete"),
+            ("00011180800100007d69a256", "complete"),
+            ("00011180808001008b294eaf", "complete"),
+            (
+                "0001fcffffffffffffff7fffffffffffffffff7f3621c263",
+                "invalid_declared_stream_size",
+            ),
+        ] {
+            let data = with_index(literal);
+            for length in 0..data.len() {
+                let out = observe(&data[..length], 0, true, Some(0));
+                if let Some(index) = out.following_index {
+                    assert_ne!(index.status, "complete", "{literal} length={length}");
+                    assert_eq!(index.unpadded_size_relationship, "unqualified");
+                    assert!(index.index_observed_hex.len() <= 48);
+                }
+            }
+            let index = observe(&data, 0, true, Some(0)).following_index.unwrap();
+            assert_eq!(index.status, expected_status, "{literal}");
+            assert_eq!(index.crc32_valid, Some(true));
+            assert_eq!(index.end_offset_exclusive, Some(data.len() as u64));
+            assert_eq!(index.index_observed_hex, literal);
+            let mut embedded = vec![0x77; 7];
+            embedded.extend(&data);
+            let shifted = observe(&embedded, 7, true, Some(0))
+                .following_index
+                .unwrap();
+            assert_eq!(shifted.start_offset, index.start_offset + 7);
+            assert_eq!(shifted.crc32_offset, index.crc32_offset.map(|n| n + 7));
+            assert_eq!(
+                shifted.end_offset_exclusive,
+                index.end_offset_exclusive.map(|n| n + 7)
+            );
+            assert_eq!(shifted.status, index.status);
+            assert_eq!(
+                shifted.record_uncompressed_size.unwrap().start_offset,
+                index.record_uncompressed_size.unwrap().start_offset + 7
+            );
+        }
+        let index = observe(
+            &with_index("0001fcffffffffffffff7fffffffffffffffff7f3621c263"),
+            0,
+            true,
+            Some(0),
+        )
+        .following_index
+        .unwrap();
+        assert_eq!(index.record_unpadded_size.unwrap().value, UNPADDED_MAX);
+        assert_eq!(
+            index.record_uncompressed_size.unwrap().value,
+            (1_u64 << 63) - 1
+        );
+    }
+
+    #[test]
+    fn following_index_distinguishes_incomplete_and_malformed_vlis() {
+        for literal in ["00", "0080", "0001", "000180", "000111", "00011180"] {
+            let index = observe(&with_index(literal), 0, true, Some(0))
+                .following_index
+                .unwrap();
+            assert_eq!(index.status, "sample_truncated_vli", "{literal}");
+        }
+        for literal in [
+            "008000",
+            "00018000",
+            "0001118000",
+            "00808080808080808080",
+            "0001808080808080808080",
+            "000111808080808080808080",
+        ] {
+            let index = observe(&with_index(literal), 0, true, Some(0))
+                .following_index
+                .unwrap();
+            assert_eq!(index.status, "invalid_vli", "{literal}");
+        }
+        for literal in ["00011101", "00011101ada658"] {
+            let index = observe(&with_index(literal), 0, true, Some(0))
+                .following_index
+                .unwrap();
+            assert_eq!(index.status, "sample_truncated_index");
+            assert!(index.crc32_valid.is_none());
+        }
+    }
+
+    #[test]
+    fn following_index_requires_qualified_locator_without_searching() {
+        let mut data = with_index("00011101ada65804");
+        assert!(observe(&data, 0, false, Some(0)).following_index.is_none());
+        data[20] ^= 1;
+        assert!(observe(&data, 0, true, Some(0)).following_index.is_none());
+        let mut missing_c = bytes("fd377a585a000000ff12d941");
+        let mut header = bytes("0180012101000000");
+        // Header is 12 bytes: optional U1, filter21 properties01/00 and zero padding.
+        header.extend(crc32fast::hash(&header).to_le_bytes());
+        header[0] = 2;
+        let crc = crc32fast::hash(&header[..8]);
+        header[8..].copy_from_slice(&crc.to_le_bytes());
+        missing_c.extend(header);
+        missing_c.extend(bytes("00011101ada65804"));
+        let out = observe(&missing_c, 0, true, Some(0));
+        assert_eq!(out.compressed_size_status, "not_declared");
+        assert!(out.following_index.is_none());
+        let mut data = with_index("0100011101ada65804");
+        let index = observe(&data, 0, true, Some(0)).following_index.unwrap();
+        assert_eq!(index.status, "next_item_not_index");
+        assert!(index.record_count.is_none());
+        data.truncate(32);
+        let index = observe(&data, 0, true, Some(0)).following_index.unwrap();
+        assert_eq!(index.status, "not_sampled");
+        assert!(index.candidate_preview_hex.is_empty());
+    }
+    #[test]
+    fn following_index_uses_check_width_without_verifying_content_or_requiring_header_u() {
+        for (id, width) in [
+            0_usize, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32, 64, 64, 64,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut data = with_index("");
+            data[7] = id as u8;
+            let crc = crc32fast::hash(&data[6..8]);
+            data[8..12].copy_from_slice(&crc.to_le_bytes());
+            data.extend(vec![0; width]);
+            let mut index = vec![0, 1, (17 + width) as u8, 1];
+            index.extend(crc32fast::hash(&index).to_le_bytes());
+            data.extend(index);
+            let out = observe(&data, 0, true, Some(id as u8));
+            let index = out.following_index.unwrap();
+            assert_eq!(index.start_offset, (32 + width) as u64);
+            assert_eq!(index.unpadded_size_relationship, "equal");
+            assert_eq!(index.uncompressed_size_relationship, "equal");
+            assert!(!out.content_decompressed);
+        }
+        let mut data = bytes("fd377a585a000000ff12d941");
+        let mut header = bytes("0240052101000000");
+        header.extend(crc32fast::hash(&header).to_le_bytes());
+        data.extend(header);
+        data.extend(bytes("010000410000000000011101ada65804"));
+        let out = observe(&data, 0, true, Some(0));
+        assert_eq!(out.uncompressed_size_status, "not_declared");
+        let index = out.following_index.unwrap();
+        assert_eq!(index.status, "complete");
+        assert_eq!(index.uncompressed_size_relationship, "header_not_declared");
+        let huge = bytes("fd377a585a000000ff12d9410440e8ffffffffffffff7f21010000007725567d");
+        let index = observe(&huge, 0, true, Some(0)).following_index.unwrap();
+        assert_eq!(index.start_offset, 9223372036854775816);
+        assert_eq!(index.status, "not_sampled");
+    }
+    #[test]
+    fn following_index_checks_aggregate_stream_limit_separately_from_vli_domain() {
+        for (literal, total, valid) in [
+            (
+                "0001d4ffffffffffffff7f01f27d0e80",
+                9223372036854775804_u64,
+                true,
+            ),
+            (
+                "0001d8ffffffffffffff7f017c9d329a",
+                9223372036854775808,
+                false,
+            ),
+            (
+                "0001fcffffffffffffff7f01d63e84dc",
+                9223372036854775844,
+                false,
+            ),
+        ] {
+            let out =
+                serde_json::to_value(observe(&with_index(literal), 0, true, Some(0))).unwrap();
+            let index = &out["following_index"];
+            assert_eq!(index["declared_single_record_stream_bytes"], total);
+            assert_eq!(index["declared_stream_size_limit_valid"], valid);
+            assert_eq!(index["unpadded_size_domain_valid"], true);
+            assert_eq!(index["crc32_valid"], true);
+            assert_eq!(
+                index["status"],
+                if valid {
+                    "complete"
+                } else {
+                    "invalid_declared_stream_size"
+                }
+            );
+            assert_eq!(
+                index["unpadded_size_relationship"],
+                if valid { "different" } else { "unqualified" }
             );
         }
     }

@@ -10961,6 +10961,11 @@ mod tests {
         assert_eq!(block["block_padding"]["end_offset_exclusive"], 32);
         assert_eq!(block["block_padding_zero"], true);
         assert_eq!(block["following_byte"], 0);
+        assert_eq!(
+            block["following_index"]["unpadded_size_relationship"],
+            "equal"
+        );
+        assert_eq!(block["following_index"]["crc32_valid"], true);
         assert_eq!(block["content_decompressed"], false);
     }
 
