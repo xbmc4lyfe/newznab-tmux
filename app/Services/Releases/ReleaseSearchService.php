@@ -535,8 +535,13 @@ class ReleaseSearchService
             }
             foreach ($terms as $term) {
                 if (strlen(trim($term)) >= 2) {
-                    $conditions[] = 'r.'.$field.' LIKE ?';
-                    $bindings[] = '%'.trim($term).'%';
+                    if ($field === 'fromname') {
+                        $conditions[] = "r.fromname LIKE ? ESCAPE '!'";
+                        $bindings[] = '%'.strtr(trim($term), ['!' => '!!', '%' => '!%', '_' => '!_']).'%';
+                    } else {
+                        $conditions[] = 'r.'.$field.' LIKE ?';
+                        $bindings[] = '%'.trim($term).'%';
+                    }
                 }
             }
             if ($field === 'searchname' && count($terms) > 1) {

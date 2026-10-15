@@ -81,6 +81,17 @@ class SearchResultsControlsViewTest extends TestCase
         $this->assertStringNotContainsString('No results found', $document->body->textContent);
     }
 
+    public function test_exact_zero_poster_is_kept_in_the_form_and_status(): void
+    {
+        $query = ['poster' => '0', 'searchadvposter' => '0', 'search_type' => 'adv'];
+        $this->bindRequest($query);
+        $document = $this->renderSearch(['exactPoster' => '0', 'listQuery' => $query]);
+
+        $this->assertSame('0', $document->querySelector('#searchForm input[name="poster"]')?->getAttribute('value'));
+        $this->assertSame('0', $document->querySelector('#searchForm input[name="searchadvposter"]')?->getAttribute('value'));
+        $this->assertStringContainsString('exact poster field “0”', $document->querySelector('[role="status"]')?->textContent ?? '');
+    }
+
     public function test_old_input_and_legacy_aliases_render_safely_after_validation_errors(): void
     {
         $this->bindRequest(['subject' => 'Legacy subject', 't' => '2000', 'search_type' => 'adv']);
