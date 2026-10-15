@@ -240,8 +240,13 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
             $this->assertSame('metadata_review', $method->invoke(app(VerifyReleaseCandidates::class), $claim)->verdict);
             DB::table('release_verification_candidates')->where('id', $claim->id)->update(['last_unique_at' => now()->subYears(2)]);
             app(CandidateRepository::class)->expire();
-            $this->assertSame($path, DB::table('release_verification_candidates')->where('id', $claim->id)->value('manifest_path'));
-            $this->assertTrue(is_file($store->path($path)));
+            $expired = DB::table('release_verification_candidates')->where('id', $claim->id)->first();
+            $this->assertSame('metadata_expired', $expired->status);
+            $this->assertSame('', $expired->manifest_path);
+            $this->assertSame(0, (int) $expired->manifest_bytes);
+            $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+            $this->assertGreaterThan((int) $candidate->version, (int) $expired->version);
+            $this->assertFalse(is_file($store->path($path)));
             app(VerificationResetService::class)->run(static function (): void {});
             $this->assertSame(0, DB::table('release_verification_candidates')->count());
             $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));

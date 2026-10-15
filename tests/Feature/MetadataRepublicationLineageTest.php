@@ -119,6 +119,18 @@ class MetadataRepublicationLineageTest extends ReleaseVerificationCandidatesTest
         self::assertSame(0, DB::table('release_nfos')->count());
         self::assertSame(0, DB::table('nfo_cleanup_commits')->count());
         self::assertFileExists(dirname($paths['A']).'/info.nfo');
+        $bManifestPath = dirname($paths['B']).'/'.NzbUploadManifestService::FILENAME;
+        self::assertSame('nzb_imported', $manifests->reconcilePending($bManifestPath)['state']);
+        $acceptedB = $manifests->read($bManifestPath)['accepted_capture'];
+        $importer->beginImport([$paths['B']], resultCallback: $callback);
+        self::assertSame($acceptedB, $manifests->read($bManifestPath)['input_capture']);
+        DB::unprepared("CREATE TRIGGER fail_receipt BEFORE INSERT ON nfo_cleanup_commits BEGIN SELECT RAISE(ABORT, 'synthetic receipt failure'); END");
+        self::assertSame('failed', $nfo->importManifest(dirname($paths['B']).'/'.NzbUploadManifestService::FILENAME, true, true)['status']);
+        self::assertSame(0, DB::table('release_nfos')->count());
+        self::assertSame(0, DB::table('nfo_cleanup_commits')->count());
+        self::assertSame(-1, DB::table('releases')->where('id', 777)->value('nfostatus'));
+        self::assertFileExists(dirname($paths['B']).'/info.nfo');
+        DB::unprepared('DROP TRIGGER fail_receipt');
         self::assertSame('imported', $nfo->importManifest(dirname($paths['B']).'/'.NzbUploadManifestService::FILENAME, true, true)['status']);
         self::assertSame("\x1f\x8b\x08\x00".gzcompress('companion-B'), DB::table('release_nfos')->where('releases_id', 777)->value('nfo'));
         // An independently admitted identical origin may share B's revision and consume its own companion.
@@ -136,9 +148,28 @@ class MetadataRepublicationLineageTest extends ReleaseVerificationCandidatesTest
         $cm = $manifests->read($dir.'/'.NzbUploadManifestService::FILENAME);
         self::assertSame($bm['accepted_admission'], $cm['accepted_admission']);
         self::assertNotSame($bm['accepted_capture'], $cm['accepted_capture']);
+        // Legitimately relinquished admitted source retains companion authority.
+        self::assertTrue($manifests->deleteCapturedInput($dir.'/incoming.nzb', $cm['accepted_capture']));
         self::assertSame('imported', $nfo->importManifest($dir.'/'.NzbUploadManifestService::FILENAME, true, true)['status']);
         self::assertSame("\x1f\x8b\x08\x00".gzcompress('companion-C'), DB::table('release_nfos')->where('releases_id', 777)->value('nfo'));
         self::assertSame(2, DB::table('nfo_cleanup_commits')->count());
+        // An identical-byte replacement has a new source generation and no admission.
+        $replacementDir = $base.'/D';
+        app('files')->ensureDirectoryExists($replacementDir);
+        copy($paths['B'], $replacementDir.'/incoming.nzb');
+        file_put_contents($replacementDir.'/info.nfo', 'companion-D');
+        $manifests->create($replacementDir, 'upload-D', 'incoming.nzb', 'info.nfo', 'companion-D');
+        $importer->beginImport([$replacementDir.'/incoming.nzb']);
+        $originalIdentity = lstat($replacementDir.'/incoming.nzb')['ino'];
+        copy($replacementDir.'/incoming.nzb', $replacementDir.'/replacement.nzb');
+        rename($replacementDir.'/replacement.nzb', $replacementDir.'/incoming.nzb');
+        clearstatcache(true, $replacementDir.'/incoming.nzb');
+        self::assertNotSame($originalIdentity, lstat($replacementDir.'/incoming.nzb')['ino']);
+        self::assertSame('skipped', $nfo->importManifest($replacementDir.'/'.NzbUploadManifestService::FILENAME, true, true)['status']);
+        self::assertSame(2, DB::table('nfo_cleanup_commits')->count());
+        self::assertSame("\x1f\x8b\x08\x00".gzcompress('companion-C'), DB::table('release_nfos')->where('releases_id', 777)->value('nfo'));
+        self::assertFileExists($replacementDir.'/info.nfo');
+
         self::assertSame('skipped', $nfo->importManifest($mp, true, true)['status']);
         self::assertFileExists(dirname($paths['A']).'/info.nfo');
         fwrite(STDERR, "LINEAGE_REGRESSION: A remains held; B and independent exact-origin C each consume their own companions under shared admitted revision.\n");

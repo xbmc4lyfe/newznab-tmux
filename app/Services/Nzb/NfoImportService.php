@@ -31,6 +31,8 @@ final class NfoImportService
             $state = $manifest['state'];
 
             if ($state === NzbUploadManifestService::STATE_NFO_IMPORTED) {
+                $this->manifests->cleanupImportedSource($manifestPath);
+
                 return ['status' => 'skipped', 'message' => 'NFO was already imported'];
             }
 

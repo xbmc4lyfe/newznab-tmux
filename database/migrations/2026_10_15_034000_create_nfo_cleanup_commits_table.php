@@ -6,7 +6,6 @@ use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
-// Private research proposal only: no deployment or runtime migration authorized.
 return new class extends Migration
 {
     public function up(): void
@@ -15,7 +14,7 @@ return new class extends Migration
             $table->string('binding', 64)->primary();
             $table->unsignedBigInteger('release_id');
             $table->string('release_guid');
-            $table->string('candidate_identity', 40);
+            $table->string('candidate_identity', 40)->nullable();
             $table->string('stored_digest', 64);
         });
     }

@@ -318,7 +318,7 @@ class NzbImportService
                     $reportResult($nzbFilePath, $importStatus, candidateIdentity: $this->verificationCandidateIdentity, inputCapture: $inputCapture);
                     $nzbsImported++;
                     if ($delete) {
-                        app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture);
+                        app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture, retainForCompanion: true);
                     }
                 } elseif ($importStatus === NzbImportStatus::Inserted) {
                     if (! $stored) {

@@ -181,6 +181,20 @@ final class NzbUploadManifestService
                 $m['legacy_provenance'] ??= array_intersect_key($m, array_flip(['version', 'state', 'candidate_identity', 'release_id', 'release_guid']));
                 $m['version'] = 2;
             }
+            $accepted = $m['accepted_capture'] ?? null;
+            if (is_array($accepted) && ($accepted['protocol'] ?? null) === 2
+                && in_array($m['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
+                && $this->sourceIdentity($path) === ($accepted['source_identity'] ?? null)
+                && ($accepted['companion_attempt'] ?? null) === ($m['nfo_capture']['attempt'] ?? null)) {
+                // A replay of the same owned generation must not orphan its accepted companion.
+                $reservation = $accepted;
+                unset($reservation['digest']);
+                $m['input_reservation'] = $reservation;
+                $m['input_capture'] = $accepted;
+                $this->write($mp, $m);
+
+                return $reservation;
+            }
             $r = ['protocol' => 2, 'attempt' => bin2hex(random_bytes(16)), 'upload_id' => $m['upload_id'], 'filename' => basename($path), 'source_identity' => $this->sourceIdentity($path), 'companion_attempt' => $m['nfo_capture']['attempt'] ?? null];
             $m['input_reservation'] = $r;
             $this->write($mp, $m);
@@ -219,20 +233,29 @@ final class NzbUploadManifestService
     }
 
     /** @param array<string, mixed>|null $capture */
-    public function deleteCapturedInput(string $path, ?array $capture): bool
+    public function deleteCapturedInput(string $path, ?array $capture, bool $retainForCompanion = false): bool
     {
         $mp = dirname($path).DIRECTORY_SEPARATOR.self::FILENAME;
         if (! $this->filesystem->isFile($mp)) {
             return $capture === null && $this->filesystem->delete($path);
         }
 
-        return $this->withManifestLock($mp, function () use ($mp, $path, $capture): bool {
+        return $this->withManifestLock($mp, function () use ($mp, $path, $capture, $retainForCompanion): bool {
             $m = $this->read($mp);
             if ($capture === null || ($m['input_reservation']['attempt'] ?? null) !== $capture['attempt']
                 || (($m['accepted_capture'] ?? null) !== $capture && (($m['outcome_capture'] ?? null) !== $capture
                     || ! in_array($m['outcome_status'] ?? null, ['failed', 'blacklisted', 'nogroup', 'duplicate'], true)))
                 || $this->sourceIdentity($path) !== $capture['source_identity']
                 || ! hash_equals($capture['digest'], $this->currentFileDigest($path))) {
+                return false;
+            }
+
+            if ($retainForCompanion && $m['state'] === self::STATE_NZB_PENDING && is_array($m['nfo_capture'] ?? null)) {
+                // Metadata enrichment may change admission revision before publication.
+                // Keep the exact uploader document until its companion commits so it can re-admit.
+                $m['delete_nzb_after_nfo'] = array_intersect_key($capture, array_flip(['source_identity', 'digest']));
+                $this->write($mp, $m);
+
                 return false;
             }
 
@@ -266,7 +289,9 @@ final class NzbUploadManifestService
             return ($manifest['relinquished_attempt'] ?? null) === $accepted['attempt'];
         }
 
-        return hash_equals($accepted['digest'], $this->currentFileDigest($source));
+        return $this->sourceIdentity($source) === $accepted['source_identity']
+            && hash_equals($accepted['digest'], $this->currentFileDigest($source))
+            && $this->sourceIdentity($source) === $accepted['source_identity'];
     }
 
     /**
@@ -569,7 +594,10 @@ final class NzbUploadManifestService
                 throw new RuntimeException('Unknown companion generation or admitted input');
             }
             $path = $this->resolvePayloadPath($manifestPath, $receipt['filename'], 'nfo');
-            $validate = function () use ($path, $receipt): void {
+            $validate = function () use ($path, $receipt, $manifestPath, &$m): void {
+                if (! $this->acceptedInputValid($manifestPath, $m)) {
+                    throw new RuntimeException('Admitted NZB source generation changed');
+                }
                 if ($this->sourceIdentity($path) !== $receipt['source_identity']
                     || ! hash_equals($receipt['digest'], $this->currentFileDigest($path))
                     || $this->sourceIdentity($path) !== $receipt['source_identity']) {
@@ -611,7 +639,7 @@ final class NzbUploadManifestService
                         }
                         $store->storeNfoContentWithCommit((int) $m['release_id'], $body, function () use ($m, $body, $validate): void {
                             $validate();
-                            // Private proposal: SQL authority is created with the actual NFO write.
+                            // SQL authority is created with the actual NFO write.
                             $stored = DB::table('release_nfos')->where('releases_id', $m['release_id'])->value('nfo');
                             $expected = "\x1f\x8b\x08\x00".gzcompress($body);
                             if (! is_string($stored) || ! hash_equals($expected, $stored)) {
@@ -632,6 +660,7 @@ final class NzbUploadManifestService
                 $m['last_error'] = null;
                 $m['updated_at'] = now()->toIso8601String();
                 $this->write($manifestPath, $m);
+                $this->finishInputDeletion($manifestPath, $m);
                 if ($delete) {
                     $validate();
 
@@ -656,7 +685,43 @@ final class NzbUploadManifestService
         });
     }
 
-    /** Private research proposal; all generation fields participate in the digest. */
+    public function cleanupImportedSource(string $manifestPath): void
+    {
+        $this->withManifestLock($manifestPath, function () use ($manifestPath): void {
+            $manifest = $this->read($manifestPath);
+            if ($manifest['state'] === self::STATE_NFO_IMPORTED) {
+                $this->finishInputDeletion($manifestPath, $manifest);
+            }
+        });
+    }
+
+    /** @param array<string, mixed> $manifest */
+    private function finishInputDeletion(string $manifestPath, array &$manifest): void
+    {
+        $requested = $manifest['delete_nzb_after_nfo'] ?? null;
+        $accepted = $manifest['accepted_capture'] ?? null;
+        if (! is_array($requested) || ! is_array($accepted)
+            || $requested !== array_intersect_key($accepted, array_flip(['source_identity', 'digest']))
+            || ! $this->nfoCleanupCommitted($manifest)) {
+            return;
+        }
+        $source = dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nzb']['filename'];
+        if (! $this->filesystem->isFile($source)) {
+            return;
+        }
+        if ($this->sourceIdentity($source) !== $accepted['source_identity']
+            || ! hash_equals($accepted['digest'], $this->currentFileDigest($source))
+            || $this->sourceIdentity($source) !== $accepted['source_identity']
+            || ! $this->quarantineDelete($source, $accepted, $this->nfoCommitBinding($manifest))) {
+            return;
+        }
+        $manifest['relinquished_attempt'] = $accepted['attempt'];
+        unset($manifest['delete_nzb_after_nfo']);
+        $this->write($manifestPath, $manifest);
+    }
+
+    /** All captured generation and admission fields participate in the digest. */
+
     /** @param array<string, mixed> $manifest */
     private function nfoCommitBinding(array $manifest): string
     {
@@ -678,7 +743,15 @@ final class NzbUploadManifestService
     {
         $admission = $manifest['accepted_admission'] ?? null;
         if (! is_array($admission)) {
-            return false;
+            // Direct publication has no verification candidate. Its actual importer outcome
+            // and captured origin authorize only the recorded live release, never verification.
+            return ! array_key_exists('accepted_admission', $manifest)
+                && ($manifest['candidate_identity'] ?? null) === null
+                && ($manifest['outcome_status'] ?? null) === NzbImportStatus::Inserted->value
+                && is_array($manifest['accepted_capture'] ?? null)
+                && ($manifest['outcome_capture'] ?? null) === $manifest['accepted_capture']
+                && DB::table('releases')->where('id', $manifest['release_id'])
+                    ->where('guid', $manifest['release_guid'])->lockForUpdate()->exists();
         }
 
         return DB::table('release_verification_candidates')
@@ -710,7 +783,8 @@ final class NzbUploadManifestService
         if (DB::transactionLevel() !== 0 || ! is_array($manifest['accepted_capture'] ?? null)
             || ($manifest['accepted_capture']['protocol'] ?? null) !== 2
             || ! is_array($manifest['nfo_capture'] ?? null)
-            || ! is_string($manifest['candidate_identity'] ?? null)
+            || ! array_key_exists('candidate_identity', $manifest)
+            || ($manifest['candidate_identity'] !== null && ! is_string($manifest['candidate_identity']))
             || ! is_int($manifest['release_id'] ?? null)
             || ! is_string($manifest['release_guid'] ?? null)) {
             return false;
@@ -749,11 +823,11 @@ final class NzbUploadManifestService
     }
 
     /**
-     * PRIVATE PROOF ONLY. Caller holds the stable manifest lock.
+     * Caller holds the stable manifest lock.
      * Writers are confined to the original pathname, not open descriptors,
      * its parent directory, or this unpredictable private attempt directory.
      * Intent survives process death; restart always holds for reconciliation.
-     * Experimental explicit directory-sync bridge; no portable power-loss claim.
+     * Directory synchronization must succeed before custody can advance.
      *
      * @param  array<string, mixed>  $receipt
      */

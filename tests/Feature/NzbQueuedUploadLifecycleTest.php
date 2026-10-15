@@ -6,6 +6,7 @@ namespace Tests\Feature;
 
 use App\Enums\NzbImportStatus;
 use App\Services\NfoService;
+use App\Services\Nzb\DirectorySyncBridge;
 use App\Services\Nzb\NfoImportService;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbUploadManifestService;
@@ -154,7 +155,13 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->assertSame(1, DB::table('release_nfos')->count());
     }
 
-    public function test_queued_callback_persists_candidate_identity_before_nzb_deletion_and_nfo_waits(): void
+    public static function companionCleanupCases(): array
+    {
+        return ['immediate cleanup' => [false], 'retry source cleanup after committed NFO' => [true]];
+    }
+
+    #[DataProvider('companionCleanupCases')]
+    public function test_queued_callback_retains_source_until_companion_commits(bool $retryCleanup): void
     {
         [$path, $manifests] = $this->upload('first');
         $service = new class(['Browser' => true]) extends NzbImportService
@@ -182,11 +189,31 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->assertSame(sha1('import:same-articles'), $manifest['candidate_identity']);
         $this->assertSame(DB::table('release_verification_candidates')->value('identity'), $manifest['candidate_identity']);
         $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $manifest['state']);
-        $this->assertFileDoesNotExist($path);
+        $this->assertFileExists($path);
         $this->assertFileExists(dirname($path).'/info.nfo');
         $result = (new NfoImportService(new Filesystem, $manifests, new NfoService))->importManifest($manifestPath);
         $this->assertSame('skipped', $result['status']);
         $this->assertSame(0, DB::table('release_nfos')->count());
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'retained-fixture-publication']);
+        DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+        $nfos = new NfoImportService(new Filesystem, $manifests, new NfoService);
+        if ($retryCleanup) {
+            DirectorySyncBridge::$fail = 'mkdir_parent';
+        }
+        try {
+            $this->assertSame('imported', $nfos->importManifest($manifestPath, delete: ! $retryCleanup)['status']);
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        $this->assertSame(1, DB::table('nfo_cleanup_commits')->count());
+        if ($retryCleanup) {
+            $this->assertFileExists($path);
+            $this->assertSame('skipped', $nfos->importManifest($manifestPath)['status']);
+        } else {
+            $this->assertFileDoesNotExist(dirname($path).'/info.nfo');
+        }
+        $this->assertFileDoesNotExist($path);
+        $this->assertArrayNotHasKey('delete_nzb_after_nfo', $manifests->read($manifestPath));
     }
 
     public function test_both_identical_upload_origins_complete_and_import_nfo_without_original_nzb(): void
