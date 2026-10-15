@@ -160,7 +160,9 @@ jobs:
           kernel_names = {0: 'scalar', 1: 'ssse3', 2: 'avx2', 3: 'avx512-vbmi2', 4: 'neon'}
           if kernel not in kernel_names:
               raise RuntimeError('Unknown Rust runtime payload kernel identity')
+          # These jobs build the current default kernels without opt-in features.
           manifest = {
+              'rust_payload_mode': 'incumbent',
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'runner_image_os': os.environ.get('ImageOS'),
               'runner_image_version': os.environ.get('ImageVersion'),
@@ -443,7 +445,9 @@ jobs:
           library = pathlib.Path('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')
           decoder = ctypes.CDLL(str(library.resolve()))
           decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          # These jobs build the current default kernels without opt-in features.
           manifest = {
+              'rust_payload_mode': 'incumbent',
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'runner_arch': os.environ.get('RUNNER_ARCH'),
               'runner_image_os': os.environ.get('ImageOS'),
@@ -548,6 +552,8 @@ jobs:
           elif [[ ! -e processing-evidence/paired/observations.jsonl ]] &&
                [[ ! -d processing-evidence || -x processing-evidence ]] &&
                [[ ! -d processing-evidence/paired || -x processing-evidence/paired ]]; then
+            # Keep Markdown backticks literal in the fallback summary.
+            # shellcheck disable=SC2016
             printf '## Fingerprint caller screen\n\nBODY and FFI/JSON diagnostics are retained separately. This median screen does not qualify a Rust replacement: the 1.5x common-path and uncommon p99 policy remains the adoption gate.\n\n| Bytes | Density | Decision | Candidate / baseline median | Simultaneous interval | Eligible / invalid |\n|---:|---|---|---:|---|---|\n\nResult: `profile only or setup incomplete`. Exact serialized caller metadata and independently expected decoded bytes must match for every pair.\n' >> "$GITHUB_STEP_SUMMARY"
           else
             echo 'Evidence utility unavailable or paired input cannot be inspected.' >&2
@@ -630,7 +636,9 @@ jobs:
           library = pathlib.Path('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')
           decoder = ctypes.CDLL(str(library.resolve()))
           decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          # These jobs build the current default kernels without opt-in features.
           manifest = {
+              'rust_payload_mode': 'incumbent',
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'runner_arch': os.environ.get('RUNNER_ARCH'),
               'runner_image_os': os.environ.get('ImageOS'),
