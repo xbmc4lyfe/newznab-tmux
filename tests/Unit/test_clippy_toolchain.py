@@ -49,7 +49,8 @@ args = sys.argv[1:]
 root = Path(__file__).parent
 home = Path(os.environ['RUSTUP_HOME'])
 with (root / 'calls.jsonl').open('a') as log:
-    log.write(json.dumps({'args': args, 'home': str(home), 'cargo': os.environ['CARGO_HOME']}) + '\\n')
+    log.write(json.dumps({'args': args, 'home': str(home), 'cargo': os.environ['CARGO_HOME'],
+                         'auto_install': os.environ.get('RUSTUP_AUTO_INSTALL')}) + '\\n')
 if args[:2] == ['toolchain', 'install']:
     if home == root / 'shared-rustup':
         raise SystemExit(30)
@@ -82,6 +83,7 @@ else:
             rustup.chmod(0o755)
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                        RUST_TOOLCHAIN='1.98.0', INSTALLED=','.join(installed),
+                       RUSTUP_AUTO_INSTALL='1',
                        INSTALL_STATUS=str(install_status), BROKEN_AFTER_INSTALL=broken_after_install,
                        BROKEN_BEFORE_INSTALL=broken_before_install, ABSENT_AFTER_INSTALL=absent_after_install,
                        RUSTUP_HOME=str(shared), RUNNER_TEMP=str(runner_temp),
@@ -147,6 +149,13 @@ else:
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertTrue(any(r['args'][:2] == ['toolchain', 'install'] for r in records))
         self.assertNotEqual(evidence['shared'], evidence['state'][0])
+
+    def test_probes_disable_implicit_shared_store_installation(self):
+        result, records, _ = self.run_setup(installed=())
+        self.assertEqual(0, result.returncode, result.stderr)
+        probes = [r for r in records if r['args'][0] == 'which']
+        self.assertTrue(probes)
+        self.assertTrue(all(r['auto_install'] == '0' for r in probes))
 
     def test_successful_install_missing_a_component_does_not_publish_environment(self):
         result, _, evidence = self.run_setup(installed=(), absent_after_install='clippy-driver')

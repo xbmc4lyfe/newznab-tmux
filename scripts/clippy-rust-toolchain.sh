@@ -6,7 +6,7 @@ clippy_rust_tools_available() {
     for tool in rustc cargo cargo-clippy clippy-driver rustfmt cargo-fmt; do
         # `rustup run` can search PATH when a selected tool is absent. Require
         # the executable inside the exact pinned toolchain before probing it.
-        resolved="$(rustup which --toolchain "$RUST_TOOLCHAIN" "$tool")" || return
+        resolved="$(RUSTUP_AUTO_INSTALL=0 rustup which --toolchain "$RUST_TOOLCHAIN" "$tool")" || return
         [[ -x "$resolved" ]] || return 1
         "$resolved" --version || return
     done
