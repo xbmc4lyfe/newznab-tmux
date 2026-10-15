@@ -1,0 +1,169 @@
+name: Native utility performance
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+    paths:
+      - '**/*.md'
+      - 'github-pages/**'
+      - 'docker/app/nzb-yenc-ffi/**'
+      - 'app/Services/Nzb/NzbArticleFingerprint.php'
+      - 'app/Services/Nzb/RustArticleFingerprintWorker.php'
+      - 'scripts/*benchmark*'
+      - 'scripts/build-docs.py'
+      - 'tests/Unit/test_docs_site.py'
+      - 'tests/Unit/test_benchmark*'
+      - 'composer.lock'
+      - '.github/workflows/native-utilities-performance.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-utilities-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: ${{ matrix.kind }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        kind: [fingerprint-ffi, fingerprint-worker, cpu-snapshot]
+    env:
+      RUST_TOOLCHAIN: '1.98.0'
+      BENCHMARK_KIND: ${{ matrix.kind }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: bcmath, dom, curl, exif, ffi, gd, intl, mbstring, mysqlnd, pdo, pdo_mysql, sqlite, pdo_sqlite, simplexml, sockets, xmlwriter, zip
+          coverage: none
+      - name: Install locked dependencies without application boot
+        run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
+      - name: Recover and verify immutable pre-migration baselines
+        shell: bash
+        run: |
+          mkdir -p utility-evidence/baselines
+          git merge-base --is-ancestor a1a9b0829610c3b62e7d0bdb418669a89c36c90b HEAD
+          git merge-base --is-ancestor 5cc5303b502e653d83bba1951dec2f5d2da1db35 HEAD
+          git show a1a9b0829610c3b62e7d0bdb418669a89c36c90b:app/Services/Nzb/NzbArticleFingerprint.php > utility-evidence/baselines/fingerprint.php
+          git show 5cc5303b502e653d83bba1951dec2f5d2da1db35:scripts/benchmark-cpu.py > utility-evidence/baselines/cpu.py
+          python3 - <<'PY'
+          import hashlib, pathlib
+          expected = {
+              'fingerprint.php': '2c24de1374bc2f734961d3a7159fb13eaca175839f565a14004bcd41d7f3a374',
+              'cpu.py': '44186d8c2cf2f72f63f41d46bab30e0d78b683a43441c802c8e62280fdf03812',
+          }
+          for name, digest in expected.items():
+              if hashlib.sha256((pathlib.Path('utility-evidence/baselines') / name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit('Frozen baseline digest mismatch')
+          PY
+      - name: Build and test optimized locked candidate
+        shell: bash
+        run: |
+          mkdir -p utility-evidence/build
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee utility-evidence/build/test.log
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee utility-evidence/build/build.log
+      - name: Record executed source, build tools and hosted runner identity
+        shell: bash
+        run: |
+          ulimit -Sa > utility-evidence/process-soft-limits.txt
+          ulimit -Ha > utility-evidence/process-hard-limits.txt
+          python3 - <<'PY'
+          import json, os, pathlib, platform, subprocess
+          def run(*command):
+              return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT).strip()
+          cgroup_membership = pathlib.Path('/proc/self/cgroup').read_text()
+          cgroup_root = pathlib.Path('/sys/fs/cgroup').resolve()
+          unified_path = next((line.split(':', 2)[2] for line in cgroup_membership.splitlines() if line.startswith('0::')), None)
+          if unified_path is None or not (cgroup_root / 'cgroup.controllers').is_file():
+              raise SystemExit('Expected hosted runner cgroup v2 resource limits')
+          current = (cgroup_root / unified_path.lstrip('/')).resolve()
+          current.relative_to(cgroup_root)
+          if not current.is_dir():
+              raise SystemExit('Cannot resolve current hosted runner cgroup')
+          cgroup_limits = []
+          fields = ('cpu.max', 'cpu.weight', 'cpuset.cpus.effective', 'cpuset.mems.effective', 'memory.max', 'memory.high', 'memory.swap.max', 'pids.max')
+          while True:
+              cgroup_limits.append({
+                  'cgroup': '/' + str(current.relative_to(cgroup_root)),
+                  'limits': {name: (current / name).read_text().strip() if (current / name).is_file() else None for name in fields},
+              })
+              if current == cgroup_root:
+                  break
+              current = current.parent
+          resources = {
+              'process_limits': pathlib.Path('/proc/self/limits').read_text(),
+              'cpu_affinity': sorted(os.sched_getaffinity(0)),
+              'cgroup_membership': cgroup_membership,
+              'cgroup_v2_ancestors': cgroup_limits,
+          }
+          pathlib.Path('utility-evidence/resource-limits.json').write_text(json.dumps(resources, indent=2) + '\n')
+          cpu = next((line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith(('model name', 'Hardware'))), platform.machine())
+          identity = {
+              'executed_sha': run('git', 'rev-parse', 'HEAD'),
+              'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
+              'cargo': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'cargo', '-V'),
+              'php': run('php', '-r', 'echo PHP_VERSION;'),
+              'python': platform.python_version(), 'architecture': platform.machine(),
+              'cpu_model': cpu, 'logical_cpus': os.cpu_count(),
+              'runner_image_os': os.environ.get('ImageOS', ''),
+              'runner_image_version': os.environ.get('ImageVersion', ''),
+              'build_profile': 'release opt-level=3 lto=true codegen-units=1; cargo --locked',
+          }
+          pathlib.Path('utility-evidence/runtime.json').write_text(json.dumps(identity, indent=2) + '\n')
+          PY
+      - name: Check public summary failure and identity contracts
+        run: python3 tests/Unit/test_benchmark_summary_export.py
+      - name: Compare complete public NZB fingerprint operation
+        if: startsWith(matrix.kind, 'fingerprint-')
+        shell: bash
+        run: |
+          mkdir -p "utility-evidence/$BENCHMARK_KIND"
+          docker/app/nzb-yenc-ffi/target/release/benchmark-article-fingerprint \
+            --baseline="$GITHUB_WORKSPACE/utility-evidence/baselines/fingerprint.php" \
+            --project="$GITHUB_WORKSPACE" --backend="${BENCHMARK_KIND#fingerprint-}" \
+            --pairs=31 --output="$GITHUB_WORKSPACE/utility-evidence/$BENCHMARK_KIND/report.json" \
+            > "utility-evidence/$BENCHMARK_KIND/console.log" 2>&1
+      - name: Compare synthetic CPU snapshot CLI including process startup
+        if: matrix.kind == 'cpu-snapshot'
+        shell: bash
+        run: |
+          docker/app/nzb-yenc-ffi/target/release/benchmark-cpu-snapshot \
+            --baseline="$GITHUB_WORKSPACE/utility-evidence/baselines/cpu.py" \
+            --project="$GITHUB_WORKSPACE" --pairs=1000 \
+            --output="$GITHUB_WORKSPACE/utility-evidence/cpu-snapshot" \
+            > utility-evidence/cpu-console.log 2>&1
+      - name: Export bounded public metrics even on failure
+        if: always()
+        run: |
+          python3 scripts/export-benchmark-summary.py --kind="$BENCHMARK_KIND" \
+            --runner='${{ matrix.runner }}' --output=public-summary/summary.json
+      - name: Retain public summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-benchmark-${{ matrix.kind }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public-summary/summary.json
+          retention-days: 14
+          if-no-files-found: error
+      - name: Retain raw observations, baseline copies and build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-utility-${{ matrix.kind }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: utility-evidence/
+          retention-days: 14
+          if-no-files-found: warn
