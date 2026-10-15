@@ -183,6 +183,7 @@ final class CandidateRepository
                 ? $this->store->prepare($manifest) : null;
             $headerAssessment = $prepared === null ? null : (new CandidateHeaderInventory)->assessment($manifest);
             $accepted = DB::transaction(function () use ($manifest, $prepared, $headerAssessment, &$capacityDeferred): bool {
+                $capacityDeferred = false;
                 $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                 $identity = (string) $manifest['identity'];
                 $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
@@ -241,7 +242,9 @@ final class CandidateRepository
     private function enrichImportedPasswordMetadata(object $existing, array $manifest, ?object $state, bool &$capacityDeferred, ?PreparedManifest $prepared): bool
     {
         if (! array_key_exists('passwords', $manifest) || $manifest['passwords'] === []) {
-            return $existing->status !== 'metadata_deferred';
+            $capacityDeferred = $existing->status === 'metadata_deferred';
+
+            return ! in_array($existing->status, ['metadata_deferred', 'metadata_review'], true);
         }
         if ($existing->release_id !== null || $existing->manifest_path === ''
             || ! in_array($existing->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'verifying', 'metadata_deferred'], true)

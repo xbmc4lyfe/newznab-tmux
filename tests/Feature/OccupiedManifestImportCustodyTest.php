@@ -7,6 +7,7 @@ use App\Services\BlacklistService;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Releases\Verification\ManifestStore;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use PHPUnit\Framework\Attributes\DataProvider;
 
 class OccupiedManifestImportCustodyTest extends ReleaseVerificationCandidatesTest
@@ -60,6 +61,9 @@ class OccupiedManifestImportCustodyTest extends ReleaseVerificationCandidatesTes
         $source = $this->passwordFixture(['synthetic assertion']);
         file_put_contents($path, $source);
         $statuses = [];
+        Log::partialMock()->shouldReceive('warning')->once()->with('NZB verification admission deferred.', [
+            'category' => 'unexpected_admission_failure',
+        ]);
         $service->beginImport([$path], delete: $delete, deleteFailed: $failed, resultCallback: static function (array $r) use (&$statuses) {
             $statuses[] = $r['status'];
         });
@@ -71,6 +75,71 @@ class OccupiedManifestImportCustodyTest extends ReleaseVerificationCandidatesTes
         if ($enrich) {
             self::assertSame($oldBytes, file_get_contents($store->path($initial->manifest_path)));
         }
+    }
+
+    #[DataProvider('modes')]
+    public function test_missing_capacity_state_is_visible_without_relinquishing_source(bool $loggerThrows, bool $delete, bool $failed): void
+    {
+        $service = $this->offlineImportService();
+        $path = config('release_verification.storage_path').'/missing-state.nzb';
+        app('files')->ensureDirectoryExists(dirname($path));
+        $source = $this->passwordFixture(['synthetic assertion']);
+        file_put_contents($path, $source);
+        DB::table('release_verification_state')->delete();
+        $logger = Log::partialMock()->shouldReceive('warning')->once()->with('NZB verification admission deferred.', [
+            'category' => 'unexpected_admission_failure',
+        ]);
+        if ($loggerThrows) {
+            $logger->andThrow(new \RuntimeException('Synthetic diagnostic failure.'));
+        }
+        $statuses = [];
+        $service->beginImport([$path], delete: $delete, deleteFailed: $failed, resultCallback: static function (array $result) use (&$statuses): void {
+            $statuses[] = $result['status'];
+            self::assertNull($result['candidate_identity']);
+        });
+        self::assertSame([NzbImportStatus::MetadataDeferred], $statuses);
+        self::assertSame($source, file_get_contents($path));
+        self::assertSame(0, DB::table('release_verification_candidates')->count());
+    }
+
+    /** @return iterable<array{string, bool, bool}> */
+    public static function heldReplays(): iterable
+    {
+        foreach (['metadata_review', 'metadata_deferred'] as $status) {
+            foreach ([false, true] as $delete) {
+                foreach ([false, true] as $failed) {
+                    yield [$status, $delete, $failed];
+                }
+            }
+        }
+    }
+
+    #[DataProvider('heldReplays')]
+    public function test_passwordless_hold_replay_preserves_custody_and_locked_state(string $status, bool $delete, bool $failed): void
+    {
+        $service = $this->offlineImportService();
+        $path = config('release_verification.storage_path').'/held.nzb';
+        app('files')->ensureDirectoryExists(dirname($path));
+        $source = $this->passwordFixture([]);
+        file_put_contents($path, $source);
+        $service->beginImport([$path]);
+        DB::table('release_verification_candidates')->update([
+            'status' => $status, 'lease_token' => null, 'lease_until' => null,
+        ]);
+        $before = (array) DB::table('release_verification_candidates')->sole();
+        $state = (array) DB::table('release_verification_state')->sole();
+        $store = app(ManifestStore::class);
+        $stored = file_get_contents($store->path($before['manifest_path']));
+        $statuses = [];
+        $service->beginImport([$path], delete: $delete, deleteFailed: $failed, resultCallback: static function (array $result) use (&$statuses): void {
+            $statuses[] = $result['status'];
+            self::assertNull($result['candidate_identity']);
+        });
+        self::assertSame([$status === 'metadata_review' ? NzbImportStatus::MetadataIgnored : NzbImportStatus::MetadataDeferred], $statuses);
+        self::assertSame($source, file_get_contents($path));
+        self::assertSame($before, (array) DB::table('release_verification_candidates')->sole());
+        self::assertSame($state, (array) DB::table('release_verification_state')->sole());
+        self::assertSame($stored, file_get_contents($store->path($before['manifest_path'])));
     }
 
     public function test_existing_valid_alternative_gzip_is_reusable(): void

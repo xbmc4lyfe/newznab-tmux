@@ -16,6 +16,7 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\ReleaseCleaningService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Services\Releases\Verification\CandidateCapacityException;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\NzbManifestReader;
 use App\Support\Utf8;
@@ -732,7 +733,17 @@ class NzbImportService
             $manifest['identity'] = sha1('import:'.($nzbDetails['articleFingerprint'] ?? $nzbDetails['verificationXml']));
             try {
                 $admitted = app(CandidateRepository::class)->enqueue($manifest);
+            } catch (CandidateCapacityException) {
+                return NzbImportStatus::MetadataDeferred;
             } catch (\Throwable) {
+                try {
+                    Log::warning('NZB verification admission deferred.', [
+                        'category' => 'unexpected_admission_failure',
+                    ]);
+                } catch (\Throwable) {
+                    // A diagnostic failure must not relinquish the retained upload.
+                }
+
                 return NzbImportStatus::MetadataDeferred;
             }
             if (! $admitted) {

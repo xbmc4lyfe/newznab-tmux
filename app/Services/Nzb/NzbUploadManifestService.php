@@ -25,6 +25,10 @@ final class NzbUploadManifestService
 
     public const STATE_NZB_PENDING = 'nzb_pending';
 
+    public const STATE_METADATA_REVIEW = 'metadata_review';
+
+    public const STATE_METADATA_DEFERRED = 'metadata_deferred';
+
     public const STATE_NZB_REJECTED = 'nzb_rejected';
 
     public const STATE_NFO_IMPORTED = 'nfo_imported';
@@ -155,6 +159,14 @@ final class NzbUploadManifestService
                 $manifest['release_id'] = null;
                 $manifest['release_guid'] = null;
                 $manifest['last_error'] = null;
+            } elseif (in_array($status, [NzbImportStatus::MetadataIgnored, NzbImportStatus::MetadataDeferred], true)) {
+                $manifest['state'] = $status === NzbImportStatus::MetadataIgnored
+                    ? self::STATE_METADATA_REVIEW
+                    : self::STATE_METADATA_DEFERRED;
+                $manifest['release_id'] = null;
+                $manifest['release_guid'] = null;
+                $manifest['candidate_identity'] = null;
+                $manifest['last_error'] = $error ?? "NZB import ended with status {$status->value}";
             } elseif ($status === NzbImportStatus::Duplicate) {
                 $manifest['state'] = self::STATE_NZB_DUPLICATE;
                 $manifest['release_id'] = null;
@@ -186,7 +198,7 @@ final class NzbUploadManifestService
 
         $manifest = $this->reconcilePending($manifestPath);
 
-        return in_array($manifest['state'], [self::STATE_STAGED, self::STATE_NZB_FAILED], true);
+        return in_array($manifest['state'], [self::STATE_STAGED, self::STATE_NZB_FAILED, self::STATE_METADATA_DEFERRED], true);
     }
 
     /**
@@ -197,13 +209,13 @@ final class NzbUploadManifestService
     public function reconcilePending(string $manifestPath): array
     {
         $manifest = $this->read($manifestPath);
-        if ($manifest['state'] !== self::STATE_NZB_PENDING) {
+        if (! $this->canReconcileCandidate($manifest)) {
             return $manifest;
         }
 
         return $this->withManifestLock($manifestPath, function () use ($manifestPath): array {
             $manifest = $this->read($manifestPath);
-            if ($manifest['state'] !== self::STATE_NZB_PENDING) {
+            if (! $this->canReconcileCandidate($manifest)) {
                 return $manifest;
             }
             app(VerificationResetService::class)->withAdmission(function () use (&$manifest, $manifestPath): void {
@@ -221,6 +233,22 @@ final class NzbUploadManifestService
 
             return $manifest;
         });
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     */
+    private function canReconcileCandidate(array $manifest): bool
+    {
+        if ($manifest['state'] === self::STATE_NZB_PENDING) {
+            return true;
+        }
+
+        $identity = $manifest['candidate_identity'] ?? null;
+
+        return $manifest['state'] === self::STATE_METADATA_REVIEW
+            && is_string($identity)
+            && preg_match('/\A[0-9a-f]{40}\z/', $identity) === 1;
     }
 
     /**
@@ -243,6 +271,15 @@ final class NzbUploadManifestService
             ->leftJoin('releases as published', 'published.id', '=', 'candidates.release_id')
             ->where('candidates.identity', $identity)->lockForUpdate()
             ->first(['candidates.status', 'candidates.release_id', 'candidates.verified_at', 'published.guid']);
+        if ($candidate !== null && $candidate->status === 'metadata_review') {
+            $manifest['state'] = self::STATE_METADATA_REVIEW;
+            $manifest['release_id'] = null;
+            $manifest['release_guid'] = null;
+            $manifest['last_error'] = 'Download verification candidate is held for metadata review.';
+            $manifest['updated_at'] = now()->toIso8601String();
+
+            return $manifest;
+        }
         if ($candidate !== null && ! in_array($candidate->status, ['complete', 'repaired', 'sampled', 'expired', 'unrepairable'], true)) {
             return $manifest;
         }

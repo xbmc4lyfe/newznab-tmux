@@ -10,6 +10,7 @@ use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\Verification\CandidateHeaderInventory;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\NzbManifestReader;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedNzbWriter;
@@ -17,6 +18,7 @@ use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\Fixtures\ManifestCompressionProbe;
@@ -350,5 +352,136 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
         $head = implode('', array_map(static fn (string $password): string => '<meta type="password">'.$password.'</meta>', $passwords));
 
         return '<nzb><head>'.$head.'</head><file poster="poster" date="1" subject="fixture.bin (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">fixture@example.test</segment></segments></file></nzb>';
+    }
+
+    public function test_password_metadata_enrichment_rolls_back_manifest_and_capacity_with_outer_transaction(): void
+    {
+        $this->assertPrivatePasswordRollback(false);
+    }
+
+    public function test_password_metadata_update_failure_rolls_back_new_storage_and_capacity(): void
+    {
+        $this->assertPrivatePasswordRollback(true);
+    }
+
+    private function assertPrivatePasswordRollback(bool $injectFailure): void
+    {
+        $repository = app(CandidateRepository::class);
+        $store = app(ManifestStore::class);
+        $manifest = $this->privateRollbackManifest();
+        self::assertTrue($repository->enqueue($manifest));
+        DB::table('release_verification_candidates')->update([
+            'status' => 'verifying', 'lease_token' => 'private-rollback-lease',
+            'lease_until' => now()->addHour(),
+        ]);
+        $before = (array) DB::table('release_verification_candidates')->first();
+        $state = (array) DB::table('release_verification_state')->first();
+        $oldBytes = file_get_contents($store->path($before['manifest_path']));
+        $incoming = $manifest + ['passwords' => ['synthetic assertion']];
+        $prepared = $store->prepare($incoming);
+        $newPath = $prepared->name;
+        self::assertNotSame($before['manifest_path'], $newPath);
+        self::assertFileDoesNotExist($store->path($newPath));
+        $injected = false;
+        if ($injectFailure) {
+            DB::listen(static function (QueryExecuted $query) use (&$injected, $store, $newPath): void {
+                if (! $injected && str_starts_with($query->sql, 'update "release_verification_candidates"')) {
+                    self::assertFileExists($store->path($newPath), 'The fault follows real manifest installation.');
+                    $injected = true;
+                    throw new \RuntimeException('Synthetic candidate update failure.');
+                }
+            });
+        } else {
+            DB::beginTransaction();
+        }
+        try {
+            self::assertTrue($repository->enqueue($incoming));
+            self::assertFalse($injectFailure, 'Candidate update fault must propagate.');
+            $during = DB::table('release_verification_candidates')->first();
+            self::assertSame($newPath, $during->manifest_path);
+            self::assertSame($before['version'] + 1, $during->version);
+            self::assertNull($during->lease_token);
+            self::assertNull($during->lease_until);
+            self::assertSame($incoming, $store->read($during->manifest_path));
+            self::assertSame($during->manifest_bytes, DB::table('release_verification_state')->value('pending_bytes'));
+            self::assertFileExists($store->path($before['manifest_path']));
+            self::assertFileExists($store->path($newPath));
+        } catch (\RuntimeException $exception) {
+            self::assertTrue($injectFailure);
+            self::assertSame('Synthetic candidate update failure.', $exception->getMessage());
+        } finally {
+            if (! $injectFailure) {
+                DB::rollBack();
+            }
+        }
+        self::assertSame($injectFailure, $injected);
+        self::assertSame(0, DB::transactionLevel());
+        self::assertSame($before, (array) DB::table('release_verification_candidates')->first());
+        self::assertSame($state, (array) DB::table('release_verification_state')->first());
+        self::assertSame($oldBytes, file_get_contents($store->path($before['manifest_path'])));
+        self::assertSame($manifest, $store->read($before['manifest_path']));
+        self::assertFileDoesNotExist($store->path($newPath));
+        self::assertSame([$store->path($before['manifest_path'])], glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
+    }
+
+    public function test_public_import_outer_transaction_guard_retains_source_before_reading(): void
+    {
+        $service = new class extends NzbImportService
+        {
+            public function __construct()
+            {
+                parent::__construct(['Browser' => true]);
+            }
+
+            protected function getAllGroups(): bool
+            {
+                $this->allGroups = ['alt.test' => 1];
+
+                return true;
+            }
+        };
+        app('files')->ensureDirectoryExists(config('release_verification.storage_path'));
+        $source = config('release_verification.storage_path').'/private-outer.nzb';
+        // Deliberately malformed: the outer guard must run before even opening this source.
+        $bytes = 'synthetic malformed input retained for retry';
+        file_put_contents($source, $bytes);
+        $state = (array) DB::table('release_verification_state')->first();
+        $filesystem = File::getFacadeRoot();
+        File::partialMock()->shouldReceive('isFile')->never();
+        File::shouldReceive('get')->never();
+        File::shouldReceive('delete')->with($source)->never();
+        $results = [];
+        DB::beginTransaction();
+        try {
+            $service->beginImport([$source], delete: true, deleteFailed: true,
+                resultCallback: static function (array $result) use (&$results): void {
+                    $results[] = $result;
+                });
+            self::assertCount(1, $results);
+            self::assertSame('metadata_deferred', $results[0]['status']->value);
+            self::assertNull($results[0]['candidate_identity']);
+            self::assertSame(1, DB::transactionLevel());
+            self::assertSame($bytes, file_get_contents($source));
+            self::assertSame(0, DB::table('release_verification_candidates')->count());
+            self::assertSame($state, (array) DB::table('release_verification_state')->first());
+        } finally {
+            DB::rollBack();
+            File::swap($filesystem);
+        }
+        self::assertSame($bytes, file_get_contents($source));
+        self::assertSame(0, DB::table('release_verification_candidates')->count());
+        self::assertSame($state, (array) DB::table('release_verification_state')->first());
+    }
+
+    /** @return array<string, mixed> */
+    private function privateRollbackManifest(): array
+    {
+        $xml = '<nzb><file subject="Fixture [1/1] &quot;fixture.rar&quot; (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">fixture@example.test</segment></segments></file></nzb>';
+        $manifest = app(NzbManifestReader::class)->read($xml, (object) [
+            'groups_id' => 1, 'searchname' => 'Fixture', 'fromname' => 'fixture poster',
+            'postdate' => '2026-10-11 12:00:00', 'metadata_source' => 'import',
+        ]);
+
+        return $manifest + ['identity' => sha1('private rollback fixture')];
     }
 }

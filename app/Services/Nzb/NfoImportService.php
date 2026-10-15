@@ -37,6 +37,13 @@ final class NfoImportService
             }
 
             if (in_array($state, [
+                NzbUploadManifestService::STATE_METADATA_REVIEW,
+                NzbUploadManifestService::STATE_METADATA_DEFERRED,
+            ], true)) {
+                return ['status' => 'skipped', 'message' => "NFO is held for metadata ({$state})"];
+            }
+
+            if (in_array($state, [
                 NzbUploadManifestService::STATE_NZB_DUPLICATE,
                 NzbUploadManifestService::STATE_NZB_FAILED,
                 NzbUploadManifestService::STATE_NZB_REJECTED,

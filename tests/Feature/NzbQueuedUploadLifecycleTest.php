@@ -15,6 +15,7 @@ use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
 
 class NzbQueuedUploadLifecycleTest extends TestCase
@@ -50,6 +51,103 @@ class NzbQueuedUploadLifecycleTest extends TestCase
     {
         (new Filesystem)->deleteDirectory($this->directory);
         parent::tearDown();
+    }
+
+    #[DataProvider('capacityDeletionFlags')]
+    public function test_real_capacity_deferral_retains_nzb_and_nfo_and_allows_retry(bool $delete, bool $deleteFailed): void
+    {
+        [$path, $manifests] = $this->upload('capacity');
+        $service = new class(['Browser' => true]) extends NzbImportService
+        {
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function scanNZBFile(mixed &$nzbXML, mixed $nzbFileName = '', mixed $source = ''): NzbImportStatus
+            {
+                return $this->insertNZB(['verificationXml' => $nzbXML->asXML(), 'groups_id' => 1, 'useFName' => 'Fixture',
+                    'subject' => 'Fixture', 'from' => 'poster', 'postDate' => '2026-10-13 12:00:00', 'articleFingerprint' => 'capacity-fixture']);
+            }
+        };
+        config(['release_verification.pending_bytes' => 0]);
+        $reports = [];
+        $record = function (array $result) use ($manifests, &$reports): void {
+            $reports[] = $result;
+            $this->assertSame(0, DB::transactionLevel());
+            $manifests->recordNzbOutcome($result['path'], $result['status'], $result['release_id'], $result['release_guid'],
+                candidateIdentity: $result['candidate_identity']);
+        };
+        $output = $service->beginImport([$path], delete: $delete, deleteFailed: $deleteFailed, resultCallback: $record);
+        $this->assertSame(NzbImportStatus::MetadataDeferred, $reports[0]['status']);
+        $this->assertNull($reports[0]['candidate_identity']);
+        $this->assertNull($reports[0]['release_id']);
+        $this->assertFileExists($path);
+        $this->assertFileExists(dirname($path).'/info.nfo');
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
+        $this->assertSame(0, DB::table('releases')->count());
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame([], glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
+        $this->assertStringContainsString('1 NZBs were skipped', $output);
+        $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
+        $this->assertSame('metadata_deferred', $manifests->read($manifestPath)['state']);
+        $this->assertTrue($manifests->shouldImportNzb($path));
+        $nfo = (new NfoImportService(new Filesystem, $manifests, new NfoService))->importManifest($manifestPath, $delete, $deleteFailed);
+        $this->assertSame('skipped', $nfo['status']);
+        $this->assertFileExists(dirname($path).'/info.nfo');
+        config(['release_verification.pending_bytes' => 1024 * 1024]);
+        $service->beginImport([$path], resultCallback: $record);
+        $this->assertSame(NzbImportStatus::Queued, $reports[1]['status']);
+        $this->assertNotNull($reports[1]['candidate_identity']);
+        $this->assertSame(1, DB::table('release_verification_candidates')->count());
+        $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $manifests->read($manifestPath)['state']);
+    }
+
+    /** @return array<string, array{bool, bool}> */
+    public static function capacityDeletionFlags(): array
+    {
+        return ['neither' => [false, false], 'delete' => [true, false], 'delete failed' => [false, true], 'both' => [true, true]];
+    }
+
+    #[DataProvider('capacityDeletionFlags')]
+    public function test_metadata_review_retains_paired_payloads_without_automatic_retry(bool $delete, bool $deleteFailed): void
+    {
+        [$path, $manifests] = $this->upload('metadata-review');
+        $source = file_get_contents($path);
+        $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
+        $manifests->recordNzbOutcome($path, NzbImportStatus::MetadataIgnored, null, null);
+        $result = (new NfoImportService(new Filesystem, $manifests, new NfoService))->importManifest($manifestPath, $delete, $deleteFailed);
+        $this->assertSame('skipped', $result['status']);
+        $this->assertSame('metadata_review', $manifests->read($manifestPath)['state']);
+        $this->assertFalse($manifests->shouldImportNzb($path));
+        $this->assertSame($source, file_get_contents($path));
+        $this->assertFileExists(dirname($path).'/info.nfo');
+        $this->assertNull($manifests->read($manifestPath)['candidate_identity']);
+    }
+
+    public function test_candidate_metadata_review_retains_nfo_and_can_reconcile_later_publication(): void
+    {
+        $identity = sha1('import:metadata-review');
+        $this->candidate($identity, 'metadata_review');
+        [$path, $manifests] = $this->upload('candidate-review');
+        $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
+        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        unlink($path);
+        $nfos = new NfoImportService(new Filesystem, $manifests, new NfoService);
+        $this->assertSame('skipped', $nfos->importManifest($manifestPath, deleteFailed: true)['status']);
+        $held = $manifests->read($manifestPath);
+        $this->assertSame('metadata_review', $held['state']);
+        $this->assertSame($identity, $held['candidate_identity']);
+        $this->assertNull($held['release_id']);
+        $this->assertFileExists(dirname($path).'/info.nfo');
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'reviewed-publication']);
+        DB::table('release_verification_candidates')->where('identity', $identity)->update([
+            'status' => 'complete', 'release_id' => 7, 'verified_at' => now(),
+        ]);
+        $this->assertSame('imported', $nfos->importManifest($manifestPath)['status']);
+        $this->assertSame(NzbUploadManifestService::STATE_NFO_IMPORTED, $manifests->read($manifestPath)['state']);
+        $this->assertSame(7, $manifests->read($manifestPath)['release_id']);
+        $this->assertSame(1, DB::table('release_nfos')->count());
     }
 
     public function test_queued_callback_persists_candidate_identity_before_nzb_deletion_and_nfo_waits(): void

@@ -29,11 +29,17 @@ final class ManifestStore
         if (! is_dir($directory) && ! mkdir($directory, 0700, true) && ! is_dir($directory)) {
             throw new RuntimeException('Candidate storage is unavailable.');
         }
+        if (! @chmod($directory, 0700)) {
+            throw new RuntimeException('Candidate storage is unavailable.');
+        }
         $name = $prepared->name;
         $path = $directory.'/'.$name;
         $compressed = $prepared->compressed;
         if (is_file($path)) {
             $this->validateOccupiedTarget($path, $prepared);
+            if (! @chmod($path, 0600)) {
+                throw new RuntimeException('Cannot secure candidate manifest.');
+            }
         } else {
             $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
             $handle = fopen($temporary, 'xb');
@@ -42,6 +48,9 @@ final class ManifestStore
             }
             try {
                 try {
+                    if (! @chmod($temporary, 0600)) {
+                        throw new RuntimeException('Cannot write candidate manifest.');
+                    }
                     if (fwrite($handle, $compressed) !== strlen($compressed) || ! fflush($handle) || ! fsync($handle)) {
                         throw new RuntimeException('Cannot persist candidate manifest.');
                     }

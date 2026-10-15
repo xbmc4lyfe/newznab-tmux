@@ -222,7 +222,7 @@ class VerifyReleaseCandidates extends Command
                         : DB::table('release_verification_candidates')->where('id', $entry->candidate_id)
                             ->where('version', '>=', $entry->version)
                             ->where(function ($query): void {
-                                $query->whereIn('status', ['expired', 'filtered'])
+                                $query->whereIn('status', ['expired', 'filtered', 'metadata_review'])
                                     ->orWhere(fn ($published) => $published->whereNotNull('release_id')->whereIn('status', ['complete', 'repaired', 'sampled']));
                             })
                             ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))
