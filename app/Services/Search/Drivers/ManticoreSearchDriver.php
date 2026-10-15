@@ -1757,7 +1757,7 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
                 ->setTable($this->getPredbIndex())
                 ->maxMatches(1000)
                 ->limit(1000)
-                ->stripBadUtf8(true)
+                ->stripBadUtf8(false)
                 ->search($expression)
                 ->get();
             $response = $results->getResponse()->getResponse();

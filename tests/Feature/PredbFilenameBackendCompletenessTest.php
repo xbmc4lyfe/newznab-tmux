@@ -155,4 +155,78 @@ final class PredbFilenameBackendCompletenessTest extends TestCase
         }
         self::assertSame($iterations, $calls);
     }
+
+    public static function rawManticoreResponses(): array
+    {
+        $cases = [];
+        foreach (['prefile', 'list', 'files'] as $caller) {
+            foreach (['unique', 'ambiguous', 'malformed UTF-8'] as $scenario) {
+                $cases[$caller.' '.$scenario] = [$caller, $scenario];
+            }
+        }
+
+        return $cases;
+    }
+
+    #[DataProvider('rawManticoreResponses')]
+    public function test_raw_manticore_json_never_erases_a_unicode_competitor(string $caller, string $scenario): void
+    {
+        $this->createPar2RenameSchema();
+        config(['nntmux.echocli' => false]);
+        DB::statement('ALTER TABLE predb ADD COLUMN filename TEXT');
+        Event::fake([ReleaseNameFixed::class]);
+        $title = 'Exact.Kelvin.Release-GRP';
+        $competitor = 'Exact.Kelvin.Release-GRP';
+        DB::table('predb')->insert([
+            ['id' => 7, 'title' => $title, 'filename' => ''],
+            ['id' => 8, 'title' => $competitor, 'filename' => ''],
+        ]);
+        $rows = [['_id' => 7, '_source' => ['title' => $title]]];
+        if ($scenario !== 'unique') {
+            $rows[] = ['_id' => 8, '_source' => ['title' => $competitor, 'source' => 'INVALID_BYTE_MARKER']];
+        }
+        $wire = json_encode(['timed_out' => false, 'hits' => [
+            'total' => count($rows), 'total_relation' => 'eq', 'hits' => $rows,
+        ]], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE);
+        if ($scenario === 'malformed UTF-8') {
+            $wire = str_replace('INVALID_BYTE_MARKER', "\xFF", $wire);
+        }
+        $client = $this->createMock(Client::class);
+        $client->expects(self::once())->method('search')->willReturnCallback(
+            // Preserve actual SDK response decoding and the exact request option that
+            // controls its lossy fallback; array responses bypass that behavior.
+            static fn (array $params): Response => (new Response($wire, 200))->setTransportInfo(['body' => $params['body']])
+        );
+        $driver = new ManticoreSearchDriver(['indexes' => ['predb' => 'custom_pre']]);
+        $driver->manticoreSearch = $client;
+        $search = new class($this->app) extends SearchService
+        {
+            public function supportsReleaseCandidatePaging(): bool
+            {
+                return false;
+            }
+        };
+        $search->extend('fixture', static fn () => $driver);
+        config(['search.default' => 'fixture']);
+        Search::swap($search);
+        $extractor = $this->createMock(FileNameExtractor::class);
+        $extractor->expects(self::never())->method('extractFromFile');
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
+        $service = new NameFixingService($updates, fileExtractor: $extractor);
+        $release = $this->pendingPar2Release(['searchname' => $title, 'predb_id' => 0]);
+        $filename = $title.'.mkv';
+        if ($caller === 'files') {
+            DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
+            $service->fixNamesWithFiles(0, true, 0, true, false);
+        } elseif ($caller === 'prefile') {
+            DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
+            $service->getPreFileNames(['prefile', '1']);
+        } else {
+            $release->releases_id = $release->id;
+            $service->matchPreDbFileNames($release, [$filename], true, true, false);
+        }
+        self::assertSame($scenario === 'unique' ? 7 : 0, $release->fresh()->predb_id);
+        self::assertSame($title, $release->fresh()->searchname);
+    }
 }
