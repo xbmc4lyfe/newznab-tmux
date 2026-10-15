@@ -854,7 +854,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     }
 
     #[DataProvider('literalDelimiterFilenameCases')]
-    public function test_add_file_info_keeps_one_literal_filename_as_one_observation(bool $literalDelimiter, string $tail, int $expected): void
+    public function test_add_file_info_keeps_one_literal_filename_as_one_observation(bool $literalDelimiter, string $tail, int $expected, string $queryTail = ''): void
     {
         $title = 'Exact.Release.2026-GRP';
         $this->prepareFullPar2NamingEvidence($title);
@@ -881,7 +881,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         self::assertArrayNotHasKey('filename', $context->release->getAttributes());
         self::assertArrayNotHasKey('observed_additional_pp_claim', $context->release->getAttributes());
         self::assertCount(1, $context->pendingReleaseFiles);
-        self::assertSame([($literalDelimiter ? 'Auxiliary.Asset ' : '').$title], $discoveredQueries);
+        self::assertSame([($literalDelimiter ? 'Auxiliary.Asset ' : '').$title.$queryTail], $discoveredQueries);
         self::assertSame($originalAttributes, $context->release->getAttributes());
         self::assertSame($originalClaim, $context->producerNamingClaim);
         self::assertSame($originalAttributes['additional_pp_claim_token'], DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
@@ -893,8 +893,8 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         return [
             'literal delimiter' => [true, '.mkv', 0],
             'normal singleton control' => [false, '.mkv', 7],
-            'erased group substring' => [false, 'disc1.mkv', 0],
-            'double payload suffix' => [false, '.flac.mkv', 0],
+            'erased group substring' => [false, 'disc1.mkv', 0, 'disc1'],
+            'double payload suffix' => [false, '.flac.mkv', 0, '.flac'],
         ];
     }
 

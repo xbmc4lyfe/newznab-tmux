@@ -175,6 +175,14 @@ class FileNameCleaner
         return $fileName;
     }
 
+    /** Preserve literal spelling for nomination; generic cleaning only validates usability. */
+    public function cleanForFilenameDiscovery(OriginalFilenameEvidence $evidence): string|false
+    {
+        return $this->cleanForMatching($evidence->stem, preserveLeadingNumber: true) === false
+            ? false
+            : $evidence->stem;
+    }
+
     /**
      * Clean a filename for PreDB matching.
      *

@@ -91,8 +91,6 @@ class NameFixingService
      */
     protected array $predbMatchCache = [];
 
-    private ?FilenameNominationCache $filenameNominations = null;
-
     /** @var array<string, bool> */
     protected array $predbEvidenceCache = [];
 
@@ -444,13 +442,14 @@ class NameFixingService
     {
         $hadEvidence = true;
         $originalFilename = (string) $release->textstring;
-        $fileName = $this->fileNameCleaner->cleanForMatching($originalFilename, preserveLeadingNumber: true);
+        $evidence = new OriginalFilenameEvidence($originalFilename);
+        $fileName = $this->fileNameCleaner->cleanForFilenameDiscovery($evidence);
 
         if (empty($fileName)) {
             return false;
         }
 
-        $bestMatch = $this->findBestPredbFilenameMatch($fileName, $originalFilename, $hadEvidence);
+        $bestMatch = $this->findBestPredbFilenameMatch($fileName, $evidence, $hadEvidence);
         if ($bestMatch !== null) {
             if ((int) ($bestMatch['id'] ?? 0) <= 0) {
                 return false;
@@ -485,19 +484,15 @@ class NameFixingService
     }
 
     /**
-     * Discovery can be reused; acceptance must be repeated against each original filename.
+     * Resolve current nominations for every observation; imports can change ambiguity between calls.
      *
      * @return array<string, mixed>|null
      */
-    private function findBestPredbFilenameMatch(string $query, string $original, bool &$hadEvidence = false): ?array
+    private function findBestPredbFilenameMatch(string $query, OriginalFilenameEvidence $evidence, bool &$hadEvidence = false): ?array
     {
-        $results = ($this->filenameNominations ??= new FilenameNominationCache)->remember($query, static function () use ($query): array {
-            $searchText = self::predbSearchText($query);
-
-            return $searchText === '' ? [] : Search::searchPredb($searchText);
-        });
+        $searchText = self::predbSearchText($query);
+        $results = $searchText === '' ? [] : Search::searchPredb($searchText);
         $hadEvidence = $results !== [];
-        $evidence = new OriginalFilenameEvidence($original);
         $eligible = array_values(array_filter($results, static function ($result) use ($evidence): bool {
             $row = (array) $result;
 
@@ -1880,13 +1875,14 @@ class NameFixingService
         $prioritizedFiles = $this->filePrioritizer->prioritizeForPreDb($files);
 
         foreach ($prioritizedFiles as $fileName) {
-            $cleanedFileName = $this->fileNameCleaner->cleanForMatching($fileName, preserveLeadingNumber: true);
+            $evidence = new OriginalFilenameEvidence($fileName);
+            $cleanedFileName = $this->fileNameCleaner->cleanForFilenameDiscovery($evidence);
 
             if (empty($cleanedFileName) || strlen($cleanedFileName) < 8) {
                 continue;
             }
 
-            $bestMatch = $this->findBestPredbFilenameMatch($cleanedFileName, $fileName);
+            $bestMatch = $this->findBestPredbFilenameMatch($cleanedFileName, $evidence);
 
             if ($bestMatch !== null && (int) ($bestMatch['id'] ?? 0) > 0) {
                 if (! $echo && $this->updateService->currentPredbTitle((int) $bestMatch['id'], (string) $bestMatch['title'], $fileName) === null) {

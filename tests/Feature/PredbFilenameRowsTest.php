@@ -81,6 +81,92 @@ final class PredbFilenameRowsTest extends TestCase
         }
     }
 
+    public static function expandedArchiveDiscovery(): array
+    {
+        $cases = [];
+        foreach (['.7z.01', '.7z.0001', '.part12345.rar', '.tar.zst', '.tgz', '.lz4', '.enc', '.rev', '.rar.par2'] as $suffix) {
+            foreach (['prefile', 'list'] as $caller) {
+                foreach ([false, true] as $alias) {
+                    $cases[$caller.$suffix.($alias ? ' alias' : ' canonical')] = [$suffix, $caller, $alias, true];
+                }
+            }
+        }
+        $cases['no nomination'] = ['.7z.01', 'list', false, false];
+        $cases['malformed wrapper'] = ['.7z.00001', 'list', false, true];
+        $cases['malformed prefile wrapper'] = ['.7z.00001', 'prefile', false, true];
+
+        foreach (['part', 'vol', 'cd', 'dvd', 'disc', 'disk'] as $token) {
+            foreach (['prefile', 'list'] as $caller) {
+                foreach (['plain', 'case', 'leading', 'archive', 'alias', 'wrapper', 'path', 'nohit', 'malformed', 'wrapper-path', 'encoded-suffix', 'wrong-title'] as $variant) {
+                    $cases[$caller.' terminal '.$token.' '.$variant] = ['.mkv', $caller, $variant === 'alias', $variant !== 'nohit', $token, $variant];
+                }
+            }
+        }
+
+        return $cases;
+    }
+
+    #[DataProvider('expandedArchiveDiscovery')]
+    public function test_expanded_archive_discovery_reaches_persisted_filename_callers(string $suffix, string $caller, bool $alias, bool $nominate, string $terminal = '', string $variant = ''): void
+    {
+        $this->createPar2RenameSchema();
+        config(['nntmux.echocli' => false]);
+        Event::fake([ReleaseNameFixed::class]);
+        $title = ($variant === 'leading' ? '01.' : '').'Exact.Release.2026-GRP'.$terminal.($terminal === '' ? '' : '1');
+        $stem = $alias ? 'Synthetic.Filename.Alias-GRP' : $title;
+        if ($alias && $terminal !== '') {
+            $stem .= $terminal.'1';
+        }
+        $queryStem = $variant === 'case' ? strtolower($stem) : $stem;
+        $suffix = $variant === 'archive' ? '.part12345.rar' : $suffix;
+        $filename = $queryStem.$suffix;
+        if ($variant === 'wrapper' || $variant === 'malformed') {
+            $filename = '__NZBSPLIT__'.($variant === 'malformed' ? 'bad' : 'abcdef1234').'__NZBSPLIT__'.str_replace('.', '_', $queryStem).$suffix;
+        }
+        if ($variant === 'wrapper-path') {
+            $filename = '__NZBSPLIT__abcdef1234__NZBSPLIT__directory/'.$queryStem.$suffix;
+        }
+        if ($variant === 'encoded-suffix') {
+            $filename = '__NZBSPLIT__abcdef1234__NZBSPLIT__'.str_replace('.', '_', $queryStem.$suffix);
+        }
+        if ($variant === 'wrong-title') {
+            $filename = 'Extra.'.$queryStem.$suffix;
+        }
+        if ($variant === 'path') {
+            $filename = 'directory/'.$filename;
+        }
+        $release = $this->pendingPar2Release(['searchname' => 'Original.Release.2026-GRP', 'predb_id' => 0]);
+        DB::table('predb')->insert(['id' => 7, 'title' => $title]);
+        if ($alias) {
+            DB::statement('ALTER TABLE predb ADD COLUMN filename TEXT');
+            DB::table('predb')->where('id', 7)->update(['filename' => $stem]);
+        }
+        DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
+        $queries = [];
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
+        Search::shouldReceive('searchPredb')->andReturnUsing(static function (string $query) use (&$queries, $queryStem, $stem, $title, $alias, $nominate, $variant): array {
+            $queries[] = $query;
+
+            return $nominate && ($query === $queryStem || in_array($variant, ['malformed', 'wrapper-path', 'encoded-suffix', 'wrong-title'], true)) ? [['id' => 7, 'title' => $title, 'filename' => $alias ? $stem : '']] : [];
+        });
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $category = $this->createStub(CategorizationService::class);
+        $category->method('determineCategory')->willReturn(['categories_id' => 8000]);
+        $service = new NameFixingService(new ReleaseUpdateService($category, searchSyncCoordinator: $sync));
+        if ($caller === 'prefile') {
+            $service->getPreFileNames(['prefile', '1']);
+        } else {
+            $service->matchPreDbFileNames($release, [$filename], true, true, false);
+        }
+        $matches = $nominate && $suffix !== '.7z.00001' && ! in_array($variant, ['malformed', 'wrapper-path', 'encoded-suffix', 'wrong-title'], true);
+        self::assertSame($matches ? 7 : 0, $release->fresh()->predb_id, json_encode($queries));
+        self::assertSame($matches ? $title : 'Original.Release.2026-GRP', $release->fresh()->searchname);
+        self::assertSame($filename, DB::table('release_files')->where('releases_id', $release->id)->value('name'));
+        if ($matches) {
+            self::assertSame([$queryStem], $queries);
+        }
+    }
+
     public static function mixedRows(): array
     {
         return ['literal first' => [false], 'independent first' => [true]];

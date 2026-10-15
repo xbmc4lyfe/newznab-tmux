@@ -147,14 +147,14 @@ final class PredbUnicodeIdentityTest extends TestCase
         }
     }
 
-    public function test_cached_rejected_filename_evidence_never_becomes_a_legacy_fallback(): void
+    public function test_repeated_rejected_filename_evidence_never_becomes_a_legacy_fallback(): void
     {
         $first = $this->pendingPar2Release(['searchname' => 'Hashed.First']);
         $second = $this->pendingPar2Release(['searchname' => 'Hashed.Second']);
         foreach ([$first, $second] as $release) {
             DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => self::TITLE.'.mkv']);
         }
-        Search::shouldReceive('searchPredb')->once()->andReturn([
+        Search::shouldReceive('searchPredb')->twice()->andReturn([
             ['id' => 7, 'title' => str_replace('Rosalía', 'Rosalia', self::TITLE)],
         ]);
         [$service] = $this->services();

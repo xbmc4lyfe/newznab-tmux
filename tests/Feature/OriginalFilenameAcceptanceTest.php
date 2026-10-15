@@ -9,9 +9,9 @@ use App\Facades\Search;
 use App\Services\AdditionalProcessing\ReleaseSearchSyncCoordinator;
 use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\Categorization\CategorizationService;
-use App\Services\NameFixing\FilenameNominationCache;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NameFixing\NameFixingService;
+use App\Services\NameFixing\OriginalFilenameEvidence;
 use App\Services\NameFixing\ReleaseUpdateService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -183,7 +183,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         self::assertTrue($updates->matched);
     }
 
-    public function test_same_cleaned_query_reuses_accepted_match_across_distinct_original_evidence(): void
+    public function test_repeated_queries_revalidate_each_distinct_original_evidence(): void
     {
         $this->createPar2RenameSchema();
         config(['nntmux.echocli' => false]);
@@ -194,7 +194,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         DB::table('predb')->insert(['id' => 7, 'title' => $title]);
         $queries = [];
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->once()->andReturnUsing(static function (string $query) use (&$queries, $title): array {
+        Search::shouldReceive('searchPredb')->twice()->andReturnUsing(static function (string $query) use (&$queries, $title): array {
             $queries[] = $query;
 
             return [['id' => 7, 'title' => $title]];
@@ -207,7 +207,58 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             self::assertSame($filename === $title.'.mkv' ? 1 : 0, $service->matchPreDbFileNames($entry, [$filename], true, true, false));
         }
         self::assertSame([7, 0], [$a->fresh()->predb_id, $b->fresh()->predb_id]);
-        self::assertSame([$title], $queries);
+        self::assertSame([$title, $title.'disc1'], $queries);
+    }
+
+    public static function nominationChanges(): array
+    {
+        return [
+            'list new mapping' => ['list', false],
+            'list new ambiguity' => ['list', true],
+            'prefile new mapping' => ['prefile', false],
+            'prefile new ambiguity' => ['prefile', true],
+        ];
+    }
+
+    #[DataProvider('nominationChanges')]
+    public function test_repeated_filename_queries_observe_current_nominations(string $caller, bool $ambiguity): void
+    {
+        $this->createPar2RenameSchema();
+        config(['nntmux.echocli' => false]);
+        Event::fake([ReleaseNameFixed::class]);
+        $title = 'Exact.Release.2026-GRP';
+        $filename = $title.'.mkv';
+        $rows = $ambiguity ? [['id' => 7, 'title' => $title]] : [];
+        if ($ambiguity) {
+            DB::table('predb')->insert(['id' => 7, 'title' => $title]);
+        }
+        $calls = 0;
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
+        Search::shouldReceive('searchPredb')->andReturnUsing(static function () use (&$rows, &$calls): array {
+            $calls++;
+
+            return $rows;
+        });
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $service = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync));
+        foreach ([false, true] as $changed) {
+            if ($changed) {
+                $id = $ambiguity ? 8 : 7;
+                DB::table('predb')->insert(['id' => $id, 'title' => $title]);
+                $rows[] = ['id' => $id, 'title' => $title];
+            }
+            $release = $this->pendingPar2Release(['searchname' => $title, 'predb_id' => 0]);
+            if ($caller === 'prefile') {
+                DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
+                $service->getPreFileNames(['prefile', '1']);
+            } else {
+                $release->releases_id = $release->id;
+                $service->matchPreDbFileNames($release, [$filename], true, true, false);
+            }
+            self::assertSame($ambiguity !== $changed ? 7 : 0, $release->fresh()->predb_id);
+            self::assertSame($title, $release->fresh()->searchname);
+        }
+        self::assertSame(2, $calls);
     }
 
     public static function mixedRows(): array
@@ -331,7 +382,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         $row = ['id' => 7, 'title' => $title, 'filename' => $alias];
         DB::table('predb')->insert($row);
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->once()->andReturn([$row]);
+        Search::shouldReceive('searchPredb')->times($accept ? 2 : 1)->andReturn([$row]);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
         $service = new NameFixingService($updates);
@@ -344,7 +395,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             $second = $this->pendingPar2Release(['searchname' => $title]);
             $second->releases_id = $second->id;
             DB::table('predb')->where('id', 7)->update(['filename' => 'Replacement.Alias-GRP.mkv']);
-            // Search nominations are stale and reused; the DB mapping must still be revalidated.
+            // Even a stale backend result must be revalidated against the current DB mapping.
             self::assertSame(0, $service->matchPreDbFileNames($second, [$original], true, true, false));
             self::assertSame(0, $second->fresh()->predb_id);
         }
@@ -401,12 +452,10 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             ['id' => 8, 'title' => 'Other.Canonical.Two', 'filename' => $title],
         ];
         $service = new NameFixingService($this->createStub(ReleaseUpdateService::class));
-        (new \ReflectionProperty($service, 'filenameNominations'))->setValue($service,
-            new FilenameNominationCache(1));
         Search::shouldReceive('searchPredb')->twice()->andReturn($rows);
         $lookup = new \ReflectionMethod($service, 'findBestPredbFilenameMatch');
-        self::assertNull($lookup->invoke($service, $title, $title.'.mkv'));
-        self::assertNull($lookup->invoke($service, $title, $title.'.mkv'));
+        self::assertNull($lookup->invoke($service, $title, new OriginalFilenameEvidence($title.'.mkv')));
+        self::assertNull($lookup->invoke($service, $title, new OriginalFilenameEvidence($title.'.mkv')));
     }
 
     public function test_uncached_tail_canonical_evidence_still_outranks_alias(): void
@@ -417,19 +466,15 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             ['id' => 8, 'title' => $title, 'filename' => ''],
         ];
         $service = new NameFixingService($this->createStub(ReleaseUpdateService::class));
-        (new \ReflectionProperty($service, 'filenameNominations'))->setValue($service,
-            new FilenameNominationCache(1));
         Search::shouldReceive('searchPredb')->twice()->andReturn($rows);
         $lookup = new \ReflectionMethod($service, 'findBestPredbFilenameMatch');
-        self::assertSame(8, $lookup->invoke($service, $title, $title.'.mkv')['id']);
-        self::assertSame(8, $lookup->invoke($service, $title, $title.'.mkv')['id']);
+        self::assertSame(8, $lookup->invoke($service, $title, new OriginalFilenameEvidence($title.'.mkv'))['id']);
+        self::assertSame(8, $lookup->invoke($service, $title, new OriginalFilenameEvidence($title.'.mkv'))['id']);
     }
 
     public function test_oversized_nominations_report_evidence_without_retaining_separate_query_keys(): void
     {
         $service = new NameFixingService($this->createStub(ReleaseUpdateService::class));
-        (new \ReflectionProperty($service, 'filenameNominations'))->setValue($service,
-            new FilenameNominationCache(1));
         Search::shouldReceive('searchPredb')->twice()->andReturn([
             ['id' => 7, 'title' => 'Other.Canonical.One'],
             ['id' => 8, 'title' => 'Other.Canonical.Two'],
@@ -437,7 +482,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         $lookup = new \ReflectionMethod($service, 'findBestPredbFilenameMatch');
         foreach (['First.Release.2026-GRP', 'Second.Release.2026-GRP'] as $query) {
             $hadEvidence = false;
-            self::assertNull($lookup->invokeArgs($service, [$query, $query.'.mkv', &$hadEvidence]));
+            self::assertNull($lookup->invokeArgs($service, [$query, new OriginalFilenameEvidence($query.'.mkv'), &$hadEvidence]));
             self::assertTrue($hadEvidence);
         }
         self::assertSame([], (new \ReflectionProperty($service, 'predbEvidenceCache'))->getValue($service));

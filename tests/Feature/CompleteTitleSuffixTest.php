@@ -124,7 +124,7 @@ final class CompleteTitleSuffixTest extends TestCase
         $row = ['id' => 7, 'title' => $title, 'filename' => $alias];
         DB::table('predb')->insert($row);
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->once()->andReturn([$row]);
+        Search::shouldReceive('searchPredb')->times($accept ? 2 : 1)->andReturn([$row]);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
         $service = new NameFixingService($updates);
@@ -137,7 +137,7 @@ final class CompleteTitleSuffixTest extends TestCase
             $second = $this->pendingPar2Release(['searchname' => $title]);
             $second->releases_id = $second->id;
             DB::table('predb')->where('id', 7)->update(['filename' => 'Replacement.Alias-GRP.mkv']);
-            // Search nominations are stale and reused; the DB mapping must still be revalidated.
+            // Even a stale backend result must be revalidated against the current DB mapping.
             self::assertSame(0, $service->matchPreDbFileNames($second, [$original], true, true, false));
             self::assertSame(0, $second->fresh()->predb_id);
         }
