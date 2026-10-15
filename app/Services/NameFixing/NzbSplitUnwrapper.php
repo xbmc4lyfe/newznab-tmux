@@ -56,7 +56,17 @@ final class NzbSplitUnwrapper
             return $value;
         }
 
-        return preg_replace('/(\.(?:7z\.\d{2,4}|part\d+\.rar|rar|r\d{2,4}|par2?))"? +yEnc(?: +\([1-9]\d*(?:\/[1-9]\d*)?\))?\z/iD', '$1', $value) ?? $value;
+        if (preg_match('/"? +yEnc(?: +\([1-9]\d*(?:\/[1-9]\d*)?\))?\z/iD', $value, $trailer, PREG_OFFSET_CAPTURE) !== 1) {
+            return $value;
+        }
+        $filename = substr($value, 0, $trailer[0][1]);
+        foreach (self::TRAILING_ARCHIVE_PATTERNS as $pattern) {
+            if (preg_match($pattern, $filename) === 1) {
+                return $filename;
+            }
+        }
+
+        return $value;
     }
 
     public function unwrap(string $value): ?string

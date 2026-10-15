@@ -13,7 +13,19 @@ final readonly class OriginalFilenameEvidence
 
     public function __construct(string $filename)
     {
-        $source = (new NzbSplitUnwrapper)->stripLiteralSubjectTrailer($filename);
+        $unwrapper = new NzbSplitUnwrapper;
+        $source = $unwrapper->stripLiteralSubjectTrailer($filename);
+        if (stripos($source, '__NZBSPLIT__') !== false) {
+            // A wrapper's payload is a filename, never a path. Validate before basename extraction
+            // can discard malformed transport text or an invalid wrapper before a slash.
+            $payload = $unwrapper->literalPayload($source);
+            if ($payload === null || strpbrk($payload, '/\\') !== false) {
+                $this->basename = '';
+                $this->stem = '';
+
+                return;
+            }
+        }
         $this->basename = preg_replace('~^.*[\\\\/]~s', '', $source) ?? '';
         $stem = (new FileNameCleaner)->stripFileSuffixes($this->basename);
         // Strip wrappers first, then decode only the protocol's separator encoding.

@@ -101,6 +101,10 @@ class NzbSplitUnwrapperTest extends TestCase
         foreach ([' yEnc', ' yEnc (1)', '" yEnc (1/42)', '  yenc (123/456)'] as $trailer) {
             self::assertSame($wrapped, $unwrapper->stripLiteralSubjectTrailer($wrapped.$trailer));
         }
+        $prefix = 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP';
+        foreach (['.part12345.rar', '.r00', '.r1234', '.7z', '.7z.01', '.7z.0001', '.rar', '.par', '.par2', '.vol123+456.par2', '.001'] as $suffix) {
+            self::assertSame($prefix.$suffix, $unwrapper->stripLiteralSubjectTrailer($prefix.$suffix.' yEnc (1/42)'));
+        }
         foreach ([' yEnc unknown', ' yEnc (1) yEnc (2)', ' yEnc (0)', ' yEnc (-1)', ' yEnc (1/0)', ' yEnc (1/2/3)', ' yEnc (1 / 2)', ' yEnc (1', "\tyEnc (1)", " yEnc (1)\n", ' yEnc (1).mkv'] as $trailer) {
             self::assertSame($wrapped.$trailer, $unwrapper->stripLiteralSubjectTrailer($wrapped.$trailer));
         }

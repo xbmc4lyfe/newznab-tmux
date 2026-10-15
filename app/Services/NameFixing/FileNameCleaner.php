@@ -148,7 +148,9 @@ class FileNameCleaner
 
         // After a wrapper (`.rar`, `.par2`) came off, a trailing codec word is part of the title, not a file
         // extension: `Movie.2020.1080p.DTS.rar` is the title `Movie.2020.1080p.DTS`.
-        if ($preserveCodecAfterWrapper && $fileName !== $original && preg_match('/\.(dts|ac3|eac3|truehd|ts|divx|opus|flac|aac|mp[23]|ogg|wav|m4a|mka|wma|ape|mpc|shn|tak|tta|wv)$/i', $fileName) === 1) {
+        if ($preserveCodecAfterWrapper && $fileName !== $original
+            && (preg_match(self::AUDIO_EXTENSIONS, $fileName) === 1
+                || preg_match('/\.(ts|divx|wmv|mpg|mpeg|rm|rmvb|m1v|m2v|mpv|mpgv|mp2|m4b|aiff?|amr|ra|w64)$/i', $fileName) === 1)) {
             return $fileName;
         }
 

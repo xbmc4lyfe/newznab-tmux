@@ -43,6 +43,15 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             'NZBSPLIT arbitrary subject tail cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.073 yEnc unknown', 'Exact.Release.2026-GRP', false, 0],
             'NZBSPLIT repeated subject tail cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.073 yEnc (1) yEnc (2)', 'Exact.Release.2026-GRP', false, 0],
             'NZBSPLIT unbounded subject counter cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.073 yEnc (1/42/77)', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT malformed counter cannot become a path' => ['Outer__NZBSPLIT__abcdef01__NZBSPLIT__Wrong_Release.rar yEnc (1/Exact.Release.2026-GRP.mkv', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT invalid wrapper cannot disappear before a slash' => ['Outer__NZBSPLIT__invalid__NZBSPLIT__Wrong_Release.rar/Exact.Release.2026-GRP.mkv', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT nested wrapper cannot disappear before a slash' => ['__NZBSPLIT__invalid__NZBSPLIT__Junk/Outer__NZBSPLIT__abcdef01__NZBSPLIT__Exact_Release_2026-GRP.rar', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT payload slash cannot become a path' => ['Outer__NZBSPLIT__abcdef01__NZBSPLIT__Wrong_Release/Exact.Release.2026-GRP.mkv', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT payload backslash cannot become a path' => ['Outer__NZBSPLIT__abcdef01__NZBSPLIT__Wrong_Release\\Exact.Release.2026-GRP.mkv', 'Exact.Release.2026-GRP', false, 0],
+            'ordinary path keeps basename support' => ['dir/Exact.Release.2026-GRP.mkv', 'Exact.Release.2026-GRP', false, 8],
+            'NZBSPLIT path before wrapper keeps basename support' => ['dir/Outer__NZBSPLIT__abcdef01__NZBSPLIT__Exact_Release_2026-GRP.rar', 'Exact.Release.2026-GRP', false, 8],
+            'NZBSPLIT bare archive trailer' => ['Outer__NZBSPLIT__abcdef01__NZBSPLIT__Exact_Release_2026-GRP.7z yEnc (1)', 'Exact.Release.2026-GRP', false, 8],
+            'NZBSPLIT numeric archive fraction trailer' => ['Outer__NZBSPLIT__abcdef01__NZBSPLIT__Exact_Release_2026-GRP.001 yEnc (1/42)', 'Exact.Release.2026-GRP', false, 8],
             'NZBSPLIT group spelling survives nomination' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRPdisc1.mkv', 'Exact.Release.2026-GRPdisc1', true, 8],
             'NZBSPLIT payload whitespace cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__ Exact_Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 0],
             'NZBSPLIT repeated separators cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact__Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 0],
@@ -94,7 +103,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
     public static function nzbSplitPipelineCases(): array
     {
         $rows = [];
-        foreach (['.7z.073', '.7z.01', '.7z.0001', '.part12345.rar.par2', '.mkv.part12345.rar', '.7z.073 yEnc (1)', '.7z.073" yEnc (1/42)'] as $suffix) {
+        foreach (['.7z.073', '.7z.01', '.7z.0001', '.part12345.rar.par2', '.mkv.part12345.rar', '.7z.073 yEnc (1)', '.7z.073" yEnc (1/42)', '.7z yEnc (1)', '.001 yEnc (1/42)'] as $suffix) {
             $rows[$suffix.' canonical hit'] = [true, $suffix];
             $rows[$suffix.' extractor fallback'] = [false, $suffix];
         }
@@ -105,7 +114,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
     public static function wrappedCodecRows(): array
     {
         $rows = [];
-        foreach (['DIVX', 'APE', 'MP2', 'MPC', 'SHN', 'TAK', 'TTA', 'WV', 'DTS'] as $codec) {
+        foreach (['DIVX', 'APE', 'MP2', 'MPC', 'SHN', 'TAK', 'TTA', 'WV', 'DTS', 'WMV', 'MPEG', 'MPG', 'AMR', 'RM', 'RMVB', 'AIFF', 'AIF', 'RA', 'W64', 'M4B', 'M1V', 'M2V', 'MPV', 'MPGV'] as $codec) {
             foreach (['both', 'correct only', 'shorter only'] as $candidates) {
                 $rows[$codec.' '.$candidates] = [$codec, $candidates];
             }
@@ -291,6 +300,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             'authoritative long part parity alias' => ['Publisher.Asset-GRP.mkv', 'Publisher.Asset-GRP.part12345.rar.par2', true],
             'authoritative short 7z alias' => ['Publisher.Asset-GRP.mkv', 'Publisher.Asset-GRP.7z.01', true],
             'authoritative long bare part alias' => ['Publisher.Asset-GRP.mkv', 'Publisher.Asset-GRP.part12345', true],
+            'malformed NZBSPLIT alias cannot become a path' => ['Publisher.Asset-GRP.mkv', 'Outer__NZBSPLIT__abcdef01__NZBSPLIT__Wrong_Release.rar yEnc (1/Publisher.Asset-GRP.mkv', false],
             'authoritative NZBSPLIT parity alias' => ['Publisher.Asset-GRP.mkv', 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Publisher_Asset-GRP.rar.par2', true],
             'authoritative preserved group alias' => ['Publisher.Asset-GRPdisc1.mkv', 'Publisher.Asset-GRPdisc1.rar', true],
             'lossy group alias cannot authorize' => ['Publisher.Asset-GRPdisc1.mkv', 'Publisher.Asset-GRP.mkv', false],
