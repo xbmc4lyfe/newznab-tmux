@@ -87,6 +87,25 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertFalse($frame['whole_file_validated']);
         self::assertFalse($frame['content_decompressed']);
 
+        // Limit observations do not suppress known literal framing or disagreement.
+        foreach ([
+            ['28b52ffd240119000041424311223344', 'different', 12],
+            ['28b52ffd24011300004111223344', 'different', 10],
+            ['28b52ffd24000300004111223344', 'equal', 10],
+        ] as [$hex, $relationship, $checksumOffset]) {
+            $sample = hex2bin($hex);
+            self::assertIsString($sample);
+            $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], YencArticles::article($sample));
+            self::assertSame($sample, $analysis['decoded_bytes']);
+            $frame = $analysis['metadata']['decoded_format_metadata']['headers'][0]['frame'];
+            self::assertSame($relationship, $frame['size_relationship']['status']);
+            self::assertNull($frame['size_relationship']['unavailable_reason']);
+            self::assertSame($checksumOffset, $frame['checksum']['start_offset']);
+            self::assertSame('observed_unverified', $frame['checksum']['status']);
+            self::assertSame(strlen($sample), $frame['observed_frame_end_offset']);
+            self::assertFalse($frame['whole_file_validated']);
+        }
+
         $huge = hex2bin('28b52ffde0ffffffffffffffff010000');
         self::assertIsString($huge);
         $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], YencArticles::article($huge));

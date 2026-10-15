@@ -231,11 +231,7 @@ pub(super) fn parse(data: &[u8], offset: usize) -> Frame {
                 .saturating_sub(payload_start)
                 .min(physical as usize);
             block.payload_complete = block.payload_available_bytes == physical as usize;
-            let limits_ok = block.physical_size_within_limit == Some(true)
-                && block.regenerated_size_within_limit != Some(false);
-            let reason = if !limits_ok {
-                Some("block_limit_exceeded")
-            } else if !block.payload_complete {
+            let reason = if !block.payload_complete {
                 Some("payload_partial")
             } else if kind == 2 {
                 Some("compressed_block_not_decoded")
@@ -244,6 +240,8 @@ pub(super) fn parse(data: &[u8], offset: usize) -> Frame {
             } else {
                 None
             };
+            // Limit comparisons remain independent observations. Even a malformed
+            // declaration cannot erase a fully observed literal byte extent.
             block.status = reason.unwrap_or("observed_literal_payload");
             frame.size_relationship.unavailable_reason = reason;
             if reason.is_none() {
@@ -330,15 +328,43 @@ mod tests {
     }
 
     #[test]
+    fn limit_observations_do_not_hide_literal_mismatches_or_checksum_coordinates() {
+        for (hex, status, checksum_offset) in [
+            ("28b52ffd240119000041424311223344", "different", 12),
+            ("28b52ffd24011300004111223344", "different", 10),
+            ("28b52ffd24000300004111223344", "equal", 10),
+        ] {
+            let sample = bytes(hex);
+            for length in checksum_offset..=sample.len() {
+                let f = serde_json::to_value(super::super::parse(&sample[..length])).unwrap()
+                    ["headers"][0]["frame"].clone();
+                assert_eq!(f["size_relationship"]["status"], status, "{hex}/{length}");
+                assert!(f["size_relationship"]["unavailable_reason"].is_null());
+                assert_eq!(f["checksum"]["start_offset"], checksum_offset);
+                assert_eq!(f["checksum"]["available_bytes"], length - checksum_offset);
+                assert_eq!(f["checksum"]["verification_status"], "not_performed");
+                assert_eq!(f["whole_file_validated"], false);
+                if length == sample.len() {
+                    assert_eq!(f["checksum"]["status"], "observed_unverified");
+                    assert_eq!(f["observed_frame_end_offset"], length);
+                } else {
+                    assert_eq!(f["checksum"]["status"], "partial_checksum");
+                    assert!(f["observed_frame_end_offset"].is_null());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn physical_and_regenerated_limits_are_independent_including_empty_rle() {
-        for (hex, physical_ok, regenerated_ok) in [
-            ("28b52ffd200003000041", false, true),
-            ("28b52ffd200113000041", true, false),
-            ("28b52ffd20011100004142", false, false),
-            ("28b52ffd000003200041", true, true),
-            ("28b52ffd00000b200041", true, false),
-            ("28b52ffd003803001041", true, true),
-            ("28b52ffd00380b001041", true, false),
+        for (hex, physical_ok, regenerated_ok, relationship) in [
+            ("28b52ffd200003000041", false, true, "equal"),
+            ("28b52ffd200113000041", true, false, "different"),
+            ("28b52ffd20011100004142", false, false, "different"),
+            ("28b52ffd000003200041", true, true, "unavailable"),
+            ("28b52ffd00000b200041", true, false, "unavailable"),
+            ("28b52ffd003803001041", true, true, "unavailable"),
+            ("28b52ffd00380b001041", true, false, "unavailable"),
         ] {
             let f = frame(hex);
             assert_eq!(
@@ -349,15 +375,16 @@ mod tests {
                 f["first_block"]["regenerated_size_within_limit"], regenerated_ok,
                 "{hex}"
             );
-            assert_eq!(f["size_relationship"]["status"], "unavailable");
-            assert_eq!(
-                f["size_relationship"]["unavailable_reason"],
-                if physical_ok && regenerated_ok {
+            assert_eq!(f["size_relationship"]["status"], relationship, "{hex}");
+            if relationship != "unavailable" {
+                assert!(f["size_relationship"]["unavailable_reason"].is_null());
+            } else {
+                assert_eq!(
+                    f["size_relationship"]["unavailable_reason"],
                     "content_size_absent"
-                } else {
-                    "block_limit_exceeded"
-                }
-            );
+                );
+            }
+            assert!(f["observed_frame_end_offset"].is_number());
         }
     }
 
