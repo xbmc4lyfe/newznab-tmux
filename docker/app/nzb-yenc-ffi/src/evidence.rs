@@ -856,6 +856,33 @@ pub fn verify(directory: &Path, source: &Path) -> Result<Value, String> {
     )
 }
 
+// Historical check receipts remain valid. New executions use the exact same
+// replay through a worker boundary so outer disposition never enters receipts.
+fn validate_fresh_replay_command(
+    command: &Value,
+    executor: &Value,
+    candidate: &Value,
+    runtime: &Value,
+) -> Result<(), String> {
+    let name = match command["arguments"][0].as_str() {
+        Some("check") => "check",
+        Some("check-worker") => "check-worker",
+        _ => return Err("fresh replay command mismatch".into()),
+    };
+    require(
+        command["program"] == executor["path"]
+            && command["arguments"]
+                == json!([
+                    name,
+                    "--candidate",
+                    candidate["path"],
+                    "--receipts",
+                    runtime["correctness"]["receipts_path"]
+                ]),
+        "fresh replay command mismatch",
+    )
+}
+
 fn verify_with_reference_policy(
     directory: &Path,
     source: &Path,
@@ -1054,17 +1081,11 @@ fn verify_with_reference_policy(
     )?;
     let (fresh_child, command) =
         bundle.child("preflight-full-correctness-replay", &identity["executor"])?;
-    require(
-        command["program"] == identity["executor"]["path"]
-            && command["arguments"]
-                == json!([
-                    "check",
-                    "--candidate",
-                    artifacts[0]["path"],
-                    "--receipts",
-                    runtime["correctness"]["receipts_path"]
-                ]),
-        "fresh replay command mismatch",
+    validate_fresh_replay_command(
+        &command,
+        &identity["executor"],
+        &artifacts[0],
+        runtime,
     )?;
     require(
         fresh["report"] == fresh_child["report"]
@@ -1446,6 +1467,101 @@ fn verify_comparisons(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh_replay_command_fixture() -> (Value, Value, Value, Value) {
+        let executor = json!({"path":"/owned/qualify-yenc"});
+        let candidate = json!({"path":"/owned/candidate.so","sha256":"candidate"});
+        let runtime = json!({"correctness":{"receipts_path":"/owned/receipts.json"}});
+        let command = json!({"program":executor["path"],"arguments":[
+            "check","--candidate",candidate["path"],"--receipts",
+            runtime["correctness"]["receipts_path"]
+        ]});
+        (command, executor, candidate, runtime)
+    }
+
+    #[test]
+    fn fresh_replay_accepts_historical_command_and_only_known_worker_alias() {
+        let (historical, executor, candidate, runtime) = fresh_replay_command_fixture();
+        assert!(
+            validate_fresh_replay_command(&historical, &executor, &candidate, &runtime).is_ok()
+        );
+        let mut worker = historical.clone();
+        worker["arguments"][0] = json!("check-worker");
+        assert!(validate_fresh_replay_command(&worker, &executor, &candidate, &runtime).is_ok());
+        assert_eq!(historical["arguments"][0], "check");
+    }
+
+    #[test]
+    fn fresh_replay_rejects_unknown_extra_reordered_or_mismatched_commands() {
+        let (historical, executor, candidate, runtime) = fresh_replay_command_fixture();
+        for name in ["check", "check-worker"] {
+            let mut original = historical.clone();
+            original["arguments"][0] = json!(name);
+            for case in [
+                "unknown", "extra", "reordered", "candidate", "receipts", "program",
+            ] {
+                let mut altered = original.clone();
+                match case {
+                    "unknown" => altered["arguments"][0] = json!("other-worker"),
+                    "extra" => altered["arguments"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("--extra")),
+                    "reordered" => altered["arguments"].as_array_mut().unwrap().swap(1, 3),
+                    "candidate" => altered["arguments"][2] = json!("/foreign/candidate.so"),
+                    "receipts" => altered["arguments"][4] = json!("/foreign/receipts.json"),
+                    "program" => altered["program"] = json!("/foreign/qualify-yenc"),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    validate_fresh_replay_command(&altered, &executor, &candidate, &runtime)
+                        .unwrap_err(),
+                    "fresh replay command mismatch",
+                    "{name}: {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_replay_alias_does_not_relax_candidate_or_corpus_hash_checks() {
+        // Synthetic historical receipt shape only; this is no current-policy proof.
+        let (historical, executor, candidate, runtime) = fresh_replay_command_fixture();
+        let report = json!({"status":"ok","artifact":{"sha256":"candidate",
+            "rapidyenc_exports":tooling::RAPIDYENC_EXPORTS,
+            "metadata_exports":tooling::NNTMUX_EXPORTS},
+            "receipt_sha256":crate::abi_receipts::FROZEN_RECEIPT_SHA256,
+            "calls":crate::abi_receipts::FROZEN_REPLAY_CALLS});
+        for name in ["check", "check-worker"] {
+            let mut command = historical.clone();
+            command["arguments"][0] = json!(name);
+            validate_fresh_replay_command(&command, &executor, &candidate, &runtime).unwrap();
+            benchmark::validate_replay_report(
+                &report,
+                "candidate",
+                crate::abi_receipts::FROZEN_RECEIPT_SHA256,
+            )
+            .unwrap();
+            for field in ["candidate", "corpus"] {
+                let mut altered = report.clone();
+                if field == "candidate" {
+                    altered["artifact"]["sha256"] = json!("foreign");
+                } else {
+                    altered["receipt_sha256"] = json!("foreign");
+                }
+                assert!(
+                    benchmark::validate_replay_report(
+                        &altered,
+                        "candidate",
+                        crate::abi_receipts::FROZEN_RECEIPT_SHA256
+                    )
+                    .is_err(),
+                    "{name}: {field}"
+                );
+            }
+            assert!(report.get("adoption_eligibility").is_none());
+        }
+    }
     const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
     fn candidate_fixture() -> (Scratch, PathBuf) {

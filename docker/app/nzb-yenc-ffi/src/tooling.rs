@@ -5,6 +5,20 @@ use sha2::{Digest, Sha256};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 
+/// Current disposition for outer command reports only. Historical validation,
+/// embedded receipts and claimed proof never authorize replacement adoption.
+pub fn with_adoption_eligibility(mut report: Value) -> Result<Value, String> {
+    report
+        .as_object_mut()
+        .ok_or("outer report must be a JSON object")?
+        .insert(
+            "adoption_eligibility".into(),
+            json!({"eligible":false,"policy":"common-and-uncommon-p99-1.5x",
+                "reason":"current-policy evidence unavailable"}),
+        );
+    Ok(report)
+}
+
 pub const RAPIDYENC_EXPORTS: &[&str] = &[
     "rapidyenc_version",
     "rapidyenc_encode_max_length",
@@ -398,6 +412,74 @@ pub fn summarize(values: &[f64]) -> Result<Statistics, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outer_adoption_disposition_preserves_historical_fields_and_nested_receipts() {
+        let historical = json!({
+            "status":"passed", "protocol":"rust-paired-yenc-v4",
+            "all_pairs":{"0":[{"ratios":{"median_ratio":0.9,"p95_ratio":1.0}}]},
+            "gates":[{"primary_pass":true,"cold_lifecycle_pass":true}],
+            "artifact":{"rapidyenc_exports":RAPIDYENC_EXPORTS,"metadata_exports":NNTMUX_EXPORTS},
+            "receipt":{"status":"verified","adoption_eligibility":{"eligible":true}},
+            "provenance":{"source":"original","sha256":"frozen"}
+        });
+        let mut report = with_adoption_eligibility(historical.clone()).unwrap();
+        assert_eq!(
+            report["adoption_eligibility"],
+            json!({
+                "eligible":false,
+                "policy":"common-and-uncommon-p99-1.5x",
+                "reason":"current-policy evidence unavailable"
+            })
+        );
+        report.as_object_mut().unwrap().remove("adoption_eligibility");
+        assert_eq!(report, historical);
+    }
+
+    #[test]
+    fn outer_adoption_disposition_never_trusts_status_or_supplied_proof() {
+        for status in ["passed", "verified", "failed_gates", "unknown"] {
+            for proof in [
+                None,
+                Some(Value::Null),
+                Some(json!({"eligible":true,"policy":"median-p95"})),
+                Some(json!({"eligible":true,"policy":"common-and-uncommon-p99-1.5x"})),
+                Some(json!("unknown")),
+            ] {
+                let mut historical = json!({"status":status});
+                if let Some(proof) = proof {
+                    historical["adoption_eligibility"] = proof;
+                }
+                let report = with_adoption_eligibility(historical).unwrap();
+                assert_eq!(report["status"], status);
+                assert_eq!(report["adoption_eligibility"]["eligible"], false);
+                assert_eq!(
+                    report["adoption_eligibility"]["policy"],
+                    "common-and-uncommon-p99-1.5x"
+                );
+                assert_eq!(
+                    report["adoption_eligibility"]["reason"],
+                    "current-policy evidence unavailable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outer_adoption_disposition_is_idempotent() {
+        let once = with_adoption_eligibility(json!({"status":"passed"})).unwrap();
+        assert_eq!(with_adoption_eligibility(once.clone()).unwrap(), once);
+    }
+
+    #[test]
+    fn outer_adoption_disposition_rejects_non_object_reports() {
+        for report in [Value::Null, json!(true), json!(1), json!("passed"), json!([])] {
+            assert_eq!(
+                with_adoption_eligibility(report).unwrap_err(),
+                "outer report must be a JSON object"
+            );
+        }
+    }
 
     #[test]
     fn fingerprint_exports_are_required_by_shared_artifact_inventory() {

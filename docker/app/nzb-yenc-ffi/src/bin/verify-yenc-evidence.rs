@@ -51,7 +51,8 @@ fn main() {
             }
             None => evidence::verify(directory, source),
         }
-    });
+    })
+    .and_then(tooling::with_adoption_eligibility);
     match result {
         Ok(report) => println!("{report}"),
         Err(error) => {

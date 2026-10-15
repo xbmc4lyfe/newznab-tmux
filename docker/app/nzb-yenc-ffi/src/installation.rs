@@ -1,8 +1,13 @@
-//! Serialize installation and verify the copied artifact before atomic replacement.
+//! Deny public replacement installation until current-policy authorization exists.
 
+#[cfg(test)]
 use crate::tooling::file_sha256;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
+#[cfg(test)]
 use std::fs::{File, OpenOptions};
+#[cfg(test)]
 use std::io::Write;
 use std::path::Path;
 
@@ -15,6 +20,25 @@ pub fn install(
 }
 
 pub fn install_after(
+    _source: &Path,
+    _destination: &Path,
+    _prepare: impl FnOnce() -> Result<(), String>,
+    _verify: impl FnOnce(&Path) -> Result<Value, String>,
+) -> Result<Value, String> {
+    Err("current-policy adoption authorization unavailable; installation denied".into())
+}
+
+#[cfg(test)]
+fn install_mechanics(
+    source: &Path,
+    destination: &Path,
+    verify: impl FnOnce(&Path) -> Result<Value, String>,
+) -> Result<Value, String> {
+    install_mechanics_after(source, destination, || Ok(()), verify)
+}
+
+#[cfg(test)]
+fn install_mechanics_after(
     source: &Path,
     destination: &Path,
     prepare: impl FnOnce() -> Result<(), String>,
@@ -105,13 +129,100 @@ mod tests {
     }
 
     #[test]
+    fn current_policy_install_preserves_existing_incumbent_without_callbacks() {
+        assert_current_policy_denial(false, true);
+    }
+
+    #[test]
+    fn current_policy_install_does_not_create_destination_parent() {
+        assert_current_policy_denial(false, false);
+    }
+
+    #[test]
+    fn current_policy_install_after_preserves_existing_incumbent_without_callbacks() {
+        assert_current_policy_denial(true, true);
+    }
+
+    #[test]
+    fn current_policy_install_after_does_not_create_destination_parent() {
+        assert_current_policy_denial(true, false);
+    }
+
+    fn assert_current_policy_denial(after: bool, incumbent: bool) {
+        use std::cell::Cell;
+        use std::collections::BTreeSet;
+
+        let directory = workspace();
+        let source = directory.join("source.so");
+        let parent = if incumbent {
+            directory.clone()
+        } else {
+            directory.join("not-created").join("nested")
+        };
+        let destination = parent.join("installed.so");
+        std::fs::write(&source, b"unqualified candidate").unwrap();
+        if incumbent {
+            std::fs::write(&destination, b"incumbent").unwrap();
+        }
+        let entries = || -> BTreeSet<_> {
+            std::fs::read_dir(&directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect()
+        };
+        let before = entries();
+        let prepared = Cell::new(0);
+        let verified = Cell::new(0);
+        let prepare = || {
+            prepared.set(prepared.get() + 1);
+            Ok(())
+        };
+        let verify = |staged: &Path| {
+            verified.set(verified.get() + 1);
+            // A byte digest is not current-policy performance authorization.
+            Ok(json!({"sha256":file_sha256(staged)?}))
+        };
+        let result = if after {
+            install_after(&source, &destination, prepare, verify)
+        } else {
+            install(&source, &destination, verify)
+        };
+        let after_entries = entries();
+        let parent_created = !incumbent && parent.exists();
+        let destination_bytes = std::fs::read(&destination).ok();
+        let source_bytes = std::fs::read(&source).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert!(
+            matches!(&result, Err(error) if error.contains("current-policy")),
+            "public installation needs current-policy denial, got {result:?}"
+        );
+        assert_eq!(prepared.get(), 0, "prepare/build callback ran");
+        assert_eq!(verified.get(), 0, "verification callback ran");
+        assert_eq!(
+            after_entries, before,
+            "lock, stage or directory was created"
+        );
+        assert!(!parent_created, "destination parent was created");
+        assert_eq!(source_bytes, b"unqualified candidate");
+        assert_eq!(
+            destination_bytes.as_deref(),
+            if incumbent {
+                Some(b"incumbent".as_slice())
+            } else {
+                None
+            }
+        );
+    }
+
+    #[test]
     fn success_verifies_staged_copy_and_retains_source() {
         let directory = workspace();
         let source = directory.join("source.so");
         let destination = directory.join("installed.so");
         std::fs::write(&source, b"candidate").unwrap();
         std::fs::write(&destination, b"old").unwrap();
-        let report = install(&source, &destination, |staged| {
+        let report = install_mechanics(&source, &destination, |staged| {
             assert_ne!(staged, source);
             assert_ne!(staged, destination);
             assert_eq!(std::fs::read(staged).unwrap(), b"candidate");
@@ -133,7 +244,7 @@ mod tests {
         let destination = directory.join("installed.so");
         std::fs::write(&source, b"candidate").unwrap();
         std::fs::write(&destination, b"old").unwrap();
-        assert!(install(&source, &destination, |_| Err("bad ABI".into())).is_err());
+        assert!(install_mechanics(&source, &destination, |_| Err("bad ABI".into())).is_err());
         assert_eq!(std::fs::read(&destination).unwrap(), b"old");
         assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
             entry
@@ -152,8 +263,10 @@ mod tests {
         let destination = directory.join("installed.so");
         std::fs::write(&source, b"candidate").unwrap();
         std::fs::write(&destination, b"old").unwrap();
-        install(&source, &destination, |staged| {
-            assert!(install(&source, &destination, |_| panic!("must not verify")).is_err());
+        install_mechanics(&source, &destination, |staged| {
+            assert!(
+                install_mechanics(&source, &destination, |_| panic!("must not verify")).is_err()
+            );
             assert_eq!(std::fs::read(&destination).unwrap(), b"old");
             Ok(json!({"sha256":file_sha256(staged)?}))
         })
@@ -169,7 +282,7 @@ mod tests {
         std::fs::write(&source, b"candidate").unwrap();
         std::fs::write(&destination, b"old").unwrap();
         assert!(
-            install(&source, &destination, |staged| {
+            install_mechanics(&source, &destination, |staged| {
                 let digest = file_sha256(staged)?;
                 std::fs::write(staged, b"replaced").unwrap();
                 Ok(json!({"sha256":digest}))

@@ -1393,7 +1393,7 @@ impl Executor {
         self.next += 1;
         let mut command = Command::new(&self.executable.path);
         command
-            .arg("check")
+            .arg("check-worker")
             .arg("--candidate")
             .arg(&candidate.path)
             .arg("--receipts")
@@ -1624,16 +1624,26 @@ pub fn run(options: &Options) -> Result<Value, String> {
         return Err("primary PHP qualification requires owned disposable Linux runtime".into());
     }
     fs::create_dir(&output).map_err(|e| format!("new output directory required: {e}"))?;
-    let result = run_owned(options, &output);
+    write_outer_result(&output, run_owned(options, &output))
+}
+// Only the outer aggregate gets the current disposition. run_owned and its
+// retained protocol, pair, worker and correctness receipts remain historical.
+fn write_outer_result(output: &Path, result: Result<Value, String>) -> Result<Value, String> {
+    let result = result.and_then(crate::tooling::with_adoption_eligibility);
     match &result {
         Ok(report) => write_json(&output.join("result.json"), report)?,
         Err(error) => write_json(
             &output.join("failure.json"),
-            &json!({"status":"failed","error":error,
-            "protocol":PROTOCOL,"no_retries":true,"all_children_retained":true}),
+            &crate::tooling::with_adoption_eligibility(json!({"status":"failed","error":error,
+            "protocol":PROTOCOL,"no_retries":true,"all_children_retained":true}))?,
         )?,
     }
     result
+}
+fn write_outer_gate_failure(output: &Path, report: Value) -> Result<Value, String> {
+    let report = crate::tooling::with_adoption_eligibility(report)?;
+    write_json(&output.join("gate-failure.json"), &report)?;
+    Err("predeclared performance gates failed; retained gate-failure.json".into())
 }
 fn run_owned(options: &Options, output: &Path) -> Result<Value, String> {
     let candidate = Artifact::freeze("candidate", required(options, "--candidate")?)?;
@@ -1888,8 +1898,7 @@ fn run_owned(options: &Options, output: &Path) -> Result<Value, String> {
     let report = json!({"status":if passed{"passed"}else{"failed_gates"},"protocol":PROTOCOL,"protocol_sha256":protocol_hash,
         "all_pairs":pairs,"gates":gates,"architecture_scope":std::env::consts::ARCH,"output_directory":output});
     if !passed {
-        write_json(&output.join("gate-failure.json"), &report)?;
-        return Err("predeclared performance gates failed; retained gate-failure.json".into());
+        return write_outer_gate_failure(output, report);
     }
     Ok(report)
 }
@@ -2310,6 +2319,90 @@ mod tests {
         ));
         fs::create_dir(&path).unwrap();
         path
+    }
+    #[test]
+    fn outer_benchmark_result_file_and_return_value_deny_adoption() {
+        let path = temporary("outer-adoption-result");
+        let historical = json!({"status":"passed","protocol":PROTOCOL,
+            "all_pairs":{"0":[{"receipt":{"count":3,"crc":42}}]},
+            "gates":[{"primary_pass":true,"cold_lifecycle_pass":true}],
+            "protocol_sha256":"original","output_directory":path});
+        let returned = write_outer_result(&path, Ok(historical.clone())).unwrap();
+        let written = read_json(&path.join("result.json")).unwrap();
+        assert_eq!(written, returned);
+        assert_eq!(written["adoption_eligibility"]["eligible"], false);
+        assert_eq!(
+            written["adoption_eligibility"]["policy"],
+            "common-and-uncommon-p99-1.5x"
+        );
+        assert_eq!(
+            written["adoption_eligibility"]["reason"],
+            "current-policy evidence unavailable"
+        );
+        let mut original_fields = written;
+        original_fields
+            .as_object_mut()
+            .unwrap()
+            .remove("adoption_eligibility");
+        assert_eq!(original_fields, historical);
+        assert!(!path.join("failure.json").exists());
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn outer_benchmark_failure_file_denies_adoption_and_preserves_error() {
+        let path = temporary("outer-adoption-failure");
+        assert_eq!(
+            write_outer_result(&path, Err("original error".into())).unwrap_err(),
+            "original error"
+        );
+        let mut failure = read_json(&path.join("failure.json")).unwrap();
+        assert_eq!(failure["adoption_eligibility"]["eligible"], false);
+        failure.as_object_mut().unwrap().remove("adoption_eligibility");
+        assert_eq!(
+            failure,
+            json!({"status":"failed","error":"original error",
+                "protocol":PROTOCOL,"no_retries":true,"all_children_retained":true})
+        );
+        assert!(!path.join("result.json").exists());
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn outer_benchmark_gate_failure_preserves_full_aggregate_and_error_with_denial() {
+        let path = temporary("outer-adoption-gate-failure");
+        let historical = json!({"status":"failed_gates","protocol":PROTOCOL,
+            "all_pairs":{"0":[{"receipt":{"count":3,"crc":42},"ratios":{"median_ratio":1.2}}]},
+            "gates":[{"primary_pass":false,"cold_lifecycle_pass":true}],
+            "protocol_sha256":"original","architecture_scope":"aarch64","output_directory":path});
+        let result = write_outer_gate_failure(&path, historical.clone());
+        assert_eq!(
+            write_outer_result(&path, result).unwrap_err(),
+            "predeclared performance gates failed; retained gate-failure.json"
+        );
+        let mut written = read_json(&path.join("gate-failure.json")).unwrap();
+        let disposition = written
+            .as_object_mut()
+            .unwrap()
+            .remove("adoption_eligibility")
+            .unwrap();
+        assert_eq!(
+            disposition,
+            json!({"eligible":false,"policy":"common-and-uncommon-p99-1.5x",
+                "reason":"current-policy evidence unavailable"})
+        );
+        assert_eq!(written, historical);
+        let mut failure = read_json(&path.join("failure.json")).unwrap();
+        assert_eq!(
+            failure.as_object_mut().unwrap().remove("adoption_eligibility"),
+            Some(disposition)
+        );
+        assert_eq!(
+            failure,
+            json!({"status":"failed",
+                "error":"predeclared performance gates failed; retained gate-failure.json",
+                "protocol":PROTOCOL,"no_retries":true,"all_children_retained":true})
+        );
+        assert!(!path.join("result.json").exists());
+        fs::remove_dir_all(path).unwrap();
     }
     #[test]
     fn zero_exit_incorrect_report_is_retained_and_fails() {
