@@ -182,10 +182,10 @@ abstract class BaseRunner
                 if ($this->isCancellationRequested()) {
                     break;
                 }
-                if ($this->hasDrainRequest() && $running === []) {
+                if (($this->hasDrainRequest() || $completionFailure !== null) && $running === []) {
                     break;
                 }
-                while (! $this->isCancellationRequested() && ! $this->hasDrainRequest(true) && count($running) < max(1, $maxProcesses) && $queue !== []) {
+                while (! $this->isCancellationRequested() && $completionFailure === null && ! $this->hasDrainRequest(true) && count($running) < max(1, $maxProcesses) && $queue !== []) {
                     $key = null;
                     $busy = [];
                     foreach (array_keys($running) as $runningKey) {
@@ -248,7 +248,6 @@ abstract class BaseRunner
                                 $onComplete($key, $output);
                             }
                         } catch (\Throwable $exception) {
-                            $this->drainRequested = true;
                             $completionFailure ??= $exception;
                         }
                     }
@@ -279,7 +278,12 @@ abstract class BaseRunner
                 }
                 $this->recordWorkerOutcome($key, 'cancellation', $process->getExitCode());
             }
-            $queuedOutcome = $this->drainRequested && ! $this->isCancellationRequested() ? 'drained' : 'cancellation';
+            $queuedOutcome = match (true) {
+                $this->isCancellationRequested() => 'cancellation',
+                $this->drainRequested => 'drained',
+                $completionFailure !== null => 'failure',
+                default => 'cancellation',
+            };
             foreach ($queue as $key => $command) {
                 $this->recordWorkerOutcome($key, $queuedOutcome, null);
             }

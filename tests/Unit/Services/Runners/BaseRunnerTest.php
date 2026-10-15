@@ -374,6 +374,119 @@ class BaseRunnerTest extends TestCase
         }
     }
 
+    #[Test]
+    #[DataProvider('completionFailureDrainModes')]
+    public function completion_failure_preserves_ordinary_timeout_unless_a_real_drain_is_observed(string $hook, bool $stop): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:', 'nntmux.concurrency_timeout' => 1]);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['stop_requested' => false]);
+        $resident = tempnam(sys_get_temp_dir(), 'nntmux-completion-resident-');
+        $release = tempnam(sys_get_temp_dir(), 'nntmux-completion-release-');
+        $this->assertNotFalse($resident);
+        $this->assertNotFalse($release);
+        $completed = false;
+        $runner = null;
+        $fail = function (string|int $key, string $output) use ($resident, $release, $stop, &$completed, &$runner): void {
+            if ($key !== 'fast') {
+                return;
+            }
+            $this->assertSame('resident', file_get_contents($resident));
+            $completed = true;
+            if ($stop) {
+                app(ProcessingRuntimeStateRepository::class)->requestStop();
+                $this->assertInstanceOf(CompletionFailureRunner::class, $runner);
+                $this->assertTrue($runner->draining(true), 'Observe the real database stop before the completion failure.');
+            }
+            file_put_contents($release, 'released');
+            throw new RuntimeException('Completion-only sentinel.');
+        };
+        $runner = new CompletionFailureRunner($hook, $fail);
+        $failure = null;
+        try {
+            try {
+                $runner->poolWithCompletion([
+                    'fast' => [PHP_BINARY, '-r', '$deadline = microtime(true) + 3; while (file_get_contents($argv[1]) !== "resident") { if (microtime(true) >= $deadline) { exit(3); } usleep(1000); }', $resident],
+                    'slow' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "resident"); $deadline = microtime(true) + 3; while (file_get_contents($argv[2]) !== "released") { if (microtime(true) >= $deadline) { exit(3); } usleep(1000); } usleep(1350000); file_put_contents($argv[1], "committed");', $resident, $release],
+                    'queued' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "queued");', $release],
+                ], 2, static function (string|int $key, string $output) use ($hook, $fail): void {
+                    if ($hook === 'onComplete') {
+                        $fail($key, $output);
+                    }
+                });
+            } catch (RuntimeException $exception) {
+                $failure = $exception;
+            }
+            $this->assertTrue($completed, 'The first completion must occur while the sibling is resident.');
+            $this->assertSame(['fast', 'slow'], $runner->started);
+            $this->assertSame($stop ? 'success' : 'timeout', $runner->outcomes()['slow']['status']);
+            $this->assertSame($stop ? 'committed' : 'resident', file_get_contents($resident));
+            $this->assertSame('released', file_get_contents($release));
+            $this->assertSame($stop ? 'drained' : 'failure', $runner->outcomes()['queued']['status']);
+            $this->assertSame($stop, $runner->draining());
+            $this->assertNotNull($failure);
+            $this->assertStringContainsString('Completion-only sentinel.', $failure->getMessage());
+            $this->assertSame('Completion-only sentinel.', $failure->getPrevious()?->getMessage());
+        } finally {
+            unlink($resident);
+            unlink($release);
+        }
+    }
+
+    #[Test]
+    #[DataProvider('completionFailureHooks')]
+    public function a_caught_completion_failure_does_not_pause_a_later_pool_on_the_same_runner(string $hook): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['stop_requested' => false]);
+        $fail = static function (string|int $key, string $output): void {
+            if ($key === 'first') {
+                throw new RuntimeException('Completion-only sentinel.');
+            }
+        };
+        $runner = new CompletionFailureRunner($hook, $fail);
+        $failure = null;
+        try {
+            $runner->poolWithCompletion([
+                'first' => [PHP_BINARY, '-r', 'echo "first";'],
+                'unstarted' => [PHP_BINARY, '-r', 'echo "unstarted";'],
+            ], 1, static function (string|int $key, string $output) use ($hook, $fail): void {
+                if ($hook === 'onComplete') {
+                    $fail($key, $output);
+                }
+            });
+        } catch (RuntimeException $exception) {
+            $failure = $exception;
+        }
+        $outcomes = $runner->outcomes();
+        $next = $runner->pool(['next' => [PHP_BINARY, '-r', 'echo "next";']], 1, 2);
+
+        $this->assertNotNull($failure);
+        $this->assertStringContainsString('Completion-only sentinel.', $failure->getMessage());
+        $this->assertSame(['next' => 'next'], $next);
+        $this->assertSame(['first', 'next'], $runner->started);
+        $this->assertSame('failure', $outcomes['unstarted']['status']);
+        $this->assertFalse($runner->draining());
+    }
+
+    /** @return array<string, array{string}> */
+    public static function completionFailureHooks(): array
+    {
+        return ['completion callback' => ['onComplete'], 'worker hook' => ['workerCompleted']];
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function completionFailureDrainModes(): array
+    {
+        return [
+            'callback without drain' => ['onComplete', false],
+            'hook without drain' => ['workerCompleted', false],
+            'callback with database stop' => ['onComplete', true],
+            'hook with database stop' => ['workerCompleted', true],
+        ];
+    }
+
     /** @return array<string, array{string, int}> */
     public static function completionHooks(): array
     {
@@ -528,9 +641,9 @@ class BaseRunnerTestDouble extends BaseRunner
         $this->completed[$key] = $output;
     }
 
-    public function draining(): bool
+    public function draining(bool $refresh = false): bool
     {
-        return $this->hasDrainRequest();
+        return $this->hasDrainRequest($refresh);
     }
 
     public function runCommand(string $command): string
@@ -570,5 +683,19 @@ class BaseRunnerTestDouble extends BaseRunner
     public function timeout(): int
     {
         return $this->concurrencyTimeout();
+    }
+}
+
+class CompletionFailureRunner extends BaseRunnerTestDouble
+{
+    /** @param \Closure(string|int, string): void $completion */
+    public function __construct(private string $hook, private \Closure $completion) {}
+
+    protected function workerCompleted(string|int $key, string $output): void
+    {
+        parent::workerCompleted($key, $output);
+        if ($this->hook === 'workerCompleted') {
+            ($this->completion)($key, $output);
+        }
     }
 }
