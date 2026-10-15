@@ -64,6 +64,12 @@ final class PredbOvhSource extends HttpFeedSource
             }
 
             $nuke = is_array($row['nuke'] ?? null) ? $row['nuke'] : null;
+            // Explicit, valid PRE identifiers must refer to the same row.
+            $rowId = self::preId($row['id'] ?? null);
+            $nukePreId = self::preId($nuke['preId'] ?? null);
+            if ($rowId !== null && $nukePreId !== null && $rowId !== $nukePreId) {
+                $nuke = null;
+            }
             $typeId = $nuke !== null ? (int) ($nuke['typeId'] ?? 0) : 0;
             $reason = is_string($nuke['reason'] ?? null) && $nuke['reason'] !== '' ? $nuke['reason'] : null;
 
@@ -86,5 +92,22 @@ final class PredbOvhSource extends HttpFeedSource
         }
 
         return $entries;
+    }
+
+    /** Canonical positive uint64 ID without narrowing through PHP integers or floats. */
+    private static function preId(mixed $value): ?string
+    {
+        if (is_int($value)) {
+            return $value > 0 ? (string) $value : null;
+        }
+        if (! is_string($value) || preg_match('/\A[0-9]+\z/D', $value) !== 1) {
+            return null;
+        }
+        $id = ltrim($value, '0');
+        if ($id === '' || strlen($id) > 20 || (strlen($id) === 20 && strcmp($id, '18446744073709551615') > 0)) {
+            return null;
+        }
+
+        return $id;
     }
 }
