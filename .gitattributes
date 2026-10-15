@@ -102,3 +102,10 @@ docker/Makefile		-binary text eol=lf
 /scripts/benchmark-resource-limits.py -binary text eol=lf
 /tests/Unit/test_benchmark_resource_limits.py -binary text eol=lf
 /tests/Unit/test_benchmark_remaining_modules_export.py -binary text eol=lf
+
+# Public benchmark inventory and deployment verification are reviewable source.
+/scripts/benchmark_rust_inventory.py -binary text eol=lf
+/scripts/verify-benchmark-pages.py -binary text eol=lf
+/tests/Unit/test_benchmark_rust_inventory.py -binary text eol=lf
+/tests/Unit/test_verify_benchmark_pages.py -binary text eol=lf
+/tests/Unit/test_benchmark_pages_completeness.py -binary text eol=lf

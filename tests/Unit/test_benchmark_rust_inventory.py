@@ -1,0 +1,90 @@
+"""Source-only inventory contract; no Rust builds or benchmark execution."""
+import hashlib
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / 'scripts/benchmark_rust_inventory.py'
+SOURCE = 'docker/app/nzb-yenc-ffi/src/lib.rs'
+
+
+def module():
+    spec = importlib.util.spec_from_file_location('rust_inventory', SCRIPT)
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+class RustInventoryTest(unittest.TestCase):
+    def test_every_current_export_has_a_source_location_and_explicit_scope(self):
+        self.assertTrue(SCRIPT.exists(), 'source-derived inventory helper is missing')
+        rows = module().inventory(ROOT)
+        self.assertEqual(len(rows), 29)
+        self.assertEqual(len({row['name'] for row in rows}), 29)
+        self.assertEqual(module().check(ROOT), [])
+        for row in rows:
+            path = ROOT / row['target']
+            self.assertEqual(row['source_sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+            self.assertIn(row['name'], path.read_text().splitlines()[row['line'] - 1])
+            self.assertNotEqual(row['coverage'], 'unclassified-gap')
+            for caller in row['callers']:
+                self.assertTrue((ROOT / caller).is_file())
+                self.assertIn(row['name'], (ROOT / caller).read_text())
+
+    def test_scope_does_not_turn_support_or_legacy_apis_into_speedup_claims(self):
+        self.assertTrue(SCRIPT.exists(), 'source-derived inventory helper is missing')
+        rows = {row['name']: row for row in module().inventory(ROOT)}
+        self.assertEqual(rows['rapidyenc_version']['coverage'], 'lifecycle-included')
+        self.assertEqual(rows['nntmux_metadata_string_free']['coverage'], 'lifecycle-included')
+        self.assertEqual(rows['nntmux_article_identity_json']['coverage'], 'compatibility-gap')
+        self.assertEqual(rows['nntmux_article_identity_json']['evidence_kinds'], [])
+        self.assertEqual(rows['nntmux_article_identity_v2_json']['coverage'], 'shared-reference-comparison')
+        self.assertEqual(rows['nntmux_article_identity_v2_json']['evidence_kinds'], ['metadata-modules'])
+        self.assertEqual(rows['nntmux_nntp_header_pair_comparison_json']['coverage'], 'unmeasured-gap')
+        self.assertEqual(rows['nntmux_nntp_header_pair_comparison_json']['evidence_kinds'], [])
+
+    def fixture(self, content):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        path = root / SOURCE
+        path.parent.mkdir(parents=True)
+        path.write_text(content)
+        subprocess.run(['git', 'init', '-q', str(root)], check=True)
+        subprocess.run(['git', '-C', str(root), 'add', SOURCE], check=True)
+        return root
+
+    def test_new_multiline_export_is_visible_and_check_fails_ignoring_comments_and_strings(self):
+        self.assertTrue(SCRIPT.exists(), 'source-derived inventory helper is missing')
+        root = self.fixture('''/* nested /* #[unsafe(no_mangle)] pub extern "C" fn bogus() {} */ end */
+// #[unsafe(no_mangle)] pub extern "C" fn commented() {}
+const TEXT: &str = r###"#[unsafe(no_mangle)] pub extern "C" fn in_string() {}"###;
+#[unsafe(no_mangle)]
+pub unsafe extern "C"
+fn future_export(
+) {}
+''')
+        rows = module().inventory(root)
+        self.assertEqual([row['name'] for row in rows], ['future_export'])
+        self.assertEqual(rows[0]['line'], 6)
+        self.assertEqual(rows[0]['coverage'], 'unclassified-gap')
+        result = subprocess.run([sys.executable, '-B', str(SCRIPT), '--check', '--root', str(root)],
+                                capture_output=True, text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('future_export', result.stdout + result.stderr)
+
+    def test_removed_declared_export_fails_check(self):
+        self.assertTrue(SCRIPT.exists(), 'source-derived inventory helper is missing')
+        root = self.fixture((ROOT / SOURCE).read_text().replace('fn rapidyenc_version(', 'fn removed_version('))
+        issues = module().check(root)
+        self.assertTrue(any('rapidyenc_version' in issue and 'missing' in issue for issue in issues))
+        self.assertTrue(any('removed_version' in issue for issue in issues))
+
+
+if __name__ == '__main__':
+    unittest.main()
