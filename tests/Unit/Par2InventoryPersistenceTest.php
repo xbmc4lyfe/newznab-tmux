@@ -59,7 +59,7 @@ final class Par2InventoryPersistenceTest extends TestCase
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication($container);
         $this->database = new Capsule($container);
-        $this->database->addConnection(['driver' => 'sqlite', 'database' => ':memory:']);
+        $this->database->addConnection(['driver' => 'sqlite', 'database' => ':memory:', 'foreign_key_constraints' => true]);
         $this->database->bootEloquent();
         $container->instance('db', $this->database->getDatabaseManager());
         $this->database->getConnection()->setTransactionManager(new DatabaseTransactionsManager);
@@ -96,6 +96,7 @@ final class Par2InventoryPersistenceTest extends TestCase
         $container->instance('db.schema', $schema);
         (require base_path('database/migrations/2026_10_12_010315_create_par_file_hash_evidence_tables.php'))->up();
         (require base_path('database/migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->up();
+        (require base_path('database/migrations/2026_10_15_190000_create_par2_descriptor_evidence_table.php'))->up();
         Search::swap(new class
         {
             public function updateRelease(int $id): void {}
@@ -135,6 +136,119 @@ final class Par2InventoryPersistenceTest extends TestCase
         $processor->applyInventoryForRename($inventory, 42, 1, 0, static fn (): bool => true);
         $processor->applyInventoryForRename($inventory, 42, 1, 0, static fn (): bool => true);
         $this->assertSame(1, $this->database->getConnection()->table('releases')->where('id', 42)->value('rarinnerfilecount'));
+    }
+
+    public function test_descriptor_evidence_persists_binary_padded_aliases_without_optional_collection_and_replays(): void
+    {
+        $this->seedRelease(42);
+        $this->database->getConnection()->table('releases')->where('id', 42)->update(['categories_id' => 2000]);
+        $inventory = new Par2PacketAccumulator;
+        $set = str_repeat('s', 16);
+        foreach (['i', 'j'] as $id) {
+            $body = str_repeat($id, 16).md5('content', true).md5('prefix', true).pack('V2', 0xFFFFFFFE, 0xFFFFFFFF)."raw\xff\0name \t";
+            $inventory->append($this->packet(Par2Info::PACKET_FILEDESC, $body, $set));
+        }
+        $processor = $this->processor(new Par2Info, false);
+        $processor->applyInventoryForRename($inventory, 42, 1, 0, expectedSnapshot: $this->snapshot());
+        $processor->applyInventoryForRename($inventory, 42, 1, 0, expectedSnapshot: $this->snapshot());
+
+        $rows = $this->database->getConnection()->table('par2_descriptor_evidence')->orderBy('id')->get();
+        $this->assertCount(2, $rows);
+        foreach ($rows as $index => $row) {
+            $descriptor = $inventory->descriptors()[$index];
+            $this->assertSame('synthetic-release-42', $row->release_guid);
+            $this->assertSame(bin2hex($set), $row->recovery_set_id);
+            $this->assertSame($descriptor['file_id'], $row->file_id);
+            $this->assertSame($descriptor['packet_checksum'], $row->packet_checksum);
+            $this->assertSame(md5('content'), $row->full_md5);
+            $this->assertSame(md5('prefix'), $row->hash16k);
+            $this->assertSame('18446744073709551614', $row->file_size);
+            $this->assertSame(base64_encode("raw\xff\0name \t\0"), $row->raw_filename_base64);
+            $this->assertSame('unknown', $row->classification);
+            $this->assertSame(0, $row->classification_version);
+            $this->assertSame('unclassified', $row->classification_provenance);
+            $this->assertSame(1, $row->descriptor_proof_version);
+        }
+        $this->assertSame(0, $this->database->getConnection()->table('release_files')->count());
+    }
+
+    #[DataProvider('replacementDescriptorGuids')]
+    public function test_descriptor_evidence_replaces_stale_guid_and_release_delete_cascades(string $guid): void
+    {
+        $this->seedRelease(42);
+        $this->database->getConnection()->table('releases')->where('id', 42)->update(['categories_id' => 2000]);
+        $processor = $this->processor(new Par2Info);
+        $processor->applyInventoryForRename($this->inventory(), 42, 1, 0);
+        $this->assertSame(1, $this->database->getConnection()->table('par2_descriptor_evidence')->count());
+        $this->database->getConnection()->table('releases')->where('id', 42)->update(['guid' => $guid]);
+        $processor->applyInventoryForRename($this->inventory(2), 42, 1, 0);
+
+        $this->assertSame([$guid, $guid], $this->database->getConnection()->table('par2_descriptor_evidence')->pluck('release_guid')->all());
+        $this->database->getConnection()->table('releases')->where('id', 42)->delete();
+        $this->assertSame(0, $this->database->getConnection()->table('par2_descriptor_evidence')->count());
+    }
+
+    /** @return array<string, array{string}> */
+    public static function replacementDescriptorGuids(): array
+    {
+        return ['replacement' => ['replacement-guid'], 'case-only replacement' => ['SYNTHETIC-RELEASE-42']];
+    }
+
+    public function test_descriptor_evidence_ownership_loss_rolls_back_append_and_stale_guid_cleanup(): void
+    {
+        $this->seedRelease(42);
+        $this->database->getConnection()->table('releases')->where('id', 42)->update(['categories_id' => 2000]);
+        $processor = $this->processor(new Par2Info);
+        $processor->applyInventoryForRename($this->inventory(), 42, 1, 0);
+        $before = $this->database->getConnection()->table('par2_descriptor_evidence')->get()->all();
+        $this->database->getConnection()->table('releases')->where('id', 42)->update(['guid' => 'replacement-guid']);
+        $owned = true;
+        $this->database->getConnection()->setEventDispatcher(new Dispatcher);
+        $this->database->getConnection()->listen(static function ($event) use (&$owned): void {
+            if (str_starts_with($event->sql, 'insert into "par2_descriptor_evidence"')) {
+                $owned = false;
+            }
+        });
+        $outcome = $processor->applyInventoryForRename($this->inventory(2), 42, 1, 0, static function () use (&$owned): bool {
+            return $owned;
+        });
+
+        $this->assertFalse($owned);
+        $this->assertSame(Par2RenameOutcome::Deferred, $outcome);
+        $this->assertEquals($before, $this->database->getConnection()->table('par2_descriptor_evidence')->get()->all());
+    }
+
+    public function test_descriptor_checksum_identity_collision_fails_without_overwriting_evidence(): void
+    {
+        $this->seedRelease(42);
+        $this->database->getConnection()->table('releases')->where('id', 42)->update(['categories_id' => 2000]);
+        $processor = $this->processor(new Par2Info);
+        $processor->applyInventoryForRename($this->inventory(), 42, 1, 0);
+        $this->assertSame(1, $this->database->getConnection()->table('par2_descriptor_evidence')->count());
+        $this->database->getConnection()->table('par2_descriptor_evidence')->update(['raw_filename_base64' => base64_encode('different bytes')]);
+        $before = $this->database->getConnection()->table('par2_descriptor_evidence')->get()->all();
+        try {
+            $processor->applyInventoryForRename($this->inventory(), 42, 1, 0);
+            $this->fail('Checksum collision or stored evidence corruption was ignored');
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString('descriptor', $error->getMessage());
+            $this->assertEquals($before, $this->database->getConnection()->table('par2_descriptor_evidence')->get()->all());
+        }
+    }
+
+    public function test_descriptor_evidence_preserves_names_larger_than_a_mysql_text_column(): void
+    {
+        $this->seedRelease(42);
+        $this->database->getConnection()->table('releases')->where('id', 42)->update(['categories_id' => 2000]);
+        $filename = str_repeat("x\xff", 40000)."\0\0";
+        $body = str_repeat('i', 16).md5('content', true).md5('prefix', true).pack('V2', 10, 0).$filename;
+        $inventory = new Par2PacketAccumulator;
+        $inventory->append($this->packet(Par2Info::PACKET_FILEDESC, $body, str_repeat('s', 16)));
+        $this->processor(new Par2Info)->applyInventoryForRename($inventory, 42, 1, 0);
+
+        $stored = $this->database->getConnection()->table('par2_descriptor_evidence')->value('raw_filename_base64');
+        $this->assertGreaterThan(65535, strlen($stored));
+        $this->assertSame($filename."\0\0", base64_decode($stored, true));
     }
 
     public function test_snapshot_mutation_after_read_prevents_count(): void
