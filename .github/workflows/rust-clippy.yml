@@ -35,6 +35,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify Rust setup failure handling
+        run: python3 tests/Unit/test_clippy_toolchain.py -v
+
       - name: Install Rust toolchain
         shell: bash
         run: source scripts/clippy-rust-toolchain.sh
