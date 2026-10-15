@@ -287,7 +287,7 @@ class BaseRunnerTest extends TestCase
 
     #[Test]
     #[DataProvider('completionHooks')]
-    public function a_failing_completion_hook_during_uncertain_drain_does_not_terminate_another_resident_worker(string $hook): void
+    public function uncertain_drain_and_completion_errors_remain_visible_after_all_resident_workers_finish(string $hook, int $slowExit): void
     {
         config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:', 'nntmux.concurrency_timeout' => 5]);
         DB::purge('sqlite');
@@ -322,20 +322,24 @@ class BaseRunnerTest extends TestCase
                     $outage = true;
                     DB::statement('DROP TABLE processing_runtime_states');
                     file_put_contents($release, 'released');
-                    DB::table('processing_runtime_states')->value('stop_requested');
+                    try {
+                        DB::table('processing_runtime_states')->value('stop_requested');
+                    } catch (\Throwable $exception) {
+                        throw new RuntimeException('Runtime lookup failed with resident children.', 0, $exception);
+                    }
                 }
                 usleep(1000);
             } while (! $outage && microtime(true) < $deadline);
         });
-        $worker = static fn (string $marker, int $delay): array => [PHP_BINARY, '-r',
-            'file_put_contents($argv[1], "resident"); $deadline = microtime(true) + 3; while (file_get_contents($argv[2]) !== "released") { if (microtime(true) >= $deadline) { exit(3); } usleep(1000); } usleep((int) $argv[3]); file_put_contents($argv[1], "committed"); echo "completed";',
-            $marker, $release, (string) $delay];
+        $worker = static fn (string $marker, int $delay, int $exit): array => [PHP_BINARY, '-r',
+            'file_put_contents($argv[1], "resident"); $deadline = microtime(true) + 3; while (file_get_contents($argv[2]) !== "released") { if (microtime(true) >= $deadline) { exit(3); } usleep(1000); } usleep((int) $argv[3]); file_put_contents($argv[1], "committed"); echo "completed"; exit((int) $argv[4]);',
+            $marker, $release, (string) $delay, (string) $exit];
         $failure = null;
         try {
             try {
                 $runner->poolWithCompletion([
-                    'fast' => $worker($fast, 100000),
-                    'slow' => $worker($slow, 600000),
+                    'fast' => $worker($fast, 100000, 0),
+                    'slow' => $worker($slow, 600000, $slowExit),
                     'queued' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "queued");', $release],
                 ], 2, static function (string|int $key, string $output) use ($hook): void {
                     if ($hook === 'onComplete') {
@@ -351,10 +355,18 @@ class BaseRunnerTest extends TestCase
             $this->assertSame('committed', file_get_contents($slow));
             $this->assertSame('released', file_get_contents($release));
             $this->assertSame(['fast', 'slow'], $runner->started);
-            $this->assertSame(['status' => 'success', 'exit_code' => 0], $runner->outcomes()['slow']);
+            $this->assertSame(['status' => $slowExit === 0 ? 'success' : 'failure', 'exit_code' => $slowExit], $runner->outcomes()['slow']);
             $this->assertSame('drained', $runner->outcomes()['queued']['status']);
             $this->assertNotNull($failure, 'The database and completion failure must remain visible after both workers finish.');
-            $this->assertStringContainsString('processing_runtime_states', $failure->getMessage());
+            $this->assertStringContainsString('Runtime lookup failed with resident children.', $failure->getMessage());
+            $this->assertNotNull($failure->getPrevious(), 'The deferred exception must remain available as a cause.');
+            if ($slowExit !== 0) {
+                $this->assertStringContainsString('slow failure (exit 7)', $failure->getMessage());
+            }
+            if ($hook !== 'none') {
+                $this->assertStringContainsString('Worker completion failed', $failure->getMessage());
+                $this->assertStringContainsString('processing_runtime_states', $failure->getMessage());
+            }
         } finally {
             unlink($fast);
             unlink($slow);
@@ -362,10 +374,16 @@ class BaseRunnerTest extends TestCase
         }
     }
 
-    /** @return array<string, array{string}> */
+    /** @return array<string, array{string, int}> */
     public static function completionHooks(): array
     {
-        return ['completion callback' => ['onComplete'], 'worker hook' => ['workerCompleted']];
+        return [
+            'completion callback' => ['onComplete', 0],
+            'worker hook' => ['workerCompleted', 0],
+            'failed child and drain lookup' => ['none', 7],
+            'failed child and completion callback' => ['onComplete', 7],
+            'failed child and worker hook' => ['workerCompleted', 7],
+        ];
     }
 
     #[Test]
@@ -435,15 +453,33 @@ class BaseRunnerTest extends TestCase
         };
         $marker = tempnam(sys_get_temp_dir(), 'nntmux-groups-');
         $this->assertNotFalse($marker);
-        $command = static fn (string $name, int $delay): array => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "start:".$argv[2]."\n", FILE_APPEND); usleep((int) $argv[3]); file_put_contents($argv[1], "finish:".$argv[2]."\n", FILE_APPEND);', $marker, $name, (string) $delay];
+        $barrier = tempnam(sys_get_temp_dir(), 'nntmux-group-barrier-');
+        $this->assertNotFalse($barrier);
+        $worker = <<<'PHP'
+            file_put_contents($argv[1], "start:".$argv[2]."\n", FILE_APPEND | LOCK_EX);
+            if ($argv[2] === 'a:1') {
+                $deadline = microtime(true) + 3;
+                while (file_get_contents($argv[3]) !== 'c-started') {
+                    if (microtime(true) >= $deadline) {
+                        exit(4);
+                    }
+                    usleep(1000);
+                }
+            } elseif ($argv[2] === 'c:1') {
+                file_put_contents($argv[3], 'c-started');
+            }
+            file_put_contents($argv[1], "finish:".$argv[2]."\n", FILE_APPEND | LOCK_EX);
+            PHP;
+        $command = static fn (string $name): array => [PHP_BINARY, '-r', $worker, $marker, $name, $barrier];
         try {
-            $runner->pool(['a:1' => $command('a:1', 400000), 'a:2' => $command('a:2', 50000), 'b:1' => $command('b:1', 100000), 'c:1' => $command('c:1', 100000)], 2, 5);
+            $runner->pool(['a:1' => $command('a:1'), 'a:2' => $command('a:2'), 'b:1' => $command('b:1'), 'c:1' => $command('c:1')], 2, 5);
             $events = file_get_contents($marker);
             $this->assertLessThan(strpos($events, 'start:a:2'), strpos($events, 'finish:a:1'));
             $this->assertLessThan(strpos($events, 'finish:a:1'), strpos($events, 'start:c:1'));
             $this->assertSame(['a:1', 'b:1', 'c:1', 'a:2'], $runner->started);
         } finally {
             unlink($marker);
+            unlink($barrier);
         }
     }
 

@@ -10,6 +10,7 @@ use App\Services\Binaries\MissedPartHandler;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
 use DariusIII\NetNntp\Error as NntpError;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -168,6 +169,59 @@ class GetArticleRangeContiguousTest extends TestCase
             'repeated deferral preserves existing tries' => [false, true, [101 => 2, 102 => 2, 201 => 2, 202 => 2,
                 1001 => 2, 1002 => 2, 1003 => 2]],
         ];
+    }
+
+    #[DataProvider('uncertainAdmissionModes')]
+    public function test_uncertain_admission_fails_without_consuming_existing_repair_attempts(bool $contiguous): void
+    {
+        Schema::create('missed_parts', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->unsignedBigInteger('numberid');
+            $table->unsignedInteger('groups_id');
+            $table->unsignedInteger('attempts');
+            $table->unique(['numberid', 'groups_id']);
+        });
+        DB::table('missed_parts')->insert([
+            ['numberid' => 1001, 'groups_id' => 1, 'attempts' => 2],
+            ['numberid' => 1002, 'groups_id' => 1, 'attempts' => 2],
+            ['numberid' => 1003, 'groups_id' => 1, 'attempts' => 2],
+        ]);
+        $failedLookup = false;
+        DB::listen(static function (QueryExecuted $query) use (&$failedLookup): void {
+            if (! $failedLookup && str_starts_with($query->sql, 'select') && str_contains($query->sql, 'processing_runtime_states')) {
+                $failedLookup = true;
+                throw new \RuntimeException('Runtime admission state unavailable.');
+            }
+        });
+        $ranges = [];
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('selectGroup')->with('alt.test')->once()->andReturn(['first' => 1, 'last' => 1003]);
+        $nntp->shouldReceive('getXOVER')->andReturnUsing(static function (string $range) use (&$ranges): array {
+            $ranges[] = $range;
+
+            return [];
+        });
+        $this->useNntp($nntp);
+
+        $this->artisan('articles:get-range', ['mode' => 'binaries', 'group' => 'alt.test', 'first' => 1001,
+            'last' => 1003, '--contiguous' => $contiguous])->assertFailed();
+
+        $this->assertTrue($failedLookup);
+        $this->assertSame([], $ranges);
+        $this->assertSame(1000, (int) DB::table('usenet_groups')->value('last_record'));
+        $this->assertSame([1001 => 2, 1002 => 2, 1003 => 2],
+            DB::table('missed_parts')->orderBy('numberid')->pluck('attempts', 'numberid')->all());
+        if (! $contiguous) {
+            DB::table('usenet_groups')->update(['last_record' => 2000]);
+            $repairable = (new MissedPartHandler)->getMissingParts(1);
+            $this->assertSame([1001, 1002, 1003], array_map(static fn (\stdClass $part): int => (int) $part->numberid, $repairable));
+        }
+    }
+
+    /** @return array<string, array{bool}> */
+    public static function uncertainAdmissionModes(): array
+    {
+        return ['contiguous' => [true], 'parallel' => [false]];
     }
 
     private function runRange(int $first, int $last): PendingCommand

@@ -82,6 +82,7 @@ class GetArticleRange extends Command
         // Ranges run in parallel and each success moves the group's cursor to its own end, so a range
         // that fails before it has been scanned would be skipped for good; queue it for part repair.
         $scanned = false;
+        $checkingDrainAdmission = false;
 
         try {
             $nntp = $this->getNntp();
@@ -106,7 +107,10 @@ class GetArticleRange extends Command
             if ($this->option('repair') && app(ConfigurationProvider::class)->ingestion()->partRepair) {
                 $binaries->partRepair($groupMySQL);
             }
-            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            $checkingDrainAdmission = true;
+            $stopRequested = app(ProcessingRuntimeStateRepository::class)->stopRequested();
+            $checkingDrainAdmission = false;
+            if ($stopRequested) {
                 if (! $this->option('contiguous') && ! $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle, true)) {
                     $this->error('The drained range could not be deferred for repair; retry this worker.');
 
@@ -155,8 +159,8 @@ class GetArticleRange extends Command
         } catch (\Throwable $e) {
             Log::error($e->getTraceAsString());
             $this->error($e->getMessage());
-            if (! $scanned) {
-                $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle);
+            if (! $scanned && (! $checkingDrainAdmission || ! $this->option('contiguous'))) {
+                $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle, $checkingDrainAdmission);
             }
 
             return self::FAILURE;

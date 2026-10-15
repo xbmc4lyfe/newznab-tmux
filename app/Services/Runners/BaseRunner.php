@@ -292,19 +292,22 @@ abstract class BaseRunner
         }
 
         $failed = array_filter($this->workerOutcomes, static fn (array $outcome): bool => ! in_array($outcome['status'], ['success', 'drained'], true));
+        $errors = [];
         if ($failed !== []) {
-            throw new RuntimeException('Worker batch did not succeed: '.implode(', ', array_map(
+            $errors[] = 'Worker batch did not succeed: '.implode(', ', array_map(
                 static fn (string|int $key, array $outcome): string => $key.' '.$outcome['status'].($outcome['status'] === 'timeout' ? ' exceeded the timeout' : '').' (exit '.($outcome['exit_code'] ?? 'none').')',
                 array_keys($failed), array_values($failed),
-            )));
+            ));
         }
 
         if ($completionFailure !== null) {
-            throw new RuntimeException('Worker completion failed: '.$completionFailure->getMessage()
-                .($this->drainStateFailure !== null ? '; drain state unavailable: '.$this->drainStateFailure->getMessage() : ''), 0, $completionFailure);
+            $errors[] = 'Worker completion failed: '.$completionFailure->getMessage();
         }
         if ($this->drainStateFailure !== null) {
-            throw new RuntimeException('Unable to determine worker drain state: '.$this->drainStateFailure->getMessage(), 0, $this->drainStateFailure);
+            $errors[] = 'Unable to determine worker drain state: '.$this->drainStateFailure->getMessage();
+        }
+        if ($errors !== []) {
+            throw new RuntimeException(implode('; ', $errors), 0, $completionFailure ?? $this->drainStateFailure);
         }
 
         return $results;
