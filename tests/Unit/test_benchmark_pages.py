@@ -68,6 +68,30 @@ class PagesTest(unittest.TestCase):
                       results=[dict(kind='cpu-snapshot', runner='ubuntu-latest', status='measured', rows=[])])
         self.assertIn('dependent bootstrap samples', pages.render(report))
 
+    def test_corrected_cpu_intervals_are_labeled_separately_from_historical_intervals(self):
+        row = dict(kind='cpu-snapshot', runner='ubuntu-latest', status='measured', rows=[],
+                   measurement_protocol_version=3, confidence_status='simultaneous_gate_intervals',
+                   confidence_family_size=3, head_sha=SHA, runtime_identity={'executed_sha': SHA},
+                   protocol_sha256='b' * 64, report_sha256='c' * 64)
+        report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[], results=[row])
+        text = pages.render(report)
+        self.assertNotIn('dependent bootstrap samples', text)
+        self.assertIn('simultaneous 95%', text)
+        row['status'] = 'invalid'
+        self.assertNotIn('CPU protocol 3 uses independent', pages.render(report))
+        row['status'] = 'measured'
+        row.pop('runtime_identity', None)
+        self.assertNotIn('CPU protocol 3 uses independent', pages.render(report))
+        row['confidence_status'] = 'unqualified'
+        self.assertIn('do not establish qualified uncertainty', pages.render(report))
+
+    def test_cpu_confidence_metadata_is_strict_and_does_not_escape_its_comparison(self):
+        summary = dict(schema_version=1, repository=pages.REPOSITORY, head_sha=SHA, run_id=12, run_attempt=2, kind='cpp', runner='ubuntu-latest', adoption_qualified=False, rows=[])
+        for metadata in ({'confidence_status': 'simultaneous_gate_intervals'},
+                         {'measurement_protocol_version': 3}, {'confidence_family_size': 3}):
+            with self.subTest(metadata=metadata), self.assertRaises(ValueError):
+                pages.validate_summary({**summary, **metadata}, self.run_row(), 'cpp', 'ubuntu-latest')
+
     def run_row(self, **changes):
         return dict(id=12, run_attempt=2, head_sha=SHA, head_branch='master', event='push',
                     status='completed', conclusion='failure', head_repository={'full_name': pages.REPOSITORY}, **changes)

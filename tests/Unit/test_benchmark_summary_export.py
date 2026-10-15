@@ -103,7 +103,7 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             protocol["runtime_manifest" if kind == "profile" else "runtime"] = []
             self.assertEqual("unknown", self.run_export(kind, records)["rust_payload_mode"])
 
-    def run_export(self, kind, records=None, raw=None, runtime=None):
+    def run_export(self, kind, records=None, raw=None, runtime=None, runtime_raw=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             if records is not None or raw is not None:
@@ -113,7 +113,7 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             if kind in ("fingerprint-ffi", "fingerprint-worker", "cpu-snapshot"):
                 runtime_path = root / "utility-evidence/runtime.json"
                 runtime_path.parent.mkdir(parents=True, exist_ok=True)
-                runtime_path.write_text(json.dumps(runtime if runtime is not None else {"executed_sha": "d" * 40, "rustc": "rustc 1.98.0", "build_profile": "release", "command": UNPUBLISHED_MARKER}))
+                runtime_path.write_text(runtime_raw if runtime_raw is not None else json.dumps(runtime if runtime is not None else {"executed_sha": "d" * 40, "rustc": "rustc 1.98.0", "build_profile": "release", "command": UNPUBLISHED_MARKER}))
             env = dict(os.environ, GITHUB_SHA="d" * 40, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2", GITHUB_REPOSITORY="xbmc4lyfe/newznab-tmux")
             result = subprocess.run(["python3", str(SCRIPT), "--kind", kind, "--runner", "linux-x64", "--output", "summary.json"], cwd=root, env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -141,6 +141,61 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             else:
                 report["summary"][name] = dict(pairs_total=31, pairs_valid=31, median_baseline_over_candidate_ratio=2, median_cold_baseline_over_candidate_ratio=1.5, pairs=[{"eligible": True}] * 31)
         return report
+
+    def test_cpu_protocol_versions_distinguish_historical_and_corrected_confidence(self):
+        old = self.run_export("cpu-snapshot", self.utility("cpu-snapshot"))
+        self.assertEqual(old.get("measurement_protocol_version"), 2)
+        self.assertEqual(old["confidence_status"], "historical_unqualified")
+        report = self.utility("cpu-snapshot")
+        report["protocol"].update(version=3, bootstrap_rng="splitmix64-rejection",
+                                  order_rng="splitmix64-rejection", bootstrap_resamples=4000,
+                                  bootstrap_seed=0, confidence_family_size=3,
+                                  confidence_method="paired_bootstrap_bonferroni")
+        for name, row in report["summary"].items():
+            row.update(gate_statistic="median_ratio" if name == "common-mounted" else "p99_ratio",
+                       gate_speedup_simultaneous_ci95=[1.6, 2.4])
+        new = self.run_export("cpu-snapshot", report)
+        self.assertEqual(new["status"], "measured_gate_failed")
+        self.assertEqual(new["confidence_status"], "simultaneous_gate_intervals")
+        self.assertEqual(new["confidence_family_size"], 3)
+        self.assertEqual(new["rows"][0]["gate_speedup_simultaneous_ci95"], [1.6, 2.4])
+        bad_runtime = self.run_export("cpu-snapshot", report, runtime={"executed_sha": "e" * 40})
+        self.assertEqual(bad_runtime["status"], "invalid")
+        self.assertEqual(bad_runtime["confidence_status"], "unqualified")
+        bad_json = self.run_export("cpu-snapshot", report, runtime_raw="{unfinished")
+        self.assertEqual(bad_json["status"], "invalid")
+        self.assertEqual(bad_json["confidence_status"], "unqualified")
+        for field, bad in (("bootstrap_rng", UNPUBLISHED_MARKER), ("order_rng", []),
+                           ("bootstrap_resamples", 2000), ("confidence_family_size", 4),
+                           ("bootstrap_seed", -1), ("confidence_method", UNPUBLISHED_MARKER)):
+            original = report["protocol"][field]
+            report["protocol"][field] = bad
+            with self.subTest(field=field):
+                rejected = self.run_export("cpu-snapshot", report)
+                self.assertEqual(rejected["status"], "invalid")
+                self.assertEqual(rejected["confidence_status"], "unqualified")
+            report["protocol"][field] = original
+
+    def test_corrected_exact_default_host_has_five_gates_and_retains_both_intervals(self):
+        report = self.utility("cpu-snapshot")
+        report["protocol"].update(version=3, host_proc_absent_at_start=True,
+                                  bootstrap_rng="splitmix64-rejection", order_rng="splitmix64-rejection",
+                                  bootstrap_resamples=4000, bootstrap_seed=0, confidence_family_size=5,
+                                  host_absent_median_ratio_ci_lower_gate=2.0,
+                                  host_absent_p99_ratio_ci_lower_gate=1.5,
+                                  confidence_method="paired_bootstrap_bonferroni")
+        report["summary"]["rare-host-unavailable"] = dict(report["summary"]["rare-unavailable"])
+        for name, row in report["summary"].items():
+            row.update(gate_statistic="median_ratio" if name == "common-mounted" else "p99_ratio",
+                       gate_speedup_simultaneous_ci95=[1.6, 2.4])
+        report["summary"]["rare-host-unavailable"]["host_median_speedup_simultaneous_ci95"] = [1.8, 2.4]
+        summary = self.run_export("cpu-snapshot", report)
+        self.assertEqual(summary["status"], "measured_gate_failed")
+        self.assertEqual(summary["confidence_family_size"], 5)
+        host = next(row for row in summary["rows"] if row["fixture"] == "rare-host-unavailable")
+        self.assertEqual(host["host_median_speedup_simultaneous_ci95"], [1.8, 2.4])
+        del report["summary"]["rare-host-unavailable"]["host_median_speedup_simultaneous_ci95"]
+        self.assertEqual(self.run_export("cpu-snapshot", report)["status"], "invalid")
 
     def test_native_utility_reports_are_bounded_and_do_not_claim_adoption(self):
         for kind in ("fingerprint-ffi", "fingerprint-worker", "cpu-snapshot"):
