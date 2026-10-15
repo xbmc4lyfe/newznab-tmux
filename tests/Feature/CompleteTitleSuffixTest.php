@@ -63,7 +63,7 @@ final class CompleteTitleSuffixTest extends TestCase
         DB::table('predb')->insert($hits);
         DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->andReturn($hits);
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturn($hits);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $category = $this->createStub(CategorizationService::class);
         $category->method('determineCategory')->willReturn(['categories_id' => 8000]);
@@ -124,7 +124,7 @@ final class CompleteTitleSuffixTest extends TestCase
         $row = ['id' => 7, 'title' => $title, 'filename' => $alias];
         DB::table('predb')->insert($row);
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->times($accept ? 2 : 1)->andReturn([$row]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->times($accept ? 2 : 1)->andReturn([$row]);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
         $service = new NameFixingService($updates);
@@ -193,7 +193,7 @@ final class CompleteTitleSuffixTest extends TestCase
         DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
         $discoveredQueries = [];
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->andReturnUsing(static function (string $query) use (&$discoveredQueries, $hits): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturnUsing(static function (string $query) use (&$discoveredQueries, $hits): array {
             $discoveredQueries[] = $query;
 
             return $hits;
@@ -246,7 +246,7 @@ final class CompleteTitleSuffixTest extends TestCase
         }
         DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->andReturn($hits);
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturn($hits);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
         (new NameFixingService($updates))->getPreFileNames(['prefile', '1']);
@@ -281,7 +281,7 @@ final class CompleteTitleSuffixTest extends TestCase
         DB::table('predb')->insert($hits);
         DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->andReturn($hits);
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturn($hits);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $category = $this->createStub(CategorizationService::class);
         $category->method('determineCategory')->willReturn(['categories_id' => 8000]);

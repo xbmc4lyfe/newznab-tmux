@@ -85,7 +85,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
         $discoveredQueries = [];
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->andReturnUsing(static function (string $query) use (&$discoveredQueries, $hits): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturnUsing(static function (string $query) use (&$discoveredQueries, $hits): array {
             $discoveredQueries[] = $query;
 
             return $hits;
@@ -143,7 +143,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         DB::table('predb')->insert($rows);
         DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->andReturn($rows);
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturn($rows);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
         (new NameFixingService($updates))->getPreFileNames(['prefile', '1']);
@@ -169,7 +169,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         }
         DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->once()->andReturn($rows);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn($rows);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $category = $this->createStub(CategorizationService::class);
         $category->method('determineCategory')->willReturn(['categories_id' => 8000]);
@@ -194,7 +194,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         DB::table('predb')->insert(['id' => 7, 'title' => $title]);
         $queries = [];
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->twice()->andReturnUsing(static function (string $query) use (&$queries, $title): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->twice()->andReturnUsing(static function (string $query) use (&$queries, $title): array {
             $queries[] = $query;
 
             return [['id' => 7, 'title' => $title]];
@@ -234,7 +234,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         }
         $calls = 0;
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->andReturnUsing(static function () use (&$rows, &$calls): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturnUsing(static function () use (&$rows, &$calls): array {
             $calls++;
 
             return $rows;
@@ -289,7 +289,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         $before = DB::table('release_files')->where('releases_id', $release->id)->orderBy('id')->pluck('name')->all();
         $discoveredQueries = [];
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->andReturnUsing(static function (string $query) use (&$discoveredQueries, $suffixTitle, $trueTitle): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturnUsing(static function (string $query) use (&$discoveredQueries, $suffixTitle, $trueTitle): array {
             $discoveredQueries[] = $query;
 
             return [['id' => 7, 'title' => $suffixTitle], ['id' => 8, 'title' => $trueTitle]];
@@ -333,7 +333,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             DB::table('releases')->where('id', $release->id)->update(['guid' => 'replacement-guid']);
         }
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => $title]]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([['id' => 7, 'title' => $title]]);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
         self::assertSame($matches ? 1 : 0, (new NameFixingService($updates))->matchPreDbFileNames($entry, [$title.'.mkv'], true, true, false));
@@ -382,7 +382,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         $row = ['id' => 7, 'title' => $title, 'filename' => $alias];
         DB::table('predb')->insert($row);
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->times($accept ? 2 : 1)->andReturn([$row]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->times($accept ? 2 : 1)->andReturn([$row]);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
         $service = new NameFixingService($updates);
@@ -433,7 +433,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         }
         $release = $this->pendingPar2Release(['searchname' => $title]);
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->once()->andReturn($rows);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn($rows);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
         $service = new NameFixingService($updates);
@@ -452,7 +452,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             ['id' => 8, 'title' => 'Other.Canonical.Two', 'filename' => $title],
         ];
         $service = new NameFixingService($this->createStub(ReleaseUpdateService::class));
-        Search::shouldReceive('searchPredb')->twice()->andReturn($rows);
+        Search::shouldReceive('searchPredbFilenameCandidates')->twice()->andReturn($rows);
         $lookup = new \ReflectionMethod($service, 'findBestPredbFilenameMatch');
         self::assertNull($lookup->invoke($service, $title, new OriginalFilenameEvidence($title.'.mkv')));
         self::assertNull($lookup->invoke($service, $title, new OriginalFilenameEvidence($title.'.mkv')));
@@ -466,7 +466,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             ['id' => 8, 'title' => $title, 'filename' => ''],
         ];
         $service = new NameFixingService($this->createStub(ReleaseUpdateService::class));
-        Search::shouldReceive('searchPredb')->twice()->andReturn($rows);
+        Search::shouldReceive('searchPredbFilenameCandidates')->twice()->andReturn($rows);
         $lookup = new \ReflectionMethod($service, 'findBestPredbFilenameMatch');
         self::assertSame(8, $lookup->invoke($service, $title, new OriginalFilenameEvidence($title.'.mkv'))['id']);
         self::assertSame(8, $lookup->invoke($service, $title, new OriginalFilenameEvidence($title.'.mkv'))['id']);
@@ -475,7 +475,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
     public function test_oversized_nominations_report_evidence_without_retaining_separate_query_keys(): void
     {
         $service = new NameFixingService($this->createStub(ReleaseUpdateService::class));
-        Search::shouldReceive('searchPredb')->twice()->andReturn([
+        Search::shouldReceive('searchPredbFilenameCandidates')->twice()->andReturn([
             ['id' => 7, 'title' => 'Other.Canonical.One'],
             ['id' => 8, 'title' => 'Other.Canonical.Two'],
         ]);

@@ -162,7 +162,7 @@ final class PredbMatchingTest extends TestCase
             $updates->expects(self::once())->method('attachPredbSnapshot')->with(self::callback(static fn (object $release): bool => (int) $release->releases_id === 42), 7)->willReturn(true);
             $updates->expects(self::never())->method('updateRelease');
         }
-        Search::shouldReceive('searchPredb')->once()->andReturn([$this->hit()]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([$this->hit()]);
         $service = new NameFixingService(updateService: $updates);
         self::assertSame(1, $service->matchPreDbFiles((object) ['releases_id' => 42, 'filename' => 'File.Name-GROUP.mkv', 'searchname' => $rename ? 'Old.Title' : 'Canonical.Scene-GROUP'], true, true, false));
     }
@@ -173,7 +173,7 @@ final class PredbMatchingTest extends TestCase
         $updates->expects(self::once())->method('currentPredbTitle')->with(7, 'Canonical.Scene-GROUP', 'File.Name-GROUP.mkv')->willReturn('Canonical.Scene-GROUP');
         $updates->expects(self::never())->method('updateRelease');
         $updates->expects(self::never())->method('attachPredbSnapshot');
-        Search::shouldReceive('searchPredb')->once()->andReturn([$this->hit()]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([$this->hit()]);
 
         self::assertSame(1, (new NameFixingService(updateService: $updates))->matchPreDbFiles((object) ['releases_id' => 42, 'filename' => 'File.Name-GROUP.mkv', 'searchname' => 'Canonical.Scene-GROUP'], false, true, false));
     }
@@ -187,7 +187,7 @@ final class PredbMatchingTest extends TestCase
         }
         DB::table('releases')->insert(['id' => 42, 'guid' => 'synthetic-release-42', 'name' => 'posted-subject', 'searchname' => $rename ? 'Old.Title' : 'Canonical.Scene-GROUP', 'predb_id' => 0, 'categories_id' => 7010, 'groups_id' => 1]);
         Event::fake([ReleaseNameFixed::class]);
-        Search::shouldReceive('searchPredb')->once()->andReturn([$this->hit()]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([$this->hit()]);
         Search::shouldReceive('updateRelease')->times($rename ? 1 : 0)->with(42);
         $release = DB::table('releases')->first();
         $release->releases_id = 42;
@@ -203,7 +203,7 @@ final class PredbMatchingTest extends TestCase
         $updates = $this->createMock(ReleaseUpdateService::class);
         $updates->expects(self::never())->method('updateRelease');
         $updates->expects(self::never())->method('attachPredbSnapshot');
-        Search::shouldReceive('searchPredb')->once()->andReturn([array_replace($this->hit(), ['id' => 0])]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([array_replace($this->hit(), ['id' => 0])]);
         self::assertSame(0, (new NameFixingService(updateService: $updates))->matchPreDbFiles((object) ['releases_id' => 42, 'filename' => 'File.Name-GROUP.mkv', 'searchname' => 'Old.Title'], false, true, false));
     }
 
@@ -441,7 +441,7 @@ final class PredbMatchingTest extends TestCase
         DB::table('predb')->insert($hits);
         $hit = $hits[$numbered ? 0 : 1];
         $evidence = $numbered ? '123.Fixture.Alias.2026-GRP' : 'Fixture.Alias.2026-GRP';
-        Search::shouldReceive('searchPredb')->once()->with($evidence)->andReturn($hits);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->with($evidence)->andReturn($hits);
         $updates = $this->getMockBuilder(ReleaseUpdateService::class)->onlyMethods(['updateRelease'])->getMock();
         $updates->expects(self::once())->method('updateRelease')
             ->with(self::anything(), $hit['title'], self::anything(), false, self::anything(), true, false, $hit['id'], $hit['filename'])
@@ -473,7 +473,7 @@ final class PredbMatchingTest extends TestCase
             ['id' => 91, 'title' => 'Fixture.Canonical.Alpha.2026-GRP', 'filename' => '123.Fixture.Alias.2026-GRP.mkv'],
             ['id' => 92, 'title' => $sameTitle ? 'Fixture.Canonical.Alpha.2026-GRP' : 'Fixture.Canonical.Beta.2026-GRP', 'filename' => '123.Fixture.Alias.2026-GRP.mkv'],
         ];
-        Search::shouldReceive('searchPredb')->once()->with('123.Fixture.Alias.2026-GRP')->andReturn($hits);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->with('123.Fixture.Alias.2026-GRP')->andReturn($hits);
         $updates = $this->createMock(ReleaseUpdateService::class);
         $updates->expects(self::never())->method('updateRelease');
         $updates->expects(self::never())->method('attachPredbSnapshot');
@@ -510,7 +510,7 @@ final class PredbMatchingTest extends TestCase
         $hit = $hits[$numbered ? 0 : 1];
         $evidence = $numbered ? '123.Fixture.Alias.2026-GRP' : 'Fixture.Alias.2026-GRP';
         Event::fake([ReleaseNameFixed::class]);
-        Search::shouldReceive('searchPredb')->once()->with($evidence)->andReturn($hits);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->with($evidence)->andReturn($hits);
         Search::shouldReceive('updateRelease')->once()->with(42);
         $release = DB::table('releases')->first();
         $release->releases_id = 42;

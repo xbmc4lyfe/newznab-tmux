@@ -438,9 +438,10 @@ class NameFixingService
     /**
      * Check PreDB for filename matches.
      */
-    protected function preDbFileCheck(object $release, bool $echo, string $type, bool $nameStatus, bool $show, ?bool &$hadEvidence = null): bool
+    protected function preDbFileCheck(object $release, bool $echo, string $type, bool $nameStatus, bool $show, ?bool &$hadEvidence = null, ?bool &$lookupComplete = null): bool
     {
         $hadEvidence = true;
+        $lookupComplete = true;
         $originalFilename = (string) $release->textstring;
         $evidence = new OriginalFilenameEvidence($originalFilename);
         $fileName = $this->fileNameCleaner->cleanForFilenameDiscovery($evidence);
@@ -449,7 +450,7 @@ class NameFixingService
             return false;
         }
 
-        $bestMatch = $this->findBestPredbFilenameMatch($fileName, $evidence, $hadEvidence);
+        $bestMatch = $this->findBestPredbFilenameMatch($fileName, $evidence, $hadEvidence, $lookupComplete);
         if ($bestMatch !== null) {
             if ((int) ($bestMatch['id'] ?? 0) <= 0) {
                 return false;
@@ -488,11 +489,16 @@ class NameFixingService
      *
      * @return array<string, mixed>|null
      */
-    private function findBestPredbFilenameMatch(string $query, OriginalFilenameEvidence $evidence, bool &$hadEvidence = false): ?array
+    private function findBestPredbFilenameMatch(string $query, OriginalFilenameEvidence $evidence, bool &$hadEvidence = false, bool &$lookupComplete = true): ?array
     {
         $searchText = self::predbSearchText($query);
-        $results = $searchText === '' ? [] : Search::searchPredb($searchText);
-        $hadEvidence = $results !== [];
+        $results = $searchText === '' ? [] : Search::searchPredbFilenameCandidates($searchText);
+        $lookupComplete = $results !== null;
+        // Unknown/incomplete nominations must also block the legacy rename fallback.
+        $hadEvidence = $results === null || $results !== [];
+        if ($results === null) {
+            return null;
+        }
         $eligible = array_values(array_filter($results, static function ($result) use ($evidence): bool {
             $row = (array) $result;
 
@@ -904,11 +910,15 @@ class NameFixingService
         )));
         $prioritized = $this->filePrioritizer->prioritizeForMatching($filenames);
 
+        // An unknown nomination set must leave this source pending for a later pass.
+        $allLookupsComplete = true;
         foreach ($prioritized as $filename) {
             $candidate = clone $release;
             $candidate->textstring = $filename;
             $hadEvidence = false;
-            $this->preDbFileCheck($candidate, $echo, 'Filenames, ', $nameStatus, $show, $hadEvidence);
+            $lookupComplete = true;
+            $this->preDbFileCheck($candidate, $echo, 'Filenames, ', $nameStatus, $show, $hadEvidence, $lookupComplete);
+            $allLookupsComplete = $allLookupsComplete && $lookupComplete;
             if ($this->updateService->matched) {
                 break;
             }
@@ -934,7 +944,7 @@ class NameFixingService
             }
         }
 
-        if (! $this->updateService->matched) {
+        if (! $this->updateService->matched && $allLookupsComplete) {
             $this->completeFilenamePass($release, $filenames, $echo, $nameStatus);
         }
 
@@ -1794,7 +1804,9 @@ class NameFixingService
 
             case 'Filenames, ':
                 $hadEvidence = false;
-                $this->preDbFileCheck($release, $echo, $type, $nameStatus, $show, $hadEvidence);
+                $lookupComplete = true;
+                $this->preDbFileCheck($release, $echo, $type, $nameStatus, $show, $hadEvidence, $lookupComplete);
+                $markProcessed = $markProcessed && $lookupComplete;
                 if (! $this->updateService->matched && ! $hadEvidence) {
                     $result = $this->fileExtractor->extractFromFile($release->textstring);
                     if ($result !== null) {

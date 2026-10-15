@@ -64,7 +64,7 @@ final class OriginalFilenameSuffixCompatibilityTest extends TestCase
         {
             public function __construct(private array $rows) {}
 
-            public function searchPredb(string $query): array
+            public function searchPredbFilenameCandidates(string $query): array
             {
                 return $this->rows;
             }

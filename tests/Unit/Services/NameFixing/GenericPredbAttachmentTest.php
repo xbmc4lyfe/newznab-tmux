@@ -283,6 +283,8 @@ final class GenericPredbAttachmentTest extends TestCase
         (new ReflectionProperty(NameFixingService::class, 'predbMatchSelector'))->setValue($service, new PredbMatchSelector);
         Search::shouldReceive('searchPredb')->with(self::TITLE)
             ->andReturn([['id' => 7, 'title' => self::TITLE, 'filename' => '']]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->with(self::TITLE)
+            ->andReturn([['id' => 7, 'title' => self::TITLE, 'filename' => '']]);
 
         return [$service, $updater];
     }

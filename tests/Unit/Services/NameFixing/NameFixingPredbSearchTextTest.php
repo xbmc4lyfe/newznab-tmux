@@ -22,7 +22,7 @@ final class NameFixingPredbSearchTextTest extends TestCase
 {
     private mixed $previousFacadeApplication;
 
-    private array $previousResolvedInstances;
+    private ?array $previousResolvedInstances;
 
     protected function setUp(): void
     {
@@ -91,7 +91,7 @@ final class NameFixingPredbSearchTextTest extends TestCase
         {
             public array $queries = [];
 
-            public function searchPredb(string $query): array
+            public function searchPredbFilenameCandidates(string $query): array
             {
                 $this->queries[] = $query;
 

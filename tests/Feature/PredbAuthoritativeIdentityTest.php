@@ -45,7 +45,7 @@ final class PredbAuthoritativeIdentityTest extends TestCase
         self::assertTrue(Par2RenameProgress::save($release->id, 'manifest', 1, []));
         DB::table('predb')->insert(['id' => 7, 'title' => 'Different.Release.2025-OTHER']);
         $input = (object) array_merge($release->getAttributes(), ['releases_id' => $release->id, 'relsize' => 5000, 'filename' => $title.'.mkv']);
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => $title]]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([['id' => 7, 'title' => $title]]);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
         $service = new NameFixingService($updates);
@@ -69,7 +69,7 @@ final class PredbAuthoritativeIdentityTest extends TestCase
         DB::table('predb')->insert(['id' => 7, 'title' => $title, 'filename' => 'different-file-name.mkv']);
         $release = $this->pendingPar2Release(['searchname' => 'Hashed.Title']);
         $input = (object) array_merge($release->getAttributes(), ['releases_id' => $release->id, 'filename' => $filename.'.mkv']);
-        Search::shouldReceive('searchPredb')->twice()->andReturn([['id' => 7, 'title' => $title, 'filename' => $filename.'.mkv']]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->twice()->andReturn([['id' => 7, 'title' => $title, 'filename' => $filename.'.mkv']]);
         $updates = $this->updater();
         self::assertSame(0, (new NameFixingService($updates))->matchPreDbFiles($input, true, true, false));
         self::assertSame(0, $release->fresh()->predb_id);
@@ -237,7 +237,7 @@ final class PredbAuthoritativeIdentityTest extends TestCase
         }
         $release = $this->pendingPar2Release(['searchname' => 'Hashed.Title']);
         $input = (object) array_merge($release->getAttributes(), ['releases_id' => $release->id, 'filename' => 'publisher-file.mkv']);
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => 'Exact.Release.2026-GRP', 'filename' => 'publisher-file.mkv']]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([['id' => 7, 'title' => 'Exact.Release.2026-GRP', 'filename' => 'publisher-file.mkv']]);
         $writes = 0;
         DB::connection()->beforeExecuting(static function (string $query) use (&$writes): void {
             if (preg_match('/^(?:update|insert|delete)/i', $query) === 1) {

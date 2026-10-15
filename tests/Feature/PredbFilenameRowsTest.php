@@ -50,7 +50,7 @@ final class PredbFilenameRowsTest extends TestCase
         $before = DB::table('release_files')->where('releases_id', $release->id)->pluck('name')->all();
         $discoveredQueries = [];
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->andReturnUsing(static function (string $query) use (&$discoveredQueries, $title): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturnUsing(static function (string $query) use (&$discoveredQueries, $title): array {
             $discoveredQueries[] = $query;
 
             return [['id' => 7, 'title' => $title]];
@@ -144,7 +144,7 @@ final class PredbFilenameRowsTest extends TestCase
         DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
         $queries = [];
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->andReturnUsing(static function (string $query) use (&$queries, $queryStem, $stem, $title, $alias, $nominate, $variant): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturnUsing(static function (string $query) use (&$queries, $queryStem, $stem, $title, $alias, $nominate, $variant): array {
             $queries[] = $query;
 
             return $nominate && ($query === $queryStem || in_array($variant, ['malformed', 'wrapper-path', 'encoded-suffix', 'wrong-title'], true)) ? [['id' => 7, 'title' => $title, 'filename' => $alias ? $stem : '']] : [];
@@ -195,7 +195,7 @@ final class PredbFilenameRowsTest extends TestCase
         $before = DB::table('release_files')->where('releases_id', $release->id)->orderBy('id')->pluck('name')->all();
         $discoveredQueries = [];
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->andReturnUsing(static function (string $query) use (&$discoveredQueries, $suffixTitle, $trueTitle): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturnUsing(static function (string $query) use (&$discoveredQueries, $suffixTitle, $trueTitle): array {
             $discoveredQueries[] = $query;
 
             return [['id' => 7, 'title' => $suffixTitle], ['id' => 8, 'title' => $trueTitle]];
@@ -239,7 +239,7 @@ final class PredbFilenameRowsTest extends TestCase
             DB::table('releases')->where('id', $release->id)->update(['guid' => 'replacement-guid']);
         }
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => $title]]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([['id' => 7, 'title' => $title]]);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
         self::assertSame($matches ? 1 : 0, (new NameFixingService($updates))->matchPreDbFileNames($entry, [$title.'.mkv'], true, true, false));

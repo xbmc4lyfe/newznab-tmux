@@ -11,6 +11,38 @@ final class PredbSearchDocument
         return mb_strtolower($value, 'UTF-8');
     }
 
+    /** @return array{id: int, title: string, filename: string, source: string}|null */
+    public static function filenameCandidate(mixed $row): ?array
+    {
+        if (! is_array($row) || ! is_array($row['_source'] ?? null)) {
+            return null;
+        }
+        $id = $row['_id'] ?? null;
+        if (is_string($id) && preg_match('/^[0-9]+$/D', $id) === 1) {
+            $digits = ltrim($id, '0');
+            $maximum = (string) PHP_INT_MAX;
+            if ($digits === '' || strlen($digits) > strlen($maximum)
+                || (strlen($digits) === strlen($maximum) && strcmp($digits, $maximum) > 0)) {
+                return null;
+            }
+            $id = (int) $digits;
+        }
+        if (! is_int($id) || $id <= 0) {
+            return null;
+        }
+        $source = $row['_source'];
+        if (! is_string($source['title'] ?? null) || $source['title'] === '') {
+            return null;
+        }
+        foreach (['filename', 'source'] as $field) {
+            if (isset($source[$field]) && ! is_string($source[$field])) {
+                return null;
+            }
+        }
+
+        return self::normalize($source, $id);
+    }
+
     /**
      * @param  array<string, mixed>  $row
      * @return array{id: int, title: string, filename: string, source: string}

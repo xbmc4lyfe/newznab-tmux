@@ -861,7 +861,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         DB::table('releases')->where('id', 1)->update(['searchname' => $title]);
         Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
         $discoveredQueries = [];
-        Search::shouldReceive('searchPredb')->once()->andReturnUsing(static function (string $query) use (&$discoveredQueries, $title): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturnUsing(static function (string $query) use (&$discoveredQueries, $title): array {
             $discoveredQueries[] = $query;
 
             return [['id' => 7, 'title' => $title]];
@@ -939,7 +939,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFilenameNaming();
         $title = 'Example.Movie.2026.1080p.WEB-DL.x264-GRP';
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
-        Search::shouldReceive('searchPredb')->andReturn([]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturn([]);
         Search::shouldReceive('updateRelease')->twice()->with(1);
         $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
         $queries = new NameFixingQueryService;
@@ -1004,7 +1004,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFilenameNaming();
         $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
-        Search::shouldReceive('searchPredb')->andReturn([]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturn([]);
         Search::shouldReceive('updateRelease')->twice()->with(1);
         $updater = new ReleaseUpdateService($this->createStub(CategorizationService::class));
         $fixer = new NameFixingService($updater);
@@ -1038,7 +1038,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         self::assertTrue($manager->addFileInfo(['name' => $title.'.mkv', 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
         $inserted = false;
         Search::shouldReceive('updateRelease')->twice()->with(1);
-        Search::shouldReceive('searchPredb')->andReturnUsing(function () use (&$inserted, $manager, $context): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturnUsing(function () use (&$inserted, $manager, $context): array {
             self::assertSame(0, DB::transactionLevel(), 'Filename discovery must not hold the completion lock.');
             if (! $inserted) {
                 $inserted = true;
@@ -1079,7 +1079,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         for ($index = 0; $index < $fileCount; $index++) {
             DB::table('release_files')->insert(['releases_id' => 1, 'name' => $index === 0 ? $name : str_repeat('b', 32).'.bin']);
         }
-        Search::shouldReceive('searchPredb')->once()->andReturn([]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([]);
         $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
         $input = Release::query()->findOrFail(1);
         $input->releases_id = 1;
@@ -1104,7 +1104,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
         $queries = new NameFixingQueryService;
         self::assertCount(1, $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
-        Search::shouldReceive('searchPredb')->once()->andReturn([]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([]);
         $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
 
         $fixer->fixNamesWithFiles(0, true, 1, true, false);
@@ -1122,7 +1122,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFilenameNaming();
         DB::table('releases')->where('id', 1)->update(['isrenamed' => 1, 'categories_id' => $category]);
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
-        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function (): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturnUsing(function (): array {
             DB::table('releases')->where('id', 1)->update(['categories_id' => Category::MOVIE_HD]);
 
             return [];
@@ -1152,7 +1152,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         self::assertSame([], $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 0));
         $candidates = $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 3);
         self::assertCount(1, $candidates);
-        Search::shouldReceive('searchPredb')->once()->andReturn([]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([]);
         $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
 
         if ($handler === 'categories3') {
@@ -1184,7 +1184,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $input = Release::query()->findOrFail(1);
         $input->releases_id = 1;
         $input->textstring = $name;
-        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function () use ($currentPredb): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturnUsing(function () use ($currentPredb): array {
             DB::table('releases')->where('id', 1)->update(['predb_id' => $currentPredb]);
 
             return [];
@@ -1226,7 +1226,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $this->prepareFilenameNaming();
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
-        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function () use ($column, $value): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturnUsing(function () use ($column, $value): array {
             DB::table('releases')->where('id', 1)->update([$column => $value]);
 
             return [];
@@ -1355,7 +1355,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFilenameNaming();
         $name = str_repeat('a', 32).'.bin';
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => $name]);
-        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function () use ($name): array {
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturnUsing(function () use ($name): array {
             DB::table('release_files')->where('releases_id', 1)->update(['name' => strtoupper($name)]);
 
             return [];

@@ -122,7 +122,7 @@ final class PredbUnicodeIdentityTest extends TestCase
             default => [['id' => 7, 'title' => self::TITLE]],
         };
         DB::table('predb')->insert(['id' => 7, 'title' => in_array($evidence, ['exact', 'duplicate'], true) ? self::TITLE : 'Different.Movie.2026-GROUP']);
-        Search::shouldReceive('searchPredb')->andReturn($hits);
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturn($hits);
         [$service] = $this->services();
 
         if ($handler === 'files') {
@@ -154,7 +154,7 @@ final class PredbUnicodeIdentityTest extends TestCase
         foreach ([$first, $second] as $release) {
             DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => self::TITLE.'.mkv']);
         }
-        Search::shouldReceive('searchPredb')->twice()->andReturn([
+        Search::shouldReceive('searchPredbFilenameCandidates')->twice()->andReturn([
             ['id' => 7, 'title' => str_replace('Rosalía', 'Rosalia', self::TITLE)],
         ]);
         [$service] = $this->services();
@@ -290,7 +290,7 @@ final class PredbUnicodeIdentityTest extends TestCase
         $release = $this->pendingPar2Release(['searchname' => 'Hashed.Title']);
         $input = $this->input($release);
         $input->filename = self::TITLE.'.mkv';
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => $different, 'filename' => $different.'.mkv']]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([['id' => 7, 'title' => $different, 'filename' => $different.'.mkv']]);
         [$service] = $this->services();
 
         $matched = $service->matchPreDbFiles($input, true, true, false);
@@ -324,7 +324,7 @@ final class PredbUnicodeIdentityTest extends TestCase
         DB::table('predb')->insert(['id' => 7, 'title' => self::TITLE]);
         [$service, $updates] = $this->services();
         if (in_array($path, ['filename', 'prefile'], true)) {
-            Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => self::TITLE]]);
+            Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([['id' => 7, 'title' => self::TITLE]]);
         }
 
         if ($path === 'donor') {
@@ -387,7 +387,7 @@ final class PredbUnicodeIdentityTest extends TestCase
         $release = $this->pendingPar2Release(['searchname' => 'Hashed.Title']);
         $input = $this->input($release);
         $input->filename = $filename;
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => $title]]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([['id' => 7, 'title' => $title]]);
         [$service] = $this->services();
 
         self::assertSame(1, $service->matchPreDbFiles($input, true, true, false));
@@ -470,7 +470,7 @@ final class PredbUnicodeIdentityTest extends TestCase
         $release = $this->pendingPar2Release(['searchname' => 'Original.Title']);
         $input = $this->input($release);
         $input->filename = 'Archive.File-GROUP.mkv';
-        Search::shouldReceive('searchPredb')->once()->andReturn([
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([
             ['id' => 7, 'title' => self::TITLE, 'filename' => $input->filename],
             ['id' => 8, 'title' => str_replace('2026', '2025', self::TITLE), 'filename' => $input->filename],
         ]);
@@ -487,7 +487,7 @@ final class PredbUnicodeIdentityTest extends TestCase
         $release = $this->pendingPar2Release(['searchname' => 'Original.Title']);
         $input = $this->input($release);
         $input->filename = self::TITLE.'.mkv';
-        Search::shouldReceive('searchPredb')->once()->andReturn([
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([
             ['id' => 8, 'title' => str_replace('2026', '2025', self::TITLE), 'filename' => $input->filename],
             ['id' => 7, 'title' => self::TITLE, 'filename' => $input->filename],
         ]);
@@ -503,7 +503,7 @@ final class PredbUnicodeIdentityTest extends TestCase
         $release = $this->pendingPar2Release(['searchname' => 'Original.Title', 'predb_id' => 999]);
         $input = $this->input($release);
         $input->filename = self::TITLE.'.mkv';
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => self::TITLE]]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->once()->andReturn([['id' => 7, 'title' => self::TITLE]]);
         [$service] = $this->services();
 
         self::assertSame(0, $service->matchPreDbFiles($input, true, true, false));
