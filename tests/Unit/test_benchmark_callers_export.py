@@ -13,6 +13,9 @@ SCRIPT = Path(__file__).resolve().parents[2] / "scripts/benchmark_callers_summar
 SPEC = importlib.util.spec_from_file_location('utility_fixture', Path(__file__).with_name('test_benchmark_utility_extended.py'))
 UTILITY_FIXTURE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(UTILITY_FIXTURE)
+PAGES_SPEC = importlib.util.spec_from_file_location('caller_pages', SCRIPT.with_name('benchmark-pages.py'))
+PAGES = importlib.util.module_from_spec(PAGES_SPEC)
+PAGES_SPEC.loader.exec_module(PAGES)
 MARKER = "unpublished-synthetic-payload"
 SAMPLE = {
     "small-dispatch": "dispatch_control", "boundary-1024": "common",
@@ -111,15 +114,17 @@ def fixture(kind, samples=31, mode="screen"):
 
 
 class CallerSummaryExportTest(unittest.TestCase):
-    def export(self, kind, records, resources=None):
+    def export(self, kind, records, resources=None, runtime='valid', trailing=''):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "utility-evidence" / kind / "observations.jsonl"
             source.parent.mkdir(parents=True)
-            source.write_text("".join(json.dumps(row) + "\n" for row in records))
+            source.write_text("".join(json.dumps(row) + "\n" for row in records) + trailing)
             UTILITY_FIXTURE.write_resources(root, resources)
-            (root / "utility-evidence/runtime.json").write_text(json.dumps({
-                "executed_sha": "e" * 40, "architecture": "aarch64", "php": "8.5", MARKER: MARKER}))
+            if runtime != 'missing':
+                (root / "utility-evidence/runtime.json").write_text(json.dumps({
+                    "executed_sha": ("f" if runtime == 'mismatch' else "e") * 40,
+                    "architecture": "aarch64", "php": "8.5", MARKER: MARKER}))
             env = dict(os.environ, GITHUB_SHA="e" * 40, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
                        GITHUB_REPOSITORY="xbmc4lyfe/newznab-tmux")
             result = subprocess.run(["python3", str(SCRIPT), "--kind", kind, "--runner", "ubuntu-24.04-arm",
@@ -130,6 +135,62 @@ class CallerSummaryExportTest(unittest.TestCase):
             summary = json.loads(text)
             self.assertIs(summary["adoption_qualified"], False)
             return summary
+
+    def test_global_integrity_failure_disqualifies_every_row_and_gate(self):
+        for kind in ('sample-planning', 'archive-parsing', 'vendor-archive'):
+            records = fixture(kind, samples=1000, mode='qualification')
+            for record in records:
+                if record.get('type') == 'stratum' and record['category'] in ('common', 'uncommon'):
+                    for decision in record['decision'].values():
+                        decision.update(status='qualified', qualifies=True, evidence='qualification')
+            if kind == 'sample-planning':
+                records[-1].update(status='qualified', acceptance_criteria_met=True)
+            elif kind == 'archive-parsing':
+                records[-1]['par2_shared_projection_qualified'] = True
+            valid = self.export(kind, records)
+            self.assertEqual(valid['status'], 'measured')
+            self.assertTrue(all(row['eligible'] for row in valid['rows']))
+            self.assertTrue(any(row.get('qualification_gate_passed') for row in valid['rows']))
+            for failure in ('source-drift', 'malformed', 'runtime-mismatch', 'runtime-missing'):
+                with self.subTest(kind=kind, failure=failure):
+                    mutated = copy.deepcopy(records)
+                    options = {}
+                    if failure == 'source-drift':
+                        mutated[-1].update(identities_stable=False, status='invalid')
+                    elif failure == 'malformed':
+                        options['trailing'] = 'not-json\n'
+                    else:
+                        options['runtime'] = 'mismatch' if failure == 'runtime-mismatch' else 'missing'
+                    summary = self.export(kind, mutated, **options)
+                    self.assertEqual(summary['status'], 'partial' if failure == 'runtime-missing' else 'invalid')
+                    self.assertFalse(any(row['eligible'] for row in summary['rows']))
+                    self.assertFalse(any(row.get('qualification_gate_passed') for row in summary['rows']))
+                    # Keep valid numeric observations available for diagnosis.
+                    self.assertTrue(any(row.get('baseline_over_candidate') == 2.5 for row in summary['rows']))
+
+    def test_finite_tail_bounds_below_minimum_sample_count_stay_unavailable(self):
+        for kind in ('sample-planning', 'archive-parsing', 'vendor-archive'):
+            with self.subTest(kind=kind):
+                records = fixture(kind, samples=999)
+                # A finite order-statistic interval is possible below the
+                # protocol's 1,000-pair reporting minimum.
+                for record in records:
+                    if record.get('type') == 'stratum' and record['category'] == 'uncommon':
+                        for decision in record['decision'].values():
+                            decision['php']['interval'] = [4.0, 6.0]
+                            decision['native']['interval'] = [1.5, 2.5]
+                            decision['simultaneous_95_percent_speedup_interval'] = [1.6, 4.0]
+                summary = self.export(kind, records)
+                self.assertEqual(summary['status'], 'measured')
+                tails = [row for row in summary['rows'] if row['category'] == 'uncommon']
+                self.assertTrue(tails)
+                for row in tails:
+                    self.assertEqual(row['metric'], 'p99_unavailable')
+                    self.assertEqual(row['speedup_interval'], [None, None])
+                    self.assertFalse(row['qualification_gate_passed'])
+                    self.assertTrue(row['eligible'])
+                    self.assertNotIn('baseline_over_candidate', row)
+                PAGES.validate_caller_rows(summary, kind)
 
     def test_current_caller_resource_receipt_cannot_be_missing_changed_or_forged(self):
         for kind in ('sample-planning', 'archive-parsing'):
@@ -210,11 +271,14 @@ class CallerSummaryExportTest(unittest.TestCase):
                 self.assertEqual(row["native_median_ms"], 2.0)
 
     def test_missing_terminal_and_stratum_remain_partial(self):
-        for kind in ("sample-planning", "archive-parsing"):
-            self.assertEqual(self.export(kind, fixture(kind)[:-1])["status"], "partial")
-            rows = fixture(kind)
-            del rows[next(index for index, row in enumerate(rows) if row["type"] == "stratum")]
-            self.assertEqual(self.export(kind, rows)["status"], "partial")
+        for kind in ("sample-planning", "archive-parsing", "vendor-archive"):
+            missing_stratum = fixture(kind)
+            del missing_stratum[next(index for index, row in enumerate(missing_stratum) if row["type"] == "stratum")]
+            for records in (fixture(kind)[:-1], missing_stratum):
+                summary = self.export(kind, records)
+                self.assertEqual(summary["status"], "partial")
+                self.assertFalse(any(row['eligible'] for row in summary['rows']))
+                self.assertFalse(any(row.get('qualification_gate_passed') for row in summary['rows']))
 
     def test_duplicate_pairs_and_invalid_observations_cannot_look_complete(self):
         for kind in ("sample-planning", "archive-parsing"):

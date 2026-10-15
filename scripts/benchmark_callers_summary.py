@@ -137,6 +137,13 @@ def valid_vendor_quantiles(source, samples):
                     for actual, required in zip(interval, expected)))
 
 
+def disqualify_rows(rows):
+    for row in rows:
+        row['eligible'] = False
+        if 'qualification_gate_passed' in row:
+            row['qualification_gate_passed'] = False
+
+
 def caller_summary(kind, records):
     """Fixed public metric projection of the PHP caller harnesses."""
     expected = CALLER_STRATA[kind]
@@ -239,6 +246,7 @@ def caller_summary(kind, records):
                                    candidate_latency_interval_ms=None if category == 'uncommon' and size < 1000 else quantiles[1]['interval'])
                     if category == "uncommon" and size < 1000:
                         row["metric"] = "p99_unavailable"
+                        row["speedup_interval"] = [None, None]
                     else:
                         row.update(baseline_over_candidate=ratio, baseline_latency_ms=quantiles[0]["estimate"],
                                    candidate_latency_ms=quantiles[1]["estimate"])
@@ -261,11 +269,8 @@ def caller_summary(kind, records):
         declared = terminal.get("strata")
         invalid |= (not isinstance(declared, dict) or set(declared) != set(expected)
                     or any(declared.get(name) != decision for name, decision in measured.items()))
-    if kind == 'vendor-archive' and invalid:
-        for row in rows:
-            row['eligible'] = False
-            if 'qualification_gate_passed' in row:
-                row['qualification_gate_passed'] = False
+    if invalid or not complete:
+        disqualify_rows(rows)
     sources, libraries = {}, {}
     for record in records:
         hashes = record.get("build_source_identities")
@@ -324,10 +329,6 @@ def export(kind, runner):
         summary.setdefault('source_sha256', {}).update(resources.verified_receipt(Path('utility-evidence')))
     except (OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         summary['status'] = 'invalid'
-        for row in summary['rows']:
-            row['eligible'] = False
-            if 'qualification_gate_passed' in row:
-                row['qualification_gate_passed'] = False
     try:
         runtime = json.loads(Path("utility-evidence/runtime.json").read_text(), parse_constant=reject_constant, parse_float=finite_float)
         if not isinstance(runtime, dict) or runtime.get("executed_sha") != summary["head_sha"]:
@@ -340,6 +341,8 @@ def export(kind, runner):
         summary["status"] = "partial" if summary["status"] != "invalid" else "invalid"
     except (OSError, UnicodeError, ValueError, TypeError, OverflowError):
         summary["status"] = "invalid"
+    if summary['status'] != 'measured':
+        disqualify_rows(summary['rows'])
     return summary
 
 
