@@ -8,6 +8,8 @@ mod iso_primary_copies;
 mod rar5_copy_checksums;
 #[path = "rar5_quick_open.rs"]
 mod rar5_quick_open;
+#[path = "xz_first_block.rs"]
+mod xz_first_block;
 #[path = "zstd_frame.rs"]
 mod zstd_frame;
 
@@ -518,6 +520,7 @@ pub enum FormatHeader {
     },
     Xz {
         offset: usize,
+        first_block: xz_first_block::FirstBlock,
         header_complete: bool,
         stream_flags_hex: Option<String>,
         reserved_bits_valid: Option<bool>,
@@ -4484,6 +4487,7 @@ fn parse_xz(data: &[u8], offset: usize) -> FormatHeader {
         ..
     } = read_xz_local_observations(data, offset);
     FormatHeader::Xz {
+        first_block: xz_first_block::observe(data, offset, header_valid == Some(true), check_id),
         stream_header_available,
         structure_valid,
         check_id_supported,
@@ -10941,5 +10945,67 @@ mod tests {
         assert_eq!(*main_archive_flags, Some(0));
         assert!(*main_extra_records_complete);
         assert_eq!(main_extra_record_types, &[1]);
+    }
+    #[test]
+    fn xz_first_block_exposes_declared_ranges_without_decompression() {
+        let sample: Vec<u8> = "fd377a585a000000ff12d94102c0050121010000f05dfb9f010000410000000000011101ada6580406729e7a010000000000595a"
+            .as_bytes().as_chunks::<2>().0.iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
+        let metadata = serde_json::to_value(parse(&sample)).unwrap();
+        let block = &metadata["headers"][0]["first_block"];
+        assert_eq!(block["header_start_offset"], 12);
+        assert_eq!(block["header_crc32_valid"], true);
+        assert_eq!(block["compressed_size"]["value"], 5);
+        assert_eq!(block["compressed_data"]["start_offset"], 24);
+        assert_eq!(block["compressed_data"]["end_offset_exclusive"], 29);
+        assert_eq!(block["block_padding"]["end_offset_exclusive"], 32);
+        assert_eq!(block["block_padding_zero"], true);
+        assert_eq!(block["following_byte"], 0);
+        assert_eq!(block["content_decompressed"], false);
+    }
+
+    #[test]
+    fn xz_first_block_metadata_keeps_existing_candidate_limit_and_crc_authority() {
+        let mut stream = XZ.to_vec();
+        stream.extend([0, 0]);
+        stream.extend(crc32fast::hash(&[0, 0]).to_le_bytes());
+        stream.push(0);
+        let many = stream.repeat(17);
+        let metadata = parse(&many);
+        assert_eq!(
+            metadata
+                .headers
+                .iter()
+                .filter(|header| matches!(header, FormatHeader::Xz { .. }))
+                .count(),
+            16
+        );
+        assert!(metadata.candidate_scan_truncated_formats.contains(&"XZ"));
+        let mut sample: Vec<u8> = "fd377a585a000000ff12d94102c0050121010000f05dfb9f"
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        sample[8] ^= 1;
+        let metadata = serde_json::to_value(parse(&sample)).unwrap();
+        assert_eq!(metadata["headers"][0]["structure_valid"], true);
+        let block = &metadata["headers"][0]["first_block"];
+        assert_eq!(block["stream_header_qualified"], false);
+        assert_eq!(block["header_crc32_valid"], true);
+        assert_eq!(block["compressed_size"]["value"], 5);
+        assert!(block["compressed_data"].is_null());
+        sample[6] = 1;
+        let crc = crc32fast::hash(&sample[6..8]);
+        sample[8..12].copy_from_slice(&crc.to_le_bytes());
+        let metadata = serde_json::to_value(parse(&sample)).unwrap();
+        assert_eq!(metadata["headers"][0]["header_crc32_valid"], true);
+        assert_eq!(metadata["headers"][0]["reserved_bits_valid"], false);
+        assert_eq!(
+            metadata["headers"][0]["first_block"]["stream_header_qualified"],
+            false
+        );
+        assert!(metadata["headers"][0]["first_block"]["compressed_data"].is_null());
     }
 }
