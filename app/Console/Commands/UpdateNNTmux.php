@@ -320,9 +320,13 @@ class UpdateNNTmux extends Command
 
         // Refresh config cache so runtime client/host settings cannot drift.
         $this->info('🧹 Clearing config cache...');
-        $this->call('config:clear');
+        if ($this->call('config:clear') !== Command::SUCCESS) {
+            throw new \RuntimeException('config:clear failed while refreshing configuration');
+        }
         $this->info('Caching config...');
-        $this->call('config:cache');
+        if ($this->call('config:cache') !== Command::SUCCESS) {
+            throw new \RuntimeException('config:cache failed while refreshing configuration');
+        }
 
         // Clear view cache
         $this->info('🧹 Clearing view cache...');

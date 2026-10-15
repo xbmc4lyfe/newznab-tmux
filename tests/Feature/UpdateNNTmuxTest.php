@@ -169,6 +169,41 @@ class UpdateNNTmuxTest extends TestCase
         $this->assertSame('failover_redis_file', $cachedStore);
     }
 
+    #[DataProvider('failedConfigurationRefreshes')]
+    public function test_failed_configuration_refresh_restores_web_access_without_restart_or_success(string $failedCommand): void
+    {
+        $command = $this->command();
+        $this->expectPreparation($command);
+        $maintenanceCalls = [];
+        foreach (['config:clear', 'config:cache', 'view:clear', 'route:clear', 'route:cache'] as $name) {
+            $command->shouldReceive('call')->with($name)->zeroOrMoreTimes()->andReturnUsing(static function () use ($name, $failedCommand, &$maintenanceCalls): int {
+                $maintenanceCalls[] = $name;
+
+                return $name === $failedCommand ? 9 : 0;
+            });
+        }
+        Cache::shouldReceive('flush')->zeroOrMoreTimes()->andReturn(true);
+        Redis::shouldReceive('connection->ping')->zeroOrMoreTimes()->andReturn('PONG');
+        $this->expectWebRestore($command);
+
+        [$status, $output] = $this->runCommand($command, ['--skip-git' => true]);
+
+        $this->assertSame(1, $status);
+        $this->assertSame($failedCommand === 'config:clear' ? ['config:clear'] : ['config:clear', 'config:cache'], $maintenanceCalls);
+        $this->assertFalse($this->maintenanceActive);
+        $this->assertStringContainsString($failedCommand.' failed', $output);
+        $this->assertStringContainsString('Skipping tmux restart', $output);
+        $this->assertStringNotContainsString('100%', $output);
+        $this->assertStringNotContainsString('update completed successfully', $output);
+        Process::assertNotRan(fn (PendingProcess $process): bool => $this->isFreshTmuxStart($process));
+        $this->assertSame(0, (new NntmuxUpdateLock)->run(fn (): int => 0, checkGit: false));
+    }
+
+    public static function failedConfigurationRefreshes(): array
+    {
+        return ['clear cannot refresh' => ['config:clear'], 'cache cannot refresh' => ['config:cache']];
+    }
+
     public function test_pre_existing_maintenance_mode_is_preserved_after_failure(): void
     {
         $this->maintenanceActive = true;

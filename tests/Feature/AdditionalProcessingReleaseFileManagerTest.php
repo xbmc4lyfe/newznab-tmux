@@ -1549,6 +1549,74 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         self::assertNull($release->additional_pp_claim_token);
     }
 
+    #[DataProvider('reverseMissingMiddleSets')]
+    public function test_reverse_recovery_passes_listed_later_sets_until_the_intended_sample_is_complete(int $sets, int $target, bool $lastSetUnavailable): void
+    {
+        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
+        Search::shouldReceive('updateRelease')->with(1);
+        $contents = $responses = [];
+        for ($episode = 1; $episode <= $sets; $episode++) {
+            $name = sprintf('Show.S01E%02d.1080p.WEB-DL-GRP', $episode);
+            foreach ([1, 2] as $part) {
+                $id = '<episode'.$episode.'-part'.$part.'>';
+                $contents[] = ['title' => sprintf('"%s.part%02d.rar" yEnc', $name, $part), 'segments' => [$id]];
+                $missingFirst = $part === 1 && $episode > 1 && $episode < $sets;
+                $unavailableLast = $lastSetUnavailable && $episode === $sets - 1;
+                $responses[$id] = $missingFirst || $unavailableLast
+                    ? null
+                    : $this->rar($name.'.mkv', str_repeat('x', 100));
+            }
+        }
+
+        $context = $this->processReviewArchiveSets($contents, $responses, [
+            'fetchLastFiles' => true, 'maximumRarPasswordChecks' => 1, 'seasonPackArchiveSets' => $target,
+        ]);
+        $release = DB::table('releases')->where('id', 1)->first();
+        $expectRetry = $lastSetUnavailable;
+
+        self::assertTrue($context->seasonPack);
+        self::assertSame($expectRetry ? $target - 1 : $target, DB::table('release_files')->count());
+        self::assertSame($expectRetry, $release->archive_retry_at !== null);
+        self::assertSame($expectRetry ? -1 : 0, (int) $release->haspreview);
+        self::assertSame($expectRetry ? -1 : 0, (int) $release->passwordstatus);
+        self::assertSame($expectRetry ? 0 : $target, (int) $release->rarinnerfilecount);
+        self::assertSame('Example', $release->searchname);
+        self::assertNull($release->additional_pp_claim_token);
+    }
+
+    public static function reverseMissingMiddleSets(): array
+    {
+        return [
+            'skip later C to recover middle B' => [3, 3, false],
+            'recover two missing middle sets' => [4, 4, false],
+            'stop once three of four sets are listed' => [4, 3, false],
+            'one missing set remains retryable after another recovers' => [4, 4, true],
+        ];
+    }
+
+    public function test_complete_archive_sample_keeps_legacy_reverse_tail_password_inspection(): void
+    {
+        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
+        Search::shouldReceive('updateRelease')->with(1);
+        $contents = $responses = [];
+        foreach ([1, 2] as $episode) {
+            $name = sprintf('Show.S01E%02d.1080p.WEB-DL-GRP', $episode);
+            foreach ([1, 2] as $part) {
+                $id = '<episode'.$episode.'-part'.$part.'>';
+                $contents[] = ['title' => sprintf('"%s.part%02d.rar" yEnc', $name, $part), 'segments' => [$id]];
+                $responses[$id] = $this->rar($name.'.mkv', str_repeat('x', 100), $episode === 2 && $part === 2);
+            }
+        }
+
+        $context = $this->processReviewArchiveSets($contents, $responses, ['fetchLastFiles' => true, 'seasonPackArchiveSets' => 2]);
+        $release = DB::table('releases')->where('id', 1)->first();
+
+        self::assertTrue($context->releaseHasPassword);
+        self::assertSame(ReleaseBrowseService::PASSWD_RAR, (int) $release->passwordstatus);
+        self::assertNull($release->archive_retry_at);
+        self::assertSame(2, (int) $release->rarinnerfilecount);
+    }
+
     public static function reverseArchiveSamples(): array
     {
         return ['reverse recovers the missing set' => [true], 'reverse repeats an already listed set' => [false]];

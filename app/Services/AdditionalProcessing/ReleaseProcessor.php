@@ -806,6 +806,7 @@ class ReleaseProcessor
             $triedCompressedMids = [];
         }
 
+        $recoveringMissingSets = $reverse && $context->archiveSampleIncomplete;
         $failed = $downloaded = 0;
         /** @var array<string, true> $listedSets */
         $listedSets = $context->listedArchiveSets;
@@ -820,7 +821,7 @@ class ReleaseProcessor
 
             // A season pack packed per episode is read set by set: the first volume of each set
             // lists its episode, and a set that fails to download only skips that set.
-            $walking = ! $reverse && $context->workPlan !== null && $context->defersArchiveNameChecks();
+            $walking = (! $reverse || $recoveringMissingSets) && $context->workPlan !== null && $context->defersArchiveNameChecks();
             if (! $walking) {
                 if ($downloaded >= $this->config->maximumRarSegments
                     || $failed >= $this->config->maximumRarPasswordChecks
@@ -885,7 +886,7 @@ class ReleaseProcessor
                 }
 
                 // The listing may have just shown this is a season pack: keep reading the other sets
-                if (! $reverse && $context->workPlan !== null && $context->defersArchiveNameChecks()) {
+                if ((! $reverse || $recoveringMissingSets) && $context->workPlan !== null && $context->defersArchiveNameChecks()) {
                     continue;
                 }
                 if ($processed) {
