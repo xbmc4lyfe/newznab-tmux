@@ -7388,6 +7388,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn iso_path_tables_use_first_primary_descriptor_after_other_descriptor_types() {
+        for preceding_type in [0, 2] {
+            let mut sample = iso_path_table_sample();
+            let primary = sample[32_768..34_816].to_vec();
+            sample[32_768..34_816].copy_from_slice(&iso_volume_descriptor(preceding_type, 1));
+            sample[34_816..36_864].copy_from_slice(&primary);
+            let mut conflicting_primary = primary.clone();
+            conflicting_primary[140..144].copy_from_slice(&24u32.to_le_bytes());
+            sample[36_864..38_912].copy_from_slice(&conflicting_primary);
+            sample[38_912..40_960].copy_from_slice(&iso_volume_descriptor(255, 1));
+            let metadata = serde_json::to_value(parse(&sample)).unwrap();
+            let copies = &metadata["iso_path_table_copies"];
+            assert_eq!(copies["source_primary_descriptor_offset"], 34_816);
+            assert_eq!(
+                copies["source_primary_descriptor_sha256"],
+                hex(&Sha256::digest(&primary))
+            );
+            assert_eq!(copies["source_size_little_endian_field_offset"], 34_948);
+            assert_eq!(copies["source_size_big_endian_field_offset"], 34_952);
+            assert_eq!(copies["tables"][0]["source_location_field_offset"], 34_956);
+            assert_eq!(copies["tables"][0]["location_logical_block"], 20);
+            assert_eq!(copies["tables"][0]["candidate_sample_offset"], 40_960);
+            assert_eq!(copies["pairs"][0]["candidate_range_bytes_equal"], true);
+            assert_eq!(copies["sequence_status"], "terminated");
+            assert_eq!(copies["image_origin_known"], false);
+            assert!(copies["qualified_path_table_copy_agreement"].is_null());
+            assert_eq!(
+                metadata["iso_primary_volume_descriptor_copies"]["all_observed_copies_equal"],
+                false
+            );
+        }
+    }
+
     fn iso_volume_descriptor(descriptor_type: u8, version: u8) -> Vec<u8> {
         let mut descriptor = vec![0u8; 2048];
         descriptor[0] = descriptor_type;
