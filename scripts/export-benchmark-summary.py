@@ -47,7 +47,8 @@ RUST_SOURCE_PATHS = {"docker/app/nzb-yenc-ffi/src/" + name + ".rs" for name in (
     "article_dates", "article_fingerprint", "article_identity", "article_xref", "cpu_snapshot", "formats",
     "iso_path_tables", "iso_primary_copies", "lib", "nntp_body", "nntp_headers", "par2", "par2_source_ranges", "payload_decoder",
     "payload_decoder_arm", "payload_decoder_x86", "rar5_copy_checksums", "rar5_quick_open", "release_names",
-    "sample_plan", "seven_zip_ranges", "xz_first_block", "yenc_framing", "zstd_frame",
+    "sample_plan", "seven_zip_ranges", "strict_article_experimental", "xz_first_block", "yenc_framing", "zstd_frame",
+    "bin/benchmark-strict-article-statistics",
     "bin/benchmark-article-fingerprint", "bin/benchmark-cpu-snapshot", "bin/nntmux-article-fingerprint",
     "bin/nntmux-cpu-snapshot", "bin/nntmux-evidence-utility")}
 SOURCE_PATHS |= RUST_SOURCE_PATHS | {"app/Services/Yenc/" + name + ".php" for name in (

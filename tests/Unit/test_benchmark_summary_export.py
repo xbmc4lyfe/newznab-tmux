@@ -243,6 +243,17 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
         for path in private:
             self.assertNotIn(path, json.dumps(summary))
 
+    def test_strict_experimental_sources_remain_mandatory_provenance(self):
+        self.assertEqual(self.run_export("php", paired("php"))["provenance_status"], "verified_current")
+        for path in ("docker/app/nzb-yenc-ffi/src/strict_article_experimental.rs",
+                     "docker/app/nzb-yenc-ffi/src/bin/benchmark-strict-article-statistics.rs"):
+            with self.subTest(path=path):
+                incomplete = dict(RUST_SOURCES)
+                del incomplete[path]
+                summary = self.run_export("php", paired("php"), runtime={"rust_source_sha256": incomplete})
+                self.assertEqual(summary["status"], "invalid")
+                self.assertEqual(summary["provenance_status"], "invalid")
+
     def unsupported_receipts(self):
         runtime = {"git_head": "d" * 40, "github_run_id": "123", "runner_arch": "X64",
                    "rust_source_sha256": dict(RUST_SOURCES), "rust_library_sha256": hashlib.sha256(b"fixture-rust").hexdigest(),

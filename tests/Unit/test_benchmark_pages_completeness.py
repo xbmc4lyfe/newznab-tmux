@@ -81,7 +81,11 @@ class CompletenessTest(unittest.TestCase):
         def unavailable(_):
             raise OSError('offline')
         report = pages.collect(SHA, ROOT, unavailable)
-        self.assertEqual(29, len(report.get('rust_exports', [])))
+        self.assertEqual(30, len(report.get('rust_exports', [])))
+        strict = next(row for row in report['rust_exports']
+                      if row['name'] == 'nntmux_yenc_decode_strict_article_v1')
+        self.assertEqual('experimental-gap', strict['coverage'])
+        self.assertEqual([], strict['evidence_kinds'])
         self.assertIn('Public Rust interfaces', pages.render(report))
         self.assertIn('nntmux_nntp_header_pair_comparison_json', pages.render(report))
 

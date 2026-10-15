@@ -24,8 +24,8 @@ class RustInventoryTest(unittest.TestCase):
     def test_every_current_export_has_a_source_location_and_explicit_scope(self):
         self.assertTrue(SCRIPT.exists(), 'source-derived inventory helper is missing')
         rows = module().inventory(ROOT)
-        self.assertEqual(len(rows), 29)
-        self.assertEqual(len({row['name'] for row in rows}), 29)
+        self.assertEqual(len(rows), 30)
+        self.assertEqual(len({row['name'] for row in rows}), 30)
         self.assertEqual(module().check(ROOT), [])
         for row in rows:
             path = ROOT / row['target']
@@ -47,6 +47,10 @@ class RustInventoryTest(unittest.TestCase):
         self.assertEqual(rows['nntmux_article_identity_v2_json']['evidence_kinds'], ['metadata-modules'])
         self.assertEqual(rows['nntmux_nntp_header_pair_comparison_json']['coverage'], 'unmeasured-gap')
         self.assertEqual(rows['nntmux_nntp_header_pair_comparison_json']['evidence_kinds'], [])
+        strict = rows['nntmux_yenc_decode_strict_article_v1']
+        self.assertEqual(strict['coverage'], 'experimental-gap')
+        self.assertEqual(strict['evidence_kinds'], [])
+        self.assertEqual(strict['callers'], ['app/Services/Yenc/ExperimentalStrictArticleDecoder.php'])
 
     def fixture(self, content):
         temp = tempfile.TemporaryDirectory()
