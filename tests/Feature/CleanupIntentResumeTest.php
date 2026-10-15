@@ -371,7 +371,19 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
         self::assertFileExists($source);
     }
 
-    public function test_late_exact_queued_outcome_keeps_committed_companion_authority_after_partial_reset(): void
+    public static function lateReceiptOutcomes(): array
+    {
+        $cases = [];
+        foreach (NzbImportStatus::cases() as $status) {
+            $cases[$status->value] = [$status, false];
+            $cases[$status->value.' ambient'] = [$status, true];
+        }
+
+        return $cases;
+    }
+
+    #[DataProvider('lateReceiptOutcomes')]
+    public function test_late_exact_outcome_keeps_committed_companion_authority_after_partial_reset(NzbImportStatus $status, bool $ambient): void
     {
         [$source, $mp, $uploads] = $this->upload(true);
         Schema::create('release_nfos', static function (Blueprint $table): void {
@@ -401,9 +413,20 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
             self::assertSame(0, DB::table('release_verification_candidates')->count());
             $committed = $uploads->read($mp);
             self::assertTrue($uploads->nfoCleanupCommitted($committed));
-            $uploads->recordNzbOutcome($source, NzbImportStatus::Queued, null, null,
-                candidateIdentity: $origin['candidate_identity'], inputCapture: $capture,
-                candidateAdmission: $origin['accepted_admission']);
+            if ($ambient) {
+                DB::beginTransaction();
+            }
+            try {
+                $uploads->recordNzbOutcome($source, $status,
+                    $status === NzbImportStatus::Inserted ? 7 : null, $status === NzbImportStatus::Inserted ? 'late-queued-guid' : null,
+                    candidateIdentity: $status === NzbImportStatus::Queued ? $origin['candidate_identity'] : null, inputCapture: $capture,
+                    candidateAdmission: $status === NzbImportStatus::Queued ? $origin['accepted_admission'] : null);
+                self::assertSame($committed, $uploads->read($mp));
+            } finally {
+                if ($ambient) {
+                    DB::rollBack();
+                }
+            }
             self::assertSame($committed, $uploads->read($mp));
             self::assertTrue($uploads->nfoCleanupCommitted($uploads->read($mp)));
             self::assertSame('imported', $nfos->importManifest($mp)['status']);
@@ -412,6 +435,177 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
         } finally {
             config(['release_verification.storage_path' => $root]);
         }
+    }
+
+    public function test_waiting_companion_consumer_preserves_another_workers_committed_receipt(): void
+    {
+        [$source, $mp, $uploads] = $this->upload(true);
+        Schema::create('release_nfos', static function (Blueprint $table): void {
+            $table->integer('releases_id')->primary();
+            $table->binary('nfo');
+        });
+        (require database_path('migrations/2026_10_15_034000_create_nfo_cleanup_commits_table.php'))->up();
+        $this->capturedFixtureImporter('waiting-companion')->beginImport([$source]);
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'waiting-companion-guid']);
+        DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+        $uploads->reconcilePending($mp);
+        $workerB = new NfoImportService(new Filesystem, $uploads, new NfoService);
+        $filesystem = new class extends Filesystem
+        {
+            public ?\Closure $beforeCheck = null;
+
+            public function isFile($file)
+            {
+                $callback = $this->beforeCheck;
+                $this->beforeCheck = null;
+                if ($callback !== null) {
+                    $callback();
+                }
+
+                return parent::isFile($file);
+            }
+        };
+        $committed = null;
+        $filesystem->beforeCheck = function () use ($workerB, $mp, $uploads, &$committed): void {
+            self::assertSame('imported', $workerB->importManifest($mp)['status']);
+            $committed = $uploads->read($mp);
+            self::assertTrue($uploads->nfoCleanupCommitted($committed));
+        };
+        $workerA = new NfoImportService($filesystem, $uploads, new NfoService);
+        self::assertSame('imported', $workerA->importManifest($mp)['status']);
+        self::assertSame($committed, $uploads->read($mp));
+        self::assertTrue($uploads->nfoCleanupCommitted($uploads->read($mp)));
+        self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
+    }
+
+    public function test_locked_reconciliation_refreshes_receipt_after_another_worker_commits_and_resets(): void
+    {
+        [$source, $mp, $uploads] = $this->upload(true);
+        Schema::create('release_nfos', static function (Blueprint $table): void {
+            $table->integer('releases_id')->primary();
+            $table->binary('nfo');
+        });
+        (require database_path('migrations/2026_10_15_034000_create_nfo_cleanup_commits_table.php'))->up();
+        $root = config('release_verification.storage_path');
+        config(['release_verification.storage_path' => $root.'/verification-state']);
+        try {
+            $this->capturedFixtureImporter('waiting-reconcile')->beginImport([$source]);
+            DB::table('releases')->insert(['id' => 7, 'guid' => 'waiting-reconcile-guid']);
+            DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+            $workerB = new NfoImportService(new Filesystem, $uploads, new NfoService);
+            $filesystem = new class extends Filesystem
+            {
+                public ?\Closure $afterRead = null;
+
+                private int $reads = 0;
+
+                public function get($path, $lock = false)
+                {
+                    $contents = parent::get($path, $lock);
+                    // The second snapshot is still outside the final manifest lock.
+                    $callback = ++$this->reads === 2 ? $this->afterRead : null;
+                    if ($callback !== null) {
+                        $this->afterRead = null;
+                    }
+                    if ($callback !== null) {
+                        $callback();
+                    }
+
+                    return $contents;
+                }
+            };
+            $committed = null;
+            $filesystem->afterRead = function () use ($workerB, $mp, $uploads, &$committed): void {
+                DirectorySyncBridge::$fail = 'rename_custody';
+                try {
+                    self::assertSame('failed', $workerB->importManifest($mp, delete: true)['status']);
+                } finally {
+                    DirectorySyncBridge::$fail = '';
+                }
+                $committed = $uploads->read($mp);
+                self::assertSame(NzbUploadManifestService::STATE_NFO_FAILED, $committed['state']);
+                self::assertTrue($uploads->nfoCleanupCommitted($committed));
+                app(VerificationResetService::class)->run(static function (): void {});
+            };
+            $result = (new NzbUploadManifestService($filesystem))->reconcilePending($mp);
+            self::assertSame(NzbUploadManifestService::STATE_NFO_IMPORTED, $result['state']);
+            self::assertSame($committed['release_id'], $result['release_id']);
+            self::assertSame($committed['release_guid'], $result['release_guid']);
+            self::assertTrue($uploads->nfoCleanupCommitted($result));
+            self::assertFileDoesNotExist(dirname($mp).'/info.nfo');
+            self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
+        } finally {
+            config(['release_verification.storage_path' => $root]);
+        }
+    }
+
+    public function test_ambient_reconciliation_defers_without_clearing_historical_receipt(): void
+    {
+        [$source, $mp, $uploads] = $this->upload(true);
+        Schema::create('release_nfos', static function (Blueprint $table): void {
+            $table->integer('releases_id')->primary();
+            $table->binary('nfo');
+        });
+        (require database_path('migrations/2026_10_15_034000_create_nfo_cleanup_commits_table.php'))->up();
+        $root = config('release_verification.storage_path');
+        config(['release_verification.storage_path' => $root.'/verification-state']);
+        try {
+            $this->capturedFixtureImporter('ambient-reconcile')->beginImport([$source]);
+            DB::table('releases')->insert(['id' => 7, 'guid' => 'ambient-reconcile-guid']);
+            DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+            $uploads->reconcilePending($mp);
+            DirectorySyncBridge::$fail = 'rename_custody';
+            try {
+                self::assertSame('failed', (new NfoImportService(new Filesystem, $uploads, new NfoService))->importManifest($mp, delete: true)['status']);
+            } finally {
+                DirectorySyncBridge::$fail = '';
+            }
+            app(VerificationResetService::class)->run(static function (): void {});
+            $committed = $uploads->read($mp);
+            DB::beginTransaction();
+            try {
+                self::assertSame($committed, $uploads->reconcilePending($mp));
+                self::assertSame($committed, $uploads->read($mp));
+            } finally {
+                DB::rollBack();
+            }
+            self::assertTrue($uploads->nfoCleanupCommitted($uploads->read($mp)));
+        } finally {
+            config(['release_verification.storage_path' => $root]);
+        }
+    }
+
+    public function test_receipt_free_pending_outcome_is_not_suppressed_in_an_ambient_transaction(): void
+    {
+        [$source, $mp, $uploads] = $this->upload(true);
+        $this->capturedFixtureImporter('ambient-first-outcome')->beginImport([$source]);
+        $capture = $uploads->read($mp)['accepted_capture'];
+        DB::beginTransaction();
+        try {
+            $uploads->recordNzbOutcome($source, NzbImportStatus::Failed, null, null, inputCapture: $capture);
+            self::assertSame(NzbUploadManifestService::STATE_NZB_FAILED, $uploads->read($mp)['state']);
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_receipt_free_imported_outcome_can_be_reconsidered_after_ambient_deferral(): void
+    {
+        [$source, $mp, $uploads] = $this->upload(true);
+        $this->capturedFixtureImporter('ambient-reconsider-outcome')->beginImport([$source]);
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'ambient-reconsider-guid']);
+        DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+        $before = $uploads->reconcilePending($mp);
+        $capture = $before['accepted_capture'];
+        DB::beginTransaction();
+        try {
+            $uploads->recordNzbOutcome($source, NzbImportStatus::Failed, null, null, inputCapture: $capture);
+            self::assertSame($before, $uploads->read($mp));
+        } finally {
+            DB::rollBack();
+        }
+        $uploads->recordNzbOutcome($source, NzbImportStatus::Failed, null, null, inputCapture: $capture);
+        self::assertSame(NzbUploadManifestService::STATE_NZB_FAILED, $uploads->read($mp)['state']);
     }
 
     public static function retirementResetBoundaries(): array

@@ -408,13 +408,12 @@ final class NzbUploadManifestService
                 && $this->nfoCandidateCurrent($manifest)) {
                 return;
             }
-            if ($status === NzbImportStatus::Queued
-                && ($manifest['candidate_identity'] ?? null) === $candidateIdentity
-                && ($manifest['accepted_capture'] ?? null) === $inputCapture
+            if (($manifest['accepted_capture'] ?? null) === $inputCapture
+                && is_array($manifest['nfo_capture'] ?? null)
                 && in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
-                && $this->nfoCleanupCommitted($manifest)) {
-                // An in-flight notification cannot replace historical receipt authority
-                // with current candidate state, including after a partial reset.
+                && (DB::transactionLevel() !== 0 || $this->nfoCleanupCommitted($manifest))) {
+                // A same-generation notification cannot replace historical receipt authority
+                // with current candidate state. Ambient receipt authority is unknown.
                 return;
             }
             $staleAdmissionRetry = ($manifest['stale_admission_retry'] ?? false) === true;
@@ -567,6 +566,16 @@ final class NzbUploadManifestService
             if (isset($manifest['custody_collision'])) {
                 return $manifest;
             }
+            if (is_array($manifest['nfo_capture'] ?? null)
+                && in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)) {
+                if (DB::transactionLevel() !== 0) {
+                    // Historical receipt authority is unknown inside an ambient transaction.
+                    return $manifest;
+                }
+                if ($this->resumeCommittedCompanionLocked($manifestPath, $manifest)) {
+                    return $manifest;
+                }
+            }
             $accepted = $manifest['accepted_capture'] ?? null;
             $source = dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nzb']['filename'];
             if ($accepted !== null && in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_FAILED], true)
@@ -712,6 +721,12 @@ final class NzbUploadManifestService
             if (isset($m['custody_collision'])) {
                 throw new RuntimeException('Custody collision requires explicit restaging.');
             }
+            if (DB::transactionLevel() !== 0) {
+                throw new RuntimeException('Companion consumption requires its own primary transaction');
+            }
+            if ($this->resumeCommittedCompanionLocked($manifestPath, $m, $delete)) {
+                return true;
+            }
             $receipt = $m['nfo_capture'] ?? null;
             $accepted = $m['accepted_capture'] ?? null;
             if (! is_array($receipt) || ($receipt['protocol'] ?? null) !== 1 || ! is_array($accepted) || ($accepted['companion_attempt'] ?? null) !== $receipt['attempt']
@@ -750,9 +765,6 @@ final class NzbUploadManifestService
                 $validate();
                 if ($body === '' || strlen($body) > 65535) {
                     throw new NfoPayloadRejected('Captured companion is empty or exceeds the NFO size limit');
-                }
-                if (DB::transactionLevel() !== 0) {
-                    throw new RuntimeException('Companion consumption requires its own primary transaction');
                 }
                 // A sequential restart may resume only the exact already committed operation.
                 // Neither matching payload bytes nor a filesystem marker supplies authority.
@@ -822,22 +834,29 @@ final class NzbUploadManifestService
             if (isset($manifest['custody_collision'])) {
                 return false;
             }
-            $this->drainCustodyGc($manifestPath, $manifest);
-            if (! in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
-                || ! $this->nfoCleanupCommitted($manifest)) {
-                return false;
-            }
-            if ($delete && ($manifest['nfo_relinquished_attempt'] ?? null) !== $manifest['nfo_capture']['attempt']) {
-                $manifest['delete_nfo_after_import'] = $manifest['nfo_capture']['attempt'];
-            }
-            $manifest['state'] = self::STATE_NFO_IMPORTED;
-            $manifest['last_error'] = null;
-            $this->write($manifestPath, $manifest);
-            $this->finishInputDeletion($manifestPath, $manifest);
-            $this->finishCompanionDeletion($manifestPath, $manifest);
 
-            return true;
+            return $this->resumeCommittedCompanionLocked($manifestPath, $manifest, $delete);
         });
+    }
+
+    /** @param array<string, mixed> $manifest */
+    private function resumeCommittedCompanionLocked(string $manifestPath, array &$manifest, bool $delete = false): bool
+    {
+        $this->drainCustodyGc($manifestPath, $manifest);
+        if (! in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
+            || ! $this->nfoCleanupCommitted($manifest)) {
+            return false;
+        }
+        if ($delete && ($manifest['nfo_relinquished_attempt'] ?? null) !== $manifest['nfo_capture']['attempt']) {
+            $manifest['delete_nfo_after_import'] = $manifest['nfo_capture']['attempt'];
+        }
+        $manifest['state'] = self::STATE_NFO_IMPORTED;
+        $manifest['last_error'] = null;
+        $this->write($manifestPath, $manifest);
+        $this->finishInputDeletion($manifestPath, $manifest);
+        $this->finishCompanionDeletion($manifestPath, $manifest);
+
+        return true;
     }
 
     /** @param array<string, mixed> $manifest */
