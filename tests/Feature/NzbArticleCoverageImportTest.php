@@ -85,7 +85,7 @@ final class NzbArticleCoverageImportTest extends TestCase
             'overlapping unequal set' => [['a1@x', 'b2@x'], true, 100, NzbImportStatus::Inserted],
             'legacy changed byte annotation' => [['a1@x', 'a2@x'], false, 150, NzbImportStatus::Duplicate],
         ];
-        foreach (['missing', 'corrupt', 'truncated', 'concatenated', 'trailing', 'oversized', 'incomplete', 'nested', 'invalid', 'foreign_container', 'compressed_oversized', 'budget', 'saturation', 'proof_before_saturation', 'guid_replacement', 'incoming_incomplete'] as $mode) {
+        foreach (['missing', 'corrupt', 'truncated', 'concatenated', 'trailing', 'oversized', 'incomplete', 'nested', 'nested_prefixed', 'nested_default', 'invalid', 'foreign_container', 'compressed_oversized', 'budget', 'saturation', 'proof_before_saturation', 'guid_replacement', 'incoming_incomplete'] as $mode) {
             $cases[$mode] = [['a1@x', 'a2@x'], true, 100, NzbImportStatus::Inserted, false, $mode];
         }
         unset($cases['proof_before_saturation']);
@@ -152,6 +152,8 @@ final class NzbArticleCoverageImportTest extends TestCase
             'oversized', 'budget' => str_replace('</nzb>', '<!--'.str_repeat('x', 16_777_216).'--></nzb>', $original),
             'incomplete' => str_replace('</nzb>', '<file><segments /></file></nzb>', $original),
             'nested' => str_replace('a1@x', 'a1@x<hidden>other</hidden>', $original),
+            'nested_prefixed' => str_replace('a1@x', 'a1@x<foreign:hidden xmlns:foreign="urn:foreign">other</foreign:hidden>', $original),
+            'nested_default' => str_replace('a1@x', 'a1@x<hidden xmlns="urn:foreign">other</hidden>', $original),
             'invalid' => str_replace('a1@x', '', $original),
             'foreign_container' => str_replace('</file>', '<foreign:segments xmlns:foreign="urn:other"><foreign:segment>extra</foreign:segment></foreign:segments></file>', $original),
             default => $original,
