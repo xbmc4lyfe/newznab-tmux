@@ -160,7 +160,9 @@ jobs:
           kernel_names = {0: 'scalar', 1: 'ssse3', 2: 'avx2', 3: 'avx512-vbmi2', 4: 'neon'}
           if kernel not in kernel_names:
               raise RuntimeError('Unknown Rust runtime payload kernel identity')
+          # These jobs build the current default kernels without opt-in features.
           manifest = {
+              'rust_payload_mode': 'incumbent',
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'runner_image_os': os.environ.get('ImageOS'),
               'runner_image_version': os.environ.get('ImageVersion'),
@@ -443,7 +445,9 @@ jobs:
           library = pathlib.Path('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')
           decoder = ctypes.CDLL(str(library.resolve()))
           decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          # These jobs build the current default kernels without opt-in features.
           manifest = {
+              'rust_payload_mode': 'incumbent',
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'runner_arch': os.environ.get('RUNNER_ARCH'),
               'runner_image_os': os.environ.get('ImageOS'),
@@ -632,7 +636,9 @@ jobs:
           library = pathlib.Path('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')
           decoder = ctypes.CDLL(str(library.resolve()))
           decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          # These jobs build the current default kernels without opt-in features.
           manifest = {
+              'rust_payload_mode': 'incumbent',
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'runner_arch': os.environ.get('RUNNER_ARCH'),
               'runner_image_os': os.environ.get('ImageOS'),

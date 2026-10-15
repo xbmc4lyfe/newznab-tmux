@@ -1,5 +1,6 @@
 """Public evidence export contracts, exercised through the actual CLI."""
 
+import importlib.util
 import itertools
 import json
 import os
@@ -43,6 +44,65 @@ def presentation():
 
 
 class BenchmarkSummaryExportTest(unittest.TestCase):
+    def test_payload_modes_follow_the_recorded_manifest_and_unsafe_or_ambiguous_modes_are_unknown(self):
+        for kind in ("cpp", "php", "profile"):
+            for supplied, expected in (("experimental", "experimental"), ("incumbent", "incumbent"),
+                                       (None, "unknown"), (UNPUBLISHED_MARKER, "unknown"), ([], "unknown")):
+                records = profile() if kind == "profile" else paired(kind)
+                manifest = {} if supplied is None else {"rust_payload_mode": supplied}
+                if kind == "profile":
+                    records[0]["runtime_manifest"] = manifest
+                else:
+                    records[0]["runtime"] = {"manifest": {"contents": manifest}}
+                with self.subTest(kind=kind, supplied=supplied):
+                    self.assertEqual(expected, self.run_export(kind, records)["rust_payload_mode"])
+            records = profile() if kind == "profile" else paired(kind)
+            records.insert(1, dict(records[0]))
+            self.assertEqual("unknown", self.run_export(kind, records)["rust_payload_mode"])
+            self.assertEqual("unknown", self.run_export(kind)["rust_payload_mode"])
+
+
+    def test_same_commit_keeps_experimental_cpp_and_incumbent_php_and_profile_distinct_on_pages(self):
+        spec = importlib.util.spec_from_file_location("pages_mode_fixture", SCRIPT.with_name("benchmark-pages.py"))
+        pages = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pages)
+        summaries = []
+        run = {"head_sha": "d" * 40, "id": 123, "run_attempt": 2}
+        for kind, mode in (("cpp", "experimental"), ("php", "incumbent"), ("profile", "incumbent")):
+            records = profile() if kind == "profile" else paired(kind)
+            if kind == "profile":
+                records[0]["runtime_manifest"] = {"rust_payload_mode": mode}
+            else:
+                records[0]["runtime"] = {"manifest": {"contents": {"rust_payload_mode": mode}}}
+            summary = self.run_export(kind, records)
+            pages.validate_summary(summary, run, kind, "linux-x64")
+            self.assertEqual(mode, summary["rust_payload_mode"])
+            summaries.append(summary)
+        rendered = pages.render({"head_sha": "d" * 40, "generated_at": "fixture", "workflows": [],
+                                 "coverage": [], "results": summaries})
+        self.assertIn("Rust payload mode: experimental", rendered)
+        self.assertIn("Rust payload mode: incumbent", rendered)
+        self.assertTrue(all(summary["adoption_qualified"] is False for summary in summaries))
+
+
+
+    def test_payload_mode_fails_closed_for_failed_malformed_or_duplicate_protocols(self):
+        for kind in ("cpp", "php", "profile"):
+            records = profile() if kind == "profile" else paired(kind)
+            protocol = records[0]
+            if kind == "profile":
+                protocol["runtime_manifest"] = {"rust_payload_mode": "incumbent"}
+            else:
+                protocol["runtime"] = {"manifest": {"contents": {"rust_payload_mode": "experimental"}}}
+            duplicate = [protocol, *records]
+            self.assertEqual("unknown", self.run_export(kind, duplicate)["rust_payload_mode"])
+            failure = dict(type="failure" if kind == "profile" else "run_failure", status="invalid")
+            self.assertEqual("unknown", self.run_export(kind, [*records, failure])["rust_payload_mode"])
+            raw = "".join(json.dumps(row) + "\n" for row in records) + "{unfinished"
+            self.assertEqual("unknown", self.run_export(kind, raw=raw)["rust_payload_mode"])
+            protocol["runtime_manifest" if kind == "profile" else "runtime"] = []
+            self.assertEqual("unknown", self.run_export(kind, records)["rust_payload_mode"])
+
     def run_export(self, kind, records=None, raw=None, runtime=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

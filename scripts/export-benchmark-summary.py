@@ -220,6 +220,24 @@ def summarize(kind, records):
     return safe_rows, status, {"expected_rows": len(expected), "observed_rows": len(seen), "complete": complete}, flags
 
 
+def rust_payload_mode(kind, records, status):
+    """Use one successful protocol's recorded build manifest, never comparison kind."""
+    if kind not in ("cpp", "php", "profile") or status not in ("ok", "useful_improvement", "inconclusive", "regression"):
+        return "unknown"
+    protocols = [record for record in records if record.get("type") == "protocol"]
+    if len(protocols) != 1:
+        return "unknown"
+    protocol = protocols[0]
+    if kind == "profile":
+        manifest = protocol.get("runtime_manifest")
+    else:
+        manifest = protocol
+        for key in ("runtime", "manifest", "contents"):
+            manifest = manifest.get(key) if isinstance(manifest, dict) else None
+    mode = manifest.get("rust_payload_mode") if isinstance(manifest, dict) else None
+    return mode if mode in ("incumbent", "experimental") else "unknown"
+
+
 def utility_summary(kind, report):
     """Publish fixed fixture names and numeric metrics; never paths, commands or raw observations."""
     cpu = kind == "cpu-snapshot"
@@ -307,7 +325,7 @@ def export(kind, runner):
                "run_id": env_count("GITHUB_RUN_ID"), "run_attempt": env_count("GITHUB_RUN_ATTEMPT"),
                "repository": repository if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) else "",
                "status": "missing", "rows": [], "evidence_type": "diagnostic_only" if kind == "profile" else "presentation_median_screen" if kind == "presentation" else "paired_median_screen",
-               "adoption_qualified": False}
+               "adoption_qualified": False, "rust_payload_mode": "unknown"}
     if kind in UTILITY_KINDS:
         try:
             report_raw = Path(INPUTS[kind]).read_bytes()
@@ -350,6 +368,7 @@ def export(kind, runner):
         malformed = True
     rows, status, completeness, flags = summarize(kind, records)
     summary.update(rows=rows, status="invalid" if malformed else status, completeness=completeness, **flags, **identities(records))
+    summary["rust_payload_mode"] = rust_payload_mode(kind, records, summary["status"])
     return summary
 
 

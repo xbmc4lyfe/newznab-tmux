@@ -13,6 +13,50 @@ SHA = 'a' * 40
 
 
 class PagesTest(unittest.TestCase):
+    def test_payload_mode_is_a_validated_enum_and_legacy_results_are_explicitly_unknown(self):
+        summary = dict(schema_version=1, kind='cpp', runner='ubuntu-latest', head_sha=SHA,
+                       run_id=12, run_attempt=2, repository=pages.REPOSITORY, rows=[], adoption_qualified=False)
+        for mode in ('incumbent', 'experimental', 'unknown'):
+            summary['rust_payload_mode'] = mode
+            pages.validate_summary(summary, self.run_row(), 'cpp', 'ubuntu-latest')
+        for invalid in ('<script>bad</script>', [], None, True, 'not_applicable'):
+            summary['rust_payload_mode'] = invalid
+            with self.assertRaises(ValueError):
+                pages.validate_summary(summary, self.run_row(), 'cpp', 'ubuntu-latest')
+        del summary['rust_payload_mode']
+        pages.validate_summary(summary, self.run_row(), 'cpp', 'ubuntu-latest')
+        rendered = pages.render(dict(head_sha=SHA, generated_at='fixture', workflows=[], coverage=[], results=[summary]))
+        self.assertIn('Rust payload mode: unknown', rendered)
+
+
+    def test_default_and_experimental_source_coverage_have_separate_comparisons(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / 'docker/app/nzb-yenc-ffi/src'
+            source.mkdir(parents=True)
+            names = ('payload_decoder', 'payload_decoder_arm', 'payload_decoder_x86')
+            for name in names:
+                (source / (name + '.rs')).touch()
+                (source / (name + '_experimental.rs')).touch()
+            rows = {Path(row['target']).stem: row for row in pages.coverage(Path(root))}
+            for name in names:
+                self.assertEqual(['incumbent'], rows[name]['payload_modes'])
+                self.assertEqual(['php'], rows[name]['comparisons'])
+                self.assertEqual(['experimental'], rows[name + '_experimental']['payload_modes'])
+                self.assertEqual(['cpp'], rows[name + '_experimental']['comparisons'])
+                self.assertNotEqual('No automated benchmark', rows[name + '_experimental']['coverage'])
+
+
+
+    def test_unsplit_source_coverage_does_not_claim_experimental_execution(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / 'docker/app/nzb-yenc-ffi/src'
+            source.mkdir(parents=True)
+            (source / 'payload_decoder.rs').touch()
+            row = pages.coverage(Path(root))[0]
+            self.assertEqual(['incumbent'], row['payload_modes'])
+            self.assertEqual(['php', 'cpp'], row['comparisons'])
+            self.assertIn('separate from measured mode', row['detail'])
+
     def run_row(self, **changes):
         return dict(id=12, run_attempt=2, head_sha=SHA, head_branch='master', event='push',
                     status='completed', conclusion='failure', head_repository={'full_name': pages.REPOSITORY}, **changes)

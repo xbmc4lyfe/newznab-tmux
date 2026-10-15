@@ -107,9 +107,11 @@ def validate_summary(summary, run, kind, runner):
     if not isinstance(summary.get('rows'), list) or len(summary['rows']) > 100:
         raise ValueError('Invalid summary rows')
     allowed = set(expected) | {'rows', 'status', 'evidence_type', 'completeness', 'source_sha256',
-                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256'}
+                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode'}
     if set(summary) - allowed:
         raise ValueError('Unexpected public summary fields')
+    if summary.get('rust_payload_mode', 'unknown') not in ('incumbent', 'experimental', 'unknown'):
+        raise ValueError('Invalid Rust payload mode')
     for mapping in ('source_sha256', 'library_sha256'):
         hashes = summary.get(mapping, {})
         if not isinstance(hashes, dict) or any(not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value) for value in hashes.values()):
@@ -151,14 +153,25 @@ def validate_summary(summary, run, kind, runner):
 
 
 def coverage(root):
-    comparative = {'payload_decoder', 'payload_decoder_x86', 'payload_decoder_arm', 'yenc_framing'}
+    payload_sources = {'payload_decoder', 'payload_decoder_x86', 'payload_decoder_arm'}
     diagnostic = {'nntp_body', 'nntp_headers', 'formats'}
     rows = []
     for path in sorted((root / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs')):
         name = path.stem
         label, detail = 'No automated benchmark', 'Correctness tests or utility execution do not measure speed.'
-        if name in comparative:
-            label, detail = 'Comparative caller benchmark', 'yEnc PHP/Rust and C++/Rust matrix; framing included in caller costs.'
+        modes, comparisons = [], []
+        if name in payload_sources:
+            modes = ['incumbent']
+            comparisons = ['php'] if path.with_stem(name + '_experimental').is_file() else ['php', 'cpp']
+            label = 'Comparative caller benchmark capability'
+            detail = 'Default incumbent kernels: ' + '/'.join(comparisons) + ' baseline comparison wiring. Capability is separate from measured mode evidence in each result manifest.'
+        elif name.removesuffix('_experimental') in payload_sources and name.endswith('_experimental'):
+            modes, comparisons = ['experimental'], ['cpp']
+            label = 'Comparative caller benchmark capability'
+            detail = 'Opt-in experimental kernels: C++ baseline comparison wiring. This coverage does not establish default-kernel performance or adoption.'
+        elif name == 'yenc_framing':
+            label, detail = 'Comparative caller benchmark capability', 'Framing is shared by yEnc comparison callers; the result manifest identifies the measured payload mode.'
+            comparisons = ['php', 'cpp']
         elif name == 'release_names':
             label, detail = 'Comparative caller benchmark', 'Release rendering, x86; 5% median screen for batches of 16+ rows.'
         elif name in diagnostic:
@@ -173,7 +186,7 @@ def coverage(root):
             label, detail = 'Comparative public operation benchmark', 'PHP baseline vs Rust FFI and worker; 31-pair median screen, p99 unqualified; PHP process startup excluded.'
         elif name in ('cpu_snapshot', 'nntmux-cpu-snapshot', 'benchmark-cpu-snapshot'):
             label, detail = 'Comparative synthetic CLI benchmark', 'Python baseline vs Rust, 1000 pairs per synthetic proc/cgroup fixture; startup included, production load unverified.'
-        rows.append({'target': str(path.relative_to(root)), 'coverage': label, 'detail': detail})
+        rows.append({'target': str(path.relative_to(root)), 'coverage': label, 'detail': detail, 'payload_modes': modes, 'comparisons': comparisons})
     return rows
 
 
@@ -268,7 +281,7 @@ def collect(sha, root, fetch=api, archive_download=download):
             except (OSError, ValueError, KeyError, TypeError):
                 state = 'Collection unavailable'
         for kind, runner in expected:
-            result = dict(kind=kind, runner=runner, status=state, rows=[], adoption_qualified=False)
+            result = dict(kind=kind, runner=runner, status=state, rows=[], adoption_qualified=False, rust_payload_mode='unknown')
             if run:
                 result.update(run_id=run['id'], run_attempt=run['run_attempt'])
                 name = f"public-benchmark-{kind}-{runner}-{run['id']}-{run['run_attempt']}"
@@ -323,12 +336,14 @@ def render(report):
             '<p>Each master push runs fresh yEnc comparisons on x86/ARM, BODY/fingerprint profiles on x86/ARM release rendering on x86 and NZB digest/CPU utility comparisons on x86/ARM. Missing, failed, cancelled and inconclusive results remain visible. Local/manual experiments are excluded. Raw evidence is retained in Actions for 14 days; published summaries last until the next build.</p>',
             '<h2>Build checks</h2><table><tr><th>Workflow</th><th>Latest state</th><th>Evidence</th></tr>']
     for row in report['workflows']:
-        body.append(f'<tr><td>{escape(row["workflow"])}</td><td>{escape(row["status"])}</td><td>{run_link(row)}</td></tr>')
+        body.append(f'<tr><td>{escape(row["workflow"])}</td><td>{escape(row.get("status", "unknown"))}</td><td>{run_link(row)}</td></tr>')
     body.append('</table><h2>Current measurements</h2>')
     if report.get('frozen_reports_available'):
         body.append('<p><a href="benchmarks/">Historical speedup charts, PHP call paths and native flamegraphs</a>. These frozen reports retain their own executed-commit and run provenance; they are separate from this build.</p>')
     for row in report['results']:
-        body.append(f'<details><summary>{escape(row["kind"])} · {escape(row["runner"])} · {escape(row["status"])}</summary><p>{run_link(row)}. Evidence: {escape(row.get("evidence_type", "unavailable"))}; adoption qualification: not established.</p>')
+        body.append(f'<details><summary>{escape(row["kind"])} · {escape(row["runner"])} · {escape(row.get("status", "unknown"))}</summary><p>{run_link(row)}. Evidence: {escape(row.get("evidence_type", "unavailable"))}; adoption qualification: not established.</p>')
+        if row.get('kind') in ('cpp', 'php', 'profile'):
+            body.append('<p>Rust payload mode: ' + escape(row.get('rust_payload_mode', 'unknown')) + '.</p>')
         if 'workflow_status' in row:
             body.append(f'<p>Overall workflow: {escape(row["workflow_status"])}</p>')
         body.append(measurement_table(row['rows']) if row['rows'] else '<p>No current measurement rows available.</p>')
@@ -341,7 +356,7 @@ def render(report):
         if historical.get('results'):
             body.append('<p>Executed source <code>' + escape(historical['head_sha']) + '</code>. ' + run_link(historical) + '.</p>')
             for row in historical['results']:
-                body.append('<h3>' + escape(row['runner']) + '</h3>' + measurement_table(row['rows']))
+                body.append('<h3>' + escape(row['runner']) + '</h3><p>Rust payload mode: ' + escape(row.get('rust_payload_mode', 'unknown')) + '.</p>' + measurement_table(row['rows']))
     body.append('<h2>Rust target coverage and priorities</h2><p>Next priorities: compare repeated native body/format scans through the full caller; extend NZB digest uncommon-tail coverage; then cover archive range parsers and sample planning. Newly added Rust source files appear automatically as gaps until their benchmark mapping is reviewed.</p><table><tr><th>Source target</th><th>Automated evidence</th><th>Scope / gap</th></tr>')
     for row in report['coverage']:
         body.append(f'<tr><td><code>{escape(row["target"])}</code></td><td>{escape(row["coverage"])}</td><td>{escape(row["detail"])}</td></tr>')

@@ -1,7 +1,5 @@
 {
   "label": "Historical PR evidence; not current master",
-  "pr_head": "35858d906f135266be148f5b20417ff73041f54c",
-  "executed_sha": "57dfddcfd029b361e92c4d6ddae21b200b57323b",
   "run_attempt": 1,
   "summaries": [
     {
@@ -9,49 +7,117 @@
       "sha256": "b4e51fd5a17ed321f67ae0e5b625589434c2c35ca8fdacd2421fce76344b371a",
       "run_id": 38655034947,
       "kind": "cpp",
-      "runner": "ubuntu-24.04-arm"
+      "runner": "ubuntu-24.04-arm",
+      "pr_head": "35858d906f135266be148f5b20417ff73041f54c",
+      "executed_sha": "57dfddcfd029b361e92c4d6ddae21b200b57323b"
     },
     {
       "file": "historical-cpp-x86.json",
       "sha256": "980bec2565268c1ae528ecabe8320e02cd0b831a9ea4b225c61b8ab4faf3d720",
       "run_id": 38655034947,
       "kind": "cpp",
-      "runner": "ubuntu-latest"
+      "runner": "ubuntu-latest",
+      "pr_head": "35858d906f135266be148f5b20417ff73041f54c",
+      "executed_sha": "57dfddcfd029b361e92c4d6ddae21b200b57323b"
     },
     {
       "file": "historical-php-arm.json",
       "sha256": "71db6bbcccfeb3c301bc1158ace3e3977b5e6ff0ebdbdf32bbaadb234a847e31",
       "run_id": 38655034947,
       "kind": "php",
-      "runner": "ubuntu-24.04-arm"
+      "runner": "ubuntu-24.04-arm",
+      "pr_head": "35858d906f135266be148f5b20417ff73041f54c",
+      "executed_sha": "57dfddcfd029b361e92c4d6ddae21b200b57323b"
     },
     {
       "file": "historical-php-x86.json",
       "sha256": "01e7db93e0ed255d634c5eaa765f577fe27fcef1c1542d07af60d46469e08dee",
       "run_id": 38655034947,
       "kind": "php",
-      "runner": "ubuntu-latest"
+      "runner": "ubuntu-latest",
+      "pr_head": "35858d906f135266be148f5b20417ff73041f54c",
+      "executed_sha": "57dfddcfd029b361e92c4d6ddae21b200b57323b"
     },
     {
       "file": "historical-presentation-x86.json",
       "sha256": "52bcf49d541ae22fa384f3e7fe3422d36a399ebe91240b3741cee85e2bf64cbc",
       "run_id": 38655034815,
       "kind": "presentation",
-      "runner": "ubuntu-latest"
+      "runner": "ubuntu-latest",
+      "pr_head": "35858d906f135266be148f5b20417ff73041f54c",
+      "executed_sha": "57dfddcfd029b361e92c4d6ddae21b200b57323b"
     },
     {
       "file": "historical-profile-arm.json",
       "sha256": "bb90f2ebd2c5fb884e20c79d748538e301996904a23c37bf1d7fbb7b61a139cb",
       "run_id": 38655034947,
       "kind": "profile",
-      "runner": "ubuntu-24.04-arm"
+      "runner": "ubuntu-24.04-arm",
+      "pr_head": "35858d906f135266be148f5b20417ff73041f54c",
+      "executed_sha": "57dfddcfd029b361e92c4d6ddae21b200b57323b"
     },
     {
       "file": "historical-profile-x86.json",
       "sha256": "e08eb516fc011ee8813e0d9a8f9b290277c06b7237d57acb47e2a6cdc26021fa",
       "run_id": 38655034947,
       "kind": "profile",
-      "runner": "ubuntu-latest"
+      "runner": "ubuntu-latest",
+      "pr_head": "35858d906f135266be148f5b20417ff73041f54c",
+      "executed_sha": "57dfddcfd029b361e92c4d6ddae21b200b57323b"
+    },
+    {
+      "file": "historical-cpu-snapshot-arm.json",
+      "sha256": "a340fd44021b166397dafbf2c65ccdad42b8c3c64dbec62d7ccd686511f99834",
+      "run_id": 38657422002,
+      "kind": "cpu-snapshot",
+      "runner": "ubuntu-24.04-arm",
+      "pr_head": "69374623316f09bf5f72acd4e57240427bfa2691",
+      "executed_sha": "a2f4298201ca05d8a69a24688bac8ed2f3896285"
+    },
+    {
+      "file": "historical-cpu-snapshot-x86.json",
+      "sha256": "73f4fe3acee09a4197ad44b2c76a9f4ca2a57ef3dfd139a16486f4114a85ba91",
+      "run_id": 38657422002,
+      "kind": "cpu-snapshot",
+      "runner": "ubuntu-latest",
+      "pr_head": "69374623316f09bf5f72acd4e57240427bfa2691",
+      "executed_sha": "a2f4298201ca05d8a69a24688bac8ed2f3896285"
+    },
+    {
+      "file": "historical-fingerprint-ffi-arm.json",
+      "sha256": "c0a597ced46e2ba0195cf2f8a7ee3436bf2aa6d95ce59c021d916e541ed3cd13",
+      "run_id": 38657422002,
+      "kind": "fingerprint-ffi",
+      "runner": "ubuntu-24.04-arm",
+      "pr_head": "69374623316f09bf5f72acd4e57240427bfa2691",
+      "executed_sha": "a2f4298201ca05d8a69a24688bac8ed2f3896285"
+    },
+    {
+      "file": "historical-fingerprint-ffi-x86.json",
+      "sha256": "c24d126efb95deac084b17eb2234cc10a38c21407ef66cdd55c2b5568c688ecb",
+      "run_id": 38657422002,
+      "kind": "fingerprint-ffi",
+      "runner": "ubuntu-latest",
+      "pr_head": "69374623316f09bf5f72acd4e57240427bfa2691",
+      "executed_sha": "a2f4298201ca05d8a69a24688bac8ed2f3896285"
+    },
+    {
+      "file": "historical-fingerprint-worker-arm.json",
+      "sha256": "5ed17390dfe1e19eeb73c2da8ddb4bc374ba14caa1313967666e103ce88c2d09",
+      "run_id": 38657422002,
+      "kind": "fingerprint-worker",
+      "runner": "ubuntu-24.04-arm",
+      "pr_head": "69374623316f09bf5f72acd4e57240427bfa2691",
+      "executed_sha": "a2f4298201ca05d8a69a24688bac8ed2f3896285"
+    },
+    {
+      "file": "historical-fingerprint-worker-x86.json",
+      "sha256": "9b98098f4ec7b879075c161bfb6069ad0d63c2d126ce2c66d91f71378b4cead4",
+      "run_id": 38657422002,
+      "kind": "fingerprint-worker",
+      "runner": "ubuntu-latest",
+      "pr_head": "69374623316f09bf5f72acd4e57240427bfa2691",
+      "executed_sha": "a2f4298201ca05d8a69a24688bac8ed2f3896285"
     }
   ]
 }
