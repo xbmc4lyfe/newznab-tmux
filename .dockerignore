@@ -2,6 +2,13 @@ vendor/
 node_modules/
 .git/
 tests/
+!tests/
+tests/*
+!tests/Fixtures/
+tests/Fixtures/*
+!tests/Fixtures/nzb-article-fingerprint/
+tests/Fixtures/nzb-article-fingerprint/*
+!tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php
 .ai/
 .agents/
 .codex/
