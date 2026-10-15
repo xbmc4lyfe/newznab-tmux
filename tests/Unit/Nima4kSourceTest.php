@@ -6,6 +6,7 @@ namespace Tests\Unit;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Services\Predb\Feeds\Sources\Nima4kSource;
+use DOMDocument;
 use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Psr7\Response;
 use GuzzleHttp\Psr7\StreamDecoratorTrait;
@@ -467,6 +468,235 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('bogusSubtitleDeclarations')]
+    public function bogus_declarations_cannot_disappear_into_an_agreeing_subtitle(string $declaration, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.'.$declaration.'Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$card;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function bogusSubtitleDeclarations(): array
+    {
+        return [
+            'bogus declaration in first card' => ['<!hidden>', false],
+            'bogus declaration after record limit' => ['<!hidden>', true],
+            'CDATA declaration in first card' => ['<![CDATA[hidden]]>', false],
+            'CDATA declaration after record limit' => ['<![CDATA[hidden]]>', true],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('literalTextBeforeRawScript')]
+    public function literal_text_before_raw_script_preserves_exact_names(string $fragment, bool $requiresLiteralLessThanPreservation): void
+    {
+        $html = $this->card('Léon.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+        if ($requiresLiteralLessThanPreservation && ! $this->nativeParserPreservesLiteralLessThan()) {
+            // Older libxml loses the comparison before our scanner runs, so fail closed there.
+            $this->expectException(RuntimeException::class);
+        }
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame(['Léon.Release-GRP', 'Second.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function literalTextBeforeRawScript(): array
+    {
+        return [
+            'literal less-than before script' => ['<p>1 < 2<script>const x = "</scripted>";</script></p>', true],
+            'quote-bearing PI before script' => ['<?note "?><script>const x = "</scripted>";</script>', false],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('lexicalBoundaryMalformedSubtitles')]
+    public function lexical_boundaries_cannot_hide_a_later_malformed_subtitle(string $fragment, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.</b>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$fragment.$card;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function lexicalBoundaryMalformedSubtitles(): array
+    {
+        $cases = [];
+        foreach (self::literalTextBeforeRawScript() as $label => [$fragment]) {
+            $cases[$label.' before first card'] = [$fragment, false];
+            $cases[$label.' after record limit'] = [$fragment, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    public function an_unterminated_processing_instruction_cannot_discard_the_listing_tail(): void
+    {
+        $html = $this->card('First.Release-GRP').'<?unfinished ';
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    #[Test]
+    #[DataProvider('inertDeclarationFragments')]
+    public function terminated_processing_instructions_and_inert_declarations_preserve_names(string $fragment): void
+    {
+        $html = $this->card('Léon.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame(['Léon.Release-GRP', 'Second.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function inertDeclarationFragments(): array
+    {
+        return [
+            'terminated PI' => ['<?note safe?>'],
+            'proper comment' => ['<!-- <!hidden> <![CDATA[hidden]]> -->'],
+            'raw script declarations' => ['<script>const x = "<!hidden> <![CDATA[hidden]]>";</script>'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('standardUtf8AliasDeclarations')]
+    public function standard_utf8_aliases_preserve_exact_unicode_names(string $declaration): void
+    {
+        $html = '<html><head>'.$declaration.'</head><body>'.$this->card('Léon_天空.Release-GRP').'</body></html>';
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertCount(1, $entries);
+        $this->assertSame('Léon_天空.Release-GRP', $entries[0]->title);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function standardUtf8AliasDeclarations(): array
+    {
+        return [
+            'unicode-1-1-utf-8' => ['<meta charset="unicode-1-1-utf-8">'],
+            'unicode11utf8' => ['<meta charset="unicode11utf8">'],
+            'unicode20utf8' => ['<meta charset="unicode20utf8">'],
+            'x-unicode20utf8' => ['<meta charset="x-unicode20utf8">'],
+            'quoted mixed case content-type alias' => ['<meta http-equiv="Content-Type" content="text/html; charset=\'Unicode-1-1-UTF-8\'">'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('numericLookingSubtitlePositions')]
+    public function unrecognized_utf8_lookalike_labels_remain_rejected(bool $afterLimit): void
+    {
+        $declaration = '<meta charset="unicode-1-1-utf-8x">';
+        $html = $afterLimit
+            ? $this->card('First.Release-GRP').$declaration.$this->card('Léon.Release-GRP')
+            : '<html><head>'.$declaration.'</head><body>'.$this->card('Léon.Release-GRP').'</body></html>';
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    #[Test]
+    #[DataProvider('inertRcdataClosingTags')]
+    public function apparent_closing_tags_in_rcdata_preserve_exact_names(string $fragment): void
+    {
+        $html = $this->card('Léon.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame(['Léon.Release-GRP', 'Second.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function inertRcdataClosingTags(): array
+    {
+        return [
+            'title text' => ['<title>foo </b> bar</title>'],
+            'textarea text' => ['<textarea>foo </b> bar</textarea>'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('rcdataMalformedSubtitles')]
+    public function rcdata_cannot_hide_a_real_malformed_subtitle(string $fragment, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.</b>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$fragment.$card;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function rcdataMalformedSubtitles(): array
+    {
+        $cases = [];
+        foreach (self::inertRcdataClosingTags() as $label => [$fragment]) {
+            $cases[$label.' before first card'] = [$fragment, false];
+            $cases[$label.' after record limit'] = [$fragment, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('rcdataContainedMalformedCards')]
+    public function rcdata_containers_cannot_expose_repaired_release_cards(string $tag, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.</b>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').'<'.$tag.'>'.$card.'</'.$tag.'>';
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function rcdataContainedMalformedCards(): array
+    {
+        return [
+            'title before first record' => ['title', false],
+            'title after record limit' => ['title', true],
+            'textarea before first record' => ['textarea', false],
+            'textarea after record limit' => ['textarea', true],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('rcdataContainedMalformedCards')]
+    public function rcdata_ancestor_closes_cannot_expose_repaired_release_cards(string $tag, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.</b>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').'<div><'.$tag.'></div>'.$card.'</'.$tag.'>';
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    #[Test]
+    #[DataProvider('benignTextInsideReleaseCards')]
+    public function benign_raw_text_inside_cards_preserves_the_observed_literal_names(string $fragment): void
+    {
+        $card = str_replace('</h2>', '</h2>'.$fragment, $this->card('Léon.Release-GRP'));
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($card.$this->card('Second.Release-GRP'));
+
+        $this->assertSame(['Léon.Release-GRP', 'Second.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function benignTextInsideReleaseCards(): array
+    {
+        return [
+            'script inside article' => ['<script>const x = "</scripted>";</script>'],
+            'style inside article' => ['<style>.example { content: "</stylesheet>"; }</style>'],
+            'title inside article' => ['<title>foo </b> bar</title>'],
+            'textarea inside article' => ['<textarea>foo </b> bar</textarea>'],
+        ];
+    }
+
+    #[Test]
     #[DataProvider('unterminatedCommentFragments')]
     public function unterminated_comments_cannot_hide_the_remaining_listing(string $fragment): void
     {
@@ -706,6 +936,21 @@ final class Nima4kSourceTest extends TestCase
     public static function streamLengthHeaders(): array
     {
         return ['absent length' => [[]], 'understated length' => [['Content-Length' => '12']]];
+    }
+
+    private function nativeParserPreservesLiteralLessThan(): bool
+    {
+        $document = new DOMDocument;
+        $previous = libxml_use_internal_errors(true);
+        libxml_clear_errors();
+        try {
+            $loaded = $document->loadHTML('<?xml encoding="UTF-8"><p>1 < 2</p>', LIBXML_NONET);
+        } finally {
+            libxml_clear_errors();
+            libxml_use_internal_errors($previous);
+        }
+
+        return $loaded && $document->getElementsByTagName('p')->item(0)?->textContent === '1 < 2';
     }
 
     private function fixture(): string

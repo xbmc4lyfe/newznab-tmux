@@ -86,15 +86,15 @@ final class Nima4kSource extends BoundedHttpFeedSource
         $unexpectedClosingTag = null;
         foreach ($errors as $error) {
             // These malformed-markup recoveries discard bytes or values; fatal errors truncate input.
-            // Codes 45 and 76 cover unterminated comments and unexpected closing tags respectively.
+            // Codes 45/47 truncate comments/PIs; 802 discards bogus declarations on newer libxml.
             $discardedName = $error->code === 68 && in_array(trim($error->message), [
                 'htmlParseStartTag: invalid element name',
                 'error parsing attribute name',
             ], true);
-            if ($error->level === LIBXML_ERR_FATAL || in_array($error->code, [42, 45, 61, 73, 800], true) || $discardedName) {
+            if ($error->level === LIBXML_ERR_FATAL || in_array($error->code, [42, 45, 47, 61, 73, 800, 802], true) || $discardedName) {
                 throw new RuntimeException('NIMA4K returned invalid HTML.');
             }
-            if ($error->code === 76 && ($unexpectedClosingTag ??= $this->hasUnexpectedClosingTag($html))) {
+            if ($error->code === 76 && ($unexpectedClosingTag ??= $this->hasUnexpectedClosingTag($html, $document))) {
                 throw new RuntimeException('NIMA4K returned invalid HTML.');
             }
             if ($error->code === 9) {
@@ -102,6 +102,18 @@ final class Nima4kSource extends BoundedHttpFeedSource
             }
         }
 
+        $cards = $this->validatedReleaseCards($document);
+        $entries = [];
+        foreach (array_slice($cards, 0, $this->pageSize) as $card) {
+            $entries[] = new PredbFeedEntry(title: $card['title'], source: 'nima4k.org');
+        }
+
+        return $entries;
+    }
+
+    /** @return list<array{article: string, subtitle: string, cover: string, title: string}> */
+    private function validatedReleaseCards(DOMDocument $document): array
+    {
         $this->assertUtf8Encoding($document);
         $xpath = new DOMXPath($document);
         // DOM values are already decoded once. Comments and script/style text are inert,
@@ -119,7 +131,7 @@ final class Nima4kSource extends BoundedHttpFeedSource
         if ($articles === false || $articles->length === 0) {
             throw new RuntimeException('NIMA4K returned no recognized release cards.');
         }
-        $entries = [];
+        $cards = [];
         foreach ($articles as $article) {
             $subtitles = $xpath->query('.//span['.$this->classToken('subtitle').']', $article);
             $titles = $xpath->query('./div['.$this->classToken('article-right').']/h2/span['.$this->classToken('subtitle').']', $article);
@@ -141,17 +153,21 @@ final class Nima4kSource extends BoundedHttpFeedSource
             if ($title === '' || preg_match('/[\s\p{Z}\p{C}]/u', $title) !== 0 || $cover->getAttribute('alt') !== $title) {
                 throw new RuntimeException('NIMA4K returned a nonliteral or inconsistent release name.');
             }
-            if (count($entries) < $this->pageSize) {
-                $entries[] = new PredbFeedEntry(title: $title, source: 'nima4k.org');
+            $articlePath = $article->getNodePath();
+            $subtitlePath = $subtitle->getNodePath();
+            $coverPath = $cover->getNodePath();
+            if (! is_string($articlePath) || ! is_string($subtitlePath) || ! is_string($coverPath)) {
+                throw new RuntimeException('NIMA4K returned an invalid release card.');
             }
+            $cards[] = ['article' => $articlePath, 'subtitle' => $subtitlePath, 'cover' => $coverPath, 'title' => $title];
         }
 
-        return $entries;
+        return $cards;
     }
 
-    private function hasUnexpectedClosingTag(string $html): bool
+    private function hasUnexpectedClosingTag(string $html, DOMDocument $original): bool
     {
-        // libxml also reports code 76 for apparent closing tags inside inert script/style text.
+        // libxml also reports code 76 for apparent closing tags inside raw text or RCDATA.
         // Recheck only this diagnostic with that text omitted; literal labels use the original DOM.
         $parts = [];
         $copied = 0;
@@ -164,6 +180,22 @@ final class Nima4kSource extends BoundedHttpFeedSource
                     throw new RuntimeException('NIMA4K returned invalid HTML.');
                 }
                 $offset = $end + 3;
+
+                continue;
+            }
+            if (substr($html, $start, 2) === '<?') {
+                // HTML processing instructions end at the first >, irrespective of quotes.
+                $end = strpos($html, '>', $start + 2);
+                if ($end === false) {
+                    throw new RuntimeException('NIMA4K returned invalid HTML.');
+                }
+                $offset = $end + 1;
+
+                continue;
+            }
+            if (preg_match('/\G<(?:[a-zA-Z!]|\/[a-zA-Z])/', $html, $unused, 0, $start) !== 1) {
+                // A literal < must not consume a subsequent actual tag opener.
+                $offset = $start + 1;
 
                 continue;
             }
@@ -190,10 +222,8 @@ final class Nima4kSource extends BoundedHttpFeedSource
             if (preg_match('~</'.$opening[1].'(?=[\x20\t\r\n/>])~i', $html, $closing, PREG_OFFSET_CAPTURE, $offset) !== 1) {
                 throw new RuntimeException('NIMA4K returned invalid HTML.');
             }
-            if (in_array(strtolower($opening[1]), ['script', 'style'], true)) {
-                $parts[] = substr($html, $copied, $offset - $copied);
-                $copied = $closing[0][1];
-            }
+            $parts[] = substr($html, $copied, $offset - $copied);
+            $copied = $closing[0][1];
             $offset = $closing[0][1];
         }
         if ($parts === []) {
@@ -203,7 +233,8 @@ final class Nima4kSource extends BoundedHttpFeedSource
         $previous = libxml_use_internal_errors(true);
         libxml_clear_errors();
         try {
-            $loaded = (new DOMDocument)->loadHTML('<?xml encoding="UTF-8">'.implode('', $parts), LIBXML_NONET);
+            $document = new DOMDocument;
+            $loaded = $document->loadHTML('<?xml encoding="UTF-8">'.implode('', $parts), LIBXML_NONET);
             $errors = libxml_get_errors();
         } finally {
             libxml_clear_errors();
@@ -218,7 +249,8 @@ final class Nima4kSource extends BoundedHttpFeedSource
             }
         }
 
-        return false;
+        // Masking must not erase or move a card, even when that card is beyond the output limit.
+        return $this->validatedReleaseCards($original) !== $this->validatedReleaseCards($document);
     }
 
     private function assertUtf8Encoding(DOMDocument $document): void
@@ -238,7 +270,10 @@ final class Nima4kSource extends BoundedHttpFeedSource
             }
         }
         foreach ($encodings as $encoding) {
-            if (! in_array(strtoupper(trim($encoding)), ['UTF-8', 'UTF8'], true)) {
+            // Exact UTF-8 labels from the WHATWG Encoding Standard; prefixes are not aliases.
+            if (! in_array(strtolower(trim($encoding, " \t\r\n\f")), [
+                'unicode-1-1-utf-8', 'unicode11utf8', 'unicode20utf8', 'utf-8', 'utf8', 'x-unicode20utf8',
+            ], true)) {
                 throw new RuntimeException('NIMA4K returned a conflicting HTML encoding.');
             }
         }
