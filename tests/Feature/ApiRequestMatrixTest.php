@@ -237,9 +237,17 @@ class ApiRequestMatrixTest extends TestCase
         $response->assertViewHas('listQuery', fn (array $query): bool => ! array_key_exists('poster', $query));
     }
 
-    public function test_exact_poster_detail_link_preserves_whitespace_through_http_and_returns_its_own_release(): void
+    public static function exactPosterValues(): array
     {
-        $poster = ' alice+usenet@example.test ';
+        return [
+            'whitespace' => [' alice+usenet@example.test ', 'alice+usenet@example.test'],
+            'zero' => ['0', '00'],
+        ];
+    }
+
+    #[DataProvider('exactPosterValues')]
+    public function test_exact_poster_detail_link_and_unchanged_form_preserve_the_literal_value(string $poster, string $editedPoster): void
+    {
         $source = (array) DB::table('releases')->first();
         $source['fromname'] = $poster;
         $source['searchname'] = 'Whitespace anchor release';
@@ -248,7 +256,7 @@ class ApiRequestMatrixTest extends TestCase
         $lookalike = $source;
         $lookalike['id'] = DB::table('releases')->max('id') + 1;
         $lookalike['guid'] = str_repeat('b', 40);
-        $lookalike['fromname'] = trim($poster);
+        $lookalike['fromname'] = $editedPoster;
         $lookalike['searchname'] = 'Different normalized poster release';
         DB::table('releases')->insert($lookalike);
 
@@ -313,25 +321,26 @@ class ApiRequestMatrixTest extends TestCase
             $form = HTMLDocument::createFromString($response->getContent());
             $visiblePoster = $form->querySelector('input[name="searchadvposter"]')?->getAttribute('value');
             $this->assertSame($poster, $visiblePoster);
-            $resubmitted = $this->actingAs($user)->get(route('search', [
-                'poster' => $poster,
-                'searchadvposter' => $visiblePoster,
-                'search_type' => 'adv',
-            ]));
+            $submitted = [];
+            foreach ($form->querySelectorAll('#searchForm input[name]') as $input) {
+                $submitted[$input->getAttribute('name')] = $input->getAttribute('value');
+            }
+            $this->assertSame($poster, $submitted['poster'] ?? null);
+            $resubmitted = $this->actingAs($user)->get(route('search', $submitted));
             $resubmitted->assertOk();
             $resubmitted->assertViewHas('exactPoster', $poster);
             $this->assertSame((int) $source['id'], (int) $resubmitted->viewData('results')->first()->id);
 
             $edited = $this->actingAs($user)->get(route('search', [
                 'poster' => $poster,
-                'searchadvposter' => trim($visiblePoster),
+                'searchadvposter' => $editedPoster,
                 'search_type' => 'adv',
             ]));
             $edited->assertOk();
-            $edited->assertViewHas('exactPoster', trim($poster));
+            $edited->assertViewHas('exactPoster', $editedPoster);
             $this->assertCount(1, $edited->viewData('results'));
             $this->assertSame((int) $lookalike['id'], (int) $edited->viewData('results')->first()->id);
-            $edited->assertViewHas('listQuery', fn (array $listQuery): bool => ($listQuery['poster'] ?? null) === trim($poster));
+            $edited->assertViewHas('listQuery', fn (array $listQuery): bool => ($listQuery['poster'] ?? null) === $editedPoster);
         } finally {
             if ($originalResolver === null) {
                 Model::unsetConnectionResolver();
