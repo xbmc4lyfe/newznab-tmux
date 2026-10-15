@@ -15,8 +15,9 @@ x-app: &app
     # www-data's login shell is nologin; tmux panes spawn $SHELL.
     SHELL: /bin/bash
     # Pulse's storage ingest upserts pulse_aggregates from every short-lived worker
-    # process and deadlocks under the tmux fan-out; only the web container records.
-    PULSE_ENABLED: "false"
+    # process and deadlocks under tmux fan-out; workers default off, web stays on.
+    # Opt in via docker/.env PULSE_ENABLED=true and config/app.env PULSE_PROCESSING_ENABLED=true.
+    PULSE_ENABLED: "${PULSE_ENABLED:-false}"
   volumes:
     - ./config/app.env:/app/.env
     - ./data/storage:/app/storage
@@ -102,7 +103,7 @@ services:
     environment:
       TZ: ${TZ:-UTC}
       SHELL: /bin/bash
-      PULSE_ENABLED: "false"
+      PULSE_ENABLED: "${PULSE_ENABLED:-false}"
       TERM: xterm-256color
       TMUX_SESSION_NAME: nntmux
       # Native decoding/planning belongs to CLI processing; web retains ffi.enable=false.
