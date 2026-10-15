@@ -107,7 +107,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p utility-evidence/build
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          python3 tests/Unit/test_benchmark_toolchain.py
+          bash scripts/benchmark-rust-toolchain.sh
           cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee utility-evidence/build/test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee utility-evidence/build/build.log
       - name: Record executed source, build tools and hosted runner identity
