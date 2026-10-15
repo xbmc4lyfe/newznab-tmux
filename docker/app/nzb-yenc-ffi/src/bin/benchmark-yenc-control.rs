@@ -83,13 +83,14 @@ fn control_order(seed: u64, fixture: &str, operation: &str, sample: u64) -> [&'s
 }
 
 fn run_child(command: &mut Command, prefix: &Path, timeout: Duration) -> Result<Value, String> {
-    run_child_mode(command, prefix, timeout, true)
+    run_child_mode(command, prefix, timeout, true, false)
 }
 fn run_child_mode(
     command: &mut Command,
     prefix: &Path,
     timeout: Duration,
     json_required: bool,
+    git_environment: bool,
 ) -> Result<Value, String> {
     let stdout_path = prefix.with_extension("stdout");
     let stderr_path = prefix.with_extension("stderr");
@@ -109,6 +110,11 @@ fn run_child_mode(
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr);
+    if git_environment {
+        // Apply after env_clear: inherited Git routing, config and tracing must
+        // not redirect the supplied checkout or trigger a prompt/lazy fetch.
+        command.envs(GIT_ENVIRONMENT.iter().copied());
+    }
     // SAFETY: this closure runs only in the freshly forked child. The two
     // libc calls are async-signal-safe; stack-only limits match native rlim_t.
     // Resource IDs1(FSIZE) and4(CORE) are shared by Linux and macOS headers.
@@ -865,7 +871,95 @@ fn kernel_verified(record: &Value, sha: &str) -> bool {
         && record["result"]["library_sha256"] == sha
 }
 fn run_child_raw(command: &mut Command, prefix: &Path, timeout: Duration) -> Result<Value, String> {
-    run_child_mode(command, prefix, timeout, false)
+    run_child_mode(command, prefix, timeout, false, false)
+}
+
+const GIT_ENVIRONMENT: [(&str, &str); 7] = [
+    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ("GIT_NO_LAZY_FETCH", "1"),
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+];
+
+fn successful_git_line(receipt: &Value) -> Option<String> {
+    if receipt["status"] != "ok"
+        || receipt["exit_code"] != 0
+        || receipt["direct_child_reaped"] != true
+        || receipt["stderr_bytes"] != 0
+    {
+        return None;
+    }
+    let bytes = read_regular(
+        Path::new(receipt["stdout_path"].as_str()?),
+        RETAINED_OUTPUT_CAP,
+    )
+    .ok()?;
+    let line = std::str::from_utf8(&bytes).ok()?.strip_suffix('\n')?;
+    if line.is_empty() || line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+        return None;
+    }
+    Some(line.to_owned())
+}
+
+fn canonical_commit(text: &str) -> Option<String> {
+    if matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(text.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn repository_identity(
+    git: &Path,
+    source: &Path,
+    declared: &str,
+    output: &Path,
+    label: &str,
+    timeout: Duration,
+    initial: Option<&Value>,
+) -> Value {
+    let probe = |name: &str, args: &[&str]| {
+        run_child_mode(
+            Command::new(git)
+                // Unsupported Git versions must fail before any object access;
+                // an older Git can silently ignore GIT_NO_LAZY_FETCH.
+                .arg("--no-lazy-fetch")
+                .arg("--no-pager")
+                .arg("-C")
+                .arg(source)
+                .args(args),
+            &output.join(format!("git-{label}-{name}")),
+            timeout,
+            false,
+            true,
+        )
+        .unwrap_or_else(|error| json!({"status":"executor_error","error":error}))
+    };
+    let head = probe(
+        "head",
+        &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
+    );
+    let root = probe("root", &["rev-parse", "--show-toplevel"]);
+    let observed_head = successful_git_line(&head).and_then(|s| canonical_commit(&s));
+    let observed_root = successful_git_line(&root).and_then(|s| Path::new(&s).canonicalize().ok());
+    let matches_manifest = observed_head.is_some() && observed_head == canonical_commit(declared);
+    let matches_source_root = observed_root.as_deref() == Some(source);
+    let matches_initial = initial.is_none_or(|before| {
+        before["verified"] == true
+            && before["observed_head"] == json!(observed_head)
+            && before["observed_root"] == json!(observed_root)
+    });
+    json!({"type":format!("repository_identity_{label}"),"source_root":source,
+        "declared_head":declared,"observed_head":observed_head,"observed_root":observed_root,
+        "matches_manifest":matches_manifest,"matches_source_root":matches_source_root,
+        "matches_initial":matches_initial,
+        "verified":matches_manifest && matches_source_root && matches_initial,
+        "git_executable":git,"environment_policy":GIT_ENVIRONMENT,
+        "head_receipt":head,"root_receipt":root,
+        "scope":"observed checkout commit and root; source-byte snapshots are separate; not proof of a clean worktree or build reproducibility"})
 }
 
 const PROBE: &str = r#"import ctypes,hashlib,json,sys
@@ -1070,6 +1164,7 @@ fn execute_owned(
             "orchestrator",
             std::env::current_exe().map_err(|e| e.to_string())?,
         ),
+        ("git", std::path::PathBuf::from("/usr/bin/git")),
     ] {
         let path = path.canonicalize().map_err(|e| e.to_string())?;
         let bytes = read_regular(&path, 67_108_864)?;
@@ -1083,6 +1178,22 @@ fn execute_owned(
             "scope":"executable identity; not a complete dynamic runtime or host image snapshot"}),
         );
         runtime_paths.insert(role, path);
+    }
+    let declared_head = manifest["git_head"]
+        .as_str()
+        .ok_or("missing declared commit")?;
+    let repository_before = repository_identity(
+        &runtime_paths["git"],
+        source,
+        declared_head,
+        output,
+        "before",
+        timeout,
+        None,
+    );
+    emit(out, &repository_before)?;
+    if repository_before["verified"] != true {
+        return Err("declared commit is not bound to the supplied checkout".into());
     }
     let probe = output.join("kernel-probe.py");
     frozen_file(&probe, PROBE.as_bytes())?;
@@ -1241,12 +1352,23 @@ fn execute_owned(
     // Always attempt the ending endpoint after a scheduling/executor failure.
     let cpu_after = counter("after");
     emit(out, &cpu_after)?;
+    let repository_after = repository_identity(
+        &runtime_paths["git"],
+        source,
+        declared_head,
+        output,
+        "after",
+        timeout,
+        Some(&repository_before),
+    );
+    emit(out, &repository_after)?;
     let after = identity_receipts(&identities);
-    let intact = after
-        .as_array()
-        .ok_or("identity shape")?
-        .iter()
-        .all(|r| r["matches"] == true);
+    let intact = repository_after["verified"] == true
+        && after
+            .as_array()
+            .ok_or("identity shape")?
+            .iter()
+            .all(|r| r["matches"] == true);
     emit(
         out,
         &json!({"type":"identity_after","receipts":after,"all_identities_unchanged":intact}),
@@ -1325,6 +1447,235 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn fixture_git(source: &Path, args: &[&str]) -> String {
+        let output = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(source)
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .envs(GIT_ENVIRONMENT)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim_end()
+            .to_owned()
+    }
+
+    fn empty_repository(source: &Path) -> String {
+        fixture_git(source, &["init", "--quiet"]);
+        fixture_git(
+            source,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--no-gpg-sign",
+                "--allow-empty",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        );
+        fixture_git(source, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn repository_binding_observes_real_commit_root_and_final_drift() {
+        let scratch = Scratch::new();
+        let source = scratch.0.join("repository");
+        fs::create_dir(&source).unwrap();
+        let declared = empty_repository(&source);
+        let source = source.canonicalize().unwrap();
+        let before = repository_identity(
+            Path::new("/usr/bin/git"),
+            &source,
+            &declared,
+            &scratch.0,
+            "before",
+            Duration::from_secs(5),
+            None,
+        );
+        assert_eq!(before["verified"], true);
+        for name in ["head_receipt", "root_receipt"] {
+            let args = before[name]["command"].as_array().unwrap();
+            assert_eq!(args[1], "--no-lazy-fetch");
+            assert_eq!(args[2], "--no-pager");
+        }
+        let stale = repository_identity(
+            Path::new("/usr/bin/git"),
+            &source,
+            &"0".repeat(40),
+            &scratch.0,
+            "stale",
+            Duration::from_secs(5),
+            None,
+        );
+        assert_eq!(stale["verified"], false);
+        assert_eq!(stale["observed_head"], declared);
+        assert_eq!(stale["matches_source_root"], true);
+        let nested = source.join("copied-source");
+        fs::create_dir(&nested).unwrap();
+        let copied = repository_identity(
+            Path::new("/usr/bin/git"),
+            &nested,
+            &declared,
+            &scratch.0,
+            "nested",
+            Duration::from_secs(5),
+            None,
+        );
+        assert_eq!(copied["verified"], false);
+        assert_eq!(copied["matches_manifest"], true);
+        assert_eq!(copied["matches_source_root"], false);
+        fixture_git(
+            &source,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--no-gpg-sign",
+                "--allow-empty",
+                "--quiet",
+                "-m",
+                "drift",
+            ],
+        );
+        let after = repository_identity(
+            Path::new("/usr/bin/git"),
+            &source,
+            &declared,
+            &scratch.0,
+            "after",
+            Duration::from_secs(5),
+            Some(&before),
+        );
+        assert_eq!(after["verified"], false);
+        assert_eq!(after["matches_initial"], false);
+        assert_eq!(after["matches_manifest"], false);
+        assert_ne!(after["observed_head"], before["observed_head"]);
+    }
+
+    #[test]
+    fn repository_binding_accepts_linked_worktrees_and_clears_git_routing() {
+        let scratch = Scratch::new();
+        let source = scratch.0.join("repository");
+        fs::create_dir(&source).unwrap();
+        let declared = empty_repository(&source);
+        let linked = scratch.0.join("linked");
+        fixture_git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let linked = linked.canonicalize().unwrap();
+        let receipt = repository_identity(
+            Path::new("/usr/bin/git"),
+            &linked,
+            &declared.to_uppercase(),
+            &scratch.0,
+            "linked",
+            Duration::from_secs(5),
+            None,
+        );
+        assert_eq!(receipt["verified"], true);
+        let raw = run_child_mode(
+            Command::new("/usr/bin/git")
+                .arg("-C")
+                .arg(&linked)
+                .args(["rev-parse", "--verify", "HEAD^{commit}"])
+                .env("GIT_DIR", "/does-not-exist")
+                .env("GIT_WORK_TREE", "/does-not-exist")
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "include.path")
+                .env("GIT_CONFIG_VALUE_0", "/does-not-exist"),
+            &scratch.0.join("injected"),
+            Duration::from_secs(5),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(successful_git_line(&raw), Some(declared));
+    }
+
+    #[test]
+    fn repository_binding_retains_missing_checkout_failure() {
+        let scratch = Scratch::new();
+        let missing = repository_identity(
+            Path::new("/usr/bin/git"),
+            &scratch.0,
+            &"1".repeat(40),
+            &scratch.0,
+            "missing",
+            Duration::from_secs(5),
+            None,
+        );
+        assert_eq!(missing["verified"], false);
+        assert!(missing["observed_head"].is_null());
+        assert_eq!(missing["head_receipt"]["status"], "child_failed");
+        assert_eq!(missing["head_receipt"]["direct_child_reaped"], true);
+    }
+
+    #[test]
+    fn git_receipts_require_exact_single_line_output_and_complete_process_success() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("stdout");
+        let mut receipt = json!({"status":"ok","exit_code":0,"stderr_bytes":0,
+            "direct_child_reaped":true,"stdout_path":path});
+        for bytes in [
+            b"abc\n".as_slice(),
+            b"abc",
+            b"abc\nextra\n",
+            b"abc\r\n",
+            b"abc\0\n",
+            b"\n",
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(successful_git_line(&receipt).is_some(), bytes == b"abc\n");
+        }
+        fs::write(&path, b"abc\n").unwrap();
+        receipt["status"] = json!("timeout");
+        assert!(successful_git_line(&receipt).is_none());
+        receipt["status"] = json!("ok");
+        receipt["stderr_bytes"] = json!(1);
+        assert!(successful_git_line(&receipt).is_none());
+        receipt["stderr_bytes"] = json!(0);
+        receipt["direct_child_reaped"] = json!(false);
+        assert!(successful_git_line(&receipt).is_none());
+        for n in [40, 64] {
+            assert_eq!(canonical_commit(&"A".repeat(n)), Some("a".repeat(n)));
+        }
+        for text in [
+            "a".repeat(39),
+            "a".repeat(41),
+            "g".repeat(40),
+            format!("{}\n", "a".repeat(40)),
+        ] {
+            assert!(canonical_commit(&text).is_none());
         }
     }
 
@@ -2046,6 +2397,17 @@ mod tests {
             .collect();
         assert_eq!(probes.len(), 2);
         assert!(probes.iter().all(|r| r["verified"] == true));
+        for kind in ["repository_identity_before", "repository_identity_after"] {
+            let receipt = records.iter().find(|r| r["type"] == kind).unwrap();
+            assert_eq!(receipt["verified"], true);
+            assert_eq!(
+                receipt["observed_head"],
+                serde_json::from_slice::<Value>(
+                    &read_regular(Path::new(&admitted.paths["manifest-a"]), 1_048_576).unwrap()
+                )
+                .unwrap()["git_head"]
+            );
+        }
         for kind in ["identity_before", "identity_after"] {
             let receipt = records.iter().find(|r| r["type"] == kind).unwrap();
             assert!(
@@ -2067,16 +2429,14 @@ mod tests {
             &read_regular(Path::new(&admitted.paths["manifest-a"]), 1_048_576).unwrap(),
         )
         .unwrap();
-        for stale_source in [false, true] {
-            let name = if stale_source {
-                "stale-source"
-            } else {
-                "mismatched-manifest"
-            };
+        for name in ["mismatched-manifest", "stale-source", "stale-commit"] {
+            let stale_source = name == "stale-source";
             let mut invalid = original.clone();
             if stale_source {
                 let sources = invalid["rust_source_sha256"].as_object_mut().unwrap();
                 *sources.values_mut().next().unwrap() = json!("0".repeat(64));
+            } else if name == "stale-commit" {
+                invalid["git_head"] = json!("0".repeat(40));
             } else {
                 invalid["library_sha256"] = json!("0".repeat(64));
             }
@@ -2088,7 +2448,8 @@ mod tests {
                 if arg.starts_with("--output=") {
                     *arg = format!("--output={}", failure_output.display());
                 } else if arg.starts_with("--manifest-b=")
-                    || (stale_source && arg.starts_with("--manifest-a="))
+                    || ((stale_source || name == "stale-commit")
+                        && arg.starts_with("--manifest-a="))
                 {
                     *arg = format!("{}={}", arg.split_once('=').unwrap().0, manifest.display());
                 }
@@ -2108,6 +2469,17 @@ mod tests {
                 .collect();
             assert_eq!(failures.last().unwrap()["type"], "run_failure");
             assert!(failures.iter().all(|r| r["type"] != "observation"));
+            if name == "stale-commit" {
+                let binding = failures
+                    .iter()
+                    .find(|r| r["type"] == "repository_identity_before")
+                    .unwrap();
+                assert_eq!(binding["verified"], false);
+                assert_eq!(binding["declared_head"], "0".repeat(40));
+                assert_eq!(binding["observed_head"], original["git_head"]);
+                assert_eq!(binding["matches_manifest"], false);
+                assert_eq!(binding["matches_source_root"], true);
+            }
         }
     }
 
