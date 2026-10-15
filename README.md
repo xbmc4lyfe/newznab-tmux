@@ -107,9 +107,9 @@ After updating the checkout, back up the database and use `make -C docker deploy
 
 Persistent data lives in `docker/data/`, logs in `docker/logs/`, and database dumps in `docker/backups/`. The backup command covers MariaDB; preserve application configuration and NZB/storage files separately. If initialization fails, inspect `make -C docker logs` before retrying; a partially initialized database needs recovery rather than a reset.
 
-## Cloud and bare-metal deployments
+## Cloud deployments
 
-For existing AWS, Hetzner, OVHcloud, and physical-server installations, use the [deployment runbooks](docs/deployment.md). They cover initialization, releases, rollback, encrypted storage, backups, and recovery.
+For Docker-based deployments on AWS, Hetzner, and OVHcloud, use the [deployment runbooks](docs/deployment.md). They cover initialization, releases, rollback, encrypted storage, backups, and recovery.
 
 ## Credits and license
 
