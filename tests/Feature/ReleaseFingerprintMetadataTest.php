@@ -147,6 +147,29 @@ final class ReleaseFingerprintMetadataTest extends TestCase
     }
 
     #[Test]
+    public function it_preserves_experimental_xz_footer_evidence_through_yenc(): void
+    {
+        $sample = hex2bin('fd377a585a000000ff12d94102c0050121010000f05dfb9f010000410000000000011101ada6580406729e7a010000000000595a');
+        self::assertIsString($sample);
+        $native = (new NativeMetadataParser)->parseFormats($sample);
+        if (! is_array($native['headers'][0]['first_block']['following_footer'] ?? null)) {
+            self::markTestSkipped('An experimental-xz-index Rust library is required for Footer propagation.');
+        }
+        $body = YencArticles::article($sample);
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        self::assertSame(hash('sha256', $body), $analysis['metadata']['article_body_sha256']);
+        $block = $analysis['metadata']['decoded_format_metadata']['headers'][0]['first_block'];
+        self::assertSame($native['headers'][0]['first_block']['following_footer'], $block['following_footer']);
+        self::assertSame('footer_index_and_header_declarations_match', $block['following_footer']['status']);
+        self::assertSame('06729e7a010000000000595a', $block['following_footer']['observed_hex']);
+        self::assertSame(40, $block['following_footer']['start_offset']);
+        self::assertSame(52, $block['following_footer']['end_offset_exclusive']);
+        self::assertFalse($block['whole_stream_validated']);
+        self::assertFalse($block['content_decompressed']);
+    }
+
+    #[Test]
     public function it_exposes_bounded_xz_first_block_declarations_and_sample_ranges(): void
     {
         $sample = hex2bin('fd377a585a000000ff12d94102c0050121010000f05dfb9f010000410000000000011101ada6580406729e7a010000000000595a');

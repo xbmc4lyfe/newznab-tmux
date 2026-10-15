@@ -11509,9 +11509,18 @@ mod tests {
                 "equal"
             );
             assert_eq!(block["following_index"]["crc32_valid"], true);
+            assert_eq!(block["following_footer"]["crc32_valid"], true);
+            assert_eq!(
+                block["following_footer"]["status"],
+                "footer_index_and_header_declarations_match"
+            );
+            assert_eq!(block["whole_stream_validated"], false);
         }
         #[cfg(not(feature = "experimental-xz-index"))]
-        assert!(block.get("following_index").is_none());
+        {
+            assert!(block.get("following_index").is_none());
+            assert!(block.get("following_footer").is_none());
+        }
         assert_eq!(block["content_decompressed"], false);
     }
 
