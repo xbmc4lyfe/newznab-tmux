@@ -12,6 +12,8 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/export-benchmark-summary.py"
+RUST_SOURCES = {str(path.relative_to(SCRIPT.parents[1])): "a" * 64 for path in
+                (SCRIPT.parents[1] / "docker/app/nzb-yenc-ffi/src").rglob("*.rs")}
 INPUTS = {"fingerprint-ffi": "utility-evidence/fingerprint-ffi/report.json", "fingerprint-worker": "utility-evidence/fingerprint-worker/report.json", "cpu-snapshot": "utility-evidence/cpu-snapshot/report.json", "cpp": "benchmark-evidence/paired/observations.jsonl", "php": "benchmark-evidence/php-paired/observations.jsonl", "profile": "processing-evidence/profile/observations.jsonl", "presentation": "benchmark-evidence/results.jsonl"}
 # Literal test sentinel; no credentials or runtime configuration are read.
 UNPUBLISHED_MARKER = "synthetic-unpublished-fixture"
@@ -28,7 +30,7 @@ def paired(kind="cpp"):
 def profile():
     records = [{"type": "protocol", "command": UNPUBLISHED_MARKER}]
     for size, density, phase in itertools.product((4096, 524288, 1048576), ("ordinary", "heavy"), ("full-analyzer", "framing", "headers", "body-metadata", "relationship", "raw-body", "whole-body")):
-        records.append({"type": "observation", "size": size, "density": density, "phase": phase, "eligible": True, "status": "ok", "result": {"status": "ok", "median_ms": 2.5, "min_ms": 2, "max_ms": 3, "metadata": UNPUBLISHED_MARKER}, "command": [UNPUBLISHED_MARKER]})
+        records.append({"type": "observation", "size": size, "density": density, "phase": phase, "eligible": True, "status": "ok", "result": {"status": "ok", "median_ms": 2.5, "min_ms": 2, "max_ms": 3, "observations": [{"warmup": False, "elapsed_ms": 2.5}], "metadata": UNPUBLISHED_MARKER}, "command": [UNPUBLISHED_MARKER]})
     records.append({"type": "summary", "status": "ok", "invalid_observations": 0, "source_and_library_identities_stable": True, "instrumentation_identities_stable": True})
     return records
 
@@ -105,12 +107,61 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             protocol["runtime_manifest" if kind == "profile" else "runtime"] = []
             self.assertEqual("unknown", self.run_export(kind, records)["rust_payload_mode"])
 
-    def run_export(self, kind, records=None, raw=None, runtime=None, runtime_raw=None, resources=None):
+    def run_export(self, kind, records=None, raw=None, runtime=None, runtime_raw=None, resources=None, proof=True, qualification=None, frozen_libraries=True):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            if kind in ("cpp", "php", "profile", "presentation") and proof and records is not None:
+                records = copy.deepcopy(records)
+                if kind == "presentation":
+                    runtime = {"git_head": "d" * 40, "github_run_id": "123", "runner_arch": "X64",
+                               "rust_source_sha256": dict(RUST_SOURCES), "rust_library_sha256": "c" * 64,
+                               "presentation_protocol": {"samples": 21, "iterations": 100, "order_seed": 20261014}, **(runtime or {})}
+                    for record in records:
+                        record["library_sha256"] = "c" * 64
+                        if record.get("candidate_backend") == "rust":
+                            record["order_seed"] = 20261014
+                            if type(record.get("rows")) is int and record["rows"] > 0:
+                                record["iterations"] = max(100, 10000 // record["rows"])
+                protocols = [row for row in records if row.get("type") == "protocol"]
+                if len(protocols) == 1:
+                    protocol = protocols[0]
+                    embedded = protocol.get("runtime_manifest", {}) if kind == "profile" else protocol.get("runtime", {}).get("manifest", {}).get("contents", {}) if isinstance(protocol.get("runtime", {}), dict) else None
+                    if isinstance(embedded, dict):
+                        receipt = {"git_head": "d" * 40, "github_run_id": "123", "runner_arch": "X64",
+                                   "rust_source_sha256": dict(RUST_SOURCES), "rust_library_sha256": "c" * 64,
+                                   "cpp_library_sha256": "b" * 64, "rust_payload_kernel_id": 3 if kind == "cpp" else 2,
+                                   "rustc": "rustc 1.98.0", "php": "PHP 8.5", **embedded}
+                        if runtime is not None:
+                            receipt.update(runtime)
+                        if kind == "profile":
+                            protocol["runtime_manifest"] = receipt
+                            protocol["sources"] = {**RUST_SOURCES, **protocol.get("sources", {})}
+                            protocol["library"] = {"sha256": "c" * 64}
+                        else:
+                            protocol["runtime"] = {"manifest": {"contents": receipt}}
+                            protocol["source_sha256"] = {**RUST_SOURCES, **protocol.get("source_sha256", {})}
+                            protocol["libraries"] = {"rust": {"sha256": "c" * 64}}
+                            if kind == "cpp":
+                                protocol["libraries"]["cpp"] = {"sha256": "b" * 64}
+                        runtime = receipt
+                        if kind == "cpp" and qualification is None:
+                            qualification = {"status": "qualified", "runner_arch": "X64", "required_kernel_id": 3,
+                                "observed_kernel": {"id": 3, "name": "avx512-vbmi2"}, "git_head": "d" * 40,
+                                "rust_library_sha256": "c" * 64, "cpp_library_sha256": "b" * 64}
+            if kind in ("cpp", "php", "profile", "presentation") and runtime is not None:
+                runtime_path = root / ("processing-evidence/build/runtime.json" if kind == "profile" else "benchmark-evidence/build/runtime.json")
+                runtime_path.parent.mkdir(parents=True, exist_ok=True)
+                runtime_path.write_text(runtime_raw if runtime_raw is not None else json.dumps(runtime))
+            if qualification is not None:
+                qualification_path = root / "benchmark-evidence/build/kernel-qualification.json"
+                qualification_path.parent.mkdir(parents=True, exist_ok=True)
+                qualification_path.write_text(json.dumps(qualification))
+                if qualification.get("status") == "unsupported_hardware" and frozen_libraries:
+                    for backend in ("rust", "cpp"):
+                        (qualification_path.parent / (backend + ".so")).write_bytes(("fixture-" + backend).encode())
             if records is not None or raw is not None:
                 source = root / INPUTS[kind]
-                source.parent.mkdir(parents=True)
+                source.parent.mkdir(parents=True, exist_ok=True)
                 source.write_text(raw if raw is not None else json.dumps(records) if kind in ("fingerprint-ffi", "fingerprint-worker", "cpu-snapshot") else "".join(json.dumps(row) + "\n" for row in records))
             if kind in ("fingerprint-ffi", "fingerprint-worker", "cpu-snapshot"):
                 runtime_path = root / "utility-evidence/runtime.json"
@@ -122,7 +173,7 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
                     spec.loader.exec_module(fixture)
                     fixture.write_resources(root, resources)
             env = dict(os.environ, GITHUB_SHA="d" * 40, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2", GITHUB_REPOSITORY="xbmc4lyfe/newznab-tmux")
-            result = subprocess.run(["python3", str(SCRIPT), "--kind", kind, "--runner", "linux-x64", "--output", "summary.json"], cwd=root, env=env, capture_output=True, text=True)
+            result = subprocess.run(["python3", "-B", str(SCRIPT), "--kind", kind, "--runner", "linux-x64", "--output", "summary.json"], cwd=root, env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             content = (root / "summary.json").read_text()
             self.assertNotIn(UNPUBLISHED_MARKER, content)
@@ -132,6 +183,113 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             self.assertEqual((summary["run_id"], summary["run_attempt"]), (123, 2))
             self.assertEqual(summary["repository"], "xbmc4lyfe/newznab-tmux")
             return summary
+
+    def test_yenc_exports_full_implementation_and_frozen_receipt_provenance(self):
+        for kind in ("cpp", "php", "profile"):
+            records = profile() if kind == "profile" else paired(kind)
+            summary = self.run_export(kind, records)
+            self.assertEqual(summary.get("provenance_status"), "verified_current")
+            self.assertEqual(summary["runtime_identity"]["executed_sha"], "d" * 40)
+            self.assertEqual(summary["source_sha256"]["docker/app/nzb-yenc-ffi/src/payload_decoder.rs"], "a" * 64)
+            self.assertEqual(summary["source_sha256"]["docker/app/nzb-yenc-ffi/src/yenc_framing.rs"], "a" * 64)
+            for field in ("protocol_sha256", "report_sha256", "runtime_manifest_sha256"):
+                self.assertRegex(summary[field], "^[a-f0-9]{64}$")
+            self.assertEqual(summary["rust_payload_kernel"], {"id": 3, "name": "avx512-vbmi2"} if kind == "cpp" else {"id": 2, "name": "avx2"})
+            self.assertEqual(summary["hardware_qualification"], "designated_kernel" if kind == "cpp" else "observed_only")
+
+    def test_yenc_legacy_and_wrong_source_receipts_cannot_claim_current_measurements(self):
+        for kind in ("cpp", "php", "profile"):
+            records = profile() if kind == "profile" else paired(kind)
+            legacy = self.run_export(kind, records, proof=False)
+            self.assertEqual(legacy["status"], "incomplete_provenance")
+            self.assertEqual(legacy["provenance_status"], "incomplete")
+            self.assertEqual(legacy["rust_payload_mode"], "unknown")
+            wrong = self.run_export(kind, records, runtime={"git_head": "e" * 40})
+            self.assertEqual(wrong["status"], "invalid")
+            self.assertEqual(wrong["provenance_status"], "invalid")
+
+    def test_profile_keeps_experiment_candidate_source_separate(self):
+        summary = self.run_export("profile", profile(), runtime={"candidate_git_head": "e" * 40,
+            "candidate_source_sha256": dict(RUST_SOURCES), "candidate_library_sha256": "c" * 64,
+            "candidate_payload_kernel_id": 2})
+        self.assertEqual(summary["head_sha"], "d" * 40)
+        self.assertEqual(summary.get("candidate_head_sha"), "e" * 40)
+        self.assertEqual(summary["provenance_status"], "verified_experiment")
+        self.assertEqual(summary["status"], "experimental_measurement")
+
+    def test_yenc_rejects_receipt_source_library_and_runtime_disagreements(self):
+        bad_sources = dict(RUST_SOURCES)
+        bad_sources["docker/app/nzb-yenc-ffi/src/payload_decoder.rs"] = "f" * 64
+        missing_sources = dict(RUST_SOURCES)
+        del missing_sources["docker/app/nzb-yenc-ffi/src/zstd_frame.rs"]
+        for change in ({"rust_source_sha256": bad_sources}, {"rust_source_sha256": missing_sources},
+                       {"rust_library_sha256": "f" * 64}, {"github_run_id": "124"},
+                       {"rust_payload_kernel_id": True}, {"rust_payload_kernel_id": 2.0}):
+            with self.subTest(change=change):
+                self.assertEqual(self.run_export("php", paired("php"), runtime=change)["status"], "invalid")
+        mismatch = self.run_export("php", paired("php"), runtime_raw=json.dumps({"git_head": "d" * 40}))
+        self.assertEqual(mismatch["status"], "invalid")
+        current_candidate_mismatch = self.run_export("profile", profile(), runtime={"candidate_git_head": "d" * 40,
+            "candidate_source_sha256": bad_sources, "candidate_library_sha256": "c" * 64})
+        self.assertEqual(current_candidate_mismatch["status"], "invalid")
+
+    def test_private_and_unreviewed_source_names_do_not_enter_public_provenance(self):
+        rows = paired("php")
+        private = (".env", "/tmp/private-source.rs", "docker/app/nzb-yenc-ffi/src/../../private.rs",
+                   "docker/app/nzb-yenc-ffi/src/unreviewed.rs")
+        rows[0]["source_sha256"].update(dict.fromkeys(private, "f" * 64))
+        summary = self.run_export("php", rows)
+        self.assertEqual(summary["status"], "useful_improvement")
+        for path in private:
+            self.assertNotIn(path, json.dumps(summary))
+
+    def unsupported_receipts(self):
+        runtime = {"git_head": "d" * 40, "github_run_id": "123", "runner_arch": "X64",
+                   "rust_source_sha256": dict(RUST_SOURCES), "rust_library_sha256": hashlib.sha256(b"fixture-rust").hexdigest(),
+                   "cpp_library_sha256": hashlib.sha256(b"fixture-cpp").hexdigest(), "rust_payload_mode": "incumbent",
+                   "rust_payload_kernel": {"id": 2, "name": "avx2", "basis": UNPUBLISHED_MARKER}}
+        qualification = {"status": "unsupported_hardware", "runner_arch": "X64", "required_kernel_id": 3,
+                         "observed_kernel": {"id": 2, "name": "avx2"}, "git_head": "d" * 40,
+                         "rust_library_sha256": runtime["rust_library_sha256"], "cpp_library_sha256": runtime["cpp_library_sha256"]}
+        return runtime, qualification
+
+    def test_cpp_unsupported_hardware_requires_matching_frozen_receipts(self):
+        runtime, qualification = self.unsupported_receipts()
+        summary = self.run_export("cpp", runtime=runtime, qualification=qualification)
+        self.assertEqual(summary["status"], "unsupported_hardware")
+        self.assertEqual(summary["provenance_status"], "verified_current")
+        self.assertEqual(summary["hardware_qualification"], "unsupported_hardware")
+        self.assertEqual(summary["rust_payload_kernel"], {"id": 2, "name": "avx2"})
+        self.assertEqual(summary["required_payload_kernel"], {"id": 3, "name": "avx512-vbmi2"})
+        self.assertEqual(summary["rows"], [])
+        self.assertRegex(summary["kernel_qualification_sha256"], "^[a-f0-9]{64}$")
+        for change in ({"git_head": "e" * 40}, {"rust_library_sha256": "f" * 64},
+                       {"observed_kernel": {"id": 2.0, "name": "avx2"}},
+                       {"required_kernel_id": 2}, {"observed_kernel": {"id": 2, "name": "unsafe"}}):
+            with self.subTest(change=change):
+                bad = self.run_export("cpp", runtime=runtime, qualification={**qualification, **change})
+                self.assertNotEqual(bad["status"], "unsupported_hardware")
+        missing = self.run_export("cpp", runtime=runtime)
+        self.assertNotEqual(missing["status"], "unsupported_hardware")
+        missing_library = self.run_export("cpp", runtime=runtime, qualification=qualification, frozen_libraries=False)
+        self.assertNotEqual(missing_library["status"], "unsupported_hardware")
+
+    def test_presentation_provenance_ties_full_native_graph_and_recorded_protocol(self):
+        summary = self.run_export("presentation", presentation())
+        self.assertEqual(summary.get("provenance_status"), "verified_current")
+        self.assertEqual(summary["runtime_identity"]["executed_sha"], "d" * 40)
+        self.assertEqual(summary["source_sha256"]["docker/app/nzb-yenc-ffi/src/xz_first_block.rs"], "a" * 64)
+        for field in ("protocol_sha256", "report_sha256", "runtime_manifest_sha256"):
+            self.assertRegex(summary[field], "^[a-f0-9]{64}$")
+        self.assertEqual(self.run_export("presentation", presentation(), proof=False)["status"], "incomplete_provenance")
+        bad = self.run_export("presentation", presentation(), runtime={"presentation_protocol": {"samples": 22, "iterations": 100, "order_seed": 20261014}})
+        self.assertEqual(bad["status"], "invalid")
+
+    def test_malformed_presentation_rows_still_export_invalid_public_json(self):
+        for value in (0, [], "16", True):
+            rows = presentation()
+            rows[-1]["rows"] = value
+            self.assertEqual(self.run_export("presentation", rows)["status"], "invalid")
 
     def utility(self, kind):
         cpu = kind == "cpu-snapshot"
@@ -472,8 +630,8 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             summary = self.run_export(kind, paired(kind))
             self.assertEqual(summary["status"], "useful_improvement")
             self.assertEqual(len(summary["rows"]), 24)
-            self.assertEqual(summary["source_sha256"], {"composer.lock": "a" * 64})
-            self.assertEqual(summary["library_sha256"], {"rust": "c" * 64})
+            self.assertEqual(summary["source_sha256"], {**RUST_SOURCES, "composer.lock": "a" * 64})
+            self.assertEqual(summary["library_sha256"], {"rust": "c" * 64, **({"cpp": "b" * 64} if kind == "cpp" else {})})
             self.assertEqual(summary["rows"][0]["median_rust_over_" + kind], 0.7)
 
     def test_missing_final_summary_is_partial(self):

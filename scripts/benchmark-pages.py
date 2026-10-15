@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 import html
 import io
+import importlib.util
+import itertools
 import json
 import math
 import os
@@ -88,6 +90,9 @@ REMAINING_SOURCES = {REMAINING_WRAPPER, "composer.json", "composer.lock", "docke
     "docker/app/nzb-yenc-ffi/src/" + module + ".rs" for modules in REMAINING_MODULES.values() for module in modules}
 
 CALLER_SOURCES |= VENDOR_SOURCE_PATHS | REMAINING_SOURCES | REMAINING_INSTRUMENTATION
+CALLER_SOURCES |= {'app/Services/Yenc/' + name + '.php' for name in (
+    'ArticleFrame', 'DecoderFactory', 'NativePayloadDecoder', 'PayloadDecoder',
+    'PhpPayloadDecoder', 'RawPayloadDecoder', 'YencPart')}
 LIMIT = 1024 * 1024
 
 
@@ -161,7 +166,141 @@ def select_run(runs, sha):
     return max(eligible, key=lambda run: int(run['id']), default=None)
 
 
-def validate_summary(summary, run, kind, runner):
+def validate_native_rows(summary, kind, run, historical=False):
+    """A current success requires a complete, internally consistent public matrix."""
+    status, rows = summary.get('status'), summary['rows']
+    success = {'cpp': {'useful_improvement', 'inconclusive', 'regression'},
+               'php': {'useful_improvement', 'inconclusive', 'regression'},
+               'profile': {'ok'}, 'presentation': {'passed', 'gate_failed'}}[kind]
+    measured = status in success or status == 'experimental_measurement'
+    if status not in success | {None, 'missing', 'partial', 'invalid', 'incomplete_provenance',
+                               'unsupported_hardware', 'experimental_measurement'}:
+        raise ValueError('Unknown native summary status')
+    provenance = summary.get('provenance_status')
+    if (any(not isinstance(key, str) or key not in CALLER_SOURCES and not re.fullmatch(r'docker/app/nzb-yenc-ffi/src/(?:bin/)?[a-z0-9_-]+\.rs', key)
+            for key in summary.get('source_sha256', {}))
+            or set(summary.get('library_sha256', {})) - {'native', 'rust', 'cpp'}):
+        raise ValueError('Unexpected native source or library identity')
+    if provenance not in (None, 'verified_current', 'verified_experiment', 'incomplete', 'invalid'):
+        raise ValueError('Invalid native provenance status')
+    runtime = summary.get('runtime_identity', {})
+    runtime_keys = {'executed_sha', 'rustc', 'cargo', 'php', 'python', 'architecture', 'cpu_model',
+                    'runner_image_os', 'runner_image_version', 'build_profile', 'logical_cpus'}
+    if (not isinstance(runtime, dict) or set(runtime) - runtime_keys
+            or any(type(v) is not int or v < 1 if k == 'logical_cpus' else not isinstance(v, str) or len(v) > 4096
+                   for k, v in runtime.items())
+            or runtime and runtime.get('executed_sha') != run['head_sha']):
+        raise ValueError('Native runtime source mismatch')
+    for field in ('runtime_manifest_sha256', 'report_sha256', 'protocol_sha256', 'kernel_qualification_sha256'):
+        if field in summary and (not isinstance(summary[field], str) or not re.fullmatch('[0-9a-f]{64}', summary[field])):
+            raise ValueError('Invalid native evidence digest')
+    names = {0: 'scalar', 1: 'ssse3', 2: 'avx2', 3: 'avx512-vbmi2', 4: 'neon'}
+    for field in ('rust_payload_kernel', 'required_payload_kernel'):
+        kernel = summary.get(field)
+        if field in summary and (not isinstance(kernel, dict) or set(kernel) != {'id', 'name'}
+                or type(kernel['id']) is not int or names.get(kernel['id']) != kernel['name']):
+            raise ValueError('Invalid measured kernel identity')
+    hardware = summary.get('hardware_qualification', 'unavailable')
+    if hardware not in ('designated_kernel', 'unsupported_hardware', 'observed_only', 'unavailable'):
+        raise ValueError('Invalid hardware qualification')
+    candidate = summary.get('candidate_head_sha')
+    if candidate is not None and (not isinstance(candidate, str) or not re.fullmatch('[0-9a-f]{40}', candidate)
+                                  or candidate == run['head_sha']):
+        raise ValueError('Invalid experiment source identity')
+    if status == 'experimental_measurement' and (provenance != 'verified_experiment' or candidate is None):
+        raise ValueError('Experiment cannot masquerade as current-source measurement')
+    if status == 'unsupported_hardware':
+        required = 4 if summary['runner'] == 'ubuntu-24.04-arm' else 3
+        if (kind != 'cpp' or rows or hardware != 'unsupported_hardware' or provenance != 'verified_current'
+                or summary.get('required_payload_kernel', {}).get('id') != required
+                or summary.get('rust_payload_kernel', {}).get('id') in (None, required)
+                or 'kernel_qualification_sha256' not in summary or not runtime
+                or 'runtime_manifest_sha256' not in summary or not summary.get('source_sha256')
+                or set(summary.get('library_sha256', {})) != {'cpp', 'rust'}):
+            raise ValueError('Unsupported hardware lacks its frozen receipt')
+    if measured and not historical:
+        implementation_sources = {p.relative_to(Path(__file__).resolve().parents[1]).as_posix()
+                                  for p in (Path(__file__).resolve().parents[1] / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs')}
+        if (provenance != ('verified_experiment' if status == 'experimental_measurement' else 'verified_current')
+                or not runtime or not summary.get('source_sha256') or not summary.get('library_sha256')
+                or provenance == 'verified_current' and not implementation_sources <= set(summary['source_sha256'])
+                or any(field not in summary for field in ('runtime_manifest_sha256', 'report_sha256', 'protocol_sha256'))):
+            raise ValueError('Current native metrics lack executed-source provenance')
+        if kind == 'cpp':
+            required = {'id': 4, 'name': 'neon'} if summary['runner'] == 'ubuntu-24.04-arm' else {'id': 3, 'name': 'avx512-vbmi2'}
+            if (hardware != 'designated_kernel' or summary.get('required_payload_kernel') != required
+                    or summary.get('rust_payload_kernel') != required or 'kernel_qualification_sha256' not in summary):
+                raise ValueError('Designated kernel comparison lacks matching hardware proof')
+    if kind in ('cpp', 'php'):
+        expected = set(itertools.product((4096, 524288, 1048576, 8388608), ('ordinary', 'heavy'), ('tolerant', 'strict', 'body')))
+        keys = [(r.get('size'), r.get('density'), r.get('path')) for r in rows]
+        if measured:
+            for row in rows:
+                ratio, interval = row.get('median_rust_over_' + kind), row.get('bootstrap_95_percent_interval')
+                if (type(row.get('eligible_pairs')) is not int or row['eligible_pairs'] < 3
+                        or type(row.get('invalid_pairs')) is not int or row['invalid_pairs'] != 0
+                        or row.get('decision') not in success or not positive(ratio)
+                        or not isinstance(interval, list) or len(interval) != 2
+                        or not all(positive(v) for v in interval) or interval[0] > interval[1]):
+                    raise ValueError('Invalid decoder measurement')
+            decisions = {r['decision'] for r in rows}
+            aggregate = ('regression' if 'regression' in decisions else 'useful_improvement'
+                         if decisions == {'useful_improvement'} else 'inconclusive')
+            if status != 'experimental_measurement' and status != aggregate:
+                raise ValueError('Decoder aggregate contradicts its strata')
+    elif kind == 'profile':
+        expected = set(itertools.product((4096, 524288, 1048576), ('ordinary', 'heavy'),
+            ('full-analyzer', 'framing', 'headers', 'body-metadata', 'relationship', 'raw-body', 'whole-body')))
+        keys = [(r.get('size'), r.get('density'), r.get('phase')) for r in rows]
+        if measured and any(r.get('eligible') is not True or r.get('status') != 'ok'
+                or type(r.get('samples')) is not int or r['samples'] < 1
+                or any(not positive(r.get(k)) for k in ('median_ms', 'max_ms'))
+                or type(r.get('min_ms')) not in (int, float) or not math.isfinite(r['min_ms'])
+                or not 0 <= r['min_ms'] <= r['median_ms'] <= r['max_ms'] for r in rows):
+            raise ValueError('Invalid native diagnostic measurement')
+    else:
+        expected = set(itertools.product(('clean', 'wrapped', 'escaped'), (1, 2, 5, 10, 16, 50, 100)))
+        keys = [(r.get('scenario'), r.get('rows')) for r in rows]
+        if measured:
+            for row in rows:
+                if type(row.get('rows')) is not int:
+                    raise ValueError('Invalid rendering batch')
+                if row['rows'] < 16:
+                    if (row.get('candidate_backend') != 'php-small-batch' or row.get('correctness_passed') is not True
+                            or row.get('performance_gate') != 'not_applicable_same_php_path'
+                            or any(k in row for k in ('gate_passed', 'improvement_percent', 'rust_median_ns'))):
+                        raise ValueError('PHP rendering control cannot claim Rust gains')
+                else:
+                    baseline, native = row.get('php_median_ns'), row.get('rust_median_ns')
+                    if (row.get('candidate_backend') != 'rust' or type(row.get('samples')) is not int or row['samples'] < 11
+                            or type(row.get('iterations')) is not int or row['iterations'] < 1
+                            or not positive(baseline) or not positive(native)
+                            or type(row.get('improvement_percent')) not in (int, float)
+                            or not math.isclose(row['improvement_percent'], 100 * (baseline - native) / baseline, rel_tol=1e-9, abs_tol=1e-9)
+                            or row.get('gate_passed') is not (row['improvement_percent'] >= 5)):
+                        raise ValueError('Invalid rendering measurement')
+            aggregate = 'passed' if all(r.get('gate_passed', True) for r in rows) else 'gate_failed'
+            if status != aggregate:
+                raise ValueError('Rendering aggregate contradicts its strata')
+    try:
+        unique = set(keys)
+        if len(unique) != len(keys) or not unique <= expected:
+            raise ValueError('Unexpected or duplicate native measurement stratum')
+    except TypeError as error:
+        raise ValueError('Invalid native measurement key') from error
+    completeness = summary.get('completeness')
+    if completeness is not None and (not isinstance(completeness, dict)
+            or set(completeness) != {'expected_rows', 'observed_rows', 'complete'}
+            or type(completeness['expected_rows']) is not int or completeness['expected_rows'] != len(expected)
+            or type(completeness['observed_rows']) is not int or completeness['observed_rows'] != len(rows)
+            or type(completeness['complete']) is not bool
+            or completeness['complete'] is True and unique != expected):
+        raise ValueError('Native completeness receipt contradicts its rows')
+    if measured and (unique != expected or not completeness or completeness.get('complete') is not True):
+        raise ValueError('Current native measurement matrix is incomplete')
+
+
+def validate_summary(summary, run, kind, runner, historical=False):
     expected = dict(schema_version=1, repository=REPOSITORY, head_sha=run['head_sha'],
                     run_id=run['id'], run_attempt=run['run_attempt'], kind=kind, runner=runner,
                     adoption_qualified=False)
@@ -170,9 +309,13 @@ def validate_summary(summary, run, kind, runner):
     if not isinstance(summary.get('rows'), list) or len(summary['rows']) > 100:
         raise ValueError('Invalid summary rows')
     allowed = set(expected) | {'rows', 'status', 'evidence_type', 'completeness', 'source_sha256',
-                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'candidate_status', 'uncertainty_method', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size', 'baseline_kind', 'benchmark_mode'}
+                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'candidate_status', 'uncertainty_method', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size', 'baseline_kind', 'benchmark_mode', 'provenance_status', 'runtime_manifest_sha256', 'kernel_qualification_sha256', 'rust_payload_kernel', 'required_payload_kernel', 'hardware_qualification', 'candidate_head_sha'}
     if set(summary) - allowed:
         raise ValueError('Unexpected public summary fields')
+    if kind not in ('cpp', 'php', 'profile', 'presentation') and set(summary) & {
+            'provenance_status', 'runtime_manifest_sha256', 'kernel_qualification_sha256',
+            'rust_payload_kernel', 'required_payload_kernel', 'hardware_qualification', 'candidate_head_sha'}:
+        raise ValueError('Native provenance fields on a different comparison')
     if kind not in REMAINING_STRATA and (set(summary) & {'baseline_kind', 'benchmark_mode'}
             or any(set(row) & {'module', 'correctness_observations', 'native_proof_observations'} for row in summary['rows'])):
         raise ValueError('Remaining module fields on a different comparison')
@@ -197,6 +340,8 @@ def validate_summary(summary, run, kind, runner):
                 'baseline_latency_interval_ms', 'candidate_latency_interval_ms', 'marginal_alpha', 'gate_statistic', 'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95'}
     if any(not isinstance(row, dict) or set(row) - row_keys for row in summary['rows']):
         raise ValueError('Unexpected public measurement fields')
+    if kind in ('cpp', 'php', 'profile', 'presentation'):
+        validate_native_rows(summary, kind, run, historical)
     if summary.get('uncertainty_method', 'not_reported') not in ('not_reported', 'mixed_output_bootstrap', 'legacy_stratified_bootstrap_unqualified', 'paired_bootstrap_bonferroni'):
         raise ValueError('Unknown uncertainty protocol')
 
@@ -504,7 +649,7 @@ def coverage(root):
             label, detail = 'Comparative public caller benchmark', 'Exact serialized PHP/native output, cold/warm calls, common median and uncommon p99 qualification mode; small/unsupported inputs remain PHP controls.'
         elif name in ('article_identity', 'article_xref', 'article_dates', 'iso_primary_copies', 'rar5_copy_checksums', 'rar5_quick_open'):
             label, detail = 'Shared independent PHP reference comparison', 'New bounded PHP references compare declared shared projections only; actual native wrapper includes FFI, allocation, JSON decoding and the full richer native result before projection. Cold/warm common median and uncommon p99 gates do not qualify adoption or historical PHP speedups.'
-        elif name in ('zstd_frame', 'xz', 'xz_frame'):
+        elif name in ('zstd_frame', 'xz', 'xz_frame', 'xz_first_block'):
             label, detail = 'No automated benchmark', 'Explicit coverage gap: no independent PHP reference comparison or qualified caller benchmark.'
         elif name == 'nntmux-evidence-utility':
             label, detail = 'Auxiliary correctness only', 'CI evidence and rendering utility; running it does not measure its own performance.'
@@ -570,7 +715,7 @@ def last_valid_comparison(fetch=api, archive_download=download):
                         break
                     artifact = matches[0]
                     summary = read_summary(archive_download(artifact['id']))
-                    validate_summary(summary, run, 'cpp', runner)
+                    validate_summary(summary, run, 'cpp', runner, historical=True)
                     if not complete_cpp_comparison(summary):
                         break
                     summaries.append(dict(summary, artifact_id=artifact['id'], workflow_status=run.get('conclusion')))
@@ -587,10 +732,84 @@ def last_valid_comparison(fetch=api, archive_download=download):
     return result
 
 
+def rust_interfaces(root):
+    spec = importlib.util.spec_from_file_location('rust_pages_inventory', Path(__file__).with_name('benchmark_rust_inventory.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.inventory(root)
+
+
+def manual_job_name(kind, runner):
+    if kind in ('cpp', 'php', 'profile'):
+        return {'cpp': 'paired-decoding', 'php': 'Rust versus PHP',
+                'profile': 'Article processing comparison'}[kind] + f' ({runner})'
+    if kind == 'presentation':
+        return 'native-presentation'
+    if kind in ('fingerprint-ffi', 'fingerprint-worker'):
+        return f'Experimental comparison {kind} ({runner})'
+    if kind == 'cpu-snapshot':
+        return f'CPU snapshot comparison {kind} ({runner})'
+    return f'{kind} ({runner})'
+
+
+def collect_dispatches(sha, fetch, archive_download):
+    """Keep bounded trusted manual studies separate from the automatic push matrix.
+
+    Show the three newest runs per producer, including latest-attempt failures.
+    Selective dispatches are identified from exact job/artifact names. A failed
+    selection lookup remains visible and never silently substitutes older data.
+    """
+    results, runs_seen = [], []
+    for workflow, expected in WORKFLOWS.items():
+        if not expected:
+            continue
+        try:
+            candidates = fetch(f'actions/workflows/{workflow}/runs?branch=master&event=workflow_dispatch&head_sha={sha}&per_page=20')['workflow_runs']
+            trusted = [r for r in candidates if isinstance(r, dict) and r.get('event') == 'workflow_dispatch'
+                and type(r.get('id')) is int and r['id'] > 0 and type(r.get('run_attempt')) is int and r['run_attempt'] > 0
+                and select_run([dict(r, event='push')], sha) is not None]
+        except (OSError, ValueError, KeyError, TypeError):
+            runs_seen.append(dict(workflow=workflow, status='Manual collection unavailable'))
+            continue
+        for run in sorted(trusted, key=lambda r: r['id'], reverse=True)[:3]:
+            info = dict(workflow=workflow, run_id=run['id'], run_attempt=run['run_attempt'],
+                        status=run.get('conclusion') or run.get('status', 'unknown'))
+            runs_seen.append(info)
+            try:
+                artifacts = fetch(f"actions/runs/{run['id']}/artifacts?per_page=100")['artifacts']
+                jobs = fetch(f"actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100")['jobs']
+                names = {j['name'] for j in jobs if isinstance(j, dict) and isinstance(j.get('name'), str)}
+            except (OSError, ValueError, KeyError, TypeError):
+                info['status'] = 'Manual selection or artifact collection unavailable'
+                continue
+            for kind, runner in expected:
+                name = f"public-benchmark-{kind}-{runner}-{run['id']}-{run['run_attempt']}"
+                matched = [a for a in artifacts if isinstance(a, dict) and a.get('name') == name]
+                if not matched and manual_job_name(kind, runner) not in names:
+                    continue
+                result = dict(kind=kind, runner=runner, rows=[], adoption_qualified=False, rust_payload_mode='unknown',
+                              run_id=run['id'], run_attempt=run['run_attempt'], workflow_status=info['status'],
+                              status='Summary unavailable' if run.get('status') == 'completed' else 'Pending')
+                results.append(result)
+                if len(matched) == 1:
+                    try:
+                        artifact = matched[0]
+                        if artifact['expired'] or artifact['size_in_bytes'] > 2 * LIMIT:
+                            raise ValueError('Expired or oversized manual summary')
+                        summary = read_summary(archive_download(artifact['id']))
+                        validate_summary(summary, run, kind, runner)
+                        result.update(summary, artifact_id=artifact['id'])
+                        result['rust_payload_mode'] = measured_payload_mode(summary)
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError, NotImplementedError, zipfile.BadZipFile):
+                        result['status'] = 'Summary invalid or unavailable'
+    return results, runs_seen
+
+
 def collect(sha, root, fetch=api, archive_download=download):
     report = dict(schema_version=1, repository=REPOSITORY, head_sha=sha,
                   generated_at=datetime.now(timezone.utc).isoformat(), workflows=[], results=[], coverage=coverage(root),
-                  frozen_reports_available=(root / 'github-pages/benchmarks/index.html').is_file())
+                  frozen_reports_available=(root / 'github-pages/benchmarks/index.html').is_file(),
+                  rust_exports=rust_interfaces(root))
     for workflow, expected in WORKFLOWS.items():
         try:
             runs = fetch(f'actions/workflows/{workflow}/runs?branch=master&event=push&head_sha={sha}&per_page=100')['workflow_runs']
@@ -631,6 +850,7 @@ def collect(sha, root, fetch=api, archive_download=download):
                         result['status'] = 'Summary invalid or unavailable'
             report['results'].append(result)
     report['last_valid_comparison'] = last_valid_comparison(fetch, archive_download)
+    report['dispatch_results'], report['dispatch_runs'] = collect_dispatches(sha, fetch, archive_download)
     return report
 
 
@@ -783,14 +1003,20 @@ def render(report):
             '<h1>NNTmux Rust benchmarks</h1>',
             f'<p>Master build <code>{escape(report["head_sha"])}</code>. Updated {escape(report["generated_at"])}. <a href="results.json">Machine-readable results</a>.</p>',
             '<p>Coverage is incomplete. Comparative median screens and diagnostic profiles are separate evidence. These builds do not establish the required 1.5× gain for every common path and representative uncommon p99 workload, or production throughput.</p>',
-            '<p>Each master push runs fresh yEnc comparisons, BODY/fingerprint profiles, NZB digest/CPU comparisons, archive diagnostics, locked PHP-reader header comparisons and sample-planning comparisons on x86/ARM, plus release rendering on x86. Missing, failed, cancelled and inconclusive results remain visible. Local/manual experiments are excluded. Raw evidence is retained in Actions for 14 days; published summaries last until the next build.</p>',
+            '<p>Each master push runs fresh yEnc comparisons, BODY/fingerprint profiles, NZB digest/CPU comparisons, archive diagnostics, locked PHP-reader header comparisons and sample-planning comparisons on x86/ARM, plus release rendering on x86. Missing, failed, cancelled and inconclusive results remain visible. Trusted manual runs of this exact master commit appear separately below; feature-branch and older-source experiments are excluded. Raw evidence is retained in Actions for 14 days; published summaries last until the next build.</p>',
             '<h2>Build checks</h2><table><tr><th>Workflow</th><th>Latest state</th><th>Evidence</th></tr>']
     for row in report['workflows']:
         body.append(f'<tr><td>{escape(row["workflow"])}</td><td>{escape(row.get("status", "unknown"))}</td><td>{run_link(row)}</td></tr>')
     body.append('</table><h2>Current measurements</h2>')
     if report.get('frozen_reports_available'):
         body.append('<p><a href="benchmarks/">Historical speedup charts, PHP call paths and native flamegraphs</a>. These frozen reports retain their own executed-commit and run provenance; they are separate from this build.</p>')
-    for row in report['results']:
+    manual_heading = ['<h2>Trusted manual measurements</h2><p>The three newest trusted master dispatches per producer are shown separately. Each uses its latest attempt. Failures and unavailable selections remain visible; older manual results do not replace newer failures or automatic push screens. Qualification and screen modes retain their own sample counts and uncertainty.</p><table><tr><th>Producer</th><th>Latest attempt state</th><th>Run</th></tr>']
+    for row in report.get('dispatch_runs', []):
+        manual_heading.append('<tr><td>' + escape(row['workflow']) + '</td><td>' + escape(row.get('status', 'unknown')) + '</td><td>' + run_link(row) + '</td></tr>')
+    manual_heading.append('</table>')
+    for index, row in enumerate(report['results'] + report.get('dispatch_results', [])):
+        if index == len(report['results']):
+            body.extend(manual_heading)
         body.append(f'<details><summary>{escape(row["kind"])} · {escape(row["runner"])} · {escape(row.get("status", "unknown"))}</summary><p>{run_link(row)}. Evidence: {escape(row.get("evidence_type", "unavailable"))}; adoption qualification: not established.</p>')
         if row.get('candidate_status') == 'experimental_withdrawn_from_production':
             body.append('<p>This archived Rust fingerprint candidate is withdrawn from the application runtime. The application uses PHP fingerprinting. These archived-candidate measurements do not select the production implementation or qualify adoption.</p>')
@@ -832,10 +1058,23 @@ def render(report):
                 body.append('<p>Exact live-host CLI decision bounds form a separate two-gate simultaneous 95% family (median and p99). They are separate from the synthetic and absent-/proc fixture family and do not establish production throughput.</p>')
         if row.get('kind') in ('cpp', 'php', 'profile'):
             body.append('<p>Rust payload mode: ' + escape(measured_payload_mode(row)) + '.</p>')
+        if row.get('provenance_status'):
+            body.append('<p>Executed-source provenance: ' + escape(row['provenance_status']) +
+                        '; hardware qualification: ' + escape(row.get('hardware_qualification', 'unavailable')) + '.</p>')
+        if row.get('rust_payload_kernel'):
+            body.append('<p>Observed payload kernel: ' + escape(row['rust_payload_kernel']['name']) + '.</p>')
+        if row.get('status') == 'unsupported_hardware':
+            body.append('<p>The designated kernel ' + escape(row['required_payload_kernel']['name']) +
+                        ' was unavailable on this worker. The strict qualification gate stopped this comparison; no speedup is claimed.</p>')
+        if row.get('candidate_head_sha'):
+            body.append('<p>Measured experiment source <code>' + escape(row['candidate_head_sha']) +
+                        '</code> differs from this harness build; it is not current-source performance evidence.</p>')
         if 'workflow_status' in row:
             body.append(f'<p>Overall workflow: {escape(row["workflow_status"])}</p>')
         body.append(measurement_table(row['rows']) if row['rows'] else '<p>No current measurement rows available.</p>')
         body.append('<details><summary>Summary data and identities</summary><pre>' + escape(json.dumps(row, indent=2, ensure_ascii=False, allow_nan=False)) + '</pre></details></details>')
+    if report.get('dispatch_runs') and not report.get('dispatch_results'):
+        body.extend(manual_heading)
     historical = report.get('last_valid_comparison', {})
     if historical:
         body.append('<h2>Last valid complete C++ comparison</h2><p>' + escape(historical.get('status')) + '. Historical evidence remains separate from the current build; a newer PHP-only/profile-only run cannot replace this comparison.</p>')
@@ -849,6 +1088,12 @@ def render(report):
     body.append('<h2>Rust target coverage and priorities</h2><p>Next priorities: inspect cold fingerprint costs and worker startup, sample-planner projection/JSON costs, and repeated native body/format scans. Native-only archive diagnostics have no equivalent PHP baseline; locked-reader comparisons cover initial headers only. Qualification runs must bound uncommon tails before proposing replacements. Newly added Rust sources appear as gaps until their benchmark mapping is reviewed.</p><table><tr><th>Source target</th><th>Automated evidence</th><th>Scope / gap</th></tr>')
     for row in report['coverage']:
         body.append(f'<tr><td><code>{escape(row["target"])}</code></td><td>{escape(row["coverage"])}</td><td>{escape(row["detail"])}</td></tr>')
+    body.append('</table><h2 id="rust-interfaces">Public Rust interfaces</h2><p>Tracked Rust ABI declarations are discovered from source, including compatibility exports and lifecycle calls. The classification describes caller wiring and evidence scope, not an individual-function timing or adoption approval. CI rejects new or removed declarations until their classification is reviewed. This source inventory does not expand macros or determine compiled conditional branches.</p><table><tr><th>Interface / source</th><th>Evidence scope</th><th>Caller and limits</th></tr>')
+    for row in report.get('rust_exports', []):
+        source = 'https://github.com/' + REPOSITORY + '/blob/' + report['head_sha'] + '/' + row['target'] + '#L' + str(row['line'])
+        body.append('<tr><td><a href="' + escape(source) + '"><code>' + escape(row['name']) +
+                    '</code></a></td><td>' + escape(row['coverage']) + ': ' + escape(', '.join(row['evidence_kinds']) or 'No comparative measurement') +
+                    '</td><td>' + escape(row['detail']) + ' ' + escape(', '.join(row['callers'])) + '</td></tr>')
     body.append('</table></html>')
     return '\n'.join(body)
 
