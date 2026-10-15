@@ -14,6 +14,7 @@ use DOMElement;
 use DOMNode;
 use DOMXPath;
 use RuntimeException;
+use SplObjectStorage;
 
 /**
  * Opt-in, latest-only NIMA4K catalogue names. The 1 MiB default bounds HTML download and DOM parsing.
@@ -110,7 +111,8 @@ final class Nima4kSource extends BoundedHttpFeedSource
             }
         }
 
-        $cards = $this->validatedReleaseCards($document);
+        $pathInterner = [];
+        $cards = $this->validatedReleaseCards($document, $pathInterner);
         // The legacy parser can expose inert cards or leave HTML5 entities undecoded without errors.
         // Compare every observed card before limiting output; labels still come from the original DOM.
         $previous = libxml_use_internal_errors(true);
@@ -133,7 +135,7 @@ final class Nima4kSource extends BoundedHttpFeedSource
                 throw new RuntimeException('NIMA4K returned an invalid numeric character reference.');
             }
         }
-        if ($cards !== $this->validatedReleaseCards($reference)) {
+        if ($cards !== $this->validatedReleaseCards($reference, $pathInterner)) {
             throw new RuntimeException('NIMA4K returned inconsistent HTML release semantics.');
         }
         $entries = [];
@@ -170,8 +172,11 @@ final class Nima4kSource extends BoundedHttpFeedSource
         return false;
     }
 
-    /** @return list<array{article: string, subtitle: string, cover: string, title: string}> */
-    private function validatedReleaseCards(DOMDocument|HTMLDocument $document): array
+    /**
+     * @param  array<string, int>  $pathInterner
+     * @return list<array{article: int, subtitle: int, cover: int, title: string}>
+     */
+    private function validatedReleaseCards(DOMDocument|HTMLDocument $document, array &$pathInterner): array
     {
         if ($document instanceof HTMLDocument) {
             $xpath = new HtmlXPath($document);
@@ -199,6 +204,12 @@ final class Nima4kSource extends BoundedHttpFeedSource
             throw new RuntimeException('NIMA4K returned no recognized release cards.');
         }
         $cards = [];
+        /** @var SplObjectStorage<DOMNode|HtmlNode, int> $positions */
+        $positions = new SplObjectStorage;
+        /** @var SplObjectStorage<DOMNode|HtmlNode, bool> $indexedParents */
+        $indexedParents = new SplObjectStorage;
+        /** @var SplObjectStorage<DOMNode|HtmlNode, int> $pathIds */
+        $pathIds = new SplObjectStorage;
         foreach ($articles as $article) {
             $subtitles = $xpath->query('.//'.$prefix.'span['.$this->classToken('subtitle').']', $article);
             $titles = $xpath->query('./'.$prefix.'div['.$this->classToken('article-right').']/'.$prefix.'h2/'.$prefix.'span['.$this->classToken('subtitle').']', $article);
@@ -220,35 +231,57 @@ final class Nima4kSource extends BoundedHttpFeedSource
             if ($title === '' || preg_match('/[\s\p{Z}\p{C}]/u', $title) !== 0 || $cover->getAttribute('alt') !== $title) {
                 throw new RuntimeException('NIMA4K returned a nonliteral or inconsistent release name.');
             }
-            $articlePath = $this->elementPath($article);
-            $subtitlePath = $this->elementPath($subtitle);
-            $coverPath = $this->elementPath($cover);
+            $articlePath = $this->elementPath($article, $positions, $indexedParents, $pathIds, $pathInterner);
+            $subtitlePath = $this->elementPath($subtitle, $positions, $indexedParents, $pathIds, $pathInterner);
+            $coverPath = $this->elementPath($cover, $positions, $indexedParents, $pathIds, $pathInterner);
             $cards[] = ['article' => $articlePath, 'subtitle' => $subtitlePath, 'cover' => $coverPath, 'title' => $title];
         }
 
         return $cards;
     }
 
-    private function elementPath(DOMNode|HtmlNode $node): string
+    /**
+     * @param  SplObjectStorage<DOMNode|HtmlNode, int>  $positions
+     * @param  SplObjectStorage<DOMNode|HtmlNode, bool>  $indexedParents
+     * @param  SplObjectStorage<DOMNode|HtmlNode, int>  $pathIds
+     * @param  array<string, int>  $pathInterner
+     */
+    private function elementPath(DOMNode|HtmlNode $node, SplObjectStorage $positions, SplObjectStorage $indexedParents, SplObjectStorage $pathIds, array &$pathInterner): int
     {
-        // Modern getNodePath uses wildcard positions; use namespace/name sibling positions for both APIs.
-        $parts = [];
-        while ($node instanceof DOMElement || $node instanceof HtmlElement) {
-            $namespace = $node->namespaceURI ?? self::HTML_NAMESPACE;
-            $name = $node->localName;
-            $position = 1;
-            for ($sibling = $node->previousSibling; $sibling !== null; $sibling = $sibling->previousSibling) {
-                if (($sibling instanceof DOMElement || $sibling instanceof HtmlElement)
-                    && ($sibling->namespaceURI ?? self::HTML_NAMESPACE) === $namespace
-                    && $sibling->localName === $name) {
-                    $position++;
-                }
-            }
-            $parts[] = '{'.$namespace.'}'.$name.'['.$position.']';
+        // Cache ancestor IDs, not full path strings. Strong node keys retain wrapper identity.
+        $ancestors = [];
+        while (($node instanceof DOMElement || $node instanceof HtmlElement) && ! $pathIds->offsetExists($node)) {
+            $ancestors[] = $node;
             $node = $node->parentNode;
         }
+        $parentId = $node !== null && $pathIds->offsetExists($node) ? $pathIds[$node] : 0;
+        for ($index = count($ancestors) - 1; $index >= 0; $index--) {
+            $element = $ancestors[$index];
+            $parent = $element->parentNode;
+            if ($parent === null) {
+                throw new RuntimeException('NIMA4K returned an invalid release card.');
+            }
+            if (! $indexedParents->offsetExists($parent)) {
+                $counts = [];
+                foreach ($parent->childNodes as $sibling) {
+                    if ($sibling instanceof DOMElement || $sibling instanceof HtmlElement) {
+                        $name = serialize([$sibling->namespaceURI ?? self::HTML_NAMESPACE, $sibling->localName]);
+                        $counts[$name] = ($counts[$name] ?? 0) + 1;
+                        $positions[$sibling] = $counts[$name];
+                    }
+                }
+                $indexedParents[$parent] = true;
+            }
+            if (! $positions->offsetExists($element)) {
+                throw new RuntimeException('NIMA4K returned an invalid release card.');
+            }
+            // Exact tuples share IDs only within this comparison; no hashes or path-prefix copies.
+            $tuple = serialize([$parentId, $element->namespaceURI ?? self::HTML_NAMESPACE, $element->localName, $positions[$element]]);
+            $parentId = $pathInterner[$tuple] ??= count($pathInterner) + 1;
+            $pathIds[$element] = $parentId;
+        }
 
-        return implode('/', array_reverse($parts));
+        return $parentId;
     }
 
     private function maskTextContents(string $html, bool $includeRcdata): string
@@ -345,7 +378,9 @@ final class Nima4kSource extends BoundedHttpFeedSource
         }
 
         // Masking must not erase or move a card, even when that card is beyond the output limit.
-        return $this->validatedReleaseCards($original) !== $this->validatedReleaseCards($document);
+        $pathInterner = [];
+
+        return $this->validatedReleaseCards($original, $pathInterner) !== $this->validatedReleaseCards($document, $pathInterner);
     }
 
     private function assertUtf8Encoding(DOMDocument $document): void

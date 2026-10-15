@@ -1051,6 +1051,72 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('wideSiblingCardLayouts')]
+    public function wide_sibling_layouts_preserve_names_and_validate_after_record_limit(int $prefixCount, int $cardCount, bool $invalidTail): void
+    {
+        $html = str_repeat('<i></i><span></span>', $prefixCount);
+        for ($index = 0; $index < $cardCount; $index++) {
+            $card = $this->card('Exact.'.$index.'-GRP');
+            if ($invalidTail && $index === $cardCount - 1) {
+                $card = str_replace('alt="Exact.'.$index.'-GRP"', 'alt="Different-GRP"', $card);
+            }
+            $html .= '<section>'.$card.'</section>';
+        }
+        if ($invalidTail) {
+            $this->expectException(RuntimeException::class);
+        }
+        $entries = (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+
+        $this->assertSame(['Exact.0-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{int, int, bool}> */
+    public static function wideSiblingCardLayouts(): array
+    {
+        return [
+            'ordinary complete listing' => [0, 2, false],
+            'mixed preceding siblings' => [64, 8, false],
+            'dense sibling cards' => [0, 64, false],
+            'wide listing invalid last card' => [64, 8, true],
+            'dense listing invalid last card' => [0, 64, true],
+        ];
+    }
+
+    #[Test]
+    public function sibling_position_caches_are_local_to_each_parse_and_dom_comparison(): void
+    {
+        $source = new Nima4kSource('https://nima4k.org/', pageSize: 1);
+        foreach ([
+            str_repeat('<div></div>', 64),
+            str_repeat('<i></i>', 64),
+            '<svg xmlns="http://www.w3.org/2000/svg"><g><text>safe</text></g></svg>',
+        ] as $prefix) {
+            $entries = $source->parseHtml($prefix.$this->card('Léon.Release-GRP').$this->card('Second.Release-GRP'));
+
+            $this->assertSame(['Léon.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+        }
+    }
+
+    #[Test]
+    #[DataProvider('foreignCardAncestors')]
+    public function sibling_position_ids_do_not_collapse_foreign_ancestor_namespaces(string $before, string $after): void
+    {
+        $html = $this->card('First.Release-GRP').$before.$this->card('Second.Release-GRP').$after;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, string}> */
+    public static function foreignCardAncestors(): array
+    {
+        return [
+            'SVG foreignObject ancestor' => ['<svg><foreignObject>', '</foreignObject></svg>'],
+            'MathML text integration ancestor' => ['<math><mtext>', '</mtext></math>'],
+        ];
+    }
+
+    #[Test]
     #[DataProvider('unterminatedCommentFragments')]
     public function unterminated_comments_cannot_hide_the_remaining_listing(string $fragment): void
     {
