@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 const SEED: u64 = 20261014;
+const BOOTSTRAP_RESAMPLES: usize = 4000;
 const ADAPTER: &str = "import importlib.util,sys; from pathlib import Path; s=importlib.util.spec_from_file_location('cpu_baseline',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); sys.exit(m.main(['--output',sys.argv[2]],Path(sys.argv[3])))";
 const STAT: &str = "cpu  102 0 31 809 5 0 3 0 0 0\ncpu0 102 0 31 809 5 0 3 0 0 0\n";
 const PRESSURE: &str = "some avg10=0.00 avg60=0.01 avg300=0.02 total=54321\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
@@ -77,15 +78,31 @@ fn file_hash(path: &Path) -> Result<String, String> {
         .map(|b| hash(&b))
         .map_err(|e| format!("{}: {e}", path.display()))
 }
+// SplitMix64 by Sebastiano Vigna, public domain:
+// https://prng.di.unimi.it/splitmix64.c . Zero is a valid seed.
 fn next(state: &mut u64) -> u64 {
-    *state = state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    *state
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+fn bounded_index(state: &mut u64, upper: usize) -> usize {
+    assert!(upper > 0);
+    let bound = upper as u64;
+    // Discard the short prefix so the accepted u64 range has a multiple
+    // of `bound` elements. Every result then has the same number of preimages.
+    let threshold = bound.wrapping_neg() % bound;
+    loop {
+        let value = next(state);
+        if value >= threshold {
+            return (value % bound) as usize;
+        }
+    }
 }
 fn orders(n: usize) -> Vec<bool> {
-    let mut s = SEED;
-    (0..n).map(|_| next(&mut s) >> 63 == 1).collect()
+    let mut state = SEED;
+    (0..n).map(|_| bounded_index(&mut state, 2) == 1).collect()
 }
 fn percentile(values: &[f64], p: f64) -> Option<f64> {
     if values.is_empty()
@@ -112,8 +129,8 @@ fn median(values: &[f64]) -> Option<f64> {
         Some((lo + v[v.len() / 2]) / 2.)
     }
 }
-fn metrics(b: &[f64], c: &[f64]) -> Option<Value> {
-    if b.len() != c.len() {
+fn metrics(b: &[f64], c: &[f64], family_size: usize, rare: bool, host: bool) -> Option<Value> {
+    if b.len() != c.len() || family_size == 0 {
         return None;
     }
     let bm = median(b)?;
@@ -124,20 +141,34 @@ fn metrics(b: &[f64], c: &[f64]) -> Option<Value> {
     let mut state = SEED;
     let mut med = Vec::new();
     let mut tail = Vec::new();
-    for _ in 0..2000 {
+    for _ in 0..BOOTSTRAP_RESAMPLES {
         let mut rb = Vec::with_capacity(b.len());
         let mut rc = Vec::with_capacity(c.len());
         for _ in b {
-            let i = (next(&mut state) as usize) % b.len();
+            let i = bounded_index(&mut state, b.len());
             rb.push(b[i]);
             rc.push(c[i]);
         }
         med.push(median(&rb)? / median(&rc)?);
         tail.push(percentile(&rb, 0.99)? / percentile(&rc, 0.99)?);
     }
-    Some(
-        json!({"valid_pairs":b.len(),"baseline_median_ns":bm,"candidate_median_ns":cm,"median_ratio":bm/cm,"paired_median_ratio":median(&paired),"speedup_percent":100.*(bm/cm-1.),"baseline_p99_ns":bp,"candidate_p99_ns":cp,"p99_ratio":bp/cp,"median_ratio_ci95":[percentile(&med,0.025),percentile(&med,0.975)],"p99_ratio_ci95":[percentile(&tail,0.025),percentile(&tail,0.975)],"expected_samples_above_p99":b.len() as f64*0.01,"p99_sample_sufficient":b.len()>=1000}),
-    )
+    let gate = if rare { &tail } else { &med };
+    let alpha = 0.05 / family_size as f64 / 2.;
+    let mut result = json!({"gate_statistic":if rare { "p99_ratio" } else { "median_ratio" },"gate_speedup_simultaneous_ci95":[percentile(gate,alpha),percentile(gate,1.-alpha)],"valid_pairs":b.len(),"baseline_median_ns":bm,"candidate_median_ns":cm,"median_ratio":bm/cm,"paired_median_ratio":median(&paired),"speedup_percent":100.*(bm/cm-1.),"baseline_p99_ns":bp,"candidate_p99_ns":cp,"p99_ratio":bp/cp,"median_ratio_ci95":[percentile(&med,0.025),percentile(&med,0.975)],"p99_ratio_ci95":[percentile(&tail,0.025),percentile(&tail,0.975)],"expected_samples_above_p99":b.len() as f64*0.01,"p99_sample_sufficient":b.len()>=1000});
+    if host {
+        result["host_median_speedup_simultaneous_ci95"] =
+            json!([percentile(&med, alpha), percentile(&med, 1. - alpha)]);
+    }
+    Some(result)
+}
+fn confidence_gate_passes(metrics: &Value, rare: bool, host: bool) -> bool {
+    metrics["gate_speedup_simultaneous_ci95"][0]
+        .as_f64()
+        .is_some_and(|r| r >= if rare { 1.5 } else { 2. })
+        && (!host
+            || metrics["host_median_speedup_simultaneous_ci95"][0]
+                .as_f64()
+                .is_some_and(|r| r >= 2.))
 }
 fn captured(path: &Path, raw: &str) -> Value {
     json!({"path":path,"status":"captured","raw":raw})
@@ -448,8 +479,11 @@ fn run(o: Options) -> Result<bool, String> {
     if host_proc_absent {
         fixtures.push(absent_fixture(Path::new("/proc")));
     }
+    // The exact default absent-/proc CLI retains BOTH its original median
+    // and p99 requirements; count that extra gate before any measurements.
+    let family_size = fixtures.len() + usize::from(host_proc_absent);
     let schedule = orders(fixtures.len() * (o.pairs + 1));
-    let protocol = json!({"version":2,"host_proc_absent_at_start":host_proc_absent,"host_absent_median_ratio_ci_lower_gate":2.0,"host_absent_p99_ratio_ci_lower_gate":1.5,"seed":SEED,"pairs":o.pairs,"warmup_pairs_per_fixture":1,"orders_candidate_first":schedule,"order_sha256":hash(&serde_json::to_vec(&schedule).unwrap()),"timeout_seconds":5,"completion_poll_microseconds":250,"bootstrap_resamples":2000,"bootstrap_seed":SEED,"p99_estimator":"nearest rank ceil(0.99*N)","minimum_p99_pairs":1000,"common_median_ratio_ci_lower_gate":2.0,"rare_p99_ratio_ci_lower_gate":1.5,"timing_scope":"Instant immediately before process spawn through observed exit; CLI startup, reads, parsing, JSON serialization, exclusive output open/write/close included; correctness and hashing excluded","limitations":["Synthetic fixtures measure mounted Linux proc/cgroup evidence collection, not production CPU throughput or kernel CPU counters","Baseline synthetic fixtures use an importlib adapter to call original main with proc root; its startup/import overhead is included. Wholly absent /proc host stratum uses exact original CLI without adapter","250us polling adds completion observation delay and scheduling noise to both implementations; reported wall latency is not CPU usage","Each child process is fresh; one discarded warmup pair per fixture warms OS caches; measured results are warm-filesystem cold-process","On Linux live /proc gets separate sequential observations with changing counters; Linux production capacity remains unverified"]});
+    let protocol = json!({"version":3,"host_proc_absent_at_start":host_proc_absent,"order_rng":"splitmix64-rejection","bootstrap_rng":"splitmix64-rejection","confidence_method":"paired_bootstrap_bonferroni","confidence_family_size":family_size,"confidence_family":"Common median plus uncommon p99 gates, and an extra median gate for exact default absent-/proc CLI; other intervals diagnostic per-statistic95%","host_absent_median_ratio_ci_lower_gate":2.0,"host_absent_p99_ratio_ci_lower_gate":1.5,"seed":SEED,"pairs":o.pairs,"warmup_pairs_per_fixture":1,"orders_candidate_first":schedule,"order_sha256":hash(&serde_json::to_vec(&schedule).unwrap()),"timeout_seconds":5,"completion_poll_microseconds":250,"bootstrap_resamples":BOOTSTRAP_RESAMPLES,"bootstrap_seed":SEED,"p99_estimator":"nearest rank ceil(0.99*N)","minimum_p99_pairs":1000,"common_median_ratio_ci_lower_gate":2.0,"rare_p99_ratio_ci_lower_gate":1.5,"timing_scope":"Instant immediately before process spawn through observed exit; CLI startup, reads, parsing, JSON serialization, exclusive output open/write/close included; correctness and hashing excluded","limitations":["Synthetic fixtures measure mounted Linux proc/cgroup evidence collection, not production CPU throughput or kernel CPU counters","Baseline synthetic fixtures use an importlib adapter to call original main with proc root; its startup/import overhead is included. Wholly absent /proc host stratum uses exact original CLI without adapter","250us polling adds completion observation delay and scheduling noise to both implementations; reported wall latency is not CPU usage","Each child process is fresh; one discarded warmup pair per fixture warms OS caches; measured results are warm-filesystem cold-process","On Linux live /proc gets separate sequential observations with changing counters; Linux production capacity remains unverified"]});
     let input_meta:Vec<_>=fixtures.iter().map(|f|json!({"name":f.name,"rare":f.rare,"proc_root":f.proc,"exact_default_cli":f.host,"negative_fixture_absence_required":f.host,"expected_exit":f.exit,"golden":f.golden,"input_sha256":f.inputs})).collect();
     let runtime = json!({"os":metadata("uname",&["-a"]),"hardware_macos":metadata("sysctl",&["-n","machdep.cpu.brand_string","hw.memsize","hw.ncpu"]),"hardware_linux":metadata("lscpu",&[]),"python":metadata(&o.python,&["-c","import sys,platform; print(sys.executable); print(sys.version); print(platform.platform())"]),"rustc":metadata("rustc",&["-Vv"]),"cargo":metadata("cargo",&["-V"]),"git_head":metadata("git",&["-C",o.project.to_str().unwrap(),"rev-parse","HEAD"]),"resource_limits":metadata("sh",&["-c","ulimit -a"]),"build_identity":"Executable hashes pinned; available compiler identity recorded; build command/profile supplied by executor, not inferred from binary"});
     fs::write(
@@ -498,17 +532,12 @@ fn run(o: Options) -> Result<bool, String> {
                 c.push(rows["candidate"]["elapsed_ns"].as_f64().unwrap());
             }
         }
-        let mut m = metrics(&b, &c).unwrap_or(json!({"valid_pairs":0}));
-        let lower = if f.rare {
-            m["p99_ratio_ci95"][0].as_f64()
-        } else {
-            m["median_ratio_ci95"][0].as_f64()
-        };
+        let mut m =
+            metrics(&b, &c, family_size, f.rare, f.host).unwrap_or(json!({"valid_pairs":0}));
         let pass = all_valid
             && b.len() == o.pairs
             && b.len() >= 1000
-            && lower.is_some_and(|r| r >= if f.rare { 1.5 } else { 2. })
-            && (!f.host || m["median_ratio_ci95"][0].as_f64().is_some_and(|r| r >= 2.));
+            && confidence_gate_passes(&m, f.rare, f.host);
         m["gate_pass"] = json!(pass);
         m["required_pairs"] = json!(o.pairs);
         gates &= pass;
@@ -593,8 +622,80 @@ mod tests {
     fn independent_order() {
         assert_eq!(
             orders(8),
-            vec![false, false, false, true, true, true, false, false]
+            vec![true, false, false, true, false, true, false, false]
         );
+    }
+    #[test]
+    fn bootstrap_preserves_uncertainty_in_alternating_latency_population() {
+        // A valid bootstrap does not force exactly half of every replicate into
+        // each latency class. The old LCG modulo 1000 made this interval [2, 2].
+        let baseline: Vec<f64> = (0..1000)
+            .map(|i| if i % 2 == 0 { 1. } else { 3. })
+            .collect();
+        let candidate = vec![1.; 1000];
+        let result = metrics(&baseline, &candidate, 4, false, false).unwrap();
+        let interval = result["median_ratio_ci95"].as_array().unwrap();
+        assert!(interval[0].as_f64().unwrap() < interval[1].as_f64().unwrap());
+    }
+    #[test]
+    fn generator_accepts_zero_seed_and_matches_published_splitmix64_vector() {
+        let mut state = 0;
+        assert_eq!(next(&mut state), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(next(&mut state), 0x6e78_9e6a_a1b9_65f4);
+    }
+    #[test]
+    fn bounded_index_rejects_the_incomplete_prefix() {
+        // This seed makes the first SplitMix64 output zero. For bound 3, that
+        // value is outside the evenly divisible accepted range and must retry.
+        let mut state = 0u64.wrapping_sub(0x9e37_79b9_7f4a_7c15);
+        assert_eq!(
+            bounded_index(&mut state, 3),
+            (0xe220_a839_7b1d_cdafu64 % 3) as usize
+        );
+        assert_eq!(state, 0x9e37_79b9_7f4a_7c15);
+        assert_eq!(bounded_index(&mut state, 1), 0);
+    }
+    #[test]
+    fn simultaneous_gate_interval_matches_the_declared_statistic_and_family() {
+        let baseline: Vec<f64> = (1..=100).map(|v| v as f64).collect();
+        let candidate = vec![1.; 100];
+        let individual = metrics(&baseline, &candidate, 1, false, false).unwrap();
+        assert_eq!(
+            individual["gate_speedup_simultaneous_ci95"],
+            individual["median_ratio_ci95"]
+        );
+        let family = metrics(&baseline, &candidate, 4, true, false).unwrap();
+        assert_eq!(family["gate_statistic"], "p99_ratio");
+        assert!(
+            family["gate_speedup_simultaneous_ci95"][0]
+                .as_f64()
+                .unwrap()
+                <= family["p99_ratio_ci95"][0].as_f64().unwrap()
+        );
+        assert!(
+            family["gate_speedup_simultaneous_ci95"][1]
+                .as_f64()
+                .unwrap()
+                >= family["p99_ratio_ci95"][1].as_f64().unwrap()
+        );
+        assert!(metrics(&baseline, &candidate, 0, false, false).is_none());
+    }
+    #[test]
+    fn exact_default_host_keeps_both_median_and_p99_requirements() {
+        let baseline = vec![175.; 1000];
+        let candidate = vec![100.; 1000];
+        let result = metrics(&baseline, &candidate, 5, true, true).unwrap();
+        // Its p99 clears 1.5x, but the exact default CLI must also clear
+        // the original 2x median gate. Fixing the RNG cannot relax that gate.
+        assert!(confidence_gate_passes(&result, true, false));
+        assert!(!confidence_gate_passes(&result, true, true));
+        let mut passing = metrics(&vec![250.; 1000], &candidate, 5, true, true).unwrap();
+        assert!(confidence_gate_passes(&passing, true, true));
+        passing
+            .as_object_mut()
+            .unwrap()
+            .remove("host_median_speedup_simultaneous_ci95");
+        assert!(!confidence_gate_passes(&passing, true, true));
     }
     #[test]
     fn nearest_rank_and_median() {
@@ -605,11 +706,11 @@ mod tests {
     }
     #[test]
     fn metrics_reject_invalid_and_preserve_p99_definition() {
-        assert!(metrics(&[], &[]).is_none());
-        assert!(metrics(&[1.], &[1., 2.]).is_none());
-        assert!(metrics(&[1.], &[0.]).is_none());
-        assert!(metrics(&[f64::INFINITY], &[1.]).is_none());
-        let m = metrics(&[10., 20., 30., 100.], &[1., 2., 3., 20.]).unwrap();
+        assert!(metrics(&[], &[], 1, false, false).is_none());
+        assert!(metrics(&[1.], &[1., 2.], 1, false, false).is_none());
+        assert!(metrics(&[1.], &[0.], 1, false, false).is_none());
+        assert!(metrics(&[f64::INFINITY], &[1.], 1, false, false).is_none());
+        let m = metrics(&[10., 20., 30., 100.], &[1., 2., 3., 20.], 3, true, false).unwrap();
         assert_eq!(m["p99_ratio"], 5.);
         assert_eq!(m["paired_median_ratio"], 10.);
     }
