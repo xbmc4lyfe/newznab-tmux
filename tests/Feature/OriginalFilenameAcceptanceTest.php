@@ -31,6 +31,13 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             'technical canonical suffix false negative' => ['Exact.Release.2026.DTS.rar', 'Exact.Release.2026.DTS', false, 8],
             'ASCII control is not literal evidence' => ["Exact.Release.2026-GRP\x01.mkv", 'Exact.Release.2026-GRP', false, 0],
             'space is not literal evidence' => ['Exact.Release.2026-GRP .mkv', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT multipart original title' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 8],
+            'NZBSPLIT codec title' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026_DTS.rar', 'Exact.Release.2026.DTS', false, 8],
+            'NZBSPLIT group spelling survives nomination' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRPdisc1.mkv', 'Exact.Release.2026-GRPdisc1', true, 8],
+            'NZBSPLIT payload whitespace cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__ Exact_Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT repeated separators cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact__Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT nested wrapper cannot authorize' => ['Outer__NZBSPLIT__invalid__NZBSPLIT__Junk__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.rar', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT invalid wrapper hash cannot authorize' => ['Outer__NZBSPLIT__invalid__NZBSPLIT__Exact_Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 0],
             'part archive positive' => ['Exact.Release.2026-GRP.part01.rar', 'Exact.Release.2026-GRP', false, 8],
             'single payload preserves canonical suffix' => ['Exact.Release.2026.flac.mkv', 'Exact.Release.2026.flac', true, 8],
             'ordinary positive' => ['Exact.Release.2026-GRP.mkv', 'Exact.Release.2026-GRP', false, 8],
@@ -70,6 +77,40 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         self::assertSame($expected, $release->fresh()->predb_id);
         self::assertSame([$filename], DB::table('release_files')->pluck('name')->all());
         self::assertSame($expected > 0, $updates->lastCommittedIdentity() !== null);
+    }
+
+    public static function nzbSplitPipelineCases(): array
+    {
+        return ['canonical PreDB hit' => [true], 'existing extractor fallback' => [false]];
+    }
+
+    #[DataProvider('nzbSplitPipelineCases')]
+    public function test_nzbsplit_file_pipeline_preserves_matching_and_fallback(bool $hit): void
+    {
+        $this->createPar2RenameSchema();
+        config(['nntmux.echocli' => false]);
+        Event::fake([ReleaseNameFixed::class]);
+        $title = 'Exact.Release.2026.1080p.WEB-DL.x264-GRP';
+        $release = $this->pendingPar2Release(['searchname' => 'Obfuscated.Payload']);
+        $filename = 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__'.str_replace('.', '_', $title).'.7z.073';
+        $rows = $hit ? [['id' => 7, 'title' => $title]] : [];
+        if ($hit) {
+            DB::table('predb')->insert($rows);
+        }
+        DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
+        Search::shouldReceive('searchPredb')->once()->andReturn($rows);
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $category = $this->createStub(CategorizationService::class);
+        $category->method('determineCategory')->willReturn(['categories_id' => 8000]);
+        $updates = new ReleaseUpdateService($category, searchSyncCoordinator: $sync);
+        $service = new NameFixingService($updates);
+        $entry = clone $release;
+        $entry->releases_id = $release->id;
+        (new \ReflectionMethod($service, 'processFileCandidates'))->invoke($service, $entry, [(object) ['textstring' => $filename]], true, true, false);
+        self::assertSame($title, $release->fresh()->searchname);
+        self::assertSame($hit ? 7 : 0, $release->fresh()->predb_id);
+        self::assertTrue($updates->matched);
     }
 
     public function test_same_cleaned_query_reuses_accepted_match_across_distinct_original_evidence(): void
@@ -189,6 +230,8 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             'lossy group alias cannot authorize' => ['Publisher.Asset-GRPdisc1.mkv', 'Publisher.Asset-GRP.mkv', false],
             'lossy payload alias cannot authorize' => ['Publisher.Asset-GRP.flac.mkv', 'Publisher.Asset-GRP.mkv', false],
             'technical alias literal match' => ['Publisher.Asset.DTS.rar', 'Publisher.Asset.DTS.mkv', true],
+            'NZBSPLIT payload alias' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Publisher_Asset-GRP.7z.073', 'Publisher.Asset-GRP.mkv', true],
+            'NZBSPLIT lossy alias rejected' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Publisher__Asset-GRP.7z.073', 'Publisher.Asset-GRP.mkv', false],
             'part archive alias' => ['Publisher.Asset-GRP.part01.rar', 'Publisher.Asset-GRP.mkv', true],
             'authoritative alias case folding' => ['PUBLISHER.ASSET-GRP.MKV', 'publisher.asset-grp.rar', true],
             'authoritative unicode alias case folding' => ['ÉDITEUR.Asset-GRP.mkv', 'éditeur.asset-grp.rar', true],
