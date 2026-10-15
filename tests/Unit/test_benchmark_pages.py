@@ -13,6 +13,61 @@ SHA = 'a' * 40
 
 
 class PagesTest(unittest.TestCase):
+    def test_payload_mode_is_a_validated_enum_and_legacy_results_are_explicitly_unknown(self):
+        summary = dict(schema_version=1, kind='cpp', runner='ubuntu-latest', head_sha=SHA,
+                       run_id=12, run_attempt=2, repository=pages.REPOSITORY, rows=[], adoption_qualified=False)
+        for mode in ('incumbent', 'experimental', 'unknown'):
+            summary['rust_payload_mode'] = mode
+            pages.validate_summary(summary, self.run_row(), 'cpp', 'ubuntu-latest')
+        for invalid in ('<script>bad</script>', [], None, True, 'not_applicable'):
+            summary['rust_payload_mode'] = invalid
+            with self.assertRaises(ValueError):
+                pages.validate_summary(summary, self.run_row(), 'cpp', 'ubuntu-latest')
+        del summary['rust_payload_mode']
+        pages.validate_summary(summary, self.run_row(), 'cpp', 'ubuntu-latest')
+        rendered = pages.render(dict(head_sha=SHA, generated_at='fixture', workflows=[], coverage=[], results=[summary]))
+        self.assertIn('Rust payload mode: unknown', rendered)
+
+
+    def test_default_and_experimental_source_coverage_have_separate_comparisons(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / 'docker/app/nzb-yenc-ffi/src'
+            source.mkdir(parents=True)
+            names = ('payload_decoder', 'payload_decoder_arm', 'payload_decoder_x86')
+            for name in names:
+                (source / (name + '.rs')).touch()
+                (source / (name + '_experimental.rs')).touch()
+            rows = {Path(row['target']).stem: row for row in pages.coverage(Path(root))}
+            for name in names:
+                self.assertEqual(['incumbent'], rows[name]['payload_modes'])
+                self.assertEqual(['php'], rows[name]['comparisons'])
+                self.assertEqual(['experimental'], rows[name + '_experimental']['payload_modes'])
+                self.assertEqual(['cpp'], rows[name + '_experimental']['comparisons'])
+                self.assertNotEqual('No automated benchmark', rows[name + '_experimental']['coverage'])
+
+
+
+    def test_unsplit_source_coverage_does_not_claim_experimental_execution(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / 'docker/app/nzb-yenc-ffi/src'
+            source.mkdir(parents=True)
+            (source / 'payload_decoder.rs').touch()
+            row = pages.coverage(Path(root))[0]
+            self.assertEqual(['incumbent'], row['payload_modes'])
+            self.assertEqual(['php', 'cpp'], row['comparisons'])
+            self.assertIn('separate from measured mode', row['detail'])
+
+    def test_failed_or_unsafe_mode_evidence_is_never_rendered_as_measured(self):
+        for status in ('invalid', 'partial', 'missing', 'failure', 'cancelled'):
+            self.assertEqual('unknown', pages.measured_payload_mode({'status': status, 'rust_payload_mode': 'incumbent'}))
+        self.assertEqual('unknown', pages.measured_payload_mode({'status': 'ok', 'rust_payload_mode': ['incumbent']}))
+        self.assertEqual('experimental', pages.measured_payload_mode({'status': 'inconclusive', 'rust_payload_mode': 'experimental'}))
+
+    def test_cpu_results_disclose_unqualified_resampling_intervals(self):
+        report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[],
+                      results=[dict(kind='cpu-snapshot', runner='ubuntu-latest', status='measured', rows=[])])
+        self.assertIn('dependent bootstrap samples', pages.render(report))
+
     def run_row(self, **changes):
         return dict(id=12, run_attempt=2, head_sha=SHA, head_branch='master', event='push',
                     status='completed', conclusion='failure', head_repository={'full_name': pages.REPOSITORY}, **changes)
@@ -24,6 +79,8 @@ class PagesTest(unittest.TestCase):
         manual.update(id=13, event='workflow_dispatch')
         self.assertEqual(12, pages.select_run([old, self.run_row(), manual], SHA)['id'])
         self.assertIsNone(pages.select_run([manual], SHA))
+        self.assertIsNone(pages.select_run([dict(old, head_repository=None)], SHA))
+        self.assertIsNone(pages.select_run([dict(old, head_sha=None)], None))
 
     def test_archive_is_bounded_and_exact_member_only(self):
         for members in [('summary.json', 'extra.txt'), ('../summary.json',), ('summary.json', 'summary.json')]:
@@ -96,6 +153,76 @@ class PagesTest(unittest.TestCase):
     def test_overflow_float_is_rejected(self):
         with self.assertRaises(ValueError):
             pages.strict_json('{"value":1e999}')
+
+    def complete_cpp(self, run, runner):
+        import itertools
+        return dict(schema_version=1, kind='cpp', runner=runner, head_sha=run['head_sha'], run_id=run['id'],
+                    run_attempt=run['run_attempt'], repository=pages.REPOSITORY, adoption_qualified=False,
+                    evidence_type='paired_median_screen', status='inconclusive', completeness={'complete': True, 'expected_rows': 24, 'observed_rows': 24},
+                    rows=[dict(size=size, density=density, path=path, eligible_pairs=31, invalid_pairs=0,
+                               decision='inconclusive', median_rust_over_cpp=0.9, bootstrap_95_percent_interval=[0.8, 1.1])
+                          for size, density, path in itertools.product((4096, 524288, 1048576, 8388608), ('ordinary', 'heavy'), ('tolerant', 'strict', 'body'))])
+
+    def test_last_valid_complete_cpp_is_separate_and_survives_new_profile_only_run(self):
+        newer = self.run_row()
+        older = self.run_row()
+        older.update(id=11, head_sha='b' * 40)
+        archives = {}
+        for artifact_id, runner in ((1, 'ubuntu-latest'), (2, 'ubuntu-24.04-arm')):
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, 'w') as archive:
+                archive.writestr('summary.json', json.dumps(self.complete_cpp(older, runner)))
+            archives[artifact_id] = buffer.getvalue()
+        def fetch(path):
+            if path.startswith('actions/workflows/'):
+                return {'workflow_runs': [newer, older]}
+            if path.startswith('actions/runs/12/'):
+                return {'artifacts': []}
+            return {'artifacts': [dict(name=f'public-benchmark-cpp-{runner}-11-2', id=i, expired=False, size_in_bytes=100)
+                                  for i, runner in ((1, 'ubuntu-latest'), (2, 'ubuntu-24.04-arm'))]}
+        history = pages.last_valid_comparison(fetch, lambda i: archives[i])
+        self.assertEqual(history['status'], 'Available historical comparison')
+        self.assertEqual(history['head_sha'], older['head_sha'])
+        self.assertEqual(history['run_id'], 11)
+        self.assertEqual(len(history['results']), 2)
+        report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[], results=[], last_valid_comparison=history)
+        rendered = pages.render(report)
+        self.assertIn('Last valid complete C++ comparison', rendered)
+        self.assertIn(older['head_sha'], rendered)
+
+    def test_last_valid_does_not_reuse_prior_attempt_partial_or_untrusted_runs(self):
+        run = self.run_row()
+        for changes in ({'event': 'pull_request'}, {'head_repository': {'full_name': 'other/repo'}}, {}):
+            candidate = dict(run, **changes)
+            def fetch(path):
+                if path.startswith('actions/workflows/'):
+                    return {'workflow_runs': [candidate]}
+                return {'artifacts': [dict(name='public-benchmark-cpp-ubuntu-latest-12-1', id=1, expired=False, size_in_bytes=100)]}
+            result = pages.last_valid_comparison(fetch, lambda _: self.fail('Wrong attempt or untrusted artifact must not be downloaded'))
+            self.assertNotEqual(result['status'], 'Available historical comparison')
+
+    def test_utility_summary_runtime_identity_and_public_fields(self):
+        summary = dict(schema_version=1, kind='cpu-snapshot', runner='ubuntu-latest', head_sha=SHA,
+                       run_id=12, run_attempt=2, repository=pages.REPOSITORY, rows=[], adoption_qualified=False,
+                       runtime_identity={'executed_sha': SHA, 'command': 'private'})
+        with self.assertRaises(ValueError):
+            pages.validate_summary(summary, self.run_row(), 'cpu-snapshot', 'ubuntu-latest')
+        summary['runtime_identity'] = {'executed_sha': 'b' * 40}
+        with self.assertRaises(ValueError):
+            pages.validate_summary(summary, self.run_row(), 'cpu-snapshot', 'ubuntu-latest')
+        summary['runtime_identity'] = {'executed_sha': SHA}
+        pages.validate_summary(summary, self.run_row(), 'cpu-snapshot', 'ubuntu-latest')
+
+    def test_utility_family_coverage_and_new_auxiliary_remains_explicit_gap(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / 'docker/app/nzb-yenc-ffi/src'
+            source.mkdir(parents=True)
+            for name in ('article_fingerprint', 'cpu_snapshot', 'new_auxiliary'):
+                (source / (name + '.rs')).write_text('')
+            rows = {Path(row['target']).stem: row for row in pages.coverage(Path(root))}
+            self.assertIn('Comparative', rows['article_fingerprint']['coverage'])
+            self.assertIn('Comparative', rows['cpu_snapshot']['coverage'])
+            self.assertEqual(rows['new_auxiliary']['coverage'], 'No automated benchmark')
 
     def test_frozen_reports_link_remains_separate_from_current_results(self):
         report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[], results=[], frozen_reports_available=True)
