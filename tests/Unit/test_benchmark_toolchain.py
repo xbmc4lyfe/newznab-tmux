@@ -13,7 +13,7 @@ TOOLCHAIN = '1.98.0'
 
 
 class BenchmarkToolchainTest(unittest.TestCase):
-    def run_helper(self, *, installed='', install_status=0, broken_after_install=''):
+    def run_helper(self, *, installed='', install_status=0, broken_after_install='', path_fallback=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             shared = root / 'shared-rustup'
@@ -31,7 +31,8 @@ args = sys.argv[1:]
 root = Path(__file__).parent
 home = Path(os.environ['RUSTUP_HOME'])
 with (root / 'calls.jsonl').open('a') as log:
-    log.write(json.dumps({'args': args, 'rustup_home': str(home)}) + '\\n')
+    log.write(json.dumps({'args': args, 'rustup_home': str(home),
+                          'auto_install': os.environ.get('RUSTUP_AUTO_INSTALL')}) + '\\n')
 if args[:2] == ['toolchain', 'install']:
     if home == root / 'shared-rustup':
         print('read-only shared toolchain store', file=sys.stderr)
@@ -40,11 +41,11 @@ if args[:2] == ['toolchain', 'install']:
         print('toolchain download failed', file=sys.stderr)
         raise SystemExit(int(os.environ['INSTALL_STATUS']))
     (home / 'installed').touch()
-elif len(args) == 4 and args[0] == 'run' and args[3] == '-V':
-    tool = args[2]
+elif len(args) == 4 and (args[0] == 'run' and args[3] == '-V' or args[:2] == ['which', '--toolchain']):
+    tool = args[2] if args[0] == 'run' else args[3]
     available = ((home == root / 'shared-rustup' and tool in os.environ['INSTALLED'].split(',')) or
                  ((home / 'installed').exists() and tool != os.environ['BROKEN_AFTER_INSTALL']))
-    if not available:
+    if not available and not (args[0] == 'run' and os.environ['PATH_FALLBACK'] == '1'):
         raise SystemExit(1)
     print(tool + ' ' + args[1] + ' (fixture)')
 else:
@@ -54,6 +55,7 @@ else:
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                        RUST_TOOLCHAIN=TOOLCHAIN, INSTALLED=installed,
                        INSTALL_STATUS=str(install_status), BROKEN_AFTER_INSTALL=broken_after_install,
+                       PATH_FALLBACK='1' if path_fallback else '0',
                        RUSTUP_HOME=str(shared), RUNNER_TEMP=str(runner_temp),
                        GITHUB_ENV=str(root / 'github-env'), CARGO_HOME=str(root / 'existing-cargo'),
                        CALLER_STATE=str(root / 'caller-state'))
@@ -74,10 +76,31 @@ else:
                     ['rustup', 'run', TOOLCHAIN, 'cargo', '-V'], env=later_env, text=True, capture_output=True)
             return result, [record['args'] for record in records], evidence
 
+    def test_path_fallback_cannot_satisfy_a_missing_pinned_binary(self):
+        for installed in ('rustc', 'cargo'):
+            with self.subTest(installed=installed):
+                result, calls, evidence = self.run_helper(installed=installed, path_fallback=True)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertTrue(any(call[:2] == ['toolchain', 'install'] for call in calls))
+                self.assertNotEqual(evidence['shared'], evidence['caller_state'][0])
+                self.assertTrue(all(record['auto_install'] == '0' for record in evidence['records']
+                                    if record['args'][0] == 'which'))
+
+    def test_path_fallback_cannot_hide_a_broken_post_installation(self):
+        for tool in ('rustc', 'cargo'):
+            with self.subTest(tool=tool):
+                result, calls, evidence = self.run_helper(broken_after_install=tool, path_fallback=True)
+                self.assertNotEqual(0, result.returncode)
+                self.assertTrue(any(call[:2] == ['toolchain', 'install'] for call in calls))
+                self.assertEqual('', evidence['github_env'])
+                self.assertEqual([], evidence['caller_state'])
+
     def test_reuses_both_pinned_tools_when_install_would_fail_on_read_only_store(self):
         result, calls, evidence = self.run_helper(installed='rustc,cargo', install_status=30)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual([
+            ['which', '--toolchain', '1.98.0', 'rustc'],
+            ['which', '--toolchain', '1.98.0', 'cargo'],
             ['run', '1.98.0', 'rustc', '-V'],
             ['run', '1.98.0', 'cargo', '-V'],
         ], calls)
@@ -88,8 +111,10 @@ else:
         result, calls, _ = self.run_helper()
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual([
-            ['run', '1.98.0', 'rustc', '-V'],
+            ['which', '--toolchain', '1.98.0', 'rustc'],
             ['toolchain', 'install', '1.98.0', '--profile', 'minimal', '--no-self-update'],
+            ['which', '--toolchain', '1.98.0', 'rustc'],
+            ['which', '--toolchain', '1.98.0', 'cargo'],
             ['run', '1.98.0', 'rustc', '-V'],
             ['run', '1.98.0', 'cargo', '-V'],
         ], calls)
@@ -98,9 +123,11 @@ else:
         result, calls, _ = self.run_helper(installed='rustc')
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual([
-            ['run', '1.98.0', 'rustc', '-V'],
-            ['run', '1.98.0', 'cargo', '-V'],
+            ['which', '--toolchain', '1.98.0', 'rustc'],
+            ['which', '--toolchain', '1.98.0', 'cargo'],
             ['toolchain', 'install', '1.98.0', '--profile', 'minimal', '--no-self-update'],
+            ['which', '--toolchain', '1.98.0', 'rustc'],
+            ['which', '--toolchain', '1.98.0', 'cargo'],
             ['run', '1.98.0', 'rustc', '-V'],
             ['run', '1.98.0', 'cargo', '-V'],
         ], calls)
@@ -109,7 +136,7 @@ else:
         result, calls, evidence = self.run_helper(install_status=42)
         self.assertEqual(42, result.returncode, result.stderr)
         self.assertEqual([
-            ['run', '1.98.0', 'rustc', '-V'],
+            ['which', '--toolchain', '1.98.0', 'rustc'],
             ['toolchain', 'install', '1.98.0', '--profile', 'minimal', '--no-self-update'],
         ], calls)
         self.assertEqual('', evidence['github_env'])
@@ -121,7 +148,7 @@ else:
                 result, calls, evidence = self.run_helper(broken_after_install=tool)
                 self.assertNotEqual(0, result.returncode)
                 self.assertTrue(calls)
-                self.assertEqual(['run', '1.98.0', tool, '-V'], calls[-1])
+                self.assertEqual(['which', '--toolchain', '1.98.0', tool], calls[-1])
                 self.assertEqual('', evidence['github_env'])
 
     def test_missing_pin_uses_a_fresh_job_store_visible_to_current_and_later_steps(self):

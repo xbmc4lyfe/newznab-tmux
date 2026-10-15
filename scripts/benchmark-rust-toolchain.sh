@@ -4,8 +4,11 @@
 benchmark_rust_toolchain_setup() {
     : "${RUST_TOOLCHAIN:?RUST_TOOLCHAIN must name the pinned benchmark toolchain}"
 
-    # A preinstalled runner toolchain may be read-only: probe without syncing.
-    if rustup run "$RUST_TOOLCHAIN" rustc -V && rustup run "$RUST_TOOLCHAIN" cargo -V; then
+    # Require binaries inside this pin: `run` alone can fall back to PATH.
+    # Disable implicit installation while probing a read-only shared store.
+    if RUSTUP_AUTO_INSTALL=0 rustup which --toolchain "$RUST_TOOLCHAIN" rustc >/dev/null &&
+       RUSTUP_AUTO_INSTALL=0 rustup which --toolchain "$RUST_TOOLCHAIN" cargo >/dev/null &&
+       rustup run "$RUST_TOOLCHAIN" rustc -V && rustup run "$RUST_TOOLCHAIN" cargo -V; then
         return 0
     fi
 
@@ -17,6 +20,8 @@ benchmark_rust_toolchain_setup() {
     benchmark_rustup_home="$(mktemp -d "$RUNNER_TEMP/nntmux-benchmark-rustup.XXXXXX")" || return
     export RUSTUP_HOME="$benchmark_rustup_home"
     rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update || return
+    RUSTUP_AUTO_INSTALL=0 rustup which --toolchain "$RUST_TOOLCHAIN" rustc >/dev/null || return
+    RUSTUP_AUTO_INSTALL=0 rustup which --toolchain "$RUST_TOOLCHAIN" cargo >/dev/null || return
     rustup run "$RUST_TOOLCHAIN" rustc -V || return
     rustup run "$RUST_TOOLCHAIN" cargo -V || return
     printf 'RUSTUP_HOME=%s\n' "$RUSTUP_HOME" >> "$GITHUB_ENV"
