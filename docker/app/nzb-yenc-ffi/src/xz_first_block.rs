@@ -32,6 +32,7 @@ pub struct Range {
 }
 
 /// Only an immediately following one-record Index; never a search for a stream end.
+#[cfg(feature = "experimental-xz-index")]
 #[derive(Debug, Default, Serialize)]
 pub struct IndexObservation {
     pub locator_basis: &'static str,
@@ -102,6 +103,7 @@ pub struct FirstBlock {
     pub check_observed_hex: String,
     pub next_item_offset: Option<u64>,
     pub following_byte: Option<u8>,
+    #[cfg(feature = "experimental-xz-index")]
     pub following_index: Option<IndexObservation>,
 }
 
@@ -165,6 +167,7 @@ fn vli(header: &[u8], cursor: &mut usize, body_end: usize, base: usize) -> Optio
     None // A continuing ninth byte cannot fit an XZ VLI.
 }
 
+#[cfg(feature = "experimental-xz-index")]
 fn index_integer(data: &[u8], cursor: &mut usize, base: usize) -> Result<Integer, &'static str> {
     let start = *cursor;
     if start == data.len() {
@@ -179,6 +182,7 @@ fn index_integer(data: &[u8], cursor: &mut usize, base: usize) -> Result<Integer
     })
 }
 
+#[cfg(feature = "experimental-xz-index")]
 fn observe_index(data: &[u8], block: &FirstBlock, start: u64) -> IndexObservation {
     let mut out = IndexObservation {
         locator_basis: "first_block_declared_end; no forward search",
@@ -501,7 +505,10 @@ pub fn observe(
     out.check_observed_hex = hex(observed(data, &check));
     out.check = Some(check);
     out.next_item_offset = Some(check_end);
-    out.following_index = Some(observe_index(data, &out, check_end));
+    #[cfg(feature = "experimental-xz-index")]
+    {
+        out.following_index = Some(observe_index(data, &out, check_end));
+    }
     out.following_byte = usize::try_from(check_end)
         .ok()
         .and_then(|offset| data.get(offset).copied());
@@ -796,6 +803,7 @@ mod tests {
             );
         }
     }
+    #[cfg(feature = "experimental-xz-index")]
     #[test]
     fn following_index_compares_checksummed_declarations_without_decoding() {
         let data = bytes(
@@ -814,12 +822,14 @@ mod tests {
         assert_eq!(out["whole_stream_validated"], false);
         assert_eq!(out["content_decompressed"], false);
     }
+    #[cfg(feature = "experimental-xz-index")]
     fn with_index(index: &str) -> Vec<u8> {
         let mut data = bytes("fd377a585a000000ff12d94102c0050121010000f05dfb9f0100004100000000");
         data.extend(bytes(index));
         data
     }
 
+    #[cfg(feature = "experimental-xz-index")]
     #[test]
     fn following_index_retains_checksummed_conflicts_and_independent_failures() {
         for (literal, status, unpadded, unpacked) in [
@@ -894,6 +904,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "experimental-xz-index")]
     #[test]
     fn following_index_alignment_maximum_and_all_partial_prefixes_are_bounded() {
         for (literal, expected_status) in [
@@ -952,6 +963,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "experimental-xz-index")]
     #[test]
     fn following_index_distinguishes_incomplete_and_malformed_vlis() {
         for literal in ["00", "0080", "0001", "000180", "000111", "00011180"] {
@@ -982,6 +994,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "experimental-xz-index")]
     #[test]
     fn following_index_requires_qualified_locator_without_searching() {
         let mut data = with_index("00011101ada65804");
@@ -1009,6 +1022,7 @@ mod tests {
         assert_eq!(index.status, "not_sampled");
         assert!(index.candidate_preview_hex.is_empty());
     }
+    #[cfg(feature = "experimental-xz-index")]
     #[test]
     fn following_index_uses_check_width_without_verifying_content_or_requiring_header_u() {
         for (id, width) in [
@@ -1047,6 +1061,7 @@ mod tests {
         assert_eq!(index.start_offset, 9223372036854775816);
         assert_eq!(index.status, "not_sampled");
     }
+    #[cfg(feature = "experimental-xz-index")]
     #[test]
     fn following_index_checks_aggregate_stream_limit_separately_from_vli_domain() {
         for (literal, total, valid) in [
