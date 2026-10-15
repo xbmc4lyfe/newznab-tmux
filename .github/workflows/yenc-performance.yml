@@ -546,19 +546,17 @@ jobs:
         if: always()
         shell: bash
         run: |
-          python3 - <<'PY_SUMMARY'
-          import json, os, pathlib
-          path = pathlib.Path('processing-evidence/paired/observations.jsonl')
-          rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write('## Fingerprint caller screen\n\nBODY and FFI/JSON diagnostics are retained separately. This median screen does not qualify a Rust replacement: the 1.5x common-path and uncommon p99 policy remains the adoption gate.\n\n')
-              summary.write('| Bytes | Density | Decision | Candidate / baseline median | Simultaneous interval | Eligible / invalid |\n|---:|---|---|---:|---|---|\n')
-              for row in rows:
-                  if row.get('type') == 'stratum_summary':
-                      summary.write(f"| {row['size']} | {row['density']} | {row['decision']} | {row.get('median_candidate_over_baseline', 'unavailable')} | {row.get('bootstrap_95_percent_interval', 'unavailable')} | {row['eligible_pairs']} / {row['invalid_pairs']} |\n")
-              final = next((row for row in reversed(rows) if row.get('type') in ('run_summary', 'run_failure')), None)
-              summary.write('\nResult: `' + (final['status'] if final else 'profile only or setup incomplete') + '`. Exact serialized caller metadata and independently expected decoded bytes must match for every pair.\n')
-          PY_SUMMARY
+          utility=docker/app/nzb-yenc-ffi/target/release/nntmux-evidence-utility
+          if [[ -x "$utility" ]]; then
+            "$utility" --mode article-summary
+          elif [[ ! -e processing-evidence/paired/observations.jsonl ]] &&
+               [[ ! -d processing-evidence || -x processing-evidence ]] &&
+               [[ ! -d processing-evidence/paired || -x processing-evidence/paired ]]; then
+            printf '## Fingerprint caller screen\n\nBODY and FFI/JSON diagnostics are retained separately. This median screen does not qualify a Rust replacement: the 1.5x common-path and uncommon p99 policy remains the adoption gate.\n\n| Bytes | Density | Decision | Candidate / baseline median | Simultaneous interval | Eligible / invalid |\n|---:|---|---|---:|---|---|\n\nResult: `profile only or setup incomplete`. Exact serialized caller metadata and independently expected decoded bytes must match for every pair.\n' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Evidence utility unavailable or paired input cannot be inspected.' >&2
+            exit 1
+          fi
 
       - name: Export compact public benchmark summary
         if: always()
