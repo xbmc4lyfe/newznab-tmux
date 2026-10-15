@@ -2,6 +2,8 @@ use md5::Md5;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+#[path = "iso_primary_copies.rs"]
+mod iso_primary_copies;
 #[path = "rar5_copy_checksums.rs"]
 mod rar5_copy_checksums;
 #[path = "rar5_quick_open.rs"]
@@ -18,6 +20,7 @@ pub struct FormatMetadata {
     pub signatures: Vec<SignatureMatch>,
     pub headers: Vec<FormatHeader>,
     pub iso_descriptor_sequence: Option<IsoDescriptorSequence>,
+    pub iso_primary_volume_descriptor_copies: Option<iso_primary_copies::PrimaryDescriptorCopies>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1005,6 +1008,9 @@ pub fn parse(data: &[u8]) -> FormatMetadata {
     }
 
     let iso_descriptor_sequence = scan_iso_descriptor_sequence(data);
+    let iso_primary_volume_descriptor_copies = iso_descriptor_sequence
+        .as_ref()
+        .map(|sequence| iso_primary_copies::parse(data, sequence));
     if let Some(offset) = iso_descriptor_sequence
         .as_ref()
         .and_then(|sequence| sequence.first_primary_volume_descriptor_offset)
@@ -1019,6 +1025,7 @@ pub fn parse(data: &[u8]) -> FormatMetadata {
 
     FormatMetadata {
         parser_engine: "nntmux-rust-ffi",
+        iso_primary_volume_descriptor_copies,
         sample_prefix_identity,
         candidate_scan_limit_per_format: MAX_SIGNATURE_CANDIDATES_PER_FORMAT,
         candidate_scan_truncated_formats,
@@ -6862,6 +6869,237 @@ mod tests {
         let limited = scan_iso_descriptor_sequence(&full_scan).unwrap();
         assert_eq!(limited.status, "scan_limit_reached");
         assert_eq!(limited.descriptors.len(), 240);
+    }
+
+    #[test]
+    fn compares_only_complete_supported_iso_primary_descriptor_recordings() {
+        let mut primary = iso_volume_descriptor(1, 1);
+        primary[40] = b'A';
+        let mut iso = vec![0; ISO_PVD_OFFSET];
+        iso.extend_from_slice(&iso_volume_descriptor(0, 1));
+        iso.extend_from_slice(&primary);
+        iso.extend_from_slice(&iso_volume_descriptor(2, 2));
+        iso.extend_from_slice(&primary);
+        iso.extend_from_slice(&iso_volume_descriptor(255, 1));
+        // A later descriptor outside the terminated sequence must not contribute.
+        primary[40] = b'B';
+        iso.extend_from_slice(&primary);
+        let metadata = serde_json::to_value(parse(&iso)).unwrap();
+        let copies = &metadata["iso_primary_volume_descriptor_copies"];
+        assert_eq!(copies["status"], "observed_copies_agree");
+        assert_eq!(copies["sequence_status"], "terminated");
+        assert_eq!(copies["sampled_descriptor_sequence_terminated"], true);
+        assert_eq!(copies["observed_descriptor_count"], 2);
+        assert_eq!(copies["repeat_comparison_count"], 1);
+        assert_eq!(copies["matching_reference_count"], 2);
+        assert_eq!(copies["differing_reference_count"], 0);
+        assert_eq!(copies["all_observed_copies_equal"], true);
+        assert_eq!(copies["reference_descriptor_offset"], 34_816);
+        assert_eq!(copies["copies"][0]["descriptor_sequence_index"], 1);
+        assert_eq!(copies["copies"][1]["descriptor_sequence_index"], 3);
+        assert_eq!(copies["copies"][1]["sector"], 19);
+        assert_eq!(copies["copies"][1]["offset"], 38_912);
+        assert_eq!(copies["copies"][1]["end_offset_exclusive"], 40_960);
+        assert_eq!(copies["copies"][1]["bytes_hashed"], 2048);
+        // Independently calculated SHA-256 of the literal header, A at byte 40,
+        // and zero-filled remainder. It is not an ISO conformance fixture.
+        assert_eq!(
+            copies["copies"][0]["raw_sha256"],
+            "725f9ad391992113e66c59367b134c9d0b9d3c8582705a3316eebf40925f01c0"
+        );
+        assert_eq!(copies["copies"][1]["matches_reference"], true);
+        assert!(copies["copies"][1]["first_difference"].is_null());
+        assert!(copies["first_difference"].is_null());
+        assert_eq!(copies["whole_image_validated"], false);
+        assert_eq!(copies["image_origin_known"], false);
+        assert!(
+            copies["offset_basis"]
+                .as_str()
+                .unwrap()
+                .contains("sample-relative")
+        );
+    }
+
+    #[test]
+    fn retains_iso_primary_byte_differences_in_partial_sequences() {
+        for changed in [7, 40, 883, 2047] {
+            let mut first = iso_volume_descriptor(1, 1);
+            first[40] = b'A';
+            let mut later = first.clone();
+            later[changed] ^= 1;
+            let mut iso = vec![0; ISO_PVD_OFFSET];
+            iso.extend_from_slice(&first);
+            iso.extend_from_slice(&later);
+            let metadata = serde_json::to_value(parse(&iso)).unwrap();
+            let copies = &metadata["iso_primary_volume_descriptor_copies"];
+            assert_eq!(copies["status"], "observed_copies_differ");
+            assert_eq!(copies["sequence_status"], "sample_truncated");
+            assert_eq!(copies["sampled_descriptor_sequence_terminated"], false);
+            assert_eq!(copies["observed_descriptor_count"], 2);
+            assert_eq!(copies["matching_reference_count"], 1);
+            assert_eq!(copies["differing_reference_count"], 1);
+            assert_eq!(copies["all_observed_copies_equal"], false);
+            let difference = &copies["first_difference"];
+            assert_eq!(difference["descriptor_relative_offset"], changed);
+            assert_eq!(difference["reference_sample_offset"], 32_768 + changed);
+            assert_eq!(difference["differing_sample_offset"], 34_816 + changed);
+            assert_eq!(difference["reference_byte"], first[changed]);
+            assert_eq!(difference["differing_byte"], later[changed]);
+            assert_eq!(copies["copies"][1]["first_difference"], *difference);
+        }
+    }
+
+    #[test]
+    fn withholds_iso_primary_equality_without_repeated_complete_observations() {
+        for (later_type, later_version, expected_status) in [
+            (1, 2, "malformed"),
+            (4, 1, "unsupported_reserved_type"),
+            (255, 2, "malformed_terminator_version"),
+        ] {
+            let mut iso = vec![0; ISO_PVD_OFFSET];
+            iso.extend_from_slice(&iso_volume_descriptor(1, 1));
+            iso.extend_from_slice(&iso_volume_descriptor(later_type, later_version));
+            let metadata = serde_json::to_value(parse(&iso)).unwrap();
+            let copies = &metadata["iso_primary_volume_descriptor_copies"];
+            assert_eq!(copies["status"], "single_primary_descriptor_observed");
+            assert_eq!(copies["observed_descriptor_count"], 1);
+            assert_eq!(copies["repeat_comparison_count"], 0);
+            assert!(copies["all_observed_copies_equal"].is_null());
+            assert_eq!(copies["sequence_status"], expected_status);
+            assert_eq!(copies["sampled_descriptor_sequence_terminated"], false);
+        }
+        let mut iso = vec![0; ISO_PVD_OFFSET];
+        iso.extend_from_slice(&iso_volume_descriptor(2, 1));
+        iso.extend_from_slice(&iso_volume_descriptor(255, 1));
+        let metadata = serde_json::to_value(parse(&iso)).unwrap();
+        let copies = &metadata["iso_primary_volume_descriptor_copies"];
+        assert_eq!(copies["status"], "no_primary_descriptor_observed");
+        assert_eq!(copies["observed_descriptor_count"], 0);
+        assert!(copies["all_observed_copies_equal"].is_null());
+        assert!(copies["reference_descriptor_offset"].is_null());
+        assert_eq!(copies["copies"].as_array().unwrap().len(), 0);
+        assert!(serde_json::to_value(parse(b"not an ISO")).unwrap()
+            ["iso_primary_volume_descriptor_copies"].is_null());
+    }
+
+    #[test]
+    fn compares_iso_primary_copies_after_detail_limit_without_unbounded_output() {
+        let first = iso_volume_descriptor(1, 1);
+        let mut iso = vec![0; ISO_PVD_OFFSET];
+        for index in 0..240 {
+            let mut descriptor = first.clone();
+            if index == 239 {
+                descriptor[2047] = 1;
+            }
+            iso.extend_from_slice(&descriptor);
+        }
+        let metadata = serde_json::to_value(parse(&iso)).unwrap();
+        let copies = &metadata["iso_primary_volume_descriptor_copies"];
+        assert_eq!(copies["status"], "observed_copies_differ");
+        assert_eq!(copies["sequence_status"], "scan_limit_reached");
+        assert_eq!(copies["sampled_descriptor_sequence_terminated"], false);
+        assert_eq!(copies["observed_descriptor_count"], 240);
+        assert_eq!(copies["repeat_comparison_count"], 239);
+        assert_eq!(copies["matching_reference_count"], 239);
+        assert_eq!(copies["differing_reference_count"], 1);
+        assert_eq!(copies["detail_limit"], 64);
+        assert_eq!(copies["details_omitted_count"], 176);
+        assert_eq!(copies["copies"].as_array().unwrap().len(), 64);
+        assert_eq!(copies["all_observed_copies_equal"], false);
+        assert_eq!(
+            copies["first_difference"]["descriptor_relative_offset"],
+            2047
+        );
+        assert_eq!(
+            copies["first_difference"]["reference_sample_offset"],
+            34_815
+        );
+        assert_eq!(
+            copies["first_difference"]["differing_sample_offset"],
+            524_287
+        );
+    }
+
+    #[test]
+    fn iso_primary_copy_coverage_keeps_failures_and_earliest_difference() {
+        let first = iso_volume_descriptor(1, 1);
+        let mut different = first.clone();
+        different[2047] = 1;
+        let mut later_difference = first.clone();
+        later_difference[7] = 2;
+        for ending in [
+            "partial_descriptor",
+            "bad_identifier",
+            "bad_terminator",
+            "terminated",
+        ] {
+            let mut iso = vec![0; ISO_PVD_OFFSET];
+            iso.extend_from_slice(&first);
+            iso.extend_from_slice(&different);
+            iso.extend_from_slice(&later_difference);
+            iso.extend_from_slice(&first);
+            let (tail, expected_status) = match ending {
+                "partial_descriptor" => (first[..2047].to_vec(), "sample_truncated"),
+                "bad_identifier" => {
+                    let mut bad = first.clone();
+                    bad[1] = b'X';
+                    (bad, "malformed")
+                }
+                "bad_terminator" => {
+                    let mut bad = iso_volume_descriptor(255, 1);
+                    bad[7] = 1;
+                    (bad, "malformed_terminator_reserved_bytes")
+                }
+                _ => (iso_volume_descriptor(255, 1), "terminated"),
+            };
+            iso.extend_from_slice(&tail);
+            // Neither a malformed boundary nor a terminator permits scanning
+            // onward for convenient matching descriptors.
+            if ending != "partial_descriptor" {
+                iso.extend_from_slice(&first);
+            }
+            let metadata = serde_json::to_value(parse(&iso)).unwrap();
+            let copies = &metadata["iso_primary_volume_descriptor_copies"];
+            assert_eq!(copies["observed_descriptor_count"], 4, "{ending}");
+            assert_eq!(copies["matching_reference_count"], 2);
+            assert_eq!(copies["differing_reference_count"], 2);
+            assert_eq!(copies["sequence_status"], expected_status, "{ending}");
+            assert_eq!(
+                copies["sampled_descriptor_sequence_terminated"],
+                ending == "terminated"
+            );
+            assert_eq!(copies["all_observed_copies_equal"], false);
+            // Earliest conflicting recording wins, not the minimum relative
+            // byte index among all conflicting recordings, nor the last one.
+            assert_eq!(
+                copies["first_difference"]["descriptor_relative_offset"],
+                2047
+            );
+            assert_eq!(
+                copies["first_difference"]["differing_sample_offset"],
+                36_863
+            );
+        }
+        // A complete matching prefix is still explicitly incomplete.
+        let mut iso = vec![0; ISO_PVD_OFFSET];
+        iso.extend_from_slice(&first);
+        iso.extend_from_slice(&first);
+        let metadata = serde_json::to_value(parse(&iso)).unwrap();
+        let copies = &metadata["iso_primary_volume_descriptor_copies"];
+        assert_eq!(copies["status"], "observed_copies_agree");
+        assert_eq!(copies["sampled_descriptor_sequence_terminated"], false);
+        assert_eq!(copies["sequence_status"], "sample_truncated");
+        // Declared logical block size cannot change descriptor sector offsets.
+        let mut small_block = first.clone();
+        small_block[128..132].copy_from_slice(&[0, 2, 2, 0]);
+        iso.truncate(ISO_PVD_OFFSET);
+        iso.extend_from_slice(&small_block);
+        iso.extend_from_slice(&small_block);
+        let metadata = serde_json::to_value(parse(&iso)).unwrap();
+        assert_eq!(
+            metadata["iso_primary_volume_descriptor_copies"]["copies"][1]["offset"],
+            34_816
+        );
     }
 
     fn iso_volume_descriptor(descriptor_type: u8, version: u8) -> Vec<u8> {
