@@ -63,6 +63,31 @@ final class MissedPartHandler
         $this->addMissingParts(range($first, $last), $groupId);
     }
 
+    /** Preserve never-attempted work without consuming retries on an existing obligation. */
+    public function deferRange(int $first, int $last, int $groupId): void
+    {
+        if ($last < $first) {
+            return;
+        }
+        $rows = [];
+        $bindings = [];
+        $conflict = DB::getDriverName() === 'sqlite'
+            ? ' ON CONFLICT(numberid, groups_id) DO NOTHING'
+            : ' ON DUPLICATE KEY UPDATE numberid = VALUES(numberid)';
+        for ($number = $first; $number <= $last; $number++) {
+            $rows[] = '(?, ?, 0)';
+            array_push($bindings, $number, $groupId);
+            if (\count($rows) === $this->chunkSize || $number === $last) {
+                DB::statement('INSERT INTO missed_parts (numberid, groups_id, attempts) VALUES '.implode(',', $rows).$conflict, $bindings);
+                $rows = [];
+                $bindings = [];
+            }
+            if ($number === $last) {
+                break;
+            }
+        }
+    }
+
     /**
      * @param  array<int, int|string>  $numbers
      */
