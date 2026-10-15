@@ -1,5 +1,8 @@
 //! Explicit Rust A/A ABI control; never a C++ comparison or caller adoption gate.
 use serde_json::{Value, json};
+
+#[path = "../control_host.rs"]
+mod control_host;
 use std::{fs, path::Path, process::Command, time::Duration};
 
 use sha2::{Digest, Sha256};
@@ -34,7 +37,19 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn read_regular(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
+fn read_regular_typed(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
+    read_file_typed(path, cap, true)
+}
+
+fn read_host_source_typed(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
+    read_file_typed(path, cap, false)
+}
+
+fn read_file_typed(
+    path: &Path,
+    cap: usize,
+    reported_size_is_exact: bool,
+) -> std::io::Result<Vec<u8>> {
     // Nonblocking avoids a swapped FIFO blocking open; NOFOLLOW rejects a
     // symlink at the final component. Metadata is checked on the opened file.
     // Linux arm64 overrides the asm-generic O_NOFOLLOW bit for AArch32 ABI
@@ -48,20 +63,46 @@ fn read_regular(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(FLAGS)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    let metadata = file.metadata().map_err(|e| e.to_string())?;
-    if !metadata.is_file() || metadata.len() > cap as u64 {
-        return Err("nonregular or oversized file".into());
+        .open(path)?;
+    let metadata = file.metadata()?;
+    read_opened_regular(
+        file,
+        metadata.is_file(),
+        metadata.len(),
+        cap,
+        reported_size_is_exact,
+    )
+}
+
+fn read_opened_regular(
+    file: impl Read,
+    is_regular: bool,
+    reported_length: u64,
+    cap: usize,
+    reported_size_is_exact: bool,
+) -> std::io::Result<Vec<u8>> {
+    // sysfs text attributes can report PAGE_SIZE while returning a short line.
+    // Host sources are still regular, NOFOLLOW-opened streams capped by actual
+    // returned bytes. Ordinary artifact admission retains its size precheck.
+    if !is_regular || (reported_size_is_exact && reported_length > cap as u64) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "nonregular or oversized file",
+        ));
     }
     let mut bytes = Vec::new();
-    file.take(cap as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+    file.take(cap as u64 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > cap {
-        return Err("file grew beyond budget".into());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file grew beyond budget",
+        ));
     }
     Ok(bytes)
+}
+
+fn read_regular(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
+    read_regular_typed(path, cap).map_err(|e| e.to_string())
 }
 
 fn exclusive(path: &Path) -> Result<fs::File, String> {
@@ -391,6 +432,7 @@ fn admit(left: &Value, right: &Value, library_sha: &str, worker_sha: &str) -> Re
         || left["library_sha256"] != library_sha
         || left["worker_sha256"] != worker_sha
         || !(hash_text(&left["git_head"], 40) || hash_text(&left["git_head"], 64))
+        || !hash_text(&left["measurement_context_sha256"], 64)
     {
         return fail();
     }
@@ -1004,7 +1046,7 @@ fn cpu_endpoint(record: &Value, label: &str) -> Option<(u64, Vec<u64>)> {
     Some((stamp, ticks))
 }
 
-fn final_control_status(
+fn cpu_interval_control_status(
     intact: bool,
     invalid_pairs: u64,
     before: &Value,
@@ -1025,6 +1067,19 @@ fn final_control_status(
         "control_observations_complete"
     } else {
         "partial_control_cpu_interval_unavailable"
+    }
+}
+
+fn final_control_status(cpu_status: &'static str, before: &Value, after: &Value) -> &'static str {
+    let context = control_host::comparison(before, after);
+    if cpu_status == "invalidated_identity_drift" {
+        cpu_status
+    } else if context["complete"] != true {
+        "invalidated_host_context_unavailable"
+    } else if context["static_identity_equal"] != true {
+        "invalidated_host_context_drift"
+    } else {
+        cpu_status
     }
 }
 
@@ -1268,9 +1323,14 @@ fn execute_owned(
     let schedule_path = output.join("schedule.json");
     frozen_file(&schedule_path, &schedule)?;
     identities.push((schedule_path, digest(&schedule), 2_097_152));
-    let mut protocol = json!({"type":"protocol","version":"rust-aa-control-v1","comparison_kind":"rust-aa-control",
+    let mut protocol = json!({"type":"protocol","version":"rust-aa-control-v2","comparison_kind":"rust-aa-control",
         "claim":"A/A ABI control observations only; no C++ comparison, actual PHP caller result, speed qualification or adoption verdict",
-        "host":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH},"source_build_manifest":manifest,
+        "host":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,
+            "observed_context_receipt":"host-context-before.json",
+            "scope":"guest-visible context verified at setup and bracketing endpoints; physical CPU identity and outer host limits unknown"},
+        "host_context_policy":"typed static identity must match setup digest and remain unchanged; ordered local monotonic endpoints; missing required evidence never qualifies",
+        "host_context_raw_budget_bytes":1_048_576,"host_context_endpoint_budget_bytes":control_host::ENDPOINT_CAP,
+        "source_build_manifest":manifest,
         "source_snapshot":source_snapshot,"runtime_executables":runtimes,"kernel_probes":probes,
         "libraries":libraries,"library_sha256":library_sha,"worker_sha256":worker_sha,
         "fixture_inventory":fixtures,"schedule_sha256":digest(&schedule),"scheduled_pairs":steps.len(),
@@ -1318,6 +1378,24 @@ fn execute_owned(
             .and_then(|v| serde_json::from_slice::<Value>(&v).ok());
         json!({"type":"cpu_endpoint","label":label,"receipt":receipt,"endpoint":endpoint,"missing_counters_are_unavailable":true})
     };
+    let host_clock = Instant::now();
+    let host_before = capture_host_endpoint(
+        &output.join("host-context-before.json"),
+        "before",
+        host_clock,
+    )?;
+    emit(
+        out,
+        &json!({"type":"host_context_before","context":host_before}),
+    )?;
+    if host_before["complete"] != true
+        || host_before["static_sha256"] != manifest["measurement_context_sha256"]
+    {
+        return Err(
+            "measurement host context unavailable or does not match its declared setup digest"
+                .into(),
+        );
+    }
     let cpu_before = counter("before");
     emit(out, &cpu_before)?;
     let context = ScheduleContext {
@@ -1352,6 +1430,18 @@ fn execute_owned(
     // Always attempt the ending endpoint after a scheduling/executor failure.
     let cpu_after = counter("after");
     emit(out, &cpu_after)?;
+    let host_after =
+        capture_host_endpoint(&output.join("host-context-after.json"), "after", host_clock)
+            .unwrap_or_else(|error| json!({"complete":false,"error":error}));
+    let host_comparison = control_host::comparison(&host_before, &host_after);
+    emit(
+        out,
+        &json!({"type":"host_context_after","context":host_after}),
+    )?;
+    emit(
+        out,
+        &json!({"type":"host_context_comparison","comparison":host_comparison}),
+    )?;
     let repository_after = repository_identity(
         &runtime_paths["git"],
         source,
@@ -1374,7 +1464,7 @@ fn execute_owned(
         &json!({"type":"identity_after","receipts":after,"all_identities_unchanged":intact}),
     )?;
     let mut summary = measured?;
-    let status = final_control_status(
+    let status = cpu_interval_control_status(
         intact,
         summary["invalid_pairs"]
             .as_u64()
@@ -1382,17 +1472,20 @@ fn execute_owned(
         &cpu_before,
         &cpu_after,
     );
+    let status = final_control_status(status, &host_before, &host_after);
     let complete = status == "control_observations_complete";
     summary["type"] = json!("run_summary");
     summary["comparison_kind"] = json!("rust-aa-control");
     summary["status"] = json!(status);
     summary["cpu_interval_qualified"] = json!(
-        final_control_status(true, 0, &cpu_before, &cpu_after) == "control_observations_complete"
+        cpu_interval_control_status(true, 0, &cpu_before, &cpu_after)
+            == "control_observations_complete"
     );
     summary["all_identities_unchanged"] = json!(intact);
     summary["noise_equivalence_qualified"] = json!(false);
     summary["adoption_qualified"] = json!(false);
-    if !intact {
+    summary["host_context"] = host_comparison.clone();
+    if !intact || host_comparison["static_identity_equal"] != true {
         summary["summaries"] = Value::Null;
         summary["qualified_pairs"] = json!(0);
     }
@@ -1404,16 +1497,65 @@ fn execute_owned(
     }
 }
 
+fn capture_host_endpoint(path: &Path, label: &str, origin: Instant) -> Result<Value, String> {
+    let start = u64::try_from(origin.elapsed().as_nanos()).map_err(|_| "host clock overflow")?;
+    let mut context = control_host::capture(
+        Path::new("/proc"),
+        Path::new("/sys"),
+        Path::new("/etc/os-release"),
+        [
+            std::env::var("ImageOS").ok(),
+            std::env::var("ImageVersion").ok(),
+        ],
+    );
+    let end = u64::try_from(origin.elapsed().as_nanos()).map_err(|_| "host clock overflow")?;
+    context["interval_start_ns"] = json!(start);
+    context["interval_end_ns"] = json!(end);
+    context["clock_scope"] =
+        json!("controller-local monotonic elapsed time; setup and run clock origins differ");
+    context["label"] = json!(label);
+    let bytes = serde_json::to_vec(&context).map_err(|e| e.to_string())?;
+    if bytes.len() > control_host::ENDPOINT_CAP {
+        return Err("host context exceeds endpoint budget".into());
+    }
+    exclusive(path)?
+        .write_all(&bytes)
+        .map_err(|e| e.to_string())?;
+    Ok(context)
+}
+
+fn capture_host_setup(arg: &str) -> Result<Value, String> {
+    if std::env::consts::OS != "linux" || std::env::consts::ARCH != "aarch64" {
+        return Err("host setup capture requires disposable Linux ARM64".into());
+    }
+    let path = Path::new(arg);
+    if !path.is_absolute() {
+        return Err("host context output path must be absolute".into());
+    }
+    let context = capture_host_endpoint(path, "setup", Instant::now())?;
+    if context["complete"] != true {
+        return Err("host context incomplete; captured evidence retained".into());
+    }
+    Ok(
+        json!({"status":"host_context_captured","path":path,"static_sha256":context["static_sha256"]}),
+    )
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] {
         println!(
-            "Rust A/A ABI control, disposable Linux ARM64 only. Every path must be absolute.\nRequired --name=value paths: {}\nOptional: --samples=31 --iterations=8 --seed=20261015 --timeout=30\nRequires identical library and complete source/build manifest bytes. No C++/PHP caller/adoption verdict.",
+            "Rust A/A ABI control, disposable Linux ARM64 only. Every path must be absolute.\nRequired --name=value paths: {}\nOptional: --samples=31 --iterations=8 --seed=20261015 --timeout=30\nSetup: --capture-host-context=/absolute/new-context.json\nRequires identical library and complete source/build manifest bytes, a measurement-context digest, and stable observed guest-visible CPU/resource evidence. No C++/PHP caller/adoption verdict.",
             PATH_KEYS.join(", ")
         );
         return;
     }
-    match options(&args).and_then(|options| execute(&options)) {
+    let result = if args.len() == 1 && args[0].starts_with("--capture-host-context=") {
+        capture_host_setup(args[0].strip_prefix("--capture-host-context=").unwrap())
+    } else {
+        options(&args).and_then(|options| execute(&options))
+    };
+    match result {
         Ok(summary) => println!("{summary}"),
         Err(error) => {
             eprintln!("{}", json!({"status":"invalid_control","error":error}));
@@ -1677,6 +1819,33 @@ mod tests {
         ] {
             assert!(canonical_commit(&text).is_none());
         }
+    }
+
+    #[test]
+    fn pseudofile_reported_page_size_is_not_a_stream_length_or_allocation_bound() {
+        let data = b"0x00000000410fd0c1\n";
+        for page_size in [4096, 65536] {
+            assert_eq!(
+                read_opened_regular(std::io::Cursor::new(data), true, page_size, 128, false)
+                    .unwrap(),
+                data
+            );
+            assert!(
+                read_opened_regular(std::io::Cursor::new(data), true, page_size, 128, true)
+                    .is_err()
+            );
+        }
+        assert!(
+            read_opened_regular(
+                std::io::Cursor::new(vec![b'A'; 129]),
+                true,
+                4096,
+                128,
+                false
+            )
+            .is_err()
+        );
+        assert!(read_opened_regular(std::io::Cursor::new(data), false, 0, 128, false).is_err());
     }
 
     #[test]
@@ -2095,7 +2264,7 @@ mod tests {
         let after = json!({"label":"after","receipt":{"status":"ok","exit_code":0,"stderr_bytes":0},
             "endpoint":{"schema_version":1,"monotonic_ns":200,"os_cpu_usable":true,"os":{"stat":{"status":"captured","raw":"cpu 2 3 4 5\n"}}}});
         assert_eq!(
-            final_control_status(true, 0, &before, &after),
+            cpu_interval_control_status(true, 0, &before, &after),
             "control_observations_complete"
         );
         for variant in 0..7 {
@@ -2110,22 +2279,22 @@ mod tests {
                 _ => bad["endpoint"]["os"]["stat"]["raw"] = json!("cpu 1 nope 3 4\n"),
             }
             assert_ne!(
-                final_control_status(true, 0, &before, &bad),
+                cpu_interval_control_status(true, 0, &before, &bad),
                 "control_observations_complete",
                 "{variant}"
             );
             assert_ne!(
-                final_control_status(true, 0, &bad, &after),
+                cpu_interval_control_status(true, 0, &bad, &after),
                 "control_observations_complete",
                 "{variant}"
             );
         }
         assert_ne!(
-            final_control_status(true, 1, &before, &after),
+            cpu_interval_control_status(true, 1, &before, &after),
             "control_observations_complete"
         );
         assert_ne!(
-            final_control_status(false, 0, &before, &after),
+            cpu_interval_control_status(false, 0, &before, &after),
             "control_observations_complete"
         );
     }
@@ -2209,6 +2378,7 @@ mod tests {
 
     fn manifest() -> Value {
         json!({"comparison_kind":"rust-aa-control", "git_head":"1".repeat(40),
+            "measurement_context_sha256":"2".repeat(64),
             "rust_payload_mode":"experimental", "library_sha256":"a".repeat(64),
             "worker_sha256":"b".repeat(64), "rust_source_sha256":{"src/lib.rs":"c".repeat(64)},
             "cargo_lock_sha256":"d".repeat(64), "cargo_toml_sha256":"e".repeat(64),
@@ -2252,6 +2422,7 @@ mod tests {
         right["library_sha256"] = json!("0".repeat(64));
         assert!(admit(&left, &right, &hash, &worker).is_err());
         for key in [
+            "measurement_context_sha256",
             "rust_source_sha256",
             "cargo_lock_sha256",
             "cargo_toml_sha256",
@@ -2320,7 +2491,7 @@ mod tests {
             serde_json::from_slice(&read_regular(config_path, 16_384).unwrap()).unwrap();
         let controller = config["controller"].as_str().unwrap();
         assert!(Path::new(controller).is_absolute());
-        let arguments: Vec<String> = config["arguments"]
+        let mut arguments: Vec<String> = config["arguments"]
             .as_array()
             .unwrap()
             .iter()
@@ -2344,6 +2515,11 @@ mod tests {
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .env("LC_ALL", "C")
+                .envs(
+                    ["ImageOS", "ImageVersion"]
+                        .into_iter()
+                        .filter_map(|key| std::env::var(key).ok().map(|value| (key, value))),
+                )
                 .stdin(Stdio::null())
                 .stdout(exclusive(&stdout_path).unwrap())
                 .stderr(exclusive(&stderr_path).unwrap())
@@ -2355,6 +2531,44 @@ mod tests {
                 read_regular(&stderr_path, 65_536).unwrap(),
             )
         };
+        // Freeze this integration executor's own inherited context. Cargo's
+        // parent limits can differ from the workflow shell used by the later
+        // control run; neither executor may borrow the other's measurement ID.
+        let context_path = setup.join("integration-measurement-context.json");
+        let (capture_status, _, capture_stderr) = invoke(
+            "context-setup",
+            &[format!("--capture-host-context={}", context_path.display())],
+        );
+        assert!(
+            capture_status.success(),
+            "{}",
+            String::from_utf8_lossy(&capture_stderr)
+        );
+        let context: Value = serde_json::from_slice(
+            &read_regular(&context_path, control_host::ENDPOINT_CAP).unwrap(),
+        )
+        .unwrap();
+        let mut bound_manifest: Value = serde_json::from_slice(
+            &read_regular(Path::new(&admitted.paths["manifest-a"]), 1_048_576).unwrap(),
+        )
+        .unwrap();
+        bound_manifest["measurement_context_sha256"] = context["static_sha256"].clone();
+        let manifest_path = setup.join("integration-source-build.json");
+        frozen_file(
+            &manifest_path,
+            &serde_json::to_vec(&bound_manifest).unwrap(),
+        )
+        .unwrap();
+        for argument in &mut arguments {
+            if argument.starts_with("--manifest-a=") || argument.starts_with("--manifest-b=") {
+                *argument = format!(
+                    "{}={}",
+                    argument.split_once('=').unwrap().0,
+                    manifest_path.display()
+                );
+            }
+        }
+        let admitted = options(&arguments).unwrap();
         let (status, stdout, stderr) = invoke("positive", &arguments);
         assert!(
             status.success(),
@@ -2397,6 +2611,37 @@ mod tests {
             .collect();
         assert_eq!(probes.len(), 2);
         assert!(probes.iter().all(|r| r["verified"] == true));
+        for kind in ["host_context_before", "host_context_after"] {
+            let receipt = records.iter().find(|r| r["type"] == kind).unwrap();
+            assert_eq!(receipt["context"]["complete"], true);
+            assert_eq!(receipt["context"]["outer_host_limits"], "unknown");
+            for processor in receipt["context"]["static_identity"]["processors"]
+                .as_array()
+                .unwrap()
+            {
+                let id = processor["cpu"].as_u64().unwrap();
+                let path = std::path::PathBuf::from(format!(
+                    "/sys/devices/system/cpu/cpu{id}/regs/identification/midr_el1"
+                ));
+                if let Ok(file) = fs::File::open(path) {
+                    let mut raw = Vec::new();
+                    if file.take(129).read_to_end(&mut raw).is_ok()
+                        && !raw.is_empty()
+                        && raw.len() <= 128
+                    {
+                        assert_eq!(
+                            processor["identification"]["basis"],
+                            "guest-visible-sysfs-midr-el1"
+                        );
+                    }
+                }
+            }
+        }
+        let host_receipt = records
+            .iter()
+            .find(|r| r["type"] == "host_context_comparison")
+            .unwrap();
+        assert_eq!(host_receipt["comparison"]["static_identity_equal"], true);
         for kind in ["repository_identity_before", "repository_identity_after"] {
             let receipt = records.iter().find(|r| r["type"] == kind).unwrap();
             assert_eq!(receipt["verified"], true);
@@ -2429,7 +2674,12 @@ mod tests {
             &read_regular(Path::new(&admitted.paths["manifest-a"]), 1_048_576).unwrap(),
         )
         .unwrap();
-        for name in ["mismatched-manifest", "stale-source", "stale-commit"] {
+        for name in [
+            "mismatched-manifest",
+            "stale-source",
+            "stale-commit",
+            "stale-context",
+        ] {
             let stale_source = name == "stale-source";
             let mut invalid = original.clone();
             if stale_source {
@@ -2437,6 +2687,8 @@ mod tests {
                 *sources.values_mut().next().unwrap() = json!("0".repeat(64));
             } else if name == "stale-commit" {
                 invalid["git_head"] = json!("0".repeat(40));
+            } else if name == "stale-context" {
+                invalid["measurement_context_sha256"] = json!("0".repeat(64));
             } else {
                 invalid["library_sha256"] = json!("0".repeat(64));
             }
@@ -2448,7 +2700,7 @@ mod tests {
                 if arg.starts_with("--output=") {
                     *arg = format!("--output={}", failure_output.display());
                 } else if arg.starts_with("--manifest-b=")
-                    || ((stale_source || name == "stale-commit")
+                    || ((stale_source || name == "stale-commit" || name == "stale-context")
                         && arg.starts_with("--manifest-a="))
                 {
                     *arg = format!("{}={}", arg.split_once('=').unwrap().0, manifest.display());

@@ -769,6 +769,9 @@ jobs:
       - name: Bind the actual source build and library identities
         shell: bash
         run: |
+          printf '%s\n' host-context > "$CONTROL_ROOT/setup/last-phase"
+          docker/app/nzb-yenc-ffi/target/release/benchmark-yenc-control \
+            "--capture-host-context=$CONTROL_ROOT/setup/measurement-context.json"
           printf '%s\n' manifest > "$CONTROL_ROOT/setup/last-phase"
           python3 - <<'PY_CONTROL'
           import hashlib, json, os, pathlib, subprocess
@@ -781,6 +784,8 @@ jobs:
           toolchain = '+' + os.environ['RUST_TOOLCHAIN']
           manifest = {
               'comparison_kind': 'rust-aa-control', 'rust_payload_mode': 'experimental',
+              'measurement_context_sha256': json.loads((pathlib.Path(os.environ['CONTROL_ROOT']) /
+                  'setup/measurement-context.json').read_text())['static_sha256'],
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'library_sha256': digest(crate / 'target/release/libnzbyenc.so'),
               'worker_sha256': digest(root / 'scripts/benchmark-yenc-abi.py'),
