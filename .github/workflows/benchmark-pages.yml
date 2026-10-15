@@ -16,8 +16,15 @@ on:
       - 'scripts/check-docs.py'
       - 'tests/Unit/test_docs_links.py'
       - '.github/workflows/native-utilities-performance.yml'
+      - '.github/workflows/archive-sample-performance.yml'
+      - 'scripts/benchmark_callers_summary.py'
+      - 'scripts/benchmark-resource-limits.py'
+      - 'tests/Unit/test_benchmark_callers_export.py'
+      - 'tests/Unit/test_benchmark_utility_extended.py'
+      - 'tests/Unit/test_benchmark_resource_limits.py'
+      - '.gitattributes'
   workflow_run:
-    workflows: ['Paired native yEnc performance', 'Rust release presentation', 'Run tests', 'rust-clippy analyze', 'Native utility performance']
+    workflows: ['Paired native yEnc performance', 'Rust release presentation', 'Run tests', 'rust-clippy analyze', 'Native utility performance', 'Archive and sample planning performance']
     types: [in_progress, completed]
     branches: [master]
   workflow_dispatch:
@@ -39,8 +46,12 @@ jobs:
         with:
           persist-credentials: false
       - run: |
+          export PYTHONDONTWRITEBYTECODE=1
           python3 tests/Unit/test_benchmark_pages.py
           python3 tests/Unit/test_benchmark_summary_export.py
+          python3 tests/Unit/test_benchmark_callers_export.py
+          python3 tests/Unit/test_benchmark_utility_extended.py
+          python3 tests/Unit/test_benchmark_resource_limits.py
           python3 tests/Unit/test_docs_site.py
           python3 tests/Unit/test_docs_links.py
       - name: Check Google style with pinned Vale
