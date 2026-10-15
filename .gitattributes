@@ -101,3 +101,4 @@ docker/Makefile		-binary text eol=lf
 /tests/Unit/test_benchmark_utility_extended.py -binary text eol=lf
 /scripts/benchmark-resource-limits.py -binary text eol=lf
 /tests/Unit/test_benchmark_resource_limits.py -binary text eol=lf
+/tests/Unit/test_benchmark_remaining_modules_export.py -binary text eol=lf
