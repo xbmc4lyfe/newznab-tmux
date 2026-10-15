@@ -49,6 +49,48 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
         (new CollectReleaseFingerprintMetadata(1))->handle($collector);
         self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
+        ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => 29]]);
+        $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
+        (new CollectReleaseFingerprintMetadata(1))->handle($collector);
+        self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
+    }
+
+    #[Test]
+    public function it_keeps_iso_primary_descriptor_byte_conflicts_and_sample_provenance(): void
+    {
+        $primary = "\x01CD001\x01".str_repeat("\0", 2041);
+        $primary[40] = 'A';
+        $later = $primary;
+        $later[40] = 'B';
+        $terminator = "\xffCD001\x01".str_repeat("\0", 2041);
+        $sample = str_repeat("\0", 32_768).$primary.$later.$terminator;
+        if ((new NativeMetadataParser)->parseFormats($sample) === null) {
+            self::markTestSkipped('Native Rust format metadata is required for ISO descriptor integration.');
+        }
+        $body = YencArticles::article($sample);
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        self::assertSame(hash('sha256', $body), $analysis['metadata']['article_body_sha256']);
+        $copies = $analysis['metadata']['decoded_format_metadata']['iso_primary_volume_descriptor_copies'];
+        self::assertSame('observed_copies_differ', $copies['status']);
+        self::assertSame('terminated', $copies['sequence_status']);
+        self::assertTrue($copies['sampled_descriptor_sequence_terminated']);
+        self::assertSame(2, $copies['observed_descriptor_count']);
+        self::assertSame(1, $copies['repeat_comparison_count']);
+        self::assertFalse($copies['all_observed_copies_equal']);
+        self::assertSame(hash('sha256', $primary), $copies['copies'][0]['raw_sha256']);
+        self::assertSame(hash('sha256', $later), $copies['copies'][1]['raw_sha256']);
+        self::assertSame(2048, $copies['copies'][1]['bytes_hashed']);
+        self::assertSame(34_816, $copies['copies'][1]['offset']);
+        self::assertSame(36_864, $copies['copies'][1]['end_offset_exclusive']);
+        self::assertSame(40, $copies['first_difference']['descriptor_relative_offset']);
+        self::assertSame(32_808, $copies['first_difference']['reference_sample_offset']);
+        self::assertSame(34_856, $copies['first_difference']['differing_sample_offset']);
+        self::assertSame(65, $copies['first_difference']['reference_byte']);
+        self::assertSame(66, $copies['first_difference']['differing_byte']);
+        self::assertFalse($copies['whole_image_validated']);
+        self::assertFalse($copies['image_origin_known']);
+        self::assertStringContainsString('sample-relative', $copies['offset_basis']);
     }
 
     #[Test]
