@@ -478,6 +478,46 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->assertNull($manifest['release_id']);
     }
 
+    /** @return array<string, array{NzbImportStatus, bool}> */
+    public static function lateMetadataOutcomes(): array
+    {
+        return [
+            'pending review' => [NzbImportStatus::MetadataIgnored, false],
+            'pending deferral' => [NzbImportStatus::MetadataDeferred, false],
+            'published review' => [NzbImportStatus::MetadataIgnored, true],
+            'published deferral' => [NzbImportStatus::MetadataDeferred, true],
+        ];
+    }
+
+    #[DataProvider('lateMetadataOutcomes')]
+    public function test_late_metadata_outcome_preserves_newer_candidate_and_paired_nfo(NzbImportStatus $late, bool $reconcileFirst): void
+    {
+        [$path, $manifests] = $this->upload('late-outcome');
+        $this->assertTrue($manifests->shouldImportNzb($path));
+        $this->assertTrue($manifests->shouldImportNzb($path));
+        $identity = sha1('import:late-outcome');
+        $this->candidate($identity, 'queued');
+        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        unlink($path);
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'late-outcome-publication']);
+        DB::table('release_verification_candidates')->where('identity', $identity)->update([
+            'status' => 'complete', 'release_id' => 7, 'verified_at' => now(),
+        ]);
+        $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
+        if ($reconcileFirst) {
+            $manifests->reconcilePending($manifestPath);
+        }
+        $before = $manifests->read($manifestPath);
+        $manifests->recordNzbOutcome($path, $late, null, null);
+        $this->assertSame($before, $manifests->read($manifestPath));
+        $this->assertSame($identity, $manifests->read($manifestPath)['candidate_identity']);
+        $nfos = new NfoImportService(new Filesystem, $manifests, new NfoService);
+        $this->assertSame('imported', $nfos->importManifest($manifestPath)['status']);
+        $this->assertSame(7, $manifests->read($manifestPath)['release_id']);
+        $this->assertSame(NzbUploadManifestService::STATE_NFO_IMPORTED, $manifests->read($manifestPath)['state']);
+        $this->assertSame(1, DB::table('release_nfos')->count());
+    }
+
     private function candidate(string $identity, string $status, ?int $releaseId = null): void
     {
         DB::table('release_verification_candidates')->insert(['identity' => $identity, 'source_identity' => $identity, 'groups_id' => 1,

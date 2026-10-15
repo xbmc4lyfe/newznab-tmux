@@ -160,6 +160,12 @@ final class NzbUploadManifestService
                 $manifest['release_guid'] = null;
                 $manifest['last_error'] = null;
             } elseif (in_array($status, [NzbImportStatus::MetadataIgnored, NzbImportStatus::MetadataDeferred], true)) {
+                // A concurrent import may already own reconciliation or have completed this upload.
+                // A late advisory metadata outcome must not discard that durable identity.
+                if ($this->canReconcileCandidate($manifest)
+                    || in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED, self::STATE_NZB_REJECTED, self::STATE_NZB_DUPLICATE], true)) {
+                    return;
+                }
                 $manifest['state'] = $status === NzbImportStatus::MetadataIgnored
                     ? self::STATE_METADATA_REVIEW
                     : self::STATE_METADATA_DEFERRED;
