@@ -115,3 +115,4 @@ docker/Makefile		-binary text eol=lf
 /tests/Unit/test_benchmark_toolchain.py -binary text eol=lf
 
 /tests/Unit/test_benchmark_concurrency.py -binary text eol=lf
+/tests/Unit/test_composer_install_retry.py -binary text eol=lf
