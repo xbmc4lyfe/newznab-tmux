@@ -1,0 +1,258 @@
+[
+  {
+    "phase": "warm",
+    "block": 0,
+    "variant": "native",
+    "wall_ms": 171.464917,
+    "flow_ms": [
+      6.387041,
+      7.329042,
+      5.904583,
+      9.0535,
+      4.799292
+    ],
+    "parity": true
+  },
+  {
+    "phase": "warm",
+    "block": 0,
+    "variant": "rust",
+    "wall_ms": 1281.879584,
+    "flow_ms": [
+      156.026208,
+      168.905958,
+      208.131291,
+      234.327916,
+      193.805584
+    ],
+    "parity": true
+  },
+  {
+    "phase": "warm",
+    "block": 1,
+    "variant": "rust",
+    "wall_ms": 1194.884583,
+    "flow_ms": [
+      172.422417,
+      175.611125,
+      204.964708,
+      160.684792,
+      156.841833
+    ],
+    "parity": true
+  },
+  {
+    "phase": "warm",
+    "block": 1,
+    "variant": "native",
+    "wall_ms": 137.110583,
+    "flow_ms": [
+      8.860625,
+      3.617959,
+      3.757875,
+      8.826708,
+      3.448042
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 0,
+    "variant": "rust",
+    "wall_ms": 286.367833,
+    "flow_ms": [
+      189.422125
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 0,
+    "variant": "native",
+    "wall_ms": 103.111958,
+    "flow_ms": [
+      14.786375
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 1,
+    "variant": "native",
+    "wall_ms": 95.71875,
+    "flow_ms": [
+      17.716333
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 1,
+    "variant": "rust",
+    "wall_ms": 298.358458,
+    "flow_ms": [
+      208.402708
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 2,
+    "variant": "native",
+    "wall_ms": 90.443208,
+    "flow_ms": [
+      12.313125
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 2,
+    "variant": "rust",
+    "wall_ms": 319.34725,
+    "flow_ms": [
+      193.96425
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 3,
+    "variant": "native",
+    "wall_ms": 85.195167,
+    "flow_ms": [
+      11.083833
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 3,
+    "variant": "rust",
+    "wall_ms": 302.132209,
+    "flow_ms": [
+      187.294542
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 4,
+    "variant": "rust",
+    "wall_ms": 270.69325,
+    "flow_ms": [
+      163.77575
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 4,
+    "variant": "native",
+    "wall_ms": 84.615291,
+    "flow_ms": [
+      20.5625
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 5,
+    "variant": "rust",
+    "wall_ms": 291.3425,
+    "flow_ms": [
+      206.0375
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 5,
+    "variant": "native",
+    "wall_ms": 70.795916,
+    "flow_ms": [
+      10.529542
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 6,
+    "variant": "rust",
+    "wall_ms": 264.369959,
+    "flow_ms": [
+      182.188541
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 6,
+    "variant": "native",
+    "wall_ms": 88.865625,
+    "flow_ms": [
+      14.013542
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 7,
+    "variant": "rust",
+    "wall_ms": 296.580625,
+    "flow_ms": [
+      190.957
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 7,
+    "variant": "native",
+    "wall_ms": 98.974958,
+    "flow_ms": [
+      14.372959
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 8,
+    "variant": "native",
+    "wall_ms": 96.269959,
+    "flow_ms": [
+      15.360166
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 8,
+    "variant": "rust",
+    "wall_ms": 266.143916,
+    "flow_ms": [
+      177.916875
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 9,
+    "variant": "rust",
+    "wall_ms": 217.314167,
+    "flow_ms": [
+      142.828583
+    ],
+    "parity": true
+  },
+  {
+    "phase": "cold",
+    "block": 9,
+    "variant": "native",
+    "wall_ms": 80.247292,
+    "flow_ms": [
+      14.946334
+    ],
+    "parity": true
+  }
+]

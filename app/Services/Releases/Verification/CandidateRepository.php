@@ -300,7 +300,7 @@ final class CandidateRepository
         $coverage = app(NzbArticleCoverage::class);
         $incoming = $coverage->parseXml($replayXml);
         if ($incoming === null || ($snapshot = $coverage->coveredSnapshot($incoming, (string) $release->guid)) === null) {
-            return false;
+            throw new CandidateAdmissionDeferredException('Publication evidence is unavailable for exact metadata replay.');
         }
 
         try {
@@ -309,7 +309,7 @@ final class CandidateRepository
                 'postdate' => $manifest['date'], 'groups_id' => $manifest['groups_id'],
             ]);
         } catch (RuntimeException) {
-            return false;
+            throw new CandidateAdmissionDeferredException('Retained publication metadata cannot be read.');
         }
 
         return ($retained['passwords'] ?? []) === ($manifest['passwords'] ?? []);

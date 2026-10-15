@@ -181,6 +181,9 @@ final class NzbUploadManifestService
                 $m['legacy_provenance'] ??= array_intersect_key($m, array_flip(['version', 'state', 'candidate_identity', 'release_id', 'release_guid']));
                 $m['version'] = 2;
             }
+            if (isset($m['delete_input_pending']) || isset($m['delete_terminal_nfo'])) {
+                return ['deferred' => true];
+            }
             if (in_array($m['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
                 && (isset($m['delete_nzb_after_nfo']) || isset($m['delete_nzb_after_publication']) || isset($m['delete_nfo_after_import']))) {
                 // Do not replace the captured operation while its owned cleanup is pending.
@@ -227,7 +230,8 @@ final class NzbUploadManifestService
                 return null;
             }
             // Exact parser bytes establish this attempt's digest; current bytes only invalidate it.
-            if (! hash_equals(hash('sha256', $xml), $this->currentFileDigest($path))) {
+            if (! hash_equals(hash('sha256', $xml), $this->currentFileDigest($path))
+                || $this->sourceIdentity($path) !== $reservation['source_identity']) {
                 return null;
             }
             $r = $reservation + ['digest' => hash('sha256', $xml)];
@@ -251,8 +255,8 @@ final class NzbUploadManifestService
             if ($capture === null || ($m['input_reservation']['attempt'] ?? null) !== $capture['attempt']
                 || (($m['accepted_capture'] ?? null) !== $capture && (($m['outcome_capture'] ?? null) !== $capture
                     || ! in_array($m['outcome_status'] ?? null, ['failed', 'blacklisted', 'nogroup', 'duplicate'], true)))
-                || $this->sourceIdentity($path) !== $capture['source_identity']
-                || ! hash_equals($capture['digest'], $this->currentFileDigest($path))) {
+                || basename($path) !== $m['nzb']['filename']
+                || (($m['delete_input_pending'] ?? null) !== $capture && ! $this->captureMatches($path, $capture))) {
                 return false;
             }
 
@@ -266,10 +270,13 @@ final class NzbUploadManifestService
                 return false;
             }
 
+            $m['delete_input_pending'] = $capture;
+            $this->write($mp, $m);
             if (! $this->quarantineDelete($path, $capture)) {
                 return false;
             }
             $m['relinquished_attempt'] = $capture['attempt'];
+            unset($m['delete_input_pending']);
             $this->write($mp, $m);
 
             return true;
@@ -300,7 +307,11 @@ final class NzbUploadManifestService
         $source = dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nzb']['filename'];
         if (! $this->filesystem->isFile($source)) {
             return ($manifest['relinquished_attempt'] ?? null) === $accepted['attempt']
-                || $this->capturedCustodyPayload($source, $accepted) !== null;
+                || $this->capturedCustodyPayload($source, $accepted) !== null
+                || (isset($manifest['delete_nzb_after_publication'])
+                    && $this->readCustodyIntent($source, $accepted) === ['protocol' => 3, 'source' => basename($source), 'receipt' => $accepted, 'commit_binding' => null]
+                    && ! file_exists($this->custodyDirectory($source, $accepted).'/payload')
+                    && ! is_link($this->custodyDirectory($source, $accepted).'/payload') && ! is_link($source));
         }
 
         return $this->sourceIdentity($source) === $accepted['source_identity']
@@ -370,6 +381,8 @@ final class NzbUploadManifestService
                     throw new RuntimeException("Inserted NZB has no release identity: {$nzbPath}");
                 }
 
+                $manifest['candidate_identity'] = null;
+                unset($manifest['accepted_admission']);
                 $manifest['state'] = self::STATE_NZB_IMPORTED;
                 $manifest['release_id'] = $releaseId;
                 $manifest['release_guid'] = $releaseGuid;
@@ -451,6 +464,13 @@ final class NzbUploadManifestService
      */
     public function reconcilePending(string $manifestPath): array
     {
+        $manifest = $this->read($manifestPath);
+        if (is_array($manifest['delete_input_pending'] ?? null)) {
+            $this->deleteCapturedInput(dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nzb']['filename'], $manifest['delete_input_pending']);
+        }
+        if (isset($manifest['delete_terminal_nfo'])) {
+            $this->deleteTerminalCompanion($manifestPath);
+        }
         $manifest = $this->read($manifestPath);
         if (in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
             && $this->resumeCommittedCompanion($manifestPath)) {
@@ -896,12 +916,19 @@ final class NzbUploadManifestService
                 return false;
             }
             $path = dirname($manifestPath).DIRECTORY_SEPARATOR.$receipt['filename'];
-            if ($this->sourceIdentity($path) !== $receipt['source_identity']
-                || ! hash_equals($receipt['digest'], $this->currentFileDigest($path))) {
+            if (($m['delete_terminal_nfo'] ?? null) !== $receipt && ! $this->captureMatches($path, $receipt)) {
                 return false;
             }
 
-            return $this->quarantineDelete($path, $receipt);
+            $m['delete_terminal_nfo'] = $receipt;
+            $this->write($manifestPath, $m);
+            if (! $this->quarantineDelete($path, $receipt)) {
+                return false;
+            }
+            unset($m['delete_terminal_nfo']);
+            $this->write($manifestPath, $m);
+
+            return true;
         });
     }
 
@@ -909,7 +936,7 @@ final class NzbUploadManifestService
      * Caller holds the stable manifest lock.
      * Writers are confined to the original pathname, not open descriptors,
      * its parent directory, or this unpredictable private attempt directory.
-     * Intent survives process death; restart always holds for reconciliation.
+     * Validated intents resume only their exact captured operation after interruption.
      * Directory synchronization must succeed before custody can advance.
      *
      * @param  array<string, mixed>  $receipt

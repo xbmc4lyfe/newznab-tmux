@@ -1,0 +1,32 @@
+{
+  "warm": {
+    "native": {
+      "n": 10,
+      "median_flow_ms": 6.145811999999999,
+      "sample_p99_flow_ms": 9.0535,
+      "median_process_wall_ms": 154.28775000000002
+    },
+    "rust": {
+      "n": 10,
+      "median_flow_ms": 174.016771,
+      "sample_p99_flow_ms": 234.327916,
+      "median_process_wall_ms": 1238.3820835000001
+    },
+    "native_over_rust": 0.03531735455544109
+  },
+  "cold": {
+    "native": {
+      "n": 10,
+      "median_flow_ms": 14.579667,
+      "sample_p99_flow_ms": 20.5625,
+      "median_process_wall_ms": 89.6544165
+    },
+    "rust": {
+      "n": 10,
+      "median_flow_ms": 188.35833350000001,
+      "sample_p99_flow_ms": 208.402708,
+      "median_process_wall_ms": 288.8551665
+    },
+    "native_over_rust": 0.07740388614130524
+  }
+}

@@ -53,13 +53,8 @@ final class NfoImportService
                 NzbUploadManifestService::STATE_NZB_FAILED,
                 NzbUploadManifestService::STATE_NZB_REJECTED,
             ], true)) {
-                if ($deleteFailed && is_array($manifest['nfo'] ?? null)) {
+                if (($deleteFailed || isset($manifest['delete_terminal_nfo'])) && is_array($manifest['nfo'] ?? null)) {
                     try {
-                        $nfoPath = $this->manifests->resolvePayloadPath(
-                            $manifestPath,
-                            $manifest['nfo']['filename'],
-                            'nfo'
-                        );
                         $this->manifests->deleteTerminalCompanion($manifestPath);
                     } catch (Throwable) {
                         // The terminal NZB outcome remains authoritative even if its NFO is already gone.

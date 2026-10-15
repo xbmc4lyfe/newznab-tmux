@@ -1,0 +1,16 @@
+{
+  "head": "d6c62ffda8ee74854b1db9f32f4ddb71fa5d821f",
+  "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28) (Homebrew)",
+  "php": "8.5.11",
+  "source_sha256": {
+    "app/Services/Nzb/NzbUploadManifestService.php": "faa8f74e7393f97e99939f74a24e1ce3a0645728a68f0793f1b6aa3a0a04d43d",
+    "app/Services/Nzb/DirectorySyncBridge.php": "bcaeed70365b8aba8ddf7e2556b9b6a9b82abeb55fc0bb8099a8abf5f621f74f",
+    "benchmarks/nzb-custody/sync.rs": "85941d73300d45298e42e52c1e78700dd58025e743a76f0c327e847986de1718",
+    "benchmarks/nzb-custody/flow.php": "07c4e38f83fcaded7dc3bd7ea6ce3ec13407cf63692fe86eda0bc330a70186d5",
+    "benchmarks/nzb-custody/compare.py": "1ce60164d5853307912ff678564981babe0b7fb0f40cc7bdf504bc8926337cb5"
+  },
+  "helper_sha256": "1c82d887fbff098ba7ff9711818cf3c896545c83ef4100333894de03e72c8667",
+  "protocol": "seed169 randomized paired blocks; 1 warmup then 5 flows per warm process; 10 paired fresh cold processes; shared host, synthetic fixture; p99 unqualified; no runtime deployment"
+}

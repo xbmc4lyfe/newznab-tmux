@@ -12,7 +12,8 @@ return new class extends Migration
     {
         Schema::create('nfo_cleanup_commits', static function (Blueprint $table): void {
             $table->string('binding', 64)->primary();
-            $table->unsignedBigInteger('release_id');
+            $table->unsignedInteger('release_id');
+            $table->foreign('release_id')->references('id')->on('releases')->cascadeOnDelete();
             $table->string('release_guid');
             $table->string('candidate_identity', 40)->nullable();
             $table->string('stored_digest', 64);

@@ -16,9 +16,21 @@ use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Tests\Support\CapturedUploadFixture;
 
 class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
 {
+    use CapturedUploadFixture;
+
+    public function test_direct_policy_transition_discards_stale_candidate_authority(): void
+    {
+        [$path, $manifests, $nfos] = $this->directUpload(true);
+        self::assertNull($manifests->read($path)['candidate_identity']);
+        self::assertSame('imported', $nfos->importManifest($path, true)['status']);
+        self::assertNull(DB::table('nfo_cleanup_commits')->value('candidate_identity'));
+        self::assertSame('metadata_deferred', DB::table('release_verification_candidates')->value('status'));
+    }
+
     public function test_direct_publication_stores_and_cleans_its_companion_without_candidate_authority(): void
     {
         [$path, $manifests, $service] = $this->directUpload();
@@ -30,6 +42,16 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
         self::assertNull(DB::table('nfo_cleanup_commits')->value('candidate_identity'));
         self::assertTrue($manifests->nfoCleanupCommitted($manifests->read($path)));
+    }
+
+    public function test_release_deletion_reclaims_committed_cleanup_receipts(): void
+    {
+        [$path, $manifests, $service] = $this->directUpload();
+        self::assertSame('imported', $service->importManifest($path)['status']);
+        self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
+        DB::table('releases')->where('id', 7)->delete();
+        self::assertSame(0, DB::table('nfo_cleanup_commits')->count());
+        self::assertFalse($manifests->nfoCleanupCommitted($manifests->read($path)));
     }
 
     public function test_direct_receipt_failure_rolls_back_nfo_and_retains_both_inputs_for_retry(): void
@@ -139,6 +161,24 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
     }
 
+    #[DataProvider('interruptedCleanupBoundaries')]
+    public function test_direct_input_cleanup_resumes_from_manifest(string $boundary): void
+    {
+        DirectorySyncBridge::$fail = $boundary;
+        try {
+            [$path, $manifests] = $this->directUpload(deleteInput: true);
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        $source = dirname($path).'/incoming.nzb';
+        self::assertFileDoesNotExist($source);
+        self::assertArrayHasKey('delete_input_pending', $manifests->read($path));
+        $result = $manifests->reconcilePending($path);
+        self::assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $result['state']);
+        self::assertArrayNotHasKey('delete_input_pending', $result);
+        self::assertSame($result['accepted_capture']['attempt'], $result['relinquished_attempt']);
+    }
+
     public function test_terminal_replay_honors_persisted_companion_deletion_intent(): void
     {
         [$path, $manifests, $service] = $this->directUpload();
@@ -159,7 +199,7 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
     }
 
     /** @return array{string, NzbUploadManifestService, NfoImportService} */
-    private function directUpload(): array
+    private function directUpload(bool $priorCandidate = false, bool $deleteInput = false): array
     {
         Schema::create('releases', static function (Blueprint $table): void {
             $table->id();
@@ -179,6 +219,12 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         file_put_contents($directory.'/info.nfo', 'direct companion');
         $manifests = app(NzbUploadManifestService::class);
         $manifests->create($directory, 'direct-fixture', 'incoming.nzb', 'info.nfo', 'direct companion');
+        if ($priorCandidate) {
+            config(['release_verification.required' => true]);
+            $this->capturedFixtureImporter('old-policy')->beginImport([$source]);
+            DB::table('release_verification_candidates')->update(['status' => 'metadata_deferred']);
+            config(['release_verification.required' => false]);
+        }
         // Stub release construction/storage only; exercise the actual public importer outcome and NFO writer.
         $importer = new class(['Browser' => true]) extends NzbImportService
         {
@@ -201,7 +247,7 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
                 return [true, null];
             }
         };
-        $importer->beginImport([$source]);
+        $importer->beginImport([$source], delete: $deleteInput);
         $path = $directory.'/'.NzbUploadManifestService::FILENAME;
         self::assertSame('nzb_imported', $manifests->read($path)['state']);
         self::assertArrayNotHasKey('accepted_admission', $manifests->read($path));

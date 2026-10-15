@@ -6,6 +6,8 @@ use App\Enums\NzbImportStatus;
 use App\Services\BlacklistService;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbUploadManifestService;
+use App\Services\Releases\Verification\CandidateAdmissionDeferredException;
 use App\Services\Releases\Verification\CandidateCapacityException;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
@@ -182,18 +184,29 @@ class NzbPublishedPasswordReplayTest extends ReleaseVerificationCandidatesTest
         $capacity = (array) DB::table('release_verification_state')->first();
         $artifactBefore = is_file($artifact) ? file_get_contents($artifact) : false;
         $accepted = in_array($mode, ['ordered', 'repeated', 'empty', 'empty-string', 'retained-superset', 'retained-different-size', 'missing-release', 'passwordless-missing-artifact', 'passwordless-changed-hash'], true);
+        $deferred = in_array($mode, ['missing-artifact', 'wrong-guid', 'corrupt', 'wrong-articles', 'wrong-release', 'decoded-bound', 'compressed-bound', 'nested-password'], true);
         if ($useImport) {
+            if ($mode === 'missing-artifact') {
+                app(NzbUploadManifestService::class)->create(dirname($sourcePath), 'replay-origin', basename($sourcePath), null);
+            }
             $incoming = (new VerifiedNzbWriter($disk))->document($manifest);
             file_put_contents($sourcePath, $incoming);
             $service->beginImport([$sourcePath], delete: true, deleteFailed: true, resultCallback: $callback);
-            self::assertSame($accepted ? NzbImportStatus::Queued : ($mode === 'passwordless-metadata-deferred' ? NzbImportStatus::MetadataDeferred : NzbImportStatus::MetadataIgnored), end($statuses));
+            self::assertSame($accepted ? NzbImportStatus::Queued : ($deferred || $mode === 'passwordless-metadata-deferred' ? NzbImportStatus::MetadataDeferred : NzbImportStatus::MetadataIgnored), end($statuses));
             if ($accepted && $mode !== 'missing-release') {
                 self::assertFileDoesNotExist($sourcePath);
             } else {
                 self::assertSame($incoming, file_get_contents($sourcePath));
             }
         } else {
-            if ($mode === 'passwordless-metadata-deferred') {
+            if ($deferred) {
+                try {
+                    $repository->enqueue($manifest);
+                    self::fail('Expected unavailable publication evidence to defer admission.');
+                } catch (CandidateAdmissionDeferredException) {
+                    self::assertTrue(true);
+                }
+            } elseif ($mode === 'passwordless-metadata-deferred') {
                 try {
                     $repository->enqueue($manifest);
                     self::fail('Expected deferred capacity signal.');
@@ -218,5 +231,13 @@ class NzbPublishedPasswordReplayTest extends ReleaseVerificationCandidatesTest
         }
         self::assertSame($artifactBefore, is_file($artifact) ? file_get_contents($artifact) : false);
         self::assertSame(1, DB::table('release_verification_candidates')->count());
+        if ($useImport && $mode === 'missing-artifact') {
+            $uploads = app(NzbUploadManifestService::class);
+            self::assertTrue($uploads->shouldImportNzb($sourcePath));
+            file_put_contents($artifact, gzencode((new VerifiedNzbWriter($disk))->document($stored)));
+            $service->beginImport([$sourcePath], resultCallback: $callback);
+            self::assertSame(NzbImportStatus::Queued, end($statuses));
+            self::assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $uploads->reconcilePending(dirname($sourcePath).'/'.NzbUploadManifestService::FILENAME)['state']);
+        }
     }
 }
