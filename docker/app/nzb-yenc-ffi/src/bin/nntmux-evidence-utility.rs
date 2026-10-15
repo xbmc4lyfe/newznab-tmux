@@ -124,6 +124,9 @@ fn raw_field<'a>(s: &'a str, wanted: &str) -> Option<&'a str> {
     }
 }
 fn lexical_py(s: &str) -> Result<String> {
+    lexical_py_with(s, float_py)
+}
+fn lexical_py_with(s: &str, render_float: fn(f64) -> String) -> Result<String> {
     let s = s.trim();
     if s.starts_with('[') {
         let mut out = Vec::new();
@@ -136,7 +139,7 @@ fn lexical_py(s: &str) -> Result<String> {
                 break;
             }
             let end = value_end(s, i);
-            out.push(lexical_py(&s[i..end])?);
+            out.push(lexical_py_with(&s[i..end], render_float)?);
             i = end;
             if s.as_bytes().get(i) == Some(&b',') {
                 i += 1
@@ -147,7 +150,7 @@ fn lexical_py(s: &str) -> Result<String> {
     if s.starts_with(|c: char| c == '-' || c.is_ascii_digit())
         && (s.contains('.') || s.contains('e') || s.contains('E'))
     {
-        return Ok(float_py(s.parse()?));
+        return Ok(render_float(s.parse()?));
     }
     Ok(py(&serde_json::from_str(s)?))
 }
@@ -352,6 +355,201 @@ fn summary(root: &Path, cpp: bool, output: &Path) -> Result<()> {
     }
     Ok(())
 }
+// Validate every value while retaining only fields the article summary reads.
+// Observation metadata can be large and must not be materialized just to ignore it.
+struct ArticleRow(Value);
+impl<'de> serde::Deserialize<'de> for ArticleRow {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = ArticleRow;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut fields = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if matches!(
+                        key.as_str(),
+                        "type"
+                            | "size"
+                            | "density"
+                            | "decision"
+                            | "eligible_pairs"
+                            | "invalid_pairs"
+                            | "median_candidate_over_baseline"
+                            | "bootstrap_95_percent_interval"
+                            | "status"
+                    ) {
+                        fields.insert(key, map.next_value::<Value>()?);
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(ArticleRow(Value::Object(fields)))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(ArticleRow(Value::Null))
+            }
+            fn visit_bool<E>(self, _value: bool) -> std::result::Result<Self::Value, E> {
+                Ok(ArticleRow(Value::Null))
+            }
+            fn visit_i64<E>(self, _value: i64) -> std::result::Result<Self::Value, E> {
+                Ok(ArticleRow(Value::Null))
+            }
+            fn visit_u64<E>(self, _value: u64) -> std::result::Result<Self::Value, E> {
+                Ok(ArticleRow(Value::Null))
+            }
+            fn visit_f64<E>(self, _value: f64) -> std::result::Result<Self::Value, E> {
+                Ok(ArticleRow(Value::Null))
+            }
+            fn visit_str<E>(self, _value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(ArticleRow(Value::Null))
+            }
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(ArticleRow(Value::Null))
+            }
+        }
+        deserializer.deserialize_any(Fields)
+    }
+}
+// serde_json's existing formatter rounds shortest decimal ties like Python.
+// Only the article mode uses it; existing summary modes retain their formatter.
+fn article_float_py(n: f64) -> String {
+    if !n.is_finite() {
+        return if n.is_nan() {
+            "nan"
+        } else if n.is_sign_negative() {
+            "-inf"
+        } else {
+            "inf"
+        }
+        .into();
+    }
+    let raw = serde_json::to_string(&n).expect("finite float serializes");
+    if n != 0.0 && (n.abs() < 1e-4 || n.abs() >= 1e16) {
+        let (mantissa, exponent) = if let Some((mantissa, exponent)) = raw.split_once('e') {
+            (
+                mantissa.to_owned(),
+                exponent.parse::<i32>().expect("formatted exponent"),
+            )
+        } else {
+            let unsigned = raw.trim_start_matches('-');
+            let point = unsigned.find('.').unwrap_or(unsigned.len());
+            let digits = unsigned.replace('.', "");
+            let leading = digits.len() - digits.trim_start_matches('0').len();
+            let significant = digits[leading..].trim_end_matches('0');
+            let mut mantissa = if n.is_sign_negative() {
+                "-".to_owned()
+            } else {
+                String::new()
+            };
+            mantissa.push_str(&significant[..1]);
+            if significant.len() > 1 {
+                mantissa.push('.');
+                mantissa.push_str(&significant[1..]);
+            }
+            (mantissa, point as i32 - leading as i32 - 1)
+        };
+        format!(
+            "{mantissa}e{}{exponent:02}",
+            if exponent < 0 { "-" } else { "+" },
+            exponent = exponent.abs()
+        )
+    } else if !raw.contains('.') {
+        format!("{raw}.0")
+    } else {
+        raw
+    }
+}
+fn article_summary(root: &Path, output: impl FnOnce() -> Result<std::path::PathBuf>) -> Result<()> {
+    let input = root.join("processing-evidence/paired/observations.jsonl");
+    let text = match fs::metadata(&input) {
+        Ok(_) => fs::read_to_string(input)?,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            String::new()
+        }
+        // Python 3.11 Path.exists also treats EBADF and ELOOP as absence.
+        // ELOOP is 40 on the workflow's Linux and 62 on local macOS/BSD.
+        Err(error)
+            if error.raw_os_error() == Some(9)
+                || error.raw_os_error()
+                    == Some(if cfg!(target_os = "linux") { 40 } else { 62 }) =>
+        {
+            String::new()
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let rows = splitlines(&text)
+        .into_iter()
+        .map(|raw| -> Result<_> { Ok((serde_json::from_str::<ArticleRow>(raw)?.0, raw)) })
+        .collect::<Result<Vec<_>>>()?;
+    let mut out = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(output()?)?;
+    write!(
+        out,
+        "## Fingerprint caller screen\n\nBODY and FFI/JSON diagnostics are retained separately. This median screen does not qualify a Rust replacement: the 1.5x common-path and uncommon p99 policy remains the adoption gate.\n\n| Bytes | Density | Decision | Candidate / baseline median | Simultaneous interval | Eligible / invalid |\n|---:|---|---|---:|---|---|\n"
+    )?;
+    for (row, raw) in &rows {
+        if !row.is_object() {
+            return Err("row is not object".into());
+        }
+        if row.get("type").and_then(Value::as_str) != Some("stratum_summary") {
+            continue;
+        }
+        let mut values = Vec::new();
+        for key in ["size", "density", "decision"] {
+            values.push(py(required(row, key)?));
+        }
+        for key in [
+            "median_candidate_over_baseline",
+            "bootstrap_95_percent_interval",
+        ] {
+            values.push(match raw_field(raw, key) {
+                Some(token) => lexical_py_with(token, article_float_py)?,
+                None => "unavailable".into(),
+            });
+        }
+        let eligible = py(required(row, "eligible_pairs")?);
+        let invalid = py(required(row, "invalid_pairs")?);
+        writeln!(out, "| {} | {eligible} / {invalid} |", values.join(" | "))?;
+    }
+    let final_row = rows.iter().rev().find(|(row, _)| {
+        matches!(
+            row.get("type").and_then(Value::as_str),
+            Some("run_summary" | "run_failure")
+        )
+    });
+    let status = if let Some((row, _)) = final_row {
+        required(row, "status")?
+            .as_str()
+            .ok_or("status not string")?
+    } else {
+        "profile only or setup incomplete"
+    };
+    write!(
+        out,
+        "\nResult: `{status}`. Exact serialized caller metadata and independently expected decoded bytes must match for every pair.\n"
+    )?;
+    out.flush()?;
+    Ok(())
+}
 fn presentation_header(root: &Path) -> Result<()> {
     let header = fs::read_to_string(root.join("docker/app/php/release-presentation.h"))?
         .replace("\r\n", "\n")
@@ -370,9 +568,14 @@ fn presentation_header(root: &Path) -> Result<()> {
 fn run() -> Result<()> {
     let args: Vec<_> = env::args().collect();
     if args.len() != 3 || args[1] != "--mode" {
-        return Err("usage: nntmux-evidence-utility --mode qualify|cpp-summary|php-summary|presentation-header".into());
+        return Err("usage: nntmux-evidence-utility --mode qualify|cpp-summary|php-summary|article-summary|presentation-header".into());
     }
     match args[2].as_str() {
+        "article-summary" => article_summary(Path::new("."), || {
+            Ok(env::var_os("GITHUB_STEP_SUMMARY")
+                .ok_or("GITHUB_STEP_SUMMARY is not set")?
+                .into())
+        }),
         "presentation-header" => presentation_header(&env::current_dir()?),
         "qualify" => qualify(Path::new(".")),
         "cpp-summary" => summary(
@@ -765,5 +968,230 @@ mod tests {
             raw_field(row, "median_rust_over_cpp"),
             Some("0.9999999999999999")
         );
+    }
+
+    const ARTICLE_HEADER: &str = "## Fingerprint caller screen\n\nBODY and FFI/JSON diagnostics are retained separately. This median screen does not qualify a Rust replacement: the 1.5x common-path and uncommon p99 policy remains the adoption gate.\n\n| Bytes | Density | Decision | Candidate / baseline median | Simultaneous interval | Eligible / invalid |\n|---:|---|---|---:|---|---|\n";
+    const ARTICLE_FOOTER: &str = ". Exact serialized caller metadata and independently expected decoded bytes must match for every pair.\n";
+    const ARTICLE_ROW: &str = r#"{"type":"stratum_summary","size":4096,"density":"ordinary","decision":"inconclusive","eligible_pairs":31,"invalid_pairs":0,"median_candidate_over_baseline":0.9999999999999999,"bootstrap_95_percent_interval":[0.00001,1e20]}"#;
+    fn article_report(f: &Fixture, input: Option<&str>) -> Result<()> {
+        if let Some(input) = input {
+            f.write("processing-evidence/paired/observations.jsonl", input);
+        }
+        article_summary(&f.0, || Ok(f.0.join("article-summary")))
+    }
+    #[test]
+    fn article_missing_or_empty_input_appends_exact_setup_summary() {
+        for input in [None, Some("")] {
+            let f = Fixture::new();
+            f.write("article-summary", "previous\n");
+            article_report(&f, input).unwrap();
+            assert_eq!(
+                f.read("article-summary"),
+                format!(
+                    "previous\n{ARTICLE_HEADER}\nResult: `profile only or setup incomplete`{ARTICLE_FOOTER}"
+                )
+            );
+        }
+    }
+    #[test]
+    fn article_reports_exact_numeric_tokens_and_last_terminal() {
+        let f = Fixture::new();
+        let input = format!(
+            "{{\"type\":\"protocol\",\"ignored\":{{\"many\":[1,2,3]}}}}\n{ARTICLE_ROW}\r\n{{\"type\":\"run_summary\",\"status\":\"old\"}}\r{{\"type\":\"run_failure\",\"status\":\"invalid\"}}\n"
+        );
+        article_report(&f, Some(&input)).unwrap();
+        assert_eq!(
+            f.read("article-summary"),
+            format!(
+                "{ARTICLE_HEADER}| 4096 | ordinary | inconclusive | 0.9999999999999999 | [1e-05, 1e+20] | 31 / 0 |\n\nResult: `invalid`{ARTICLE_FOOTER}"
+            )
+        );
+    }
+    #[test]
+    fn article_distinguishes_absent_optional_values_and_null() {
+        let f = Fixture::new();
+        article_report(&f, Some(r#"{"type":"stratum_summary","size":1,"density":"heavy","decision":"invalid","eligible_pairs":0,"invalid_pairs":1,"median_candidate_over_baseline":null}"#)).unwrap();
+        assert!(
+            f.read("article-summary")
+                .contains("| 1 | heavy | invalid | None | unavailable | 0 / 1 |\n")
+        );
+    }
+    #[test]
+    fn article_parses_all_input_before_resolving_or_opening_output() {
+        for input in [format!("{ARTICLE_ROW}\n{{"), format!("{ARTICLE_ROW}\n\n")] {
+            let f = Fixture::new();
+            f.write("processing-evidence/paired/observations.jsonl", &input);
+            f.write("article-summary", "keep");
+            assert!(article_summary(&f.0, || panic!("output lookup before parsing")).is_err());
+            assert_eq!(f.read("article-summary"), "keep");
+        }
+    }
+    #[test]
+    fn article_semantic_failures_preserve_completed_rows() {
+        for row in [
+            "null",
+            r#"{"type":"stratum_summary","size":9}"#,
+            r#"{"type":"run_summary","status":false}"#,
+        ] {
+            let f = Fixture::new();
+            assert!(article_report(&f, Some(&format!("{ARTICLE_ROW}\n{row}"))).is_err());
+            assert_eq!(
+                f.read("article-summary"),
+                format!(
+                    "{ARTICLE_HEADER}| 4096 | ordinary | inconclusive | 0.9999999999999999 | [1e-05, 1e+20] | 31 / 0 |\n"
+                )
+            );
+        }
+    }
+    #[test]
+    fn article_invalid_text_and_directory_input_leave_summary_untouched() {
+        let f = Fixture::new();
+        f.write("article-summary", "keep");
+        let input = f.0.join("processing-evidence/paired/observations.jsonl");
+        fs::create_dir_all(input.parent().unwrap()).unwrap();
+        fs::write(&input, [255]).unwrap();
+        assert!(article_report(&f, None).is_err());
+        fs::remove_file(&input).unwrap();
+        fs::create_dir(&input).unwrap();
+        assert!(article_report(&f, None).is_err());
+        assert_eq!(f.read("article-summary"), "keep");
+    }
+    #[test]
+    fn article_output_errors_are_reported_without_creating_parents() {
+        let f = Fixture::new();
+        assert!(article_summary(&f.0, || Err("missing output environment".into())).is_err());
+        assert!(article_summary(&f.0, || Ok(f.0.join("missing/summary"))).is_err());
+        assert!(!f.0.join("missing").exists());
+        assert!(article_summary(&f.0, || Ok(f.0.clone())).is_err());
+        if Path::new("/dev/full").exists() {
+            assert!(article_summary(&f.0, || Ok("/dev/full".into())).is_err());
+        }
+    }
+    #[test]
+    fn article_summary_appends_through_symlink_and_preserves_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let f = Fixture::new();
+        f.write("target", "prefix\n");
+        fs::set_permissions(f.0.join("target"), fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(f.0.join("target"), f.0.join("article-summary")).unwrap();
+        article_report(&f, None).unwrap();
+        assert!(
+            f.read("target")
+                .starts_with("prefix\n## Fingerprint caller screen")
+        );
+        assert_eq!(
+            fs::metadata(f.0.join("target"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn article_numeric_rendering_matches_python_ties_to_even() {
+        for token in ["0.10000991821289062", "2.9802322387695312e-08"] {
+            let f = Fixture::new();
+            let row = format!(
+                r#"{{"type":"stratum_summary","size":4096,"density":"ordinary","decision":"inconclusive","eligible_pairs":31,"invalid_pairs":0,"median_candidate_over_baseline":{token},"bootstrap_95_percent_interval":[{token},1]}}"#
+            );
+            article_report(&f, Some(&row)).unwrap();
+            assert!(
+                f.read("article-summary")
+                    .contains(&format!("| {token} | [{token}, 1] |"))
+            );
+        }
+    }
+
+    #[test]
+    fn article_ignored_metadata_is_still_fully_validated_before_output() {
+        let f = Fixture::new();
+        for input in [
+            r#"{"type":"observation","result":{"nested":[true,null,{"key":[1,]}]}}"#,
+            r#"{"type":"observation","result":{"nested":tru}}"#,
+        ] {
+            f.write("processing-evidence/paired/observations.jsonl", input);
+            assert!(
+                article_summary(&f.0, || panic!("invalid ignored JSON opened output")).is_err()
+            );
+            assert!(!f.0.join("article-summary").exists());
+        }
+    }
+    #[test]
+    fn article_nonobject_rows_fail_after_the_heading_for_all_scalar_types() {
+        for input in [
+            "true",
+            "false",
+            "-1",
+            "18446744073709551615",
+            "1.5",
+            r#""text""#,
+            "null",
+            "[1, {\"ignored\": [true,null]}]",
+        ] {
+            let f = Fixture::new();
+            assert!(article_report(&f, Some(input)).is_err(), "{input}");
+            assert_eq!(f.read("article-summary"), ARTICLE_HEADER);
+        }
+    }
+    #[test]
+    fn article_canonical_float_format_matches_python_boundaries_and_signs() {
+        for (number, text) in [
+            (1e-4, "0.0001"),
+            (1e-5, "1e-05"),
+            (-1e-5, "-1e-05"),
+            (1.234e-5, "1.234e-05"),
+            (1e16, "1e+16"),
+            (1e15, "1000000000000000.0"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "nan"),
+        ] {
+            assert_eq!(article_float_py(number), text);
+        }
+    }
+
+    #[test]
+    fn article_unsearchable_input_parent_fails_without_opening_summary() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.write("processing-evidence/paired/observations.jsonl", ARTICLE_ROW);
+        f.write("article-summary", "keep\n");
+        let parent = f.0.join("processing-evidence");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root-capable build runners can traverse mode-000 directories. The
+        // separate non-root caller oracle must exercise this failure branch.
+        let denied = fs::metadata(parent.join("paired/observations.jsonl"))
+            .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied);
+        if !denied {
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let result = article_report(&f, None);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(f.read("article-summary"), "keep\n");
+    }
+    #[test]
+    fn article_missing_paths_keep_python_nondirectory_and_symlink_loop_semantics() {
+        use std::os::unix::fs::symlink;
+        for case in 0..3 {
+            let f = Fixture::new();
+            match case {
+                0 => f.write("processing-evidence", "regular file, not directory"),
+                1 => symlink("absent", f.0.join("processing-evidence")).unwrap(),
+                _ => symlink("processing-evidence", f.0.join("processing-evidence")).unwrap(),
+            }
+            article_report(&f, None).unwrap();
+            assert_eq!(
+                f.read("article-summary"),
+                format!(
+                    "{ARTICLE_HEADER}\nResult: `profile only or setup incomplete`{ARTICLE_FOOTER}"
+                )
+            );
+        }
     }
 }
