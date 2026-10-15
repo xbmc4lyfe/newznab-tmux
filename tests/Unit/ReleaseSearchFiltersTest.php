@@ -26,6 +26,7 @@ use Illuminate\Support\Facades\Facade;
 use Illuminate\Support\Facades\Schema;
 use Manticoresearch\Client;
 use Manticoresearch\Search as ManticoreQuery;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use Psr\Http\Client\ClientInterface;
@@ -35,6 +36,131 @@ use ReflectionClass;
 
 final class ReleaseSearchFiltersTest extends TestCase
 {
+    public static function literalPosterPatterns(): array
+    {
+        return [
+            'percent' => ['alice%', [1]],
+            'underscore' => ['alice_', [2]],
+            'backslash' => ['alice\\', [3]],
+            'escape character' => ['alice!', [4]],
+            'only percent' => ['%%', [6]],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('literalPosterPatterns')]
+    public function sql_fallback_treats_poster_pattern_characters_literally(string $poster, array $expectedIds): void
+    {
+        $pdo = new \PDO('sqlite::memory:');
+        $pdo->exec('CREATE TABLE releases (id INTEGER PRIMARY KEY, searchname TEXT, fromname TEXT, passwordstatus INTEGER)');
+        $insert = $pdo->prepare('INSERT INTO releases VALUES (?, ?, ?, 0)');
+        foreach ([1 => 'alice%', 2 => 'alice_', 3 => 'alice\\', 4 => 'alice!', 5 => 'aliceX', 6 => '%%'] as $id => $value) {
+            $insert->execute([$id, 'Release '.$id, $value]);
+        }
+        $connection = new WebSearchSqliteFixtureConnection($pdo);
+        $originalApp = Facade::getFacadeApplication();
+        $originalContainer = Container::getInstance();
+        $originalResolver = Model::getConnectionResolver();
+        $container = new Container;
+        $container->instance('config', new Repository(['app' => ['debug' => false], 'nntmux' => ['mysql_search_fallback' => true, 'cache_expiry_medium' => 5]]));
+        $container->instance('cache', new \Illuminate\Cache\Repository(new ArrayStore));
+        $container->instance('db.schema', new class
+        {
+            public function hasTable(string $table): bool
+            {
+                return false;
+            }
+        });
+        Container::setInstance($container);
+        Facade::setFacadeApplication($container);
+        DB::swap($connection);
+        $resolver = new ConnectionResolver(['testing' => $connection]);
+        $resolver->setDefaultConnection('testing');
+        Model::setConnectionResolver($resolver);
+        Search::swap(new class
+        {
+            public function isAvailable(): bool
+            {
+                return false;
+            }
+        });
+        try {
+            $page = (new ReleaseSearchService)->search(['fromname' => $poster], -1, -1, -1, -1, -1, 0, 10, 'name_asc');
+            $this->assertSame($expectedIds, $page->modelKeys());
+            $this->assertSame(count($expectedIds), $page[0]->_totalrows);
+        } finally {
+            Facade::clearResolvedInstances();
+            Facade::setFacadeApplication($originalApp);
+            Container::setInstance($originalContainer);
+            if ($originalResolver === null) {
+                Model::unsetConnectionResolver();
+            } else {
+                Model::setConnectionResolver($originalResolver);
+            }
+        }
+    }
+
+    public static function posterFuzzyModes(): array
+    {
+        return [
+            'poster miss' => ['alice', false],
+            'forced poster' => ['alice', true],
+            'zero poster miss' => ['0', false],
+            'forced zero poster' => ['0', true],
+            'title miss still retries' => [null, false],
+            'forced title still fuzzy' => [null, true],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('posterFuzzyModes')]
+    public function elasticsearch_fuzzy_modes_never_relax_a_poster_constraint(?string $poster, bool $fuzzyOnly): void
+    {
+        $http = $this->createStub(ClientInterface::class);
+        $requests = [];
+        $http->method('sendRequest')->willReturnCallback(static function (RequestInterface $request) use (&$requests): ResponseInterface {
+            $body = json_decode((string) $request->getBody(), true, flags: JSON_THROW_ON_ERROR);
+            $requests[] = $body;
+            $fuzzy = str_contains(json_encode($body, JSON_THROW_ON_ERROR), 'fuzziness');
+
+            return new Response(200, ['Content-Type' => 'application/json', 'X-Elastic-Product' => 'Elasticsearch'], json_encode([
+                'hits' => ['total' => ['value' => $fuzzy ? 1 : 0], 'hits' => $fuzzy ? [['_id' => '99']] : []],
+            ], JSON_THROW_ON_ERROR));
+        });
+        $client = ClientBuilder::create()->setHosts(['http://127.0.0.1:9200'])->setHttpClient($http)->build();
+        $reflection = new ReflectionClass(ElasticSearchDriver::class);
+        $previous = [];
+        foreach (['client' => $client, 'availabilityCache' => true, 'availabilityCacheTime' => time()] as $name => $value) {
+            $property = $reflection->getProperty($name);
+            $previous[$name] = $property->getValue();
+            $property->setValue(null, $value);
+        }
+        try {
+            $phrases = ['searchname' => 'Example title'];
+            if ($poster !== null) {
+                $phrases['fromname'] = $poster;
+            }
+            $driver = new ElasticSearchDriver(['indexes' => ['releases' => 'releases'], 'fuzzy' => ['enabled' => true]]);
+            $result = $driver->searchReleasesFiltered(['phrases' => $phrases, 'groups_id' => 7, 'try_fuzzy' => true, 'fuzzy_only' => $fuzzyOnly], 25);
+            $this->assertSame($poster === null ? [99] : [], $result['ids']);
+            $this->assertSame($poster === null ? 1 : 0, $result['total']);
+            $this->assertSame($poster === null, $result['fuzzy']);
+            $this->assertCount($poster === null && ! $fuzzyOnly ? 2 : 1, $requests);
+            foreach ($requests as $body) {
+                $this->assertContains(['term' => ['groups_id' => 7]], $body['query']['bool']['filter']);
+                $this->assertSame('Example title', $body['query']['bool']['must'][0]['multi_match']['query']);
+                if ($poster !== null) {
+                    $this->assertContains(['match' => ['fromname' => ['query' => $poster, 'operator' => 'and']]], $body['query']['bool']['must']);
+                    $this->assertStringNotContainsString('fuzziness', json_encode($body, JSON_THROW_ON_ERROR));
+                }
+            }
+        } finally {
+            foreach ($previous as $name => $value) {
+                $reflection->getProperty($name)->setValue(null, $value);
+            }
+        }
+    }
+
     #[Test]
     public function ranges_keep_zero_bounds_and_drop_untrusted_fields_and_values(): void
     {
