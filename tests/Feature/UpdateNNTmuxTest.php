@@ -6,6 +6,8 @@ namespace Tests\Feature;
 
 use App\Console\Commands\UpdateNNTmux;
 use App\Services\NntmuxUpdateLock;
+use Dotenv\Dotenv;
+use Illuminate\Console\OutputStyle;
 use Illuminate\Contracts\Foundation\MaintenanceMode;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
@@ -16,6 +18,7 @@ use Mockery;
 use Mockery\MockInterface;
 use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
+use Symfony\Component\Console\Helper\ProgressBar;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Output\BufferedOutput;
 use Tests\Support\ConfigurationTestBuilder;
@@ -140,6 +143,30 @@ class UpdateNNTmuxTest extends TestCase
         $this->assertFalse($this->maintenanceActive);
         $this->assertStringContainsString('update completed successfully', $output);
         $this->assertStringNotContainsString(config('app.key'), $output);
+    }
+
+    public function test_environment_keys_are_merged_before_configuration_is_cached(): void
+    {
+        File::put($this->directory.'/.env', "APP_NAME=NNTmux\n");
+        File::put($this->directory.'/.env.example', "APP_NAME=NNTmux\nCACHE_STORE=failover_redis_file\n");
+        $command = $this->command();
+        foreach (['config:clear', 'view:clear', 'route:clear', 'route:cache'] as $name) {
+            $command->shouldReceive('call')->once()->with($name)->andReturn(0);
+        }
+        $cachedStore = null;
+        $command->shouldReceive('call')->once()->with('config:cache')->andReturnUsing(function () use (&$cachedStore): int {
+            $environment = Dotenv::parse(File::get($this->directory.'/.env'));
+            $cachedStore = $environment['CACHE_STORE'] ?? 'database';
+
+            return 0;
+        });
+        $output = new BufferedOutput;
+        $command->setOutput(new OutputStyle(new ArrayInput([]), $output));
+        (new \ReflectionProperty(UpdateNNTmux::class, 'progressBar'))->setValue($command, new ProgressBar($output, 1));
+
+        (new \ReflectionMethod(UpdateNNTmux::class, 'performMaintenanceTasks'))->invoke($command);
+
+        $this->assertSame('failover_redis_file', $cachedStore);
     }
 
     public function test_pre_existing_maintenance_mode_is_preserved_after_failure(): void

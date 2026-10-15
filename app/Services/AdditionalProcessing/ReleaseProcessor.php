@@ -157,6 +157,7 @@ class ReleaseProcessor
                 ProcessingStage::ReleaseInitialization,
                 function () use ($context): bool {
                     $this->initializeContext($context);
+                    $this->refreshSeasonPackState($context, $context->nzbContents);
 
                     return $this->releaseManager->processReleaseNameFromNzbContents($context->nzbContents, $context);
                 },
@@ -513,7 +514,9 @@ class ReleaseProcessor
      */
     private function runDeferredArchiveNameChecks(ReleaseProcessingContext $context): void
     {
-        if ($context->releaseHasPassword || $context->seasonPack || ! $context->seasonPackProbable) {
+        if ($context->releaseHasPassword || $context->seasonPack || ! $context->seasonPackProbable
+            || ! $context->archiveSetWalkComplete
+        ) {
             return;
         }
 
@@ -805,7 +808,7 @@ class ReleaseProcessor
 
         $failed = $downloaded = 0;
         /** @var array<string, true> $listedSets */
-        $listedSets = [];
+        $listedSets = $context->listedArchiveSets;
         /** @var array<string, int> $setFailures */
         $setFailures = [];
         $setKey = '';
@@ -874,12 +877,15 @@ class ReleaseProcessor
                     $archiveCandidate,
                 );
 
+                if ($context->workPlan !== null && $context->defersArchiveNameChecks()
+                    && $context->totalFileInfo > $filesBefore
+                ) {
+                    $listedSets[$context->workPlan->setKeyOf($archiveCandidate)] = true;
+                    $context->listedArchiveSets = $listedSets;
+                }
+
                 // The listing may have just shown this is a season pack: keep reading the other sets
                 if (! $reverse && $context->workPlan !== null && $context->defersArchiveNameChecks()) {
-                    if ($context->totalFileInfo > $filesBefore) {
-                        $listedSets[$context->workPlan->setKeyOf($archiveCandidate)] = true;
-                    }
-
                     continue;
                 }
                 if ($processed) {
@@ -894,6 +900,14 @@ class ReleaseProcessor
                 $this->output->echoCompressedFailure($failed);
             }
         }
+
+        if ($context->workPlan !== null && $context->defersArchiveNameChecks()) {
+            $setCount = $context->workPlan->archiveSetCount();
+            $context->archiveSetWalkComplete = count($listedSets) === $setCount;
+            $context->archiveSampleIncomplete = count($listedSets) < min($setCount, $this->config->seasonPackArchiveSets)
+                && $context->archiveRetryable;
+        }
+
     }
 
     /**

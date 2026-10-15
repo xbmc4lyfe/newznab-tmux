@@ -108,11 +108,7 @@ class ReleaseFileManager
             return false;
         }
 
-        // Skip support files
-        if (preg_match(
-            '/(?:'.$supportFileRegex.'|part\d+|[rz]\d{1,3}|zipr\d{2,3}|\d{2,3}|zipx?|zip|rar)(\s*\.rar)?$/i',
-            $file['name']
-        )) {
+        if ($this->isArchiveOrSupportFile($file['name'], $supportFileRegex)) {
             return false;
         }
 
@@ -244,7 +240,7 @@ class ReleaseFileManager
      */
     public function processReleaseNameFromNzbContents(array $nzbContents, ReleaseProcessingContext $context): bool
     {
-        if (! $this->releaseHasNzbSplitWrapper($context->release)) {
+        if ($context->defersArchiveNameChecks() || ! $this->releaseHasNzbSplitWrapper($context->release)) {
             return false;
         }
 
@@ -367,7 +363,9 @@ class ReleaseFileManager
 
                 $releaseFilesCount = ReleaseFile::whereReleasesId($context->release->id)->count('releases_id') ?? 0;
 
-                if (! $context->releaseHasPassword && $context->nzbHasCompressedFile && $releaseFilesCount === 0) {
+                if (! $context->releaseHasPassword && $context->nzbHasCompressedFile
+                    && ($releaseFilesCount === 0 || $context->archiveSampleIncomplete)
+                ) {
                     // No file list could be read, often because volumes were still missing.
                     // Queue the release once more after a delay; a second failure stays unknown.
                     // Only retry when inspection ran and a later attempt could still read the list.
@@ -889,20 +887,41 @@ class ReleaseFileManager
             return;
         }
 
-        foreach (array_slice($files, 0, self::DEFAULT_RELEASE_FILE_LIMIT) as $file) {
+        $accepted = 0;
+        $seen = [];
+        foreach ($files as $file) {
             $name = (string) ($file['name'] ?? '');
-            if ($name === '' || str_starts_with($name, '.')
-                || preg_match('/'.$this->config->supportFileRegex.'$/i', $name) === 1
+            if (isset($file['error']) || $name === '' || ! empty($file['pass'])
+                || ($this->config->innerFileBlacklist !== false && preg_match($this->config->innerFileBlacklist, $name) === 1)
+                || $this->isArchiveOrSupportFile($name, $this->config->supportFileRegex)
+                || $this->normalizeFileSize($file['size'] ?? 0) === null
+                || isset($seen[$name])
             ) {
                 continue;
             }
+            $seen[$name] = true;
+            if ($accepted++ >= self::DEFAULT_RELEASE_FILE_LIMIT) {
+                break;
+            }
+            if (str_starts_with($name, '.')) {
+                continue;
+            }
 
-            $context->release['filename'] = $name;
-            $context->release['releases_id'] = $context->release->id;
-            if ($this->nameFixingService->matchPreDbFiles($context->release, true, true, true) > 0) {
+            if ($this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($name): void {
+                $entry->setAttribute('filename', $name);
+                $this->nameFixingService->matchPreDbFiles($entry, true, true, true);
+            })) {
                 return;
             }
         }
+    }
+
+    private function isArchiveOrSupportFile(string $name, string $supportFileRegex): bool
+    {
+        return preg_match(
+            '/(?:'.$supportFileRegex.'|part\\d+|[rz]\\d{1,3}|zipr\\d{2,3}|\\d{2,3}|zipx?|zip|rar)(\\s*\\.rar)?$/i',
+            $name,
+        ) === 1;
     }
 
     /**

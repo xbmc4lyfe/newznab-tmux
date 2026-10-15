@@ -1333,6 +1333,263 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         });
     }
 
+    #[DataProvider('deferredClaimReplacements')]
+    public function test_deferred_predb_naming_preserves_a_replaced_claim(string $column): void
+    {
+        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
+        $this->prepareFullPar2NamingEvidence($title);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $replacement = $column === 'additional_pp_claim_token' ? 'new-owner' : now()->addMinute()->toDateTimeString();
+        DB::table('releases')->where('id', 1)->update([$column => $replacement]);
+        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
+        $manager = $this->makeFullPar2NamingManager($sync);
+
+        $manager->matchFileNamesToPreDb([['name' => $title.'.mkv', 'size' => 100]], $context);
+        $manager->finalizeRelease($context, false);
+
+        self::assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
+        self::assertSame($replacement, DB::table('releases')->where('id', 1)->value($column));
+        self::assertTrue($context->fullPar2EvidenceDeferred);
+        Event::assertNotDispatched(ReleaseNameFixed::class);
+    }
+
+    public static function deferredClaimReplacements(): array
+    {
+        return ['new owner' => ['additional_pp_claim_token'], 'renewed owner' => ['additional_pp_claimed_at']];
+    }
+
+    public function test_deferred_predb_rename_advances_identity_and_finalizes_buffered_files(): void
+    {
+        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
+        $this->prepareFullPar2NamingEvidence($title);
+        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
+        $manager = $this->makeFullPar2NamingManager($sync);
+        $file = ['name' => $title.'.mkv', 'size' => 100];
+        $context->seasonPackProbable = true;
+        $manager->addFileInfo($file, $context, '\\.sfv');
+        $context->seasonPackProbable = false;
+
+        $manager->matchFileNamesToPreDb([$file], $context);
+        $manager->finalizeRelease($context, false);
+
+        self::assertSame($title, $context->fullPar2EvidenceSnapshot()['searchname']);
+        self::assertSame($title, DB::table('releases')->where('id', 1)->value('searchname'));
+        self::assertSame(1, DB::table('release_files')->count());
+        self::assertNull(DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
+        self::assertFalse($context->fullPar2EvidenceDeferred);
+    }
+
+    #[DataProvider('deferredIneligibleFiles')]
+    public function test_deferred_predb_matching_skips_archive_and_support_entries(string $extension): void
+    {
+        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
+        $this->prepareFullPar2NamingEvidence($title);
+        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
+
+        $this->makeFullPar2NamingManager($sync)->matchFileNamesToPreDb([['name' => $title.$extension, 'size' => 100]], $context);
+
+        self::assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
+    }
+
+    public static function deferredIneligibleFiles(): array
+    {
+        return array_map(static fn (string $extension): array => [$extension], ['.rar', '.r00', '.zip', '.zipx', '.001', '.part01', '.sfv', '.par2']);
+    }
+
+    public function test_deferred_predb_limit_counts_eligible_files_after_skipped_entries(): void
+    {
+        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
+        $this->prepareFullPar2NamingEvidence($title);
+        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
+        $files = array_fill(0, 11, ['name' => 'ignored.sfv', 'size' => 100]);
+        $files[] = ['name' => $title.'.mkv', 'size' => 100];
+
+        $this->makeFullPar2NamingManager($sync)->matchFileNamesToPreDb($files, $context);
+
+        self::assertSame($title, DB::table('releases')->where('id', 1)->value('searchname'));
+        self::assertSame(0, DB::table('release_files')->count());
+    }
+
+    public function test_two_nzbsplit_episodes_cannot_name_an_obfuscated_release_before_pack_detection(): void
+    {
+        $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
+        $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__';
+        DB::table('releases')->where('id', 1)->update(['name' => $wrapped.'opaque', 'searchname' => $wrapped.'opaque', 'nfostatus' => 1]);
+        $context = $this->processReviewArchiveSets([
+            ['title' => '"'.$wrapped.'Show.S01E01.1080p.WEB-DL-GRP.mkv" yEnc', 'segments' => ['<one>']],
+            ['title' => '"'.$wrapped.'Show.S01E02.1080p.WEB-DL-GRP.mkv" yEnc', 'segments' => ['<two>']],
+        ], [], ['processPasswords' => false], realNaming: true);
+
+        self::assertTrue($context->seasonPack);
+        self::assertSame($wrapped.'opaque', DB::table('releases')->where('id', 1)->value('searchname'));
+        Event::assertNotDispatched(ReleaseNameFixed::class);
+    }
+
+    #[DataProvider('incompleteProbableArchiveWalks')]
+    public function test_an_incomplete_probable_pack_walk_keeps_naming_deferred(string $failure, int $limit): void
+    {
+        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
+        Search::shouldReceive('updateRelease')->with(1);
+        $responses = ['<one>' => $this->rar('Show.S01E01.1080p.WEB-DL-GRP.mkv', str_repeat('x', 100)), '<two>' => $failure === 'unreadable' ? 'invalid archive' : null];
+        $context = $this->processReviewArchiveSets([
+            ['title' => '"opaque1.rar" yEnc', 'segments' => ['<one>']],
+            ['title' => '"opaque2.rar" yEnc', 'segments' => ['<two>']],
+        ], $responses, ['seasonPackArchiveSets' => $limit, 'maximumRarSegments' => $limit], unavailable: $failure === 'group-unavailable' ? '<two>' : null);
+
+        self::assertTrue($context->seasonPackProbable);
+        self::assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
+        self::assertSame(1, DB::table('release_files')->count());
+    }
+
+    public static function incompleteProbableArchiveWalks(): array
+    {
+        return ['missing second set' => ['missing', 3], 'unavailable group' => ['group-unavailable', 3], 'unreadable second set' => ['unreadable', 3], 'configured one set cap' => ['missing', 1]];
+    }
+
+    #[DataProvider('boundedArchiveSamples')]
+    public function test_archive_sample_retry_depends_on_remaining_intended_sample(int $sets, bool $expectRetry): void
+    {
+        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
+        Search::shouldReceive('updateRelease')->with(1);
+        $contents = $responses = [];
+        for ($episode = 1; $episode <= $sets; $episode++) {
+            $name = sprintf('Show.S01E%02d.1080p.WEB-DL-GRP', $episode);
+            $id = '<episode'.$episode.'>';
+            $contents[] = ['title' => '"'.$name.'.rar" yEnc', 'segments' => [$id]];
+            $responses[$id] = $episode === 2 ? null : $this->rar($name.'.mkv', str_repeat('x', 100));
+        }
+        $context = $this->processReviewArchiveSets($contents, $responses);
+        $release = DB::table('releases')->where('id', 1)->first();
+
+        self::assertTrue($context->seasonPack);
+        self::assertSame($sets === 2 ? 1 : 3, DB::table('release_files')->count());
+        self::assertSame($expectRetry, $release->archive_retry_at !== null);
+        self::assertSame($expectRetry ? -1 : 0, (int) $release->haspreview);
+        self::assertSame($expectRetry ? -1 : 0, (int) $release->passwordstatus);
+        self::assertNull($release->additional_pp_claim_token);
+        if ($expectRetry) {
+            DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => 'retry-owner', 'additional_pp_claimed_at' => now()]);
+            $this->processReviewArchiveSets($contents, $responses);
+            self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('haspreview'));
+            self::assertSame($release->archive_retry_at, DB::table('releases')->where('id', 1)->value('archive_retry_at'));
+        }
+    }
+
+    #[DataProvider('reverseArchiveSamples')]
+    public function test_reverse_archive_recovery_counts_distinct_sets_before_finalizing(bool $recoversMissingSet): void
+    {
+        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
+        Search::shouldReceive('updateRelease')->with(1);
+        $contents = $responses = [];
+        foreach ($recoversMissingSet ? [1, 2] : [2, 1] as $episode) {
+            $name = sprintf('Show.S01E%02d.1080p.WEB-DL-GRP', $episode);
+            foreach ([1, 2] as $part) {
+                $id = '<episode'.$episode.'-part'.$part.'>';
+                $contents[] = ['title' => sprintf('"%s.part%02d.rar" yEnc', $name, $part), 'segments' => [$id]];
+                $responses[$id] = $episode === 2 && ($part === 1 || ! $recoversMissingSet)
+                    ? null
+                    : $this->rar($name.'.mkv', str_repeat('x', 100));
+            }
+        }
+
+        $context = $this->processReviewArchiveSets($contents, $responses, [
+            'fetchLastFiles' => true, 'maximumRarPasswordChecks' => 1, 'seasonPackArchiveSets' => 2,
+        ]);
+        $release = DB::table('releases')->where('id', 1)->first();
+
+        self::assertTrue($context->seasonPack);
+        self::assertSame($recoversMissingSet ? 2 : 1, DB::table('release_files')->count());
+        self::assertSame(! $recoversMissingSet, $release->archive_retry_at !== null);
+        self::assertSame($recoversMissingSet ? 0 : -1, (int) $release->haspreview);
+        self::assertSame($recoversMissingSet ? 0 : -1, (int) $release->passwordstatus);
+        self::assertSame($recoversMissingSet ? 2 : 0, (int) $release->rarinnerfilecount);
+        self::assertSame('Example', $release->searchname);
+        self::assertNull($release->additional_pp_claim_token);
+    }
+
+    public function test_reverse_recovery_completes_three_of_four_sets_without_releasing_probable_pack_naming(): void
+    {
+        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
+        Search::shouldReceive('updateRelease')->with(1);
+        $contents = $responses = [];
+        $names = [
+            'opaque-a' => 'Show.S01E01.1080p.WEB-DL-GRP.mkv',
+            'opaque-b' => 'Show.S01E01.1080p.WEB-DL-GRP.en.srt',
+            'opaque-d' => null,
+            'opaque-c' => 'Show.S01E01.1080p.WEB-DL-GRP.fr.srt',
+        ];
+        foreach ($names as $set => $name) {
+            foreach ([1, 2] as $part) {
+                $id = '<'.$set.'-part'.$part.'>';
+                $contents[] = ['title' => sprintf('"%s.part%02d.rar" yEnc', $set, $part), 'segments' => [$id]];
+                $responses[$id] = $name === null ? 'unreadable archive' : $this->rar($name, str_repeat('x', 100));
+            }
+        }
+
+        $context = $this->processReviewArchiveSets($contents, $responses, [
+            'fetchLastFiles' => true, 'maximumRarSegments' => 3, 'maximumRarPasswordChecks' => 1, 'seasonPackArchiveSets' => 3,
+        ]);
+        $release = DB::table('releases')->where('id', 1)->first();
+
+        self::assertFalse($context->seasonPack);
+        self::assertTrue($context->seasonPackProbable);
+        self::assertSame(3, DB::table('release_files')->count());
+        self::assertNull($release->archive_retry_at);
+        self::assertSame(0, (int) $release->haspreview);
+        self::assertSame(0, (int) $release->passwordstatus);
+        self::assertSame(3, (int) $release->rarinnerfilecount);
+        self::assertSame('Example', $release->searchname);
+        self::assertNull($release->additional_pp_claim_token);
+    }
+
+    public static function reverseArchiveSamples(): array
+    {
+        return ['reverse recovers the missing set' => [true], 'reverse repeats an already listed set' => [false]];
+    }
+
+    public static function boundedArchiveSamples(): array
+    {
+        return ['two sets with one missing retries' => [2, true], 'three listed out of four completes' => [4, false]];
+    }
+
+    /** @param list<array<string, mixed>> $contents
+     * @param  array<string, ?string>  $responses
+     * @param  array<string, mixed>  $overrides
+     */
+    private function processReviewArchiveSets(array $contents, array $responses, array $overrides = [], bool $realNaming = false, ?string $unavailable = null): ReleaseProcessingContext
+    {
+        $config = $this->makeConfig(['processPasswords' => true, 'archiveProbeFiles' => 0, ...$overrides]);
+        $parser = Mockery::mock(NzbContentParser::class);
+        $parser->shouldReceive('parseNzb')->once()->andReturn(['error' => null, 'contents' => $contents]);
+        $download = Mockery::mock(UsenetDownloadService::class);
+        $download->shouldReceive('beginReleaseScope')->once();
+        $download->shouldReceive('finishReleaseScope')->once()->andReturn(new DownloadMetrics);
+        $download->shouldReceive('download')->andReturnUsing(static fn (DownloadKind $kind, array $ids): array => [
+            'success' => isset($responses[$ids[0]]), 'data' => $responses[$ids[0]] ?? null, 'groupUnavailable' => $ids[0] === $unavailable, 'error' => null,
+        ]);
+        $workspace = Mockery::mock(TempWorkspaceService::class);
+        $workspace->shouldReceive('createReleaseTempFolder')->once()->andReturn('/tmp/review-archive/');
+        $workspace->shouldReceive('listFiles')->andReturn([]);
+        $workspace->shouldReceive('clearDirectory')->once();
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
+        $manager = $realNaming ? $this->makeFullPar2NamingManager($sync) : $this->makeManager();
+        $processor = new ReleaseProcessor($config, $parser, new AdditionalWorkPlanner($config), new ArchiveExtractionService($config),
+            Mockery::mock(MediaExtractionService::class)->shouldIgnoreMissing(false), $download, $manager,
+            Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(), $workspace,
+            Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing());
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $processor->process($context, '/tmp/');
+
+        return $context;
+    }
+
     public function test_season_pack_files_are_not_matched_to_predb_one_by_one(): void
     {
         DB::table('releases')->insert(['searchname' => 'Show.S01.1080p.WEB-DL-GRP'] + $this->releaseRow());

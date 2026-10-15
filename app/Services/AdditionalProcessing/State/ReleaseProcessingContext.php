@@ -78,6 +78,15 @@ class ReleaseProcessingContext
      */
     public bool $archiveRetryable = false;
 
+    /** Every known archive set yielded a listing, allowing probable-pack naming to be reconsidered. */
+    public bool $archiveSetWalkComplete = false;
+
+    /** Retryable failures left fewer listed sets than the configured bounded sample requires. */
+    public bool $archiveSampleIncomplete = false;
+
+    /** @var array<string, true> Distinct successfully listed sets across forward and reverse walks. */
+    public array $listedArchiveSets = [];
+
     /**
      * @var list<array<string, mixed>>
      */
@@ -317,6 +326,9 @@ class ReleaseProcessingContext
         $this->archiveInspectionAttempted = false;
         $this->archiveListingUndecodable = false;
         $this->archiveRetryable = false;
+        $this->archiveSetWalkComplete = false;
+        $this->archiveSampleIncomplete = false;
+        $this->listedArchiveSets = [];
         $this->groupUnavailable = false;
         $this->workPlan = null;
         $this->seasonPack = false;

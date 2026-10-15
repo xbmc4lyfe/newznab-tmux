@@ -1616,10 +1616,13 @@ pub(crate) fn ratio(candidate: &Value, baseline: &Value) -> Result<Value, String
 /// Full fixed protocol. No retries are attempted: failures are retained and stop
 /// this candidate. A harness/environment repair requires a new output directory.
 pub fn run(options: &Options) -> Result<Value, String> {
+    let output = PathBuf::from(required(options, "--output-dir")?);
+    if !output.is_absolute() {
+        return Err("qualification output directory must be absolute".into());
+    }
     if !cfg!(target_os = "linux") {
         return Err("primary PHP qualification requires owned disposable Linux runtime".into());
     }
-    let output = PathBuf::from(required(options, "--output-dir")?);
     fs::create_dir(&output).map_err(|e| format!("new output directory required: {e}"))?;
     let result = run_owned(options, &output);
     match &result {
@@ -2236,6 +2239,22 @@ mod tests {
         "observations":(-1..3).map(|sample|json!({"sample":sample,"warmup":sample<0,
         "elapsed_ms":if sample<0 {4.}else{sample as f64+1.},"correct":true,
         "decoded_bytes":4,"decoded_sha256":"fixture"})).collect::<Vec<_>>()})
+    }
+    #[test]
+    fn relative_output_is_rejected_before_qualification_creates_files() {
+        let output = format!("nntmux-relative-output-{}", std::process::id());
+        assert!(!Path::new(&output).exists(), "test output must be unowned");
+        let options = Options::from([("--output-dir".to_string(), output.clone())]);
+        let result = run(&options);
+        let created = Path::new(&output).exists();
+        if created {
+            fs::remove_dir_all(&output).unwrap();
+        }
+        assert_eq!(
+            result.unwrap_err(),
+            "qualification output directory must be absolute"
+        );
+        assert!(!created);
     }
     #[test]
     fn malformed_or_incorrect_php_cannot_qualify() {

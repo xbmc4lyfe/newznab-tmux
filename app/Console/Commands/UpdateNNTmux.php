@@ -314,6 +314,10 @@ class UpdateNNTmux extends Command
      */
     private function performMaintenanceTasks(): void
     {
+        // Merge environment variables
+        $this->info('⚙️ Merging environment configuration...');
+        $this->mergeEnvironmentConfig();
+
         // Refresh config cache so runtime client/host settings cannot drift.
         $this->info('🧹 Clearing config cache...');
         $this->call('config:clear');
@@ -330,9 +334,6 @@ class UpdateNNTmux extends Command
         $this->call('route:cache');
         $this->info('Routes cached successfully');
 
-        // Merge environment variables
-        $this->info('⚙️ Merging environment configuration...');
-        $this->mergeEnvironmentConfig();
         $this->progressBar->advance();
     }
 
