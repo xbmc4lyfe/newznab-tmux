@@ -52,6 +52,35 @@ jobs:
           cargo build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml
       - name: Verify native parity and restricted web scope
         run: php vendor/bin/phpunit --fail-on-skipped tests/Unit/AdminReleaseNamesNativeTest.php tests/Unit/AdminReleaseNamesTest.php tests/Feature/AdminReleaseNameViewTest.php
+      - name: Freeze presentation source, runtime, and protocol identity
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, os, pathlib, subprocess
+          def version(*args):
+              return subprocess.check_output(args, text=True).strip()
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          root = pathlib.Path.cwd()
+          evidence = root / 'benchmark-evidence/build'
+          evidence.mkdir(parents=True, exist_ok=True)
+          receipt = {
+              'git_head': version('git', 'rev-parse', 'HEAD'),
+              'github_run_id': os.environ['GITHUB_RUN_ID'],
+              'runner_arch': os.environ['RUNNER_ARCH'],
+              'runner_image_os': os.environ.get('ImageOS', ''),
+              'runner_image_version': os.environ.get('ImageVersion', ''),
+              'rustc': version('rustc', '--version'),
+              'cargo': version('cargo', '--version'),
+              'php': version('php', '-r', 'echo PHP_VERSION;'),
+              'rust_source_sha256': {
+                  str(path.relative_to(root)): digest(path)
+                  for path in sorted((root / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs'))
+              },
+              'rust_library_sha256': digest(root / 'docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so'),
+              'presentation_protocol': {'samples': 21, 'iterations': 100, 'order_seed': 20261014},
+          }
+          (evidence / 'runtime.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          PYTHON
       - name: Compare complete rendering integration with PHP
         shell: bash
         run: |
@@ -60,7 +89,7 @@ jobs:
           php -d opcache.enable_cli=1 -d ffi.enable=preload \
             -d ffi.preload="$PWD/benchmark-evidence/presentation.h" \
             -d opcache.preload="$PWD/docker/app/php/release-presentation-preload.php" \
-            scripts/benchmark-release-names.php | tee benchmark-evidence/results.jsonl
+            scripts/benchmark-release-names.php --samples=21 --iterations=100 --seed=20261014 | tee benchmark-evidence/results.jsonl
       - name: Exercise production web runtime with concurrent requests
         run: |
           docker build -f tests/Fixtures/ReleasePresentation.Dockerfile -t release-presentation-fixture .

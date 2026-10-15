@@ -43,6 +43,173 @@ SOURCE_PATHS = {
     "docker/app/nzb-yenc-ffi/src/lib.rs", "docker/app/nzb-yenc-ffi/src/release_names.rs",
     "docker/app/php/release-presentation-preload.php", "vendor/composer/installed.json",
 }
+RUST_SOURCE_PATHS = {"docker/app/nzb-yenc-ffi/src/" + name + ".rs" for name in (
+    "article_dates", "article_fingerprint", "article_identity", "article_xref", "cpu_snapshot", "formats",
+    "iso_primary_copies", "lib", "nntp_body", "nntp_headers", "par2", "par2_source_ranges", "payload_decoder",
+    "payload_decoder_arm", "payload_decoder_x86", "rar5_copy_checksums", "rar5_quick_open", "release_names",
+    "sample_plan", "seven_zip_ranges", "xz_first_block", "yenc_framing", "zstd_frame",
+    "bin/benchmark-article-fingerprint", "bin/benchmark-cpu-snapshot", "bin/nntmux-article-fingerprint",
+    "bin/nntmux-cpu-snapshot", "bin/nntmux-evidence-utility")}
+SOURCE_PATHS |= RUST_SOURCE_PATHS | {"app/Services/Yenc/" + name + ".php" for name in (
+    "ArticleFrame", "DecoderFactory", "NativePayloadDecoder", "PayloadDecoder", "PhpPayloadDecoder", "RawPayloadDecoder", "YencPart")}
+KERNEL_NAMES = {0: "scalar", 1: "ssse3", 2: "avx2", 3: "avx512-vbmi2", 4: "neon"}
+CURRENT_STATUSES = {"ok", "useful_improvement", "inconclusive", "regression", "passed", "gate_failed"}
+
+
+def canonical_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+
+
+def frozen_json(path):
+    with Path(path).open("rb") as source:
+        raw = source.read(8 * 1024 * 1024 + 1)
+    if len(raw) > 8 * 1024 * 1024:
+        raise ValueError("Oversized frozen receipt")
+    value = json.loads(raw, parse_constant=reject_constant, parse_float=finite_float)
+    if not isinstance(value, dict):
+        raise ValueError("Invalid frozen receipt")
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def kernel_identity(value):
+    if isinstance(value, dict):
+        identifier = value.get("id")
+        if type(identifier) is not int or identifier not in KERNEL_NAMES or value.get("name") != KERNEL_NAMES[identifier]:
+            raise ValueError("Invalid kernel receipt")
+    else:
+        identifier = value
+        if type(identifier) is not int or identifier not in KERNEL_NAMES:
+            raise ValueError("Invalid kernel identity")
+    return {"id": identifier, "name": KERNEL_NAMES[identifier]}
+
+
+def build_receipt(kind, summary):
+    prefix = "processing-evidence" if kind == "profile" else "benchmark-evidence"
+    manifest, receipt_hash = frozen_json(prefix + "/build/runtime.json")
+    if (manifest.get("git_head") != summary["head_sha"]
+            or str(manifest.get("github_run_id")) != str(summary["run_id"])):
+        raise ValueError("Runtime receipt does not match selected source and run")
+    candidate = manifest.get("candidate_git_head", manifest["git_head"]) if kind == "profile" else manifest["git_head"]
+    if not isinstance(candidate, str) or not re.fullmatch("[0-9a-f]{40}", candidate):
+        raise ValueError("Invalid selected candidate source")
+    experiment = candidate != summary["head_sha"]
+    rust_sources = manifest.get("rust_source_sha256")
+    if (not isinstance(rust_sources, dict) or set(rust_sources) != RUST_SOURCE_PATHS
+            or any(not digest(value) for value in rust_sources.values())):
+        raise ValueError("Incomplete frozen Rust implementation inventory")
+    sources = rust_sources
+    library = manifest.get("rust_library_sha256")
+    if kind == "profile" and "candidate_git_head" in manifest:
+        selected = manifest.get("candidate_source_sha256")
+        if not isinstance(selected, dict) or not selected:
+            raise ValueError("Missing selected candidate graph")
+        sources = {key: value for key, value in selected.items() if key in SOURCE_PATHS}
+        if (not sources or any(not digest(value) for value in sources.values())
+                or not experiment and not RUST_SOURCE_PATHS <= set(sources)):
+            raise ValueError("Incomplete selected candidate graph")
+        library = manifest.get("candidate_library_sha256")
+    if not digest(library):
+        raise ValueError("Missing selected native library identity")
+    result = {"provenance_status": "verified_experiment" if experiment else "verified_current",
+              "runtime_manifest_sha256": receipt_hash, "source_sha256": sources,
+              "runtime_identity": {"executed_sha": manifest["git_head"]}, "hardware_qualification": "unavailable"}
+    if experiment:
+        result["candidate_head_sha"] = candidate
+    for field in ("rustc", "cargo", "php", "runner_image_os", "runner_image_version"):
+        value = manifest.get(field)
+        if isinstance(value, str) and len(value) <= 4096:
+            result["runtime_identity"][field] = value
+    if manifest.get("runner_arch") in ("X64", "ARM64"):
+        result["runtime_identity"]["architecture"] = manifest["runner_arch"]
+    kernel = (manifest.get("candidate_payload_kernel_id") if kind == "profile" and "candidate_git_head" in manifest
+              else manifest.get("rust_payload_kernel", manifest.get("rust_payload_kernel_id")))
+    if kernel is not None:
+        result["rust_payload_kernel"] = kernel_identity(kernel)
+        result["hardware_qualification"] = "observed_only"
+    return manifest, result, library
+
+
+def cpp_hardware_receipt(manifest, evidence, library):
+    qualification, receipt_hash = frozen_json("benchmark-evidence/build/kernel-qualification.json")
+    required = {"X64": 3, "ARM64": 4}.get(manifest.get("runner_arch"))
+    if required is None or type(qualification.get("required_kernel_id")) is not int or qualification["required_kernel_id"] != required:
+        raise ValueError("Invalid designated kernel requirement")
+    observed = kernel_identity(qualification.get("observed_kernel"))
+    if observed != evidence.get("rust_payload_kernel"):
+        raise ValueError("Kernel observation disagrees with runtime")
+    for field in ("runner_arch", "git_head", "rust_library_sha256", "cpp_library_sha256"):
+        if qualification.get(field) != manifest.get(field):
+            raise ValueError("Kernel qualification does not match build receipt")
+    if not digest(manifest.get("cpp_library_sha256")) or library != manifest.get("rust_library_sha256"):
+        raise ValueError("Invalid qualified library identities")
+    supported = observed["id"] == required
+    if qualification.get("status") != ("qualified" if supported else "unsupported_hardware"):
+        raise ValueError("Kernel status disagrees with designated requirement")
+    return {"hardware_qualification": "designated_kernel" if supported else "unsupported_hardware",
+            "required_payload_kernel": kernel_identity(required), "kernel_qualification_sha256": receipt_hash}
+
+
+def measurement_provenance(kind, summary, records):
+    """Bind the public measurements to the same frozen execution receipt."""
+    manifest, evidence, library = build_receipt(kind, summary)
+    if kind == "presentation":
+        protocol = manifest.get("presentation_protocol")
+        if (not isinstance(protocol, dict) or set(protocol) != {"samples", "iterations", "order_seed"}
+                or any(type(value) is not int or value < 1 for value in protocol.values())):
+            raise ValueError("Invalid presentation protocol receipt")
+        for record in records:
+            if record.get("library_sha256") != library:
+                raise ValueError("Presentation library disagrees with build receipt")
+            if type(record.get("rows")) is not int or record["rows"] not in BATCHES:
+                raise ValueError("Unknown presentation batch")
+            if record.get("candidate_backend") == "rust" and (record.get("samples") != protocol["samples"]
+                    or record.get("order_seed") != protocol["order_seed"]
+                    or record.get("iterations") != max(protocol["iterations"], 10000 // record["rows"])):
+                raise ValueError("Presentation observations disagree with protocol")
+    else:
+        protocols = [row for row in records if row.get("type") == "protocol"]
+        if len(protocols) != 1:
+            raise ValueError("Expected one frozen measurement protocol")
+        protocol = protocols[0]
+        embedded = protocol.get("runtime_manifest") if kind == "profile" else protocol.get("runtime", {}).get("manifest", {}).get("contents")
+        if embedded != manifest:
+            raise ValueError("Measurement and build runtime receipts disagree")
+        protocol_library = (protocol.get("library", {}).get("sha256") if kind == "profile"
+                            else protocol.get("libraries", {}).get("rust", {}).get("sha256"))
+        if protocol_library != library:
+            raise ValueError("Measured library does not match selected source receipt")
+        if kind == "cpp":
+            if protocol.get("libraries", {}).get("cpp", {}).get("sha256") != manifest.get("cpp_library_sha256"):
+                raise ValueError("C++ baseline library disagrees with receipt")
+            evidence.update(cpp_hardware_receipt(manifest, evidence, library))
+            if evidence["hardware_qualification"] != "designated_kernel":
+                raise ValueError("Measured C++ comparison lacks designated kernel")
+    for record in records:
+        for field in ("source_sha256", "sources"):
+            sources = record.get(field, {})
+            if isinstance(sources, dict) and any(key in sources and sources[key] != value for key, value in evidence["source_sha256"].items()):
+                raise ValueError("Measured source graph disagrees with receipt")
+    evidence["protocol_sha256"] = canonical_digest(protocol)
+    return evidence
+
+
+def unavailable_cpp_hardware(summary):
+    """A failed strict SIMD gate is a hardware cause only with its matching receipt."""
+    if not Path("benchmark-evidence/build/kernel-qualification.json").is_file():
+        return summary
+    try:
+        manifest, evidence, library = build_receipt("cpp", summary)
+        evidence.update(cpp_hardware_receipt(manifest, evidence, library))
+        if evidence["hardware_qualification"] != "unsupported_hardware":
+            return summary
+        for backend in ("rust", "cpp"):
+            with Path("benchmark-evidence/build/" + backend + ".so").open("rb") as binary:
+                if hashlib.file_digest(binary, "sha256").hexdigest() != manifest[backend + "_library_sha256"]:
+                    raise ValueError("Frozen qualification binary disagrees with receipt")
+        summary.update(evidence, status="unsupported_hardware", rows=[], library_sha256={"rust": library, "cpp": manifest["cpp_library_sha256"]})
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        summary.update(status="invalid", provenance_status="invalid", hardware_qualification="unavailable")
+    return summary
 
 
 def number(value):
@@ -631,24 +798,48 @@ def export(kind, runner):
                 if 'decision' in row:
                     row['decision'] = 'invalid'
         return summary
+    summary.update(provenance_status="incomplete", hardware_qualification="unavailable")
     records, malformed = [], False
+    report_hash = hashlib.sha256()
     try:
-        with Path(INPUTS[kind]).open(encoding="utf-8") as source:
+        with Path(INPUTS[kind]).open("rb") as source:
             for line in source:
+                report_hash.update(line)
                 try:
                     record = json.loads(line, parse_constant=reject_constant, parse_float=finite_float)
                     if not isinstance(record, dict):
                         malformed = True
                     else:
                         records.append(record)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, UnicodeError):
                     malformed = True
     except FileNotFoundError:
-        return summary
+        return unavailable_cpp_hardware(summary) if kind == "cpp" else summary
     except (OSError, UnicodeError):
         malformed = True
     rows, status, completeness, flags = summarize(kind, records)
     summary.update(rows=rows, status="invalid" if malformed else status, completeness=completeness, **flags, **identities(records))
+    summary["report_sha256"] = report_hash.hexdigest()
+    try:
+        evidence = measurement_provenance(kind, summary, records)
+        sources = summary.get("source_sha256", {}) | evidence.pop("source_sha256")
+        summary.update(evidence, source_sha256=sources)
+        if summary["provenance_status"] == "verified_experiment" and summary["status"] in CURRENT_STATUSES:
+            summary["status"] = "experimental_measurement"
+    except FileNotFoundError:
+        if summary["status"] in CURRENT_STATUSES:
+            summary["status"] = "incomplete_provenance"
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        summary.update(status="invalid", provenance_status="invalid", hardware_qualification="unavailable")
+    if summary["provenance_status"] not in ("verified_current", "verified_experiment") or summary["status"] in ("invalid", "incomplete_provenance"):
+        for row in rows:
+            if "eligible" in row:
+                row["eligible"] = False
+            for gate in ("gate_passed", "qualification_gate_passed"):
+                if gate in row:
+                    row[gate] = False
+            if "decision" in row:
+                row["decision"] = "invalid"
     summary["rust_payload_mode"] = rust_payload_mode(kind, records, summary["status"])
     return summary
 

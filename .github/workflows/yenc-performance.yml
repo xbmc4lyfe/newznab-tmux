@@ -7,6 +7,8 @@ on:
     paths:
       - '.github/workflows/yenc-performance.yml'
       - 'scripts/export-benchmark-summary.py'
+      - 'scripts/benchmark-rust-toolchain.sh'
+      - 'tests/Unit/test_benchmark_toolchain.py'
       - 'tests/Unit/test_benchmark_summary_export.py'
       - 'scripts/benchmark-yenc.php'
       - 'scripts/benchmark-article-processing.php'
@@ -116,7 +118,8 @@ jobs:
       - name: Build and test locked Rust candidate
         shell: bash
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          python3 tests/Unit/test_benchmark_toolchain.py
+          source scripts/benchmark-rust-toolchain.sh
           cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-build.log
 
@@ -399,7 +402,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p processing-evidence/build
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          python3 tests/Unit/test_benchmark_toolchain.py
+          source scripts/benchmark-rust-toolchain.sh
           cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee processing-evidence/build/rust-build.log
           cp docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so processing-evidence/build/native.so
@@ -616,7 +620,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p benchmark-evidence/build
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          python3 tests/Unit/test_benchmark_toolchain.py
+          source scripts/benchmark-rust-toolchain.sh
           cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee benchmark-evidence/build/rust-build.log
           YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
