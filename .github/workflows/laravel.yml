@@ -78,6 +78,18 @@ jobs:
       - name: Test production PHP article identity without FFI or process spawning
         run: php -d ffi.enable=false -d disable_functions=proc_open vendor/bin/phpunit --fail-on-skipped tests/Unit/Nzb/NzbArticleFingerprintTest.php
 
+      - name: Qualify native PHP directory durability on Linux
+        env:
+          APP_ENV: testing
+          DB_CONNECTION: testing
+          DB_DATABASE: ':memory:'
+          CACHE_STORE: array
+          SESSION_DRIVER: array
+          QUEUE_CONNECTION: sync
+        run: |
+          php -r 'exit(PHP_OS_FAMILY === "Linux" ? 0 : 1);'
+          php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Unit/DirectorySyncBridgeTest.php
+
       - name: Deployment configuration parser tests
         run: python3 deploy/cloud/tests/test_configuration.py
 

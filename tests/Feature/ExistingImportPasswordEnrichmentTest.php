@@ -23,9 +23,12 @@ use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\Fixtures\ManifestCompressionProbe;
+use Tests\Support\CapturedUploadFixture;
 
 class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidatesTest
 {
+    use CapturedUploadFixture;
+
     public static function scenarios(): array
     {
         return array_map(static fn ($mode) => [$mode], ['exact', 'exact-spot', 'appeared-after-advisory', 'appeared-changed-after-advisory', 'capacity', 'password-order', 'changed-date', 'changed-mode', 'changed-subject', 'changed-subject-after-advisory', 'changed-groups', 'changed-bytes', 'changed-file-key', 'conflict', 'stored-conflict', 'corrupt']);
@@ -549,7 +552,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
                 $savedQueued = $r;
 
                 return;
-            } $manifests->recordNzbOutcome($r['path'], $r['status'], $r['release_id'], $r['release_guid'], candidateIdentity: $r['candidate_identity']);
+            } $manifests->recordNzbOutcome($r['path'], $r['status'], $r['release_id'], $r['release_guid'], candidateIdentity: $r['candidate_identity'], inputCapture: $r['input_capture']);
         };
         $service->beginImport([$path], resultCallback: $callback);
         self::assertSame([NzbImportStatus::Queued], $statuses);
@@ -586,7 +589,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
 
     public function test_identity_backed_deferral_reconciles_review_and_later_publication(): void
     {
-        $identity = sha1('private:held-metadata');
+        $identity = sha1('import:held-metadata');
         DB::table('release_verification_candidates')->insert(['identity' => $identity, 'source_identity' => $identity, 'groups_id' => 1,
             'manifest_path' => '', 'manifest_hash' => str_repeat('a', 64), 'manifest_bytes' => 0, 'status' => 'metadata_deferred',
             'last_unique_at' => now(), 'next_attempt_at' => now()]);
@@ -597,17 +600,17 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
         $directory = config('release_verification.storage_path').'/projection';
         app('files')->ensureDirectoryExists($directory);
         $path = $directory.'/incoming.nzb';
-        file_put_contents($path, 'retained synthetic payload');
+        file_put_contents($path, $this->passwordFixture([]));
         $manifests = app(NzbUploadManifestService::class);
         $manifests->create($directory, 'private-projection', 'incoming.nzb', null);
         $manifestPath = $directory.'/'.NzbUploadManifestService::FILENAME;
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
         self::assertTrue($manifests->shouldImportNzb($path));
         $held = $manifests->read($manifestPath);
         self::assertSame('metadata_deferred', $held['state']);
         self::assertSame($identity, $held['candidate_identity']);
         foreach ([NzbImportStatus::MetadataIgnored, NzbImportStatus::MetadataDeferred] as $late) {
-            $manifests->recordNzbOutcome($path, $late, null, null);
+            $this->recordCapturedOutcome($manifests, $path, $late, null, null);
             self::assertSame($held, $manifests->read($manifestPath));
         }
         DB::table('release_verification_candidates')->where('identity', $identity)->update(['status' => 'metadata_review']);
@@ -615,7 +618,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
         self::assertSame($identity, $manifests->read($manifestPath)['candidate_identity']);
         DB::table('releases')->insert(['id' => 7, 'guid' => 'private-publication']);
         DB::table('release_verification_candidates')->where('identity', $identity)->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
-        unlink($path);
+        $this->relinquishCapturedSource($manifests, $path);
         $published = $manifests->reconcilePending($manifestPath);
         self::assertSame('nzb_imported', $published['state']);
         self::assertSame(7, $published['release_id']);

@@ -16,10 +16,13 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Tests\Support\CapturedUploadFixture;
 use Tests\TestCase;
 
 class NzbQueuedUploadLifecycleTest extends TestCase
 {
+    use CapturedUploadFixture;
+
     private string $directory;
 
     protected function setUp(): void
@@ -31,6 +34,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->directory = sys_get_temp_dir().'/queued-upload-'.bin2hex(random_bytes(8));
         config(['release_verification.storage_path' => $this->directory.'/verification']);
         (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
+        (require database_path('migrations/2026_10_15_034000_create_nfo_cleanup_commits_table.php'))->up();
         Schema::create('releases', static function (Blueprint $table): void {
             $table->id();
             $table->string('guid');
@@ -115,7 +119,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         [$path, $manifests] = $this->upload('metadata-review');
         $source = file_get_contents($path);
         $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
-        $manifests->recordNzbOutcome($path, NzbImportStatus::MetadataIgnored, null, null);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::MetadataIgnored, null, null);
         $result = (new NfoImportService(new Filesystem, $manifests, new NfoService))->importManifest($manifestPath, $delete, $deleteFailed);
         $this->assertSame('skipped', $result['status']);
         $this->assertSame('metadata_review', $manifests->read($manifestPath)['state']);
@@ -131,8 +135,8 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->candidate($identity, 'metadata_review');
         [$path, $manifests] = $this->upload('candidate-review');
         $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
-        unlink($path);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->relinquishCapturedSource($manifests, $path);
         $nfos = new NfoImportService(new Filesystem, $manifests, new NfoService);
         $this->assertSame('skipped', $nfos->importManifest($manifestPath, deleteFailed: true)['status']);
         $held = $manifests->read($manifestPath);
@@ -192,8 +196,8 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         DB::table('releases')->insert(['id' => 7, 'guid' => 'published-guid']);
         foreach (['first', 'second'] as $origin) {
             [$path, $manifests] = $this->upload($origin);
-            $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
-            unlink($path);
+            $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+            $this->relinquishCapturedSource($manifests, $path);
             $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
             $result = (new NfoImportService(new Filesystem, $manifests, new NfoService))->importManifest($manifestPath);
             $this->assertSame('imported', $result['status'], $result['message']);
@@ -212,7 +216,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->candidate($identity, 'repaired', 7);
         DB::table('releases')->insert(['id' => 7, 'guid' => 'repaired-guid']);
         [$path, $manifests] = $this->upload('repaired');
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
         $this->assertFalse($manifests->shouldImportNzb($path));
         $manifest = $manifests->read(dirname($path).'/'.NzbUploadManifestService::FILENAME);
         $this->assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $manifest['state']);
@@ -226,7 +230,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         DB::table('releases')->insert(['id' => 7, 'guid' => 'sampled-guid']);
         [$path, $manifests] = $this->upload('sampled');
 
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
 
         $result = $manifests->reconcilePending(dirname($path).'/'.NzbUploadManifestService::FILENAME);
         $this->assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $result['state']);
@@ -239,7 +243,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $identity = sha1('import:expired');
         $this->candidate($identity, 'expired');
         [$path, $manifests] = $this->upload('expired');
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
         $this->assertFalse($manifests->shouldImportNzb($path));
         $this->assertFalse($manifests->shouldImportNzb($path));
         $manifest = $manifests->read(dirname($path).'/'.NzbUploadManifestService::FILENAME);
@@ -256,8 +260,8 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         [$path, $manifests] = $this->upload('unrepairable');
         $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
         $nfoPath = dirname($path).'/info.nfo';
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
-        unlink($path);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->relinquishCapturedSource($manifests, $path);
         $this->assertSame(0, Artisan::call('nntmux:import-nzbs', ['--folder' => dirname($path)]));
         $manifest = $manifests->read($manifestPath);
         $this->assertSame(NzbUploadManifestService::STATE_NZB_REJECTED, $manifest['state']);
@@ -265,7 +269,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->assertNull($manifest['release_id']);
         $this->assertNull($manifest['release_guid']);
         $this->assertFalse($manifests->shouldImportNzb($path));
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
         $this->assertSame(NzbUploadManifestService::STATE_NZB_REJECTED, $manifests->read($manifestPath)['state']);
         $importer = new NfoImportService(new Filesystem, $manifests, new NfoService);
         $this->assertSame('skipped', $importer->importManifest($manifestPath, delete: true)['status']);
@@ -284,7 +288,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         DB::table('releases')->insert(['id' => 7, 'guid' => 'stale-publication']);
         [$path, $manifests] = $this->upload('unrepairable-stale');
         $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
         $this->assertSame(NzbUploadManifestService::STATE_NZB_REJECTED, $manifests->reconcilePending($manifestPath)['state']);
         $this->assertNull($manifests->read($manifestPath)['release_id']);
         $this->assertNull($manifests->read($manifestPath)['release_guid']);
@@ -299,7 +303,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
             $identity = sha1('import:'.$status);
             $this->candidate($identity, $status, 999);
             [$path, $manifests] = $this->upload($status);
-            $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+            $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
             $this->assertFalse($manifests->shouldImportNzb($path));
             $manifest = $manifests->read(dirname($path).'/'.NzbUploadManifestService::FILENAME);
             $this->assertNull($manifest['release_id']);
@@ -322,8 +326,8 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         DB::table('releases')->insert(['id' => 7, 'guid' => 'no-nfo-guid']);
         [$path, $manifests] = $this->upload('no-nfo');
         $manifests->create(dirname($path), 'no-nfo', 'Release.nzb', null);
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
-        unlink($path);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->relinquishCapturedSource($manifests, $path);
         unlink(dirname($path).'/info.nfo');
         $this->assertSame(0, Artisan::call('nntmux:import-nzbs', ['--folder' => dirname($path), '--delete' => true]));
         $manifest = $manifests->read(dirname($path).'/'.NzbUploadManifestService::FILENAME);
@@ -340,10 +344,10 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         DB::table('releases')->insert(['id' => 7, 'guid' => 'repeat-guid']);
         [$path, $manifests] = $this->upload('repeat');
         $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
         $result = (new NfoImportService(new Filesystem, $manifests, new NfoService))->importManifest($manifestPath);
         $this->assertSame('imported', $result['status']);
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
         $this->assertSame(NzbUploadManifestService::STATE_NFO_IMPORTED, $manifests->read($manifestPath)['state']);
     }
 
@@ -354,8 +358,8 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         [$path, $manifests] = $this->upload('removed');
         $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
         $nfoPath = dirname($path).'/info.nfo';
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
-        unlink($path);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->relinquishCapturedSource($manifests, $path);
         DB::table('release_verification_candidates')->where('identity', $identity)->delete();
 
         $this->assertSame(0, Artisan::call('nntmux:import-nzbs', ['--folder' => dirname($path), '--delete' => true]));
@@ -366,7 +370,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->assertNull($manifest['release_guid']);
         $this->assertStringContainsString('candidate no longer exists', $manifest['last_error']);
         $this->assertFalse($manifests->shouldImportNzb($path));
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
         $this->assertSame(NzbUploadManifestService::STATE_NZB_REJECTED, $manifests->reconcilePending($manifestPath)['state']);
         $importer = new NfoImportService(new Filesystem, $manifests, new NfoService);
         $result = $importer->importManifest($manifestPath, delete: true);
@@ -387,7 +391,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
             $identity = sha1('import:outer-'.$kind);
             [$path, $manifests] = $this->upload('outer-'.$kind);
             $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
-            $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+            $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
             DB::beginTransaction();
             try {
                 if ($kind === 'published') {
@@ -410,9 +414,13 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $identity = sha1('import:outer-commit');
         [$path, $manifests] = $this->upload('outer-commit');
         $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->capturedFixtureImporter('outer-commit')->beginImport([$path]);
+        $admitted = DB::table('release_verification_candidates')->where('identity', $identity)->sole();
+        $this->assertSame($manifests->read($manifestPath)['accepted_admission']['manifest_hash'], $admitted->manifest_hash);
         DB::beginTransaction();
-        $this->candidate($identity, 'complete', 7);
+        DB::table('release_verification_candidates')->where('id', $admitted->id)
+            ->where('version', $admitted->version)->where('manifest_hash', $admitted->manifest_hash)
+            ->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now(), 'manifest_path' => '', 'manifest_bytes' => 0]);
         DB::table('releases')->insert(['id' => 7, 'guid' => 'committed-publication']);
         try {
             $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $manifests->reconcilePending($manifestPath)['state']);
@@ -433,7 +441,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
     {
         [$path, $manifests] = $this->upload('commit-failure');
         $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: sha1('import:commit-failure'));
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: sha1('import:commit-failure'));
         $interrupted = false;
         DB::listen(function (QueryExecuted $event) use (&$interrupted): void {
             if (! $interrupted && str_contains($event->sql, 'from "release_verification_candidates" as "candidates"')) {
@@ -456,7 +464,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
     {
         [$path, $manifests] = $this->upload('retry');
         $manifestPath = dirname($path).'/'.NzbUploadManifestService::FILENAME;
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: sha1('import:retry'));
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: sha1('import:retry'));
         Schema::drop('release_verification_candidates');
         $result = (new NfoImportService(new Filesystem, $manifests, new NfoService))->importManifest($manifestPath, deleteFailed: true);
         $this->assertSame('failed', $result['status']);
@@ -471,7 +479,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         DB::table('releases')->insert(['id' => 7, 'guid' => 'unverified-guid']);
         DB::table('release_verification_candidates')->update(['verified_at' => null]);
         [$path, $manifests] = $this->upload('unverified');
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
         $this->assertFalse($manifests->shouldImportNzb($path));
         $manifest = $manifests->read(dirname($path).'/'.NzbUploadManifestService::FILENAME);
         $this->assertSame('nzb_rejected', $manifest['state']);
@@ -497,8 +505,8 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->assertTrue($manifests->shouldImportNzb($path));
         $identity = sha1('import:late-outcome');
         $this->candidate($identity, 'queued');
-        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
-        unlink($path);
+        $this->recordCapturedOutcome($manifests, $path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $this->relinquishCapturedSource($manifests, $path);
         DB::table('releases')->insert(['id' => 7, 'guid' => 'late-outcome-publication']);
         DB::table('release_verification_candidates')->where('identity', $identity)->update([
             'status' => 'complete', 'release_id' => 7, 'verified_at' => now(),
@@ -508,7 +516,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
             $manifests->reconcilePending($manifestPath);
         }
         $before = $manifests->read($manifestPath);
-        $manifests->recordNzbOutcome($path, $late, null, null);
+        $this->recordCapturedOutcome($manifests, $path, $late, null, null);
         $this->assertSame($before, $manifests->read($manifestPath));
         $this->assertSame($identity, $manifests->read($manifestPath)['candidate_identity']);
         $nfos = new NfoImportService(new Filesystem, $manifests, new NfoService);
@@ -536,7 +544,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $filesystem->put($path, '<nzb><file subject="Release [1/1] &quot;movie.mkv&quot; (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">a@b</segment></segments></file></nzb>');
         $filesystem->put($directory.'/info.nfo', 'paired uploaded NFO');
         $manifests = new NzbUploadManifestService($filesystem);
-        $manifests->create($directory, $origin, 'Release.nzb', 'info.nfo');
+        $manifests->create($directory, $origin, 'Release.nzb', 'info.nfo', 'paired uploaded NFO');
 
         return [$path, $manifests];
     }

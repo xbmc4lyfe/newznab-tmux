@@ -13,8 +13,6 @@ use Throwable;
 
 final class NfoImportService
 {
-    private const MAX_NFO_SIZE = 65535;
-
     public function __construct(
         private readonly Filesystem $filesystem,
         private readonly NzbUploadManifestService $manifests,
@@ -55,7 +53,7 @@ final class NfoImportService
                             $manifest['nfo']['filename'],
                             'nfo'
                         );
-                        $this->filesystem->delete($nfoPath);
+                        $this->manifests->deleteTerminalCompanion($manifestPath);
                     } catch (Throwable) {
                         // The terminal NZB outcome remains authoritative even if its NFO is already gone.
                     }
@@ -75,6 +73,10 @@ final class NfoImportService
                 return ['status' => 'skipped', 'message' => 'Upload has no paired NFO'];
             }
 
+            if (! $this->filesystem->isFile(dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nfo']['filename'])) {
+                throw new RuntimeException('Companion input is missing');
+            }
+
             $releaseId = $manifest['release_id'] ?? null;
             $releaseGuid = $manifest['release_guid'] ?? null;
             if (! is_int($releaseId) || $releaseId <= 0 || ! is_string($releaseGuid) || $releaseGuid === '') {
@@ -89,52 +91,18 @@ final class NfoImportService
                 throw new RuntimeException('The release recorded by the upload manifest no longer exists');
             }
 
-            $nfoPath = $this->manifests->resolvePayloadPath(
-                $manifestPath,
-                $manifest['nfo']['filename'],
-                'nfo'
-            );
-            $content = $this->filesystem->get($nfoPath);
-            if ($content === '' || strlen($content) > self::MAX_NFO_SIZE) {
-                throw new RuntimeException('NFO import must not be empty or exceed 65535 bytes');
-            }
-
-            if (! $this->nfoService->storeNfoContent($releaseId, $content)) {
-                throw new RuntimeException('Failed to store NFO content for the release');
-            }
-
-            $this->manifests->recordNfoOutcome($manifestPath, true);
-            if ($delete && ! $this->filesystem->delete($nfoPath)) {
-                Log::channel('nzb_upload')->warning('Imported NFO could not be deleted', [
-                    'manifest' => $manifestPath,
-                    'filename' => basename($nfoPath),
-                ]);
-            }
+            $this->manifests->consumeCompanion($manifestPath,
+                $this->nfoService, $delete);
 
             Log::channel('nzb_upload')->info('Paired NFO imported', [
                 'upload_id' => $manifest['upload_id'],
                 'release_id' => $releaseId,
                 'release_guid' => $releaseGuid,
-                'filename' => basename($nfoPath),
+                'filename' => $manifest['nfo']['filename'],
             ]);
 
             return ['status' => 'imported', 'message' => "Imported {$manifest['nfo']['filename']}"];
         } catch (Throwable $exception) {
-            try {
-                if (isset($manifest) && in_array($manifest['state'], [NzbUploadManifestService::STATE_NZB_IMPORTED, NzbUploadManifestService::STATE_NFO_FAILED], true)) {
-                    $this->manifests->recordNfoOutcome($manifestPath, false, $exception->getMessage());
-                }
-            } catch (Throwable $manifestException) {
-                Log::channel('nzb_upload')->error('Failed to record NFO import failure', [
-                    'manifest' => $manifestPath,
-                    'error' => $manifestException->getMessage(),
-                ]);
-            }
-
-            if ($deleteFailed && $nfoPath !== null && $this->filesystem->isFile($nfoPath)) {
-                $this->filesystem->delete($nfoPath);
-            }
-
             Log::channel('nzb_upload')->warning('Paired NFO import failed', [
                 'manifest' => $manifestPath,
                 'error' => $exception->getMessage(),

@@ -93,6 +93,7 @@ class ImportNzbs extends Command
                         $result['release_id'],
                         $result['release_guid'],
                         candidateIdentity: $result['candidate_identity'] ?? null,
+                        inputCapture: $result['input_capture'] ?? null,
                     );
                 }
             );
