@@ -514,9 +514,9 @@ class NameFixingService
             $eligible = $canonical;
         }
         // The selector still applies its scoring and literal ambiguity policy, using the preserved stem.
-        $match = $this->predbMatchSelector->selectBestMatch($evidence->stem, $eligible)
-            ?? $this->predbMatchSelector->selectBestMatch($evidence->basename, $eligible)
-            ?? $this->predbMatchSelector->selectBestMatch($query, $eligible);
+        $match = $this->predbMatchSelector->selectBestMatch($evidence->stem, $eligible, $evidence)
+            ?? $this->predbMatchSelector->selectBestMatch($evidence->basename, $eligible, $evidence)
+            ?? $this->predbMatchSelector->selectBestMatch($query, $eligible, $evidence);
         if ($match === null || (int) ($match['id'] ?? 0) <= 0) {
             return null;
         }

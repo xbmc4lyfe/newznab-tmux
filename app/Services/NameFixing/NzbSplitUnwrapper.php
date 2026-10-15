@@ -49,6 +49,16 @@ final class NzbSplitUnwrapper
         return str_replace(['_', '+'], ['.', ' '], $matches[1]);
     }
 
+    /** Remove a bounded transport trailer only from a valid archive-wrapped NZBSPLIT filename. */
+    public function stripLiteralSubjectTrailer(string $value): string
+    {
+        if ($this->literalPayload($value) === null) {
+            return $value;
+        }
+
+        return preg_replace('/(\.(?:7z\.\d{2,4}|part\d+\.rar|rar|r\d{2,4}|par2?))"? +yEnc(?: +\([1-9]\d*(?:\/[1-9]\d*)?\))?\z/iD', '$1', $value) ?? $value;
+    }
+
     public function unwrap(string $value): ?string
     {
         if (! preg_match(self::WRAPPER_PATTERN, $value, $matches)) {

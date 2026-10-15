@@ -13,7 +13,8 @@ final readonly class OriginalFilenameEvidence
 
     public function __construct(string $filename)
     {
-        $this->basename = preg_replace('~^.*[\\\\/]~s', '', $filename) ?? '';
+        $source = (new NzbSplitUnwrapper)->stripLiteralSubjectTrailer($filename);
+        $this->basename = preg_replace('~^.*[\\\\/]~s', '', $source) ?? '';
         $stem = (new FileNameCleaner)->stripFileSuffixes($this->basename);
         // Strip wrappers first, then decode only the protocol's separator encoding.
         $this->stem = (new NzbSplitUnwrapper)->literalPayload($stem) ?? $stem;

@@ -148,7 +148,7 @@ class FileNameCleaner
 
         // After a wrapper (`.rar`, `.par2`) came off, a trailing codec word is part of the title, not a file
         // extension: `Movie.2020.1080p.DTS.rar` is the title `Movie.2020.1080p.DTS`.
-        if ($preserveCodecAfterWrapper && $fileName !== $original && preg_match('/\.(dts|ac3|eac3|truehd|ts|opus|flac|aac|mp3|ogg|wav|m4a|mka|wma)$/i', $fileName) === 1) {
+        if ($preserveCodecAfterWrapper && $fileName !== $original && preg_match('/\.(dts|ac3|eac3|truehd|ts|divx|opus|flac|aac|mp[23]|ogg|wav|m4a|mka|wma|ape|mpc|shn|tak|tta|wv)$/i', $fileName) === 1) {
             return $fileName;
         }
 
@@ -204,6 +204,8 @@ class FileNameCleaner
         if ($fileName === '' || str_starts_with($fileName, '.')) {
             return false;
         }
+
+        $fileName = $this->nzbSplitUnwrapper->stripLiteralSubjectTrailer($fileName);
 
         // Extract filename from path
         $fileName = $this->extractFilenameFromPath($fileName);

@@ -38,6 +38,11 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             'NZBSPLIT payload under long part' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.mkv.part12345.rar', 'Exact.Release.2026-GRP', false, 8],
             'NZBSPLIT archive token in literal title' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026.rar.mkv', 'Exact.Release.2026.rar', false, 8],
             'NZBSPLIT codec title' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026_DTS.rar', 'Exact.Release.2026.DTS', false, 8],
+            'NZBSPLIT yEnc subject counter' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.073 yEnc (1)', 'Exact.Release.2026-GRP', false, 8],
+            'NZBSPLIT quoted yEnc fraction' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.073" yEnc (1/42)', 'Exact.Release.2026-GRP', false, 8],
+            'NZBSPLIT arbitrary subject tail cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.073 yEnc unknown', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT repeated subject tail cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.073 yEnc (1) yEnc (2)', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT unbounded subject counter cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.073 yEnc (1/42/77)', 'Exact.Release.2026-GRP', false, 0],
             'NZBSPLIT group spelling survives nomination' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRPdisc1.mkv', 'Exact.Release.2026-GRPdisc1', true, 8],
             'NZBSPLIT payload whitespace cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__ Exact_Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 0],
             'NZBSPLIT repeated separators cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact__Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 0],
@@ -88,12 +93,55 @@ final class OriginalFilenameAcceptanceTest extends TestCase
     public static function nzbSplitPipelineCases(): array
     {
         $rows = [];
-        foreach (['.7z.073', '.7z.01', '.7z.0001', '.part12345.rar.par2', '.mkv.part12345.rar'] as $suffix) {
+        foreach (['.7z.073', '.7z.01', '.7z.0001', '.part12345.rar.par2', '.mkv.part12345.rar', '.7z.073 yEnc (1)', '.7z.073" yEnc (1/42)'] as $suffix) {
             $rows[$suffix.' canonical hit'] = [true, $suffix];
             $rows[$suffix.' extractor fallback'] = [false, $suffix];
         }
 
         return $rows;
+    }
+
+    public static function wrappedCodecRows(): array
+    {
+        $rows = [];
+        foreach (['DIVX', 'APE', 'MP2', 'MPC', 'SHN', 'TAK', 'TTA', 'WV', 'DTS'] as $codec) {
+            foreach (['both', 'correct only', 'shorter only'] as $candidates) {
+                $rows[$codec.' '.$candidates] = [$codec, $candidates];
+            }
+        }
+
+        return $rows;
+    }
+
+    #[DataProvider('wrappedCodecRows')]
+    public function test_archive_wrapped_codec_preserves_canonical_identity(string $codec, string $candidates): void
+    {
+        $this->createPar2RenameSchema();
+        config(['nntmux.echocli' => false]);
+        Event::fake([ReleaseNameFixed::class]);
+        $shorter = 'Exact.Release.2026';
+        $title = $shorter.'.'.$codec;
+        $filename = $title.'.rar';
+        $release = $this->pendingPar2Release(['searchname' => $title, 'predb_id' => 0]);
+        $rows = [];
+        if ($candidates !== 'correct only') {
+            $rows[] = ['id' => 7, 'title' => $shorter];
+        }
+        if ($candidates !== 'shorter only') {
+            $rows[] = ['id' => 8, 'title' => $title];
+        }
+        DB::table('predb')->insert($rows);
+        DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
+        Search::shouldReceive('searchPredb')->andReturn($rows);
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
+        (new NameFixingService($updates))->getPreFileNames(['prefile', '1']);
+        $accepted = $candidates !== 'shorter only';
+        self::assertSame($accepted ? 8 : 0, $release->fresh()->predb_id);
+        self::assertSame($title, $release->fresh()->searchname);
+        self::assertSame($accepted, $updates->lastCommittedIdentity() !== null);
+        self::assertSame([$filename], DB::table('release_files')->pluck('name')->all());
     }
 
     #[DataProvider('nzbSplitPipelineCases')]
@@ -238,6 +286,10 @@ final class OriginalFilenameAcceptanceTest extends TestCase
     {
         return [
             'authoritative ordinary alias' => ['Publisher.Asset-GRP.mkv', 'Publisher.Asset-GRP.rar', true],
+            'authoritative parity alias' => ['Publisher.Asset-GRP.mkv', 'Publisher.Asset-GRP.rar.par2', true],
+            'authoritative long part parity alias' => ['Publisher.Asset-GRP.mkv', 'Publisher.Asset-GRP.part12345.rar.par2', true],
+            'authoritative short 7z alias' => ['Publisher.Asset-GRP.mkv', 'Publisher.Asset-GRP.7z.01', true],
+            'authoritative NZBSPLIT parity alias' => ['Publisher.Asset-GRP.mkv', 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Publisher_Asset-GRP.rar.par2', true],
             'authoritative preserved group alias' => ['Publisher.Asset-GRPdisc1.mkv', 'Publisher.Asset-GRPdisc1.rar', true],
             'lossy group alias cannot authorize' => ['Publisher.Asset-GRPdisc1.mkv', 'Publisher.Asset-GRP.mkv', false],
             'lossy payload alias cannot authorize' => ['Publisher.Asset-GRP.flac.mkv', 'Publisher.Asset-GRP.mkv', false],
