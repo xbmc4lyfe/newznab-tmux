@@ -107,11 +107,14 @@ def validate_summary(summary, run, kind, runner):
     if not isinstance(summary.get('rows'), list) or len(summary['rows']) > 100:
         raise ValueError('Invalid summary rows')
     allowed = set(expected) | {'rows', 'status', 'evidence_type', 'completeness', 'source_sha256',
-                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size'}
+                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'candidate_status', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size'}
     if set(summary) - allowed:
         raise ValueError('Unexpected public summary fields')
     if summary.get('rust_payload_mode', 'unknown') not in ('incumbent', 'experimental', 'unknown'):
         raise ValueError('Invalid Rust payload mode')
+    if 'candidate_status' in summary and (kind not in ('fingerprint-ffi', 'fingerprint-worker')
+            or summary['candidate_status'] != 'experimental_withdrawn_from_production'):
+        raise ValueError('Invalid fingerprint candidate status')
     for mapping in ('source_sha256', 'library_sha256'):
         hashes = summary.get(mapping, {})
         if not isinstance(hashes, dict) or any(not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value) for value in hashes.values()):
@@ -219,7 +222,7 @@ def coverage(root):
         elif name == 'lib':
             label, detail = 'Mixed coverage', 'FFI exports: decoding/rendering comparisons; metadata profiles; some APIs unbenchmarked.'
         elif name in ('article_fingerprint', 'nntmux-article-fingerprint', 'benchmark-article-fingerprint'):
-            label, detail = 'Comparative public operation benchmark', 'PHP baseline vs Rust FFI and worker; 31-pair median screen, p99 unqualified; PHP process startup excluded.'
+            label, detail = 'Comparative archived-candidate benchmark', 'Rust fingerprinting is withdrawn from the application runtime; PHP baseline vs archived FFI/worker, 31-pair median screen, p99 unqualified; PHP process startup excluded.'
         elif name in ('cpu_snapshot', 'nntmux-cpu-snapshot', 'benchmark-cpu-snapshot'):
             label, detail = 'Comparative synthetic CLI benchmark', 'Python baseline vs Rust, 1000 pairs per synthetic proc/cgroup fixture; startup included, production load unverified.'
         rows.append({'target': str(path.relative_to(root)), 'coverage': label, 'detail': detail, 'payload_modes': modes, 'comparisons': comparisons})
@@ -382,6 +385,8 @@ def render(report):
         body.append('<p><a href="benchmarks/">Historical speedup charts, PHP call paths and native flamegraphs</a>. These frozen reports retain their own executed-commit and run provenance; they are separate from this build.</p>')
     for row in report['results']:
         body.append(f'<details><summary>{escape(row["kind"])} · {escape(row["runner"])} · {escape(row.get("status", "unknown"))}</summary><p>{run_link(row)}. Evidence: {escape(row.get("evidence_type", "unavailable"))}; adoption qualification: not established.</p>')
+        if row.get('candidate_status') == 'experimental_withdrawn_from_production':
+            body.append('<p>This archived Rust fingerprint candidate is withdrawn from the application runtime. The application uses native PHP fingerprinting; these median screens do not qualify adoption.</p>')
         if row.get('kind') == 'cpu-snapshot':
             provenance = row.get('runtime_identity', {})
             supported = (row.get('status') in ('measured', 'measured_gate_failed')

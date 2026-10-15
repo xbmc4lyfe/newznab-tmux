@@ -11,6 +11,7 @@ on:
       - 'docker/app/nzb-yenc-ffi/**'
       - 'app/Services/Nzb/NzbArticleFingerprint.php'
       - 'app/Services/Nzb/RustArticleFingerprintWorker.php'
+      - 'tests/Fixtures/nzb-article-fingerprint/**'
       - 'scripts/*benchmark*'
       - 'scripts/build-docs.py'
       - 'tests/Unit/test_docs_site.py'
@@ -28,7 +29,7 @@ concurrency:
 
 jobs:
   compare:
-    name: ${{ matrix.kind }} (${{ matrix.runner }})
+    name: Experimental comparison ${{ matrix.kind }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     strategy:
@@ -127,7 +128,7 @@ jobs:
           PY
       - name: Check public summary failure and identity contracts
         run: python3 tests/Unit/test_benchmark_summary_export.py
-      - name: Compare complete public NZB fingerprint operation
+      - name: Compare archived experimental Rust fingerprint (withdrawn from production)
         if: startsWith(matrix.kind, 'fingerprint-')
         shell: bash
         run: |
