@@ -63,10 +63,71 @@ class PagesTest(unittest.TestCase):
         self.assertEqual('unknown', pages.measured_payload_mode({'status': 'ok', 'rust_payload_mode': ['incumbent']}))
         self.assertEqual('experimental', pages.measured_payload_mode({'status': 'inconclusive', 'rust_payload_mode': 'experimental'}))
 
-    def test_cpu_results_disclose_unqualified_resampling_intervals(self):
+    def test_cpu_protocol_two_discloses_historical_resampling_intervals(self):
         report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[],
-                      results=[dict(kind='cpu-snapshot', runner='ubuntu-latest', status='measured', rows=[])])
+                      results=[dict(kind='cpu-snapshot', runner='ubuntu-latest', status='measured', rows=[], measurement_protocol_version=2)])
         self.assertIn('dependent bootstrap samples', pages.render(report))
+
+    def test_corrected_cpu_intervals_are_labeled_separately_from_historical_intervals(self):
+        row = dict(kind='cpu-snapshot', runner='ubuntu-latest', status='measured', rows=[],
+                   measurement_protocol_version=3, confidence_status='simultaneous_gate_intervals',
+                   confidence_family_size=3, head_sha=SHA, runtime_identity={'executed_sha': SHA},
+                   protocol_sha256='b' * 64, report_sha256='c' * 64)
+        report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[], results=[row])
+        text = pages.render(report)
+        self.assertNotIn('dependent bootstrap samples', text)
+        self.assertIn('simultaneous 95%', text)
+        row['status'] = 'invalid'
+        self.assertNotIn('CPU protocol 3 uses independent', pages.render(report))
+        row['status'] = 'measured'
+        row.pop('runtime_identity', None)
+        self.assertNotIn('CPU protocol 3 uses independent', pages.render(report))
+        row['confidence_status'] = 'unqualified'
+        self.assertIn('do not establish qualified uncertainty', pages.render(report))
+
+    def test_unavailable_cpu_provenance_never_invents_historical_protocol(self):
+        for version in (None, 0, 3):
+            for status in ('missing', 'pending', 'partial', 'invalid', 'measured_gate_failed'):
+                with self.subTest(version=version, status=status):
+                    row = dict(kind='cpu-snapshot', runner='ubuntu-latest', status=status, rows=[],
+                               confidence_status='unqualified')
+                    if version is not None:
+                        row['measurement_protocol_version'] = version
+                    text = pages.render(dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[], results=[row]))
+                    self.assertNotIn('historical protocol 2', text)
+                    self.assertNotIn('dependent bootstrap samples', text)
+                    self.assertIn('do not establish qualified uncertainty', text)
+                    self.assertIn('CPU protocol 3' if version == 3 else 'protocol provenance is unavailable', text)
+
+    def test_measurement_table_displays_actual_gate_bounds_separately_from_diagnostics(self):
+        rows = [dict(fixture='common-mounted', gate_statistic='median_ratio',
+                     gate_speedup_simultaneous_ci95=[1.61, 2.41],
+                     median_ratio_ci95=[1.81, 2.21], p99_ratio_ci95=[1.71, 2.31]),
+                dict(fixture='rare-host-unavailable', gate_statistic='p99_ratio',
+                     gate_speedup_simultaneous_ci95=[1.62, 2.42],
+                     host_median_speedup_simultaneous_ci95=[2.02, 2.82],
+                     median_ratio_ci95=[2.12, 2.72], p99_ratio_ci95=[1.72, 2.32])]
+        text = pages.measurement_table(rows)
+        self.assertIn('Simultaneous decision bounds', text)
+        self.assertIn('Diagnostic intervals', text)
+        for value in ('gate_statistic', 'median_ratio', 'p99_ratio',
+                      'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95',
+                      '[1.61, 2.41]', '[1.62, 2.42]', '[2.02, 2.82]',
+                      'median_ratio_ci95', '[1.81, 2.21]', '[2.12, 2.72]',
+                      'p99_ratio_ci95', '[1.71, 2.31]', '[1.72, 2.32]'):
+            self.assertIn(value, text)
+        rows[0]['fixture'] = '<script>fixture</script>'
+        rows[0]['gate_statistic'] = '<script>statistic</script>'
+        text = pages.measurement_table(rows)
+        self.assertNotIn('<script>', text)
+        self.assertIn('&lt;script&gt;statistic&lt;/script&gt;', text)
+
+    def test_cpu_confidence_metadata_is_strict_and_does_not_escape_its_comparison(self):
+        summary = dict(schema_version=1, repository=pages.REPOSITORY, head_sha=SHA, run_id=12, run_attempt=2, kind='cpp', runner='ubuntu-latest', adoption_qualified=False, rows=[])
+        for metadata in ({'confidence_status': 'simultaneous_gate_intervals'},
+                         {'measurement_protocol_version': 3}, {'confidence_family_size': 3}):
+            with self.subTest(metadata=metadata), self.assertRaises(ValueError):
+                pages.validate_summary({**summary, **metadata}, self.run_row(), 'cpp', 'ubuntu-latest')
 
     def run_row(self, **changes):
         return dict(id=12, run_attempt=2, head_sha=SHA, head_branch='master', event='push',
