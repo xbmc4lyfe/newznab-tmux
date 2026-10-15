@@ -24,7 +24,7 @@ WORKFLOWS = {
                              ('profile', 'ubuntu-latest'), ('profile', 'ubuntu-24.04-arm')],
     'release-presentation.yml': [('presentation', 'ubuntu-latest')],
     'native-utilities-performance.yml': [(kind, runner) for kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot') for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')],
-    'archive-sample-performance.yml': [(kind, runner) for kind in ('sample-planning', 'archive-parsing', 'vendor-archive') for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')],
+    'archive-sample-performance.yml': [(kind, runner) for kind in ('sample-planning', 'archive-parsing', 'vendor-archive', 'metadata-modules', 'archive-modules') for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')],
     'laravel.yml': [], 'rust-clippy.yml': [],
 }
 RESOURCE_HASHES = {'resource_limits_before', 'resource_limits_after', 'resource_limits_comparison'}
@@ -65,7 +65,29 @@ VENDOR_SOURCE_PATHS = {'composer.lock', 'vendor/composer/installed.json', 'vendo
     'vendor/dariusiii/rarinfo/ZipInfo.php', 'vendor/dariusiii/rarinfo/SzipInfo.php',
     'scripts/benchmark-vendor-archive.php', 'tests/Fixtures/VendorArchiveBenchmarkFixtures.php'} | {path for path, _ in VENDOR_INPUTS.values()}
 
-CALLER_SOURCES |= VENDOR_SOURCE_PATHS
+REMAINING_MODULES = {
+    "metadata-modules": {
+        "article_dates": ("dates-ordinary", "dates-folded", "dates-uncommon-duplicates", "dates-uncommon-malformed"),
+        "article_identity": ("identity-ordinary", "identity-overview", "identity-uncommon-conflicts", "identity-uncommon-boundary"),
+        "article_xref": ("xref-ordinary", "xref-overview", "xref-uncommon-duplicates", "xref-uncommon-limits")},
+    "archive-modules": {
+        "iso_primary_copies": ("iso-copies-equal", "iso-copies-different", "iso-copies-uncommon-limit", "iso-copies-uncommon-partial"),
+        "rar5_copy_checksums": ("rar-copy-crc", "rar-copy-blake", "rar-copy-uncommon-ambiguous", "rar-copy-uncommon-truncated"),
+        "rar5_quick_open": ("rar-quick-open-match", "rar-quick-open-conflict", "rar-quick-open-uncommon-retention", "rar-quick-open-uncommon-corrupt")},
+}
+REMAINING_STRATA = {kind: {name: dict(module=module, category="common" if index < 2 else "uncommon",
+    comparison_scope="bounded-reference-shared-projection-v1" if kind == "metadata-modules" else
+    "bounded independent PHP reference versus shared metadata projection; no full-parser equivalence or production PHP speedup")
+    for module, names in modules.items() for index, name in enumerate(names)} for kind, modules in REMAINING_MODULES.items()}
+REMAINING_INSTRUMENTATION = {"scripts/benchmark-remaining-modules.php", "scripts/benchmark-sample-planning.php",
+    "scripts/benchmark-article-processing.php", "scripts/benchmark-yenc.php", "tests/Fixtures/SamplePlanningBenchmarkFixtures.php",
+    "tests/Fixtures/RemainingMetadataBenchmarkFixtures.php", "tests/Fixtures/RemainingArchiveBenchmarkFixtures.php"}
+REMAINING_WRAPPER = "app/Services/Releases/Fingerprint/NativeMetadataParser.php"
+REMAINING_SOURCES = {REMAINING_WRAPPER, "composer.json", "composer.lock", "docker/app/nzb-yenc-ffi/Cargo.toml",
+    "docker/app/nzb-yenc-ffi/Cargo.lock", "docker/app/nzb-yenc-ffi/src/lib.rs"} | {
+    "docker/app/nzb-yenc-ffi/src/" + module + ".rs" for modules in REMAINING_MODULES.values() for module in modules}
+
+CALLER_SOURCES |= VENDOR_SOURCE_PATHS | REMAINING_SOURCES | REMAINING_INSTRUMENTATION
 LIMIT = 1024 * 1024
 
 
@@ -148,9 +170,12 @@ def validate_summary(summary, run, kind, runner):
     if not isinstance(summary.get('rows'), list) or len(summary['rows']) > 100:
         raise ValueError('Invalid summary rows')
     allowed = set(expected) | {'rows', 'status', 'evidence_type', 'completeness', 'source_sha256',
-                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'candidate_status', 'uncertainty_method', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size'}
+                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'candidate_status', 'uncertainty_method', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size', 'baseline_kind', 'benchmark_mode'}
     if set(summary) - allowed:
         raise ValueError('Unexpected public summary fields')
+    if kind not in REMAINING_STRATA and (set(summary) & {'baseline_kind', 'benchmark_mode'}
+            or any(set(row) & {'module', 'correctness_observations', 'native_proof_observations'} for row in summary['rows'])):
+        raise ValueError('Remaining module fields on a different comparison')
     if summary.get('rust_payload_mode', 'unknown') not in ('incumbent', 'experimental', 'unknown'):
         raise ValueError('Invalid Rust payload mode')
     if 'candidate_status' in summary and (kind not in ('fingerprint-ffi', 'fingerprint-worker')
@@ -168,7 +193,7 @@ def validate_summary(summary, run, kind, runner):
                 'median_ms', 'min_ms', 'max_ms', 'candidate_backend', 'correctness_passed', 'performance_gate',
                 'gate_passed', 'samples', 'iterations', 'php_median_ns', 'rust_median_ns', 'improvement_percent',
                 'body_ffi_median_ms', 'fixture', 'p99_sample_sufficient', 'baseline_median_ns', 'candidate_median_ns', 'median_ratio', 'paired_median_ratio', 'baseline_p99_ns', 'candidate_p99_ns', 'p99_ratio', 'median_ratio_ci95', 'p99_ratio_ci95', 'median_baseline_over_candidate_ratio', 'median_cold_baseline_over_candidate_ratio',
-                'category', 'comparison', 'metric', 'baseline_over_candidate', 'speedup_interval', 'baseline_latency_ms', 'candidate_latency_ms', 'native_median_ms', 'qualification_gate_passed', 'p99_threshold_met',
+                'module', 'correctness_observations', 'native_proof_observations', 'category', 'comparison', 'metric', 'baseline_over_candidate', 'speedup_interval', 'baseline_latency_ms', 'candidate_latency_ms', 'native_median_ms', 'qualification_gate_passed', 'p99_threshold_met',
                 'baseline_latency_interval_ms', 'candidate_latency_interval_ms', 'marginal_alpha', 'gate_statistic', 'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95'}
     if any(not isinstance(row, dict) or set(row) - row_keys for row in summary['rows']):
         raise ValueError('Unexpected public measurement fields')
@@ -214,12 +239,12 @@ def validate_summary(summary, run, kind, runner):
             if any(field in row for field in ('live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95')) and row.get('fixture') != 'host-live':
                 raise ValueError('Exact live CPU bounds on a different fixture')
 
-    if kind in ('sample-planning', 'archive-parsing', 'vendor-archive'):
+    if kind in ('sample-planning', 'archive-parsing', 'vendor-archive', 'metadata-modules', 'archive-modules'):
         if set(summary.get('source_sha256', {})) - CALLER_SOURCES or set(summary.get('library_sha256', {})) - {'native'}:
             raise ValueError('Unexpected public caller identity names')
         validate_caller_rows(summary, kind)
 
-    if kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot', 'sample-planning', 'archive-parsing', 'vendor-archive'):
+    if kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot', 'sample-planning', 'archive-parsing', 'vendor-archive', 'metadata-modules', 'archive-modules'):
         revision = '5cc5303b502e653d83bba1951dec2f5d2da1db35' if kind == 'cpu-snapshot' else 'a1a9b0829610c3b62e7d0bdb418669a89c36c90b'
         if kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot') and set(summary.get('source_sha256', {})) - UTILITY_SOURCES:
             raise ValueError('Unexpected public utility identity names')
@@ -289,6 +314,7 @@ CALLER_FIXTURES = {
             'par2-ranges-missing', 'par2-ranges-conflicting', 'par2-ranges-checksum'), 'diagnostic')},
 }
 
+CALLER_FIXTURES.update({kind: {name: row['category'] for name, row in strata.items()} for kind, strata in REMAINING_STRATA.items()})
 
 def require_current_provenance(summary):
     if (not summary.get('runtime_identity') or not summary.get('source_sha256')
@@ -306,10 +332,18 @@ def positive(value):
 
 def validate_caller_rows(summary, kind):
     fixtures = CALLER_FIXTURES[kind]
+    remaining = kind in REMAINING_STRATA
+    if remaining and (summary.get('baseline_kind') != 'independent_php_reference_projection'
+            or summary.get('evidence_type') != 'shared_independent_php_reference_projection'
+            or summary.get('benchmark_mode') not in (('screen', 'qualification') if summary.get('status') == 'measured' else ('screen', 'qualification', 'unknown'))
+            or summary.get('adoption_qualified') is not False or 'baseline_revision' in summary):
+        raise ValueError('Invalid independent PHP reference scope')
     keys = {'fixture', 'phase', 'candidate_backend', 'samples', 'category', 'p99_sample_sufficient',
             'comparison', 'native_median_ms', 'metric', 'baseline_latency_ms', 'candidate_latency_ms',
             'speedup_interval', 'baseline_over_candidate', 'qualification_gate_passed', 'eligible',
             'confidence_family_size', 'marginal_alpha', 'baseline_latency_interval_ms', 'candidate_latency_interval_ms'}
+    if remaining:
+        keys |= {'module', 'correctness_observations', 'native_proof_observations'}
     seen = set()
     for row in summary['rows']:
         fixture, phase = row.get('fixture'), row.get('phase')
@@ -322,11 +356,17 @@ def validate_caller_rows(summary, kind):
                 or not 0 <= samples <= 10000 or type(row.get('eligible')) is not bool
                 or row.get('p99_sample_sufficient') is not (samples >= 1000)):
             raise ValueError('Invalid caller row contract')
+        if remaining:
+            if (row.get('module') != REMAINING_STRATA[kind][fixture]['module']
+                    or row.get('confidence_family_size') != 48 or type(row.get('confidence_family_size')) is not int
+                    or not positive(row.get('marginal_alpha')) or not math.isclose(row['marginal_alpha'], .05/48, rel_tol=1e-12)
+                    or summary.get('status') != 'measured' and (row['eligible'] or row.get('qualification_gate_passed') is True)):
+                raise ValueError('Invalid remaining module proof or global gate')
         if row.get('comparison') == 'invalid' and row['eligible'] is False:
-            if set(row) - {'fixture', 'phase', 'candidate_backend', 'samples', 'category', 'p99_sample_sufficient', 'comparison', 'eligible'} or row.get('candidate_backend') != 'rust':
+            if set(row) - ({'fixture', 'phase', 'candidate_backend', 'samples', 'category', 'p99_sample_sufficient', 'comparison', 'eligible'} | ({'module', 'confidence_family_size', 'marginal_alpha', 'qualification_gate_passed'} if remaining else set())) or row.get('candidate_backend') != 'rust':
                 raise ValueError('Invalid caller row contains measurement claims')
             continue
-        comparison = ('native_only_diagnostic' if category == 'diagnostic' else 'same_php_control'
+        comparison = ('shared_independent_php_reference_projection' if remaining else 'native_only_diagnostic' if category == 'diagnostic' else 'same_php_control'
                       if category.endswith('control') else 'shared_par2_projection'
                       if kind == 'archive-parsing' else 'shared_vendor_header_projection'
                       if kind == 'vendor-archive' else 'exact_public_caller')
@@ -363,9 +403,10 @@ def validate_caller_rows(summary, kind):
                 raise ValueError('Invalid caller gate')
             if row.get('qualification_gate_passed') is True and (samples < 1000 or not row['eligible'] or not interval or interval[0] is None or interval[0] < 1.5):
                 raise ValueError('Unqualified caller gate')
-        if kind == 'vendor-archive':
-            if (type(row.get('confidence_family_size')) is not int or row['confidence_family_size'] != 32 or not positive(row.get('marginal_alpha'))
-                    or not math.isclose(row['marginal_alpha'], 0.05 / 32, rel_tol=1e-12)):
+        if kind == 'vendor-archive' or remaining:
+            family = 48 if remaining else 32
+            if (type(row.get('confidence_family_size')) is not int or row['confidence_family_size'] != family or not positive(row.get('marginal_alpha'))
+                    or not math.isclose(row['marginal_alpha'], 0.05 / family, rel_tol=1e-12)):
                 raise ValueError('Invalid vendor archive confidence family')
             for key in ('baseline_latency_interval_ms', 'candidate_latency_interval_ms'):
                 interval = row.get(key)
@@ -388,6 +429,16 @@ def validate_caller_rows(summary, kind):
                         or any(actual is not None if expected is None else not positive(actual) or not math.isclose(actual, expected, rel_tol=1e-12)
                                for actual, expected in zip(row['speedup_interval'], expected_interval))):
                     raise ValueError('Vendor archive speedup interval disagrees with marginal bounds')
+        if remaining:
+            if (type(row.get('qualification_gate_passed')) is not bool
+                    or type(row.get('correctness_observations')) is not int or row['correctness_observations'] != 2*samples
+                    or type(row.get('native_proof_observations')) is not int or row['native_proof_observations'] != samples):
+                raise ValueError('Invalid remaining module observation proof counts')
+            interval = row.get('speedup_interval')
+            required_gate = (summary['benchmark_mode'] == 'qualification' and row['eligible'] and samples >= 1000
+                             and isinstance(interval, list) and interval[0] is not None and interval[0] >= 1.5)
+            if row['qualification_gate_passed'] is not required_gate:
+                raise ValueError('Remaining projection gate disagrees with evidence')
         for key in ('native_median_ms', 'baseline_latency_ms', 'candidate_latency_ms', 'baseline_over_candidate'):
             if key in row and not positive(row[key]):
                 raise ValueError('Invalid caller numeric value')
@@ -398,6 +449,12 @@ def validate_caller_rows(summary, kind):
         require_current_provenance(summary)
         if not summary.get('library_sha256', {}).get('native'):
             raise ValueError('Measured caller summary lacks native library identity')
+        if remaining:
+            if (not (REMAINING_SOURCES | REMAINING_INSTRUMENTATION) <= set(summary['source_sha256'])
+                    or summary.get('completeness') != dict(expected_rows=24, observed_rows=24, complete=True)
+                    or len({row['samples'] for row in summary['rows']}) != 1
+                    or summary['benchmark_mode'] == 'qualification' and any(row['samples'] < 1000 for row in summary['rows'])):
+                raise ValueError('Invalid remaining module source provenance or completeness')
         if kind == 'vendor-archive':
             sources = summary['source_sha256']
             if (not VENDOR_SOURCE_PATHS <= set(sources)
@@ -445,8 +502,10 @@ def coverage(root):
             label, detail = 'Native caller diagnostics', 'Correctness-gated bounded range fixtures with FFI and JSON costs; no equivalent PHP range baseline or exhaustive archive coverage.'
         elif name in ('sample_plan', 'spotcheck_plan'):
             label, detail = 'Comparative public caller benchmark', 'Exact serialized PHP/native output, cold/warm calls, common median and uncommon p99 qualification mode; small/unsupported inputs remain PHP controls.'
-        elif name in ('article_identity', 'article_xref', 'article_dates'):
-            detail = 'Correctness/parity checks exist; no independent comparative timing protocol or module-specific caller benchmark.'
+        elif name in ('article_identity', 'article_xref', 'article_dates', 'iso_primary_copies', 'rar5_copy_checksums', 'rar5_quick_open'):
+            label, detail = 'Shared independent PHP reference comparison', 'New bounded PHP references compare declared shared projections only; actual native wrapper includes FFI, allocation, JSON decoding and the full richer native result before projection. Cold/warm common median and uncommon p99 gates do not qualify adoption or historical PHP speedups.'
+        elif name in ('zstd_frame', 'xz', 'xz_frame'):
+            label, detail = 'No automated benchmark', 'Explicit coverage gap: no independent PHP reference comparison or qualified caller benchmark.'
         elif name == 'nntmux-evidence-utility':
             label, detail = 'Auxiliary correctness only', 'CI evidence and rendering utility; running it does not measure its own performance.'
         elif name == 'lib':
@@ -662,7 +721,7 @@ def measurement_table(rows):
         'shared_vendor_header_projection': 'Shared archive header projection only (locked PHP readers)',
         'native_only_diagnostic': 'Native-only diagnostic; no baseline',
         'same_php_control': 'PHP control; Rust speedup not applicable',
-        'exact_public_caller': 'Exact public caller', 'exact_public_fingerprint_operation': 'Exact public fingerprint operation',
+        'shared_independent_php_reference_projection': 'Shared independent PHP reference projection', 'exact_public_caller': 'Exact public caller', 'exact_public_fingerprint_operation': 'Exact public fingerprint operation',
         'exact_host_cli': 'Exact host CLI', 'synthetic_cli': 'Synthetic CLI',
     }
     metrics = {'p99_unavailable': 'Tail unavailable (<1,000 pairs)', 'p99_latency': 'p99 latency',

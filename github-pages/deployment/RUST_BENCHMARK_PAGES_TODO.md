@@ -6,10 +6,32 @@ The shared `benchmark-pages.yml` publisher serves documentation and the current 
 
 - `native-utilities-performance.yml` runs both fingerprint backends with `--coverage=full` and the CPU collector's separate synthetic and exact-host protocols on x86 and ARM. Fingerprinting covers nine cold/repeated workloads, including parsed XML, incremental collection, maximum-length IDs and disk spill. Default 31-pair screens omit unreliable p99 metrics. Manual `tail_pairs=1000` collects uncommon tails; `pairs=1000` extends every stratum.
 - `archive-sample-performance.yml` measures actual PHP callers for six sample-planning strata, four PAR2 shared-projection comparisons and sixteen native archive/range diagnostics. A separate eight-stratum vendor archive comparison uses locked PHP RAR4/RAR5, ZIP and 7z readers with independent header oracles; this is shared-header evidence rather than full parser equivalence. Manual `mode=qualification`, `samples=1000` tests the predeclared common-median and uncommon-p99 criteria. Full-result differences are preserved: the PHP PAR2 fallback does not expose all native metadata.
+- The same archive workflow adds `metadata-modules` and `archive-modules` on x86 and ARM for master pushes and PRs. Manual `comparison=remaining` (default) selects these six modules; `existing` selects earlier caller families and `all` selects both. The existing single Pages publisher refreshes trusted master results. See the six-module protocol below; reference-projection coverage does not imply full parser equivalence or adoption.
 - Every measured job preserves source/build receipts, input/result hashes, randomized order, warmup, every failed observation and resource endpoints. Resource checks compare process limits, affinity and all namespace-visible cgroup ancestors before and after execution. Outer host limits remain unknown. Missing required endpoints or changed visible static limits invalidate public eligibility. Optional I/O-controller files retain their presence and value; an absent controller remains unknown.
 - Public summaries expose bounded metrics and hashes, with controls and native-only diagnostics labeled separately. They do not publish raw payloads, source graphs, binaries or private configuration. Raw evidence has 14-day Actions retention. The rejected PAR2 normalization prototype has a retained historical summary in `github-pages/docs/data/par2-normalization-screen.json`; its small common-path gains did not meet the adoption threshold.
 
 The following original handoff is historical. Its unchecked items and old harness limits describe the initial inventory, rather than the current implementation. Remaining all-module gaps stay explicit in the generated dashboard.
+
+## Six-module reference-projection protocol
+
+Frozen source [3c647eb7466a8dd7cfea4958cd5a0ad03ecd1f19](https://github.com/xbmc4lyfe/newznab-tmux/tree/3c647eb7466a8dd7cfea4958cd5a0ad03ecd1f19) implements `scripts/benchmark-remaining-modules.php`. Historical qualification [run 38719300890](https://github.com/xbmc4lyfe/newznab-tmux/actions/runs/38719300890) completed on x86 and ARM with 48,000 eligible pairs, 96 decision rows, and zero invalid pairs. Every stratum has 1,000 pairs per architecture. No projection gate passed, so no production replacement was adopted. The four exact `study-six-*-modules-*.json` summaries and source/run/attempt/artifact digests are retained in the Pages checksum manifest. These frozen results do not describe each subsequent master build.
+
+- `metadata-modules`: `article_dates`, `article_identity`, `article_xref`.
+- `archive-modules`: `iso_primary_copies`, `rar5_copy_checksums`, `rar5_quick_open`.
+
+The source inventory found no equivalent historical PHP implementation for these six modules. Independent test-only PHP reference parsers compute bounded shared projections from raw bytes. The final actual `NativeMetadataParser` computes richer whole outputs, including packing, FFI allocation/copying, JSON copying/freeing, PHP decoding, and projection inside the timed boundary. Independent expected-output oracles and exact serialized projection parity gate observations; full native output is retained separately. This comparison does not establish full parser equivalence, a production PHP speedup, or adoption proof. `adoption_qualified` and `acceptance_criteria_met` remain `false` even if projection gates pass.
+
+Each family predeclares twelve strata, two measured phases, and common/uncommon fixture labels; the labels are not production-frequency evidence. Every backend observation gets a fresh PHP process. Its first call includes FFI loading, followed by one untimed warmup and a repeated call. PHP startup/autoload are excluded and process elapsed is retained separately. First-call cold is not OS-cache cold. Randomized paired order, source/build/runtime identities, input/result hashes, resource endpoints, failed observations, and full-output identities remain in retained evidence. The first invalid pair stops the run with no retries; unattempted strata do not qualify.
+
+Qualification requires at least 1,000 independent pairs per stratum, zero invalid pairs, and stable required resource endpoints. Twelve strata × two phases × two backend marginal quantiles form 48 Bonferroni-adjusted marginal intervals for conservative simultaneous 95% bounds per family and architecture. Every common-median and uncommon-p99 speedup lower bound must reach 1.5× in both phases. This is a shared-projection gate only. A 31-pair screen cannot qualify p99 or adoption.
+
+Use the archive workflow's locked setup and runtime manifests. The harness command shape is:
+
+```bash
+php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-remaining-modules.php --family=metadata-modules --native="$RUST_LIBRARY" --runtime-manifest="$MANIFEST" --output-dir="$NEW_OUTPUT" --mode=qualification --samples=1000 --order-seed=20261015 --timeout=30
+```
+
+Repeat with `--family=archive-modules` and a new output directory. Manual workflow selection is `comparison=[remaining,existing,all]`, `mode=[screen,qualification]`, and `samples` (31 for screens, at least 1,000 for qualification). Public summaries must retain the reference-only scope and explicit pending/failed/invalid/unavailable states. The separate `zstd_frame` and `xz_first_block` comparison gaps remain outside this six-module study.
 
 ## Original ownership and scope
 
@@ -95,8 +117,9 @@ These are coverage states, not speed claims. Discover Rust modules from `src/lib
 | `release_names` | Separate native/PHP rendering CI | Integrate its workflow summaries and runtime evidence. |
 | `article_fingerprint` | Standalone paired harness | Wire both backends and extend uncommon-tail coverage. |
 | `cpu_snapshot` | Standalone CLI paired harness; correctness tests | Wire benchmark execution separately from collection; expose p99 protocol limits. |
-| `article_dates`, `article_identity`, `article_xref` | Correctness/parity or indirect caller coverage | Define explicit native-baseline comparisons and representative unusual headers/date/Xref inputs. |
-| `formats`, including RAR5 Quick Open / copy-entry checksums / archive metadata | Rust/unit and PHP parity tests; one RAR5 profile fixture | Add isolated and caller-level comparisons per archive format and metadata path; preserve malformed/bounded-input semantics. A fixed RAR5 profile is not all-format performance coverage. |
+| `article_dates`, `article_identity`, `article_xref` | Recurring `metadata-modules` PHP reference-projection comparisons through the actual native caller | Retain the bounded shared-output scope, correctness oracles, cold/repeated phases, uncertainty and qualification evidence; full parser equivalence and production PHP speedup remain unproven. |
+| `iso_primary_copies`, `rar5_copy_checksums`, `rar5_quick_open` | Recurring `archive-modules` PHP reference-projection comparisons through the actual native caller | Retain shared-projection limits and malformed/bounded-input semantics; richer full metadata is not equivalent. No adoption proof. |
+| Other `formats` paths, including `zstd_frame`, `xz_first_block` | Existing vendor-reader shared-header comparisons and bounded native diagnostics | Keep the zstd and xz comparison gaps explicit. These paths are outside the six-module study; a fixed RAR5 profile is not all-format performance coverage. |
 | `par2`, `par2_source_ranges` | Correctness/parity only identified | Add real caller baselines, valid/corrupt/large/uncommon recovery fixtures and ownership/correctness checks. |
 | `seven_zip_ranges` | Correctness/parity only identified | Add 7z-specific common/uncommon comparisons and caller overhead. |
 | `sample_plan` | Correctness/parity only identified | Add representative common/uncommon planning workloads, output/order equivalence and real caller cost. |
