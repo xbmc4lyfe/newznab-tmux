@@ -40,8 +40,9 @@ on:
 permissions:
   contents: read
 
+# Keep manual measurements independent of automatic push coverage.
 concurrency:
-  group: native-utilities-${{ github.ref }}
+  group: native-utilities-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
