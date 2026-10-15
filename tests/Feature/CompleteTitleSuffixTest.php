@@ -83,6 +83,9 @@ final class CompleteTitleSuffixTest extends TestCase
     public static function aliasRows(): array
     {
         return [
+            'control in alias wrapper prefix rejects' => ['Publisher.Asset-GRP.mkv', "Outer\x01__NZBSPLIT__abcdef01__NZBSPLIT__Publisher_Asset-GRP.rar", false],
+            'pipe in alias wrapper prefix rejects' => ['Publisher.Asset-GRP.mkv', 'Outer||__NZBSPLIT__abcdef01__NZBSPLIT__Publisher_Asset-GRP.rar', false],
+            'invalid UTF8 in alias wrapper prefix rejects' => ['Publisher.Asset-GRP.mkv', "Outer\xff__NZBSPLIT__abcdef01__NZBSPLIT__Publisher_Asset-GRP.rar", false],
             'repeat alias retains intermediate title' => ['Publisher.Asset-GRP.rar.rar', 'Publisher.Asset-GRP.rar.mkv', true],
             'repeat alias encoded intermediate title' => ['Outer__NZBSPLIT__abcdef01__NZBSPLIT__Publisher_Asset-GRP.rar.rar', 'Publisher.Asset-GRP.rar.mkv', true],
             'authoritative ordinary alias' => ['Publisher.Asset-GRP.mkv', 'Publisher.Asset-GRP.rar', true],

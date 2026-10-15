@@ -49,6 +49,9 @@ final readonly class OriginalFilenameEvidence
             return false;
         }
         $other = new self($alias);
+        if (! $this->valid($other->basename)) {
+            return false;
+        }
 
         foreach ([$this->stem, $other->stem] as $identity) {
             if ($this->valid($identity)
