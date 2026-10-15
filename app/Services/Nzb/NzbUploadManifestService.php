@@ -408,6 +408,15 @@ final class NzbUploadManifestService
                 && $this->nfoCandidateCurrent($manifest)) {
                 return;
             }
+            if ($status === NzbImportStatus::Queued
+                && ($manifest['candidate_identity'] ?? null) === $candidateIdentity
+                && ($manifest['accepted_capture'] ?? null) === $inputCapture
+                && in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
+                && $this->nfoCleanupCommitted($manifest)) {
+                // An in-flight notification cannot replace historical receipt authority
+                // with current candidate state, including after a partial reset.
+                return;
+            }
             $staleAdmissionRetry = ($manifest['stale_admission_retry'] ?? false) === true;
             if (in_array($status, [NzbImportStatus::Queued, NzbImportStatus::MetadataIgnored, NzbImportStatus::MetadataDeferred], true)) {
                 unset($manifest['stale_admission_retry']);
@@ -1013,8 +1022,8 @@ final class NzbUploadManifestService
     public function deleteTerminalCompanion(string $manifestPath): bool
     {
         return $this->withManifestLock($manifestPath, function () use ($manifestPath): bool {
-            return $this->withRetirementAdmission(function () use ($manifestPath): bool {
-                $m = $this->read($manifestPath);
+            $m = $this->read($manifestPath);
+            $cleanup = function () use ($manifestPath, $m): bool {
                 if (isset($m['custody_collision'])) {
                     return false;
                 }
@@ -1052,7 +1061,13 @@ final class NzbUploadManifestService
                 $this->drainCustodyGc($manifestPath, $m);
 
                 return true;
-            });
+            };
+
+            // Captured terminal NZB outcomes are filesystem authority. Only failed
+            // companion cleanup consults live SQL and needs reset admission fencing.
+            return $m['state'] === self::STATE_NFO_FAILED
+                ? $this->withRetirementAdmission($cleanup)
+                : $cleanup();
         });
     }
 

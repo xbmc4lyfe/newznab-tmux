@@ -4,6 +4,7 @@ namespace Tests\Unit;
 
 use App\Services\Nzb\DirectorySyncBridge;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Process\Process;
 
 final class DirectorySyncBridgeTest extends TestCase
 {
@@ -35,6 +36,24 @@ final class DirectorySyncBridgeTest extends TestCase
         }
         rmdir($this->directory);
         parent::tearDown();
+    }
+
+    public function test_current_standalone_custody_fixture_completes_one_functional_flow(): void
+    {
+        $owned = $this->directory.'/owned-flow';
+        self::assertTrue(mkdir($owned, 0700));
+        $root = dirname(__DIR__, 2);
+        $process = new Process([PHP_BINARY, $root.'/benchmarks/nzb-custody/flow.php'], $root, [
+            'CUSTODY_VARIANT' => 'native', 'CUSTODY_OWNED' => $owned,
+            'CUSTODY_COUNT' => '1', 'CUSTODY_WARMUP' => '0',
+        ]);
+        $process->setTimeout(20);
+        $process->run();
+        self::assertSame(0, $process->getExitCode(), $process->getErrorOutput());
+        $result = json_decode($process->getOutput(), true, flags: JSON_THROW_ON_ERROR);
+        self::assertTrue($result['parity']);
+        self::assertCount(1, $result['flow_ms']);
+        self::assertDirectoryDoesNotExist($owned);
     }
 
     public function test_real_local_directory_sync_is_required_on_this_runtime(): void

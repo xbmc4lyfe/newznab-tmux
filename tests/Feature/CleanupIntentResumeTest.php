@@ -371,6 +371,49 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
         self::assertFileExists($source);
     }
 
+    public function test_late_exact_queued_outcome_keeps_committed_companion_authority_after_partial_reset(): void
+    {
+        [$source, $mp, $uploads] = $this->upload(true);
+        Schema::create('release_nfos', static function (Blueprint $table): void {
+            $table->integer('releases_id')->primary();
+            $table->binary('nfo');
+        });
+        (require database_path('migrations/2026_10_15_034000_create_nfo_cleanup_commits_table.php'))->up();
+        $root = config('release_verification.storage_path');
+        config(['release_verification.storage_path' => $root.'/verification-state']);
+        try {
+            $this->capturedFixtureImporter('late-queued-committed')->beginImport([$source]);
+            DB::table('releases')->insert(['id' => 7, 'guid' => 'late-queued-guid']);
+            DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+            $origin = $uploads->reconcilePending($mp);
+            // Importer A obtained its exact capture before B stored the companion.
+            $capture = $uploads->finalizeInput($source, file_get_contents($source), $uploads->reserveInput($source));
+            self::assertSame($origin['accepted_capture'], $capture);
+            $nfos = new NfoImportService(new Filesystem, $uploads, new NfoService);
+            DirectorySyncBridge::$fail = 'rename_custody';
+            try {
+                self::assertSame('failed', $nfos->importManifest($mp, delete: true)['status']);
+            } finally {
+                DirectorySyncBridge::$fail = '';
+            }
+            self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
+            app(VerificationResetService::class)->run(static function (): void {});
+            self::assertSame(0, DB::table('release_verification_candidates')->count());
+            $committed = $uploads->read($mp);
+            self::assertTrue($uploads->nfoCleanupCommitted($committed));
+            $uploads->recordNzbOutcome($source, NzbImportStatus::Queued, null, null,
+                candidateIdentity: $origin['candidate_identity'], inputCapture: $capture,
+                candidateAdmission: $origin['accepted_admission']);
+            self::assertSame($committed, $uploads->read($mp));
+            self::assertTrue($uploads->nfoCleanupCommitted($uploads->read($mp)));
+            self::assertSame('imported', $nfos->importManifest($mp)['status']);
+            self::assertFileDoesNotExist(dirname($mp).'/info.nfo');
+            self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
+        } finally {
+            config(['release_verification.storage_path' => $root]);
+        }
+    }
+
     public static function retirementResetBoundaries(): array
     {
         return ['before move' => ['intent_dir'], 'payload complete' => ['complete_dir'], 'manifest retirement' => ['manifest']];
