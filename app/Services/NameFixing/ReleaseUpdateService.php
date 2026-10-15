@@ -146,7 +146,7 @@ class ReleaseUpdateService
      * @param  bool  $nameStatus  Whether to update status columns
      * @param  bool  $show  Whether to show output
      * @param  int|null  $preId  PreDB ID if matched
-     * @param  string|null  $filenameEvidence  Cleaned literal filename used to select a PreDB mapping
+     * @param  string|null  $filenameEvidence  Original filename used to accept a PreDB mapping
      *
      * @throws \Exception
      */
@@ -934,11 +934,11 @@ class ReleaseUpdateService
             || PredbSearchDocument::exactValue((string) $row->title) !== PredbSearchDocument::exactValue($title)) {
             return null;
         }
-        if ($filenameEvidence === null || PredbSearchDocument::exactValue($title) === PredbSearchDocument::exactValue($filenameEvidence)) {
+        if ($filenameEvidence === null) {
             return (string) $row->title;
         }
 
-        return $this->fileNameCleaner->matchesPredbFilenameEvidence((string) ($row->filename ?? ''), $filenameEvidence)
+        return (new OriginalFilenameEvidence($filenameEvidence))->accepts((string) $row->title, (string) ($row->filename ?? ''))
             ? (string) $row->title : null;
     }
 

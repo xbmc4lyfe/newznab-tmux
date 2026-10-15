@@ -91,6 +91,8 @@ class NameFixingService
      */
     protected array $predbMatchCache = [];
 
+    private ?FilenameNominationCache $filenameNominations = null;
+
     /** @var array<string, bool> */
     protected array $predbEvidenceCache = [];
 
@@ -441,24 +443,24 @@ class NameFixingService
     protected function preDbFileCheck(object $release, bool $echo, string $type, bool $nameStatus, bool $show, ?bool &$hadEvidence = null): bool
     {
         $hadEvidence = true;
-        $fileName = $this->fileNameCleaner->cleanForMatching($release->textstring, preserveLeadingNumber: true);
+        $originalFilename = (string) $release->textstring;
+        $fileName = $this->fileNameCleaner->cleanForMatching($originalFilename, preserveLeadingNumber: true);
 
         if (empty($fileName)) {
             return false;
         }
 
-        $bestMatch = $this->findBestPredbMatch($fileName);
-        $hadEvidence = $bestMatch !== null || ($this->predbEvidenceCache[$fileName] ?? false);
+        $bestMatch = $this->findBestPredbFilenameMatch($fileName, $originalFilename, $hadEvidence);
         if ($bestMatch !== null) {
             if ((int) ($bestMatch['id'] ?? 0) <= 0) {
                 return false;
             }
-            if (! $echo && $this->updateService->currentPredbTitle((int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $fileName) === null) {
+            if (! $echo && $this->updateService->currentPredbTitle((int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $originalFilename) === null) {
                 return false;
             }
             if (PredbSearchDocument::exactValue((string) ($bestMatch['title'] ?? '')) === PredbSearchDocument::exactValue((string) $release->searchname)) {
                 if ($echo) {
-                    $this->updateService->attachPredbSnapshot($release, (int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $fileName);
+                    $this->updateService->attachPredbSnapshot($release, (int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $originalFilename);
                 }
 
                 return $this->updateService->matched;
@@ -473,13 +475,60 @@ class NameFixingService
                 $nameStatus,
                 $show,
                 $bestMatch['id'] ?? null,
-                $fileName
+                $originalFilename
             );
 
             return $this->updateService->matched;
         }
 
         return false;
+    }
+
+    /**
+     * Discovery can be reused; acceptance must be repeated against each original filename.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function findBestPredbFilenameMatch(string $query, string $original, bool &$hadEvidence = false): ?array
+    {
+        $results = ($this->filenameNominations ??= new FilenameNominationCache)->remember($query, static function () use ($query): array {
+            $searchText = self::predbSearchText($query);
+
+            return $searchText === '' ? [] : Search::searchPredb($searchText);
+        });
+        $hadEvidence = $results !== [];
+        $evidence = new OriginalFilenameEvidence($original);
+        $eligible = array_values(array_filter($results, static function ($result) use ($evidence): bool {
+            $row = (array) $result;
+
+            return $evidence->accepts((string) ($row['title'] ?? ''), (string) ($row['filename'] ?? ''));
+        }));
+        // Original canonical title evidence outranks an alias-only nomination.
+        // Ambiguity is still rejected within the strongest available evidence tier.
+        $canonical = array_values(array_filter($eligible, static function ($result) use ($evidence): bool {
+            $row = (array) $result;
+
+            return $evidence->accepts((string) ($row['title'] ?? ''));
+        }));
+        if ($canonical !== []) {
+            $eligible = $canonical;
+        }
+        // The selector still applies its scoring and literal ambiguity policy, using the preserved stem.
+        $match = $this->predbMatchSelector->selectBestMatch($evidence->stem, $eligible)
+            ?? $this->predbMatchSelector->selectBestMatch($evidence->basename, $eligible)
+            ?? $this->predbMatchSelector->selectBestMatch($query, $eligible);
+        if ($match === null || (int) ($match['id'] ?? 0) <= 0) {
+            return null;
+        }
+        foreach ($eligible as $row) {
+            $row = (array) $row;
+            if ((int) ($row['id'] ?? 0) !== (int) $match['id']
+                || PredbSearchDocument::exactValue((string) ($row['title'] ?? '')) !== PredbSearchDocument::exactValue((string) $match['title'])) {
+                return null;
+            }
+        }
+
+        return $match;
     }
 
     /**
@@ -1837,19 +1886,19 @@ class NameFixingService
                 continue;
             }
 
-            $bestMatch = $this->findBestPredbMatch($cleanedFileName);
+            $bestMatch = $this->findBestPredbFilenameMatch($cleanedFileName, $fileName);
 
             if ($bestMatch !== null && (int) ($bestMatch['id'] ?? 0) > 0) {
-                if (! $echo && $this->updateService->currentPredbTitle((int) $bestMatch['id'], (string) $bestMatch['title'], $cleanedFileName) === null) {
+                if (! $echo && $this->updateService->currentPredbTitle((int) $bestMatch['id'], (string) $bestMatch['title'], $fileName) === null) {
                     continue;
                 }
                 if (PredbSearchDocument::exactValue((string) $bestMatch['title']) !== PredbSearchDocument::exactValue((string) $release->searchname)) {
-                    $this->updateService->updateRelease($release, $bestMatch['title'], 'file matched source: '.($bestMatch['source'] ?? ''), $echo, 'PreDB file match, ', $nameStatus, $show, (int) $bestMatch['id'], $cleanedFileName);
+                    $this->updateService->updateRelease($release, $bestMatch['title'], 'file matched source: '.($bestMatch['source'] ?? ''), $echo, 'PreDB file match, ', $nameStatus, $show, (int) $bestMatch['id'], $fileName);
                     if ($echo && ! $this->updateService->matched) {
                         continue;
                     }
                 } elseif ($echo) {
-                    $matching = $this->updateService->attachPredbSnapshot($release, (int) $bestMatch['id'], (string) $bestMatch['title'], $cleanedFileName) ? 1 : 0;
+                    $matching = $this->updateService->attachPredbSnapshot($release, (int) $bestMatch['id'], (string) $bestMatch['title'], $fileName) ? 1 : 0;
 
                     return $matching;
                 }

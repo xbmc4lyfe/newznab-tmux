@@ -854,7 +854,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     }
 
     #[DataProvider('literalDelimiterFilenameCases')]
-    public function test_add_file_info_keeps_one_literal_filename_as_one_observation(bool $literalDelimiter): void
+    public function test_add_file_info_keeps_one_literal_filename_as_one_observation(bool $literalDelimiter, string $tail, int $expected): void
     {
         $title = 'Exact.Release.2026-GRP';
         $this->prepareFullPar2NamingEvidence($title);
@@ -872,11 +872,11 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
         $originalAttributes = $context->release->getAttributes();
         $originalClaim = $context->producerNamingClaim;
-        $filename = ($literalDelimiter ? 'Auxiliary.Asset||' : '').$title.'.mkv';
+        $filename = ($literalDelimiter ? 'Auxiliary.Asset||' : '').$title.$tail;
 
         self::assertTrue($manager->addFileInfo(['name' => $filename, 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
 
-        self::assertSame($literalDelimiter ? 0 : 7, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+        self::assertSame($expected, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
         self::assertSame($title, $context->release->searchname);
         self::assertArrayNotHasKey('filename', $context->release->getAttributes());
         self::assertArrayNotHasKey('observed_additional_pp_claim', $context->release->getAttributes());
@@ -890,7 +890,12 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
 
     public static function literalDelimiterFilenameCases(): array
     {
-        return ['literal delimiter' => [true], 'normal singleton control' => [false]];
+        return [
+            'literal delimiter' => [true, '.mkv', 0],
+            'normal singleton control' => [false, '.mkv', 7],
+            'erased group substring' => [false, 'disc1.mkv', 0],
+            'double payload suffix' => [false, '.flac.mkv', 0],
+        ];
     }
 
     public function test_release_file_rows_are_deduped_and_flushed_once_at_finalize(): void

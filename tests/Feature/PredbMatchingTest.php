@@ -170,7 +170,7 @@ final class PredbMatchingTest extends TestCase
     public function test_filename_match_does_not_attach_id_when_writes_are_disabled(): void
     {
         $updates = $this->createMock(ReleaseUpdateService::class);
-        $updates->expects(self::once())->method('currentPredbTitle')->with(7, 'Canonical.Scene-GROUP', 'File.Name-GROUP')->willReturn('Canonical.Scene-GROUP');
+        $updates->expects(self::once())->method('currentPredbTitle')->with(7, 'Canonical.Scene-GROUP', 'File.Name-GROUP.mkv')->willReturn('Canonical.Scene-GROUP');
         $updates->expects(self::never())->method('updateRelease');
         $updates->expects(self::never())->method('attachPredbSnapshot');
         Search::shouldReceive('searchPredb')->once()->andReturn([$this->hit()]);
@@ -444,7 +444,7 @@ final class PredbMatchingTest extends TestCase
         Search::shouldReceive('searchPredb')->once()->with($evidence)->andReturn($hits);
         $updates = $this->getMockBuilder(ReleaseUpdateService::class)->onlyMethods(['updateRelease'])->getMock();
         $updates->expects(self::once())->method('updateRelease')
-            ->with(self::anything(), $hit['title'], self::anything(), false, self::anything(), true, false, $hit['id'], $evidence)
+            ->with(self::anything(), $hit['title'], self::anything(), false, self::anything(), true, false, $hit['id'], $hit['filename'])
             ->willReturnCallback(static function () use ($updates): void {
                 $updates->matched = true;
             });

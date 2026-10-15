@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace Tests\Unit\Services\NameFixing;
 
+use App\Facades\Search;
 use App\Models\Release;
 use App\Services\NameFixing\DonorMatchSelector;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\FilePrioritizer;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NameFixing\NameFixingService;
+use App\Services\NameFixing\PredbMatchSelector;
 use App\Services\NameFixing\ReleaseUpdateService;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
@@ -278,7 +280,9 @@ final class GenericPredbAttachmentTest extends TestCase
         (new ReflectionProperty(NameFixingService::class, 'fileNameCleaner'))->setValue($service, new FileNameCleaner);
         (new ReflectionProperty(NameFixingService::class, 'filePrioritizer'))->setValue($service, new FilePrioritizer);
         (new ReflectionProperty(NameFixingService::class, 'donorMatchSelector'))->setValue($service, new DonorMatchSelector);
-        (new ReflectionProperty(NameFixingService::class, 'predbMatchCache'))->setValue($service, [self::TITLE => ['id' => 7, 'title' => self::TITLE]]);
+        (new ReflectionProperty(NameFixingService::class, 'predbMatchSelector'))->setValue($service, new PredbMatchSelector);
+        Search::shouldReceive('searchPredb')->with(self::TITLE)
+            ->andReturn([['id' => 7, 'title' => self::TITLE, 'filename' => '']]);
 
         return [$service, $updater];
     }

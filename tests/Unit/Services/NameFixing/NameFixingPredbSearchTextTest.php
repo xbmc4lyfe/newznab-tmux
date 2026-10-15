@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 namespace Tests\Unit\Services\NameFixing;
 
+use App\Facades\Search;
 use App\Services\NameFixing\DonorMatchSelector;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\NameFixingService;
+use App\Services\NameFixing\PredbMatchSelector;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
+use Illuminate\Support\Facades\Facade;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use ReflectionClass;
@@ -17,6 +20,26 @@ use ReflectionProperty;
 
 final class NameFixingPredbSearchTextTest extends TestCase
 {
+    private mixed $previousFacadeApplication;
+
+    private array $previousResolvedInstances;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->previousFacadeApplication = Facade::getFacadeApplication();
+        $this->previousResolvedInstances = (new ReflectionProperty(Facade::class, 'resolvedInstance'))->getValue();
+        Facade::setFacadeApplication(null);
+        Facade::clearResolvedInstances();
+    }
+
+    protected function tearDown(): void
+    {
+        Facade::setFacadeApplication($this->previousFacadeApplication);
+        (new ReflectionProperty(Facade::class, 'resolvedInstance'))->setValue(null, $this->previousResolvedInstances);
+        parent::tearDown();
+    }
+
     /**
      * Hashed file names with unbalanced parentheses, quotes and operators reached Manticore unescaped
      * and failed with "P08: syntax error, unexpected ')'" (BUGS.md #35).
@@ -52,7 +75,7 @@ final class NameFixingPredbSearchTextTest extends TestCase
         $updates = $this->getMockBuilder(ReleaseUpdateService::class)->disableOriginalConstructor()
             ->onlyMethods(['attachPredbSnapshot', 'updateRelease', 'updateSingleColumn', 'currentPredbTitle'])->getMock();
         $updates->expects($this->exactly($update ? 0 : 1))->method('currentPredbTitle')
-            ->with(7, 'Canonical.Scene-GROUP', 'Canonical.Scene-GROUP')->willReturn('Canonical.Scene-GROUP');
+            ->with(7, 'Canonical.Scene-GROUP', 'Canonical.Scene-GROUP.mkv')->willReturn('Canonical.Scene-GROUP');
         $updates->expects($this->never())->method('updateRelease');
         $updates->expects($this->never())->method('updateSingleColumn');
         $updates->expects($this->exactly($update ? 1 : 0))->method('attachPredbSnapshot')->with($this->callback(static fn (object $release): bool => (int) $release->releases_id === 42), 7)
@@ -63,10 +86,20 @@ final class NameFixingPredbSearchTextTest extends TestCase
                 return true;
             });
 
-        $service = $this->getMockBuilder(NameFixingService::class)->disableOriginalConstructor()
-            ->onlyMethods(['findBestPredbMatch'])->getMock();
-        $service->expects($this->once())->method('findBestPredbMatch')->with('Canonical.Scene-GROUP')
-            ->willReturn(['id' => 7, 'title' => 'Canonical.Scene-GROUP']);
+        $service = (new ReflectionClass(NameFixingService::class))->newInstanceWithoutConstructor();
+        $search = new class
+        {
+            public array $queries = [];
+
+            public function searchPredb(string $query): array
+            {
+                $this->queries[] = $query;
+
+                return [['id' => 7, 'title' => 'Canonical.Scene-GROUP', 'filename' => '']];
+            }
+        };
+        Search::swap($search);
+        (new ReflectionProperty(NameFixingService::class, 'predbMatchSelector'))->setValue($service, new PredbMatchSelector);
         (new ReflectionProperty(NameFixingService::class, 'fileNameCleaner'))->setValue($service, new FileNameCleaner);
         (new ReflectionProperty(NameFixingService::class, 'updateService'))->setValue($service, $updates);
         $release = (object) [
@@ -77,6 +110,7 @@ final class NameFixingPredbSearchTextTest extends TestCase
         $matched = (new ReflectionMethod(NameFixingService::class, 'preDbFileCheck'))
             ->invoke($service, $release, $update, 'Filenames, ', true, false);
 
+        $this->assertSame(['Canonical.Scene-GROUP'], $search->queries);
         $this->assertSame($update, $matched);
         $this->assertSame(0, $updates->fixed);
         $this->assertSame('canonical.scene-group', $release->searchname);
