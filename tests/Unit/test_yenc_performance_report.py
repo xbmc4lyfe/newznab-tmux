@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
 
 
@@ -297,6 +298,9 @@ class ProfileBuildTest(unittest.TestCase):
                 self.assertFalse((evidence / 'profile-build').exists())
 
     def test_rust_aa_control_job_is_manual_isolated_and_retains_failure_evidence(self):
+        manifest = tomllib.loads((SCRIPT.parents[1] / 'docker/app/nzb-yenc-ffi/Cargo.toml').read_text())
+        control = next((target for target in manifest.get('bin', []) if target['name'] == 'benchmark-yenc-control'), {})
+        self.assertEqual(['experimental-payload-kernels'], control.get('required-features'))
         workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()
         self.assertIn('options: [all, php, cpp, profile, processing, rust-aa-control]', workflow)
         job = workflow.split('  rust-aa-control:\n', 1)[1]

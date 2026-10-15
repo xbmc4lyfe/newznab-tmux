@@ -17,6 +17,11 @@ experimental-xz-index = []
 name = "nzbyenc"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "benchmark-yenc-control"
+path = "src/bin/benchmark-yenc-control.rs"
+required-features = ["experimental-payload-kernels"]
+
 [dependencies]
 md-5 = "0.10"
 nzb-decode = "=0.1.3"
