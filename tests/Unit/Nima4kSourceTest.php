@@ -1117,6 +1117,406 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('plaintextInertTails')]
+    public function plaintext_inert_tail_preserves_exact_names(string $tail): void
+    {
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($this->card('Léon.Release-GRP').$tail);
+
+        $this->assertSame(['Léon.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function plaintextInertTails(): array
+    {
+        return [
+            'reported plaintext tail' => ['<plaintext>fallback &#1; </b>'],
+            'uppercase and quoted greater-than' => ['<PLAINTEXT data-marker=">">fallback &#1; </b>'],
+            'apparent close remains plaintext' => ['<plaintext>fallback </plaintext> &#1; </b>'],
+            'form feed spelling remains plaintext' => ['<plaintext>fallback &#12; &#x0C;'],
+            'C1 and surrogate spellings remain plaintext' => ['<plaintext>&#128; &#x81; &#xD800;'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('plaintextMalformedCardBoundaries')]
+    public function plaintext_context_cannot_hide_malformed_cards(string $before, string $after, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.</b>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$before.$card.$after;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, string, bool}> */
+    public static function plaintextMalformedCardBoundaries(): array
+    {
+        $cases = [];
+        foreach ([
+            'before actual plaintext tail' => ['', '<plaintext>fallback &#1; </b>'],
+            'quoted fake plaintext opener' => ['<div data-marker="<plaintext>"></div>', ''],
+            'comment fake plaintext opener' => ['<!-- <plaintext> -->', ''],
+            'script fake plaintext opener' => ['<script>const text = "<plaintext>";</script>', ''],
+            'title fake plaintext opener' => ['<title><plaintext></title>', ''],
+            'textarea fake plaintext opener' => ['<textarea><plaintext></textarea>', ''],
+            'foreign plaintext element' => ['<svg><plaintext></plaintext></svg>', ''],
+            'template plaintext element' => ['<template><plaintext></plaintext></template>', ''],
+        ] as $label => [$before, $after]) {
+            $cases[$label.' first card'] = [$before, $after, false];
+            $cases[$label.' after record limit'] = [$before, $after, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('plaintextCardShapedTails')]
+    public function plaintext_card_shaped_tail_cannot_enter_the_release_inventory(bool $afterLimit): void
+    {
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').'<plaintext>'.$this->card('Hidden.Release-GRP');
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{bool}> */
+    public static function plaintextCardShapedTails(): array
+    {
+        return [
+            'only inert card' => [false],
+            'inert card after record limit' => [true],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('foreignCdataInertFragments')]
+    public function foreign_cdata_inert_text_preserves_exact_names(string $fragment): void
+    {
+        $html = $this->card('Léon.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame(['Léon.Release-GRP', 'Second.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function foreignCdataInertFragments(): array
+    {
+        return [
+            'reported SVG CDATA' => ['<svg><![CDATA[&#1;]]></svg>'],
+            'MathML CDATA' => ['<math><![CDATA[&#1; </b>]]></math>'],
+            'nested SVG CDATA' => ['<svg><g><![CDATA[&#0; &#xD800; </b>]]></g></svg>'],
+            'SVG foreignObject remains a foreign current node' => ['<svg><foreignObject><![CDATA[&#1;]]></foreignObject></svg>'],
+            'MathML mtext remains a foreign current node' => ['<math><mtext><![CDATA[&#1;]]></mtext></math>'],
+            'foreign CDATA form feed spellings' => ['<svg><![CDATA[&#12; &#x0C;]]></svg>'],
+            'foreign CDATA C1 and surrogate spellings' => ['<svg><![CDATA[&#128; &#x81; &#xD800;]]></svg>'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('foreignCdataMalformedCardBoundaries')]
+    public function foreign_cdata_context_cannot_hide_malformed_cards(string $before, string $after, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.</b>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$before.$card.$after;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, string, bool}> */
+    public static function foreignCdataMalformedCardBoundaries(): array
+    {
+        $cases = [];
+        foreach ([
+            'after actual CDATA close' => ['<svg><![CDATA[&#1;]]></svg>', ''],
+            'quoted fake foreign CDATA opener' => ['<div data-marker="<svg><![CDATA["></div>', '<div data-marker="]]></svg>"></div>'],
+            'comment fake foreign CDATA opener' => ['<!-- <svg><![CDATA[ -->', '<!-- ]]></svg> -->'],
+            'HTML child of foreign integration point' => ['<svg><foreignObject><div>', '</div></foreignObject></svg>'],
+        ] as $label => [$before, $after]) {
+            $cases[$label.' first card'] = [$before, $after, false];
+            $cases[$label.' after record limit'] = [$before, $after, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('plaintextAndCdataInvalidValues')]
+    public function plaintext_and_foreign_cdata_do_not_waive_invalid_values(string $fragment): void
+    {
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($this->card('First.Release-GRP').$fragment);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function plaintextAndCdataInvalidValues(): array
+    {
+        return [
+            'literal control in plaintext' => ["<plaintext>\x01"],
+            'literal control in foreign CDATA' => ["<svg><![CDATA[\x01]]></svg>"],
+            'decoded control after CDATA close' => ['<svg><![CDATA[safe]]></svg><p>&#1;</p>'],
+            'decoded control in foreign attribute' => ['<svg data-marker="&#1;"><![CDATA[safe]]></svg>'],
+            'decoded control in plaintext attribute' => ['<plaintext data-marker="&#1;">safe'],
+            'decimal form feed in foreign decoded text' => ['<svg><script>&#12;</script></svg>'],
+            'hexadecimal form feed in foreign decoded text' => ['<svg><script>&#x0C;</script></svg>'],
+            'remapped C1 outside inert contexts' => ['<svg><![CDATA[safe]]></svg><p>&#128;</p>'],
+            'retained C1 outside inert contexts' => ['<svg><![CDATA[safe]]></svg><p>&#x81;</p>'],
+            'surrogate outside inert contexts' => ['<svg><![CDATA[safe]]></svg><p>&#xD800;</p>'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('plaintextAndCdataLeadingControls')]
+    public function plaintext_and_foreign_cdata_exceptions_preserve_leading_form_feed_rejection(string $prefix): void
+    {
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/'))->parseHtml($prefix.$this->card('Exact.Release-GRP'));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function plaintextAndCdataLeadingControls(): array
+    {
+        return [
+            'leading decimal form feed' => ['&#12;'],
+            'leading hexadecimal form feed' => ['&#x0C;'],
+        ];
+    }
+
+    #[Test]
+    public function plaintext_and_foreign_cdata_preserve_once_escaped_form_feed_labels(): void
+    {
+        $literal = 'Exact&#12;.&#x0C;Release-GRP';
+        $html = $this->card($literal).'<svg><![CDATA[&#12;]]></svg><plaintext>&#x0C;';
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame([$literal], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    #[Test]
+    #[DataProvider('provenInertMarkerControls')]
+    public function plaintext_and_foreign_cdata_provenance_preserves_literal_controls(string $fragment): void
+    {
+        $literal = 'Léon.&#00012;Release-GRP';
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($this->card($literal).$fragment);
+
+        $this->assertSame([$literal], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function provenInertMarkerControls(): array
+    {
+        return [
+            'raw marker names in comments and attributes' => ['<!-- NIMA-INERT-0-Z --><svg data-marker="nima-inert-1-z"><![CDATA[&#1;]]></svg><plaintext data-nima-inert-2-zp="0">&#1; </b>'],
+            'entity decoded marker prefix in foreign text' => ['<svg>nima&#45;inert&#45;0&#45;zc0z<![CDATA[&#1;]]></svg><plaintext>&#1; </b>'],
+            'adjacent foreign CDATA spans' => ['<svg><![CDATA[&#1;]]><![CDATA[&#12; </b>]]></svg>'],
+            'nested pseudo opener stays inside first CDATA span' => ['<svg><![CDATA[<![CDATA[&#1;]]></svg>'],
+            'CDATA boundary must not join numeric reference' => ['<svg>&<![CDATA[safe]]>#1;</svg>'],
+            'CDATA boundary must not join named reference' => ['<svg>&<![CDATA[safe]]>Tab;</svg>'],
+            'self closing syntax does not terminate plaintext' => ['<plaintext/>&#1; </b>'],
+            'many raw text candidates remain inert' => ['<script>'.str_repeat('<plaintext><![CDATA[&#1;]]>', 128).'</script><plaintext>&#12; </b>'],
+            'decimal and hexadecimal longer tokens remain distinct' => ['<p>&#120; &#xC0;</p><svg><![CDATA[&#12;]]></svg>'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('provenInertMarkerCounterexamples')]
+    public function plaintext_and_foreign_cdata_provenance_cannot_hide_malformed_cards(string $before, string $after, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.</b>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$before.$card.$after;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, string, bool}> */
+    public static function provenInertMarkerCounterexamples(): array
+    {
+        $cases = [];
+        foreach ([
+            'HTML bogus opener ends before later foreign text' => ['<![CDATA[>', '<svg>later]]></svg>'],
+            'HTML child of SVG integration point' => ['<svg><foreignObject><div><![CDATA[>', '<svg>later]]></svg></div></foreignObject></svg>'],
+            'HTML child of MathML integration point' => ['<math><mtext><div><![CDATA[>', '<svg>later]]></svg></div></mtext></math>'],
+            'decoded marker cannot spoof source span' => ['<svg>nima&#45;inert&#45;0&#45;zc0z</svg><![CDATA[>', '<svg>later]]></svg>'],
+            'valid foreign span does not license HTML bogus span' => ['<svg><![CDATA[safe]]></svg><![CDATA[>', '<svg>later]]></svg>'],
+            'unterminated foreign CDATA remains rejected' => ['<svg><![CDATA[', '</svg>'],
+        ] as $label => [$before, $after]) {
+            $cases[$label.' first card'] = [$before, $after, false];
+            $cases[$label.' after record limit'] = [$before, $after, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('provenInertFormFeedSpellings')]
+    public function plaintext_and_foreign_cdata_provenance_preserves_exact_form_feed_rejection(string $prefix): void
+    {
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/'))->parseHtml($prefix.$this->card('Exact.Release-GRP').'<svg><![CDATA[&#12;]]></svg><plaintext>&#12;');
+    }
+
+    /** @return array<string, array{string}> */
+    public static function provenInertFormFeedSpellings(): array
+    {
+        return [
+            'decimal leading zeros' => ['&#00012;'],
+            'uppercase hex and optional semicolon' => ['&#X000c'],
+            'decimal reference followed by nondigit' => ['&#12x'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('provenInertDiscoveryControls')]
+    public function plaintext_and_foreign_cdata_discovery_ignores_fake_lexical_boundaries(string $fragment): void
+    {
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($this->card('Exact.Release-GRP').$fragment);
+
+        $this->assertSame(['Exact.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function provenInertDiscoveryControls(): array
+    {
+        $cases = [];
+        foreach (['script', 'style'] as $tag) {
+            foreach (['comment opener' => '<!--', 'unclosed quoted tag' => '<div title="'] as $label => $text) {
+                $prefix = '<'.$tag.'>'.$text.'</'.$tag.'>';
+                $cases[$tag.' '.$label.' before CDATA'] = [$prefix.'<svg><![CDATA[&#1;]]></svg>'];
+                $cases[$tag.' '.$label.' before plaintext'] = [$prefix.'<plaintext>&#1; </b>'];
+            }
+        }
+        $cases['foreign script contains real CDATA'] = ['<svg><script><![CDATA[&#1;]]></script></svg>'];
+        $cases['foreign style contains real CDATA'] = ['<svg><style><![CDATA[&#1;]]></style></svg>'];
+        $cases['quoted plaintext lookalike cannot escape its attribute'] = ['<div data-note="<plaintext>"></div><svg><![CDATA[&#1;]]></svg>'];
+        $cases['single quoted plaintext lookalike cannot escape its attribute'] = ["<div data-note='<plaintext>'></div><plaintext>&#1; </b>"];
+        $cases['empty foreign CDATA does not add a text node'] = ['<svg><![CDATA[]]></svg><plaintext>&#1; </b>'];
+        $cases['adjacent foreign text and CDATA retain their values'] = ['<svg>before<![CDATA[]]><![CDATA[&#1;]]>after</svg>'];
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('provenInertRcdataTruncationControls')]
+    public function plaintext_and_foreign_cdata_do_not_waive_rcdata_truncation(string $fragment): void
+    {
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/'))->parseHtml($this->card('Exact.Release-GRP').$fragment);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function provenInertRcdataTruncationControls(): array
+    {
+        // Native characterization retained legacy 45/73 for these exact RCDATA inputs.
+        // Preserve their strict rejection contract even though HTML5 treats the text as inert.
+        $cases = [];
+        foreach (['title', 'textarea'] as $tag) {
+            foreach (['comment opener' => '<!--', 'unclosed quoted tag' => '<div title="'] as $label => $text) {
+                $prefix = '<'.$tag.'>'.$text.'</'.$tag.'>';
+                $cases[$tag.' '.$label.' before CDATA'] = [$prefix.'<svg><![CDATA[&#1;]]></svg>'];
+                $cases[$tag.' '.$label.' before plaintext'] = [$prefix.'<plaintext>&#1; </b>'];
+            }
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('provenInertDiscoveryCounterexamples')]
+    public function plaintext_and_foreign_cdata_discovery_retains_malformed_cards(string $before, string $after, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.</b>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$before.$card.$after;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, string, bool}> */
+    public static function provenInertDiscoveryCounterexamples(): array
+    {
+        $cases = [];
+        foreach ([
+            'script fake comment before genuine CDATA' => ['<script><!--</script>', '<svg><![CDATA[&#1;]]></svg>'],
+            'textarea fake quoted tag before genuine CDATA' => ['<textarea><div title="</textarea>', '<svg><![CDATA[&#1;]]></svg>'],
+            'malformed card after CDATA and fake comment' => ['<script><!--</script><svg><![CDATA[&#1;]]></svg>', ''],
+            'malformed card after CDATA and fake quoted tag' => ['<textarea><div title="</textarea><svg><![CDATA[&#1;]]></svg>', ''],
+            'unquoted encoding lookalike remains a foreign context' => ['<math><annotation-xml encoding=text/html<plaintext>', '</annotation-xml></math><svg><![CDATA[&#1;]]></svg>'],
+            'unquoted attribute lookalike cannot create plaintext' => ['<div data-note=<plaintext>></div>', '<svg><![CDATA[&#1;]]></svg>'],
+            'unquoted value cannot expose a foreign font breakout attribute' => ['<svg><font data-note=<plaintext/color=red><plaintext>', '</plaintext></font></svg><svg><![CDATA[&#1;]]></svg>'],
+        ] as $label => [$before, $after]) {
+            $cases[$label.' first card'] = [$before, $after, false];
+            $cases[$label.' after record limit'] = [$before, $after, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    public function plaintext_and_foreign_cdata_provenance_retains_deep_document_rejection_at_body_limit(): void
+    {
+        $html = str_repeat('<div>', 50000).$this->card('Exact.Release-GRP').'<svg><![CDATA[&#1;]]></svg>'.str_repeat('</div>', 50000);
+        $html .= str_repeat(' ', 1048576 - strlen($html));
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+    }
+
+    #[Test]
+    #[DataProvider('plaintextOpenerBoundaryMalformedAttributes')]
+    public function plaintext_opener_boundary_does_not_hide_malformed_attributes(string $suffix, string $ordering): void
+    {
+        $html = $this->card('First.Release-GRP');
+        if ($ordering === 'both cards before opener') {
+            $html .= $this->card('Second.Release-GRP');
+        }
+        $html .= $suffix;
+        if ($ordering === 'second card after opener') {
+            $html .= $this->card('Second.Release-GRP');
+        }
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, string}> */
+    public static function plaintextOpenerBoundaryMalformedAttributes(): array
+    {
+        $cases = [];
+        foreach ([
+            'double quote inside unquoted attribute' => '<plaintext a=b" c=">x" <foo>safe',
+            'single quote inside unquoted attribute' => "<plaintext a=b' c='>x' <foo>safe",
+            'quote inside attribute name' => '<plaintext a" c=">x" <foo>safe',
+        ] as $label => $suffix) {
+            foreach (['one card before opener', 'both cards before opener', 'second card after opener'] as $ordering) {
+                $cases[$label.' '.$ordering] = [$suffix, $ordering];
+            }
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('plaintextOpenerBoundaryQuotedAttributes')]
+    public function plaintext_opener_boundary_preserves_properly_quoted_attributes(string $suffix): void
+    {
+        $entries = (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($this->card('First.Release-GRP').$this->card('Second.Release-GRP').$suffix);
+
+        $this->assertSame(['First.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function plaintextOpenerBoundaryQuotedAttributes(): array
+    {
+        return [
+            'double quote inside single quoted attribute' => ["<plaintext a='b\"' c=\">x\">safe &#1; </b>"],
+            'single quote inside double quoted attribute' => ['<plaintext a="b\'" c=\'>x\'>safe &#1; </b>'],
+            'boolean attribute and whitespace around equals' => ['<plaintext disabled a = ">x" b=word>safe &#1; </b>'],
+            'slash begins an unquoted value' => ['<plaintext data-path=/safe/path data-note=">">safe &#1; </b>'],
+        ];
+    }
+
+    #[Test]
     #[DataProvider('unterminatedCommentFragments')]
     public function unterminated_comments_cannot_hide_the_remaining_listing(string $fragment): void
     {
