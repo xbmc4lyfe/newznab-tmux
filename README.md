@@ -19,7 +19,9 @@ Modernization is incremental. The application currently uses Laravel 13, Livewir
 
 See the [fork's commit history](https://github.com/xbmc4lyfe/newznab-tmux/commits/master/) for individual changes.
 
-The [Rust benchmark dashboard](https://xbmc4lyfe.github.io/newznab-tmux/) refreshes on every master build and benchmark completion, including reruns. It reports current-commit yEnc comparisons, BODY/fingerprint profiles, release rendering and Rust target coverage gaps. Median screens and diagnostic profiles do not establish the project's 1.5× common-path and uncommon p99 adoption requirements. Failed, missing and inconclusive measurements remain visible; raw evidence is linked through Actions and retained for 14 days. Run the existing performance workflows for local/manual investigations; those experiments are excluded from the current-master dashboard.
+The [Rust benchmark dashboard](https://xbmc4lyfe.github.io/newznab-tmux/performance-current.html) refreshes on every master build and benchmark completion, including reruns. It reports current-commit yEnc comparisons, BODY/fingerprint profiles, release rendering and Rust target coverage gaps. Median screens and diagnostic profiles do not establish the project's 1.5× common-path and uncommon p99 adoption requirements. Failed, missing and inconclusive measurements remain visible; raw evidence is linked through Actions and retained for 14 days. Run the existing performance workflows for local/manual investigations; those experiments are excluded from the current-master dashboard.
+
+Read the [personal fork documentation](https://xbmc4lyfe.github.io/newznab-tmux/) for the Rust migration, benchmark evidence, fork history, and local setup. [NNTmux](https://github.com/NNTmux/newznab-tmux) remains the main project; this fork is a personal project under development and testing.
 
 ## Run the local Docker Compose stack
 
@@ -107,9 +109,9 @@ After updating the checkout, back up the database and use `make -C docker deploy
 
 Persistent data lives in `docker/data/`, logs in `docker/logs/`, and database dumps in `docker/backups/`. The backup command covers MariaDB; preserve application configuration and NZB/storage files separately. If initialization fails, inspect `make -C docker logs` before retrying; a partially initialized database needs recovery rather than a reset.
 
-## Cloud and bare-metal deployments
+## Cloud deployments
 
-For existing AWS, Hetzner, OVHcloud, and physical-server installations, use the [deployment runbooks](docs/deployment.md). They cover initialization, releases, rollback, encrypted storage, backups, and recovery.
+For Docker-based deployments on AWS, Hetzner, and OVHcloud, use the [deployment runbooks](docs/deployment.md). They cover initialization, releases, rollback, encrypted storage, backups, and recovery.
 
 ## Credits and license
 

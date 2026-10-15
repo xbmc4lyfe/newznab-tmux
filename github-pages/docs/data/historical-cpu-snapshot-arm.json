@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "kind": "cpu-snapshot",
+  "runner": "ubuntu-24.04-arm",
+  "head_sha": "a2f4298201ca05d8a69a24688bac8ed2f3896285",
+  "run_id": 38657422002,
+  "run_attempt": 1,
+  "repository": "xbmc4lyfe/newznab-tmux",
+  "status": "measured",
+  "rows": [
+    {
+      "fixture": "common-mounted",
+      "candidate_backend": "rust-cli",
+      "samples": 1000,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": true,
+      "baseline_median_ns": 31105121.0,
+      "candidate_median_ns": 1187584.0,
+      "median_ratio": 26.191933370607888,
+      "paired_median_ratio": 26.275661136155943,
+      "baseline_p99_ns": 32674443.0,
+      "candidate_p99_ns": 1287394.0,
+      "p99_ratio": 25.380297717715013,
+      "median_ratio_ci95": [
+        26.146634483007944,
+        26.24044235244947
+      ],
+      "p99_ratio_ci95": [
+        25.17043910189663,
+        26.442174954674954
+      ],
+      "gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "rare-deep64",
+      "candidate_backend": "rust-cli",
+      "samples": 1000,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": true,
+      "baseline_median_ns": 39292815.0,
+      "candidate_median_ns": 3316024.0,
+      "median_ratio": 11.849375939378001,
+      "paired_median_ratio": 12.072171727296633,
+      "baseline_p99_ns": 41135331.0,
+      "candidate_p99_ns": 3414027.0,
+      "p99_ratio": 12.048917890807543,
+      "median_ratio_ci95": [
+        11.824324238799546,
+        11.869518009432937
+      ],
+      "p99_ratio_ci95": [
+        11.955490262121149,
+        12.165424250291636
+      ],
+      "gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "rare-unavailable",
+      "candidate_backend": "rust-cli",
+      "samples": 1000,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": true,
+      "baseline_median_ns": 30394774.5,
+      "candidate_median_ns": 1173149.5,
+      "median_ratio": 25.908696632441135,
+      "paired_median_ratio": 26.007835844971453,
+      "baseline_p99_ns": 32268791.0,
+      "candidate_p99_ns": 1233671.0,
+      "p99_ratio": 26.156723307915968,
+      "median_ratio_ci95": [
+        25.844659475078174,
+        25.967862622336934
+      ],
+      "p99_ratio_ci95": [
+        25.003029370952284,
+        26.57325981427884
+      ],
+      "gate_passed": true,
+      "eligible": true
+    }
+  ],
+  "evidence_type": "synthetic_cli_comparison",
+  "adoption_qualified": false,
+  "completeness": {
+    "expected_rows": 3,
+    "observed_rows": 3,
+    "complete": true
+  },
+  "baseline_revision": "5cc5303b502e653d83bba1951dec2f5d2da1db35",
+  "source_sha256": {
+    "baseline": "44186d8c2cf2f72f63f41d46bab30e0d78b683a43441c802c8e62280fdf03812",
+    "candidate_binary": "54ce6e203c17608410f5365497870c58538a9e32fa1834b90e1d02e0e2b4f3d4",
+    "coordinator_binary": "6e8115c949d2cb7161b29217e44e69d07378f8698c4660e10ad0bb9e275a3970",
+    "cargo_lock": "77b88ca781e79d95668cb5cb2d8bb61b89d3b3c4dd0892cdc86d4b260dffb55d",
+    "cargo_toml": "bc7f6c7f61bd00bd978ae6f817666f544562f5aff72feac709fa5bf6fe36f02d",
+    "candidate_source": "70cb1bb43f0bfb44bfc9c4a9e1f5487b3882768f0671c29511dc2e1f8e5a3753",
+    "candidate_cli": "bf0470b984f4f8c6ec1b971ccdded811f345a1b5dde26c04a65182814edfb293",
+    "coordinator_source": "04becc7923365b391987722ba36b00301d3bbb20a14f804ec9b715c4f4e9c9e5",
+    "python_executable": "c86f21d0da9290ece2d7d49a3f7ed52aed59cb029abdf0ea25c79634f6cbe960",
+    "crate_lib_source": "50c88c7f3fd5e6f481c6811c70652125116a60bbbf2b3504fd456a8b7f5ce76d"
+  },
+  "protocol_sha256": "de811558c6a07baa9b3947a2322fa4ce4d0b8b02f0b3b5d44686250870cce4e7",
+  "report_sha256": "6459a8c1d7d056f407bc6364a2f503023bf41f5389dbbd3a7b99a69cf99ae034",
+  "runtime_identity": {
+    "executed_sha": "a2f4298201ca05d8a69a24688bac8ed2f3896285",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "php": "8.5.11",
+    "python": "3.12.3",
+    "architecture": "aarch64",
+    "cpu_model": "aarch64",
+    "runner_image_os": "ubuntu24-arm64",
+    "runner_image_version": "20261004.142.1",
+    "build_profile": "release opt-level=3 lto=true codegen-units=1; cargo --locked",
+    "logical_cpus": 4
+  }
+}
