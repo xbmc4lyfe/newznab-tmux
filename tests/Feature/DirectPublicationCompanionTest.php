@@ -54,6 +54,42 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         self::assertFalse($manifests->nfoCleanupCommitted($manifests->read($path)));
     }
 
+    public static function invalidCompanions(): array
+    {
+        return ['empty' => [''], 'oversized' => [str_repeat('x', 65536)]];
+    }
+
+    #[DataProvider('invalidCompanions')]
+    public function test_delete_failed_retires_only_the_captured_invalid_companion(string $body): void
+    {
+        [$path, $manifests, $service] = $this->directUpload(nfoBody: $body);
+        self::assertSame('failed', $service->importManifest($path, deleteFailed: true)['status']);
+        self::assertFileDoesNotExist(dirname($path).'/info.nfo');
+        self::assertFileExists(dirname($path).'/incoming.nzb');
+        self::assertSame(0, DB::table('nfo_cleanup_commits')->count());
+        self::assertSame(0, DB::table('release_nfos')->count());
+        self::assertSame('skipped', $service->importManifest($path)['status']);
+        self::assertSame([], glob(dirname($path).'/.custody-*'));
+    }
+
+    #[DataProvider('interruptedCleanupBoundaries')]
+    public function test_failed_payload_deletion_resumes_without_repeating_delete_failed(string $boundary): void
+    {
+        [$path, $manifests, $service] = $this->directUpload(nfoBody: '');
+        DirectorySyncBridge::$fail = $boundary;
+        try {
+            self::assertSame('failed', $service->importManifest($path, deleteFailed: true)['status']);
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        self::assertArrayHasKey('delete_terminal_nfo', $manifests->read($path));
+        self::assertSame('skipped', $service->importManifest($path)['status']);
+        self::assertFileDoesNotExist(dirname($path).'/info.nfo');
+        self::assertFileExists(dirname($path).'/incoming.nzb');
+        self::assertSame([], glob(dirname($path).'/.custody-*'));
+        self::assertSame(0, DB::table('nfo_cleanup_commits')->count());
+    }
+
     public function test_direct_receipt_failure_rolls_back_nfo_and_retains_both_inputs_for_retry(): void
     {
         [$path, , $service] = $this->directUpload();
@@ -72,7 +108,7 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         [$path, , $service] = $this->directUpload();
         copy(dirname($path).'/incoming.nzb', dirname($path).'/replacement.nzb');
         rename(dirname($path).'/replacement.nzb', dirname($path).'/incoming.nzb');
-        self::assertSame('skipped', $service->importManifest($path, true)['status']);
+        self::assertSame('skipped', $service->importManifest($path, true, true)['status']);
         self::assertSame(0, DB::table('nfo_cleanup_commits')->count());
         self::assertFileExists(dirname($path).'/info.nfo');
     }
@@ -217,7 +253,7 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
     }
 
     /** @return array{string, NzbUploadManifestService, NfoImportService} */
-    private function directUpload(bool $priorCandidate = false, bool $deleteInput = false): array
+    private function directUpload(bool $priorCandidate = false, bool $deleteInput = false, string $nfoBody = 'direct companion'): array
     {
         Schema::create('releases', static function (Blueprint $table): void {
             $table->id();
@@ -234,9 +270,9 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         app('files')->ensureDirectoryExists($directory);
         $source = $directory.'/incoming.nzb';
         file_put_contents($source, '<nzb><file subject="fixture.bin"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">direct@example.test</segment></segments></file></nzb>');
-        file_put_contents($directory.'/info.nfo', 'direct companion');
+        file_put_contents($directory.'/info.nfo', $nfoBody);
         $manifests = app(NzbUploadManifestService::class);
-        $manifests->create($directory, 'direct-fixture', 'incoming.nzb', 'info.nfo', 'direct companion');
+        $manifests->create($directory, 'direct-fixture', 'incoming.nzb', 'info.nfo', $nfoBody);
         if ($priorCandidate) {
             config(['release_verification.required' => true]);
             $this->capturedFixtureImporter('old-policy')->beginImport([$source]);

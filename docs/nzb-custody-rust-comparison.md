@@ -9,7 +9,8 @@ receipts, and durable filesystem intents. It must retain sources on uncertainty.
 The Rust trial replaces its directory durability boundary through an isolated
 Rust process; all actual manifest capture, outcome, immediate deletion and
 terminal companion cleanup calls remain identical. Moving SQL ownership into
-that process has not been qualified. The current caller includes the durable moved-generation checkpoint before unlink.
+that process has not been qualified. The current caller includes the durable moved-generation checkpoint before unlink
+and persisted, retryable journal reclamation after manifest completion.
 The synthetic failed-import fixture bypasses
 XML parsing, NNTP, the application bootstrap and SQL, and does not certify the
 whole importer or publication path.
@@ -42,9 +43,9 @@ platform, raw observations and summaries are committed under
 
 | Current synthetic screen | PHP median ms | Rust process median ms | PHP / Rust |
 | --- | ---: | ---: | ---: |
-| Warm complete custody flow | 3.703 | 171.646 | 0.022 |
-| Cold complete custody flow | 12.606 | 186.615 | 0.068 |
-| Cold whole PHP process | 79.472 | 267.321 | 0.297 |
+| Warm complete custody flow | 19.523 | 625.284 | 0.031 |
+| Cold complete custody flow | 28.453 | 639.761 | 0.044 |
+| Cold whole PHP process | 155.980 | 784.502 | 0.199 |
 
 This fails the required1.5x common-path gate by a wide margin. The shared host
 was uncontrolled; the focused recovery run finished before this comparison;

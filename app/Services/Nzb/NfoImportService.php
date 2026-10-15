@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
+use App\Exceptions\NfoPayloadRejected;
 use App\Models\Release;
 use App\Services\NfoService;
 use Illuminate\Filesystem\Filesystem;
@@ -75,6 +76,10 @@ final class NfoImportService
                 return ['status' => 'skipped', 'message' => 'Upload has no paired NFO'];
             }
 
+            if (($manifest['nfo_failed_relinquished_attempt'] ?? null) === ($manifest['nfo_capture']['attempt'] ?? false)) {
+                return ['status' => 'skipped', 'message' => 'Captured failed companion already removed'];
+            }
+
             if (! $this->filesystem->isFile(dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nfo']['filename'])) {
                 throw new RuntimeException('Companion input is missing');
             }
@@ -105,6 +110,13 @@ final class NfoImportService
 
             return ['status' => 'imported', 'message' => "Imported {$manifest['nfo']['filename']}"];
         } catch (Throwable $exception) {
+            if ($deleteFailed && $exception instanceof NfoPayloadRejected) {
+                try {
+                    $this->manifests->deleteTerminalCompanion($manifestPath);
+                } catch (Throwable) {
+                    // Failed cleanup keeps its exact pending operation for reconciliation.
+                }
+            }
             Log::channel('nzb_upload')->warning('Paired NFO import failed', [
                 'manifest' => $manifestPath,
                 'error' => $exception->getMessage(),

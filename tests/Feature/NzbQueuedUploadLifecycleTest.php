@@ -58,6 +58,28 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         parent::tearDown();
     }
 
+    public function test_companion_locks_candidate_before_release(): void
+    {
+        [$source, $manifests] = $this->upload('lock-order');
+        $this->capturedFixtureImporter('lock-order')->beginImport([$source]);
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'lock-order-guid']);
+        DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+        $manifests->reconcilePending(dirname($source).'/'.NzbUploadManifestService::FILENAME);
+        $locks = [];
+        DB::listen(static function (QueryExecuted $query) use (&$locks): void {
+            if (DB::transactionLevel() > 0 && str_starts_with($query->sql, 'select exists(')) {
+                foreach (['release_verification_candidates', 'releases'] as $table) {
+                    if (str_contains($query->sql, 'from "'.$table.'"')) {
+                        $locks[] = $table;
+                    }
+                }
+            }
+        });
+        $service = new NfoImportService(new Filesystem, $manifests, new NfoService);
+        self::assertSame('imported', $service->importManifest(dirname($source).'/'.NzbUploadManifestService::FILENAME)['status']);
+        self::assertSame(['release_verification_candidates', 'releases'], array_slice($locks, 0, 2));
+    }
+
     #[DataProvider('capacityDeletionFlags')]
     public function test_real_capacity_deferral_retains_nzb_and_nfo_and_allows_retry(bool $delete, bool $deleteFailed): void
     {

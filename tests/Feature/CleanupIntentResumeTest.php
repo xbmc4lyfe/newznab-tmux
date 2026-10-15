@@ -147,6 +147,134 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
         self::assertSame(['deferred' => true], $uploads->reserveInput($source));
     }
 
+    public static function gcBoundaries(): array
+    {
+        return ['removed files' => ['custody_gc_files'], 'removed directory' => ['custody_gc_parent']];
+    }
+
+    #[DataProvider('gcBoundaries')]
+    public function test_gc_sync_failure_keeps_retry_authority_without_retiring_replacement(string $boundary): void
+    {
+        [$source, $mp, $uploads] = $this->upload(false);
+        $importer = new class(['Browser' => true]) extends NzbImportService
+        {
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function scanNZBFile(mixed &$nzbXML, mixed $nzbFileName = '', mixed $source = ''): NzbImportStatus
+            {
+                return NzbImportStatus::Failed;
+            }
+        };
+        DirectorySyncBridge::$fail = $boundary;
+        try {
+            $importer->beginImport([$source], deleteFailed: true);
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        self::assertFileDoesNotExist($source);
+        self::assertArrayHasKey('custody_gc', $uploads->read($mp));
+        file_put_contents($source, 'new source while GC waits');
+        self::assertSame(['deferred' => true], $uploads->reserveInput($source));
+        $result = $uploads->reconcilePending($mp);
+        self::assertArrayNotHasKey('custody_gc', $result);
+        self::assertSame([], glob(dirname($source).'/.custody-*'));
+        self::assertSame('new source while GC waits', file_get_contents($source));
+    }
+
+    public function test_gc_requires_durable_manifest_authority_before_removing_journals(): void
+    {
+        [$source, $mp, $uploads] = $this->upload(false);
+        $importer = new class(['Browser' => true]) extends NzbImportService
+        {
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function scanNZBFile(mixed &$nzbXML, mixed $nzbFileName = '', mixed $source = ''): NzbImportStatus
+            {
+                return NzbImportStatus::Failed;
+            }
+        };
+        DirectorySyncBridge::$afterSync = static function (string $directory, string $boundary): void {
+            if ($boundary === 'complete_dir') {
+                DirectorySyncBridge::$fail = 'manifest_parent';
+            }
+        };
+        try {
+            try {
+                $importer->beginImport([$source], deleteFailed: true);
+                self::fail('Expected uncertain final manifest durability');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('durability', $error->getMessage());
+            }
+            self::assertArrayHasKey('custody_gc', $uploads->read($mp));
+            $journals = glob(dirname($source).'/.custody-*/*.json');
+            self::assertCount(3, $journals);
+            try {
+                $uploads->reconcilePending($mp);
+                self::fail('GC must not proceed without durable manifest authority');
+            } catch (\RuntimeException) {
+                foreach ($journals as $journal) {
+                    self::assertFileExists($journal);
+                }
+            }
+        } finally {
+            DirectorySyncBridge::$fail = '';
+            DirectorySyncBridge::$afterSync = null;
+        }
+        $result = $uploads->reconcilePending($mp);
+        self::assertArrayNotHasKey('custody_gc', $result);
+        self::assertSame([], glob(dirname($source).'/.custody-*'));
+    }
+
+    public function test_completed_source_journal_is_reclaimed_and_partial_gc_retries(): void
+    {
+        [$source, $mp] = $this->upload(false);
+        $fs = new class extends Filesystem
+        {
+            public bool $failGc = true;
+
+            public function delete($paths)
+            {
+                $deleted = parent::delete($paths);
+                if ($this->failGc && is_string($paths) && basename($paths) === 'intent.json') {
+                    $this->failGc = false;
+
+                    return false;
+                }
+
+                return $deleted;
+            }
+        };
+        $uploads = new NzbUploadManifestService($fs);
+        app()->instance(NzbUploadManifestService::class, $uploads);
+        $importer = new class(['Browser' => true]) extends NzbImportService
+        {
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function scanNZBFile(mixed &$nzbXML, mixed $nzbFileName = '', mixed $source = ''): NzbImportStatus
+            {
+                return NzbImportStatus::Failed;
+            }
+        };
+        $importer->beginImport([$source], deleteFailed: true);
+        self::assertFileDoesNotExist($source);
+        self::assertArrayHasKey('custody_gc', $uploads->read($mp));
+        self::assertCount(1, glob(dirname($source).'/.custody-*'));
+        file_put_contents($source, 'independent replacement');
+        $m = $uploads->reconcilePending($mp);
+        self::assertArrayNotHasKey('custody_gc', $m);
+        self::assertSame([], glob(dirname($source).'/.custody-*'));
+        self::assertSame('independent replacement', file_get_contents($source));
+    }
+
     #[DataProvider('sourceBoundaries')]
     public function test_failed_input_and_companion_resume_from_manifest_without_original_paths(string $boundary, bool $replacement): void
     {
