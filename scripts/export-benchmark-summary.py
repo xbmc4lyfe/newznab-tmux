@@ -52,7 +52,7 @@ RUST_SOURCE_PATHS = {"docker/app/nzb-yenc-ffi/src/" + name + ".rs" for name in (
     "bin/benchmark-article-fingerprint", "bin/benchmark-cpu-snapshot", "bin/nntmux-article-fingerprint",
     "bin/nntmux-cpu-snapshot", "bin/nntmux-evidence-utility")}
 SOURCE_PATHS |= RUST_SOURCE_PATHS | {"app/Services/Yenc/" + name + ".php" for name in (
-    "ArticleFrame", "DecoderFactory", "NativePayloadDecoder", "PayloadDecoder", "PhpPayloadDecoder", "RawPayloadDecoder", "YencPart")}
+    "ArticleFrame", "DecoderFactory", "ExperimentalStrictArticleDecoder", "NativePayloadDecoder", "PayloadDecoder", "PhpPayloadDecoder", "RawPayloadDecoder", "YencPart")}
 KERNEL_NAMES = {0: "scalar", 1: "ssse3", 2: "avx2", 3: "avx512-vbmi2", 4: "neon"}
 CURRENT_STATUSES = {"ok", "useful_improvement", "inconclusive", "regression", "passed", "gate_failed"}
 

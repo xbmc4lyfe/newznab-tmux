@@ -209,13 +209,15 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             self.assertEqual(wrong["provenance_status"], "invalid")
 
     def test_profile_keeps_experiment_candidate_source_separate(self):
+        strict_caller = "app/Services/Yenc/ExperimentalStrictArticleDecoder.php"
         summary = self.run_export("profile", profile(), runtime={"candidate_git_head": "e" * 40,
-            "candidate_source_sha256": dict(RUST_SOURCES), "candidate_library_sha256": "c" * 64,
+            "candidate_source_sha256": dict(RUST_SOURCES, **{strict_caller: "b" * 64}), "candidate_library_sha256": "c" * 64,
             "candidate_payload_kernel_id": 2})
         self.assertEqual(summary["head_sha"], "d" * 40)
         self.assertEqual(summary.get("candidate_head_sha"), "e" * 40)
         self.assertEqual(summary["provenance_status"], "verified_experiment")
         self.assertEqual(summary["status"], "experimental_measurement")
+        self.assertEqual(summary["source_sha256"].get(strict_caller), "b" * 64)
 
     def test_yenc_rejects_receipt_source_library_and_runtime_disagreements(self):
         bad_sources = dict(RUST_SOURCES)
