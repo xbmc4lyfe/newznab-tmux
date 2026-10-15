@@ -45,12 +45,52 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
         (new CollectReleaseFingerprintMetadata(1))->handle($collector);
         self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
-        foreach ([28, 29, 30, 31, 32] as $schemaVersion) {
+        foreach ([28, 29, 30, 31, 32, 33] as $schemaVersion) {
             ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => $schemaVersion]]);
             $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
             (new CollectReleaseFingerprintMetadata(1))->handle($collector);
             $recollected = ReleaseFingerprintMetadata::query()->where('releases_id', 1)->firstOrFail();
             self::assertSame('unavailable', $recollected->status);
+        }
+    }
+
+    #[Test]
+    public function it_preserves_long_gzip_text_fields_through_yenc(): void
+    {
+        $name = str_repeat('A', 4097);
+        $comment = str_repeat('B', 4097);
+        // Literal gzip header plus independent low-16-bit CRC32 (0xa583).
+        $header = hex2bin('1f8b081a000000000003').$name."\0".$comment."\0".hex2bin('83a5');
+        foreach ([false, true] as $corruptHeaderCrc) {
+            $sample = str_repeat('U', 7).$header;
+            if ($corruptHeaderCrc) {
+                $sample[strlen($sample) - 1] = chr(ord($sample[strlen($sample) - 1]) ^ 1);
+            }
+            if ((new NativeMetadataParser)->parseFormats($sample) === null) {
+                self::markTestSkipped('Native Rust format metadata is required for gzip text-field integration.');
+            }
+            $body = YencArticles::article($sample);
+            $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+            self::assertSame($sample, $analysis['decoded_bytes']);
+            self::assertSame(hash('sha256', $body), $analysis['metadata']['article_body_sha256']);
+            $gzip = $analysis['metadata']['decoded_format_metadata']['headers'][0];
+            self::assertSame(7, $gzip['offset']);
+            self::assertTrue($gzip['header_complete']);
+            self::assertSame(! $corruptHeaderCrc, $gzip['header_valid']);
+            self::assertSame(! $corruptHeaderCrc, $gzip['header_crc16_valid']);
+            self::assertSame(4097, $gzip['filename_full_byte_length']);
+            self::assertSame(4097, $gzip['original_filename_bytes_length']);
+            self::assertSame(hash('sha256', $name), $gzip['filename_sha256']);
+            self::assertSame($gzip['filename_sha256'], $gzip['original_filename_bytes_sha256']);
+            self::assertSame(4097, $gzip['comment_full_byte_length']);
+            self::assertSame(4097, $gzip['comment_bytes_length']);
+            self::assertSame(hash('sha256', $comment), $gzip['comment_sha256']);
+            self::assertSame($gzip['comment_sha256'], $gzip['comment_bytes_sha256']);
+            self::assertSame(512, strlen($gzip['filename_bytes_hex']));
+            self::assertSame(512, strlen($gzip['comment_bytes_hex']));
+            self::assertTrue($gzip['filename_bytes_hex_truncated']);
+            self::assertTrue($gzip['comment_bytes_hex_truncated']);
+            self::assertSame(8208, $gzip['header_bytes']);
         }
     }
 
@@ -104,6 +144,29 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertSame(24, $copies['pairs'][0]['first_difference']['required_byte']);
         self::assertSame(25, $copies['pairs'][0]['first_difference']['optional_byte']);
         self::assertTrue($copies['pairs'][1]['candidate_range_bytes_equal']);
+    }
+
+    #[Test]
+    public function it_preserves_experimental_xz_footer_evidence_through_yenc(): void
+    {
+        $sample = hex2bin('fd377a585a000000ff12d94102c0050121010000f05dfb9f010000410000000000011101ada6580406729e7a010000000000595a');
+        self::assertIsString($sample);
+        $native = (new NativeMetadataParser)->parseFormats($sample);
+        if (! is_array($native['headers'][0]['first_block']['following_footer'] ?? null)) {
+            self::markTestSkipped('An experimental-xz-index Rust library is required for Footer propagation.');
+        }
+        $body = YencArticles::article($sample);
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        self::assertSame(hash('sha256', $body), $analysis['metadata']['article_body_sha256']);
+        $block = $analysis['metadata']['decoded_format_metadata']['headers'][0]['first_block'];
+        self::assertSame($native['headers'][0]['first_block']['following_footer'], $block['following_footer']);
+        self::assertSame('footer_index_and_header_declarations_match', $block['following_footer']['status']);
+        self::assertSame('06729e7a010000000000595a', $block['following_footer']['observed_hex']);
+        self::assertSame(40, $block['following_footer']['start_offset']);
+        self::assertSame(52, $block['following_footer']['end_offset_exclusive']);
+        self::assertFalse($block['whole_stream_validated']);
+        self::assertFalse($block['content_decompressed']);
     }
 
     #[Test]

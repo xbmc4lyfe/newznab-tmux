@@ -105,6 +105,61 @@ pub struct IndexObservation {
     pub relationship_basis: &'static str,
 }
 
+#[cfg(feature = "experimental-xz-index")]
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FooterRelationship {
+    #[default]
+    Unqualified,
+    Equal,
+    Different,
+}
+
+#[cfg(feature = "experimental-xz-index")]
+#[derive(Debug)]
+pub struct FooterFlags([u8; 2]);
+
+#[cfg(feature = "experimental-xz-index")]
+impl Serialize for FooterFlags {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let encoded = [
+            DIGITS[(self.0[0] >> 4) as usize],
+            DIGITS[(self.0[0] & 15) as usize],
+            DIGITS[(self.0[1] >> 4) as usize],
+            DIGITS[(self.0[1] & 15) as usize],
+        ];
+        let text =
+            std::str::from_utf8(&encoded).map_err(<S::Error as serde::ser::Error>::custom)?;
+        serializer.serialize_str(text)
+    }
+}
+
+#[cfg(feature = "experimental-xz-index")]
+#[derive(Debug, Default, Serialize)]
+pub struct FooterObservation {
+    pub locator_basis: &'static str,
+    pub offset_basis: &'static str,
+    pub relationship_basis: &'static str,
+    pub status: &'static str,
+    pub start_offset: Option<u64>,
+    pub end_offset_exclusive: Option<u64>,
+    pub available_bytes: usize,
+    pub observed_hex: IndexHex,
+    pub observed_index_bytes: Option<u64>,
+    pub crc32_expected: Option<u32>,
+    pub crc32_calculated: Option<u32>,
+    pub crc32_valid: Option<bool>,
+    pub backward_size_stored: Option<u32>,
+    pub backward_size_bytes: Option<u64>,
+    pub stream_flags_hex: Option<FooterFlags>,
+    pub header_stream_flags_hex: Option<FooterFlags>,
+    pub reserved_flags_valid: Option<bool>,
+    pub magic_valid: Option<bool>,
+    pub backward_size_relationship: FooterRelationship,
+    pub header_flags_relationship: FooterRelationship,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct FirstBlock {
     pub offset_basis: &'static str,
@@ -150,6 +205,8 @@ pub struct FirstBlock {
     pub following_byte: Option<u8>,
     #[cfg(feature = "experimental-xz-index")]
     pub following_index: Option<IndexObservation>,
+    #[cfg(feature = "experimental-xz-index")]
+    pub following_footer: Option<FooterObservation>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -384,6 +441,105 @@ fn observe_index(data: &[u8], block: &FirstBlock, start: u64) -> IndexObservatio
     out
 }
 
+#[cfg(feature = "experimental-xz-index")]
+fn observe_footer(data: &[u8], candidate: usize, index: &IndexObservation) -> FooterObservation {
+    let mut out = FooterObservation {
+        locator_basis: "complete immediately following single-record Index end; no search",
+        offset_basis: "decoded_parser_sample_relative; file origin is unknown",
+        relationship_basis: "Local Footer CRC, reserved bits and magic qualify comparisons of Backward Size with observed Index length and Footer flags with the caller-qualified Stream Header flags. No decompression, content-check verification, EOF, trailing-data or whole-stream validation; earlier Block/Index conflicts remain independent.",
+        status: "index_unqualified",
+        backward_size_relationship: FooterRelationship::Unqualified,
+        header_flags_relationship: FooterRelationship::Unqualified,
+        ..FooterObservation::default()
+    };
+    if index.status != "complete" {
+        return out;
+    }
+    let Some(start) = index.end_offset_exclusive else {
+        return out;
+    };
+    out.start_offset = Some(start);
+    let Some(index_bytes) = start.checked_sub(index.start_offset) else {
+        out.status = "invalid_index_range";
+        return out;
+    };
+    out.observed_index_bytes = Some(index_bytes);
+    let Some(end) = start.checked_add(12) else {
+        out.status = "offset_overflow";
+        return out;
+    };
+    out.end_offset_exclusive = Some(end);
+    let header_flags = candidate
+        .checked_add(6)
+        .and_then(|start| start.checked_add(2).and_then(|end| data.get(start..end)));
+    out.header_stream_flags_hex = header_flags
+        .and_then(|flags| flags.try_into().ok())
+        .map(FooterFlags);
+    out.status = "not_sampled";
+    // Prove coverage before narrowing a potentially huge sample-relative offset.
+    if start >= data.len() as u64 {
+        return out;
+    }
+    let start = start as usize;
+    let raw = &data[start..start + (data.len() - start).min(12)];
+    out.available_bytes = raw.len();
+    let Some(observed) = IndexHex::from_bytes(raw) else {
+        out.status = "invalid_evidence_range";
+        return out;
+    };
+    out.observed_hex = observed;
+    if raw.len() >= 4 {
+        out.crc32_expected = Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+    }
+    if raw.len() >= 8 {
+        let stored = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+        out.backward_size_stored = Some(stored);
+        out.backward_size_bytes = Some((u64::from(stored) + 1) * 4);
+    }
+    if raw.len() >= 10 {
+        let calculated = crc32fast::hash(&raw[4..10]);
+        out.crc32_calculated = Some(calculated);
+        out.crc32_valid = Some(out.crc32_expected == Some(calculated));
+        out.stream_flags_hex = Some(FooterFlags([raw[8], raw[9]]));
+        out.reserved_flags_valid = Some(raw[8] == 0 && raw[9] & 0xf0 == 0);
+    }
+    if raw.len() < 12 {
+        out.status = "sample_truncated_footer";
+        return out;
+    }
+    out.magic_valid = Some(&raw[10..12] == b"YZ");
+    out.status = if out.crc32_valid != Some(true) {
+        "crc32_mismatch"
+    } else if out.reserved_flags_valid != Some(true) {
+        "unsupported_stream_flags"
+    } else if out.magic_valid != Some(true) {
+        "footer_magic_mismatch"
+    } else {
+        out.backward_size_relationship = if out.backward_size_bytes == Some(index_bytes) {
+            FooterRelationship::Equal
+        } else {
+            FooterRelationship::Different
+        };
+        let Some(header_flags) = header_flags else {
+            out.status = "header_flags_unavailable";
+            return out;
+        };
+        out.header_flags_relationship = if &raw[8..10] == header_flags {
+            FooterRelationship::Equal
+        } else {
+            FooterRelationship::Different
+        };
+        if out.backward_size_relationship == FooterRelationship::Different {
+            "backward_size_mismatch"
+        } else if out.header_flags_relationship == FooterRelationship::Different {
+            "stream_flags_mismatch"
+        } else {
+            "footer_index_and_header_declarations_match"
+        }
+    };
+    out
+}
+
 pub fn observe(
     data: &[u8],
     candidate: usize,
@@ -586,7 +742,11 @@ pub fn observe(
     out.next_item_offset = Some(check_end);
     #[cfg(feature = "experimental-xz-index")]
     {
-        out.following_index = Some(observe_index(data, &out, check_end));
+        let index = observe_index(data, &out, check_end);
+        if index.status == "complete" {
+            out.following_footer = Some(observe_footer(data, candidate, &index));
+        }
+        out.following_index = Some(index);
     }
     out.following_byte = usize::try_from(check_end)
         .ok()
@@ -1153,9 +1313,9 @@ mod tests {
     #[test]
     fn following_index_distinguishes_incomplete_and_malformed_vlis() {
         for literal in ["00", "0080", "0001", "000180", "000111", "00011180"] {
-            let index = observe(&with_index(literal), 0, true, Some(0))
-                .following_index
-                .unwrap();
+            let out = observe(&with_index(literal), 0, true, Some(0));
+            assert!(out.following_footer.is_none());
+            let index = out.following_index.unwrap();
             assert_eq!(index.status, "sample_truncated_vli", "{literal}");
         }
         for literal in [
@@ -1166,9 +1326,9 @@ mod tests {
             "0001808080808080808080",
             "000111808080808080808080",
         ] {
-            let index = observe(&with_index(literal), 0, true, Some(0))
-                .following_index
-                .unwrap();
+            let out = observe(&with_index(literal), 0, true, Some(0));
+            assert!(out.following_footer.is_none());
+            let index = out.following_index.unwrap();
             assert_eq!(index.status, "invalid_vli", "{literal}");
         }
         for literal in ["00011101", "00011101ada658"] {
@@ -1290,5 +1450,198 @@ mod tests {
                 if valid { "different" } else { "unqualified" }
             );
         }
+    }
+
+    #[cfg(feature = "experimental-xz-index")]
+    fn footer_sample(backward: u32, flags: [u8; 2], magic: [u8; 2]) -> Vec<u8> {
+        let mut data = bytes(
+            "fd377a585a000000ff12d94102c0050121010000f05dfb9f010000410000000000011101ada65804",
+        );
+        let mut covered = backward.to_le_bytes().to_vec();
+        covered.extend_from_slice(&flags);
+        data.extend_from_slice(&crc32fast::hash(&covered).to_le_bytes());
+        data.extend_from_slice(&covered);
+        data.extend_from_slice(&magic);
+        data
+    }
+
+    #[cfg(feature = "experimental-xz-index")]
+    #[test]
+    fn following_footer_compares_only_observed_declarations() {
+        let mut data = footer_sample(1, [0, 0], *b"YZ");
+        assert_eq!(&data[40..], &bytes("06729e7a010000000000595a"));
+        data.extend_from_slice(b"unexamined trailing content");
+        for prefix in [0, 1, 7] {
+            let mut embedded = vec![0x41; prefix];
+            embedded.extend_from_slice(&data);
+            let out = serde_json::to_value(observe(&embedded, prefix, true, Some(0))).unwrap();
+            let footer = &out["following_footer"];
+            assert_eq!(
+                footer["status"],
+                "footer_index_and_header_declarations_match"
+            );
+            assert_eq!(footer["start_offset"], 40 + prefix);
+            assert_eq!(footer["end_offset_exclusive"], 52 + prefix);
+            assert_eq!(footer["available_bytes"], 12);
+            assert_eq!(footer["crc32_valid"], true);
+            assert_eq!(footer["magic_valid"], true);
+            assert_eq!(footer["reserved_flags_valid"], true);
+            assert_eq!(footer["header_stream_flags_hex"], "0000");
+            assert_eq!(footer["stream_flags_hex"], "0000");
+            assert_eq!(footer["backward_size_stored"], 1);
+            assert_eq!(footer["backward_size_bytes"], 8);
+            assert_eq!(footer["backward_size_relationship"], "equal");
+            assert_eq!(footer["header_flags_relationship"], "equal");
+            assert_eq!(out["whole_stream_validated"], false);
+            assert_eq!(out["content_decompressed"], false);
+            assert_eq!(out["file_offset_known"], false);
+        }
+    }
+
+    #[cfg(feature = "experimental-xz-index")]
+    #[test]
+    fn following_footer_retains_every_partial_prefix_without_search() {
+        let data = footer_sample(1, [0, 0], *b"YZ");
+        for count in 0..12 {
+            let out = serde_json::to_value(observe(&data[..40 + count], 0, true, Some(0))).unwrap();
+            let footer = &out["following_footer"];
+            assert_eq!(
+                footer["status"],
+                if count == 0 {
+                    "not_sampled"
+                } else {
+                    "sample_truncated_footer"
+                }
+            );
+            assert_eq!(footer["available_bytes"], count);
+            assert_eq!(footer["observed_hex"], hex(&data[40..40 + count]));
+            assert_eq!(footer["crc32_expected"].is_number(), count >= 4);
+            assert_eq!(footer["backward_size_stored"].is_number(), count >= 8);
+            assert_eq!(footer["stream_flags_hex"].is_string(), count >= 10);
+            assert_eq!(footer["magic_valid"].is_boolean(), count >= 12);
+            assert_eq!(footer["backward_size_relationship"], "unqualified");
+            assert_eq!(footer["header_flags_relationship"], "unqualified");
+        }
+        let mut displaced = data[..40].to_vec();
+        displaced.push(0);
+        displaced.extend_from_slice(&data[40..]);
+        let out = serde_json::to_value(observe(&displaced, 0, true, Some(0))).unwrap();
+        assert_ne!(
+            out["following_footer"]["status"],
+            "footer_index_and_header_declarations_match"
+        );
+        let mut corrupt_index = data;
+        corrupt_index[39] ^= 1;
+        let out = serde_json::to_value(observe(&corrupt_index, 0, true, Some(0))).unwrap();
+        assert!(out["following_footer"].is_null());
+    }
+
+    #[cfg(feature = "experimental-xz-index")]
+    #[test]
+    fn following_footer_distinguishes_integrity_and_relationship_failures() {
+        for (backward, flags, magic, expected) in [
+            (0, [0, 0], *b"YZ", "backward_size_mismatch"),
+            (u32::MAX, [0, 0], *b"YZ", "backward_size_mismatch"),
+            (1, [0, 1], *b"YZ", "stream_flags_mismatch"),
+            (1, [0, 2], *b"YZ", "stream_flags_mismatch"),
+            (1, [1, 0], *b"YZ", "unsupported_stream_flags"),
+            (1, [0, 0x10], *b"YZ", "unsupported_stream_flags"),
+            (1, [0, 0], *b"Yx", "footer_magic_mismatch"),
+        ] {
+            let data = footer_sample(backward, flags, magic);
+            let out = serde_json::to_value(observe(&data, 0, true, Some(0))).unwrap();
+            let footer = &out["following_footer"];
+            assert_eq!(footer["status"], expected);
+            assert_eq!(footer["crc32_valid"], true);
+            assert_eq!(footer["backward_size_bytes"], (u64::from(backward) + 1) * 4);
+            if matches!(
+                expected,
+                "unsupported_stream_flags" | "footer_magic_mismatch"
+            ) {
+                assert_eq!(footer["backward_size_relationship"], "unqualified");
+                assert_eq!(footer["header_flags_relationship"], "unqualified");
+            }
+        }
+        let mut data = footer_sample(1, [0, 0], *b"YZ");
+        data[40] ^= 1;
+        let out = serde_json::to_value(observe(&data, 0, true, Some(0))).unwrap();
+        assert_eq!(out["following_footer"]["status"], "crc32_mismatch");
+        assert_eq!(out["following_footer"]["magic_valid"], true);
+        assert_eq!(
+            out["following_footer"]["backward_size_relationship"],
+            "unqualified"
+        );
+        assert_eq!(
+            out["following_footer"]["header_flags_relationship"],
+            "unqualified"
+        );
+    }
+
+    #[cfg(feature = "experimental-xz-index")]
+    #[test]
+    fn following_footer_does_not_repair_other_block_evidence() {
+        let mut data = footer_sample(1, [0, 0], *b"YZ");
+        data[34] = 18;
+        let crc = crc32fast::hash(&data[32..36]);
+        data[36..40].copy_from_slice(&crc.to_le_bytes());
+        let out = serde_json::to_value(observe(&data, 0, true, Some(0))).unwrap();
+        assert_eq!(out["following_index"]["status"], "complete");
+        assert_eq!(
+            out["following_index"]["unpadded_size_relationship"],
+            "different"
+        );
+        assert_eq!(
+            out["following_footer"]["status"],
+            "footer_index_and_header_declarations_match"
+        );
+        assert_eq!(out["whole_stream_validated"], false);
+    }
+
+    #[cfg(feature = "experimental-xz-index")]
+    #[test]
+    fn following_footer_inline_storage_is_bounded_without_allocations() {
+        for byte in 0..=255 {
+            let raw = [byte, !byte];
+            assert_eq!(serde_json::to_value(FooterFlags(raw)).unwrap(), hex(&raw));
+        }
+        let data = footer_sample(1, [0, 0], *b"YZ");
+        let block = observe(&data, 0, true, Some(0));
+        let index = block.following_index.as_ref().unwrap();
+        let mut json = Vec::with_capacity(4096);
+        let (_, allocations) = crate::tests::observed_allocations(|| {
+            let footer = observe_footer(&data, 0, index);
+            serde_json::to_writer(&mut json, &footer).unwrap();
+            footer
+        });
+        assert_eq!(allocations, 0);
+        assert!(!std::mem::needs_drop::<FooterObservation>());
+        assert!(std::mem::size_of::<FooterObservation>() <= 224);
+    }
+
+    #[cfg(feature = "experimental-xz-index")]
+    #[test]
+    fn following_footer_checks_declared_offsets_before_narrowing() {
+        let mut index = IndexObservation {
+            status: "complete",
+            start_offset: u64::MAX - 13,
+            end_offset_exclusive: Some(u64::MAX - 5),
+            ..IndexObservation::default()
+        };
+        assert_eq!(observe_footer(&[], 0, &index).status, "offset_overflow");
+        index.start_offset = (1_u64 << 63) - 8;
+        index.end_offset_exclusive = Some(1_u64 << 63);
+        assert_eq!(observe_footer(&[], 0, &index).status, "not_sampled");
+        index.start_offset = 10;
+        index.end_offset_exclusive = Some(5);
+        assert_eq!(observe_footer(&[], 0, &index).status, "invalid_index_range");
+        index.start_offset = 32;
+        index.end_offset_exclusive = Some(40);
+        let data = footer_sample(1, [0, 0], *b"YZ");
+        assert_eq!(
+            observe_footer(&data, usize::MAX, &index).status,
+            "header_flags_unavailable"
+        );
+        index.status = "sample_truncated_vli";
+        assert_eq!(observe_footer(&data, 0, &index).status, "index_unqualified");
     }
 }
