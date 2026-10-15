@@ -8,10 +8,16 @@ use App\Services\CollectionCleanupService;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
+use Illuminate\Container\Container;
+use Illuminate\Database\DatabaseManager;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Facade;
 use PDO;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\PreserveGlobalState;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use Tests\Fixtures\ManifestCompressionProbe;
 use Tests\TestCase;
 
@@ -31,6 +37,19 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
 
     private string $password = '';
 
+    private ?Filesystem $fixtureFiles = null;
+
+    private ?DatabaseManager $fixtureConnections = null;
+
+    private bool $ownsConnection = false;
+
+    private ?\Closure $afterSchemaInitialized = null;
+
+    private ?\Closure $beforeCleanup = null;
+
+    /** @var list<\Throwable> */
+    private array $cleanupFailures = [];
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -42,38 +61,37 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
         $this->username = (string) (getenv('VERIFICATION_LOCK_TEST_USERNAME') ?: 'root');
         $this->password = (string) getenv('VERIFICATION_LOCK_TEST_PASSWORD');
         $this->administrator = new PDO('mysql:host='.$this->host.';port=3306;charset=utf8mb4', $this->username, $this->password);
-        try {
-            $this->initializeDatabase(function (): void {
-                $this->storagePath = storage_path('framework/testing/lock-'.bin2hex(random_bytes(8)));
-                config(['database.default' => 'mariadb', 'database.connections.mariadb.host' => $this->host,
-                    'database.connections.mariadb.port' => 3306, 'database.connections.mariadb.database' => $this->database,
-                    'database.connections.mariadb.username' => $this->username, 'database.connections.mariadb.password' => $this->password,
-                    'database.connections.mariadb.url' => null, 'database.connections.mariadb.unix_socket' => '',
-                    'database.connections.mariadb.prefix' => '',
-                    'release_verification.required' => true, 'nntmux.echocli' => false,
-                    'release_verification.storage_path' => $this->storagePath]);
-                DB::purge();
-                DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
-                (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
-                DB::statement('CREATE TABLE collections (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                    collectionhash BINARY(20) NOT NULL, subject VARCHAR(255) NOT NULL, fromname VARCHAR(255) NOT NULL,
-                    totalfiles INT NOT NULL, groups_id INT NOT NULL, collection_regexes_id INT DEFAULT 0,
-                    date DATETIME NOT NULL, filecheck INT DEFAULT 3, filesize BIGINT DEFAULT 5,
-                    UNIQUE KEY ix_collection_collectionhash (collectionhash)) ENGINE=InnoDB');
-                DB::statement('CREATE TABLE binaries (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                    collections_id BIGINT UNSIGNED NOT NULL, binaryhash BINARY(16) NOT NULL,
-                    name VARCHAR(255) NOT NULL, totalparts INT NOT NULL,
-                    FOREIGN KEY (collections_id) REFERENCES collections(id) ON DELETE CASCADE) ENGINE=InnoDB');
-                DB::statement('CREATE TABLE parts (binaries_id BIGINT UNSIGNED NOT NULL, partnumber INT NOT NULL,
-                    messageid VARCHAR(255) NOT NULL, size INT NOT NULL, PRIMARY KEY (binaries_id, partnumber),
-                    FOREIGN KEY (binaries_id) REFERENCES binaries(id) ON DELETE CASCADE) ENGINE=InnoDB');
-                DB::statement('CREATE TABLE usenet_groups (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL) ENGINE=InnoDB');
-                DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.test']);
-            });
-        } catch (\Throwable $error) {
-            $this->tearDown();
-            throw $error;
-        }
+        $this->initializeDatabase(function (): void {
+            $this->fixtureFiles = app('files');
+            $this->fixtureConnections = app('db');
+            $this->ownsConnection = true;
+            $this->storagePath = storage_path('framework/testing/lock-'.bin2hex(random_bytes(8)));
+            config(['database.default' => 'mariadb', 'database.connections.mariadb.host' => $this->host,
+                'database.connections.mariadb.port' => 3306, 'database.connections.mariadb.database' => $this->database,
+                'database.connections.mariadb.username' => $this->username, 'database.connections.mariadb.password' => $this->password,
+                'database.connections.mariadb.url' => null, 'database.connections.mariadb.unix_socket' => '',
+                'database.connections.mariadb.prefix' => '',
+                'release_verification.required' => true, 'nntmux.echocli' => false,
+                'release_verification.storage_path' => $this->storagePath]);
+            DB::purge();
+            DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
+            (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
+            DB::statement('CREATE TABLE collections (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                collectionhash BINARY(20) NOT NULL, subject VARCHAR(255) NOT NULL, fromname VARCHAR(255) NOT NULL,
+                totalfiles INT NOT NULL, groups_id INT NOT NULL, collection_regexes_id INT DEFAULT 0,
+                date DATETIME NOT NULL, filecheck INT DEFAULT 3, filesize BIGINT DEFAULT 5,
+                UNIQUE KEY ix_collection_collectionhash (collectionhash)) ENGINE=InnoDB');
+            DB::statement('CREATE TABLE binaries (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                collections_id BIGINT UNSIGNED NOT NULL, binaryhash BINARY(16) NOT NULL,
+                name VARCHAR(255) NOT NULL, totalparts INT NOT NULL,
+                FOREIGN KEY (collections_id) REFERENCES collections(id) ON DELETE CASCADE) ENGINE=InnoDB');
+            DB::statement('CREATE TABLE parts (binaries_id BIGINT UNSIGNED NOT NULL, partnumber INT NOT NULL,
+                messageid VARCHAR(255) NOT NULL, size INT NOT NULL, PRIMARY KEY (binaries_id, partnumber),
+                FOREIGN KEY (binaries_id) REFERENCES binaries(id) ON DELETE CASCADE) ENGINE=InnoDB');
+            DB::statement('CREATE TABLE usenet_groups (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL) ENGINE=InnoDB');
+            DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.test']);
+            ($this->afterSchemaInitialized ?? static function (): void {})();
+        });
     }
 
     private function initializeDatabase(callable $initialize): void
@@ -89,32 +107,62 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
         }
     }
 
-    private function cleanupFixture(): void
+    /**
+     * Retain failures independently of the primary setup exception; failed resources remain owned for retry.
+     *
+     * @return list<\Throwable>
+     */
+    private function cleanupFixture(): array
     {
+        $failures = [];
         try {
             if ($this->storagePath !== '') {
-                app('files')->deleteDirectory($this->storagePath);
-            }
-        } finally {
-            try {
-                if ($this->ownsDatabase) {
-                    DB::purge('mariadb');
+                ($this->beforeCleanup ?? static function (): void {})('storage');
+                if (preg_match('~/framework/testing/lock-[a-f0-9]{16}$~D', $this->storagePath) !== 1
+                    || $this->fixtureFiles === null
+                    || ($this->fixtureFiles->exists($this->storagePath) && ! $this->fixtureFiles->deleteDirectory($this->storagePath))) {
+                    throw new \RuntimeException('Could not remove owned archive-lock storage.');
                 }
-            } finally {
-                if ($this->ownsDatabase && $this->administrator !== null
-                    && preg_match('/^nntmux_archive_lock_test_[a-f0-9]{16}$/', $this->database) === 1) {
-                    $this->administrator->exec('DROP DATABASE `'.$this->database.'`');
-                    $this->ownsDatabase = false;
-                }
+                $this->storagePath = '';
             }
+        } catch (\Throwable $error) {
+            $failures[] = $error;
         }
+        try {
+            if ($this->ownsConnection) {
+                ($this->beforeCleanup ?? static function (): void {})('connection');
+                $this->fixtureConnections->purge('mariadb');
+                $this->ownsConnection = false;
+            }
+        } catch (\Throwable $error) {
+            $failures[] = $error;
+        }
+        try {
+            if ($this->ownsDatabase && $this->administrator !== null
+                && preg_match('/^nntmux_archive_lock_test_[a-f0-9]{16}$/D', $this->database) === 1) {
+                ($this->beforeCleanup ?? static function (): void {})('database');
+                $this->administrator->exec('DROP DATABASE `'.$this->database.'`');
+                $this->ownsDatabase = false;
+            }
+        } catch (\Throwable $error) {
+            $failures[] = $error;
+        }
+        array_push($this->cleanupFailures, ...$failures);
+        foreach ($failures as $failure) {
+            fwrite(STDOUT, 'Archive-lock fixture cleanup failure: '.$failure::class.': '.$failure->getMessage().PHP_EOL);
+        }
+
+        return $failures;
     }
 
     protected function tearDown(): void
     {
         ManifestCompressionProbe::$onCompress = null;
         try {
-            $this->cleanupFixture();
+            $failures = $this->cleanupFixture();
+            if ($failures !== []) {
+                throw $failures[0];
+            }
         } finally {
             parent::tearDown();
         }
@@ -144,6 +192,124 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
         } finally {
             if ($createdDatabase !== '') {
                 $this->administrator->exec('DROP DATABASE IF EXISTS `'.$createdDatabase.'`');
+            }
+        }
+    }
+
+    public static function setupCleanupFailures(): iterable
+    {
+        yield 'successful cleanup' => [''];
+        yield 'database cleanup failure' => ['database'];
+        yield 'storage cleanup failure' => ['storage'];
+        yield 'connection cleanup failure' => ['connection'];
+    }
+
+    #[RunInSeparateProcess]
+    #[PreserveGlobalState(false)]
+    #[DataProvider('setupCleanupFailures')]
+    public function test_failed_setup_preserves_primary_failure_and_retries_owned_cleanup(string $failedResource): void
+    {
+        $fixture = new self(__FUNCTION__);
+        $original = new \RuntimeException('Original schema initialization failure.');
+        $cleanupFailure = new \RuntimeException('Injected '.$failedResource.' cleanup failure.');
+        $database = '';
+        $path = '';
+        $attempts = [];
+        $files = app('files');
+        $survivorPath = $this->storagePath;
+        $files->ensureDirectoryExists($survivorPath);
+        file_put_contents($survivorPath.'/survivor', 'separate fixture');
+        $fixture->afterSchemaInitialized = function () use ($fixture, $original, &$database, &$path, $files): void {
+            $database = $fixture->database;
+            $path = $fixture->storagePath;
+            $files->ensureDirectoryExists($path);
+            file_put_contents($path.'/owned', 'failed fixture');
+            $fixture->administrator->exec('CREATE TABLE `'.$database.'`.partial_setup (id INT PRIMARY KEY)');
+            throw $original;
+        };
+        $fixture->beforeCleanup = function (string $resource) use ($failedResource, $cleanupFailure, &$attempts): void {
+            $attempts[] = $resource;
+            if ($resource === $failedResource) {
+                throw $cleanupFailure;
+            }
+        };
+        $caught = null;
+        $secondary = null;
+        try {
+            try {
+                $fixture->setUp();
+            } catch (\Throwable $error) {
+                $caught = $error;
+            }
+            $statement = $this->administrator->prepare('SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?');
+            $statement->execute([$database]);
+            $databaseRemains = $statement->fetchColumn() !== false;
+            $pathRemains = is_dir($path);
+            $ownershipRetained = $fixture->ownsDatabase;
+            $connectionOwnershipRetained = $fixture->ownsConnection;
+            $pathOwnershipRetained = $fixture->storagePath === $path;
+            $reported = in_array($cleanupFailure, $fixture->cleanupFailures, true);
+            $setupAttempts = $attempts;
+            // This is the after-test hook PHPUnit invokes even when setUp throws.
+            $fixture->beforeCleanup = function (string $resource) use (&$attempts): void {
+                $attempts[] = $resource;
+            };
+            try {
+                $fixture->tearDown();
+            } catch (\Throwable $error) {
+                $secondary = $error;
+            }
+            $statement->execute([$database]);
+            $remainingDatabase = $statement->fetchColumn();
+            $statement->execute([$this->database]);
+            $survivorDatabase = $statement->fetchColumn();
+            $observed = [
+                'primary_identity' => $caught === $original,
+                'primary' => $caught?->getMessage(),
+                'secondary' => $secondary?->getMessage(),
+                'database_retained_before_retry' => $databaseRemains,
+                'storage_retained_before_retry' => $pathRemains,
+                'database_ownership' => $ownershipRetained,
+                'connection_ownership' => $connectionOwnershipRetained,
+                'storage_ownership' => $pathOwnershipRetained,
+                'cleanup_failure_reported' => $reported,
+                'attempts' => $setupAttempts,
+            ];
+            fwrite(STDOUT, "\nSETUP_CLEANUP_PROBE ".json_encode($observed, JSON_THROW_ON_ERROR)."\n");
+            $this->assertSame($original, $caught, json_encode($observed));
+            $this->assertNull($secondary, json_encode($observed));
+            $this->assertSame($failedResource === 'database', $databaseRemains);
+            $this->assertSame($failedResource === 'storage', $pathRemains);
+            $this->assertSame($failedResource === 'database', $ownershipRetained);
+            $this->assertSame($failedResource === 'connection', $connectionOwnershipRetained);
+            $this->assertSame(['storage', 'connection', 'database'], $setupAttempts);
+            $this->assertSame($failedResource === '' ? $setupAttempts : [...$setupAttempts, $failedResource], $attempts);
+            $this->assertSame($failedResource === 'storage', $pathOwnershipRetained);
+            $this->assertSame($failedResource !== '', $reported);
+            $this->assertContains('storage', $setupAttempts);
+            $this->assertContains('connection', $setupAttempts);
+            $this->assertContains('database', $setupAttempts);
+            $this->assertFalse($remainingDatabase);
+            $this->assertDirectoryDoesNotExist($path);
+            $this->assertFalse($fixture->ownsDatabase);
+            $this->assertSame('', $fixture->storagePath);
+            $this->assertFalse($fixture->ownsConnection);
+            $this->assertSame($failedResource === '' ? [] : [$cleanupFailure], $fixture->cleanupFailures);
+            $fixture->tearDown();
+            $this->assertSame($failedResource === '' ? $setupAttempts : [...$setupAttempts, $failedResource], $attempts, 'Repeated teardown must not retry released resources.');
+            $this->assertSame($this->database, $survivorDatabase);
+            $this->assertSame('separate fixture', file_get_contents($survivorPath.'/survivor'));
+        } finally {
+            // Restore the outer fixture's application after the nested lifecycle.
+            Container::setInstance($this->app);
+            Facade::setFacadeApplication($this->app);
+            Facade::clearResolvedInstances();
+            $fixture->beforeCleanup = null;
+            if ($database !== '' && preg_match('/^nntmux_archive_lock_test_[a-f0-9]{16}$/', $database) === 1) {
+                $this->administrator->exec('DROP DATABASE IF EXISTS `'.$database.'`');
+            }
+            if ($path !== '') {
+                $files->deleteDirectory($path);
             }
         }
     }
