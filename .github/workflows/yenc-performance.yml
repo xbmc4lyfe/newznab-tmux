@@ -161,9 +161,9 @@ jobs:
           kernel_names = {0: 'scalar', 1: 'ssse3', 2: 'avx2', 3: 'avx512-vbmi2', 4: 'neon'}
           if kernel not in kernel_names:
               raise RuntimeError('Unknown Rust runtime payload kernel identity')
-          # These jobs build the current default kernels without opt-in features.
+          # This paired C++ comparison explicitly builds experimental kernels.
           manifest = {
-              'rust_payload_mode': 'incumbent',
+              'rust_payload_mode': 'experimental',
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'runner_image_os': os.environ.get('ImageOS'),
               'runner_image_version': os.environ.get('ImageVersion'),
@@ -178,7 +178,6 @@ jobs:
               'cargo_lock_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.lock'),
               'cargo_toml_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.toml'),
               'rust_build_command': 'cargo +1.98.0 build --release --locked --features experimental-payload-kernels --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml',
-              'rust_payload_mode': 'experimental',
               'cpp_build_script_sha256': digest('scripts/build-rapidyenc.sh'),
               'cpp_source_archive_sha256': {path.name: digest(path) for path in pathlib.Path('storage/app/rapidyenc').glob('rapidyenc-*.tar.gz')},
               'cpp_library_sha256': digest('storage/app/rapidyenc/librapidyenc.so'),
@@ -649,7 +648,6 @@ jobs:
               'github_run_id': os.environ.get('GITHUB_RUN_ID'),
               'cpu': run('lscpu'), 'uname': run('uname', '-a'), 'php': run('php', '-v'),
               'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
-              'rust_payload_mode': 'incumbent',
               'rust_build_command': 'cargo +1.98.0 build --release --locked --no-default-features --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml',
               'rust_source_sha256': {str(path): digest(path) for path in sorted(pathlib.Path('docker/app/nzb-yenc-ffi/src').rglob('*.rs'))},
               'cargo_lock_sha256': digest('docker/app/nzb-yenc-ffi/Cargo.lock'),

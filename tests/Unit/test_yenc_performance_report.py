@@ -1,7 +1,9 @@
+import ast
 import importlib.util
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -293,6 +295,24 @@ class ProfileBuildTest(unittest.TestCase):
                                        capture_output=True, text=True, timeout=10)
                 self.assertEqual(2, child.returncode)
                 self.assertFalse((evidence / 'profile-build').exists())
+
+    def test_runtime_manifests_declare_one_unambiguous_payload_mode(self):
+        workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()
+        modes = []
+        blocks = re.finditer(
+            r"^ {10}python3[^\n]* <<'(?P<marker>PY[^']*)'\n(?P<body>.*?)^ {10}(?P=marker)$",
+            workflow, re.MULTILINE | re.DOTALL)
+        for block in blocks:
+            tree = ast.parse(textwrap.dedent(block['body']))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Dict):
+                    continue
+                values = [value for key, value in zip(node.keys, node.values)
+                          if isinstance(key, ast.Constant) and key.value == 'rust_payload_mode']
+                if values:
+                    self.assertEqual(1, len(values), 'Duplicate payload-mode declarations')
+                    modes.append(ast.literal_eval(values[0]))
+        self.assertEqual(['experimental', 'incumbent', 'incumbent'], modes)
 
     def test_experimental_workflow_passes_its_payload_mode_to_the_profiling_handler(self):
         workflow = (SCRIPT.parents[1] / '.github/workflows/yenc-performance.yml').read_text()
