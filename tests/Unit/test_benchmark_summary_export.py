@@ -238,6 +238,18 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             self.assertEqual(summary["rows"][0]["samples"], 1000 if kind == "cpu-snapshot" else 31)
             self.assertIn("baseline_revision", summary)
 
+    def test_withdrawn_fingerprint_status_is_public_without_copying_freeform_scope(self):
+        for kind in ("fingerprint-ffi", "fingerprint-worker"):
+            report = self.utility(kind)
+            report["candidate_status"] = "experimental_withdrawn_from_production"
+            report["comparison_scope"] = UNPUBLISHED_MARKER
+            summary = self.run_export(kind, report)
+            self.assertEqual(summary["candidate_status"], "experimental_withdrawn_from_production")
+            self.assertFalse(summary["adoption_qualified"])
+            self.assertNotIn("comparison_scope", summary)
+            report["candidate_status"] = UNPUBLISHED_MARKER
+            self.assertEqual(self.run_export(kind, report)["status"], "invalid")
+
     def test_native_utility_wrong_baseline_backend_missing_fixture_and_failures(self):
         for kind in ("fingerprint-ffi", "fingerprint-worker", "cpu-snapshot"):
             report = self.utility(kind)
