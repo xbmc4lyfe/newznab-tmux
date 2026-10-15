@@ -9,7 +9,8 @@ receipts, and durable filesystem intents. It must retain sources on uncertainty.
 The Rust trial replaces its directory durability boundary through an isolated
 Rust process; all actual manifest capture, outcome, immediate deletion and
 terminal companion cleanup calls remain identical. Moving SQL ownership into
-that process has not been qualified. The synthetic failed-import fixture bypasses
+that process has not been qualified. The current caller includes the durable moved-generation checkpoint before unlink.
+The synthetic failed-import fixture bypasses
 XML parsing, NNTP, the application bootstrap and SQL, and does not certify the
 whole importer or publication path.
 
@@ -41,12 +42,12 @@ platform, raw observations and summaries are committed under
 
 | Current synthetic screen | PHP median ms | Rust process median ms | PHP / Rust |
 | --- | ---: | ---: | ---: |
-| Warm complete custody flow | 6.146 | 174.017 | 0.035 |
-| Cold complete custody flow | 14.580 | 188.358 | 0.077 |
-| Cold whole PHP process | 89.654 | 288.855 | 0.310 |
+| Warm complete custody flow | 3.703 | 171.646 | 0.022 |
+| Cold complete custody flow | 12.606 | 186.615 | 0.068 |
+| Cold whole PHP process | 79.472 | 267.321 | 0.297 |
 
 This fails the required1.5x common-path gate by a wide margin. The shared host
-was uncontrolled and a small focused test run overlapped part of measurement;
+was uncontrolled; the focused recovery run finished before this comparison;
 these are rejection screens, not causal production throughput estimates.
 Ten observations per arm do not qualify p99. The recorded sample quantile is an
 order statistic only; representative uncommon-workload p99 remains unqualified.

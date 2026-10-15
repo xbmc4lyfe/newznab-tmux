@@ -305,13 +305,18 @@ final class NzbUploadManifestService
             }
         }
         $source = dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nzb']['filename'];
-        if (! $this->filesystem->isFile($source)) {
-            return ($manifest['relinquished_attempt'] ?? null) === $accepted['attempt']
-                || $this->capturedCustodyPayload($source, $accepted) !== null
-                || (isset($manifest['delete_nzb_after_publication'])
-                    && $this->readCustodyIntent($source, $accepted) === ['protocol' => 3, 'source' => basename($source), 'receipt' => $accepted, 'commit_binding' => null]
-                    && ! file_exists($this->custodyDirectory($source, $accepted).'/payload')
-                    && ! is_link($this->custodyDirectory($source, $accepted).'/payload') && ! is_link($source));
+        // Custody belongs to the captured generation, independently of a new original path.
+        if (($manifest['relinquished_attempt'] ?? null) === $accepted['attempt']
+            || $this->capturedCustodyPayload($source, $accepted) !== null) {
+            return true;
+        }
+        $expected = ['protocol' => 3, 'source' => basename($source), 'receipt' => $accepted, 'commit_binding' => null];
+        $directory = $this->custodyDirectory($source, $accepted);
+        if (isset($manifest['delete_nzb_after_publication'])
+            && $this->readCustodyIntent($source, $accepted) === $expected
+            && $this->custodyMarkerMatches($directory.'/moved.json', $expected)
+            && ! file_exists($directory.'/payload') && ! is_link($directory.'/payload')) {
+            return true;
         }
 
         return $this->sourceIdentity($source) === $accepted['source_identity']
@@ -986,20 +991,37 @@ final class NzbUploadManifestService
         if (! DirectorySyncBridge::sync($attempt, 'rename_custody') || ! DirectorySyncBridge::sync(dirname($source), 'rename_parent')) {
             return false;
         }
+        $moved = $attempt.'/moved.json';
         if (file_exists($private) || is_link($private)) {
-            if (! $this->captureMatches($private, $receipt, renamed: true) || ! $this->filesystem->delete($private)) {
+            if (! $this->captureMatches($private, $receipt, renamed: true) || is_link($moved)) {
                 return false;
             }
-        } elseif (file_exists($source) || is_link($source)) {
-            // Never treat an unrelated replacement pathname as owned cleanup work.
+            // Persist owned relocation before unlink. After unlink, this exact checkpoint
+            // distinguishes completed custody from an intent whose move never happened.
+            if (! $this->custodyMarkerMatches($moved, $expected)) {
+                $this->write($moved, $expected);
+            }
+            if (! DirectorySyncBridge::sync($attempt, 'moved_dir') || ! $this->filesystem->delete($private)) {
+                return false;
+            }
+        } elseif (! $this->custodyMarkerMatches($moved, $expected)) {
+            // No proof that this generation reached private custody: retain uncertainty.
             return false;
         }
+        // A newly arrived original pathname is independent and is never removed here.
         if (! DirectorySyncBridge::sync($attempt, 'unlink_dir')) {
             return false;
         }
         $this->write($complete, $expected);
 
         return DirectorySyncBridge::sync($attempt, 'complete_dir');
+    }
+
+    /** @param array<string, mixed> $expected */
+    private function custodyMarkerMatches(string $path, array $expected): bool
+    {
+        return ! is_link($path) && is_file($path)
+            && json_decode($this->filesystem->get($path), true) === $expected;
     }
 
     /** @param array<string, mixed> $receipt */

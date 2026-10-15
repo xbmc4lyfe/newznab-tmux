@@ -141,7 +141,7 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
 
     public static function interruptedCleanupBoundaries(): array
     {
-        return array_combine(['rename_custody', 'rename_parent', 'unlink_dir', 'complete_dir'], array_map(static fn (string $boundary): array => [$boundary], ['rename_custody', 'rename_parent', 'unlink_dir', 'complete_dir']));
+        return array_combine(['rename_custody', 'rename_parent', 'moved_dir', 'unlink_dir', 'complete_dir'], array_map(static fn (string $boundary): array => [$boundary], ['rename_custody', 'rename_parent', 'moved_dir', 'unlink_dir', 'complete_dir']));
     }
 
     #[DataProvider('interruptedCleanupBoundaries')]
@@ -177,6 +177,24 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         self::assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $result['state']);
         self::assertArrayNotHasKey('delete_input_pending', $result);
         self::assertSame($result['accepted_capture']['attempt'], $result['relinquished_attempt']);
+    }
+
+    #[DataProvider('interruptedCleanupBoundaries')]
+    public function test_direct_cleanup_and_paired_nfo_preserve_new_source_generation(string $boundary): void
+    {
+        DirectorySyncBridge::$fail = $boundary;
+        try {
+            [$path, $manifests, $nfos] = $this->directUpload(deleteInput: true);
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        $source = dirname($path).'/incoming.nzb';
+        self::assertFileDoesNotExist($source);
+        file_put_contents($source, 'new independent source');
+        self::assertSame('imported', $nfos->importManifest($path, true)['status']);
+        self::assertSame('new independent source', file_get_contents($source));
+        self::assertArrayNotHasKey('delete_input_pending', $manifests->read($path));
+        self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
     }
 
     public function test_terminal_replay_honors_persisted_companion_deletion_intent(): void

@@ -2,31 +2,31 @@
   "warm": {
     "native": {
       "n": 10,
-      "median_flow_ms": 6.145811999999999,
-      "sample_p99_flow_ms": 9.0535,
-      "median_process_wall_ms": 154.28775000000002
+      "median_flow_ms": 3.7033755,
+      "sample_p99_flow_ms": 4.662459,
+      "median_process_wall_ms": 102.5394795
     },
     "rust": {
       "n": 10,
-      "median_flow_ms": 174.016771,
-      "sample_p99_flow_ms": 234.327916,
-      "median_process_wall_ms": 1238.3820835000001
+      "median_flow_ms": 171.6464585,
+      "sample_p99_flow_ms": 188.367584,
+      "median_process_wall_ms": 1270.4882505
     },
-    "native_over_rust": 0.03531735455544109
+    "native_over_rust": 0.021575600990334443
   },
   "cold": {
     "native": {
       "n": 10,
-      "median_flow_ms": 14.579667,
-      "sample_p99_flow_ms": 20.5625,
-      "median_process_wall_ms": 89.6544165
+      "median_flow_ms": 12.606000000000002,
+      "sample_p99_flow_ms": 14.611375,
+      "median_process_wall_ms": 79.4717085
     },
     "rust": {
       "n": 10,
-      "median_flow_ms": 188.35833350000001,
-      "sample_p99_flow_ms": 208.402708,
-      "median_process_wall_ms": 288.8551665
+      "median_flow_ms": 186.6154785,
+      "sample_p99_flow_ms": 269.005917,
+      "median_process_wall_ms": 267.32068749999996
     },
-    "native_over_rust": 0.07740388614130524
+    "native_over_rust": 0.06755066675779524
   }
 }

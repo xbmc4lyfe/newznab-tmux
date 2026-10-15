@@ -21,7 +21,7 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
 
     public static function boundaries(): array
     {
-        return array_combine(['rename_custody', 'rename_parent', 'unlink_dir', 'complete_dir'], array_map(static fn ($v) => [$v], ['rename_custody', 'rename_parent', 'unlink_dir', 'complete_dir']));
+        return array_combine(['rename_custody', 'rename_parent', 'moved_dir', 'unlink_dir', 'complete_dir'], array_map(static fn ($v) => [$v], ['rename_custody', 'rename_parent', 'moved_dir', 'unlink_dir', 'complete_dir']));
     }
 
     private function upload(bool $companion): array
@@ -44,8 +44,20 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
         return [$source, $dir.'/'.NzbUploadManifestService::FILENAME, $uploads];
     }
 
-    #[DataProvider('boundaries')]
-    public function test_source_only_publication_resumes_after_private_payload_disappears(string $boundary): void
+    public static function sourceBoundaries(): array
+    {
+        $cases = [];
+        foreach (self::boundaries() as $name => [$boundary]) {
+            foreach ([false, true] as $replacement) {
+                $cases[$name.($replacement ? ' replacement' : ' absent')] = [$boundary, $replacement];
+            }
+        }
+
+        return $cases;
+    }
+
+    #[DataProvider('sourceBoundaries')]
+    public function test_source_only_publication_resumes_after_private_payload_disappears(string $boundary, bool $replacement): void
     {
         [$source, $mp, $uploads] = $this->upload(false);
         $this->capturedFixtureImporter('intent-only')->beginImport([$source], delete: true);
@@ -59,7 +71,13 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
         }
         self::assertFileDoesNotExist($source);
         self::assertArrayHasKey('delete_nzb_after_publication', $uploads->read($mp));
+        if ($replacement) {
+            file_put_contents($source, 'replacement generation');
+        }
         $result = $uploads->reconcilePending($mp);
+        if ($replacement) {
+            self::assertSame('replacement generation', file_get_contents($source));
+        }
         self::assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $result['state']);
         self::assertSame(7, $result['release_id']);
         self::assertArrayNotHasKey('delete_nzb_after_publication', $result);
@@ -97,8 +115,40 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
         self::assertSame(NzbUploadManifestService::STATE_NZB_FAILED, $result['state']);
     }
 
-    #[DataProvider('boundaries')]
-    public function test_failed_input_and_companion_resume_from_manifest_without_original_paths(string $boundary): void
+    public function test_intent_without_owned_move_checkpoint_cannot_retire_replacement(): void
+    {
+        [$source, $mp, $uploads] = $this->upload(false);
+        $importer = new class(['Browser' => true]) extends NzbImportService
+        {
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function scanNZBFile(mixed &$nzbXML, mixed $nzbFileName = '', mixed $source = ''): NzbImportStatus
+            {
+                return NzbImportStatus::Failed;
+            }
+        };
+        DirectorySyncBridge::$fail = 'unlink_dir';
+        try {
+            $importer->beginImport([$source], deleteFailed: true);
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        $markers = glob(dirname($source).'/.custody-*/moved.json');
+        self::assertCount(1, $markers);
+        unlink($markers[0]);
+        file_put_contents($source, 'replacement without relocation proof');
+        $result = $uploads->reconcilePending($mp);
+        self::assertArrayHasKey('delete_input_pending', $result);
+        self::assertArrayNotHasKey('relinquished_attempt', $result);
+        self::assertSame('replacement without relocation proof', file_get_contents($source));
+        self::assertSame(['deferred' => true], $uploads->reserveInput($source));
+    }
+
+    #[DataProvider('sourceBoundaries')]
+    public function test_failed_input_and_companion_resume_from_manifest_without_original_paths(string $boundary, bool $replacement): void
     {
         [$source, $mp, $uploads] = $this->upload(true);
         $importer = new class(['Browser' => true]) extends NzbImportService
@@ -125,11 +175,20 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
         self::assertFileDoesNotExist(dirname($source).'/info.nfo');
         self::assertArrayHasKey('delete_input_pending', $uploads->read($mp));
         self::assertArrayHasKey('delete_terminal_nfo', $uploads->read($mp));
+        if ($replacement) {
+            file_put_contents($source, 'replacement NZB');
+            file_put_contents(dirname($source).'/info.nfo', 'replacement NFO');
+        }
         $result = $uploads->reconcilePending($mp);
         self::assertSame(NzbUploadManifestService::STATE_NZB_FAILED, $result['state']);
         self::assertArrayNotHasKey('delete_input_pending', $result);
         self::assertArrayNotHasKey('delete_terminal_nfo', $result);
         self::assertSame($result['outcome_capture']['attempt'], $result['relinquished_attempt']);
         self::assertSame(0, DB::table('releases')->count());
+        if ($replacement) {
+            self::assertSame('replacement NZB', file_get_contents($source));
+            self::assertSame('replacement NFO', file_get_contents(dirname($source).'/info.nfo'));
+            self::assertArrayNotHasKey('deferred', $uploads->reserveInput($source));
+        }
     }
 }
