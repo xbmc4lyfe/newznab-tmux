@@ -140,7 +140,7 @@ jobs:
         run: |
           YENC_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
             php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
-              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines|it_withholds_integrity_for_trailer_only_multipart_declarations|it_accepts_identical_control_fields_in_native_and_fallback_metadata|it_requires_multipart_footer_fields_before_granting_integrity|it_exposes_rar5_file_times_in_native_release_metadata|it_exposes_archived_revision_declarations_without_replacing_stored_names|it_exposes_quick_open_cache_relationships_in_native_release_metadata|it_exposes_empty_rar5_file_copy_checksums_without_hashing_target_contents' \
+              --filter='it_withholds_integrity_when_yenc_occurrence_scanning_is_truncated|it_withholds_native_integrity_for_orphan_control_lines|it_withholds_integrity_for_trailer_only_multipart_declarations|it_accepts_identical_control_fields_in_native_and_fallback_metadata|it_requires_multipart_footer_fields_before_granting_integrity|it_exposes_rar5_file_times_in_native_release_metadata|it_exposes_archived_revision_declarations_without_replacing_stored_names|it_exposes_quick_open_cache_relationships_in_native_release_metadata|it_exposes_empty_rar5_file_copy_checksums_without_hashing_target_contents|it_keeps_iso_primary_descriptor_byte_conflicts_and_sample_provenance' \
               2>&1 | tee benchmark-evidence/build/framing-budget-integration.log
 
       - name: Record build and runtime identities
@@ -161,7 +161,9 @@ jobs:
           kernel_names = {0: 'scalar', 1: 'ssse3', 2: 'avx2', 3: 'avx512-vbmi2', 4: 'neon'}
           if kernel not in kernel_names:
               raise RuntimeError('Unknown Rust runtime payload kernel identity')
+          # These jobs build the current default kernels without opt-in features.
           manifest = {
+              'rust_payload_mode': 'incumbent',
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'runner_image_os': os.environ.get('ImageOS'),
               'runner_image_version': os.environ.get('ImageVersion'),
@@ -446,7 +448,9 @@ jobs:
           library = pathlib.Path('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')
           decoder = ctypes.CDLL(str(library.resolve()))
           decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          # These jobs build the current default kernels without opt-in features.
           manifest = {
+              'rust_payload_mode': 'incumbent',
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'runner_arch': os.environ.get('RUNNER_ARCH'),
               'runner_image_os': os.environ.get('ImageOS'),
@@ -545,19 +549,19 @@ jobs:
         if: always()
         shell: bash
         run: |
-          python3 - <<'PY_SUMMARY'
-          import json, os, pathlib
-          path = pathlib.Path('processing-evidence/paired/observations.jsonl')
-          rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write('## Fingerprint caller screen\n\nBODY and FFI/JSON diagnostics are retained separately. This median screen does not qualify a Rust replacement: the 1.5x common-path and uncommon p99 policy remains the adoption gate.\n\n')
-              summary.write('| Bytes | Density | Decision | Candidate / baseline median | Simultaneous interval | Eligible / invalid |\n|---:|---|---|---:|---|---|\n')
-              for row in rows:
-                  if row.get('type') == 'stratum_summary':
-                      summary.write(f"| {row['size']} | {row['density']} | {row['decision']} | {row.get('median_candidate_over_baseline', 'unavailable')} | {row.get('bootstrap_95_percent_interval', 'unavailable')} | {row['eligible_pairs']} / {row['invalid_pairs']} |\n")
-              final = next((row for row in reversed(rows) if row.get('type') in ('run_summary', 'run_failure')), None)
-              summary.write('\nResult: `' + (final['status'] if final else 'profile only or setup incomplete') + '`. Exact serialized caller metadata and independently expected decoded bytes must match for every pair.\n')
-          PY_SUMMARY
+          utility=docker/app/nzb-yenc-ffi/target/release/nntmux-evidence-utility
+          if [[ -x "$utility" ]]; then
+            "$utility" --mode article-summary
+          elif [[ ! -e processing-evidence/paired/observations.jsonl ]] &&
+               [[ ! -d processing-evidence || -x processing-evidence ]] &&
+               [[ ! -d processing-evidence/paired || -x processing-evidence/paired ]]; then
+            # Keep Markdown backticks literal in the fallback summary.
+            # shellcheck disable=SC2016
+            printf '## Fingerprint caller screen\n\nBODY and FFI/JSON diagnostics are retained separately. This median screen does not qualify a Rust replacement: the 1.5x common-path and uncommon p99 policy remains the adoption gate.\n\n| Bytes | Density | Decision | Candidate / baseline median | Simultaneous interval | Eligible / invalid |\n|---:|---|---|---:|---|---|\n\nResult: `profile only or setup incomplete`. Exact serialized caller metadata and independently expected decoded bytes must match for every pair.\n' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Evidence utility unavailable or paired input cannot be inspected.' >&2
+            exit 1
+          fi
 
       - name: Export compact public benchmark summary
         if: always()
@@ -635,7 +639,9 @@ jobs:
           library = pathlib.Path('docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so')
           decoder = ctypes.CDLL(str(library.resolve()))
           decoder.nntmux_yenc_payload_kernel_v1.restype = ctypes.c_uint32
+          # These jobs build the current default kernels without opt-in features.
           manifest = {
+              'rust_payload_mode': 'incumbent',
               'git_head': run('git', 'rev-parse', 'HEAD'),
               'runner_arch': os.environ.get('RUNNER_ARCH'),
               'runner_image_os': os.environ.get('ImageOS'),

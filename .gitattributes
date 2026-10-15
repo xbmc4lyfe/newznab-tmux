@@ -87,3 +87,10 @@ docker/Makefile		-binary text eol=lf
 /scripts/export-benchmark-summary.py -binary text eol=lf
 /tests/Unit/test_benchmark_pages.py -binary text eol=lf
 /tests/Unit/test_benchmark_summary_export.py -binary text eol=lf
+
+# Documentation tooling and vendored style license remain reviewable.
+/scripts/build-docs.py -binary text eol=lf
+/scripts/check-docs.py -binary text eol=lf
+/tests/Unit/test_docs_links.py -binary text eol=lf
+/tests/Unit/test_docs_site.py -binary text eol=lf
+/github-pages/docs/vale/styles/Google/LICENSE -binary text eol=lf
