@@ -16,8 +16,10 @@ use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedNzbWriter;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
+use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
@@ -26,6 +28,30 @@ use PHPUnit\Framework\Attributes\DataProvider;
 
 class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
 {
+    public function createApplication()
+    {
+        $app = require __DIR__.'/../../bootstrap/app.php';
+        $app->useEnvironmentPath(sys_get_temp_dir());
+        $app->loadEnvironmentFrom('.nntmux-validation-no-env');
+        $app->make(Kernel::class)->bootstrap();
+
+        return $app;
+    }
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Bus::fake();
+        $scratch = sys_get_temp_dir().'/nntmux-publication-'.bin2hex(random_bytes(12));
+        app('files')->ensureDirectoryExists($scratch);
+        $worker = $scratch.'/nntmux-article-fingerprint';
+        copy(__DIR__.'/../Fixtures/article-fingerprint-worker.php', $worker);
+        chmod($worker, 0700);
+        config(['release_verification.storage_path' => $scratch, 'yenc.native_library' => $scratch.'/missing-native-library',
+            'logging.default' => 'single', 'logging.channels.single.path' => $scratch.'/laravel.log',
+            'logging.channels.nzb_creation.path' => $scratch.'/nzb_creation.log']);
+    }
+
     public function test_timing_does_not_log_after_a_failed_commit_leaves_pdo_in_a_transaction(): void
     {
         config(['release_verification.publication_timing_sample_every' => 1]);
@@ -93,6 +119,9 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             'legacy manifest' => [null, 5, null],
             'including reconstructed file' => [12345, 12345, null],
             'trusted unpublished legacy row' => [12345, 12345, 'legacy'],
+            'cohort legacy publication rotates and retires derived rows' => [12345, 12345, 'legacy', null, ['alt.test'], null, true],
+            'cohort covered duplicate preserves epoch and derived rows' => [12345, 12345, 'exact', null, ['alt.test'], null, true],
+            'cohort legacy rollback preserves epoch and derived rows' => [12345, 12345, 'legacy', 'legacy_update', ['alt.test'], null, true],
             'changed legacy publication is not overwritten' => [12345, 12345, 'legacy_changed', 'legacy_changed'],
             'missing legacy row cannot recreate duplicates' => [12345, 12345, 'legacy_missing', 'legacy_missing'],
             'forged result legacy identity cannot publish' => [12345, 12345, 'legacy', 'legacy_forged'],
@@ -122,12 +151,15 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
 
     /** @param list<string> $groupNames */
     #[DataProvider('verifiedSizes')]
-    public function test_successful_download_publishes_exact_verified_nzb_once(?int $verifiedBytes, int $expectedSize, ?string $duplicateKind, ?string $failure = null, array $groupNames = ['alt.test'], ?string $timingMode = null): void
+    public function test_successful_download_publishes_exact_verified_nzb_once(?int $verifiedBytes, int $expectedSize, ?string $duplicateKind, ?string $failure = null, array $groupNames = ['alt.test'], ?string $timingMode = null, bool $packLifecycle = false): void
     {
         config(['nntmux.release_dedupe_enabled' => $duplicateKind !== null, 'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
         app('files')->ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
         Schema::create('releases', function (Blueprint $table): void {
             $table->id();
+            $table->json('additional_pack_evidence')->nullable();
+            $table->string('additional_pp_claim_token')->nullable();
+            $table->timestamp('additional_pp_claimed_at')->nullable();
             foreach (['name', 'searchname', 'guid', 'leftguid', 'fromname', 'postdate', 'adddate'] as $column) {
                 $table->string($column);
             }
@@ -135,6 +167,12 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 $table->integer($column);
             }
         });
+        $derivedTables = ['release_files', 'release_nfos', 'media_infos', 'par_hashes', 'par_file_hashes', 'par_file_hash_inventories', 'par2_hash_retry', 'par2_rename_progress'];
+        foreach ($derivedTables as $table) {
+            Schema::create($table, static function (Blueprint $schema): void {
+                $schema->integer('releases_id')->primary();
+            });
+        }
         Schema::create('release_regexes', function (Blueprint $table): void {
             $table->integer('releases_id');
             $table->integer('collection_regex_id');
@@ -240,6 +278,15 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         }
         if ($duplicateKind === 'unpublished_exact') {
             DB::table('releases')->where('id', 777)->update(['nzbstatus' => NzbService::NZB_NONE]);
+        }
+        $packBefore = null;
+        if ($packLifecycle) {
+            $packBefore = json_encode(['v' => 1, 'identity_sha256' => hash('sha256', json_encode(['777', $duplicateGuid], JSON_THROW_ON_ERROR)),
+                'epoch' => str_repeat('a', 64), 'state' => 'confirmed'], JSON_THROW_ON_ERROR);
+            DB::table('releases')->where('id', 777)->update(['additional_pack_evidence' => $packBefore]);
+            foreach ($derivedTables as $table) {
+                DB::table($table)->insert(['releases_id' => 777]);
+            }
         }
         $path = $store->write($manifest);
         DB::table('release_verification_candidates')->insert(['identity' => sha1('publish'), 'groups_id' => 1,
@@ -360,6 +407,12 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 $this->assertSame($failure === 'legacy_missing' ? 0 : 1, DB::table('releases')->count());
                 if ($failure === 'legacy_update') {
                     $this->assertSame(NzbService::NZB_NONE, (int) DB::table('releases')->value('nzbstatus'));
+                    if ($packLifecycle) {
+                        self::assertSame($packBefore, DB::table('releases')->value('additional_pack_evidence'));
+                        foreach ($derivedTables as $table) {
+                            self::assertSame(1, DB::table($table)->where('releases_id', 777)->count(), $table);
+                        }
+                    }
                 }
 
                 return;
@@ -388,6 +441,19 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $this->assertSame($duplicateGuid, DB::table('releases')->where('id', 777)->value('guid'));
         } elseif ($duplicateKind !== null) {
             $this->assertNotSame(777, $id);
+        }
+        if ($packLifecycle) {
+            $packAfter = DB::table('releases')->where('id', 777)->value('additional_pack_evidence');
+            if ($duplicateKind === 'exact') {
+                self::assertSame($packBefore, $packAfter);
+            } else {
+                $decoded = json_decode((string) $packAfter, true, flags: JSON_THROW_ON_ERROR);
+                self::assertNull($decoded['state']);
+                self::assertNotSame(str_repeat('a', 64), $decoded['epoch']);
+            }
+            foreach ($derivedTables as $table) {
+                self::assertSame($duplicateKind === 'exact' ? 1 : 0, DB::table($table)->where('releases_id', 777)->count(), $table);
+            }
         }
         if ($duplicateKind === 'unpublished_exact') {
             $this->assertSame(NzbService::NZB_NONE, (int) DB::table('releases')->where('id', 777)->value('nzbstatus'));

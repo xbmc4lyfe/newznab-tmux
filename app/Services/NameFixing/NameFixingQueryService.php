@@ -122,7 +122,7 @@ final class NameFixingQueryService
         $bindings[] = max(1, $limit);
 
         return $this->database->select(
-            "SELECT r.id AS releases_id, r.id, r.name, r.searchname, r.fromname, r.groups_id,
+            "SELECT r.id AS releases_id, r.id, r.name, r.searchname, r.additional_pack_evidence, r.fromname, r.groups_id,
                     r.categories_id, r.size AS relsize, r.guid, r.predb_id, r.nfostatus,
                     r.proc_nfo, r.proc_files, r.proc_par2, r.proc_uid, r.proc_srr,
                     r.proc_hash16k, r.proc_crc32, r.isrenamed
@@ -166,7 +166,7 @@ final class NameFixingQueryService
         $bindings[] = max(1, $limit);
 
         return $this->database->select(
-            'SELECT r.id AS releases_id, r.id, r.name, r.searchname, r.fromname, r.guid,
+            'SELECT r.id AS releases_id, r.id, r.name, r.searchname, r.additional_pack_evidence, r.fromname, r.guid,
                     r.groups_id, r.categories_id, r.size AS relsize, r.predb_id, r.nfostatus,
                     r.proc_nfo, r.proc_uid, r.proc_files, r.proc_par2, r.proc_hash16k,
                     r.proc_srr, r.proc_crc32, r.isrenamed
@@ -216,9 +216,9 @@ final class NameFixingQueryService
     {
         $filter = match ($source) {
             self::SOURCE_FILES => '',
-            self::SOURCE_SRR => " AND (rf.name LIKE '%.srr' OR rf.name LIKE '%.srs')",
+            self::SOURCE_SRR => " AND (rf.name LIKE '%%.srr' OR rf.name LIKE '%%.srs')",
             self::SOURCE_CRC => " AND rf.crc32 IS NOT NULL AND rf.crc32 != ''",
-            self::SOURCE_XXX => " AND rf.name LIKE '%SDPORN%'",
+            self::SOURCE_XXX => " AND rf.name LIKE '%%SDPORN%%'",
             default => throw new InvalidArgumentException("Unsupported release-file source [{$source}]."),
         };
 
@@ -580,7 +580,7 @@ final class NameFixingQueryService
         $like = '%'.$this->escapeLike($title).'%';
 
         return $this->database->select(
-            'SELECT r.id AS releases_id, r.guid, r.name, r.fromname, r.searchname,
+            'SELECT r.id AS releases_id, r.guid, r.name, r.fromname, r.searchname, r.additional_pack_evidence,
                     r.groups_id, r.categories_id
              FROM releases r
              WHERE r.id IN ('.$this->placeholders(count($candidateIds)).')
@@ -657,7 +657,7 @@ final class NameFixingQueryService
         $direction = $descending ? 'DESC' : 'ASC';
 
         return $this->database->select(
-            'SELECT r.id AS releases_id, r.guid, r.name, r.searchname, r.fromname,
+            'SELECT r.id AS releases_id, r.guid, r.name, r.searchname, r.additional_pack_evidence, r.fromname,
                     r.groups_id, r.categories_id
              FROM releases r
              WHERE r.predb_id = 0

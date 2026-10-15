@@ -14,6 +14,33 @@ class AdditionalWorkPlannerTest extends TestCase
     use CreatesProcessingConfiguration;
 
     #[Test]
+    public function it_uses_one_set_identity_for_numbered_subjects_without_merging_distinct_names_or_families(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+        foreach ([true, false] as $quoted) {
+            $quote = $quoted ? '"' : '';
+            $plan = $planner->plan([
+                ['title' => $quote.'opaque.001'.$quote.' yEnc (1/50)', 'segments' => ['<a-first>']],
+                ['title' => $quote.'opaque.010'.$quote.' yEnc (1/50)', 'segments' => ['<a-last>']],
+                ['title' => $quote.'other.001'.$quote.' yEnc (1/50)', 'segments' => ['<b-first>']],
+                ['title' => $quote.'other.010'.$quote.' yEnc (1/50)', 'segments' => ['<b-last>']],
+                ['title' => 'opaque.part01.rar yEnc (1/50)', 'segments' => ['<rar>']],
+                ['title' => 'opaque.7z.001 yEnc (1/50)', 'segments' => ['<7z>']],
+            ], 'alt.binaries.test');
+            $keys = [];
+            foreach ($plan->archiveCandidates as $candidate) {
+                $keys[$candidate->messageIds[0]] = $plan->setKeyOf($candidate);
+            }
+            self::assertSame($keys['<a-first>'], $keys['<a-last>']);
+            self::assertSame($keys['<b-first>'], $keys['<b-last>']);
+            self::assertNotSame($keys['<a-first>'], $keys['<b-first>']);
+            self::assertNotSame($keys['<a-first>'], $keys['<rar>']);
+            self::assertNotSame($keys['<a-first>'], $keys['<7z>']);
+            self::assertSame(3, $plan->archiveSetCount());
+        }
+    }
+
+    #[Test]
     public function it_builds_one_ordered_plan_for_direct_and_archive_candidates(): void
     {
         $planner = new AdditionalWorkPlanner($this->makeConfig([

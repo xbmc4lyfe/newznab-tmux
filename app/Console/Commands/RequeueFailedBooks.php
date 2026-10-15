@@ -9,6 +9,8 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Services\BookProcessingCandidateQuery;
 use App\Services\NameFixing\Extractors\ObfuscatedSubjectExtractor;
+use App\Services\NameFixing\ReleaseUpdateService;
+use App\Support\ReleasePackEvidence;
 use Illuminate\Console\Command;
 
 class RequeueFailedBooks extends Command
@@ -29,7 +31,7 @@ class RequeueFailedBooks extends Command
         $normalizeObfuscatedAll = (bool) $this->option('normalize-obfuscated-all');
 
         $query = Release::query()
-            ->select(['id', 'name', 'searchname', 'categories_id', 'bookinfo_id'])
+            ->select(['id', 'guid', 'name', 'searchname', 'categories_id', 'bookinfo_id', ReleasePackEvidence::COLUMN])
             ->where(function ($builder): void {
                 $builder->whereBetween('categories_id', [Category::BOOKS_ROOT, Category::BOOKS_UNKNOWN])
                     ->orWhere('categories_id', Category::MUSIC_AUDIOBOOK);
@@ -119,7 +121,11 @@ class RequeueFailedBooks extends Command
                 continue;
             }
 
-            Release::query()->where('id', $release->id)->update($updates);
+            if (! app(ReleaseUpdateService::class)->updateAutomaticSnapshot($release, $updates)) {
+                $skipped++;
+
+                continue;
+            }
             Search::updateRelease((int) $release->id);
 
             $queued++;

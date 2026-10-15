@@ -9,6 +9,7 @@ use App\Services\AdditionalProcessing\DTO\AdditionalWorkPlan;
 use App\Services\AdditionalProcessing\DTO\ArchivedMediaEntry;
 use App\Services\AdditionalProcessing\DTO\DownloadedArchive;
 use App\Services\AdditionalProcessing\DTO\MediaSourcePlan;
+use App\Support\ReleasePackEvidence;
 
 /**
  * Mutable context object that holds the processing state for a single release.
@@ -29,6 +30,13 @@ class ReleaseProcessingContext
 
     // The release being processed
     public Release $release;
+
+    /** @var array{present: bool, id: int, guid: string, name: mixed, searchname: mixed, value: mixed} */
+    public array $packEvidenceObservation;
+
+    public ?string $loadedPackState = null;
+
+    public bool $packEvidenceInvalid = false;
 
     // Processing state flags
     public bool $foundVideo = false;
@@ -86,6 +94,10 @@ class ReleaseProcessingContext
 
     /** @var array<string, true> Distinct successfully listed sets across forward and reverse walks. */
     public array $listedArchiveSets = [];
+
+    public int $archiveListingsRead = 0;
+
+    public bool $archiveFileNamesTruncated = false;
 
     /**
      * @var list<array<string, mixed>>
@@ -213,6 +225,14 @@ class ReleaseProcessingContext
     public function __construct(Release $release)
     {
         $this->release = $release;
+        $this->packEvidenceObservation = ReleasePackEvidence::observe($release);
+        if ($this->packEvidenceObservation['present']) {
+            $evidence = ReleasePackEvidence::decode($release);
+            $this->loadedPackState = $evidence['kind'] === 'current' ? $evidence['state'] : null;
+            $this->packEvidenceInvalid = $evidence['kind'] === 'invalid';
+            $this->seasonPack = $this->loadedPackState === 'confirmed';
+            $this->seasonPackProbable = $this->loadedPackState === 'probable';
+        }
         $attributes = $release->getAttributes();
         $this->producerNamingClaim = array_key_exists('additional_pp_claim_token', $attributes)
             && array_key_exists('additional_pp_claimed_at', $attributes)
@@ -258,6 +278,8 @@ class ReleaseProcessingContext
         $this->currentPar2EvidenceSnapshot = [...$proof['after'], 'additional_pp_claim_token' => $this->par2EvidenceSnapshot['additional_pp_claim_token']];
         $this->release->name = $proof['after']['name'];
         $this->release->searchname = $proof['after']['searchname'];
+        $this->packEvidenceObservation['name'] = $proof['after']['name'];
+        $this->packEvidenceObservation['searchname'] = $proof['after']['searchname'];
 
         return true;
     }
@@ -329,10 +351,12 @@ class ReleaseProcessingContext
         $this->archiveSetWalkComplete = false;
         $this->archiveSampleIncomplete = false;
         $this->listedArchiveSets = [];
+        $this->archiveListingsRead = 0;
+        $this->archiveFileNamesTruncated = false;
         $this->groupUnavailable = false;
         $this->workPlan = null;
-        $this->seasonPack = false;
-        $this->seasonPackProbable = false;
+        $this->seasonPack = $this->loadedPackState === 'confirmed';
+        $this->seasonPackProbable = $this->loadedPackState === 'probable';
         $this->archiveFileNames = [];
         $this->firstArchiveFiles = null;
         $this->reverseArchiveSummary = null;
@@ -373,7 +397,12 @@ class ReleaseProcessingContext
     {
         foreach ($files as $file) {
             $name = (string) ($file['name'] ?? '');
-            if ($name === '' || count($this->archiveFileNames) >= self::MAX_ARCHIVE_FILE_NAMES || in_array($name, $this->archiveFileNames, true)) {
+            if ($name === '' || in_array($name, $this->archiveFileNames, true)) {
+                continue;
+            }
+            if (count($this->archiveFileNames) >= self::MAX_ARCHIVE_FILE_NAMES) {
+                $this->archiveFileNamesTruncated = true;
+
                 continue;
             }
             $this->archiveFileNames[] = $name;
@@ -386,7 +415,7 @@ class ReleaseProcessingContext
      */
     public function defersArchiveNameChecks(): bool
     {
-        return $this->seasonPack || $this->seasonPackProbable;
+        return $this->seasonPack || $this->seasonPackProbable || $this->archiveFileNamesTruncated || $this->packEvidenceInvalid;
     }
 
     /**

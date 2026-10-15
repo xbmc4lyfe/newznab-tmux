@@ -408,7 +408,7 @@ final readonly class AdditionalWorkPlanner
      */
     private function archiveSetKey(string $title): string
     {
-        $volume = $this->rarVolume($title) ?? $this->sevenZipVolume($title);
+        $volume = $this->rarVolume($title) ?? $this->sevenZipVolume($title) ?? $this->numberedVolume($title);
         if ($volume !== null) {
             return $volume[0];
         }

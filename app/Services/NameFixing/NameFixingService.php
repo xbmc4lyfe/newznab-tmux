@@ -11,8 +11,10 @@ use App\Services\NameFixing\Extractors\FileNameExtractor;
 use App\Services\NameFixing\Extractors\NfoNameExtractor;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
+use App\Services\Nzb\NzbService;
 use App\Support\Par2FileHashEvidence;
 use App\Support\PredbSearchDocument;
+use App\Support\ReleasePackEvidence;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Database\Query\Builder;
@@ -219,7 +221,7 @@ class NameFixingService
                 }
 
                 if (! $this->updateService->matched) {
-                    $this->markProcessed($echo, $nameStatus, 'proc_srr', (int) $release->releases_id);
+                    $this->markProcessed($echo, $nameStatus, 'proc_srr', $release);
                 }
 
                 $this->echoRenamed($show);
@@ -270,7 +272,7 @@ class NameFixingService
                 }
 
                 if (! $this->updateService->matched) {
-                    $this->markProcessed($echo, $nameStatus, 'proc_crc32', (int) $release->releases_id);
+                    $this->markProcessed($echo, $nameStatus, 'proc_crc32', $release);
                 }
 
                 $this->echoRenamed($show);
@@ -311,7 +313,7 @@ class NameFixingService
                 }
 
                 if (! $this->updateService->matched) {
-                    $this->markProcessed($echo, $nameStatus, 'proc_uid', (int) $release->releases_id);
+                    $this->markProcessed($echo, $nameStatus, 'proc_uid', $release);
                 }
 
                 $this->echoRenamed($show);
@@ -678,7 +680,7 @@ class NameFixingService
                 }
             }
             $after = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
-            if ($this->par2HashSnapshotMatches($after, $release)
+            if (! $this->updateService->namingDeferred() && $this->par2HashSnapshotMatches($after, $release)
                 && ! DB::table('par_file_hashes')->where('releases_id', $releaseId)->exists()) {
                 if ($echo && $nameStatus) {
                     $this->par2HashSnapshotQuery($release)->whereNotExists(function (Builder $query): void {
@@ -693,7 +695,9 @@ class NameFixingService
 
     private function par2HashSnapshotMatches(?object $current, object $release): bool
     {
-        return $current !== null && $current->guid === $release->guid && $current->name === $release->name
+        return $current !== null && (int) $current->nzbstatus === NzbService::NZB_ADDED
+            && ReleasePackEvidence::matches($current, ReleasePackEvidence::observe($release))
+            && $current->guid === $release->guid && $current->name === $release->name
             && $current->searchname === $release->searchname && (int) $current->predb_id === 0
             && (int) $current->isrenamed === (int) ($release->isrenamed ?? 0);
     }
@@ -711,7 +715,15 @@ class NameFixingService
             }
         }
 
-        return $query;
+        $current = DB::table('releases')->where('id', (int) $release->releases_id)->lockForUpdate()->first();
+        if (! $this->par2HashSnapshotMatches($current, $release)) {
+            return $query->whereRaw('1 = 0');
+        }
+        $value = ReleasePackEvidence::observe($current)['value'];
+        $query->where('nzbstatus', NzbService::NZB_ADDED);
+
+        return $value === null ? $query->whereNull(ReleasePackEvidence::COLUMN)
+            : $query->whereRaw('HEX('.ReleasePackEvidence::COLUMN.') = ?', [strtoupper(bin2hex(is_string($value) ? $value : json_encode($value, JSON_THROW_ON_ERROR)))]);
     }
 
     private function deferPar2HashCandidate(object $release, string $generation, bool $exists): void
@@ -831,7 +843,7 @@ class NameFixingService
                 }
             }
         }
-        if (! $this->updateService->matched && $markProcessed && $echo && $nameStatus) {
+        if (! $this->updateService->matched && ! $this->updateService->namingDeferred() && $markProcessed && $echo && $nameStatus) {
             $this->updateService->updateSnapshotColumn($entry, 'proc_nfo', self::PROC_NFO_DONE);
         }
 
@@ -902,7 +914,7 @@ class NameFixingService
     /** @param list<string> $filenames */
     private function completeFilenamePass(object $release, array $filenames, bool $echo, bool $nameStatus): void
     {
-        if (! $echo || ! $nameStatus) {
+        if (! $echo || ! $nameStatus || $this->updateService->namingDeferred()) {
             return;
         }
         $release = clone $release;
@@ -931,10 +943,10 @@ class NameFixingService
         }, 3);
     }
 
-    protected function markProcessed(bool $echo, bool $nameStatus, string $column, int $releaseId): void
+    protected function markProcessed(bool $echo, bool $nameStatus, string $column, object $release): void
     {
-        if ($echo && $nameStatus) {
-            $this->updateService->updateSingleColumn($column, 1, $releaseId);
+        if ($echo && $nameStatus && ! $this->updateService->namingDeferred()) {
+            $this->updateService->updateSnapshotColumn($release, $column, 1);
         }
     }
 
@@ -1071,8 +1083,8 @@ class NameFixingService
                     }
                 }
 
-                if (! $this->updateService->matched) {
-                    $this->updateService->updateSingleColumn('proc_uid', self::PROC_UID_DONE, $releaseId);
+                if (! $this->updateService->matched && ! $this->updateService->namingDeferred()) {
+                    $this->updateService->updateSnapshotColumn($release, 'proc_uid', self::PROC_UID_DONE);
                 }
             }
 
@@ -1102,8 +1114,8 @@ class NameFixingService
                     }
                 }
 
-                if (! $this->updateService->matched) {
-                    $this->updateService->updateSingleColumn('proc_crc32', self::PROC_CRC_DONE, $releaseId);
+                if (! $this->updateService->matched && ! $this->updateService->namingDeferred()) {
+                    $this->updateService->updateSnapshotColumn($release, 'proc_crc32', self::PROC_CRC_DONE);
                 }
             }
 
@@ -1121,8 +1133,8 @@ class NameFixingService
                     }
                 }
 
-                if (! $this->updateService->matched) {
-                    $this->updateService->updateSingleColumn('proc_srr', self::PROC_SRR_DONE, $releaseId);
+                if (! $this->updateService->matched && ! $this->updateService->namingDeferred()) {
+                    $this->updateService->updateSnapshotColumn($release, 'proc_srr', self::PROC_SRR_DONE);
                 }
             }
 
@@ -1163,7 +1175,7 @@ class NameFixingService
                 if ($result === true || $result === Par2RenameOutcome::Renamed) {
                     $this->updateService->fixed++;
                 } elseif ($result === false || $result === Par2RenameOutcome::NoMatch) {
-                    $this->updateService->updateSingleColumn('proc_par2', self::PROC_PAR2_DONE, $releaseId);
+                    $this->updateService->updateSnapshotColumn($release, 'proc_par2', self::PROC_PAR2_DONE);
                 }
             }
         }
@@ -1278,6 +1290,14 @@ class NameFixingService
                 continue;
             }
 
+            if ($this->updateService->namingRejection === 'confirmed') {
+                continue;
+            }
+            if ($this->updateService->namingDeferred()) {
+                $retry = true;
+
+                continue;
+            }
             $current = DB::table('releases')->useWritePdo()
                 ->where('id', (int) $release->releases_id)
                 ->first(['predb_id', 'name', 'searchname']);
@@ -1635,7 +1655,7 @@ class NameFixingService
                 }
 
                 if (! $this->updateService->matched) {
-                    $this->markProcessed($echo, $nameStatus, 'proc_uid', (int) $release->releases_id);
+                    $this->markProcessed($echo, $nameStatus, 'proc_uid', $release);
                 }
 
                 $this->echoRenamed($show);
@@ -1768,11 +1788,11 @@ class NameFixingService
         }
 
         // Update processing flags if not matched
-        if ($echo && $nameStatus && $markProcessed && ! $this->updateService->matched) {
+        if ($echo && $nameStatus && $markProcessed && ! $this->updateService->matched && ! $this->updateService->namingDeferred()) {
             if ($type === 'Filenames, ') {
                 $this->completeFilenamePass($release, [(string) $identityText], $echo, $nameStatus);
             } else {
-                $this->updateProcessingFlags($type, $release->releases_id);
+                $this->updateProcessingFlags($type, $release);
             }
         }
 
@@ -1782,28 +1802,15 @@ class NameFixingService
     /**
      * Update processing flags based on type.
      */
-    protected function updateProcessingFlags(string $type, int $releaseId): void
+    protected function updateProcessingFlags(string $type, object $release): void
     {
-        switch ($type) {
-            case 'NFO, ':
-                $this->updateService->updateSingleColumn('proc_nfo', self::PROC_NFO_DONE, $releaseId);
-                break;
-            case 'PAR2, ':
-                $this->updateService->updateSingleColumn('proc_par2', self::PROC_PAR2_DONE, $releaseId);
-                break;
-            case 'PAR2 hash, ':
-                $this->updateService->updateSingleColumn('proc_hash16k', self::PROC_HASH16K_DONE, $releaseId);
-                break;
-            case 'SRR, ':
-                $this->updateService->updateSingleColumn('proc_srr', self::PROC_SRR_DONE, $releaseId);
-                break;
-            case 'UID, ':
-            case 'Mediainfo, ':
-                $this->updateService->updateSingleColumn('proc_uid', self::PROC_UID_DONE, $releaseId);
-                break;
-            case 'CRC32, ':
-                $this->updateService->updateSingleColumn('proc_crc32', self::PROC_CRC_DONE, $releaseId);
-                break;
+        $column = match ($type) {
+            'NFO, ' => 'proc_nfo', 'PAR2, ' => 'proc_par2', 'PAR2 hash, ' => 'proc_hash16k',
+            'SRR, ' => 'proc_srr', 'UID, ', 'Mediainfo, ' => 'proc_uid', 'CRC32, ' => 'proc_crc32',
+            default => null,
+        };
+        if ($column !== null && ! $this->updateService->namingDeferred()) {
+            $this->updateService->updateSnapshotColumn($release, $column, 1);
         }
     }
 

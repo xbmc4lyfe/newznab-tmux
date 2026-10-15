@@ -8,6 +8,7 @@ use App\Enums\Par2RenameOutcome;
 use App\Facades\Search;
 use App\Models\Release;
 use App\Services\NameFixing\NameFixingService;
+use App\Services\NfoService;
 use App\Services\NNTP\BoundedArticleResult;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
@@ -17,6 +18,7 @@ use App\Services\Par2Processor;
 use App\Services\PostProcessService;
 use App\Support\Par2RenameProgress;
 use dariusiii\rarinfo\Par2Info;
+use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
@@ -33,6 +35,15 @@ final class Par2PersistenceGuardTest extends TestCase
     use Par2RenameTestDatabase;
 
     private const TITLE = 'Valid.Scene.Release.2026-GROUP';
+
+    public function createApplication()
+    {
+        $app = require __DIR__.'/../../bootstrap/app.php';
+        $app->useEnvironmentPath(sys_get_temp_dir())->loadEnvironmentFrom('.nntmux-validation-no-env');
+        $app->make(Kernel::class)->bootstrap();
+
+        return $app;
+    }
 
     protected function setUp(): void
     {
@@ -383,6 +394,7 @@ final class Par2PersistenceGuardTest extends TestCase
             public function __construct(private SimpleXMLElement $xml, NNTPService $nntp, PostProcessService $post)
             {
                 $this->nntp = $nntp;
+                $this->nfo = new NfoService;
                 $this->postProcessService = $post;
                 $this->parserService = new NzbParserService;
             }

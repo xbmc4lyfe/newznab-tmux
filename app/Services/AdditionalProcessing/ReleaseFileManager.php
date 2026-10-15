@@ -25,6 +25,7 @@ use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Support\Par2FileHashEvidence;
 use App\Support\PredbSearchDocument;
+use App\Support\ReleasePackEvidence;
 use dariusiii\rarinfo\Par2Info;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Database\Eloquent\Builder;
@@ -126,11 +127,6 @@ class ReleaseFileManager
         // Increment total file info count
         $context->totalFileInfo++;
 
-        // Don't add too many files
-        if ($context->addedFileInfo >= $this->releaseFileLimit($context)) {
-            return false;
-        }
-
         $queued = $this->queueReleaseFile(
             $context,
             $context->release->id,
@@ -187,6 +183,9 @@ class ReleaseFileManager
             }
         }
         $entry = clone $context->release;
+        if ($context->packEvidenceObservation['present']) {
+            $entry->setAttribute('observed_pack_evidence', $context->packEvidenceObservation);
+        }
         $entry->releases_id = $entry->id;
         if ($context->producerNamingClaim !== null) {
             $entry->setAttribute('observed_additional_pp_claim', $context->producerNamingClaim);
@@ -317,7 +316,7 @@ class ReleaseFileManager
         $pendingReleaseFiles = array_values($context->pendingReleaseFiles);
         $pendingParHashes = array_values($context->pendingParHashes);
         $pendingFullParHashes = array_values($context->pendingFullParHashes);
-        $requiresSnapshotGuard = $pendingReleaseFiles !== [] || $pendingFullParHashes !== [] || $context->audioMetadataCommitted || $context->producerNamingAttempted;
+        $requiresSnapshotGuard = $pendingReleaseFiles !== [] || $pendingFullParHashes !== [] || $context->audioMetadataCommitted || $context->producerNamingAttempted || $context->producerNamingClaim !== null || $context->packEvidenceObservation['present'];
 
         try {
             $insertedReleaseFiles = DB::transaction(function () use (
@@ -330,6 +329,12 @@ class ReleaseFileManager
                 $processPasswords,
                 $passwordStatus,
             ): ?int {
+                $current = DB::table('releases')->where('id', $context->release->id)->lockForUpdate()->first();
+                if ($current === null || (int) $current->nzbstatus !== NzbService::NZB_ADDED
+                    || ! ReleasePackEvidence::matches($current, $context->packEvidenceObservation)
+                    || ! ReleasePackEvidence::ownsClaim($current, $context->producerNamingClaim)) {
+                    return null;
+                }
                 if ($requiresSnapshotGuard) {
                     if (! $this->ownsFullPar2Evidence($context)) {
                         return null;
@@ -346,6 +351,33 @@ class ReleaseFileManager
                         throw new \RuntimeException('Additional-processing evidence ownership changed inside finalization.');
                     }
                 }
+                $current = DB::table('releases')->where('id', $context->release->id)->lockForUpdate()->first();
+                if ($current === null || (int) $current->nzbstatus !== NzbService::NZB_ADDED
+                    || ! ReleasePackEvidence::matches($current, $context->packEvidenceObservation)
+                    || ! ReleasePackEvidence::ownsClaim($current, $context->producerNamingClaim)) {
+                    throw new \RuntimeException('Additional-processing admission changed after evidence persistence.');
+                }
+                $intent = match (true) {
+                    $context->seasonPack => 'confirmed',
+                    $context->seasonPackProbable || $context->archiveFileNamesTruncated => 'probable',
+                    $context->archiveSetWalkComplete && ! $context->archiveFileNamesTruncated => 'clear-probable',
+                    default => 'retain',
+                };
+                $packEvidence = ReleasePackEvidence::merge($current, $context->packEvidenceObservation, $intent);
+                $updateRows[ReleasePackEvidence::COLUMN] = $packEvidence;
+                DB::afterCommit(static function () use ($context, $packEvidence): void {
+                    $context->release->setAttribute(ReleasePackEvidence::COLUMN, $packEvidence);
+                    $context->packEvidenceObservation = ReleasePackEvidence::observe($context->release);
+                    $evidence = ReleasePackEvidence::decode($context->release);
+                    $context->loadedPackState = $evidence['kind'] === 'current' ? $evidence['state'] : null;
+                });
+
+                $currentFileCount = ReleaseFile::whereReleasesId($context->release->id)->count();
+                $alreadyPersisted = $pendingReleaseFiles === [] ? [] : ReleaseFile::whereReleasesId($context->release->id)
+                    ->whereIn('name', array_column($pendingReleaseFiles, 'name'))->pluck('name')->all();
+                $pendingReleaseFiles = array_values(array_filter($pendingReleaseFiles,
+                    static fn (array $file): bool => ! in_array($file['name'], $alreadyPersisted, true)));
+                $pendingReleaseFiles = array_slice($pendingReleaseFiles, 0, max(0, $this->releaseFileLimit($context) - $currentFileCount));
                 $inserted = $pendingReleaseFiles === []
                     ? 0
                     : ReleaseFile::query()->insertOrIgnore($pendingReleaseFiles);
@@ -369,8 +401,8 @@ class ReleaseFileManager
                     // No file list could be read, often because volumes were still missing.
                     // Queue the release once more after a delay; a second failure stays unknown.
                     // Only retry when inspection ran and a later attempt could still read the list.
-                    $retried = $updateRows['haspreview'] === 0
-                        && $context->archiveInspectionAttempted
+                    $updateRows['rarinnerfilecount'] = $releaseFilesCount;
+                    $retried = $context->archiveInspectionAttempted
                         && (! $context->archiveListingUndecodable || $context->archiveRetryable)
                         && $this->commitFullPar2FinalizationUpdate(
                             $context,
@@ -543,42 +575,29 @@ class ReleaseFileManager
 
         // Only get new name if category is OTHER
         $foundName = true;
-        if ((int) $releaseInfo->proc_pp === 0 && $this->config->renamePar2
+        if (! $context->defersArchiveNameChecks() && (int) $releaseInfo->proc_pp === 0 && $this->config->renamePar2
             && in_array((int) $context->release->categories_id, Category::OTHERS_GROUP, false)
         ) {
             $foundName = false;
         }
 
         $this->queueFullPar2Evidence($fileLocation, $context, $par2Info);
-        $filesAdded = 0;
-        $fileLimit = $this->releaseFileLimit($context);
-
         foreach ((new Par2FileList)->getFiles($par2Info) as $file) {
             if (! isset($file['name'])) {
                 continue;
             }
 
-            if ($foundName && $filesAdded >= $fileLimit) {
-                break;
-            }
-
-            // Add to release files
+            // File admission shares the persisted+queued budget; hash evidence is independent.
             if ($this->config->addPAR2Files) {
-                if ($filesAdded < $fileLimit) {
-                    if ($this->queueReleaseFile(
-                        $context,
-                        $context->release->id,
-                        $file['name'],
-                        $file['size'] ?? 0,
-                        $postDate,
-                        0,
-                        $file['hash_16K'] ?? ''
-                    )) {
-                        $filesAdded++;
-                    }
-                }
-            } else {
-                $filesAdded++;
+                $this->queueReleaseFile(
+                    $context,
+                    $context->release->id,
+                    $file['name'],
+                    $file['size'] ?? 0,
+                    $postDate,
+                    0,
+                    $file['hash_16K'] ?? ''
+                );
             }
 
             // Try to get a new name
@@ -659,7 +678,9 @@ class ReleaseFileManager
             } elseif ($value instanceof \DateTimeInterface) {
                 $value = $value->format('Y-m-d H:i:s');
             }
-            if ($current === null || $actual !== $value) {
+            $same = $column === ReleasePackEvidence::COLUMN
+                ? ReleasePackEvidence::sameStoredValue($actual, $value) : $actual === $value;
+            if ($current === null || ! $same) {
                 throw new \RuntimeException('Additional-processing evidence ownership or terminal state changed during final status update.');
             }
         }
@@ -679,7 +700,8 @@ class ReleaseFileManager
             return false;
         }
         $current = DB::table('releases')->where('id', $snapshot['id'])->lockForUpdate()->first();
-        if ($current === null) {
+        if ($current === null || (int) $current->nzbstatus !== NzbService::NZB_ADDED
+            || ! ReleasePackEvidence::matches($current, $context->packEvidenceObservation)) {
             return false;
         }
         foreach ($snapshot as $column => $value) {
@@ -691,23 +713,10 @@ class ReleaseFileManager
                 return false;
             }
         }
-        $token = $snapshot['additional_pp_claim_token'];
-        $claimedAt = $current->additional_pp_claimed_at ?? null;
-        if ($context->producerNamingAttempted && $context->producerNamingClaim !== null
-            && $claimedAt !== $context->producerNamingClaim['claimed_at']) {
-            return false;
-        }
-        if ($token === null || $token === '') {
-            return $claimedAt === null;
-        }
 
-        if (! is_string($claimedAt)) {
-            return false;
-        }
-        $parsed = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $claimedAt);
-
-        return $parsed !== false && $parsed->format('Y-m-d H:i:s') === $claimedAt
-            && $claimedAt >= AdditionalCandidateQuery::claimStaleBefore()->toDateTimeString();
+        return ReleasePackEvidence::ownsClaim($current, $context->producerNamingClaim ?? [
+            'token' => $snapshot['additional_pp_claim_token'], 'claimed_at' => null,
+        ]);
     }
 
     private function queueFullPar2Evidence(string $fileLocation, ReleaseProcessingContext $context, Par2Info $par2Info): void
@@ -784,7 +793,7 @@ class ReleaseFileManager
             $data = $this->normalizeNfoEncoding($data);
 
             if ($this->nfo->isNFO($data, $context->release->guid)
-                && $this->nfo->addAlternateNfo($data, $context->release, $nntp)
+                && $this->nfo->addAlternateNfo($data, $context->release, $nntp, $context->packEvidenceObservation, $context->producerNamingClaim)
             ) {
                 $context->releaseHasNoNFO = false;
 
@@ -1070,6 +1079,10 @@ class ReleaseFileManager
             return false;
         }
 
+        if (count($context->existingReleaseFileNames) >= $this->releaseFileLimit($context)) {
+            return false;
+        }
+
         $context->pendingReleaseFiles[$name] = [
             'releases_id' => (int) $releaseId,
             'name' => $name,
@@ -1093,6 +1106,7 @@ class ReleaseFileManager
 
         $existingNames = ReleaseFile::query()
             ->where('releases_id', $context->release->id)
+            ->limit(max(self::DEFAULT_RELEASE_FILE_LIMIT, $this->config->seasonPackMaxReleaseFiles))
             ->pluck('name')
             ->all();
 

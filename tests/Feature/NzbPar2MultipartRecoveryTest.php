@@ -15,6 +15,7 @@ use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
+use App\Services\NfoService;
 use App\Services\NNTP\BoundedArticleResult;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
@@ -463,7 +464,7 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
         $reads = 0;
         $nntp = $this->createMock(NNTPService::class);
         $nntp->expects($this->never())->method('getMessages');
-        $nntp->method('getMessageBounded')->with('alt.binaries.test', 'one', 2097152, false, self::isType('callable'))
+        $nntp->method('getMessageBounded')->with('alt.binaries.test', 'one', 2097152, false, self::isCallable())
             ->willReturnCallback(static function (string $group, string $messageId, int $maximumBytes, bool $alternate, callable $onRead) use ($metadata, &$reads): BoundedArticleResult {
                 $reads++;
                 if (! $onRead()) {
@@ -502,7 +503,7 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
         $reads = 0;
         $nntp = $this->createMock(NNTPService::class);
         $nntp->expects($this->never())->method('getMessages');
-        $nntp->method('getMessageBounded')->with('alt.binaries.test', 'one', 2097152, false, self::isType('callable'))
+        $nntp->method('getMessageBounded')->with('alt.binaries.test', 'one', 2097152, false, self::isCallable())
             ->willReturnCallback(static function () use (&$reads): BoundedArticleResult {
                 $reads++;
 
@@ -631,6 +632,7 @@ final class NzbPar2MultipartRecoveryTest extends TestCase
             public function __construct(private SimpleXMLElement|\Closure $xml, NNTPService $nntp, PostProcessService $post, private bool $failLoad)
             {
                 $this->nntp = $nntp;
+                $this->nfo = new NfoService;
                 $this->postProcessService = $post;
                 $this->parserService = new NzbParserService;
                 $this->alternateNntp = false;

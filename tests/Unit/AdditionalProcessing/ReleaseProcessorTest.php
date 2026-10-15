@@ -1695,6 +1695,8 @@ class ReleaseProcessorTest extends TestCase
         return new ReleaseProcessingContext(new Release([
             'id' => 1,
             'guid' => 'guid-1',
+            'nzbstatus' => 1,
+            'additional_pack_evidence' => null,
             'size' => 1024,
             'groups_id' => 10,
             'nfostatus' => -1,

@@ -28,6 +28,8 @@ class FindSizeMismatchedReleases extends Command
         $query = Release::query()
             ->select([
                 'releases.id',
+                'releases.guid',
+                'releases.additional_pack_evidence',
                 'releases.searchname',
                 'releases.name',
                 'releases.groups_id',

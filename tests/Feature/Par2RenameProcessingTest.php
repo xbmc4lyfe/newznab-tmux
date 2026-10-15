@@ -12,6 +12,7 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
+use App\Services\NfoService;
 use App\Services\NNTP\BoundedArticleResult;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
@@ -951,6 +952,7 @@ PHP;
             public function __construct(private SimpleXMLElement|false $xml, NNTPService $nntp, PostProcessService $post)
             {
                 $this->nntp = $nntp;
+                $this->nfo = new NfoService;
                 $this->postProcessService = $post;
                 $this->parserService = new NzbParserService;
             }

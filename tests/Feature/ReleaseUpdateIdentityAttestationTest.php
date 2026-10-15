@@ -5,11 +5,14 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Events\ReleaseNameFixed;
+use App\Facades\Search;
 use App\Services\AdditionalProcessing\ReleaseSearchSyncCoordinator;
 use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
+use App\Support\ReleasePackEvidence;
+use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -22,6 +25,15 @@ final class ReleaseUpdateIdentityAttestationTest extends TestCase
     use Par2RenameTestDatabase;
 
     private const TITLE = 'ROSALÍA.Album.2026-GRP';
+
+    public function createApplication()
+    {
+        $app = require __DIR__.'/../../bootstrap/app.php';
+        $app->useEnvironmentPath(sys_get_temp_dir())->loadEnvironmentFrom('.nntmux-validation-no-env');
+        $app->make(Kernel::class)->bootstrap();
+
+        return $app;
+    }
 
     protected function setUp(): void
     {
@@ -236,6 +248,268 @@ final class ReleaseUpdateIdentityAttestationTest extends TestCase
         $current = DB::table('releases')->where('id', 42)->first();
         self::assertSame(['replacement-guid', 'Replacement.Subject', 'Replacement.Identity'], [$current->guid, $current->name, $current->searchname]);
         self::assertNull($updater->lastCommittedIdentity());
+    }
+
+    #[DataProvider('legacyNullSuccessPaths')]
+    public function test_legacy_null_partial_admission_keeps_historical_by_id_success(string $missing): void
+    {
+        $input = $this->input();
+        if ($missing !== 'name') {
+            unset($input->guid);
+        }
+        if ($missing !== 'guid') {
+            unset($input->name);
+        }
+        if ($missing === 'string IDs') {
+            $input->id = $input->releases_id = '42';
+        }
+        $sync = [];
+        $updater = $this->legacyUpdater($sync);
+
+        $this->legacyRename($updater, $input);
+
+        self::assertTrue($updater->matched);
+        self::assertSame($this->proof('obfuscated', 'Exact.Release.2026-GRP'), $updater->lastCommittedIdentity());
+        self::assertSame([42], $sync);
+        Event::assertDispatchedTimes(ReleaseNameFixed::class, 1);
+    }
+
+    public static function legacyNullSuccessPaths(): iterable
+    {
+        foreach (['guid', 'name', 'both', 'string IDs'] as $missing) {
+            yield $missing => [$missing];
+        }
+    }
+
+    #[DataProvider('legacyNullRejections')]
+    public function test_legacy_null_partial_admission_rejects_unobserved_or_stale_boundaries(string $scenario): void
+    {
+        $input = $this->input();
+        unset($input->guid, $input->name);
+        $current = DB::table('releases')->where('id', 42)->first();
+        $tombstone = ReleasePackEvidence::tombstone($current);
+        if ($scenario === 'supplied guid') {
+            $input->guid = 'stale-guid';
+        } elseif ($scenario === 'supplied name') {
+            $input->name = 'stale subject';
+        } elseif ($scenario === 'supplied searchname') {
+            $input->searchname = 'stale title';
+        } elseif ($scenario === 'missing JSON') {
+            unset($input->additional_pack_evidence);
+        } elseif ($scenario === 'captured tombstone') {
+            $input->additional_pack_evidence = $tombstone;
+        } elseif ($scenario === 'current tombstone') {
+            DB::table('releases')->where('id', 42)->update(['additional_pack_evidence' => $tombstone]);
+        } elseif (in_array($scenario, ['current probable', 'current confirmed'], true)) {
+            $state = substr($scenario, 8);
+            DB::table('releases')->where('id', 42)->update(['additional_pack_evidence' => ReleasePackEvidence::merge($current, ReleasePackEvidence::observe($current), $state)]);
+        } elseif ($scenario === 'current invalid') {
+            DB::table('releases')->where('id', 42)->update(['additional_pack_evidence' => '{"invalid":true}']);
+        } elseif ($scenario === 'unpublished') {
+            DB::table('releases')->where('id', 42)->update(['nzbstatus' => 0]);
+        } elseif ($scenario === 'current token') {
+            DB::table('releases')->where('id', 42)->update(['additional_pp_claim_token' => 'owner']);
+        } elseif ($scenario === 'current timestamp') {
+            DB::table('releases')->where('id', 42)->update(['additional_pp_claimed_at' => now()->toDateTimeString()]);
+        } elseif ($scenario === 'expired owner') {
+            DB::table('releases')->where('id', 42)->update(['additional_pp_claim_token' => 'old-owner', 'additional_pp_claimed_at' => '2000-01-01 00:00:00']);
+        } elseif ($scenario === 'captured token') {
+            $input->additional_pp_claim_token = 'old-owner';
+        } elseif ($scenario === 'captured timestamp') {
+            $input->additional_pp_claimed_at = '2000-01-01 00:00:00';
+        } elseif ($scenario === 'linked') {
+            DB::table('releases')->where('id', 42)->update(['predb_id' => 7]);
+        } elseif ($scenario === 'alias mismatch') {
+            $input->id = 43;
+        }
+        $sync = [];
+        $updater = $this->legacyUpdater($sync);
+
+        $this->legacyRename($updater, $input, $scenario === 'confirmed PreDB' ? 7 : 0);
+
+        self::assertFalse($updater->matched);
+        self::assertSame('obfuscated', DB::table('releases')->where('id', 42)->value('searchname'));
+        self::assertNull($updater->lastCommittedIdentity());
+        self::assertSame([], $sync);
+        Event::assertNotDispatched(ReleaseNameFixed::class);
+    }
+
+    public static function legacyNullRejections(): iterable
+    {
+        foreach (['supplied guid', 'supplied name', 'supplied searchname', 'missing JSON', 'captured tombstone', 'current tombstone', 'current probable', 'current confirmed', 'current invalid', 'unpublished', 'current token', 'current timestamp', 'expired owner', 'captured token', 'captured timestamp', 'linked', 'alias mismatch', 'confirmed PreDB'] as $scenario) {
+            yield $scenario => [$scenario];
+        }
+    }
+
+    #[DataProvider('legacyExplicitMarkers')]
+    public function test_legacy_null_partial_admission_does_not_replace_an_explicit_observation(string $marker, mixed $value): void
+    {
+        $input = $this->input();
+        unset($input->guid, $input->name);
+        $input->{$marker} = $value;
+        $sync = [];
+        $updater = $this->legacyUpdater($sync);
+
+        $this->legacyRename($updater, $input);
+
+        self::assertFalse($updater->matched);
+        self::assertNull($updater->lastCommittedIdentity());
+        self::assertSame('obfuscated', DB::table('releases')->where('id', 42)->value('searchname'));
+        self::assertSame([], $sync);
+        Event::assertNotDispatched(ReleaseNameFixed::class);
+    }
+
+    public static function legacyExplicitMarkers(): iterable
+    {
+        foreach (['observed_pack_evidence', 'observed_additional_pp_claim', 'observed_par2_hash_generation', 'observed_isrenamed'] as $marker) {
+            yield $marker.' NULL' => [$marker, null];
+            yield $marker.' supplied' => [$marker, $marker === 'observed_isrenamed' ? 0 : 'stale'];
+        }
+    }
+
+    #[DataProvider('legacyInvalidIds')]
+    public function test_legacy_null_partial_admission_rejects_noncanonical_ids_before_lookup(mixed $id): void
+    {
+        $input = $this->input();
+        unset($input->guid, $input->name);
+        $input->id = $input->releases_id = $id;
+        $sync = [];
+        $updater = $this->legacyUpdater($sync);
+        $lookups = [];
+        DB::listen(static function (QueryExecuted $event) use (&$lookups): void {
+            if (str_contains($event->sql, 'from "releases"')) {
+                $lookups[] = $event->sql;
+            }
+        });
+
+        $this->legacyRename($updater, $input);
+
+        self::assertSame([], $lookups);
+        self::assertFalse($updater->matched);
+        self::assertNull($updater->lastCommittedIdentity());
+        self::assertSame([], $sync);
+        Event::assertNotDispatched(ReleaseNameFixed::class);
+    }
+
+    public static function legacyInvalidIds(): iterable
+    {
+        foreach (['leading zero' => '042', 'sign' => '+42', 'leading whitespace' => ' 42', 'trailing whitespace' => '42 ', 'fraction string' => '42.0', 'zero' => 0, 'negative' => -42, 'boolean' => true, 'float' => 42.0, 'overflow' => '9223372036854775808', 'zero string' => '0'] as $label => $id) {
+            yield $label => [$id];
+        }
+    }
+
+    #[DataProvider('legacyWriteRaces')]
+    public function test_legacy_null_partial_admission_rolls_back_guarded_write_loss_without_success(string $stage, string $column): void
+    {
+        $input = $this->input();
+        unset($input->guid, $input->name);
+        $before = (array) DB::table('releases')->where('id', 42)->first();
+        $sync = [];
+        $updater = $this->legacyUpdater($sync);
+        $replacement = match ($column) {
+            'guid' => 'replacement-guid', 'name' => 'replacement subject', 'searchname' => 'Replacement.Title',
+            'additional_pack_evidence' => ReleasePackEvidence::tombstone((object) $before),
+            'additional_pp_claim_token' => 'new-owner', 'nzbstatus' => 0, 'predb_id' => 7,
+        };
+        $fired = false;
+        DB::listen(static function (QueryExecuted $event) use ($stage, $column, $replacement, &$fired): void {
+            $target = $stage === 'before UPDATE'
+                ? str_starts_with($event->sql, 'select * from "releases" where "id" = ?')
+                : str_starts_with($event->sql, 'update "releases"');
+            if (! $fired && $target) {
+                $fired = true;
+                DB::table('releases')->where('id', 42)->update([$column => $replacement]);
+            }
+        });
+
+        $this->legacyRename($updater, $input);
+
+        self::assertTrue($fired);
+        self::assertFalse($updater->matched);
+        self::assertSame($before, (array) DB::table('releases')->where('id', 42)->first());
+        self::assertNull($updater->lastCommittedIdentity());
+        self::assertSame([], $sync);
+        Event::assertNotDispatched(ReleaseNameFixed::class);
+    }
+
+    public static function legacyWriteRaces(): iterable
+    {
+        foreach (['before UPDATE', 'after UPDATE'] as $stage) {
+            foreach (['guid', 'name', 'searchname', 'additional_pack_evidence', 'additional_pp_claim_token', 'nzbstatus', 'predb_id'] as $column) {
+                yield $stage.' '.$column => [$stage, $column];
+            }
+        }
+    }
+
+    public function test_legacy_null_partial_admission_propagates_unrelated_database_callback_errors(): void
+    {
+        $input = $this->input();
+        unset($input->guid, $input->name);
+        $before = (array) DB::table('releases')->where('id', 42)->first();
+        $sync = [];
+        $updater = $this->legacyUpdater($sync);
+        $failure = new \RuntimeException('unrelated database callback failure');
+        DB::listen(static function (QueryExecuted $event) use ($failure): void {
+            if (str_starts_with($event->sql, 'update "releases"')) {
+                throw $failure;
+            }
+        });
+        $caught = null;
+        try {
+            $this->legacyRename($updater, $input);
+        } catch (\RuntimeException $exception) {
+            $caught = $exception;
+        }
+
+        self::assertSame($failure, $caught);
+        self::assertSame($before, (array) DB::table('releases')->where('id', 42)->first());
+        self::assertNull($updater->lastCommittedIdentity());
+        self::assertSame([], $sync);
+        Event::assertNotDispatched(ReleaseNameFixed::class);
+    }
+
+    public function test_legacy_null_cli_subject_cleaner_uses_complete_original_projection_and_real_updater(): void
+    {
+        $subject = '[1/2] - "Movie.2020.1080p-GRP.mkv"';
+        $this->input($subject);
+        DB::statement('CREATE TABLE release_naming_regexes (id INTEGER PRIMARY KEY, group_regex VARCHAR(255), regex VARCHAR(255), status INTEGER DEFAULT 1, ordinal INTEGER DEFAULT 0)');
+        DB::connection()->getPdo()->sqliteCreateFunction('REGEXP', static fn (?string $pattern, ?string $value): int => preg_match('/'.$pattern.'/i', (string) $value));
+        Search::shouldReceive('matchPredbExact')->andReturn(null);
+        $sync = [];
+        $updater = $this->legacyUpdater($sync);
+        $this->app->instance(ReleaseUpdateService::class, $updater);
+        $candidateReads = [];
+        DB::listen(static function (QueryExecuted $event) use (&$candidateReads): void {
+            if (str_contains($event->sql, 'from "releases" as "r"')) {
+                $candidateReads[] = $event->sql;
+            }
+        });
+
+        $this->artisan('releases:clean-subject-names')
+            ->expectsOutputToContain('Renamed 1 of 1 releases (0 linked to PreDB).')
+            ->assertSuccessful();
+
+        self::assertNotEmpty($candidateReads);
+        self::assertStringContainsString('"r"."guid"', $candidateReads[0]);
+        self::assertStringContainsString('"r"."additional_pack_evidence"', $candidateReads[0]);
+        self::assertSame('Movie.2020.1080p-GRP', DB::table('releases')->where('id', 42)->value('searchname'));
+        self::assertSame('original-guid', DB::table('releases')->where('id', 42)->value('guid'));
+        self::assertNull(DB::table('releases')->where('id', 42)->value('additional_pack_evidence'));
+        self::assertSame($this->proof($subject, 'Movie.2020.1080p-GRP'), $updater->lastCommittedIdentity());
+        self::assertSame([42], $sync);
+        Event::assertDispatchedTimes(ReleaseNameFixed::class, 1);
+    }
+
+    private function legacyUpdater(array &$sync): ReleaseUpdateService
+    {
+        return new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$sync): void {
+            $sync[] = $id;
+        }));
+    }
+
+    private function legacyRename(ReleaseUpdateService $updater, object $input, int $preId = 0): void
+    {
+        $updater->updateRelease($input, 'Exact.Release.2026-GRP', 'Title Match fixture', true, 'PAR2 hash, ', true, false, $preId);
     }
 
     private function input(string $searchname = 'obfuscated'): object

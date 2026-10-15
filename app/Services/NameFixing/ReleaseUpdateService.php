@@ -12,10 +12,12 @@ use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\AdditionalProcessing\ReleaseSearchSyncCoordinator;
 use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\Categorization\CategorizationService;
+use App\Services\Nzb\NzbService;
 use App\Services\ReleaseCleaningService;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Support\Par2RenameProgress;
 use App\Support\PredbSearchDocument;
+use App\Support\ReleasePackEvidence;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
@@ -107,6 +109,10 @@ class ReleaseUpdateService
      * Has the current release found a new name?
      */
     public bool $matched = false;
+
+    public ?string $namingRejection = null;
+
+    private bool $temporaryNamingRefusal = false;
 
     /**
      * Was the check completed?
@@ -258,7 +264,7 @@ class ReleaseUpdateService
         int $predbId,
         ?string $filenameEvidence = null
     ): void {
-        $this->reset();
+        $this->reset(true);
         $release = clone $release;
         if (trim($title) === '' || ! mb_check_encoding($title, 'UTF-8')
             || mb_strlen($title, 'UTF-8') > 255 || preg_match('/\p{C}/u', $title) !== 0
@@ -316,7 +322,8 @@ class ReleaseUpdateService
             $attempt = $this->identityAttempt;
             if (! $this->withPredbIdentity($predbId, $title, null, function () use ($release, $predbId, $attempt): bool {
                 $before = $this->predbSnapshotQuery($release)->lockForUpdate()->first();
-                if ($before === null || $this->predbSnapshotQuery($release)->update(['predb_id' => $predbId]) !== 1) {
+                if ($before === null || ! $this->admitEpisodeCandidate($before, $release, (string) $release->searchname)
+                    || $this->guardGenerationQuery($this->predbSnapshotQuery($release), $before)->update(['predb_id' => $predbId]) !== 1) {
                     return false;
                 }
                 $after = $this->releaseSnapshotQuery($release)->lockForUpdate()->first();
@@ -378,14 +385,16 @@ class ReleaseUpdateService
         try {
             $written = DB::transaction(function () use ($release, $title, $categoryId, $guard, $attempt, $aborted): bool {
                 $before = $this->predbSnapshotQuery($release)->lockForUpdate()->first();
-                if ($before === null || ($guard !== null && ! $guard())) {
+                if ($before === null || ! $this->admitEpisodeCandidate($before, $release, $title) || ($guard !== null && ! $guard())) {
                     return false;
                 }
                 $values = ['searchname' => $title, 'categories_id' => $categoryId, 'isrenamed' => 1, 'iscategorized' => 1, 'proc_pp' => 1];
-                $updated = $this->predbSnapshotQuery($release)->update($values);
+                $updated = $this->guardGenerationQuery($this->predbSnapshotQuery($release), $before)->update($values);
                 $after = DB::table('releases')->where('id', $before->id)->lockForUpdate()->first();
                 if ($after === null || $after->guid !== $before->guid || $after->name !== $before->name
-                    || (int) $after->predb_id !== 0 || ($guard !== null && ! $guard())) {
+                    || (int) $after->predb_id !== 0
+                    || ! ReleasePackEvidence::matches($after, $release->observed_pack_evidence ?? ReleasePackEvidence::observe($release), false)
+                    || ($guard !== null && ! $guard())) {
                     throw $aborted;
                 }
                 foreach ($values as $column => $value) {
@@ -487,6 +496,51 @@ class ReleaseUpdateService
 
         DB::afterCommit(static function () use ($snapshot): void {
             Par2RenameProgress::forgetCompletedSnapshot($snapshot);
+        });
+    }
+
+    /** @param Builder<Release> $query
+     * @return Builder<Release>
+     */
+    private function guardGenerationQuery(Builder $query, object $current): Builder
+    {
+        $value = ReleasePackEvidence::observe($current)['value'];
+        $query->where('nzbstatus', NzbService::NZB_ADDED);
+
+        return $value === null ? $query->whereNull(ReleasePackEvidence::COLUMN)
+            : $query->whereRaw('HEX('.ReleasePackEvidence::COLUMN.') = ?', [strtoupper(bin2hex(is_string($value) ? $value : json_encode($value, JSON_THROW_ON_ERROR)))]);
+    }
+
+    /**
+     * Apply existing automatic normalization fields while preserving the observed cohort.
+     *
+     * @param  array<string, mixed>  $values
+     */
+    public function updateAutomaticSnapshot(object $release, array $values): bool
+    {
+        $allowed = ['name', 'searchname', 'categories_id', 'isrenamed', 'iscategorized', 'videos_id', 'tv_episodes_id',
+            'tv_lookup_attempts', 'tv_lookup_retry_at', 'imdbid', 'musicinfo_id', 'consoleinfo_id', 'gamesinfo_id',
+            'bookinfo_id', 'book_lookup_attempts', 'book_lookup_retry_at', 'book_name_normalized_at', 'anidbid'];
+        if ($values === [] || array_diff(array_keys($values), $allowed) !== []) {
+            throw new InvalidArgumentException('Unsupported automatic release snapshot fields.');
+        }
+        $release = clone $release;
+        $snapshot = $this->completedReleaseSnapshot($release);
+        $title = (string) ($values['searchname'] ?? $release->searchname);
+        if ($snapshot === null || $snapshot['id'] <= 0 || $snapshot['guid'] === '' || $title === ''
+            || ! mb_check_encoding($title, 'UTF-8') || mb_strlen($title, 'UTF-8') > 255 || preg_match('/\p{C}/u', $title) !== 0) {
+            return false;
+        }
+        $release->releases_id = $snapshot['id'];
+
+        return DB::transaction(function () use ($release, $values, $title): bool {
+            $query = $this->releaseSnapshotQuery($release);
+            $current = (clone $query)->lockForUpdate()->first();
+            if ($current === null || ! $this->admitEpisodeCandidate($current, $release, $title)) {
+                return false;
+            }
+
+            return $this->guardGenerationQuery($query, $current)->update($values) > 0;
         });
     }
 
@@ -658,19 +712,37 @@ class ReleaseUpdateService
     ): bool {
         $release = clone $release;
         $expectedSnapshot = $expectedSnapshot === null ? null : clone $expectedSnapshot;
+        $legacy = $expectedSnapshot === null && $preId === 0;
         $releaseId = (int) $release->releases_id;
+        if ($legacy) {
+            $fields = $release instanceof Release ? $release->getAttributes() : get_object_vars($release);
+            $canonicalId = $this->canonicalPositiveReleaseId($fields['releases_id'] ?? null);
+            if ($canonicalId === null || (array_key_exists('id', $fields) && $this->canonicalPositiveReleaseId($fields['id']) !== $canonicalId)) {
+                return false;
+            }
+            $releaseId = $canonicalId;
+        }
         $completedSnapshot = null;
         $attempt = $this->identityAttempt;
-        $write = function (?string $canonicalTitle = null) use ($release, $releaseId, $newTitle, $type, $nameStatus, $preId, $expectedSnapshot, $attempt, &$completedSnapshot): bool {
+        $legacyAdmissionLost = new \RuntimeException('Legacy release admission changed during update.');
+        $write = function (?string $canonicalTitle = null) use ($release, $releaseId, $newTitle, $type, $nameStatus, $preId, $expectedSnapshot, $legacy, $legacyAdmissionLost, $attempt, &$completedSnapshot): bool {
             $newTitle = $canonicalTitle ?? $newTitle;
             $actualRelease = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
             if ($actualRelease === null) {
                 return false;
             }
+            $admission = $legacy ? $this->legacyPartialAdmission($release, $actualRelease) : $release;
+            if ($admission === null || ! $this->admitEpisodeCandidate($actualRelease, $admission, $newTitle)) {
+                return false;
+            }
             $completedSnapshot = $this->completedReleaseSnapshot($actualRelease, $newTitle);
-            $query = $expectedSnapshot !== null
-                ? $this->predbSnapshotQuery($expectedSnapshot)
-                : Release::query()->where('id', $releaseId);
+            $lockedIdentity = clone $actualRelease;
+            $lockedIdentity->releases_id = $releaseId;
+            $query = $legacy ? $this->predbSnapshotQuery($lockedIdentity)
+                ->whereNull(AdditionalCandidateQuery::CLAIM_TOKEN_COLUMN)
+                ->whereNull(AdditionalCandidateQuery::CLAIMED_AT_COLUMN)
+                : $this->predbSnapshotQuery($expectedSnapshot ?? $release);
+            $query = $this->guardGenerationQuery($query, $actualRelease);
             if ($nameStatus === true) {
                 $status = $this->getStatusColumnsForType($type);
 
@@ -713,11 +785,23 @@ class ReleaseUpdateService
                 ]);
             }
 
-            if ($expectedSnapshot !== null && $affected !== 1) {
+            if ($affected !== 1) {
+                if ($legacy) {
+                    throw $legacyAdmissionLost;
+                }
+
                 return false;
             }
 
             $after = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
+            if ($legacy && ($after === null || (int) $after->id !== $releaseId
+                || $after->guid !== $actualRelease->guid || $after->name !== $actualRelease->name
+                || $after->searchname !== $newTitle || (int) $after->predb_id !== 0
+                || (int) $after->nzbstatus !== NzbService::NZB_ADDED
+                || ! ReleasePackEvidence::observe($after)['present'] || ReleasePackEvidence::observe($after)['value'] !== null
+                || $after->additional_pp_claim_token !== null || $after->additional_pp_claimed_at !== null)) {
+                throw $legacyAdmissionLost;
+            }
             if ($after !== null && $after->searchname === $newTitle) {
                 $this->queueIdentityAttestation($actualRelease, $after, $attempt);
             }
@@ -737,9 +821,17 @@ class ReleaseUpdateService
 
             return true;
         };
-        $updated = $preId > 0
-            ? $this->withPredbIdentity($preId, $newTitle, $filenameEvidence, $write)
-            : DB::transaction(static fn (): bool => $write());
+        try {
+            $updated = $preId > 0
+                ? $this->withPredbIdentity($preId, $newTitle, $filenameEvidence, $write)
+                : DB::transaction(static fn (): bool => $write());
+        } catch (\RuntimeException $exception) {
+            if ($exception !== $legacyAdmissionLost) {
+                throw $exception;
+            }
+
+            return false;
+        }
 
         if ($updated) {
             if ($preId > 0 || ($nameStatus && ($this->getStatusColumnsForType($type)['isrenamed'] ?? 0) === 1)) {
@@ -752,6 +844,53 @@ class ReleaseUpdateService
         }
 
         return $updated;
+    }
+
+    /** Historical unconfirmed by-ID compatibility; does not prove prior identity continuity. */
+    private function legacyPartialAdmission(object $observed, object $current): ?object
+    {
+        $fields = $observed instanceof Release ? $observed->getAttributes() : get_object_vars($observed);
+        $currentEvidence = ReleasePackEvidence::observe($current);
+        if ((array_key_exists('guid', $fields) && array_key_exists('name', $fields))
+            || ! array_key_exists(ReleasePackEvidence::COLUMN, $fields) || $fields[ReleasePackEvidence::COLUMN] !== null
+            || ! array_key_exists('searchname', $fields) || $fields['searchname'] !== $current->searchname
+            || $this->canonicalPositiveReleaseId($fields['releases_id'] ?? null) !== (int) $current->id
+            || (array_key_exists('id', $fields) && $this->canonicalPositiveReleaseId($fields['id']) !== (int) $current->id)
+            || (int) $current->nzbstatus !== NzbService::NZB_ADDED
+            || ! $currentEvidence['present'] || $currentEvidence['value'] !== null
+            || $current->additional_pp_claim_token !== null || $current->additional_pp_claimed_at !== null
+            || ($fields['additional_pp_claim_token'] ?? null) !== null || ($fields['additional_pp_claimed_at'] ?? null) !== null) {
+            return null;
+        }
+        foreach (['observed_pack_evidence', 'observed_additional_pp_claim', 'observed_par2_hash_generation', 'observed_isrenamed'] as $marker) {
+            if (array_key_exists($marker, $fields)) {
+                return null;
+            }
+        }
+        $admitted = clone $observed;
+        foreach (['guid', 'name'] as $column) {
+            if (array_key_exists($column, $fields)) {
+                if ($fields[$column] !== $current->{$column}) {
+                    return null;
+                }
+            } else {
+                $admitted->{$column} = $current->{$column};
+            }
+        }
+
+        return $admitted;
+    }
+
+    private function canonicalPositiveReleaseId(mixed $value): ?int
+    {
+        if (is_int($value)) {
+            return $value > 0 ? $value : null;
+        }
+        if (! is_string($value) || preg_match('/^[1-9][0-9]*$/D', $value) !== 1 || (string) (int) $value !== $value) {
+            return null;
+        }
+
+        return (int) $value;
     }
 
     /**
@@ -814,6 +953,9 @@ class ReleaseUpdateService
 
     private function updateSnapshotStatus(object $release, string $column, int $status, int $expectedPredbId): bool
     {
+        if ($this->namingDeferred()) {
+            return false;
+        }
         if (! in_array($column, self::SINGLE_UPDATE_COLUMNS, true) || $column === 'predb_id') {
             throw new InvalidArgumentException("Unsupported release status column [{$column}].");
         }
@@ -823,12 +965,21 @@ class ReleaseUpdateService
             return false;
         }
         $release->releases_id = $snapshot['id'];
-        $updated = $this->releaseSnapshotQuery($release)->where('predb_id', $expectedPredbId)->update([$column => $status]);
-        if ($updated > 0 && $column === 'proc_par2' && $status === 1) {
-            $this->clearCompletedPar2Progress($snapshot['id'], $snapshot);
-        }
 
-        return $updated > 0;
+        return DB::transaction(function () use ($release, $column, $status, $expectedPredbId, $snapshot): bool {
+            $query = $this->releaseSnapshotQuery($release)->where('predb_id', $expectedPredbId);
+            $current = (clone $query)->lockForUpdate()->first();
+            if ($current === null || (int) $current->nzbstatus !== NzbService::NZB_ADDED
+                || ! ReleasePackEvidence::matches($current, $release->observed_pack_evidence ?? ReleasePackEvidence::observe($release))) {
+                return false;
+            }
+            $updated = $this->guardGenerationQuery($query, $current)->update([$column => $status]);
+            if ($updated > 0 && $column === 'proc_par2' && $status === 1) {
+                $this->clearCompletedPar2Progress($snapshot['id'], $snapshot);
+            }
+
+            return $updated > 0;
+        });
     }
 
     public function attachPredbId(int $releaseId, int $predbId): void
@@ -839,7 +990,7 @@ class ReleaseUpdateService
         }
 
         $release = DB::table('releases')->where('id', $releaseId)
-            ->select(['id as releases_id', 'guid', 'name', 'searchname'])->first();
+            ->select(['id as releases_id', 'guid', 'name', 'searchname', ReleasePackEvidence::COLUMN])->first();
         if ($release !== null) {
             $this->attachPredbSnapshot($release, $predbId);
         }
@@ -851,7 +1002,7 @@ class ReleaseUpdateService
      */
     public function attachPredbSnapshot(object $release, int $predbId, ?string $expectedTitle = null, ?string $filenameEvidence = null): bool
     {
-        $this->reset();
+        $this->reset(true);
         $releaseId = (int) ($release->releases_id ?? 0);
         $attributes = $release instanceof Release ? $release->getAttributes() : get_object_vars($release);
         if ($releaseId <= 0 || $predbId <= 0 || ! isset($release->guid, $release->searchname)
@@ -866,9 +1017,10 @@ class ReleaseUpdateService
         $accepted = $this->withPredbIdentity($predbId, $expectedTitle ?? (string) $release->searchname, $filenameEvidence, function () use ($release, $predbId, $attempt, &$attached): bool {
             $identity = $this->releaseSnapshotQuery($release);
             $before = (clone $identity)->lockForUpdate()->first();
-            if ($before === null) {
+            if ($before === null || ! $this->admitEpisodeCandidate($before, $release, (string) $release->searchname)) {
                 return false;
             }
+            $identity = $this->guardGenerationQuery($identity, $before);
             $alreadyLinked = (clone $identity)->where('predb_id', $predbId)->exists();
             $attached = ! $alreadyLinked && (clone $identity)->where('predb_id', 0)->update(['predb_id' => $predbId]) === 1;
             $accepted = $alreadyLinked || $attached || (clone $identity)->where('predb_id', $predbId)->exists();
@@ -1008,13 +1160,36 @@ class ReleaseUpdateService
             && ! SeasonPackDetector::isSeasonPack($newName);
     }
 
+    public function namingDeferred(): bool
+    {
+        return $this->temporaryNamingRefusal || ($this->namingRejection !== null && $this->namingRejection !== 'confirmed');
+    }
+
+    private function admitEpisodeCandidate(object $current, object $observed, string $title): bool
+    {
+        $observation = $observed->observed_pack_evidence ?? ReleasePackEvidence::observe($observed);
+        $owner = $this->hasObservedAdditionalClaim($observed) ? $observed->observed_additional_pp_claim : null;
+        $reason = ReleasePackEvidence::candidateRejection($current, $observation, $title, $owner);
+        if ($reason !== null) {
+            $this->namingRejection = $reason;
+            $this->temporaryNamingRefusal = $this->temporaryNamingRefusal || $reason !== 'confirmed';
+
+            return false;
+        }
+
+        return true;
+    }
+
     /**
      * Reset status variables for new processing.
      */
-    public function reset(): void
+    public function reset(bool $preserveNamingDeferral = false): void
     {
+        $refusal = $preserveNamingDeferral && $this->namingDeferred() ? $this->namingRejection : null;
         $this->clearIdentityAttestation();
         $this->done = $this->matched = false;
+        $this->namingRejection = $refusal;
+        $this->temporaryNamingRefusal = $refusal !== null;
     }
 
     /**

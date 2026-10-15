@@ -17,6 +17,9 @@ trait Par2RenameTestDatabase
         DB::connection()->getPdo()->sqliteCreateFunction('UNCOMPRESS', static fn (?string $value): ?string => $value);
         Schema::create('releases', function (Blueprint $table): void {
             $table->id();
+            $table->json('additional_pack_evidence')->nullable();
+            $table->string('additional_pp_claim_token')->nullable();
+            $table->string('additional_pp_claimed_at')->nullable();
             foreach (['name', 'searchname', 'fromname', 'guid', 'leftguid', 'postdate', 'adddate'] as $column) {
                 $table->string($column)->nullable();
             }
@@ -78,7 +81,8 @@ trait Par2RenameTestDatabase
     {
         return Release::withoutEvents(function () use ($attributes): Release {
             $release = Release::factory()->createOne(array_merge([
-                'groups_id' => 1, 'categories_id' => Category::OTHER_HASHED, 'isrenamed' => 0,
+                'groups_id' => 1, 'categories_id' => Category::OTHER_HASHED, 'isrenamed' => 0, 'nzbstatus' => 1,
+                'additional_pack_evidence' => null, 'additional_pp_claim_token' => null, 'additional_pp_claimed_at' => null,
                 'adddate' => now()->toDateTimeString(),
             ], $attributes));
             assert($release instanceof Release);

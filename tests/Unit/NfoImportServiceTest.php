@@ -15,6 +15,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use PDO;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Psr\Log\LoggerInterface;
 use Tests\TestCase;
 
@@ -47,6 +48,7 @@ final class NfoImportServiceTest extends TestCase
         $this->setEnvironmentValue('DB_DATABASE', $this->databasePath);
 
         $app = require __DIR__.'/../../bootstrap/app.php';
+        $app->useEnvironmentPath(sys_get_temp_dir())->loadEnvironmentFrom('.nntmux-validation-no-env');
         $app->make(Kernel::class)->bootstrap();
 
         return $app;
@@ -69,6 +71,10 @@ final class NfoImportServiceTest extends TestCase
             $table->increments('id');
             $table->string('guid')->unique();
             $table->integer('nfostatus')->default(-1);
+            $table->string('name')->default('Release');
+            $table->string('searchname')->default('Release');
+            $table->integer('nzbstatus')->default(1);
+            $table->json('additional_pack_evidence')->nullable();
         });
         Schema::create('release_nfos', function (Blueprint $table): void {
             $table->unsignedInteger('releases_id')->primary();
@@ -93,6 +99,56 @@ final class NfoImportServiceTest extends TestCase
         foreach ($this->originalEnvironment as $key => $value) {
             $this->setEnvironmentValue($key, $value === false ? null : $value);
         }
+    }
+
+    #[DataProvider('nfoObservationChanges')]
+    public function test_paired_nfo_import_admits_the_observation_captured_before_reading_payload(string $change): void
+    {
+        $guid = '11111111-1111-4111-8111-111111111111';
+        DB::table('releases')->insert(['id' => 1, 'guid' => $guid, 'nfostatus' => -1]);
+        [$manifestPath, $nfoPath, $manifests] = $this->makeResolvedUpload($guid);
+        $filesystem = new class extends Filesystem
+        {
+            public ?\Closure $beforeNfoRead = null;
+
+            public function get($path, $lock = false)
+            {
+                if (str_ends_with((string) $path, '.nfo') && $this->beforeNfoRead !== null) {
+                    $callback = $this->beforeNfoRead;
+                    $this->beforeNfoRead = null;
+                    $callback();
+                }
+
+                return parent::get($path, $lock);
+            }
+        };
+        $filesystem->beforeNfoRead = static function () use ($change, $guid): void {
+            $values = match ($change) {
+                'epoch' => ['additional_pack_evidence' => json_encode(['v' => 1,
+                    'identity_sha256' => hash('sha256', json_encode(['1', $guid], JSON_THROW_ON_ERROR)),
+                    'epoch' => str_repeat('b', 64), 'state' => null], JSON_THROW_ON_ERROR)],
+                'guid' => ['guid' => 'replacement-guid'],
+                'identity' => ['searchname' => 'Replacement.Title'],
+                'unpublished' => ['nzbstatus' => 0],
+                default => [],
+            };
+            if ($values !== []) {
+                DB::table('releases')->where('id', 1)->update($values);
+            }
+        };
+
+        $result = (new NfoImportService($filesystem, $manifests, new NfoService))->importManifest($manifestPath);
+
+        self::assertSame($change === 'unchanged' ? 'imported' : 'failed', $result['status']);
+        self::assertSame($change === 'unchanged' ? 1 : 0, DB::table('release_nfos')->count());
+        self::assertSame($change === 'unchanged' ? 1 : -1, (int) DB::table('releases')->where('id', 1)->value('nfostatus'));
+        self::assertFileExists($nfoPath);
+    }
+
+    public static function nfoObservationChanges(): array
+    {
+        return ['content epoch changed' => ['epoch'], 'GUID replaced' => ['guid'], 'identity changed' => ['identity'],
+            'publication unavailable' => ['unpublished'], 'unchanged control' => ['unchanged']];
     }
 
     public function test_it_replaces_an_existing_nfo_for_the_manifest_release(): void

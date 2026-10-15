@@ -8,7 +8,9 @@ use App\Facades\Search;
 use App\Models\Release;
 use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\NzbSplitUnwrapper;
+use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
+use App\Support\ReleasePackEvidence;
 use Illuminate\Console\Command;
 
 class FixNzbSplitNames extends Command
@@ -24,7 +26,7 @@ class FixNzbSplitNames extends Command
         $includeRenamed = (bool) $this->option('include-renamed');
 
         $query = Release::query()
-            ->select(['id', 'name', 'searchname', 'fromname', 'groups_id', 'categories_id'])
+            ->select(['id', 'guid', 'name', 'searchname', 'fromname', 'groups_id', 'categories_id', 'isrenamed', ReleasePackEvidence::COLUMN])
             ->where(function ($builder): void {
                 $builder
                     ->where('name', 'like', '%__NZBSPLIT__%')
@@ -85,22 +87,22 @@ class FixNzbSplitNames extends Command
                     continue;
                 }
 
-                Release::query()
-                    ->where('id', $release->id)
-                    ->update([
-                        'name' => $newTitle,
-                        'searchname' => $newTitle,
-                        'categories_id' => $newCategoryId,
-                        'isrenamed' => 1,
-                        'iscategorized' => 1,
-                        ...TvProcessingCandidateQuery::resetColumns(),
-                        'imdbid' => null,
-                        'musicinfo_id' => null,
-                        'consoleinfo_id' => null,
-                        'gamesinfo_id' => 0,
-                        'bookinfo_id' => 0,
-                        'anidbid' => null,
-                    ]);
+                if (! app(ReleaseUpdateService::class)->updateAutomaticSnapshot($release, [
+                    'name' => $newTitle,
+                    'searchname' => $newTitle,
+                    'categories_id' => $newCategoryId,
+                    'isrenamed' => 1,
+                    'iscategorized' => 1,
+                    ...TvProcessingCandidateQuery::resetColumns(),
+                    'imdbid' => null,
+                    'musicinfo_id' => null,
+                    'consoleinfo_id' => null,
+                    'gamesinfo_id' => 0,
+                    'bookinfo_id' => 0,
+                    'anidbid' => null,
+                ])) {
+                    continue;
+                }
 
                 Search::updateRelease((int) $release->id);
                 $updated++;

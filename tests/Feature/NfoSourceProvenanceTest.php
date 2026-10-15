@@ -12,6 +12,7 @@ use App\Services\NameFixing\Data\NameFixResult;
 use App\Services\NameFixing\Extractors\NfoNameExtractor;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
+use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -29,6 +30,15 @@ final class NfoSourceProvenanceTest extends TestCase
     private const TARGET = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
 
     private EventFake $events;
+
+    public function createApplication()
+    {
+        $app = require __DIR__.'/../../bootstrap/app.php';
+        $app->useEnvironmentPath(sys_get_temp_dir())->loadEnvironmentFrom('.nntmux-validation-no-env');
+        $app->make(Kernel::class)->bootstrap();
+
+        return $app;
+    }
 
     protected function setUp(): void
     {

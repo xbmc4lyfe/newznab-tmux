@@ -21,7 +21,9 @@ use App\Services\AdditionalProcessing\State\MediaByteBudget;
 use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\AdditionalProcessing\State\ProcessingMetrics;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
+use App\Services\NameFixing\NzbSplitUnwrapper;
 use App\Services\NameFixing\SeasonPackDetector;
+use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\TempWorkspaceService;
 use dariusiii\rarinfo\SzipInfo;
@@ -111,6 +113,14 @@ class ReleaseProcessor
         ProcessingMetrics $metrics,
     ): ReleaseProcessingResult {
         $release = $context->release;
+        if (! $context->packEvidenceObservation['present']) {
+            throw new \LogicException('Additional processing requires the captured pack evidence projection.');
+        }
+        if ((int) $release->nzbstatus !== NzbService::NZB_ADDED) {
+            $context->fullPar2EvidenceDeferred = true;
+
+            return $this->result($context, ProcessingOutcome::NotFound, reason: 'Release content admission changed.');
+        }
 
         $this->output->echoReleaseStart($release->id, $release->size);
         $this->output->setProcessTitle((int) $release->id);
@@ -473,7 +483,8 @@ class ReleaseProcessor
         $names = [];
         foreach ($nzbContents as $file) {
             $title = \is_array($file) ? (string) ($file['title'] ?? '') : '';
-            $names[] = preg_match('/"([^"\r\n]+)"/', $title, $quoted) === 1 ? $quoted[1] : $title;
+            $name = preg_match('/"([^"\r\n]+)"/', $title, $quoted) === 1 ? $quoted[1] : $title;
+            $names[] = (new NzbSplitUnwrapper)->unwrap($name) ?? $name;
         }
         $context->seasonPack = SeasonPackDetector::isMultiEpisodeSet($names);
     }
@@ -515,6 +526,7 @@ class ReleaseProcessor
     private function runDeferredArchiveNameChecks(ReleaseProcessingContext $context): void
     {
         if ($context->releaseHasPassword || $context->seasonPack || ! $context->seasonPackProbable
+            || $context->archiveFileNamesTruncated
             || ! $context->archiveSetWalkComplete
         ) {
             return;
@@ -869,7 +881,7 @@ class ReleaseProcessor
                 $this->output->echoCompressedDownload();
                 $downloaded++;
 
-                $filesBefore = $context->totalFileInfo;
+                $listingsBefore = $context->archiveListingsRead;
                 $processed = $this->processCompressedData(
                     $this->withSevenZipTail($context, $result['data'], $archiveCandidate->tailMessageIds),
                     $context,
@@ -878,8 +890,7 @@ class ReleaseProcessor
                     $archiveCandidate,
                 );
 
-                if ($context->workPlan !== null && $context->defersArchiveNameChecks()
-                    && $context->totalFileInfo > $filesBefore
+                if ($context->workPlan !== null && $context->archiveListingsRead > $listingsBefore
                 ) {
                     $listedSets[$context->workPlan->setKeyOf($archiveCandidate)] = true;
                     $context->listedArchiveSets = $listedSets;
@@ -987,6 +998,7 @@ class ReleaseProcessor
         }
 
         $files = is_array($result['files'] ?? null) ? $result['files'] : [];
+        $context->archiveListingsRead++;
         $this->noteArchiveListing($context, $files);
         if (! $reverse && $files !== [] && $context->defersArchiveNameChecks()) {
             $context->firstArchiveFiles ??= $files;

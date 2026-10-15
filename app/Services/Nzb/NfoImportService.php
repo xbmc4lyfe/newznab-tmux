@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
-use App\Models\Release;
 use App\Services\NfoService;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Log;
@@ -74,12 +73,9 @@ final class NfoImportService
                 throw new RuntimeException('Upload manifest has no valid release identity');
             }
 
-            $releaseExists = Release::query()
-                ->whereKey($releaseId)
-                ->where('guid', $releaseGuid)
-                ->exists();
-            if (! $releaseExists) {
-                throw new RuntimeException('The release recorded by the upload manifest no longer exists');
+            $observation = $this->nfoService->observeRelease($releaseId, $releaseGuid);
+            if ($observation === null) {
+                throw new RuntimeException('The release recorded by the upload manifest is unavailable');
             }
 
             $nfoPath = $this->manifests->resolvePayloadPath(
@@ -92,7 +88,7 @@ final class NfoImportService
                 throw new RuntimeException('NFO import must not be empty or exceed 65535 bytes');
             }
 
-            if (! $this->nfoService->storeNfoContent($releaseId, $content)) {
+            if (! $this->nfoService->storeNfoContent($releaseId, $content, true, $observation)) {
                 throw new RuntimeException('Failed to store NFO content for the release');
             }
 

@@ -11,6 +11,7 @@ use App\Services\NfoService;
 use App\Services\NNTP\NNTPService;
 use App\Services\PostProcessService;
 use App\Support\Par2RenameProgress;
+use App\Support\ReleasePackEvidence;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Support\Facades\Cache;
@@ -75,14 +76,20 @@ class NzbContentsService
      * @param  int  $relID  The release ID.
      * @param  int  $groupID  The group ID.
      * @param  string  $groupName  The group name.
+     * @param  array{present: bool, id: int, guid: string, name: mixed, searchname: mixed, value: mixed}|null  $observation
      * @return string|false The verified NFO content as a string, or false if not found, download failed, or verification failed.
      *
      * @throws \Exception If NNTP operations fail.
      */
-    public function getNfoFromNzb(string $guid, int $relID, int $groupID, string $groupName): string|false
+    public function getNfoFromNzb(string $guid, int $relID, int $groupID, string $groupName, ?array $observation = null): string|false
     {
+        $observation ??= $this->nfo->observeRelease($relID, $guid);
+        if ($observation === null || $observation['id'] !== $relID || $observation['guid'] !== $guid
+            || ! $this->nfo->withReleaseObservation($observation, static function (): void {})) {
+            return false;
+        }
         // Step 1: Attempt to find a potential NFO message ID
-        $messageID = $this->parseNzb($guid, $relID, $groupID, true);
+        $messageID = $this->parseNzb($guid, $relID, $groupID, true, $observation);
 
         // If no NFO message ID found
         if ($messageID === false || ! isset($messageID['id'])) {
@@ -90,7 +97,9 @@ class NzbContentsService
                 echo '-';
             }
             // Make sure we set status to NFO_NONFO
-            Release::query()->where('id', $relID)->update(['nfostatus' => NfoService::NFO_NONFO]);
+            $this->nfo->withReleaseObservation($observation, static function () use ($relID): void {
+                Release::query()->where('id', $relID)->update(['nfostatus' => NfoService::NFO_NONFO]);
+            });
 
             return false;
         }
@@ -101,7 +110,9 @@ class NzbContentsService
         // Check if download failed
         if ($this->nntp->isError($fetchedBinary)) {
             // NFO download failed, decrement attempts to allow retries
-            Release::query()->where('id', $relID)->decrement('nfostatus');
+            $this->nfo->withReleaseObservation($observation, static function () use ($relID): void {
+                Release::query()->where('id', $relID)->decrement('nfostatus');
+            });
             if ($this->echoOutput) {
                 echo 'f';
             }
@@ -117,14 +128,16 @@ class NzbContentsService
                 echo $messageID['hidden'] === false ? '+' : '*';
             }
 
-            return $fetchedBinary;
+            return $this->nfo->withReleaseObservation($observation, static function (): void {}) ? $fetchedBinary : false;
         }
 
         // Step 4: Handle verification failure - not a valid NFO
         if ($this->echoOutput) {
             echo '-';
         }
-        Release::query()->where('id', $relID)->update(['nfostatus' => NfoService::NFO_NONFO]);
+        $this->nfo->withReleaseObservation($observation, static function () use ($relID): void {
+            Release::query()->where('id', $relID)->update(['nfostatus' => NfoService::NFO_NONFO]);
+        });
 
         return false;
     }
@@ -136,12 +149,19 @@ class NzbContentsService
      * @param  int  $relID  The release ID.
      * @param  int  $groupID  The group ID.
      * @param  bool  $nfoCheck  Whether to specifically look for an NFO file.
+     * @param  array{token: ?string, claimed_at: ?string}|null  $owner
+     * @param  array{present: bool, id: int, guid: string, name: mixed, searchname: mixed, value: mixed}|null  $observation
      * @return array<string, mixed>|false An array containing NFO message ID and hidden status, or false if not found/error.
      *
      * @throws \Exception If NNTP operations fail.
      */
-    public function parseNzb(string $guid, int $relID, int $groupID, bool $nfoCheck = false): bool|array
+    public function parseNzb(string $guid, int $relID, int $groupID, bool $nfoCheck = false, ?array $observation = null, ?array $owner = null): bool|array
     {
+        $observation ??= $this->nfo->observeRelease($relID, $guid);
+        if ($observation === null || $observation['id'] !== $relID || $observation['guid'] !== $guid
+            || ! $this->nfo->withReleaseObservation($observation, static function (): void {}, owner: $owner)) {
+            return false;
+        }
         $nzbFile = $this->loadNzb($guid);
         if ($nzbFile === false) {
             return false;
@@ -196,8 +216,11 @@ class NzbContentsService
             // Look specifically for the .par2 index file (often small, but not always 1/1)
             if ($this->lookupPar2 && ! $foundPAR2 && isset($firstSegmentId) && $this->parserService->detectPar2IndexFile($subject)) {
                 // Attempt to parse the PAR2 file using its first segment ID
-                if ($this->postProcessService->parsePAR2($firstSegmentId, $relID, $groupID, $this->nntp, 1) === true) {
-                    Release::query()->where('id', $relID)->update(['proc_par2' => 1]);
+                if ($this->postProcessService->parsePAR2ForRename($firstSegmentId, $relID, $groupID, $this->nntp, 1,
+                    fn (): bool => $this->nfo->withReleaseObservation($observation, static function (): void {}, false, $owner)) === Par2RenameOutcome::Renamed) {
+                    $this->nfo->withReleaseObservation($observation, static function () use ($relID): void {
+                        Release::query()->where('id', $relID)->update(['proc_par2' => 1]);
+                    }, owner: $owner);
                     $foundPAR2 = true;
                 }
             }
@@ -206,7 +229,11 @@ class NzbContentsService
         // Calculate completion
         $completion = $this->calculateCompletion($actualParts, $artificialParts);
 
-        Release::query()->where('id', $relID)->update(['completion' => $completion]);
+        if (! $this->nfo->withReleaseObservation($observation, static function () use ($relID, $completion): void {
+            Release::query()->where('id', $relID)->update(['completion' => $completion]);
+        }, owner: $owner)) {
+            return false;
+        }
 
         // If NFO check was requested, return the found message ID (prioritizing explicit)
         if ($nfoCheck && $nfoMessageId !== null && \strlen($nfoMessageId['id']) > 1) {
@@ -216,7 +243,9 @@ class NzbContentsService
         // If NFO check was requested but nothing suitable was found
         if ($nfoCheck && $nfoMessageId === null) {
             // Update status to indicate no NFO was found in the NZB structure
-            Release::query()->where('id', $relID)->update(['nfostatus' => NfoService::NFO_NONFO]);
+            $this->nfo->withReleaseObservation($observation, static function () use ($relID): void {
+                Release::query()->where('id', $relID)->update(['nfostatus' => NfoService::NFO_NONFO]);
+            }, owner: $owner);
 
             return false;
         }
@@ -292,10 +321,12 @@ class NzbContentsService
                 return Par2RenameOutcome::Deferred;
             }
 
-            $release = Release::query()->where('id', $relID)->first(['id', 'guid', 'name', 'searchname', 'groups_id', 'proc_par2', 'isrenamed', 'predb_id']);
-            if ($release === null || $release->guid !== $guid || (int) $release->groups_id !== $groupID) {
+            $release = Release::query()->where('id', $relID)->first(['id', 'guid', 'name', 'searchname', 'groups_id', 'proc_par2', 'isrenamed', 'predb_id', 'nzbstatus', ReleasePackEvidence::COLUMN]);
+            if ($release === null || $release->guid !== $guid || (int) $release->groups_id !== $groupID
+                || (int) $release->nzbstatus !== NzbService::NZB_ADDED) {
                 return Par2RenameOutcome::Deferred;
             }
+            $observation = ReleasePackEvidence::observe($release);
             $snapshot = ['id' => $relID, 'guid' => $guid, 'name' => $release->name, 'searchname' => $release->searchname];
             $readerOwnership = new class
             {
@@ -305,8 +336,9 @@ class NzbContentsService
                 return $readerOwnership->held && ($onArticleReceived === null || $onArticleReceived())
                     && $this->refreshPar2Claim($lock);
             };
-            $guard = function () use ($deadline, $refreshOwnership): bool {
-                return ($deadline === null || now()->getTimestampMs() / 1000 < $deadline) && $refreshOwnership();
+            $guard = function () use ($deadline, $refreshOwnership, $observation): bool {
+                return ($deadline === null || now()->getTimestampMs() / 1000 < $deadline) && $refreshOwnership()
+                    && $this->nfo->withReleaseObservation($observation, static function (): void {}, false);
             };
             $lastHeartbeat = 0;
             $onArticleRead = function () use ($refreshOwnership, &$lastHeartbeat, $readerOwnership): bool {

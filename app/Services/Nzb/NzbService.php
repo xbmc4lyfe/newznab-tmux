@@ -12,7 +12,9 @@ use App\Services\Binaries\BinariesConfig;
 use App\Services\CollectionCleanupService;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Support\Data\NzbCreationResult;
+use App\Support\ReleasePackEvidence;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
@@ -102,6 +104,25 @@ class NzbService
     {
         if (config('release_verification.required', true)) {
             return NzbCreationResult::transient('Release verification must publish the verified NZB; header-only creation is disabled.');
+        }
+        $attributes = $release->getAttributes();
+        $required = ['id', 'guid', 'name', 'searchname', 'nzbstatus', ReleasePackEvidence::COLUMN,
+            NzbCreationCandidateQuery::CLAIM_TOKEN_COLUMN, NzbCreationCandidateQuery::CLAIMED_AT_COLUMN];
+        foreach ($required as $column) {
+            if (! array_key_exists($column, $attributes)) {
+                return NzbCreationResult::deferred('NZB creation requires the complete release publication observation.');
+            }
+        }
+        $observed = ReleasePackEvidence::observe($release);
+        try {
+            $admitted = DB::transaction(fn (): bool => $this->admitsNzbCreation(
+                Release::query()->whereKey($release->id)->lockForUpdate()->first(), $observed, $attributes
+            ));
+            if (! $admitted) {
+                return NzbCreationResult::deferred('Release publication or creation claim changed before NZB creation.');
+            }
+        } catch (Throwable $e) {
+            return NzbCreationResult::deferred('Could not verify NZB publication admission: '.$e->getMessage());
         }
         try {
             $collections = Collection::whereReleasesId($release->id)
@@ -262,17 +283,26 @@ class NzbService
 
             $fingerprint = $fingerprintAccumulator->value();
 
-            if (! $this->moveTemporaryNzbIntoPlace($tempPath, $path)) {
-                return NzbCreationResult::transient("Failed to move temporary NZB into place: {$tempPath} -> {$path}", $collectionIds, $path);
-            }
-            $tempPath = null;
-
-            if (! File::isFile($path) || ! is_readable($path)) {
-                return NzbCreationResult::transient("Final NZB file is missing or unreadable: {$path}", $collectionIds, $path);
-            }
-
-            DB::transaction(function () use ($release, $fingerprint): void {
-                $release->update($this->successfulReleaseUpdateValues($fingerprint));
+            $publication = DB::transaction(function () use ($release, $fingerprint, $observed, $attributes, &$tempPath, $path, $collectionIds): ?NzbCreationResult {
+                try {
+                    $current = Release::query()->whereKey($release->id)->lockForUpdate()->first();
+                    if ($current === null || ! $this->admitsNzbCreation($current, $observed, $attributes)) {
+                        return NzbCreationResult::deferred('Release publication or creation claim changed before NZB installation.', $collectionIds, $path);
+                    }
+                } catch (Throwable $e) {
+                    return NzbCreationResult::deferred('Could not verify final NZB publication admission: '.$e->getMessage(), $collectionIds, $path);
+                }
+                if ($tempPath === null || ! $this->moveTemporaryNzbIntoPlace($tempPath, $path)) {
+                    return NzbCreationResult::transient("Failed to move temporary NZB into place: {$tempPath} -> {$path}", $collectionIds, $path);
+                }
+                $tempPath = null;
+                if (! File::isFile($path) || ! is_readable($path)) {
+                    return NzbCreationResult::transient("Final NZB file is missing or unreadable: {$path}", $collectionIds, $path);
+                }
+                ReleasePackEvidence::retireDerivedEvidence((int) $current->id);
+                $current->update($this->successfulReleaseUpdateValues($fingerprint) + [
+                    ReleasePackEvidence::COLUMN => ReleasePackEvidence::tombstone($current),
+                ]);
 
                 if (NzbCreationCandidateQuery::supportsFailureState()) {
                     ReleaseNzbCreationFailure::query()
@@ -280,7 +310,12 @@ class NzbService
                         ->delete();
                     $release->unsetRelation('nzbCreationFailure');
                 }
+
+                return null;
             });
+            if ($publication !== null) {
+                return $publication;
+            }
             try {
                 CollectReleaseFingerprintMetadata::dispatch((int) $release->id);
             } catch (Throwable $dispatchException) {
@@ -796,6 +831,32 @@ class NzbService
     protected function moveTemporaryNzbIntoPlace(string $temporaryPath, string $finalPath): bool
     {
         return rename($temporaryPath, $finalPath);
+    }
+
+    /**
+     * @param  array{present: bool, id: int, guid: string, name: mixed, searchname: mixed, value: mixed}  $observed
+     * @param  array<string, mixed>  $attributes
+     */
+    private function admitsNzbCreation(?Release $current, array $observed, array $attributes): bool
+    {
+        if ($current === null || (int) $current->nzbstatus !== self::NZB_NONE
+            || (int) $attributes['nzbstatus'] !== self::NZB_NONE
+            || ! ReleasePackEvidence::matches($current, $observed)) {
+            return false;
+        }
+        $currentAttributes = $current->getAttributes();
+        foreach ([NzbCreationCandidateQuery::CLAIM_TOKEN_COLUMN, NzbCreationCandidateQuery::CLAIMED_AT_COLUMN] as $column) {
+            if (($currentAttributes[$column] ?? null) !== ($attributes[$column] ?? null)) {
+                return false;
+            }
+        }
+
+        $token = $currentAttributes[NzbCreationCandidateQuery::CLAIM_TOKEN_COLUMN] ?? null;
+        $claimedAt = $currentAttributes[NzbCreationCandidateQuery::CLAIMED_AT_COLUMN] ?? null;
+
+        return ($token === null && $claimedAt === null)
+            || (is_string($token) && $token !== '' && is_string($claimedAt)
+                && Carbon::parse($claimedAt)->greaterThanOrEqualTo(NzbCreationCandidateQuery::claimStaleBefore()));
     }
 
     /**

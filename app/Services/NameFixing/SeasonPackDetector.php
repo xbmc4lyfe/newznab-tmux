@@ -13,8 +13,8 @@ namespace App\Services\NameFixing;
  */
 final class SeasonPackDetector
 {
-    /** S01, S1, S01-S03, S01-03, S01D1, S01.Disc.2 between separators */
-    private const string SEASON_TOKEN_REGEX = '/(?:^|[._ \-\[(])S\d{1,2}(?:[._ ]?D(?:is[ck])?[._ ]?\d{1,2})?(?=$|[._ \-\])])/i';
+    /** S01, S1, S2024, S01-S03, S01-03, S01D1, S01.Disc.2 between separators */
+    private const string SEASON_TOKEN_REGEX = '/(?:^|[._ \-\[(])S\d{1,4}(?:[._ ]?D(?:is[ck])?[._ ]?\d{1,2})?(?=$|[._ \-\])])/i';
 
     /** Season.1, Season 2, Seasons.1-3 */
     private const string SEASON_WORD_REGEX = '/(?:^|[._ \-\[(])Seasons?[._ ]?\d{1,2}(?=$|[._ \-\])])/i';
@@ -25,8 +25,11 @@ final class SeasonPackDetector
     /** S01E01, S01.E05, S01E01E02, S2024E01, 1x05, Episode.5, EP06, standalone E05 */
     private const string EPISODE_REGEX = '/(?:^|[^a-z0-9])(?:S\d{1,4}[._ ]?E\d{1,4}(?!\d)|\d{1,2}x\d{2,3}(?![0-9a-z])|Episode[._ ]?\d{1,4}(?!\d)|EP?\d{2,3}(?![0-9a-z]))/i';
 
-    /** Show prefix, separator, season, first episode, extra episodes (E02, -E03, -03) and the rest */
-    private const string EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)(?<sep>[._ \-]+)S(?<season>\d{1,2})[._ ]?E(?<episode>\d{1,4})(?:[._\-]?E\d{1,4}|-\d{1,4}(?=$|[._ ]))*(?<rest>.*)$/i';
+    /** Show prefix, explicit season, first episode (E01 or Episode.1), extra episodes and the rest */
+    private const string EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)(?<sep>[._ \-]+)S(?<season>\d{1,4})[._ ]?E(?:pisode[._ ]?)?(?<episode>\d{1,4})(?:[._\-]?E\d{1,4}|-\d{1,4}(?=$|[._ ]))*(?!\d)(?<rest>.*)$/i';
+
+    /** Explicit season and episode in 1x01 notation, including ranges such as 1x01-03 */
+    private const string X_EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)(?<sep>[._ \-]+)(?<season>\d{1,2})x(?<episode>\d{2,3})(?:-\d{2,3}(?=$|[._ ]))*(?![a-z0-9])(?<rest>.*)$/i';
 
     /** A token where the release information starts; an episode title ends before it */
     private const string RELEASE_INFO_TOKEN_REGEX = '/^(?:\d{3,4}[pi]|4k|uhd|hdr(?:10)?(?:plus)?|dv|sdr|web|webrip|webdl|bluray|blu|bd|bdrip|bdremux|brrip|remux|dvd|dvdrip|dvdr|dvd5|dvd9|hdtv|pdtv|sdtv|hdrip|dsr|amzn|nf|dsnp|hmax|atvp|hulu|pcok|pmtp|stan|crav|x26[45]|h26[45]|hevc|avc|xvid|divx|10bit|8bit|aac\d*|e?ac3|ddp?\d*|dts|truehd|atmos|flac|proper|repack\d*|rerip|internal|multi|dual|subbed|dubbed|extended|uncut|german|french|spanish|italian|dutch|nordic|swedish|danish|finnish|norwegian|polish|russian|hindi|japanese|korean)$/i';
@@ -194,7 +197,8 @@ final class SeasonPackDetector
         if ($base === '' || preg_match(self::SAMPLE_REGEX, $base) === 1) {
             return null;
         }
-        if (preg_match(self::EPISODE_SPLIT_REGEX, $base, $match) !== 1) {
+        if (preg_match(self::EPISODE_SPLIT_REGEX, $base, $match) !== 1
+            && preg_match(self::X_EPISODE_SPLIT_REGEX, $base, $match) !== 1) {
             return null;
         }
 

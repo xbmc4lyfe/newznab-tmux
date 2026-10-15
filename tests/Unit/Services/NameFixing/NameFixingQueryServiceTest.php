@@ -10,6 +10,25 @@ use PHPUnit\Framework\TestCase;
 
 class NameFixingQueryServiceTest extends TestCase
 {
+    public function test_file_row_filters_preserve_literal_sql_wildcards(): void
+    {
+        $database = $this->createMock(ConnectionInterface::class);
+        $patterns = ["(rf.name LIKE '%.srr' OR rf.name LIKE '%.srs')", "rf.name LIKE '%SDPORN%'"];
+        $calls = 0;
+        $database->expects($this->exactly(2))->method('select')
+            ->willReturnCallback(static function (string $sql, array $bindings) use (&$calls, $patterns): array {
+                self::assertStringContainsString('rf.releases_id IN (?,?)', $sql);
+                self::assertStringContainsString($patterns[$calls++], $sql);
+                self::assertSame([11, 22], $bindings);
+
+                return [];
+            });
+        $queries = new NameFixingQueryService($database);
+
+        self::assertSame([], $queries->fileRows([11, 22], NameFixingQueryService::SOURCE_SRR));
+        self::assertSame([], $queries->fileRows([11, 22], NameFixingQueryService::SOURCE_XXX));
+    }
+
     public function test_it_preserves_every_source_row_when_grouping_by_release(): void
     {
         $database = $this->createStub(ConnectionInterface::class);

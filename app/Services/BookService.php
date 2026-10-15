@@ -13,11 +13,13 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\NameFixing\Extractors\ObfuscatedSubjectExtractor;
+use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Support\BookIsbn;
 use App\Support\BookMatchScorer;
 use App\Support\Data\BookParseResult;
 use App\Support\MetadataSearchLookup;
+use App\Support\ReleasePackEvidence;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -429,7 +431,7 @@ class BookService
         }
 
         $this->processBookReleasesHelper(
-            $query->get(['searchname', 'id', 'categories_id']),
+            $query->get(['searchname', 'name', 'id', 'guid', 'categories_id', ReleasePackEvidence::COLUMN]),
             sprintf(
                 '%d-%d,%d',
                 Category::BOOKS_ROOT,
@@ -442,7 +444,7 @@ class BookService
     protected function normalizeBookSearchNames(string $groupID = '', string $guidChar = ''): void
     {
         $query = Release::query()
-            ->select(['id', 'name', 'searchname', 'categories_id', 'isrenamed'])
+            ->select(['id', 'guid', 'name', 'searchname', 'categories_id', 'isrenamed', ReleasePackEvidence::COLUMN])
             ->whereRaw(BookProcessingCandidateQuery::categoryCondition())
             ->whereRaw(BookProcessingCandidateQuery::normalizationCondition($this->lookupMode))
             ->orderByDesc('postdate')
@@ -469,7 +471,9 @@ class BookService
                 $updates['isrenamed'] = 1;
             }
 
-            Release::query()->where('id', (int) $release->id)->update($updates);
+            if (! app(ReleaseUpdateService::class)->updateAutomaticSnapshot($release, $updates)) {
+                continue;
+            }
             if ($nameChanged) {
                 Search::updateRelease((int) $release->id);
             }
@@ -495,10 +499,10 @@ class BookService
                 // audiobooks are also books and should be handled in an identical manor, even though it falls under a music category
                 if ($arr['categories_id'] === (int) Category::MUSIC_AUDIOBOOK) {
                     // audiobook
-                    $bookInfo = $this->parseTitle($arr['searchname'], $arr['id'], 'audiobook');
+                    $bookInfo = $this->parseTitle($arr['searchname'], $arr['id'], 'audiobook', $arr);
                 } else {
                     // ebook
-                    $bookInfo = $this->parseTitle($arr['searchname'], $arr['id'], 'ebook');
+                    $bookInfo = $this->parseTitle($arr['searchname'], $arr['id'], 'ebook', $arr);
                 }
 
                 if ($bookInfo !== false) {
@@ -578,16 +582,19 @@ class BookService
      *
      * @return bool|string
      */
-    public function parseTitle(mixed $release_name, mixed $releaseID, mixed $releasetype)
+    public function parseTitle(mixed $release_name, mixed $releaseID, mixed $releasetype, ?object $observedRelease = null)
     {
+        $observedRelease ??= Release::query()->find((int) $releaseID);
         $rawReleaseName = (string) $release_name;
         $parsed = $this->parseReleaseName($rawReleaseName, (string) $releasetype);
         $normalizedReleaseName = $this->determineReadableBookSearchName($rawReleaseName, $parsed) ?? $rawReleaseName;
         if ($normalizedReleaseName !== $rawReleaseName) {
-            Release::query()->where('id', (int) $releaseID)->update([
-                'searchname' => $normalizedReleaseName,
-                'isrenamed' => 1,
-            ]);
+            if ($observedRelease === null || ! app(ReleaseUpdateService::class)->updateAutomaticSnapshot($observedRelease, [
+                'searchname' => $normalizedReleaseName, 'isrenamed' => 1,
+            ])) {
+                return false;
+            }
+            $observedRelease->searchname = $normalizedReleaseName;
             Search::updateRelease((int) $releaseID);
         }
         $this->parsedBookResult = $parsed;
@@ -600,8 +607,9 @@ class BookService
                 if ($this->echooutput) {
                     cli()->headerOver('Changing category to misc books: ').cli()->primary($releasename);
                 }
-                Release::query()->where('id', $releaseID)->update(['categories_id' => Category::BOOKS_UNKNOWN]);
-                Search::updateRelease((int) $releaseID);
+                if ($observedRelease !== null && app(ReleaseUpdateService::class)->updateAutomaticSnapshot($observedRelease, ['categories_id' => Category::BOOKS_UNKNOWN])) {
+                    Search::updateRelease((int) $releaseID);
+                }
 
                 return false;
             }
@@ -610,8 +618,9 @@ class BookService
                 if ($this->echooutput) {
                     cli()->headerOver('Changing category to magazines: ').cli()->primary($releasename);
                 }
-                Release::query()->where('id', $releaseID)->update(['categories_id' => Category::BOOKS_MAGAZINES]);
-                Search::updateRelease((int) $releaseID);
+                if ($observedRelease !== null && app(ReleaseUpdateService::class)->updateAutomaticSnapshot($observedRelease, ['categories_id' => Category::BOOKS_MAGAZINES])) {
+                    Search::updateRelease((int) $releaseID);
+                }
 
                 return false;
             }

@@ -13,6 +13,7 @@ use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
+use App\Support\ReleasePackEvidence;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -129,7 +130,11 @@ final class VerifiedReleasePublisher
                     } else {
                         $id = (int) $legacy->id;
                         unset($parameters['naming_regex_id']);
-                        DB::table('releases')->where('id', $id)->update($parameters + ['iscategorized' => 1]);
+                        ReleasePackEvidence::retireDerivedEvidence($id);
+                        DB::table('releases')->where('id', $id)->update($parameters + [
+                            'iscategorized' => 1,
+                            ReleasePackEvidence::COLUMN => ReleasePackEvidence::tombstone($legacy),
+                        ]);
                         DB::afterCommit(static fn () => Search::updateRelease($id));
                     }
                     if ($id === null) {
