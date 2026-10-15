@@ -8,10 +8,20 @@ ARG BASE_IMAGE=nntmux/base:local
 
 # Native yEnc decoder: nzb-decode behind RapidYenc's C ABI (docker/app/nzb-yenc-ffi),
 # loaded by App\Services\Yenc\NativePayloadDecoder through FFI.
-FROM rust:1.98-bookworm AS yenc
-WORKDIR /src
-COPY docker/app/nzb-yenc-ffi/ /src/
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+FROM rust:1.98-bookworm AS rust-toolchain
+FROM ${BASE_IMAGE} AS yenc
+USER root
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:$PATH
+RUN install -d -o www-data -g www-data /out /usr/local/cargo/registry \
+    && chown -R www-data:www-data /usr/local/cargo
+WORKDIR /app/docker/app/nzb-yenc-ffi
+COPY docker/app/nzb-yenc-ffi/ ./
+COPY app/Services/Nzb/RustArticleFingerprintWorker.php /app/app/Services/Nzb/RustArticleFingerprintWorker.php
+COPY tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php /app/tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php
+USER www-data
+RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=33,gid=33 \
     cargo test --release --locked \
     && cargo build --release --locked \
     && install -D -m 0644 target/release/libnzbyenc.so /out/libnzbyenc.so \
