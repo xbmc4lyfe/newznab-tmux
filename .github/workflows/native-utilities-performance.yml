@@ -79,10 +79,38 @@ jobs:
       - name: Record executed source, build tools and hosted runner identity
         shell: bash
         run: |
+          ulimit -Sa > utility-evidence/process-soft-limits.txt
+          ulimit -Ha > utility-evidence/process-hard-limits.txt
           python3 - <<'PY'
           import json, os, pathlib, platform, subprocess
           def run(*command):
               return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT).strip()
+          cgroup_membership = pathlib.Path('/proc/self/cgroup').read_text()
+          cgroup_root = pathlib.Path('/sys/fs/cgroup').resolve()
+          unified_path = next((line.split(':', 2)[2] for line in cgroup_membership.splitlines() if line.startswith('0::')), None)
+          if unified_path is None or not (cgroup_root / 'cgroup.controllers').is_file():
+              raise SystemExit('Expected hosted runner cgroup v2 resource limits')
+          current = (cgroup_root / unified_path.lstrip('/')).resolve()
+          current.relative_to(cgroup_root)
+          if not current.is_dir():
+              raise SystemExit('Cannot resolve current hosted runner cgroup')
+          cgroup_limits = []
+          fields = ('cpu.max', 'cpu.weight', 'cpuset.cpus.effective', 'cpuset.mems.effective', 'memory.max', 'memory.high', 'memory.swap.max', 'pids.max')
+          while True:
+              cgroup_limits.append({
+                  'cgroup': '/' + str(current.relative_to(cgroup_root)),
+                  'limits': {name: (current / name).read_text().strip() if (current / name).is_file() else None for name in fields},
+              })
+              if current == cgroup_root:
+                  break
+              current = current.parent
+          resources = {
+              'process_limits': pathlib.Path('/proc/self/limits').read_text(),
+              'cpu_affinity': sorted(os.sched_getaffinity(0)),
+              'cgroup_membership': cgroup_membership,
+              'cgroup_v2_ancestors': cgroup_limits,
+          }
+          pathlib.Path('utility-evidence/resource-limits.json').write_text(json.dumps(resources, indent=2) + '\n')
           cpu = next((line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith(('model name', 'Hardware'))), platform.machine())
           identity = {
               'executed_sha': run('git', 'rev-parse', 'HEAD'),
