@@ -93,6 +93,7 @@ class NntmuxResetDb extends Command
                 'tv_episodes',
                 'tv_info',
                 'release_nfos',
+                'nfo_cleanup_commits',
                 'release_comments',
                 'users_releases',
                 'user_movies',

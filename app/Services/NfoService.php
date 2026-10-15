@@ -1755,6 +1755,18 @@ class NfoService
         return $nfoRecord->nfo;
     }
 
+    /** Private proposal: this final writer supplies the cleanup callback only after its actual SQL writes. */
+    final public function storeNfoContentWithCommit(int $releaseId, string $nfoContent, \Closure $commit): void
+    {
+        if (DB::transactionLevel() < 1) {
+            throw new \RuntimeException('NFO commit witness requires an active transaction');
+        }
+        $data = "\x1f\x8b\x08\x00".gzcompress($nfoContent);
+        ReleaseNfo::updateOrCreate(['releases_id' => $releaseId], ['nfo' => $data]);
+        Release::whereId($releaseId)->update(['nfostatus' => self::NFO_FOUND]);
+        $commit();
+    }
+
     /**
      * Store NFO content for a release.
      *

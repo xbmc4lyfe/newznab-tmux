@@ -7,6 +7,7 @@ namespace Tests\Unit;
 use App\Enums\NzbImportStatus;
 use App\Services\NfoService;
 use App\Services\Nzb\NfoImportService;
+use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbUploadManifestService;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
@@ -17,10 +18,13 @@ use Illuminate\Support\Facades\Schema;
 use PDO;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Psr\Log\LoggerInterface;
+use Tests\Support\CapturedUploadFixture;
 use Tests\TestCase;
 
 final class NfoImportServiceTest extends TestCase
 {
+    use CapturedUploadFixture;
+
     private string $databasePath;
 
     private string $uploadFolder;
@@ -83,6 +87,16 @@ final class NfoImportServiceTest extends TestCase
 
         $this->uploadFolder = sys_get_temp_dir().'/nntmux-nfo-import-'.bin2hex(random_bytes(6));
         (new Filesystem)->makeDirectory($this->uploadFolder, 0775, true);
+        config(['release_verification.required' => true, 'nntmux.release_dedupe_enabled' => true, 'nntmux.echocli' => false,
+            'release_verification.storage_path' => $this->uploadFolder.'/verification']);
+        (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
+        (require database_path('migrations/2026_10_15_034000_create_nfo_cleanup_commits_table.php'))->up();
+        Schema::create('usenet_groups', static function (Blueprint $table): void {
+            $table->id();
+            $table->string('name');
+        });
+        DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.test']);
+
     }
 
     protected function tearDown(): void
@@ -106,22 +120,36 @@ final class NfoImportServiceTest extends TestCase
     {
         $guid = '11111111-1111-4111-8111-111111111111';
         DB::table('releases')->insert(['id' => 1, 'guid' => $guid, 'nfostatus' => -1]);
-        [$manifestPath, $nfoPath, $manifests] = $this->makeResolvedUpload($guid);
         $filesystem = new class extends Filesystem
         {
             public ?\Closure $beforeNfoRead = null;
 
+            public ?string $nfoPayloadPath = null;
+
+            public int $nfoReadCallbacks = 0;
+
+            public int $nfoPayloadReads = 0;
+
             public function get($path, $lock = false)
             {
-                if (str_ends_with((string) $path, '.nfo') && $this->beforeNfoRead !== null) {
+                if ((string) $path === $this->nfoPayloadPath) {
+                    $this->nfoPayloadReads++;
+                }
+                $caller = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1]['function'] ?? null;
+                if ((string) $path === $this->nfoPayloadPath && $caller !== 'currentFileDigest' && $this->beforeNfoRead !== null) {
                     $callback = $this->beforeNfoRead;
                     $this->beforeNfoRead = null;
+                    $this->nfoReadCallbacks++;
                     $callback();
                 }
 
                 return parent::get($path, $lock);
             }
         };
+        [$manifestPath, $nfoPath, $manifests] = $this->makeResolvedUpload($guid, $filesystem);
+        $payloadPath = realpath($nfoPath);
+        self::assertIsString($payloadPath);
+        $filesystem->nfoPayloadPath = $payloadPath;
         $filesystem->beforeNfoRead = static function () use ($change, $guid): void {
             $values = match ($change) {
                 'epoch' => ['additional_pack_evidence' => json_encode(['v' => 1,
@@ -139,8 +167,11 @@ final class NfoImportServiceTest extends TestCase
 
         $result = (new NfoImportService($filesystem, $manifests, new NfoService))->importManifest($manifestPath);
 
+        self::assertSame(1, $filesystem->nfoReadCallbacks);
+        self::assertGreaterThan(1, $filesystem->nfoPayloadReads);
         self::assertSame($change === 'unchanged' ? 'imported' : 'failed', $result['status']);
         self::assertSame($change === 'unchanged' ? 1 : 0, DB::table('release_nfos')->count());
+        self::assertSame($change === 'unchanged' ? 1 : 0, DB::table('nfo_cleanup_commits')->count());
         self::assertSame($change === 'unchanged' ? 1 : -1, (int) DB::table('releases')->where('id', 1)->value('nfostatus'));
         self::assertFileExists($nfoPath);
     }
@@ -199,16 +230,22 @@ final class NfoImportServiceTest extends TestCase
         $manifests = new NzbUploadManifestService($filesystem);
         $directory = $this->uploadFolder.'/duplicate';
         $filesystem->makeDirectory($directory, 0775, true);
-        $filesystem->put($directory.'/Release.nzb', '<nzb></nzb>');
+        $filesystem->put($directory.'/Release.nzb', '<nzb><file subject="Fixture"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">fixture@local.test</segment></segments></file></nzb>');
         $filesystem->put($directory.'/different.nfo', 'duplicate release information');
         $manifestPath = $directory.'/'.NzbUploadManifestService::FILENAME;
-        $manifests->create($directory, 'duplicate', 'Release.nzb', 'different.nfo');
-        $manifests->recordNzbOutcome(
-            $directory.'/Release.nzb',
-            NzbImportStatus::Duplicate,
-            null,
-            null,
-        );
+        $manifests->create($directory, 'duplicate', 'Release.nzb', 'different.nfo', 'duplicate release information');
+        (new class(['Browser' => true]) extends NzbImportService
+        {
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function scanNZBFile(mixed &$nzbXML, mixed $nzbFileName = '', mixed $source = ''): NzbImportStatus
+            {
+                return NzbImportStatus::Duplicate;
+            }
+        })->beginImport([$directory.'/Release.nzb']);
 
         $result = (new NfoImportService($filesystem, $manifests, new NfoService))
             ->importManifest($manifestPath, deleteFailed: true);
@@ -247,19 +284,20 @@ final class NfoImportServiceTest extends TestCase
     /**
      * @return array{string,string,NzbUploadManifestService}
      */
-    private function makeResolvedUpload(string $guid): array
+    private function makeResolvedUpload(string $guid, ?Filesystem $filesystem = null): array
     {
-        $filesystem = new Filesystem;
+        $filesystem ??= new Filesystem;
         $manifests = new NzbUploadManifestService($filesystem);
         $directory = $this->uploadFolder.'/resolved';
         $filesystem->makeDirectory($directory, 0775, true);
         $nzbPath = $directory.'/Release.nzb';
         $nfoPath = $directory.'/different.nfo';
-        $filesystem->put($nzbPath, '<nzb></nzb>');
+        $filesystem->put($nzbPath, '<nzb><file subject="Fixture"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">fixture@local.test</segment></segments></file></nzb>');
         $filesystem->put($nfoPath, 'new release information');
         $manifestPath = $directory.'/'.NzbUploadManifestService::FILENAME;
-        $manifests->create($directory, 'resolved', 'Release.nzb', 'different.nfo');
-        $manifests->recordNzbOutcome($nzbPath, NzbImportStatus::Inserted, 1, $guid);
+        $manifests->create($directory, 'resolved', 'Release.nzb', 'different.nfo', 'new release information');
+        $this->capturedFixtureImporter('nfo-resolved')->beginImport([$nzbPath]);
+        DB::table('release_verification_candidates')->where('identity', sha1('import:nfo-resolved'))->update(['status' => 'complete', 'release_id' => 1, 'verified_at' => now()]);
 
         return [$manifestPath, $nfoPath, $manifests];
     }

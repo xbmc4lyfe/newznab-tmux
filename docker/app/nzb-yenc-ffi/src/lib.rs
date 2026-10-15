@@ -1356,6 +1356,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "experimental-xz-index"))]
+    fn default_format_abi_keeps_unqualified_index_extraction_inactive() {
+        let sample = [
+            253, 55, 122, 88, 90, 0, 0, 0, 255, 18, 217, 65, 2, 192, 5, 1, 33, 1, 0, 0, 240, 93,
+            251, 159, 1, 0, 0, 65, 0, 0, 0, 0, 0, 1, 17, 1, 173, 166, 88, 4,
+        ];
+        let pointer = unsafe { nntmux_format_metadata_json(sample.as_ptr(), sample.len()) };
+        assert!(!pointer.is_null());
+        let json = unsafe { CStr::from_ptr(pointer) }.to_bytes().to_owned();
+        unsafe { nntmux_metadata_string_free(pointer) };
+        let metadata: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let block = &metadata["headers"][0]["first_block"];
+        assert_eq!(block["compressed_size"]["value"], 5);
+        assert!(block.get("following_index").is_none());
+    }
+
+    #[test]
     fn exposes_iso_character_set_declaration_through_ffi() {
         let offset = 16 * 2048;
         let mut sample = vec![0u8; offset + 2048];

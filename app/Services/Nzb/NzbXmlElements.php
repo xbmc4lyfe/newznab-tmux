@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
-/** Traverse accepted NZB elements by namespace URI, preserving first-container semantics. */
+use App\Exceptions\NzbPasswordMetadataRejected;
+
+/** Traverse accepted NZB elements by namespace URI. */
 final class NzbXmlElements
 {
     public const string CANONICAL_NAMESPACE = 'http://www.newzbin.com/DTD/2003/nzb';
@@ -48,6 +50,40 @@ final class NzbXmlElements
     public function metadata(): iterable
     {
         return $this->containerChildren($this->document, 'head', 'meta');
+    }
+
+    public function assertUnambiguousPasswordMetadata(): void
+    {
+        $root = dom_import_simplexml($this->document);
+        foreach ($root->childNodes as $child) {
+            if ($child->nodeType === XML_ENTITY_REF_NODE) {
+                throw new NzbPasswordMetadataRejected('Invalid NZB password metadata structure.');
+            }
+            if ($child instanceof \DOMElement && $child->localName === 'head'
+                && ($child->namespaceURI ?? '') === $this->namespace) {
+                foreach ($child->childNodes as $headChild) {
+                    if ($headChild->nodeType === XML_ENTITY_REF_NODE) {
+                        throw new NzbPasswordMetadataRejected('Invalid NZB password metadata structure.');
+                    }
+                }
+            }
+        }
+        $heads = $this->namespace === ''
+            ? ($this->document->xpath('./head') ?: [])
+            : $this->document->children($this->namespace)->head;
+        if (count($heads) <= 1) {
+            return;
+        }
+        foreach ($heads as $head) {
+            $metadata = $this->namespace === ''
+                ? ($head->xpath('./meta') ?: [])
+                : $head->children($this->namespace)->meta;
+            foreach ($metadata as $meta) {
+                if ((string) $meta->attributes()['type'] === 'password') {
+                    throw new NzbPasswordMetadataRejected('Invalid NZB password metadata structure.');
+                }
+            }
+        }
     }
 
     /** @return iterable<\SimpleXMLElement> */

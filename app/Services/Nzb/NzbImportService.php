@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Nzb;
 
 use App\Enums\NzbImportStatus;
+use App\Exceptions\NzbPasswordMetadataRejected;
 use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Category;
 use App\Models\Predb;
@@ -15,6 +16,8 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\ReleaseCleaningService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Services\Releases\Verification\CandidateAdmissionDeferredException;
+use App\Services\Releases\Verification\CandidateCapacityException;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\NzbManifestReader;
 use App\Support\Utf8;
@@ -24,6 +27,7 @@ use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -71,6 +75,9 @@ class NzbImportService
 
     protected ?string $verificationCandidateIdentity = null;
 
+    /** @var array{candidate_id: int, identity: string, version: int, manifest_hash: string}|null */
+    protected ?array $verificationAdmission = null;
+
     public mixed $echoCLI;
 
     public NzbService $nzb;
@@ -107,7 +114,7 @@ class NzbImportService
     /**
      * Begin importing NZB files.
      *
-     * @param  null|callable(array{path:string,status:NzbImportStatus,release_id:int|null,release_guid:string|null,candidate_identity:string|null}):void  $resultCallback
+     * @param  null|callable(array{path:string,status:NzbImportStatus,release_id:int|null,release_guid:string|null,candidate_identity:string|null,input_capture:array<string,mixed>|null}):void  $resultCallback
      *
      * @throws FileNotFoundException
      */
@@ -155,19 +162,28 @@ class NzbImportService
             $this->echoOut("Filtered out {$totalFilesFiltered} non-NZB files. Processing ".count($nzbFiles).' NZB files.');
         }
 
-        $reportResult = static function (
+        $inputCapture = null;
+        $reportResult = function (
             string $path,
             NzbImportStatus $status,
             ?int $releaseId = null,
             ?string $releaseGuid = null,
             ?string $candidateIdentity = null,
+            ?array $inputCapture = null,
         ) use ($resultCallback): void {
+            if ($inputCapture !== null) {
+                // The importer owns the authoritative outcome; caller notification can be delayed or discard fields.
+                app(NzbUploadManifestService::class)->recordNzbOutcome($path, $status, $releaseId, $releaseGuid,
+                    candidateIdentity: $candidateIdentity, inputCapture: $inputCapture, candidateAdmission: $status === NzbImportStatus::Queued ? $this->verificationAdmission : null);
+            }
             if ($resultCallback === null) {
                 return;
             }
 
             $resultCallback([
                 'path' => $path,
+                'input_capture' => $inputCapture,
+                'candidate_admission' => $status === NzbImportStatus::Queued ? $this->verificationAdmission : null,
                 'status' => $status,
                 'release_id' => $status === NzbImportStatus::Inserted ? $releaseId : null,
                 'release_guid' => $status === NzbImportStatus::Inserted ? $releaseGuid : null,
@@ -177,12 +193,25 @@ class NzbImportService
 
         // Loop over the NZB file names only.
         foreach ($nzbFiles as $nzbFilePath) {
+            $inputCapture = null;
+            $this->verificationAdmission = null;
+            // Admission must commit before source custody can be relinquished.
+            // A nested transaction cannot establish that durable boundary.
+            if (config('release_verification.required', true) && DB::transactionLevel() > 0) {
+                $reportResult($nzbFilePath, NzbImportStatus::MetadataDeferred, inputCapture: $inputCapture);
+                $this->echoOut('Verification admission deferred by an active transaction; retaining source for retry.');
+                $nzbsSkipped++;
+
+                continue;
+            }
+
             // Check if the file is really there.
             if (File::isFile($nzbFilePath)) {
                 $this->relGuid = '';
                 $this->relId = null;
                 $this->verificationCandidateIdentity = null;
 
+                $inputReservation = app(NzbUploadManifestService::class)->reserveInput($nzbFilePath);
                 // Get the contents of the NZB file as a string.
                 if (Str::endsWith(strtolower($nzbFilePath), '.nzb.gz')) {
                     $nzbString = unzipGzipFile($nzbFilePath);
@@ -192,11 +221,20 @@ class NzbImportService
 
                 if ($nzbString === false) {
                     $this->echoOut('ERROR: Unable to read: '.$nzbFilePath);
-                    $reportResult($nzbFilePath, NzbImportStatus::Failed);
+                    $reportResult($nzbFilePath, NzbImportStatus::Failed, inputCapture: $inputCapture);
 
                     if ($deleteFailed) {
-                        File::delete($nzbFilePath);
+                        app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture);
                     }
+                    $nzbsSkipped++;
+
+                    continue;
+                }
+
+                $inputCapture = app(NzbUploadManifestService::class)->finalizeInput($nzbFilePath, $nzbString, $inputReservation);
+
+                if ($inputReservation !== null && $inputCapture === null) {
+                    $reportResult($nzbFilePath, NzbImportStatus::MetadataDeferred, inputCapture: $inputCapture);
                     $nzbsSkipped++;
 
                     continue;
@@ -206,10 +244,10 @@ class NzbImportService
                 $nzbXML = @simplexml_load_string($nzbString);
                 if ($nzbXML === false || strtolower($nzbXML->getName()) !== 'nzb') {
                     $this->echoOut('ERROR: Unable to load NZB XML data: '.$nzbFilePath);
-                    $reportResult($nzbFilePath, NzbImportStatus::Failed);
+                    $reportResult($nzbFilePath, NzbImportStatus::Failed, inputCapture: $inputCapture);
 
                     if ($deleteFailed) {
-                        File::delete($nzbFilePath);
+                        app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture);
                     }
                     $nzbsSkipped++;
 
@@ -230,6 +268,9 @@ class NzbImportService
                 $stored = false;
                 $path = null;
                 try {
+                    if (config('release_verification.required', true)) {
+                        (new NzbManifestReader)->passwordMetadata(new NzbXmlElements($nzbXML));
+                    }
                     [$importStatus, $stored, $path] = $this->withArticleIdentityLock(
                         $lockFingerprint,
                         function () use ($nzbXML, $nzbFileName, $source, $nzbString): array {
@@ -251,6 +292,8 @@ class NzbImportService
                     $nzbsSkipped++;
 
                     continue;
+                } catch (NzbPasswordMetadataRejected) {
+                    $importStatus = NzbImportStatus::MetadataIgnored;
                 } catch (\Throwable $exception) {
                     Log::error('NZB import failed while scanning or inserting a release.', [
                         'path' => $nzbFilePath,
@@ -266,24 +309,35 @@ class NzbImportService
                     $importStatus = NzbImportStatus::Failed;
                 }
 
-                if ($importStatus === NzbImportStatus::Queued) {
-                    $reportResult($nzbFilePath, $importStatus, candidateIdentity: $this->verificationCandidateIdentity);
+                if (in_array($importStatus, [NzbImportStatus::MetadataIgnored, NzbImportStatus::MetadataDeferred], true)) {
+                    $reportResult($nzbFilePath, $importStatus, inputCapture: $inputCapture);
+                    $this->echoOut($importStatus === NzbImportStatus::MetadataDeferred
+                        ? 'Verification admission deferred; retaining source for retry.'
+                        : 'Uploader metadata requires review; retaining source.');
+                    $nzbsSkipped++;
+                } elseif ($importStatus === NzbImportStatus::Queued) {
+                    $reportResult($nzbFilePath, $importStatus, candidateIdentity: $this->verificationCandidateIdentity, inputCapture: $inputCapture);
                     $nzbsImported++;
-                    if ($delete) {
-                        File::delete($nzbFilePath);
+                    // Without a durable capture there is no authority to retire a pathname:
+                    // even a published replay can race an unrelated uploader replacement.
+                    if ($delete && $inputCapture !== null) {
+                        $current = Str::endsWith(strtolower($nzbFilePath), '.nzb.gz') ? unzipGzipFile($nzbFilePath) : File::get($nzbFilePath);
+                        if ($current === $nzbString) {
+                            app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture, retainForCompanion: true);
+                        }
                     }
                 } elseif ($importStatus === NzbImportStatus::Inserted) {
                     if (! $stored) {
                         $destination = $path ?? $this->relGuid;
                         $this->echoOut('ERROR: Problem compressing NZB file to: '.$destination);
-                        $reportResult($nzbFilePath, NzbImportStatus::Failed);
+                        $reportResult($nzbFilePath, NzbImportStatus::Failed, inputCapture: $inputCapture);
 
                         if ($deleteFailed) {
-                            File::delete($nzbFilePath);
+                            app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture);
                         }
                         $nzbsSkipped++;
                     } else {
-                        $reportResult($nzbFilePath, NzbImportStatus::Inserted, $this->relId, $this->relGuid);
+                        $reportResult($nzbFilePath, NzbImportStatus::Inserted, $this->relId, $this->relGuid, inputCapture: $inputCapture);
                         if ($this->relId !== null) {
                             try {
                                 CollectReleaseFingerprintMetadata::dispatch($this->relId);
@@ -296,30 +350,30 @@ class NzbImportService
                         }
 
                         if ($delete) {
-                            // Remove the nzb file.
-                            File::delete($nzbFilePath);
+                            // Relinquish only the still-owned captured generation for staged uploads.
+                            app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture);
                         }
 
                         $nzbsImported++;
                     }
                 } else {
-                    $reportResult($nzbFilePath, $importStatus);
+                    $reportResult($nzbFilePath, $importStatus, inputCapture: $inputCapture);
 
                     if ($importStatus === NzbImportStatus::Duplicate) {
                         $nzbsDuplicate++;
 
                         if ($delete || $deleteFailed) {
-                            File::delete($nzbFilePath);
+                            app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture);
                         }
                     } else {
                         if (in_array($importStatus, [NzbImportStatus::Blacklisted, NzbImportStatus::NoGroup], true)) {
                             if ($delete || $deleteFailed) {
-                                File::delete($nzbFilePath);
+                                app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture);
                             }
                         } else {
                             $this->echoOut('ERROR: Failed to insert NZB!');
                             if ($deleteFailed) {
-                                File::delete($nzbFilePath);
+                                app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture);
                             }
                         }
 
@@ -328,7 +382,7 @@ class NzbImportService
                 }
             } else {
                 $this->echoOut('ERROR: Unable to fetch: '.$nzbFilePath);
-                $reportResult($nzbFilePath, NzbImportStatus::Failed);
+                $reportResult($nzbFilePath, NzbImportStatus::Failed, inputCapture: $inputCapture);
                 $nzbsSkipped++;
             }
         }
@@ -701,9 +755,32 @@ class NzbImportService
                 && Category::query()->where('id', $categoryId)->where('status', Category::STATUS_ACTIVE)->exists()) {
                 $info->categories_id = $categoryId;
             }
-            $manifest = app(NzbManifestReader::class)->read($nzbDetails['verificationXml'], $info);
+            try {
+                $manifest = app(NzbManifestReader::class)->read($nzbDetails['verificationXml'], $info);
+            } catch (NzbPasswordMetadataRejected) {
+                return NzbImportStatus::MetadataIgnored;
+            }
             $manifest['identity'] = sha1('import:'.($nzbDetails['articleFingerprint'] ?? $nzbDetails['verificationXml']));
-            app(CandidateRepository::class)->enqueue($manifest);
+            try {
+                $admission = app(CandidateRepository::class)->enqueueWithAdmission($manifest);
+                $admitted = $admission !== null;
+                $this->verificationAdmission = $admission?->toArray();
+            } catch (CandidateCapacityException|CandidateAdmissionDeferredException) {
+                return NzbImportStatus::MetadataDeferred;
+            } catch (\Throwable) {
+                try {
+                    Log::warning('NZB verification admission deferred.', [
+                        'category' => 'unexpected_admission_failure',
+                    ]);
+                } catch (\Throwable) {
+                    // A diagnostic failure must not relinquish the retained upload.
+                }
+
+                return NzbImportStatus::MetadataDeferred;
+            }
+            if (! $admitted) {
+                return NzbImportStatus::MetadataIgnored;
+            }
             $this->verificationCandidateIdentity = $manifest['identity'];
             $this->echoOut('NZB queued for download verification.');
 
