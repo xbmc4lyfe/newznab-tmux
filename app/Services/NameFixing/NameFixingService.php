@@ -1814,9 +1814,20 @@ class NameFixingService
      */
     public function matchPreDbFiles(object $release, bool $echo, bool $nameStatus, bool $show): int
     {
+        return $this->matchPreDbFileNames($release, explode('||', $release->filename ?? ''), $echo, $nameStatus, $show);
+    }
+
+    /**
+     * Match independent filename observations without serializing their boundaries.
+     *
+     * @param  list<string>  $files
+     *
+     * @throws \Exception
+     */
+    public function matchPreDbFileNames(object $release, array $files, bool $echo, bool $nameStatus, bool $show): int
+    {
         $matching = 0;
 
-        $files = explode('||', $release->filename ?? '');
         $prioritizedFiles = $this->filePrioritizer->prioritizeForPreDb($files);
 
         foreach ($prioritizedFiles as $fileName) {
@@ -1916,12 +1927,15 @@ class NameFixingService
             foreach ($batch as $row) {
                 $releaseFiles = $files[(int) $row->releases_id] ?? [];
                 usort($releaseFiles, static fn (object $left, object $right): int => strlen((string) $right->textstring) <=> strlen((string) $left->textstring));
-                $row->filename = implode('||', array_map(
+                $fileNames = array_map(
                     static fn (object $file): string => (string) $file->textstring,
                     $releaseFiles
-                ));
+                );
 
-                if ($this->matchPreDbFiles($row, true, true, $show) === 1) {
+                // Preserve the CLI display context; matching uses the original row list.
+                $row->filename = implode('||', $fileNames);
+
+                if ($this->matchPreDbFileNames($row, $fileNames, true, true, $show) === 1) {
                     $counted++;
                 }
                 $counter++;
