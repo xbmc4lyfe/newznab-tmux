@@ -123,7 +123,7 @@ class AppServiceProvider extends ServiceProvider
                 }
             }
             $command = (new ArgvInput(array_values($arguments)))->getFirstArgument();
-            if ($command !== null && preg_match('/^(?:tmux|multiprocessing|postprocess|update|releases|binaries|backfill|group|predb):/', $command) === 1) {
+            if ($command !== null && preg_match('/^(?:tmux|multiprocessing|postprocess|update|releases|binaries|articles|backfill|group|predb):/', $command) === 1) {
                 $this->app['config']->set('pulse.enabled', false);
             }
         }
