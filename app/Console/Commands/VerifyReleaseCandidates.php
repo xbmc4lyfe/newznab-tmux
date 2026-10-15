@@ -14,49 +14,80 @@ use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerificationResult;
+use App\Services\Releases\Verification\VerificationRunDiagnostics;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use App\Services\YencService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Throwable;
 
 class VerifyReleaseCandidates extends Command
 {
-    protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the active candidate} {--no-summary : Skip global candidate status counts}';
+    protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the active candidate} {--no-summary : Skip global candidate status counts} {--diagnostics : Log bounded natural verification run counters and timings}';
 
     protected $description = 'Spot check bounded articles before publishing complete candidate NZBs';
 
     public function handle(CandidateRepository $repository, ManifestStore $store, VerifiedReleasePublisher $publisher, ScratchInventory $scratchInventory, ScratchBudget $scratchBudget): int
     {
+        $diagnostics = $this->option('diagnostics') ? new VerificationRunDiagnostics(hrtime(true), now()->utc()->toIso8601String(),
+            max(1, (int) $this->option('limit')), max(0, (int) $this->option('max-seconds')), max(0, (int) $this->option('slot'))) : null;
+        try {
+            $exitCode = $this->runVerification($repository, $store, $publisher, $scratchInventory, $scratchBudget, $diagnostics);
+            $diagnostics?->returned($exitCode);
+
+            return $exitCode;
+        } catch (Throwable $error) {
+            $diagnostics?->failed(hrtime(true));
+
+            throw $error;
+        } finally {
+            $diagnostics?->observe(static function (array $report): void {
+                Log::channel('daily')->info('Candidate verification run summary.', $report);
+            });
+        }
+    }
+
+    private function runVerification(CandidateRepository $repository, ManifestStore $store, VerifiedReleasePublisher $publisher,
+        ScratchInventory $scratchInventory, ScratchBudget $scratchBudget, ?VerificationRunDiagnostics $diagnostics): int
+    {
         $root = (string) config('release_verification.storage_path');
         File::ensureDirectoryExists($root, 0700);
         try {
             if (! $scratchBudget->initialize()) {
+                $diagnostics?->stop('initialization_unavailable', hrtime(true));
                 $this->info('Verification scratch accounting is waiting for exclusive access.');
 
                 return self::SUCCESS;
             }
         } catch (Throwable $error) {
+            $diagnostics?->stop('initialization_error', hrtime(true));
             $this->error($error->getMessage());
 
             return self::FAILURE;
         }
         $locks = new VerificationWorkerLocks;
         if (! $locks->start(max(0, (int) $this->option('slot')))) {
+            $diagnostics?->stop('worker_unavailable', hrtime(true));
             $this->info('Verification worker slots are occupied or exclusive maintenance is running.');
 
             return self::SUCCESS;
         }
+        $diagnostics?->workerAcquired();
         try {
             if (! $this->scratchRootIsSafe($root.'/scratch')) {
+                $diagnostics?->stop('unsafe_scratch_root', hrtime(true));
                 $this->error('Verification scratch root must be an accessible directory, not a symlink.');
 
                 return self::FAILURE;
             }
+            $diagnostics?->maintenanceSkipped();
             if ($locks->tryGc()) {
+                $diagnostics?->maintenanceStarted(hrtime(true));
+                $maintenanceSuccessful = false;
                 try {
                     // A slow maintenance backlog must not monopolize a verification slot.
                     // Finish admitted transactions and individual filesystem operations; retain partial directories.
@@ -70,21 +101,29 @@ class VerifyReleaseCandidates extends Command
                         $this->cleanupTerminalScratch($root, $locks, $mayMaintain);
                         $repository->expire($mayMaintain);
                     }
+                    $maintenanceSuccessful = true;
                 } finally {
                     $locks->releaseGc();
+                    $diagnostics?->maintenanceFinished(hrtime(true), $maintenanceSuccessful);
                 }
             }
             $decoder = app(YencService::class);
             $runStarted = hrtime(true);
+            $diagnostics?->loopStarted($runStarted);
             $maxSeconds = max(0, (int) $this->option('max-seconds'));
             for ($index = 0; $index < max(1, (int) $this->option('limit')); $index++) {
                 if ($index > 0 && $maxSeconds > 0 && (hrtime(true) - $runStarted) / 1e9 >= $maxSeconds) {
+                    $diagnostics?->stop('deadline', hrtime(true));
                     break;
                 }
-                $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $locks->preferReady());
+                $preferReady = $locks->preferReady();
+                $diagnostics?->claimCalled();
+                $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
                 if ($claim === null) {
+                    $diagnostics?->stop('no_claim', hrtime(true));
                     break;
                 }
+                $diagnostics?->claimed();
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;
                 try {
                     $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
@@ -113,15 +152,20 @@ class VerifyReleaseCandidates extends Command
                     $manifest = $store->read($claim->manifest_path);
                     $started = microtime(true);
                     $result = $verifier->verify($manifest, $progressHeartbeat);
+                    $diagnostics?->verified($result->verdict);
                     if ($result->passed()) {
                         if ($publisher->publish($claim, $result) === null) {
                             $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
+                            $diagnostics?->filtered();
+                        } else {
+                            $diagnostics?->published();
                         }
                         if (File::deleteDirectory($directory) || (! file_exists($directory) && ! is_link($directory))) {
                             $scratchInventory->forget($scratchEntryId);
                         }
                     } else {
                         $repository->finish($claim, $result);
+                        $diagnostics?->finished();
                     }
                     $bytes = $result->passed()
                         ? (int) ($result->manifest['spot_check']['bytes'] ?? $result->manifest['verified_bytes'] ?? 0) : 0;
@@ -139,11 +183,14 @@ class VerifyReleaseCandidates extends Command
                     }
                     $this->line($claim->id.': '.$result->verdict.' — '.$result->reason);
                 } catch (Throwable $error) {
+                    $diagnostics?->candidateFailed();
                     $filtered = $this->filteredResult($claim);
                     if ($filtered !== null) {
+                        $diagnostics?->filtered();
                         $this->line($claim->id.': '.$filtered->verdict.' — '.$filtered->reason);
                     } else {
                         $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
+                        $diagnostics?->finished();
                         $this->warn($claim->id.': retry pending — '.$error->getMessage());
                     }
                 } finally {
@@ -151,12 +198,17 @@ class VerifyReleaseCandidates extends Command
                     $locks->releaseCandidate();
                 }
             }
+            $diagnostics?->stop('limit', hrtime(true));
             if (! $this->option('no-summary')) {
                 $counts = DB::table('release_verification_candidates')->selectRaw('status, COUNT(*) AS count')->groupBy('status')->get();
                 foreach ($counts as $count) {
                     $this->line($count->status.': '.$count->count);
                 }
             }
+        } catch (Throwable $error) {
+            $diagnostics?->failed(hrtime(true));
+
+            throw $error;
         } finally {
             unset($source);
             $locks->close();
