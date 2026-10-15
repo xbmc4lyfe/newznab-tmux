@@ -224,6 +224,50 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('completeParserFragments')]
+    public function complete_ordinary_and_safe_depth_listings_preserve_literal_names(string $fragment): void
+    {
+        $html = $this->card('First.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+
+        $this->assertCount(1, $entries);
+        $this->assertSame('First.Release-GRP', $entries[0]->title);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function completeParserFragments(): array
+    {
+        return [
+            'ordinary listing' => [''],
+            'single safe attribute' => ['<div data-marker="safe"></div>'],
+            'safe depth 240' => [str_repeat('<div>', 240).'<p>safe</p>'.str_repeat('</div>', 240)],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('discardedParserFragments')]
+    public function discarded_attributes_or_truncated_tails_reject_the_whole_listing(string $fragment): void
+    {
+        $html = $this->card('First.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function discardedParserFragments(): array
+    {
+        $cases = [];
+        foreach (['safe' => 'safe', 'C1' => '&#128;', 'noncharacter' => '&#xFDD0;', 'control' => '&#1;', 'nul' => '&#0;', 'surrogate' => '&#xD800;'] as $label => $value) {
+            $cases['second duplicate attribute '.$label] = ['<div data-marker="safe" data-marker="'.$value.'"></div>'];
+            $cases['first duplicate attribute '.$label] = ['<div data-marker="'.$value.'" data-marker="safe"></div>'];
+            $cases['truncated depth 260 '.$label] = [str_repeat('<div>', 260).'<p>'.$value.'</p>'.str_repeat('</div>', 260)];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
     public function malformed_characters_after_the_record_limit_still_reject_the_listing(): void
     {
         $html = $this->card('First.Release-GRP').str_replace('Second.Release-GRP</span>', 'Second.&#1;Release-GRP</span>', $this->card('Second.Release-GRP'));
