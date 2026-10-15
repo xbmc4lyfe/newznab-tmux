@@ -1,5 +1,6 @@
 """Public evidence export contracts, exercised through the actual CLI."""
 
+import importlib.util
 import itertools
 import json
 import os
@@ -9,7 +10,7 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/export-benchmark-summary.py"
-INPUTS = {"cpp": "benchmark-evidence/paired/observations.jsonl", "php": "benchmark-evidence/php-paired/observations.jsonl", "profile": "processing-evidence/profile/observations.jsonl", "presentation": "benchmark-evidence/results.jsonl"}
+INPUTS = {"fingerprint-ffi": "utility-evidence/fingerprint-ffi/report.json", "fingerprint-worker": "utility-evidence/fingerprint-worker/report.json", "cpu-snapshot": "utility-evidence/cpu-snapshot/report.json", "cpp": "benchmark-evidence/paired/observations.jsonl", "php": "benchmark-evidence/php-paired/observations.jsonl", "profile": "processing-evidence/profile/observations.jsonl", "presentation": "benchmark-evidence/results.jsonl"}
 # Literal test sentinel; no credentials or runtime configuration are read.
 UNPUBLISHED_MARKER = "synthetic-unpublished-fixture"
 
@@ -43,13 +44,76 @@ def presentation():
 
 
 class BenchmarkSummaryExportTest(unittest.TestCase):
-    def run_export(self, kind, records=None, raw=None):
+    def test_payload_modes_follow_the_recorded_manifest_and_unsafe_or_ambiguous_modes_are_unknown(self):
+        for kind in ("cpp", "php", "profile"):
+            for supplied, expected in (("experimental", "experimental"), ("incumbent", "incumbent"),
+                                       (None, "unknown"), (UNPUBLISHED_MARKER, "unknown"), ([], "unknown")):
+                records = profile() if kind == "profile" else paired(kind)
+                manifest = {} if supplied is None else {"rust_payload_mode": supplied}
+                if kind == "profile":
+                    records[0]["runtime_manifest"] = manifest
+                else:
+                    records[0]["runtime"] = {"manifest": {"contents": manifest}}
+                with self.subTest(kind=kind, supplied=supplied):
+                    self.assertEqual(expected, self.run_export(kind, records)["rust_payload_mode"])
+            records = profile() if kind == "profile" else paired(kind)
+            records.insert(1, dict(records[0]))
+            self.assertEqual("unknown", self.run_export(kind, records)["rust_payload_mode"])
+            self.assertEqual("unknown", self.run_export(kind)["rust_payload_mode"])
+
+
+    def test_same_commit_keeps_experimental_cpp_and_incumbent_php_and_profile_distinct_on_pages(self):
+        spec = importlib.util.spec_from_file_location("pages_mode_fixture", SCRIPT.with_name("benchmark-pages.py"))
+        pages = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pages)
+        summaries = []
+        run = {"head_sha": "d" * 40, "id": 123, "run_attempt": 2}
+        for kind, mode in (("cpp", "experimental"), ("php", "incumbent"), ("profile", "incumbent")):
+            records = profile() if kind == "profile" else paired(kind)
+            if kind == "profile":
+                records[0]["runtime_manifest"] = {"rust_payload_mode": mode}
+            else:
+                records[0]["runtime"] = {"manifest": {"contents": {"rust_payload_mode": mode}}}
+            summary = self.run_export(kind, records)
+            pages.validate_summary(summary, run, kind, "linux-x64")
+            self.assertEqual(mode, summary["rust_payload_mode"])
+            summaries.append(summary)
+        rendered = pages.render({"head_sha": "d" * 40, "generated_at": "fixture", "workflows": [],
+                                 "coverage": [], "results": summaries})
+        self.assertIn("Rust payload mode: experimental", rendered)
+        self.assertIn("Rust payload mode: incumbent", rendered)
+        self.assertTrue(all(summary["adoption_qualified"] is False for summary in summaries))
+
+
+
+    def test_payload_mode_fails_closed_for_failed_malformed_or_duplicate_protocols(self):
+        for kind in ("cpp", "php", "profile"):
+            records = profile() if kind == "profile" else paired(kind)
+            protocol = records[0]
+            if kind == "profile":
+                protocol["runtime_manifest"] = {"rust_payload_mode": "incumbent"}
+            else:
+                protocol["runtime"] = {"manifest": {"contents": {"rust_payload_mode": "experimental"}}}
+            duplicate = [protocol, *records]
+            self.assertEqual("unknown", self.run_export(kind, duplicate)["rust_payload_mode"])
+            failure = dict(type="failure" if kind == "profile" else "run_failure", status="invalid")
+            self.assertEqual("unknown", self.run_export(kind, [*records, failure])["rust_payload_mode"])
+            raw = "".join(json.dumps(row) + "\n" for row in records) + "{unfinished"
+            self.assertEqual("unknown", self.run_export(kind, raw=raw)["rust_payload_mode"])
+            protocol["runtime_manifest" if kind == "profile" else "runtime"] = []
+            self.assertEqual("unknown", self.run_export(kind, records)["rust_payload_mode"])
+
+    def run_export(self, kind, records=None, raw=None, runtime=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             if records is not None or raw is not None:
                 source = root / INPUTS[kind]
                 source.parent.mkdir(parents=True)
-                source.write_text(raw if raw is not None else "".join(json.dumps(row) + "\n" for row in records))
+                source.write_text(raw if raw is not None else json.dumps(records) if kind in ("fingerprint-ffi", "fingerprint-worker", "cpu-snapshot") else "".join(json.dumps(row) + "\n" for row in records))
+            if kind in ("fingerprint-ffi", "fingerprint-worker", "cpu-snapshot"):
+                runtime_path = root / "utility-evidence/runtime.json"
+                runtime_path.parent.mkdir(parents=True, exist_ok=True)
+                runtime_path.write_text(json.dumps(runtime if runtime is not None else {"executed_sha": "d" * 40, "rustc": "rustc 1.98.0", "build_profile": "release", "command": UNPUBLISHED_MARKER}))
             env = dict(os.environ, GITHUB_SHA="d" * 40, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2", GITHUB_REPOSITORY="xbmc4lyfe/newznab-tmux")
             result = subprocess.run(["python3", str(SCRIPT), "--kind", kind, "--runner", "linux-x64", "--output", "summary.json"], cwd=root, env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -61,6 +125,80 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             self.assertEqual((summary["run_id"], summary["run_attempt"]), (123, 2))
             self.assertEqual(summary["repository"], "xbmc4lyfe/newznab-tmux")
             return summary
+
+    def utility(self, kind):
+        cpu = kind == "cpu-snapshot"
+        names = ("common-mounted", "rare-deep64", "rare-unavailable") if cpu else ("ids16", "ids4096", "ids10000-unique-plus-duplicates", "ids50000", "xml10000")
+        digest = "44186d8c2cf2f72f63f41d46bab30e0d78b683a43441c802c8e62280fdf03812" if cpu else "2c24de1374bc2f734961d3a7159fb13eaca175839f565a14004bcd41d7f3a374"
+        report = dict(benchmark="cpu-snapshot-cold-cli" if cpu else "nzb-article-fingerprint-paired-comparison",
+                      protocol=dict(version=2 if cpu else 3, pairs=1000, pairs_per_fixture=31, backend=kind.removeprefix("fingerprint-")),
+                      sources={"baseline": {"sha256": digest, "path": UNPUBLISHED_MARKER}},
+                      runtime={"command": UNPUBLISHED_MARKER}, observations=[], invalid_observations=[], changed_artifacts=[], correctness_pass=True, adoption_gate_pass=False)
+        report["summary"] = {}
+        for name in names:
+            if cpu:
+                report["summary"][name] = dict(valid_pairs=1000, required_pairs=1000, baseline_median_ns=200, candidate_median_ns=100, median_ratio=2, paired_median_ratio=2, baseline_p99_ns=400, candidate_p99_ns=200, p99_ratio=2, median_ratio_ci95=[1.8, 2.2], p99_ratio_ci95=[1.7, 2.3], p99_sample_sufficient=True, gate_pass=False)
+            else:
+                report["summary"][name] = dict(pairs_total=31, pairs_valid=31, median_baseline_over_candidate_ratio=2, median_cold_baseline_over_candidate_ratio=1.5, pairs=[{"eligible": True}] * 31)
+        return report
+
+    def test_native_utility_reports_are_bounded_and_do_not_claim_adoption(self):
+        for kind in ("fingerprint-ffi", "fingerprint-worker", "cpu-snapshot"):
+            summary = self.run_export(kind, self.utility(kind))
+            self.assertIn(summary["status"], ("measured", "measured_gate_failed"))
+            self.assertTrue(summary["completeness"]["complete"])
+            self.assertEqual(len(summary["rows"]), 3 if kind == "cpu-snapshot" else 5)
+            self.assertEqual(summary["source_sha256"]["baseline"], self.utility(kind)["sources"]["baseline"]["sha256"])
+            self.assertEqual(summary["rows"][0]["samples"], 1000 if kind == "cpu-snapshot" else 31)
+            self.assertIn("baseline_revision", summary)
+
+    def test_native_utility_wrong_baseline_backend_missing_fixture_and_failures(self):
+        for kind in ("fingerprint-ffi", "fingerprint-worker", "cpu-snapshot"):
+            report = self.utility(kind)
+            report["sources"]["baseline"]["sha256"] = "0" * 64
+            self.assertEqual(self.run_export(kind, report)["status"], "invalid")
+            report = self.utility(kind)
+            del report["summary"][next(iter(report["summary"]))]
+            self.assertEqual(self.run_export(kind, report)["status"], "partial")
+            report = self.utility(kind)
+            report["summary"][UNPUBLISHED_MARKER] = {}
+            self.assertEqual(self.run_export(kind, report)["status"], "invalid")
+            report = self.utility(kind)
+            if kind == "cpu-snapshot":
+                report["correctness_pass"] = False
+            else:
+                report["invalid_observations"] = [{"command": UNPUBLISHED_MARKER}]
+            self.assertEqual(self.run_export(kind, report)["status"], "invalid")
+        report = self.utility("fingerprint-ffi")
+        report["protocol"]["backend"] = "worker"
+        self.assertEqual(self.run_export("fingerprint-ffi", report)["status"], "invalid")
+
+    def test_native_utility_invalid_metrics_and_insufficient_tail_are_visible(self):
+        report = self.utility("cpu-snapshot")
+        report["summary"]["common-mounted"]["valid_pairs"] = 0
+        self.assertEqual(self.run_export("cpu-snapshot", report)["status"], "invalid")
+        report = self.utility("cpu-snapshot")
+        report["summary"]["common-mounted"]["p99_ratio"] = float("nan")
+        self.assertEqual(self.run_export("cpu-snapshot", report)["status"], "invalid")
+        summary = self.run_export("fingerprint-ffi", self.utility("fingerprint-ffi"))
+        self.assertTrue(all(row["p99_sample_sufficient"] is False for row in summary["rows"]))
+
+    def test_cpu_optional_absent_proc_host_fixture_is_preserved(self):
+        report = self.utility("cpu-snapshot")
+        report["protocol"]["host_proc_absent_at_start"] = True
+        self.assertEqual(self.run_export("cpu-snapshot", report)["status"], "partial")
+        report["summary"]["rare-host-unavailable"] = dict(report["summary"]["rare-unavailable"])
+        summary = self.run_export("cpu-snapshot", report)
+        self.assertEqual(summary["status"], "measured_gate_failed")
+        self.assertEqual(len(summary["rows"]), 4)
+
+    def test_utility_runtime_identity_is_current_and_allowlisted(self):
+        summary = self.run_export("fingerprint-ffi", self.utility("fingerprint-ffi"))
+        self.assertEqual(summary["runtime_identity"]["executed_sha"], "d" * 40)
+        self.assertNotIn("command", summary["runtime_identity"])
+        self.assertEqual(self.run_export("fingerprint-ffi", self.utility("fingerprint-ffi"), runtime={"executed_sha": "e" * 40})["status"], "invalid")
+        self.assertEqual(len(summary["report_sha256"]), 64)
+        self.assertEqual(len(summary["protocol_sha256"]), 64)
 
     def test_missing_inputs_always_produce_json(self):
         for kind in INPUTS:

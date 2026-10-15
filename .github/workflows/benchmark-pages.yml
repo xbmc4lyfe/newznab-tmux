@@ -10,8 +10,14 @@ on:
       - '.github/workflows/release-presentation.yml'
       - 'scripts/*benchmark*'
       - 'tests/Unit/test_benchmark*'
+      - 'github-pages/docs/**'
+      - 'scripts/build-docs.py'
+      - 'tests/Unit/test_docs_site.py'
+      - 'scripts/check-docs.py'
+      - 'tests/Unit/test_docs_links.py'
+      - '.github/workflows/native-utilities-performance.yml'
   workflow_run:
-    workflows: ['Paired native yEnc performance', 'Rust release presentation', 'Run tests', 'rust-clippy analyze']
+    workflows: ['Paired native yEnc performance', 'Rust release presentation', 'Run tests', 'rust-clippy analyze', 'Native utility performance']
     types: [in_progress, completed]
     branches: [master]
   workflow_dispatch:
@@ -35,6 +41,23 @@ jobs:
       - run: |
           python3 tests/Unit/test_benchmark_pages.py
           python3 tests/Unit/test_benchmark_summary_export.py
+          python3 tests/Unit/test_docs_site.py
+          python3 tests/Unit/test_docs_links.py
+      - name: Check Google style with pinned Vale
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/vale.tar.gz" https://github.com/vale-cli/vale/releases/download/v3.24.0/vale_3.24.0_Linux_64-bit.tar.gz
+          echo "867534ddb678abca7f214bc4706ead0922bd5252ffe8035fc227013f66c8b214  $RUNNER_TEMP/vale.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/vale"
+          tar -xzf "$RUNNER_TEMP/vale.tar.gz" -C "$RUNNER_TEMP/vale" vale
+          "$RUNNER_TEMP/vale/vale" --config=github-pages/docs/.vale.ini github-pages/docs/content
+      - name: Build and check documentation preview
+        run: |
+          node --check github-pages/docs/assets/site.js
+          bash github-pages/deployment/prepare-benchmarks.sh docs-preview
+          echo '{"status":"unavailable","reason":"Preview has no current-build collection"}' > docs-preview/results.json
+          python3 scripts/build-docs.py --output=docs-preview
+          python3 scripts/check-docs.py --site=docs-preview
 
   build:
     needs: test
@@ -69,6 +92,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BUILD_SHA: ${{ steps.identity.outputs.sha }}
         run: python3 scripts/benchmark-pages.py --sha="$BUILD_SHA" --output=benchmark-site
+      - name: Build documentation around current and historical evidence
+        run: |
+          python3 scripts/build-docs.py --output=benchmark-site
+          python3 scripts/check-docs.py --site=benchmark-site
       - uses: actions/upload-pages-artifact@v4
         with:
           path: benchmark-site

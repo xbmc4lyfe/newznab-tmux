@@ -1,0 +1,395 @@
+{
+  "schema_version": 1,
+  "kind": "php",
+  "runner": "ubuntu-latest",
+  "head_sha": "57dfddcfd029b361e92c4d6ddae21b200b57323b",
+  "run_id": 38655034947,
+  "run_attempt": 1,
+  "repository": "xbmc4lyfe/newznab-tmux",
+  "status": "useful_improvement",
+  "rows": [
+    {
+      "size": 4096,
+      "density": "ordinary",
+      "path": "tolerant",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.3062317624015669,
+      "bootstrap_95_percent_interval": [
+        0.300196101973026,
+        0.3186320087318592
+      ]
+    },
+    {
+      "size": 4096,
+      "density": "ordinary",
+      "path": "strict",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.3870760900541465,
+      "bootstrap_95_percent_interval": [
+        0.3776041666666667,
+        0.3966753705270126
+      ]
+    },
+    {
+      "size": 4096,
+      "density": "ordinary",
+      "path": "body",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.4896853313052571,
+      "bootstrap_95_percent_interval": [
+        0.4792789325121889,
+        0.49680007641608565
+      ]
+    },
+    {
+      "size": 4096,
+      "density": "heavy",
+      "path": "tolerant",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.0357497751216227,
+      "bootstrap_95_percent_interval": [
+        0.034650895979020976,
+        0.03662737130572421
+      ]
+    },
+    {
+      "size": 4096,
+      "density": "heavy",
+      "path": "strict",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.05125023238520172,
+      "bootstrap_95_percent_interval": [
+        0.04961090833964603,
+        0.052270767861612485
+      ]
+    },
+    {
+      "size": 4096,
+      "density": "heavy",
+      "path": "body",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.08234342097615716,
+      "bootstrap_95_percent_interval": [
+        0.08083925955044133,
+        0.08459529088607823
+      ]
+    },
+    {
+      "size": 524288,
+      "density": "ordinary",
+      "path": "tolerant",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.06615729993618442,
+      "bootstrap_95_percent_interval": [
+        0.06503096803975708,
+        0.06884403750319448
+      ]
+    },
+    {
+      "size": 524288,
+      "density": "ordinary",
+      "path": "strict",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.07067311129386353,
+      "bootstrap_95_percent_interval": [
+        0.06895201467589186,
+        0.07498099672469542
+      ]
+    },
+    {
+      "size": 524288,
+      "density": "ordinary",
+      "path": "body",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.20231282020439711,
+      "bootstrap_95_percent_interval": [
+        0.19651997271010632,
+        0.2075149165153945
+      ]
+    },
+    {
+      "size": 524288,
+      "density": "heavy",
+      "path": "tolerant",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.007888317994677716,
+      "bootstrap_95_percent_interval": [
+        0.007794633559040995,
+        0.007991085032256892
+      ]
+    },
+    {
+      "size": 524288,
+      "density": "heavy",
+      "path": "strict",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.008156861228607532,
+      "bootstrap_95_percent_interval": [
+        0.008083598845899985,
+        0.008354065335795753
+      ]
+    },
+    {
+      "size": 524288,
+      "density": "heavy",
+      "path": "body",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.03927531927230226,
+      "bootstrap_95_percent_interval": [
+        0.038062257037243655,
+        0.040187050424324855
+      ]
+    },
+    {
+      "size": 1048576,
+      "density": "ordinary",
+      "path": "tolerant",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.061534772855395166,
+      "bootstrap_95_percent_interval": [
+        0.06018547518157488,
+        0.06259768794669875
+      ]
+    },
+    {
+      "size": 1048576,
+      "density": "ordinary",
+      "path": "strict",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.0645259430599488,
+      "bootstrap_95_percent_interval": [
+        0.06222184195122482,
+        0.06631707665575749
+      ]
+    },
+    {
+      "size": 1048576,
+      "density": "ordinary",
+      "path": "body",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.21250681172288285,
+      "bootstrap_95_percent_interval": [
+        0.20686050600172437,
+        0.21615273825860556
+      ]
+    },
+    {
+      "size": 1048576,
+      "density": "heavy",
+      "path": "tolerant",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.008322311157837327,
+      "bootstrap_95_percent_interval": [
+        0.008200909507084742,
+        0.008478137518360443
+      ]
+    },
+    {
+      "size": 1048576,
+      "density": "heavy",
+      "path": "strict",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.008881166406318792,
+      "bootstrap_95_percent_interval": [
+        0.008736421974618769,
+        0.009061230029291115
+      ]
+    },
+    {
+      "size": 1048576,
+      "density": "heavy",
+      "path": "body",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.040074702788879694,
+      "bootstrap_95_percent_interval": [
+        0.03960817567148055,
+        0.040593989664341565
+      ]
+    },
+    {
+      "size": 8388608,
+      "density": "ordinary",
+      "path": "tolerant",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.05349332857846799,
+      "bootstrap_95_percent_interval": [
+        0.052594806883206405,
+        0.05518441936050592
+      ]
+    },
+    {
+      "size": 8388608,
+      "density": "ordinary",
+      "path": "strict",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.055988666500085854,
+      "bootstrap_95_percent_interval": [
+        0.05517932188784134,
+        0.05682940614604262
+      ]
+    },
+    {
+      "size": 8388608,
+      "density": "ordinary",
+      "path": "body",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.27770377706995725,
+      "bootstrap_95_percent_interval": [
+        0.2738468216383423,
+        0.2828129033127802
+      ]
+    },
+    {
+      "size": 8388608,
+      "density": "heavy",
+      "path": "tolerant",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.008986721959797774,
+      "bootstrap_95_percent_interval": [
+        0.00881622121408158,
+        0.009218068884743495
+      ]
+    },
+    {
+      "size": 8388608,
+      "density": "heavy",
+      "path": "strict",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.00941597450070835,
+      "bootstrap_95_percent_interval": [
+        0.009319388076642026,
+        0.009499059792267527
+      ]
+    },
+    {
+      "size": 8388608,
+      "density": "heavy",
+      "path": "body",
+      "decision": "useful_improvement",
+      "eligible_pairs": 31,
+      "invalid_pairs": 0,
+      "bootstrap_replicates": 10000,
+      "confidence_family_size": 24,
+      "median_rust_over_php": 0.0669965454088884,
+      "bootstrap_95_percent_interval": [
+        0.0662156181931662,
+        0.06783567109696856
+      ]
+    }
+  ],
+  "evidence_type": "paired_median_screen",
+  "adoption_qualified": false,
+  "completeness": {
+    "expected_rows": 24,
+    "observed_rows": 24,
+    "complete": true
+  },
+  "source_sha256": {
+    "tests/Support/YencNntpHarness.php": "db660242d67eebe633cc972f59884d83ee2c37f2d04e7364e8e53a391188e8aa",
+    "scripts/build-rapidyenc.sh": "0df7854ff8b1028c54e9f2b94fcd05ffc636dc229d2200bc08992dc0e35da8c5",
+    "docker/app/nzb-yenc-ffi/src/release_names.rs": "5f16c3cd04a0706492e7577a6d7832bd06f8675713258c046624764aa3ef3087",
+    "app/Services/YencService.php": "f906e5ef85cff2ed4755fcea5a7690043daa38a818f0e6d4ee7d30c14a87706a",
+    "app/Services/NNTP/NNTPService.php": "ec94b2c96c07ea9958305f9959ec9c401af2386d71161ad388f9340b729d4fdd",
+    "tests/Fixtures/YencArticles.php": "b100f4567e5e722335f10d758d6872aa086e37d8689a5828d38634a14e9a5c2c",
+    "scripts/benchmark-yenc.php": "33bb0b26ccd391650f9f099ef7a5d7951c5547e95c537977faea56e5ecc34843",
+    "docker/app/nzb-yenc-ffi/Cargo.toml": "bc7f6c7f61bd00bd978ae6f817666f544562f5aff72feac709fa5bf6fe36f02d",
+    "docker/app/nzb-yenc-ffi/src/lib.rs": "50c88c7f3fd5e6f481c6811c70652125116a60bbbf2b3504fd456a8b7f5ce76d",
+    "docker/app/nzb-yenc-ffi/Cargo.lock": "77b88ca781e79d95668cb5cb2d8bb61b89d3b3c4dd0892cdc86d4b260dffb55d",
+    "composer.lock": "ee1360f9ab65dbd1d3435cc2d986a2d4a3f2069ba8e129222df3889facdd5be8"
+  },
+  "library_sha256": {
+    "rust": "6db926bc9e55b913e2041a5deb7a3a589f39bfd2d1649f9fa1698a0c320f3422"
+  }
+}

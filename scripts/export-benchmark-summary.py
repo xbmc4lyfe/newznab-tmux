@@ -2,6 +2,7 @@
 """Export public benchmark metrics without copying private evidence payloads."""
 
 import argparse
+import hashlib
 import itertools
 import json
 import math
@@ -10,7 +11,12 @@ from pathlib import Path
 import re
 import statistics
 
-INPUTS = {
+UTILITY_BASELINES = {
+    "fingerprint": ("a1a9b0829610c3b62e7d0bdb418669a89c36c90b", "2c24de1374bc2f734961d3a7159fb13eaca175839f565a14004bcd41d7f3a374"),
+    "cpu-snapshot": ("5cc5303b502e653d83bba1951dec2f5d2da1db35", "44186d8c2cf2f72f63f41d46bab30e0d78b683a43441c802c8e62280fdf03812"),
+}
+UTILITY_KINDS = ("fingerprint-ffi", "fingerprint-worker", "cpu-snapshot")
+INPUTS = {**{kind: f"utility-evidence/{kind}/report.json" for kind in UTILITY_KINDS},
     "cpp": "benchmark-evidence/paired/observations.jsonl",
     "php": "benchmark-evidence/php-paired/observations.jsonl",
     "profile": "processing-evidence/profile/observations.jsonl",
@@ -214,6 +220,98 @@ def summarize(kind, records):
     return safe_rows, status, {"expected_rows": len(expected), "observed_rows": len(seen), "complete": complete}, flags
 
 
+def rust_payload_mode(kind, records, status):
+    """Use one successful protocol's recorded build manifest, never comparison kind."""
+    if kind not in ("cpp", "php", "profile") or status not in ("ok", "useful_improvement", "inconclusive", "regression"):
+        return "unknown"
+    protocols = [record for record in records if record.get("type") == "protocol"]
+    if len(protocols) != 1:
+        return "unknown"
+    protocol = protocols[0]
+    if kind == "profile":
+        manifest = protocol.get("runtime_manifest")
+    else:
+        manifest = protocol
+        for key in ("runtime", "manifest", "contents"):
+            manifest = manifest.get(key) if isinstance(manifest, dict) else None
+    mode = manifest.get("rust_payload_mode") if isinstance(manifest, dict) else None
+    return mode if mode in ("incumbent", "experimental") else "unknown"
+
+
+def utility_summary(kind, report):
+    """Publish fixed fixture names and numeric metrics; never paths, commands or raw observations."""
+    cpu = kind == "cpu-snapshot"
+    revision, baseline_hash = UTILITY_BASELINES["cpu-snapshot" if cpu else "fingerprint"]
+    expected = ("common-mounted", "rare-deep64", "rare-unavailable") if cpu else ("ids16", "ids4096", "ids10000-unique-plus-duplicates", "ids50000", "xml10000")
+    protocol = report.get("protocol", {})
+    if cpu and isinstance(protocol, dict) and protocol.get("host_proc_absent_at_start") is True:
+        expected = (*expected, "rare-host-unavailable")
+    source = report.get("sources", {})
+    measured = report.get("summary", {})
+    if not isinstance(protocol, dict) or not isinstance(source, dict) or not isinstance(measured, dict):
+        raise ValueError("Invalid utility report")
+    baseline = source.get("baseline", {})
+    baseline = baseline if isinstance(baseline, dict) else {}
+    invalid = baseline.get("sha256") != baseline_hash
+    invalid |= report.get("benchmark") != ("cpu-snapshot-cold-cli" if cpu else "nzb-article-fingerprint-paired-comparison")
+    invalid |= protocol.get("version") != (2 if cpu else 3)
+    invalid |= bool(set(measured) - set(expected))
+    if cpu:
+        invalid |= report.get("correctness_pass") is not True or report.get("changed_artifacts") != []
+        invalid |= type(report.get("adoption_gate_pass")) is not bool
+    else:
+        invalid |= report.get("invalid_observations") != [] or protocol.get("backend") != kind.removeprefix("fingerprint-")
+    rows = []
+    for fixture in expected:
+        if fixture not in measured:
+            continue
+        metrics = measured[fixture]
+        if not isinstance(metrics, dict):
+            invalid = True
+            continue
+        samples = metrics.get("valid_pairs" if cpu else "pairs_valid")
+        required = metrics.get("required_pairs" if cpu else "pairs_total")
+        declared = protocol.get("pairs" if cpu else "pairs_per_fixture")
+        valid = count(samples) and count(required) and samples > 0 and samples == required == declared
+        row = dict(fixture=fixture, candidate_backend="rust-cli" if cpu else kind.removeprefix("fingerprint-"),
+                   samples=samples if count(samples) else 0, invalid_pairs=max(0, required - samples) if count(required) and count(samples) else 0,
+                   p99_sample_sufficient=cpu and count(samples) and samples >= 1000)
+        scalar_keys = ("baseline_median_ns", "candidate_median_ns", "median_ratio", "paired_median_ratio", "baseline_p99_ns", "candidate_p99_ns", "p99_ratio") if cpu else ("median_baseline_over_candidate_ratio", "median_cold_baseline_over_candidate_ratio")
+        for key in scalar_keys:
+            if number(metrics.get(key)) and metrics[key] > 0:
+                row[key] = metrics[key]
+            else:
+                valid = False
+        if cpu:
+            for key in ("median_ratio_ci95", "p99_ratio_ci95"):
+                interval = metrics.get(key)
+                if isinstance(interval, list) and len(interval) == 2 and all(number(x) and x > 0 for x in interval) and interval[0] <= interval[1]:
+                    row[key] = interval
+                else:
+                    valid = False
+            valid &= type(metrics.get("gate_pass")) is bool
+            valid &= metrics.get("p99_sample_sufficient") is row["p99_sample_sufficient"]
+            row["gate_passed"] = metrics.get("gate_pass") is True
+        else:
+            pairs = metrics.get("pairs")
+            valid &= isinstance(pairs, list) and len(pairs) == samples and all(isinstance(pair, dict) and pair.get("eligible") is True for pair in pairs)
+        row["eligible"] = bool(valid)
+        invalid |= not valid
+        rows.append(row)
+    identities = {}
+    allowed = ("baseline", "candidate", "composer_lock", "benchmark", "rust_cargo_lock", "rust_accumulator", "rust_abi", "rust_worker", "php_worker", "native_library", "native_worker", "candidate_binary", "coordinator_binary", "cargo_lock", "cargo_toml", "candidate_source", "candidate_cli", "coordinator_source", "python_executable", "crate_lib_source")
+    for name in allowed:
+        entry = source.get(name)
+        if isinstance(entry, dict) and digest(entry.get("sha256")):
+            identities[name] = entry["sha256"]
+    complete = len(rows) == len(expected)
+    return dict(rows=rows, status="invalid" if invalid else "partial" if not complete else "measured_gate_failed" if cpu and not report["adoption_gate_pass"] else "measured",
+                completeness=dict(expected_rows=len(expected), observed_rows=len(rows), complete=complete),
+                baseline_revision=revision, source_sha256=identities,
+                protocol_sha256=hashlib.sha256(json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                evidence_type="synthetic_cli_comparison" if cpu else "paired_public_operation_median_screen")
+
+
 def env_count(key):
     value = os.environ.get(key, "")
     return int(value) if re.fullmatch(r"[0-9]{1,20}", value) else 0
@@ -227,7 +325,31 @@ def export(kind, runner):
                "run_id": env_count("GITHUB_RUN_ID"), "run_attempt": env_count("GITHUB_RUN_ATTEMPT"),
                "repository": repository if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) else "",
                "status": "missing", "rows": [], "evidence_type": "diagnostic_only" if kind == "profile" else "presentation_median_screen" if kind == "presentation" else "paired_median_screen",
-               "adoption_qualified": False}
+               "adoption_qualified": False, "rust_payload_mode": "unknown"}
+    if kind in UTILITY_KINDS:
+        try:
+            report_raw = Path(INPUTS[kind]).read_bytes()
+            report = json.loads(report_raw, parse_constant=reject_constant, parse_float=finite_float)
+            if not isinstance(report, dict):
+                raise ValueError("Expected report object")
+            summary.update(utility_summary(kind, report))
+            summary["report_sha256"] = hashlib.sha256(report_raw).hexdigest()
+            runtime_file = Path("utility-evidence/runtime.json")
+            if not runtime_file.is_file():
+                summary["status"] = "partial" if summary["status"] != "invalid" else "invalid"
+            else:
+                runtime = json.loads(runtime_file.read_text(), parse_constant=reject_constant, parse_float=finite_float)
+                allowed_runtime = ("executed_sha", "rustc", "cargo", "php", "python", "architecture", "cpu_model", "runner_image_os", "runner_image_version", "build_profile")
+                if not isinstance(runtime, dict) or runtime.get("executed_sha") != summary["head_sha"]:
+                    raise ValueError("Executed build identity mismatch")
+                summary["runtime_identity"] = {key: runtime[key] for key in allowed_runtime if isinstance(runtime.get(key), str) and len(runtime[key]) <= 4096}
+                if count(runtime.get("logical_cpus")):
+                    summary["runtime_identity"]["logical_cpus"] = runtime["logical_cpus"]
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError, ValueError, TypeError, OverflowError):
+            summary["status"] = "invalid"
+        return summary
     records, malformed = [], False
     try:
         with Path(INPUTS[kind]).open(encoding="utf-8") as source:
@@ -246,6 +368,7 @@ def export(kind, runner):
         malformed = True
     rows, status, completeness, flags = summarize(kind, records)
     summary.update(rows=rows, status="invalid" if malformed else status, completeness=completeness, **flags, **identities(records))
+    summary["rust_payload_mode"] = rust_payload_mode(kind, records, summary["status"])
     return summary
 
 
