@@ -7,8 +7,10 @@ namespace Tests\Feature;
 use App\Facades\Search;
 use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Release;
+use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\Binaries\BinariesConfig;
 use App\Services\CollectionCleanupService;
+use App\Services\NfoService;
 use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbArticleFingerprintUnavailable;
 use App\Services\Nzb\NzbCreationCandidateQuery;
@@ -160,14 +162,25 @@ class NzbCreationReliabilityTest extends TestCase
         self::assertSame([], $nzb->findStaleTemporaryNzbPaths(0));
     }
 
-    public function test_none_publication_rotates_its_epoch_and_retires_only_its_old_derived_evidence(): void
+    /** @return array<string, array{bool}> */
+    public static function passwordCheckModes(): array
     {
+        return ['password checks enabled' => [true], 'password checks disabled' => [false]];
+    }
+
+    #[DataProvider('passwordCheckModes')]
+    public function test_none_publication_rotates_its_epoch_and_retires_only_its_old_derived_evidence(bool $checkPasswords): void
+    {
+        config(['nntmux_settings.check_passworded_rars' => $checkPasswords]);
         Bus::fake();
         Search::shouldReceive('updateRelease')->andReturnNull();
         $this->insertRelease(1, 'a');
         $this->insertWritableCbp(200, 2000, 1);
         $before = $this->packEnvelope(1, str_repeat('a', 36));
+        $this->insertRelease(2, 'b');
+        DB::table('releases')->whereIn('id', [1, 2])->update($this->completedProcessingState());
         DB::table('releases')->where('id', 1)->update(['additional_pack_evidence' => $before]);
+        $otherBefore = (array) DB::table('releases')->where('id', 2)->first();
         foreach ($this->derivedEvidenceTables() as $table) {
             DB::table($table)->insert([['releases_id' => 1], ['releases_id' => 2]]);
         }
@@ -178,6 +191,8 @@ class NzbCreationReliabilityTest extends TestCase
         $result = $nzb->createNzbForRelease($release);
 
         self::assertTrue($result->success);
+        $this->assertProcessingState(1, reset: true, checkPasswords: $checkPasswords);
+        self::assertSame($otherBefore, (array) DB::table('releases')->where('id', 2)->first());
         $after = json_decode((string) DB::table('releases')->value('additional_pack_evidence'), true, flags: JSON_THROW_ON_ERROR);
         self::assertNull($after['state']);
         self::assertNotSame(str_repeat('a', 64), $after['epoch']);
@@ -193,7 +208,10 @@ class NzbCreationReliabilityTest extends TestCase
         $this->insertRelease(1, 'a');
         $this->insertWritableCbp(200, 2000, 1);
         $before = $this->packEnvelope(1, str_repeat('a', 36));
+        $this->insertRelease(2, 'b');
+        DB::table('releases')->whereIn('id', [1, 2])->update($this->completedProcessingState());
         DB::table('releases')->where('id', 1)->update(['additional_pack_evidence' => $before]);
+        $otherBefore = (array) DB::table('releases')->where('id', 2)->first();
         DB::unprepared("CREATE TRIGGER reject_publication BEFORE UPDATE OF nzbstatus ON releases WHEN NEW.nzbstatus = 1 BEGIN SELECT RAISE(ABORT, 'forced publication failure'); END");
         foreach ($this->derivedEvidenceTables() as $table) {
             DB::table($table)->insert([['releases_id' => 1], ['releases_id' => 2]]);
@@ -205,6 +223,8 @@ class NzbCreationReliabilityTest extends TestCase
         $result = $nzb->createNzbForRelease($release);
 
         self::assertFalse($result->success);
+        $this->assertProcessingState(1, reset: false);
+        self::assertSame($otherBefore, (array) DB::table('releases')->where('id', 2)->first());
         self::assertSame(NzbService::NZB_NONE, (int) DB::table('releases')->value('nzbstatus'));
         self::assertSame($before, DB::table('releases')->value('additional_pack_evidence'));
         self::assertSame(1, DB::table('collections')->count());
@@ -534,6 +554,42 @@ class NzbCreationReliabilityTest extends TestCase
             Bus::assertNothingDispatched();
         } finally {
             $this->travelBack();
+        }
+    }
+
+    /** @return array<string, int|string> */
+    private function completedProcessingState(): array
+    {
+        return ['nfostatus' => 1, 'haspreview' => 1, 'passwordstatus' => 0,
+            'proc_nfo' => 1, 'proc_files' => 1, 'proc_par2' => 1, 'proc_hash16k' => 1,
+            'proc_crc32' => 1, 'proc_srr' => 1, 'proc_uid' => 1, 'rarinnerfilecount' => 9,
+            'pp_timeout_count' => 3, 'additional_pp_claim_token' => 'old-generation',
+            'additional_pp_claimed_at' => '2099-01-01 00:00:00', 'archive_retry_at' => '2099-01-01 00:00:00',
+            'proc_pp' => 1, 'jpgstatus' => 1, 'videostatus' => 1, 'audiostatus' => 1, 'movieinfo_id' => 42];
+    }
+
+    private function assertProcessingState(int $id, bool $reset, bool $checkPasswords = true): void
+    {
+        $expected = $this->completedProcessingState();
+        if ($reset) {
+            $expected = ['nfostatus' => -1, 'haspreview' => -1, 'passwordstatus' => $checkPasswords ? -1 : 0,
+                'proc_nfo' => 0, 'proc_files' => 0, 'proc_par2' => 0, 'proc_hash16k' => 0,
+                'proc_crc32' => 0, 'proc_srr' => 0, 'proc_uid' => 0, 'rarinnerfilecount' => 0,
+                'pp_timeout_count' => 0, 'additional_pp_claim_token' => null,
+                'additional_pp_claimed_at' => null, 'archive_retry_at' => null] + $expected;
+        }
+        $release = DB::table('releases')->where('id', $id)->first();
+        foreach ($expected as $column => $value) {
+            self::assertSame($value, is_int($value) ? (int) $release->$column : $release->$column, $column);
+        }
+        if ($reset) {
+            self::assertTrue(AdditionalCandidateQuery::baseBuilder(minSizeBytes: 0, maxSizeBytes: 0)->where('r.id', $id)->exists());
+            $nfo = app(NfoService::class);
+            foreach (['minSize' => 0, 'maxSize' => 0, 'maxRetries' => -8] as $property => $value) {
+                (new \ReflectionProperty(NfoService::class, $property))->setValue($nfo, $value);
+            }
+            $nfoQuery = new \ReflectionMethod(NfoService::class, 'buildNfoProcessingQuery');
+            self::assertTrue($nfoQuery->invoke($nfo, '', '')->where('id', $id)->exists());
         }
     }
 
@@ -1165,7 +1221,7 @@ class NzbCreationReliabilityTest extends TestCase
             DB::statement("DROP TABLE IF EXISTS {$table}");
         }
         DB::statement('CREATE TABLE root_categories (id INTEGER PRIMARY KEY, title VARCHAR(255), status INTEGER DEFAULT 1, disablepreview INTEGER DEFAULT 0)');
-        DB::statement('CREATE TABLE categories (id INTEGER PRIMARY KEY, title VARCHAR(255), root_categories_id INTEGER NULL)');
+        DB::statement('CREATE TABLE categories (id INTEGER PRIMARY KEY, title VARCHAR(255), disablepreview INTEGER DEFAULT 0, root_categories_id INTEGER NULL)');
         DB::statement('CREATE TABLE releases (
             id INTEGER PRIMARY KEY,
             guid VARCHAR(64),
@@ -1179,7 +1235,28 @@ class NzbCreationReliabilityTest extends TestCase
             nzb_creation_claimed_at DATETIME NULL,
             nzb_creation_claim_token VARCHAR(64) NULL,
             article_fingerprint CHAR(40) NULL,
-            additional_pack_evidence TEXT NULL
+            additional_pack_evidence TEXT NULL,
+            nfostatus INTEGER DEFAULT -1,
+            haspreview INTEGER DEFAULT -1,
+            passwordstatus INTEGER DEFAULT -1,
+            size INTEGER DEFAULT 2000000,
+            additional_pp_claimed_at DATETIME NULL,
+            additional_pp_claim_token VARCHAR(64) NULL,
+            archive_retry_at DATETIME NULL,
+            proc_nfo INTEGER DEFAULT 0,
+            proc_files INTEGER DEFAULT 0,
+            proc_par2 INTEGER DEFAULT 0,
+            proc_hash16k INTEGER DEFAULT 0,
+            proc_crc32 INTEGER DEFAULT 0,
+            proc_srr INTEGER DEFAULT 0,
+            proc_uid INTEGER DEFAULT 0,
+            rarinnerfilecount INTEGER DEFAULT 0,
+            pp_timeout_count INTEGER DEFAULT 0,
+            proc_pp INTEGER DEFAULT 0,
+            jpgstatus INTEGER DEFAULT 0,
+            videostatus INTEGER DEFAULT 0,
+            audiostatus INTEGER DEFAULT 0,
+            movieinfo_id INTEGER DEFAULT 0
         )');
         DB::statement('CREATE TABLE release_nzb_creation_failures (
             releases_id INTEGER PRIMARY KEY,

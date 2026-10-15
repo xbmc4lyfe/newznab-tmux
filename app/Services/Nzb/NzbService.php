@@ -299,8 +299,8 @@ class NzbService
                 if (! File::isFile($path) || ! is_readable($path)) {
                     return NzbCreationResult::transient("Final NZB file is missing or unreadable: {$path}", $collectionIds, $path);
                 }
-                ReleasePackEvidence::retireDerivedEvidence((int) $current->id);
-                $current->update($this->successfulReleaseUpdateValues($fingerprint) + [
+                $processingReset = ReleasePackEvidence::retireDerivedEvidence((int) $current->id);
+                $current->update($processingReset + $this->successfulReleaseUpdateValues($fingerprint) + [
                     ReleasePackEvidence::COLUMN => ReleasePackEvidence::tombstone($current),
                 ]);
 

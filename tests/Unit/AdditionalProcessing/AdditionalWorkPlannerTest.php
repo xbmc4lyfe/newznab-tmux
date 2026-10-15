@@ -14,6 +14,54 @@ class AdditionalWorkPlannerTest extends TestCase
     use CreatesProcessingConfiguration;
 
     #[Test]
+    public function it_keeps_distinct_zip_names_with_spaces_separate(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+        foreach ([['Show.One S01E01', 'Show.Two S01E01'], ['Show.zip Episode1', 'Show.zip Episode2']] as [$one, $two]) {
+            foreach ([false, true] as $quoted) {
+                $quote = $quoted ? '"' : '';
+                $plan = $planner->plan([
+                    ['title' => $quote.$one.'.zip'.$quote.' yEnc (1/4)', 'segments' => ['<one>']],
+                    ['title' => $quote.$one.'.z01'.$quote.' yEnc (1/4)', 'segments' => ['<one-next>']],
+                    ['title' => $quote.$two.'.zip'.$quote.' yEnc (1/4)', 'segments' => ['<two>']],
+                    ['title' => $quote.$two.'.z01'.$quote.' yEnc (1/4)', 'segments' => ['<two-next>']],
+                ], 'alt.binaries.test');
+                $keys = [];
+                foreach ($plan->archiveCandidates as $candidate) {
+                    $keys[$candidate->messageIds[0]] = $plan->setKeyOf($candidate);
+                }
+                self::assertSame($keys['<one>'], $keys['<one-next>']);
+                self::assertSame($keys['<two>'], $keys['<two-next>']);
+                self::assertNotSame($keys['<one>'], $keys['<two>']);
+                self::assertSame(2, $plan->archiveSetCount());
+            }
+        }
+    }
+
+    #[Test]
+    public function it_groups_zip_volumes_before_subject_trailers(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+        foreach ([false, true] as $quoted) {
+            $quote = $quoted ? '"' : '';
+            $plan = $planner->plan([
+                ['title' => $quote.'Show.S01E01.zip'.$quote.' yEnc (1/4)', 'segments' => ['<first>']],
+                ['title' => $quote.'Show.S01E01.z01'.$quote.' yEnc (1/4)', 'segments' => ['<next>']],
+                ['title' => $quote.'Show.S01E02.zip'.$quote.' yEnc (1/4)', 'segments' => ['<other>']],
+                ['title' => $quote.'Show.S01E02.z01'.$quote.' yEnc (1/4)', 'segments' => ['<other-next>']],
+            ], 'alt.binaries.test');
+            $keys = [];
+            foreach ($plan->archiveCandidates as $candidate) {
+                $keys[$candidate->messageIds[0]] = $plan->setKeyOf($candidate);
+            }
+            self::assertSame($keys['<first>'], $keys['<next>']);
+            self::assertSame($keys['<other>'], $keys['<other-next>']);
+            self::assertNotSame($keys['<first>'], $keys['<other>']);
+            self::assertSame(2, $plan->archiveSetCount());
+        }
+    }
+
+    #[Test]
     public function it_uses_one_set_identity_for_numbered_subjects_without_merging_distinct_names_or_families(): void
     {
         $planner = new AdditionalWorkPlanner($this->makeConfig());

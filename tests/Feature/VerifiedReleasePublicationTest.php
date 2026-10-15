@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Facades\Search;
+use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
+use App\Services\NfoService;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
@@ -120,6 +122,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             'including reconstructed file' => [12345, 12345, null],
             'trusted unpublished legacy row' => [12345, 12345, 'legacy'],
             'cohort legacy publication rotates and retires derived rows' => [12345, 12345, 'legacy', null, ['alt.test'], null, true],
+            'cohort legacy publication without password checks' => [12345, 12345, 'legacy', null, ['alt.test'], null, true, false],
             'cohort covered duplicate preserves epoch and derived rows' => [12345, 12345, 'exact', null, ['alt.test'], null, true],
             'cohort legacy rollback preserves epoch and derived rows' => [12345, 12345, 'legacy', 'legacy_update', ['alt.test'], null, true],
             'changed legacy publication is not overwritten' => [12345, 12345, 'legacy_changed', 'legacy_changed'],
@@ -151,8 +154,9 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
 
     /** @param list<string> $groupNames */
     #[DataProvider('verifiedSizes')]
-    public function test_successful_download_publishes_exact_verified_nzb_once(?int $verifiedBytes, int $expectedSize, ?string $duplicateKind, ?string $failure = null, array $groupNames = ['alt.test'], ?string $timingMode = null, bool $packLifecycle = false): void
+    public function test_successful_download_publishes_exact_verified_nzb_once(?int $verifiedBytes, int $expectedSize, ?string $duplicateKind, ?string $failure = null, array $groupNames = ['alt.test'], ?string $timingMode = null, bool $packLifecycle = false, bool $checkPasswords = true): void
     {
+        config(['nntmux_settings.check_passworded_rars' => $checkPasswords]);
         config(['nntmux.release_dedupe_enabled' => $duplicateKind !== null, 'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
         app('files')->ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
         Schema::create('releases', function (Blueprint $table): void {
@@ -160,6 +164,10 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $table->json('additional_pack_evidence')->nullable();
             $table->string('additional_pp_claim_token')->nullable();
             $table->timestamp('additional_pp_claimed_at')->nullable();
+            $table->timestamp('archive_retry_at')->nullable();
+            foreach (['proc_nfo', 'proc_files', 'proc_par2', 'proc_hash16k', 'proc_crc32', 'proc_srr', 'proc_uid', 'rarinnerfilecount', 'pp_timeout_count', 'proc_pp', 'jpgstatus', 'videostatus', 'audiostatus', 'movieinfo_id'] as $column) {
+                $table->integer($column)->default(0);
+            }
             foreach (['name', 'searchname', 'guid', 'leftguid', 'fromname', 'postdate', 'adddate'] as $column) {
                 $table->string($column);
             }
@@ -167,6 +175,11 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 $table->integer($column);
             }
         });
+        Schema::create('categories', static function (Blueprint $table): void {
+            $table->id();
+            $table->integer('disablepreview')->default(0);
+        });
+        DB::table('categories')->insert(['id' => 2000]);
         $derivedTables = ['release_files', 'release_nfos', 'media_infos', 'par_hashes', 'par_file_hashes', 'par_file_hash_inventories', 'par2_hash_retry', 'par2_rename_progress'];
         foreach ($derivedTables as $table) {
             Schema::create($table, static function (Blueprint $schema): void {
@@ -283,7 +296,10 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         if ($packLifecycle) {
             $packBefore = json_encode(['v' => 1, 'identity_sha256' => hash('sha256', json_encode(['777', $duplicateGuid], JSON_THROW_ON_ERROR)),
                 'epoch' => str_repeat('a', 64), 'state' => 'confirmed'], JSON_THROW_ON_ERROR);
-            DB::table('releases')->where('id', 777)->update(['additional_pack_evidence' => $packBefore]);
+            DB::table('releases')->where('id', 777)->update([
+                'additional_pack_evidence' => $packBefore,
+                ...$this->completedProcessingState(),
+            ]);
             foreach ($derivedTables as $table) {
                 DB::table($table)->insert(['releases_id' => 777]);
             }
@@ -409,6 +425,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                     $this->assertSame(NzbService::NZB_NONE, (int) DB::table('releases')->value('nzbstatus'));
                     if ($packLifecycle) {
                         self::assertSame($packBefore, DB::table('releases')->value('additional_pack_evidence'));
+                        $this->assertProcessingState(777, reset: false);
                         foreach ($derivedTables as $table) {
                             self::assertSame(1, DB::table($table)->where('releases_id', 777)->count(), $table);
                         }
@@ -444,6 +461,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         }
         if ($packLifecycle) {
             $packAfter = DB::table('releases')->where('id', 777)->value('additional_pack_evidence');
+            $this->assertProcessingState(777, reset: $duplicateKind !== 'exact', checkPasswords: $checkPasswords);
             if ($duplicateKind === 'exact') {
                 self::assertSame($packBefore, $packAfter);
             } else {
@@ -571,5 +589,41 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         $claim = (object) ['id' => 999, 'version' => 1, 'lease_token' => 'lost', 'manifest_hash' => 'old'];
         $this->expectException(\RuntimeException::class);
         app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Verified', []));
+    }
+
+    /** @return array<string, int|string> */
+    private function completedProcessingState(): array
+    {
+        return ['nfostatus' => 1, 'haspreview' => 1, 'passwordstatus' => 0,
+            'proc_nfo' => 1, 'proc_files' => 1, 'proc_par2' => 1, 'proc_hash16k' => 1,
+            'proc_crc32' => 1, 'proc_srr' => 1, 'proc_uid' => 1, 'rarinnerfilecount' => 9,
+            'pp_timeout_count' => 3, 'additional_pp_claim_token' => 'old-generation',
+            'additional_pp_claimed_at' => '2099-01-01 00:00:00', 'archive_retry_at' => '2099-01-01 00:00:00',
+            'proc_pp' => 1, 'jpgstatus' => 1, 'videostatus' => 1, 'audiostatus' => 1, 'movieinfo_id' => 42];
+    }
+
+    private function assertProcessingState(int $id, bool $reset, bool $checkPasswords = true): void
+    {
+        $expected = $this->completedProcessingState();
+        if ($reset) {
+            $expected = ['nfostatus' => -1, 'haspreview' => -1, 'passwordstatus' => $checkPasswords ? -1 : 0,
+                'proc_nfo' => 0, 'proc_files' => 0, 'proc_par2' => 0, 'proc_hash16k' => 0,
+                'proc_crc32' => 0, 'proc_srr' => 0, 'proc_uid' => 0, 'rarinnerfilecount' => 0,
+                'pp_timeout_count' => 0, 'additional_pp_claim_token' => null,
+                'additional_pp_claimed_at' => null, 'archive_retry_at' => null] + $expected;
+        }
+        $release = DB::table('releases')->where('id', $id)->first();
+        foreach ($expected as $column => $value) {
+            self::assertSame($value, is_int($value) ? (int) $release->$column : $release->$column, $column);
+        }
+        if ($reset) {
+            self::assertTrue(AdditionalCandidateQuery::baseBuilder(minSizeBytes: 0, maxSizeBytes: 0)->where('r.id', $id)->exists());
+            $nfo = app(NfoService::class);
+            foreach (['minSize' => 0, 'maxSize' => 0, 'maxRetries' => -8] as $property => $value) {
+                (new \ReflectionProperty(NfoService::class, $property))->setValue($nfo, $value);
+            }
+            $nfoQuery = new \ReflectionMethod(NfoService::class, 'buildNfoProcessingQuery');
+            self::assertTrue($nfoQuery->invoke($nfo, '', '')->where('id', $id)->exists());
+        }
     }
 }

@@ -176,12 +176,35 @@ final class ReleasePackEvidence
         return self::encode($current, null);
     }
 
-    /** Retire only evidence attached to this unpublished cohort; shared catalogue data stays intact. */
-    public static function retireDerivedEvidence(int $releaseId): void
+    /**
+     * Retire this unpublished cohort's evidence and return its generation-specific reset.
+     * The caller applies these values with publication in the same locked transaction.
+     *
+     * @return array<string, int|null>
+     */
+    public static function retireDerivedEvidence(int $releaseId): array
     {
         foreach (['release_files', 'release_nfos', 'media_infos', 'par_hashes', 'par_file_hashes', 'par_file_hash_inventories', 'par2_hash_retry', 'par2_rename_progress'] as $table) {
             DB::table($table)->where('releases_id', $releaseId)->delete();
         }
+
+        return [
+            'nfostatus' => -1,
+            'haspreview' => -1,
+            'passwordstatus' => config('nntmux_settings.check_passworded_rars') === true ? -1 : 0,
+            'proc_nfo' => 0,
+            'proc_files' => 0,
+            'proc_srr' => 0,
+            'proc_crc32' => 0,
+            'proc_uid' => 0,
+            'proc_par2' => 0,
+            'proc_hash16k' => 0,
+            'rarinnerfilecount' => 0,
+            'pp_timeout_count' => 0,
+            'archive_retry_at' => null,
+            'additional_pp_claim_token' => null,
+            'additional_pp_claimed_at' => null,
+        ];
     }
 
     private static function identity(int $id, string $guid): string

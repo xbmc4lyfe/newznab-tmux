@@ -143,8 +143,8 @@ final class VerifiedReleasePublisher
                     } else {
                         $id = (int) $legacy->id;
                         unset($parameters['naming_regex_id']);
-                        ReleasePackEvidence::retireDerivedEvidence($id);
-                        DB::table('releases')->where('id', $id)->update($parameters + [
+                        $processingReset = ReleasePackEvidence::retireDerivedEvidence($id);
+                        DB::table('releases')->where('id', $id)->update($processingReset + $parameters + [
                             'iscategorized' => 1,
                             ReleasePackEvidence::COLUMN => ReleasePackEvidence::tombstone($legacy),
                         ]);

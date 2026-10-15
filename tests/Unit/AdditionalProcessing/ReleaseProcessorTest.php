@@ -1498,6 +1498,36 @@ class ReleaseProcessorTest extends TestCase
     }
 
     #[Test]
+    public function it_does_not_mark_one_split_zip_episode_as_a_probable_season_pack(): void
+    {
+        $config = $this->makeConfig(['processPasswords' => true]);
+        $nzbParser = Mockery::mock(NzbContentParser::class);
+        $nzbParser->shouldReceive('parseNzb')->once()->andReturn(['error' => null, 'contents' => [
+            ['title' => 'opaque.zip yEnc (1/4)', 'segments' => ['<episode>']],
+            ['title' => 'opaque.z01 yEnc (1/4)', 'segments' => ['<continuation>']],
+        ]]);
+        $downloadService = Mockery::mock(UsenetDownloadService::class);
+        $this->expectDownloadScope($downloadService);
+        $downloadService->shouldReceive('download')->andReturnUsing(fn (DownloadKind $kind, array $ids): array => [
+            'success' => $ids === ['<episode>'],
+            'data' => $ids === ['<episode>'] ? $this->zip('Show.S01E05.1080p.WEB-DL-GRP.mkv', str_repeat('x', 100)) : '',
+            'groupUnavailable' => false,
+            'error' => $ids === ['<episode>'] ? null : 'A continuation is not independently readable.',
+        ]);
+        $releaseManager = $this->countingReleaseManager();
+        $releaseManager->shouldReceive('matchFileNamesToPreDb')->andReturnNull();
+
+        $context = $this->makeContext();
+        $context->release->nfostatus = 1;
+        $this->seasonPackProcessor($config, $nzbParser, $downloadService, $releaseManager)->process($context, '/tmp/main/');
+
+        $this->assertSame(1, $context->workPlan->archiveSetCount());
+        $this->assertSame(1, $context->totalFileInfo);
+        $this->assertFalse($context->seasonPack);
+        $this->assertFalse($context->seasonPackProbable);
+    }
+
+    #[Test]
     public function it_runs_the_held_back_predb_match_when_only_one_episode_was_listed(): void
     {
         $config = $this->makeConfig(['processPasswords' => true]);

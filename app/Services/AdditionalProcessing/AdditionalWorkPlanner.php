@@ -413,6 +413,13 @@ final readonly class AdditionalWorkPlanner
             return $volume[0];
         }
 
+        [$zipName, $zipPrefix] = preg_match('/"([^"\r\n]+)"/', $title, $quotedZip) === 1
+            ? [$quotedZip[1], '^(.+)']
+            : [$title, '^([^"\r\n]+)'];
+        if (preg_match('/'.$zipPrefix.'\.(?:zipx?|zipr\d{2,3}|z\d{2,3})(?:$|[ ")-])/i', $zipName, $zip) === 1) {
+            return strtolower($zip[1]);
+        }
+
         if (preg_match('/"([a-f0-9]{32})\.[1-9]\d{1,2}"/i', $title, $hashed) === 1) {
             return strtolower($hashed[1]);
         }
