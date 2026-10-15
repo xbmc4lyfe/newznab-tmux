@@ -87,6 +87,9 @@ class PagesTest(unittest.TestCase):
         self.assertIn('1.235 ms', rendered)
         self.assertIn('2.70×', rendered)
         self.assertIn('1.876×', rendered)
+        cells = rendered.split('<tr><td>')[1].split('</td>')
+        self.assertNotIn('<th>Recorded / diagnostic intervals</th>', rendered)
+        self.assertIn('Speedup 95% interval', cells[2])
         self.assertIn('N=31', rendered)
         self.assertIn('Eligible', rendered)
         report = dict(head_sha=SHA, generated_at='fixture', workflows=[], coverage=[],
@@ -107,6 +110,8 @@ class PagesTest(unittest.TestCase):
         self.assertIn('&lt;img', rendered)
         self.assertNotIn('<script>', rendered)
         self.assertNotIn('×', rendered)
+        self.assertNotIn('<th>Recorded / diagnostic intervals</th>', rendered)
+        self.assertNotIn('<th>Simultaneous decision bounds</th>', rendered)
         interval = pages.display_interval([1.4999, 1.5001], 'ratio')
         self.assertEqual(interval, '[1.499×, 1.501×]')
         control = pages.measurement_table([dict(comparison='same_php_control', baseline_latency_ms=1,
@@ -177,7 +182,7 @@ class PagesTest(unittest.TestCase):
                      median_ratio_ci95=[2.12, 2.72], p99_ratio_ci95=[1.72, 2.32])]
         text = pages.measurement_table(rows)
         self.assertIn('Simultaneous decision bounds', text)
-        self.assertIn('Diagnostic intervals', text)
+        self.assertIn('Recorded / diagnostic intervals', text)
         for value in ('gate_statistic', 'median_ratio', 'p99_ratio',
                       'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95',
                       '[1.610×, 2.410×]', '[1.620×, 2.420×]', '[2.020×, 2.820×]',

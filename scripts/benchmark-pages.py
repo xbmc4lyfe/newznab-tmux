@@ -623,7 +623,6 @@ def display_interval(value, unit):
 
 
 def measurement_table(rows):
-    table = ['<table><tr><th>Workload</th><th>Latency / ratio</th><th>Diagnostic intervals</th><th>Simultaneous decision bounds</th><th>Scope / samples / eligibility</th></tr>']
     labels = ('size', 'density', 'path', 'phase', 'scenario', 'rows', 'fixture')
     latencies = {
         'php_median_ns': ('PHP median', 1000000), 'rust_median_ns': ('Rust median', 1000000),
@@ -646,6 +645,15 @@ def measurement_table(rows):
         'baseline_latency_interval_ms': ('Baseline quantile interval', 'ms'),
         'candidate_latency_interval_ms': ('Candidate quantile interval', 'ms'),
     }
+    decision_fields = {'speedup_interval', 'baseline_latency_interval_ms', 'candidate_latency_interval_ms',
+        'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95',
+        'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95', 'gate_statistic'}
+    has_diagnostics = any(set(row) & (set(intervals) - decision_fields) for row in rows)
+    has_bounds = any(set(row) & decision_fields for row in rows)
+    table = ['<table><tr><th>Workload</th><th>Latency / ratio</th>'
+        + ('<th>Recorded / diagnostic intervals</th>' if has_diagnostics else '')
+        + ('<th>Simultaneous decision bounds</th>' if has_bounds else '')
+        + '<th>Scope / samples / eligibility</th></tr>']
     comparisons = {
         'shared_par2_projection': 'Shared PAR2 projection only',
         'shared_vendor_header_projection': 'Shared archive header projection only (locked PHP readers)',
@@ -677,7 +685,8 @@ def measurement_table(rows):
                 bounds.append(key + ': ' + str(value))
             elif key in intervals:
                 title, unit = intervals[key]
-                diagnostics.append(title + ': ' + ('unavailable' if value is None else display_interval(value, unit)))
+                destination = bounds if key in ('speedup_interval', 'baseline_latency_interval_ms', 'candidate_latency_interval_ms') else diagnostics
+                destination.append(title + ': ' + ('unavailable' if value is None else display_interval(value, unit)))
             elif key == 'body_ffi_median_ms' and isinstance(value, dict):
                 values.extend('BODY ' + str(stage) + ': ' + latency_ms(duration) for stage, duration in value.items())
             elif key == 'improvement_percent':
@@ -695,10 +704,13 @@ def measurement_table(rows):
             else:
                 # Keep unfamiliar fields visible; the exact envelope remains below.
                 values.append(str(key) + ': ' + json.dumps(value, ensure_ascii=False))
-        table.append('<tr><td>' + escape(label) + '</td><td>' + '<br>'.join(escape(value) for value in values)
-                     + '</td><td>' + '<br>'.join(escape(value) for value in diagnostics)
-                     + '</td><td>' + '<br>'.join(escape(value) for value in bounds)
-                     + '</td><td>' + '<br>'.join(escape(value) for value in states) + '</td></tr>')
+        cells = [escape(label), '<br>'.join(escape(value) for value in values)]
+        if has_diagnostics:
+            cells.append('<br>'.join(escape(value) for value in diagnostics))
+        if has_bounds:
+            cells.append('<br>'.join(escape(value) for value in bounds))
+        cells.append('<br>'.join(escape(value) for value in states))
+        table.append('<tr><td>' + '</td><td>'.join(cells) + '</td></tr>')
     table.append('</table>')
     return '\n'.join(table)
 
