@@ -14,9 +14,11 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\NNTP\NNTPService;
+use App\Services\Nzb\NzbService;
 use App\Services\Par2FileList;
 use App\Services\Par2PacketAccumulator;
 use App\Services\Par2Processor;
+use App\Support\ReleasePackEvidence;
 use dariusiii\rarinfo\Par2Info;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
@@ -70,6 +72,10 @@ final class Par2NameRecoveryIntegrationTest extends TestCase
         });
         $schema->create('releases', function (Blueprint $table): void {
             $table->integer('id')->primary();
+            $table->integer('nzbstatus')->default(NzbService::NZB_NONE);
+            $table->json('additional_pack_evidence')->nullable();
+            $table->string('additional_pp_claim_token')->nullable();
+            $table->timestamp('additional_pp_claimed_at')->nullable();
             foreach (['groups_id', 'categories_id', 'isrenamed', 'iscategorized', 'predb_id', 'proc_par2', 'proc_hash16k', 'rarinnerfilecount', 'videos_id', 'tv_episodes_id', 'tv_lookup_attempts', 'book_lookup_attempts'] as $column) {
                 $table->integer($column)->default(0);
             }
@@ -95,6 +101,7 @@ final class Par2NameRecoveryIntegrationTest extends TestCase
         $container->instance('db.schema', $schema);
         (require base_path('database/migrations/2026_10_12_010315_create_par_file_hash_evidence_tables.php'))->up();
         (require base_path('database/migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php'))->up();
+        (require base_path('database/migrations/2026_10_15_190000_create_par2_descriptor_evidence_table.php'))->up();
         $this->database->getConnection()->table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.binaries.test']);
     }
 
@@ -230,6 +237,8 @@ final class Par2NameRecoveryIntegrationTest extends TestCase
     {
         $this->database->getConnection()->table('releases')->insert([
             'id' => $id, 'guid' => 'synthetic-release-'.$id, 'groups_id' => 1, 'categories_id' => Category::OTHER_MISC,
+            'nzbstatus' => NzbService::NZB_ADDED,
+            'additional_pack_evidence' => ReleasePackEvidence::tombstone((object) ['id' => $id, 'guid' => 'synthetic-release-'.$id]),
             'name' => '7ae60ee3d802bfd4388b0f2c6e982e7a',
             'searchname' => '7ae60ee3d802bfd4388b0f2c6e982e7a',
             'postdate' => '2026-10-11 00:00:00',

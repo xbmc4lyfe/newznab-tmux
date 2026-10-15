@@ -165,6 +165,35 @@ final class Par2PacketAccumulator
         return $files;
     }
 
+    /**
+     * Project accepted FileDesc packets without filename or file-ID deduplication.
+     * IDs, hashes and validated packet checksums are lowercase hex; filename bytes
+     * include the original NUL padding and may contain non-UTF-8 data. Rejected
+     * conflicting identities are not accepted evidence and never appear here.
+     *
+     * @return list<array{recovery_set_id: string, file_id: string, hash: string, hash_16K: string, size_decimal: string, filename_bytes: string, packet_checksum: string}>
+     */
+    public function descriptors(): array
+    {
+        $descriptors = [];
+        foreach ($this->packets as $packet) {
+            if (substr($packet, 48, 16) !== Par2Info::PACKET_FILEDESC) {
+                continue;
+            }
+            $descriptors[] = [
+                'recovery_set_id' => bin2hex(substr($packet, 32, 16)),
+                'file_id' => bin2hex(substr($packet, 64, 16)),
+                'hash' => bin2hex(substr($packet, 80, 16)),
+                'hash_16K' => bin2hex(substr($packet, 96, 16)),
+                'size_decimal' => Par2FileHashEvidence::littleEndianSize(substr($packet, 112, 8)),
+                'filename_bytes' => substr($packet, 120),
+                'packet_checksum' => bin2hex(substr($packet, 16, 16)),
+            ];
+        }
+
+        return $descriptors;
+    }
+
     private function consume(string $bytes): void
     {
         $offset = 0;

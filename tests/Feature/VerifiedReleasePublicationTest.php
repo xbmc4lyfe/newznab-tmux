@@ -180,7 +180,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $table->integer('disablepreview')->default(0);
         });
         DB::table('categories')->insert(['id' => 2000]);
-        $derivedTables = ['release_files', 'release_nfos', 'media_infos', 'par_hashes', 'par_file_hashes', 'par_file_hash_inventories', 'par2_hash_retry', 'par2_rename_progress'];
+        $derivedTables = ['release_files', 'release_nfos', 'media_infos', 'par_hashes', 'par_file_hashes', 'par_file_hash_inventories', 'par2_hash_retry', 'par2_rename_progress', 'par2_descriptor_evidence'];
         foreach ($derivedTables as $table) {
             Schema::create($table, static function (Blueprint $schema): void {
                 $schema->integer('releases_id')->primary();
