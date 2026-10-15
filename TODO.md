@@ -1,5 +1,15 @@
 # To do
 
+## Qualify actionable hash retry counts (2026-10-15)
+
+Exclude a future same-generation PAR2 hash retry only from the hash naming branch. Keep other ready naming sources actionable, preserve byte-sensitive GUID identity and the exact retry boundary, and retain the PAR2-first short circuit.
+
+- [x] Reproduce the count/worker disagreement through the real tmux aggregate in isolated SQLite: the future same-generation case expected zero actionable renames but counted one; six related admission cases passed before the fix.
+- [x] Local affected PHPUnit passed: backlog, PAR2 full-hash and book/TV tmux consumers, 86 tests and 724 assertions. Owned-path Pint and syntax lint passed; full configured PHPStan passed with zero errors. PHP source hashes remained unchanged after Pint.
+- [ ] Complete the full integrated PHPUnit/native suite; bounded local checks do not qualify MariaDB or production behavior.
+- [x] Reject the private Rust composer after actual tmux aggregate comparison including startup/IPC/reaping: both correctness modes passed 26 tests/91 assertions; 5 warmup pairs and 100 randomized pairs gave median native/Rust speedup 0.22057× and bootstrap median upper 99% screen 0.23117×, below 1.5×. Retain native PHP. Uncommon p99 remains unrun and unqualified; private receipts are in `nntmux-actionable-hash-retry-review-20261015-v1`.
+- [ ] Obtain current-head independent Codex approval, green required checks and verified signed squash. Any deployment and live queue verification remain with the designated deployment owner.
+
 ## Qualify authoritative backfill date targets (2026-10-14)
 
 Use the same selected NNTP connection for backfill targeting and storage. Date-based admission requires the requested article's parseable date from that provider/group; unrelated local part numbers, neighboring article dates and the current clock cannot supply it. Missing endpoint or midpoint metadata defers the attempt. Successful exact probes retain the approximate date search with bounded, integer-safe arithmetic; article Date ordering is still not guaranteed. Failed overview ranges must retain their cursor, while successful empty ranges remain completed work.
