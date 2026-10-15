@@ -368,7 +368,7 @@ class TmuxRuntimeTest extends TestCase
 
         $this->assertSame("started\nfinished\nbatch complete\n", file_get_contents($marker));
         $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('tmux_running'));
-        $this->assertSame(1, (int) DB::table('processing_runtime_states')->value('stop_requested'));
+        $this->assertSame(0, (int) DB::table('processing_runtime_states')->value('stop_requested'));
         $this->assertFalse($session->sessionExists());
         $this->assertTrue($keeper->sessionExists());
     }

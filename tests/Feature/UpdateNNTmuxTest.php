@@ -6,6 +6,7 @@ namespace Tests\Feature;
 
 use App\Console\Commands\UpdateNNTmux;
 use App\Services\NntmuxUpdateLock;
+use Illuminate\Console\OutputStyle;
 use Illuminate\Contracts\Foundation\MaintenanceMode;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
@@ -16,6 +17,7 @@ use Mockery;
 use Mockery\MockInterface;
 use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
+use Symfony\Component\Console\Helper\ProgressBar;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Output\BufferedOutput;
 use Tests\Support\ConfigurationTestBuilder;
@@ -140,6 +142,29 @@ class UpdateNNTmuxTest extends TestCase
         $this->assertFalse($this->maintenanceActive);
         $this->assertStringContainsString('update completed successfully', $output);
         $this->assertStringNotContainsString(config('app.key'), $output);
+    }
+
+    public function test_maintenance_merges_missing_environment_keys_before_caching_configuration(): void
+    {
+        File::put($this->directory.'/.env', "APP_NAME=ExistingName\n");
+        File::put($this->directory.'/.env.example', "APP_NAME=TemplateName\nCACHE_STORE=failover_redis_file\n");
+        $command = $this->command();
+        $output = new OutputStyle(new ArrayInput([]), new BufferedOutput);
+        $command->setOutput($output);
+        (new \ReflectionProperty(UpdateNNTmux::class, 'progressBar'))->setValue($command, new ProgressBar($output, 1));
+        foreach (['config:clear', 'view:clear', 'route:clear', 'route:cache'] as $name) {
+            $command->shouldReceive('call')->once()->with($name)->andReturn(0);
+        }
+        $command->shouldReceive('call')->once()->with('config:cache')->andReturnUsing(function (): int {
+            $environment = File::get($this->directory.'/.env');
+            $this->assertStringContainsString("CACHE_STORE=failover_redis_file\n", $environment);
+            $this->assertStringContainsString("APP_NAME=ExistingName\n", $environment);
+            $this->assertStringNotContainsString('APP_NAME=TemplateName', $environment);
+
+            return 0;
+        });
+
+        (new \ReflectionMethod(UpdateNNTmux::class, 'performMaintenanceTasks'))->invoke($command);
     }
 
     public function test_failed_tmux_shutdown_aborts_before_git_and_restores_web_access(): void
