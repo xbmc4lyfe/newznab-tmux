@@ -103,6 +103,8 @@ docker/Makefile		-binary text eol=lf
 /tests/Unit/test_benchmark_resource_limits.py -binary text eol=lf
 /tests/Unit/test_benchmark_remaining_modules_export.py -binary text eol=lf
 
+# Clippy setup regression is reviewable Python source.
+/tests/Unit/test_clippy_toolchain.py -binary text eol=lf
 # Public benchmark inventory and deployment verification are reviewable source.
 /scripts/benchmark_rust_inventory.py -binary text eol=lf
 /scripts/verify-benchmark-pages.py -binary text eol=lf
