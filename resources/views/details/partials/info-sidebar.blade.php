@@ -27,7 +27,7 @@
                         <dt class="text-sm font-medium text-gray-500 dark:text-gray-400">Posted</dt>
                         <dd class="mt-1 text-sm text-gray-900 dark:text-gray-100">{{ userDate($release->postdate, 'M d, Y H:i') }}</dd>
                     </div>
-                    @if(!empty($release->fromname))
+                    @if(isset($release->fromname) && $release->fromname !== '')
                         <div>
                             <dt class="text-sm font-medium text-gray-500 dark:text-gray-400">Posted By</dt>
                             <dd class="mt-1 text-sm text-gray-900 dark:text-gray-100 break-all">

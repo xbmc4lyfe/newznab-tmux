@@ -2972,7 +2972,10 @@ class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterfac
 
         $phrases = $criteria['phrases'] ?? null;
         $hasText = $phrases !== null && $phrases !== '' && $phrases !== -1;
-        $tryFuzzy = (bool) ($criteria['try_fuzzy'] ?? true) && ! self::hasMediaInfoFieldQuery($phrases);
+        $hasPosterFieldQuery = self::hasPosterFieldQuery($phrases);
+        $tryFuzzy = (bool) ($criteria['try_fuzzy'] ?? true)
+            && ! self::hasMediaInfoFieldQuery($phrases)
+            && ! $hasPosterFieldQuery;
 
         $run = function (bool $useFuzzy) use ($criteria, $limit, $offset, $hasText, $phrases): array {
             $filter = $this->buildElasticsearchReleaseFilters($criteria);
@@ -3088,7 +3091,7 @@ class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterfac
         };
 
         if ($hasText && (bool) ($criteria['fuzzy_only'] ?? false)) {
-            return $run(true);
+            return $run(! $hasPosterFieldQuery);
         }
 
         if ($hasText) {
@@ -3180,6 +3183,14 @@ class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterfac
         }
 
         return false;
+    }
+
+    private static function hasPosterFieldQuery(mixed $phrases): bool
+    {
+        return is_array($phrases)
+            && isset($phrases['fromname'])
+            && $phrases['fromname'] !== ''
+            && $phrases['fromname'] !== -1;
     }
 
     /**
