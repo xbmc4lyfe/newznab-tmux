@@ -642,8 +642,15 @@ fn validated_child(
                 && report["data_sha256"] == work["data_sha256"],
             "invalid native child identity/correctness count",
         )?;
+        let expected_version = match string(artifact, "name")? {
+            "cpp" => 0x010101,
+            "candidate" | "incumbent" => 0x0103,
+            _ => return Err("unknown native artifact role".into()),
+        };
         require(
-            report["os"] == "linux" && report["arch"] == "aarch64" && report["version"] == 0x0103,
+            report["os"] == "linux"
+                && report["arch"] == "aarch64"
+                && report["version"] == expected_version,
             "native child runtime/version mismatch",
         )?;
         let elapsed = positive(report, "elapsed_ms")?;
@@ -1790,7 +1797,7 @@ mod complete_tests {
                     )
                     .unwrap()
                 };
-                json!({"status":"ok","operation":work["operation"],"iterations":iterations,"elapsed_ms":elapsed,"library_sha256":artifact["sha256"],"input_sha256":work["input_sha256"],"data_sha256":work["data_sha256"],"receipt":receipt,"expected_sha256":if freeze {Value::Null} else {comparison["expected_receipt_sha256"].clone()},"batch_results":{"count":iterations,"value":(integer(&receipt,"count").unwrap() as u64).wrapping_add((integer(&receipt,"crc").unwrap() as u64)<<32).wrapping_add(integer(&receipt,"number").unwrap() as u64),"encoding":"one run; every scalar or byte/state witness checked"},"os":"linux","arch":"aarch64","version":259,"timed_chunks":comparison["timed_chunks_per_observation"],"chunk_slots":comparison["chunk_slots"],"chunk_memory_limit":33554432,"maximum_chunk_slots":8,"scalar_chunk_slots":4096,"decoder_kernel":4096,"crc_kernel":72})
+                json!({"status":"ok","operation":work["operation"],"iterations":iterations,"elapsed_ms":elapsed,"library_sha256":artifact["sha256"],"input_sha256":work["input_sha256"],"data_sha256":work["data_sha256"],"receipt":receipt,"expected_sha256":if freeze {Value::Null} else {comparison["expected_receipt_sha256"].clone()},"batch_results":{"count":iterations,"value":(integer(&receipt,"count").unwrap() as u64).wrapping_add((integer(&receipt,"crc").unwrap() as u64)<<32).wrapping_add(integer(&receipt,"number").unwrap() as u64),"encoding":"one run; every scalar or byte/state witness checked"},"os":"linux","arch":"aarch64","version":if artifact["name"] == "cpp" {0x010101} else {0x0103},"timed_chunks":comparison["timed_chunks_per_observation"],"chunk_slots":comparison["chunk_slots"],"chunk_memory_limit":33554432,"maximum_chunk_slots":8,"scalar_chunk_slots":4096,"decoder_kernel":4096,"crc_kernel":72})
             };
             let suffix = format!(
                 "{phase}-{}-{}",
@@ -2110,6 +2117,109 @@ mod complete_tests {
             write(&child.join("collector.json"), &parent);
         }
     }
+    fn validate_native_version_child(role: &str, version: u64) -> Result<Value, String> {
+        let scratch = Scratch::new().unwrap();
+        let bundle = scratch.0.join("bundle");
+        for path in [bundle.join("objects"), bundle.join("children")] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let mut fixture = Fixture {
+            source: scratch.0.join("unused-source"),
+            scratch,
+            bundle,
+            identity: Value::Null,
+            protocol: Value::Null,
+            result: Value::Null,
+            next: 0,
+        };
+        let executor = fixture.artifact("executor");
+        let artifact = fixture.artifact(role);
+        fixture.identity = json!({"executor":executor});
+        let fixture_sha256 = hash(b"abc");
+        let comparison = json!({
+            "workload":{
+                "id":"native-version", "operation":"decode", "php":false,
+                "size":3, "input_bytes":3,
+                "data":"/evidence/fixtures/data", "input":"/evidence/fixtures/input",
+                "data_sha256":fixture_sha256, "input_sha256":fixture_sha256
+            },
+            "chunk_slots":8, "timed_chunks_per_observation":1
+        });
+        fixture.observation(&comparison, &artifact, "freeze", 1, true, false);
+        let name = format!("000000-freeze-{role}-native-version");
+        let child = fixture.bundle.join("children").join(&name);
+        let mut outcome = read(&child.join("outcome.json")).unwrap();
+        outcome["report"]["version"] = json!(version);
+        write(&child.join("stdout"), &outcome["report"]);
+        write(&child.join("outcome.json"), &outcome);
+        Fixture::refresh_collector(&child);
+        let mut retained = Bundle {
+            root: fixture.bundle.clone(),
+            original: PathBuf::from("/evidence"),
+            next: 0,
+            child_names: BTreeSet::from([name]),
+        };
+
+        validated_child(
+            &mut retained,
+            &fixture.identity,
+            &comparison,
+            &artifact,
+            "freeze",
+            1,
+            true,
+            true,
+        )
+    }
+
+    #[test]
+    fn native_version_accepts_pinned_cpp_receipt() {
+        let child = validate_native_version_child("cpp", 0x010101).unwrap();
+        assert_eq!(child["report"]["version"], 65793);
+    }
+
+    #[test]
+    fn native_version_accepts_candidate_receipt() {
+        assert!(validate_native_version_child("candidate", 0x0103).is_ok());
+    }
+
+    #[test]
+    fn native_version_accepts_incumbent_receipt() {
+        assert!(validate_native_version_child("incumbent", 0x0103).is_ok());
+    }
+
+    #[test]
+    fn native_version_rejects_cpp_receipt_with_rust_version() {
+        assert_eq!(
+            validate_native_version_child("cpp", 0x0103).unwrap_err(),
+            "native child runtime/version mismatch"
+        );
+    }
+
+    #[test]
+    fn native_version_rejects_candidate_receipt_with_cpp_version() {
+        assert_eq!(
+            validate_native_version_child("candidate", 0x010101).unwrap_err(),
+            "native child runtime/version mismatch"
+        );
+    }
+
+    #[test]
+    fn native_version_rejects_incumbent_receipt_with_cpp_version() {
+        assert_eq!(
+            validate_native_version_child("incumbent", 0x010101).unwrap_err(),
+            "native child runtime/version mismatch"
+        );
+    }
+
+    #[test]
+    fn native_version_rejects_unknown_artifact_role() {
+        assert_eq!(
+            validate_native_version_child("unknown", 0x0103).unwrap_err(),
+            "unknown native artifact role"
+        );
+    }
+
     #[test]
     fn complete_portable_bundle_and_adversarial_mutations() {
         let mut fixture = Fixture::build();
