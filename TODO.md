@@ -8,9 +8,11 @@ and two PHP diagnostic text updates, was approved on 2026-10-14 after two
 GPT-6 Astra Max review passes.
 
 - [ ] Complete the full decoder/CRC ABI of the pinned decode-only C++ build in Rust, including raw/incremental state, in-place decoding and CRC field helpers. Preserve existing Rust metadata exports and application behavior. The incumbent backend includes Rust SIMD payload decoding; its five RapidYenc exports do not establish full sixteen-function ABI parity.
-- [ ] Freeze reference vectors and a paired benchmark protocol, then prove byte/state/CRC parity and the required measured speedup on the recorded local host/workloads. Retain failures and raw observations. The local Linux caller fixture must use no production credentials, mounts or jobs.
+- [ ] Freeze reference vectors and a paired benchmark protocol, then prove byte/state/CRC parity and at least 1.5x speedup for each common actual-caller path and representative uncommon p99; aim for 2–3x. Retain failures and raw observations. The local Linux caller fixture must use no production credentials, mounts or jobs.
+- [ ] Repair qualification-harness custody before further execution: retain an exact owned unreaped leader through group settlement, disarm signaling before reaping, never reconstruct signal authority from a historical PID file, and prove bounded cancellation/owner-death cleanup with independently owned containment.
+- [ ] Reject experimental library profiles before canonical decoder calls or cache publication, using the reviewed combined nullable profile/capability admission contract. Preserve anchored FFI identity, exact missing-symbol error handling and legacy-compatible combinations.
 - [ ] Remove the replaced C++ download/build/cache path after the gates pass, select the Rust artifact in native CI and qualify the actual Rust backend without unexpected decoder fallback. All new implementation and benchmark logic is Rust; the two existing PHP diagnostic text edits are approved.
-- [ ] Obtain local Codex validation with `--yolo`, current-head GitHub Codex clearance and green CI; include current upstream commits, squash merge with verified `xbmc4lyfe` identity, then verify the guarded deployment and fresh native decoding before checking this replacement complete and moving on.
+- [ ] Obtain local Codex validation with `--yolo`, current-head GitHub Codex clearance and green CI; include current upstream commits, squash merge with verified `xbmc4lyfe` identity, then hand the exact verified squash SHA to `DEPLOY M5STEPHEN` for deployment and verify the rollout and fresh native decoding before checking this replacement complete and moving on.
 
 ## Qualify legacy scheduler STOP custody (2026-10-15)
 
