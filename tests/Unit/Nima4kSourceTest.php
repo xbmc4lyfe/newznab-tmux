@@ -414,6 +414,136 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('nonliteralSubtitleMarkup')]
+    public function subtitle_markup_cannot_disappear_into_an_agreeing_name(string $markup, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.'.$markup.'Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$card;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function nonliteralSubtitleMarkup(): array
+    {
+        $cases = [];
+        foreach (['unexpected closing tag' => '</b>', 'comment' => '<!--hidden-->', 'empty comment' => '<!---->', 'processing instruction' => '<?hidden value?>'] as $label => $markup) {
+            $cases[$label.' in first card'] = [$markup, false];
+            $cases[$label.' after record limit'] = [$markup, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('rawTextDiagnosticBoundaries')]
+    public function inert_markup_cannot_hide_a_real_malformed_subtitle(string $before, string $after, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>Exact.</b>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$before.$card.$after;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, string, bool}> */
+    public static function rawTextDiagnosticBoundaries(): array
+    {
+        $cases = [];
+        foreach ([
+            'inert script closing tag' => ['<script>const x = "</scripted>";</script>', ''],
+            'inert style closing tag' => ['<style>.example { content: "</stylesheet>"; }</style>', ''],
+            'quoted fake script opener' => ['<div data-marker="<script>"></div>', '<div data-marker="</script>"></div>'],
+            'closed-comment fake script opener' => ['<!-- <script> -->', '<!-- </script> -->'],
+            'title RCDATA fake script opener' => ['<title><script></title>', '<title></script></title>'],
+            'textarea RCDATA fake script opener' => ['<textarea><script></textarea>', '<textarea></script></textarea>'],
+        ] as $label => [$before, $after]) {
+            $cases[$label.' before first card'] = [$before, $after, false];
+            $cases[$label.' after record limit'] = [$before, $after, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('unterminatedCommentFragments')]
+    public function unterminated_comments_cannot_hide_the_remaining_listing(string $fragment): void
+    {
+        $html = $this->card('First.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function unterminatedCommentFragments(): array
+    {
+        return [
+            'bare opener' => ['<!--'],
+            'comment text' => ['<!-- hidden listing'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('conflictingEncodingDeclarations')]
+    public function conflicting_charsets_cannot_redecode_utf8_names(string $declaration, bool $afterLimit): void
+    {
+        $html = $afterLimit
+            ? $this->card('First.Release-GRP').$declaration.$this->card('Léon.Release-GRP')
+            : '<html><head>'.$declaration.'</head><body>'.$this->card('Léon.Release-GRP').'</body></html>';
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function conflictingEncodingDeclarations(): array
+    {
+        $cases = [];
+        foreach ([
+            'HTML5 charset' => '<meta charset="ISO-8859-1">',
+            'mixed case charset' => '<META CHARSET="windows-1252">',
+            'content type' => '<meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-1">',
+            'quoted content type charset' => '<meta http-equiv="Content-Type" content="text/html; charset=\'ISO-8859-1\'">',
+            'conflict after UTF-8 declaration' => '<meta charset="UTF-8"><meta charset="ISO-8859-1">',
+        ] as $label => $declaration) {
+            $cases[$label.' before first card'] = [$declaration, false];
+            $cases[$label.' after record limit'] = [$declaration, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('literalUnicodeDocuments')]
+    public function utf8_metadata_and_comments_outside_subtitles_preserve_unicode_names(string $metadata, string $fragment): void
+    {
+        $title = 'Léon_天空.&amp;&#1;.DD+5.1-GRP';
+        $html = '<html><head>'.$metadata.'</head><body>'.$this->card($title).$fragment.$this->card('Second.Release-GRP').'</body></html>';
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame([$title, 'Second.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string, string}> */
+    public static function literalUnicodeDocuments(): array
+    {
+        return [
+            'no declaration' => ['', ''],
+            'HTML5 UTF-8' => ['<meta charset="UTF-8">', ''],
+            'UTF8 alias' => ['<meta charset="UTF8">', ''],
+            'case insensitive UTF-8' => ['<META CHARSET="utf-8">', ''],
+            'content type UTF-8' => ['<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">', ''],
+            'quoted content type UTF-8' => ['<meta http-equiv="Content-Type" content="text/html; charset=\'UTF-8\'">', ''],
+            'terminated comment' => ['', '<!-- hidden -->'],
+            'empty comment' => ['', '<!---->'],
+            'inert charset and closing tag in comment' => ['', '<!-- <meta charset="ISO-8859-1"> </b> -->'],
+            'inert charset in script' => ['', '<script>const metadata = \'<meta charset="ISO-8859-1">\';</script>'],
+        ];
+    }
+
+    #[Test]
     public function agreeing_escaped_numeric_looking_labels_are_decoded_exactly_once(): void
     {
         $html = $this->card('Exact.<1>Release-GRP').$this->card('Exact.&lt;1&gt;Release-GRP');
