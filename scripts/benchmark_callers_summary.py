@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import statistics
+from functools import lru_cache
 
 CALLER_STRATA = {
     "sample-planning": {"small-dispatch": "dispatch_control", "boundary-1024": "common", "large-16384": "common",
@@ -21,6 +22,31 @@ CALLER_STRATA = {
                                         "seven-ranges-complete", "seven-ranges-split", "seven-ranges-missing", "seven-ranges-conflicting",
                                         "par2-ranges-complete", "par2-ranges-split", "par2-ranges-missing", "par2-ranges-conflicting", "par2-ranges-checksum"), "diagnostic")},
 }
+
+
+# Fixed declarations mirror the fixture contract, never arbitrary raw labels.
+REMAINING_MODULES = {
+    "metadata-modules": {
+        "article_dates": ("dates-ordinary", "dates-folded", "dates-uncommon-duplicates", "dates-uncommon-malformed"),
+        "article_identity": ("identity-ordinary", "identity-overview", "identity-uncommon-conflicts", "identity-uncommon-boundary"),
+        "article_xref": ("xref-ordinary", "xref-overview", "xref-uncommon-duplicates", "xref-uncommon-limits")},
+    "archive-modules": {
+        "iso_primary_copies": ("iso-copies-equal", "iso-copies-different", "iso-copies-uncommon-limit", "iso-copies-uncommon-partial"),
+        "rar5_copy_checksums": ("rar-copy-crc", "rar-copy-blake", "rar-copy-uncommon-ambiguous", "rar-copy-uncommon-truncated"),
+        "rar5_quick_open": ("rar-quick-open-match", "rar-quick-open-conflict", "rar-quick-open-uncommon-retention", "rar-quick-open-uncommon-corrupt")},
+}
+REMAINING_STRATA = {kind: {name: dict(module=module, category="common" if index < 2 else "uncommon",
+    comparison_scope="bounded-reference-shared-projection-v1" if kind == "metadata-modules" else
+    "bounded independent PHP reference versus shared metadata projection; no full-parser equivalence or production PHP speedup")
+    for module, names in modules.items() for index, name in enumerate(names)} for kind, modules in REMAINING_MODULES.items()}
+CALLER_STRATA.update({kind: {name: row['category'] for name, row in strata.items()} for kind, strata in REMAINING_STRATA.items()})
+REMAINING_INSTRUMENTATION = {"scripts/benchmark-remaining-modules.php", "scripts/benchmark-sample-planning.php",
+    "scripts/benchmark-article-processing.php", "scripts/benchmark-yenc.php", "tests/Fixtures/SamplePlanningBenchmarkFixtures.php",
+    "tests/Fixtures/RemainingMetadataBenchmarkFixtures.php", "tests/Fixtures/RemainingArchiveBenchmarkFixtures.php"}
+REMAINING_WRAPPER = "app/Services/Releases/Fingerprint/NativeMetadataParser.php"
+REMAINING_SOURCES = {REMAINING_WRAPPER, "composer.json", "composer.lock", "docker/app/nzb-yenc-ffi/Cargo.toml",
+    "docker/app/nzb-yenc-ffi/Cargo.lock", "docker/app/nzb-yenc-ffi/src/lib.rs"} | {
+    "docker/app/nzb-yenc-ffi/src/" + module + ".rs" for modules in REMAINING_MODULES.values() for module in modules}
 
 
 VENDOR_INPUTS = {
@@ -59,7 +85,7 @@ SOURCE_PATHS = {
     "docker/app/php/release-presentation-preload.php", "vendor/composer/installed.json",
 }
 
-SOURCE_PATHS |= VENDOR_SOURCES
+SOURCE_PATHS |= VENDOR_SOURCES | REMAINING_SOURCES | REMAINING_INSTRUMENTATION
 
 
 def number(value):
@@ -144,8 +170,206 @@ def disqualify_rows(rows):
             row['qualification_gate_passed'] = False
 
 
+
+@lru_cache(maxsize=128)
+def remaining_ranks(samples, quantile):
+    """Exact binomial order-statistic bounds; stable relative weights at the mode."""
+    failure = 1 - quantile
+    mode = math.floor((samples + 1) * failure)
+    weights = [0.] * (samples + 1)
+    weights[mode] = 1.
+    for k in range(mode, 0, -1):
+        weights[k - 1] = weights[k] * k / (samples - k + 1) * quantile / failure
+    for k in range(mode, samples):
+        weights[k + 1] = weights[k] * (samples - k) / (k + 1) * failure / quantile
+    total, cumulative, lower, upper = sum(weights), 0., None, samples
+    for k, weight in enumerate(weights):
+        cumulative += weight / total
+        if lower is None and cumulative >= .05 / 48 / 2:
+            lower = k
+        if cumulative >= 1 - .05 / 48 / 2:
+            upper = k
+            break
+    return [samples - upper, samples - lower + 1]
+
+
+def remaining_quantile(values, quantile):
+    values = sorted(values)
+    n = len(values)
+    ranks = remaining_ranks(n, quantile)
+    return dict(estimate=statistics.median(values) if quantile == .5 else values[math.ceil(quantile * n) - 1],
+        interval=[values[ranks[0] - 1] if ranks[0] >= 1 else None,
+                  values[ranks[1] - 1] if ranks[1] <= n else None],
+        ranks=ranks, samples=n, confidence=1 - .05 / 48)
+
+
+def same_numbers(actual, expected):
+    if expected is None:
+        return actual is None
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and set(actual) == set(expected) and all(same_numbers(actual[k], v) for k, v in expected.items())
+    if isinstance(expected, list):
+        return isinstance(actual, list) and len(actual) == len(expected) and all(same_numbers(a, b) for a, b in zip(actual, expected))
+    return number(actual) and math.isclose(actual, expected, rel_tol=1e-12)
+
+
+def remaining_summary(kind, records):
+    expected = REMAINING_STRATA[kind]
+    protocols = [r for r in records if r.get('type') == 'protocol']
+    setups = [r for r in records if r.get('type') == 'setup']
+    terminals = [r for r in records if r.get('type') == 'summary']
+    protocol = protocols[0] if len(protocols) == 1 else {}
+    setup = setups[0] if len(setups) == 1 else {}
+    terminal = terminals[0] if len(terminals) == 1 and records[-1] is terminals[0] else {}
+    samples = protocol.get('samples_per_stratum')
+    mode = protocol.get('mode')
+    valid = (count(samples) and 1 <= samples <= 10000 and mode in ('screen', 'qualification')
+             and (mode != 'qualification' or samples >= 1000))
+    invalid = (not valid or protocol.get('protocol') != 'remaining-modules-v1' or protocol.get('family') != kind
+        or protocol.get('strata') != expected or protocol.get('baseline_kind') != 'independent_php_reference_projection'
+        or type(protocol.get('confidence_family_size')) is not int or protocol['confidence_family_size'] != 48)
+    instrumentation = protocol.get('instrumentation')
+    invalid |= (not isinstance(instrumentation, dict) or set(instrumentation) != REMAINING_INSTRUMENTATION
+                or not all(digest(v) for v in instrumentation.values()))
+    sources = setup.get('build_source_identities', {})
+    snapshot = setup.get('source', {})
+    library = setup.get('library', {})
+    invalid |= (not isinstance(sources, dict) or not all(digest(sources.get(p)) for p in REMAINING_SOURCES)
+        or not isinstance(snapshot, dict) or not isinstance(snapshot.get('files'), dict)
+        or snapshot.get('files', {}).get(REMAINING_WRAPPER) != sources.get(REMAINING_WRAPPER)
+        or not isinstance(library, dict) or not digest(library.get('sha256')))
+    observed, pairs, fixtures, measured = {}, {}, {}, {}
+    for r in records:
+        typ = r.get('type')
+        if typ not in ('observation', 'pair', 'fixture', 'stratum'):
+            if typ not in ('protocol', 'setup', 'summary'):
+                invalid = True
+            continue
+        name = r.get('stratum')
+        if not isinstance(name, str) or name not in expected:
+            invalid = True
+            continue
+        definition = expected[name]
+        if typ == 'fixture':
+            invalid |= name in fixtures or r.get('module') != definition['module'] or not digest(r.get('sha256'))
+            fixtures[name] = r.get('sha256')
+            continue
+        if typ == 'stratum':
+            invalid |= name in measured or r.get('module') != definition['module'] or r.get('category') != definition['category']
+            measured[name] = r.get('decision')
+            continue
+        pair = r.get('pair')
+        if not valid or not count(pair) or pair >= samples:
+            invalid = True
+            continue
+        key = (name, pair)
+        if typ == 'pair':
+            invalid |= (key in pairs or r.get('eligible') is not True or r.get('exact_serialized_projection_parity') is not True
+                or r.get('fixture_sha256') != fixtures.get(name) or r.get('order') not in (['php', 'native'], ['native', 'php']))
+            pairs[key] = r
+            continue
+        backend = r.get('backend')
+        if backend not in ('php', 'native') or (name, pair, backend) in observed:
+            invalid = True
+            continue
+        child = r.get('child')
+        result = child.get('result') if isinstance(child, dict) else None
+        good = (r.get('eligible') is True and isinstance(child, dict) and child.get('status') == 'ok'
+                and child.get('stdout_truncated_for_json') is False and isinstance(result, dict))
+        if good:
+            runtime = result.get('runtime_sources', {})
+            files = runtime.get('files') if isinstance(runtime, dict) else None
+            projection, full = result.get('projection', {}), result.get('full', {})
+            good = (result.get('status') == 'ok' and result.get('backend') == backend
+                and result.get('fixture_sha256') == fixtures.get(name) and result.get('instrumentation') == instrumentation
+                and isinstance(files, dict) and bool(files) and runtime.get('root') == snapshot.get('root')
+                and all(digest(v) and snapshot.get('files', {}).get(p) == v for p, v in files.items())
+                and files.get(REMAINING_WRAPPER) == sources.get(REMAINING_WRAPPER)
+                and runtime.get('classes', {}).get('App\\Services\\Releases\\Fingerprint\\NativeMetadataParser') == REMAINING_WRAPPER
+                and isinstance(projection, dict) and digest(projection.get('sha256'))
+                and isinstance(full, dict) and digest(full.get('sha256'))
+                and (backend != 'native' or result.get('library_sha256') == library.get('sha256')))
+            phases = result.get('observations')
+            good &= isinstance(phases, dict) and set(phases) == {'cold', 'warmup', 'warm'}
+            if good:
+                engine = 'nntmux-rust-' + definition['module'].replace('_', '-') if kind == 'metadata-modules' else 'nntmux-rust-ffi'
+                for phase in phases.values():
+                    good &= (isinstance(phase, dict) and phase.get('correct') is True and number(phase.get('elapsed_ms'))
+                        and phase['elapsed_ms'] > 0 and phase.get('projection_sha256') == projection['sha256']
+                        and (phase.get('selected_library_cached') is True and phase.get('parser_engine') == engine if backend == 'native'
+                             else phase.get('selected_library_cached') is False and phase.get('parser_engine') is None))
+        invalid |= not good
+        observed[name, pair, backend] = result if good else None
+    rows = []
+    for name, definition in expected.items():
+        category = definition['category']
+        decision = measured.get(name)
+        if decision is None:
+            continue
+        if not isinstance(decision, dict) or set(decision) != {'cold', 'warm'}:
+            invalid = True
+            continue
+        pair_count = sum((name, i) in pairs for i in range(samples)) if valid else 0
+        complete_observations = valid and all(observed.get((name, i, b)) for i in range(samples) for b in ('php', 'native'))
+        parity = complete_observations and all(observed[name,i,'php']['projection']['sha256'] == observed[name,i,'native']['projection']['sha256'] for i in range(samples))
+        for phase in ('cold', 'warm'):
+            source = decision[phase]
+            row = dict(fixture=name, module=definition['module'], phase=phase, candidate_backend='rust', samples=pair_count,
+                category=category, p99_sample_sufficient=pair_count >= 1000, comparison='shared_independent_php_reference_projection',
+                confidence_family_size=48, marginal_alpha=.05/48, qualification_gate_passed=False, eligible=False)
+            good = complete_observations and parity and pair_count == samples and isinstance(source, dict)
+            if good:
+                quantiles = [remaining_quantile([observed[name,i,b]['observations'][phase]['elapsed_ms'] for i in range(samples)], .99 if category == 'uncommon' else .5) for b in ('php','native')]
+                baseline, native = (q['interval'] for q in quantiles)
+                interval = [baseline[0] / native[1] if baseline[0] is not None and native[1] is not None else None,
+                            baseline[1] / native[0] if baseline[1] is not None and native[0] is not None else None]
+                qualifies = mode == 'qualification' and samples >= 1000 and interval[0] is not None and interval[0] >= 1.5
+                status = 'qualified_projection' if qualifies else 'threshold_not_met' if interval[1] is not None and interval[1] < 1.5 else 'inconclusive'
+                metric = 'p99_latency' if category == 'uncommon' else 'median_latency'
+                good &= (same_numbers(source.get('php'), quantiles[0]) and same_numbers(source.get('native'), quantiles[1])
+                    and same_numbers(source.get('php_over_native'), quantiles[0]['estimate'] / quantiles[1]['estimate'])
+                    and same_numbers(source.get('simultaneous_95_percent_speedup_interval'), interval)
+                    and same_numbers(source.get('marginal_alpha'), .05/48) and source.get('status') == status
+                    and source.get('eligible_pairs') == samples and type(source.get('eligible_pairs')) is int
+                    and source.get('invalid_pairs') == 0 and type(source.get('invalid_pairs')) is int
+                    and source.get('metric') == metric and source.get('qualifies') is qualifies
+                    and source.get('evidence') == ('screen_only_no_adoption' if mode == 'screen' else 'reference_projection_only_no_adoption'))
+                unavailable = category == 'uncommon' and samples < 1000
+                row.update(metric='p99_unavailable' if unavailable else metric, speedup_interval=[None,None] if unavailable else interval,
+                    baseline_latency_interval_ms=None if unavailable else baseline, candidate_latency_interval_ms=None if unavailable else native,
+                    correctness_observations=2*samples, native_proof_observations=samples, qualification_gate_passed=bool(good and qualifies))
+                if not unavailable:
+                    row.update(baseline_over_candidate=quantiles[0]['estimate']/quantiles[1]['estimate'],
+                        baseline_latency_ms=quantiles[0]['estimate'], candidate_latency_ms=quantiles[1]['estimate'])
+            else:
+                row['comparison'] = 'invalid'
+            row['eligible'] = bool(good)
+            invalid |= not good
+            rows.append(row)
+    complete = (valid and len(rows) == 24 and bool(terminal) and set(fixtures) == set(expected)
+        and len(pairs) == samples * 12 and len(observed) == samples * 24)
+    if terminal:
+        invalid |= (terminal.get('status') != 'measured' or terminal.get('identities_stable') is not True
+            or terminal.get('invalid_pairs') != 0 or type(terminal.get('invalid_pairs')) is not int
+            or terminal.get('strata') != measured or set(measured) != set(expected)
+            or terminal.get('baseline_kind') != 'independent_php_reference_projection'
+            or terminal.get('adoption_qualified') is not False or terminal.get('acceptance_criteria_met') is not False
+            or terminal.get('performance_gates_passed') is not (complete and all(r['qualification_gate_passed'] for r in rows)))
+    if invalid or not complete:
+        disqualify_rows(rows)
+    return dict(rows=rows, status='invalid' if invalid else 'measured' if complete else 'partial',
+        completeness=dict(expected_rows=24, observed_rows=len(rows), complete=bool(complete)),
+        evidence_type='shared_independent_php_reference_projection', baseline_kind='independent_php_reference_projection',
+        benchmark_mode=mode if mode in ('screen','qualification') else 'unknown',
+        protocol_sha256=hashlib.sha256(json.dumps(protocol, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+        source_sha256={p: value for p, value in (sources.items() if isinstance(sources, dict) else []) if p in SOURCE_PATHS and digest(value)}
+            | {p: value for p, value in (instrumentation.items() if isinstance(instrumentation, dict) else []) if p in REMAINING_INSTRUMENTATION and digest(value)},
+        library_sha256={'native': library['sha256']} if isinstance(library, dict) and digest(library.get('sha256')) else {})
+
 def caller_summary(kind, records):
     """Fixed public metric projection of the PHP caller harnesses."""
+    if kind in REMAINING_STRATA:
+        return remaining_summary(kind, records)
     expected = CALLER_STRATA[kind]
     protocols = [row for row in records if row.get("type") == "protocol"]
     terminal = records[-1] if records and records[-1].get("type") == "summary" else {}
@@ -299,6 +523,9 @@ def export(kind, runner):
                    repository=repository if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) else "",
                    run_id=env_count("GITHUB_RUN_ID"), run_attempt=env_count("GITHUB_RUN_ATTEMPT"),
                    adoption_qualified=False, rust_payload_mode="unknown", status="missing", rows=[])
+    if kind in REMAINING_STRATA:
+        summary.update(baseline_kind='independent_php_reference_projection',
+            evidence_type='shared_independent_php_reference_projection', benchmark_mode='unknown')
     path = Path("utility-evidence") / kind / "observations.jsonl"
     records, malformed = [], False
     hasher = hashlib.sha256()
@@ -318,7 +545,10 @@ def export(kind, runner):
         return summary
     except (OSError, UnicodeError):
         malformed = True
-    summary.update(caller_summary(kind, records))
+    try:
+        summary.update(caller_summary(kind, records))
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        summary["status"] = "invalid"
     summary["report_sha256"] = hasher.hexdigest()
     if malformed:
         summary["status"] = "invalid"

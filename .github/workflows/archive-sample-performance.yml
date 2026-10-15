@@ -19,6 +19,11 @@ on:
       - 'composer.lock'
   workflow_dispatch:
     inputs:
+      comparison:
+        type: choice
+        options: [remaining, existing, all]
+        default: remaining
+        description: Select the six remaining modules or existing caller families
       mode:
         type: choice
         options: [screen, qualification]
@@ -45,7 +50,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-        kind: [sample-planning, archive-parsing, vendor-archive]
+        kind: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.comparison == 'remaining' && '["metadata-modules","archive-modules"]' || github.event_name == 'workflow_dispatch' && inputs.comparison == 'existing' && '["sample-planning","archive-parsing","vendor-archive"]' || '["sample-planning","archive-parsing","vendor-archive","metadata-modules","archive-modules"]') }}
     env:
       RUST_TOOLCHAIN: '1.98.0'
       BENCHMARK_KIND: ${{ matrix.kind }}
@@ -66,7 +71,9 @@ jobs:
       - name: Verify benchmark correctness and decisions
         run: |
           php vendor/bin/phpunit tests/Unit/SamplePlanningBenchmarkTest.php tests/Unit/ArchiveParsingBenchmarkTest.php tests/Unit/VendorArchiveBenchmarkTest.php
+          php vendor/bin/phpunit tests/Unit/RemainingMetadataBenchmarkFixturesTest.php tests/Unit/RemainingArchiveBenchmarkFixturesTest.php tests/Unit/RemainingModulesBenchmarkTest.php
           python3 tests/Unit/test_benchmark_callers_export.py
+          python3 tests/Unit/test_benchmark_remaining_modules_export.py
           python3 tests/Unit/test_benchmark_resource_limits.py
       - name: Build and test optimized locked native library
         shell: bash
@@ -81,6 +88,7 @@ jobs:
         run: |
           php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter=test_real_native_worker_has_exact_public_caller_output_and_execution_proof
           php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter=test_all_vendor_archive_native_callers_match_independent_oracles_with_execution_proof
+          php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter='test_real_linux_native_wrappers_match_all_projection_oracles_and_retain_full_metadata|test_real_native_parity_when_explicit_linux_library_is_available'
       - name: Freeze executed build receipt
         shell: bash
         run: |
@@ -91,7 +99,7 @@ jobs:
               return subprocess.check_output(args, text=True).strip()
           def digest(path):
               return hashlib.sha256(path.read_bytes()).hexdigest()
-          code = "define('NNTMUX_VENDOR_ARCHIVE_BENCHMARK_FUNCTIONS_ONLY', true); require 'scripts/benchmark-vendor-archive.php'; echo json_encode(match (getenv('BENCHMARK_KIND')) {'vendor-archive' => vendorArchiveBenchmarkSources(getcwd()), 'archive-parsing' => archiveBenchmarkSources(getcwd()), default => sampleBenchmarkSources(getcwd())}, JSON_THROW_ON_ERROR);"
+          code = "define('NNTMUX_REMAINING_BENCHMARK_FUNCTIONS_ONLY', true); require 'scripts/benchmark-remaining-modules.php'; define('NNTMUX_VENDOR_ARCHIVE_BENCHMARK_FUNCTIONS_ONLY', true); require 'scripts/benchmark-vendor-archive.php'; echo json_encode(match (getenv('BENCHMARK_KIND')) {'metadata-modules', 'archive-modules' => remainingBenchmarkSources(getcwd()), 'vendor-archive' => vendorArchiveBenchmarkSources(getcwd()), 'archive-parsing' => archiveBenchmarkSources(getcwd()), default => sampleBenchmarkSources(getcwd())}, JSON_THROW_ON_ERROR);"
           sources = json.loads(run('php', '-r', code))
           cpu = next((line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith(('model name', 'Hardware'))), platform.machine())
           receipt = {
@@ -123,7 +131,13 @@ jobs:
         shell: bash
         run: |
           set +e
-          php -d ffi.enable=true "scripts/benchmark-$BENCHMARK_KIND.php" \
+          entry="scripts/benchmark-$BENCHMARK_KIND.php"
+          family=()
+          if [[ "$BENCHMARK_KIND" == metadata-modules || "$BENCHMARK_KIND" == archive-modules ]]; then
+            entry=scripts/benchmark-remaining-modules.php
+            family=("--family=$BENCHMARK_KIND")
+          fi
+          php -d ffi.enable=true "$entry" "${family[@]}" \
             --native="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
             --runtime-manifest="$GITHUB_WORKSPACE/utility-evidence/runtime.json" \
             --source-dir="$GITHUB_WORKSPACE" --mode="$BENCHMARK_MODE" --samples="$BENCHMARK_SAMPLES" \
