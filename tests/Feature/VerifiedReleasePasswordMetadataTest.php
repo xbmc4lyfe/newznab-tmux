@@ -6,9 +6,13 @@ namespace Tests\Feature;
 
 use App\Console\Commands\VerifyReleaseCandidates;
 use App\Facades\Search;
+use App\Services\CollectionCleanupService;
 use App\Services\NNTP\NNTPService;
+use App\Services\Nzb\NzbArticleCoverage;
+use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseCleaningService;
+use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NzbManifestReader;
@@ -32,6 +36,20 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
     {
         return [
             'exact missing assertions retains archive' => ['exact', 'missing', true],
+            'later compatible fingerprint missing' => ['sibling-fingerprint', 'missing', false],
+            'later compatible fingerprint different' => ['sibling-fingerprint', 'different', false],
+            'later compatible name missing' => ['sibling-name', 'missing', false],
+            'later compatible name different' => ['sibling-name', 'different', false],
+            'later compatible size missing' => ['sibling-size', 'missing', false],
+            'later compatible size different' => ['sibling-size', 'different', false],
+
+            'all incompatible fingerprint' => ['sibling-fingerprint', 'missing', true, false, true],
+            'bounded later compatible fingerprint' => ['sibling-fingerprint', 'different', true, false, false, true],
+            'all incompatible name' => ['sibling-name', 'missing', true, false, true],
+            'bounded later compatible name' => ['sibling-name', 'different', true, false, false, true],
+            'all incompatible size' => ['sibling-size', 'missing', true, false, true],
+            'bounded later compatible size' => ['sibling-size', 'different', true, false, false, true],
+            'shared decoded budget holds without duplicate insertion' => ['sibling-name', 'different', true, false, false, false, true],
             'worker exception after metadata hold preserves verdict' => ['exact', 'missing', true, true],
             'exact conflicting assertions retains archive' => ['exact', 'different', true],
             'exact identical assertions safely reuses' => ['exact', 'same', false],
@@ -44,12 +62,13 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
     }
 
     #[DataProvider('cases')]
-    public function test_publisher_preserves_document_assertions(string $relation, string $assertions, bool $hold, bool $workerException = false): void
+    public function test_publisher_preserves_document_assertions(string $relation, string $assertions, bool $hold, bool $workerException = false, bool $allIncompatible = false, bool $exhausted = false, bool $byteExhausted = false): void
     {
         config(['nntmux.release_dedupe_enabled' => true, 'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
         app('files')->ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
         Schema::create('releases', function (Blueprint $table): void {
             $table->id();
+            $table->string('article_fingerprint')->nullable();
             foreach (['name', 'searchname', 'guid', 'leftguid', 'fromname', 'postdate', 'adddate'] as $column) {
                 $table->string($column);
             }
@@ -115,6 +134,47 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
         } else {
             app(VerifiedNzbWriter::class)->write($retained, $guid);
         }
+        $sibling = str_starts_with($relation, 'sibling-');
+        if ($sibling) {
+            $second = (array) DB::table('releases')->where('id', 777)->first();
+            $second['id'] = $exhausted || $byteExhausted ? 1000 : 778;
+            $second['guid'] = (string) Str::uuid();
+            DB::table('releases')->insert($second);
+            app(VerifiedNzbWriter::class)->write($allIncompatible ? $retained : $manifest, $second['guid']);
+            if ($exhausted || $byteExhausted) {
+                for ($index = 778; $index <= ($byteExhausted ? 778 : 904); $index++) {
+                    $intermediate = $second;
+                    $intermediate['id'] = $index;
+                    $intermediate['guid'] = (string) Str::uuid();
+                    DB::table('releases')->insert($intermediate);
+                    app(VerifiedNzbWriter::class)->write($retained, $intermediate['guid']);
+                }
+            }
+            if ($relation !== 'sibling-name') {
+                DB::table('releases')->update(['name' => 'Unrelated', 'searchname' => 'Unrelated']);
+            }
+            if ($relation === 'sibling-fingerprint') {
+                $fingerprint = NzbArticleFingerprint::fromXml(simplexml_load_string(app(VerifiedNzbWriter::class)->document($manifest)));
+                DB::table('releases')->update(['article_fingerprint' => $fingerprint, 'size' => 999]);
+            }
+        }
+        if ($sibling) {
+            $realNzb = app(NzbService::class);
+            $reads = [];
+            $boundedNzb = $this->getMockBuilder(NzbService::class)->setConstructorArgs([app(CollectionCleanupService::class)])->onlyMethods(['readNzbContentsBounded'])->getMock();
+            $boundedNzb->expects(self::exactly($exhausted ? 128 : 2))->method('readNzbContentsBounded')
+                ->willReturnCallback(static function (string $guid, int $compressed, int $decoded, int &$used) use ($realNzb, &$reads, $byteExhausted): string|false {
+                    self::assertArrayNotHasKey($guid, $reads, 'Each candidate must supply coverage and metadata from a single read.');
+                    $reads[$guid] = true;
+                    $contents = $realNzb->readNzbContentsBounded($guid, $compressed, $decoded, $used);
+                    if ($byteExhausted) {
+                        $used = $decoded;
+                    }
+
+                    return $contents;
+                });
+            $this->app->instance(NzbService::class, $boundedNzb);
+        }
         $retainedPath = app(NzbService::class)->getNzbPath($guid);
         $retainedBytes = is_file($retainedPath) ? file_get_contents($retainedPath) : null;
         $store = app(ManifestStore::class);
@@ -165,7 +225,7 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
         }
         if ($hold) {
             $this->assertNull($id);
-            $this->assertSame(1, DB::table('releases')->count());
+            $this->assertSame($exhausted ? 129 : ($byteExhausted ? 3 : ($sibling ? 2 : 1)), DB::table('releases')->count());
             $this->assertSame('metadata_review', $candidate->status);
             $this->assertNull($candidate->release_id);
             $this->assertNull($candidate->lease_token);
@@ -188,8 +248,11 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
             $this->assertFalse(is_file($store->path($path)));
 
         } else {
-            $this->assertSame($relation === 'different' ? 2 : 1, DB::table('releases')->count());
-            $this->assertSame($relation !== 'different', $id === 777);
+            $this->assertSame($relation === 'different' || $sibling ? 2 : 1, DB::table('releases')->count());
+            if ($sibling) {
+                $this->assertSame(778, $id);
+            }
+            $this->assertSame($relation !== 'different' && ! $sibling, $id === 777);
             $publishedGuid = DB::table('releases')->where('id', $id)->value('guid');
             $reader = app(NzbManifestReader::class);
             $published = $reader->read(app(NzbService::class)->readNzbContents($publishedGuid), (object) [
@@ -217,8 +280,12 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
         $retained['files'][0]['segments'][0]['messageid'] = 'replacement@example.test';
         app(VerifiedNzbWriter::class)->write($retained, $guid);
         $method = new \ReflectionMethod(VerifiedReleasePublisher::class, 'duplicatePreservesPasswordMetadata');
-        $this->assertFalse($method->invoke(app(VerifiedReleasePublisher::class), 33, $incoming));
+        $coverage = new NzbArticleCoverage(app(NzbService::class), app(ReleaseDuplicateFinder::class));
+        $incomingXml = $coverage->parseXml(app(VerifiedNzbWriter::class)->document($incoming));
+        $this->assertNull($coverage->coveredSnapshot($incomingXml, $guid));
         app(VerifiedNzbWriter::class)->write($incoming, $guid);
-        $this->assertTrue($method->invoke(app(VerifiedReleasePublisher::class), 33, $incoming));
+        $snapshot = $coverage->coveredSnapshot($incomingXml, $guid);
+        $this->assertNotNull($snapshot);
+        $this->assertTrue($method->invoke(app(VerifiedReleasePublisher::class), $snapshot, $incoming));
     }
 }

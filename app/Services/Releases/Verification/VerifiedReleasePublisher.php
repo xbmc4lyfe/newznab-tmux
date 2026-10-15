@@ -98,10 +98,11 @@ final class VerifiedReleasePublisher
                             throw new RuntimeException('Legacy release identity changed before publication.');
                         }
                     }
-                    $duplicateId = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing) : null;
-                    if ($duplicateId !== null) {
+                    $duplicate = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing) : ['release_id' => null, 'metadata_conflict' => false];
+                    $duplicateId = $duplicate['release_id'];
+                    if ($duplicateId !== null || $duplicate['metadata_conflict']) {
                         $timing?->nextPhase('sql_accounting');
-                        if (! $this->duplicatePreservesPasswordMetadata($duplicateId, $manifest)) {
+                        if ($duplicateId === null) {
                             // Article reuse must not discard uploader assertions or create the same articles again.
                             DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
                                 'status' => 'metadata_review', 'reason' => 'Covered release does not preserve supplied metadata; review retained candidate.',
@@ -181,40 +182,51 @@ final class VerifiedReleasePublisher
     /**
      * @param  array<string, mixed>  $manifest
      * @param  array<string, mixed>  $metadata
+     * @return array{release_id: ?int, metadata_conflict: bool}
      */
-    private function findCoveredDuplicate(object $claim, array $manifest, array $metadata, int $size, ?PublicationTiming $timing): ?int
+    private function findCoveredDuplicate(object $claim, array $manifest, array $metadata, int $size, ?PublicationTiming $timing): array
     {
         $lastHeartbeat = 0.0;
         $repository = app(CandidateRepository::class);
-        $heartbeat = function () use ($repository, $claim, &$lastHeartbeat): void {
+        $heartbeat = function (Release $candidate) use ($repository, $claim, &$lastHeartbeat): void {
             if (microtime(true) - $lastHeartbeat >= 1) {
                 $repository->heartbeat((int) $claim->id, $claim->lease_token);
                 $lastHeartbeat = microtime(true);
             }
+            // Hold the nominated published row stable while reading its retained generation.
+            DB::table('releases')->where('id', $candidate->id)->where('nzbstatus', NzbService::NZB_ADDED)
+                ->lockForUpdate()->first(['id', 'guid']);
         };
         $coverage = new NzbArticleCoverage(app(NzbService::class), $this->duplicates);
         $timing?->nextPhase('incoming_xml_fingerprint');
         $xml = $coverage->parseXml($this->writer->document($manifest));
         $fingerprint = $xml === null ? null : NzbArticleFingerprint::fromXml($xml);
         $timing?->nextPhase('duplicate_search_revalidation');
-        $duplicate = $xml === null ? null : $coverage->findCoveredUpload($size, $fingerprint, $xml,
-            $metadata['name'], $metadata['searchname'], $metadata['predb_id'], publishedOnly: true, onCandidate: $heartbeat);
-        if ($duplicate !== null && $xml !== null) {
+        $metadataConflict = false;
+        $acceptCovered = function (Release $duplicate, \SimpleXMLElement $snapshot) use ($manifest, &$metadataConflict): bool {
             $current = DB::table('releases')->where('id', $duplicate->id)->where('nzbstatus', NzbService::NZB_ADDED)
                 ->lockForUpdate()->first(['id', 'guid']);
-            if ($current !== null && $current->guid === (string) $duplicate->guid && $coverage->coversXml($xml, (string) $current->guid)) {
-                $repository->heartbeat((int) $claim->id, $claim->lease_token);
-
-                return (int) $current->id;
+            if ($current === null || $current->guid !== (string) $duplicate->guid) {
+                return false;
             }
-        }
+            if (! $this->duplicatePreservesPasswordMetadata($snapshot, $manifest)) {
+                $metadataConflict = true;
+
+                return false;
+            }
+
+            return true;
+        };
+        $duplicate = $xml === null ? null : $coverage->findCoveredUpload($size, $fingerprint, $xml,
+            $metadata['name'], $metadata['searchname'], $metadata['predb_id'], publishedOnly: true,
+            onCandidate: $heartbeat, acceptCovered: $acceptCovered);
         $repository->heartbeat((int) $claim->id, $claim->lease_token);
 
-        return null;
+        return ['release_id' => $duplicate === null ? null : (int) $duplicate->id, 'metadata_conflict' => $metadataConflict];
     }
 
     /** @param array<string, mixed> $manifest */
-    private function duplicatePreservesPasswordMetadata(int $releaseId, array $manifest): bool
+    private function duplicatePreservesPasswordMetadata(\SimpleXMLElement $snapshot, array $manifest): bool
     {
         $passwords = $manifest['passwords'] ?? [];
         if ($passwords === []) {
@@ -223,14 +235,7 @@ final class VerifiedReleasePublisher
         if (! NzbPasswordMetadata::isValid($passwords)) {
             return false;
         }
-        $guid = DB::table('releases')->where('id', $releaseId)->value('guid');
-        if (! is_string($guid) || $guid === '') {
-            return false;
-        }
-        $coverage = new NzbArticleCoverage(app(NzbService::class), $this->duplicates);
-        $incoming = $coverage->parseXml($this->writer->document($manifest));
-        $snapshot = $incoming === null ? null : $coverage->coveredSnapshot($incoming, $guid);
-        $contents = $snapshot?->asXML();
+        $contents = $snapshot->asXML();
         if (! is_string($contents)) {
             return false;
         }
