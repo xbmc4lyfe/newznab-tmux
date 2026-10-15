@@ -21,6 +21,10 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
 
     private string $database = '';
 
+    private bool $ownsDatabase = false;
+
+    private string $storagePath = '';
+
     private string $host = '';
 
     private string $username = '';
@@ -38,45 +42,109 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
         $this->username = (string) (getenv('VERIFICATION_LOCK_TEST_USERNAME') ?: 'root');
         $this->password = (string) getenv('VERIFICATION_LOCK_TEST_PASSWORD');
         $this->administrator = new PDO('mysql:host='.$this->host.';port=3306;charset=utf8mb4', $this->username, $this->password);
+        try {
+            $this->initializeDatabase(function (): void {
+                $this->storagePath = storage_path('framework/testing/lock-'.bin2hex(random_bytes(8)));
+                config(['database.default' => 'mariadb', 'database.connections.mariadb.host' => $this->host,
+                    'database.connections.mariadb.port' => 3306, 'database.connections.mariadb.database' => $this->database,
+                    'database.connections.mariadb.username' => $this->username, 'database.connections.mariadb.password' => $this->password,
+                    'database.connections.mariadb.url' => null, 'database.connections.mariadb.unix_socket' => '',
+                    'database.connections.mariadb.prefix' => '',
+                    'release_verification.required' => true, 'nntmux.echocli' => false,
+                    'release_verification.storage_path' => $this->storagePath]);
+                DB::purge();
+                DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
+                (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
+                DB::statement('CREATE TABLE collections (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    collectionhash BINARY(20) NOT NULL, subject VARCHAR(255) NOT NULL, fromname VARCHAR(255) NOT NULL,
+                    totalfiles INT NOT NULL, groups_id INT NOT NULL, collection_regexes_id INT DEFAULT 0,
+                    date DATETIME NOT NULL, filecheck INT DEFAULT 3, filesize BIGINT DEFAULT 5,
+                    UNIQUE KEY ix_collection_collectionhash (collectionhash)) ENGINE=InnoDB');
+                DB::statement('CREATE TABLE binaries (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    collections_id BIGINT UNSIGNED NOT NULL, binaryhash BINARY(16) NOT NULL,
+                    name VARCHAR(255) NOT NULL, totalparts INT NOT NULL,
+                    FOREIGN KEY (collections_id) REFERENCES collections(id) ON DELETE CASCADE) ENGINE=InnoDB');
+                DB::statement('CREATE TABLE parts (binaries_id BIGINT UNSIGNED NOT NULL, partnumber INT NOT NULL,
+                    messageid VARCHAR(255) NOT NULL, size INT NOT NULL, PRIMARY KEY (binaries_id, partnumber),
+                    FOREIGN KEY (binaries_id) REFERENCES binaries(id) ON DELETE CASCADE) ENGINE=InnoDB');
+                DB::statement('CREATE TABLE usenet_groups (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL) ENGINE=InnoDB');
+                DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.test']);
+            });
+        } catch (\Throwable $error) {
+            $this->tearDown();
+            throw $error;
+        }
+    }
+
+    private function initializeDatabase(callable $initialize): void
+    {
         $this->database = 'nntmux_archive_lock_test_'.bin2hex(random_bytes(8));
         $this->administrator->exec('CREATE DATABASE `'.$this->database.'`');
-        config(['database.default' => 'mariadb', 'database.connections.mariadb.host' => $this->host,
-            'database.connections.mariadb.port' => 3306, 'database.connections.mariadb.database' => $this->database,
-            'database.connections.mariadb.username' => $this->username, 'database.connections.mariadb.password' => $this->password,
-            'database.connections.mariadb.url' => null, 'database.connections.mariadb.unix_socket' => '',
-            'database.connections.mariadb.prefix' => '',
-            'release_verification.required' => true, 'nntmux.echocli' => false,
-            'release_verification.storage_path' => storage_path('framework/testing/lock-'.bin2hex(random_bytes(8)))]);
-        DB::purge();
-        DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
-        (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
-        DB::statement('CREATE TABLE collections (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-            collectionhash BINARY(20) NOT NULL, subject VARCHAR(255) NOT NULL, fromname VARCHAR(255) NOT NULL,
-            totalfiles INT NOT NULL, groups_id INT NOT NULL, collection_regexes_id INT DEFAULT 0,
-            date DATETIME NOT NULL, filecheck INT DEFAULT 3, filesize BIGINT DEFAULT 5,
-            UNIQUE KEY ix_collection_collectionhash (collectionhash)) ENGINE=InnoDB');
-        DB::statement('CREATE TABLE binaries (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-            collections_id BIGINT UNSIGNED NOT NULL, binaryhash BINARY(16) NOT NULL,
-            name VARCHAR(255) NOT NULL, totalparts INT NOT NULL,
-            FOREIGN KEY (collections_id) REFERENCES collections(id) ON DELETE CASCADE) ENGINE=InnoDB');
-        DB::statement('CREATE TABLE parts (binaries_id BIGINT UNSIGNED NOT NULL, partnumber INT NOT NULL,
-            messageid VARCHAR(255) NOT NULL, size INT NOT NULL, PRIMARY KEY (binaries_id, partnumber),
-            FOREIGN KEY (binaries_id) REFERENCES binaries(id) ON DELETE CASCADE) ENGINE=InnoDB');
-        DB::statement('CREATE TABLE usenet_groups (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL) ENGINE=InnoDB');
-        DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.test']);
+        $this->ownsDatabase = true;
+        try {
+            $initialize();
+        } catch (\Throwable $error) {
+            $this->cleanupFixture();
+            throw $error;
+        }
+    }
+
+    private function cleanupFixture(): void
+    {
+        try {
+            if ($this->storagePath !== '') {
+                app('files')->deleteDirectory($this->storagePath);
+            }
+        } finally {
+            try {
+                if ($this->ownsDatabase) {
+                    DB::purge('mariadb');
+                }
+            } finally {
+                if ($this->ownsDatabase && $this->administrator !== null
+                    && preg_match('/^nntmux_archive_lock_test_[a-f0-9]{16}$/', $this->database) === 1) {
+                    $this->administrator->exec('DROP DATABASE `'.$this->database.'`');
+                    $this->ownsDatabase = false;
+                }
+            }
+        }
     }
 
     protected function tearDown(): void
     {
         ManifestCompressionProbe::$onCompress = null;
         try {
-            if ($this->administrator !== null && preg_match('/^nntmux_archive_lock_test_[a-f0-9]{16}$/', $this->database) === 1) {
-                app('files')->deleteDirectory((string) config('release_verification.storage_path'));
-                DB::disconnect();
-                $this->administrator->exec('DROP DATABASE `'.$this->database.'`');
-            }
+            $this->cleanupFixture();
         } finally {
             parent::tearDown();
+        }
+    }
+
+    public function test_setup_failure_drops_only_the_database_created_by_that_fixture(): void
+    {
+        $fixture = new self(__FUNCTION__);
+        $fixture->administrator = $this->administrator;
+        $failure = new \RuntimeException('Injected schema initialization failure.');
+        $createdDatabase = '';
+
+        try {
+            $fixture->initializeDatabase(function () use ($fixture, $failure, &$createdDatabase): void {
+                $createdDatabase = $fixture->database;
+                $fixture->administrator->exec('CREATE TABLE `'.$createdDatabase.'`.partial_setup (id INT PRIMARY KEY)');
+                throw $failure;
+            });
+            $this->fail('The initialization failure must propagate.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame($failure, $error);
+            $statement = $this->administrator->prepare('SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?');
+            $statement->execute([$createdDatabase]);
+            $this->assertFalse($statement->fetchColumn(), 'Failed setup must drop its database before tearDown.');
+            $statement->execute([$this->database]);
+            $this->assertSame($this->database, $statement->fetchColumn(), 'Cleanup must preserve another fixture database.');
+        } finally {
+            if ($createdDatabase !== '') {
+                $this->administrator->exec('DROP DATABASE IF EXISTS `'.$createdDatabase.'`');
+            }
         }
     }
 
