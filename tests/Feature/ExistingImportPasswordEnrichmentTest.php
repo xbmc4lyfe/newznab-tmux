@@ -323,6 +323,45 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
         self::assertSame($artifacts, glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
     }
 
+    public function test_accepted_enrichment_preserves_expiry_and_fences_old_claim_before_ordered_reclaim(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $store = app(ManifestStore::class);
+        $manifest = $this->privateRollbackManifest();
+        self::assertTrue($repository->enqueue($manifest));
+        $claim = $repository->claim();
+        self::assertNotNull($claim);
+        $expiry = DB::table('release_verification_candidates')->value('last_unique_at');
+        $this->travel(1)->hours();
+        $passwords = ['first assertion', '', 'first assertion', 'second assertion'];
+        self::assertTrue($repository->enqueue($manifest + ['passwords' => $passwords]));
+        $replacement = (array) DB::table('release_verification_candidates')->first();
+        self::assertSame($expiry, $replacement['last_unique_at']);
+        self::assertSame((int) $claim->version + 1, (int) $replacement['version']);
+        self::assertNull($replacement['lease_token']);
+        self::assertNull($replacement['lease_until']);
+        self::assertNotSame($claim->manifest_path, $replacement['manifest_path']);
+        $state = (array) DB::table('release_verification_state')->first();
+        $leaseLost = false;
+        try {
+            $repository->heartbeat($claim->id, $claim->lease_token);
+        } catch (\RuntimeException $exception) {
+            $leaseLost = true;
+            self::assertSame('Verification lease was lost.', $exception->getMessage());
+        }
+        self::assertTrue($leaseLost, 'The superseded claim cannot renew the replacement lease.');
+        $repository->finish($claim, new VerificationResult('unrepairable', 'Synthetic stale completion.'));
+        self::assertSame($replacement, (array) DB::table('release_verification_candidates')->first());
+        self::assertSame($state, (array) DB::table('release_verification_state')->first());
+        $fresh = $repository->claim();
+        self::assertNotNull($fresh);
+        self::assertSame($replacement['version'], $fresh->version);
+        self::assertNotSame($claim->lease_token, $fresh->lease_token);
+        self::assertSame($passwords, $store->read($fresh->manifest_path)['passwords']);
+        self::assertSame($manifest['files'], $store->read($fresh->manifest_path)['files']);
+        self::assertSame($expiry, $fresh->last_unique_at);
+    }
+
     private function offlineImportService(): NzbImportService
     {
         $blacklist = $this->createStub(BlacklistService::class);

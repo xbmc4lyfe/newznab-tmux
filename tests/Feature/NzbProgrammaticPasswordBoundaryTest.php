@@ -121,6 +121,41 @@ class NzbProgrammaticPasswordBoundaryTest extends ReleaseVerificationCandidatesT
         $this->assertSame($values, $roundTrip['passwords'] ?? []);
     }
 
+    public static function suppliedPasswordInventoryModes(): array
+    {
+        return ['full verification' => [false], 'spot check' => [true]];
+    }
+
+    #[DataProvider('suppliedPasswordInventoryModes')]
+    public function test_writer_preserves_articles_and_exclusive_inventory_labels_with_supplied_passwords(bool $spot): void
+    {
+        $passwords = ['first assertion', '', 'first assertion', 'second assertion'];
+        $manifest = $this->programmaticManifest() + ['passwords' => $passwords];
+        $manifest['expected_files'] = 3;
+        $manifest['verified_file_count'] = 2;
+        if ($spot) {
+            $manifest['verification_mode'] = 'spot_check';
+        }
+        self::assertTrue(app(CandidateRepository::class)->enqueue($manifest));
+        $stored = app(ManifestStore::class)->read(DB::table('release_verification_candidates')->value('manifest_path'));
+        $xml = app(VerifiedNzbWriter::class)->document($stored);
+        $document = simplexml_load_string($xml);
+        self::assertNotFalse($document);
+        $document->registerXPathNamespace('n', 'http://www.newzbin.com/DTD/2003/nzb');
+        $declared = $document->xpath('/n:nzb/n:head/n:meta[@type="nntmux:declared-file-count"]');
+        $verified = $document->xpath('/n:nzb/n:head/n:meta[@type="nntmux:verified-file-count"]');
+        $mode = $document->xpath('/n:nzb/n:head/n:meta[@type="nntmux:verification-mode"]');
+        self::assertCount($spot ? 1 : 0, $declared);
+        self::assertCount($spot ? 0 : 1, $verified);
+        self::assertSame('3', (string) ($spot ? $declared[0] : $verified[0]));
+        self::assertSame($spot ? ['spot-check'] : [], array_map(strval(...), $mode));
+        $roundTrip = app(NzbManifestReader::class)->read($xml, $this->programmaticRelease());
+        self::assertSame($passwords, $roundTrip['passwords']);
+        $ids = static fn (array $value): array => array_merge(...array_map(
+            static fn (array $file): array => array_column($file['segments'], 'messageid'), $value['files']));
+        self::assertSame($ids($manifest), $ids($roundTrip));
+    }
+
     private function programmaticManifest(): array
     {
         $xml = '<nzb><file subject="Fixture [1/1] &quot;fixture.rar&quot; (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">fixture@example.test</segment></segments></file></nzb>';

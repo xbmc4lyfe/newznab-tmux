@@ -28,6 +28,14 @@ final class NzbPasswordEntityReferenceTest extends TestCase
         }
     }
 
+    public function test_whitespace_between_cdata_sections_is_part_of_the_assertion(): void
+    {
+        $xml = '<nzb><head><meta type="password"><![CDATA[first]]> '."\t\n".' <![CDATA[second]]></meta></head><file subject="fixture"><groups><group>alt.test</group></groups><segments><segment number="1" bytes="5">fixture@example.test</segment></segments></file></nzb>';
+        $manifest = (new NzbManifestReader)->read($xml, (object) ['searchname' => 'fixture', 'fromname' => 'fixture', 'postdate' => '2026-10-01 00:00:00', 'groups_id' => 1]);
+        self::assertSame(["first \t\n second"], $manifest['passwords']);
+        self::assertSame($manifest, json_decode(gzdecode((new PreparedManifest($manifest))->compressed), true, flags: JSON_THROW_ON_ERROR));
+    }
+
     public function test_text_cdata_escapes_comments_and_empty_repeats_remain_supported(): void
     {
         $xml = '<nzb><head><meta type="password">a&amp;<![CDATA[b]]><!-- fixture -->c</meta><meta type="password"/><meta type="password"/></head><file subject="fixture"><groups><group>alt.test</group></groups><segments><segment number="1" bytes="5">fixture@example.test</segment></segments></file></nzb>';
