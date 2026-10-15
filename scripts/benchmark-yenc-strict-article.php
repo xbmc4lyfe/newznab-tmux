@@ -270,8 +270,11 @@ function statisticsMatches(array $summary, array $strata, string $protocolHash, 
             // Relative tolerance absorbs floating-point division rounding only.
             $ratio = (float) $row['rust_over_cpp'];
             $speedup = (float) $row['observed_speedup'];
-            if (abs($speedup - 1 / $ratio) > 1e-12 * max($speedup, 1 / $ratio)
-                || ($rare && abs($ratio - $row['rust_p99_ms'] / $row['cpp_p99_ms']) > 1e-12 * max($ratio, $row['rust_p99_ms'] / $row['cpp_p99_ms']))) {
+            $reciprocal = 1 / $ratio;
+            $p99Ratio = $rare ? $row['rust_p99_ms'] / $row['cpp_p99_ms'] : $ratio;
+            if (! is_finite($reciprocal) || $reciprocal <= 0 || ! is_finite($p99Ratio) || $p99Ratio <= 0
+                || abs($speedup - $reciprocal) > 1e-12 * max($speedup, $reciprocal)
+                || abs($ratio - $p99Ratio) > 1e-12 * max($ratio, $p99Ratio)) {
                 return false;
             }
             if ($lower > $upper || ($row['bootstrap_replicates'] ?? null) !== 10000 || $row['qualified'] !== ($upper <= 2 / 3)

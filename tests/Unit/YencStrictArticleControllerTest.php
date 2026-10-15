@@ -126,6 +126,12 @@ final class YencStrictArticleControllerTest extends TestCase
             $contradictory['strata'][41][$key] = $value;
             self::assertFalse(statisticsMatches($contradictory, $strata, str_repeat('a', 64), str_repeat('b', 64), 42), $key);
         }
+        foreach ([['cpp_p99_ms' => 5e-324, 'rust_p99_ms' => 1e308], ['rust_over_cpp' => 5e-324],
+            ['cpp_p99_ms' => 1e308, 'rust_p99_ms' => 5e-324]] as $values) {
+            $contradictory = $summary;
+            $contradictory['strata'][41] = array_replace($contradictory['strata'][41], $values);
+            self::assertFalse(statisticsMatches($contradictory, $strata, str_repeat('a', 64), str_repeat('b', 64), 42));
+        }
         $stale = $summary;
         unset($stale['bootstrap_replicates']);
         self::assertFalse(statisticsMatches($stale, $strata, str_repeat('a', 64), str_repeat('b', 64), 42));
