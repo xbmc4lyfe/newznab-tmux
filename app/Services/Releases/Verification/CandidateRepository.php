@@ -6,6 +6,7 @@ namespace App\Services\Releases\Verification;
 
 use App\Exceptions\CandidateMetadataBudgetExceeded;
 use App\Services\CollectionCleanupService;
+use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbService;
 use App\Support\NzbPasswordMetadata;
 use Illuminate\Database\Query\Builder;
@@ -178,17 +179,24 @@ final class CandidateRepository
             // Prepare incoming assertions before capacity ownership. The authoritative
             // locked comparison below admits only this exact manifest/prepared pair.
             // Passwordless known replays retain their existing cheap path.
-            $prepared = ($manifest['passwords'] ?? []) !== []
-                || ! DB::table('release_verification_candidates')->where('identity', (string) $manifest['identity'])->exists()
+            $observed = DB::table('release_verification_candidates')->where('identity', (string) $manifest['identity'])->first(['release_id']);
+            $prepared = ($manifest['passwords'] ?? []) !== [] || $observed === null
                 ? $this->store->prepare($manifest) : null;
+            $replayXml = $observed?->release_id !== null && ($manifest['passwords'] ?? []) !== []
+                ? app(VerifiedNzbWriter::class)->document($manifest) : null;
             $headerAssessment = $prepared === null ? null : (new CandidateHeaderInventory)->assessment($manifest);
-            $accepted = DB::transaction(function () use ($manifest, $prepared, $headerAssessment, &$capacityDeferred): bool {
+            $accepted = DB::transaction(function () use ($manifest, $prepared, $headerAssessment, $replayXml, &$capacityDeferred): bool {
                 $capacityDeferred = false;
                 $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                 $identity = (string) $manifest['identity'];
                 $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
-                if ($existing !== null && ($existing->release_id === null
-                    || DB::table('releases')->where('id', $existing->release_id)->lockForUpdate()->first(['id']) !== null)) {
+                $release = $existing?->release_id === null ? null
+                    : DB::table('releases')->where('id', $existing->release_id)->lockForUpdate()->first(['id', 'guid', 'nzbstatus']);
+                if ($existing !== null && ($existing->release_id === null || $release !== null)) {
+                    if ($release !== null && ($manifest['passwords'] ?? []) !== []) {
+                        return $this->identicalPublishedReplay($existing, $release, $manifest, $prepared, $replayXml);
+                    }
+
                     return $this->enrichImportedPasswordMetadata($existing, $manifest, $state, $capacityDeferred, $prepared);
                 }
                 if ($state === null) {
@@ -231,6 +239,35 @@ final class CandidateRepository
         }
 
         return $accepted;
+    }
+
+    /** @param array<string, mixed> $manifest */
+    private function identicalPublishedReplay(object $existing, object $release, array $manifest, ?PreparedManifest $prepared, ?string $replayXml): bool
+    {
+        // The caller owns admission, capacity, and candidate locks in that order.
+        if ((string) $release->guid === '' || (int) $release->nzbstatus !== NzbService::NZB_ADDED
+            || ! in_array($existing->status, ['complete', 'repaired', 'sampled'], true) || $existing->verified_at === null
+            || $existing->manifest_path !== '' || (int) $existing->manifest_bytes !== 0
+            || $prepared === null || $replayXml === null || ! hash_equals((string) $existing->manifest_hash, substr($prepared->name, 0, 64))
+            || ($manifest['metadata_source'] ?? null) !== 'import' || ($manifest['conflict'] ?? false)) {
+            return false;
+        }
+        $coverage = app(NzbArticleCoverage::class);
+        $incoming = $coverage->parseXml($replayXml);
+        if ($incoming === null || ($snapshot = $coverage->coveredSnapshot($incoming, (string) $release->guid)) === null) {
+            return false;
+        }
+
+        try {
+            $retained = (new NzbManifestReader)->read((string) $snapshot->asXML(), (object) [
+                'searchname' => $manifest['subject'], 'fromname' => $manifest['fromname'],
+                'postdate' => $manifest['date'], 'groups_id' => $manifest['groups_id'],
+            ]);
+        } catch (RuntimeException) {
+            return false;
+        }
+
+        return ($retained['passwords'] ?? []) === ($manifest['passwords'] ?? []);
     }
 
     /**
