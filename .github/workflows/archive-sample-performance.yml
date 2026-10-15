@@ -2,7 +2,7 @@ name: Archive and sample planning performance
 
 on:
   push:
-    branches: [master, codex/remaining-rust-target-benchmarks]
+    branches: [master]
   pull_request:
     branches: [master]
     paths:
@@ -45,7 +45,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-        kind: [sample-planning, archive-parsing]
+        kind: [sample-planning, archive-parsing, vendor-archive]
     env:
       RUST_TOOLCHAIN: '1.98.0'
       BENCHMARK_KIND: ${{ matrix.kind }}
@@ -65,7 +65,7 @@ jobs:
         run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
       - name: Verify benchmark correctness and decisions
         run: |
-          php vendor/bin/phpunit tests/Unit/SamplePlanningBenchmarkTest.php tests/Unit/ArchiveParsingBenchmarkTest.php
+          php vendor/bin/phpunit tests/Unit/SamplePlanningBenchmarkTest.php tests/Unit/ArchiveParsingBenchmarkTest.php tests/Unit/VendorArchiveBenchmarkTest.php
           python3 tests/Unit/test_benchmark_callers_export.py
           python3 tests/Unit/test_benchmark_resource_limits.py
       - name: Build and test optimized locked native library
@@ -75,29 +75,12 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee utility-evidence/build/test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib 2>&1 | tee utility-evidence/build/build.log
-      - name: Build frozen incumbent native library for full PAR2 caller comparison
-        if: matrix.kind == 'archive-parsing'
-        shell: bash
-        run: |
-          incumbent="$RUNNER_TEMP/incumbent-archive-source"
-          git merge-base --is-ancestor 80d19cad1d2f91022a0dbb4d2096bcafe60321e9 HEAD
-          git worktree add --detach "$incumbent" 80d19cad1d2f91022a0dbb4d2096bcafe60321e9
-          test "$(git -C "$incumbent" rev-parse HEAD)" = 80d19cad1d2f91022a0dbb4d2096bcafe60321e9
-          cmp composer.lock "$incumbent/composer.lock"
-          cp -a vendor "$incumbent/vendor"
-          cargo +"$RUST_TOOLCHAIN" build --release --locked --lib \
-            --manifest-path "$incumbent/docker/app/nzb-yenc-ffi/Cargo.toml" \
-            2>&1 | tee utility-evidence/build/incumbent-build.log
-      - name: Verify full PAR2 integer parity and optional ABI compatibility
-        if: matrix.kind == 'archive-parsing'
-        env:
-          NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
-          NNTMUX_TEST_OLD_NATIVE_LIBRARY: ${{ runner.temp }}/incumbent-archive-source/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
-        run: php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped tests/Unit/Par2NativeIntegerNormalizationTest.php
       - name: Verify sample planner through the native public caller
         env:
           NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
-        run: php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter=test_real_native_worker_has_exact_public_caller_output_and_execution_proof
+        run: |
+          php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter=test_real_native_worker_has_exact_public_caller_output_and_execution_proof
+          php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter=test_all_vendor_archive_native_callers_match_independent_oracles_with_execution_proof
       - name: Freeze executed build receipt
         shell: bash
         run: |
@@ -108,7 +91,7 @@ jobs:
               return subprocess.check_output(args, text=True).strip()
           def digest(path):
               return hashlib.sha256(path.read_bytes()).hexdigest()
-          code = "define('NNTMUX_ARCHIVE_BENCHMARK_FUNCTIONS_ONLY', true); require 'scripts/benchmark-archive-parsing.php'; echo json_encode(getenv('BENCHMARK_KIND') === 'archive-parsing' ? archiveBenchmarkSources(getcwd()) : sampleBenchmarkSources(getcwd()), JSON_THROW_ON_ERROR);"
+          code = "define('NNTMUX_VENDOR_ARCHIVE_BENCHMARK_FUNCTIONS_ONLY', true); require 'scripts/benchmark-vendor-archive.php'; echo json_encode(match (getenv('BENCHMARK_KIND')) {'vendor-archive' => vendorArchiveBenchmarkSources(getcwd()), 'archive-parsing' => archiveBenchmarkSources(getcwd()), default => sampleBenchmarkSources(getcwd())}, JSON_THROW_ON_ERROR);"
           sources = json.loads(run('php', '-r', code))
           cpu = next((line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith(('model name', 'Hardware'))), platform.machine())
           receipt = {
@@ -125,18 +108,6 @@ jobs:
               'build_profile': 'release opt-level=3 lto=true codegen-units=1; cargo --locked; default features',
           }
           pathlib.Path('utility-evidence/runtime.json').write_text(json.dumps(receipt, indent=2) + '\n')
-          if os.environ['BENCHMARK_KIND'] == 'archive-parsing':
-              incumbent = pathlib.Path(os.environ['RUNNER_TEMP']) / 'incumbent-archive-source'
-              source_code = "define('NNTMUX_ARCHIVE_BENCHMARK_FUNCTIONS_ONLY', true); require 'scripts/benchmark-archive-parsing.php'; echo json_encode(archiveBenchmarkSources(getenv('INCUMBENT_ROOT')), JSON_THROW_ON_ERROR);"
-              incumbent_env = dict(os.environ, INCUMBENT_ROOT=str(incumbent))
-              incumbent_sources = json.loads(subprocess.check_output(['php', '-r', source_code], env=incumbent_env, text=True))
-              incumbent_receipt = dict(receipt,
-                  executed_sha=run('git', '-C', str(incumbent), 'rev-parse', 'HEAD'),
-                  candidate_library_sha256=digest(incumbent / 'docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so'),
-                  candidate_source_sha256=incumbent_sources)
-              if incumbent_receipt['executed_sha'] != '80d19cad1d2f91022a0dbb4d2096bcafe60321e9':
-                  raise SystemExit('Frozen incumbent source changed')
-              pathlib.Path('utility-evidence/incumbent-runtime.json').write_text(json.dumps(incumbent_receipt, indent=2) + '\n')
           PY
       - name: Capture all visible resource limits before measurement
         shell: bash
@@ -162,26 +133,6 @@ jobs:
           set -e
           echo "$status" > "utility-evidence/$BENCHMARK_KIND-exit.txt"
           # 1 is a valid measured failure to qualify, not a correctness success.
-          if [[ "$status" -gt 1 ]]; then exit "$status"; fi
-      - name: Compare exact complete incumbent and candidate PAR2 caller results
-        if: matrix.kind == 'archive-parsing'
-        shell: bash
-        run: |
-          incumbent="$RUNNER_TEMP/incumbent-archive-source"
-          set +e
-          php -d ffi.enable=true scripts/benchmark-par2-normalization.php \
-            --incumbent-source="$incumbent" --candidate-source="$GITHUB_WORKSPACE" \
-            --incumbent-native="$incumbent/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
-            --candidate-native="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
-            --incumbent-manifest="$GITHUB_WORKSPACE/utility-evidence/incumbent-runtime.json" \
-            --candidate-manifest="$GITHUB_WORKSPACE/utility-evidence/runtime.json" \
-            --output-dir="$GITHUB_WORKSPACE/utility-evidence/par2-normalization" \
-            --mode="$BENCHMARK_MODE" --samples="$BENCHMARK_SAMPLES" \
-            > utility-evidence/par2-normalization-console.log 2>&1
-          status=$?
-          set -e
-          echo "$status" > utility-evidence/par2-normalization-exit.txt
-          # 1 retains measured nonqualification; correctness/setup failures abort.
           if [[ "$status" -gt 1 ]]; then exit "$status"; fi
       - name: Capture all visible resource limits after measurement
         if: always()

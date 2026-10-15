@@ -64,6 +64,73 @@ class PagesTest(unittest.TestCase):
         self.assertEqual('unknown', pages.measured_payload_mode({'status': 'ok', 'rust_payload_mode': ['incumbent']}))
         self.assertEqual('experimental', pages.measured_payload_mode({'status': 'inconclusive', 'rust_payload_mode': 'experimental'}))
 
+    def test_actual_sample_plan_source_has_benchmark_mapping_and_public_identity(self):
+        root = Path(__file__).parents[2]
+        actual = root / 'docker/app/nzb-yenc-ffi/src/sample_plan.rs'
+        self.assertTrue(actual.is_file())
+        rows = {row['target']: row for row in pages.coverage(root)}
+        self.assertEqual(rows[str(actual.relative_to(root))]['coverage'], 'Comparative public caller benchmark')
+        self.assertIn('docker/app/nzb-yenc-ffi/src/sample_plan.rs', pages.CALLER_SOURCES)
+        spec = importlib.util.spec_from_file_location('caller_export', root / 'scripts/benchmark_callers_summary.py')
+        exporter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(exporter)
+        result = exporter.caller_summary('sample-planning', [dict(type='setup', build_source_identities={
+            'docker/app/nzb-yenc-ffi/src/sample_plan.rs': 'a' * 64})])
+        self.assertEqual(result['source_sha256'], {'docker/app/nzb-yenc-ffi/src/sample_plan.rs': 'a' * 64})
+
+    def test_compact_table_formats_units_ratios_intervals_and_keeps_exact_data(self):
+        row = dict(fixture='boundary-1024', phase='cold', samples=31, eligible=True,
+                   comparison='exact_public_caller', metric='median_latency',
+                   baseline_latency_ms=1.234567891, candidate_latency_ms=0.456789123,
+                   baseline_over_candidate=2.702708596, speedup_interval=[1.87654321, 3.1234567])
+        rendered = pages.measurement_table([row])
+        self.assertIn('1.235 ms', rendered)
+        self.assertIn('2.70×', rendered)
+        self.assertIn('1.876×', rendered)
+        self.assertIn('N=31', rendered)
+        self.assertIn('Eligible', rendered)
+        report = dict(head_sha=SHA, generated_at='fixture', workflows=[], coverage=[],
+                      results=[dict(kind='sample-planning', runner='ubuntu-latest', status='partial', rows=[row])])
+        full = pages.render(report)
+        self.assertIn('Summary data and identities', full)
+        self.assertIn('1.234567891', full)
+        self.assertIn('2.702708596', full)
+
+    def test_compact_intervals_round_outward_and_native_diagnostics_have_no_ratio(self):
+        row = dict(fixture='<script>unsafe</script>', comparison='native_only_diagnostic',
+                   native_median_ms=0.0000004, eligible=False, samples=31, unfamiliar_field='<img src=x onerror=bad>')
+        rendered = pages.measurement_table([row])
+        self.assertIn('Native-only diagnostic; no baseline', rendered)
+        self.assertIn('&lt;0.001 ms', rendered)
+        self.assertIn('Ineligible', rendered)
+        self.assertIn('unfamiliar_field', rendered)
+        self.assertIn('&lt;img', rendered)
+        self.assertNotIn('<script>', rendered)
+        self.assertNotIn('×', rendered)
+        interval = pages.display_interval([1.4999, 1.5001], 'ratio')
+        self.assertEqual(interval, '[1.499×, 1.501×]')
+        control = pages.measurement_table([dict(comparison='same_php_control', baseline_latency_ms=1,
+                                               candidate_latency_ms=2, metric='not_applicable')])
+        self.assertIn('PHP control; Rust speedup not applicable', control)
+        self.assertNotIn('×', control)
+
+    def test_compact_table_preserves_all_legacy_metric_families_and_unknown_values(self):
+        rows = [dict(median_rust_over_cpp=.923456, bootstrap_95_percent_interval=[.81234, 1.11234]),
+                dict(median_rust_over_php=.712345), dict(median_ms=1.23456, min_ms=.45678, max_ms=9.12345,
+                    body_ffi_median_ms={'allocate_and_memcpy': .23456}),
+                dict(php_median_ns=1234567, rust_median_ns=456789, improvement_percent=63.012345),
+                dict(median_baseline_over_candidate_ratio=2.123456, median_cold_baseline_over_candidate_ratio=.812345),
+                dict(baseline_median_ns=8000000, candidate_median_ns=1000000, paired_median_ratio=8.12345,
+                    baseline_p99_ns=9000000, candidate_p99_ns=2000000, p99_ratio=4.512345,
+                    median_ratio_ci95=[7.12345, 9.12345], p99_ratio_ci95=[3.12345, 5.12345]),
+                dict(future_metric={'unknown': '<unsafe>'})]
+        rendered = pages.measurement_table(rows)
+        for text in ('Rust / C++ latency: 0.92×', 'Rust / PHP latency: 0.71×', 'Minimum: 0.457 ms',
+                     'Maximum: 9.123 ms', 'BODY allocate_and_memcpy: 0.235 ms', 'PHP median: 1.235 ms',
+                     'Improvement: 63.01%', 'Cold median baseline / candidate: 0.81×',
+                     'Baseline p99: 9.000 ms', 'p99 ratio 95% interval', 'future_metric', '&lt;unsafe&gt;'):
+            self.assertIn(text, rendered)
+
     def test_cpu_results_disclose_unqualified_resampling_intervals(self):
         report = dict(head_sha=SHA, generated_at='now', workflows=[], coverage=[],
                       results=[dict(kind='cpu-snapshot', runner='ubuntu-latest', status='measured', rows=[])])
@@ -242,15 +309,47 @@ class PagesTest(unittest.TestCase):
 
     def test_new_caller_workflow_matrix_and_safe_nullable_tail_are_published(self):
         self.assertEqual(set(pages.WORKFLOWS['archive-sample-performance.yml']),
-                         {(kind, runner) for kind in ('sample-planning', 'archive-parsing')
+                         {(kind, runner) for kind in ('sample-planning', 'archive-parsing', 'vendor-archive')
                           for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')})
-        for kind in ('sample-planning', 'archive-parsing'):
+        for kind in ('sample-planning', 'archive-parsing', 'vendor-archive'):
             summary = self.caller_summary(kind)
             pages.validate_summary(summary, self.run_row(), kind, 'ubuntu-latest')
             rendered = pages.render(dict(head_sha=SHA, generated_at='fixture', workflows=[], coverage=[], results=[summary]))
             self.assertIn('p99_unavailable', rendered)
-            self.assertIn('null, null', rendered)
+            self.assertIn('Tail unavailable', rendered)
             self.assertNotIn('unpublished-synthetic-payload', rendered)
+
+    def test_archive_source_coverage_keeps_header_projection_separate_from_ranges_and_iso(self):
+        root = Path(__file__).parents[2]
+        rows = {Path(row['target']).stem: row for row in pages.coverage(root)}
+        self.assertEqual(rows['formats']['coverage'], 'Shared header caller comparison and diagnostics')
+        self.assertIn('ISO have no equivalent baseline', rows['formats']['detail'])
+        for name in ('seven_zip_ranges', 'par2_source_ranges'):
+            self.assertEqual(rows[name]['coverage'], 'Native caller diagnostics')
+            self.assertIn('no equivalent PHP range baseline', rows[name]['detail'])
+
+    def test_vendor_archive_pages_rejects_unlocked_sources_wrong_family_and_full_semantic_claim(self):
+        valid = self.caller_summary('vendor-archive')
+        pages.validate_summary(valid, self.run_row(), 'vendor-archive', 'ubuntu-latest')
+        rendered = pages.measurement_table(valid['rows'])
+        self.assertIn('Shared archive header projection only', rendered)
+        self.assertIn('Tail unavailable', rendered)
+        mutations = (
+            lambda s: s['source_sha256'].pop('vendor/dariusiii/rarinfo/RarInfo.php'),
+            lambda s: s['source_sha256'].update({'vendor/dariusiii/rarinfo/tests/fixtures/rar/store_method.rar': 'a' * 64}),
+            lambda s: s['source_sha256'].update({'vendor/unreviewed.rar': 'a' * 64}),
+            lambda s: s['rows'][0].update(confidence_family_size=16),
+            lambda s: s['rows'][0].update(comparison='exact_public_caller'),
+            lambda s: s['rows'][0].update(speedup_interval=[1.8, 4]),
+            lambda s: s['rows'][0].update(baseline_latency_interval_ms=[6, 8]),
+            lambda s: s.update(adoption_qualified=True),
+            lambda s: s.update(evidence_type='full_archive_semantics'),
+        )
+        for mutation in mutations:
+            summary = copy.deepcopy(valid)
+            mutation(summary)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                pages.validate_summary(summary, self.run_row(), 'vendor-archive', 'ubuntu-latest')
 
     def test_caller_diagnostics_controls_and_unmeasured_tails_cannot_claim_speedups(self):
         for kind, category, patch in (

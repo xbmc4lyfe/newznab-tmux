@@ -5,6 +5,7 @@ CI reporting only; standard library, no application boot or artifact extraction.
 """
 import argparse
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 import html
 import io
 import json
@@ -23,7 +24,7 @@ WORKFLOWS = {
                              ('profile', 'ubuntu-latest'), ('profile', 'ubuntu-24.04-arm')],
     'release-presentation.yml': [('presentation', 'ubuntu-latest')],
     'native-utilities-performance.yml': [(kind, runner) for kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot') for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')],
-    'archive-sample-performance.yml': [(kind, runner) for kind in ('sample-planning', 'archive-parsing') for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')],
+    'archive-sample-performance.yml': [(kind, runner) for kind in ('sample-planning', 'archive-parsing', 'vendor-archive') for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')],
     'laravel.yml': [], 'rust-clippy.yml': [],
 }
 RESOURCE_HASHES = {'resource_limits_before', 'resource_limits_after', 'resource_limits_comparison'}
@@ -45,9 +46,26 @@ CALLER_SOURCES = {
     'docker/app/nzb-yenc-ffi/src/lib.rs', 'docker/app/nzb-yenc-ffi/src/release_names.rs',
     'docker/app/nzb-yenc-ffi/src/par2.rs', 'docker/app/nzb-yenc-ffi/src/formats.rs',
     'docker/app/nzb-yenc-ffi/src/seven_zip_ranges.rs', 'docker/app/nzb-yenc-ffi/src/par2_source_ranges.rs',
-    'docker/app/nzb-yenc-ffi/src/spotcheck_plan.rs', 'docker/app/php/release-presentation-preload.php',
+    'docker/app/nzb-yenc-ffi/src/sample_plan.rs', 'docker/app/php/release-presentation-preload.php',
     'vendor/composer/installed.json',
 } | RESOURCE_HASHES
+VENDOR_INPUTS = {
+    'rar4-stored': ('rar/store_method.rar', 'c32c1bb9c65159df7a8cedd939e7e42d3fd424e334898e586c1558093bc89d37'),
+    'rar5-mixed': ('rar/rar50_quickopen.rar', '645f6a8adfae57ff04b3e2ff0fbf018101e623646b4396d3cd605437d3b5f882'),
+    'zip-stored': ('zip/little_file.zip', 'ababf71680cceb96c44ee04d69ab5dd99436c3b05c1d60242ffb8994e171ff09'),
+    'seven-stored': ('szip/store_method.7z', 'ec369e350984c9af3f5211f6cc20008abf29f7f331f8aa656604be05fafede5a'),
+    'rar4-solid': ('rar/solid.rar', '05d39c43a4ba897ea358543aa5b700208eba307ee6e6379d8d7cbd978aa374e4'),
+    'rar5-encrypted-headers': ('rar/rar50_encrypted_headers.rar', 'f5db452c3d7dc351b1ff9971edfb0611893838affa369e31e209570e270cc2af'),
+    'zip-aes': ('zip/encrypted_file_aes.zip', '7555457edd346b22c718e43d3409e1b9ae1dca1b118a26b1cdb960e58781238d'),
+    'seven-encrypted-headers': ('szip/encrypted_headers.7z', '4b7fdbb7b875847278e65bed4ce23fc29a149a7a7e93334304dbf34fb8d52f0d'),
+}
+VENDOR_INPUTS = {name: ('vendor/dariusiii/rarinfo/tests/fixtures/' + path, digest) for name, (path, digest) in VENDOR_INPUTS.items()}
+VENDOR_SOURCE_PATHS = {'composer.lock', 'vendor/composer/installed.json', 'vendor/dariusiii/rarinfo/composer.json',
+    'vendor/dariusiii/rarinfo/ArchiveReader.php', 'vendor/dariusiii/rarinfo/RarInfo.php',
+    'vendor/dariusiii/rarinfo/ZipInfo.php', 'vendor/dariusiii/rarinfo/SzipInfo.php',
+    'scripts/benchmark-vendor-archive.php', 'tests/Fixtures/VendorArchiveBenchmarkFixtures.php'} | {path for path, _ in VENDOR_INPUTS.values()}
+
+CALLER_SOURCES |= VENDOR_SOURCE_PATHS
 LIMIT = 1024 * 1024
 
 
@@ -147,18 +165,19 @@ def validate_summary(summary, run, kind, runner):
                 'median_ms', 'min_ms', 'max_ms', 'candidate_backend', 'correctness_passed', 'performance_gate',
                 'gate_passed', 'samples', 'iterations', 'php_median_ns', 'rust_median_ns', 'improvement_percent',
                 'body_ffi_median_ms', 'fixture', 'p99_sample_sufficient', 'baseline_median_ns', 'candidate_median_ns', 'median_ratio', 'paired_median_ratio', 'baseline_p99_ns', 'candidate_p99_ns', 'p99_ratio', 'median_ratio_ci95', 'p99_ratio_ci95', 'median_baseline_over_candidate_ratio', 'median_cold_baseline_over_candidate_ratio',
-                'category', 'comparison', 'metric', 'baseline_over_candidate', 'speedup_interval', 'baseline_latency_ms', 'candidate_latency_ms', 'native_median_ms', 'qualification_gate_passed', 'p99_threshold_met'}
+                'category', 'comparison', 'metric', 'baseline_over_candidate', 'speedup_interval', 'baseline_latency_ms', 'candidate_latency_ms', 'native_median_ms', 'qualification_gate_passed', 'p99_threshold_met',
+                'baseline_latency_interval_ms', 'candidate_latency_interval_ms', 'marginal_alpha'}
     if any(not isinstance(row, dict) or set(row) - row_keys for row in summary['rows']):
         raise ValueError('Unexpected public measurement fields')
     if summary.get('uncertainty_method', 'not_reported') not in ('not_reported', 'mixed_output_bootstrap', 'legacy_stratified_bootstrap_unqualified'):
         raise ValueError('Unknown uncertainty protocol')
 
-    if kind in ('sample-planning', 'archive-parsing'):
+    if kind in ('sample-planning', 'archive-parsing', 'vendor-archive'):
         if set(summary.get('source_sha256', {})) - CALLER_SOURCES or set(summary.get('library_sha256', {})) - {'native'}:
             raise ValueError('Unexpected public caller identity names')
         validate_caller_rows(summary, kind)
 
-    if kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot', 'sample-planning', 'archive-parsing'):
+    if kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot', 'sample-planning', 'archive-parsing', 'vendor-archive'):
         revision = '5cc5303b502e653d83bba1951dec2f5d2da1db35' if kind == 'cpu-snapshot' else 'a1a9b0829610c3b62e7d0bdb418669a89c36c90b'
         if kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot') and set(summary.get('source_sha256', {})) - UTILITY_SOURCES:
             raise ValueError('Unexpected public utility identity names')
@@ -215,6 +234,8 @@ def validate_summary(summary, run, kind, runner):
 
 
 CALLER_FIXTURES = {
+    'vendor-archive': {name: 'common' for name in ('rar4-stored', 'rar5-mixed', 'zip-stored', 'seven-stored')}
+        | {name: 'uncommon' for name in ('rar4-solid', 'rar5-encrypted-headers', 'zip-aes', 'seven-encrypted-headers')},
     'sample-planning': {'small-dispatch': 'dispatch_control', 'boundary-1024': 'common',
         'large-16384': 'common', 'duplicates-inferred': 'uncommon', 'tight-budget': 'uncommon',
         'unsupported-coercion': 'fallback_control'},
@@ -245,7 +266,8 @@ def validate_caller_rows(summary, kind):
     fixtures = CALLER_FIXTURES[kind]
     keys = {'fixture', 'phase', 'candidate_backend', 'samples', 'category', 'p99_sample_sufficient',
             'comparison', 'native_median_ms', 'metric', 'baseline_latency_ms', 'candidate_latency_ms',
-            'speedup_interval', 'baseline_over_candidate', 'qualification_gate_passed', 'eligible'}
+            'speedup_interval', 'baseline_over_candidate', 'qualification_gate_passed', 'eligible',
+            'confidence_family_size', 'marginal_alpha', 'baseline_latency_interval_ms', 'candidate_latency_interval_ms'}
     seen = set()
     for row in summary['rows']:
         fixture, phase = row.get('fixture'), row.get('phase')
@@ -264,7 +286,8 @@ def validate_caller_rows(summary, kind):
             continue
         comparison = ('native_only_diagnostic' if category == 'diagnostic' else 'same_php_control'
                       if category.endswith('control') else 'shared_par2_projection'
-                      if kind == 'archive-parsing' else 'exact_public_caller')
+                      if kind == 'archive-parsing' else 'shared_vendor_header_projection'
+                      if kind == 'vendor-archive' else 'exact_public_caller')
         if row.get('comparison') != comparison or row.get('candidate_backend') != ('php' if category.endswith('control') else 'rust'):
             raise ValueError('Unexpected caller comparison')
         if category == 'diagnostic':
@@ -298,6 +321,31 @@ def validate_caller_rows(summary, kind):
                 raise ValueError('Invalid caller gate')
             if row.get('qualification_gate_passed') is True and (samples < 1000 or not row['eligible'] or not interval or interval[0] is None or interval[0] < 1.5):
                 raise ValueError('Unqualified caller gate')
+        if kind == 'vendor-archive':
+            if (type(row.get('confidence_family_size')) is not int or row['confidence_family_size'] != 32 or not positive(row.get('marginal_alpha'))
+                    or not math.isclose(row['marginal_alpha'], 0.05 / 32, rel_tol=1e-12)):
+                raise ValueError('Invalid vendor archive confidence family')
+            for key in ('baseline_latency_interval_ms', 'candidate_latency_interval_ms'):
+                interval = row.get(key)
+                if row['category'] == 'uncommon' and samples < 1000:
+                    if interval is not None:
+                        raise ValueError('Insufficient vendor archive tail samples')
+                elif row['eligible']:
+                    if (not isinstance(interval, list) or len(interval) != 2
+                            or any(bound is not None and not positive(bound) for bound in interval)
+                            or all(bound is not None for bound in interval) and interval[0] > interval[1]):
+                        raise ValueError('Invalid vendor archive marginal interval')
+            if row['eligible'] and row['metric'] != 'p99_unavailable':
+                baseline, candidate = row['baseline_latency_interval_ms'], row['candidate_latency_interval_ms']
+                for interval, estimate in ((baseline, row['baseline_latency_ms']), (candidate, row['candidate_latency_ms'])):
+                    if interval[0] is not None and interval[0] > estimate or interval[1] is not None and interval[1] < estimate:
+                        raise ValueError('Vendor archive marginal interval excludes estimate')
+                expected_interval = [baseline[0] / candidate[1] if baseline[0] is not None and candidate[1] is not None else None,
+                                     baseline[1] / candidate[0] if baseline[1] is not None and candidate[0] is not None else None]
+                if (not isinstance(row.get('speedup_interval'), list)
+                        or any(actual is not None if expected is None else not positive(actual) or not math.isclose(actual, expected, rel_tol=1e-12)
+                               for actual, expected in zip(row['speedup_interval'], expected_interval))):
+                    raise ValueError('Vendor archive speedup interval disagrees with marginal bounds')
         for key in ('native_median_ms', 'baseline_latency_ms', 'candidate_latency_ms', 'baseline_over_candidate'):
             if key in row and not positive(row[key]):
                 raise ValueError('Invalid caller numeric value')
@@ -308,6 +356,12 @@ def validate_caller_rows(summary, kind):
         require_current_provenance(summary)
         if not summary.get('library_sha256', {}).get('native'):
             raise ValueError('Measured caller summary lacks native library identity')
+        if kind == 'vendor-archive':
+            sources = summary['source_sha256']
+            if (not VENDOR_SOURCE_PATHS <= set(sources)
+                    or any(sources.get(path) != expected_hash for path, expected_hash in VENDOR_INPUTS.values())
+                    or summary.get('evidence_type') != 'shared_vendor_archive_header_projection'):
+                raise ValueError('Invalid locked vendor archive source provenance')
 
 
 def measured_payload_mode(summary):
@@ -343,9 +397,11 @@ def coverage(root):
             label, detail = 'Diagnostic caller profile', 'Fixed article-analysis inputs; no isolated baseline comparison or complete archive-format coverage.'
         elif name == 'par2':
             label, detail = 'Shared-semantics caller comparison', 'Four actual PHP fallback/native caller strata; backend extras differ and remain retained. No overall adoption qualification.'
-        elif name in ('formats', 'seven_zip_ranges', 'par2_source_ranges'):
-            label, detail = 'Native caller diagnostics', 'Correctness-gated bounded format/range fixtures with FFI and JSON costs; no equivalent PHP baseline or exhaustive archive coverage.'
-        elif name == 'spotcheck_plan':
+        elif name == 'formats':
+            label, detail = 'Shared header caller comparison and diagnostics', 'Eight locked PHP-reader/native initial-header projections for RAR4/RAR5/ZIP/7z with caller FFI/JSON costs. Full archive semantics and ISO have no equivalent baseline or adoption qualification.'
+        elif name in ('seven_zip_ranges', 'par2_source_ranges'):
+            label, detail = 'Native caller diagnostics', 'Correctness-gated bounded range fixtures with FFI and JSON costs; no equivalent PHP range baseline or exhaustive archive coverage.'
+        elif name in ('sample_plan', 'spotcheck_plan'):
             label, detail = 'Comparative public caller benchmark', 'Exact serialized PHP/native output, cold/warm calls, common median and uncommon p99 qualification mode; small/unsupported inputs remain PHP controls.'
         elif name in ('article_identity', 'article_xref', 'article_dates'):
             detail = 'Correctness/parity checks exist; no independent comparative timing protocol or module-specific caller benchmark.'
@@ -488,13 +544,116 @@ def run_link(row):
     return f'<a href="https://github.com/{REPOSITORY}/actions/runs/{number}/attempts/{attempt}">Run {number}, attempt {attempt}</a>'
 
 
+def compact_number(value, decimals=3):
+    if type(value) not in (int, float):
+        return json.dumps(value, ensure_ascii=False)
+    try:
+        return f'{value:.{decimals}f}'
+    except (ValueError, OverflowError):
+        return str(value)
+
+
+def latency_ms(value, divisor=1):
+    if type(value) not in (int, float):
+        return json.dumps(value, ensure_ascii=False)
+    try:
+        value = value / divisor
+    except (OverflowError, ValueError):
+        return str(value) + ' / ' + str(divisor) + ' ms'
+    if 0 < value < 0.001:
+        return '<0.001 ms'
+    return compact_number(value) + ' ms'
+
+
+def display_interval(value, unit):
+    if not isinstance(value, list) or len(value) != 2:
+        return json.dumps(value, ensure_ascii=False)
+    def bound(number, index):
+        if number is None:
+            return 'unbounded'
+        if type(number) not in (int, float):
+            return json.dumps(number, ensure_ascii=False)
+        try:
+            rounded = Decimal(str(number)).quantize(Decimal('0.001'), rounding=ROUND_FLOOR if index == 0 else ROUND_CEILING)
+            text = f'{rounded:.3f}'
+        except (InvalidOperation, ValueError, OverflowError):
+            text = str(number)
+        return text + (' ms' if unit == 'ms' else '×')
+    return '[' + ', '.join(bound(number, index) for index, number in enumerate(value)) + ']'
+
+
+
 def measurement_table(rows):
-    table = ['<table><tr><th>Workload</th><th>Latency / ratio / uncertainty</th><th>Decision / eligibility</th></tr>']
+    table = ['<table><tr><th>Workload</th><th>Latency / ratio / uncertainty</th><th>Scope / samples / eligibility</th></tr>']
+    labels = ('size', 'density', 'path', 'phase', 'scenario', 'rows', 'fixture')
+    latencies = {
+        'php_median_ns': ('PHP median', 1000000), 'rust_median_ns': ('Rust median', 1000000),
+        'baseline_median_ns': ('Baseline median', 1000000), 'candidate_median_ns': ('Candidate median', 1000000),
+        'baseline_p99_ns': ('Baseline p99', 1000000), 'candidate_p99_ns': ('Candidate p99', 1000000),
+        'baseline_latency_ms': ('Baseline latency', 1), 'candidate_latency_ms': ('Candidate latency', 1),
+        'native_median_ms': ('Native median', 1), 'median_ms': ('Median', 1), 'min_ms': ('Minimum', 1), 'max_ms': ('Maximum', 1),
+    }
+    ratios = {
+        'median_rust_over_cpp': 'Rust / C++ latency', 'median_rust_over_php': 'Rust / PHP latency',
+        'median_ratio': 'Median baseline / candidate', 'paired_median_ratio': 'Paired median baseline / candidate',
+        'median_baseline_over_candidate_ratio': 'Median baseline / candidate',
+        'median_cold_baseline_over_candidate_ratio': 'Cold median baseline / candidate',
+        'p99_ratio': 'p99 baseline / candidate', 'baseline_over_candidate': 'Baseline / candidate',
+    }
+    intervals = {
+        'bootstrap_95_percent_interval': ('Rust / baseline 95% interval', 'ratio'),
+        'median_ratio_ci95': ('Median ratio 95% interval', 'ratio'), 'p99_ratio_ci95': ('p99 ratio 95% interval', 'ratio'),
+        'speedup_interval': ('Speedup 95% interval', 'ratio'),
+        'baseline_latency_interval_ms': ('Baseline quantile interval', 'ms'),
+        'candidate_latency_interval_ms': ('Candidate quantile interval', 'ms'),
+    }
+    comparisons = {
+        'shared_par2_projection': 'Shared PAR2 projection only',
+        'shared_vendor_header_projection': 'Shared archive header projection only (locked PHP readers)',
+        'native_only_diagnostic': 'Native-only diagnostic; no baseline',
+        'same_php_control': 'PHP control; Rust speedup not applicable',
+        'exact_public_caller': 'Exact public caller', 'exact_public_fingerprint_operation': 'Exact public fingerprint operation',
+        'exact_host_cli': 'Exact host CLI', 'synthetic_cli': 'Synthetic CLI',
+    }
+    metrics = {'p99_unavailable': 'Tail unavailable (<1,000 pairs)', 'p99_latency': 'p99 latency',
+               'median_latency': 'Median latency', 'not_applicable': 'Comparison not applicable'}
+    status_keys = {'decision', 'status', 'eligible_pairs', 'invalid_pairs', 'gate_passed', 'performance_gate',
+                   'p99_sample_sufficient', 'qualification_gate_passed', 'p99_threshold_met', 'category',
+                   'candidate_backend', 'correctness_passed', 'bootstrap_replicates', 'confidence_family_size',
+                   'iterations', 'marginal_alpha'}
     for row in rows:
-        label = ' · '.join(str(row[key]) for key in ('size', 'density', 'path', 'phase', 'scenario', 'rows', 'fixture') if key in row)
-        metrics = {key: value for key, value in row.items() if key.startswith('median_') or key in ('php_median_ns', 'rust_median_ns', 'improvement_percent', 'body_ffi_median_ms', 'baseline_median_ns', 'candidate_median_ns', 'paired_median_ratio', 'baseline_p99_ns', 'candidate_p99_ns', 'p99_ratio', 'p99_ratio_ci95', 'baseline_over_candidate', 'speedup_interval', 'baseline_latency_ms', 'candidate_latency_ms', 'native_median_ms')}
-        status = {key: row[key] for key in ('decision', 'eligible', 'eligible_pairs', 'invalid_pairs', 'gate_passed', 'performance_gate', 'samples', 'p99_sample_sufficient', 'qualification_gate_passed', 'p99_threshold_met', 'comparison', 'category', 'metric') if key in row}
-        table.append(f'<tr><td>{escape(label)}</td><td>{escape(json.dumps(metrics))}</td><td>{escape(json.dumps(status))}</td></tr>')
+        label = ' · '.join(str(row[key]) for key in labels if key in row)
+        values, states = [], []
+        for key, value in row.items():
+            if key in labels:
+                continue
+            if key in latencies:
+                title, divisor = latencies[key]
+                values.append(title + ': ' + ('unavailable' if value is None else latency_ms(value, divisor)))
+            elif key in ratios:
+                values.append(ratios[key] + ': ' + ('unavailable' if value is None else compact_number(value, 2) + '×'))
+            elif key in intervals:
+                title, unit = intervals[key]
+                values.append(title + ': ' + ('unavailable' if value is None else display_interval(value, unit)))
+            elif key == 'body_ffi_median_ms' and isinstance(value, dict):
+                values.extend('BODY ' + str(stage) + ': ' + latency_ms(duration) for stage, duration in value.items())
+            elif key == 'improvement_percent':
+                values.append('Improvement: ' + compact_number(value, 2) + '%')
+            elif key == 'samples':
+                states.append('N=' + str(value))
+            elif key == 'eligible':
+                states.append('Eligible' if value is True else 'Ineligible' if value is False else 'Eligibility: ' + str(value))
+            elif key == 'comparison':
+                states.append(comparisons.get(value, 'Comparison: ' + str(value)) if isinstance(value, str) else 'Comparison: ' + str(value))
+            elif key == 'metric':
+                states.append(metrics.get(value, 'Metric: ' + str(value)) if isinstance(value, str) else 'Metric: ' + str(value))
+            elif key in status_keys:
+                states.append(key.replace('_', ' ') + ': ' + json.dumps(value, ensure_ascii=False))
+            else:
+                # Keep unfamiliar fields visible; the exact envelope remains below.
+                values.append(str(key) + ': ' + json.dumps(value, ensure_ascii=False))
+        table.append('<tr><td>' + escape(label) + '</td><td>' + '<br>'.join(escape(value) for value in values)
+                     + '</td><td>' + '<br>'.join(escape(value) for value in states) + '</td></tr>')
     table.append('</table>')
     return '\n'.join(table)
 
@@ -505,7 +664,7 @@ def render(report):
             '<h1>NNTmux Rust benchmarks</h1>',
             f'<p>Master build <code>{escape(report["head_sha"])}</code>. Updated {escape(report["generated_at"])}. <a href="results.json">Machine-readable results</a>.</p>',
             '<p>Coverage is incomplete. Comparative median screens and diagnostic profiles are separate evidence. These builds do not establish the required 1.5× gain for every common path and representative uncommon p99 workload, or production throughput.</p>',
-            '<p>Each master push runs fresh yEnc comparisons, BODY/fingerprint profiles, NZB digest/CPU comparisons, archive diagnostics and sample-planning comparisons on x86/ARM, plus release rendering on x86. Missing, failed, cancelled and inconclusive results remain visible. Local/manual experiments are excluded. Raw evidence is retained in Actions for 14 days; published summaries last until the next build.</p>',
+            '<p>Each master push runs fresh yEnc comparisons, BODY/fingerprint profiles, NZB digest/CPU comparisons, archive diagnostics, locked PHP-reader header comparisons and sample-planning comparisons on x86/ARM, plus release rendering on x86. Missing, failed, cancelled and inconclusive results remain visible. Local/manual experiments are excluded. Raw evidence is retained in Actions for 14 days; published summaries last until the next build.</p>',
             '<h2>Build checks</h2><table><tr><th>Workflow</th><th>Latest state</th><th>Evidence</th></tr>']
     for row in report['workflows']:
         body.append(f'<tr><td>{escape(row["workflow"])}</td><td>{escape(row.get("status", "unknown"))}</td><td>{run_link(row)}</td></tr>')
@@ -534,7 +693,8 @@ def render(report):
             body.append('<p>Executed source <code>' + escape(historical['head_sha']) + '</code>. ' + run_link(historical) + '.</p>')
             for row in historical['results']:
                 body.append('<h3>' + escape(row['runner']) + '</h3><p>Rust payload mode: ' + escape(measured_payload_mode(row)) + '.</p>' + measurement_table(row['rows']))
-    body.append('<h2>Rust target coverage and priorities</h2><p>Next priorities: inspect cold fingerprint costs and worker startup, sample-planner projection/JSON costs, and repeated native body/format scans. Archive diagnostics have no equivalent PHP baseline; qualification runs must bound uncommon tails before proposing replacements. Newly added Rust sources appear as gaps until their benchmark mapping is reviewed.</p><table><tr><th>Source target</th><th>Automated evidence</th><th>Scope / gap</th></tr>')
+                body.append('<details><summary>Summary data and identities</summary><pre>' + escape(json.dumps(row, indent=2, ensure_ascii=False, allow_nan=False)) + '</pre></details>')
+    body.append('<h2>Rust target coverage and priorities</h2><p>Next priorities: inspect cold fingerprint costs and worker startup, sample-planner projection/JSON costs, and repeated native body/format scans. Native-only archive diagnostics have no equivalent PHP baseline; locked-reader comparisons cover initial headers only. Qualification runs must bound uncommon tails before proposing replacements. Newly added Rust sources appear as gaps until their benchmark mapping is reviewed.</p><table><tr><th>Source target</th><th>Automated evidence</th><th>Scope / gap</th></tr>')
     for row in report['coverage']:
         body.append(f'<tr><td><code>{escape(row["target"])}</code></td><td>{escape(row["coverage"])}</td><td>{escape(row["detail"])}</td></tr>')
     body.append('</table></html>')

@@ -14,9 +14,6 @@ final class NativeMetadataParser
     /** @var array<string, FFI> */
     private static array $libraries = [];
 
-    /** @var array<string, FFI|null> */
-    private static array $par2IntegerRangeLibraries = [];
-
     /** @var array<string, FFI> */
     private static array $identityLibraries = [];
 
@@ -49,44 +46,6 @@ final class NativeMetadataParser
     public function parsePar2(string $bytes): ?array
     {
         return $this->parseJson('nntmux_par2_metadata_json', $bytes);
-    }
-
-    /** @return array{metadata: array<string, mixed>, unsupported_range_count: int}|null */
-    public function parsePar2WithIntegerRanges(string $bytes): ?array
-    {
-        if (PHP_INT_SIZE !== 8 || strlen($bytes) > 67_108_864) {
-            return null;
-        }
-        $library = $this->par2IntegerRangeLibrary();
-        if ($library === null) {
-            return null;
-        }
-        try {
-            $length = strlen($bytes);
-            $buffer = $library->new($length > 0 ? 'unsigned char['.$length.']' : 'unsigned char[1]');
-            if ($length > 0) {
-                FFI::memcpy($buffer, $bytes, $length);
-            }
-            $count = $library->new('uint64_t[1]');
-            $pointer = $library->nntmux_par2_integer_ranges_v1_json($buffer, $length, $count); // @phpstan-ignore method.notFound
-            if (FFI::isNull($pointer)) {
-                return null;
-            }
-            try {
-                $encoded = FFI::string($pointer);
-            } finally {
-                $library->nntmux_metadata_string_free($pointer); // @phpstan-ignore method.notFound
-            }
-            $unsupportedRangeCount = $count[0];
-            if (! is_int($unsupportedRangeCount) || $unsupportedRangeCount < 0) {
-                return null;
-            }
-            $metadata = json_decode($encoded, true, 512, JSON_BIGINT_AS_STRING);
-
-            return is_array($metadata) ? ['metadata' => $metadata, 'unsupported_range_count' => $unsupportedRangeCount] : null;
-        } catch (Throwable) {
-            return null;
-        }
     }
 
     /** @return array<string, mixed>|null */
@@ -351,35 +310,6 @@ final class NativeMetadataParser
 
             return $library;
         } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private function par2IntegerRangeLibrary(): ?FFI
-    {
-        if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || ! extension_loaded('FFI')) {
-            return null;
-        }
-        $resolved = realpath((string) config('yenc.native_library', ''));
-        if ($resolved === false || ! is_file($resolved) || ! is_readable($resolved)) {
-            return null;
-        }
-        $key = getmypid().':'.$resolved;
-        if (array_key_exists($key, self::$par2IntegerRangeLibraries)) {
-            return self::$par2IntegerRangeLibraries[$key];
-        }
-        try {
-            // Optional binding: older libraries retain every existing native API.
-            $library = FFI::cdef(<<<'C'
-                char* nntmux_par2_integer_ranges_v1_json(const unsigned char* data, size_t length, uint64_t* unsupported_count);
-                void nntmux_metadata_string_free(char* value);
-                C, $resolved);
-            self::$par2IntegerRangeLibraries[$key] = $library;
-
-            return $library;
-        } catch (Throwable) {
-            self::$par2IntegerRangeLibraries[$key] = null;
-
             return null;
         }
     }

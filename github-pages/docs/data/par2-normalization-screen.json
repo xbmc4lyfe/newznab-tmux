@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "experiment": "PAR2 recursive integer normalization",
+  "status": "rejected_after_common_path_screen",
+  "adoption_qualified": false,
+  "executed_sha": "48ce039e43fcc2ad0ada56b84378a93c7219b7af",
+  "baseline_sha": "80d19cad1d2f91022a0dbb4d2096bcafe60321e9",
+  "repository": "xbmc4lyfe/newznab-tmux",
+  "run_id": 38667970872,
+  "run_attempt": 1,
+  "runner": "ubuntu-latest",
+  "pairs_per_stratum": 31,
+  "invalid_pairs": 0,
+  "comparison_scope": "Exact complete serialized results through each frozen native PHP caller; cold and warmed calls. FFI/JSON/normalization included, PHP startup excluded.",
+  "correctness": "All 124 pairs and their three lifecycle outputs had exact serialized parity and positive candidate ABI execution proof.",
+  "raw_observations_sha256": "6341d9c182cf1bf7b48cdf38a86356762edc56c8280587d8bc247780b9b3f552",
+  "input_sha256": {
+    "public-rename-index": "daa664a5a3c782d03be0eb8bf954b1d3daec18f8c72c7e9d09786c244757ad9e",
+    "synthetic-128": "0a132da1c5614ee01d4b0d29d4c12a954c1c453f3ebc319a06e8b0e7f05da90a",
+    "synthetic-512": "22f053fdf5dd4f1a6028a006ee26cf86752e4f5a996e270bc71450834045614e",
+    "synthetic-1024": "28214fb5a0b7a5751b4655bb87bfb53a7d935d3ac2343f1d70e2851ddb7ad01d"
+  },
+  "library_sha256": {
+    "incumbent": "6db926bc9e55b913e2041a5deb7a3a589f39bfd2d1649f9fa1698a0c320f3422",
+    "candidate": "74831df84088054b6889558f710a5708d458e4b8ec875a4875516bcd7673d7df"
+  },
+  "runtime_identity": {
+    "executed_sha": "48ce039e43fcc2ad0ada56b84378a93c7219b7af",
+    "candidate_library_sha256": "74831df84088054b6889558f710a5708d458e4b8ec875a4875516bcd7673d7df",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "php": "8.5.11",
+    "python": "3.12.3",
+    "architecture": "x86_64",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "logical_cpus": 4,
+    "runner_image_os": "ubuntu24",
+    "runner_image_version": "20261012.334.1",
+    "build_profile": "release opt-level=3 lto=true codegen-units=1; cargo --locked; default features"
+  },
+  "reason": "Both common cold-path upper confidence bounds are below 1.5x. Uncommon p99 unavailable at 31 pairs; no qualification or adoption. Preserve existing native implementation.",
+  "resource_limitation": "Before/after visible CPU/memory/pids/affinity/process limits stable. This initial protocol omitted io.max/io.weight; later recurring jobs capture these too. These observations are screening evidence only.",
+  "rows": [
+    {
+      "fixture": "public-rename-index",
+      "phase": "cold",
+      "samples": 31,
+      "category": "common",
+      "p99_available": false,
+      "metric": "median_latency",
+      "incumbent_ms": 3.175642,
+      "candidate_ms": 2.943725,
+      "incumbent_over_candidate": 1.0787835140850452,
+      "simultaneous_95_percent_speedup_interval": [
+        1.05616178027259,
+        1.1083723437513897
+      ]
+    },
+    {
+      "fixture": "public-rename-index",
+      "phase": "warm",
+      "samples": 31,
+      "category": "common",
+      "p99_available": false,
+      "metric": "median_latency",
+      "incumbent_ms": 2.135826,
+      "candidate_ms": 1.618944,
+      "incumbent_over_candidate": 1.3192710804079695,
+      "simultaneous_95_percent_speedup_interval": [
+        1.289920282209245,
+        1.3269013294225627
+      ]
+    },
+    {
+      "fixture": "synthetic-128",
+      "phase": "cold",
+      "samples": 31,
+      "category": "common",
+      "p99_available": false,
+      "metric": "median_latency",
+      "incumbent_ms": 10.983894,
+      "candidate_ms": 10.202827,
+      "incumbent_over_candidate": 1.076553978617887,
+      "simultaneous_95_percent_speedup_interval": [
+        1.0540636639570298,
+        1.1020326702537995
+      ]
+    },
+    {
+      "fixture": "synthetic-128",
+      "phase": "warm",
+      "samples": 31,
+      "category": "common",
+      "p99_available": false,
+      "metric": "median_latency",
+      "incumbent_ms": 9.485818,
+      "candidate_ms": 7.590384,
+      "incumbent_over_candidate": 1.249715165925729,
+      "simultaneous_95_percent_speedup_interval": [
+        1.2201536053313318,
+        1.2965195191248664
+      ]
+    },
+    {
+      "fixture": "synthetic-512",
+      "phase": "cold",
+      "samples": 31,
+      "category": "uncommon",
+      "p99_available": false,
+      "metric": "p99_unavailable"
+    },
+    {
+      "fixture": "synthetic-512",
+      "phase": "warm",
+      "samples": 31,
+      "category": "uncommon",
+      "p99_available": false,
+      "metric": "p99_unavailable"
+    },
+    {
+      "fixture": "synthetic-1024",
+      "phase": "cold",
+      "samples": 31,
+      "category": "uncommon",
+      "p99_available": false,
+      "metric": "p99_unavailable"
+    },
+    {
+      "fixture": "synthetic-1024",
+      "phase": "warm",
+      "samples": 31,
+      "category": "uncommon",
+      "p99_available": false,
+      "metric": "p99_unavailable"
+    }
+  ]
+}

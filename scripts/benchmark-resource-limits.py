@@ -9,10 +9,14 @@ import pathlib
 import time
 
 
-STATIC_FIELDS = (
+REQUIRED_STATIC_FIELDS = (
     "cpu.max", "cpu.weight", "cpuset.cpus.effective", "cpuset.mems.effective",
     "memory.max", "memory.high", "memory.swap.max", "pids.max",
 )
+OPTIONAL_STATIC_FIELDS = (
+    "io.max", "io.weight", "cgroup.controllers", "cgroup.subtree_control",
+)
+STATIC_FIELDS = REQUIRED_STATIC_FIELDS + OPTIONAL_STATIC_FIELDS
 DYNAMIC_FIELDS = (
     "cpu.stat", "cpu.pressure", "memory.current", "memory.peak", "memory.events",
     "memory.stat", "memory.pressure", "memory.swap.current", "pids.current",
@@ -59,15 +63,18 @@ def capture(soft_limits, hard_limits, proc_root=pathlib.Path("/proc"),
     affinity = sorted(os.sched_getaffinity(0))
     if not process_limits.strip() or not soft.strip() or not hard.strip() or not affinity:
         raise ValueError("Missing process limits, shell ulimits, or CPU affinity")
-    # Root controller files can be absent by kernel design. Require every
-    # dimension somewhere in the chain so absence is never called unlimited.
-    missing = [name for name in STATIC_FIELDS
+    # Root controller files can be absent by kernel design. Keep existing
+    # CPU/memory/pids completeness requirements. I/O controls are not exposed
+    # on every kernel/cgroup: retain explicit nulls and freeze their presence
+    # as well as values, without interpreting missing files as unlimited I/O.
+    missing = [name for name in REQUIRED_STATIC_FIELDS
                if not any(entry["limits"][name] is not None for entry in ancestors)]
     if missing:
         raise ValueError("Unobserved visible limit dimensions: " + ", ".join(missing))
     return {
         "schema_version": 1, "valid": True, "captured_at_unix_ns": time.time_ns(),
         "scope": SCOPE, "outer_host_limits": "unknown",
+        "missing_controller_files": "unknown; never interpreted as unlimited",
         "process_limits": process_limits, "cpu_affinity": affinity,
         "shell_soft_limits": soft, "shell_hard_limits": hard,
         "cgroup_membership": membership,
@@ -106,7 +113,7 @@ def static_identity(snapshot):
         usage = entry.get("usage")
         if not isinstance(usage, dict) or set(usage) != set(DYNAMIC_FIELDS):
             raise ValueError("Missing cgroup usage endpoint")
-    if any(not any(entry["limits"][name] is not None for entry in ancestors) for name in STATIC_FIELDS):
+    if any(not any(entry["limits"][name] is not None for entry in ancestors) for name in REQUIRED_STATIC_FIELDS):
         raise ValueError("Unobserved cgroup limit dimensions")
     return {
         key: snapshot[key] for key in (

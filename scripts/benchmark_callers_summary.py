@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export fixed public archive/sample metrics; raw evidence never leaves the allowlist."""
+"""Export fixed public caller metrics; raw evidence never leaves the allowlist."""
 
 import argparse
 import hashlib
@@ -14,11 +14,30 @@ import statistics
 CALLER_STRATA = {
     "sample-planning": {"small-dispatch": "dispatch_control", "boundary-1024": "common", "large-16384": "common",
                         "duplicates-inferred": "uncommon", "tight-budget": "uncommon", "unsupported-coercion": "fallback_control"},
+    "vendor-archive": {name: 'common' for name in ('rar4-stored', 'rar5-mixed', 'zip-stored', 'seven-stored')}
+        | {name: 'uncommon' for name in ('rar4-solid', 'rar5-encrypted-headers', 'zip-aes', 'seven-encrypted-headers')},
     "archive-parsing": {"public-rename-index": "common", "synthetic-128": "common", "synthetic-512": "uncommon", "synthetic-1024": "uncommon",
                         **dict.fromkeys(("rar4", "rar5", "zip", "seven-zip", "iso", "seven-zip-truncated", "seven-zip-corrupt",
                                         "seven-ranges-complete", "seven-ranges-split", "seven-ranges-missing", "seven-ranges-conflicting",
                                         "par2-ranges-complete", "par2-ranges-split", "par2-ranges-missing", "par2-ranges-conflicting", "par2-ranges-checksum"), "diagnostic")},
 }
+
+
+VENDOR_INPUTS = {
+    'rar4-stored': ('rar/store_method.rar', 'c32c1bb9c65159df7a8cedd939e7e42d3fd424e334898e586c1558093bc89d37'),
+    'rar5-mixed': ('rar/rar50_quickopen.rar', '645f6a8adfae57ff04b3e2ff0fbf018101e623646b4396d3cd605437d3b5f882'),
+    'zip-stored': ('zip/little_file.zip', 'ababf71680cceb96c44ee04d69ab5dd99436c3b05c1d60242ffb8994e171ff09'),
+    'seven-stored': ('szip/store_method.7z', 'ec369e350984c9af3f5211f6cc20008abf29f7f331f8aa656604be05fafede5a'),
+    'rar4-solid': ('rar/solid.rar', '05d39c43a4ba897ea358543aa5b700208eba307ee6e6379d8d7cbd978aa374e4'),
+    'rar5-encrypted-headers': ('rar/rar50_encrypted_headers.rar', 'f5db452c3d7dc351b1ff9971edfb0611893838affa369e31e209570e270cc2af'),
+    'zip-aes': ('zip/encrypted_file_aes.zip', '7555457edd346b22c718e43d3409e1b9ae1dca1b118a26b1cdb960e58781238d'),
+    'seven-encrypted-headers': ('szip/encrypted_headers.7z', '4b7fdbb7b875847278e65bed4ce23fc29a149a7a7e93334304dbf34fb8d52f0d'),
+}
+VENDOR_INPUTS = {name: ('vendor/dariusiii/rarinfo/tests/fixtures/' + path, digest) for name, (path, digest) in VENDOR_INPUTS.items()}
+VENDOR_SOURCES = {'composer.lock', 'vendor/composer/installed.json', 'vendor/dariusiii/rarinfo/composer.json',
+    'vendor/dariusiii/rarinfo/ArchiveReader.php', 'vendor/dariusiii/rarinfo/RarInfo.php',
+    'vendor/dariusiii/rarinfo/ZipInfo.php', 'vendor/dariusiii/rarinfo/SzipInfo.php',
+    'scripts/benchmark-vendor-archive.php', 'tests/Fixtures/VendorArchiveBenchmarkFixtures.php'} | {path for path, _ in VENDOR_INPUTS.values()}
 
 
 SOURCE_PATHS = {
@@ -27,7 +46,7 @@ SOURCE_PATHS = {
     "scripts/benchmark-sample-planning.php", "scripts/benchmark-archive-parsing.php",
     "tests/Fixtures/SamplePlanningBenchmarkFixtures.php", "tests/Fixtures/ArchiveParsingBenchmarkFixtures.php",
     "tests/Fixtures/par2/rename-index.par2", "docker/app/nzb-yenc-ffi/src/par2.rs", "docker/app/nzb-yenc-ffi/src/formats.rs",
-    "docker/app/nzb-yenc-ffi/src/seven_zip_ranges.rs", "docker/app/nzb-yenc-ffi/src/par2_source_ranges.rs", "docker/app/nzb-yenc-ffi/src/spotcheck_plan.rs",
+    "docker/app/nzb-yenc-ffi/src/seven_zip_ranges.rs", "docker/app/nzb-yenc-ffi/src/par2_source_ranges.rs", "docker/app/nzb-yenc-ffi/src/sample_plan.rs",
     "scripts/benchmark-yenc.php", "scripts/build-rapidyenc.sh", "composer.lock",
     "scripts/benchmark-article-processing.php", "scripts/benchmark-release-names.php",
     "app/Services/YencService.php", "app/Services/NNTP/NNTPService.php",
@@ -39,6 +58,8 @@ SOURCE_PATHS = {
     "docker/app/nzb-yenc-ffi/src/lib.rs", "docker/app/nzb-yenc-ffi/src/release_names.rs",
     "docker/app/php/release-presentation-preload.php", "vendor/composer/installed.json",
 }
+
+SOURCE_PATHS |= VENDOR_SOURCES
 
 
 def number(value):
@@ -67,8 +88,57 @@ def digest(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
+def valid_vendor_setup(protocol, records):
+    declarations = protocol.get('strata')
+    if not isinstance(declarations, dict) or set(declarations) != set(VENDOR_INPUTS):
+        return False
+    for name, (path, expected_hash) in VENDOR_INPUTS.items():
+        row = declarations[name]
+        if (not isinstance(row, dict) or row.get('category') != CALLER_STRATA['vendor-archive'][name]
+                or row.get('path') != path or row.get('sha256') != expected_hash or row.get('paired') is not True):
+            return False
+    setups = [row for row in records if row.get('type') == 'setup']
+    if len(setups) != 1:
+        return False
+    hashes, receipt = setups[0].get('build_source_identities'), setups[0].get('vendor_receipt')
+    if not isinstance(hashes, dict) or not all(digest(hashes.get(key)) for key in VENDOR_SOURCES) or not isinstance(receipt, dict):
+        return False
+    files = receipt.get('files')
+    expected_files = {key: hashes[key] for key in VENDOR_SOURCES if key.startswith('vendor/') or key == 'composer.lock'}
+    return (all(hashes[path] == expected_hash for path, expected_hash in VENDOR_INPUTS.values())
+            and receipt.get('package') == 'dariusiii/rarinfo' and receipt.get('version') in ('3.1', 'v3.1')
+            and receipt.get('license') == ['BSD-3-Clause']
+            and receipt.get('source_reference') == '2cd3220b76d807de1798a98d743f20224f30d63a'
+            and isinstance(files, dict) and files == expected_files)
+
+
+def valid_vendor_quantiles(source, samples):
+    alpha = 0.05 / 32
+    if not number(source.get('marginal_alpha')) or not math.isclose(source['marginal_alpha'], alpha, rel_tol=1e-12):
+        return False
+    quantiles = [source.get(key) for key in ('php', 'native')]
+    if not all(isinstance(value, dict) and value.get('samples') == samples
+               and number(value.get('confidence')) and math.isclose(value['confidence'], 1 - alpha, rel_tol=1e-12)
+               and number(value.get('estimate')) and value['estimate'] > 0 for value in quantiles):
+        return False
+    for value in quantiles:
+        interval = value.get('interval')
+        if (not isinstance(interval, list) or len(interval) != 2
+                or any(bound is not None and (not number(bound) or bound <= 0) for bound in interval)
+                or interval[0] is not None and interval[0] > value['estimate']
+                or interval[1] is not None and interval[1] < value['estimate']):
+            return False
+    baseline, candidate = (value['interval'] for value in quantiles)
+    expected = [baseline[0] / candidate[1] if baseline[0] is not None and candidate[1] is not None else None,
+                baseline[1] / candidate[0] if baseline[1] is not None and candidate[0] is not None else None]
+    interval = source.get('simultaneous_95_percent_speedup_interval')
+    return (isinstance(interval, list) and len(interval) == 2
+            and all(actual is None if required is None else number(actual) and math.isclose(actual, required, rel_tol=1e-12)
+                    for actual, required in zip(interval, expected)))
+
+
 def caller_summary(kind, records):
-    """Fixed public metric projection of the two PHP caller harnesses."""
+    """Fixed public metric projection of the PHP caller harnesses."""
     expected = CALLER_STRATA[kind]
     protocols = [row for row in records if row.get("type") == "protocol"]
     terminal = records[-1] if records and records[-1].get("type") == "summary" else {}
@@ -79,6 +149,8 @@ def caller_summary(kind, records):
                       and protocol.get("mode") in ("screen", "qualification")
                       and (protocol["mode"] != "qualification" or samples >= 1000))
     invalid |= bool(protocol) and not valid_protocol
+    if kind == 'vendor-archive':
+        invalid |= not valid_vendor_setup(protocol, records)
     measured, pairs = {}, {key: set() for key in expected}
     for record in records:
         if record.get("type") not in ("stratum", "pair"):
@@ -143,7 +215,7 @@ def caller_summary(kind, records):
                     else:
                         good = False
             else:
-                row["comparison"] = "shared_par2_projection" if kind == "archive-parsing" else "exact_public_caller"
+                row["comparison"] = "shared_vendor_header_projection" if kind == "vendor-archive" else "shared_par2_projection" if kind == "archive-parsing" else "exact_public_caller"
                 row["metric"] = "p99_latency" if category == "uncommon" else "median_latency"
                 good &= (source.get("status") in ("qualified", "inconclusive") and source.get("metric") == row["metric"]
                          and source.get("eligible_pairs") == size and source.get("invalid_pairs") == 0
@@ -157,8 +229,14 @@ def caller_summary(kind, records):
                 quantiles = [source.get(key) for key in ("php", "native")]
                 good &= all(isinstance(value, dict) and value.get("samples") == size
                             and number(value.get("estimate")) and value["estimate"] > 0 for value in quantiles)
+                if kind == 'vendor-archive':
+                    good &= valid_vendor_quantiles(source, size)
+                    row.update(confidence_family_size=32, marginal_alpha=0.05 / 32)
                 if good:
                     row["speedup_interval"] = interval
+                    if kind == 'vendor-archive':
+                        row.update(baseline_latency_interval_ms=None if category == 'uncommon' and size < 1000 else quantiles[0]['interval'],
+                                   candidate_latency_interval_ms=None if category == 'uncommon' and size < 1000 else quantiles[1]['interval'])
                     if category == "uncommon" and size < 1000:
                         row["metric"] = "p99_unavailable"
                     else:
@@ -176,9 +254,18 @@ def caller_summary(kind, records):
         invalid |= terminal.get("identities_stable") is not True
         invalid |= terminal.get("status") not in (("qualified", "inconclusive") if kind == "sample-planning" else ("partial_semantics_only",))
         invalid |= terminal.get("invalid_pairs" if kind == "sample-planning" else "invalid_observations_or_pairs") != 0
+        if kind == 'vendor-archive':
+            invalid |= terminal.get('acceptance_criteria_met') is not False
+            expected_gate = complete and all(row.get('qualification_gate_passed') is True for row in rows)
+            invalid |= terminal.get('vendor_archive_shared_projection_qualified') is not expected_gate
         declared = terminal.get("strata")
         invalid |= (not isinstance(declared, dict) or set(declared) != set(expected)
                     or any(declared.get(name) != decision for name, decision in measured.items()))
+    if kind == 'vendor-archive' and invalid:
+        for row in rows:
+            row['eligible'] = False
+            if 'qualification_gate_passed' in row:
+                row['qualification_gate_passed'] = False
     sources, libraries = {}, {}
     for record in records:
         hashes = record.get("build_source_identities")
@@ -189,7 +276,7 @@ def caller_summary(kind, records):
             libraries["native"] = library["sha256"]
     return dict(rows=rows, status="invalid" if invalid else "measured" if complete else "partial",
                 completeness=dict(expected_rows=2 * len(expected), observed_rows=len(rows), complete=complete),
-                evidence_type="shared_par2_projection_and_native_diagnostics" if kind == "archive-parsing" else "paired_public_caller_quantiles",
+                evidence_type="shared_vendor_archive_header_projection" if kind == "vendor-archive" else "shared_par2_projection_and_native_diagnostics" if kind == "archive-parsing" else "paired_public_caller_quantiles",
                 protocol_sha256=hashlib.sha256(json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                 source_sha256=sources, library_sha256=libraries)
 

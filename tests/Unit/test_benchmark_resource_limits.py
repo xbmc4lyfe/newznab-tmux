@@ -69,6 +69,79 @@ class ResourceLimitsTest(unittest.TestCase):
         self.assertTrue(result["stable_static_limits"])
         self.assertFalse(result["dynamic_usage_compared_for_stability"])
 
+    def test_present_io_limits_are_frozen_at_every_ancestor_and_receipt_rejects_drift(self):
+        left, right, receipt = (self.root / f'resource-limits-{name}.json'
+                                for name in ('before', 'after', 'comparison'))
+        cases = {
+            'io.max': ('8:0 rbps=max wbps=1048576 riops=max wiops=max',
+                       '8:0 rbps=max wbps=10485760 riops=max wiops=max'),
+            'io.weight': ('default 100', 'default 1000'),
+        }
+        for directory in (self.cgroup / 'runner/job', self.cgroup / 'runner', self.cgroup):
+            for field, (initial, changed) in cases.items():
+                with self.subTest(cgroup=directory, field=field):
+                    (directory / field).write_text(initial + '\n')
+                    before = self.snapshot()
+                    left.write_text(json.dumps(before))
+                    right.write_text(json.dumps(before))
+                    receipt.write_text(json.dumps(RESOURCES.compare(left, right)))
+                    RESOURCES.verified_receipt(self.root)
+                    (directory / field).write_text(changed + '\n')
+                    after = self.snapshot()
+                    result = self.compare(before, after)
+                    self.assertTrue(result['valid'])
+                    self.assertFalse(result['stable_static_limits'])
+                    self.assertIn('cgroup_v2_ancestors', result['changed_fields'])
+                    # Keep the earlier claimed stable receipt: exporters must
+                    # independently notice the raw I/O endpoint changed.
+                    right.write_text(json.dumps(after))
+                    with self.assertRaises(ValueError):
+                        RESOURCES.verified_receipt(self.root)
+
+    def test_absent_io_controller_is_unknown_and_presence_transitions_fail_stability(self):
+        directories = (self.cgroup / 'runner/job', self.cgroup / 'runner', self.cgroup)
+        for directory in directories:
+            for field in ('io.max', 'io.weight'):
+                (directory / field).unlink(missing_ok=True)
+            (directory / 'cgroup.controllers').write_text('cpu memory pids cpuset\n')
+            (directory / 'cgroup.subtree_control').write_text('cpu memory pids cpuset\n')
+        absent = self.snapshot()
+        self.assertEqual(absent['missing_controller_files'], 'unknown; never interpreted as unlimited')
+        for ancestor in absent['cgroup_v2_ancestors']:
+            self.assertIsNone(ancestor['limits']['io.max'])
+            self.assertIsNone(ancestor['limits']['io.weight'])
+            self.assertEqual(ancestor['limits']['cgroup.controllers'], 'cpu memory pids cpuset')
+        self.assertTrue(self.compare(absent, self.snapshot())['stable_static_limits'])
+        for field in ('io.max', 'io.weight'):
+            with self.subTest(field=field):
+                limit = directories[0] / field
+                limit.write_text('default 100' if field == 'io.weight' else '8:0 wbps=1048576')
+                present = self.snapshot()
+                self.assertFalse(self.compare(absent, present)['stable_static_limits'])
+                limit.unlink()
+                removed = self.snapshot()
+                self.assertFalse(self.compare(present, removed)['stable_static_limits'])
+                self.assertTrue(self.compare(absent, removed)['stable_static_limits'])
+
+    def test_io_field_removal_from_raw_endpoint_is_rejected(self):
+        before = self.snapshot()
+        for field in ('io.max', 'io.weight'):
+            with self.subTest(field=field):
+                after = copy.deepcopy(before)
+                del after['cgroup_v2_ancestors'][0]['limits'][field]
+                result = self.compare(before, after)
+                self.assertFalse(result['valid'])
+                self.assertFalse(result['stable_static_limits'])
+
+    def test_io_controller_availability_changes_are_static(self):
+        directory = self.cgroup / 'runner/job'
+        for field in ('cgroup.controllers', 'cgroup.subtree_control'):
+            with self.subTest(field=field):
+                (directory / field).write_text('cpu memory\n')
+                before = self.snapshot()
+                (directory / field).write_text('cpu memory io\n')
+                self.assertFalse(self.compare(before, self.snapshot())['stable_static_limits'])
+
     def test_static_limit_affinity_membership_or_shell_change_fails_stability(self):
         before = self.snapshot()
         changes = [

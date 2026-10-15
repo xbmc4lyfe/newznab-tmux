@@ -27,12 +27,39 @@ ARCHIVE.update(dict.fromkeys(("rar4", "rar5", "zip", "seven-zip", "iso", "seven-
     "par2-ranges-conflicting", "par2-ranges-checksum"), "diagnostic"))
 
 
+VENDOR = dict.fromkeys(('rar4-stored', 'rar5-mixed', 'zip-stored', 'seven-stored'), 'common') | dict.fromkeys(
+    ('rar4-solid', 'rar5-encrypted-headers', 'zip-aes', 'seven-encrypted-headers'), 'uncommon')
+VENDOR_INPUTS = {
+    'rar4-stored': ('rar/store_method.rar', 'c32c1bb9c65159df7a8cedd939e7e42d3fd424e334898e586c1558093bc89d37'),
+    'rar5-mixed': ('rar/rar50_quickopen.rar', '645f6a8adfae57ff04b3e2ff0fbf018101e623646b4396d3cd605437d3b5f882'),
+    'zip-stored': ('zip/little_file.zip', 'ababf71680cceb96c44ee04d69ab5dd99436c3b05c1d60242ffb8994e171ff09'),
+    'seven-stored': ('szip/store_method.7z', 'ec369e350984c9af3f5211f6cc20008abf29f7f331f8aa656604be05fafede5a'),
+    'rar4-solid': ('rar/solid.rar', '05d39c43a4ba897ea358543aa5b700208eba307ee6e6379d8d7cbd978aa374e4'),
+    'rar5-encrypted-headers': ('rar/rar50_encrypted_headers.rar', 'f5db452c3d7dc351b1ff9971edfb0611893838affa369e31e209570e270cc2af'),
+    'zip-aes': ('zip/encrypted_file_aes.zip', '7555457edd346b22c718e43d3409e1b9ae1dca1b118a26b1cdb960e58781238d'),
+    'seven-encrypted-headers': ('szip/encrypted_headers.7z', '4b7fdbb7b875847278e65bed4ce23fc29a149a7a7e93334304dbf34fb8d52f0d'),
+}
+VENDOR_INPUTS = {name: ('vendor/dariusiii/rarinfo/tests/fixtures/' + path, digest) for name, (path, digest) in VENDOR_INPUTS.items()}
+VENDOR_FILES = {'composer.lock', 'vendor/composer/installed.json', 'vendor/dariusiii/rarinfo/composer.json',
+                'vendor/dariusiii/rarinfo/ArchiveReader.php', 'vendor/dariusiii/rarinfo/RarInfo.php',
+                'vendor/dariusiii/rarinfo/ZipInfo.php', 'vendor/dariusiii/rarinfo/SzipInfo.php',
+                'scripts/benchmark-vendor-archive.php', 'tests/Fixtures/VendorArchiveBenchmarkFixtures.php'}
+
+
 def fixture(kind, samples=31, mode="screen"):
-    definitions = SAMPLE if kind == "sample-planning" else ARCHIVE
+    definitions = VENDOR if kind == "vendor-archive" else SAMPLE if kind == "sample-planning" else ARCHIVE
     records = [{"type": "protocol", "protocol": kind + "-v1", "mode": mode,
                 "samples_per_stratum": samples, "instrumentation": {MARKER: "a" * 64}},
                {"type": "setup", "build_source_identities": {"composer.lock": "b" * 64, MARKER: "c" * 64},
                 "library": {"sha256": "d" * 64, "path": MARKER}}]
+    if kind == 'vendor-archive':
+        records[0]['strata'] = {name: dict(category=category, path=VENDOR_INPUTS[name][0], sha256=VENDOR_INPUTS[name][1], paired=True)
+                                for name, category in VENDOR.items()}
+        hashes = dict.fromkeys(VENDOR_FILES, 'a' * 64) | dict(VENDOR_INPUTS.values())
+        records[1]['build_source_identities'].update(hashes)
+        records[1]['vendor_receipt'] = dict(package='dariusiii/rarinfo', version='v3.1', license=['BSD-3-Clause'],
+            source_reference='2cd3220b76d807de1798a98d743f20224f30d63a',
+            files={key: value for key, value in hashes.items() if key.startswith('vendor/') or key == 'composer.lock'})
     decisions = {}
     for name, category in definitions.items():
         size = min(samples, 31) if category == "diagnostic" else samples
@@ -59,6 +86,11 @@ def fixture(kind, samples=31, mode="screen"):
                        "metric": metric, "php": marginal, "native": native,
                        "php_over_native": 2.5, "simultaneous_95_percent_speedup_interval": interval,
                        "qualifies": False, "evidence": "screen_only_no_adoption"}
+                if kind == 'vendor-archive':
+                    row['marginal_alpha'] = 0.05 / 32
+                    row['php']['confidence'] = row['native']['confidence'] = 1 - 0.05 / 32
+                    if mode == 'qualification' and size >= 1000:
+                        row.update(qualifies=True, status='qualified')
             decision[phase] = row
         decisions[name] = decision
         for pair in range(size):
@@ -73,6 +105,8 @@ def fixture(kind, samples=31, mode="screen"):
                     "identities_stable": True, "invalid_pairs": 0, "invalid_observations_or_pairs": 0,
                     "strata": decisions, "acceptance_criteria_met": False, "par2_shared_projection_qualified": False,
                     "reason": MARKER})
+    if kind == 'vendor-archive':
+        records[-1]['vendor_archive_shared_projection_qualified'] = mode == 'qualification' and samples >= 1000
     return records
 
 
@@ -107,6 +141,48 @@ class CallerSummaryExportTest(unittest.TestCase):
             summary = self.export(kind, fixture(kind))
             self.assertEqual({key for key in summary['source_sha256'] if key.startswith('resource_limits_')},
                              {'resource_limits_before', 'resource_limits_after', 'resource_limits_comparison'})
+
+    def test_vendor_archive_projects_8_fixed_strata_32_marginals_without_adoption(self):
+        summary = self.export('vendor-archive', fixture('vendor-archive'))
+        self.assertEqual(summary['status'], 'measured')
+        self.assertEqual(summary['evidence_type'], 'shared_vendor_archive_header_projection')
+        self.assertEqual(len(summary['rows']), 16)
+        self.assertEqual({row['fixture'] for row in summary['rows']}, set(VENDOR))
+        self.assertTrue(all(row['comparison'] == 'shared_vendor_header_projection' and row['confidence_family_size'] == 32 for row in summary['rows']))
+        self.assertEqual(sum(row['metric'] == 'p99_unavailable' for row in summary['rows']), 8)
+        self.assertFalse(any(row.get('qualification_gate_passed') for row in summary['rows']))
+        self.assertTrue(VENDOR_FILES <= set(summary['source_sha256']))
+        for path, expected in VENDOR_INPUTS.values():
+            self.assertEqual(summary['source_sha256'][path], expected)
+        qualified = self.export('vendor-archive', fixture('vendor-archive', samples=1000, mode='qualification'))
+        self.assertEqual(qualified['status'], 'measured')
+        self.assertTrue(all(row['qualification_gate_passed'] for row in qualified['rows']))
+        self.assertIs(qualified['adoption_qualified'], False)
+
+    def test_vendor_archive_wrong_protocol_confidence_receipt_or_locked_input_is_invalid(self):
+        mutations = (
+            lambda rows: rows[0].update(protocol='archive-parsing-v1'),
+            lambda rows: rows[0]['strata']['rar4-stored'].update(sha256='a' * 64),
+            lambda rows: rows[1]['vendor_receipt'].update(license=['private']),
+            lambda rows: rows[1]['vendor_receipt'].update(source_reference='a' * 40),
+            lambda rows: rows[1]['vendor_receipt']['files'].pop('vendor/dariusiii/rarinfo/RarInfo.php'),
+            lambda rows: rows[1]['build_source_identities'].pop('vendor/dariusiii/rarinfo/ZipInfo.php'),
+            lambda rows: next(row for row in rows if row['type'] == 'pair').update(shared_projection_parity=False),
+            lambda rows: next(row for row in rows if row['type'] == 'stratum')['decision']['cold'].update(marginal_alpha=.05/16),
+            lambda rows: next(row for row in rows if row['type'] == 'stratum')['decision']['cold']['php'].update(confidence=.95),
+            lambda rows: next(row for row in rows if row['type'] == 'stratum')['decision']['cold'].update(simultaneous_95_percent_speedup_interval=[2, 4]),
+            lambda rows: rows[-1].update(acceptance_criteria_met=True),
+            lambda rows: rows[-1].update(vendor_archive_shared_projection_qualified=True),
+        )
+        for mutation in mutations:
+            rows = fixture('vendor-archive')
+            mutation(rows)
+            with self.subTest(mutation=mutation):
+                self.assertEqual(self.export('vendor-archive', rows)['status'], 'invalid')
+        for mutation in ('missing', 'changed', 'forged'):
+            result = self.export('vendor-archive', fixture('vendor-archive'), resources=mutation)
+            self.assertEqual(result['status'], 'invalid')
+            self.assertFalse(any(row['eligible'] for row in result['rows']))
 
     def test_complete_sample_keeps_controls_and_unknown_tail(self):
         summary = self.export("sample-planning", fixture("sample-planning"))
