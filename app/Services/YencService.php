@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Services\Yenc\ArticleFrame;
+use App\Services\Yenc\ExperimentalStrictArticleDecoder;
 use App\Services\Yenc\NativePayloadDecoder;
 use App\Services\Yenc\PayloadDecoder;
 use App\Services\Yenc\PhpPayloadDecoder;
@@ -14,7 +15,10 @@ use RuntimeException;
 
 class YencService
 {
-    public function __construct(private readonly PayloadDecoder $decoder = new PhpPayloadDecoder) {}
+    public function __construct(
+        private readonly PayloadDecoder $decoder = new PhpPayloadDecoder,
+        private readonly ?ExperimentalStrictArticleDecoder $experimentalStrictDecoder = null,
+    ) {}
 
     /**
      * @param  bool  $ignore  Legacy unused argument retained for compatibility.
@@ -23,6 +27,12 @@ class YencService
      */
     public function decode(string &$text, bool $ignore = false): string|false
     {
+        if ($this->experimentalStrictDecoder !== null) {
+            $decoded = $this->experimentalStrictDecoder->decode($text);
+            if ($decoded !== null) {
+                return $decoded;
+            }
+        }
         $frame = ArticleFrame::parse($text);
         if ($frame === null) {
             return false;

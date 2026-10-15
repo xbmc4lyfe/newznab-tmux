@@ -19,6 +19,42 @@ mod par2;
 mod par2_source_ranges;
 mod payload_decoder;
 mod release_names;
+#[cfg(feature = "experimental-strict-article")]
+mod strict_article_experimental;
+#[cfg(feature = "experimental-strict-article")]
+pub use strict_article_experimental::StrictArticleResult;
+
+/// Experimental bounded strict single/multipart article decoding.
+/// Status 1 (unsupported) and 2 (bad arguments) leave all output untouched.
+/// No default build exports this capability.
+///
+/// # Safety
+/// Validated nonempty source and destination ranges must be readable/writable,
+/// respectively; result must hold sixteen writable bytes. These three ranges
+/// must be disjoint. Only the reported decoded prefix is written. Result
+/// alignment is not required. Internal-error status 255 must not trigger fallback.
+#[cfg(feature = "experimental-strict-article")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_yenc_decode_strict_article_v1(
+    source: *const c_void,
+    source_length: usize,
+    destination: *mut c_void,
+    destination_capacity: usize,
+    php_integer_max: u64,
+    result: *mut StrictArticleResult,
+) -> u32 {
+    catch_unwind(|| unsafe {
+        strict_article_experimental::decode(
+            source.cast(),
+            source_length,
+            destination.cast(),
+            destination_capacity,
+            php_integer_max,
+            result,
+        )
+    })
+    .unwrap_or(255)
+}
 
 #[cfg(target_arch = "aarch64")]
 mod payload_decoder_arm;
