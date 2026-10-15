@@ -231,23 +231,26 @@ final class OriginalFilenameAcceptanceTest extends TestCase
 
     public static function strongestTierRows(): array
     {
-        return [
-            'canonical outranks alias' => [false, false, 7],
-            'canonical outranks alias reversed' => [true, false, 7],
-            'same canonical identity has conflicting IDs' => [false, true, 0],
-            'same canonical identity has conflicting IDs reversed' => [true, true, 0],
-        ];
+        $rows = [];
+        foreach (['.mkv', '.7z.001', '.mkv.001', '.epub', '.iso', '.r100', '.z01'] as $suffix) {
+            $rows[$suffix.' canonical outranks alias'] = [false, false, 7, $suffix];
+            $rows[$suffix.' canonical outranks alias reversed'] = [true, false, 7, $suffix];
+            $rows[$suffix.' conflicting canonical IDs'] = [false, true, 0, $suffix];
+            $rows[$suffix.' conflicting canonical IDs reversed'] = [true, true, 0, $suffix];
+        }
+
+        return $rows;
     }
 
     #[DataProvider('strongestTierRows')]
-    public function test_original_canonical_tier_preserves_identity_and_ambiguity(bool $reverse, bool $duplicateCanonical, int $expected): void
+    public function test_original_canonical_tier_preserves_identity_and_ambiguity(bool $reverse, bool $duplicateCanonical, int $expected, string $suffix): void
     {
         $this->createPar2RenameSchema();
         DB::statement('ALTER TABLE predb ADD COLUMN filename TEXT');
         config(['nntmux.echocli' => false]);
         Event::fake([ReleaseNameFixed::class]);
         $title = 'Éxact.Release.2026-GRP';
-        $original = 'ÉXACT.RELEASE.2026-GRP.mkv';
+        $original = 'ÉXACT.RELEASE.2026-GRP'.$suffix;
         $rows = [
             ['id' => 7, 'title' => $title, 'filename' => $original],
             ['id' => 8, 'title' => $duplicateCanonical ? mb_strtolower($title) : 'Different.Canonical.2026-GRP', 'filename' => $original],

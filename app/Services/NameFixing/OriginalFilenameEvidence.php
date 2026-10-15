@@ -14,7 +14,11 @@ final readonly class OriginalFilenameEvidence
     public function __construct(string $filename)
     {
         $this->basename = preg_replace('~^.*[\\\\/]~s', '', $filename) ?? '';
-        $this->stem = preg_replace('/(?:\.part[0-9]+\.rar|\.(?:rar|r[0-9]{2}|[0-9]{3}|7z|zip|mkv|mp4|avi|mov|wmv|ts|m2ts|flac|mp3|m4a|ogg|wav|nfo|srr))$/iD', '', $this->basename) ?? '';
+        // Preserve the guard's existing support for multipart numbers longer than the shared helper allows.
+        $longMultipartStem = preg_replace('/\.part[0-9]{5,}\.rar$/iD', '', $this->basename) ?? $this->basename;
+        $this->stem = $longMultipartStem !== $this->basename
+            ? $longMultipartStem
+            : (new FileNameCleaner)->stripFileSuffixes($this->basename);
     }
 
     public function accepts(string $title, string $alias = ''): bool
