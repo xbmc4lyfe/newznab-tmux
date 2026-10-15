@@ -23,6 +23,84 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
 {
     use CapturedUploadFixture;
 
+    public static function resetRetirementSchedules(): array
+    {
+        $cases = [];
+        foreach (['initial', 'replay', 'invalid'] as $mode) {
+            foreach (['intent_dir', 'complete_dir', 'manifest_parent', 'custody_gc_parent'] as $boundary) {
+                $cases[$mode.' '.$boundary] = [$mode, $boundary];
+            }
+        }
+
+        return $cases;
+    }
+
+    #[DataProvider('resetRetirementSchedules')]
+    public function test_reset_is_excluded_through_companion_retirement(string $mode, string $boundary): void
+    {
+        [$path, $manifests, $service] = $this->directUpload(nfoBody: $mode === 'invalid' ? '' : 'direct companion');
+        if ($mode === 'replay') {
+            self::assertSame('imported', $service->importManifest($path)['status']);
+        }
+        $probes = 0;
+        $admitted = false;
+        $retiring = false;
+        DirectorySyncBridge::$afterSync = static function (string $directory, string $point) use ($path, $boundary, &$probes, &$admitted, &$retiring): void {
+            if ($point === 'intent_dir') {
+                $retiring = true;
+            }
+            if (! $retiring || $point !== $boundary || ($point === 'manifest_parent' && $directory !== dirname($path))) {
+                return;
+            }
+            $probes++;
+            $lock = fopen(config('release_verification.storage_path').'/reset.lock', 'c');
+            try {
+                if (flock($lock, LOCK_EX | LOCK_NB)) {
+                    $admitted = true;
+                    // The full reset removes the committed NFO and its SQL authority.
+                    DB::table('nfo_cleanup_commits')->delete();
+                    DB::table('release_nfos')->delete();
+                    DB::table('releases')->delete();
+                    flock($lock, LOCK_UN);
+                }
+            } finally {
+                fclose($lock);
+            }
+        };
+        try {
+            $service->importManifest($path, delete: true, deleteFailed: $mode === 'invalid');
+        } finally {
+            DirectorySyncBridge::$afterSync = null;
+        }
+        self::assertGreaterThan(0, $probes);
+        self::assertFalse($admitted, 'Reset crossed SQL-authorized companion retirement.');
+        self::assertSame(1, DB::table('releases')->count());
+        self::assertSame($mode === 'invalid' ? 0 : 1, DB::table('nfo_cleanup_commits')->count());
+        self::assertFileDoesNotExist(dirname($path).'/info.nfo');
+        self::assertSame([], glob(dirname($path).'/.custody-*'));
+        $result = $manifests->read($path);
+        $field = $mode === 'invalid' ? 'nfo_failed_relinquished_attempt' : 'nfo_relinquished_attempt';
+        self::assertSame($result['nfo_capture']['attempt'], $result[$field]);
+    }
+
+    public function test_invalid_companion_retirement_defers_inside_an_ambient_transaction(): void
+    {
+        [$path, $manifests, $service] = $this->directUpload(nfoBody: '');
+        self::assertSame('failed', $service->importManifest($path)['status']);
+        $before = $manifests->read($path);
+        DB::beginTransaction();
+        try {
+            self::assertFalse($manifests->deleteTerminalCompanion($path));
+            self::assertFileExists(dirname($path).'/info.nfo');
+            self::assertSame($before, $manifests->read($path));
+            self::assertSame([], glob(dirname($path).'/.custody-*'));
+        } finally {
+            DB::rollBack();
+        }
+        self::assertTrue($manifests->deleteTerminalCompanion($path));
+        self::assertFileDoesNotExist(dirname($path).'/info.nfo');
+    }
+
     public static function callbackCompanionStates(): array
     {
         return ['stored' => ['direct companion', 'imported'], 'failed' => ['', 'failed']];

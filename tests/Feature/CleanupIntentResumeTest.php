@@ -20,6 +20,112 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
 {
     use CapturedUploadFixture;
 
+    public static function rawSourceEncodings(): array
+    {
+        return ['XML' => [false], 'gzip' => [true]];
+    }
+
+    #[DataProvider('rawSourceEncodings')]
+    public function test_raw_verified_source_is_retained_without_generation_custody(bool $gzip): void
+    {
+        [$source, $mp] = $this->upload(false);
+        unlink($mp);
+        if ($gzip) {
+            file_put_contents($source.'.gz', gzencode(file_get_contents($source)));
+            unlink($source);
+            $source .= '.gz';
+        }
+        Schema::table('releases', static fn (Blueprint $table) => $table->integer('nzbstatus')->default(1));
+        $filesystem = new class($source) extends Filesystem
+        {
+            public int $probes = 0;
+
+            public bool $admitted = false;
+
+            public function __construct(private string $source) {}
+
+            public function delete($paths)
+            {
+                if ($paths === $this->source) {
+                    $this->probes++;
+                    $lock = fopen(config('release_verification.storage_path').'/reset.lock', 'c');
+                    try {
+                        if (flock($lock, LOCK_EX | LOCK_NB)) {
+                            $this->admitted = true;
+                            DB::table('release_verification_candidates')->delete();
+                            flock($lock, LOCK_UN);
+                        }
+                    } finally {
+                        fclose($lock);
+                    }
+                }
+
+                if ($paths === $this->source) {
+                    file_put_contents($this->source, 'replacement immediately before raw unlink');
+                }
+
+                return parent::delete($paths);
+            }
+        };
+        app()->instance(NzbUploadManifestService::class, new NzbUploadManifestService($filesystem));
+        $this->capturedFixtureImporter('raw-retirement-reset')->beginImport([$source], delete: true,
+            resultCallback: static function (array $outcome): void {
+                self::assertNull($outcome['input_capture']);
+                self::assertSame(NzbImportStatus::Queued, $outcome['status']);
+                DB::table('releases')->insert(['id' => 7, 'guid' => 'raw-retirement-guid']);
+                DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+            });
+        self::assertFileExists($source, 'Raw publication cannot authorize deleting an unowned pathname generation.');
+        self::assertSame(0, $filesystem->probes);
+        self::assertFalse($filesystem->admitted);
+        self::assertSame(1, DB::table('release_verification_candidates')->count());
+    }
+
+    public static function rawRetirementHolds(): array
+    {
+        return ['unpublished' => ['unpublished'], 'reset' => ['reset'], 'replacement' => ['replacement'],
+            'ambient transaction' => ['ambient'], 'changed admission' => ['revision']];
+    }
+
+    #[DataProvider('rawRetirementHolds')]
+    public function test_raw_queued_source_remains_when_current_publication_cannot_authorize_retirement(string $mode): void
+    {
+        [$source, $mp] = $this->upload(false);
+        unlink($mp);
+        Schema::table('releases', static fn (Blueprint $table) => $table->integer('nzbstatus')->default(1));
+        $root = config('release_verification.storage_path');
+        config(['release_verification.storage_path' => $root.'/verification-state']);
+        try {
+            $this->capturedFixtureImporter('raw-retirement-hold')->beginImport([$source], delete: true,
+                resultCallback: static function (array $outcome) use ($mode, $source): void {
+                    self::assertSame(NzbImportStatus::Queued, $outcome['status']);
+                    if ($mode === 'unpublished') {
+                        return;
+                    }
+                    DB::table('releases')->insert(['id' => 7, 'guid' => 'raw-hold-guid']);
+                    DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+                    if ($mode === 'reset') {
+                        app(VerificationResetService::class)->run(static function (): void {});
+                    } elseif ($mode === 'replacement') {
+                        file_put_contents($source, 'independent replacement');
+                    } elseif ($mode === 'ambient') {
+                        DB::beginTransaction();
+                    } elseif ($mode === 'revision') {
+                        DB::table('release_verification_candidates')->increment('version');
+                    }
+                });
+            self::assertFileExists($source);
+            if ($mode === 'replacement') {
+                self::assertSame('independent replacement', file_get_contents($source));
+            }
+        } finally {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+            config(['release_verification.storage_path' => $root]);
+        }
+    }
+
     public static function retirementResetBoundaries(): array
     {
         return ['before move' => ['intent_dir'], 'payload complete' => ['complete_dir'], 'manifest retirement' => ['manifest']];

@@ -22,7 +22,7 @@ class ImportNzbs extends Command
     protected $signature = 'nntmux:import-nzbs
         {--folder= : Import folder path}
         {--filename : Use filename true or false}
-        {--delete : Delete files after import}
+        {--delete : Delete files after import; verified imports require staged generation custody}
         {--delete-failed : Delete files after failed import}
         {--source= : Source of the NZB files}';
 

@@ -796,24 +796,44 @@ final class NzbUploadManifestService
     /** @param array<string, mixed> $manifest */
     private function finishCompanionDeletion(string $manifestPath, array &$manifest): bool
     {
-        $receipt = $manifest['nfo_capture'] ?? null;
-        if (! is_array($receipt) || ($manifest['delete_nfo_after_import'] ?? null) !== $receipt['attempt']) {
-            return true;
-        }
-        if (! $this->nfoCleanupCommitted($manifest)) {
-            return false;
-        }
-        $path = dirname($manifestPath).DIRECTORY_SEPARATOR.$receipt['filename'];
-        if (! $this->quarantineDelete($path, $receipt, $this->nfoCommitBinding($manifest))) {
-            return false;
-        }
-        $manifest['nfo_relinquished_attempt'] = $receipt['attempt'];
-        unset($manifest['delete_nfo_after_import']);
-        $this->rememberCustodyGc($manifest, $path, $receipt, $this->nfoCommitBinding($manifest));
-        $this->write($manifestPath, $manifest);
-        $this->drainCustodyGc($manifestPath, $manifest);
+        return $this->withRetirementAdmission(function () use ($manifestPath, &$manifest): bool {
+            $receipt = $manifest['nfo_capture'] ?? null;
+            if (! is_array($receipt) || ($manifest['delete_nfo_after_import'] ?? null) !== $receipt['attempt']) {
+                return true;
+            }
+            if (! $this->nfoCleanupCommitted($manifest)) {
+                return false;
+            }
+            $path = dirname($manifestPath).DIRECTORY_SEPARATOR.$receipt['filename'];
+            if (! $this->quarantineDelete($path, $receipt, $this->nfoCommitBinding($manifest))) {
+                return false;
+            }
+            $manifest['nfo_relinquished_attempt'] = $receipt['attempt'];
+            unset($manifest['delete_nfo_after_import']);
+            $this->rememberCustodyGc($manifest, $path, $receipt, $this->nfoCommitBinding($manifest));
+            $this->write($manifestPath, $manifest);
+            $this->drainCustodyGc($manifestPath, $manifest);
 
-        return true;
+            return true;
+        });
+    }
+
+    /**
+     * Authorize and retire only committed evidence while excluding destructive reset.
+     *
+     * @param  callable(): bool  $retire
+     */
+    private function withRetirementAdmission(callable $retire): bool
+    {
+        if (DB::transactionLevel() !== 0) {
+            return false;
+        }
+        $retired = false;
+        app(VerificationResetService::class)->withAdmission(function () use ($retire, &$retired): void {
+            $retired = $retire();
+        });
+
+        return $retired;
     }
 
     public function cleanupImportedSource(string $manifestPath): void
@@ -949,41 +969,43 @@ final class NzbUploadManifestService
     public function deleteTerminalCompanion(string $manifestPath): bool
     {
         return $this->withManifestLock($manifestPath, function () use ($manifestPath): bool {
-            $m = $this->read($manifestPath);
-            $receipt = $m['nfo_capture'] ?? null;
-            $outcome = $m['outcome_capture'] ?? $m['accepted_capture'] ?? null;
-            $failedCompanion = $m['state'] === self::STATE_NFO_FAILED
-                && ($m['nfo_failure_kind'] ?? null) === 'invalid_payload'
-                && is_array($m['accepted_capture'] ?? null)
-                && $outcome === $m['accepted_capture']
-                && $this->acceptedInputValid($manifestPath, $m)
-                && $this->nfoCandidateCurrent($m)
-                && ! $this->nfoCleanupCommitted($m);
-            if (! is_array($receipt) || ($receipt['protocol'] ?? null) !== 1 || ! is_array($outcome) || ($m['input_reservation']['attempt'] ?? null) !== $outcome['attempt'] || ($outcome['companion_attempt'] ?? null) !== $receipt['attempt']
-                || (! in_array($m['outcome_status'] ?? null, ['failed', 'blacklisted', 'nogroup', 'duplicate'], true)
-                    && ! (isset($m['accepted_capture']) && $m['state'] === self::STATE_NZB_REJECTED) && ! $failedCompanion)) {
-                return false;
-            }
-            $path = dirname($manifestPath).DIRECTORY_SEPARATOR.$receipt['filename'];
-            if (($m['delete_terminal_nfo'] ?? null) !== $receipt && ! $this->captureMatches($path, $receipt)) {
-                return false;
-            }
+            return $this->withRetirementAdmission(function () use ($manifestPath): bool {
+                $m = $this->read($manifestPath);
+                $receipt = $m['nfo_capture'] ?? null;
+                $outcome = $m['outcome_capture'] ?? $m['accepted_capture'] ?? null;
+                $failedCompanion = $m['state'] === self::STATE_NFO_FAILED
+                    && ($m['nfo_failure_kind'] ?? null) === 'invalid_payload'
+                    && is_array($m['accepted_capture'] ?? null)
+                    && $outcome === $m['accepted_capture']
+                    && $this->acceptedInputValid($manifestPath, $m)
+                    && $this->nfoCandidateCurrent($m)
+                    && ! $this->nfoCleanupCommitted($m);
+                if (! is_array($receipt) || ($receipt['protocol'] ?? null) !== 1 || ! is_array($outcome) || ($m['input_reservation']['attempt'] ?? null) !== $outcome['attempt'] || ($outcome['companion_attempt'] ?? null) !== $receipt['attempt']
+                    || (! in_array($m['outcome_status'] ?? null, ['failed', 'blacklisted', 'nogroup', 'duplicate'], true)
+                        && ! (isset($m['accepted_capture']) && $m['state'] === self::STATE_NZB_REJECTED) && ! $failedCompanion)) {
+                    return false;
+                }
+                $path = dirname($manifestPath).DIRECTORY_SEPARATOR.$receipt['filename'];
+                if (($m['delete_terminal_nfo'] ?? null) !== $receipt && ! $this->captureMatches($path, $receipt)) {
+                    return false;
+                }
 
-            $m['delete_terminal_nfo'] = $receipt;
-            $this->write($manifestPath, $m);
-            if (! $this->quarantineDelete($path, $receipt)) {
-                return false;
-            }
-            unset($m['delete_terminal_nfo']);
-            if ($failedCompanion) {
-                $m['nfo_failed_relinquished_attempt'] = $receipt['attempt'];
-                unset($m['delete_nfo_after_import']);
-            }
-            $this->rememberCustodyGc($m, $path, $receipt);
-            $this->write($manifestPath, $m);
-            $this->drainCustodyGc($manifestPath, $m);
+                $m['delete_terminal_nfo'] = $receipt;
+                $this->write($manifestPath, $m);
+                if (! $this->quarantineDelete($path, $receipt)) {
+                    return false;
+                }
+                unset($m['delete_terminal_nfo']);
+                if ($failedCompanion) {
+                    $m['nfo_failed_relinquished_attempt'] = $receipt['attempt'];
+                    unset($m['delete_nfo_after_import']);
+                }
+                $this->rememberCustodyGc($m, $path, $receipt);
+                $this->write($manifestPath, $m);
+                $this->drainCustodyGc($manifestPath, $m);
 
-            return true;
+                return true;
+            });
         });
     }
 
