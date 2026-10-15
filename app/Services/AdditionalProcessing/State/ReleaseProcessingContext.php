@@ -25,6 +25,8 @@ class ReleaseProcessingContext
 
     private const int MAX_RETAINED_ARCHIVE_BYTES = 16_777_216;
 
+    private const int MAX_ARCHIVE_FILE_NAMES = 500;
+
     // The release being processed
     public Release $release;
 
@@ -47,6 +49,9 @@ class ReleaseProcessingContext
     public int $passwordStatus = 0;
 
     public bool $releaseHasPassword = false;
+
+    /** An archive listing was cut off or had unreadable records, so some entries were never checked for a password. */
+    public bool $archiveListingIncomplete = false;
 
     // NFO state
     public bool $releaseHasNoNFO = false;
@@ -77,11 +82,37 @@ class ReleaseProcessingContext
     public bool $archiveRetryable = false;
 
     /**
+     * Volume sets of compressed candidates whose data turned out to be plain media,
+     * which has no password.
+     *
+     * @var array<string, true>
+     */
+    public array $mediaVolumeSets = [];
+
+    // Archive data was found outside the planned archive candidates (e.g. by the probe).
+    public bool $unplannedArchiveSeen = false;
+
+    /**
      * @var list<array<string, mixed>>
      */
     public array $nzbContents = [];
 
     public ?AdditionalWorkPlan $workPlan = null;
+
+    /** The release is a whole season (by name, NZB file names or listed archive contents). */
+    public bool $seasonPack = false;
+
+    /** One episode was listed from a release with several archive sets; the rest of the season may follow. */
+    public bool $seasonPackProbable = false;
+
+    /** @var list<string> names listed from every archive read for this release */
+    public array $archiveFileNames = [];
+
+    /** @var array<int, array<string, mixed>>|null files of the first archive listed while names were deferred */
+    public ?array $firstArchiveFiles = null;
+
+    /** @var array<string, mixed>|null summary of the last archive read in reverse while names were deferred */
+    public ?array $reverseArchiveSummary = null;
 
     /** Real names the PAR2 index revealed for obfuscated files. */
     public ?MediaSourcePlan $mediaPlan = null;
@@ -296,12 +327,20 @@ class ReleaseProcessingContext
     {
         $this->passwordStatus = 0;
         $this->releaseHasPassword = false;
+        $this->archiveListingIncomplete = false;
         $this->nzbHasCompressedFile = false;
         $this->archiveInspectionAttempted = false;
         $this->archiveListingUndecodable = false;
         $this->archiveRetryable = false;
+        $this->mediaVolumeSets = [];
+        $this->unplannedArchiveSeen = false;
         $this->groupUnavailable = false;
         $this->workPlan = null;
+        $this->seasonPack = false;
+        $this->seasonPackProbable = false;
+        $this->archiveFileNames = [];
+        $this->firstArchiveFiles = null;
+        $this->reverseArchiveSummary = null;
         $this->mediaPlan = null;
         $this->mediaBudget = null;
         $this->archivedMedia = [];
@@ -330,6 +369,29 @@ class ReleaseProcessingContext
         $this->retainedArchiveBytes += $archive->byteSize();
 
         return true;
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $files
+     */
+    public function rememberArchiveFileNames(array $files): void
+    {
+        foreach ($files as $file) {
+            $name = (string) ($file['name'] ?? '');
+            if ($name === '' || count($this->archiveFileNames) >= self::MAX_ARCHIVE_FILE_NAMES || in_array($name, $this->archiveFileNames, true)) {
+                continue;
+            }
+            $this->archiveFileNames[] = $name;
+        }
+    }
+
+    /**
+     * Season packs read several archive sets, and no inner file name (one episode)
+     * may rename the release while they are read.
+     */
+    public function defersArchiveNameChecks(): bool
+    {
+        return $this->seasonPack || $this->seasonPackProbable;
     }
 
     /**
@@ -391,6 +453,25 @@ class ReleaseProcessingContext
             'par2Info' => $this->foundPAR2Info = true,
             default => null,
         };
+    }
+
+    /**
+     * True when every compressed candidate was proven to be plain media; an unread or
+     * unreadable archive anywhere else in the release keeps its password status unknown.
+     */
+    public function compressedFilesAreMedia(): bool
+    {
+        if ($this->mediaVolumeSets === [] || $this->unplannedArchiveSeen) {
+            return false;
+        }
+
+        foreach ($this->workPlan->archiveCandidates ?? [] as $candidate) {
+            if (! isset($this->mediaVolumeSets[$candidate->volumeSet()])) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**

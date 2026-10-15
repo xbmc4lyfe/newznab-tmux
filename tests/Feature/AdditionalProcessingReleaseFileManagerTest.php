@@ -421,6 +421,69 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Event::assertNotDispatched(ReleaseNameFixed::class);
     }
 
+    public function test_deferred_archive_filename_cannot_rename_after_the_additional_claim_is_replaced(): void
+    {
+        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
+        $this->prepareFullPar2NamingEvidence($title);
+        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title, 'source' => 'fixture']]);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => 'replacement-owner']);
+        $published = [];
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
+            $published[] = $id;
+        });
+        $sync->beginReleaseScope(1);
+        $manager = $this->makeFullPar2NamingManager($sync);
+
+        $manager->matchFileNamesToPreDb([['name' => $title.'.mkv']], $context);
+        $manager->finalizeRelease($context, false);
+        $sync->finishReleaseScope();
+
+        self::assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
+        self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+        self::assertSame('replacement-owner', DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
+        self::assertSame('Example', $context->release->searchname);
+        self::assertSame('Example', $context->fullPar2EvidenceSnapshot()['searchname']);
+        self::assertTrue($context->fullPar2EvidenceDeferred);
+        self::assertArrayNotHasKey('filename', $context->release->getAttributes());
+        self::assertArrayNotHasKey('observed_additional_pp_claim', $context->release->getAttributes());
+        self::assertSame([], $published);
+        Event::assertNotDispatched(ReleaseNameFixed::class);
+    }
+
+    public function test_deferred_archive_filename_advances_committed_identity_before_metadata_finalization(): void
+    {
+        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
+        $this->prepareFullPar2NamingEvidence($title);
+        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title, 'source' => 'fixture']]);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $published = [];
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
+            $published[] = $id;
+        });
+        $sync->beginReleaseScope(1);
+        $manager = $this->makeFullPar2NamingManager($sync);
+
+        $manager->matchFileNamesToPreDb([['name' => $title.'.mkv']], $context);
+
+        self::assertSame($title, DB::table('releases')->where('id', 1)->value('searchname'));
+        self::assertSame($title, $context->release->searchname);
+        self::assertSame($title, $context->fullPar2EvidenceSnapshot()['searchname']);
+        self::assertSame('Example', $context->par2EvidenceSnapshot['searchname']);
+        self::assertArrayNotHasKey('filename', $context->release->getAttributes());
+        self::assertArrayNotHasKey('observed_additional_pp_claim', $context->release->getAttributes());
+        self::assertTrue($manager->addFileInfo(['name' => '.hidden.mkv', 'size' => 123], $context, 'nfo|par2'));
+        $manager->finalizeRelease($context, false);
+        $sync->finishReleaseScope();
+
+        self::assertFalse($context->fullPar2EvidenceDeferred);
+        self::assertSame(1, DB::table('release_files')->count());
+        self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('rarinnerfilecount'));
+        self::assertNull(DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
+        self::assertSame([1], $published);
+        Event::assertDispatchedTimes(ReleaseNameFixed::class, 1);
+    }
+
     private function attemptProducerNaming(string $kind, ReleaseFileManager $manager, ReleaseProcessingContext $context, string $title, string $wrapped): void
     {
         if ($kind === 'nzbsplit') {
@@ -1333,6 +1396,57 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         });
     }
 
+    public function test_season_pack_files_are_not_matched_to_predb_one_by_one(): void
+    {
+        DB::table('releases')->insert(['searchname' => 'Show.S01.1080p.WEB-DL-GRP'] + $this->releaseRow());
+        Search::shouldReceive('updateRelease')->with(1);
+        $nameFixing = new CountingNameFixingService;
+        $manager = $this->makeManager($nameFixing);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context->seasonPack = true;
+
+        $manager->addFileInfo(['name' => 'Show.S01E01.1080p.WEB-DL-GRP.mkv', 'size' => 2048], $context, '\\.sfv');
+        $manager->processReleaseNameFromRar(['file_list' => [['name' => 'Show.S01E10.1080p.WEB-DL-GRP.mkv']]], $context);
+        $manager->finalizeRelease($context, false);
+
+        $this->assertSame(0, $nameFixing->matchPreDbFilesCalls);
+        $this->assertSame('Show.S01.1080p.WEB-DL-GRP', DB::table('releases')->where('id', 1)->value('searchname'));
+    }
+
+    public function test_season_pack_lists_every_episode_while_other_releases_keep_eleven_files(): void
+    {
+        DB::table('releases')->insert($this->releaseRow());
+        DB::table('releases')->insert(['id' => 2, 'guid' => 'guid-2'] + $this->releaseRow());
+        Search::shouldReceive('updateRelease')->twice();
+        $manager = $this->makeManager();
+
+        $pack = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $pack->seasonPack = true;
+        $other = new ReleaseProcessingContext(Release::query()->findOrFail(2));
+        for ($episode = 1; $episode <= 25; $episode++) {
+            $name = sprintf('Show.S01E%02d.1080p.WEB-DL-GRP.mkv', $episode);
+            $manager->addFileInfo(['name' => $name, 'size' => 2048], $pack, '\\.sfv');
+            $manager->addFileInfo(['name' => $name, 'size' => 2048], $other, '\\.sfv');
+        }
+        $manager->finalizeRelease($pack, false);
+        $manager->finalizeRelease($other, false);
+
+        $this->assertSame(25, DB::table('release_files')->where('releases_id', 1)->count());
+        $this->assertSame(11, DB::table('release_files')->where('releases_id', 2)->count());
+    }
+
+    public function test_a_season_pack_is_never_renamed_to_one_of_its_episodes(): void
+    {
+        DB::table('releases')->insert(['searchname' => 'Show.S01.1080p.WEB-DL-GRP'] + $this->releaseRow());
+        $service = new ReleaseUpdateService;
+
+        $service->updateRelease(DB::table('releases')->where('id', 1)->first(), 'Show.S01E01.1080p.WEB-DL-GRP', 'test', true, 'Filenames, ', true, false);
+
+        $this->assertFalse($service->matched);
+        $this->assertSame(0, $service->fixed);
+        $this->assertSame('Show.S01.1080p.WEB-DL-GRP', DB::table('releases')->where('id', 1)->value('searchname'));
+    }
+
     public function test_finalization_flushes_rows_and_synchronizes_search_immediately(): void
     {
         DB::table('releases')->insert($this->releaseRow());
@@ -1806,6 +1920,349 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             'encrypted ZIP entry' => ['zip', true, null],
             'ZIP continuation unavailable' => ['zip', false, 'missing-article'],
             'ZIP group unavailable' => ['zip', false, 'group-unavailable'],
+        ];
+    }
+
+    #[DataProvider('compressedCandidatePayloads')]
+    public function test_plain_media_behind_an_archive_name_finalizes_with_no_password(?string $data, string $expected): void
+    {
+        $data ??= $this->rar('Movie.2026.1080p.mkv', str_repeat('B', 100));
+        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
+        Search::shouldReceive('updateRelease')->once()->with(1);
+        config(['nntmux.archive_retry_delay' => 86400]);
+        $this->freezeSecond();
+
+        $config = $this->makeConfig(['processPasswords' => true]);
+        $parser = Mockery::mock(NzbContentParser::class);
+        $parser->shouldReceive('parseNzb')->once()->with('guid-1')->andReturn([
+            'error' => null,
+            'contents' => [['title' => '"Movie.2026.part01.rar" yEnc (1/50)', 'segments' => ['<v1>']]],
+        ]);
+        $download = Mockery::mock(UsenetDownloadService::class);
+        $download->shouldReceive('beginReleaseScope')->once();
+        $download->shouldReceive('finishReleaseScope')->once()->andReturn(new DownloadMetrics);
+        $download->shouldReceive('download')->once()
+            ->with(DownloadKind::Compressed, ['<v1>'], '', 1, '"Movie.2026.part01.rar" yEnc (1/50)')
+            ->andReturn(['success' => true, 'data' => $data, 'groupUnavailable' => false, 'error' => null]);
+        $tmpPath = sys_get_temp_dir().'/media-payload-'.uniqid().'/';
+        File::ensureDirectoryExists($tmpPath);
+        $workspace = Mockery::mock(TempWorkspaceService::class);
+        $workspace->shouldReceive('createReleaseTempFolder')->once()->andReturn($tmpPath);
+        $workspace->shouldReceive('listFiles')->andReturn([]);
+        $workspace->shouldReceive('clearDirectory')->once()->with($tmpPath, false)
+            ->andReturnUsing(static fn () => File::deleteDirectory($tmpPath));
+        $processor = new ReleaseProcessor(
+            $config,
+            $parser,
+            new AdditionalWorkPlanner($config),
+            new ArchiveExtractionService($config),
+            Mockery::mock(MediaExtractionService::class),
+            $download,
+            $this->makeManager(),
+            Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(),
+            $workspace,
+            Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing(),
+        );
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+
+        $processor->process($context, '/tmp/');
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame($expected === 'archive' ? 1 : 0, DB::table('release_files')->count());
+        if ($expected === 'unknown') {
+            $this->assertSame(-1, (int) $release->passwordstatus);
+            $this->assertSame(-1, (int) $release->haspreview);
+            $this->assertSame(now()->addDay()->toDateTimeString(), $release->archive_retry_at);
+        } else {
+            $this->assertSame(ReleaseBrowseService::PASSWD_NONE, (int) $release->passwordstatus);
+            $this->assertSame(0, (int) $release->haspreview);
+            $this->assertNull($release->archive_retry_at);
+        }
+    }
+
+    /**
+     * @return array<string, array{string|null, string}>
+     */
+    public static function compressedCandidatePayloads(): array
+    {
+        $pad = static fn (string $head): string => str_pad($head, 512, "\x5A");
+        $ts = str_repeat("\x47".str_repeat("\x10", 187), 3);
+
+        return [
+            'Matroska' => [$pad("\x1A\x45\xDF\xA3\x01\x00\x00\x00"), 'media'],
+            'MP4' => [$pad("\x00\x00\x00\x20ftypmp42"), 'media'],
+            'MOV' => [$pad("\x00\x00\x00\x14ftypqt  "), 'media'],
+            'AVI' => [$pad('RIFF'."\x00\x10\x00\x00".'AVI LIST'), 'media'],
+            'MPEG-TS' => [$ts, 'media'],
+            'MPEG-PS' => [$pad("\x00\x00\x01\xBA\x44"), 'media'],
+            'FLV' => [$pad("FLV\x01\x05\x00\x00\x00\x09"), 'media'],
+            'Ogg' => [$pad("OggS\x00\x02"), 'media'],
+            'RAR' => [null, 'archive'],
+            'unknown data' => [$pad("\x8E\x13\x7F\x02random"), 'unknown'],
+        ];
+    }
+
+    /**
+     * @param  list<array{string, string, string|false|null}>  $files  title, message-id and its data (false: download fails,
+     *                                                                 null: not downloaded, 'encrypted rar'/'encrypted zip'/'encrypted 7z': such an archive)
+     */
+    #[DataProvider('mediaBesideOtherCandidates')]
+    public function test_plain_media_only_finalizes_when_no_other_archive_stayed_unread(array $files, int $status): void
+    {
+        $files = array_map(fn (array $file): array => [$file[0], $file[1], match ($file[2]) {
+            'encrypted rar' => $this->rar('Movie.2026.1080p.mkv', str_repeat('x', 100), encryptedFile: true),
+            'encrypted zip' => $this->zip('Movie.2026.1080p.mkv', str_repeat('x', 100), encryptedFile: true),
+            'encrypted 7z' => $this->sevenZip('Movie.2026.1080p.mkv', str_repeat('x', 100), encryptedHeader: true),
+            default => $file[2],
+        }], $files);
+        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
+        Search::shouldReceive('updateRelease')->once()->with(1);
+        config(['nntmux.archive_retry_delay' => 86400]);
+        $this->freezeSecond();
+
+        $config = $this->makeConfig(['processPasswords' => true, 'maximumRarPasswordChecks' => 2]);
+        $parser = Mockery::mock(NzbContentParser::class);
+        $parser->shouldReceive('parseNzb')->once()->with('guid-1')->andReturn([
+            'error' => null,
+            'contents' => array_map(static fn (array $file): array => ['title' => $file[0], 'segments' => [$file[1]]], $files),
+        ]);
+        $download = Mockery::mock(UsenetDownloadService::class);
+        $download->shouldReceive('beginReleaseScope')->once();
+        $download->shouldReceive('finishReleaseScope')->once()->andReturn(new DownloadMetrics);
+        foreach ($files as [$title, $messageId, $data]) {
+            if ($data === null) {
+                continue;
+            }
+            $download->shouldReceive('download')->once()
+                ->with(DownloadKind::Compressed, [$messageId], '', 1, $title)
+                ->andReturn(['success' => $data !== false, 'data' => $data === false ? null : $data, 'groupUnavailable' => false, 'error' => null]);
+        }
+        $tmpPath = sys_get_temp_dir().'/media-payload-'.uniqid().'/';
+        File::ensureDirectoryExists($tmpPath);
+        $workspace = Mockery::mock(TempWorkspaceService::class);
+        $workspace->shouldReceive('createReleaseTempFolder')->once()->andReturn($tmpPath);
+        $workspace->shouldReceive('listFiles')->andReturn([]);
+        $workspace->shouldReceive('clearDirectory')->once()->with($tmpPath, false)
+            ->andReturnUsing(static fn () => File::deleteDirectory($tmpPath));
+        $processor = new ReleaseProcessor(
+            $config,
+            $parser,
+            new AdditionalWorkPlanner($config),
+            new ArchiveExtractionService($config),
+            Mockery::mock(MediaExtractionService::class)->shouldIgnoreMissing(false),
+            $download,
+            $this->makeManager(),
+            Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(),
+            $workspace,
+            Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing(),
+        );
+
+        $processor->process(new ReleaseProcessingContext(Release::query()->findOrFail(1)), '/tmp/');
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame($status, (int) $release->passwordstatus);
+        $this->assertSame($status === -1 ? now()->addDay()->toDateTimeString() : null, $release->archive_retry_at);
+    }
+
+    /**
+     * @return array<string, array{list<array{string, string, string|false|null}>, int}>
+     */
+    public static function mediaBesideOtherCandidates(): array
+    {
+        $mkv = str_pad("\x1A\x45\xDF\xA3\x01\x00\x00\x00", 512, "\x5A");
+        $media = ['"Movie.2026.part01.rar" yEnc (1/50)', '<v1>', $mkv];
+        $spaced = ['First Movie.rar yEnc (1/50)', '<v1>', $mkv];
+
+        $unreadable = str_pad("\x8E\x13\x7F\x02", 512, "\x5A");
+        $none = ReleaseBrowseService::PASSWD_NONE;
+        $passworded = ReleaseBrowseService::PASSWD_RAR;
+
+        return [
+            'an unreadable archive beside it' => [[$media, ['"Extras.2026.rar" yEnc (1/3)', '<x1>', $unreadable]], -1],
+            'a missing archive beside it' => [[$media, ['"Extras.2026.rar" yEnc (1/3)', '<x1>', false]], -1],
+            'later volumes of the same file' => [[$media, ['"Movie.2026.part02.rar" yEnc (1/50)', '<v2>', null]], $none],
+            'unquoted later volumes of the same file' => [[
+                ['Movie.2026.part01.rar yEnc (1/50)', '<v1>', $mkv],
+                ['Movie.2026.part02.rar yEnc (1/50)', '<v2>', null],
+                ['[03/50] - Movie.2026.part03.rar yEnc', '<v3>', null],
+            ], $none],
+            'a split video piece and its later pieces' => [[['"Show.S01E01.mkv.001" yEnc (1/80)', '<s1>', $mkv], ['"Show.S01E01.mkv.002" yEnc (1/80)', '<s2>', null]], $none],
+            'an unquoted split video piece and its later pieces' => [[['Show.S01E01.mkv.001 yEnc (1/80)', '<s1>', $mkv], ['Show.S01E01.mkv.002 yEnc (1/80)', '<s2>', null]], $none],
+            'an encrypted same-stem ZIP beside it' => [[$media, ['"Movie.2026.zip" yEnc (1/3)', '<z1>', 'encrypted zip']], $passworded],
+            'an encrypted same-stem 7z beside it' => [[$media, ['"Movie.2026.7z" yEnc (1/3)', '<z1>', 'encrypted 7z']], $passworded],
+            'an unreadable same-stem ZIP beside it' => [[$media, ['"Movie.2026.zip" yEnc (1/3)', '<z1>', $unreadable]], -1],
+            'an unreadable same-stem 7z beside it' => [[$media, ['"Movie.2026.7z.001" yEnc (1/3)', '<z1>', $unreadable]], -1],
+            'an encrypted same-stem ZIP beside a split video' => [[
+                ['"Movie.2026.mkv.001" yEnc (1/80)', '<s1>', $mkv],
+                ['"Movie.2026.mkv.zip" yEnc (1/3)', '<z1>', 'encrypted zip'],
+            ], $passworded],
+            'an encrypted archive with another spaced name beside it' => [[$spaced, ['Second Movie.rar yEnc (1/50)', '<x1>', 'encrypted rar']], $passworded],
+            'an unreadable archive with another spaced name beside it' => [[$spaced, ['Second Movie.rar yEnc (1/50)', '<x1>', $unreadable]], -1],
+            'a missing archive with another spaced name beside it' => [[$spaced, ['Second Movie.rar yEnc (1/50)', '<x1>', false]], -1],
+            'spaced later volumes of the same file' => [[
+                ['First Movie.part01.rar yEnc (1/50)', '<v1>', $mkv],
+                ['First Movie.part02.rar yEnc (1/50)', '<v2>', null],
+                ['[03/50] - First Movie.part03.rar yEnc', '<v3>', null],
+                ['"First Movie.part04.rar" yEnc (1/50)', '<v4>', null],
+            ], $none],
+        ];
+    }
+
+    #[DataProvider('sevenZipListings')]
+    public function test_a_cut_off_7z_listing_leaves_the_password_status_unknown(string $script, int $passwordStatus, array $names = []): void
+    {
+        DB::table('releases')->insert($this->releaseRow());
+        Search::shouldReceive('updateRelease')->once()->with(1);
+
+        $dir = sys_get_temp_dir().'/'.uniqid('7z-listing-', true);
+        mkdir($dir);
+        try {
+            file_put_contents($dir.'/7z', "#!/bin/sh\n".$script."\n");
+            chmod($dir.'/7z', 0755);
+            $archiveService = new ArchiveExtractionService($this->makeConfig(['sevenZipPath' => $dir.'/7z']));
+            $manager = $this->makeManager();
+            $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+            $context->nzbHasCompressedFile = true;
+
+            $archive = $this->sevenZip('ignored.mkv', str_repeat('x', 100), compressedHeader: true);
+            $result = $archiveService->listEncodedSevenZip($archive, null, $context, $dir.'/');
+            $this->assertIsArray($result);
+            foreach ($result['files'] as $file) {
+                if ($context->releaseHasPassword) {
+                    break;
+                }
+                $manager->addFileInfo($file, $context, '\\.(?:par2|sfv|nzb)');
+            }
+            $manager->finalizeRelease($context, true);
+        } finally {
+            array_map('unlink', glob($dir.'/*') ?: []);
+            rmdir($dir);
+        }
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame($passwordStatus, (int) $release->passwordstatus);
+        $this->assertSame(0, (int) $release->haspreview);
+        $this->assertNull($release->archive_retry_at);
+        $this->assertGreaterThan(0, DB::table('release_files')->count());
+        foreach ($names as $name) {
+            $this->assertTrue(DB::table('release_files')->where('name', $name)->exists(), $name);
+        }
+    }
+
+    /**
+     * @return array<string, array{0: string, 1: int, 2?: list<string>}>
+     */
+    public static function sevenZipListings(): array
+    {
+        $plain = static fn (int $count, string $pad = ''): string => 'i=0; while [ $i -lt '.$count.' ]; do '
+            .'printf \'Path = %d'.$pad.'.txt\\nSize = 0\\nEncrypted = -\\n\\n\' $i; i=$((i+1)); done; ';
+        $encrypted = 'printf \'Path = Movie.2026.1080p.mkv\\nSize = 100\\nEncrypted = +\\n\\n\'; ';
+
+        return [
+            'encrypted entry past the entry cap' => [
+                $plain(ArchiveExtractionService::SEVENZIP_LISTING_MAX_ENTRIES).$encrypted,
+                -1,
+            ],
+            'encrypted entry past the output cap' => [
+                $plain(300, str_repeat('a', 20000)).$encrypted,
+                -1,
+            ],
+            'encrypted entry before the cap' => [
+                $plain(5).$encrypted.$plain(2000),
+                ReleaseBrowseService::PASSWD_RAR,
+            ],
+            'complete listing without encryption' => [
+                $plain(5),
+                ReleaseBrowseService::PASSWD_NONE,
+            ],
+            'CRLF listing of names containing byte 0x85' => [
+                'printf \'Path = \303\205land.mkv\r\nSize = 10\r\nEncrypted = -\r\n\r\n\'; '
+                    .'printf \'Path = Movie.\344\271\205.mkv\r\nSize = 13\r\nEncrypted = -\r\n\r\n\'; ',
+                ReleaseBrowseService::PASSWD_NONE,
+                ['Åland.mkv', 'Movie.久.mkv'],
+            ],
+            'encrypted entry behind a control character' => [
+                $plain(5).'printf \'Path = Movie\001.mkv\nSize = 100\nEncrypted = +\n\n\'; ',
+                -1,
+            ],
+            'encrypted entry behind a duplicate property' => [
+                $plain(5).'printf \'Path = a.txt\nPath = Movie.mkv\nSize = 100\nEncrypted = +\n\n\'; ',
+                -1,
+            ],
+        ];
+    }
+
+    /**
+     * @param  list<string>  $listings  7-Zip client output for each 7z archive of the release, listed in order
+     */
+    #[DataProvider('sevenZipListingsWithoutReadableRecords')]
+    public function test_a_7z_listing_without_one_readable_record_still_leaves_the_password_status_unknown(
+        array $listings,
+        bool $hasReleaseFile,
+        int $passwordStatus,
+        bool $retried,
+    ): void {
+        DB::table('releases')->insert($this->releaseRow());
+        if ($hasReleaseFile) {
+            DB::table('release_files')->insert(['releases_id' => 1, 'name' => 'Extras/readme.txt', 'size' => 10]);
+        }
+        Search::shouldReceive('updateRelease')->once()->with(1);
+        config(['nntmux.archive_retry_delay' => 86400]);
+        $this->freezeSecond();
+
+        $dir = sys_get_temp_dir().'/'.uniqid('7z-listing-', true);
+        mkdir($dir);
+        try {
+            $manager = $this->makeManager();
+            $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+            $context->nzbHasCompressedFile = true;
+            $context->archiveInspectionAttempted = true;
+            $archive = $this->sevenZip('ignored.mkv', str_repeat('x', 100), compressedHeader: true);
+
+            foreach ($listings as $index => $listing) {
+                $client = $dir.'/7z-'.$index;
+                file_put_contents($client, "#!/bin/sh\n".$listing."\n");
+                chmod($client, 0755);
+                $result = (new ArchiveExtractionService($this->makeConfig(['sevenZipPath' => $client])))
+                    ->listEncodedSevenZip($archive, null, $context, $dir.'/');
+                foreach ($result['files'] ?? [] as $file) {
+                    if ($context->releaseHasPassword) {
+                        break;
+                    }
+                    $manager->addFileInfo($file, $context, '\\.(?:par2|sfv|nzb)');
+                }
+            }
+            $manager->finalizeRelease($context, true);
+        } finally {
+            array_map('unlink', glob($dir.'/*') ?: []);
+            rmdir($dir);
+        }
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame($passwordStatus, (int) $release->passwordstatus);
+        $this->assertSame($retried ? -1 : 0, (int) $release->haspreview);
+        $this->assertSame($retried ? now()->addDay()->toDateTimeString() : null, $release->archive_retry_at);
+    }
+
+    /**
+     * @return array<string, array{list<string>, bool, int, bool}>
+     */
+    public static function sevenZipListingsWithoutReadableRecords(): array
+    {
+        $controlCharacter = 'printf \'Path = Movie\001.mkv\nSize = 100\nEncrypted = +\n\n\'';
+        $duplicateProperty = 'printf \'Path = a.txt\nPath = Movie.mkv\nSize = 100\nEncrypted = +\n\n\'';
+        $plain = 'printf \'Path = Extras/info.txt\nSize = 4\nEncrypted = -\n\n\'';
+        $encrypted = 'printf \'Path = Movie.2026.1080p.mkv\nSize = 100\nEncrypted = +\n\n\'';
+
+        return [
+            'control character beside a stored file' => [[$controlCharacter], true, -1, false],
+            'duplicate property beside a stored file' => [[$duplicateProperty], true, -1, false],
+            'control character, then a complete listing' => [[$controlCharacter, $plain], false, -1, false],
+            'duplicate property, then a complete listing' => [[$duplicateProperty, $plain], false, -1, false],
+            'complete listing, then a control character' => [[$plain, $controlCharacter], false, -1, false],
+            'control character, then an encrypted entry' => [[$controlCharacter, $encrypted], false, ReleaseBrowseService::PASSWD_RAR, false],
+            'control character and no file at all' => [[$controlCharacter], false, -1, true],
+            'empty listing beside a stored file' => [[''], true, ReleaseBrowseService::PASSWD_NONE, false],
         ];
     }
 

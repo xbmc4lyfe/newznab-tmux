@@ -1,5 +1,9 @@
 # To do
 
+## Qualify upstream archive synchronization (2026-10-15)
+
+- [ ] Run the full integrated PHPUnit/native retest on final synchronized master, including real Linux 7-Zip compressed/encrypted-header fixtures, archive naming, claim/provenance and publication guards, and tmux/updater behavior. Bounded private SQLite and fake-client checks do not complete this gate.
+
 ## Qualify preparation statement reuse (2026-10-15)
 
 Keep unknown retry updates and ready promotions immediate, with their existing row-local timestamps and complete snapshot predicates. A private local MariaDB mechanism comparison found a 1.88× median paired improvement from retaining a native prepared statement; this is not a Laravel caller or production throughput result. Preserve all eight pairs, the slow retained-execute observation and the cleanup-classifier failure with its independent absence reconciliation in `nntmux-preparation-prepare-cost-20261015-v1`.

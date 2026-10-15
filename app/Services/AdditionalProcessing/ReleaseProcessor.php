@@ -21,6 +21,7 @@ use App\Services\AdditionalProcessing\State\MediaByteBudget;
 use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\AdditionalProcessing\State\ProcessingMetrics;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
+use App\Services\NameFixing\SeasonPackDetector;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\TempWorkspaceService;
 use dariusiii\rarinfo\SzipInfo;
@@ -191,6 +192,7 @@ class ReleaseProcessor
             $probedArchive = $probe !== null && ArchiveExtractionService::hasArchiveSignature($probe[1]) ? $probe : null;
             if ($probedArchive !== null) {
                 $context->nzbHasCompressedFile = true;
+                $context->unplannedArchiveSeen = true;
             }
 
             if ($this->shouldProcessDownloads()) {
@@ -205,13 +207,14 @@ class ReleaseProcessor
                 if (! $bookFlood && $context->nzbHasCompressedFile) {
                     $context->archiveInspectionAttempted = true;
                     $triedCompressedMids = [];
+                    $readArchiveSets = [];
                     $metrics->measure(
                         ProcessingStage::ArchiveDownloads,
-                        function () use ($context, &$triedCompressedMids, $probedArchive): void {
+                        function () use ($context, &$triedCompressedMids, &$readArchiveSets, $probedArchive): void {
                             if ($probedArchive !== null) {
                                 $this->processProbedArchive($context, $probedArchive[0], $probedArchive[1]);
                             }
-                            $this->processNzbCompressedFiles($context, false, $triedCompressedMids);
+                            $this->processNzbCompressedFiles($context, false, $triedCompressedMids, $readArchiveSets);
                         },
                     );
                     if (($timeoutResult = $this->processingTimeoutResult($context, $metrics)) !== null) {
@@ -221,8 +224,8 @@ class ReleaseProcessor
                     if ($this->config->fetchLastFiles) {
                         $metrics->measure(
                             ProcessingStage::ArchiveDownloads,
-                            function () use ($context, &$triedCompressedMids): void {
-                                $this->processNzbCompressedFiles($context, true, $triedCompressedMids);
+                            function () use ($context, &$triedCompressedMids, &$readArchiveSets): void {
+                                $this->processNzbCompressedFiles($context, true, $triedCompressedMids, $readArchiveSets);
                             },
                         );
                         if (($timeoutResult = $this->processingTimeoutResult($context, $metrics)) !== null) {
@@ -239,6 +242,8 @@ class ReleaseProcessor
                             return $timeoutResult;
                         }
                     }
+
+                    $this->runDeferredArchiveNameChecks($context, $readArchiveSets);
                 }
 
                 if ($this->mediaSourceStage->hasWork($context)) {
@@ -377,9 +382,10 @@ class ReleaseProcessor
         }
 
         $this->output->echoCompressedDownload();
-        $this->processCompressedData(
-            $this->withSevenZipTail($context, $data, $candidate->tailMessageIds),
+        $this->processArchiveData(
             $context,
+            $data,
+            $candidate->tailMessageIds,
             false,
             $candidate->title,
             $candidate,
@@ -403,6 +409,7 @@ class ReleaseProcessor
             $context->releaseGroupName,
         );
         $this->useWorkPlan($context, $workPlan);
+        $this->refreshSeasonPackState($context, $context->nzbContents);
 
         return $workPlan->bookFlood;
     }
@@ -445,6 +452,91 @@ class ReleaseProcessor
             $context,
             $context->workPlan->withMappedNames($this->workPlanner->plan($renamed, $context->releaseGroupName)),
         );
+        $this->refreshSeasonPackState($context, $renamed);
+    }
+
+    /**
+     * Mark the release as a season pack when its name or its NZB file names say so.
+     *
+     * @param  array<int|string, mixed>  $nzbContents
+     */
+    private function refreshSeasonPackState(ReleaseProcessingContext $context, array $nzbContents): void
+    {
+        if ($context->seasonPack) {
+            return;
+        }
+
+        if (SeasonPackDetector::isSeasonPack((string) $context->release->searchname)) {
+            $context->seasonPack = true;
+
+            return;
+        }
+
+        $names = [];
+        foreach ($nzbContents as $file) {
+            $title = \is_array($file) ? (string) ($file['title'] ?? '') : '';
+            $names[] = preg_match('/"([^"\r\n]+)"/', $title, $quoted) === 1 ? $quoted[1] : $title;
+        }
+        $context->seasonPack = SeasonPackDetector::isMultiEpisodeSet($names);
+    }
+
+    /**
+     * Record what an archive listed and whether that makes the release a season pack.
+     *
+     * @param  array<int, array<string, mixed>>  $files
+     */
+    private function noteArchiveListing(ReleaseProcessingContext $context, array $files): void
+    {
+        $context->rememberArchiveFileNames($files);
+        if ($context->seasonPack) {
+            return;
+        }
+
+        if (SeasonPackDetector::isMultiEpisodeSet($context->archiveFileNames)) {
+            $context->seasonPack = true;
+            $context->seasonPackProbable = false;
+
+            return;
+        }
+
+        if (! $context->seasonPackProbable && ($context->workPlan?->archiveSetCount() ?? 0) >= 2) {
+            foreach ($context->archiveFileNames as $name) {
+                if (SeasonPackDetector::isEpisodeName(basename(str_replace('\\', '/', $name)))) {
+                    $context->seasonPackProbable = true;
+
+                    return;
+                }
+            }
+        }
+    }
+
+    /**
+     * Once every archive set was read: a confirmed season pack keeps its name, and when no
+     * second episode showed up the per-file renames held back during the walk run as usual.
+     *
+     * @param  array<string, true>  $readArchiveSets
+     */
+    private function runDeferredArchiveNameChecks(ReleaseProcessingContext $context, array $readArchiveSets): void
+    {
+        if ($context->releaseHasPassword || $context->seasonPack || ! $context->seasonPackProbable
+            || $context->archiveListingIncomplete || $context->workPlan === null
+        ) {
+            return;
+        }
+
+        foreach ($context->workPlan->archiveCandidates as $candidate) {
+            if (! isset($readArchiveSets[$context->workPlan->setKeyOf($candidate)])) {
+                return;
+            }
+        }
+
+        $context->seasonPackProbable = false;
+        if ($context->firstArchiveFiles !== null) {
+            $this->releaseManager->matchFileNamesToPreDb($context->firstArchiveFiles, $context);
+        }
+        if ($context->reverseArchiveSummary !== null) {
+            $this->releaseManager->processReleaseNameFromRar($context->reverseArchiveSummary, $context);
+        }
     }
 
     private function initializeContext(ReleaseProcessingContext $context): void
@@ -705,11 +797,13 @@ class ReleaseProcessor
 
     /**
      * @param  list<string>  $triedCompressedMids
+     * @param  array<string, true>  $readArchiveSets
      */
     private function processNzbCompressedFiles(
         ReleaseProcessingContext $context,
         bool $reverse,
-        array &$triedCompressedMids
+        array &$triedCompressedMids,
+        array &$readArchiveSets
     ): void {
         if ($context->groupUnavailable) {
             return;
@@ -725,16 +819,46 @@ class ReleaseProcessor
         }
 
         $failed = $downloaded = 0;
+        /** @var array<string, true> $listedSets */
+        $listedSets = [];
+        /** @var array<string, int> $setFailures */
+        $setFailures = [];
+        $setKey = '';
 
         foreach ($archiveCandidates as $archiveCandidate) {
-            if ($downloaded >= $this->config->maximumRarSegments
-                || $failed >= $this->config->maximumRarPasswordChecks
-                || $context->releaseHasPassword
-            ) {
+            if ($context->releaseHasPassword) {
                 break;
             }
 
+            // A season pack packed per episode is read set by set: the first volume of each set
+            // lists its episode, and a set that fails to download only skips that set.
+            $walking = ! $reverse && $context->workPlan !== null && $context->defersArchiveNameChecks();
+            if (! $walking) {
+                if ($downloaded >= $this->config->maximumRarSegments
+                    || $failed >= $this->config->maximumRarPasswordChecks
+                ) {
+                    break;
+                }
+            } else {
+                $setKey = $context->workPlan->setKeyOf($archiveCandidate);
+                if (count($listedSets) >= $this->config->seasonPackArchiveSets
+                    || $downloaded >= max($this->config->maximumRarSegments, $this->config->seasonPackArchiveSets)
+                    || $failed >= $this->config->seasonPackArchiveSets * $this->config->maximumRarPasswordChecks
+                    || $context->isTimedOut($this->config->releaseProcessingTimeout)
+                ) {
+                    break;
+                }
+                if (isset($listedSets[$setKey]) || ($setFailures[$setKey] ?? 0) >= $this->config->maximumRarPasswordChecks) {
+                    continue;
+                }
+            }
+
             if ($reverse && array_intersect($archiveCandidate->messageIds, $triedCompressedMids) !== []) {
+                continue;
+            }
+
+            // Further volumes of a file already found to be plain media hold no file list.
+            if (isset($context->mediaVolumeSets[$archiveCandidate->volumeSet()])) {
                 continue;
             }
 
@@ -761,19 +885,35 @@ class ReleaseProcessor
                 $this->output->echoCompressedDownload();
                 $downloaded++;
 
-                $processed = $this->processCompressedData(
-                    $this->withSevenZipTail($context, $result['data'], $archiveCandidate->tailMessageIds),
+                $filesBefore = $context->totalFileInfo;
+                $processed = $this->processArchiveData(
                     $context,
+                    $result['data'],
+                    $archiveCandidate->tailMessageIds,
                     $reverse,
                     $archiveCandidate->title,
                     $archiveCandidate,
+                    $readArchiveSets,
                 );
-                if ($processed) {
+
+                // The listing may have just shown this is a season pack: keep reading the other sets
+                if (! $reverse && $context->workPlan !== null && $context->defersArchiveNameChecks()) {
+                    if ($context->totalFileInfo > $filesBefore) {
+                        $listedSets[$context->workPlan->setKeyOf($archiveCandidate)] = true;
+                    }
+
+                    continue;
+                }
+                // Plain media says nothing about the release's other archives; keep checking them.
+                if ($processed && ! isset($context->mediaVolumeSets[$archiveCandidate->volumeSet()])) {
                     break;
                 }
             } else {
                 $failed++;
                 $context->archiveRetryable = true;
+                if ($walking) {
+                    $setFailures[$setKey] = ($setFailures[$setKey] ?? 0) + 1;
+                }
                 $this->output->echoCompressedFailure($failed);
             }
         }
@@ -781,11 +921,49 @@ class ReleaseProcessor
 
     /**
      * @param  list<string>  $tailMessageIds
+     * @param  array<string, true>  $readArchiveSets
      */
-    private function withSevenZipTail(ReleaseProcessingContext $context, string $data, array $tailMessageIds): string
+    private function processArchiveData(
+        ReleaseProcessingContext $context,
+        string $data,
+        array $tailMessageIds,
+        bool $reverse,
+        string $archiveTitle,
+        ?ArchiveCandidate $source = null,
+        array &$readArchiveSets = [],
+    ): bool {
+        // Without a tail, a 7z whose end header is already in $data is still listed by 7-Zip.
+        $tail = $this->downloadSevenZipTail($context, $data, $tailMessageIds);
+        $listing = str_starts_with($data, SzipInfo::MARKER_SIGNATURE)
+            ? $this->archiveService->listEncodedSevenZip($data, $tail, $context, $context->tmpPath)
+            : null;
+        $archiveData = $data;
+        if ($listing === null) {
+            $archiveData = $tail === null ? $data : ($this->archiveService->withSevenZipEndHeader($data, $tail) ?? $data);
+            $listing = $this->archiveService->processCompressedData(
+                $archiveData,
+                $context,
+                $context->tmpPath,
+            );
+        }
+
+        if ($source !== null && $context->workPlan !== null
+            && ! $context->archiveListingIncomplete
+            && ($listing['success'] || isset($listing['standaloneVideoType']))
+        ) {
+            $readArchiveSets[$context->workPlan->setKeyOf($source)] = true;
+        }
+
+        return $this->handleArchiveResult($listing, $archiveData, $context, $reverse, $archiveTitle, $source);
+    }
+
+    /**
+     * @param  list<string>  $tailMessageIds
+     */
+    private function downloadSevenZipTail(ReleaseProcessingContext $context, string $data, array $tailMessageIds): ?string
     {
         if ($tailMessageIds === [] || ! $this->archiveService->needsSevenZipEndHeader($data)) {
-            return $data;
+            return null;
         }
 
         $result = $this->downloadService->download(
@@ -798,11 +976,7 @@ class ReleaseProcessor
             $context->groupUnavailable = true;
         }
 
-        if (! $result['success'] || ! is_string($result['data'])) {
-            return $data;
-        }
-
-        return $this->archiveService->withSevenZipEndHeader($data, $result['data']) ?? $data;
+        return $result['success'] && is_string($result['data']) ? $result['data'] : null;
     }
 
     private function processCompressedData(
@@ -812,12 +986,27 @@ class ReleaseProcessor
         string $archiveTitle = '',
         ?ArchiveCandidate $source = null,
     ): bool {
-        $result = $this->archiveService->processCompressedData(
+        return $this->handleArchiveResult(
+            $this->archiveService->processCompressedData($compressedData, $context, $context->tmpPath),
             $compressedData,
             $context,
-            $context->tmpPath
+            $reverse,
+            $archiveTitle,
+            $source,
         );
+    }
 
+    /**
+     * @param  array<string, mixed>  $result
+     */
+    private function handleArchiveResult(
+        array $result,
+        string $compressedData,
+        ReleaseProcessingContext $context,
+        bool $reverse,
+        string $archiveTitle,
+        ?ArchiveCandidate $source,
+    ): bool {
         if ($result['hasPassword']) {
             $context->releaseHasPassword = true;
             $context->passwordStatus = $result['passwordStatus'];
@@ -826,6 +1015,9 @@ class ReleaseProcessor
         }
 
         if (isset($result['standaloneVideoType'])) {
+            if ($source !== null) {
+                $context->mediaVolumeSets[$source->volumeSet()] = true;
+            }
             $this->output->echoInlineVideo();
             $fileLocation = $context->tmpPath.'inline_video_'.uniqid('', true).'.'.$result['standaloneVideoType'];
             File::put($fileLocation, $result['standaloneVideoData']);
@@ -854,8 +1046,18 @@ class ReleaseProcessor
             $this->output->echoArchiveMarker($result['archiveMarker']);
         }
 
+        $files = is_array($result['files'] ?? null) ? $result['files'] : [];
+        $this->noteArchiveListing($context, $files);
+        if (! $reverse && $files !== [] && $context->defersArchiveNameChecks()) {
+            $context->firstArchiveFiles ??= $files;
+        }
+
         if ($reverse && ! empty($result['dataSummary'])) {
-            $this->releaseManager->processReleaseNameFromRar($result['dataSummary'], $context);
+            if ($context->defersArchiveNameChecks()) {
+                $context->reverseArchiveSummary ??= $result['dataSummary'];
+            } else {
+                $this->releaseManager->processReleaseNameFromRar($result['dataSummary'], $context);
+            }
         }
 
         foreach ($result['files'] as $file) {

@@ -39,6 +39,8 @@ use Illuminate\Support\Facades\Log;
  */
 class ReleaseFileManager
 {
+    private const int DEFAULT_RELEASE_FILE_LIMIT = 11;
+
     private readonly ReleaseUpdateService $releaseUpdateService;
 
     private readonly FileNameCleaner $fileNameCleaner;
@@ -129,7 +131,7 @@ class ReleaseFileManager
         $context->totalFileInfo++;
 
         // Don't add too many files
-        if ($context->addedFileInfo >= 11) {
+        if ($context->addedFileInfo >= $this->releaseFileLimit($context)) {
             return false;
         }
 
@@ -152,7 +154,7 @@ class ReleaseFileManager
                 }
                 $context->releaseHasPassword = true;
                 $context->passwordStatus = ReleaseBrowseService::PASSWD_RAR;
-            } elseif ($file['name'] !== '' && ! str_starts_with($file['name'], '.')) {
+            } elseif ($file['name'] !== '' && ! str_starts_with($file['name'], '.') && ! $context->defersArchiveNameChecks()) {
                 // Run PreDB filename check
                 $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($file): void {
                     $entry->setAttribute('filename', $file['name']);
@@ -365,7 +367,9 @@ class ReleaseFileManager
 
                 $releaseFilesCount = ReleaseFile::whereReleasesId($context->release->id)->count('releases_id') ?? 0;
 
-                if (! $context->releaseHasPassword && $context->nzbHasCompressedFile && $releaseFilesCount === 0) {
+                if (! $context->releaseHasPassword && $context->nzbHasCompressedFile && ! $context->compressedFilesAreMedia()
+                    && $releaseFilesCount === 0
+                ) {
                     // No file list could be read, often because volumes were still missing.
                     // Queue the release once more after a delay; a second failure stays unknown.
                     // Only retry when inspection ran and a later attempt could still read the list.
@@ -383,7 +387,12 @@ class ReleaseFileManager
                         $this->commitFullPar2FinalizationUpdate($context, Release::query()->where('id', $context->release->id), $updateRows, $requiresSnapshotGuard);
                     }
                 } else {
-                    $updateRows['passwordstatus'] = $processPasswords ? $passwordStatus : ReleaseBrowseService::PASSWD_NONE;
+                    // A cut-off listing cannot rule out an encrypted entry beyond the cut.
+                    if (! $processPasswords) {
+                        $updateRows['passwordstatus'] = ReleaseBrowseService::PASSWD_NONE;
+                    } elseif ($context->releaseHasPassword || ! $context->archiveListingIncomplete) {
+                        $updateRows['passwordstatus'] = $passwordStatus;
+                    }
                     $updateRows['rarinnerfilecount'] = $releaseFilesCount;
                     $this->commitFullPar2FinalizationUpdate($context, Release::query()->where('id', $context->release->id), $updateRows, $requiresSnapshotGuard);
                 }
@@ -551,19 +560,20 @@ class ReleaseFileManager
 
         $this->queueFullPar2Evidence($fileLocation, $context, $par2Info);
         $filesAdded = 0;
+        $fileLimit = $this->releaseFileLimit($context);
 
         foreach ((new Par2FileList)->getFiles($par2Info) as $file) {
             if (! isset($file['name'])) {
                 continue;
             }
 
-            if ($foundName && $filesAdded > 10) {
+            if ($foundName && $filesAdded >= $fileLimit) {
                 break;
             }
 
             // Add to release files
             if ($this->config->addPAR2Files) {
-                if ($filesAdded < 11) {
+                if ($filesAdded < $fileLimit) {
                     if ($this->queueReleaseFile(
                         $context,
                         $context->release->id,
@@ -875,6 +885,37 @@ class ReleaseFileManager
     }
 
     /**
+     * Match listed file names to PreDB, as addFileInfo() does per file, for names that
+     * were held back while the release might still turn out to be a season pack.
+     *
+     * @param  array<int, array<string, mixed>>  $files
+     */
+    public function matchFileNamesToPreDb(array $files, ReleaseProcessingContext $context): void
+    {
+        if ($context->defersArchiveNameChecks()) {
+            return;
+        }
+
+        foreach (array_slice($files, 0, self::DEFAULT_RELEASE_FILE_LIMIT) as $file) {
+            $name = (string) ($file['name'] ?? '');
+            if ($name === '' || str_starts_with($name, '.')
+                || preg_match('/'.$this->config->supportFileRegex.'$/i', $name) === 1
+            ) {
+                continue;
+            }
+
+            $matched = 0;
+            $accepted = $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($name, &$matched): void {
+                $entry->setAttribute('filename', $name);
+                $matched = $this->nameFixingService->matchPreDbFiles($entry, true, true, true);
+            });
+            if ($accepted || $matched > 0 || $context->fullPar2EvidenceDeferred) {
+                return;
+            }
+        }
+    }
+
+    /**
      * Handle release name extraction from RAR file content.
      *
      * @param  array<string, mixed>  $dataSummary
@@ -883,6 +924,11 @@ class ReleaseFileManager
         array $dataSummary,
         ReleaseProcessingContext $context
     ): void {
+        // One inner file names one episode, not the whole season pack
+        if ($context->defersArchiveNameChecks()) {
+            return;
+        }
+
         $fileData = $dataSummary['file_list'] ?? [];
         if (empty($fileData)) {
             return;
@@ -1103,6 +1149,14 @@ class ReleaseFileManager
     /**
      * Check if a title is plausible for release naming.
      */
+    /**
+     * Inner files stored per release; a season pack lists more so every episode shows.
+     */
+    private function releaseFileLimit(ReleaseProcessingContext $context): int
+    {
+        return $context->seasonPack ? $this->config->seasonPackMaxReleaseFiles : self::DEFAULT_RELEASE_FILE_LIMIT;
+    }
+
     private function isPlausibleReleaseTitle(string $title): bool
     {
         return $this->fileNameCleaner->isPlausibleReleaseTitle($title);
