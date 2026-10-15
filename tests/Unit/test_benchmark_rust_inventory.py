@@ -78,6 +78,40 @@ fn future_export(
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('future_export', result.stdout + result.stderr)
 
+    def test_linker_exports_do_not_depend_on_rust_visibility_or_function_name(self):
+        root = self.fixture('''
+#[unsafe(export_name = "future_export")]
+pub extern "C" fn internal_name() {}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn private_export() {}
+#[no_mangle]
+pub(crate) extern "C" fn restricted_export() {}
+''')
+        rows = module().inventory(root)
+        self.assertEqual([row['name'] for row in rows],
+                         ['future_export', 'private_export', 'restricted_export'])
+        issues = module().check(root)
+        for name in ('future_export', 'private_export', 'restricted_export'):
+            self.assertIn('unclassified export: ' + name, issues)
+
+    def test_non_c_abi_and_rust_abi_exports_are_visible(self):
+        root = self.fixture('''
+#[unsafe(no_mangle)]
+extern "C-unwind" fn unwind_export() {}
+#[no_mangle]
+fn rust_export() {}
+''')
+        self.assertEqual([row['name'] for row in module().inventory(root)],
+                         ['unwind_export', 'rust_export'])
+
+    def test_unsupported_exported_declarations_fail_closed(self):
+        for declaration in ('#[unsafe(no_mangle)] pub static EXPORTED: u8 = 1;',
+                            '#[unsafe(export_name = r"raw_name")] extern "C" fn internal() {}'):
+            with self.subTest(declaration=declaration):
+                root = self.fixture(declaration)
+                with self.assertRaises(ValueError):
+                    module().inventory(root)
+
     def test_removed_declared_export_fails_check(self):
         self.assertTrue(SCRIPT.exists(), 'source-derived inventory helper is missing')
         root = self.fixture((ROOT / SOURCE).read_text().replace('fn rapidyenc_version(', 'fn removed_version('))

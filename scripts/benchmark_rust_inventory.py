@@ -143,8 +143,36 @@ def _mask_noncode(source):
     return ''.join(output)
 
 
-EXPORT = re.compile(r'#\s*\[\s*(?:unsafe\s*\(\s*no_mangle\s*\)|no_mangle)\s*\]'
-                    r'\s*(?:#\s*\[[^\]]*\]\s*)*pub\s+(?:unsafe\s+)?extern\s+"C"\s+fn\s+(?P<name>[A-Za-z_][A-Za-z_0-9]*)\s*\(')
+# Linker visibility is independent of Rust visibility. Retain attributes so
+# renamed symbols are classified by their exported name, not the Rust fn name.
+EXPORT = re.compile(r'(?P<attributes>(?:#\s*\[[^\]]*\]\s*)+)'
+                    r'(?:pub(?:\s*\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?'
+                    r'(?:extern(?:\s+"C")?\s+)?fn\s+(?:r#)?(?P<name>[A-Za-z_][A-Za-z_0-9]*)\s*\(')
+EXPORT_ATTRIBUTE = re.compile(r'#\s*\[[^\]]*\b(?:no_mangle|export_name)\b[^\]]*\]')
+
+
+def exported_functions(source):
+    masked = _mask_noncode(source)
+    covered = set()
+    for match in EXPORT.finditer(masked):
+        attributes = match.group('attributes')
+        export_attributes = list(EXPORT_ATTRIBUTE.finditer(attributes))
+        if not export_attributes:
+            continue
+        for attribute in export_attributes:
+            covered.add(match.start('attributes') + attribute.start())
+        name = match.group('name')
+        if re.search(r'\bexport_name\s*=', attributes):
+            original = source[match.start('attributes'):match.end('attributes')]
+            # Unsupported literal expressions fail closed instead of silently
+            # allowing an unclassified linker symbol into the next build.
+            names = re.findall(r'\bexport_name\s*=\s*"([A-Za-z_][A-Za-z_0-9]*)"', original)
+            if len(names) != 1:
+                raise ValueError('Export name requires an explicit supported symbol literal')
+            name = names[0]
+        yield name, match.start('name')
+    if any(attribute.start() not in covered for attribute in EXPORT_ATTRIBUTE.finditer(masked)):
+        raise ValueError('Unsupported exported declaration requires an inventory classification')
 
 
 def inventory(root):
@@ -164,12 +192,11 @@ def inventory(root):
             raise ValueError('Rust source inventory exceeds source size bound')
         data = path.read_bytes()
         source = data.decode('utf-8')
-        for match in EXPORT.finditer(_mask_noncode(source)):
-            name = match.group('name')
+        for name, position in exported_functions(source):
             coverage, kinds, callers, detail = DECLARATIONS.get(name, (
                 'unclassified-gap', (), (), 'New public export requires an explicit evidence classification.'))
             rows.append(dict(name=name, target=target,
-                             line=source.count('\n', 0, match.start('name')) + 1,
+                             line=source.count('\n', 0, position) + 1,
                              source_sha256=hashlib.sha256(data).hexdigest(), coverage=coverage,
                              detail=detail, evidence_kinds=list(kinds), callers=list(callers)))
             if len(rows) > MAX_EXPORTS:
