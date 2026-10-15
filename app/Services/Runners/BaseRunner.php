@@ -19,14 +19,21 @@ abstract class BaseRunner
 
     private bool $drainRequested = false;
 
+    private ?\Throwable $drainStateFailure = null;
+
     private float $lastDrainCheckAt = 0.0;
 
     protected function hasDrainRequest(bool $refresh = false): bool
     {
         if (! $this->drainRequested && ($refresh || microtime(true) - $this->lastDrainCheckAt >= 0.25)) {
             $this->lastDrainCheckAt = microtime(true);
-            if (app()->bound('db') && app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            try {
+                if (app()->bound('db') && app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                    $this->drainRequested = true;
+                }
+            } catch (\Throwable $exception) {
                 $this->drainRequested = true;
+                $this->drainStateFailure = $exception;
             }
         }
 
@@ -151,6 +158,7 @@ abstract class BaseRunner
         $queue = $commands;
         $running = [];
         $results = [];
+        $completionFailure = null;
         $this->workerOutcomes = [];
         $this->cancellationRequested = false;
         $handlers = [];
@@ -214,7 +222,9 @@ abstract class BaseRunner
                     $status = null;
                     try {
                         if ($process->isRunning()) {
-                            $process->checkTimeout();
+                            if (! $this->hasDrainRequest()) {
+                                $process->checkTimeout();
+                            }
 
                             continue;
                         }
@@ -232,10 +242,15 @@ abstract class BaseRunner
                     $this->recordWorkerOutcome($key, $status, $process->getExitCode(), $this->outputTail($process));
                     unset($running[$key]);
                     if ($status === 'success') {
-                        $this->workerCompleted($key, $output);
-                    }
-                    if ($onComplete !== null && $status === 'success') {
-                        $onComplete($key, $output);
+                        try {
+                            $this->workerCompleted($key, $output);
+                            if ($onComplete !== null) {
+                                $onComplete($key, $output);
+                            }
+                        } catch (\Throwable $exception) {
+                            $this->drainRequested = true;
+                            $completionFailure ??= $exception;
+                        }
                     }
                 }
                 usleep(50000);
@@ -282,6 +297,14 @@ abstract class BaseRunner
                 static fn (string|int $key, array $outcome): string => $key.' '.$outcome['status'].($outcome['status'] === 'timeout' ? ' exceeded the timeout' : '').' (exit '.($outcome['exit_code'] ?? 'none').')',
                 array_keys($failed), array_values($failed),
             )));
+        }
+
+        if ($completionFailure !== null) {
+            throw new RuntimeException('Worker completion failed: '.$completionFailure->getMessage()
+                .($this->drainStateFailure !== null ? '; drain state unavailable: '.$this->drainStateFailure->getMessage() : ''), 0, $completionFailure);
+        }
+        if ($this->drainStateFailure !== null) {
+            throw new RuntimeException('Unable to determine worker drain state: '.$this->drainStateFailure->getMessage(), 0, $this->drainStateFailure);
         }
 
         return $results;

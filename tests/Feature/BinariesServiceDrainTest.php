@@ -11,7 +11,6 @@ use App\Services\NNTP\NNTPService;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
-use Mockery;
 use PHPUnit\Framework\Attributes\DataProvider;
 use ReflectionMethod;
 use Tests\Support\ConfigurationTestBuilder;
@@ -75,10 +74,43 @@ class BinariesServiceDrainTest extends TestCase
         $this->assertSame(50, $range['total']);
     }
 
+    public function test_stop_during_first_repair_range_preserves_unstarted_ranges_without_charging_attempts(): void
+    {
+        Schema::create('missed_parts', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->unsignedBigInteger('numberid');
+            $table->unsignedInteger('groups_id');
+            $table->unsignedInteger('attempts');
+            $table->unique(['numberid', 'groups_id']);
+        });
+        DB::table('missed_parts')->insert([
+            ['numberid' => 101, 'groups_id' => 1, 'attempts' => 1],
+            ['numberid' => 102, 'groups_id' => 1, 'attempts' => 1],
+            ['numberid' => 1001, 'groups_id' => 1, 'attempts' => 2],
+            ['numberid' => 1002, 'groups_id' => 1, 'attempts' => 2],
+        ]);
+        $ranges = [];
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getOverview')->andReturnUsing(function (string $range) use (&$ranges): array {
+            $ranges[] = $range;
+            app(ProcessingRuntimeStateRepository::class)->requestStop();
+
+            return [];
+        });
+        $service = new BinariesService(new BinariesConfig(messageBuffer: 100, echoCli: false), nntp: $nntp);
+
+        $service->partRepair(['id' => 1, 'name' => 'alt.test']);
+
+        $this->assertSame(['101-102'], $ranges);
+        $this->assertSame([101 => 2, 102 => 2, 1001 => 2, 1002 => 2],
+            DB::table('missed_parts')->orderBy('numberid')->pluck('attempts', 'numberid')->all());
+        $this->assertSame(1000, (int) DB::table('usenet_groups')->value('last_record'));
+    }
+
     #[DataProvider('overviewResults')]
     public function test_chunk_cursor_distinguishes_empty_overview_from_failed_download(bool $successful, int $expectedCursor): void
     {
-        $nntp = Mockery::mock(NNTPService::class);
+        $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getXOVER')->with('1001-1003')->once()->andReturnUsing(function () use ($successful) {
             app(ProcessingRuntimeStateRepository::class)->requestStop();
 

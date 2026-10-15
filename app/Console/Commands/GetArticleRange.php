@@ -8,6 +8,7 @@ use App\Models\UsenetGroup;
 use App\Services\Binaries\BinariesService;
 use App\Services\Binaries\MissedPartHandler;
 use App\Services\Configuration\ConfigurationProvider;
+use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
 use Illuminate\Console\Command;
@@ -105,6 +106,15 @@ class GetArticleRange extends Command
             if ($this->option('repair') && app(ConfigurationProvider::class)->ingestion()->partRepair) {
                 $binaries->partRepair($groupMySQL);
             }
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+                if (! $this->option('contiguous') && ! $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle, true)) {
+                    $this->error('The drained range could not be deferred for repair; retry this worker.');
+
+                    return self::FAILURE;
+                }
+
+                return self::SUCCESS;
+            }
             $scanned = true;
             $return = $binaries->scan(
                 $groupMySQL,
@@ -156,12 +166,17 @@ class GetArticleRange extends Command
     /**
      * Queue the whole range in the group's part repair list so a later pass fetches it.
      */
-    private function queueRangeForRepair(string $groupName, int $first, int $last): bool
+    private function queueRangeForRepair(string $groupName, int $first, int $last, bool $deferred = false): bool
     {
         try {
             $groupId = (int) (UsenetGroup::query()->where('name', $groupName)->value('id') ?? 0);
             if ($groupId > 0) {
-                (new MissedPartHandler)->addMissingRange($first, $last, $groupId);
+                $handler = new MissedPartHandler;
+                if ($deferred) {
+                    $handler->deferRange($first, $last, $groupId);
+                } else {
+                    $handler->addMissingRange($first, $last, $groupId);
+                }
                 $this->warn("Queued articles {$first}-{$last} of {$groupName} for part repair.");
 
                 return true;

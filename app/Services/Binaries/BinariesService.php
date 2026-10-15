@@ -426,6 +426,9 @@ class BinariesService
      */
     public function partRepair(array $groupArr): void
     {
+        if ($this->runtimeState->stopRequested()) {
+            return;
+        }
         $missingParts = $this->missedPartHandler->getMissingParts($groupArr['id']);
         $missingCount = \count($missingParts);
 
@@ -443,18 +446,28 @@ class BinariesService
         $ranges = $this->groupMissingPartsIntoRanges($missingParts);
 
         // Download missing parts in ranges
+        $lastAttemptedPart = null;
+        $attemptedCount = 0;
         foreach ($ranges as $range) {
+            if ($this->runtimeState->stopRequested()) {
+                break;
+            }
             if ($this->config->echoCli) {
                 echo \chr(random_int(45, 46)).PHP_EOL;
             }
 
             $this->scan($groupArr, $range['partfrom'], $range['partto'], 'partrepair', $range['partlist']);
+            $lastAttemptedPart = $range['partto'];
+            $attemptedCount += \count($range['partlist']);
+        }
+        if ($lastAttemptedPart === null) {
+            return;
         }
 
         // Calculate parts repaired
-        $lastPartNumber = $missingParts[$missingCount - 1]->numberid;
+        $lastPartNumber = $lastAttemptedPart;
         $remainingCount = $this->missedPartHandler->getCount($groupArr['id'], $lastPartNumber);
-        $partsRepaired = $missingCount - $remainingCount;
+        $partsRepaired = $attemptedCount - $remainingCount;
 
         // Update attempts on remaining parts
         if (isset($missingParts[$missingCount - 1]->id)) {

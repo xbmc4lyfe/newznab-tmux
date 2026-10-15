@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 namespace Tests\Unit\Services\Runners;
 
+use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\Runners\BaseRunner;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use RuntimeException;
 use Tests\Support\ConfigurationTestBuilder;
@@ -61,13 +63,13 @@ class BaseRunnerTest extends TestCase
     #[Test]
     public function a_failed_worker_logs_the_tail_of_its_output(): void
     {
-        Log::spy();
+        $log = Log::spy();
         $runner = new BaseRunnerTestDouble;
         try {
             $runner->pool(['failed' => [PHP_BINARY, '-r', 'fwrite(STDERR, "Cannot connect to server: too many connections"); exit(1);'], 'ok' => [PHP_BINARY, '-r', 'echo "fine";']], 2, 3);
             $this->fail('Expected a failed batch.');
         } catch (RuntimeException) {
-            Log::shouldHaveReceived('error')->once()->with(
+            $log->shouldHaveReceived('error')->once()->with(
                 'Multiprocessing worker did not succeed',
                 \Mockery::on(static fn (array $context): bool => $context['worker'] === 'failed'
                     && str_contains($context['output_tail'] ?? '', 'too many connections')),
@@ -78,13 +80,13 @@ class BaseRunnerTest extends TestCase
     #[Test]
     public function a_failed_workers_stderr_survives_verbose_stdout(): void
     {
-        Log::spy();
+        $log = Log::spy();
         $runner = new BaseRunnerTestDouble;
         try {
             $runner->pool(['failed' => [PHP_BINARY, '-r', 'fwrite(STDERR, "Cannot connect: too many connections"); echo str_repeat("progress line\n", 200); exit(1);']], 1, 3);
             $this->fail('Expected a failed batch.');
         } catch (RuntimeException) {
-            Log::shouldHaveReceived('error')->once()->with(
+            $log->shouldHaveReceived('error')->once()->with(
                 'Multiprocessing worker did not succeed',
                 \Mockery::on(static fn (array $context): bool => str_contains($context['output_tail'] ?? '', 'stderr: Cannot connect: too many connections')
                     && str_contains($context['output_tail'], 'stdout: ')),
@@ -173,6 +175,200 @@ class BaseRunnerTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('drainSources')]
+    public function cooperative_drain_allows_a_resident_worker_to_finish_past_its_ordinary_timeout(string $source): void
+    {
+        if (! function_exists('pcntl_signal') || ! function_exists('posix_kill')) {
+            $this->markTestSkipped('POSIX signals are unavailable.');
+        }
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['stop_requested' => false]);
+        $runner = new BaseRunnerTestDouble;
+        $marker = tempnam(sys_get_temp_dir(), 'nntmux-drain-deadline-');
+        $this->assertNotFalse($marker);
+        $observed = false;
+        if ($source !== 'signal') {
+            DB::listen(function (QueryExecuted $query) use ($source, $marker, &$observed): void {
+                if ($observed || ! str_starts_with($query->sql, 'select') || ! str_contains($query->sql, 'processing_runtime_states')
+                    || file_get_contents($marker) !== 'drain') {
+                    return;
+                }
+                $observed = true;
+                if ($source === 'database-failure') {
+                    throw new RuntimeException('Runtime drain lookup unavailable at the deadline.');
+                }
+                app(ProcessingRuntimeStateRepository::class)->requestStop();
+            });
+        }
+        $failure = null;
+        try {
+            try {
+                $runner->pool([
+                    'active' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "resident"); usleep(750000); file_put_contents($argv[1], "drain"); if ($argv[2] === "signal") { posix_kill(posix_getppid(), SIGUSR1); } usleep(600000); file_put_contents($argv[1], "committed"); echo "completed";', $marker, $source],
+                    'queued' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "queued");', $marker],
+                ], 1, 1);
+            } catch (RuntimeException $exception) {
+                $failure = $exception;
+            }
+
+            $this->assertSame('committed', file_get_contents($marker));
+            $this->assertSame(['active' => 'completed'], $runner->completed);
+            $this->assertSame(['status' => 'success', 'exit_code' => 0], $runner->outcomes()['active']);
+            $this->assertSame('drained', $runner->outcomes()['queued']['status']);
+            $this->assertSame(['active'], $runner->started);
+            if ($source === 'database-failure') {
+                $this->assertNotNull($failure);
+                $this->assertStringContainsString('Runtime drain lookup unavailable at the deadline', $failure->getMessage());
+            } else {
+                $this->assertNull($failure);
+            }
+            if ($source !== 'signal') {
+                $this->assertTrue($observed);
+            }
+        } finally {
+            unlink($marker);
+        }
+    }
+
+    /** @return array<string, array{string}> */
+    public static function drainSources(): array
+    {
+        return ['signal' => ['signal'], 'database stop' => ['database-stop'], 'database uncertainty' => ['database-failure']];
+    }
+
+    #[Test]
+    public function uncertain_drain_state_stops_admission_but_finishes_an_already_resident_worker(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['stop_requested' => false]);
+        $runner = new BaseRunnerTestDouble;
+        $marker = tempnam(sys_get_temp_dir(), 'nntmux-drain-db-error-');
+        $this->assertNotFalse($marker);
+        $residentObserved = false;
+        DB::listen(function (QueryExecuted $query) use ($runner, $marker, &$residentObserved): void {
+            if ($residentObserved || $runner->started !== ['active'] || ! str_starts_with($query->sql, 'select')
+                || ! str_contains($query->sql, 'processing_runtime_states')) {
+                return;
+            }
+            $deadline = microtime(true) + 2;
+            do {
+                if (file_get_contents($marker) === 'resident') {
+                    $residentObserved = true;
+                    throw new RuntimeException('Runtime drain lookup unavailable during resident work.');
+                }
+                usleep(1000);
+            } while (microtime(true) < $deadline);
+        });
+        $failure = null;
+        try {
+            try {
+                $runner->pool([
+                    'active' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "resident"); usleep(500000); file_put_contents($argv[1], "committed"); echo "completed";', $marker],
+                    'queued' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "queued");', $marker],
+                ], 1, 5);
+            } catch (RuntimeException $exception) {
+                $failure = $exception;
+            }
+
+            $this->assertTrue($residentObserved, 'The lookup must fail while a real admitted child is resident.');
+            $this->assertSame('committed', file_get_contents($marker));
+            $this->assertSame(['active' => 'completed'], $runner->completed);
+            $this->assertSame(['active'], $runner->started);
+            $this->assertSame(['status' => 'success', 'exit_code' => 0], $runner->outcomes()['active']);
+            $this->assertSame('drained', $runner->outcomes()['queued']['status']);
+            $this->assertNotNull($failure, 'Drain-state uncertainty must be surfaced after admitted work finishes.');
+            $this->assertStringContainsString('Runtime drain lookup unavailable', $failure->getMessage());
+        } finally {
+            unlink($marker);
+        }
+    }
+
+    #[Test]
+    #[DataProvider('completionHooks')]
+    public function a_failing_completion_hook_during_uncertain_drain_does_not_terminate_another_resident_worker(string $hook): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:', 'nntmux.concurrency_timeout' => 5]);
+        DB::purge('sqlite');
+        ConfigurationTestBuilder::updateRuntime(['stop_requested' => false]);
+        $runner = new class($hook) extends BaseRunnerTestDouble
+        {
+            public function __construct(private string $hook) {}
+
+            protected function workerCompleted(string|int $key, string $output): void
+            {
+                parent::workerCompleted($key, $output);
+                if ($this->hook === 'workerCompleted') {
+                    DB::table('processing_runtime_states')->value('stop_requested');
+                }
+            }
+        };
+        $fast = tempnam(sys_get_temp_dir(), 'nntmux-drain-fast-');
+        $slow = tempnam(sys_get_temp_dir(), 'nntmux-drain-slow-');
+        $release = tempnam(sys_get_temp_dir(), 'nntmux-drain-release-');
+        $this->assertNotFalse($fast);
+        $this->assertNotFalse($slow);
+        $this->assertNotFalse($release);
+        $outage = false;
+        DB::listen(function (QueryExecuted $query) use ($runner, $fast, $slow, $release, &$outage): void {
+            if ($outage || $runner->started !== ['fast', 'slow'] || ! str_starts_with($query->sql, 'select')
+                || ! str_contains($query->sql, 'processing_runtime_states')) {
+                return;
+            }
+            $deadline = microtime(true) + 2;
+            do {
+                if (file_get_contents($fast) === 'resident' && file_get_contents($slow) === 'resident') {
+                    $outage = true;
+                    DB::statement('DROP TABLE processing_runtime_states');
+                    file_put_contents($release, 'released');
+                    DB::table('processing_runtime_states')->value('stop_requested');
+                }
+                usleep(1000);
+            } while (! $outage && microtime(true) < $deadline);
+        });
+        $worker = static fn (string $marker, int $delay): array => [PHP_BINARY, '-r',
+            'file_put_contents($argv[1], "resident"); $deadline = microtime(true) + 3; while (file_get_contents($argv[2]) !== "released") { if (microtime(true) >= $deadline) { exit(3); } usleep(1000); } usleep((int) $argv[3]); file_put_contents($argv[1], "committed"); echo "completed";',
+            $marker, $release, (string) $delay];
+        $failure = null;
+        try {
+            try {
+                $runner->poolWithCompletion([
+                    'fast' => $worker($fast, 100000),
+                    'slow' => $worker($slow, 600000),
+                    'queued' => [PHP_BINARY, '-r', 'file_put_contents($argv[1], "queued");', $release],
+                ], 2, static function (string|int $key, string $output) use ($hook): void {
+                    if ($hook === 'onComplete') {
+                        DB::table('processing_runtime_states')->value('stop_requested');
+                    }
+                });
+            } catch (\Throwable $exception) {
+                $failure = $exception;
+            }
+
+            $this->assertTrue($outage, 'The database must become unavailable while two admitted children are resident.');
+            $this->assertSame('committed', file_get_contents($fast));
+            $this->assertSame('committed', file_get_contents($slow));
+            $this->assertSame('released', file_get_contents($release));
+            $this->assertSame(['fast', 'slow'], $runner->started);
+            $this->assertSame(['status' => 'success', 'exit_code' => 0], $runner->outcomes()['slow']);
+            $this->assertSame('drained', $runner->outcomes()['queued']['status']);
+            $this->assertNotNull($failure, 'The database and completion failure must remain visible after both workers finish.');
+            $this->assertStringContainsString('processing_runtime_states', $failure->getMessage());
+        } finally {
+            unlink($fast);
+            unlink($slow);
+            unlink($release);
+        }
+    }
+
+    /** @return array<string, array{string}> */
+    public static function completionHooks(): array
+    {
+        return ['completion callback' => ['onComplete'], 'worker hook' => ['workerCompleted']];
+    }
+
+    #[Test]
     public function a_paused_pool_launches_nothing_and_reports_every_task_as_drained(): void
     {
         config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:']);
@@ -232,7 +428,7 @@ class BaseRunnerTest extends TestCase
     {
         $runner = new class extends BaseRunnerTestDouble
         {
-            protected function workerConcurrencyKey(string|int $key): string|int|null
+            protected function workerConcurrencyKey(string|int $key): string
             {
                 return explode(':', (string) $key)[0];
             }
@@ -312,6 +508,15 @@ class BaseRunnerTestDouble extends BaseRunner
     public function pool(array $commands, int $limit, int $timeout): array
     {
         return $this->runParallelCommands($commands, $limit, $timeout);
+    }
+
+    /**
+     * @param  array<string|int, string|list<string>>  $commands
+     * @param  callable(string|int, string): void  $onComplete
+     */
+    public function poolWithCompletion(array $commands, int $limit, callable $onComplete): void
+    {
+        $this->runParallelCommandsWithCompletion($commands, $limit, $onComplete);
     }
 
     /** @return array<string|int, array{status: string, exit_code: ?int}> */
