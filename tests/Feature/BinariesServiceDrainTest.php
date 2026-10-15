@@ -8,6 +8,7 @@ use App\Services\Binaries\BinariesConfig;
 use App\Services\Binaries\BinariesService;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -132,5 +133,85 @@ class BinariesServiceDrainTest extends TestCase
     public static function overviewResults(): array
     {
         return ['empty response' => [true, 1003], 'failed download' => [false, 1000]];
+    }
+
+    #[DataProvider('scanCapacityFailures')]
+    public function test_scan_capacity_failure_defers_unattempted_headers_without_consuming_repair_attempts(string $type, bool $lookupThrows, bool $deferralFails): void
+    {
+        config(['release_verification.required' => true, 'release_verification.pending_bytes' => 100]);
+        Schema::create('release_verification_state', function (Blueprint $table): void {
+            $table->unsignedInteger('id')->primary();
+            $table->unsignedBigInteger('pending_bytes');
+        });
+        DB::table('release_verification_state')->insert(['id' => 1, 'pending_bytes' => $lookupThrows ? 0 : 100]);
+        Schema::create('missed_parts', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->unsignedBigInteger('numberid');
+            $table->unsignedInteger('groups_id');
+            $table->unsignedInteger('attempts');
+            $table->unique(['numberid', 'groups_id']);
+        });
+        DB::table('missed_parts')->insert([
+            ['numberid' => 1001, 'groups_id' => 1, 'attempts' => 2],
+            ['numberid' => 1002, 'groups_id' => 1, 'attempts' => 2],
+        ]);
+        if ($deferralFails) {
+            DB::statement("CREATE TRIGGER reject_capacity_deferral BEFORE INSERT ON missed_parts BEGIN SELECT RAISE(ABORT, 'capacity deferral storage failed'); END");
+        }
+        $lookupFailure = new \RuntimeException('Capacity state lookup failed before scan headers.');
+        $capacityChecks = 0;
+        DB::listen(static function (QueryExecuted $query) use ($lookupFailure, $lookupThrows, &$capacityChecks): void {
+            if (str_starts_with($query->sql, 'select "pending_bytes" from "release_verification_state"')) {
+                $capacityChecks++;
+                if ($lookupThrows) {
+                    throw $lookupFailure;
+                }
+            }
+        });
+        $ranges = [];
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getXOVER', 'getOverview')->andReturnUsing(static function (string $range) use (&$ranges): array {
+            $ranges[] = $range;
+
+            return [];
+        });
+        $service = new BinariesService(new BinariesConfig(echoCli: false), nntp: $nntp);
+
+        for ($attempt = 0; $attempt < 2; $attempt++) {
+            $failure = null;
+            try {
+                $service->scan(['id' => 1, 'name' => 'alt.test'], 1001, 1003, $type, $type === 'partrepair' ? [1001, 1002] : null);
+            } catch (\Throwable $exception) {
+                $failure = $exception;
+            }
+            $this->assertNotNull($failure, 'Capacity uncertainty or rejection must remain a visible failure.');
+            if ($lookupThrows) {
+                $this->assertSame($lookupFailure, $deferralFails ? $failure->getPrevious() : $failure);
+            } else {
+                $this->assertStringContainsString('Verification backlog is full', $failure->getMessage());
+            }
+            if ($deferralFails) {
+                $this->assertStringContainsString('capacity deferral storage failed', $failure->getMessage());
+                $this->assertNotNull($failure->getPrevious());
+            }
+            $this->assertNull($service->completedRangeEnd());
+        }
+
+        $this->assertSame([], $ranges);
+        $this->assertSame(2, $capacityChecks);
+        $this->assertSame($type === 'partrepair' || $deferralFails ? [1001 => 2, 1002 => 2] : [1001 => 2, 1002 => 2, 1003 => 0],
+            DB::table('missed_parts')->orderBy('numberid')->pluck('attempts', 'numberid')->all());
+        $this->assertSame(1000, (int) DB::table('usenet_groups')->value('last_record'));
+    }
+
+    /** @return iterable<string, array{string, bool, bool}> */
+    public static function scanCapacityFailures(): iterable
+    {
+        foreach (['update', 'backfill', 'partrepair'] as $type) {
+            yield $type.' full capacity' => [$type, false, false];
+            yield $type.' lookup failure' => [$type, true, false];
+        }
+        yield 'lookup failure with failed deferral' => ['update', true, true];
+        yield 'full capacity with failed deferral' => ['backfill', false, true];
     }
 }

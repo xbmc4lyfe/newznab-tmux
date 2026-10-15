@@ -68,23 +68,26 @@ class GetArticleRange extends Command
             }
         }
 
-        if (! app(CandidateRepository::class)->capacityAvailable()) {
-            if (! $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle)) {
-                $this->error('Verification backlog is full and this range could not be queued for repair; retry this worker.');
-
-                return self::FAILURE;
-            }
-            $this->warn('Verification backlog is full; this range was deferred to part repair.');
-
-            return self::SUCCESS;
-        }
-
-        // Ranges run in parallel and each success moves the group's cursor to its own end, so a range
-        // that fails before it has been scanned would be skipped for good; queue it for part repair.
+        // Before scan() is called, legacy parallel ranges need durable deferral because a sibling
+        // can advance the cursor. Once called, scan owns its admission and storage failure handling.
         $scanned = false;
-        $checkingDrainAdmission = false;
 
         try {
+            if (! app(CandidateRepository::class)->capacityAvailable()) {
+                if ($this->option('contiguous')) {
+                    $this->warn('Verification backlog is full; leaving this range at the persisted cursor.');
+
+                    return self::SUCCESS;
+                }
+                if (! $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle)) {
+                    $this->error('Verification backlog is full and this range could not be queued for repair; retry this worker.');
+
+                    return self::FAILURE;
+                }
+                $this->warn('Verification backlog is full; this range was deferred to part repair.');
+
+                return self::SUCCESS;
+            }
             $nntp = $this->getNntp();
             $group = UsenetGroup::getByName($groupName);
             $groupMySQL = $group?->toArray();
@@ -97,7 +100,9 @@ class GetArticleRange extends Command
 
             if (NNTPService::isError($nntp->selectGroup($groupMySQL['name']))
                 && NNTPService::isError($nntp->dataError($nntp, $groupMySQL['name']))) {
-                $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle);
+                if (! $this->option('contiguous')) {
+                    $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle);
+                }
 
                 return self::FAILURE;
             }
@@ -107,11 +112,9 @@ class GetArticleRange extends Command
             if ($this->option('repair') && app(ConfigurationProvider::class)->ingestion()->partRepair) {
                 $binaries->partRepair($groupMySQL);
             }
-            $checkingDrainAdmission = true;
             $stopRequested = app(ProcessingRuntimeStateRepository::class)->stopRequested();
-            $checkingDrainAdmission = false;
             if ($stopRequested) {
-                if (! $this->option('contiguous') && ! $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle, true)) {
+                if (! $this->option('contiguous') && ! $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle)) {
                     $this->error('The drained range could not be deferred for repair; retry this worker.');
 
                     return self::FAILURE;
@@ -159,8 +162,8 @@ class GetArticleRange extends Command
         } catch (\Throwable $e) {
             Log::error($e->getTraceAsString());
             $this->error($e->getMessage());
-            if (! $scanned && (! $checkingDrainAdmission || ! $this->option('contiguous'))) {
-                $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle, $checkingDrainAdmission);
+            if (! $scanned && ! $this->option('contiguous')) {
+                $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle);
             }
 
             return self::FAILURE;
@@ -168,19 +171,14 @@ class GetArticleRange extends Command
     }
 
     /**
-     * Queue the whole range in the group's part repair list so a later pass fetches it.
+     * Defer an unattempted range without consuming existing repair retries.
      */
-    private function queueRangeForRepair(string $groupName, int $first, int $last, bool $deferred = false): bool
+    private function queueRangeForRepair(string $groupName, int $first, int $last): bool
     {
         try {
             $groupId = (int) (UsenetGroup::query()->where('name', $groupName)->value('id') ?? 0);
             if ($groupId > 0) {
-                $handler = new MissedPartHandler;
-                if ($deferred) {
-                    $handler->deferRange($first, $last, $groupId);
-                } else {
-                    $handler->addMissingRange($first, $last, $groupId);
-                }
+                (new MissedPartHandler)->deferRange($first, $last, $groupId);
                 $this->warn("Queued articles {$first}-{$last} of {$groupName} for part repair.");
 
                 return true;

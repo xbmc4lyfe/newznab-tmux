@@ -290,11 +290,20 @@ class BinariesService
     public function scan(array $groupMySQL, int $first, int $last, string $type = 'update', ?array $missingParts = null): array
     {
         $this->completedRangeEnd = null;
-        if (! app(CandidateRepository::class)->capacityAvailable()) {
-            if ($type !== 'partrepair') {
-                $this->missedPartHandler->addMissingRange($first, $last, (int) $groupMySQL['id']);
+        try {
+            if (! app(CandidateRepository::class)->capacityAvailable()) {
+                throw new \RuntimeException('Verification backlog is full; scan paused before downloading headers.');
             }
-            throw new \RuntimeException('Verification backlog is full; scan paused before downloading headers.');
+        } catch (\Throwable $exception) {
+            if ($type !== 'partrepair') {
+                try {
+                    $this->missedPartHandler->deferRange($first, $last, (int) $groupMySQL['id']);
+                } catch (\Throwable $deferralFailure) {
+                    throw new \RuntimeException('Unable to defer headers after capacity admission failed: '
+                        .$exception->getMessage().'; '.$deferralFailure->getMessage(), 0, $exception);
+                }
+            }
+            throw $exception;
         }
         $this->startLoop = Carbon::now();
         $this->groupMySQL = $groupMySQL;

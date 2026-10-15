@@ -188,7 +188,7 @@ class GetArticleRangeContiguousTest extends TestCase
         ]);
         $failedLookup = false;
         DB::listen(static function (QueryExecuted $query) use (&$failedLookup): void {
-            if (! $failedLookup && str_starts_with($query->sql, 'select') && str_contains($query->sql, 'processing_runtime_states')) {
+            if (! $failedLookup && str_starts_with($query->sql, 'select * from "processing_runtime_states"')) {
                 $failedLookup = true;
                 throw new \RuntimeException('Runtime admission state unavailable.');
             }
@@ -222,6 +222,110 @@ class GetArticleRangeContiguousTest extends TestCase
     public static function uncertainAdmissionModes(): array
     {
         return ['contiguous' => [true], 'parallel' => [false]];
+    }
+
+    /** @param list<string> $expectedRepairs */
+    #[DataProvider('preScanFailures')]
+    public function test_pre_scan_failure_preserves_normal_range_and_unstarted_repair_attempts(
+        bool $contiguous, string $phase, int $failedPoll, array $expectedRepairs, int $firstRepairAttempts
+    ): void {
+        ConfigurationTestBuilder::update(ConfigurationDomain::Ingestion, ['part_repair' => true, 'max_messages' => 100]);
+        Schema::create('missed_parts', function (Blueprint $table): void {
+            $table->increments('id');
+            $table->unsignedBigInteger('numberid');
+            $table->unsignedInteger('groups_id');
+            $table->unsignedInteger('attempts');
+            $table->timestamps();
+            $table->unique(['numberid', 'groups_id']);
+        });
+        DB::table('missed_parts')->insert([
+            ['numberid' => 101, 'groups_id' => 1, 'attempts' => 1],
+            ['numberid' => 102, 'groups_id' => 1, 'attempts' => 1],
+            ['numberid' => 201, 'groups_id' => 1, 'attempts' => 2],
+            ['numberid' => 202, 'groups_id' => 1, 'attempts' => 2],
+            ['numberid' => 1001, 'groups_id' => 1, 'attempts' => 2],
+            ['numberid' => 1002, 'groups_id' => 1, 'attempts' => 2],
+            ['numberid' => 1003, 'groups_id' => 1, 'attempts' => 2],
+        ]);
+        $polls = 0;
+        $injected = false;
+        DB::listen(static function (QueryExecuted $query) use ($failedPoll, &$polls, &$injected): void {
+            if (str_starts_with($query->sql, 'select * from "processing_runtime_states"')) {
+                $polls++;
+                if ($failedPoll > 0 && $polls === $failedPoll) {
+                    $injected = true;
+                    throw new \RuntimeException('Runtime state failed before the normal range.');
+                }
+            }
+        });
+        $repairs = [];
+        $normalRanges = [];
+        if ($phase === 'connection') {
+            $this->app->instance(GetArticleRange::class, new class extends GetArticleRange
+            {
+                protected function getNntp(): NNTPService
+                {
+                    throw new \RuntimeException('Connection failed before the normal range.');
+                }
+            });
+        } else {
+            $nntp = $this->mock(NNTPService::class);
+            $nntp->shouldReceive('selectGroup')->with('alt.test')->once()->andReturnUsing(static function () use ($phase): array|NntpError {
+                if ($phase === 'selection-throw') {
+                    throw new \RuntimeException('Selection failed before the normal range.');
+                }
+
+                return $phase === 'selection-error' ? new NntpError('Group selection failed', 411) : ['first' => 1, 'last' => 1003];
+            });
+            if ($phase === 'selection-error') {
+                $nntp->shouldReceive('dataError')->with($nntp, 'alt.test')->once()->andReturn(new NntpError('Group selection retry failed', 411));
+            }
+            $nntp->shouldReceive('getOverview')->andReturnUsing(static function (string $range) use (&$repairs): false {
+                $repairs[] = $range;
+
+                return false;
+            });
+            $nntp->shouldReceive('getXOVER')->andReturnUsing(static function (string $range) use (&$normalRanges): array {
+                $normalRanges[] = $range;
+
+                return [];
+            });
+            $this->useNntp($nntp);
+        }
+
+        $this->artisan('articles:get-range', ['mode' => 'binaries', 'group' => 'alt.test', 'first' => 1001,
+            'last' => 1003, '--contiguous' => $contiguous, '--repair' => true])->assertFailed();
+
+        $this->assertSame($failedPoll > 0, $injected);
+        $this->assertSame($failedPoll, $polls);
+        $this->assertSame($expectedRepairs, $repairs);
+        $this->assertSame([], $normalRanges);
+        $this->assertSame(1000, (int) DB::table('usenet_groups')->value('last_record'));
+        $this->assertSame([101 => $firstRepairAttempts, 102 => $firstRepairAttempts, 201 => 2, 202 => 2,
+            1001 => 2, 1002 => 2, 1003 => 2], DB::table('missed_parts')->orderBy('numberid')->pluck('attempts', 'numberid')->all());
+        if (! $contiguous) {
+            DB::table('usenet_groups')->update(['last_record' => 2000]);
+            $repairable = array_map(static fn (\stdClass $part): int => (int) $part->numberid,
+                (new MissedPartHandler)->getMissingParts(1));
+            $this->assertSame([1001, 1002, 1003], array_values(array_intersect($repairable, [1001, 1002, 1003])));
+        }
+    }
+
+    /** @return iterable<string, array{bool, string, int, list<string>, int}> */
+    public static function preScanFailures(): iterable
+    {
+        $phases = [
+            'repair entry' => ['repair-entry', 1, [], 1],
+            'first repair boundary' => ['repair-first-range', 2, [], 1],
+            'next repair boundary' => ['repair-next-range', 3, ['101-102'], 2],
+            'connection exception' => ['connection', 0, [], 1],
+            'selection exception' => ['selection-throw', 0, [], 1],
+            'selection error response' => ['selection-error', 0, [], 1],
+        ];
+        foreach ($phases as $name => [$phase, $poll, $repairs, $attempts]) {
+            yield 'contiguous '.$name => [true, $phase, $poll, $repairs, $attempts];
+            yield 'parallel '.$name => [false, $phase, $poll, $repairs, $attempts];
+        }
     }
 
     private function runRange(int $first, int $last): PendingCommand
