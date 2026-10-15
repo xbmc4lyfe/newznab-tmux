@@ -735,7 +735,7 @@ class NNTPService extends NntpClient
      *                         All newer than article number: "679871775-"
      *                         All older than article number: "-679871775"
      *                         Message-ID:                    "<part1of1.uS*yYxQvtAYt$5t&wmE%UejhjkCKXBJ!@example.local>"
-     * @return array<string, mixed>|string|NNTPService Multi-dimensional Array of headers on success, Error object on failure.
+     * @return mixed Header rows on success; the underlying NNTP error or connection-failure result otherwise.
      *
      * @throws \Exception
      */
