@@ -1,0 +1,81 @@
+{
+  "benchmark_status": "useful_improvement",
+  "profiling_setup": {
+    "status": "complete",
+    "exit_code": 0,
+    "phase": "native-build-and-capture",
+    "script_receipt": {
+      "status": "complete",
+      "exit_code": 0,
+      "phase": "capture-summary"
+    }
+  },
+  "profiles": [
+    {
+      "path": "profiles/cpp-heavy-body/php.callgrind",
+      "status": "ok",
+      "sha256": "b25dd06dce44e6eb01edc98c37de6098dd709f4fe607b0622095030651efe67e"
+    },
+    {
+      "path": "profiles/cpp-heavy-strict/php.callgrind",
+      "status": "ok",
+      "sha256": "e3b9c56a47b427abf54378d25d17e3b2141dfd18ffd25fcc9db3f2c3c390f276"
+    },
+    {
+      "path": "profiles/cpp-heavy-tolerant/php.callgrind",
+      "status": "ok",
+      "sha256": "fc60b7b7079c8f0f7cfa4c44bd8358018f1684b65888577752fba1e3cec2c56c"
+    },
+    {
+      "path": "profiles/cpp-ordinary-body/php.callgrind",
+      "status": "ok",
+      "sha256": "9cee0800e3071f5c637b5a8bd95ea86a999e097ddef822fdc4b811c37bbf93d2"
+    },
+    {
+      "path": "profiles/cpp-ordinary-strict/php.callgrind",
+      "status": "ok",
+      "sha256": "19a09fdd305138cb47257598265981fe77d7df1a54b18a43e3121d7f9c873d3c"
+    },
+    {
+      "path": "profiles/cpp-ordinary-tolerant/php.callgrind",
+      "status": "ok",
+      "sha256": "60283b3ccf4b9febcdcffb4215865f4e605a16df80aef8a71a980c101924d65a"
+    },
+    {
+      "path": "profiles/rust-heavy-body/php.callgrind",
+      "status": "ok",
+      "sha256": "0fa048b5eb0900b6a6b5c9199a62cbc92d0493ce169297678b05b0e93d910234"
+    },
+    {
+      "path": "profiles/rust-heavy-strict/php.callgrind",
+      "status": "ok",
+      "sha256": "72e3e0a26256ab7898d0ac499c3fe6112ccf4970dd64bf23a2c3edea364963a0"
+    },
+    {
+      "path": "profiles/rust-heavy-tolerant/php.callgrind",
+      "status": "ok",
+      "sha256": "6b17eaf1b5f51f80cdfd22881de80266f98d1b802aa18983ff193c1654f08c20"
+    },
+    {
+      "path": "profiles/rust-ordinary-body/php.callgrind",
+      "status": "ok",
+      "sha256": "a0f4b53cd9f24633ba076b8d3fd3ff07c57514be0c95833956f33fcdc60a89fa"
+    },
+    {
+      "path": "profiles/rust-ordinary-strict/php.callgrind",
+      "status": "ok",
+      "sha256": "ac348969861b1182f7b0333c3e044c89cf088d26cc1bf6b4b595ec85fefee579"
+    },
+    {
+      "path": "profiles/rust-ordinary-tolerant/php.callgrind",
+      "status": "ok",
+      "sha256": "bc6f4c83601654bd20c6878a905136ee64329ac8f32044379ea224aac4fc5088"
+    },
+    {
+      "path": "profiles/rust-rar5-metadata/php.callgrind",
+      "status": "ok",
+      "sha256": "b3784c7c3942231d8853b160cae31bb198bb13c181ddc07f9a0843713934a88e"
+    }
+  ],
+  "observations_sha256": "33365ba68f30eea035bd5d46d98d53444b66aa6104be6fe94512b7d66692c1e2"
+}
