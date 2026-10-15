@@ -1,9 +1,0 @@
----
-- name: Install lifecycle helpers
-  ansible.builtin.copy:
-    src: "{{ playbook_dir }}/../../../deploy/baremetal/{{ item }}"
-    dest: "/usr/local/lib/nntmux/{{ item }}"
-    owner: root
-    group: root
-    mode: '0755'
-  loop: [host.py, tmux.sh, health.php]
