@@ -351,6 +351,70 @@
       "executed_sha": "48ce039e43fcc2ad0ada56b84378a93c7219b7af",
       "run_id": 38667970872,
       "run_attempt": 1
+    },
+    {
+      "file": "study-six-archive-modules-arm.json",
+      "sha256": "f03f3fea6b6e06f7be53df7a7c37e121466fa9f7fb21eeaf2542903d2a592c3e",
+      "label": "Frozen six-module reference-projection study; not current master or adoption evidence",
+      "kind": "archive-modules",
+      "runner": "ubuntu-24.04-arm",
+      "source_sha": "3c647eb7466a8dd7cfea4958cd5a0ad03ecd1f19",
+      "executed_sha": "3c647eb7466a8dd7cfea4958cd5a0ad03ecd1f19",
+      "run_id": 38719300890,
+      "run_attempt": 1,
+      "public_artifact_id": 11968520015,
+      "public_artifact_zip_digest": "sha256:b876a8da99f3bb90f6adeeb3dff14ba45e70724feffe67589aa73edcab2479d9",
+      "raw_artifact_id": 11968060453,
+      "raw_artifact_zip_digest": "sha256:d933eeb40bf088cd5907b8a3545374c56ebe27496f684e6e0a63d33264b28099",
+      "raw_artifact_expires_at": "2026-10-29T11:04:21Z"
+    },
+    {
+      "file": "study-six-archive-modules-x86.json",
+      "sha256": "f4ec45e5bbec47d6ca24a93cbecde3401ac89ff5d77bc31f1f917232deb41c65",
+      "label": "Frozen six-module reference-projection study; not current master or adoption evidence",
+      "kind": "archive-modules",
+      "runner": "ubuntu-latest",
+      "source_sha": "3c647eb7466a8dd7cfea4958cd5a0ad03ecd1f19",
+      "executed_sha": "3c647eb7466a8dd7cfea4958cd5a0ad03ecd1f19",
+      "run_id": 38719300890,
+      "run_attempt": 1,
+      "public_artifact_id": 11966679302,
+      "public_artifact_zip_digest": "sha256:b8e582583fc5022a8baa82d03b14dc44bb4c6c48763d596754c71e7c55f14871",
+      "raw_artifact_id": 11966984393,
+      "raw_artifact_zip_digest": "sha256:1a81ed4e5b9d4cf2b0c6a562f51600303b76b90d48655d25a965363ae2bccb16",
+      "raw_artifact_expires_at": "2026-10-29T10:58:58Z"
+    },
+    {
+      "file": "study-six-metadata-modules-arm.json",
+      "sha256": "0250d6a2b5563070e0b8492e46804645cc071e98fd683d112301be9e7196dce6",
+      "label": "Frozen six-module reference-projection study; not current master or adoption evidence",
+      "kind": "metadata-modules",
+      "runner": "ubuntu-24.04-arm",
+      "source_sha": "3c647eb7466a8dd7cfea4958cd5a0ad03ecd1f19",
+      "executed_sha": "3c647eb7466a8dd7cfea4958cd5a0ad03ecd1f19",
+      "run_id": 38719300890,
+      "run_attempt": 1,
+      "public_artifact_id": 11966774417,
+      "public_artifact_zip_digest": "sha256:3a0f86f136698946ffc0c6fac25300933d44245f941bf50f6d09def6016d3a6d",
+      "raw_artifact_id": 11966614847,
+      "raw_artifact_zip_digest": "sha256:23b54a77c9f314232649ee1bc60290295176ed36e5ac9980303051a9ac9ac4cd",
+      "raw_artifact_expires_at": "2026-10-29T11:00:32Z"
+    },
+    {
+      "file": "study-six-metadata-modules-x86.json",
+      "sha256": "9b962c983a482599976b33dd439c7bd433759bedb48d69222eb95c0f3a7e8f61",
+      "label": "Frozen six-module reference-projection study; not current master or adoption evidence",
+      "kind": "metadata-modules",
+      "runner": "ubuntu-latest",
+      "source_sha": "3c647eb7466a8dd7cfea4958cd5a0ad03ecd1f19",
+      "executed_sha": "3c647eb7466a8dd7cfea4958cd5a0ad03ecd1f19",
+      "run_id": 38719300890,
+      "run_attempt": 1,
+      "public_artifact_id": 11967068851,
+      "public_artifact_zip_digest": "sha256:64e8eb414d6916f32b2869aabbfd9afa7f95eccae2f311698f6316b736d52ff9",
+      "raw_artifact_id": 11966969190,
+      "raw_artifact_zip_digest": "sha256:ca992091b7c2ad543a42c2a9e0c46f9f14d55f5c6c317c3093565af9fb269b3e",
+      "raw_artifact_expires_at": "2026-10-29T10:57:41Z"
     }
   ],
   "cpu_protocol3_study": {
@@ -378,6 +442,34 @@
     "production_replacement_adopted": false,
     "fingerprint_candidate_status_at_publication": "experimental_withdrawn_from_production",
     "fingerprint_candidate_sha256": "d43ccd3c5528d56be1c93791745243fc057f514fbdde85877259cf0679627374",
+    "raw_artifact_retention_days": 14
+  },
+  "six_module_reference_study": {
+    "source_sha": "3c647eb7466a8dd7cfea4958cd5a0ad03ecd1f19",
+    "run_id": 38719300890,
+    "run_attempt": 1,
+    "summaries": 4,
+    "modules": [
+      "article_dates",
+      "article_identity",
+      "article_xref",
+      "iso_primary_copies",
+      "rar5_copy_checksums",
+      "rar5_quick_open"
+    ],
+    "pairs_per_stratum": 1000,
+    "eligible_pairs": 48000,
+    "decision_rows": 96,
+    "invalid_pairs": 0,
+    "confidence_family_size_per_family_architecture": 48,
+    "baseline_kind": "independent_php_reference_projection",
+    "scope": "Bounded shared outputs only; actual richer native caller includes FFI and JSON; no full parser equivalence or production PHP speedup proof",
+    "adoption_qualified": false,
+    "production_replacement_adopted": false,
+    "additional_comparison_gaps": [
+      "zstd_frame",
+      "xz_first_block"
+    ],
     "raw_artifact_retention_days": 14
   }
 }
