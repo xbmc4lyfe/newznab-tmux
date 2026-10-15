@@ -42,17 +42,20 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
 }
 
 fn main() {
-    let result = parse_options(std::env::args().skip(1)).and_then(|options| {
-        let directory = std::path::Path::new(&options.directory);
-        let source = std::path::Path::new(&options.source);
-        match options.candidate {
-            Some(candidate) => {
-                evidence::verify_with_candidate(directory, source, std::path::Path::new(&candidate))
+    let result = parse_options(std::env::args().skip(1))
+        .and_then(|options| {
+            let directory = std::path::Path::new(&options.directory);
+            let source = std::path::Path::new(&options.source);
+            match options.candidate {
+                Some(candidate) => evidence::verify_with_candidate(
+                    directory,
+                    source,
+                    std::path::Path::new(&candidate),
+                ),
+                None => evidence::verify(directory, source),
             }
-            None => evidence::verify(directory, source),
-        }
-    })
-    .and_then(tooling::with_adoption_eligibility);
+        })
+        .and_then(tooling::with_adoption_eligibility);
     match result {
         Ok(report) => println!("{report}"),
         Err(error) => {

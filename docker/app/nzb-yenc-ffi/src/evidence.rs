@@ -1081,12 +1081,7 @@ fn verify_with_reference_policy(
     )?;
     let (fresh_child, command) =
         bundle.child("preflight-full-correctness-replay", &identity["executor"])?;
-    validate_fresh_replay_command(
-        &command,
-        &identity["executor"],
-        &artifacts[0],
-        runtime,
-    )?;
+    validate_fresh_replay_command(&command, &identity["executor"], &artifacts[0], runtime)?;
     require(
         fresh["report"] == fresh_child["report"]
             && fresh["lifetime_ms"] == fresh_child["lifetime_ms"]
@@ -1498,7 +1493,12 @@ mod tests {
             let mut original = historical.clone();
             original["arguments"][0] = json!(name);
             for case in [
-                "unknown", "extra", "reordered", "candidate", "receipts", "program",
+                "unknown",
+                "extra",
+                "reordered",
+                "candidate",
+                "receipts",
+                "program",
             ] {
                 let mut altered = original.clone();
                 match case {

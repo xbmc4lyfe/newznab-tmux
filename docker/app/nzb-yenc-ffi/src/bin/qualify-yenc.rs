@@ -82,7 +82,10 @@ mod tests {
                 "receipt":{"status":"ok","calls":9479481}});
             let mut report = finish_report(command, historical.clone()).unwrap();
             assert_eq!(report["adoption_eligibility"]["eligible"], false);
-            report.as_object_mut().unwrap().remove("adoption_eligibility");
+            report
+                .as_object_mut()
+                .unwrap()
+                .remove("adoption_eligibility");
             assert_eq!(report, historical, "{command}");
         }
     }
@@ -103,7 +106,13 @@ mod tests {
     fn replay_worker_and_public_check_share_strict_named_options() {
         for command in ["check", "check-worker"] {
             let arguments = [
-                command, "--candidate", "unused", "--receipts", "unused", "--extra", "value",
+                command,
+                "--candidate",
+                "unused",
+                "--receipts",
+                "unused",
+                "--extra",
+                "value",
             ];
             assert_eq!(
                 run(arguments.into_iter().map(str::to_owned)).unwrap_err(),

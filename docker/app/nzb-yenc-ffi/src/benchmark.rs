@@ -2357,7 +2357,10 @@ mod tests {
         );
         let mut failure = read_json(&path.join("failure.json")).unwrap();
         assert_eq!(failure["adoption_eligibility"]["eligible"], false);
-        failure.as_object_mut().unwrap().remove("adoption_eligibility");
+        failure
+            .as_object_mut()
+            .unwrap()
+            .remove("adoption_eligibility");
         assert_eq!(
             failure,
             json!({"status":"failed","error":"original error",
@@ -2392,7 +2395,10 @@ mod tests {
         assert_eq!(written, historical);
         let mut failure = read_json(&path.join("failure.json")).unwrap();
         assert_eq!(
-            failure.as_object_mut().unwrap().remove("adoption_eligibility"),
+            failure
+                .as_object_mut()
+                .unwrap()
+                .remove("adoption_eligibility"),
             Some(disposition)
         );
         assert_eq!(

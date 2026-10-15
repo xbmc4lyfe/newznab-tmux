@@ -432,7 +432,10 @@ mod tests {
                 "reason":"current-policy evidence unavailable"
             })
         );
-        report.as_object_mut().unwrap().remove("adoption_eligibility");
+        report
+            .as_object_mut()
+            .unwrap()
+            .remove("adoption_eligibility");
         assert_eq!(report, historical);
     }
 
@@ -473,7 +476,13 @@ mod tests {
 
     #[test]
     fn outer_adoption_disposition_rejects_non_object_reports() {
-        for report in [Value::Null, json!(true), json!(1), json!("passed"), json!([])] {
+        for report in [
+            Value::Null,
+            json!(true),
+            json!(1),
+            json!("passed"),
+            json!([]),
+        ] {
             assert_eq!(
                 with_adoption_eligibility(report).unwrap_err(),
                 "outer report must be a JSON object"
