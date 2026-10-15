@@ -10,6 +10,7 @@ import time
 
 DIRECTORY = Path('/var/tmp/nntmux')
 STATE = DIRECTORY / 'legacy-scheduler-drain.json'
+PROTOCOL = 'legacy-scheduler-stop-v1'
 interrupted = False
 
 
@@ -61,26 +62,60 @@ def descriptor(state):
 
 def save(state):
     temporary = STATE.with_suffix('.tmp')
-    temporary.write_text(json.dumps(state))
+    with temporary.open('w', encoding='utf-8') as stream:
+        json.dump(state, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
     os.replace(temporary, STATE)
+    handle = os.open(STATE.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+
+
+def verified_stop(state):
+    if (state.get('protocol') != PROTOCOL
+            or state.get('stop') not in ('confirmed', 'preserved')
+            or type(state.get('initially_stopped')) is not bool
+            or (state['stop'] == 'confirmed' and state['initially_stopped'])):
+        raise RuntimeError('Legacy scheduler STOP is unconfirmed; preserving its admission hold.')
 
 
 def restore(token=None):
     if not STATE.exists():
         return
     state = json.loads(STATE.read_text())
-    if token is not None and state.get('token') != token:
+    if state.get('token') != token:
         return
     handle = descriptor(state)
     try:
-        if not state['initially_stopped']:
+        verified_stop(state)
+        item = process(state['pid'])
+        if not identity_matches(item, state) or item['state'] != 'T':
+            raise RuntimeError('Legacy scheduler admission barrier was lost; refusing restoration.')
+        if state['stop'] == 'confirmed':
+            # Confirmed means successful STOP plus observed T before encoding;
+            # it does not attest the final directory-fsync acknowledgment. Direct
+            # competing signal authority is outside this helper's observable scope.
             signal.pidfd_send_signal(handle, signal.SIGCONT)
+            deadline = time.monotonic() + 5
+            while True:
+                item = process(state['pid'])
+                if not identity_matches(item, state) or item['state'] in ('Z', 'X'):
+                    raise RuntimeError('Legacy scheduler identity exited during restoration; preserving its hold.')
+                if item['state'] not in ('T', 't'):
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Legacy scheduler restoration was not observed; preserving its hold.')
+                time.sleep(.02)
         STATE.unlink()
     finally:
         os.close(handle)
 
 
 def active_work(state):
+    verified_stop(state)
     coordinator = process(state['pid'])
     if not identity_matches(coordinator, state) or coordinator['state'] != 'T':
         raise RuntimeError('Legacy scheduler admission barrier was lost; refusing to stop containers.')
@@ -120,21 +155,36 @@ def drain(timeout, token=None):
         if len(candidates) != 1:
             raise RuntimeError('Expected exactly one legacy scheduler coordinator; refusing an unverified drain.')
         item = candidates[0]
-        state = {'pid': item['pid'], 'start': item['start'], 'initially_stopped': item['state'] == 'T', 'token': token}
+        state = {'pid': item['pid'], 'start': item['start'], 'initially_stopped': item['state'] == 'T',
+                 'token': token, 'protocol': PROTOCOL, 'stop': 'intent'}
         save(state)
     handle = descriptor(state)
     try:
-        signal.pidfd_send_signal(handle, signal.SIGSTOP)
-        barrier_deadline = time.monotonic() + 5
-        while True:
+        if state['stop'] == 'intent':
             item = process(state['pid'])
             if not identity_matches(item, state):
                 raise RuntimeError('Legacy scheduler exited before the admission barrier.')
             if item['state'] == 'T':
-                break
-            if interrupted or time.monotonic() >= barrier_deadline:
-                raise RuntimeError('Could not freeze the legacy scheduler coordinator.')
-            time.sleep(.02)
+                state['stop'] = 'preserved'
+            else:
+                if state['initially_stopped'] or item['state'] in ('Z', 'X', 't'):
+                    raise RuntimeError('Legacy scheduler state changed before STOP; preserving its hold.')
+                signal.pidfd_send_signal(handle, signal.SIGSTOP)
+                barrier_deadline = time.monotonic() + 5
+                while True:
+                    item = process(state['pid'])
+                    if not identity_matches(item, state):
+                        raise RuntimeError('Legacy scheduler exited before the admission barrier.')
+                    if item['state'] == 'T':
+                        state['stop'] = 'confirmed'
+                        break
+                    if interrupted or time.monotonic() >= barrier_deadline:
+                        raise RuntimeError('Could not freeze the legacy scheduler coordinator.')
+                    time.sleep(.02)
+            # Intent survives any failure before replacement. If replacement
+            # succeeds but directory fsync fails, surviving confirmation still
+            # truthfully records STOP/observation, while drain reports failure.
+            save(state)
         deadline = time.monotonic() + timeout
         while True:
             if interrupted:
@@ -164,7 +214,8 @@ def main():
         if mode == 'resume':
             restore(token)
         elif mode == 'check':
-            if not STATE.exists() or active_work(json.loads(STATE.read_text())):
+            state = json.loads(STATE.read_text()) if STATE.exists() else None
+            if state is None or state.get('token') != token or active_work(state):
                 raise RuntimeError('Legacy scheduler is not drained; refusing to stop containers.')
         elif mode == 'drain' and len(sys.argv) in (3, 4) and sys.argv[2].isdecimal():
             try:

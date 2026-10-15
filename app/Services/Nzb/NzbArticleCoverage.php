@@ -27,29 +27,32 @@ final class NzbArticleCoverage
      * requires a complete readable NZB covering the incoming set by exact ID bytes.
      * Bounds limit comparison work, never whether an incoming NZB may be imported.
      *
-     * @param  (callable(): void)|null  $onCandidate
+     * @param  (callable(Release): void)|null  $onCandidate
+     * @param  (callable(Release, \SimpleXMLElement): bool)|null  $acceptCovered
      */
-    public function findCoveredUpload(int $totalSize, ?string $fingerprint, ?\SimpleXMLElement $incoming = null, string $name = '', string $searchName = '', int $predbId = 0, bool $publishedOnly = false, ?callable $onCandidate = null): ?Release
+    public function findCoveredUpload(int $totalSize, ?string $fingerprint, ?\SimpleXMLElement $incoming = null, string $name = '', string $searchName = '', int $predbId = 0, bool $publishedOnly = false, ?callable $onCandidate = null, ?callable $acceptCovered = null): ?Release
     {
         if ($incoming === null || ($required = $this->coverageIds($incoming)) === null) {
             return null;
         }
         $seen = [];
         $budget = self::COVERAGE_TOTAL_BYTES;
-        $verify = function (Release $candidate) use (&$seen, &$budget, $required, $publishedOnly, $onCandidate): bool {
+        $verify = function (Release $candidate) use (&$seen, &$budget, $required, $publishedOnly, $onCandidate, $acceptCovered): bool {
             if ((string) $candidate->guid === '' || isset($seen[$candidate->id]) || count($seen) >= self::COVERAGE_CANDIDATES || $budget <= 0) {
                 return false;
             }
             $seen[$candidate->id] = true;
             if ($onCandidate !== null) {
-                $onCandidate();
+                $onCandidate($candidate);
             }
             if (! $this->isCurrentRelease($candidate, $publishedOnly)) {
                 return false;
             }
 
-            return $this->coversIds($required, (string) $candidate->guid, $budget)
-                && $this->isCurrentRelease($candidate, $publishedOnly);
+            $snapshot = $this->coveredIdsSnapshot($required, (string) $candidate->guid, $budget);
+
+            return $snapshot !== null && $this->isCurrentRelease($candidate, $publishedOnly)
+                && ($acceptCovered === null || $acceptCovered($candidate, $snapshot));
         };
         if ($fingerprint !== null) {
             foreach (ReleaseArticleFingerprintStore::candidates($fingerprint)->take(self::COVERAGE_CANDIDATES) as $candidate) {
@@ -109,21 +112,44 @@ final class NzbArticleCoverage
         return $required !== null && $this->coversIds($required, $guid, $budget);
     }
 
+    /** Use one bounded retained generation for article and companion metadata evidence. */
+    public function coveredSnapshot(\SimpleXMLElement $incoming, string $guid): ?\SimpleXMLElement
+    {
+        $required = $this->coverageIds($incoming);
+        if ($required === null) {
+            return null;
+        }
+        $used = 0;
+        $contents = $this->nzb->readNzbContentsBounded($guid, self::COVERAGE_COMPRESSED_BYTES, self::COVERAGE_DECODED_BYTES, $used);
+        if ($contents === false || ($xml = $this->parseXml($contents)) === null) {
+            return null;
+        }
+        $available = $this->coverageIds($xml);
+
+        return $available !== null && array_diff_key($required, $available) === [] ? $xml : null;
+    }
+
     /** @param array<string, true> $required */
     private function coversIds(array $required, string $guid, int &$budget): bool
     {
+        return $this->coveredIdsSnapshot($required, $guid, $budget) !== null;
+    }
+
+    /** @param array<string, true> $required */
+    private function coveredIdsSnapshot(array $required, string $guid, int &$budget): ?\SimpleXMLElement
+    {
         if ($budget <= 0) {
-            return false;
+            return null;
         }
         $used = 0;
         $contents = $this->nzb->readNzbContentsBounded($guid, self::COVERAGE_COMPRESSED_BYTES, min($budget, self::COVERAGE_DECODED_BYTES), $used);
         $budget -= max(0, $used);
         if ($contents === false || ($xml = $this->parseXml($contents)) === null) {
-            return false;
+            return null;
         }
         $available = $this->coverageIds($xml);
 
-        return $available !== null && array_diff_key($required, $available) === [];
+        return $available !== null && array_diff_key($required, $available) === [] ? $xml : null;
     }
 
     /** @phpstan-impure */
@@ -168,7 +194,7 @@ final class NzbArticleCoverage
                 $attributes = $segment->attributes();
                 $number = (string) $attributes['number'];
                 $bytes = (string) $attributes['bytes'];
-                if (! preg_match('/^[1-9][0-9]*$/D', $number) || ! ctype_digit($bytes) || count($segment->xpath('./*') ?: []) !== 0) {
+                if (! preg_match('/^[1-9][0-9]*$/D', $number) || ! ctype_digit($bytes) || dom_import_simplexml($segment)->childElementCount !== 0) {
                     return null;
                 }
                 $id = NzbArticleFingerprint::validatedMessageId((string) $segment);

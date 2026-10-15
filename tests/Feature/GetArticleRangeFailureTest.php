@@ -7,10 +7,12 @@ namespace Tests\Feature;
 use App\Console\Commands\GetArticleRange;
 use App\Services\Binaries\MissedPartHandler;
 use App\Services\NNTP\NNTPService;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Tests\Support\ConfigurationTestBuilder;
 use Tests\TestCase;
 
 final class GetArticleRangeFailureTest extends TestCase
@@ -52,7 +54,7 @@ final class GetArticleRangeFailureTest extends TestCase
         $this->assertCount(500, $repair);
         $this->assertSame($first, (int) $repair[0]->numberid);
         $this->assertSame($last, (int) $repair[499]->numberid);
-        $this->assertSame(1, (int) $repair[0]->attempts);
+        $this->assertSame(0, (int) $repair[0]->attempts);
         $this->assertSame($siblingPosition, (int) DB::table('usenet_groups')->where('id', 7)->value($cursor));
     }
 
@@ -61,6 +63,127 @@ final class GetArticleRangeFailureTest extends TestCase
     {
         return ['forward' => ['binaries', 1001, 1500, 'last_record', 2000],
             'backfill' => ['backfill', 501, 1000, 'first_record', 1]];
+    }
+
+    public function test_repeated_capacity_deferral_preserves_existing_attempts_and_charges_no_new_attempts(): void
+    {
+        $this->fillCapacity();
+        DB::table('missed_parts')->insert([
+            ['numberid' => 1001, 'groups_id' => 7, 'attempts' => 2],
+            ['numberid' => 1002, 'groups_id' => 7, 'attempts' => 2],
+            ['numberid' => 1001, 'groups_id' => 8, 'attempts' => 1],
+        ]);
+        $command = $this->refuseNntp();
+
+        $this->artisan('articles:get-range', ['mode' => 'binaries', 'group' => 'alt.binaries.test', 'first' => 1001, 'last' => 1500])
+            ->assertSuccessful();
+        $this->artisan('articles:get-range', ['mode' => 'binaries', 'group' => 'alt.binaries.test', 'first' => 1001, 'last' => 1500])
+            ->assertSuccessful();
+
+        $this->assertFalse($command->contacted);
+        $this->assertSame(1000, (int) DB::table('usenet_groups')->value('last_record'));
+        $this->assertSame([1001 => 2, 1002 => 2], DB::table('missed_parts')->where('groups_id', 7)
+            ->where('attempts', '>', 0)->orderBy('numberid')->pluck('attempts', 'numberid')->all());
+        $this->assertSame(498, DB::table('missed_parts')->where('groups_id', 7)->where('attempts', 0)->count());
+        $this->assertSame(1, (int) DB::table('missed_parts')->where(['groups_id' => 8, 'numberid' => 1001])->value('attempts'));
+        DB::table('usenet_groups')->where('id', 7)->update(['last_record' => 2000]);
+        $repairable = (new MissedPartHandler)->getMissingParts(7);
+        $this->assertCount(500, $repairable);
+        $this->assertSame(1001, (int) $repairable[0]->numberid);
+        $this->assertSame(1500, (int) $repairable[499]->numberid);
+    }
+
+    public function test_contiguous_capacity_pause_leaves_the_cursor_pending_without_creating_repair_work(): void
+    {
+        $this->fillCapacity();
+        $command = $this->refuseNntp();
+
+        $this->artisan('articles:get-range', ['mode' => 'binaries', 'group' => 'alt.binaries.test', 'first' => 1001,
+            'last' => 1500, '--contiguous' => true])->assertSuccessful();
+        $this->artisan('articles:get-range', ['mode' => 'binaries', 'group' => 'alt.binaries.test', 'first' => 1001,
+            'last' => 1500, '--contiguous' => true])->assertSuccessful();
+
+        $this->assertFalse($command->contacted);
+        $this->assertSame(1000, (int) DB::table('usenet_groups')->value('last_record'));
+        $this->assertSame(0, DB::table('missed_parts')->count());
+    }
+
+    #[DataProvider('capacityAdmissionFailures')]
+    public function test_capacity_admission_failure_preserves_unattempted_range_after_later_cursor_progress(
+        string $mode, bool $contiguous, string $phase, int $first, int $last, string $cursor, int $initialCursor, int $laterCursor
+    ): void {
+        ConfigurationTestBuilder::installDefaults();
+        config(['release_verification.required' => true, 'release_verification.pending_bytes' => 100]);
+        Schema::create('release_verification_state', function (Blueprint $table): void {
+            $table->unsignedInteger('id')->primary();
+            $table->unsignedBigInteger('pending_bytes');
+        });
+        DB::table('release_verification_state')->insert(['id' => 1, 'pending_bytes' => 0]);
+        DB::table('missed_parts')->insert([
+            ['numberid' => $first, 'groups_id' => 7, 'attempts' => 2],
+            ['numberid' => $first + 1, 'groups_id' => 7, 'attempts' => 2],
+            ['numberid' => $last, 'groups_id' => 7, 'attempts' => 2],
+        ]);
+        $checks = 0;
+        $injected = false;
+        DB::listen(static function (QueryExecuted $query) use ($phase, &$checks, &$injected): void {
+            if (! str_starts_with($query->sql, 'select "pending_bytes" from "release_verification_state"')) {
+                return;
+            }
+            $checks++;
+            if (($phase === 'initial-lookup' && $checks === 1) || ($phase === 'scan-lookup' && $checks === 2)) {
+                $injected = true;
+                throw new \RuntimeException('Capacity state lookup failed before normal headers.');
+            }
+            if ($phase === 'scan-full' && $checks === 1) {
+                $injected = true;
+                DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => 100]);
+            }
+        });
+        $ranges = [];
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('selectGroup')->with('alt.binaries.test')->andReturn(['first' => 1, 'last' => 2000]);
+        $nntp->shouldReceive('getXOVER')->andReturnUsing(static function (string $range) use (&$ranges): array {
+            $ranges[] = $range;
+
+            return [];
+        });
+        $command = new class($nntp) extends GetArticleRange
+        {
+            public function __construct(private NNTPService $nntp)
+            {
+                parent::__construct();
+            }
+
+            protected function getNntp(): NNTPService
+            {
+                return $this->nntp;
+            }
+        };
+        $this->app->instance(GetArticleRange::class, $command);
+
+        $this->artisan('articles:get-range', ['mode' => $mode, 'group' => 'alt.binaries.test', 'first' => $first,
+            'last' => $last, '--contiguous' => $contiguous])->assertFailed();
+
+        $this->assertTrue($injected);
+        $this->assertSame($phase === 'initial-lookup' ? 1 : 2, $checks);
+        $this->assertSame([], $ranges);
+        $this->assertSame($initialCursor, (int) DB::table('usenet_groups')->value($cursor));
+        $this->assertSame([$first => 2, $first + 1 => 2, $last => 2],
+            DB::table('missed_parts')->where('groups_id', 7)->orderBy('numberid')->pluck('attempts', 'numberid')->all());
+        DB::table('usenet_groups')->where('id', 7)->update([$cursor => $laterCursor]);
+        $repairable = (new MissedPartHandler)->getMissingParts(7);
+        $this->assertSame([$first, $first + 1, $last], array_map(static fn (\stdClass $part): int => (int) $part->numberid, $repairable));
+    }
+
+    /** @return iterable<string, array{string, bool, string, int, int, string, int, int}> */
+    public static function capacityAdmissionFailures(): iterable
+    {
+        foreach (['initial-lookup', 'scan-lookup', 'scan-full'] as $phase) {
+            yield 'legacy forward '.$phase => ['binaries', false, $phase, 1001, 1003, 'last_record', 1000, 2000];
+            yield 'contiguous forward '.$phase => ['binaries', true, $phase, 1001, 1003, 'last_record', 1000, 2000];
+            yield 'legacy backfill '.$phase => ['backfill', false, $phase, 501, 503, 'first_record', 1001, 1];
+        }
     }
 
     #[DataProvider('invalidRanges')]
@@ -119,6 +242,7 @@ final class GetArticleRangeFailureTest extends TestCase
         DB::table('release_verification_state')->insert(['id' => 1, 'pending_bytes' => 100]);
     }
 
+    /** @return GetArticleRange&object{contacted: bool} */
     private function refuseNntp(): GetArticleRange
     {
         $command = new class extends GetArticleRange
@@ -156,7 +280,7 @@ final class GetArticleRangeFailureTest extends TestCase
         $this->assertSame(500, DB::table('missed_parts')->where('groups_id', 7)->count());
         $this->assertSame(1001, (int) DB::table('missed_parts')->min('numberid'));
         $this->assertSame(1500, (int) DB::table('missed_parts')->max('numberid'));
-        $this->assertSame(1, (int) DB::table('missed_parts')->value('attempts'));
+        $this->assertSame(0, (int) DB::table('missed_parts')->value('attempts'));
     }
 
     public function test_an_unknown_group_queues_nothing(): void
