@@ -82,7 +82,12 @@ final class NameFixingQueryService
             if ($source === self::SOURCE_PAR2) {
                 continue;
             }
-            $sources[] = '(r.'.$column.' = 0 AND ('.self::SOURCE_EXISTS[$source].'))';
+            $sourceCondition = self::SOURCE_EXISTS[$source];
+            if ($source === self::SOURCE_HASH) {
+                $sourceCondition .= ' AND NOT EXISTS (SELECT 1 FROM par2_hash_retry hr WHERE hr.releases_id = r.id'
+                    .' AND HEX(hr.release_guid) = HEX(r.guid) AND hr.retry_at > CURRENT_TIMESTAMP)';
+            }
+            $sources[] = '(r.'.$column.' = 0 AND ('.$sourceCondition.'))';
         }
 
         $condition = 'r.predb_id = 0 AND (r.isrenamed = 0 OR r.categories_id IN ('

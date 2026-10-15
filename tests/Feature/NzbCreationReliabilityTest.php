@@ -10,8 +10,10 @@ use App\Models\Release;
 use App\Services\Binaries\BinariesConfig;
 use App\Services\CollectionCleanupService;
 use App\Services\Nzb\NzbArticleFingerprint;
+use App\Services\Nzb\NzbArticleFingerprintUnavailable;
 use App\Services\Nzb\NzbCreationCandidateQuery;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\RustArticleFingerprintWorker;
 use App\Services\ReleaseCreationService;
 use App\Services\ReleaseImageService;
 use App\Services\ReleaseProcessingService;
@@ -86,7 +88,7 @@ class NzbCreationReliabilityTest extends TestCase
 
         $this->createSchema();
         NzbCreationCandidateQuery::flushCapabilityCache();
-        $this->bindProtocolFingerprint();
+        $this->bindNativeFingerprint();
     }
 
     protected function tearDown(): void
@@ -540,12 +542,12 @@ class NzbCreationReliabilityTest extends TestCase
         return ['release_files', 'release_nfos', 'media_infos', 'par_hashes', 'par_file_hashes', 'par_file_hash_inventories', 'par2_hash_retry', 'par2_rename_progress'];
     }
 
-    public function test_runtime_death_custody_red(): void
+    public function test_experimental_worker_death_preserves_custody(): void
     {
         $this->runtimeCustodyProbe('death');
     }
 
-    public function test_truncated_digest_custody_red(): void
+    public function test_experimental_worker_truncated_digest_preserves_custody(): void
     {
         $this->runtimeCustodyProbe('truncated');
     }
@@ -560,7 +562,12 @@ class NzbCreationReliabilityTest extends TestCase
         $worker = $this->tempNzbPath.'/worker';
         copy(__DIR__.'/../Fixtures/runtime-'.$mode.'.php', $worker);
         chmod($worker, 0700);
-        $this->app->bind(NzbArticleFingerprint::class, static fn (): NzbArticleFingerprint => new NzbArticleFingerprint(workerPath: $worker));
+        $this->app->bind(NzbArticleFingerprint::class, static function () use ($worker): NzbArticleFingerprint {
+            $experimentalWorker = new RustArticleFingerprintWorker($worker);
+            $experimentalWorker->add('part01@example.test');
+            $experimentalWorker->value();
+            throw new \LogicException('Expected an experimental worker transport failure.');
+        });
         $nzb = new NzbService(app(CollectionCleanupService::class));
         $path = $nzb->getNzbPath(str_repeat('a', 36), createIfNotExist: true);
         file_put_contents($path, 'prior-artifact');
@@ -568,8 +575,6 @@ class NzbCreationReliabilityTest extends TestCase
         $releaseBefore = (array) DB::table('releases')->first();
         $failureBefore = (array) DB::table('release_nzb_creation_failures')->first();
         $added = $service->createNZBs(null);
-        $state = ['added' => $added, 'artifact_preserved' => file_get_contents($path) === 'prior-artifact', 'status' => DB::table('releases')->value('nzbstatus'), 'fingerprint' => DB::table('releases')->value('article_fingerprint'), 'collections' => DB::table('collections')->count(), 'binaries' => DB::table('binaries')->count(), 'parts' => DB::table('parts')->count(), 'failures' => DB::table('release_nzb_creation_failures')->count(), 'temporary' => count($nzb->findStaleTemporaryNzbPaths(0))];
-        fwrite(STDERR, json_encode(['mode' => $mode, 'observed' => $state]).PHP_EOL);
         $this->assertSame(0, $added, 'Runtime backend failure must defer publication and preserve custody');
         $this->assertSame('prior-artifact', file_get_contents($path));
         $this->assertSame(1, DB::table('collections')->count());
@@ -623,14 +628,14 @@ class NzbCreationReliabilityTest extends TestCase
         }
         Bus::assertNothingDispatched();
         Event::assertNotDispatched('eloquent.updated: '.Release::class);
-        $this->bindProtocolFingerprint();
+        $this->bindNativeFingerprint();
         try {
             $this->assertSame(1, $service->createNZBs(null));
             $xml = unzipGzipFile($priorPath);
             $this->assertIsString($xml);
             $this->assertNotSame('prior-artifact', file_get_contents($priorPath));
             $this->assertStringContainsString('part01@example.test', $xml);
-            $this->assertSame(sha1(str_repeat('a', 40)), DB::table('releases')->value('article_fingerprint'));
+            $this->assertSame('8f4bbce41949cf99526152819587abc71f7b64ec', DB::table('releases')->value('article_fingerprint'));
             $this->assertMatchesRegularExpression('/^[0-9a-f]{40}$/', DB::table('releases')->value('article_fingerprint'));
             $this->assertNotSame(str_repeat('f', 40), DB::table('releases')->value('article_fingerprint'));
             $this->assertSame(NzbService::NZB_ADDED, (int) DB::table('releases')->value('nzbstatus'));
@@ -649,6 +654,11 @@ class NzbCreationReliabilityTest extends TestCase
         } finally {
             $this->app->forgetInstance(NzbArticleFingerprint::class);
         }
+    }
+
+    public function test_native_stream_failure_preserves_prior_identity_artifact_and_cbp_without_retry_penalty(): void
+    {
+        $this->assertBackendDeferralPreservesCustody(2, nativeIoFailure: true);
     }
 
     public function test_generic_constructor_failure_remains_transient_and_consumes_retry(): void
@@ -700,22 +710,23 @@ class NzbCreationReliabilityTest extends TestCase
         $this->assertBackendDeferralPreservesCustody(0);
     }
 
-    private function bindProtocolFingerprint(): void
+    private function bindNativeFingerprint(): void
     {
-        $worker = $this->tempNzbPath.'/fingerprint-worker';
-        copy(__DIR__.'/../Fixtures/article-fingerprint-worker.php', $worker);
-        chmod($worker, 0700);
-        $this->app->bind(NzbArticleFingerprint::class, static fn (): NzbArticleFingerprint => new NzbArticleFingerprint(workerPath: $worker));
+        $this->app->bind(NzbArticleFingerprint::class, static fn (): NzbArticleFingerprint => new NzbArticleFingerprint);
     }
 
     private function bindUnavailableFingerprint(): void
     {
-        $this->app->bind(NzbArticleFingerprint::class, static fn (): NzbArticleFingerprint => new NzbArticleFingerprint(libraryPath: __DIR__.'/missing-native-library'));
+        $this->app->bind(NzbArticleFingerprint::class, static fn (): NzbArticleFingerprint => throw new NzbArticleFingerprintUnavailable('Injected unavailable fingerprint runtime.'));
     }
 
-    private function assertBackendDeferralPreservesCustody(int $attempts): void
+    private function assertBackendDeferralPreservesCustody(int $attempts, bool $nativeIoFailure = false): void
     {
-        $this->bindUnavailableFingerprint();
+        if ($nativeIoFailure) {
+            $this->app->bind(NzbArticleFingerprint::class, static fn (): NzbArticleFingerprint => new NzbArticleFingerprint(temporaryStreamFactory: static fn () => false));
+        } else {
+            $this->bindUnavailableFingerprint();
+        }
         Bus::fake();
         $cleanup = \Mockery::mock(CollectionCleanupService::class)->makePartial();
         $cleanup->shouldNotReceive('deleteCollectionsAndDescendants');
@@ -1039,7 +1050,7 @@ class NzbCreationReliabilityTest extends TestCase
         $this->assertLessThan(strpos($xml, 'part03@example.test'), strpos($xml, 'part02@example.test'));
         $this->assertStringContainsString('<group>alt.test</group>', $xml);
         $this->assertSame(0, DB::table('release_nzb_creation_failures')->count());
-        $this->assertSame(sha1(str_repeat('a', 40)), DB::table('releases')->where('id', 1)->value('article_fingerprint'));
+        $this->assertSame('0dc4cde0ceec4711ebb2fee0206ae1b83990a6d9', DB::table('releases')->where('id', 1)->value('article_fingerprint'));
     }
 
     public function test_stale_temporary_nzb_cleanup_deletes_only_old_temp_files(): void
