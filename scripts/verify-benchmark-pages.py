@@ -17,8 +17,8 @@ MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 PUBLICATION = 'publication.json'
 SITE_URL = 'https://xbmc4lyfe.github.io/newznab-tmux/'
-# Pages consumes this control file but does not serve it over HTTP.
-EXCLUDED_CONTROL_FILES = ['.nojekyll']
+# Pages consumes these control files but does not serve them over HTTP.
+EXCLUDED_CONTROL_FILES = ['.nojekyll', 'benchmarks/.nojekyll']
 
 
 def source_sha(value):
