@@ -168,7 +168,7 @@ final class NzbArticleCoverage
                 $attributes = $segment->attributes();
                 $number = (string) $attributes['number'];
                 $bytes = (string) $attributes['bytes'];
-                if (! preg_match('/^[1-9][0-9]*$/D', $number) || ! ctype_digit($bytes) || count($segment->xpath('./*') ?: []) !== 0) {
+                if (! preg_match('/^[1-9][0-9]*$/D', $number) || ! ctype_digit($bytes) || dom_import_simplexml($segment)->childElementCount !== 0) {
                     return null;
                 }
                 $id = NzbArticleFingerprint::validatedMessageId((string) $segment);
