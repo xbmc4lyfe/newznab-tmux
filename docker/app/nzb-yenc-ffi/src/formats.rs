@@ -939,7 +939,9 @@ const MAX_7Z_NEXT_HEADER_PREVIEW_BYTES: usize = 256;
 const MAX_RECORDED_RAR5_EXTRA_RECORD_TYPES: usize = 4_096;
 const MAX_RETAINED_RAR5_ARCHIVE_NAME_BYTES: usize = 4_096;
 const MAX_RECORDED_GZIP_FIELD_HEX_BYTES: usize = 256;
-const MAX_SCANNED_GZIP_TEXT_FIELD_BYTES: usize = 4_096;
+// Support this many non-NUL text bytes, with one bounded terminator/lookahead
+// byte. Retained previews are capped independently above.
+const MAX_GZIP_OPTIONAL_FIELD_BYTES: usize = 65_536;
 const MAX_RECORDED_GZIP_EXTRA_SUBFIELD_IDS: usize = 4_096;
 const MAX_RECORDED_ZIP_FIELD_HEX_BYTES: usize = 256;
 const MAX_RECORDED_ZIP_EXTRA_FIELD_IDS: usize = 4_096;
@@ -4407,7 +4409,7 @@ fn parse_gzip_extra_subfields(extra: &[u8]) -> GzipExtraSubfieldSummary {
 
 fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation {
     let Some(search_end) = cursor
-        .checked_add(MAX_SCANNED_GZIP_TEXT_FIELD_BYTES + 1)
+        .checked_add(MAX_GZIP_OPTIONAL_FIELD_BYTES + 1)
         .map(|end| end.min(data.len()))
     else {
         return GzipTextFieldObservation {
@@ -4436,7 +4438,7 @@ fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation
         };
     };
     let terminator = field.iter().position(|byte| *byte == 0);
-    let observed_length = terminator.unwrap_or(field.len().min(MAX_SCANNED_GZIP_TEXT_FIELD_BYTES));
+    let observed_length = terminator.unwrap_or(field.len().min(MAX_GZIP_OPTIONAL_FIELD_BYTES));
     let observed = &field[..observed_length];
     let retained = &observed[..observed.len().min(MAX_RECORDED_GZIP_FIELD_HEX_BYTES)];
     let terminated = terminator.is_some();
@@ -5764,7 +5766,8 @@ fn read_gzip_local_observations(data: &[u8], offset: usize) -> GzipLocalObservat
             }
         }
         if optional_fields_valid && flags_value & 0x08 != 0 {
-            match take_nul_terminated(data, cursor, MAX_GZIP_OPTIONAL_FIELD_BYTES) {
+            // Match parse_gzip_text_field's content bound plus NUL lookahead.
+            match take_nul_terminated(data, cursor, MAX_GZIP_OPTIONAL_FIELD_BYTES + 1) {
                 Some((field, next)) => {
                     original_filename = Some(field);
                     cursor = next;
@@ -5773,7 +5776,7 @@ fn read_gzip_local_observations(data: &[u8], offset: usize) -> GzipLocalObservat
             }
         }
         if optional_fields_valid && flags_value & 0x10 != 0 {
-            match take_nul_terminated(data, cursor, MAX_GZIP_OPTIONAL_FIELD_BYTES) {
+            match take_nul_terminated(data, cursor, MAX_GZIP_OPTIONAL_FIELD_BYTES + 1) {
                 Some((field, next)) => {
                     comment = Some(field);
                     cursor = next;
@@ -6734,8 +6737,6 @@ const MAX_RAR5_ARCHIVE_NAME_DISPLAY_BYTES: usize = 4096;
 const MAX_RAR5_ARCHIVE_NAME_HEX_BYTES: usize = 256;
 
 const MAX_SIGNATURE_CANDIDATES_PER_FORMAT: usize = 16;
-
-const MAX_GZIP_OPTIONAL_FIELD_BYTES: usize = 65_536;
 
 #[cfg(test)]
 mod tests {
@@ -10808,6 +10809,226 @@ mod tests {
             invalid_json["headers"][0]["password_check_trailer_checksum_valid"],
             false
         );
+    }
+
+    #[test]
+    fn gzip_public_parse_keeps_long_text_fields_and_fhcrc_consistent() {
+        // Literal header, 4097 'A' bytes, NUL, 4097 'B' bytes, NUL.
+        // Independent IEEE CRC32 low 16 bits: 0xa583 (little endian below).
+        let mut gzip = vec![0x1f, 0x8b, 8, 0x1a, 0, 0, 0, 0, 0, 3];
+        gzip.extend_from_slice(&[b'A'; 4097]);
+        gzip.push(0);
+        gzip.extend_from_slice(&[b'B'; 4097]);
+        gzip.push(0);
+        gzip.extend_from_slice(&[0x83, 0xa5]);
+        let mut sample = vec![0x55; 7];
+        sample.extend_from_slice(&gzip);
+        let json = serde_json::to_value(parse(&sample)).unwrap();
+        let header = &json["headers"][0];
+        assert_eq!(header["offset"], 7);
+        assert_eq!(header["structure_valid"], true);
+        assert_eq!(header["header_complete"], true);
+        assert_eq!(header["header_valid"], true);
+        assert_eq!(header["filename_terminated"], true);
+        assert_eq!(header["filename_full_byte_length"], 4097);
+        assert_eq!(header["filename_byte_length"], 4097);
+        assert_eq!(header["original_filename_bytes_length"], 4097);
+        assert_eq!(
+            header["filename_sha256"],
+            "225e68d4d9603bdfca93fe3896ba95ab8a10e6505172d8a386af21c5525b950a"
+        );
+        assert_eq!(
+            header["filename_sha256"],
+            header["original_filename_bytes_sha256"]
+        );
+        assert_eq!(
+            header["filename_sha256_basis"],
+            "complete-nul-terminated-field"
+        );
+        assert_eq!(header["comment_terminated"], true);
+        assert_eq!(header["comment_full_byte_length"], 4097);
+        assert_eq!(header["comment_byte_length"], 4097);
+        assert_eq!(header["comment_bytes_length"], 4097);
+        assert_eq!(
+            header["comment_sha256"],
+            "e9b66ae7cb510f0ad5cb78b88084b5769bd2d684204cb9293063923f7232c09c"
+        );
+        assert_eq!(header["comment_sha256"], header["comment_bytes_sha256"]);
+        assert_eq!(
+            header["comment_sha256_basis"],
+            "complete-nul-terminated-field"
+        );
+        assert_eq!(header["filename_bytes_hex"].as_str().unwrap().len(), 512);
+        assert_eq!(header["comment_bytes_hex"].as_str().unwrap().len(), 512);
+        assert_eq!(header["filename_bytes_hex_truncated"], true);
+        assert_eq!(header["comment_bytes_hex_truncated"], true);
+        assert_eq!(header["header_crc16_expected"], 0xa583);
+        assert_eq!(header["header_crc16_calculated"], 0xa583);
+        assert_eq!(header["header_crc16_valid"], true);
+        assert_eq!(header["header_bytes"], 8208);
+
+        // Header completion is independent of the CRC result.
+        *sample.last_mut().unwrap() ^= 1;
+        let corrupt = serde_json::to_value(parse(&sample)).unwrap();
+        assert_eq!(corrupt["headers"][0]["header_complete"], true);
+        assert_eq!(corrupt["headers"][0]["header_valid"], false);
+        assert_eq!(corrupt["headers"][0]["header_crc16_valid"], false);
+    }
+
+    #[test]
+    fn gzip_public_parse_never_admits_unsupported_compression_methods() {
+        for method in [0, 1, 2, 3, 4, 5, 6, 7, 9, 255] {
+            let candidate = [0x1f, 0x8b, method, 0, 0, 0, 0, 0, 0, 3];
+            let parsed = parse(&candidate);
+            assert!(parsed.signatures.iter().all(|item| item.format != "gzip"));
+            assert!(
+                parsed
+                    .headers
+                    .iter()
+                    .all(|header| !matches!(header, FormatHeader::Gzip { .. }))
+            );
+        }
+        let supported = parse(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
+        assert!(matches!(
+            supported.headers.as_slice(),
+            [FormatHeader::Gzip {
+                header_valid: Some(true),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn gzip_public_parse_text_boundaries_keep_exact_lengths_and_bounded_previews() {
+        for (flag, field, alias) in [
+            (0x08, "filename", "original_filename"),
+            (0x10, "comment", "comment"),
+        ] {
+            for length in [0, 255, 256, 257, 4095, 4096, 4097, 65535, 65536] {
+                let mut gzip = vec![0x1f, 0x8b, 8, flag | 2, 0, 0, 0, 0, 0, 3];
+                gzip.extend(std::iter::repeat_n(b'a', length));
+                gzip.push(0);
+                let crc = crc32fast::hash(&gzip) as u16;
+                gzip.extend_from_slice(&crc.to_le_bytes());
+                let json = serde_json::to_value(parse(&gzip)).unwrap();
+                let header = &json["headers"][0];
+                assert_eq!(header["header_complete"], true, "{field}: {length}");
+                assert_eq!(header["structure_valid"], true, "{field}: {length}");
+                assert_eq!(header["header_valid"], true, "{field}: {length}");
+                assert_eq!(header[format!("{field}_terminated")], true);
+                assert_eq!(header[format!("{field}_byte_length")], length);
+                assert_eq!(header[format!("{field}_full_byte_length")], length);
+                assert_eq!(header[format!("{alias}_bytes_length")], length);
+                assert_eq!(
+                    header[format!("{field}_sha256")],
+                    header[format!("{alias}_bytes_sha256")]
+                );
+                assert_eq!(
+                    header[format!("{field}_sha256_basis")],
+                    "complete-nul-terminated-field"
+                );
+                assert_eq!(
+                    header[format!("{field}_bytes_hex")],
+                    "61".repeat(length.min(256))
+                );
+                assert_eq!(header[format!("{field}_bytes_hex_truncated")], length > 256);
+                assert_eq!(header[format!("{alias}_hex_truncated")], length > 256);
+                assert_eq!(header["header_crc16_valid"], true);
+                assert_eq!(header["header_bytes"], length + 13);
+            }
+        }
+    }
+
+    #[test]
+    fn gzip_public_parse_distinguishes_sample_end_from_text_scan_exhaustion() {
+        for (flag, field, alias) in [
+            (0x08, "filename", "original_filename"),
+            (0x10, "comment", "comment"),
+        ] {
+            for (length, trailing_nul, observed, basis) in [
+                (0, false, 0, "observed-prefix-sample-ended"),
+                (4097, false, 4097, "observed-prefix-sample-ended"),
+                (65536, false, 65536, "observed-prefix-sample-ended"),
+                (65537, false, 65536, "observed-prefix-scan-limited"),
+                (65537, true, 65536, "observed-prefix-scan-limited"),
+            ] {
+                // FNAME also advertises a later comment. It must remain unavailable
+                // when the name has no supported terminator, as must FHCRC.
+                let flags = if flag == 0x08 { 0x1a } else { 0x12 };
+                let mut gzip = vec![0x1f, 0x8b, 8, flags, 0, 0, 0, 0, 0, 3];
+                gzip.extend(std::iter::repeat_n(b'a', length));
+                if trailing_nul {
+                    gzip.extend_from_slice(b"\0later\0\x12\x34");
+                }
+                let json = serde_json::to_value(parse(&gzip)).unwrap();
+                let header = &json["headers"][0];
+                assert_eq!(header["header_complete"], false);
+                assert_eq!(header["structure_valid"], false);
+                assert!(header["header_valid"].is_null());
+                assert_eq!(header[format!("{field}_terminated")], false);
+                assert_eq!(header[format!("{field}_byte_length")], observed);
+                assert!(header[format!("{field}_full_byte_length")].is_null());
+                assert_eq!(header[format!("{field}_sha256_basis")], basis);
+                assert!(header[format!("{alias}_bytes_length")].is_null());
+                assert!(header["header_bytes"].is_null());
+                assert!(header["header_crc16_expected"].is_null());
+                assert!(header["header_crc16_calculated"].is_null());
+                assert!(header["header_crc16_valid"].is_null());
+                if flag == 0x08 {
+                    assert!(header["comment_terminated"].is_null());
+                    assert!(header["comment_bytes_length"].is_null());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gzip_public_parse_keeps_long_field_evidence_when_fhcrc_is_truncated() {
+        for (flag, field, alias) in [
+            (0x08, "filename", "original_filename"),
+            (0x10, "comment", "comment"),
+        ] {
+            let mut gzip = vec![0x1f, 0x8b, 8, flag | 2, 0, 0, 0, 0, 0, 3];
+            gzip.extend_from_slice(&[b'a'; 4097]);
+            gzip.extend_from_slice(&[0, 0x42]);
+            let json = serde_json::to_value(parse(&gzip)).unwrap();
+            let header = &json["headers"][0];
+            assert_eq!(header[format!("{field}_terminated")], true);
+            assert_eq!(header[format!("{field}_full_byte_length")], 4097);
+            assert_eq!(header[format!("{alias}_bytes_length")], 4097);
+            assert_eq!(header["header_complete"], false);
+            assert_eq!(header["structure_valid"], false);
+            assert!(header["header_valid"].is_null());
+            assert!(header["header_crc16_valid"].is_null());
+        }
+    }
+
+    #[test]
+    fn gzip_public_parse_caps_raw_previews_without_splitting_into_lossy_text() {
+        for (flag, field, alias) in [
+            (0x08, "filename", "original_filename"),
+            (0x10, "comment", "comment"),
+        ] {
+            let mut gzip = vec![0x1f, 0x8b, 8, flag, 0, 0, 0, 0, 0, 3];
+            gzip.extend_from_slice(&[b'a'; 255]);
+            // Raw bytes resembling a UTF-8 multibyte character cross the preview
+            // boundary; gzip text is not interpreted as UTF-8 by this parser.
+            gzip.extend_from_slice(&[0xe2, 0x82, 0xac, 0]);
+            let json = serde_json::to_value(parse(&gzip)).unwrap();
+            let header = &json["headers"][0];
+            assert_eq!(
+                header[format!("{field}_bytes_hex")],
+                format!("{}e2", "61".repeat(255))
+            );
+            assert_eq!(
+                header[format!("{alias}_bytes_hex")],
+                header[format!("{field}_bytes_hex")]
+            );
+            assert_eq!(header[format!("{field}_full_byte_length")], 258);
+            assert_eq!(header[format!("{alias}_bytes_length")], 258);
+            assert_eq!(header[format!("{field}_bytes_hex_truncated")], true);
+            assert_eq!(header["header_complete"], true);
+        }
     }
 
     #[test]
