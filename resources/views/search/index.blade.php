@@ -44,7 +44,7 @@
 
     <x-page-header title="Search Releases" description="Find exactly what you're looking for" icon="fas fa-search" />
 
-    @if(!empty($exactPoster))
+    @if(isset($exactPoster) && $exactPoster !== '')
         <p class="px-6 text-sm text-gray-600 dark:text-gray-400" role="status">
             Showing releases with the exact poster field “{{ $exactPoster }}”.
         </p>
@@ -52,7 +52,7 @@
 
     <!-- Search Form -->
     <form method="GET" action="{{ route('search') }}" class="px-6 pb-6" id="searchForm">
-        @if(!empty($exactPoster))
+        @if(isset($exactPoster) && $exactPoster !== '')
             <input type="hidden" name="poster" value="{{ $exactPoster }}">
         @elseif(!empty($posterReleaseId))
             <input type="hidden" name="poster_release_id" value="{{ $posterReleaseId }}">
