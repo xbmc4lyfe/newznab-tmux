@@ -89,7 +89,7 @@ class NzbSplitUnwrapperTest extends TestCase
         foreach (['Exact_Release_2026.rar', ' Exact__Release_2026-GRP ', 'Exact_Release_2026_DTS', 'Exact++Release', "Exact_Release\n"] as $payload) {
             self::assertSame(str_replace(['_', '+'], ['.', ' '], $payload), $unwrapper->literalPayload('Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__'.$payload));
         }
-        foreach (['Outer__NZBSPLIT__invalid__NZBSPLIT__Title', 'Outer__NZBSPLIT__abcdef0__NZBSPLIT__Title', 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__', 'Outer__NZBSPLIT__invalid__NZBSPLIT__Junk__NZBSPLIT__abcdef0123456789__NZBSPLIT__Title'] as $invalid) {
+        foreach (['Outer__NZBSPLIT__invalid__NZBSPLIT__Title', 'Outer__NZBSPLIT__abcdef0__NZBSPLIT__Title', 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__', 'Outer__NZBSPLIT__invalid__NZBSPLIT__Junk__NZBSPLIT__abcdef0123456789__NZBSPLIT__Title', '__NZBSPLIT__NZBSPLIT__abcdef01__NZBSPLIT__Title', 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__NZBSPLIT__Title'] as $invalid) {
             self::assertNull($unwrapper->literalPayload($invalid));
         }
     }

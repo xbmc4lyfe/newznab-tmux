@@ -41,6 +41,7 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             'NZBSPLIT group spelling survives nomination' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRPdisc1.mkv', 'Exact.Release.2026-GRPdisc1', true, 8],
             'NZBSPLIT payload whitespace cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__ Exact_Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 0],
             'NZBSPLIT repeated separators cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact__Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 0],
+            'NZBSPLIT overlapping marker cannot authorize' => ['__NZBSPLIT__NZBSPLIT__abcdef01__NZBSPLIT__Exact_Release_2026-GRP.rar', 'Exact.Release.2026-GRP', false, 0],
             'NZBSPLIT nested wrapper cannot authorize' => ['Outer__NZBSPLIT__invalid__NZBSPLIT__Junk__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.rar', 'Exact.Release.2026-GRP', false, 0],
             'NZBSPLIT invalid wrapper hash cannot authorize' => ['Outer__NZBSPLIT__invalid__NZBSPLIT__Exact_Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 0],
             'part archive positive' => ['Exact.Release.2026-GRP.part01.rar', 'Exact.Release.2026-GRP', false, 8],

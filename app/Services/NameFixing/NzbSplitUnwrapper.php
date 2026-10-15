@@ -35,8 +35,13 @@ final class NzbSplitUnwrapper
     /** Decode a single wrapper's literal payload; the caller owns suffix handling. */
     public function literalPayload(string $value): ?string
     {
-        if (substr_count(strtoupper($value), '__NZBSPLIT__') !== 2
-            || preg_match('/__NZBSPLIT__(?:[a-f0-9]{8,})__NZBSPLIT__(.+)\z/isD', $value, $matches) !== 1) {
+        $first = stripos($value, '__NZBSPLIT__');
+        if ($first === false) {
+            return null;
+        }
+        $second = stripos($value, '__NZBSPLIT__', $first + 1);
+        if ($second === false || stripos($value, '__NZBSPLIT__', $second + 1) !== false
+            || preg_match('/\A__NZBSPLIT__(?:[a-f0-9]{8,})__NZBSPLIT__(.+)\z/isD', substr($value, $first), $matches) !== 1) {
             return null;
         }
 
