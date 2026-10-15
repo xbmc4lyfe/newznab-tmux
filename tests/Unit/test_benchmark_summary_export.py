@@ -176,6 +176,37 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
                 self.assertEqual(rejected["confidence_status"], "unqualified")
             report["protocol"][field] = original
 
+    def test_corrected_cpu_confidence_requires_sufficient_declared_and_valid_pairs(self):
+        for declared, samples, sufficient, qualified in (
+                (1, 1, False, False), (15, 15, False, False),
+                (999, 1000, True, False), (1000, 999, False, False),
+                (1000, 1000, None, False), (1000, 1000, False, False),
+                (1000, 1000, True, True)):
+            with self.subTest(declared=declared, samples=samples, sufficient=sufficient):
+                report = self.utility("cpu-snapshot")
+                report["protocol"].update(version=3, pairs=declared,
+                                          bootstrap_rng="splitmix64-rejection", order_rng="splitmix64-rejection",
+                                          bootstrap_resamples=4000, bootstrap_seed=0, confidence_family_size=3,
+                                          confidence_method="paired_bootstrap_bonferroni")
+                for name, row in report["summary"].items():
+                    row.update(gate_statistic="median_ratio" if name == "common-mounted" else "p99_ratio",
+                               gate_speedup_simultaneous_ci95=[1.6, 2.4],
+                               valid_pairs=samples, required_pairs=declared)
+                    if sufficient is None:
+                        row.pop("p99_sample_sufficient")
+                    else:
+                        row["p99_sample_sufficient"] = sufficient
+                summary = self.run_export("cpu-snapshot", report)
+                self.assertEqual(summary["confidence_status"],
+                                 "simultaneous_gate_intervals" if qualified else "unqualified")
+                self.assertEqual(summary["rows"][0]["baseline_median_ns"], 200)
+                if declared == samples and sufficient is False and samples < 1000:
+                    self.assertEqual(summary["status"], "measured_gate_failed")
+                # One insufficient stratum must also disqualify the whole family.
+                if qualified:
+                    report["summary"]["rare-unavailable"].update(valid_pairs=15, p99_sample_sufficient=False)
+                    self.assertEqual(self.run_export("cpu-snapshot", report)["confidence_status"], "unqualified")
+
     def test_corrected_exact_default_host_has_five_gates_and_retains_both_intervals(self):
         report = self.utility("cpu-snapshot")
         report["protocol"].update(version=3, host_proc_absent_at_start=True,

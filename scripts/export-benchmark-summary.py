@@ -315,6 +315,9 @@ def utility_summary(kind, report):
                     valid = False
             valid &= type(metrics.get("gate_pass")) is bool
             valid &= metrics.get("p99_sample_sufficient") is row["p99_sample_sufficient"]
+            confidence_valid &= (count(declared) and declared >= 1000
+                                 and row["p99_sample_sufficient"]
+                                 and metrics.get("p99_sample_sufficient") is True)
             row["gate_passed"] = metrics.get("gate_pass") is True
         else:
             pairs = metrics.get("pairs")

@@ -354,12 +354,15 @@ def run_link(row):
 
 
 def measurement_table(rows):
-    table = ['<table><tr><th>Workload</th><th>Median latency / ratio</th><th>Decision / eligibility</th></tr>']
+    table = ['<table><tr><th>Workload</th><th>Latency / ratio</th><th>Diagnostic intervals</th><th>Simultaneous decision bounds</th><th>Decision / eligibility</th></tr>']
     for row in rows:
         label = ' · '.join(str(row[key]) for key in ('size', 'density', 'path', 'phase', 'scenario', 'rows', 'fixture') if key in row)
         metrics = {key: value for key, value in row.items() if key.startswith('median_') or key in ('php_median_ns', 'rust_median_ns', 'improvement_percent', 'body_ffi_median_ms', 'baseline_median_ns', 'candidate_median_ns', 'baseline_p99_ns', 'candidate_p99_ns', 'p99_ratio', 'p99_ratio_ci95')}
+        diagnostics = {key: value for key, value in metrics.items() if key.endswith('_ci95')}
+        metrics = {key: value for key, value in metrics.items() if key not in diagnostics}
+        bounds = {key: row[key] for key in ('gate_statistic', 'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95') if key in row}
         status = {key: row[key] for key in ('decision', 'eligible', 'eligible_pairs', 'invalid_pairs', 'gate_passed', 'performance_gate', 'samples', 'p99_sample_sufficient') if key in row}
-        table.append(f'<tr><td>{escape(label)}</td><td>{escape(json.dumps(metrics))}</td><td>{escape(json.dumps(status))}</td></tr>')
+        table.append(f'<tr><td>{escape(label)}</td><td>{escape(json.dumps(metrics))}</td><td>{escape(json.dumps(diagnostics))}</td><td>{escape(json.dumps(bounds))}</td><td>{escape(json.dumps(status))}</td></tr>')
     table.append('</table>')
     return '\n'.join(table)
 
@@ -394,7 +397,14 @@ def render(report):
             if supported:
                 body.append('<p>CPU protocol 3 uses independent paired bootstrap samples and simultaneous 95% intervals across its declared fixture gates. Other intervals are diagnostic per-statistic 95%; this does not establish production adoption qualification.</p>')
             else:
-                body.append('<p>CPU interval limitation: historical protocol 2 uses dependent bootstrap samples. Unqualified interval fields do not establish qualified uncertainty. Point estimates remain recorded measurements. <a href="performance.html#utility-results">Read the protocol limits</a>.</p>')
+                version = row.get('measurement_protocol_version')
+                if type(version) is int and version == 2:
+                    limitation = 'historical protocol 2 uses dependent bootstrap samples.'
+                elif type(version) is int and version == 3:
+                    limitation = 'CPU protocol 3 lacks complete qualified sample or runtime provenance.'
+                else:
+                    limitation = 'CPU measurement protocol provenance is unavailable.'
+                body.append('<p>CPU interval limitation: ' + limitation + ' Unqualified interval fields do not establish qualified uncertainty. Point estimates remain recorded measurements. <a href="performance.html#utility-results">Read the protocol limits</a>.</p>')
         if row.get('kind') in ('cpp', 'php', 'profile'):
             body.append('<p>Rust payload mode: ' + escape(measured_payload_mode(row)) + '.</p>')
         if 'workflow_status' in row:
