@@ -95,3 +95,10 @@ docker/Makefile		-binary text eol=lf
 /tests/Unit/test_docs_links.py -binary text eol=lf
 /tests/Unit/test_docs_site.py -binary text eol=lf
 /github-pages/docs/vale/styles/Google/LICENSE -binary text eol=lf
+
+# Benchmark protocol exporters and fixture tests remain reviewable.
+/scripts/benchmark_callers_summary.py -binary text eol=lf
+/tests/Unit/test_benchmark_callers_export.py -binary text eol=lf
+/tests/Unit/test_benchmark_utility_extended.py -binary text eol=lf
+/scripts/benchmark-resource-limits.py -binary text eol=lf
+/tests/Unit/test_benchmark_resource_limits.py -binary text eol=lf

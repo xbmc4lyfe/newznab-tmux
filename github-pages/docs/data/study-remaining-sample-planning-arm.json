@@ -1,0 +1,260 @@
+{
+  "schema_version": 1,
+  "kind": "sample-planning",
+  "runner": "ubuntu-24.04-arm",
+  "head_sha": "16301bd24e8f39dee3a1a5137e562b85052d549c",
+  "repository": "xbmc4lyfe/newznab-tmux",
+  "run_id": 38669727732,
+  "run_attempt": 1,
+  "adoption_qualified": false,
+  "rust_payload_mode": "unknown",
+  "status": "measured",
+  "rows": [
+    {
+      "fixture": "small-dispatch",
+      "phase": "cold",
+      "candidate_backend": "php",
+      "samples": 1000,
+      "category": "dispatch_control",
+      "p99_sample_sufficient": true,
+      "comparison": "same_php_control",
+      "metric": "not_applicable",
+      "baseline_latency_ms": 0.25456,
+      "candidate_latency_ms": 0.254304,
+      "eligible": true
+    },
+    {
+      "fixture": "small-dispatch",
+      "phase": "warm",
+      "candidate_backend": "php",
+      "samples": 1000,
+      "category": "dispatch_control",
+      "p99_sample_sufficient": true,
+      "comparison": "same_php_control",
+      "metric": "not_applicable",
+      "baseline_latency_ms": 0.2042625,
+      "candidate_latency_ms": 0.204062,
+      "eligible": true
+    },
+    {
+      "fixture": "boundary-1024",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "median_latency",
+      "speedup_interval": [
+        1.5394549803315476,
+        1.5511114356868565
+      ],
+      "baseline_over_candidate": 1.5458269371724127,
+      "baseline_latency_ms": 1.676658,
+      "candidate_latency_ms": 1.084635,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "boundary-1024",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "median_latency",
+      "speedup_interval": [
+        2.1156133598947724,
+        2.1261256976154237
+      ],
+      "baseline_over_candidate": 2.1214203214595027,
+      "baseline_latency_ms": 1.608061,
+      "candidate_latency_ms": 0.7580115000000001,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "large-16384",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "median_latency",
+      "speedup_interval": [
+        2.8972951157435287,
+        2.9097291075271308
+      ],
+      "baseline_over_candidate": 2.90380554667158,
+      "baseline_latency_ms": 39.999345,
+      "candidate_latency_ms": 13.774801499999999,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "large-16384",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "common",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "median_latency",
+      "speedup_interval": [
+        3.56217087991052,
+        3.5800053088808235
+      ],
+      "baseline_over_candidate": 3.5715247106005084,
+      "baseline_latency_ms": 36.870905,
+      "candidate_latency_ms": 10.3235755,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "duplicates-inferred",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "p99_latency",
+      "speedup_interval": [
+        3.117534232893395,
+        3.5978234095641066
+      ],
+      "baseline_over_candidate": 3.5444579733502106,
+      "baseline_latency_ms": 51.164024,
+      "candidate_latency_ms": 14.434936,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "duplicates-inferred",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "p99_latency",
+      "speedup_interval": [
+        4.093013385230851,
+        4.702906346732723
+      ],
+      "baseline_over_candidate": 4.539626232406516,
+      "baseline_latency_ms": 48.149473,
+      "candidate_latency_ms": 10.606484,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "tight-budget",
+      "phase": "cold",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "p99_latency",
+      "speedup_interval": [
+        2.121763270564388,
+        2.7676388357832216
+      ],
+      "baseline_over_candidate": 2.434355180419616,
+      "baseline_latency_ms": 35.600665,
+      "candidate_latency_ms": 14.624269,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "tight-budget",
+      "phase": "warm",
+      "candidate_backend": "rust",
+      "samples": 1000,
+      "category": "uncommon",
+      "p99_sample_sufficient": true,
+      "comparison": "exact_public_caller",
+      "metric": "p99_latency",
+      "speedup_interval": [
+        2.9487191857601998,
+        3.487940716187975
+      ],
+      "baseline_over_candidate": 3.2627561502051825,
+      "baseline_latency_ms": 32.875283,
+      "candidate_latency_ms": 10.075924,
+      "qualification_gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "unsupported-coercion",
+      "phase": "cold",
+      "candidate_backend": "php",
+      "samples": 1000,
+      "category": "fallback_control",
+      "p99_sample_sufficient": true,
+      "comparison": "same_php_control",
+      "metric": "not_applicable",
+      "baseline_latency_ms": 1.6750145,
+      "candidate_latency_ms": 1.9501585000000001,
+      "eligible": true
+    },
+    {
+      "fixture": "unsupported-coercion",
+      "phase": "warm",
+      "candidate_backend": "php",
+      "samples": 1000,
+      "category": "fallback_control",
+      "p99_sample_sufficient": true,
+      "comparison": "same_php_control",
+      "metric": "not_applicable",
+      "baseline_latency_ms": 1.6076730000000001,
+      "candidate_latency_ms": 1.627065,
+      "eligible": true
+    }
+  ],
+  "completeness": {
+    "expected_rows": 12,
+    "observed_rows": 12,
+    "complete": true
+  },
+  "evidence_type": "paired_public_caller_quantiles",
+  "protocol_sha256": "02e72a5e5e10d68d48315ac6d9f1e44355e6ae1bd10b29f936ba0e16b08f2ffe",
+  "source_sha256": {
+    "app/Services/Releases/Verification/NativeSpotCheckPlanner.php": "aa43ff2b697dbdd91fef8d8de104579181828772a72a5db1bf0468e5950d8f42",
+    "docker/app/nzb-yenc-ffi/src/par2_source_ranges.rs": "e5f95b98a99fa577a875f8b293c571ef97e15c96aad95fd4e74a269f1ebfe756",
+    "composer.lock": "ee1360f9ab65dbd1d3435cc2d986a2d4a3f2069ba8e129222df3889facdd5be8",
+    "composer.json": "a3c76ac537f57efd3ecb6862db3e07332f901ad94e7c8ccc5db4c9c01be04b8f",
+    "docker/app/nzb-yenc-ffi/Cargo.toml": "bc7f6c7f61bd00bd978ae6f817666f544562f5aff72feac709fa5bf6fe36f02d",
+    "docker/app/nzb-yenc-ffi/Cargo.lock": "77b88ca781e79d95668cb5cb2d8bb61b89d3b3c4dd0892cdc86d4b260dffb55d",
+    "docker/app/nzb-yenc-ffi/src/par2.rs": "50e4506ac4a003c6279425170b5c83a79485679b6c4e54d2f6888dc3d739981c",
+    "docker/app/nzb-yenc-ffi/src/formats.rs": "e09d61d14a79459daa0584a05a5e844719e61ba919e2d2d40dabc109c1f7bb09",
+    "docker/app/nzb-yenc-ffi/src/seven_zip_ranges.rs": "d4a0803b53e7ad52e77e46518fd6440bdf68d2ee5b17d9924685dff284aba4e4",
+    "docker/app/nzb-yenc-ffi/src/lib.rs": "50c88c7f3fd5e6f481c6811c70652125116a60bbbf2b3504fd456a8b7f5ce76d",
+    "docker/app/nzb-yenc-ffi/src/release_names.rs": "5f16c3cd04a0706492e7577a6d7832bd06f8675713258c046624764aa3ef3087",
+    "app/Services/Releases/Verification/SpotCheckPlanner.php": "ac517ccfb463f6b2727f2158e78fdc1871bbe9d98f3fa18d40d5cbc7ca2d1a98",
+    "docker/app/nzb-yenc-ffi/src/sample_plan.rs": "516bb888e1177c4426e67a656adad189d49a496cd6745ae906c321692aa76700",
+    "resource_limits_before": "5363f3e0784523259a3f08d4917a8c78db54cb3599f8155e0c04da7ec3e61d36",
+    "resource_limits_after": "8bf237171cf4ff583f3cb5d3d3807638367a0312906202ffc6158743902bcefa",
+    "resource_limits_comparison": "f368959c87708b03f08f209a5d8d26931c8f5ad68353d8ee712e51ea7221480e"
+  },
+  "library_sha256": {
+    "native": "96be1a5fe8b746188d09cf84f390bb918688721ac28ea4e5194a3912d47b183f"
+  },
+  "report_sha256": "fea80d75f6af1abbeaca294564a282a2e35a5ef3fbbfac57fee1ed95e58675b8",
+  "runtime_identity": {
+    "executed_sha": "16301bd24e8f39dee3a1a5137e562b85052d549c",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "php": "8.5.11",
+    "python": "3.12.3",
+    "architecture": "aarch64",
+    "cpu_model": "aarch64",
+    "runner_image_os": "ubuntu24-arm64",
+    "runner_image_version": "20261004.142.1",
+    "build_profile": "release opt-level=3 lto=true codegen-units=1; cargo --locked; default features",
+    "logical_cpus": 4
+  }
+}

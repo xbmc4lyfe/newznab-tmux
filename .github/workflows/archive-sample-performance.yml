@@ -1,0 +1,173 @@
+name: Archive and sample planning performance
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+    paths:
+      - '.github/workflows/archive-sample-performance.yml'
+      - 'scripts/*benchmark*'
+      - 'app/Services/Releases/Fingerprint/**'
+      - 'app/Services/Releases/Verification/*SpotCheckPlanner.php'
+      - 'docker/app/nzb-yenc-ffi/**'
+      - 'tests/Fixtures/*BenchmarkFixtures.php'
+      - 'tests/Fixtures/par2/**'
+      - 'tests/Unit/*BenchmarkTest.php'
+      - 'tests/Unit/test_benchmark*'
+      - 'composer.json'
+      - 'composer.lock'
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [screen, qualification]
+        default: screen
+        description: Qualification requires 1000 independent pairs
+      samples:
+        default: '31'
+        description: Pairs per comparative stratum; use at least 1000 for qualification
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archive-sample-performance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    name: ${{ matrix.kind }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        kind: [sample-planning, archive-parsing, vendor-archive]
+    env:
+      RUST_TOOLCHAIN: '1.98.0'
+      BENCHMARK_KIND: ${{ matrix.kind }}
+      BENCHMARK_MODE: ${{ inputs.mode || 'screen' }}
+      BENCHMARK_SAMPLES: ${{ inputs.samples || '31' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: bcmath, dom, curl, exif, ffi, gd, intl, mbstring, mysqlnd, pdo, pdo_mysql, sqlite, pdo_sqlite, simplexml, sockets, xmlwriter, zip
+          coverage: none
+      - name: Install locked dependencies without application boot
+        run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
+      - name: Verify benchmark correctness and decisions
+        run: |
+          php vendor/bin/phpunit tests/Unit/SamplePlanningBenchmarkTest.php tests/Unit/ArchiveParsingBenchmarkTest.php tests/Unit/VendorArchiveBenchmarkTest.php
+          python3 tests/Unit/test_benchmark_callers_export.py
+          python3 tests/Unit/test_benchmark_resource_limits.py
+      - name: Build and test optimized locked native library
+        shell: bash
+        run: |
+          mkdir -p utility-evidence/build
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee utility-evidence/build/test.log
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib 2>&1 | tee utility-evidence/build/build.log
+      - name: Verify sample planner through the native public caller
+        env:
+          NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
+        run: |
+          php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter=test_real_native_worker_has_exact_public_caller_output_and_execution_proof
+          php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter=test_all_vendor_archive_native_callers_match_independent_oracles_with_execution_proof
+      - name: Freeze executed build receipt
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, platform, subprocess
+          root = pathlib.Path.cwd()
+          def run(*args):
+              return subprocess.check_output(args, text=True).strip()
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          code = "define('NNTMUX_VENDOR_ARCHIVE_BENCHMARK_FUNCTIONS_ONLY', true); require 'scripts/benchmark-vendor-archive.php'; echo json_encode(match (getenv('BENCHMARK_KIND')) {'vendor-archive' => vendorArchiveBenchmarkSources(getcwd()), 'archive-parsing' => archiveBenchmarkSources(getcwd()), default => sampleBenchmarkSources(getcwd())}, JSON_THROW_ON_ERROR);"
+          sources = json.loads(run('php', '-r', code))
+          cpu = next((line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith(('model name', 'Hardware'))), platform.machine())
+          receipt = {
+              'executed_sha': run('git', 'rev-parse', 'HEAD'),
+              'candidate_library_sha256': digest(root / 'docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so'),
+              'candidate_source_sha256': sources,
+              'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
+              'cargo': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'cargo', '-V'),
+              'php': run('php', '-r', 'echo PHP_VERSION;'),
+              'python': platform.python_version(), 'architecture': platform.machine(),
+              'cpu_model': cpu, 'logical_cpus': os.cpu_count(),
+              'runner_image_os': os.environ.get('ImageOS', ''),
+              'runner_image_version': os.environ.get('ImageVersion', ''),
+              'build_profile': 'release opt-level=3 lto=true codegen-units=1; cargo --locked; default features',
+          }
+          pathlib.Path('utility-evidence/runtime.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          PY
+      - name: Capture all visible resource limits before measurement
+        shell: bash
+        run: |
+          ulimit -Sa > utility-evidence/process-soft-limits.txt
+          ulimit -Ha > utility-evidence/process-hard-limits.txt
+          python3 scripts/benchmark-resource-limits.py capture \
+            --soft-limits=utility-evidence/process-soft-limits.txt \
+            --hard-limits=utility-evidence/process-hard-limits.txt \
+            --output=utility-evidence/resource-limits-before.json
+          cp utility-evidence/resource-limits-before.json utility-evidence/resource-limits.json
+      - name: Measure actual PHP caller and retain inconclusive qualification
+        shell: bash
+        run: |
+          set +e
+          php -d ffi.enable=true "scripts/benchmark-$BENCHMARK_KIND.php" \
+            --native="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            --runtime-manifest="$GITHUB_WORKSPACE/utility-evidence/runtime.json" \
+            --source-dir="$GITHUB_WORKSPACE" --mode="$BENCHMARK_MODE" --samples="$BENCHMARK_SAMPLES" \
+            --output-dir="$GITHUB_WORKSPACE/utility-evidence/$BENCHMARK_KIND" \
+            > "utility-evidence/$BENCHMARK_KIND-console.log" 2>&1
+          status=$?
+          set -e
+          echo "$status" > "utility-evidence/$BENCHMARK_KIND-exit.txt"
+          # 1 is a valid measured failure to qualify, not a correctness success.
+          if [[ "$status" -gt 1 ]]; then exit "$status"; fi
+      - name: Capture all visible resource limits after measurement
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p utility-evidence
+          ulimit -Sa > utility-evidence/process-soft-limits-after.txt
+          ulimit -Ha > utility-evidence/process-hard-limits-after.txt
+          python3 scripts/benchmark-resource-limits.py capture \
+            --soft-limits=utility-evidence/process-soft-limits-after.txt \
+            --hard-limits=utility-evidence/process-hard-limits-after.txt \
+            --output=utility-evidence/resource-limits-after.json
+      - name: Require unchanged visible static limits and retain raw usage endpoints
+        if: always()
+        run: |
+          python3 scripts/benchmark-resource-limits.py compare \
+            --before=utility-evidence/resource-limits-before.json \
+            --after=utility-evidence/resource-limits-after.json \
+            --output=utility-evidence/resource-limits-comparison.json
+      - name: Export bounded public metrics even on failure
+        if: always()
+        run: python3 scripts/benchmark_callers_summary.py --kind="$BENCHMARK_KIND" --runner='${{ matrix.runner }}' --output=public-summary/summary.json
+      - name: Retain public summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-benchmark-${{ matrix.kind }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public-summary/summary.json
+          retention-days: 14
+          if-no-files-found: error
+      - name: Retain observations and frozen evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-utility-${{ matrix.kind }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: utility-evidence/
+          retention-days: 14
+          if-no-files-found: warn

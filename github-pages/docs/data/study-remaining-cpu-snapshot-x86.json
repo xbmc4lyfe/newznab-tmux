@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "kind": "cpu-snapshot",
+  "runner": "ubuntu-latest",
+  "head_sha": "16301bd24e8f39dee3a1a5137e562b85052d549c",
+  "run_id": 38671295256,
+  "run_attempt": 1,
+  "repository": "xbmc4lyfe/newznab-tmux",
+  "status": "measured",
+  "rows": [
+    {
+      "fixture": "common-mounted",
+      "candidate_backend": "rust-cli",
+      "samples": 1000,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": true,
+      "comparison": "synthetic_cli",
+      "baseline_median_ns": 36169502.5,
+      "candidate_median_ns": 1169100.0,
+      "median_ratio": 30.937903087845353,
+      "paired_median_ratio": 30.99437394629836,
+      "baseline_p99_ns": 40531746.0,
+      "candidate_p99_ns": 1549348.0,
+      "p99_ratio": 26.16051784363487,
+      "median_ratio_ci95": [
+        30.81993511474604,
+        31.01153649051423
+      ],
+      "p99_ratio_ci95": [
+        25.784055006081857,
+        26.739930474333985
+      ],
+      "gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "rare-deep64",
+      "candidate_backend": "rust-cli",
+      "samples": 1000,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": true,
+      "comparison": "synthetic_cli",
+      "baseline_median_ns": 48196958.5,
+      "candidate_median_ns": 4567823.5,
+      "median_ratio": 10.551405609257888,
+      "paired_median_ratio": 10.878023194467087,
+      "baseline_p99_ns": 52431654.0,
+      "candidate_p99_ns": 4911223.0,
+      "p99_ratio": 10.675885415913715,
+      "median_ratio_ci95": [
+        10.529773368447225,
+        10.584654870634866
+      ],
+      "p99_ratio_ci95": [
+        10.534415303805867,
+        11.10345411779455
+      ],
+      "gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "rare-unavailable",
+      "candidate_backend": "rust-cli",
+      "samples": 1000,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": true,
+      "comparison": "synthetic_cli",
+      "baseline_median_ns": 34630885.5,
+      "candidate_median_ns": 1141000.5,
+      "median_ratio": 30.351332449021715,
+      "paired_median_ratio": 30.425173126596196,
+      "baseline_p99_ns": 38430722.0,
+      "candidate_p99_ns": 1247244.0,
+      "p99_ratio": 30.812513028725736,
+      "median_ratio_ci95": [
+        30.29121537733315,
+        30.42652192510266
+      ],
+      "p99_ratio_ci95": [
+        30.309353439802756,
+        31.605173235695887
+      ],
+      "gate_passed": true,
+      "eligible": true
+    },
+    {
+      "fixture": "host-live",
+      "candidate_backend": "rust-cli",
+      "samples": 1000,
+      "invalid_pairs": 0,
+      "p99_sample_sufficient": true,
+      "comparison": "exact_host_cli",
+      "baseline_median_ns": 35129061.0,
+      "candidate_median_ns": 1484005.5,
+      "median_ratio": 23.671786256856866,
+      "paired_median_ratio": 23.760691176053033,
+      "baseline_p99_ns": 39010490.0,
+      "candidate_p99_ns": 1593058.0,
+      "p99_ratio": 24.487802703981902,
+      "median_ratio_ci95": [
+        23.579874460876738,
+        23.773249431017483
+      ],
+      "p99_ratio_ci95": [
+        24.00381127248137,
+        24.690026042845005
+      ],
+      "gate_passed": true,
+      "eligible": true
+    }
+  ],
+  "evidence_type": "synthetic_and_exact_host_cli_comparison",
+  "adoption_qualified": false,
+  "rust_payload_mode": "unknown",
+  "completeness": {
+    "expected_rows": 4,
+    "observed_rows": 4,
+    "complete": true
+  },
+  "baseline_revision": "5cc5303b502e653d83bba1951dec2f5d2da1db35",
+  "source_sha256": {
+    "baseline": "44186d8c2cf2f72f63f41d46bab30e0d78b683a43441c802c8e62280fdf03812",
+    "candidate_binary": "e9a7a1b5479e6cb23f5424f8f41ca61275367a3711fe186863e64f70559434f6",
+    "coordinator_binary": "9b25841924c7589044e2baa88722b2ce47de4964f38b7965ae997726faee518a",
+    "cargo_lock": "77b88ca781e79d95668cb5cb2d8bb61b89d3b3c4dd0892cdc86d4b260dffb55d",
+    "cargo_toml": "bc7f6c7f61bd00bd978ae6f817666f544562f5aff72feac709fa5bf6fe36f02d",
+    "candidate_source": "70cb1bb43f0bfb44bfc9c4a9e1f5487b3882768f0671c29511dc2e1f8e5a3753",
+    "candidate_cli": "bf0470b984f4f8c6ec1b971ccdded811f345a1b5dde26c04a65182814edfb293",
+    "coordinator_source": "ee1e6277570ef120bffd54dcd7259e589b4256cab30b12e8386d79238d81f220",
+    "python_executable": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+    "crate_lib_source": "50c88c7f3fd5e6f481c6811c70652125116a60bbbf2b3504fd456a8b7f5ce76d",
+    "resource_limits_before": "0761437ccc322447d5a8b18febd366908440194711e5a43d7f4f7adbfc7075e4",
+    "resource_limits_after": "1e5db1687c62c2daf2ae52f1ef0e1fa0884a3fc9c6b26c3df5ea3a739aed3cd1",
+    "resource_limits_comparison": "f368959c87708b03f08f209a5d8d26931c8f5ad68353d8ee712e51ea7221480e"
+  },
+  "protocol_sha256": "a7da4fe6eb262cd4946e31b0e83431f81a4e1bd81440347a89077513e2dfcfc2",
+  "uncertainty_method": "mixed_output_bootstrap",
+  "report_sha256": "e44fbce4f973f5f76c5cf4ce3ccb96f62e6e3cf6d603fc7dd99d119e9f884497",
+  "runtime_identity": {
+    "executed_sha": "16301bd24e8f39dee3a1a5137e562b85052d549c",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "php": "8.5.11",
+    "python": "3.12.3",
+    "architecture": "x86_64",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "runner_image_os": "ubuntu24",
+    "runner_image_version": "20261004.327.1",
+    "build_profile": "release opt-level=3 lto=true codegen-units=1; cargo --locked",
+    "logical_cpus": 4
+  }
+}
