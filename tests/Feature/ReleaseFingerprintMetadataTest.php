@@ -45,18 +45,62 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
         (new CollectReleaseFingerprintMetadata(1))->handle($collector);
         self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
-        ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => 28]]);
-        $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
-        (new CollectReleaseFingerprintMetadata(1))->handle($collector);
-        self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
-        ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => 29]]);
-        $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
-        (new CollectReleaseFingerprintMetadata(1))->handle($collector);
-        self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
-        ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => 30]]);
-        $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
-        (new CollectReleaseFingerprintMetadata(1))->handle($collector);
-        self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
+        foreach ([28, 29, 30, 31] as $schemaVersion) {
+            ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => $schemaVersion]]);
+            $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
+            (new CollectReleaseFingerprintMetadata(1))->handle($collector);
+            $recollected = ReleaseFingerprintMetadata::query()->where('releases_id', 1)->firstOrFail();
+            self::assertSame('unavailable', $recollected->status);
+        }
+    }
+
+    #[Test]
+    public function it_exposes_bounded_xz_first_block_declarations_and_sample_ranges(): void
+    {
+        $sample = hex2bin('fd377a585a000000ff12d94102c0050121010000f05dfb9f010000410000000000011101ada6580406729e7a010000000000595a');
+        self::assertIsString($sample);
+        if ((new NativeMetadataParser)->parseFormats($sample) === null) {
+            self::markTestSkipped('Native Rust format metadata is required for XZ first-block integration.');
+        }
+        $analyzer = new NzbFingerprintAnalyzer(new YencService);
+        $body = YencArticles::article($sample);
+        $analysis = $analyzer->analyzeArticleAndDecodedBytes([], $body);
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        self::assertSame(hash('sha256', $body), $analysis['metadata']['article_body_sha256']);
+        $format = $analysis['metadata']['decoded_format_metadata']['headers'][0];
+        self::assertSame('xz', $format['format']);
+        $block = $format['first_block'];
+        self::assertSame('declared_block_ranges', $block['extent_status']);
+        self::assertSame(12, $block['header_start_offset']);
+        self::assertTrue($block['header_crc32_valid']);
+        self::assertSame(5, $block['compressed_size']['value']);
+        self::assertSame([24, 29, 5], array_map(static fn (string $key): int => $block['compressed_data'][$key], ['start_offset', 'end_offset_exclusive', 'available_bytes']));
+        self::assertTrue($block['block_padding_zero']);
+        self::assertSame(32, $block['next_item_offset']);
+        self::assertFalse($block['whole_stream_validated']);
+        self::assertFalse($block['content_decompressed']);
+        self::assertFalse($block['file_offset_known']);
+        self::assertStringContainsString('sample_relative', $block['offset_basis']);
+        $sample[29] = "\x01";
+        $conflict = $analyzer->analyzeArticleAndDecodedBytes([], YencArticles::article($sample));
+        $block = $conflict['metadata']['decoded_format_metadata']['headers'][0]['first_block'];
+        self::assertTrue($block['header_crc32_valid']);
+        self::assertFalse($block['block_padding_zero']);
+        self::assertSame('declared_block_ranges', $block['extent_status']);
+        $huge = hex2bin('fd377a585a000000ff12d9410440e8ffffffffffffff7f21010000007725567d');
+        self::assertIsString($huge);
+        $large = $analyzer->analyzeArticleAndDecodedBytes([], YencArticles::article($huge));
+        $block = $large['metadata']['decoded_format_metadata']['headers'][0]['first_block'];
+        self::assertSame('9223372036854775816', $block['next_item_offset']);
+        self::assertFalse($block['minimum_stream_size_lower_bound_fits']);
+        self::assertFalse($block['compressed_data']['complete']);
+        $sample[8] = chr(ord($sample[8]) ^ 1);
+        $invalid = $analyzer->analyzeArticleAndDecodedBytes([], YencArticles::article($sample));
+        $block = $invalid['metadata']['decoded_format_metadata']['headers'][0]['first_block'];
+        self::assertFalse($block['stream_header_qualified']);
+        self::assertTrue($block['header_crc32_valid']);
+        self::assertSame(5, $block['compressed_size']['value']);
+        self::assertNull($block['compressed_data']);
     }
 
     #[Test]
