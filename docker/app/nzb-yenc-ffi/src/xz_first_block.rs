@@ -31,6 +31,51 @@ pub struct Range {
     pub complete: bool,
 }
 
+/// Owned evidence with a fixed bound; serialized as the same lowercase JSON string.
+#[cfg(feature = "experimental-xz-index")]
+#[derive(Debug, Default)]
+pub struct IndexHex {
+    bytes: [u8; 24],
+    len: u8,
+}
+
+#[cfg(feature = "experimental-xz-index")]
+impl IndexHex {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > 24 {
+            return None;
+        }
+        let mut out = Self::default();
+        out.bytes[..bytes.len()].copy_from_slice(bytes);
+        out.len = bytes.len() as u8;
+        Some(out)
+    }
+}
+
+#[cfg(feature = "experimental-xz-index")]
+impl Serialize for IndexHex {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = [0_u8; 48];
+        for (index, byte) in self.bytes[..usize::from(self.len)].iter().enumerate() {
+            encoded[index * 2] = DIGITS[(byte >> 4) as usize];
+            encoded[index * 2 + 1] = DIGITS[(byte & 15) as usize];
+        }
+        let text = std::str::from_utf8(&encoded[..usize::from(self.len) * 2])
+            .map_err(<S::Error as serde::ser::Error>::custom)?;
+        serializer.serialize_str(text)
+    }
+}
+
+#[cfg(feature = "experimental-xz-index")]
+#[derive(Debug, Serialize)]
+pub struct IndexInteger {
+    pub start_offset: usize,
+    pub end_offset_exclusive: usize,
+    pub raw_hex: IndexHex,
+    pub value: u64,
+}
+
 /// Only an immediately following one-record Index; never a search for a stream end.
 #[cfg(feature = "experimental-xz-index")]
 #[derive(Debug, Default, Serialize)]
@@ -40,11 +85,11 @@ pub struct IndexObservation {
     pub start_offset: u64,
     pub first_byte: Option<u8>,
     pub status: &'static str,
-    pub candidate_preview_hex: String,
-    pub index_observed_hex: String,
-    pub record_count: Option<Integer>,
-    pub record_unpadded_size: Option<Integer>,
-    pub record_uncompressed_size: Option<Integer>,
+    pub candidate_preview_hex: IndexHex,
+    pub index_observed_hex: IndexHex,
+    pub record_count: Option<IndexInteger>,
+    pub record_unpadded_size: Option<IndexInteger>,
+    pub record_uncompressed_size: Option<IndexInteger>,
     pub unpadded_size_domain_valid: Option<bool>,
     pub declared_single_record_stream_bytes: Option<u64>,
     pub declared_stream_size_limit_valid: Option<bool>,
@@ -168,18 +213,43 @@ fn vli(header: &[u8], cursor: &mut usize, body_end: usize, base: usize) -> Optio
 }
 
 #[cfg(feature = "experimental-xz-index")]
-fn index_integer(data: &[u8], cursor: &mut usize, base: usize) -> Result<Integer, &'static str> {
+fn index_integer(
+    data: &[u8],
+    cursor: &mut usize,
+    base: usize,
+) -> Result<IndexInteger, &'static str> {
     let start = *cursor;
     if start == data.len() {
         return Err("sample_truncated_vli");
     }
-    vli(data, cursor, data.len(), base).ok_or_else(|| {
+    // Match the Header decoder's cursor and canonicality rules without creating its String.
+    let mut value = 0_u64;
+    for index in 0..9 {
+        let Some(byte) = data.get(*cursor).copied() else {
+            break;
+        };
+        *cursor += 1;
+        if index > 0 && byte == 0 {
+            break;
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok(IndexInteger {
+                start_offset: base + start,
+                end_offset_exclusive: base + *cursor,
+                raw_hex: IndexHex::from_bytes(&data[start..*cursor])
+                    .ok_or("invalid_evidence_range")?,
+                value,
+            });
+        }
+    }
+    Err(
         if *cursor == data.len() && *cursor - start < 9 && data[*cursor - 1] & 0x80 != 0 {
             "sample_truncated_vli"
         } else {
             "invalid_vli"
-        }
-    })
+        },
+    )
 }
 
 #[cfg(feature = "experimental-xz-index")]
@@ -201,7 +271,11 @@ fn observe_index(data: &[u8], block: &FirstBlock, start: u64) -> IndexObservatio
     }
     let start = start as usize;
     let candidate = &data[start..start + (data.len() - start).min(24)];
-    out.candidate_preview_hex = hex(candidate);
+    let Some(preview) = IndexHex::from_bytes(candidate) else {
+        out.status = "invalid_evidence_range";
+        return out;
+    };
+    out.candidate_preview_hex = preview;
     out.first_byte = candidate.first().copied();
     if out.first_byte != Some(0) {
         out.status = "next_item_not_index";
@@ -261,7 +335,12 @@ fn observe_index(data: &[u8], block: &FirstBlock, start: u64) -> IndexObservatio
     let padding = range(data, out.start_offset + cursor as u64, crc_offset);
     out.padding_zero = zero_observation(data, &padding);
     out.padding = Some(padding);
-    out.index_observed_hex = hex(&candidate[..candidate.len().min(index_end)]);
+    let Some(observed_hex) = IndexHex::from_bytes(&candidate[..candidate.len().min(index_end)])
+    else {
+        out.status = "invalid_evidence_range";
+        return out;
+    };
+    out.index_observed_hex = observed_hex;
     let Some(complete) = candidate.get(..index_end) else {
         out.status = "sample_truncated_index";
         return out;
@@ -822,6 +901,110 @@ mod tests {
         assert_eq!(out["whole_stream_validated"], false);
         assert_eq!(out["content_decompressed"], false);
     }
+
+    #[cfg(feature = "experimental-xz-index")]
+    #[test]
+    fn index_observation_and_preallocated_serialization_do_not_allocate() {
+        let data = bytes("00011101ada65804");
+        let block = FirstBlock {
+            unpadded_block_bytes: Some(17),
+            uncompressed_size: Some(Integer {
+                start_offset: 0,
+                end_offset_exclusive: 1,
+                raw_hex: "01".to_owned(),
+                value: 1,
+            }),
+            ..FirstBlock::default()
+        };
+        let mut encoded = Vec::with_capacity(4096);
+        let (index, allocations) = crate::tests::observed_allocations(|| {
+            let index = observe_index(&data, &block, 0);
+            serde_json::to_writer(&mut encoded, &index).unwrap();
+            index
+        });
+        assert_eq!(index.status, "complete");
+        assert_eq!(index.crc32_valid, Some(true));
+        assert_eq!(
+            allocations, 0,
+            "Index evidence must not allocate temporary hex strings"
+        );
+        assert!(!std::mem::needs_drop::<IndexObservation>());
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["record_unpadded_size"]["raw_hex"], "11");
+        assert_eq!(value["index_observed_hex"], "00011101ada65804");
+    }
+
+    #[cfg(feature = "experimental-xz-index")]
+    #[test]
+    fn inline_index_hex_serializes_exact_bounded_bytes() {
+        assert_eq!(serde_json::to_string(&IndexHex::default()).unwrap(), "\"\"");
+        let bytes: Vec<u8> = (0..=255).collect();
+        for chunk in bytes.chunks(24) {
+            let evidence = IndexHex::from_bytes(chunk).unwrap();
+            assert_eq!(serde_json::to_value(&evidence).unwrap(), hex(chunk));
+        }
+        let mut input = [0xff; 24];
+        let evidence = IndexHex::from_bytes(&input).unwrap();
+        input.fill(0);
+        assert_eq!(serde_json::to_value(evidence).unwrap(), "ff".repeat(24));
+        assert!(IndexHex::from_bytes(&[0; 25]).is_none());
+    }
+
+    #[cfg(feature = "experimental-xz-index")]
+    #[test]
+    fn inline_index_integer_matches_header_decoder_cursor_and_evidence() {
+        for literal in [
+            "",
+            "00",
+            "01",
+            "7f",
+            "8000",
+            "8001",
+            "81",
+            "8180",
+            "ffffffffffffffff7f",
+            "808080808080808080",
+            "0100",
+        ] {
+            let data = bytes(literal);
+            for length in 0..=data.len() {
+                let prefix = &data[..length];
+                for start in 0..=length + 1 {
+                    let mut old_cursor = start;
+                    let mut new_cursor = start;
+                    let old = vli(prefix, &mut old_cursor, prefix.len(), 7);
+                    let new = index_integer(prefix, &mut new_cursor, 7);
+                    assert_eq!(
+                        new_cursor, old_cursor,
+                        "{literal} length={length} start={start}"
+                    );
+                    match (old, new) {
+                        (Some(old), Ok(new)) => assert_eq!(
+                            serde_json::to_string(&new).unwrap(),
+                            serde_json::to_string(&old).unwrap(),
+                        ),
+                        (None, Err(status)) => {
+                            let truncated = start == prefix.len()
+                                || (old_cursor == prefix.len()
+                                    && old_cursor - start < 9
+                                    && prefix[old_cursor - 1] & 0x80 != 0);
+                            assert_eq!(
+                                status,
+                                if truncated {
+                                    "sample_truncated_vli"
+                                } else {
+                                    "invalid_vli"
+                                }
+                            );
+                        }
+                        _ => panic!(
+                            "Decoder disagreement for {literal} length={length} start={start}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
     #[cfg(feature = "experimental-xz-index")]
     fn with_index(index: &str) -> Vec<u8> {
         let mut data = bytes("fd377a585a000000ff12d94102c0050121010000f05dfb9f0100004100000000");
@@ -891,7 +1074,7 @@ mod tests {
             assert_eq!(index.status, status, "{literal}");
             assert_eq!(index.unpadded_size_relationship, unpadded, "{literal}");
             assert_eq!(index.uncompressed_size_relationship, unpacked, "{literal}");
-            assert!(index.candidate_preview_hex.len() <= 48);
+            assert!(index.candidate_preview_hex.len <= 24);
             assert!(!out.content_decompressed);
         }
         let mut data = with_index("00011101ada65804");
@@ -923,14 +1106,17 @@ mod tests {
                 if let Some(index) = out.following_index {
                     assert_ne!(index.status, "complete", "{literal} length={length}");
                     assert_eq!(index.unpadded_size_relationship, "unqualified");
-                    assert!(index.index_observed_hex.len() <= 48);
+                    assert!(index.index_observed_hex.len <= 24);
                 }
             }
             let index = observe(&data, 0, true, Some(0)).following_index.unwrap();
             assert_eq!(index.status, expected_status, "{literal}");
             assert_eq!(index.crc32_valid, Some(true));
             assert_eq!(index.end_offset_exclusive, Some(data.len() as u64));
-            assert_eq!(index.index_observed_hex, literal);
+            assert_eq!(
+                serde_json::to_value(&index.index_observed_hex).unwrap(),
+                literal
+            );
             let mut embedded = vec![0x77; 7];
             embedded.extend(&data);
             let shifted = observe(&embedded, 7, true, Some(0))
@@ -1020,7 +1206,10 @@ mod tests {
         data.truncate(32);
         let index = observe(&data, 0, true, Some(0)).following_index.unwrap();
         assert_eq!(index.status, "not_sampled");
-        assert!(index.candidate_preview_hex.is_empty());
+        assert_eq!(
+            serde_json::to_value(&index.candidate_preview_hex).unwrap(),
+            ""
+        );
     }
     #[cfg(feature = "experimental-xz-index")]
     #[test]
