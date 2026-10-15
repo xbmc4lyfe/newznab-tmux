@@ -106,6 +106,38 @@ final class Nima4kSource extends BoundedHttpFeedSource
             libxml_use_internal_errors($previous);
         }
         $provenanceHtml = $this->maskProvenInertContents($html, $reference);
+        $outsideValues = $document;
+        if ($provenanceHtml !== $html) {
+            // Some legacy parsers decode C1 references inside genuine foreign CDATA. Validate
+            // outside values on only the native-proven projection, never on a broader raw-text mask.
+            $outsideValues = new DOMDocument;
+            $previous = libxml_use_internal_errors(true);
+            libxml_clear_errors();
+            try {
+                $loaded = $outsideValues->loadHTML('<?xml encoding="UTF-8">'.$provenanceHtml, LIBXML_NONET);
+                $outsideErrors = libxml_get_errors();
+            } finally {
+                libxml_clear_errors();
+                libxml_use_internal_errors($previous);
+            }
+            if (! $loaded) {
+                throw new RuntimeException('NIMA4K returned invalid HTML.');
+            }
+            foreach ($outsideErrors as $error) {
+                $discardedName = $error->code === 68 && in_array(trim($error->message), [
+                    'htmlParseStartTag: invalid element name',
+                    'error parsing attribute name',
+                ], true);
+                if ($error->level === LIBXML_ERR_FATAL || in_array($error->code, [42, 45, 47, 61, 73, 800, 802], true) || $discardedName) {
+                    throw new RuntimeException('NIMA4K returned invalid HTML.');
+                }
+            }
+            $projectionPaths = [];
+            if ($this->validatedReleaseCards($document, $projectionPaths) !== $this->validatedReleaseCards($outsideValues, $projectionPaths)) {
+                throw new RuntimeException('NIMA4K returned inconsistent HTML release semantics.');
+            }
+        }
+        $this->assertDecodedValues($outsideValues);
 
         // This parser reports discarded controls, surrogates and overflowing references as code 9.
         $unexpectedClosingTag = null;
@@ -147,6 +179,7 @@ final class Nima4kSource extends BoundedHttpFeedSource
         if ($this->hasDisallowedControlReference($html, $hasControlReference)) {
             throw new RuntimeException('NIMA4K returned an invalid numeric character reference.');
         }
+        $this->assertDecodedValues($reference);
         if ($cards !== $this->validatedReleaseCards($reference, $pathInterner)) {
             throw new RuntimeException('NIMA4K returned inconsistent HTML release semantics.');
         }
@@ -188,11 +221,7 @@ final class Nima4kSource extends BoundedHttpFeedSource
         return false;
     }
 
-    /**
-     * @param  array<string, int>  $pathInterner
-     * @return list<array{article: int, subtitle: int, cover: int, title: string}>
-     */
-    private function validatedReleaseCards(DOMDocument|HTMLDocument $document, array &$pathInterner): array
+    private function assertDecodedValues(DOMDocument|HTMLDocument $document): void
     {
         if ($document instanceof HTMLDocument) {
             $xpath = new HtmlXPath($document);
@@ -213,6 +242,23 @@ final class Nima4kSource extends BoundedHttpFeedSource
             if (preg_match(self::FORBIDDEN_CHARACTERS, $value->nodeValue ?? '') !== 0) {
                 throw new RuntimeException('NIMA4K returned invalid HTML.');
             }
+        }
+    }
+
+    /**
+     * @param  array<string, int>  $pathInterner
+     * @return list<array{article: int, subtitle: int, cover: int, title: string}>
+     */
+    private function validatedReleaseCards(DOMDocument|HTMLDocument $document, array &$pathInterner): array
+    {
+        if ($document instanceof HTMLDocument) {
+            $xpath = new HtmlXPath($document);
+            $xpath->registerNamespace('h', self::HTML_NAMESPACE);
+            $prefix = 'h:';
+        } else {
+            $this->assertUtf8Encoding($document);
+            $xpath = new DOMXPath($document);
+            $prefix = '';
         }
         $templateFilter = $document instanceof HTMLDocument ? '[not(ancestor::h:template)]' : '';
         $articles = $xpath->query('//'.$prefix.'div['.$this->classToken('article').']'.$templateFilter);

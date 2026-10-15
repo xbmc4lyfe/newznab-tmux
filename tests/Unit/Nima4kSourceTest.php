@@ -1213,6 +1213,69 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('foreignCdataPortabilityOutsideValues')]
+    public function foreign_cdata_portability_preserves_outside_value_rejection(string $fragment, bool $beforeCdata): void
+    {
+        $cdata = '<svg><![CDATA[&#128; &#x81; &#xD800;]]></svg>';
+        $html = $this->card('First.Release-GRP').($beforeCdata ? $fragment.$cdata : $cdata.$fragment);
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function foreignCdataPortabilityOutsideValues(): array
+    {
+        return [
+            'C1 in HTML text before proven CDATA' => ['<p>&#x81;</p>', true],
+            'C1 in foreign decoded text after proven CDATA' => ['<svg><g>&#x81;</g></svg>', false],
+            'remapped C1 in HTML attribute before proven CDATA' => ['<p data-note="&#128;">safe</p>', true],
+            'C1 in foreign attribute after proven CDATA' => ['<svg data-note="&#x81;"></svg>', false],
+            'C1 in plaintext opener attribute' => ['<plaintext data-note="&#x81;">safe', false],
+            'bogus CDATA in HTML integration child' => ['<svg><foreignObject><div><![CDATA[&#x81;]]></div></foreignObject></svg>', true],
+            'decoded marker lookalike cannot authorize bogus CDATA' => ['<svg>nima&#45;inert&#45;0&#45;zc0z</svg><![CDATA[><p>&#x81;</p><svg>later]]></svg>', false],
+            'literal C1 remains forbidden inside foreign CDATA' => ["<svg><![CDATA[\u{0081}]]></svg>", false],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('foreignCdataPortabilityMalformedCards')]
+    public function foreign_cdata_portability_preserves_original_card_validation(string $subtitle, string $cover, bool $afterLimit): void
+    {
+        $card = str_replace('>Exact.Release-GRP</span>', '>'.$subtitle.'</span>', $this->card('Exact.Release-GRP'));
+        $card = str_replace('alt="Exact.Release-GRP"', 'alt="'.$cover.'"', $card);
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').'<svg><![CDATA[&#128; &#x81; &#xD800;]]></svg>'.$card;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, string, bool}> */
+    public static function foreignCdataPortabilityMalformedCards(): array
+    {
+        $cases = [];
+        foreach ([
+            'malformed subtitle close' => ['Exact.</b>Release-GRP', 'Exact.Release-GRP'],
+            'agreeing decoded C1 labels' => ['Exact.&#x81;Release-GRP', 'Exact.&#x81;Release-GRP'],
+        ] as $label => [$subtitle, $cover]) {
+            $cases[$label.' first card'] = [$subtitle, $cover, false];
+            $cases[$label.' after record limit'] = [$subtitle, $cover, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    public function foreign_cdata_portability_preserves_once_escaped_c1_labels(): void
+    {
+        $literal = 'Exact.&#x81;Release-GRP';
+        $html = $this->card($literal).'<svg><![CDATA[&#128; &#x81; &#xD800;]]></svg>';
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame([$literal], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    #[Test]
     #[DataProvider('foreignCdataMalformedCardBoundaries')]
     public function foreign_cdata_context_cannot_hide_malformed_cards(string $before, string $after, bool $afterLimit): void
     {
