@@ -277,6 +277,8 @@ def utility_summary(kind, report):
         invalid |= type(report.get("adoption_gate_pass")) is not bool
     else:
         invalid |= report.get("invalid_observations") != [] or protocol.get("backend") != kind.removeprefix("fingerprint-")
+        if "candidate_status" in report:
+            invalid |= report["candidate_status"] != "experimental_withdrawn_from_production"
     rows = []
     for fixture in expected:
         if fixture not in measured:
@@ -337,6 +339,8 @@ def utility_summary(kind, report):
                 baseline_revision=revision, source_sha256=identities,
                 protocol_sha256=hashlib.sha256(json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                 evidence_type="synthetic_cli_comparison" if cpu else "paired_public_operation_median_screen")
+    if not cpu and report.get("candidate_status") == "experimental_withdrawn_from_production":
+        result["candidate_status"] = "experimental_withdrawn_from_production"
     if cpu:
         result["measurement_protocol_version"] = version if type(version) is int and version in (2, 3) else 0
         result["confidence_status"] = ("historical_unqualified" if version == 2 else
