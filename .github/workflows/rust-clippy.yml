@@ -36,7 +36,8 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --component rustfmt
+        shell: bash
+        run: source scripts/clippy-rust-toolchain.sh
 
       - name: Check Rust formatting
         run: cargo +"$RUST_TOOLCHAIN" fmt --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --all -- --check
