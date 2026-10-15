@@ -141,7 +141,7 @@ class VerifyReleaseCandidates extends Command
                 } catch (Throwable $error) {
                     $filtered = $this->filteredResult($claim);
                     if ($filtered !== null) {
-                        $this->line($claim->id.': filtered — '.$filtered->reason);
+                        $this->line($claim->id.': '.$filtered->verdict.' — '.$filtered->reason);
                     } else {
                         $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
                         $this->warn($claim->id.': retry pending — '.$error->getMessage());
@@ -222,7 +222,7 @@ class VerifyReleaseCandidates extends Command
                         : DB::table('release_verification_candidates')->where('id', $entry->candidate_id)
                             ->where('version', '>=', $entry->version)
                             ->where(function ($query): void {
-                                $query->whereIn('status', ['expired', 'filtered'])
+                                $query->whereIn('status', ['expired', 'filtered', 'metadata_review', 'metadata_deferred', 'metadata_expired'])
                                     ->orWhere(fn ($published) => $published->whereNotNull('release_id')->whereIn('status', ['complete', 'repaired', 'sampled']));
                             })
                             ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))
@@ -294,8 +294,8 @@ class VerifyReleaseCandidates extends Command
     private function filteredResult(object $claim): ?VerificationResult
     {
         $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->where('version', $claim->version)
-            ->where('manifest_hash', $claim->manifest_hash)->where('status', 'filtered')->whereNull('release_id')->first();
+            ->where('manifest_hash', $claim->manifest_hash)->whereIn('status', ['filtered', 'metadata_review'])->whereNull('release_id')->first();
 
-        return $candidate === null ? null : new VerificationResult('filtered', (string) $candidate->reason);
+        return $candidate === null ? null : new VerificationResult((string) $candidate->status, (string) $candidate->reason);
     }
 }

@@ -103,6 +103,9 @@ docker/Makefile		-binary text eol=lf
 /tests/Unit/test_benchmark_resource_limits.py -binary text eol=lf
 /tests/Unit/test_benchmark_remaining_modules_export.py -binary text eol=lf
 
+# Custody benchmark protocol and Rust candidate are reviewable source.
+/benchmarks/nzb-custody/compare.py -binary text eol=lf
+/benchmarks/nzb-custody/sync.rs -binary text eol=lf
 # Clippy setup regression is reviewable Python source.
 /tests/Unit/test_clippy_toolchain.py -binary text eol=lf
 # Public benchmark inventory and deployment verification are reviewable source.

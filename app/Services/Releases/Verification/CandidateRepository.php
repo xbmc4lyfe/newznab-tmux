@@ -6,7 +6,9 @@ namespace App\Services\Releases\Verification;
 
 use App\Exceptions\CandidateMetadataBudgetExceeded;
 use App\Services\CollectionCleanupService;
+use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbService;
+use App\Support\NzbPasswordMetadata;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -166,52 +168,225 @@ final class CandidateRepository
     }
 
     /** @param array<string, mixed> $manifest */
-    public function enqueue(array $manifest): void
+    public function enqueue(array $manifest, ?\Closure $onAdmitted = null): bool
     {
-        app(VerificationResetService::class)->withAdmission(function () use ($manifest): void {
-            // Avoid preparing known replays; the locked read remains authoritative below.
-            $prepared = DB::table('release_verification_candidates')->where('identity', (string) $manifest['identity'])->exists()
-                ? null : $this->store->prepare($manifest);
+        if (array_key_exists('passwords', $manifest) && ! NzbPasswordMetadata::isValid($manifest['passwords'])) {
+            return false;
+        }
+        $accepted = false;
+        $capacityDeferred = false;
+        $publicationDeferred = false;
+        app(VerificationResetService::class)->withAdmission(function () use ($manifest, &$accepted, &$capacityDeferred, &$publicationDeferred, $onAdmitted): void {
+            // Prepare incoming assertions before capacity ownership. The authoritative
+            // locked comparison below admits only this exact manifest/prepared pair.
+            // Passwordless known replays retain their existing cheap path.
+            $observed = DB::table('release_verification_candidates')->where('identity', (string) $manifest['identity'])->first(['release_id']);
+            $prepared = ($manifest['passwords'] ?? []) !== [] || $observed === null
+                ? $this->store->prepare($manifest) : null;
+            $replayXml = $observed?->release_id !== null && ($manifest['passwords'] ?? []) !== []
+                ? app(VerifiedNzbWriter::class)->document($manifest) : null;
             $headerAssessment = $prepared === null ? null : (new CandidateHeaderInventory)->assessment($manifest);
-            DB::transaction(function () use ($manifest, $prepared, $headerAssessment): void {
-                $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
-                $identity = (string) $manifest['identity'];
-                $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
-                if ($existing !== null && ($existing->release_id === null
-                    || DB::table('releases')->where('id', $existing->release_id)->lockForUpdate()->first(['id']) !== null)) {
-                    return;
-                }
-                if ($state === null) {
-                    throw new RuntimeException('Verification migration has not initialized capacity state.');
-                }
-                $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
-                $bytes = (int) filesize($this->store->path($path));
-                $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + $bytes;
-                if ($pending > (int) config('release_verification.pending_bytes')) {
-                    if ($existing === null || $existing->manifest_path !== $path) {
-                        $this->store->deleteIfUnreferenced($path);
+            $accepted = DB::transaction(function () use ($manifest, $prepared, $headerAssessment, $replayXml, &$capacityDeferred, &$publicationDeferred, $onAdmitted): bool {
+                $admit = function () use ($manifest, $prepared, $headerAssessment, $replayXml, &$capacityDeferred, &$publicationDeferred): bool {
+                    $capacityDeferred = false;
+                    $publicationDeferred = false;
+                    $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                    $identity = (string) $manifest['identity'];
+                    $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
+                    $release = $existing?->release_id === null ? null
+                        : DB::table('releases')->where('id', $existing->release_id)->lockForUpdate()->first(['id', 'guid', 'nzbstatus']);
+                    $metadataReadmission = $existing !== null && $existing->status === 'metadata_expired'
+                        && $existing->release_id === null && $existing->manifest_path === '' && (int) $existing->manifest_bytes === 0;
+                    if ($metadataReadmission && (($manifest['passwords'] ?? []) === []
+                        || ($manifest['metadata_source'] ?? null) !== 'import' || ($manifest['conflict'] ?? false))) {
+                        return false;
                     }
-                    throw new RuntimeException('Candidate capacity is full; import retained for retry.');
-                }
-                $assessment = $headerAssessment ?? (new CandidateHeaderInventory)->assessment($manifest);
-                $values = ['identity' => $identity, 'source_identity' => $identity,
-                    'groups_id' => (int) $manifest['groups_id'], 'manifest_path' => $path, 'manifest_bytes' => $bytes,
-                    'manifest_hash' => substr($path, 0, 64), 'last_unique_at' => now(), 'next_attempt_at' => now(),
-                    'version' => (int) ($existing->version ?? 0) + 1, 'status' => $assessment['status'], 'reason' => $assessment['reason'],
-                    'release_id' => null, 'verified_at' => null, 'lease_token' => null, 'lease_until' => null];
-                if ($existing === null) {
-                    DB::table('release_verification_candidates')->insert($values);
-                } else {
-                    DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
-                    if ($existing->manifest_path !== '' && $existing->manifest_path !== $path) {
-                        DB::afterCommit(function () use ($existing): void {
-                            $this->store->deleteIfUnreferenced($existing->manifest_path);
-                        });
+                    if ($existing !== null && ! $metadataReadmission && ($existing->release_id === null || $release !== null)) {
+                        if ($release !== null && ($manifest['passwords'] ?? []) !== []) {
+                            if ($replayXml === null) {
+                                $publicationDeferred = true;
+
+                                return false;
+                            }
+
+                            return $this->identicalPublishedReplay($existing, $release, $manifest, $prepared, $replayXml);
+                        }
+
+                        return $this->enrichImportedPasswordMetadata($existing, $manifest, $state, $capacityDeferred, $prepared);
                     }
+                    if ($state === null) {
+                        throw new RuntimeException('Verification migration has not initialized capacity state.');
+                    }
+                    $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
+                    $bytes = (int) filesize($this->store->path($path));
+                    $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + $bytes;
+                    if ($pending > (int) config('release_verification.pending_bytes')) {
+                        if ($existing === null || $existing->manifest_path !== $path) {
+                            $this->store->deleteIfUnreferenced($path);
+                        }
+                        throw new CandidateCapacityException('Candidate capacity is full; import retained for retry.');
+                    }
+                    $assessment = $headerAssessment ?? (new CandidateHeaderInventory)->assessment($manifest);
+                    $values = ['identity' => $identity, 'source_identity' => $identity,
+                        'groups_id' => (int) $manifest['groups_id'], 'manifest_path' => $path, 'manifest_bytes' => $bytes,
+                        'manifest_hash' => substr($path, 0, 64), 'last_unique_at' => now(), 'next_attempt_at' => now(),
+                        'version' => (int) ($existing->version ?? 0) + 1, 'status' => $assessment['status'], 'reason' => $assessment['reason'],
+                        'release_id' => null, 'verified_at' => null, 'lease_token' => null, 'lease_until' => null];
+                    if ($existing === null) {
+                        DB::table('release_verification_candidates')->insert($values);
+                    } else {
+                        DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
+                        if ($existing->manifest_path !== '' && $existing->manifest_path !== $path) {
+                            DB::afterCommit(function () use ($existing): void {
+                                $this->store->deleteIfUnreferenced($existing->manifest_path);
+                            });
+                        }
+                    }
+                    DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
+
+                    return true;
+                };
+                $ok = $admit();
+                if ($ok && $onAdmitted !== null) {
+                    $row = DB::table('release_verification_candidates')->where('identity', $manifest['identity'])->lockForUpdate()->first();
+                    if ($row === null) {
+                        throw new RuntimeException('Accepted candidate disappeared under admission lock');
+                    }
+                    $onAdmitted(new CandidateAdmission((int) $row->id, (string) $row->identity, (int) $row->version, (string) $row->manifest_hash));
                 }
-                DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
+
+                return $ok;
             }, 5);
         });
+
+        if ($publicationDeferred) {
+            throw new CandidateAdmissionDeferredException('Publication changed during admission; import retained for retry.');
+        }
+
+        if ($capacityDeferred) {
+            // Signal after the admission transaction commits its lease fence.
+            throw new CandidateCapacityException('Metadata capacity is full; import retained for retry.');
+        }
+
+        return $accepted;
+    }
+
+    /**
+     * Return the exact accepted revision while its admission transaction owns the locks.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    public function enqueueWithAdmission(array $manifest): ?CandidateAdmission
+    {
+        $receipt = null;
+        $accepted = $this->enqueue($manifest, static function (CandidateAdmission $value) use (&$receipt): void {
+            $receipt = $value;
+        });
+
+        return $accepted ? $receipt : null;
+    }
+
+    /** @param array<string, mixed> $manifest */
+    private function identicalPublishedReplay(object $existing, object $release, array $manifest, ?PreparedManifest $prepared, ?string $replayXml): bool
+    {
+        // The caller owns admission, capacity, and candidate locks in that order.
+        if ((string) $release->guid === '' || (int) $release->nzbstatus !== NzbService::NZB_ADDED
+            || ! in_array($existing->status, ['complete', 'repaired', 'sampled'], true) || $existing->verified_at === null
+            || $existing->manifest_path !== '' || (int) $existing->manifest_bytes !== 0
+            || $prepared === null || $replayXml === null || ! hash_equals((string) $existing->manifest_hash, substr($prepared->name, 0, 64))
+            || ($manifest['metadata_source'] ?? null) !== 'import' || ($manifest['conflict'] ?? false)) {
+            return false;
+        }
+        $coverage = app(NzbArticleCoverage::class);
+        $incoming = $coverage->parseXml($replayXml);
+        if ($incoming === null || ($snapshot = $coverage->coveredSnapshot($incoming, (string) $release->guid)) === null) {
+            throw new CandidateAdmissionDeferredException('Publication evidence is unavailable for exact metadata replay.');
+        }
+
+        try {
+            $retained = (new NzbManifestReader)->read((string) $snapshot->asXML(), (object) [
+                'searchname' => $manifest['subject'], 'fromname' => $manifest['fromname'],
+                'postdate' => $manifest['date'], 'groups_id' => $manifest['groups_id'],
+            ]);
+        } catch (RuntimeException) {
+            throw new CandidateAdmissionDeferredException('Retained publication metadata cannot be read.');
+        }
+
+        return ($retained['passwords'] ?? []) === ($manifest['passwords'] ?? []);
+    }
+
+    /**
+     * Fill explicit uploader metadata only for an otherwise identical unpublished import.
+     * Caller holds the capacity row and candidate locks in admission order.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    private function enrichImportedPasswordMetadata(object $existing, array $manifest, ?object $state, bool &$capacityDeferred, ?PreparedManifest $prepared): bool
+    {
+        if (! array_key_exists('passwords', $manifest) || $manifest['passwords'] === []) {
+            $capacityDeferred = $existing->status === 'metadata_deferred';
+
+            return ! in_array($existing->status, ['metadata_deferred', 'metadata_review', 'metadata_expired'], true);
+        }
+        if ($existing->release_id !== null || $existing->manifest_path === ''
+            || ! in_array($existing->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'verifying', 'metadata_deferred'], true)
+            || ($manifest['metadata_source'] ?? null) !== 'import' || ($manifest['conflict'] ?? false)) {
+            return false;
+        }
+        $passwords = $manifest['passwords'] ?? [];
+        $original = $this->store->read($existing->manifest_path);
+        if (($original['metadata_source'] ?? null) !== 'import' || ($original['conflict'] ?? false)) {
+            return false;
+        }
+        $incoming = $manifest;
+        $comparison = $original;
+        unset($incoming['passwords'], $comparison['passwords']);
+        // Compare exactly the bytes that preparation hashes, without compressing either
+        // throwaway comparison. Preserve key order, types, and UTF-8 substitution policy.
+        if (json_encode($incoming, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE)
+            !== json_encode($comparison, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE)) {
+            return false;
+        }
+        if (($original['passwords'] ?? []) !== []) {
+            return $original['passwords'] === $passwords;
+        }
+        if ($state === null) {
+            throw new RuntimeException('Verification migration has not initialized capacity state.');
+        }
+        if ($prepared === null) {
+            throw new RuntimeException('Explicit metadata must be prepared before admission.');
+        }
+        // Current locked metadata matches the complete incoming manifest. Install
+        // its exact precomputed pair without compression under capacity ownership.
+        $original = $manifest;
+        $path = $this->store->writePrepared($prepared);
+        $bytes = (int) filesize($this->store->path($path));
+        $pending = (int) $state->pending_bytes - (int) $existing->manifest_bytes + $bytes;
+        if ($pending > (int) config('release_verification.pending_bytes')) {
+            $this->store->deleteIfUnreferenced($path);
+            // Keep the original bounded manifest/capacity, but prevent its passwordless publication.
+            // Expiry releases this reservation while retaining a metadata fence; the
+            // uploader source owns the additional metadata outside this reservation.
+            DB::table('release_verification_candidates')->where('id', $existing->id)->update([
+                'status' => 'metadata_deferred', 'reason' => 'Explicit metadata awaits capacity.',
+                'version' => (int) $existing->version + 1, 'lease_token' => null, 'lease_until' => null,
+            ]);
+            $capacityDeferred = true;
+
+            return false;
+        }
+        $assessment = (new CandidateHeaderInventory)->assessment($original);
+        DB::table('release_verification_candidates')->where('id', $existing->id)->update([
+            'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => $bytes,
+            'version' => (int) $existing->version + 1, 'status' => $assessment['status'], 'reason' => $assessment['reason'],
+            'next_attempt_at' => now(), 'lease_token' => null, 'lease_until' => null,
+        ]);
+        DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
+        DB::afterCommit(function () use ($existing): void {
+            $this->store->deleteIfUnreferenced($existing->manifest_path);
+        });
+
+        return true;
     }
 
     /** @param list<int> $ids */
@@ -401,7 +576,7 @@ final class CandidateRepository
             return;
         }
         $ids = DB::table('release_verification_candidates')->whereNull('release_id')
-            ->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'unrepairable', 'verifying', 'dirty'])
+            ->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'unrepairable', 'verifying', 'dirty', 'metadata_deferred', 'metadata_review'])
             ->where('last_unique_at', '<', now()->subHours((int) config('release_verification.expiry_hours')))
             ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
             ->orderBy('id')->limit(100)->pluck('id');
@@ -413,13 +588,14 @@ final class CandidateRepository
                 DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                 $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
                 if ($row === null || $row->release_id !== null
-                    || ! in_array($row->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'unrepairable', 'verifying', 'dirty'], true)
+                    || ! in_array($row->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'unrepairable', 'verifying', 'dirty', 'metadata_deferred', 'metadata_review'], true)
                     || $row->last_unique_at >= now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s')
                     || ($row->lease_until !== null && $row->lease_until >= now()->format('Y-m-d H:i:s'))) {
                     return;
                 }
                 DB::table('release_verification_state')->where('id', 1)->decrement('pending_bytes', (int) $row->manifest_bytes);
-                DB::table('release_verification_candidates')->where('id', $id)->update(['status' => 'expired',
+                DB::table('release_verification_candidates')->where('id', $id)->update(['status' => in_array($row->status, ['metadata_deferred', 'metadata_review'], true) ? 'metadata_expired' : 'expired',
+                    'version' => (int) $row->version + 1,
                     'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
                 DB::afterCommit(function () use ($row): void {
                     $this->store->deleteIfUnreferenced($row->manifest_path);

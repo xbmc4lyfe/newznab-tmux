@@ -107,7 +107,7 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
     public function test_sweep_recovers_expired_filtered_and_repaired_scratch_left_after_cleanup_failure(): void
     {
         $directories = [];
-        foreach (['expired', 'filtered', 'repaired', 'sampled'] as $index => $status) {
+        foreach (['expired', 'filtered', 'metadata_review', 'metadata_deferred', 'metadata_expired', 'repaired', 'sampled'] as $index => $status) {
             $directories[] = $this->candidateScratch($index + 1, $status);
         }
 
