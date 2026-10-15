@@ -747,6 +747,120 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('delayedReviewInertFragments')]
+    public function delayed_review_inert_text_preserves_literal_card_order(string $fragment): void
+    {
+        $html = $this->card('Exact.&period;.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/'))->parseHtml($html);
+
+        $this->assertSame(['Exact.&period;.Release-GRP', 'Second.Release-GRP'], array_map(static fn (PredbFeedEntry $entry): string => $entry->title, $entries));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function delayedReviewInertFragments(): array
+    {
+        $cases = [
+            'iframe apparent invalid attribute' => ['<iframe><foo "bad"></iframe>'],
+            'title apparent invalid attribute' => ['<title><foo "bad"></title>'],
+            'double escaped script' => ['<script><!--<script></script>&#1; </b></script>'],
+            'ordinary script literal control' => ['<script>&#1; </b></script>'],
+            'mixed case double escaped script' => ['<ScRiPt><!--<ScRiPt></sCrIpT>&#1; </b></ScRiPt>'],
+            'repeated double escaped script transitions' => ['<script><!--<script></script><script></script>&#1; </b></script>'],
+            'script close name needs delimiter' => ['<script></scripted>&#1; </b></script>'],
+            'empty text elements retain their boundaries' => ['<iframe></iframe><title></title><script></script>'],
+            'decoded closing marker lookalike remains literal' => ['<p>nima&#45;inert&#45;0&#45;ze1z</p><iframe><foo "bad"></iframe>'],
+            'quoted fake text element does not obscure genuine text' => ['<div data-note="<iframe>fake</iframe>"></div><iframe><foo "bad"></iframe>'],
+        ];
+        foreach (['iframe', 'title', 'textarea', 'xmp', 'noembed', 'noframes'] as $tag) {
+            $cases[$tag.' apparent conflicting metadata'] = ['<'.$tag.'><meta charset=windows-1252></'.$tag.'>'];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('delayedReviewActiveTails')]
+    public function delayed_review_inert_text_does_not_waive_active_tail_errors(string $fragment): void
+    {
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($this->card('First.Release-GRP').$fragment);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function delayedReviewActiveTails(): array
+    {
+        return [
+            'invalid attribute after iframe close' => ['<iframe>safe</iframe><foo "bad">'],
+            'invalid attribute after title close' => ['<title>safe</title><foo "bad">'],
+            'real conflicting metadata after iframe close' => ['<iframe>safe</iframe><meta charset=windows-1252>'],
+            'real conflicting metadata after title close' => ['<title>safe</title><meta charset=windows-1252>'],
+            'decoded control after double escaped script close' => ['<script><!--<script></script>safe</script><p>&#1;</p>'],
+            'malformed markup after double escaped script close' => ['<script><!--<script></script>safe</script><foo "bad">'],
+            'title still decodes numeric controls' => ['<title><foo "bad">&#1;</title>'],
+            'textarea still decodes numeric controls' => ['<textarea><meta charset=windows-1252>&#1;</textarea>'],
+            'foreign script still decodes numeric controls' => ['<svg><script>&#1;</script></svg>'],
+            'foreign title still decodes numeric controls' => ['<svg><title>&#1;</title></svg>'],
+            'raw text opener attribute remains decoded' => ['<iframe data-note="&#1;">safe</iframe>'],
+            'RCDATA C1 remains decoded' => ['<title>&#x81;</title>'],
+            'escaped script actual close leaves decoded tail' => ['<script><!--safe</script><p>&#1;</p>'],
+            'false close does not prove unterminated double escaped script' => ['<script><!--<script></script>&#1;'],
+            'incomplete script end token stays rejected' => ['<script>&#1;</script '],
+            'quoted incomplete script end token stays rejected' => ['<script>&#1;</script data-note=">'],
+            'HTML integration metadata remains active' => ['<svg><foreignObject><meta charset=windows-1252></foreignObject></svg>'],
+            'real metadata after double escaped script remains active' => ['<script><!--<script></script>safe</script><meta charset=windows-1252>'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('delayedReviewMalformedCards')]
+    public function delayed_review_inert_text_preserves_full_card_validation(string $fragment, bool $afterLimit): void
+    {
+        $malformed = str_replace('>Exact.Release-GRP</span>', '>Exact.</b>Release-GRP</span>', $this->card('Exact.Release-GRP'));
+        $html = ($afterLimit ? $this->card('First.Release-GRP') : '').$fragment.$malformed;
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function delayedReviewMalformedCards(): array
+    {
+        $cases = [];
+        foreach ([
+            'apparent invalid attribute' => '<iframe><foo "bad"></iframe>',
+            'apparent conflicting metadata' => '<iframe><meta charset=windows-1252></iframe>',
+            'double escaped script' => '<script><!--<script></script>&#1; </b></script>',
+        ] as $label => $fragment) {
+            $cases[$label.' before first card'] = [$fragment, false];
+            $cases[$label.' beyond page limit'] = [$fragment, true];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('delayedReviewDoubleEscapedCards')]
+    public function delayed_review_double_escaped_script_cannot_expose_inert_cards(bool $afterLimit): void
+    {
+        $hidden = '<script><!--<script></script>'.$this->card('Hidden.Release-GRP').'</script>';
+        $html = $afterLimit
+            ? $this->card('First.Release-GRP').$hidden
+            : $hidden.$this->card('Visible.Release-GRP');
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{bool}> */
+    public static function delayedReviewDoubleEscapedCards(): array
+    {
+        return [
+            'inert card before visible card' => [false],
+            'inert card beyond page limit' => [true],
+        ];
+    }
+
+    #[Test]
     #[DataProvider('semanticInertCards')]
     public function semantic_inert_cards_are_rejected_without_closing_tag_diagnostics(string $tag, bool $afterLimit): void
     {

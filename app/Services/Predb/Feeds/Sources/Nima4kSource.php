@@ -105,11 +105,13 @@ final class Nima4kSource extends BoundedHttpFeedSource
             libxml_clear_errors();
             libxml_use_internal_errors($previous);
         }
-        $provenanceHtml = $this->maskProvenInertContents($html, $reference);
+        $projections = $this->maskProvenInertContents($html, $reference);
+        $provenanceHtml = $projections['markup'];
+        $this->assertUtf8Encoding($reference);
         $outsideValues = $document;
         if ($provenanceHtml !== $html) {
-            // Some legacy parsers decode C1 references inside genuine foreign CDATA. Validate
-            // outside values on only the native-proven projection, never on a broader raw-text mask.
+            // Legacy parsers can expose phantom tags/encodings or decode inert references. Only
+            // native-proven text spans may change this outside-value view; original labels stay intact.
             $outsideValues = new DOMDocument;
             $previous = libxml_use_internal_errors(true);
             libxml_clear_errors();
@@ -157,7 +159,7 @@ final class Nima4kSource extends BoundedHttpFeedSource
             if ($error->code === 76 && ($unexpectedClosingTag ??= $this->hasMaskedDiagnostic($html, $document, 76, $provenanceHtml))) {
                 throw new RuntimeException('NIMA4K returned invalid HTML.');
             }
-            if ($error->code === 9 && ($invalidNumericReference ??= $this->hasMaskedDiagnostic($html, $document, 9, $provenanceHtml))) {
+            if ($error->code === 9 && ($invalidNumericReference ??= $this->hasMaskedDiagnostic($html, $document, 9, $projections['raw']))) {
                 throw new RuntimeException('NIMA4K returned an invalid numeric character reference.');
             }
         }
@@ -256,7 +258,6 @@ final class Nima4kSource extends BoundedHttpFeedSource
             $xpath->registerNamespace('h', self::HTML_NAMESPACE);
             $prefix = 'h:';
         } else {
-            $this->assertUtf8Encoding($document);
             $xpath = new DOMXPath($document);
             $prefix = '';
         }
@@ -346,10 +347,13 @@ final class Nima4kSource extends BoundedHttpFeedSource
         return $parentId;
     }
 
-    private function maskProvenInertContents(string $html, HTMLDocument $reference): string
+    /** @return array{raw: string, markup: string} */
+    private function maskProvenInertContents(string $html, HTMLDocument $reference): array
     {
-        if (stripos($html, '<plaintext') === false && ! str_contains($html, '<![CDATA[')) {
-            return $html;
+        $unchanged = ['raw' => $html, 'markup' => $html];
+        preg_match_all('/<!\[CDATA\[|<\/?(?i:plaintext|script|style|title|textarea|iframe|xmp|noembed|noframes)(?=[\x20\t\r\n\f\/>])/', $html, $openings, PREG_OFFSET_CAPTURE);
+        if ($openings[0] === []) {
+            return $unchanged;
         }
 
         // Inventory collisions once, including entity-decoded text that could otherwise spoof a
@@ -379,24 +383,23 @@ final class Nima4kSource extends BoundedHttpFeedSource
         $length = strlen($html);
         // Discovery has no guessed HTML context: fake comments or quotes in raw text cannot hide
         // later candidates. Only the marked native parse decides which candidates are inert.
-        preg_match_all('/<!\[CDATA\[|<(?i:plaintext)(?=[\x20\t\r\n\/>])/', $html, $openings, PREG_OFFSET_CAPTURE);
         foreach ($openings[0] as [$opening, $start]) {
             $id = count($candidates);
             $end = $start + strlen($opening);
             $cdata = $opening === '<![CDATA[';
-            $candidates[] = ['kind' => $cdata ? 'cdata' : 'plaintext', 'start' => $start, 'end' => $end];
+            $closing = ! $cdata && $opening[1] === '/';
+            $tag = $cdata ? '' : strtolower(substr($opening, $closing ? 2 : 1));
+            $candidates[] = ['kind' => $cdata ? 'cdata' : ($closing ? 'close' : 'open'), 'tag' => $tag, 'start' => $start, 'end' => $end];
             // No quotes or tag delimiters are inserted into possible attribute lookalikes. Spaces
             // delimit the numeric value even before />; the original name/value prefix is retained.
-            $marker = $cdata ? $prefix.'c'.$id.'z' : ' '.$attribute.'='.$id.' ';
-            $parts[] = substr($html, $copied, $end - $copied).$marker;
-            $copied = $end;
-        }
-        if ($candidates === []) {
-            return $html;
+            $at = $closing ? $start : $end;
+            $marker = $cdata ? $prefix.'c'.$id.'z' : ($closing ? $prefix.'e'.$id.'z' : ' '.$attribute.'='.$id.' ');
+            $parts[] = substr($html, $copied, $at - $copied).$marker;
+            $copied = $at;
         }
         $parts[] = substr($html, $copied);
-        // Candidates consume at least nine disjoint source bytes. Each receives one ASCII marker
-        // whose two integers are bounded by input length; the 1 MiB input therefore grows < 6x.
+        // Candidates consume at least four disjoint source bytes. One ASCII marker per candidate,
+        // with input-bounded integer IDs, keeps the default 1 MiB annotation below 16x source size.
         $previous = libxml_use_internal_errors(true);
         libxml_clear_errors();
         try {
@@ -408,6 +411,7 @@ final class Nima4kSource extends BoundedHttpFeedSource
         $markedXpath = new HtmlXPath($marked);
         $markedXpath->registerNamespace('h', self::HTML_NAMESPACE);
         $plaintext = $markedXpath->query('//h:plaintext[@'.$attribute.']');
+        $elements = $markedXpath->query('//*[@'.$attribute.']');
         $values = $markedXpath->query('//text() | //comment() | //processing-instruction() | //@*');
         // A retained HTML plaintext opener consumes the remainder of the input. Reject ambiguity
         // before scanning an original opener, so fake candidates never cause repeated suffix scans.
@@ -415,12 +419,14 @@ final class Nima4kSource extends BoundedHttpFeedSource
             throw new RuntimeException('NIMA4K returned ambiguous inert HTML.');
         }
         $proven = [];
-        foreach ($plaintext as $node) {
+        foreach ($elements as $node) {
             if (! $node instanceof HtmlElement) {
                 throw new RuntimeException('NIMA4K returned invalid HTML.');
             }
             $id = $node->getAttribute($attribute);
-            if (ctype_digit($id) && isset($candidates[(int) $id]) && $candidates[(int) $id]['kind'] === 'plaintext') {
+            if ($node->namespaceURI === self::HTML_NAMESPACE && ctype_digit($id)
+                && isset($candidates[(int) $id]) && $candidates[(int) $id]['kind'] === 'open'
+                && strtolower($node->localName) === $candidates[(int) $id]['tag']) {
                 if (isset($proven[(int) $id])) {
                     throw new RuntimeException('NIMA4K returned ambiguous inert HTML.');
                 }
@@ -428,17 +434,33 @@ final class Nima4kSource extends BoundedHttpFeedSource
             }
         }
         $counts = [];
+        $ends = [];
         foreach ($values as $value) {
-            preg_match_all('/'.$prefix.'c(0|[1-9][0-9]*)z/', $value->nodeValue ?? '', $matches);
-            foreach ($matches[1] as $id) {
-                if (! isset($candidates[(int) $id]) || $candidates[(int) $id]['kind'] !== 'cdata') {
+            $text = $value->nodeValue ?? '';
+            preg_match_all('/'.$prefix.'([ce])(0|[1-9][0-9]*)z/', $text, $matches, PREG_SET_ORDER);
+            foreach ($matches as [$marker, $kind, $id]) {
+                if (! isset($candidates[(int) $id]) || $candidates[(int) $id]['kind'] !== ($kind === 'c' ? 'cdata' : 'close')) {
                     throw new RuntimeException('NIMA4K returned ambiguous inert HTML.');
                 }
                 $counts[(int) $id] = ($counts[(int) $id] ?? 0) + 1;
                 $parent = $value->parentNode;
                 if (in_array($value->nodeType, [XML_TEXT_NODE, XML_CDATA_SECTION_NODE], true)
-                    && $parent instanceof HtmlElement && $parent->namespaceURI !== null && $parent->namespaceURI !== self::HTML_NAMESPACE) {
-                    $proven[(int) $id] = true;
+                    && $parent instanceof HtmlElement) {
+                    if ($kind === 'c' && $parent->namespaceURI !== null && $parent->namespaceURI !== self::HTML_NAMESPACE) {
+                        $proven[(int) $id] = true;
+                    } elseif ($kind === 'e' && $parent->namespaceURI === self::HTML_NAMESPACE
+                        && $value->nextSibling === null && str_ends_with($text, $marker)
+                        && strtolower($parent->localName) === $candidates[(int) $id]['tag']) {
+                        $opener = $parent->getAttribute($attribute);
+                        if (ctype_digit($opener) && isset($proven[(int) $opener])) {
+                            if (isset($ends[(int) $opener])) {
+                                throw new RuntimeException('NIMA4K returned ambiguous inert HTML.');
+                            }
+                            // An actual close ends native text at its prefix marker. A false script
+                            // close stays literal after that marker, including double-escaped states.
+                            $ends[(int) $opener] = (int) $id;
+                        }
+                    }
                 }
             }
         }
@@ -446,7 +468,7 @@ final class Nima4kSource extends BoundedHttpFeedSource
         // attribute (for example SVG font color). Undo only fresh annotations and require the
         // entire native tree to agree before trusting any recorded namespace provenance.
         foreach ($values as $value) {
-            $restored = preg_replace('/ '.$attribute.'=(?:0|[1-9][0-9]*) |'.$prefix.'c(?:0|[1-9][0-9]*)z/', '', $value->nodeValue ?? '');
+            $restored = preg_replace('/ '.$attribute.'=(?:0|[1-9][0-9]*) |'.$prefix.'[ce](?:0|[1-9][0-9]*)z/', '', $value->nodeValue ?? '');
             if ($restored === null) {
                 throw new RuntimeException('NIMA4K returned invalid HTML.');
             }
@@ -462,76 +484,33 @@ final class Nima4kSource extends BoundedHttpFeedSource
         $reference->normalize();
         $marked->normalize();
         if (! $reference->isEqualNode($marked)) {
-            return $html;
+            return $unchanged;
         }
-        $parts = [];
+        $spans = [];
         $copied = 0;
         foreach ($candidates as $id => $candidate) {
             if ($candidate['start'] < $copied || ! isset($proven[$id])) {
                 continue;
             }
-            if ($candidate['kind'] === 'plaintext') {
-                // Only a quote at the start of an attribute value opens a quoted value. Quotes
-                // inside names or unquoted values are literal bytes and cannot hide the true >.
-                $state = 'before-name';
-                for ($end = $candidate['end']; $end < $length; $end++) {
-                    $character = $html[$end];
-                    if ($state === 'double-quoted' || $state === 'single-quoted') {
-                        if ($character === ($state === 'double-quoted' ? '"' : "'")) {
-                            $state = 'after-value';
-                        }
-
-                        continue;
-                    }
-                    if ($character === '>') {
-                        break;
-                    }
-                    $space = str_contains(" \t\r\n\f", $character);
-                    switch ($state) {
-                        case 'before-name':
-                        case 'after-value':
-                            $state = $space || $character === '/' ? 'before-name' : 'name';
-                            break;
-                        case 'name':
-                            if ($space) {
-                                $state = 'after-name';
-                            } elseif ($character === '/') {
-                                $state = 'before-name';
-                            } elseif ($character === '=') {
-                                $state = 'before-value';
-                            }
-                            break;
-                        case 'after-name':
-                            if ($character === '=') {
-                                $state = 'before-value';
-                            } elseif ($character === '/') {
-                                $state = 'before-name';
-                            } elseif (! $space) {
-                                $state = 'name';
-                            }
-                            break;
-                        case 'before-value':
-                            if (! $space) {
-                                $state = match ($character) {
-                                    '"' => 'double-quoted',
-                                    "'" => 'single-quoted',
-                                    default => 'unquoted',
-                                };
-                            }
-                            break;
-                        case 'unquoted':
-                            if ($space) {
-                                $state = 'before-name';
-                            }
-                            break;
-                    }
+            if ($candidate['kind'] === 'open') {
+                $plaintext = $candidate['tag'] === 'plaintext';
+                if (! $plaintext && ! isset($ends[$id])) {
+                    continue;
                 }
-                if ($end === $length) {
-                    throw new RuntimeException('NIMA4K returned invalid HTML.');
+                $close = $plaintext ? $length : $candidates[$ends[$id]]['start'];
+                if (! $plaintext && ($counts[$ends[$id]] ?? 0) !== 1) {
+                    throw new RuntimeException('NIMA4K returned ambiguous inert HTML.');
                 }
-                $parts[] = substr($html, $copied, $end + 1 - $copied);
+                $end = $this->provenTagEnd($html, $candidate['end'], $close);
+                if (! $plaintext) {
+                    // A truncated end tag can be discarded at EOF. A terminal text marker alone
+                    // must not authorize that loss; retain and require its complete source token.
+                    $this->provenTagEnd($html, $candidates[$ends[$id]]['end'], $length);
+                }
+                $spans[] = ['start' => $end + 1, 'end' => $close, 'replacement' => '', 'rcdata' => in_array($candidate['tag'], ['title', 'textarea'], true)];
+                $copied = $close;
 
-                return implode('', $parts);
+                continue;
             }
             if (($counts[$id] ?? 0) !== 1) {
                 throw new RuntimeException('NIMA4K returned ambiguous inert HTML.');
@@ -541,85 +520,92 @@ final class Nima4kSource extends BoundedHttpFeedSource
                 throw new RuntimeException('NIMA4K returned invalid HTML.');
             }
             // A comment preserves token separation on both sides of an authorized whole span.
-            $parts[] = substr($html, $copied, $candidate['start'] - $copied).'<!-- -->';
+            $spans[] = ['start' => $candidate['start'], 'end' => $end + 3, 'replacement' => '<!-- -->', 'rcdata' => false];
             $copied = $end + 3;
         }
-        $parts[] = substr($html, $copied);
+        $projections = [];
+        foreach (['raw', 'markup'] as $mode) {
+            $parts = [];
+            $copied = 0;
+            foreach ($spans as $span) {
+                if ($mode === 'raw' && $span['rcdata']) {
+                    continue;
+                }
+                $parts[] = substr($html, $copied, $span['start'] - $copied).$span['replacement'];
+                $copied = $span['end'];
+            }
+            $parts[] = substr($html, $copied);
+            $projections[$mode] = implode('', $parts);
+        }
 
-        return implode('', $parts);
+        return ['raw' => $projections['raw'], 'markup' => $projections['markup']];
     }
 
-    private function maskTextContents(string $html, bool $includeRcdata): string
+    private function provenTagEnd(string $html, int $offset, int $limit): int
     {
-        $parts = [];
-        $copied = 0;
-        $offset = 0;
-        $length = strlen($html);
-        while (($start = strpos($html, '<', $offset)) !== false) {
-            if (substr($html, $start, 4) === '<!--') {
-                $end = strpos($html, '-->', $start + 4);
-                if ($end === false) {
-                    throw new RuntimeException('NIMA4K returned invalid HTML.');
+        // Called only for native-proven, disjoint element boundaries. A quote starts a quoted
+        // value only after =; quotes inside names or unquoted values cannot hide the true >.
+        $state = 'before-name';
+        for ($end = $offset; $end < $limit; $end++) {
+            $character = $html[$end];
+            if ($state === 'double-quoted' || $state === 'single-quoted') {
+                if ($character === ($state === 'double-quoted' ? '"' : "'")) {
+                    $state = 'after-value';
                 }
-                $offset = $end + 3;
 
                 continue;
             }
-            if (substr($html, $start, 2) === '<?') {
-                // HTML processing instructions end at the first >, irrespective of quotes.
-                $end = strpos($html, '>', $start + 2);
-                if ($end === false) {
-                    throw new RuntimeException('NIMA4K returned invalid HTML.');
-                }
-                $offset = $end + 1;
-
-                continue;
+            if ($character === '>') {
+                return $end;
             }
-            if (preg_match('/\G<(?:[a-zA-Z!]|\/[a-zA-Z])/', $html, $unused, 0, $start) !== 1) {
-                // A literal < must not consume a subsequent actual tag opener.
-                $offset = $start + 1;
-
-                continue;
-            }
-            $quote = null;
-            for ($end = $start + 1; $end < $length; $end++) {
-                $character = $html[$end];
-                if ($quote !== null) {
-                    if ($character === $quote) {
-                        $quote = null;
-                    }
-                } elseif ($character === '"' || $character === "'") {
-                    $quote = $character;
-                } elseif ($character === '>') {
+            $space = str_contains(" \t\r\n\f", $character);
+            switch ($state) {
+                case 'before-name':
+                case 'after-value':
+                    $state = $space || $character === '/' ? 'before-name' : 'name';
                     break;
-                }
+                case 'name':
+                    if ($space) {
+                        $state = 'after-name';
+                    } elseif ($character === '/') {
+                        $state = 'before-name';
+                    } elseif ($character === '=') {
+                        $state = 'before-value';
+                    }
+                    break;
+                case 'after-name':
+                    if ($character === '=') {
+                        $state = 'before-value';
+                    } elseif ($character === '/') {
+                        $state = 'before-name';
+                    } elseif (! $space) {
+                        $state = 'name';
+                    }
+                    break;
+                case 'before-value':
+                    if (! $space) {
+                        $state = match ($character) {
+                            '"' => 'double-quoted',
+                            "'" => 'single-quoted',
+                            default => 'unquoted',
+                        };
+                    }
+                    break;
+                case 'unquoted':
+                    if ($space) {
+                        $state = 'before-name';
+                    }
+                    break;
             }
-            if ($end === $length) {
-                break;
-            }
-            $offset = $end + 1;
-            if (preg_match('/\A<(script|style|title|textarea|iframe|xmp|noembed|noframes)(?=[\x20\t\r\n\/>])/i', substr($html, $start, $offset - $start), $opening) !== 1) {
-                continue;
-            }
-            if (preg_match('~</'.$opening[1].'(?=[\x20\t\r\n/>])~i', $html, $closing, PREG_OFFSET_CAPTURE, $offset) !== 1) {
-                throw new RuntimeException('NIMA4K returned invalid HTML.');
-            }
-            // RCDATA must be skipped lexically in both modes, but numeric references there still decode.
-            if ($includeRcdata || ! in_array(strtolower($opening[1]), ['title', 'textarea'], true)) {
-                $parts[] = substr($html, $copied, $offset - $copied);
-                $copied = $closing[0][1];
-            }
-            $offset = $closing[0][1];
         }
-        $parts[] = substr($html, $copied);
 
-        return implode('', $parts);
+        throw new RuntimeException('NIMA4K returned invalid HTML.');
     }
 
     private function hasMaskedDiagnostic(string $html, DOMDocument $original, int $code, string $provenanceHtml): bool
     {
-        // Recheck code 76 with raw text/RCDATA omitted, and code 9 with only raw text omitted.
-        $masked = in_array($code, [9, 76], true) ? $this->maskTextContents($provenanceHtml, $code === 76) : $provenanceHtml;
+        // The caller chooses native-proven raw text for numeric diagnostics, also RCDATA for markup.
+        $masked = $provenanceHtml;
         if ($masked === $html) {
             return true;
         }
@@ -652,17 +638,20 @@ final class Nima4kSource extends BoundedHttpFeedSource
         return $this->validatedReleaseCards($original, $pathInterner) !== $this->validatedReleaseCards($document, $pathInterner);
     }
 
-    private function assertUtf8Encoding(DOMDocument $document): void
+    private function assertUtf8Encoding(DOMDocument|HTMLDocument $document): void
     {
         // A meta declaration can override the prepended XML encoding and corrupt both labels alike.
         // libxml can retain the content-type charset's quote delimiters in this property.
-        $encodings = $document->encoding === null ? [] : [$this->unquoteEncoding($document->encoding)];
-        foreach ($document->getElementsByTagName('meta') as $meta) {
+        $encodings = $document instanceof DOMDocument && $document->encoding !== null ? [$this->unquoteEncoding($document->encoding)] : [];
+        $metadata = $document instanceof HTMLDocument
+            ? $document->getElementsByTagNameNS(self::HTML_NAMESPACE, 'meta')
+            : $document->getElementsByTagName('meta');
+        foreach ($metadata as $meta) {
             if ($meta->hasAttribute('charset')) {
                 $encodings[] = $meta->getAttribute('charset');
             }
-            if (strcasecmp(trim($meta->getAttribute('http-equiv')), 'content-type') === 0) {
-                preg_match_all('/(?:^|;)[\x20\t\r\n\f]*charset[\x20\t\r\n\f]*=[\x20\t\r\n\f]*("[^"]*"|\'[^\']*\'|[^;]*)(?=[\x20\t\r\n\f]*(?:;|$))/i', $meta->getAttribute('content'), $matches);
+            if (strcasecmp(trim($meta->getAttribute('http-equiv') ?? ''), 'content-type') === 0) {
+                preg_match_all('/(?:^|;)[\x20\t\r\n\f]*charset[\x20\t\r\n\f]*=[\x20\t\r\n\f]*("[^"]*"|\'[^\']*\'|[^;]*)(?=[\x20\t\r\n\f]*(?:;|$))/i', $meta->getAttribute('content') ?? '', $matches);
                 foreach ($matches[1] as $encoding) {
                     $encodings[] = $this->unquoteEncoding($encoding);
                 }
