@@ -9,8 +9,11 @@ A human prompt or goal authorizes agents to commit task changes, push feature br
 
 ## Prepare the branch
 
-- Work on a feature branch. Keep `master` as the PR base. Don't push directly to it.
-- Update the branch against the current destination `master` before review. Preserve unrelated work and resolve conflicts before verification.
+- Start each new task in an isolated Git worktree on a new `codex/` branch whose name is absent from the remote. Reuse that task's worktree while continuing it; an explicitly requested existing PR keeps its branch. Keep `master` as the PR base and never develop or push directly on it.
+- Verify the remote points to `xbmc4lyfe/newznab-tmux`, fetch its `master` at task start, and create the worktree/branch from that fetched commit. `NNTmux/newznab-tmux:master` is a separate upstream and is not the feature-branch base.
+- During active work, fetch and integrate newer fork-master commits every 30–60 minutes. Refresh when resuming a session if the last fetch is older than 30 minutes. Preserve unrelated and uncommitted work; never reset or discard it to synchronize. Resolve conflicts and rerun affected checks.
+- Fetch and integrate the fork's current `master` immediately before local review and PR creation, and recheck it before merging. An advanced destination requires updating the branch, affected verification, and fresh local and PR reviews.
+- After each PR merge, fetch the fork's `master` again before creating the next task's worktree and new branch. Start from the newly fetched commit, not the previous task branch or a stale local `master`.
 - Stage files with explicit paths. Exclude scratch files, logs, and unrelated changes.
 - Run the checks required for the changed files. Documentation changes need prose and consistency checks. App changes also need relevant tests and lint.
 
