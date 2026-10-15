@@ -8,6 +8,7 @@ use App\Services\Nzb\DirectorySyncBridge;
 use App\Services\Nzb\NfoImportService;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbUploadManifestService;
+use App\Services\Releases\Verification\VerificationResetService;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
@@ -22,6 +23,46 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
     public static function retirementResetBoundaries(): array
     {
         return ['before move' => ['intent_dir'], 'payload complete' => ['complete_dir'], 'manifest retirement' => ['manifest']];
+    }
+
+    public static function reconciledImportSchedules(): array
+    {
+        return ['source only' => [false, false], 'source after reset' => [false, true],
+            'companion before storage' => [true, false], 'companion after reset' => [true, true]];
+    }
+
+    #[DataProvider('reconciledImportSchedules')]
+    public function test_queued_importer_cannot_bypass_retention_after_concurrent_reconciliation(bool $companion, bool $reset): void
+    {
+        [$source, $mp, $uploads] = $this->upload($companion);
+        $root = config('release_verification.storage_path');
+        // Keep the uploader directory outside the real reset's owned verification artifacts.
+        config(['release_verification.storage_path' => $root.'/verification-state']);
+        try {
+            $this->capturedFixtureImporter('reconciled-before-delete')->beginImport([$source], delete: true,
+                resultCallback: function (array $outcome) use ($uploads, $mp, $reset): void {
+                    self::assertSame(NzbImportStatus::Queued, $outcome['status']);
+                    DB::table('releases')->insert(['id' => 7, 'guid' => 'reconciled-retirement-guid']);
+                    DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+                    self::assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $uploads->reconcilePending($mp)['state']);
+                    if ($reset) {
+                        app(VerificationResetService::class)->run(static function (): void {});
+                    }
+                });
+            $result = $uploads->read($mp);
+            if ($companion || $reset) {
+                self::assertFileExists($source);
+                self::assertArrayNotHasKey('relinquished_attempt', $result);
+                if ($companion) {
+                    self::assertFileExists(dirname($mp).'/info.nfo');
+                }
+            } else {
+                self::assertFileDoesNotExist($source);
+                self::assertSame($result['accepted_capture']['attempt'], $result['relinquished_attempt']);
+            }
+        } finally {
+            config(['release_verification.storage_path' => $root]);
+        }
     }
 
     #[DataProvider('retirementResetBoundaries')]

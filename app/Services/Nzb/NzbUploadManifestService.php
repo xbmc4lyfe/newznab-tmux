@@ -261,9 +261,10 @@ final class NzbUploadManifestService
                 return false;
             }
 
-            if ($retainForCompanion && $m['state'] === self::STATE_NZB_PENDING) {
+            if ($retainForCompanion) {
                 // Metadata enrichment may change admission revision before publication.
-                // Keep the exact uploader document until its companion commits so it can re-admit.
+                // Reconciliation may already have advanced this upload. Always retire
+                // queued captures through the fenced publication or companion path.
                 $field = is_array($m['nfo_capture'] ?? null) ? 'delete_nzb_after_nfo' : 'delete_nzb_after_publication';
                 $m[$field] = array_intersect_key($capture, array_flip(['source_identity', 'digest']));
                 $this->write($mp, $m);
