@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use App\Services\Yenc\ExperimentalStrictArticleDecoder;
 use App\Services\YencService;
 use InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
@@ -409,6 +410,26 @@ final class YencStrictArticleWorkerTest extends TestCase
         self::assertArrayNotHasKey('median_ms', $result);
     }
 
+    public function test_only_absent_optional_strict_capability_allows_native_integration_skip(): void
+    {
+        foreach ([
+            [false, 'symbol_or_ffi_unavailable', true],
+            [false, 'known_answer_failed', false],
+            [false, 'unsupported_runtime', false],
+            [false, 'library_absent', false],
+            [false, null, false],
+            [true, null, false],
+            [true, 'symbol_or_ffi_unavailable', false],
+        ] as [$available, $reason, $expected]) {
+            self::assertSame($expected, self::strictCapabilityMayBeSkipped($available, $reason));
+        }
+    }
+
+    private static function strictCapabilityMayBeSkipped(bool $available, ?string $reason): bool
+    {
+        return ! $available && $reason === 'symbol_or_ffi_unavailable';
+    }
+
     public function test_linux_native_cli_uses_both_roles_for_supported_fallback_unused_and_expected_error(): void
     {
         if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || ! extension_loaded('FFI')) {
@@ -420,6 +441,11 @@ final class YencStrictArticleWorkerTest extends TestCase
         if ($rust === false || $cpp === false) {
             self::markTestSkipped('Build pinned C++ and experimental Rust libraries before native worker integration.');
         }
+        $experimental = new ExperimentalStrictArticleDecoder($rust);
+        if (self::strictCapabilityMayBeSkipped($experimental->isAvailable(), $experimental->unavailabilityReason())) {
+            self::markTestSkipped('Optional experimental-strict-article capability is absent or CLI FFI is unavailable.');
+        }
+        self::assertTrue($experimental->isAvailable(), 'Experimental strict capability must qualify: '.($experimental->unavailabilityReason() ?? 'unknown'));
         $protocol = $this->protocol();
         $protocol['libraries'] = [
             'cpp' => ['path' => $cpp, 'sha256' => hash_file('sha256', $cpp)],
