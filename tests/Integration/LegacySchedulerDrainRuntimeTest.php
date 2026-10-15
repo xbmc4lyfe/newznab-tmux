@@ -24,8 +24,10 @@ class LegacySchedulerDrainRuntimeTest extends TestCase
         $this->directory = sys_get_temp_dir().'/'.$this->container;
         mkdir($this->directory, 0777);
         chmod($this->directory, 0777);
+        $owner = getenv('NNTMUX_LEGACY_TEST_OWNER') ?: $this->container;
         (new Process([
             'docker', 'run', '-d', '--init', '--user=33:33', '--name', $this->container, '--network=none', '--memory=512m', '--cpus=2',
+            '--label', 'scheduler.stop.runtime.owner='.$owner,
             '--restart=unless-stopped', '--tmpfs=/var/tmp/nntmux:uid=33,gid=33,mode=0770', '-v', $this->directory.':/state',
             '-e', 'APP_ENV=testing', '-e', 'DB_CONNECTION=sqlite', '-e', 'DB_DATABASE=/tmp/legacy.sqlite',
             '-e', 'CACHE_STORE=array', '-e', 'LOG_CHANNEL=stderr', '--entrypoint=sh', $image,
@@ -181,6 +183,86 @@ PYTHON])->mustRun();
         $this->assertSame(1, $resume->getExitCode(), $resume->getErrorOutput());
         $this->assertStringContainsString('identity changed', $resume->getErrorOutput());
         $this->awaitCoordinator(true);
+    }
+
+    public function test_resume_preserves_an_external_stop_after_unconfirmed_stop_intent(): void
+    {
+        $this->assertUnconfirmedResumePreservesExternalStop('intent');
+    }
+
+    public function test_resume_preserves_an_external_stop_with_an_old_unconfirmed_record(): void
+    {
+        $this->assertUnconfirmedResumePreservesExternalStop(null);
+    }
+
+    private function assertUnconfirmedResumePreservesExternalStop(?string $stop): void
+    {
+        $this->exec(['pkill', '-STOP', '-f', '^php artisan schedule:work$'])->mustRun();
+        $this->awaitCoordinator(true);
+        $this->exec(['python3', '-c', <<<'PYTHON'
+import json
+from pathlib import Path
+import sys
+items = []
+for path in Path('/proc').iterdir():
+    if path.name.isdecimal():
+        try:
+            if (path / 'cmdline').read_bytes() == b'php\0artisan\0schedule:work\0':
+                fields = (path / 'stat').read_text().rsplit(')', 1)[1].split()
+                items.append({'pid': int(path.name), 'start': fields[19],
+                              'initially_stopped': False, 'token': 'owner'})
+        except FileNotFoundError:
+            pass
+assert len(items) == 1, items
+state = items[0]
+if sys.argv[1]:
+    state['stop'] = sys.argv[1]
+    state['protocol'] = 'legacy-scheduler-stop-v1'
+Path('/var/tmp/nntmux/legacy-scheduler-drain.json').write_text(json.dumps(state))
+PYTHON, $stop ?? ''])->mustRun();
+
+        $check = $this->bridge('check', 10, 'owner');
+        $check->run();
+        $this->assertSame(1, $check->getExitCode(), $check->getErrorOutput());
+        $resume = $this->bridge('resume', 10, 'owner');
+        $resume->run();
+        $this->assertSame(1, $resume->getExitCode(), $resume->getErrorOutput());
+        $this->awaitCoordinator(true);
+        $this->exec(['test', '-f', '/var/tmp/nntmux/legacy-scheduler-drain.json'])->mustRun();
+        touch($this->directory.'/release');
+        $this->awaitCompletion();
+    }
+
+    public function test_resume_rejects_a_foreign_stop_protocol(): void
+    {
+        touch($this->directory.'/release');
+        $this->bridge('drain', 10, 'owner')->mustRun();
+        $this->exec(['python3', '-c', <<<'PYTHON'
+import json
+from pathlib import Path
+path = Path('/var/tmp/nntmux/legacy-scheduler-drain.json')
+state = json.loads(path.read_text())
+state['protocol'] = 'foreign'
+path.write_text(json.dumps(state))
+PYTHON])->mustRun();
+        $resume = $this->bridge('resume', 10, 'owner');
+        $resume->run();
+        $this->assertSame(1, $resume->getExitCode(), $resume->getErrorOutput());
+        $this->awaitCoordinator(true);
+        $this->exec(['test', '-f', '/var/tmp/nntmux/legacy-scheduler-drain.json'])->mustRun();
+    }
+
+    public function test_resume_without_a_token_preserves_another_operations_barrier(): void
+    {
+        touch($this->directory.'/release');
+        $this->bridge('drain', 10, 'owner')->mustRun();
+        $check = $this->bridge('check');
+        $check->run();
+        $this->assertSame(1, $check->getExitCode(), $check->getErrorOutput());
+        $this->bridge('resume')->mustRun();
+        $this->awaitCoordinator(true);
+        $this->bridge('resume', 10, 'owner')->mustRun();
+        $this->awaitCoordinator(false);
     }
 
     public function test_a_lost_admission_barrier_fails_the_final_check(): void
