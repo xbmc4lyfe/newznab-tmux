@@ -40,6 +40,17 @@ final class PredbSearchDocument
             }
         }
 
+        foreach (['title', 'filename'] as $field) {
+            if (isset($source[$field]) && (! mb_check_encoding($source[$field], 'UTF-8')
+                || preg_match('/\p{C}/u', $source[$field]) !== 0)) {
+                return null;
+            }
+        }
+
+        if (strpbrk($source['title'], '/\\|') !== false) {
+            return null;
+        }
+
         return self::normalize($source, $id);
     }
 

@@ -910,8 +910,10 @@ class NameFixingService
         )));
         $prioritized = $this->filePrioritizer->prioritizeForMatching($filenames);
 
-        // An unknown nomination set must leave this source pending for a later pass.
+        // Resolve the complete pass before attempting any legacy extraction. An
+        // unresolved earlier or later filename must remain eligible for retry.
         $allLookupsComplete = true;
+        $fallbacks = [];
         foreach ($prioritized as $filename) {
             $candidate = clone $release;
             $candidate->textstring = $filename;
@@ -922,25 +924,28 @@ class NameFixingService
             if ($this->updateService->matched) {
                 break;
             }
-            if ($hadEvidence) {
-                continue;
+            if (! $hadEvidence) {
+                $fallbacks[] = $candidate;
             }
-            $fileResult = $this->fileExtractor->extractFromFile($filename);
+        }
 
-            if ($fileResult !== null) {
-                $this->updateService->updateRelease(
-                    $candidate,
-                    $fileResult->newName,
-                    'fileCheck: '.$fileResult->method,
-                    $echo,
-                    'Filenames, ',
-                    $nameStatus,
-                    $show
-                );
-            }
-
-            if ($this->updateService->matched) {
-                break;
+        if (! $this->updateService->matched && $allLookupsComplete) {
+            foreach ($fallbacks as $candidate) {
+                $fileResult = $this->fileExtractor->extractFromFile($candidate->textstring);
+                if ($fileResult !== null) {
+                    $this->updateService->updateRelease(
+                        $candidate,
+                        $fileResult->newName,
+                        'fileCheck: '.$fileResult->method,
+                        $echo,
+                        'Filenames, ',
+                        $nameStatus,
+                        $show
+                    );
+                }
+                if ($this->updateService->matched) {
+                    break;
+                }
             }
         }
 

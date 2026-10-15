@@ -544,6 +544,26 @@ final class PredbSearchDriverTest extends TestCase
                     $cases[$backend.' '.$field.' '.json_encode($value)] = [$backend, [$row], false];
                 }
             }
+            foreach (['title', 'filename'] as $field) {
+                foreach (["bad\0identity", "bad\nidentity", "bad\x7fidentity", "bad\u{200B}identity", "bad\u{0085}identity", "bad\u{E000}identity"] as $index => $value) {
+                    $row = $good;
+                    $row['_source'][$field] = $value;
+                    $cases[$backend.' malformed identity '.$field.' '.$index] = [$backend, [$good, $row], false];
+                }
+            }
+            foreach (['bad/title', 'bad\\title', 'bad|title'] as $index => $value) {
+                $row = $good;
+                $row['_source']['title'] = $value;
+                $cases[$backend.' forbidden title separator '.$index] = [$backend, [$good, $row], false];
+            }
+            foreach (['/directory/Alias.Release-GRP.rar', 'C:\\directory\\Alias.Release-GRP.rar', '<<< NZBSPLIT >>> Alias.Release-GRP.rar yEnc (1/2)'] as $index => $value) {
+                $row = $good;
+                $row['_source']['filename'] = $value;
+                $cases[$backend.' valid filename path or trailer '.$index] = [$backend, [$row], true];
+            }
+            $row = $good;
+            $row['_source']['filename'] = "/bad\u{200B}directory/Alias.Release-GRP.rar";
+            $cases[$backend.' malformed discarded directory'] = [$backend, [$good, $row], false];
             $cases[$backend.' missing optional fields'] = [$backend, [$good], true];
             $cases[$backend.' null optional fields'] = [$backend, [['_id' => '7', '_source' => ['title' => 'Canonical.Release-GRP', 'filename' => null, 'source' => null]]], true];
             $cases[$backend.' leading zero decimal wire id'] = [$backend, [['_id' => '07', '_source' => ['title' => 'Canonical.Release-GRP']]], true];

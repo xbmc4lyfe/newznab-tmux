@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Facades\Search;
+use App\Services\NameFixing\Extractors\FileNameExtractor;
 use App\Services\NameFixing\NameFixingService;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -117,6 +118,47 @@ final class PredbFilenameRetryCompletionTest extends TestCase
         }
         self::assertSame(count($names), $calls);
         self::assertSame($mixedUnknown ? 0 : 1, $release->fresh()->proc_files);
+        self::assertSame(0, $release->fresh()->predb_id);
+        self::assertSame(0, $release->fresh()->isrenamed);
+    }
+
+    public static function fallbackPasses(): array
+    {
+        return [['files', false], ['files', true], ['standard', false], ['standard', true]];
+    }
+
+    #[DataProvider('fallbackPasses')]
+    public function test_any_incomplete_filename_suppresses_fallback_for_the_whole_pass(string $caller, bool $reverse): void
+    {
+        $this->createPar2RenameSchema();
+        config(['tmux.fix_names.cache_store' => 'array']);
+        Cache::store('array')->flush();
+        $release = $this->pendingPar2Release([
+            'searchname' => 'Unresolved.Synthetic.2026-GRP', 'leftguid' => 'a',
+            'proc_files' => 0, 'proc_uid' => 1, 'proc_crc32' => 1,
+            'proc_hash16k' => 1, 'proc_nfo' => 1, 'proc_srr' => 1, 'proc_par2' => 1,
+        ]);
+        $names = ['Synthetic.Unknown.2026-GRP.mkv', 'Synthetic.Fallback.2026-GRP.mkv'];
+        foreach ($reverse ? array_reverse($names) : $names as $name) {
+            DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $name]);
+        }
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
+        $calls = 0;
+        Search::shouldReceive('searchPredbFilenameCandidates')->andReturnUsing(static function (string $query) use (&$calls): ?array {
+            $calls++;
+
+            return str_contains($query, 'Unknown') ? null : [];
+        });
+        $extractor = $this->createMock(FileNameExtractor::class);
+        $extractor->expects(self::never())->method('extractFromFile');
+        $service = new NameFixingService(fileExtractor: $extractor);
+        if ($caller === 'files') {
+            $service->fixNamesWithFiles(0, true, 0, true, false);
+        } else {
+            $service->processStandardBatch('a', 1, false);
+        }
+        self::assertSame(2, $calls);
+        self::assertSame(0, $release->fresh()->proc_files);
         self::assertSame(0, $release->fresh()->predb_id);
         self::assertSame(0, $release->fresh()->isrenamed);
     }
