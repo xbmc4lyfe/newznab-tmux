@@ -39,6 +39,7 @@ class TmuxProcessingBacklogTest extends TestCase
             $table->string('searchname')->default('obfuscated');
             $table->string('fromname')->default('poster');
             $table->string('guid')->default('guid');
+            $table->string('leftguid')->default('g');
             $table->integer('groups_id')->default(1);
             $table->dateTime('adddate')->nullable();
             $table->bigInteger('size')->default(2147483648);
@@ -75,6 +76,11 @@ class TmuxProcessingBacklogTest extends TestCase
                 }
             });
         }
+        Schema::create('par2_hash_retry', static function (Blueprint $table): void {
+            $table->unsignedInteger('releases_id')->primary();
+            $table->string('release_guid', 40)->collation('NOCASE');
+            $table->timestamp('retry_at');
+        });
         Schema::create('categories', static function (Blueprint $table): void {
             $table->integer('id')->primary();
             $table->integer('disablepreview')->default(0);
@@ -160,6 +166,66 @@ class TmuxProcessingBacklogTest extends TestCase
         $this->assertSame(0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
     }
 
+    /** @return iterable<string, array{?string, int, bool, int, int}> */
+    public static function hashRetryAdmissionCases(): iterable
+    {
+        yield 'future same-generation retry' => ['guid', 60, false, 0, 0];
+        yield 'expired retry' => ['guid', -1, false, 1, 1];
+        yield 'retry due at exact boundary' => ['guid', 0, false, 1, 1];
+        yield 'retry for old generation' => ['old-guid', 60, false, 1, 1];
+        yield 'case-only different generation' => ['GUID', 60, false, 1, 1];
+        yield 'no retry recorded' => [null, 0, false, 1, 1];
+        yield 'future hash retry with ready file source' => ['guid', 60, true, 1, 0];
+    }
+
+    #[DataProvider('hashRetryAdmissionCases')]
+    public function test_rename_backlog_respects_hash_retry_admission(
+        ?string $retryGuid,
+        int $retryOffset,
+        bool $hasFileSource,
+        int $expectedRenames,
+        int $expectedHashCandidates
+    ): void {
+        $clock = $this->freezeRenameClock();
+        DB::table('releases')->insert(['id' => 1, 'proc_hash16k' => 0, 'proc_files' => $hasFileSource ? 0 : 1]);
+        DB::table('par_hashes')->insert(['releases_id' => 1, 'hash' => md5('prefix')]);
+        if ($retryGuid !== null) {
+            DB::table('par2_hash_retry')->insert([
+                'releases_id' => 1,
+                'release_guid' => $retryGuid,
+                'retry_at' => $clock->addSeconds($retryOffset)->toDateTimeString(),
+            ]);
+        }
+        if ($hasFileSource) {
+            DB::table('release_files')->insert(['releases_id' => 1, 'name' => 'title.rar']);
+        }
+
+        $this->assertSame($expectedRenames, (int) $this->counts()->processrenames);
+        $queries = new NameFixingQueryService;
+        $this->assertCount($expectedHashCandidates, $queries->candidateBatch(NameFixingQueryService::SOURCE_HASH, 2, 1));
+        $this->assertCount($expectedRenames, $queries->standardCandidateBatch('g', 10));
+    }
+
+    /** @return iterable<string, array{?string}> */
+    public static function missingHashSources(): iterable
+    {
+        yield 'no hash row' => [null];
+        yield 'empty hash value' => [''];
+    }
+
+    #[DataProvider('missingHashSources')]
+    public function test_rename_hash_backlog_requires_a_present_hash_source(?string $hash): void
+    {
+        $this->freezeRenameClock();
+        DB::table('releases')->insert(['id' => 1, 'proc_hash16k' => 0]);
+        if ($hash !== null) {
+            DB::table('par_hashes')->insert(['releases_id' => 1, 'hash' => $hash]);
+        }
+
+        $this->assertSame(0, (int) $this->counts()->processrenames);
+        $this->assertSame([], (new NameFixingQueryService)->candidateBatch(NameFixingQueryService::SOURCE_HASH, 2, 1));
+    }
+
     public function test_tv_backlog_counts_only_pending_lookups_that_are_due(): void
     {
         ConfigurationTestBuilder::update(ConfigurationDomain::Metadata, ['tv_lookup' => 1]);
@@ -215,10 +281,15 @@ class TmuxProcessingBacklogTest extends TestCase
 
     public function test_pending_par2_count_does_not_probe_metadata_sources(): void
     {
-        DB::table('releases')->insert(['id' => 1, 'proc_par2' => 0, 'proc_nfo' => 0]);
+        $clock = $this->freezeRenameClock();
+        DB::table('releases')->insert(['id' => 1, 'proc_par2' => 0, 'proc_nfo' => 0, 'proc_hash16k' => 0]);
         DB::table('release_nfos')->insert(['releases_id' => 99]);
+        DB::table('par_hashes')->insert(['releases_id' => 1, 'hash' => md5('prefix')]);
+        DB::table('par2_hash_retry')->insert(['releases_id' => 1, 'release_guid' => 'guid', 'retry_at' => $clock->addMinute()->toDateTimeString()]);
         DB::statement('ALTER TABLE release_nfos RENAME TO stored_release_nfos');
+        DB::statement('ALTER TABLE par2_hash_retry RENAME TO stored_par2_hash_retry');
         $probes = 0;
+        $retryProbes = 0;
         /** @var PDO $pdo */
         $pdo = DB::connection()->getPdo();
         $pdo->sqliteCreateFunction('count_metadata_probe', static function (int $id) use (&$probes): int {
@@ -226,14 +297,22 @@ class TmuxProcessingBacklogTest extends TestCase
 
             return $id;
         }, 1);
+        $pdo->sqliteCreateFunction('count_retry_probe', static function (int $id) use (&$retryProbes): int {
+            $retryProbes++;
+
+            return $id;
+        }, 1);
         DB::statement('CREATE VIEW release_nfos AS SELECT count_metadata_probe(releases_id) AS releases_id FROM stored_release_nfos');
+        DB::statement('CREATE VIEW par2_hash_retry AS SELECT count_retry_probe(releases_id) AS releases_id, release_guid, retry_at FROM stored_par2_hash_retry');
 
         $this->assertSame(1, (int) $this->counts()->processrenames);
         $this->assertSame(0, $probes);
+        $this->assertSame(0, $retryProbes);
 
         DB::table('releases')->where('id', 1)->update(['proc_par2' => 1]);
         $this->assertSame(0, (int) $this->counts()->processrenames);
         $this->assertGreaterThan(0, $probes);
+        $this->assertGreaterThan(0, $retryProbes);
     }
 
     public function test_par2_work_without_an_nzb_is_neither_counted_nor_selected(): void
@@ -385,5 +464,16 @@ class TmuxProcessingBacklogTest extends TestCase
     private function counts(): object
     {
         return DB::selectOne((new Tmux)->proc_query(1, '', ''));
+    }
+
+    private function freezeRenameClock(): CarbonImmutable
+    {
+        $clock = CarbonImmutable::parse('2026-10-15 12:00:00');
+        $this->travelTo($clock);
+        /** @var PDO $pdo */
+        $pdo = DB::connection()->getPdo();
+        $pdo->sqliteCreateFunction('current_timestamp', static fn (): string => $clock->toDateTimeString(), 0);
+
+        return $clock;
     }
 }
