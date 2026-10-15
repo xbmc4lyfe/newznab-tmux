@@ -1078,6 +1078,10 @@ fn final_control_status(cpu_status: &'static str, before: &Value, after: &Value)
         "invalidated_host_context_unavailable"
     } else if context["static_identity_equal"] != true {
         "invalidated_host_context_drift"
+    } else if cpu_status == "control_observations_complete"
+        && control_host::cpu_interval(before, after)["qualified"] != true
+    {
+        "partial_control_cgroup_cpu_interval_unavailable"
     } else {
         cpu_status
     }
@@ -1323,7 +1327,7 @@ fn execute_owned(
     let schedule_path = output.join("schedule.json");
     frozen_file(&schedule_path, &schedule)?;
     identities.push((schedule_path, digest(&schedule), 2_097_152));
-    let mut protocol = json!({"type":"protocol","version":"rust-aa-control-v2","comparison_kind":"rust-aa-control",
+    let mut protocol = json!({"type":"protocol","version":"rust-aa-control-v3","comparison_kind":"rust-aa-control",
         "claim":"A/A ABI control observations only; no C++ comparison, actual PHP caller result, speed qualification or adoption verdict",
         "host":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,
             "observed_context_receipt":"host-context-before.json",
@@ -1339,6 +1343,7 @@ fn execute_owned(
         "crc_reference":"existing Python zlib oracle inside each worker, plus frozen independent Rust CRC known answers; no separately timed zlib slot",
         "boundary":"worker batch of native calls with resident preallocated buffers, including Python ctypes loop; setup, warmup, hashing and verification untimed",
         "counter_scope":"dedicated snapshots bracket control scheduling and subprocess overhead; worker getrusage separately brackets its timed batch",
+        "cgroup_counter_policy":"bounded controller context captures every visible ancestor cpu.stat; required usage and throttling counters must be present, path-bound and monotonic; missing root counters remain partial, never zero",
         "cleanup_scope":"direct worker only; owned frozen worker has no subprocess spawning path",
         "per_child_retained_file_limit_bytes":RETAINED_OUTPUT_CAP,
         "timeout_failure_budget":1,
@@ -1477,7 +1482,7 @@ fn execute_owned(
     summary["type"] = json!("run_summary");
     summary["comparison_kind"] = json!("rust-aa-control");
     summary["status"] = json!(status);
-    summary["cpu_interval_qualified"] = json!(
+    summary["os_cpu_interval_qualified"] = json!(
         cpu_interval_control_status(true, 0, &cpu_before, &cpu_after)
             == "control_observations_complete"
     );
@@ -1485,6 +1490,11 @@ fn execute_owned(
     summary["noise_equivalence_qualified"] = json!(false);
     summary["adoption_qualified"] = json!(false);
     summary["host_context"] = host_comparison.clone();
+    summary["cgroup_cpu_interval"] = control_host::cpu_interval(&host_before, &host_after);
+    summary["cpu_interval_qualified"] = json!(
+        summary["os_cpu_interval_qualified"] == true
+            && summary["cgroup_cpu_interval"]["qualified"] == true
+    );
     if !intact || host_comparison["static_identity_equal"] != true {
         summary["summaries"] = Value::Null;
         summary["qualified_pairs"] = json!(0);
@@ -2258,7 +2268,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_requires_a_valid_observed_cpu_interval_as_well_as_valid_pairs() {
+    fn os_cpu_interval_requires_valid_ticks_and_pairs_but_cgroup_qualification_is_separate() {
         let before = json!({"label":"before","receipt":{"status":"ok","exit_code":0,"stderr_bytes":0},
             "endpoint":{"schema_version":1,"monotonic_ns":100,"os_cpu_usable":true,"os":{"stat":{"status":"captured","raw":"cpu 1 2 3 4\n"}}}});
         let after = json!({"label":"after","receipt":{"status":"ok","exit_code":0,"stderr_bytes":0},
@@ -2570,19 +2580,8 @@ mod tests {
         }
         let admitted = options(&arguments).unwrap();
         let (status, stdout, stderr) = invoke("positive", &arguments);
-        assert!(
-            status.success(),
-            "CLI failed; retained evidence at {setup:?}"
-        );
-        assert!(stderr.is_empty());
-        let summary: Value = serde_json::from_slice(&stdout).unwrap();
-        assert_eq!(summary["status"], "control_observations_complete");
-        assert_eq!(summary["eligible_pairs"], 32);
-        assert_eq!(summary["invalid_pairs"], 0);
-        assert_eq!(summary["cpu_interval_qualified"], true);
-        assert_eq!(summary["all_identities_unchanged"], true);
-        assert_eq!(summary["noise_equivalence_qualified"], false);
-        assert_eq!(summary["adoption_qualified"], false);
+        // A valid namespace can omit bandwidth counters at its visible root.
+        // That is a tested partial/nonzero result, never successful completion.
         let observations_path = output.join("observations.jsonl");
         let raw = read_regular(&observations_path, 8_388_608).unwrap();
         let records: Vec<Value> = raw
@@ -2590,7 +2589,71 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_slice(line).unwrap())
             .collect();
-        assert_eq!(records.last().unwrap(), &summary);
+        let summary = records
+            .iter()
+            .rev()
+            .find(|record| record["type"] == "run_summary")
+            .expect("run summary retained even when a terminal run_failure follows");
+        assert_eq!(summary["type"], "run_summary");
+        if status.success() {
+            assert_eq!(records.last().unwrap(), summary);
+            assert!(stderr.is_empty());
+            assert_eq!(serde_json::from_slice::<Value>(&stdout).unwrap(), *summary);
+            assert_eq!(summary["status"], "control_observations_complete");
+            assert_eq!(summary["cpu_interval_qualified"], true);
+            assert_eq!(summary["cgroup_cpu_interval"]["qualified"], true);
+        } else {
+            assert_eq!(records.last().unwrap()["type"], "run_failure");
+            assert!(stdout.is_empty());
+            assert_eq!(
+                serde_json::from_slice::<Value>(&stderr).unwrap()["status"],
+                "invalid_control"
+            );
+            assert_eq!(
+                summary["status"],
+                "partial_control_cgroup_cpu_interval_unavailable"
+            );
+            assert_eq!(summary["cpu_interval_qualified"], false);
+            assert_eq!(summary["cgroup_cpu_interval"]["qualified"], false);
+            // Independent check of a real missing key/file, rather than trusting
+            // the completion predicate or treating any CLI failure as expected.
+            let required = [
+                "usage_usec",
+                "user_usec",
+                "system_usec",
+                "nr_periods",
+                "nr_throttled",
+                "throttled_usec",
+            ];
+            assert!(
+                records
+                    .iter()
+                    .filter(
+                        |r| r["type"] == "host_context_before" || r["type"] == "host_context_after"
+                    )
+                    .flat_map(|r| r["context"]["resources"]["cpu_counters"]
+                        .as_array()
+                        .unwrap())
+                    .any(|row| {
+                        let receipt = &row["source"];
+                        receipt["status"] != "captured"
+                            || required.iter().any(|key| {
+                                !receipt["raw"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .lines()
+                                    .any(|line| line.split_ascii_whitespace().next() == Some(*key))
+                            })
+                    }),
+                "unexpected CLI failure without independently observed missing counters; evidence at {setup:?}"
+            );
+        }
+        assert_eq!(summary["eligible_pairs"], 32);
+        assert_eq!(summary["invalid_pairs"], 0);
+        assert_eq!(summary["os_cpu_interval_qualified"], true);
+        assert_eq!(summary["all_identities_unchanged"], true);
+        assert_eq!(summary["noise_equivalence_qualified"], false);
+        assert_eq!(summary["adoption_qualified"], false);
         let observations: Vec<_> = records
             .iter()
             .filter(|r| r["type"] == "observation")

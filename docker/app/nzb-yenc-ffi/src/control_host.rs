@@ -447,21 +447,166 @@ pub(super) fn comparison(before: &Value, after: &Value) -> Value {
         "outer_host_limits":"unknown","physical_cpu_identity":"unknown"})
 }
 
+pub(super) fn cpu_interval(before: &Value, after: &Value) -> Value {
+    let mut interval = resources::cpu_interval(&before["resources"], &after["resources"]);
+    let ordered = comparison(before, after)["endpoint_intervals_ordered"] == true;
+    if !ordered {
+        interval["qualified"] = json!(false);
+        interval["status"] = json!("partial_unordered_endpoints");
+        interval["ancestors"] = Value::Null;
+    }
+    interval["endpoint_intervals_ordered"] = json!(ordered);
+    interval
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{fs, path::PathBuf};
 
+    #[test]
+    fn completion_requires_every_visible_cgroup_usage_and_throttling_interval() {
+        let f = Fixture::new();
+        let before = f.endpoint(10);
+        let after = f.endpoint(20);
+        assert_eq!(comparison(&before, &after)["static_identity_equal"], true);
+        assert_eq!(
+            super::super::final_control_status("control_observations_complete", &before, &after),
+            "partial_control_cgroup_cpu_interval_unavailable"
+        );
+        // Missing counters do not become zero, even with valid OS CPU ticks.
+        // Equal, explicitly captured zero counters are valid observations.
+        for prefix in ["cgroup", "cgroup/leaf"] {
+            f.put(&format!("{prefix}/cpu.stat"),
+                "usage_usec 0\nuser_usec 0\nsystem_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n");
+        }
+        let before = f.endpoint(30);
+        let after = f.endpoint(40);
+        assert_eq!(
+            super::super::final_control_status("control_observations_complete", &before, &after),
+            "control_observations_complete"
+        );
+        fs::remove_file(f.0.join("cgroup/cpu.stat")).unwrap();
+        let absent_parent = f.endpoint(50);
+        assert_eq!(
+            super::super::final_control_status(
+                "control_observations_complete",
+                &before,
+                &absent_parent
+            ),
+            "partial_control_cgroup_cpu_interval_unavailable"
+        );
+    }
+
+    #[test]
+    fn cgroup_cpu_deltas_preserve_parent_throttling_without_changing_static_identity() {
+        let f = Fixture::new();
+        let first = "usage_usec 100\nuser_usec 200\nsystem_usec 300\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n";
+        for prefix in ["cgroup", "cgroup/leaf"] {
+            f.put(&format!("{prefix}/cpu.stat"), first);
+        }
+        let before = f.endpoint(10);
+        f.put("cgroup/cpu.stat", "usage_usec 110\nuser_usec 201\nsystem_usec 302\nnr_periods 4\nnr_throttled 2\nthrottled_usec 700\n");
+        let after = f.endpoint(20);
+        assert_eq!(before["static_sha256"], after["static_sha256"]);
+        let interval = cpu_interval(&before, &after);
+        assert_eq!(interval["qualified"], true);
+        assert_eq!(interval["ancestors"][0]["deltas"]["throttled_usec"], 0);
+        assert_eq!(interval["ancestors"][1]["deltas"]["throttled_usec"], 700);
+        assert_eq!(interval["ancestors"][1]["deltas"]["usage_usec"], 10);
+        assert_eq!(interval["outer_host_counters"], "unknown");
+        // The accounting fields need not add up, and multicore/throttling
+        // counters need not be bounded by this fixture's wall interval.
+        assert_eq!(
+            super::super::final_control_status("control_observations_complete", &before, &after),
+            "control_observations_complete"
+        );
+        assert_eq!(cpu_interval(&before, &f.endpoint(10))["qualified"], false);
+    }
+
+    #[test]
+    fn cgroup_cpu_missing_malformed_duplicate_overflow_reset_and_optional_drift_are_partial() {
+        let f = Fixture::new();
+        let good = "usage_usec 100\nuser_usec 20\nsystem_usec 30\nnr_periods 40\nnr_throttled 5\nthrottled_usec 60\n";
+        for prefix in ["cgroup", "cgroup/leaf"] {
+            f.put(&format!("{prefix}/cpu.stat"), good);
+        }
+        let before = f.endpoint(10);
+        for raw in [
+            "",
+            "usage_usec 100\nuser_usec 20\nsystem_usec 30\n",
+            "usage_usec 100\nuser_usec 20\nsystem_usec 30\nnr_periods 40\nnr_throttled 5\n",
+            "usage_usec -1\nuser_usec 20\nsystem_usec 30\nnr_periods 40\nnr_throttled 5\nthrottled_usec 60\n",
+            "usage_usec 18446744073709551616\nuser_usec 20\nsystem_usec 30\nnr_periods 40\nnr_throttled 5\nthrottled_usec 60\n",
+            "usage_usec 100\nusage_usec 100\nuser_usec 20\nsystem_usec 30\nnr_periods 40\nnr_throttled 5\nthrottled_usec 60\n",
+            "usage_usec 100 extra\nuser_usec 20\nsystem_usec 30\nnr_periods 40\nnr_throttled 5\nthrottled_usec 60\n",
+            "usage_usec 100\nuser_usec 20\nsystem_usec 30\nnr_periods 40\nnr_throttled 4\nthrottled_usec 60\n",
+        ] {
+            // Only the parent fails; a leaf-only predicate would pass.
+            f.put("cgroup/cpu.stat", raw);
+            let after = f.endpoint(20);
+            assert_eq!(
+                super::super::final_control_status(
+                    "control_observations_complete",
+                    &before,
+                    &after
+                ),
+                "partial_control_cgroup_cpu_interval_unavailable",
+                "{raw:?}"
+            );
+            assert_eq!(cpu_interval(&before, &after)["ancestors"], Value::Null);
+        }
+        f.put("cgroup/cpu.stat", &format!("{good}nr_bursts 1\n"));
+        assert_eq!(cpu_interval(&before, &f.endpoint(20))["qualified"], false);
+        let optional_before = f.endpoint(30);
+        f.put("cgroup/cpu.stat", &format!("{good}nr_bursts 2\n"));
+        assert_eq!(
+            cpu_interval(&optional_before, &f.endpoint(40))["ancestors"][1]["deltas"]["nr_bursts"],
+            1
+        );
+        f.put("cgroup/cpu.stat", &"x".repeat(4097));
+        assert_eq!(cpu_interval(&before, &f.endpoint(50))["qualified"], false);
+    }
+
+    #[test]
+    fn cgroup_cpu_receipts_cannot_detach_from_the_validated_map_or_raw_bytes() {
+        let f = Fixture::new();
+        for prefix in ["cgroup", "cgroup/leaf"] {
+            f.put(&format!("{prefix}/cpu.stat"), "usage_usec 0\nuser_usec 0\nsystem_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n");
+        }
+        let before = f.endpoint(10);
+        let after = f.endpoint(20);
+        for variant in 0..7 {
+            let mut bad = after.clone();
+            let rows = &mut bad["resources"]["cpu_counters"];
+            match variant {
+                0 => *rows = json!([]),
+                1 => {
+                    rows.as_array_mut().unwrap().pop();
+                }
+                2 => rows[0]["directory"] = json!("/unrelated"),
+                3 => rows[0]["source"]["path"] = json!("/unrelated/cpu.stat"),
+                4 => rows[0]["source"]["sha256"] = json!("0".repeat(64)),
+                5 => rows[0]["source"]["bytes"] = json!(0),
+                _ => rows[0]["source"]["status"] = json!("unavailable"),
+            }
+            assert_eq!(cpu_interval(&before, &bad)["qualified"], false, "{variant}");
+        }
+    }
+
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static ID: AtomicU64 = AtomicU64::new(0);
             let root = std::env::temp_dir().join(format!(
-                "nntmux-host-{}-{}",
+                "nntmux-host-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                ID.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&root).unwrap();
             let f = Self(root);
@@ -700,6 +845,9 @@ mod tests {
     #[test]
     fn final_completion_cannot_borrow_cpu_counter_success_without_host_evidence() {
         let f = Fixture::new();
+        for prefix in ["cgroup", "cgroup/leaf"] {
+            f.put(&format!("{prefix}/cpu.stat"), "usage_usec 0\nuser_usec 0\nsystem_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n");
+        }
         let before = f.endpoint(1);
         let after = f.endpoint(10);
         assert_eq!(

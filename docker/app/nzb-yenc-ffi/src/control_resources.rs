@@ -416,10 +416,14 @@ fn mapping(raw: &str, member: &str) -> Option<Mapping> {
         }
         for (_, directory) in &directories {
             if covers(&other.mount, directory)
-                || REQUIRED.into_iter().chain(OPTIONAL).any(|name| {
-                    let path = Path::new(directory).join(name);
-                    covers(&other.mount, path.to_str().unwrap())
-                })
+                || REQUIRED
+                    .into_iter()
+                    .chain(OPTIONAL)
+                    .chain(["cpu.stat"])
+                    .any(|name| {
+                        let path = Path::new(directory).join(name);
+                        covers(&other.mount, path.to_str().unwrap())
+                    })
             {
                 return None;
             }
@@ -459,6 +463,7 @@ fn source(
 
 pub(super) fn capture(proc: &Path, read: &mut impl FnMut(&Path, usize) -> Value) -> Value {
     let mut raw_sources = Vec::new();
+    let mut cpu_counters = Vec::new();
     let mut reasons = Vec::new();
     let mut identity =
         json!({"scope":SCOPE,"outer_host_limits":"unknown","physical_hierarchy_root":"unknown"});
@@ -498,6 +503,13 @@ pub(super) fn capture(proc: &Path, read: &mut impl FnMut(&Path, usize) -> Value)
         identity["mountpoint"] = json!(selected.mount);
         let mut ancestors = Vec::new();
         for (hierarchy, directory) in selected.directories {
+            // Dynamic counters use the same hardened map and shared reader
+            // budget, but must never enter the static resource identity.
+            let path = Path::new(&directory).join("cpu.stat");
+            let receipt = read(&path, CONTROL_CAP);
+            raw_sources.push(receipt.clone());
+            cpu_counters.push(json!({"hierarchy_path":hierarchy,"directory":directory,
+                "source":receipt}));
             let mut settings = BTreeMap::new();
             for name in REQUIRED.into_iter().chain(OPTIONAL) {
                 let path = Path::new(&directory).join(name);
@@ -535,7 +547,121 @@ pub(super) fn capture(proc: &Path, read: &mut impl FnMut(&Path, usize) -> Value)
         reasons.push("no unambiguous bounded cgroup v2 mount/membership mapping".into());
     }
     json!({"complete":reasons.is_empty(),"static_identity":identity,"raw_sources":raw_sources,
+        "cpu_counters":cpu_counters,
         "unavailable_reasons":reasons,"scope":SCOPE})
+}
+
+type CpuCounters = Vec<(String, BTreeMap<String, u64>)>;
+
+fn cpu_counters(resource: &Value) -> Result<CpuCounters, String> {
+    let required = [
+        "usage_usec",
+        "user_usec",
+        "system_usec",
+        "nr_periods",
+        "nr_throttled",
+        "throttled_usec",
+    ];
+    let rows = resource["cpu_counters"]
+        .as_array()
+        .filter(|rows| !rows.is_empty() && rows.len() <= MAX_ANCESTORS)
+        .ok_or("missing or unbounded visible cgroup CPU counter rows")?;
+    let expected = resource["static_identity"]["ancestors"]
+        .as_array()
+        .filter(|rows| !rows.is_empty() && rows.len() <= MAX_ANCESTORS)
+        .ok_or("missing visible cgroup map")?;
+    if resource["complete"] != true || rows.len() != expected.len() {
+        return Err("incomplete or mismatched visible cgroup map".into());
+    }
+    let mut result = Vec::with_capacity(rows.len());
+    for (row, identity) in rows.iter().zip(expected) {
+        let directory = identity["directory"]
+            .as_str()
+            .filter(|path| path.starts_with('/') && path.len() <= CONTROL_CAP)
+            .ok_or("invalid cgroup directory")?;
+        if row["directory"] != directory || row["hierarchy_path"] != identity["hierarchy_path"] {
+            return Err("CPU counter path differs from the bound resource map".into());
+        }
+        let receipt = &row["source"];
+        let path = Path::new(directory).join("cpu.stat");
+        let raw = receipt["raw"]
+            .as_str()
+            .filter(|raw| raw.len() <= CONTROL_CAP)
+            .ok_or_else(|| format!("unavailable or oversized {}", path.display()))?;
+        if receipt["status"] != "captured"
+            || receipt["path"] != json!(path)
+            || receipt["bytes"].as_u64() != Some(raw.len() as u64)
+            || receipt["sha256"] != super::super::digest(raw.as_bytes())
+        {
+            return Err(format!("unbound CPU counter receipt {}", path.display()));
+        }
+        let mut counters = BTreeMap::new();
+        for line in raw.lines() {
+            let mut fields = line.split_ascii_whitespace();
+            let key = fields
+                .next()
+                .filter(|key| {
+                    !key.is_empty()
+                        && key.len() <= 64
+                        && key
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'))
+                })
+                .ok_or("invalid CPU counter key")?;
+            let value = fields
+                .next()
+                .and_then(unsigned)
+                .ok_or("invalid CPU counter value")?;
+            if fields.next().is_some()
+                || counters.len() >= 64
+                || counters.insert(key.to_owned(), value).is_some()
+            {
+                return Err("duplicate, oversized or malformed CPU counter record".into());
+            }
+        }
+        if required.iter().any(|key| !counters.contains_key(*key)) {
+            return Err(format!(
+                "required usage or throttling counters unavailable at {}",
+                path.display()
+            ));
+        }
+        result.push((directory.to_owned(), counters));
+    }
+    Ok(result)
+}
+
+pub(super) fn cpu_interval(before: &Value, after: &Value) -> Value {
+    let compare = || -> Result<Value, String> {
+        if before["static_identity"] != after["static_identity"] {
+            return Err("cgroup resource identities differ".into());
+        }
+        let a = cpu_counters(before)?;
+        let b = cpu_counters(after)?;
+        let mut deltas = Vec::with_capacity(a.len());
+        for ((path, start), (end_path, end)) in a.iter().zip(&b) {
+            if path != end_path || start.keys().ne(end.keys()) {
+                return Err("cgroup paths or CPU counter availability changed".into());
+            }
+            let mut delta = BTreeMap::new();
+            for (key, first) in start {
+                let value = end[key]
+                    .checked_sub(*first)
+                    .ok_or_else(|| format!("CPU counter decreased at {path}: {key}"))?;
+                delta.insert(key, value);
+            }
+            deltas.push(json!({"directory":path,"deltas":delta}));
+        }
+        Ok(json!(deltas))
+    };
+    let (qualified, deltas, error) = match compare() {
+        Ok(deltas) => (true, deltas, Value::Null),
+        Err(error) => (false, Value::Null, json!(error)),
+    };
+    json!({"qualified":qualified,"status":if qualified {"observed_monotonic_usage_and_throttling"} else {"partial_unavailable_or_nonmonotonic"},
+        "error":error,"ancestors":deltas,
+        "scope":"every namespace-visible ancestor from the bounded controller resource map; ancestor usage is not summed",
+        "missing_counter_policy":"required usage and throttling counters must be observed, including at the visible mount root; missing is unknown, never zero or proof of no throttling",
+        "outer_host_counters":"unknown","noise_equivalence_qualified":false})
 }
 
 #[cfg(test)]
@@ -891,6 +1017,24 @@ Max realtime timeout      unlimited            unlimited            us\n";
                 }
             });
             assert_eq!(value["complete"], false, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn dynamic_cpu_stat_file_overmounts_never_borrow_the_validated_resource_map() {
+        for directory in ["/sys/fs/cgroup/job", "/sys/fs/cgroup"] {
+            for filesystem in ["cgroup2 cgroup", "tmpfs tmpfs"] {
+                let mut files = fixture("/job");
+                files
+                    .get_mut("/proc/self/mountinfo")
+                    .unwrap()
+                    .push_str(&format!(
+                        "88 36 0:32 /other/cpu.stat {directory}/cpu.stat rw - {filesystem} rw\n"
+                    ));
+                let value = snapshot(&files);
+                assert_eq!(value["complete"], false, "{directory} {filesystem}");
+                assert!(value["cpu_counters"].as_array().unwrap().is_empty());
+            }
         }
     }
 
