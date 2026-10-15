@@ -106,3 +106,11 @@ docker/Makefile		-binary text eol=lf
 # Custody benchmark protocol and Rust candidate are reviewable source.
 /benchmarks/nzb-custody/compare.py -binary text eol=lf
 /benchmarks/nzb-custody/sync.rs -binary text eol=lf
+# Public benchmark inventory and deployment verification are reviewable source.
+/scripts/benchmark_rust_inventory.py -binary text eol=lf
+/scripts/verify-benchmark-pages.py -binary text eol=lf
+/tests/Unit/test_benchmark_rust_inventory.py -binary text eol=lf
+/tests/Unit/test_verify_benchmark_pages.py -binary text eol=lf
+/tests/Unit/test_benchmark_pages_completeness.py -binary text eol=lf
+/scripts/benchmark-rust-toolchain.sh -binary text eol=lf
+/tests/Unit/test_benchmark_toolchain.py -binary text eol=lf
