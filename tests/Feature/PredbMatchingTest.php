@@ -76,7 +76,7 @@ final class PredbMatchingTest extends TestCase
         Cache::flush();
         DB::statement('CREATE TABLE predb (id INTEGER PRIMARY KEY, title TEXT, filename TEXT, source TEXT, size TEXT, category TEXT, nuked INTEGER DEFAULT 0)');
         DB::table('predb')->insert(['id' => 7, 'title' => 'Canonical.Scene-GROUP', 'filename' => 'File.Name-GROUP', 'source' => 'srrdb']);
-        DB::statement('CREATE TABLE releases (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, searchname TEXT, totalpart INTEGER, groups_id INTEGER, adddate TEXT, guid TEXT, leftguid TEXT, postdate TEXT, fromname TEXT, size INTEGER, passwordstatus INTEGER, haspreview INTEGER, categories_id INTEGER, nfostatus INTEGER, nzbstatus INTEGER, isrenamed INTEGER, iscategorized INTEGER, predb_id INTEGER)');
+        DB::statement('CREATE TABLE releases (additional_pack_evidence TEXT DEFAULT NULL, id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, searchname TEXT, totalpart INTEGER, groups_id INTEGER, adddate TEXT, guid TEXT, leftguid TEXT, postdate TEXT, fromname TEXT, size INTEGER, passwordstatus INTEGER, haspreview INTEGER, categories_id INTEGER, nfostatus INTEGER, nzbstatus INTEGER DEFAULT 1, isrenamed INTEGER, iscategorized INTEGER, predb_id INTEGER)');
         DB::statement('PRAGMA foreign_keys = ON');
         (require base_path('database/migrations/2026_10_11_215821_create_par2_rename_progress_table.php'))->up();
         DB::statement('CREATE TABLE usenet_groups (id INTEGER PRIMARY KEY, name TEXT)');

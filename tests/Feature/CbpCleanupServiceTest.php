@@ -787,7 +787,22 @@ class CbpCleanupServiceTest extends TestCase
             isrenamed INTEGER,
             iscategorized INTEGER,
             predb_id INTEGER,
-            source VARCHAR(255) NULL
+            source VARCHAR(255) NULL,
+            additional_pack_evidence JSON NULL,
+            nzb_creation_claim_token VARCHAR(64) NULL,
+            nzb_creation_claimed_at DATETIME NULL,
+            additional_pp_claim_token VARCHAR(64) NULL,
+            additional_pp_claimed_at DATETIME NULL,
+            archive_retry_at DATETIME NULL,
+            proc_nfo INTEGER DEFAULT 0,
+            proc_files INTEGER DEFAULT 0,
+            proc_srr INTEGER DEFAULT 0,
+            proc_crc32 INTEGER DEFAULT 0,
+            proc_uid INTEGER DEFAULT 0,
+            proc_par2 INTEGER DEFAULT 0,
+            proc_hash16k INTEGER DEFAULT 0,
+            rarinnerfilecount INTEGER DEFAULT 0,
+            pp_timeout_count INTEGER DEFAULT 0
         )');
         DB::statement('CREATE TABLE collections (
             id INTEGER PRIMARY KEY,
@@ -819,6 +834,9 @@ class CbpCleanupServiceTest extends TestCase
             partnumber INTEGER,
             size INTEGER
         )');
+        foreach (['release_files', 'release_nfos', 'media_infos', 'par_hashes', 'par_file_hashes', 'par_file_hash_inventories', 'par2_hash_retry', 'par2_rename_progress', 'par2_descriptor_evidence'] as $table) {
+            DB::statement('CREATE TABLE '.$table.' (releases_id INTEGER PRIMARY KEY)');
+        }
         DB::statement('CREATE TABLE release_regexes (releases_id INTEGER, collection_regex_id INTEGER, naming_regex_id INTEGER)');
         DB::statement('CREATE TABLE releases_groups (releases_id INTEGER, groups_id INTEGER)');
         DB::statement('CREATE TABLE release_naming_regexes (

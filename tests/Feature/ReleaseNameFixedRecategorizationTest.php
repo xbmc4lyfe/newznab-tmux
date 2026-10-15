@@ -10,6 +10,7 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Models\UsenetGroup;
 use App\Services\NameFixing\ReleaseUpdateService;
+use App\Services\Nzb\NzbService;
 use App\Support\Par2RenameProgress;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
@@ -104,6 +105,7 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
             'tv_lookup_retry_at' => now()->addDay(),
             'fromname' => 'poster@example.com',
             'groups_id' => $group->id,
+            'nzbstatus' => NzbService::NZB_ADDED,
             'categories_id' => Category::OTHER_HASHED,
             'iscategorized' => 1,
             'isrenamed' => 0,
@@ -159,6 +161,7 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
             'searchname' => $oldName,
             'fromname' => 'poster@example.com',
             'groups_id' => $group->id,
+            'nzbstatus' => NzbService::NZB_ADDED,
             'categories_id' => Category::TV_WEBDL,
             'iscategorized' => 1,
             'isrenamed' => 0,
@@ -206,6 +209,7 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
             'searchname' => $oldName,
             'fromname' => 'poster@example.com',
             'groups_id' => $group->id,
+            'nzbstatus' => NzbService::NZB_ADDED,
             'categories_id' => Category::MOVIE_WEBDL,
             'iscategorized' => 1,
             'isrenamed' => 0,
@@ -251,6 +255,7 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
             'searchname' => $oldName,
             'fromname' => 'poster@example.com',
             'groups_id' => $group->id,
+            'nzbstatus' => NzbService::NZB_ADDED,
             'categories_id' => Category::TV_HD,
             'iscategorized' => 1,
             'isrenamed' => 1,
@@ -291,6 +296,7 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
         ]);
         $release = Release::factory()->create([
             'groups_id' => $group->id,
+            'nzbstatus' => NzbService::NZB_ADDED,
             'guid' => str_repeat('d', 40),
             'leftguid' => 'd',
             'proc_nfo' => 0,
@@ -384,7 +390,10 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
                 $table->tinyInteger('proc_srr')->default(0);
                 $table->tinyInteger('proc_crc32')->default(0);
                 $table->tinyInteger('passwordstatus')->default(0);
-                $table->tinyInteger('nzbstatus')->default(0);
+                $table->tinyInteger('nzbstatus')->default(NzbService::NZB_NONE);
+                $table->json('additional_pack_evidence')->nullable();
+                $table->string('additional_pp_claim_token')->nullable();
+                $table->timestamp('additional_pp_claimed_at')->nullable();
             });
         }
     }

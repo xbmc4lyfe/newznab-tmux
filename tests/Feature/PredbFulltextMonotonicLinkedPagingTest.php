@@ -121,7 +121,7 @@ final class PredbFulltextMonotonicLinkedPagingTest extends TestCase
         $this->database(self::TITLE, self::TITLE, self::TITLE);
         DB::table('releases')->where('id', 1)->update(['predb_id' => 7]);
         $read = new PDO('sqlite::memory:');
-        $read->exec('CREATE TABLE releases (id INTEGER PRIMARY KEY, guid TEXT, name TEXT, searchname TEXT, fromname TEXT, groups_id INTEGER, categories_id INTEGER, predb_id INTEGER)');
+        $read->exec('CREATE TABLE releases (additional_pack_evidence TEXT DEFAULT NULL, nzbstatus INTEGER DEFAULT 1, id INTEGER PRIMARY KEY, guid TEXT, name TEXT, searchname TEXT, fromname TEXT, groups_id INTEGER, categories_id INTEGER, predb_id INTEGER)');
         $read->sqliteCreateFunction('like', static fn (): int => 0, 3);
         DB::connection()->setReadPdo($read);
         $this->pages(10);
@@ -276,7 +276,7 @@ final class PredbFulltextMonotonicLinkedPagingTest extends TestCase
         }, 3);
         DB::connection()->setPdo($pdo);
         DB::connection()->setReadPdo($pdo);
-        $pdo->exec('CREATE TABLE releases (id INTEGER PRIMARY KEY, guid TEXT, name TEXT COLLATE NOCASE, searchname TEXT COLLATE NOCASE, fromname TEXT, groups_id INTEGER, categories_id INTEGER, predb_id INTEGER, videos_id INTEGER DEFAULT 81, tv_episodes_id INTEGER DEFAULT 82, tv_lookup_attempts INTEGER DEFAULT 0, tv_lookup_retry_at TEXT, imdbid TEXT DEFAULT "tt-preserved", musicinfo_id TEXT DEFAULT "83", consoleinfo_id TEXT DEFAULT "84", bookinfo_id TEXT DEFAULT "85", book_lookup_attempts INTEGER DEFAULT 3, book_lookup_retry_at TEXT DEFAULT "2026-10-01", book_name_normalized_at TEXT DEFAULT "2026-10-01", anidbid TEXT DEFAULT "86", isrenamed INTEGER DEFAULT 0, iscategorized INTEGER DEFAULT 0)');
+        $pdo->exec('CREATE TABLE releases (additional_pack_evidence TEXT DEFAULT NULL, nzbstatus INTEGER DEFAULT 1, id INTEGER PRIMARY KEY, guid TEXT, name TEXT COLLATE NOCASE, searchname TEXT COLLATE NOCASE, fromname TEXT, groups_id INTEGER, categories_id INTEGER, predb_id INTEGER, videos_id INTEGER DEFAULT 81, tv_episodes_id INTEGER DEFAULT 82, tv_lookup_attempts INTEGER DEFAULT 0, tv_lookup_retry_at TEXT, imdbid TEXT DEFAULT "tt-preserved", musicinfo_id TEXT DEFAULT "83", consoleinfo_id TEXT DEFAULT "84", bookinfo_id TEXT DEFAULT "85", book_lookup_attempts INTEGER DEFAULT 3, book_lookup_retry_at TEXT DEFAULT "2026-10-01", book_name_normalized_at TEXT DEFAULT "2026-10-01", anidbid TEXT DEFAULT "86", isrenamed INTEGER DEFAULT 0, iscategorized INTEGER DEFAULT 0)');
         (require base_path('database/migrations/2026_10_11_215821_create_par2_rename_progress_table.php'))->up();
         $pdo->exec('CREATE TABLE predb (id INTEGER PRIMARY KEY, title TEXT)');
         DB::table('predb')->insert(['id' => 7, 'title' => $canonicalTitle ?? $name]);

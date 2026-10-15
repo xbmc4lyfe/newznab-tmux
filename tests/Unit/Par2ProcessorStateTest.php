@@ -10,6 +10,7 @@ use App\Services\NameFixing\Extractors\FileNameExtractor;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\NNTP\NNTPService;
+use App\Services\Nzb\NzbService;
 use App\Services\Par2Processor;
 use dariusiii\rarinfo\Par2Info;
 use Illuminate\Config\Repository;
@@ -67,6 +68,10 @@ final class Par2ProcessorStateTest extends TestCase
             $table->integer('predb_id')->default(0);
             $table->integer('proc_par2')->default(0);
             $table->integer('rarinnerfilecount')->default(0);
+            $table->integer('nzbstatus')->default(NzbService::NZB_NONE);
+            $table->json('additional_pack_evidence')->nullable();
+            $table->string('additional_pp_claim_token')->nullable();
+            $table->timestamp('additional_pp_claimed_at')->nullable();
         });
         $schema->create('predb', function (Blueprint $table): void {
             $table->integer('id')->primary();
@@ -100,9 +105,9 @@ final class Par2ProcessorStateTest extends TestCase
         $sceneName = 'Example.Show.S01E01.1080p.WEB-DL.x264-GRP';
         $this->database->getConnection()->table('predb')->insert(['id' => 99, 'title' => $sceneName]);
         $this->database->getConnection()->table('releases')->insert([
-            ['id' => 123, 'guid' => 'synthetic-release-123', 'groups_id' => 1, 'categories_id' => Category::OTHER_MISC,
+            ['id' => 123, 'nzbstatus' => NzbService::NZB_ADDED, 'guid' => 'synthetic-release-123', 'groups_id' => 1, 'categories_id' => Category::OTHER_MISC,
                 'name' => $sceneName, 'searchname' => $sceneName],
-            ['id' => 456, 'guid' => 'synthetic-release-456', 'groups_id' => 1, 'categories_id' => Category::OTHER_MISC,
+            ['id' => 456, 'nzbstatus' => NzbService::NZB_ADDED, 'guid' => 'synthetic-release-456', 'groups_id' => 1, 'categories_id' => Category::OTHER_MISC,
                 'name' => 'unrelated-hash', 'searchname' => 'unrelated-hash'],
         ]);
 
@@ -152,7 +157,7 @@ final class Par2ProcessorStateTest extends TestCase
             $table->primary(['releases_id', 'hash']);
         });
         $this->database->getConnection()->table('releases')->insert([
-            'id' => 123, 'guid' => 'synthetic-release-123', 'groups_id' => 1, 'categories_id' => 2000,
+            'id' => 123, 'nzbstatus' => NzbService::NZB_ADDED, 'guid' => 'synthetic-release-123', 'groups_id' => 1, 'categories_id' => 2000,
             'name' => 'known-release', 'searchname' => 'known-release',
             'postdate' => '2026-10-11 00:00:00', 'rarinnerfilecount' => 7,
         ]);
