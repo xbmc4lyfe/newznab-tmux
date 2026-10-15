@@ -4,7 +4,7 @@
 
 Use the same selected NNTP connection for backfill targeting and storage. Date-based admission requires the requested article's parseable date from that provider/group; unrelated local part numbers, neighboring article dates and the current clock cannot supply it. Missing endpoint or midpoint metadata defers the attempt. Successful exact probes retain the approximate date search with bounded, integer-safe arithmetic; article Date ordering is still not guaranteed. Failed overview ranges must retain their cursor, while successful empty ranges remain completed work.
 
-- [ ] Run the full PHPUnit/native retest and required CI on final integrated master, including default/reused multi-group callers, initial forward indexing, large article numbers, missing/mismatched dates, failed and empty ranges, storage repair and cooperative drain/retry boundaries.
+- [ ] Run the full PHPUnit/native retest and required CI on final integrated master, including default/reused multi-group callers, initial forward indexing, large article numbers, missing/mismatched dates, failed and empty ranges, storage repair, cooperative drain/retry boundaries and durable deployment recovery holds.
 - [ ] Verify a guarded rollout, reviewed source/image parity, service health and M4 TLS connectivity. The already-loaded legacy workers lack the new stop checks; source fixes alone do not establish a safe interruption/replay procedure.
 - [ ] Observe natural date targets, range spans, cursor continuity, useful release creation and backlog change. Fixture prevention of excess work is not a measured production throughput gain; preserve unknown/sparse-date deferrals and failed observations.
 

@@ -59,6 +59,7 @@ docker/docs/
 docker/app/nzb-yenc-ffi/target/
 docker/.deploy.lock
 docker/.deploy.lock.claim
+docker/.deploy.lock.recovery-hold
 docker/.deploy.log
 docker/.deploy.stamp
 
