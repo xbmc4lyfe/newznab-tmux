@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "kind": "presentation",
+  "runner": "ubuntu-latest",
+  "head_sha": "57dfddcfd029b361e92c4d6ddae21b200b57323b",
+  "run_id": 38655034815,
+  "run_attempt": 1,
+  "repository": "xbmc4lyfe/newznab-tmux",
+  "status": "passed",
+  "rows": [
+    {
+      "scenario": "clean",
+      "rows": 1,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "clean",
+      "rows": 2,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "clean",
+      "rows": 5,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "clean",
+      "rows": 10,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "clean",
+      "rows": 16,
+      "candidate_backend": "rust",
+      "gate_passed": true,
+      "samples": 21,
+      "iterations": 625,
+      "php_median_ns": 118585.7456,
+      "rust_median_ns": 40049.0784,
+      "improvement_percent": 66.22774668458972
+    },
+    {
+      "scenario": "clean",
+      "rows": 50,
+      "candidate_backend": "rust",
+      "gate_passed": true,
+      "samples": 21,
+      "iterations": 200,
+      "php_median_ns": 371560.16,
+      "rust_median_ns": 70459.35,
+      "improvement_percent": 81.03689319113221
+    },
+    {
+      "scenario": "clean",
+      "rows": 100,
+      "candidate_backend": "rust",
+      "gate_passed": true,
+      "samples": 21,
+      "iterations": 100,
+      "php_median_ns": 738309.65,
+      "rust_median_ns": 115526.37,
+      "improvement_percent": 84.35258566646122
+    },
+    {
+      "scenario": "wrapped",
+      "rows": 1,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "wrapped",
+      "rows": 2,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "wrapped",
+      "rows": 5,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "wrapped",
+      "rows": 10,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "wrapped",
+      "rows": 16,
+      "candidate_backend": "rust",
+      "gate_passed": true,
+      "samples": 21,
+      "iterations": 625,
+      "php_median_ns": 124584.9824,
+      "rust_median_ns": 43942.6448,
+      "improvement_percent": 64.72877873922629
+    },
+    {
+      "scenario": "wrapped",
+      "rows": 50,
+      "candidate_backend": "rust",
+      "gate_passed": true,
+      "samples": 21,
+      "iterations": 200,
+      "php_median_ns": 387891.005,
+      "rust_median_ns": 82950.945,
+      "improvement_percent": 78.61488306489602
+    },
+    {
+      "scenario": "wrapped",
+      "rows": 100,
+      "candidate_backend": "rust",
+      "gate_passed": true,
+      "samples": 21,
+      "iterations": 100,
+      "php_median_ns": 781370.42,
+      "rust_median_ns": 140232.16,
+      "improvement_percent": 82.05304981982809
+    },
+    {
+      "scenario": "escaped",
+      "rows": 1,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "escaped",
+      "rows": 2,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "escaped",
+      "rows": 5,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "escaped",
+      "rows": 10,
+      "candidate_backend": "php-small-batch",
+      "correctness_passed": true,
+      "performance_gate": "not_applicable_same_php_path"
+    },
+    {
+      "scenario": "escaped",
+      "rows": 16,
+      "candidate_backend": "rust",
+      "gate_passed": true,
+      "samples": 21,
+      "iterations": 625,
+      "php_median_ns": 126820.4192,
+      "rust_median_ns": 47658.5552,
+      "improvement_percent": 62.420440256674375
+    },
+    {
+      "scenario": "escaped",
+      "rows": 50,
+      "candidate_backend": "rust",
+      "gate_passed": true,
+      "samples": 21,
+      "iterations": 200,
+      "php_median_ns": 394590.655,
+      "rust_median_ns": 93194.36,
+      "improvement_percent": 76.38201543318354
+    },
+    {
+      "scenario": "escaped",
+      "rows": 100,
+      "candidate_backend": "rust",
+      "gate_passed": true,
+      "samples": 21,
+      "iterations": 100,
+      "php_median_ns": 793965.25,
+      "rust_median_ns": 159002.09,
+      "improvement_percent": 79.97367139178951
+    }
+  ],
+  "evidence_type": "presentation_median_screen",
+  "adoption_qualified": false,
+  "completeness": {
+    "expected_rows": 21,
+    "observed_rows": 21,
+    "complete": true
+  },
+  "source_sha256": {
+    "docker/app/nzb-yenc-ffi/src/lib.rs": "50c88c7f3fd5e6f481c6811c70652125116a60bbbf2b3504fd456a8b7f5ce76d",
+    "app/Support/AdminReleaseNames.php": "d3da8a9aa8ecfeaf4e6454c8d42b34cdf5cebf161d5c81069087e0341695f576",
+    "scripts/benchmark-release-names.php": "3d2f6ba6de149d5b692216ea7612f49de695624d3fc1b435b94cd52a88b11f68",
+    "app/Support/ReleaseNameDisplay.php": "9abc6e372204fd5678d013e8be3cd276b3ad2d44658a206b23df951a5a5b3a98",
+    "docker/app/nzb-yenc-ffi/src/release_names.rs": "5f16c3cd04a0706492e7577a6d7832bd06f8675713258c046624764aa3ef3087",
+    "docker/app/php/release-presentation-preload.php": "ae806836f6f7386961d56bded4666347801b933cfe8b3cbeeb11c797be4a79da",
+    "docker/app/nzb-yenc-ffi/Cargo.lock": "77b88ca781e79d95668cb5cb2d8bb61b89d3b3c4dd0892cdc86d4b260dffb55d",
+    "composer.lock": "ee1360f9ab65dbd1d3435cc2d986a2d4a3f2069ba8e129222df3889facdd5be8",
+    "vendor/composer/installed.json": "9cbae4e09630824e80bb17bf5470afaf2ac8a07ff6b933392ce96ec4b57a896c"
+  },
+  "library_sha256": {
+    "native": "6db926bc9e55b913e2041a5deb7a3a589f39bfd2d1649f9fa1698a0c320f3422"
+  }
+}
