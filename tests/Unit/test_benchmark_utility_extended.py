@@ -82,14 +82,17 @@ def cpu_host():
 
 
 class ExtendedUtilityExportTest(unittest.TestCase):
-    def export(self, kind, report, resources=None):
+    def export(self, kind, report, resources=None, runtime='valid'):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "utility-evidence" / kind / "report.json"
             source.parent.mkdir(parents=True)
             source.write_text(json.dumps(report))
             write_resources(root, resources)
-            (root / "utility-evidence/runtime.json").write_text(json.dumps({"executed_sha": "e" * 40, "architecture": "aarch64", MARKER: MARKER}))
+            if runtime != 'missing':
+                (root / "utility-evidence/runtime.json").write_text(json.dumps({
+                    "executed_sha": ("f" if runtime == 'mismatch' else "e") * 40,
+                    "architecture": "aarch64", MARKER: MARKER}))
             env = dict(os.environ, GITHUB_SHA="e" * 40, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1", GITHUB_REPOSITORY="xbmc4lyfe/newznab-tmux")
             result = subprocess.run(["python3", str(SCRIPT), "--kind", kind, "--runner", "ubuntu-24.04-arm", "--output", "summary.json"],
                                     cwd=root, env=env, capture_output=True, text=True)
@@ -99,6 +102,32 @@ class ExtendedUtilityExportTest(unittest.TestCase):
             result = json.loads(raw)
             self.assertIs(result["adoption_qualified"], False)
             return result
+
+    def test_global_utility_failure_clears_eligibility_and_favorable_gates(self):
+        for kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot'):
+            report = cpu_host() if kind == 'cpu-snapshot' else fingerprint(1000)
+            if kind.startswith('fingerprint-'):
+                report['protocol']['backend'] = kind.removeprefix('fingerprint-')
+            valid = self.export(kind, report)
+            self.assertEqual(valid['status'], 'measured')
+            self.assertTrue(all(row['eligible'] for row in valid['rows']))
+            self.assertTrue(any(row.get('gate_passed') or row.get('p99_threshold_met') for row in valid['rows']))
+            for failure in ('invalid-report', 'partial-report', 'runtime-mismatch', 'runtime-missing'):
+                with self.subTest(kind=kind, failure=failure):
+                    changed = copy.deepcopy(report)
+                    options = {}
+                    if failure == 'invalid-report':
+                        changed['correctness_pass' if kind == 'cpu-snapshot' else 'invalid_observations'] = False if kind == 'cpu-snapshot' else ['source drift']
+                    elif failure == 'partial-report':
+                        del changed['summary']['rare-unavailable' if kind == 'cpu-snapshot' else 'ids16']
+                    else:
+                        options['runtime'] = 'mismatch' if failure == 'runtime-mismatch' else 'missing'
+                    summary = self.export(kind, changed, **options)
+                    self.assertEqual(summary['status'], 'partial' if failure in ('partial-report', 'runtime-missing') else 'invalid')
+                    self.assertFalse(any(row['eligible'] for row in summary['rows']))
+                    self.assertFalse(any(row.get('gate_passed') or row.get('p99_threshold_met') for row in summary['rows']))
+                    self.assertFalse(any(row.get('decision') == 'useful_improvement' for row in summary['rows']))
+                    self.assertTrue(any(row.get('baseline_median_ns', 0) > 0 for row in summary['rows']))
 
     def test_current_protocol_requires_real_stable_resource_receipts(self):
         for kind, report in (("fingerprint-ffi", fingerprint()), ("cpu-snapshot", cpu_host())):
@@ -149,6 +178,14 @@ class ExtendedUtilityExportTest(unittest.TestCase):
         self.assertEqual(len(summary["rows"]), 4)
         self.assertEqual(sum(row["comparison"] == "exact_host_cli" for row in summary["rows"]), 1)
         self.assertEqual(summary["uncertainty_method"], "mixed_output_bootstrap")
+        negative = cpu_host()
+        negative['host_comparison']['summary'].update(gate_pass=False, p99_ratio_ci95=[1, 10])
+        negative['host_comparison']['host_gate_pass'] = negative['host_gate_pass'] = False
+        summary = self.export('cpu-snapshot', negative)
+        self.assertEqual(summary['status'], 'measured_gate_failed')
+        self.assertTrue(all(row['eligible'] for row in summary['rows']))
+        self.assertFalse(next(row for row in summary['rows'] if row['fixture'] == 'host-live')['gate_passed'])
+        self.assertTrue(any(row.get('gate_passed') for row in summary['rows']))
 
     def test_cpu_host_invalid_witness_duplicate_or_source_drift_remains_invalid(self):
         for mutation in ("invalid", "duplicate", "drift", "witness", "metric", "false-gate"):

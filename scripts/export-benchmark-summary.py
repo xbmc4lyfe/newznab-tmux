@@ -526,11 +526,6 @@ def export(kind, runner):
                     summary.setdefault('source_sha256', {}).update(resource_receipt())
                 except (OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
                     summary['status'] = 'invalid'
-                    for row in summary['rows']:
-                        row['eligible'] = False
-                        for gate in ('gate_passed', 'p99_threshold_met'):
-                            if row.get(gate) is True:
-                                row[gate] = False
             runtime_file = Path("utility-evidence/runtime.json")
             if not runtime_file.is_file():
                 summary["status"] = "partial" if summary["status"] != "invalid" else "invalid"
@@ -546,6 +541,14 @@ def export(kind, runner):
             pass
         except (OSError, UnicodeError, ValueError, TypeError, OverflowError):
             summary["status"] = "invalid"
+        if summary['status'] not in ('measured', 'measured_gate_failed'):
+            for row in summary['rows']:
+                row['eligible'] = False
+                for gate in ('gate_passed', 'p99_threshold_met'):
+                    if row.get(gate) is True:
+                        row[gate] = False
+                if 'decision' in row:
+                    row['decision'] = 'invalid'
         return summary
     records, malformed = [], False
     try:
