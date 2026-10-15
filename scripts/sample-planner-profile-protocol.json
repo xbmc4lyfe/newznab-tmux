@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "status": "source_only_proposal_not_executed",
+  "question": "Which phases of the complete sample-planning caller account for the cold1024 gap, and is there enough removable cost to justify a narrow optimization?",
+  "source_commit": "0e62874c6a1090072de9fac50e50a6ec7f4c5bea",
+  "context_evidence": {
+    "historical_qualification_source": "16301bd24e8f39dee3a1a5137e562b85052d549c",
+    "current_ci_run": 38812539972,
+    "current_ci_attempt": 1,
+    "x86_public_artifact": 12008684373,
+    "x86_public_zip_sha256": "2d2242c9dfda46924781b3aca76f6595077c9c756afeed0f172fd92cc896cfd4",
+    "x86_raw_artifact": 12009103317,
+    "x86_raw_zip_sha256": "8011646596debf96645b1d18ede0afb0e66e098471ea3ec34fd77215a7005e8a",
+    "arm_public_artifact": 12009491547,
+    "arm_public_zip_sha256": "b42887170084eb708475282ca46ad4e65b3e36f729ca4c3bdb033bab8d7e4833",
+    "note": "Existing standard PHP/native cold/warm observations retained unchanged. No whole-library or cross-host timing parity inferred."
+  },
+  "executor": {
+    "required": "existing reviewed disposable actual x86_64 Linux executor, isolated from all production services",
+    "not_allowed": [
+      "ARM emulation represented as x86",
+      "production M5 services, data, provider credentials or stack",
+      "new fleet provisioning",
+      "new dependencies",
+      "execution before shared queue authorization and frozen source/protocol/runtime identities"
+    ],
+    "selection": "proposed existing archive-sample-performance.yml manual branch-ref attribution-only job; exact patch under source review; actual x86 isolation must be established before dispatch"
+  },
+  "arms": [
+    "unchanged production NativeSpotCheckPlanner and optimized locked native library",
+    "private instrumented PHP wrapper copy using the exact same verified frozen native.so and vendor; no Rust instrumentation or rebuild; never integrated into production"
+  ],
+  "workload": {
+    "fixtures": "exact six frozen variant-0 fixtures from raw artifact12009103317; no altered inputs",
+    "pairs": 186,
+    "order": "seed20261016 randomized native-control/instrumented-copy order per pair; fresh PHP process per arm",
+    "phases": [
+      "cold",
+      "warmup",
+      "warm"
+    ],
+    "parity": "compare serialized outputs against retained existing PHP reference for every frozen fixture and every pair outside measurement; require expected native success/fallback counts",
+    "independent_fresh_process_pairs_per_stratum": 31,
+    "fixture_variant": 0
+  },
+  "observers": {
+    "php": [
+      "instrumented native-select admission/support check; unchanged outer PHP dispatch/support remains part of whole-caller unattributed residual",
+      "library resolution, FFI cdef and known-input probe",
+      "typed projection plus json_encode",
+      "native call and output conversion/free/json_decode",
+      "result semantic and budget validation"
+    ],
+    "rust": [],
+    "transport": "diagnostic data collected after the timed public call via private observer access; no provider/service/database I/O; phase instrumentation implementation requires source review before build",
+    "limits": "observer costs, diagnostic access and different cache/alloc behavior are measured against the uninstrumented control, never subtracted to create an adoption result",
+    "native": "whole ABI invocation only, including native internals; no finer native attribution claimed"
+  },
+  "identity_requirements": [
+    "all source hashes and patch hashes for both arms",
+    "Cargo/composer lock and vendor identities",
+    "library and binary hashes",
+    "actual rustc/cargo/PHP/OS/CPU architecture and kernel",
+    "frozen artifact optimized build receipt/compiler flags/default features; no new build",
+    "CPU, memory, throttling and cgroup limits before/after",
+    "exact fixture/protocol/order hashes",
+    "per-worker exit status, timeout, stdout/stderr and process/group closure"
+  ],
+  "failure_policy": "retain every timeout/crash/mismatch/missing observation; invalid pair never supplies a phase conclusion; do not retry to choose favorable timings",
+  "budgets": {
+    "proposed_batch_seconds": 600,
+    "proposed_worker_seconds": 30,
+    "build_and_test_window": "separately declared and authorized; no command launched yet"
+  },
+  "interpretation": {
+    "type": "attribution-only paired diagnostic screen",
+    "p99_qualified": false,
+    "adoption_qualified": false,
+    "new_replacement_allowed": false,
+    "decision": "only propose a narrow candidate if attributed removable cost plausibly exceeds observed boundary deficit; candidate needs fresh uninstrumented full-caller correctness plus >=1.5common and uncommon p99 proof on required platforms before integration"
+  },
+  "unchanged_guards": [
+    "Linux CLI/FFI gating",
+    "exact type/list/identity validation",
+    "library cdef and known-input ABI qualification",
+    "input/output bounds and ownership/free",
+    "numeric-digest fallback for all eligible inputs, including unselected",
+    "stable ties, duplicate-file-key semantics, duplicate IDs, budget skips and stop after an empty round"
+  ],
+  "observer_trace_contract": {
+    "storage": "bounded PHP trace of at most128eight-scalar event rows and8invocations; row allocations, clocks,finally and readout COW remain observer interference; no JSON/logging/I/O in measured code",
+    "invocation_identity": "retain known-input qualification probe and actual workload separately using PHP call-site role and cold/warmup/warm tags; no last-call overwrite",
+    "cold_integrity": "fresh process initializes PHP trace without accessing FFI; no preload/reset/read or diagnostic symbol resolution before original cold boundary; known-input probe remains inside original setup call",
+    "readout": "bounded observer readout after each measured public call, with identical outside-boundary scheduling in control and instrumented arms; control readout must not preload native code or replace a production operation. Retain accessor/cache asymmetry explicitly as observer interference, not corrected performance",
+    "reset": "fresh process is the initial reset; any subsequent reset/read only outside measurement and cannot discard prior probe/workload evidence",
+    "invalidity": [
+      "overflow",
+      "missing invocation or call-site tag",
+      "unexpected extra invocation",
+      "trace ordinal/phase mismatch",
+      "observer state surviving a fresh-process boundary"
+    ],
+    "event_capacity": 128,
+    "invocation_capacity": 8,
+    "expected_events": {
+      "successful_native": {
+        "cold": 16,
+        "warmup": 11,
+        "warm": 11,
+        "total": 38,
+        "invocations": 4
+      },
+      "unsupported_fallback": {
+        "cold": 10,
+        "warmup": 5,
+        "warm": 5,
+        "total": 20,
+        "invocations": 1
+      },
+      "small_dispatch": {
+        "cold": 0,
+        "warmup": 0,
+        "warm": 0,
+        "total": 0,
+        "invocations": 0
+      }
+    }
+  },
+  "phase_accounting_contract": {
+    "order": "preserve all original PHP statement/guard/call ordering; frozen Rust library remains byte-identical, including per-file eligibility/hash/sort interleaving",
+    "tree": "whole unchanged SpotCheckPlanner public call contains uninstrumented outer NativeSpotCheckPlanner::supportsInventory dispatch residual, instrumented ProfiledNativeSpotCheckPlanner select admission/inner support, setup/probe, projection, encoding, actual native aggregate invocation, conversion/free/decode and validation. Probe ABI duration remains nested under setup.",
+    "exclusive": "derive each parent-exclusive duration by subtracting only immediate contained children: setup6 subtracts cdef11 and probe call10; each call10 subtracts ABI7,conversion8,decode9; admission2 subtracts support1. Native internals remain one aggregate. Never add inclusive parents and nested children as independent caller costs",
+    "residual": "retain PHP/FFI/allocator/observer/unattributed residual separately; do not label the cold-warm delta or minor faults as FFI time",
+    "clock": "monotonic duration measurements in each runtime; freeze clock/unit identity and resolution. No conversion of independently-originated absolute timestamps into cross-runtime event order",
+    "tolerance": "record clock resolution and predeclare tolerance before execution; any child-stage sum exceeding its enclosing measured span beyond that tolerance is invalid, never clipped into a plausible result",
+    "overhead": "pair with unchanged native control and retain total observer overhead/distribution; do not subtract overhead or phase estimates to synthesize an adoption result"
+  },
+  "historical_isa_policy": {
+    "scope": "private non-adopting attribution only on existing disposable GitHub-hosted actual x86_64 Linux executor",
+    "approving_coordinator_thread": "01a12d8e-7f36-7fa3-81b8-f6f988ce9a02",
+    "approved_policy": "Unknown historical required ISA/build provenance may remain explicitly unknown. Capture original API/build/runtime receipts, exact artifact/library digests, actual host CPU flags and nonloading ELF notes/dependencies/version requirements. No invented decoder-kernel qualification or rebuild.",
+    "required_failure_handling": "Every load, SIGILL, ABI failure or missing/mismatching result is invalid and retained; never skip, substitute, resample or claim portability/adoption/p99 qualification.",
+    "receipt": "Retain this protocol hash and approving coordinator with explicit unknown ISA state and actual captured evidence in resulting receipt."
+  },
+  "control_integrity": "Production NativeSpotCheckPlanner and SpotCheckPlanner remain byte-identical to frozen artifact; instrumented private class has distinct ProfiledNativeSpotCheckPlanner name and extends NativeSpotCheckPlanner for accepted caller type. Do not instrument or duplicate the unchanged outer static supportsInventory call; its cost remains in full-caller residual."
+}

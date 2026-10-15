@@ -23,14 +23,22 @@ on:
     inputs:
       comparison:
         type: choice
-        options: [remaining, existing, all]
+        options: [remaining, existing, all, php-attribution]
         default: remaining
-        description: Select the six remaining modules or existing caller families
+        description: Select benchmark family or the private PHP attribution screen
+      authorize_private_study:
+        type: boolean
+        default: false
+        description: Explicitly authorize the bounded, non-adopting diagnostic screen
+      profile_sha:
+        type: string
+        default: ''
+        description: Exact reviewed instrumentation branch commit; required only for php-attribution
       mode:
         type: choice
         options: [screen, qualification]
         default: screen
-        description: Qualification requires 1000 independent pairs
+        description: php-attribution requires screen; qualification is unavailable for that choice
       samples:
         default: '31'
         description: Pairs per comparative stratum; use at least 1000 for qualification
@@ -46,6 +54,7 @@ concurrency:
 
 jobs:
   compare:
+    if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'php-attribution'
     name: ${{ matrix.kind }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
@@ -196,5 +205,458 @@ jobs:
         with:
           name: native-utility-${{ matrix.kind }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: utility-evidence/
+          retention-days: 14
+          if-no-files-found: warn
+
+  # Manual-only diagnostic. It imports the exact, already-built x86 artifact;
+  # this job must never enter a compile/install path or the qualification flow.
+  php-attribution:
+    if: github.event_name == 'workflow_dispatch' && inputs.comparison == 'php-attribution' && inputs.authorize_private_study
+    name: PHP attribution diagnostic (x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    env:
+      PROFILE_SHA: ${{ inputs.profile_sha }}
+      PROFILE_PROTOCOL_SHA256: f40aa2daf2ae6aad4f0db73627511b4b6a11cc1ead36812e3d2770a971bd70f2
+      EXPECTED_LIBRARY_SHA256: 02eeb2be7d182cbc046cd5358792795825acf9daac549a020afc0fb2ea847213
+      PROFILE_PACKET_MANIFEST_SHA256: f20e41e1bd48e47e8888fa9341bde3bb8ccc89802ebc3264ed8400724c223d16
+      PROFILE_RUNNER_MANIFEST_SHA256: 31fbabe37c9d73c84567b8ca233db4f77c2d02266901893602faeecb8f99bf01
+      PROFILE_ISA_APPROVAL_THREAD: 01a12d8e-7f36-7fa3-81b8-f6f988ce9a02
+      AUTHORIZE_PRIVATE_STUDY: ${{ inputs.authorize_private_study }}
+      ARTIFACT_RUN_ID: '38812539972'
+      ARTIFACT_ID: '12009103317'
+      ARTIFACT_SHA256: '8011646596debf96645b1d18ede0afb0e66e098471ea3ec34fd77215a7005e8a'
+      ARTIFACT_NAME: native-utility-sample-planning-ubuntu-latest-38812539972-1
+      ARTIFACT_HEAD_SHA: 0e62874c6a1090072de9fac50e50a6ec7f4c5bea
+      PHP_VERSION_REQUIRED: '8.5.11'
+    steps:
+      - name: Fail closed before checkout unless this is a hosted x86_64 Linux VM
+        shell: bash
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Capture executor identity and actual x86_64 Linux state
+        shell: bash
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/raw evidence/import
+          printf '%s\n' "$GITHUB_SHA" > evidence/raw/profile-sha.txt
+          python3 - <<'PY'
+          import json, os, pathlib
+          pathlib.Path('evidence/raw/study-policy.json').write_text(json.dumps({
+              'scope': 'private diagnostic attribution only',
+              'unknown_cpu_isa': 'capture actual CPU flags and ELF notes; retain result; no portability, adoption, or p99 claim',
+              'invalid_observation': 'ABI/load/SIGILL failure is retained as invalid and never resampled',
+              'rebuild_or_substitution': 'forbidden',
+              'approval_thread_id': os.environ['PROFILE_ISA_APPROVAL_THREAD'],
+              'protocol_sha256': os.environ['PROFILE_PROTOCOL_SHA256'],
+          }, indent=2) + '\n')
+          PY
+          printf 'environment=%s\nos=%s\narch=%s\n' "$RUNNER_ENVIRONMENT" "$RUNNER_OS" "$RUNNER_ARCH" > evidence/raw/runner-context.txt
+          uname -a > evidence/raw/uname.txt
+          lscpu --json > evidence/raw/lscpu.json
+          cat /proc/cpuinfo > evidence/raw/cpuinfo.txt
+          cat /proc/self/cgroup > evidence/raw/cgroup.txt
+          cat /sys/fs/cgroup/cpu.max > evidence/raw/cpu.max 2>&1 || true
+          cat /sys/fs/cgroup/memory.max > evidence/raw/memory.max 2>&1 || true
+          df -h . > evidence/raw/disk.txt
+          ulimit -Sa > evidence/raw/ulimit-soft.txt
+          ulimit -Ha > evidence/raw/ulimit-hard.txt
+          printf 'image_os=%s\nimage_version=%s\n' "${ImageOS:-}" "${ImageVersion:-}" > evidence/raw/runner-image.txt
+          test "$GITHUB_REF_TYPE" = branch
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -n "$PROFILE_SHA" && test "$PROFILE_SHA" = "$GITHUB_SHA"
+          [[ "$PROFILE_PROTOCOL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "${{ inputs.authorize_private_study }}" = true
+          test "${{ inputs.mode }}" = screen
+          test "${{ inputs.samples }}" = 31
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+      - name: Download and verify exact original build artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions"
+          curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "$api/artifacts/$ARTIFACT_ID" > evidence/raw/artifact-api-metadata.json
+          curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "$api/runs/$ARTIFACT_RUN_ID" > evidence/raw/artifact-run.json
+          python3 - <<'PY'
+          import json, os, pathlib
+          m=json.loads(pathlib.Path('evidence/raw/artifact-api-metadata.json').read_text())
+          r=json.loads(pathlib.Path('evidence/raw/artifact-run.json').read_text())
+          expect={
+              'id': int(os.environ['ARTIFACT_ID']),
+              'name': os.environ['ARTIFACT_NAME'],
+              'digest': 'sha256:'+os.environ['ARTIFACT_SHA256'],
+              'run_id': int(os.environ['ARTIFACT_RUN_ID']),
+              'head_sha': os.environ['ARTIFACT_HEAD_SHA'],
+          }
+          assert m['id']==expect['id'] and m['name']==expect['name'] and m['digest']==expect['digest']
+          assert not m['expired'] and m['workflow_run']['id']==expect['run_id']
+          assert m['workflow_run']['head_sha']==expect['head_sha']
+          assert r['id']==expect['run_id'] and r['head_sha']==expect['head_sha'] and r['run_attempt']==1
+          assert r['status']=='completed' and r['conclusion']=='success'
+          pathlib.Path('evidence/raw/artifact-identity.json').write_text(json.dumps({
+              'artifact_id':m['id'],'artifact_name':m['name'],'artifact_api_digest':m['digest'],
+              'artifact_run_id':r['id'],'artifact_head_sha':r['head_sha'],
+              'run_status':r['status'],'run_conclusion':r['conclusion'],
+              'profile_sha':os.environ['PROFILE_SHA'],
+              'profile_protocol_sha256':os.environ['PROFILE_PROTOCOL_SHA256'],
+              'runner_environment':os.environ['RUNNER_ENVIRONMENT'],
+              'packet_manifest_sha256':os.environ['PROFILE_PACKET_MANIFEST_SHA256'],
+              'runner_manifest_sha256':os.environ['PROFILE_RUNNER_MANIFEST_SHA256'],
+              'study_policy_sha256':__import__('hashlib').sha256(pathlib.Path('evidence/raw/study-policy.json').read_bytes()).hexdigest(),
+          },indent=2)+'\n')
+          PY
+          curl --fail --location --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "$api/artifacts/$ARTIFACT_ID/zip" -o evidence/raw/original-build.zip
+          unset GH_TOKEN
+          printf '%s  %s\n' "$ARTIFACT_SHA256" evidence/raw/original-build.zip | sha256sum --check
+          python3 - <<'PY'
+          import pathlib, stat, zipfile
+          archive=pathlib.Path('evidence/raw/original-build.zip')
+          dest=pathlib.Path('evidence/import')
+          with zipfile.ZipFile(archive) as z:
+              for item in z.infolist():
+                  name=item.filename
+                  p=pathlib.PurePosixPath(name)
+                  mode=(item.external_attr >> 16) & 0xffff
+                  if p.is_absolute() or '..' in p.parts or '\\' in name:
+                      raise SystemExit('unsafe ZIP member path: '+name)
+                  if stat.S_ISLNK(mode) or (mode and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))):
+                      raise SystemExit('unsupported ZIP member type: '+name)
+              z.extractall(dest)
+          PY
+          cp evidence/import/runtime.json evidence/raw/original-runtime.json
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          root=pathlib.Path('evidence/import')
+          receipt=json.loads((root/'runtime.json').read_text())
+          assert receipt['executed_sha']==os.environ['ARTIFACT_HEAD_SHA']
+          assert receipt['architecture']=='x86_64'
+          assert receipt['php']==os.environ['PHP_VERSION_REQUIRED']
+          src=root/'sample-planning/source'
+          assert (src/'vendor/autoload.php').is_file()
+          library=root/'sample-planning/native.so'
+          h=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+          assert h(library)==receipt['candidate_library_sha256']
+          for rel, expected in receipt['candidate_source_sha256'].items():
+              path=src/rel
+              assert path.is_file() and h(path)==expected, 'source receipt mismatch: '+rel
+          for rel in ('.env', 'bootstrap/cache/config.php'):
+              assert not (src/rel).exists(), 'production configuration present in frozen runtime: '+rel
+          (pathlib.Path('evidence/raw/import-validation.json')).write_text(json.dumps({
+              'receipt_sha256':h(root/'runtime.json'),'library_sha256':h(library),
+              'source_hashes_verified':len(receipt['candidate_source_sha256']),
+              'production_config_paths_absent':['.env','bootstrap/cache/config.php'],
+              'vendor_autoload_sha256':h(src/'vendor/autoload.php'),
+              'php_receipt':receipt['php'],'architecture_receipt':receipt['architecture'],
+          },indent=2)+'\n')
+          PY
+      - name: Set up the exact PHP runtime from the build receipt
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5.11'
+          extensions: ffi
+          coverage: none
+      - name: Capture isolated PHP hrtime and clock-source evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          php -n -r '
+            if (PHP_VERSION !== getenv("PHP_VERSION_REQUIRED") || PHP_INT_SIZE !== 8 || extension_loaded("FFI")) { exit(1); }
+            $binary = realpath(PHP_BINARY);
+            if ($binary === false) { exit(1); }
+            $hash = hash_file("sha256", $binary);
+            if ($hash === false) { exit(1); }
+            $previous = hrtime(true);
+            if (!is_int($previous)) { exit(1); }
+            $minimum = null;
+            $zero = 0;
+            for ($i = 0; $i < 1000; $i++) {
+                $current = hrtime(true);
+                if (!is_int($current) || $current < $previous) { exit(1); }
+                $delta = $current - $previous;
+                if ($delta === 0) { $zero++; }
+                elseif ($minimum === null || $delta < $minimum) { $minimum = $delta; }
+                $previous = $current;
+            }
+            if ($minimum === null) { exit(1); }
+            $record = [
+                "php_version_observed" => PHP_VERSION,
+                "php_binary_realpath" => $binary,
+                "php_binary_sha256" => $hash,
+                "php_int_size_bytes" => PHP_INT_SIZE,
+                "ffi_extension_loaded_in_probe" => extension_loaded("FFI"),
+                "hrtime_return_type" => "int",
+                "hrtime_unit_from_official_api" => "nanoseconds",
+                "monotonicity_observed_over_1000_samples" => true,
+                "sample_count" => 1000,
+                "equal_adjacent_sample_count" => $zero,
+                "minimum_positive_observed_tick_ns" => $minimum,
+                "minimum_tick_is_empirical_not_nominal_resolution" => true,
+                "official_api_url" => "https://www.php.net/manual/en/function.hrtime.php",
+                "official_source_urls" => [
+                    "https://raw.githubusercontent.com/php/php-src/php-8.5.11/ext/standard/hrtime.c",
+                    "https://raw.githubusercontent.com/php/php-src/php-8.5.11/Zend/zend_hrtime.h"
+                ],
+                "source_binding" => "inferred from observed PHP_VERSION 8.5.11 and official tag URL; this does not prove the binary was built from those exact source bytes",
+                "official_source_bytes_downloaded_or_hashed" => false
+            ];
+            file_put_contents("evidence/raw/php-clock-runtime.json", json_encode($record, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT) . "\n");
+          '
+          python3 - <<'PY'
+          import json, pathlib, platform, time
+          p=pathlib.Path('evidence/raw/php-clock-runtime.json')
+          evidence=json.loads(p.read_text())
+          if not hasattr(time, 'CLOCK_MONOTONIC'):
+              raise SystemExit('Python CLOCK_MONOTONIC unavailable')
+          resolution=time.clock_getres(time.CLOCK_MONOTONIC)
+          if resolution <= 0:
+              raise SystemExit('CLOCK_MONOTONIC resolution unavailable')
+          evidence['python_monotonic_clock']={
+              'implementation':time.get_clock_info('monotonic').implementation,
+              'clock_getres_source':'time.clock_getres(time.CLOCK_MONOTONIC)',
+              'clock_getres_seconds':resolution,
+              'clock_getres_ns':round(resolution*1_000_000_000),
+              'python_version':platform.python_version(),
+              'binding_to_php_hrtime':'corroborating host clock evidence only; source equivalence remains inferred from PHP source tag, not proven from binary',
+          }
+          pathlib.Path('evidence/raw/php-clock-preflight.json').write_text(json.dumps(evidence,indent=2)+'\n')
+          PY
+      - name: Capture PHP and native ABI evidence without rebuilding
+        shell: bash
+        run: |
+          set -euo pipefail
+          php -r 'if (PHP_VERSION !== getenv("PHP_VERSION_REQUIRED") || PHP_OS_FAMILY !== "Linux" || PHP_SAPI !== "cli" || !extension_loaded("FFI")) { fwrite(STDERR,"PHP runtime does not match imported receipt\\n"); exit(1); }'
+          php --ini > evidence/raw/php-ini.txt
+          php -i > evidence/raw/php-info.txt
+          mkdir -p evidence/import/.executor-evidence
+          LC_ALL=C readelf -h evidence/import/sample-planning/native.so > evidence/raw/native-header.txt
+          LC_ALL=C readelf -n evidence/import/sample-planning/native.so > evidence/raw/native-notes.txt
+          LC_ALL=C readelf -d evidence/import/sample-planning/native.so > evidence/raw/native-dependencies.txt
+          LC_ALL=C readelf --version-info evidence/import/sample-planning/native.so > evidence/raw/native-version-requirements.txt
+          LC_ALL=C readelf -Ws evidence/import/sample-planning/native.so > evidence/raw/native-symbols.txt
+          cp evidence/raw/native-notes.txt evidence/import/.executor-evidence/notes.txt
+          cp evidence/raw/native-dependencies.txt evidence/import/.executor-evidence/dependencies.txt
+          cp evidence/raw/native-version-requirements.txt evidence/import/.executor-evidence/version-requirements.txt
+          python3 - <<'PY'
+          import pathlib, re
+          header=pathlib.Path('evidence/raw/native-header.txt').read_text()
+          notes=pathlib.Path('evidence/raw/native-notes.txt').read_text()
+          dependencies=pathlib.Path('evidence/raw/native-dependencies.txt').read_text()
+          versions=pathlib.Path('evidence/raw/native-version-requirements.txt').read_text()
+          symbols=pathlib.Path('evidence/raw/native-symbols.txt').read_text()
+          receipt=__import__('json').loads(pathlib.Path('evidence/raw/original-runtime.json').read_text())
+          for symbol in ('nntmux_spot_check_sample_v1_json','nntmux_metadata_string_free'):
+              assert symbol in symbols, 'required original export missing: '+symbol
+          assert re.search(r'^\s*Class:\s+ELF64$',header,re.M), 'ELF class is not ELF64'
+          assert re.search(r'^\s*Machine:\s+Advanced Micro Devices X86-64$',header,re.M), 'ELF machine is not x86_64'
+          needed=re.findall(r'\(NEEDED\).*\[(.*?)\]',dependencies)
+          pathlib.Path('evidence/raw/native-abi.json').write_text(__import__('json').dumps({
+              'elf_class':'ELF64','machine':'x86_64','needed_libraries':needed,
+              'gnu_property_notes_present':'Properties:' in notes,
+              'version_requirements_present':'Version needs section' in versions,
+              'cpu_isa_policy':'unknown ISA may be observed only under the recorded private-study policy; capture GNU property notes and actual CPU flags; any load/SIGILL/ABI failure invalidates and is retained',
+              'build_receipt':{key:receipt.get(key) for key in ('executed_sha','rustc','cargo','build_profile','cpu_model')},
+          },indent=2)+'\n')
+          # Empty/unknown dependency or version metadata stays recorded as ABI-unknown;
+          # the natural cold load/result determines invalidity without resampling.
+          PY
+      - name: Restore reviewed source packets into runner temporary storage
+        shell: bash
+        env:
+          PROFILE_SHA: ${{ inputs.profile_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = branch
+          test "$PROFILE_SHA" = "$GITHUB_SHA"
+          packet="$RUNNER_TEMP/sample-planner-php-profile"
+          coordinator="$RUNNER_TEMP/sample-planner-profile-runner"
+          mkdir -p "$packet" "$coordinator"
+          cp scripts/sample-planner-profile-packet-manifest.json "$packet/manifest.json"
+          cp scripts/sample-planner-profile-packet-generate.py "$packet/generate.py"
+          cp scripts/sample-planner-profile-packet-source-inspection.json "$packet/source-inspection.json"
+          cp scripts/sample-planner-profile-packet-static-checks.json "$packet/static-checks.json"
+          cp scripts/sample-planner-profile-packet-instrumentation.patch "$packet/instrumentation.patch"
+          cp scripts/sample-planner-profile-packet-driver.php "$packet/driver.php"
+          cp scripts/sample-planner-profile-packet-instrumented.php "$packet/NativeSpotCheckPlanner.instrumented.php"
+          cp scripts/sample-planner-profile-packet-README.md "$packet/README.md"
+          cp scripts/sample-planner-profile-packet-native.so.sha256 "$packet/native.so.sha256"
+          cp scripts/sample-planner-profile-packet-order.json "$packet/order.json"
+          cp scripts/sample-planner-profile-packet-control.php "$packet/NativeSpotCheckPlanner.control.php"
+          cp scripts/sample-planner-profile-runner.py "$coordinator/run.py"
+          cp scripts/sample-planner-profile-runner-README.md "$coordinator/README.md"
+          cp scripts/sample-planner-profile-runner-manifest.json "$coordinator/manifest.json"
+          cp scripts/sample-planner-profile-protocol.json "$RUNNER_TEMP/sample-planner-attribution-protocol.json"
+          printf '%s  %s\n' \
+            "$PROFILE_PACKET_MANIFEST_SHA256" "$packet/manifest.json" \
+            "$PROFILE_RUNNER_MANIFEST_SHA256" "$coordinator/manifest.json" \
+            "$PROFILE_PROTOCOL_SHA256" "$RUNNER_TEMP/sample-planner-attribution-protocol.json" | sha256sum --check
+          python3 - "$packet" "$coordinator" <<'PY'
+          import hashlib, json, pathlib, sys
+          for folder in map(pathlib.Path, sys.argv[1:]):
+              manifest=json.loads((folder/'manifest.json').read_text())
+              for name, expected in manifest['files'].items():
+                  actual=hashlib.sha256((folder/name).read_bytes()).hexdigest()
+                  if actual != expected:
+                      raise SystemExit('transported file hash mismatch: '+str(folder/name))
+          PY
+      - name: Create preflight receipt from verified artifact and executor evidence
+        shell: bash
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          php -d ffi.enable=1 -d opcache.enable_cli=0 -d opcache.jit=1235 -d memory_limit=-1 -r '
+            if (PHP_VERSION !== "8.5.11" || PHP_OS_FAMILY !== "Linux" || PHP_SAPI !== "cli" || !extension_loaded("FFI") || ini_get("ffi.enable") != "1" || ini_get("opcache.enable_cli") != "0" || ini_get("opcache.jit") !== "1235" || ini_get("memory_limit") !== "-1" || ini_get("auto_prepend_file") !== "" || ini_get("auto_append_file") !== "") { exit(1); }
+          '
+          php --ini > evidence/raw/php-ini.txt
+          php -i > evidence/raw/php-info.txt
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re
+          frozen=pathlib.Path('evidence/import')
+          packet=pathlib.Path(os.environ['RUNNER_TEMP'])/'sample-planner-php-profile'
+          protocol=pathlib.Path(os.environ['RUNNER_TEMP'])/'sample-planner-attribution-protocol.json'
+          policy=json.loads(protocol.read_text())['historical_isa_policy']
+          assert policy['approving_coordinator_thread']==os.environ['PROFILE_ISA_APPROVAL_THREAD']
+          assert policy['scope']=='private non-adopting attribution only on existing disposable GitHub-hosted actual x86_64 Linux executor'
+          assert hashlib.sha256(protocol.read_bytes()).hexdigest()==os.environ['PROFILE_PROTOCOL_SHA256']
+          packet_manifest=hashlib.sha256((packet/'manifest.json').read_bytes()).hexdigest()
+          assert packet_manifest==os.environ['PROFILE_PACKET_MANIFEST_SHA256']
+          flags=[]
+          for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines():
+              if line.split(':',1)[0].strip() in ('flags','Features'):
+                  flags=line.split(':',1)[1].split()
+                  break
+          if not flags:
+              raise SystemExit('actual CPU feature flags unavailable')
+          original=[]
+          for path in sorted(frozen.rglob('*')):
+              rel=path.relative_to(frozen)
+              if not path.is_file() or rel.parts[0]=='.executor-evidence':
+                  continue
+              if path.is_symlink():
+                  raise SystemExit('symlink found in verified artifact tree: '+str(rel))
+              original.append((rel.as_posix(),hashlib.sha256(path.read_bytes()).hexdigest()))
+          if not original:
+              raise SystemExit('verified frozen artifact file map is empty')
+          ebase=frozen/'.executor-evidence'
+          ev={key:{'path':'.executor-evidence/'+name,'sha256':hashlib.sha256((ebase/name).read_bytes()).hexdigest()} for key,name in {
+              'notes':'notes.txt','dependencies':'dependencies.txt','version_requirements':'version-requirements.txt'
+          }.items()}
+          receipt={
+              'archive_sha256':os.environ['ARTIFACT_SHA256'],
+              'library_sha256':os.environ['EXPECTED_LIBRARY_SHA256'],
+              'packet_manifest_sha256':packet_manifest,
+              'protocol_sha256':os.environ['PROFILE_PROTOCOL_SHA256'],
+              'approving_coordinator_thread':policy['approving_coordinator_thread'],
+              'authorized':os.environ['AUTHORIZE_PRIVATE_STUDY']=='true',
+              'authorization_source':{'workflow_dispatch_run_id':os.environ['GITHUB_RUN_ID'],'profile_sha':os.environ['PROFILE_SHA']},
+              'vendor_source_identity_verified':True,
+              'original_build_runtime_api_receipts_verified':True,
+              'actual_x86_64_verified':True,
+              'elf_notes_dependencies_cpu_flags_captured':True,
+              'fresh_github_hosted_vm_job_containment':True,
+              'php_8_5_11_ini_verified':True,
+              'php_clock_preflight':json.loads(pathlib.Path('evidence/raw/php-clock-preflight.json').read_text()),
+              'host_cpu_flags':flags,
+              'elf_evidence':ev,
+              'historical_isa':{'state':'unknown','policy':'private_attribution_only_reuse_no_rebuild_no_portability_claim','coordinator_unknown_isa_allowed':True},
+              'abi_preflight_status':'unknown_private_attribution_failures_invalid',
+              'frozen_file_sha256':dict(original),
+              'preflight_provenance':{
+                  'api_identity':'evidence/raw/artifact-identity.json',
+                  'api_identity_sha256':hashlib.sha256(pathlib.Path('evidence/raw/artifact-identity.json').read_bytes()).hexdigest(),
+                  'runtime_receipt':'evidence/raw/original-runtime.json',
+                  'runtime_receipt_sha256':hashlib.sha256(pathlib.Path('evidence/raw/original-runtime.json').read_bytes()).hexdigest(),
+                  'cpu_flags_source':'/proc/cpuinfo',
+                  'elf_evidence_directory':str(ebase),
+                  'policy':policy,
+              },
+          }
+          if receipt['authorized'] is not True:
+              raise SystemExit('private-study authorization missing')
+          (frozen/'attribution-preflight.json').write_text(json.dumps(receipt,indent=2)+'\n')
+          PY
+      - name: Run bounded private PHP attribution screen
+        shell: bash
+        env:
+          PROFILE_SHA: ${{ inputs.profile_sha }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = branch
+          test "$PROFILE_SHA" = "$GITHUB_SHA"
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          python3 "$RUNNER_TEMP/sample-planner-profile-runner/run.py" \
+            --packet "$RUNNER_TEMP/sample-planner-php-profile" \
+            --frozen-root evidence/import \
+            --library evidence/import/sample-planning/native.so \
+            --output evidence/results \
+            --protocol "$RUNNER_TEMP/sample-planner-attribution-protocol.json"
+      - name: Capture final resource state on success or failure
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p evidence/raw
+          date -u +%FT%TZ > evidence/raw/finished-at.txt
+          uname -a > evidence/raw/uname-after.txt 2>&1 || true
+          lscpu --json > evidence/raw/lscpu-after.json 2>&1 || true
+          cat /proc/cpuinfo > evidence/raw/cpuinfo-after.txt 2>&1 || true
+          cat /sys/fs/cgroup/cpu.stat > evidence/raw/cpu-stat-after.txt 2>&1 || true
+          cat /sys/fs/cgroup/memory.current > evidence/raw/memory-current-after.txt 2>&1 || true
+          df -h . > evidence/raw/disk-after.txt 2>&1 || true
+          ulimit -Sa > evidence/raw/ulimit-soft-after.txt 2>&1 || true
+          ulimit -Ha > evidence/raw/ulimit-hard-after.txt 2>&1 || true
+      - name: Retain raw diagnostic evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-attribution-raw-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
           retention-days: 14
           if-no-files-found: warn

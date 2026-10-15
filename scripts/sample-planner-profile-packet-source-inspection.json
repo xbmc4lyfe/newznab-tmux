@@ -1,0 +1,30 @@
+{
+  "status": "python_text_inspection_locked_pint_and_focused_phpstan_pass_no_functional_validation",
+  "original_nonblank_lines_preserved_in_order_allowing_explicit_private_role_argument_and_class_rename": true,
+  "original_sha256": "aa43ff2b697dbdd91fef8d8de104579181828772a72a5db1bf0468e5950d8f42",
+  "not_proven": [
+    "runtime equivalence",
+    "exception ownership behavior",
+    "trace shape",
+    "performance"
+  ],
+  "deliberate_class": "ProfiledNativeSpotCheckPlanner extends NativeSpotCheckPlanner",
+  "expected_events": {
+    "native": [
+      16,
+      11,
+      11
+    ],
+    "unsupported": [
+      10,
+      5,
+      5
+    ],
+    "small": [
+      0,
+      0,
+      0
+    ]
+  },
+  "static_receipt": "static-checks.json"
+}

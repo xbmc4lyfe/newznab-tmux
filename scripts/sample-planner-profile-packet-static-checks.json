@@ -1,0 +1,44 @@
+{
+  "receipt": {
+    "checks": [
+      {
+        "command": [
+          "php",
+          "vendor/bin/pint",
+          "--test",
+          "scripts/sample-planner-profile-packet-control.php",
+          "scripts/sample-planner-profile-packet-instrumented.php",
+          "scripts/sample-planner-profile-packet-driver.php"
+        ],
+        "exit": 0,
+        "stdout": "{\"tool\":\"pint\",\"result\":\"passed\"}",
+        "stderr": ""
+      },
+      {
+        "command": [
+          "php",
+          "vendor/bin/phpstan",
+          "analyse",
+          "--no-progress",
+          "--memory-limit=512M",
+          "scripts/sample-planner-profile-packet-control.php",
+          "scripts/sample-planner-profile-packet-instrumented.php",
+          "scripts/sample-planner-profile-packet-driver.php"
+        ],
+        "exit": 0,
+        "stdout": "{\"tool\":\"phpstan\",\"result\":\"passed\",\"errors\":0}\n",
+        "stderr": ""
+      }
+    ],
+    "elapsed_seconds": 1.7927920410002116,
+    "performance_evidence": false
+  },
+  "private_copies_equal_checked_worktree_copies": true,
+  "checked_sha256": {
+    "NativeSpotCheckPlanner.control.php": "aa43ff2b697dbdd91fef8d8de104579181828772a72a5db1bf0468e5950d8f42",
+    "NativeSpotCheckPlanner.instrumented.php": "1f76690756515cf1bb1a610e35815aa5926c5f5d23220f7bac9b8ddaeea350b4",
+    "driver.php": "8a405ee1465d67b8ba28a023de2558b71a200def06a9826515eb49f81c5c9434"
+  },
+  "functional_execution": false,
+  "timing_or_performance_evidence": false
+}

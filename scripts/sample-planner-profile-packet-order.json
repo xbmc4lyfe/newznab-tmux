@@ -1,0 +1,1679 @@
+{
+  "seed": 20261016,
+  "schedule": [
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 0,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 1,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 2,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 3,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 4,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 5,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 6,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 7,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 8,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 9,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 10,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 11,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 12,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 13,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 14,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 15,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 16,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 17,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 18,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 19,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 20,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 21,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 22,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 23,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 24,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 25,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 26,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 27,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 28,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 29,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "small-dispatch",
+      "variant": 0,
+      "pair": 30,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 0,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 1,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 2,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 3,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 4,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 5,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 6,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 7,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 8,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 9,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 10,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 11,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 12,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 13,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 14,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 15,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 16,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 17,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 18,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 19,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 20,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 21,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 22,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 23,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 24,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 25,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 26,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 27,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 28,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 29,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "boundary-1024",
+      "variant": 0,
+      "pair": 30,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 0,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 1,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 2,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 3,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 4,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 5,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 6,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 7,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 8,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 9,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 10,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 11,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 12,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 13,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 14,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 15,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 16,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 17,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 18,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 19,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 20,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 21,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 22,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 23,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 24,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 25,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 26,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 27,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 28,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 29,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "large-16384",
+      "variant": 0,
+      "pair": 30,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 0,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 1,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 2,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 3,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 4,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 5,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 6,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 7,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 8,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 9,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 10,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 11,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 12,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 13,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 14,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 15,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 16,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 17,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 18,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 19,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 20,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 21,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 22,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 23,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 24,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 25,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 26,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 27,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 28,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 29,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "duplicates-inferred",
+      "variant": 0,
+      "pair": 30,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 0,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 1,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 2,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 3,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 4,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 5,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 6,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 7,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 8,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 9,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 10,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 11,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 12,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 13,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 14,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 15,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 16,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 17,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 18,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 19,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 20,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 21,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 22,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 23,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 24,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 25,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 26,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 27,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 28,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 29,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "tight-budget",
+      "variant": 0,
+      "pair": 30,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 0,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 1,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 2,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 3,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 4,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 5,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 6,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 7,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 8,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 9,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 10,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 11,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 12,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 13,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 14,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 15,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 16,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 17,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 18,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 19,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 20,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 21,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 22,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 23,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 24,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 25,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 26,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 27,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 28,
+      "arms": [
+        "control",
+        "instrumented"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 29,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    },
+    {
+      "stratum": "unsupported-coercion",
+      "variant": 0,
+      "pair": 30,
+      "arms": [
+        "instrumented",
+        "control"
+      ]
+    }
+  ]
+}

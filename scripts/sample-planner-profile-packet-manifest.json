@@ -1,0 +1,18 @@
+{
+  "status": "private_source_locked_pint_formatted_no_functional_or_timing_execution",
+  "source_commit": "0e62874c6a1090072de9fac50e50a6ec7f4c5bea",
+  "source_sha256": "aa43ff2b697dbdd91fef8d8de104579181828772a72a5db1bf0468e5950d8f42",
+  "archive_sha256": "8011646596debf96645b1d18ede0afb0e66e098471ea3ec34fd77215a7005e8a",
+  "files": {
+    "NativeSpotCheckPlanner.control.php": "aa43ff2b697dbdd91fef8d8de104579181828772a72a5db1bf0468e5950d8f42",
+    "NativeSpotCheckPlanner.instrumented.php": "1f76690756515cf1bb1a610e35815aa5926c5f5d23220f7bac9b8ddaeea350b4",
+    "README.md": "5ba482f9f79f125b67ab35b11301478077678a59b7c791e6b31ab422794e1b4c",
+    "driver.php": "8a405ee1465d67b8ba28a023de2558b71a200def06a9826515eb49f81c5c9434",
+    "generate.py": "d74aaecbc4e48a3f34a93fd7191698637609e1bf75e97bae99ddd9bc650354ae",
+    "instrumentation.patch": "dd01dddb4f7bcd9070941d7860a7fd0eb3b78010cc831480817d9eaedffb2bf7",
+    "native.so.sha256": "daec9e8196accc220e649444e6a5ccdd31d156d30f1d5d1f1a57058b921bd67a",
+    "order.json": "7b2341e404802ec7b0a0fa9a3b9f66cfc490c567e415315b4b90a5a637a76720",
+    "source-inspection.json": "f17583d2c6203c9dae148b6530b572bf5d12802273cc9dde362dbadfa0e894fe",
+    "static-checks.json": "9929fb60c00721c1e92cacc7c874e52c6368be93144341cdec92e7651e7f673f"
+  }
+}
