@@ -7,6 +7,7 @@ namespace Tests\Feature;
 use App\Enums\NzbImportStatus;
 use App\Services\NfoService;
 use App\Services\Nzb\DirectorySyncBridge;
+use App\Services\Nzb\NativeManifestIoProbe;
 use App\Services\Nzb\NfoImportService;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbUploadManifestService;
@@ -21,6 +22,33 @@ use Tests\Support\CapturedUploadFixture;
 class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
 {
     use CapturedUploadFixture;
+
+    public static function callbackCompanionStates(): array
+    {
+        return ['stored' => ['direct companion', 'imported'], 'failed' => ['', 'failed']];
+    }
+
+    #[DataProvider('callbackCompanionStates')]
+    public function test_replayed_inserted_outcome_does_not_overwrite_companion_progress(string $body, string $status): void
+    {
+        [$path, $manifests, $service] = $this->directUpload(nfoBody: $body);
+        $captured = $manifests->read($path)['accepted_capture'];
+        self::assertSame($status, $service->importManifest($path)['status']);
+        $progress = $manifests->read($path);
+        $writes = 0;
+        NativeManifestIoProbe::$beforeRename = static function (string $from, string $to) use ($path, &$writes): void {
+            if ($to === $path) {
+                $writes++;
+            }
+        };
+        try {
+            $manifests->recordNzbOutcome(dirname($path).'/incoming.nzb', NzbImportStatus::Inserted, 7, 'direct-fixture-guid', inputCapture: $captured);
+        } finally {
+            NativeManifestIoProbe::$beforeRename = null;
+        }
+        self::assertSame($progress, $manifests->read($path));
+        self::assertSame(0, $writes);
+    }
 
     public function test_direct_policy_transition_discards_stale_candidate_authority(): void
     {

@@ -15,7 +15,15 @@ The synthetic failed-import fixture bypasses
 XML parsing, NNTP, the application bootstrap and SQL, and does not certify the
 whole importer or publication path.
 
-## Reproduce the current rejection screen
+## Reproduce the rejection screen
+
+The committed observations freeze the source hashes in `recorded/metadata.json`.
+Those five files match commit `7bf1024395ee86362847dde62b511771a6556c7f`;
+the metadata records its preceding HEAD because the working snapshot was measured
+before that commit. Later admission-fence and outcome-idempotence repairs are not
+covered by these timings. Running the command on a newer revision produces a new
+source snapshot; it does not reproduce the old source automatically. No current
+revision performance qualification is inferred from the recorded observations.
 
 From the repository root with its existing locked vendor directory and installed
 PHP/Rust toolchains:
@@ -41,7 +49,7 @@ and40 measured flows passed the stated parity checks. Source hashes, tools,
 platform, raw observations and summaries are committed under
 `benchmarks/nzb-custody/recorded`.
 
-| Current synthetic screen | PHP median ms | Rust process median ms | PHP / Rust |
+| Frozen synthetic screen | PHP median ms | Rust process median ms | PHP / Rust |
 | --- | ---: | ---: | ---: |
 | Warm complete custody flow | 7.031 | 254.918 | 0.028 |
 | Cold complete custody flow | 16.768 | 281.692 | 0.060 |
@@ -66,7 +74,7 @@ capture/outcome service SHA256
 and fixture SHA256
 `3e35d2c5100b02023e64c26edd0271fa7fe03a0e647418207220da5808c77d90`.
 These predate the current recovery protocol and cannot certify its correctness.
-Their raw artifacts remain preserved privately; the current screen above is the
+Their raw artifacts remain preserved privately; the frozen screen above is the
 committed reproducible evidence.
 
 - A direct Rust C ABI with request-local cached FFI passed normal primitive and

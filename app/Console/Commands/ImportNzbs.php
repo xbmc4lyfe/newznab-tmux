@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
-use App\Enums\NzbImportStatus;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbUploadManifestService;
 use Illuminate\Console\Command;
@@ -84,18 +83,6 @@ class ImportNzbs extends Command
                 $deleteNZB,
                 $deleteFailedNZB,
                 $source,
-                static function (array $result) use ($manifests): void {
-                    /** @var NzbImportStatus $status */
-                    $status = $result['status'];
-                    $manifests->recordNzbOutcome(
-                        $result['path'],
-                        $status,
-                        $result['release_id'],
-                        $result['release_guid'],
-                        candidateIdentity: $result['candidate_identity'] ?? null,
-                        inputCapture: $result['input_capture'] ?? null,
-                    );
-                }
             );
         } catch (Throwable $exception) {
             $this->error($exception->getMessage());

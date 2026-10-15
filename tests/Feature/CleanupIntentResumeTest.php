@@ -19,6 +19,56 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
 {
     use CapturedUploadFixture;
 
+    public static function retirementResetBoundaries(): array
+    {
+        return ['before move' => ['intent_dir'], 'payload complete' => ['complete_dir'], 'manifest retirement' => ['manifest']];
+    }
+
+    #[DataProvider('retirementResetBoundaries')]
+    public function test_reset_is_excluded_until_source_retirement_is_durable(string $boundary): void
+    {
+        [$source, $mp, $uploads] = $this->upload(false);
+        $this->capturedFixtureImporter('retirement-reset')->beginImport([$source], delete: true);
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'retirement-reset-guid']);
+        DB::table('release_verification_candidates')->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+        $attempts = 0;
+        $admitted = false;
+        $retiring = false;
+        $probe = static function () use (&$attempts, &$admitted): void {
+            $attempts++;
+            $lock = fopen(config('release_verification.storage_path').'/reset.lock', 'c');
+            try {
+                if (flock($lock, LOCK_EX | LOCK_NB)) {
+                    $admitted = true;
+                    // Reproduce the reset's candidate removal without touching uploader files.
+                    DB::table('release_verification_candidates')->delete();
+                    flock($lock, LOCK_UN);
+                }
+            } finally {
+                fclose($lock);
+            }
+        };
+        DirectorySyncBridge::$afterSync = static function (string $directory, string $point) use ($mp, $boundary, $probe, &$retiring): void {
+            if ($point === 'intent_dir') {
+                $retiring = true;
+            }
+            if ($point === $boundary || ($boundary === 'manifest' && $retiring
+                && $point === 'manifest_parent' && $directory === dirname($mp))) {
+                $probe();
+            }
+        };
+        try {
+            $result = $uploads->reconcilePending($mp);
+        } finally {
+            DirectorySyncBridge::$afterSync = null;
+        }
+        self::assertGreaterThan(0, $attempts);
+        self::assertFalse($admitted, 'Reset must remain excluded through durable retirement.');
+        self::assertSame(1, DB::table('release_verification_candidates')->count());
+        self::assertSame($result['accepted_capture']['attempt'], $result['relinquished_attempt']);
+        self::assertFileDoesNotExist($source);
+    }
+
     public static function boundaries(): array
     {
         return array_combine(['rename_custody', 'rename_parent', 'moved_dir', 'unlink_dir', 'complete_dir'], array_map(static fn ($v) => [$v], ['rename_custody', 'rename_parent', 'moved_dir', 'unlink_dir', 'complete_dir']));

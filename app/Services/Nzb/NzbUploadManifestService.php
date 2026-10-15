@@ -364,6 +364,18 @@ final class NzbUploadManifestService
                     return;
                 }
             }
+            if ($status === NzbImportStatus::Inserted
+                && ($manifest['outcome_status'] ?? null) === $status->value
+                && ($manifest['outcome_capture'] ?? null) === $inputCapture
+                && ($manifest['accepted_capture'] ?? null) === $inputCapture
+                && ($manifest['release_id'] ?? null) === $releaseId
+                && ($manifest['release_guid'] ?? null) === $releaseGuid
+                && ($manifest['candidate_identity'] ?? null) === null
+                && ! array_key_exists('accepted_admission', $manifest)
+                && in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)) {
+                // Notifications cannot replay an accepted outcome over newer companion work.
+                return;
+            }
             if ($status === NzbImportStatus::Duplicate
                 && in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
                 && ($manifest['accepted_capture'] ?? null) === $inputCapture
@@ -816,32 +828,36 @@ final class NzbUploadManifestService
     /** @param array<string, mixed> $manifest */
     private function finishInputDeletion(string $manifestPath, array &$manifest, bool $publicationOnly = false): void
     {
-        $field = $publicationOnly ? 'delete_nzb_after_publication' : 'delete_nzb_after_nfo';
-        $requested = $manifest[$field] ?? null;
-        $accepted = $manifest['accepted_capture'] ?? null;
-        if (! is_array($requested) || ! is_array($accepted)
-            || $requested !== array_intersect_key($accepted, array_flip(['source_identity', 'digest']))
-            || DB::transactionLevel() !== 0) {
+        if (DB::transactionLevel() !== 0) {
             return;
         }
-        if ($publicationOnly) {
-            if ($manifest['state'] !== self::STATE_NZB_IMPORTED || is_array($manifest['nfo_capture'] ?? null)
-                || ! $this->nfoCandidateCurrent($manifest)
-                || ! DB::table('releases')->where('id', $manifest['release_id'])->where('guid', $manifest['release_guid'])->exists()) {
+        app(VerificationResetService::class)->withAdmission(function () use ($manifestPath, &$manifest, $publicationOnly): void {
+            $field = $publicationOnly ? 'delete_nzb_after_publication' : 'delete_nzb_after_nfo';
+            $requested = $manifest[$field] ?? null;
+            $accepted = $manifest['accepted_capture'] ?? null;
+            if (! is_array($requested) || ! is_array($accepted)
+                || $requested !== array_intersect_key($accepted, array_flip(['source_identity', 'digest']))) {
                 return;
             }
-        } elseif (! $this->nfoCleanupCommitted($manifest)) {
-            return;
-        }
-        $source = dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nzb']['filename'];
-        if (! $this->quarantineDelete($source, $accepted, $publicationOnly ? null : $this->nfoCommitBinding($manifest))) {
-            return;
-        }
-        $manifest['relinquished_attempt'] = $accepted['attempt'];
-        unset($manifest[$field]);
-        $this->rememberCustodyGc($manifest, $source, $accepted, $publicationOnly ? null : $this->nfoCommitBinding($manifest));
-        $this->write($manifestPath, $manifest);
-        $this->drainCustodyGc($manifestPath, $manifest);
+            if ($publicationOnly) {
+                if ($manifest['state'] !== self::STATE_NZB_IMPORTED || is_array($manifest['nfo_capture'] ?? null)
+                    || ! $this->nfoCandidateCurrent($manifest)
+                    || ! DB::table('releases')->where('id', $manifest['release_id'])->where('guid', $manifest['release_guid'])->exists()) {
+                    return;
+                }
+            } elseif (! $this->nfoCleanupCommitted($manifest)) {
+                return;
+            }
+            $source = dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nzb']['filename'];
+            if (! $this->quarantineDelete($source, $accepted, $publicationOnly ? null : $this->nfoCommitBinding($manifest))) {
+                return;
+            }
+            $manifest['relinquished_attempt'] = $accepted['attempt'];
+            unset($manifest[$field]);
+            $this->rememberCustodyGc($manifest, $source, $accepted, $publicationOnly ? null : $this->nfoCommitBinding($manifest));
+            $this->write($manifestPath, $manifest);
+            $this->drainCustodyGc($manifestPath, $manifest);
+        });
     }
 
     /** All captured generation and admission fields participate in the digest. */
