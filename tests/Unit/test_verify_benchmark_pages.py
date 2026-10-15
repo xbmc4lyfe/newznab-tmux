@@ -129,6 +129,46 @@ class PublicationTest(unittest.TestCase):
             publication.verify_publication(self.manifest, SHA, URL, fetch=fetch, attempts=2, delay=0)
         self.assertEqual(2, len(calls))
 
+    def propagation(self, *, tampered=False, never_current=False):
+        clock = [0.0]
+        calls = []
+        stale = copy.deepcopy(self.manifest)
+        # A different publication of the same source must remain detectable.
+        stale['files'][0]['sha256'] = '0' * 64
+
+        def fetch(url, limit, timeout):
+            name = url.removeprefix(URL).split('?', 1)[0]
+            calls.append((clock[0], name))
+            if name == 'publication.json' and (clock[0] < 600 or never_current):
+                return json.dumps(stale).encode()
+            if tampered and name == 'benchmarks/summary.json':
+                return b'{"latency": 43}'
+            return self.fetch(url, limit, timeout)
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with patch.object(publication.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(publication.time, 'sleep', side_effect=sleep):
+            try:
+                result = publication.verify_publication(self.manifest, SHA, URL, fetch=fetch)
+            finally:
+                self.assertLessEqual(clock[0], 750)
+                self.assertLessEqual(sum(name == 'publication.json' for _, name in calls), 25)
+        return result, clock[0], calls
+
+    def test_default_budget_covers_pages_cache_lifetime_then_checks_every_file(self):
+        count, elapsed, calls = self.propagation()
+        self.assertEqual(4, count)
+        self.assertGreaterEqual(elapsed, 600)
+        self.assertLessEqual(elapsed, 750)
+        self.assertEqual(set(self.files), {name for _, name in calls if name != 'publication.json'})
+
+    def test_propagation_never_accepts_a_stale_or_tampered_publication(self):
+        for options in ({'never_current': True}, {'tampered': True}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.propagation(**options)
+
     def test_unsafe_urls_are_rejected_before_fetch(self):
         for url in ('http://xbmc4lyfe.github.io/newznab-tmux/', 'https://evil.invalid/',
                     'https://xbmc4lyfe.github.io@evil.invalid/newznab-tmux/',
