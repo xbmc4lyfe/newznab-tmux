@@ -21,7 +21,7 @@ final class OriginalFilenameSuffixCompatibilityTest extends TestCase
 {
     public static function supportedWrappers(): array
     {
-        return array_map(fn ($s) => [$s], ['.epub', '.iso', '.srs', '.mkv.001', '.7z.001', '.r100', '.z01', '.rar.par2', '.vol00+01.par2', '.m4v', '.tar.zst', '.part01.rar', '.part12345.rar', '.part12345678901234567890.rar', '.r00', '.rar', '.mkv']);
+        return array_map(fn ($s) => [$s], ['.epub', '.iso', '.srs', '.mkv.001', '.7z.001', '.r100', '.z01', '.rar.par2', '.vol00+01.par2', '.m4v', '.tar.zst', '.part01.rar', '.part12345.rar', '.part12345678901234567890.rar', '.part12345', '.part12345678901234567890', '.r00', '.rar', '.mkv']);
     }
 
     #[DataProvider('supportedWrappers')]

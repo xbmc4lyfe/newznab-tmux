@@ -136,7 +136,7 @@ class FileNameCleaner
             ...self::ARCHIVE_PATTERNS,
             '/\.(zst|tgz|lz4|enc|rev)$/i',
             '/\.vol\d+[+-]\d+$/i',
-            '/\.part\d{0,4}$/i',
+            '/\.part\d*$/i',
             '/\.(nfo|sfv|nzb|srr|srs)$/i',
         ];
 
