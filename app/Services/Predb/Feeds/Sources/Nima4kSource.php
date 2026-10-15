@@ -16,6 +16,8 @@ use RuntimeException;
  */
 final class Nima4kSource extends BoundedHttpFeedSource
 {
+    private const FORBIDDEN_CHARACTERS = '/[\x{0000}-\x{0008}\x{000B}\x{000C}\x{000E}-\x{001F}\x{007F}-\x{009F}\x{FDD0}-\x{FDEF}\x{FFFE}-\x{FFFF}\x{1FFFE}-\x{1FFFF}\x{2FFFE}-\x{2FFFF}\x{3FFFE}-\x{3FFFF}\x{4FFFE}-\x{4FFFF}\x{5FFFE}-\x{5FFFF}\x{6FFFE}-\x{6FFFF}\x{7FFFE}-\x{7FFFF}\x{8FFFE}-\x{8FFFF}\x{9FFFE}-\x{9FFFF}\x{AFFFE}-\x{AFFFF}\x{BFFFE}-\x{BFFFF}\x{CFFFE}-\x{CFFFF}\x{DFFFE}-\x{DFFFF}\x{EFFFE}-\x{EFFFF}\x{FFFFE}-\x{FFFFF}\x{10FFFE}-\x{10FFFF}]/u';
+
     public function __construct(
         string $endpoint,
         int $pageSize = 100,
@@ -63,36 +65,15 @@ final class Nima4kSource extends BoundedHttpFeedSource
             throw new RuntimeException('NIMA4K returned invalid HTML.');
         }
         // libxml can discard malformed characters before the literal labels are compared.
-        if (preg_match('/[\x{0000}-\x{0008}\x{000B}\x{000C}\x{000E}-\x{001F}\x{007F}-\x{009F}\x{FDD0}-\x{FDEF}\x{FFFE}-\x{FFFF}\x{1FFFE}-\x{1FFFF}\x{2FFFE}-\x{2FFFF}\x{3FFFE}-\x{3FFFF}\x{4FFFE}-\x{4FFFF}\x{5FFFE}-\x{5FFFF}\x{6FFFE}-\x{6FFFF}\x{7FFFE}-\x{7FFFF}\x{8FFFE}-\x{8FFFF}\x{9FFFE}-\x{9FFFF}\x{AFFFE}-\x{AFFFF}\x{BFFFE}-\x{BFFFF}\x{CFFFE}-\x{CFFFF}\x{DFFFE}-\x{DFFFF}\x{EFFFE}-\x{EFFFF}\x{FFFFE}-\x{FFFFF}\x{10FFFE}-\x{10FFFF}]/u', $html) !== 0) {
+        if (preg_match(self::FORBIDDEN_CHARACTERS, $html) !== 0) {
             throw new RuntimeException('NIMA4K returned invalid HTML.');
         }
-        $invalidNumericReference = false;
-        preg_replace_callback('/&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));?/', static function (array $match) use (&$invalidNumericReference): string {
-            $hexadecimal = $match[1] !== '';
-            $digits = $hexadecimal ? $match[1] : $match[2];
-            $limit = $hexadecimal ? '10ffff' : '1114111';
-            $normalized = ltrim(strtolower($digits), '0');
-            $normalized = $normalized === '' ? '0' : $normalized;
-            $tooLarge = strlen($normalized) > strlen($limit)
-                || (strlen($normalized) === strlen($limit) && strcmp($normalized, $limit) > 0);
-            $codepoint = $tooLarge ? 0 : (int) ($hexadecimal ? hexdec($normalized) : $normalized);
-            if ($tooLarge || $codepoint <= 8 || $codepoint === 11 || $codepoint === 12
-                || ($codepoint >= 14 && $codepoint <= 31) || ($codepoint >= 127 && $codepoint <= 159)
-                || ($codepoint >= 0xD800 && $codepoint <= 0xDFFF) || ($codepoint >= 0xFDD0 && $codepoint <= 0xFDEF)
-                || ($codepoint & 0xFFFF) >= 0xFFFE) {
-                $invalidNumericReference = true;
-            }
-
-            return $match[0];
-        }, $html);
-        if ($invalidNumericReference) {
-            throw new RuntimeException('NIMA4K returned an invalid numeric character reference.');
-        }
-
         $document = new DOMDocument;
         $previous = libxml_use_internal_errors(true);
+        libxml_clear_errors();
         try {
             $loaded = $document->loadHTML('<?xml encoding="UTF-8">'.$html, LIBXML_NONET);
+            $errors = libxml_get_errors();
         } finally {
             libxml_clear_errors();
             libxml_use_internal_errors($previous);
@@ -101,7 +82,25 @@ final class Nima4kSource extends BoundedHttpFeedSource
             throw new RuntimeException('NIMA4K returned invalid HTML.');
         }
 
+        // This parser reports discarded controls, surrogates and overflowing references as code 9.
+        foreach ($errors as $error) {
+            if ($error->code === 9) {
+                throw new RuntimeException('NIMA4K returned an invalid numeric character reference.');
+            }
+        }
+
         $xpath = new DOMXPath($document);
+        // DOM values are already decoded once. Comments and script/style text are inert,
+        // but their attributes and every decoded value beyond the record limit still matter.
+        $decodedValues = $xpath->query('//text()[not(parent::script or parent::style)] | //@*');
+        if ($decodedValues === false) {
+            throw new RuntimeException('NIMA4K returned invalid HTML.');
+        }
+        foreach ($decodedValues as $value) {
+            if (preg_match(self::FORBIDDEN_CHARACTERS, $value->nodeValue ?? '') !== 0) {
+                throw new RuntimeException('NIMA4K returned invalid HTML.');
+            }
+        }
         $articles = $xpath->query('//div['.$this->classToken('article').']');
         if ($articles === false || $articles->length === 0) {
             throw new RuntimeException('NIMA4K returned no recognized release cards.');

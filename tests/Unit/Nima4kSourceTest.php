@@ -165,6 +165,65 @@ final class Nima4kSourceTest extends TestCase
     }
 
     #[Test]
+    #[DataProvider('inertNumericReferenceFragments')]
+    public function numeric_looking_raw_text_and_comments_preserve_literal_names(string $fragment): void
+    {
+        $html = $this->card('Léon_天空.&amp;&#1;.DD+5.1-GRP').$fragment.$this->card('Second.Release-GRP');
+        $entries = (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+
+        $this->assertCount(1, $entries);
+        $this->assertSame('Léon_天空.&amp;&#1;.DD+5.1-GRP', $entries[0]->title);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function inertNumericReferenceFragments(): array
+    {
+        return [
+            'script text' => ['<script>const x = "&#1;";</script>'],
+            'style text' => ['<style>.example::after { content: "&#x1;"; }</style>'],
+            'comment' => ['<!-- &#0; &#xD800; &#1114112; &#xFFFF; -->'],
+            'uppercase script and reference' => ['<SCRIPT>const x = "&#X00001;";</SCRIPT>'],
+            'quoted greater than in script attribute' => ['<script data-marker=">">const x = "&#1;";</script>'],
+            'quoted greater than in style attribute' => ["<style data-marker='>'>.example { content: '&#1;'; }</style>"],
+            'script apparent markup stays raw' => ['<script>const x = "<!-- <style> &#1; </style> -->";</script>'],
+            'script close name requires a delimiter' => ['<script>const x = "</scripted> &#1;";</script>'],
+            'style close name requires a delimiter' => ['<style>.example { content: "</stylesheet> &#1;"; }</style>'],
+            'comment apparent markup stays inert' => ['<!-- <script data-marker="&#1;"> &#1; </script> -->'],
+            'semicolonless numeric-looking script text' => ['<script>const x = "&#1";</script>'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('decodedInvalidReferenceFragments')]
+    public function invalid_references_in_decoded_contexts_still_reject_the_whole_listing(string $fragment): void
+    {
+        $html = $this->card('First.Release-GRP').$fragment.$this->card('Second.Release-GRP');
+
+        $this->expectException(RuntimeException::class);
+        (new Nima4kSource('https://nima4k.org/', pageSize: 1))->parseHtml($html);
+    }
+
+    /** @return array<string, array{string}> */
+    public static function decodedInvalidReferenceFragments(): array
+    {
+        return [
+            'ordinary text' => ['<p>&#1;</p>'],
+            'ordinary attribute' => ['<div data-marker="&#1;"></div>'],
+            'script attribute' => ['<script data-marker="&#1;">const x = "safe";</script>'],
+            'style attribute' => ['<style data-marker="&#1;">.example { color: red; }</style>'],
+            'quoted fake script opener' => ['<div data-marker="<script>">&#1;</div>'],
+            'quoted fake comment opener' => ['<div data-marker="<!--">&#1;</div>'],
+            'after actual script close' => ['<script>const x = "safe";</script><p>&#1;</p>'],
+            'after actual style close' => ['<style>.example { color: red; }</style><p>&#1;</p>'],
+            'after actual comment close' => ['<!-- safe --><p>&#1;</p>'],
+            'title RCDATA' => ['<title>&#1;</title>'],
+            'textarea RCDATA' => ['<textarea>&#1;</textarea>'],
+            'noncharacter in ordinary text' => ['<p>&#xFDD0;</p>'],
+            'C1 in ordinary attribute' => ['<div data-marker="&#128;"></div>'],
+        ];
+    }
+
+    #[Test]
     public function malformed_characters_after_the_record_limit_still_reject_the_listing(): void
     {
         $html = $this->card('First.Release-GRP').str_replace('Second.Release-GRP</span>', 'Second.&#1;Release-GRP</span>', $this->card('Second.Release-GRP'));
