@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use Illuminate\Database\Connection;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use stdClass;
@@ -39,6 +40,7 @@ final class CandidatePreparationService
         $cursors = [];
         $exhausted = [];
         $error = false;
+        $updates = null;
         try {
             $cutoff = now();
             $waiting = [];
@@ -122,12 +124,20 @@ final class CandidatePreparationService
                                     $values['next_attempt_at'] = now()->addSeconds((int) config('release_verification.retry_seconds'));
                                 }
                             }
-                            $affected = DB::table('release_verification_candidates')->where('id', $row->id)
+                            $query = DB::table('release_verification_candidates')->where('id', $row->id)
                                 ->where('version', $row->version)->where('manifest_path', $row->manifest_path)
                                 ->where('status', $row->status)->where('next_attempt_at', $row->next_attempt_at)
                                 ->whereNull('release_id')->whereNull('lease_token')
-                                ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', $cutoff))
-                                ->update($values);
+                                ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', $cutoff));
+                            $connection = $query->getConnection();
+                            if ($connection instanceof Connection) {
+                                $updates ??= new PreparedCandidateUpdate($connection);
+                                $affected = $updates->update($query, $values);
+                            } else {
+                                // Custom ConnectionInterface implementations retain
+                                // their own update pipeline and do not use our macro.
+                                $affected = $query->update($values);
+                            }
                             $changed += $affected;
                             $diagnostics?->updated($assessment['status'], $affected);
                         } finally {
