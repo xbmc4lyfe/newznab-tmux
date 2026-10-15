@@ -97,6 +97,10 @@ deploy/**/__pycache__/
 
 # Production image builds use the committed frontend dependency lock.
 !/package-lock.json
+# Keep legacy operator inventories and cached facts private after upgrades.
+/infra/ansible/inventory/*.yml
+/infra/ansible/inventory/*.json
+/infra/ansible/.cache/
 
 # Self-hosted docker/ stack runtime state and secrets
 /docker/data/
