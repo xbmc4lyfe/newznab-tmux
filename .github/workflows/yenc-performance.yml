@@ -552,6 +552,8 @@ jobs:
           elif [[ ! -e processing-evidence/paired/observations.jsonl ]] &&
                [[ ! -d processing-evidence || -x processing-evidence ]] &&
                [[ ! -d processing-evidence/paired || -x processing-evidence/paired ]]; then
+            # Keep Markdown backticks literal in the fallback summary.
+            # shellcheck disable=SC2016
             printf '## Fingerprint caller screen\n\nBODY and FFI/JSON diagnostics are retained separately. This median screen does not qualify a Rust replacement: the 1.5x common-path and uncommon p99 policy remains the adoption gate.\n\n| Bytes | Density | Decision | Candidate / baseline median | Simultaneous interval | Eligible / invalid |\n|---:|---|---|---:|---|---|\n\nResult: `profile only or setup incomplete`. Exact serialized caller metadata and independently expected decoded bytes must match for every pair.\n' >> "$GITHUB_STEP_SUMMARY"
           else
             echo 'Evidence utility unavailable or paired input cannot be inspected.' >&2
