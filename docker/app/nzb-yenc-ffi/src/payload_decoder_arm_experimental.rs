@@ -117,18 +117,13 @@ unsafe fn ordinary_sparse_group_mask(remove: u64) -> bool {
 #[inline]
 unsafe fn decode_neon_group_sparse_lane(
     bytes: std::arch::aarch64::uint8x16_t,
-    equals: std::arch::aarch64::uint8x16_t,
+    adjustment: std::arch::aarch64::uint8x16_t,
     remove: u16,
     destination: *mut u8,
-    incoming: bool,
     final_lane: bool,
 ) -> usize {
     use std::arch::aarch64::*;
     unsafe {
-        let adjustment = vorrq_u8(
-            vandq_u8(vextq_u8(vdupq_n_u8(0), equals, 15), vdupq_n_u8(64)),
-            vsetq_lane_u8::<0>(u8::from(incoming) << 6, vdupq_n_u8(0)),
-        );
         let decoded = vsubq_u8(bytes, vaddq_u8(vdupq_n_u8(42), adjustment));
         if remove == 0 {
             vst1q_u8(destination, decoded);
@@ -472,17 +467,24 @@ unsafe fn decode_neon_regular(source: *const u8, destination: *mut u8, length: u
                     && ordinary_sparse_group_mask(remove)
                 {
                     for lane in 0..4 {
-                        let incoming = if lane == 0 {
-                            escaped
+                        // Keep cross-lane escape carry in vector registers.
+                        // For lanes 1..3, EXT places the preceding equality
+                        // vector's final byte before this lane's first 15 bytes.
+                        // Lane zero alone needs the scalar carry from the prior
+                        // group. Qualification above excludes escaped markers.
+                        let adjustment = if lane == 0 {
+                            vorrq_u8(
+                                vandq_u8(vextq_u8(vdupq_n_u8(0), equals[0], 15), vdupq_n_u8(64)),
+                                vsetq_lane_u8::<0>(u8::from(escaped) << 6, vdupq_n_u8(0)),
+                            )
                         } else {
-                            (markers >> (lane * 16 - 1)) & 1 != 0
+                            vandq_u8(vextq_u8(equals[lane - 1], equals[lane], 15), vdupq_n_u8(64))
                         };
                         written += decode_neon_group_sparse_lane(
                             bytes[lane],
-                            equals[lane],
+                            adjustment,
                             masks[lane],
                             destination.add(written),
-                            incoming,
                             lane == 3,
                         );
                     }
@@ -774,8 +776,31 @@ mod tests {
         carry_expected.extend_from_slice(&[68; 16]);
         carry_expected.extend_from_slice(&[69; 16]);
 
-        for (literal, expected_literal) in [(no_carry, no_carry_expected), (carry, carry_expected)]
-        {
+        // Escape markers at bytes 15, 31 and 47 carry into all three
+        // following vectors. Expected bytes are literal, independent of the
+        // production mask/compaction helpers.
+        let mut every_boundary = vec![b'k'; 15];
+        every_boundary.extend_from_slice(b"=@");
+        every_boundary.extend_from_slice(&[b'l'; 14]);
+        every_boundary.extend_from_slice(b"=A");
+        every_boundary.extend_from_slice(&[b'm'; 14]);
+        every_boundary.extend_from_slice(b"=B");
+        every_boundary.extend_from_slice(&[b'n'; 15]);
+        let mut every_boundary_expected = vec![65; 15];
+        every_boundary_expected.push(214);
+        every_boundary_expected.extend_from_slice(&[66; 14]);
+        every_boundary_expected.push(215);
+        every_boundary_expected.extend_from_slice(&[67; 14]);
+        every_boundary_expected.push(216);
+        every_boundary_expected.extend_from_slice(&[68; 15]);
+        assert_eq!(every_boundary.len(), 64);
+        assert_eq!(every_boundary_expected.len(), 61);
+
+        for (literal, expected_literal) in [
+            (no_carry, no_carry_expected),
+            (carry, carry_expected),
+            (every_boundary, every_boundary_expected),
+        ] {
             for prefix in 0..16 {
                 for tail in 0..17 {
                     let mut payload = vec![b'k'; prefix];
