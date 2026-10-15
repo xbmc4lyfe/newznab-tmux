@@ -82,4 +82,15 @@ class NzbSplitUnwrapperTest extends TestCase
 
         $this->assertNull($unwrapper->unwrap($wrapped));
     }
+
+    public function test_literal_payload_preserves_spelling_without_archive_or_whitespace_cleanup(): void
+    {
+        $unwrapper = new NzbSplitUnwrapper;
+        foreach (['Exact_Release_2026.rar', ' Exact__Release_2026-GRP ', 'Exact_Release_2026_DTS', 'Exact++Release', "Exact_Release\n"] as $payload) {
+            self::assertSame(str_replace(['_', '+'], ['.', ' '], $payload), $unwrapper->literalPayload('Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__'.$payload));
+        }
+        foreach (['Outer__NZBSPLIT__invalid__NZBSPLIT__Title', 'Outer__NZBSPLIT__abcdef0__NZBSPLIT__Title', 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__', 'Outer__NZBSPLIT__invalid__NZBSPLIT__Junk__NZBSPLIT__abcdef0123456789__NZBSPLIT__Title'] as $invalid) {
+            self::assertNull($unwrapper->literalPayload($invalid));
+        }
+    }
 }

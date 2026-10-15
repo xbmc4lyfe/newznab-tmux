@@ -32,6 +32,11 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             'ASCII control is not literal evidence' => ["Exact.Release.2026-GRP\x01.mkv", 'Exact.Release.2026-GRP', false, 0],
             'space is not literal evidence' => ['Exact.Release.2026-GRP .mkv', 'Exact.Release.2026-GRP', false, 0],
             'NZBSPLIT multipart original title' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 8],
+            'NZBSPLIT two digit multipart' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.01', 'Exact.Release.2026-GRP', false, 8],
+            'NZBSPLIT four digit multipart' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.0001', 'Exact.Release.2026-GRP', false, 8],
+            'NZBSPLIT long part parity chain' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.part12345.rar.par2', 'Exact.Release.2026-GRP', false, 8],
+            'NZBSPLIT payload under long part' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.mkv.part12345.rar', 'Exact.Release.2026-GRP', false, 8],
+            'NZBSPLIT archive token in literal title' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026.rar.mkv', 'Exact.Release.2026.rar', false, 8],
             'NZBSPLIT codec title' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026_DTS.rar', 'Exact.Release.2026.DTS', false, 8],
             'NZBSPLIT group spelling survives nomination' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRPdisc1.mkv', 'Exact.Release.2026-GRPdisc1', true, 8],
             'NZBSPLIT payload whitespace cannot authorize' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__ Exact_Release_2026-GRP.7z.073', 'Exact.Release.2026-GRP', false, 0],
@@ -81,18 +86,24 @@ final class OriginalFilenameAcceptanceTest extends TestCase
 
     public static function nzbSplitPipelineCases(): array
     {
-        return ['canonical PreDB hit' => [true], 'existing extractor fallback' => [false]];
+        $rows = [];
+        foreach (['.7z.073', '.7z.01', '.7z.0001', '.part12345.rar.par2', '.mkv.part12345.rar'] as $suffix) {
+            $rows[$suffix.' canonical hit'] = [true, $suffix];
+            $rows[$suffix.' extractor fallback'] = [false, $suffix];
+        }
+
+        return $rows;
     }
 
     #[DataProvider('nzbSplitPipelineCases')]
-    public function test_nzbsplit_file_pipeline_preserves_matching_and_fallback(bool $hit): void
+    public function test_nzbsplit_file_pipeline_preserves_matching_and_fallback(bool $hit, string $suffix): void
     {
         $this->createPar2RenameSchema();
         config(['nntmux.echocli' => false]);
         Event::fake([ReleaseNameFixed::class]);
         $title = 'Exact.Release.2026.1080p.WEB-DL.x264-GRP';
         $release = $this->pendingPar2Release(['searchname' => 'Obfuscated.Payload']);
-        $filename = 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__'.str_replace('.', '_', $title).'.7z.073';
+        $filename = 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__'.str_replace('.', '_', $title).$suffix;
         $rows = $hit ? [['id' => 7, 'title' => $title]] : [];
         if ($hit) {
             DB::table('predb')->insert($rows);
@@ -231,6 +242,8 @@ final class OriginalFilenameAcceptanceTest extends TestCase
             'lossy payload alias cannot authorize' => ['Publisher.Asset-GRP.flac.mkv', 'Publisher.Asset-GRP.mkv', false],
             'technical alias literal match' => ['Publisher.Asset.DTS.rar', 'Publisher.Asset.DTS.mkv', true],
             'NZBSPLIT payload alias' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Publisher_Asset-GRP.7z.073', 'Publisher.Asset-GRP.mkv', true],
+            'NZBSPLIT short multipart alias' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Publisher_Asset-GRP.7z.01', 'Publisher.Asset-GRP.mkv', true],
+            'NZBSPLIT long parity chain alias' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Publisher_Asset-GRP.part12345.rar.par2', 'Publisher.Asset-GRP.mkv', true],
             'NZBSPLIT lossy alias rejected' => ['Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Publisher__Asset-GRP.7z.073', 'Publisher.Asset-GRP.mkv', false],
             'part archive alias' => ['Publisher.Asset-GRP.part01.rar', 'Publisher.Asset-GRP.mkv', true],
             'authoritative alias case folding' => ['PUBLISHER.ASSET-GRP.MKV', 'publisher.asset-grp.rar', true],

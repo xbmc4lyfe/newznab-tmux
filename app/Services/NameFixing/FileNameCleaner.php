@@ -131,6 +131,8 @@ class FileNameCleaner
     private function stripKnownFileSuffixes(string $fileName, bool $preserveCodecAfterWrapper): string
     {
         $wrappers = [
+            '/\.7z\.\d{2,4}$/i',
+            '/\.part\d+\.rar$/i',
             ...self::ARCHIVE_PATTERNS,
             '/\.(zst|tgz|lz4|enc|rev)$/i',
             '/\.vol\d+[+-]\d+$/i',

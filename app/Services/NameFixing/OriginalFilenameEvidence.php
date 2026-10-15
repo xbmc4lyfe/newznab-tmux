@@ -14,26 +14,9 @@ final readonly class OriginalFilenameEvidence
     public function __construct(string $filename)
     {
         $this->basename = preg_replace('~^.*[\\\\/]~s', '', $filename) ?? '';
-        // Preserve the guard's existing support for multipart numbers longer than the shared helper allows.
-        $longMultipartStem = preg_replace('/\.part[0-9]{5,}\.rar$/iD', '', $this->basename) ?? $this->basename;
-        $cleaner = new FileNameCleaner;
-        $stem = $longMultipartStem !== $this->basename
-            ? $longMultipartStem
-            : $cleaner->stripFileSuffixes($this->basename);
-        // Decode the supported wrapper after suffix handling so codec title tokens survive.
-        $this->stem = $this->decodeNzbSplit($stem, $cleaner);
-    }
-
-    private function decodeNzbSplit(string $stem, FileNameCleaner $cleaner): string
-    {
-        if (substr_count(strtoupper($stem), '__NZBSPLIT__') !== 2
-            || preg_match('/\A.*?__NZBSPLIT__(?:[a-f0-9]{8,})__NZBSPLIT__(.+)\z/iD', $stem, $parts) !== 1) {
-            return $stem;
-        }
-        $decoded = str_replace(['_', '+'], ['.', ' '], $parts[1]);
-
-        // The wrapper encodes separators; trimming or collapsing the payload is not identity evidence.
-        return $cleaner->extractNzbSplitName($stem) === $decoded ? $decoded : $stem;
+        $stem = (new FileNameCleaner)->stripFileSuffixes($this->basename);
+        // Strip wrappers first, then decode only the protocol's separator encoding.
+        $this->stem = (new NzbSplitUnwrapper)->literalPayload($stem) ?? $stem;
     }
 
     public function accepts(string $title, string $alias = ''): bool

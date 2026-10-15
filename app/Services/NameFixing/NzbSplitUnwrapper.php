@@ -32,6 +32,18 @@ final class NzbSplitUnwrapper
         '/\s+yEnc.*$/i',
     ];
 
+    /** Decode a single wrapper's literal payload; the caller owns suffix handling. */
+    public function literalPayload(string $value): ?string
+    {
+        if (substr_count(strtoupper($value), '__NZBSPLIT__') !== 2
+            || preg_match('/__NZBSPLIT__(?:[a-f0-9]{8,})__NZBSPLIT__(.+)\z/isD', $value, $matches) !== 1) {
+            return null;
+        }
+
+        // Separator encoding is defined by the wrapper. Preserve every other payload byte.
+        return str_replace(['_', '+'], ['.', ' '], $matches[1]);
+    }
+
     public function unwrap(string $value): ?string
     {
         if (! preg_match(self::WRAPPER_PATTERN, $value, $matches)) {
