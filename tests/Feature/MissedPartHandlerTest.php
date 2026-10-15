@@ -56,6 +56,24 @@ class MissedPartHandlerTest extends TestCase
         $this->assertSame([100, 300], array_map(static fn (object $part): int => (int) $part->numberid, $parts));
     }
 
+    public function test_deferring_an_unattempted_range_is_idempotent_and_preserves_existing_retry_counts(): void
+    {
+        $handler = new MissedPartHandler(partRepairLimit: 100, partRepairMaxTries: 3, chunkSize: 50);
+        DB::table('missed_parts')->insert([
+            ['numberid' => 1001, 'groups_id' => 7, 'attempts' => 2],
+            ['numberid' => 1001, 'groups_id' => 8, 'attempts' => 1],
+        ]);
+
+        $handler->deferRange(1001, 1052, 7);
+        $handler->deferRange(1001, 1052, 7);
+
+        $this->assertSame(52, DB::table('missed_parts')->where('groups_id', 7)->count());
+        $this->assertSame(2, (int) DB::table('missed_parts')->where(['groups_id' => 7, 'numberid' => 1001])->value('attempts'));
+        $this->assertSame(51, DB::table('missed_parts')->where('groups_id', 7)->where('attempts', 0)->count());
+        $this->assertSame(1, (int) DB::table('missed_parts')->where(['groups_id' => 8, 'numberid' => 1001])->value('attempts'));
+        $this->assertCount(52, $handler->getMissingParts(7));
+    }
+
     public function test_remove_increment_count_and_cleanup_paths(): void
     {
         $handler = new MissedPartHandler(partRepairLimit: 10, partRepairMaxTries: 3);
