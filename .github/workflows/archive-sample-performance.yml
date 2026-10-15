@@ -37,8 +37,9 @@ on:
 permissions:
   contents: read
 
+# Keep manual measurements independent of automatic push coverage.
 concurrency:
-  group: archive-sample-performance-${{ github.ref }}
+  group: archive-sample-performance-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:

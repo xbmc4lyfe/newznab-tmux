@@ -72,6 +72,7 @@ jobs:
           python3 -B tests/Unit/test_benchmark_pages.py
           python3 -B tests/Unit/test_benchmark_pages_completeness.py
           python3 -B tests/Unit/test_verify_benchmark_pages.py
+          python3 -B tests/Unit/test_benchmark_concurrency.py
           python3 -B tests/Unit/test_benchmark_rust_inventory.py
           python3 -B tests/Unit/test_benchmark_toolchain.py
           python3 -B scripts/benchmark_rust_inventory.py --check --root .
