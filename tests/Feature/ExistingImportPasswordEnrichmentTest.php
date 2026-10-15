@@ -6,6 +6,7 @@ use App\Enums\NzbImportStatus;
 use App\Services\BlacklistService;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbUploadManifestService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\Verification\CandidateHeaderInventory;
 use App\Services\Releases\Verification\CandidateRepository;
@@ -522,5 +523,125 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
         ]);
 
         return $manifest + ['identity' => sha1('private rollback fixture')];
+    }
+
+    public static function callbackOrders(): array
+    {
+        return ['queued first' => [false], 'deferred before delayed queued' => [true]];
+    }
+
+    #[DataProvider('callbackOrders')]
+    public function test_actual_admission_deferral_preserves_identity_and_allows_exact_retry(bool $delayQueued): void
+    {
+        $service = $this->offlineImportService();
+        $directory = config('release_verification.storage_path').'/upload';
+        app('files')->ensureDirectoryExists($directory);
+        $path = $directory.'/incoming.nzb';
+        file_put_contents($path, $this->passwordFixture([]));
+        $manifests = app(NzbUploadManifestService::class);
+        $manifests->create($directory, 'private-retry', 'incoming.nzb', null);
+        $statuses = [];
+        $savedQueued = null;
+        $holdQueued = $delayQueued;
+        $callback = static function (array $r) use ($manifests, &$statuses, &$savedQueued, &$holdQueued): void {
+            $statuses[] = $r['status'];
+            if ($holdQueued && $r['status'] === NzbImportStatus::Queued) {
+                $savedQueued = $r;
+
+                return;
+            } $manifests->recordNzbOutcome($r['path'], $r['status'], $r['release_id'], $r['release_guid'], candidateIdentity: $r['candidate_identity']);
+        };
+        $service->beginImport([$path], resultCallback: $callback);
+        self::assertSame([NzbImportStatus::Queued], $statuses);
+        $candidate = DB::table('release_verification_candidates')->first();
+        self::assertNotNull($candidate);
+        $identity = $candidate->identity;
+        config(['release_verification.pending_bytes' => $candidate->manifest_bytes]);
+        file_put_contents($path, $this->passwordFixture(['synthetic assertion']));
+        $service->beginImport([$path], delete: true, deleteFailed: true, resultCallback: $callback);
+        self::assertSame([NzbImportStatus::Queued, NzbImportStatus::MetadataDeferred], $statuses);
+        if ($savedQueued !== null) {
+            $manifests->recordNzbOutcome($savedQueued['path'], $savedQueued['status'], null, null, candidateIdentity: $savedQueued['candidate_identity']);
+        }
+        $holdQueued = false;
+        self::assertSame('metadata_deferred', DB::table('release_verification_candidates')->value('status'));
+        $manifest = $manifests->read($directory.'/'.NzbUploadManifestService::FILENAME);
+        self::assertSame($identity, $manifest['candidate_identity']);
+        self::assertSame('nzb_pending', $manifest['state']);
+        self::assertFileExists($path);
+        Schema::create('releases', static function (Blueprint $t): void {
+            $t->id();
+            $t->string('guid');
+        });
+        config(['release_verification.pending_bytes' => 1048576]);
+        self::assertNull(app(CandidateRepository::class)->claim());
+        self::assertTrue($manifests->shouldImportNzb($path), 'Once capacity returns, retained source must be eligible for the exact metadata replay required by the held candidate.');
+        self::assertSame($identity, $manifests->read($directory.'/'.NzbUploadManifestService::FILENAME)['candidate_identity']);
+        $service->beginImport([$path], delete: true, deleteFailed: true, resultCallback: $callback);
+        self::assertSame(NzbImportStatus::Queued, end($statuses));
+        self::assertNotSame('metadata_deferred', DB::table('release_verification_candidates')->value('status'));
+        self::assertSame($identity, DB::table('release_verification_candidates')->value('identity'));
+        self::assertFileDoesNotExist($path);
+    }
+
+    public function test_identity_backed_deferral_reconciles_review_and_later_publication(): void
+    {
+        $identity = sha1('private:held-metadata');
+        DB::table('release_verification_candidates')->insert(['identity' => $identity, 'source_identity' => $identity, 'groups_id' => 1,
+            'manifest_path' => '', 'manifest_hash' => str_repeat('a', 64), 'manifest_bytes' => 0, 'status' => 'metadata_deferred',
+            'last_unique_at' => now(), 'next_attempt_at' => now()]);
+        Schema::create('releases', static function (Blueprint $t): void {
+            $t->id();
+            $t->string('guid');
+        });
+        $directory = config('release_verification.storage_path').'/projection';
+        app('files')->ensureDirectoryExists($directory);
+        $path = $directory.'/incoming.nzb';
+        file_put_contents($path, 'retained synthetic payload');
+        $manifests = app(NzbUploadManifestService::class);
+        $manifests->create($directory, 'private-projection', 'incoming.nzb', null);
+        $manifestPath = $directory.'/'.NzbUploadManifestService::FILENAME;
+        $manifests->recordNzbOutcome($path, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        self::assertTrue($manifests->shouldImportNzb($path));
+        $held = $manifests->read($manifestPath);
+        self::assertSame('metadata_deferred', $held['state']);
+        self::assertSame($identity, $held['candidate_identity']);
+        foreach ([NzbImportStatus::MetadataIgnored, NzbImportStatus::MetadataDeferred] as $late) {
+            $manifests->recordNzbOutcome($path, $late, null, null);
+            self::assertSame($held, $manifests->read($manifestPath));
+        }
+        DB::table('release_verification_candidates')->where('identity', $identity)->update(['status' => 'metadata_review']);
+        self::assertFalse($manifests->shouldImportNzb($path));
+        self::assertSame($identity, $manifests->read($manifestPath)['candidate_identity']);
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'private-publication']);
+        DB::table('release_verification_candidates')->where('identity', $identity)->update(['status' => 'complete', 'release_id' => 7, 'verified_at' => now()]);
+        unlink($path);
+        $published = $manifests->reconcilePending($manifestPath);
+        self::assertSame('nzb_imported', $published['state']);
+        self::assertSame(7, $published['release_id']);
+        self::assertSame($identity, $published['candidate_identity']);
+    }
+
+    public function test_late_advisory_preserves_terminal_and_malformed_pending_states(): void
+    {
+        $directory = config('release_verification.storage_path').'/states';
+        app('files')->ensureDirectoryExists($directory);
+        $path = $directory.'/incoming.nzb';
+        $manifests = app(NzbUploadManifestService::class);
+        $manifests->create($directory, 'private-states', 'incoming.nzb', null);
+        $manifestPath = $directory.'/'.NzbUploadManifestService::FILENAME;
+        $base = $manifests->read($manifestPath);
+        foreach (['nzb_imported', 'nfo_imported', 'nfo_failed', 'nzb_rejected', 'nzb_duplicate', 'nzb_pending'] as $state) {
+            foreach ([null, 'invalid'] as $identity) {
+                $before = $base;
+                $before['state'] = $state;
+                $before['candidate_identity'] = $identity;
+                file_put_contents($manifestPath, json_encode($before));
+                foreach ([NzbImportStatus::MetadataIgnored, NzbImportStatus::MetadataDeferred] as $late) {
+                    $manifests->recordNzbOutcome($path, $late, null, null);
+                    self::assertSame($before, $manifests->read($manifestPath));
+                }
+            }
+        }
     }
 }

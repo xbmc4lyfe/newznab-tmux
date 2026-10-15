@@ -252,7 +252,7 @@ final class NzbUploadManifestService
 
         $identity = $manifest['candidate_identity'] ?? null;
 
-        return $manifest['state'] === self::STATE_METADATA_REVIEW
+        return in_array($manifest['state'], [self::STATE_METADATA_REVIEW, self::STATE_METADATA_DEFERRED], true)
             && is_string($identity)
             && preg_match('/\A[0-9a-f]{40}\z/', $identity) === 1;
     }
@@ -277,6 +277,15 @@ final class NzbUploadManifestService
             ->leftJoin('releases as published', 'published.id', '=', 'candidates.release_id')
             ->where('candidates.identity', $identity)->lockForUpdate()
             ->first(['candidates.status', 'candidates.release_id', 'candidates.verified_at', 'published.guid']);
+        if ($candidate !== null && $candidate->status === 'metadata_deferred') {
+            $manifest['state'] = self::STATE_METADATA_DEFERRED;
+            $manifest['release_id'] = null;
+            $manifest['release_guid'] = null;
+            $manifest['last_error'] = 'Download verification candidate awaits metadata capacity; retained source may retry.';
+            $manifest['updated_at'] = now()->toIso8601String();
+
+            return $manifest;
+        }
         if ($candidate !== null && $candidate->status === 'metadata_review') {
             $manifest['state'] = self::STATE_METADATA_REVIEW;
             $manifest['release_id'] = null;
