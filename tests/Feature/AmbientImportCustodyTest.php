@@ -155,7 +155,7 @@ class AmbientImportCustodyTest extends ReleaseVerificationCandidatesTest
         if ($mode === 'exact') {
             self::assertSame(NzbImportStatus::Queued, end($statuses));
             self::assertSame(['synthetic assertion'], $store->read(DB::table('release_verification_candidates')->first()->manifest_path)['passwords']);
-            self::assertSame(! $delete, is_file($path));
+            self::assertSame($sourceHash, hash_file('sha256', $path), 'Queued metadata retains its original source until publication.');
         } elseif (in_array($mode, ['invalid', 'legacy-invalid'], true)) {
             self::assertSame(NzbImportStatus::Failed, end($statuses));
             self::assertSame(! $deleteFailed, is_file($path));

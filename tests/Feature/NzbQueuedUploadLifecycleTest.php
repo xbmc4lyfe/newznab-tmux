@@ -237,6 +237,36 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->assertSame(1, DB::table('release_nfos')->count());
     }
 
+    public function test_later_origin_nfo_does_not_revoke_earlier_committed_source_cleanup(): void
+    {
+        $identity = sha1('import:same-articles');
+        $this->candidate($identity, 'complete', 7);
+        DB::table('releases')->insert(['id' => 7, 'guid' => 'published-guid']);
+        [$first, $manifests] = $this->upload('receipt-first');
+        $this->recordCapturedOutcome($manifests, $first, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        $firstManifest = dirname($first).'/'.NzbUploadManifestService::FILENAME;
+        $capture = $manifests->read($firstManifest)['accepted_capture'];
+        $manifests->deleteCapturedInput($first, $capture, retainForCompanion: true);
+        $nfos = new NfoImportService(new Filesystem, $manifests, new NfoService);
+        DirectorySyncBridge::$fail = 'mkdir_parent';
+        try {
+            self::assertSame('imported', $nfos->importManifest($firstManifest)['status']);
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        self::assertFileExists($first);
+        [$second] = $this->upload('receipt-second');
+        file_put_contents(dirname($second).'/info.nfo', 'different second companion');
+        $manifests->create(dirname($second), 'receipt-second', basename($second), 'info.nfo', 'different second companion');
+        $this->recordCapturedOutcome($manifests, $second, NzbImportStatus::Queued, null, null, candidateIdentity: $identity);
+        self::assertSame('imported', $nfos->importManifest(dirname($second).'/'.NzbUploadManifestService::FILENAME)['status']);
+        $latest = DB::table('release_nfos')->value('nfo');
+        self::assertSame('skipped', $nfos->importManifest($firstManifest)['status']);
+        self::assertFileDoesNotExist($first);
+        self::assertSame($latest, DB::table('release_nfos')->value('nfo'));
+        self::assertSame(2, DB::table('nfo_cleanup_commits')->count());
+    }
+
     public function test_existing_nzb_import_cycle_reconciles_repaired_publication(): void
     {
         $identity = sha1('import:repaired');

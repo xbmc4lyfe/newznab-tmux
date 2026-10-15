@@ -6,6 +6,7 @@ namespace Tests\Feature;
 
 use App\Enums\NzbImportStatus;
 use App\Services\NfoService;
+use App\Services\Nzb\DirectorySyncBridge;
 use App\Services\Nzb\NfoImportService;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbUploadManifestService;
@@ -14,6 +15,7 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
 {
@@ -53,6 +55,31 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         self::assertFileExists(dirname($path).'/info.nfo');
     }
 
+    public function test_duplicate_replay_preserves_the_same_successful_origin_for_companion_import(): void
+    {
+        [$path, $manifests, $service] = $this->directUpload();
+        $source = dirname($path).'/incoming.nzb';
+        $accepted = $manifests->read($path);
+        $replay = new class(['Browser' => true]) extends NzbImportService
+        {
+            protected function getAllGroups(): bool
+            {
+                return true;
+            }
+
+            protected function scanNZBFile(mixed &$nzbXML, mixed $nzbFileName = '', mixed $source = ''): NzbImportStatus
+            {
+                return NzbImportStatus::Duplicate;
+            }
+        };
+        $replay->beginImport([$source], deleteFailed: true);
+        $fields = array_flip(['state', 'release_id', 'release_guid', 'accepted_capture', 'outcome_capture', 'outcome_status']);
+        self::assertSame(array_intersect_key($accepted, $fields), array_intersect_key($manifests->read($path), $fields));
+        self::assertFileExists(dirname($path).'/info.nfo');
+        self::assertSame('imported', $service->importManifest($path, true, true)['status']);
+        self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
+    }
+
     public function test_direct_publication_rejects_reused_release_identity(): void
     {
         [$path, , $service] = $this->directUpload();
@@ -62,12 +89,18 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         self::assertFileExists(dirname($path).'/info.nfo');
     }
 
-    public function test_source_replacement_during_nfo_write_rolls_back_receipt_and_nfo(): void
+    public static function replacementWritePoints(): array
+    {
+        return ['NFO insert' => ['release_nfos'], 'receipt insert' => ['nfo_cleanup_commits']];
+    }
+
+    #[DataProvider('replacementWritePoints')]
+    public function test_source_replacement_during_nfo_write_rolls_back_receipt_and_nfo(string $table): void
     {
         [$path, , $service] = $this->directUpload();
         $armed = true;
-        DB::listen(static function (QueryExecuted $query) use ($path, &$armed): void {
-            if ($armed && str_starts_with(strtolower($query->sql), 'insert') && str_contains($query->sql, 'release_nfos')) {
+        DB::listen(static function (QueryExecuted $query) use ($path, $table, &$armed): void {
+            if ($armed && str_starts_with(strtolower($query->sql), 'insert') && str_contains($query->sql, $table)) {
                 $armed = false;
                 copy(dirname($path).'/incoming.nzb', dirname($path).'/replacement.nzb');
                 rename(dirname($path).'/replacement.nzb', dirname($path).'/incoming.nzb');
@@ -82,6 +115,47 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
         self::assertSame(0, DB::table('release_nfos')->count());
         self::assertFileExists(dirname($path).'/incoming.nzb');
         self::assertFileExists(dirname($path).'/info.nfo');
+    }
+
+    public static function interruptedCleanupBoundaries(): array
+    {
+        return array_combine(['rename_custody', 'rename_parent', 'unlink_dir', 'complete_dir'], array_map(static fn (string $boundary): array => [$boundary], ['rename_custody', 'rename_parent', 'unlink_dir', 'complete_dir']));
+    }
+
+    #[DataProvider('interruptedCleanupBoundaries')]
+    public function test_committed_companion_cleanup_resumes_after_private_move(string $boundary): void
+    {
+        [$path, $manifests, $service] = $this->directUpload();
+        DirectorySyncBridge::$fail = $boundary;
+        try {
+            self::assertSame('failed', $service->importManifest($path, true)['status']);
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
+        self::assertSame('imported', $service->importManifest($path)['status']);
+        self::assertFileDoesNotExist(dirname($path).'/info.nfo');
+        self::assertArrayNotHasKey('delete_nfo_after_import', $manifests->read($path));
+        self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
+    }
+
+    public function test_terminal_replay_honors_persisted_companion_deletion_intent(): void
+    {
+        [$path, $manifests, $service] = $this->directUpload();
+        DirectorySyncBridge::$fail = 'mkdir_parent';
+        try {
+            self::assertSame('failed', $service->importManifest($path, true)['status']);
+        } finally {
+            DirectorySyncBridge::$fail = '';
+        }
+        // Simulate the durable terminal manifest at the pre-cleanup interruption point.
+        // SQL storage and its receipt above are real; no admission/receipt is fabricated.
+        $manifest = $manifests->read($path);
+        $manifest['state'] = NzbUploadManifestService::STATE_NFO_IMPORTED;
+        file_put_contents($path, json_encode($manifest, JSON_THROW_ON_ERROR));
+        self::assertSame('skipped', $service->importManifest($path)['status']);
+        self::assertFileDoesNotExist(dirname($path).'/info.nfo');
+        self::assertSame(1, DB::table('nfo_cleanup_commits')->count());
     }
 
     /** @return array{string, NzbUploadManifestService, NfoImportService} */

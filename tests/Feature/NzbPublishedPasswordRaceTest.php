@@ -9,7 +9,9 @@ use App\Facades\Search;
 use App\Services\BlacklistService;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbUploadManifestService;
 use App\Services\ReleaseCleaningService;
+use App\Services\Releases\Verification\CandidateAdmissionDeferredException;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NzbManifestReader;
@@ -96,6 +98,9 @@ class NzbPublishedPasswordRaceTest extends ReleaseVerificationCandidatesTest
         app('files')->ensureDirectoryExists(dirname($source));
         $incoming = app(VerifiedNzbWriter::class)->document($manifest);
         file_put_contents($source, $incoming);
+        if ($useImport) {
+            app(NzbUploadManifestService::class)->create(dirname($source), 'publication-race', basename($source), null);
+        }
         $statuses = [];
         $callback = static function (array $result) use (&$statuses): void {
             $statuses[] = $result['status'];
@@ -124,6 +129,13 @@ class NzbPublishedPasswordRaceTest extends ReleaseVerificationCandidatesTest
             $manifest = app(ManifestStore::class)->read(DB::table('release_verification_candidates')->value('manifest_path'));
         } else {
             self::assertTrue(app(CandidateRepository::class)->enqueue($manifest));
+        }
+        if ($useImport) {
+            $fresh = dirname($source).'/fresh-origin';
+            app('files')->ensureDirectoryExists($fresh);
+            $source = $fresh.'/race-source.nzb';
+            file_put_contents($source, $incoming);
+            app(NzbUploadManifestService::class)->create($fresh, 'fresh-publication-race', basename($source), null);
         }
         // Observe a genuine queued candidate, or no candidate at all. Publication below
         // uses the real claim/publisher path; no fixture writes published status fields.
@@ -187,9 +199,19 @@ class NzbPublishedPasswordRaceTest extends ReleaseVerificationCandidatesTest
         });
         if ($useImport) {
             $service->beginImport([$source], delete: $delete, deleteFailed: $deleteFailed, resultCallback: $callback);
-            self::assertSame($passwordBearing ? NzbImportStatus::MetadataIgnored : NzbImportStatus::Queued, end($statuses));
+            self::assertSame($passwordBearing ? NzbImportStatus::MetadataDeferred : NzbImportStatus::Queued, end($statuses));
         } else {
-            self::assertSame(! $passwordBearing, app(CandidateRepository::class)->enqueue($manifest));
+            if ($passwordBearing) {
+                $deferred = false;
+                try {
+                    app(CandidateRepository::class)->enqueue($manifest);
+                } catch (CandidateAdmissionDeferredException) {
+                    $deferred = true;
+                }
+                self::assertTrue($deferred, 'Missing replay evidence is retryable, not a permanent metadata rejection.');
+            } else {
+                self::assertTrue(app(CandidateRepository::class)->enqueue($manifest));
+            }
         }
         self::assertTrue($fired);
         self::assertTrue($lockedReadAfterPublication);
@@ -201,6 +223,9 @@ class NzbPublishedPasswordRaceTest extends ReleaseVerificationCandidatesTest
             self::assertSame($incoming, file_get_contents($source));
         } else {
             self::assertFileDoesNotExist($source);
+        }
+        if ($useImport && $passwordBearing) {
+            self::assertTrue(app(NzbUploadManifestService::class)->shouldImportNzb($source));
         }
         // A fresh admission now observes the published link, prepares XML, and admits
         // the same exact document without changing candidate/version/capacity/artifact.

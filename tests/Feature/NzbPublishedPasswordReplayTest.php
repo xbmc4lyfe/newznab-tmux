@@ -187,7 +187,7 @@ class NzbPublishedPasswordReplayTest extends ReleaseVerificationCandidatesTest
             file_put_contents($sourcePath, $incoming);
             $service->beginImport([$sourcePath], delete: true, deleteFailed: true, resultCallback: $callback);
             self::assertSame($accepted ? NzbImportStatus::Queued : ($mode === 'passwordless-metadata-deferred' ? NzbImportStatus::MetadataDeferred : NzbImportStatus::MetadataIgnored), end($statuses));
-            if ($accepted) {
+            if ($accepted && $mode !== 'missing-release') {
                 self::assertFileDoesNotExist($sourcePath);
             } else {
                 self::assertSame($incoming, file_get_contents($sourcePath));

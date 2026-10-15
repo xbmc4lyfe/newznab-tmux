@@ -16,6 +16,7 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\ReleaseCleaningService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Services\Releases\Verification\CandidateAdmissionDeferredException;
 use App\Services\Releases\Verification\CandidateCapacityException;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\NzbManifestReader;
@@ -318,7 +319,15 @@ class NzbImportService
                     $reportResult($nzbFilePath, $importStatus, candidateIdentity: $this->verificationCandidateIdentity, inputCapture: $inputCapture);
                     $nzbsImported++;
                     if ($delete) {
-                        app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture, retainForCompanion: true);
+                        $retain = $inputCapture !== null || ! $this->publishedAdmissionExists();
+                        // Raw inputs have no durable per-upload manifest: keep them until
+                        // a fresh exact replay observes committed verified publication.
+                        if ($inputCapture !== null || ! $retain) {
+                            $current = Str::endsWith(strtolower($nzbFilePath), '.nzb.gz') ? unzipGzipFile($nzbFilePath) : File::get($nzbFilePath);
+                            if ($current === $nzbString) {
+                                app(NzbUploadManifestService::class)->deleteCapturedInput($nzbFilePath, $inputCapture, retainForCompanion: $retain);
+                            }
+                        }
                     }
                 } elseif ($importStatus === NzbImportStatus::Inserted) {
                     if (! $stored) {
@@ -420,6 +429,22 @@ class NzbImportService
 
         // Tidy up any trailing dots/whitespace left behind.
         return rtrim($name, ". \t\n\r\0\x0B");
+    }
+
+    private function publishedAdmissionExists(): bool
+    {
+        $admission = $this->verificationAdmission;
+        if ($admission === null || DB::transactionLevel() !== 0) {
+            return false;
+        }
+        $candidate = DB::table('release_verification_candidates')
+            ->where('id', $admission['candidate_id'])->where('identity', $admission['identity'])
+            ->where('version', $admission['version'])->where('manifest_hash', $admission['manifest_hash'])
+            ->whereIn('status', ['complete', 'repaired', 'sampled'])->whereNotNull('verified_at')
+            ->whereNotNull('release_id')->first(['release_id']);
+
+        return $candidate !== null && DB::table('releases')->where('id', $candidate->release_id)
+            ->where('nzbstatus', NzbService::NZB_ADDED)->exists();
     }
 
     protected function writeCompressedNzb(string $path, string $contents): bool
@@ -759,7 +784,7 @@ class NzbImportService
                 $admission = app(CandidateRepository::class)->enqueueWithAdmission($manifest);
                 $admitted = $admission !== null;
                 $this->verificationAdmission = $admission?->toArray();
-            } catch (CandidateCapacityException) {
+            } catch (CandidateCapacityException|CandidateAdmissionDeferredException) {
                 return NzbImportStatus::MetadataDeferred;
             } catch (\Throwable) {
                 try {

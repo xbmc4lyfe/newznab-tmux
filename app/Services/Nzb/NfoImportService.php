@@ -27,6 +27,11 @@ final class NfoImportService
         $nfoPath = null;
 
         try {
+            $prior = $this->manifests->read($manifestPath);
+            if ($this->manifests->resumeCommittedCompanion($manifestPath, $delete)) {
+                return ['status' => $prior['state'] === NzbUploadManifestService::STATE_NFO_IMPORTED ? 'skipped' : 'imported',
+                    'message' => 'NFO storage was already committed; cleanup retried'];
+            }
             $manifest = $this->manifests->reconcilePending($manifestPath);
             $state = $manifest['state'];
 

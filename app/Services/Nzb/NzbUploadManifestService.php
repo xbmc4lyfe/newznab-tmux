@@ -181,6 +181,12 @@ final class NzbUploadManifestService
                 $m['legacy_provenance'] ??= array_intersect_key($m, array_flip(['version', 'state', 'candidate_identity', 'release_id', 'release_guid']));
                 $m['version'] = 2;
             }
+            if (in_array($m['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
+                && (isset($m['delete_nzb_after_nfo']) || isset($m['delete_nzb_after_publication']) || isset($m['delete_nfo_after_import']))) {
+                // Do not replace the captured operation while its owned cleanup is pending.
+                // The ordinary reconciliation/companion loop retries that operation first.
+                return ['deferred' => true];
+            }
             $accepted = $m['accepted_capture'] ?? null;
             if (is_array($accepted) && ($accepted['protocol'] ?? null) === 2
                 && in_array($m['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
@@ -237,10 +243,10 @@ final class NzbUploadManifestService
     {
         $mp = dirname($path).DIRECTORY_SEPARATOR.self::FILENAME;
         if (! $this->filesystem->isFile($mp)) {
-            return $capture === null && $this->filesystem->delete($path);
+            return ! $retainForCompanion && $capture === null && $this->filesystem->delete($path);
         }
 
-        return $this->withManifestLock($mp, function () use ($mp, $path, $capture, $retainForCompanion): bool {
+        $deleted = $this->withManifestLock($mp, function () use ($mp, $path, $capture, $retainForCompanion): bool {
             $m = $this->read($mp);
             if ($capture === null || ($m['input_reservation']['attempt'] ?? null) !== $capture['attempt']
                 || (($m['accepted_capture'] ?? null) !== $capture && (($m['outcome_capture'] ?? null) !== $capture
@@ -250,10 +256,11 @@ final class NzbUploadManifestService
                 return false;
             }
 
-            if ($retainForCompanion && $m['state'] === self::STATE_NZB_PENDING && is_array($m['nfo_capture'] ?? null)) {
+            if ($retainForCompanion && $m['state'] === self::STATE_NZB_PENDING) {
                 // Metadata enrichment may change admission revision before publication.
                 // Keep the exact uploader document until its companion commits so it can re-admit.
-                $m['delete_nzb_after_nfo'] = array_intersect_key($capture, array_flip(['source_identity', 'digest']));
+                $field = is_array($m['nfo_capture'] ?? null) ? 'delete_nzb_after_nfo' : 'delete_nzb_after_publication';
+                $m[$field] = array_intersect_key($capture, array_flip(['source_identity', 'digest']));
                 $this->write($mp, $m);
 
                 return false;
@@ -267,6 +274,12 @@ final class NzbUploadManifestService
 
             return true;
         });
+        if (! $deleted && $retainForCompanion && $capture !== null) {
+            $this->reconcilePending($mp);
+            $deleted = ($this->read($mp)['relinquished_attempt'] ?? null) === ($capture['attempt'] ?? null);
+        }
+
+        return $deleted;
     }
 
     /** @param array<string, mixed> $manifest */
@@ -286,7 +299,8 @@ final class NzbUploadManifestService
         }
         $source = dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nzb']['filename'];
         if (! $this->filesystem->isFile($source)) {
-            return ($manifest['relinquished_attempt'] ?? null) === $accepted['attempt'];
+            return ($manifest['relinquished_attempt'] ?? null) === $accepted['attempt']
+                || $this->capturedCustodyPayload($source, $accepted) !== null;
         }
 
         return $this->sourceIdentity($source) === $accepted['source_identity']
@@ -331,6 +345,14 @@ final class NzbUploadManifestService
                     return;
                 }
             }
+            if ($status === NzbImportStatus::Duplicate
+                && in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
+                && ($manifest['accepted_capture'] ?? null) === $inputCapture
+                && ($manifest['outcome_status'] ?? null) === NzbImportStatus::Inserted->value
+                && $this->acceptedInputValid($manifestPath, $manifest)
+                && $this->nfoCandidateCurrent($manifest)) {
+                return;
+            }
             $staleAdmissionRetry = ($manifest['stale_admission_retry'] ?? false) === true;
             if (in_array($status, [NzbImportStatus::Queued, NzbImportStatus::MetadataIgnored, NzbImportStatus::MetadataDeferred], true)) {
                 unset($manifest['stale_admission_retry']);
@@ -358,7 +380,15 @@ final class NzbUploadManifestService
                 }
                 if (($manifest['candidate_identity'] ?? null) === $candidateIdentity
                     && in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED, self::STATE_NZB_REJECTED], true)) {
-                    return;
+                    if ($candidateAdmission === null) {
+                        return;
+                    }
+                    if ($this->nfoCandidateCurrent($manifest) && $this->acceptedInputValid($manifestPath, $manifest)) {
+                        $manifest['updated_at'] = now()->toIso8601String();
+                        $this->write($manifestPath, $manifest);
+
+                        return;
+                    }
                 }
                 $manifest['candidate_identity'] = $candidateIdentity;
                 $manifest['state'] = self::STATE_NZB_PENDING;
@@ -422,6 +452,10 @@ final class NzbUploadManifestService
     public function reconcilePending(string $manifestPath): array
     {
         $manifest = $this->read($manifestPath);
+        if (in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
+            && $this->resumeCommittedCompanion($manifestPath)) {
+            return $this->read($manifestPath);
+        }
         if (! isset($manifest['accepted_capture']) && ($this->canReconcileCandidate($manifest)
             || in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_FAILED], true))) {
             return $this->withManifestLock($manifestPath, function () use ($manifestPath): array {
@@ -456,6 +490,10 @@ final class NzbUploadManifestService
                 return $manifest;
             }
             if (! $this->canReconcileCandidate($manifest)) {
+                if ($manifest['state'] === self::STATE_NZB_IMPORTED) {
+                    $this->finishInputDeletion($manifestPath, $manifest, publicationOnly: true);
+                }
+
                 return $manifest;
             }
             app(VerificationResetService::class)->withAdmission(function () use (&$manifest, $manifestPath): void {
@@ -470,6 +508,9 @@ final class NzbUploadManifestService
                     $manifest = $resolved;
                 }
             });
+            if ($manifest['state'] === self::STATE_NZB_IMPORTED) {
+                $this->finishInputDeletion($manifestPath, $manifest, publicationOnly: true);
+            }
 
             return $manifest;
         });
@@ -593,6 +634,10 @@ final class NzbUploadManifestService
                 $this->write($manifestPath, $m);
                 throw new RuntimeException('Unknown companion generation or admitted input');
             }
+            if ($delete) {
+                $m['delete_nfo_after_import'] = $receipt['attempt'];
+                $this->write($manifestPath, $m);
+            }
             $path = $this->resolvePayloadPath($manifestPath, $receipt['filename'], 'nfo');
             $validate = function () use ($path, $receipt, $manifestPath, &$m): void {
                 if (! $this->acceptedInputValid($manifestPath, $m)) {
@@ -619,12 +664,9 @@ final class NzbUploadManifestService
                 $existingReceipt = DB::table('nfo_cleanup_commits')
                     ->where('binding', $this->nfoCommitBinding($m))->exists();
                 if ($existingReceipt) {
-                    $stored = DB::table('release_nfos')->where('releases_id', $m['release_id'])->value('nfo');
-                    $expected = "\x1f\x8b\x08\x00".gzcompress($body);
-                    if (! $this->nfoCleanupCommitted($m) || ! is_string($stored) || ! hash_equals($expected, $stored)) {
+                    if (! $this->nfoCleanupCommitted($m)) {
                         throw new RuntimeException('Existing NFO receipt does not match committed operation');
                     }
-                    $validate();
                 } else {
                     DB::transaction(function () use ($store, $m, $body, $validate): void {
                         if (! DB::table('releases')->where('id', $m['release_id'])->where('guid', $m['release_guid'])->lockForUpdate()->exists()) {
@@ -652,6 +694,7 @@ final class NzbUploadManifestService
                                 'candidate_identity' => $m['candidate_identity'],
                                 'stored_digest' => hash('sha256', $stored),
                             ]);
+                            $validate();
                         });
                     });
                 }
@@ -661,17 +704,8 @@ final class NzbUploadManifestService
                 $m['updated_at'] = now()->toIso8601String();
                 $this->write($manifestPath, $m);
                 $this->finishInputDeletion($manifestPath, $m);
-                if ($delete) {
-                    $validate();
-
-                    if (! $this->nfoCleanupCommitted($m)) {
-                        throw new RuntimeException('NFO cleanup has no matching committed SQL authority');
-                    }
-                    if (! $this->quarantineDelete($path, $receipt, $this->nfoCommitBinding($m))) {
-                        throw new RuntimeException('Companion cleanup held in private custody');
-                    }
-
-                    return true;
+                if (! $this->finishCompanionDeletion($manifestPath, $m)) {
+                    throw new RuntimeException('Companion cleanup held in private custody');
                 }
 
                 return true;
@@ -685,6 +719,47 @@ final class NzbUploadManifestService
         });
     }
 
+    public function resumeCommittedCompanion(string $manifestPath, bool $delete = false): bool
+    {
+        return $this->withManifestLock($manifestPath, function () use ($manifestPath, $delete): bool {
+            $manifest = $this->read($manifestPath);
+            if (! in_array($manifest['state'], [self::STATE_NZB_IMPORTED, self::STATE_NFO_IMPORTED, self::STATE_NFO_FAILED], true)
+                || ! $this->nfoCleanupCommitted($manifest)) {
+                return false;
+            }
+            if ($delete) {
+                $manifest['delete_nfo_after_import'] = $manifest['nfo_capture']['attempt'];
+            }
+            $manifest['state'] = self::STATE_NFO_IMPORTED;
+            $manifest['last_error'] = null;
+            $this->write($manifestPath, $manifest);
+            $this->finishInputDeletion($manifestPath, $manifest);
+            $this->finishCompanionDeletion($manifestPath, $manifest);
+
+            return true;
+        });
+    }
+
+    /** @param array<string, mixed> $manifest */
+    private function finishCompanionDeletion(string $manifestPath, array &$manifest): bool
+    {
+        $receipt = $manifest['nfo_capture'] ?? null;
+        if (! is_array($receipt) || ($manifest['delete_nfo_after_import'] ?? null) !== $receipt['attempt']) {
+            return true;
+        }
+        if (! $this->nfoCleanupCommitted($manifest)) {
+            return false;
+        }
+        $path = dirname($manifestPath).DIRECTORY_SEPARATOR.$receipt['filename'];
+        if (! $this->quarantineDelete($path, $receipt, $this->nfoCommitBinding($manifest))) {
+            return false;
+        }
+        unset($manifest['delete_nfo_after_import']);
+        $this->write($manifestPath, $manifest);
+
+        return true;
+    }
+
     public function cleanupImportedSource(string $manifestPath): void
     {
         $this->withManifestLock($manifestPath, function () use ($manifestPath): void {
@@ -696,27 +771,31 @@ final class NzbUploadManifestService
     }
 
     /** @param array<string, mixed> $manifest */
-    private function finishInputDeletion(string $manifestPath, array &$manifest): void
+    private function finishInputDeletion(string $manifestPath, array &$manifest, bool $publicationOnly = false): void
     {
-        $requested = $manifest['delete_nzb_after_nfo'] ?? null;
+        $field = $publicationOnly ? 'delete_nzb_after_publication' : 'delete_nzb_after_nfo';
+        $requested = $manifest[$field] ?? null;
         $accepted = $manifest['accepted_capture'] ?? null;
         if (! is_array($requested) || ! is_array($accepted)
             || $requested !== array_intersect_key($accepted, array_flip(['source_identity', 'digest']))
-            || ! $this->nfoCleanupCommitted($manifest)) {
+            || DB::transactionLevel() !== 0) {
+            return;
+        }
+        if ($publicationOnly) {
+            if ($manifest['state'] !== self::STATE_NZB_IMPORTED || is_array($manifest['nfo_capture'] ?? null)
+                || ! $this->nfoCandidateCurrent($manifest)
+                || ! DB::table('releases')->where('id', $manifest['release_id'])->where('guid', $manifest['release_guid'])->exists()) {
+                return;
+            }
+        } elseif (! $this->nfoCleanupCommitted($manifest)) {
             return;
         }
         $source = dirname($manifestPath).DIRECTORY_SEPARATOR.$manifest['nzb']['filename'];
-        if (! $this->filesystem->isFile($source)) {
-            return;
-        }
-        if ($this->sourceIdentity($source) !== $accepted['source_identity']
-            || ! hash_equals($accepted['digest'], $this->currentFileDigest($source))
-            || $this->sourceIdentity($source) !== $accepted['source_identity']
-            || ! $this->quarantineDelete($source, $accepted, $this->nfoCommitBinding($manifest))) {
+        if (! $this->quarantineDelete($source, $accepted, $publicationOnly ? null : $this->nfoCommitBinding($manifest))) {
             return;
         }
         $manifest['relinquished_attempt'] = $accepted['attempt'];
-        unset($manifest['delete_nzb_after_nfo']);
+        unset($manifest[$field]);
         $this->write($manifestPath, $manifest);
     }
 
@@ -789,16 +868,20 @@ final class NzbUploadManifestService
             || ! is_string($manifest['release_guid'] ?? null)) {
             return false;
         }
+        if (! DB::connection()->getSchemaBuilder()->hasTable('nfo_cleanup_commits')) {
+            return false;
+        }
         $row = DB::table('nfo_cleanup_commits')->where('binding', $this->nfoCommitBinding($manifest))->first();
-        if (! $this->nfoCandidateCurrent($manifest) || $row === null || (int) $row->release_id !== $manifest['release_id']
+        if ($row === null || (int) $row->release_id !== $manifest['release_id']
             || $row->release_guid !== $manifest['release_guid']
             || $row->candidate_identity !== $manifest['candidate_identity']
             || ! DB::table('releases')->where('id', $manifest['release_id'])->where('guid', $manifest['release_guid'])->exists()) {
             return false;
         }
-        $stored = DB::table('release_nfos')->where('releases_id', $manifest['release_id'])->value('nfo');
 
-        return is_string($stored) && hash_equals($row->stored_digest, hash('sha256', $stored));
+        // Another admitted origin may legitimately replace the selected NFO later.
+        // This immutable receipt proves this origin's earlier committed storage.
+        return is_string($row->stored_digest) && preg_match('/\A[0-9a-f]{64}\z/', $row->stored_digest) === 1;
     }
 
     public function deleteTerminalCompanion(string $manifestPath): bool
@@ -833,74 +916,115 @@ final class NzbUploadManifestService
      */
     private function quarantineDelete(string $source, array $receipt, ?string $commitBinding = null): bool
     {
-        $attempt = dirname($source).'/.custody-'.bin2hex(random_bytes(16));
-        if (! mkdir($attempt, 0700)) {
+        $attempt = $this->custodyDirectory($source, $receipt);
+        if (! is_dir($attempt) && ! mkdir($attempt, 0700)) {
             return false;
         }
-        if (! DirectorySyncBridge::sync(dirname($source), 'mkdir_parent')) {
+        $stat = lstat($attempt);
+        if ($stat === false || ($stat['mode'] & 0170000) !== 0040000 || ($stat['mode'] & 0777) !== 0700
+            || ! DirectorySyncBridge::sync(dirname($source), 'mkdir_parent')) {
+            return false;
+        }
+        $expected = ['protocol' => 3, 'source' => basename($source), 'receipt' => $receipt, 'commit_binding' => $commitBinding];
+        $intentPath = $attempt.'/intent.json';
+        $intent = $this->readCustodyIntent($source, $receipt);
+        if ($intent === null) {
+            if (! $this->captureMatches($source, $receipt) || file_exists($attempt.'/payload')
+                || is_link($attempt.'/payload') || file_exists($attempt.'/complete.json') || is_link($intentPath)) {
+                return false;
+            }
+            // An interrupted pre-move journal write can be replaced while the exact
+            // source is still owned and no custody transition has happened.
+            $this->write($intentPath, $expected);
+            $intent = $this->readCustodyIntent($source, $receipt);
+        }
+        if ($intent !== $expected || ! DirectorySyncBridge::sync($attempt, 'intent_dir')) {
             return false;
         }
         $private = $attempt.'/payload';
-        $journal = fopen($attempt.'/intent.json', 'x');
-        if ($journal === false) {
+        $complete = $attempt.'/complete.json';
+        if (is_link($complete)) {
             return false;
         }
-        try {
-            $manifest = $this->read(dirname($source).DIRECTORY_SEPARATOR.self::FILENAME);
-            $pair = array_intersect_key($manifest, array_flip(['upload_id', 'accepted_capture', 'outcome_capture', 'outcome_status', 'nfo_capture']));
-            $intent = json_encode(['protocol' => $commitBinding === null ? 1 : 2, 'operation' => $commitBinding === null ? 'legacy-hold' : 'nfo-store-cleanup', 'commit_binding' => $commitBinding, 'release_id' => $manifest['release_id'] ?? null, 'release_guid' => $manifest['release_guid'] ?? null, 'candidate_identity' => $manifest['candidate_identity'] ?? null, 'pair' => $pair, 'source' => basename($source),
-                'receipt' => $receipt, 'private' => 'payload', 'policy' => 'restart-hold'], JSON_THROW_ON_ERROR);
-            if (fwrite($journal, $intent) !== strlen($intent) || ! fflush($journal) || ! fsync($journal)) {
+        if (is_file($complete)
+            && json_decode($this->filesystem->get($complete), true) === $expected
+            && ! file_exists($private) && ! is_link($private)) {
+            return DirectorySyncBridge::sync($attempt, 'complete_dir');
+        }
+        if (! file_exists($private) && ! is_link($private) && $this->captureMatches($source, $receipt)) {
+            if (! $this->filesystem->move($source, $private)) {
                 return false;
             }
-        } finally {
-            fclose($journal);
-        }
-        if (! DirectorySyncBridge::sync($attempt, 'intent_dir')) {
-            return false;
-        }
-        // Destination is absent in a new 0700 nonce directory on the same filesystem.
-        // A false/throwing move leaves source or captured payload under the intent.
-        if (! $this->filesystem->move($source, $private)) {
-            return false;
         }
         if (! DirectorySyncBridge::sync($attempt, 'rename_custody') || ! DirectorySyncBridge::sync(dirname($source), 'rename_parent')) {
             return false;
         }
-        $expected = json_decode($receipt['source_identity'], true, flags: JSON_THROW_ON_ERROR);
-        $actualIdentity = $this->sourceIdentity($private);
-        $actual = $actualIdentity === null ? null : json_decode($actualIdentity, true, flags: JSON_THROW_ON_ERROR);
-        // rename may update ctime: dev+ino and immutable content remain the authority.
-        unset($expected['ctime']);
-        if (is_array($actual)) {
-            unset($actual['ctime']);
-        }
-        if ($actual !== $expected || ! hash_equals($receipt['digest'], $this->currentFileDigest($private))) {
-            // Never restore with rename(): that could overwrite a newly arrived C.
-            // Retain B with intent+receipt for explicit paired-generation reconciliation.
-            return false;
-        }
-
-        if (! $this->filesystem->delete($private)) {
+        if (file_exists($private) || is_link($private)) {
+            if (! $this->captureMatches($private, $receipt, renamed: true) || ! $this->filesystem->delete($private)) {
+                return false;
+            }
+        } elseif (file_exists($source) || is_link($source)) {
+            // Never treat an unrelated replacement pathname as owned cleanup work.
             return false;
         }
         if (! DirectorySyncBridge::sync($attempt, 'unlink_dir')) {
             return false;
         }
-        $complete = fopen($attempt.'/complete.json', 'x');
-        if ($complete === false) {
-            return false;
-        }
-        try {
-            $bytes = json_encode(['protocol' => 1, 'receipt' => $receipt, 'policy' => 'restart-hold'], JSON_THROW_ON_ERROR);
-            if (fwrite($complete, $bytes) !== strlen($bytes) || ! fflush($complete) || ! fsync($complete)) {
-                return false;
-            }
-        } finally {
-            fclose($complete);
-        }
+        $this->write($complete, $expected);
 
         return DirectorySyncBridge::sync($attempt, 'complete_dir');
+    }
+
+    /** @param array<string, mixed> $receipt */
+    private function custodyDirectory(string $source, array $receipt): string
+    {
+        // The captured attempt is a private random nonce; this stable locator is unguessable.
+        return dirname($source).'/.custody-'.hash('sha256', json_encode([basename($source), $receipt], JSON_THROW_ON_ERROR));
+    }
+
+    /** @param array<string, mixed> $receipt
+     * @return array<string, mixed>|null
+     */
+    private function readCustodyIntent(string $source, array $receipt): ?array
+    {
+        $directory = $this->custodyDirectory($source, $receipt);
+        $path = $directory.'/intent.json';
+        if (is_link($directory) || is_link($path) || ! is_file($path)) {
+            return null;
+        }
+        $intent = json_decode($this->filesystem->get($path), true);
+
+        return is_array($intent) && ($intent['protocol'] ?? null) === 3
+            && ($intent['source'] ?? null) === basename($source) && ($intent['receipt'] ?? null) === $receipt ? $intent : null;
+    }
+
+    /** @param array<string, mixed> $receipt */
+    private function capturedCustodyPayload(string $source, array $receipt): ?string
+    {
+        if ($this->readCustodyIntent($source, $receipt) === null) {
+            return null;
+        }
+        $private = $this->custodyDirectory($source, $receipt).'/payload';
+
+        return $this->captureMatches($private, $receipt, renamed: true) ? $private : null;
+    }
+
+    /** @param array<string, mixed> $receipt */
+    private function captureMatches(string $path, array $receipt, bool $renamed = false): bool
+    {
+        $identity = $this->sourceIdentity($path);
+        if ($identity === null || ! is_string($receipt['source_identity'] ?? null) || ! is_string($receipt['digest'] ?? null)) {
+            return false;
+        }
+        $expected = json_decode($receipt['source_identity'], true);
+        $actual = json_decode($identity, true);
+        if ($renamed && is_array($expected) && is_array($actual)) {
+            // A same-filesystem rename may update ctime, but not inode, mode or bytes.
+            unset($expected['ctime'], $actual['ctime']);
+        }
+
+        return $expected === $actual && hash_equals($receipt['digest'], $this->currentFileDigest($path))
+            && $this->sourceIdentity($path) === $identity;
     }
 
     /**

@@ -16,9 +16,42 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use PHPUnit\Framework\Attributes\DataProvider;
+use Tests\Support\CapturedUploadFixture;
 
 class MetadataDeferredProgressTest extends ReleaseVerificationCandidatesTest
 {
+    use CapturedUploadFixture;
+
+    public static function sourceCustodians(): array
+    {
+        return ['manifested without companion' => [true], 'raw input' => [false]];
+    }
+
+    #[DataProvider('sourceCustodians')]
+    public function test_metadata_expiry_keeps_original_assertions_after_queued_delete_request(bool $manifested): void
+    {
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->id();
+            $table->string('guid');
+        });
+        $directory = config('release_verification.storage_path').'/custody';
+        app('files')->ensureDirectoryExists($directory);
+        $path = $directory.'/incoming.nzb';
+        $xml = '<nzb><head><meta type="password">synthetic assertion</meta></head><file poster="fixture" date="1" subject="fixture.bin"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">expiry@example.test</segment></segments></file></nzb>';
+        file_put_contents($path, $xml);
+        if ($manifested) {
+            app(NzbUploadManifestService::class)->create($directory, 'expiry-custody', 'incoming.nzb', null);
+        }
+        $this->capturedFixtureImporter('expiry-custody')->beginImport([$path], delete: true);
+        self::assertFileExists($path);
+        DB::table('release_verification_candidates')->update(['status' => 'metadata_review', 'last_unique_at' => now()->subDays(100)]);
+        app(CandidateRepository::class)->expire();
+        self::assertSame('metadata_expired', DB::table('release_verification_candidates')->value('status'));
+        self::assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        self::assertSame($xml, file_get_contents($path));
+    }
+
     private function manifest(string $key, array $passwords = []): array
     {
         $manifest = (new NzbManifestReader)->read('<nzb><file poster="poster" date="1" subject="fixture.bin (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">'.$key.'@example.test</segment></segments></file></nzb>', (object) ['groups_id' => 1, 'searchname' => 'fixture', 'fromname' => 'poster', 'postdate' => '1970-01-01 00:00:01', 'metadata_source' => 'import']);

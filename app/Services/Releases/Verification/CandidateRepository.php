@@ -175,7 +175,8 @@ final class CandidateRepository
         }
         $accepted = false;
         $capacityDeferred = false;
-        app(VerificationResetService::class)->withAdmission(function () use ($manifest, &$accepted, &$capacityDeferred, $onAdmitted): void {
+        $publicationDeferred = false;
+        app(VerificationResetService::class)->withAdmission(function () use ($manifest, &$accepted, &$capacityDeferred, &$publicationDeferred, $onAdmitted): void {
             // Prepare incoming assertions before capacity ownership. The authoritative
             // locked comparison below admits only this exact manifest/prepared pair.
             // Passwordless known replays retain their existing cheap path.
@@ -185,9 +186,10 @@ final class CandidateRepository
             $replayXml = $observed?->release_id !== null && ($manifest['passwords'] ?? []) !== []
                 ? app(VerifiedNzbWriter::class)->document($manifest) : null;
             $headerAssessment = $prepared === null ? null : (new CandidateHeaderInventory)->assessment($manifest);
-            $accepted = DB::transaction(function () use ($manifest, $prepared, $headerAssessment, $replayXml, &$capacityDeferred, $onAdmitted): bool {
-                $admit = function () use ($manifest, $prepared, $headerAssessment, $replayXml, &$capacityDeferred): bool {
+            $accepted = DB::transaction(function () use ($manifest, $prepared, $headerAssessment, $replayXml, &$capacityDeferred, &$publicationDeferred, $onAdmitted): bool {
+                $admit = function () use ($manifest, $prepared, $headerAssessment, $replayXml, &$capacityDeferred, &$publicationDeferred): bool {
                     $capacityDeferred = false;
+                    $publicationDeferred = false;
                     $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
                     $identity = (string) $manifest['identity'];
                     $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
@@ -201,6 +203,12 @@ final class CandidateRepository
                     }
                     if ($existing !== null && ! $metadataReadmission && ($existing->release_id === null || $release !== null)) {
                         if ($release !== null && ($manifest['passwords'] ?? []) !== []) {
+                            if ($replayXml === null) {
+                                $publicationDeferred = true;
+
+                                return false;
+                            }
+
                             return $this->identicalPublishedReplay($existing, $release, $manifest, $prepared, $replayXml);
                         }
 
@@ -250,6 +258,10 @@ final class CandidateRepository
                 return $ok;
             }, 5);
         });
+
+        if ($publicationDeferred) {
+            throw new CandidateAdmissionDeferredException('Publication changed during admission; import retained for retry.');
+        }
 
         if ($capacityDeferred) {
             // Signal after the admission transaction commits its lease fence.

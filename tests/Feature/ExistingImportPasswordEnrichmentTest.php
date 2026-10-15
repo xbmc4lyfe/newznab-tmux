@@ -185,7 +185,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
         $manifest = app(ManifestStore::class)->read($candidate->manifest_path);
         if (in_array($mode, ['exact', 'exact-spot', 'appeared-after-advisory'], true)) {
             self::assertSame(['synthetic assertion'], $manifest['passwords'] ?? [], 'Accepted replay must preserve newly asserted uploader metadata before deletion.');
-            self::assertFileDoesNotExist($path);
+            self::assertFileExists($path);
             self::assertFileDoesNotExist($store->path($storedPath), 'Old artifact cleanup follows the committed candidate swap.');
             self::assertSame((int) $first->version + 1, (int) $candidate->version);
             self::assertNull($candidate->lease_token);
@@ -257,11 +257,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
         self::assertSame($retainedBytes, file_get_contents($store->path($before->manifest_path)));
         self::assertSame($pendingBytes, DB::table('release_verification_state')->value('pending_bytes'));
         self::assertSame([$store->path($before->manifest_path)], glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
-        if ($expected === NzbImportStatus::Queued) {
-            self::assertFileDoesNotExist($path);
-        } else {
-            self::assertSame($source, file_get_contents($path), 'Rejected metadata must retain the exact incoming source.');
-        }
+        self::assertSame($source, file_get_contents($path), 'Unpublished or rejected metadata retains its exact incoming source.');
     }
 
     public static function stalePublicationScenarios(): array
@@ -301,7 +297,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
             self::assertFileExists($path);
         } else {
             self::assertNotSame($claim->manifest_hash, $candidate->manifest_hash);
-            self::assertFileDoesNotExist($path);
+            self::assertFileExists($path);
         }
         Schema::create('releases', static function (Blueprint $table): void {
             $table->id();
@@ -584,7 +580,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
         self::assertSame(NzbImportStatus::Queued, end($statuses));
         self::assertNotSame('metadata_deferred', DB::table('release_verification_candidates')->value('status'));
         self::assertSame($identity, DB::table('release_verification_candidates')->value('identity'));
-        self::assertFileDoesNotExist($path);
+        self::assertFileExists($path);
     }
 
     public function test_identity_backed_deferral_reconciles_review_and_later_publication(): void
