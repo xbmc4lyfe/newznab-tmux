@@ -8,6 +8,7 @@ on:
     paths:
       - '.github/workflows/archive-sample-performance.yml'
       - 'scripts/*benchmark*'
+      - 'scripts/composer-install-ci.sh'
       - 'app/Services/Releases/Fingerprint/**'
       - 'app/Services/Releases/Verification/*SpotCheckPlanner.php'
       - 'docker/app/nzb-yenc-ffi/**'
@@ -15,6 +16,7 @@ on:
       - 'tests/Fixtures/par2/**'
       - 'tests/Unit/*BenchmarkTest.php'
       - 'tests/Unit/test_benchmark*'
+      - 'tests/Unit/test_composer_install_retry.py'
       - 'composer.json'
       - 'composer.lock'
   workflow_dispatch:
@@ -67,8 +69,17 @@ jobs:
           php-version: '8.5'
           extensions: bcmath, dom, curl, exif, ffi, gd, intl, mbstring, mysqlnd, pdo, pdo_mysql, sqlite, pdo_sqlite, simplexml, sockets, xmlwriter, zip
           coverage: none
+      - name: Verify locked installation retry policy
+        run: python3 -B tests/Unit/test_composer_install_retry.py
+      - name: Cache Composer archives without authentication files
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/nntmux-composer-archives/files
+          key: composer-archives-v1-${{ hashFiles('composer.lock') }}
       - name: Install locked dependencies without application boot
-        run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
+        run: bash scripts/composer-install-ci.sh utility-evidence/install
+        env:
+          COMPOSER_CACHE_DIR: ${{ runner.temp }}/nntmux-composer-archives
       - name: Verify benchmark correctness and decisions
         run: |
           php vendor/bin/phpunit tests/Unit/SamplePlanningBenchmarkTest.php tests/Unit/ArchiveParsingBenchmarkTest.php tests/Unit/VendorArchiveBenchmarkTest.php

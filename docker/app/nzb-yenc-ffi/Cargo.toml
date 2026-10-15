@@ -10,6 +10,11 @@ publish = false
 name = "nzbyenc"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+# Experimental only until full-caller correctness and performance gates pass.
+experimental-xz-index = []
+
 [dependencies]
 md-5 = "0.10"
 nzb-decode = "=0.1.3"
