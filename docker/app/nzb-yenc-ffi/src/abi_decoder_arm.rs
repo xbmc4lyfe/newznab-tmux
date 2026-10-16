@@ -128,6 +128,20 @@ unsafe fn newline_dot_candidates(
     }
 }
 
+/// Joint raw64 negative certificate for one block of loaded bytes.
+#[inline(always)]
+unsafe fn joint_admission(
+    bytes: uint8x16_t,
+    next: uint8x16_t,
+    control: uint8x16_t,
+    previous_equals: uint8x16_t,
+) -> uint8x16_t {
+    unsafe {
+        let next_dot = vceqq_u8(vextq_u8::<1>(bytes, next), vdupq_n_u8(b'.'));
+        vandq_u8(control, vorrq_u8(previous_equals, next_dot))
+    }
+}
+
 /// Secondary test oracle: detect complete CR LF control triples in loaded vectors.
 /// Zero register padding cannot match LF, dot or '=' and never reads a suffix.
 #[cfg(test)]
@@ -256,64 +270,87 @@ pub(super) unsafe fn prefix<const RAW: bool, const END: bool>(
                 written += 64;
                 continue;
             }
-            // Dense runs use the classified dense prefix. Keep their extra
-            // interleaved loads out of the sparse ordinary compaction loop.
-            let line_a = vqtbl1q_u8(newline_lookup, a);
-            let line_b = vqtbl1q_u8(newline_lookup, b);
-            let line_c = vqtbl1q_u8(newline_lookup, c);
-            let line_d = vqtbl1q_u8(newline_lookup, d);
-            let lines = vorrq_u8(vorrq_u8(line_a, line_b), vorrq_u8(line_c, line_d));
-            if vgetq_lane_u8::<15>(d) == b'=' {
+            // Raw non-END can reject all final controls together before
+            // producing the negative certificate or performing exact checks.
+            if RAW && !END {
+                if vgetq_lane_u8::<15>(control_d) != 0 {
+                    break;
+                }
+            } else if vgetq_lane_u8::<15>(d) == b'=' {
                 break;
             }
             let prev_a = vextq_u8(vdupq_n_u8(0), eq_a, 15);
             let prev_b = vextq_u8(eq_a, eq_b, 15);
             let prev_c = vextq_u8(eq_b, eq_c, 15);
             let prev_d = vextq_u8(eq_c, eq_d, 15);
-            // Adjacent markers and escaped newline values need canonical
-            // scalar handling. Reject the complete group before any stores.
-            let hazards = vorrq_u8(
-                vorrq_u8(vandq_u8(control_a, prev_a), vandq_u8(control_b, prev_b)),
-                vorrq_u8(vandq_u8(control_c, prev_c), vandq_u8(control_d, prev_d)),
-            );
-            if vmaxvq_u8(hazards) != 0 {
-                break;
-            }
-            if RAW && !END && vmaxvq_u8(lines) != 0 {
-                // A final newline needs canonical handling even with zero
-                // padding. A complete CR LF dot always has a newline-dot pair;
-                // only positive candidates need the exact scalar check.
-                if vgetq_lane_u8::<15>(line_d) != 0 {
-                    break;
-                }
-                let candidates = vorrq_u8(
+            let exact_admission = if RAW && !END {
+                let joint = vorrq_u8(
                     vorrq_u8(
-                        newline_dot_candidates(a, b, line_a),
-                        newline_dot_candidates(b, c, line_b),
+                        joint_admission(a, b, control_a, prev_a),
+                        joint_admission(b, c, control_b, prev_b),
                     ),
                     vorrq_u8(
-                        newline_dot_candidates(c, d, line_c),
-                        newline_dot_candidates(d, vdupq_n_u8(0), line_d),
+                        joint_admission(c, d, control_c, prev_c),
+                        joint_admission(d, vdupq_n_u8(0), control_d, prev_d),
                     ),
                 );
-                if vmaxvq_u8(candidates) != 0
-                    && (!safe_lines::<false>(line_a, src.add(read), 0, 64)
-                        || !safe_lines::<false>(line_b, src.add(read), 16, 64)
-                        || !safe_lines::<false>(line_c, src.add(read), 32, 64)
-                        || !safe_lines::<false>(line_d, src.add(read), 48, 64))
+                vmaxvq_u8(joint) != 0
+            } else {
+                true
+            };
+            if exact_admission {
+                // Dense runs use the classified dense prefix. Keep their extra
+                // interleaved loads out of the sparse ordinary compaction loop.
+                let line_a = vqtbl1q_u8(newline_lookup, a);
+                let line_b = vqtbl1q_u8(newline_lookup, b);
+                let line_c = vqtbl1q_u8(newline_lookup, c);
+                let line_d = vqtbl1q_u8(newline_lookup, d);
+                let lines = vorrq_u8(vorrq_u8(line_a, line_b), vorrq_u8(line_c, line_d));
+                // Adjacent markers and escaped newline values need canonical
+                // scalar handling. Reject the complete group before any stores.
+                let hazards = vorrq_u8(
+                    vorrq_u8(vandq_u8(control_a, prev_a), vandq_u8(control_b, prev_b)),
+                    vorrq_u8(vandq_u8(control_c, prev_c), vandq_u8(control_d, prev_d)),
+                );
+                if vmaxvq_u8(hazards) != 0 {
+                    break;
+                }
+                if RAW && !END && vmaxvq_u8(lines) != 0 {
+                    // A final newline needs canonical handling even with zero
+                    // padding. A complete CR LF dot always has a newline-dot pair;
+                    // only positive candidates need the exact scalar check.
+                    if vgetq_lane_u8::<15>(line_d) != 0 {
+                        break;
+                    }
+                    let candidates = vorrq_u8(
+                        vorrq_u8(
+                            newline_dot_candidates(a, b, line_a),
+                            newline_dot_candidates(b, c, line_b),
+                        ),
+                        vorrq_u8(
+                            newline_dot_candidates(c, d, line_c),
+                            newline_dot_candidates(d, vdupq_n_u8(0), line_d),
+                        ),
+                    );
+                    if vmaxvq_u8(candidates) != 0
+                        && (!safe_lines::<false>(line_a, src.add(read), 0, 64)
+                            || !safe_lines::<false>(line_b, src.add(read), 16, 64)
+                            || !safe_lines::<false>(line_c, src.add(read), 32, 64)
+                            || !safe_lines::<false>(line_d, src.add(read), 48, 64))
+                    {
+                        break;
+                    }
+                }
+                if RAW
+                    && END
+                    && vmaxvq_u8(lines) != 0
+                    && (!safe_lines::<END>(line_a, src.add(read), 0, 64)
+                        || !safe_lines::<END>(line_b, src.add(read), 16, 64)
+                        || !safe_lines::<END>(line_c, src.add(read), 32, 64)
+                        || !safe_lines::<END>(line_d, src.add(read), 48, 64))
                 {
                     break;
                 }
-            }
-            if RAW
-                && END
-                && vmaxvq_u8(lines) != 0
-                && (!safe_lines::<END>(line_a, src.add(read), 0, 64)
-                    || !safe_lines::<END>(line_b, src.add(read), 16, 64)
-                    || !safe_lines::<END>(line_c, src.add(read), 32, 64)
-                    || !safe_lines::<END>(line_d, src.add(read), 48, 64))
-            {
-                break;
             }
             let weights =
                 vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
@@ -700,6 +737,127 @@ mod tests {
                 "production width={} END={end} {bytes:?}",
                 bytes.len()
             );
+        }
+    }
+
+    unsafe fn actual_joint_certificate(bytes: &[u8; 64]) -> ([u8; 16], bool) {
+        unsafe {
+            let lookup = vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr());
+            let marker = vdupq_n_u8(b'=');
+            let zero = vdupq_n_u8(0);
+            let a = vld1q_u8(bytes.as_ptr());
+            let b = vld1q_u8(bytes.as_ptr().add(16));
+            let c = vld1q_u8(bytes.as_ptr().add(32));
+            let d = vld1q_u8(bytes.as_ptr().add(48));
+            let ea = vceqq_u8(a, marker);
+            let eb = vceqq_u8(b, marker);
+            let ec = vceqq_u8(c, marker);
+            let ed = vceqq_u8(d, marker);
+            let ca = vqtbx1q_u8(ea, lookup, a);
+            let cb = vqtbx1q_u8(eb, lookup, b);
+            let cc = vqtbx1q_u8(ec, lookup, c);
+            let cd = vqtbx1q_u8(ed, lookup, d);
+            let certificate = vorrq_u8(
+                vorrq_u8(
+                    joint_admission(a, b, ca, vextq_u8(zero, ea, 15)),
+                    joint_admission(b, c, cb, vextq_u8(ea, eb, 15)),
+                ),
+                vorrq_u8(
+                    joint_admission(c, d, cc, vextq_u8(eb, ec, 15)),
+                    joint_admission(d, zero, cd, vextq_u8(ec, ed, 15)),
+                ),
+            );
+            let mut lanes = [0; 16];
+            vst1q_u8(lanes.as_mut_ptr(), certificate);
+            (lanes, vgetq_lane_u8::<15>(cd) == 0)
+        }
+    }
+
+    #[test]
+    fn joint_certificate_matches_literal_all_byte_pairs_at_every_adjacent_position() {
+        let background: [u8; 64] = std::array::from_fn(|lane| 128 + lane as u8);
+        for position in 0..63 {
+            for left in 0..=255u8 {
+                for right in 0..=255u8 {
+                    let mut bytes = background;
+                    bytes[position] = left;
+                    bytes[position + 1] = right;
+                    let (actual, final_safe) = unsafe { actual_joint_certificate(&bytes) };
+                    // Literal pair rules place their signal at the special byte.
+                    let mut expected = [0u8; 16];
+                    if left == b'=' && matches!(right, b'=' | b'\r' | b'\n') {
+                        expected[(position + 1) % 16] = 255;
+                    }
+                    if matches!(left, b'=' | b'\r' | b'\n') && right == b'.' {
+                        expected[position % 16] = 255;
+                    }
+                    assert_eq!(actual, expected, "position={position} pair={left},{right}");
+                    if actual.iter().all(|&lane| lane == 0) && final_safe {
+                        assert!(
+                            literal_raw_union(&bytes, false),
+                            "negative position={position} pair={left},{right}"
+                        );
+                    }
+                }
+            }
+        }
+        for byte in 0..=255u8 {
+            let mut bytes = background;
+            bytes[63] = byte;
+            let (_, final_safe) = unsafe { actual_joint_certificate(&bytes) };
+            assert_eq!(
+                final_safe,
+                !matches!(byte, b'=' | b'\r' | b'\n'),
+                "last={byte}"
+            );
+            assert_raw_union(&bytes);
+        }
+    }
+
+    #[test]
+    fn joint_positive_valid_pairs_are_consumed_with_literal_scalar_output() {
+        for position in 0..63 {
+            for pair in [b"=.", b"\n.", b"\r."] {
+                let mut bytes: [u8; 64] = std::array::from_fn(|lane| 128 + lane as u8);
+                bytes[position..position + 2].copy_from_slice(pair);
+                assert!(literal_raw_union(&bytes, false));
+                assert!(
+                    unsafe { actual_joint_certificate(&bytes) }
+                        .0
+                        .iter()
+                        .any(|&lane| lane != 0)
+                );
+                let mut expected = Vec::new();
+                let mut escaped = false;
+                for byte in bytes {
+                    if escaped {
+                        expected.push(byte.wrapping_sub(106));
+                        escaped = false;
+                    } else if byte == b'=' {
+                        escaped = true;
+                    } else if !matches!(byte, b'\r' | b'\n') {
+                        expected.push(byte.wrapping_sub(42));
+                    }
+                }
+                let mut actual = [0xcc; 64];
+                let (read, written) =
+                    unsafe { prefix::<true, false>(bytes.as_ptr(), actual.as_mut_ptr(), 64) };
+                assert_eq!(read, 64, "position={position} pair={pair:?}");
+                assert_eq!(
+                    &actual[..written],
+                    &expected,
+                    "position={position} pair={pair:?}"
+                );
+            }
+        }
+        for position in 0..63 {
+            for fragment in [b"\r\n.".as_slice(), b"==", b"=\r", b"=\n", b"=\r\n."] {
+                if position + fragment.len() <= 64 {
+                    let mut bytes = [b'k'; 64];
+                    bytes[position..position + fragment.len()].copy_from_slice(fragment);
+                    assert_raw_union(&bytes);
+                }
+            }
         }
     }
 

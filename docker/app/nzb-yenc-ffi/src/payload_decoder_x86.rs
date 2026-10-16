@@ -404,8 +404,44 @@ pub(crate) unsafe fn decode_avx2(source: *const u8, destination: *mut u8, length
     }
 }
 
-// Register compression avoids a memory-form compress-store. The final masked
-// store writes only the contiguous decoded prefix, never the unused suffix.
+// Register compression avoids a memory-form compress-store, and exact unmasked
+// stores write only the contiguous decoded prefix without byte-masked store stalls.
+#[target_feature(enable = "avx2,avx512vbmi2,avx512bw,avx512vl,popcnt")]
+#[inline]
+unsafe fn store_compressed_vbmi2(packed: x86::__m256i, count: usize, destination: *mut u8) {
+    use x86::*;
+    unsafe {
+        if count == 32 {
+            _mm256_storeu_si256(destination.cast(), packed);
+        } else if count >= 16 {
+            _mm_storeu_si128(destination.cast(), _mm256_castsi256_si128(packed));
+            if count > 16 {
+                let high = _mm256_extracti128_si256::<1>(packed);
+                let low_word = _mm_cvtsi128_si64(high) as u64;
+                let high_word = _mm_extract_epi64::<1>(high) as u64;
+                store_pair(
+                    low_word,
+                    high_word,
+                    (count - 16).min(8),
+                    count.saturating_sub(24),
+                    destination.add(16),
+                );
+            }
+        } else if count != 0 {
+            let low = _mm256_castsi256_si128(packed);
+            let low_word = _mm_cvtsi128_si64(low) as u64;
+            let high_word = _mm_extract_epi64::<1>(low) as u64;
+            store_pair(
+                low_word,
+                high_word,
+                count.min(8),
+                count.saturating_sub(8),
+                destination,
+            );
+        }
+    }
+}
+
 #[target_feature(enable = "avx2,avx512vbmi2,avx512bw,avx512vl,popcnt")]
 #[inline]
 unsafe fn compact_vbmi2(
@@ -423,8 +459,7 @@ unsafe fn compact_vbmi2(
             );
             return 32;
         }
-        let equals =
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'=' as i8))) as u32;
+        let equals = _mm256_cmpeq_epi8_mask(bytes, _mm256_set1_epi8(b'=' as i8));
         let newlines = specials & !equals;
         let incoming = *escaped;
         if newlines == 0
@@ -450,22 +485,17 @@ unsafe fn compact_vbmi2(
                 u32::from(lo_adjust) | (u32::from(hi_adjust) << 16),
             )
         };
-        // Expand the full 32-bit mask instead of a lane-local byte shift:
-        // an escape marker in byte 15 still adjusts its value in byte 16.
-        let offsets = _mm256_add_epi8(
-            _mm256_set1_epi8(42),
-            _mm256_and_si256(_mm256_movm_epi8(adjust), _mm256_set1_epi8(64)),
-        );
         let keep = !remove;
         let count = keep.count_ones() as usize;
         if count != 0 {
-            let packed = _mm256_maskz_compress_epi8(keep, _mm256_sub_epi8(bytes, offsets));
-            let prefix = if count == 32 {
-                u32::MAX
-            } else {
-                (1u32 << count) - 1
-            };
-            _mm256_mask_storeu_epi8(destination.cast(), prefix, packed);
+            let decoded = _mm256_mask_sub_epi8(
+                _mm256_sub_epi8(bytes, _mm256_set1_epi8(42)),
+                adjust,
+                bytes,
+                _mm256_set1_epi8(106),
+            );
+            let packed = _mm256_maskz_compress_epi8(keep, decoded);
+            store_compressed_vbmi2(packed, count, destination);
         }
         count
     }
@@ -476,13 +506,85 @@ unsafe fn compact_vbmi2(
 unsafe fn vbmi2_specials(bytes: x86::__m256i) -> u32 {
     use x86::*;
     unsafe {
-        _mm256_movemask_epi8(_mm256_cmpeq_epi8(
+        _mm256_cmpeq_epi8_mask(
             bytes,
             _mm256_shuffle_epi8(
                 _mm256_broadcastsi128_si256(_mm_loadu_si128(SPECIAL_BYTES.as_ptr().cast())),
                 _mm256_min_epu8(bytes, _mm256_set1_epi8(46)),
             ),
-        )) as u32
+        )
+    }
+}
+
+#[target_feature(enable = "avx2,avx512vbmi2,avx512bw,avx512vl,popcnt")]
+#[inline(never)]
+unsafe fn decode_vbmi2_dense(source: *const u8, destination: *mut u8, length: usize) -> usize {
+    use x86::*;
+    let mut read = 0;
+    let mut written = 0;
+    let mut escaped = false;
+    unsafe {
+        let marker = _mm256_set1_epi8(b'=' as i8);
+        let cr = _mm256_set1_epi8(b'\r' as i8);
+        let lf = _mm256_set1_epi8(b'\n' as i8);
+        let offset = _mm256_set1_epi8(106);
+        while length - read >= 32 {
+            while read < length && matches!(source.add(read).read(), b'\r' | b'\n') {
+                read += 1;
+            }
+            if length - read < 32 {
+                break;
+            }
+            let expected_markers = if escaped {
+                0xaaaa_aaaau32
+            } else {
+                0x5555_5555u32
+            };
+            let value_mask = !expected_markers;
+            if length - read >= 64 {
+                let low = _mm256_loadu_si256(source.add(read).cast());
+                let high = _mm256_loadu_si256(source.add(read + 32).cast());
+                let low_eq = _mm256_cmpeq_epi8_mask(low, marker);
+                let high_eq = _mm256_cmpeq_epi8_mask(high, marker);
+                let low_nl = _mm256_cmpeq_epi8_mask(low, cr) | _mm256_cmpeq_epi8_mask(low, lf);
+                let high_nl = _mm256_cmpeq_epi8_mask(high, cr) | _mm256_cmpeq_epi8_mask(high, lf);
+                if (low_nl | high_nl) == 0
+                    && (low_eq & expected_markers) == expected_markers
+                    && (high_eq & expected_markers) == expected_markers
+                {
+                    let packed_low =
+                        _mm256_maskz_compress_epi8(value_mask, _mm256_sub_epi8(low, offset));
+                    let packed_high =
+                        _mm256_maskz_compress_epi8(value_mask, _mm256_sub_epi8(high, offset));
+                    _mm_storeu_si128(
+                        destination.add(written).cast(),
+                        _mm256_castsi256_si128(packed_low),
+                    );
+                    _mm_storeu_si128(
+                        destination.add(written + 16).cast(),
+                        _mm256_castsi256_si128(packed_high),
+                    );
+                    written += 32;
+                    read += 64;
+                    continue;
+                }
+            }
+            let bytes = _mm256_loadu_si256(source.add(read).cast());
+            let eq = _mm256_cmpeq_epi8_mask(bytes, marker);
+            let nl = _mm256_cmpeq_epi8_mask(bytes, cr) | _mm256_cmpeq_epi8_mask(bytes, lf);
+            if nl == 0 && (eq & expected_markers) == expected_markers {
+                let packed = _mm256_maskz_compress_epi8(value_mask, _mm256_sub_epi8(bytes, offset));
+                _mm_storeu_si128(
+                    destination.add(written).cast(),
+                    _mm256_castsi256_si128(packed),
+                );
+                written += 16;
+            } else {
+                written += compact_vbmi2(bytes, eq | nl, destination.add(written), &mut escaped);
+            }
+            read += 32;
+        }
+        scalar_tail(source, destination, length, read, written, escaped)
     }
 }
 
@@ -493,9 +595,19 @@ pub(crate) unsafe fn decode_vbmi2(source: *const u8, destination: *mut u8, lengt
     let mut written = 0;
     let mut escaped = false;
     unsafe {
+        if length >= 32 {
+            let first = _mm256_loadu_si256(source.cast());
+            let eq = _mm256_cmpeq_epi8_mask(first, _mm256_set1_epi8(b'=' as i8));
+            if (eq & 0x5555_5555) == 0x5555_5555 {
+                return decode_vbmi2_dense(source, destination, length);
+            }
+        }
         while length - read >= 64 {
             if matches!(source.add(read).read(), b'\r' | b'\n') {
                 read += 1;
+                while read < length && matches!(source.add(read).read(), b'\r' | b'\n') {
+                    read += 1;
+                }
                 continue;
             }
             // Load both vectors before any store, including overlapping output.
@@ -521,6 +633,13 @@ pub(crate) unsafe fn decode_vbmi2(source: *const u8, destination: *mut u8, lengt
             read += 64;
         }
         while length - read >= 32 {
+            if matches!(source.add(read).read(), b'\r' | b'\n') {
+                read += 1;
+                while read < length && matches!(source.add(read).read(), b'\r' | b'\n') {
+                    read += 1;
+                }
+                continue;
+            }
             let bytes = _mm256_loadu_si256(source.add(read).cast());
             written += compact_vbmi2(
                 bytes,
@@ -820,6 +939,14 @@ mod tests {
         }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
             kernels.push(decode_avx2);
+        }
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("avx512vbmi2")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("popcnt")
+        {
+            kernels.push(decode_vbmi2);
         }
         let mut payloads = Vec::new();
         for position in 0..32 {

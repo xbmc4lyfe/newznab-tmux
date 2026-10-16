@@ -11,6 +11,7 @@ use App\Services\Releases\Fingerprint\NativeMetadataParser;
 use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
 use App\Services\Releases\Fingerprint\Par2MetadataParser;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
+use App\Services\Yenc\DecoderFactory;
 use App\Services\YencService;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -70,27 +71,36 @@ final class ReleaseFingerprintMetadataTest extends TestCase
                 self::markTestSkipped('Native Rust format metadata is required for gzip text-field integration.');
             }
             $body = YencArticles::article($sample);
-            $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
-            self::assertSame($sample, $analysis['decoded_bytes']);
-            self::assertSame(hash('sha256', $body), $analysis['metadata']['article_body_sha256']);
-            $gzip = $analysis['metadata']['decoded_format_metadata']['headers'][0];
-            self::assertSame(7, $gzip['offset']);
-            self::assertTrue($gzip['header_complete']);
-            self::assertSame(! $corruptHeaderCrc, $gzip['header_valid']);
-            self::assertSame(! $corruptHeaderCrc, $gzip['header_crc16_valid']);
-            self::assertSame(4097, $gzip['filename_full_byte_length']);
-            self::assertSame(4097, $gzip['original_filename_bytes_length']);
-            self::assertSame(hash('sha256', $name), $gzip['filename_sha256']);
-            self::assertSame($gzip['filename_sha256'], $gzip['original_filename_bytes_sha256']);
-            self::assertSame(4097, $gzip['comment_full_byte_length']);
-            self::assertSame(4097, $gzip['comment_bytes_length']);
-            self::assertSame(hash('sha256', $comment), $gzip['comment_sha256']);
-            self::assertSame($gzip['comment_sha256'], $gzip['comment_bytes_sha256']);
-            self::assertSame(512, strlen($gzip['filename_bytes_hex']));
-            self::assertSame(512, strlen($gzip['comment_bytes_hex']));
-            self::assertTrue($gzip['filename_bytes_hex_truncated']);
-            self::assertTrue($gzip['comment_bytes_hex_truncated']);
-            self::assertSame(8208, $gzip['header_bytes']);
+            $services = [new YencService];
+            $libraryPath = (string) getenv('YENC_NATIVE_LIBRARY');
+            if ($libraryPath !== '') {
+                $nativeService = new YencService((new DecoderFactory)->make('native', $libraryPath));
+                self::assertSame('RapidYenc', $nativeService->decoderName());
+                $services[] = $nativeService;
+            }
+            foreach ($services as $yencService) {
+                $analysis = (new NzbFingerprintAnalyzer($yencService))->analyzeArticleAndDecodedBytes([], $body);
+                self::assertSame($sample, $analysis['decoded_bytes']);
+                self::assertSame(hash('sha256', $body), $analysis['metadata']['article_body_sha256']);
+                $gzip = $analysis['metadata']['decoded_format_metadata']['headers'][0];
+                self::assertSame(7, $gzip['offset']);
+                self::assertTrue($gzip['header_complete']);
+                self::assertSame(! $corruptHeaderCrc, $gzip['header_valid']);
+                self::assertSame(! $corruptHeaderCrc, $gzip['header_crc16_valid']);
+                self::assertSame(4097, $gzip['filename_full_byte_length']);
+                self::assertSame(4097, $gzip['original_filename_bytes_length']);
+                self::assertSame(hash('sha256', $name), $gzip['filename_sha256']);
+                self::assertSame($gzip['filename_sha256'], $gzip['original_filename_bytes_sha256']);
+                self::assertSame(4097, $gzip['comment_full_byte_length']);
+                self::assertSame(4097, $gzip['comment_bytes_length']);
+                self::assertSame(hash('sha256', $comment), $gzip['comment_sha256']);
+                self::assertSame($gzip['comment_sha256'], $gzip['comment_bytes_sha256']);
+                self::assertSame(512, strlen($gzip['filename_bytes_hex']));
+                self::assertSame(512, strlen($gzip['comment_bytes_hex']));
+                self::assertTrue($gzip['filename_bytes_hex_truncated']);
+                self::assertTrue($gzip['comment_bytes_hex_truncated']);
+                self::assertSame(8208, $gzip['header_bytes']);
+            }
         }
     }
 
