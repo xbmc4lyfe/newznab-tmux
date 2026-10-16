@@ -413,31 +413,44 @@ unsafe fn store_compressed_vbmi2(packed: x86::__m256i, count: usize, destination
     unsafe {
         if count == 32 {
             _mm256_storeu_si256(destination.cast(), packed);
-        } else if count >= 16 {
+        } else if count >= 24 {
             _mm_storeu_si128(destination.cast(), _mm256_castsi256_si128(packed));
-            if count > 16 {
-                let high = _mm256_extracti128_si256::<1>(packed);
-                let low_word = _mm_cvtsi128_si64(high) as u64;
-                let high_word = _mm_extract_epi64::<1>(high) as u64;
-                store_pair(
-                    low_word,
-                    high_word,
-                    (count - 16).min(8),
-                    count.saturating_sub(24),
-                    destination.add(16),
-                );
-            }
-        } else if count != 0 {
+            let high = _mm256_extracti128_si256::<1>(packed);
+            _mm_storel_epi64(destination.add(16).cast(), high);
+            let low_word = _mm_cvtsi128_si64(high) as u64;
+            let high_word = _mm_extract_epi64::<1>(high) as u64;
+            let combined = u128::from(low_word) | (u128::from(high_word) << 64);
+            let tail = (combined >> ((count - 24) * 8)) as u64;
+            destination
+                .add(count - 8)
+                .cast::<u64>()
+                .write_unaligned(tail.to_le());
+        } else if count >= 16 {
+            let low = _mm256_castsi256_si128(packed);
+            _mm_storeu_si128(destination.cast(), low);
+            let high = _mm256_extracti128_si256::<1>(packed);
+            let low_word = _mm_extract_epi64::<1>(low) as u64;
+            let high_word = _mm_cvtsi128_si64(high) as u64;
+            let combined = u128::from(low_word) | (u128::from(high_word) << 64);
+            let tail = (combined >> ((count - 16) * 8)) as u64;
+            destination
+                .add(count - 8)
+                .cast::<u64>()
+                .write_unaligned(tail.to_le());
+        } else if count >= 8 {
             let low = _mm256_castsi256_si128(packed);
             let low_word = _mm_cvtsi128_si64(low) as u64;
             let high_word = _mm_extract_epi64::<1>(low) as u64;
-            store_pair(
-                low_word,
-                high_word,
-                count.min(8),
-                count.saturating_sub(8),
-                destination,
-            );
+            destination.cast::<u64>().write_unaligned(low_word.to_le());
+            let combined = u128::from(low_word) | (u128::from(high_word) << 64);
+            let tail = (combined >> ((count - 8) * 8)) as u64;
+            destination
+                .add(count - 8)
+                .cast::<u64>()
+                .write_unaligned(tail.to_le());
+        } else if count != 0 {
+            let low = _mm256_castsi256_si128(packed);
+            store_word((_mm_cvtsi128_si64(low) as u64).to_le(), destination, count);
         }
     }
 }
@@ -462,14 +475,6 @@ unsafe fn compact_vbmi2(
         let equals = _mm256_cmpeq_epi8_mask(bytes, _mm256_set1_epi8(b'=' as i8));
         let newlines = specials & !equals;
         let incoming = *escaped;
-        if newlines == 0
-            && ((!incoming && equals == 0x5555_5555) || (incoming && equals == 0xaaaa_aaaa))
-        {
-            let packed =
-                _mm256_maskz_compress_epi8(!equals, _mm256_sub_epi8(bytes, _mm256_set1_epi8(106)));
-            _mm_storeu_si128(destination.cast(), _mm256_castsi256_si128(packed));
-            return 16;
-        }
         let following = equals.wrapping_shl(1);
         let (remove, adjust) = if following & (equals | newlines) == 0
             && (!incoming || (equals | newlines) & 1 == 0)

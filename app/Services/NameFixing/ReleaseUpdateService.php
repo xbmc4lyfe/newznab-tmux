@@ -36,7 +36,7 @@ class ReleaseUpdateService
 {
     use OwnsPredbIdentityTransactions;
 
-    public const PREDB_IDENTITY_POLICY = '36e61c0f117fea527f40128cf2f308748711efdc48f8b37ced04deba69f4cde2';
+    public const PREDB_IDENTITY_POLICY = 'c3e8a2cea7731a57939aeaca60f54268baa738ddd187f973dd4ae2469ea8e299';
 
     /**
      * @var list<string>
@@ -962,10 +962,10 @@ class ReleaseUpdateService
 
         return $filenameGuard === null
             ? $this->updateSnapshotStatus($release, 'proc_files', self::PROC_FILES_DONE, $predbId)
-            : $this->withFilenameGuard($release, $filenameGuard, fn (): bool => $this->updateSnapshotStatus($release, 'proc_files', self::PROC_FILES_DONE, $predbId), 3);
+            : $this->withFilenameGuard($release, $filenameGuard, fn (): bool => $this->updateSnapshotStatus($release, 'proc_files', self::PROC_FILES_DONE, $predbId, false), 3);
     }
 
-    private function updateSnapshotStatus(object $release, string $column, int $status, int $expectedPredbId): bool
+    private function updateSnapshotStatus(object $release, string $column, int $status, int $expectedPredbId, bool $ownTransaction = true): bool
     {
         if ($this->namingDeferred()) {
             return false;
@@ -980,7 +980,7 @@ class ReleaseUpdateService
         }
         $release->releases_id = $snapshot['id'];
 
-        return DB::transaction(function () use ($release, $column, $status, $expectedPredbId, $snapshot): bool {
+        $write = function () use ($release, $column, $status, $expectedPredbId, $snapshot): bool {
             $query = $this->releaseSnapshotQuery($release)->where('predb_id', $expectedPredbId);
             $current = (clone $query)->lockForUpdate()->first();
             if ($current === null || (int) $current->nzbstatus !== NzbService::NZB_ADDED
@@ -993,7 +993,9 @@ class ReleaseUpdateService
             }
 
             return $updated > 0;
-        });
+        };
+
+        return $ownTransaction ? DB::transaction($write) : $write();
     }
 
     public function attachPredbId(int $releaseId, int $predbId): void
