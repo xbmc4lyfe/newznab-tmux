@@ -6,6 +6,12 @@
 - [ ] Qualify complete ZIP episode evidence and ownership of legacy audit/orphan NZBs before relaxing their conservative deferral. Subject filenames alone do not certify body type or complete archive scope; uninspected files remain incomplete.
 - [ ] Measure full-caller and lock-held overhead of source evidence, including duplicate staged NZB decompression/hashing during publication. Compare representative 1,000-, 10,000- and 91,000-article inventories before claiming unchanged shared-capacity latency or adopting a preparation optimization.
 
+## Retest scalar NNTP ownership callbacks (2026-10-16)
+
+- [x] Reproduce missing callbacks through the public handler, then pass focused NNTP validation with literal `codex --yolo`: 86 tests and 381 assertions, no errors or skips. Pint, changed-file syntax and focused NNTP PHPStan passed.
+- [x] Reproduce the review follow-up with seven cancellation failures and ten passing controls, then pass focused NNTP validation with literal `codex --yolo`: 95 tests and 500 assertions, no errors or skips. Verify false-once primary cancellation prevents alternate requests, cancellation discards array prefixes and closes owned alternates, and ordinary provider-error fallback/prefix behavior remains covered. Pint, changed-file syntax and focused NNTP PHPStan passed; failed static-modeling attempts remain retained separately.
+- [ ] Run the full integrated PHPUnit/native retest on final synchronized master, covering scalar Message-IDs, integer/numeric-string article numbers and arrays on primary/alternate providers, callback cadence, ownership-loss cancellation, body/framing/session reuse and the PAR2 post-download persistence guard. Provider/runtime qualification remains deferred to the deployment owner. Performance remains unqualified.
+
 ## Qualify preparation statement reuse (2026-10-15)
 
 Keep unknown retry updates and ready promotions immediate, with their existing row-local timestamps and complete snapshot predicates. A private local MariaDB mechanism comparison found a 1.88× median paired improvement from retaining a native prepared statement; this is not a Laravel caller or production throughput result. Preserve all eight pairs, the slow retained-execute observation and the cleanup-classifier failure with its independent absence reconciliation in `nntmux-preparation-prepare-cost-20261015-v1`.
