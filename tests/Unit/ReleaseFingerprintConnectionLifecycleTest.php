@@ -47,6 +47,29 @@ final class ReleaseFingerprintConnectionLifecycleTest extends TestCase
         $this->assertHealthyCollectionLifecycle(3);
     }
 
+    public function test_empty_par2_set_does_not_emit_a_null_offset_deprecation(): void
+    {
+        $deprecations = [];
+        set_error_handler(static function (int $severity, string $message) use (&$deprecations): bool {
+            if ($severity !== E_DEPRECATED) {
+                return false;
+            }
+            $deprecations[] = $message;
+
+            return true;
+        }, E_DEPRECATED);
+        try {
+            $result = $this->assertHealthyCollectionLifecycle(3);
+        } finally {
+            restore_error_handler();
+        }
+
+        $this->assertFalse($result['data']['par2']['present']);
+        $this->assertSame([], $result['data']['par2']['set_ids']);
+        $this->assertSame([], $result['data']['par2']['files']);
+        $this->assertSame([], $deprecations, 'An empty PAR2 set must preserve its metadata without emitting a null-offset deprecation.');
+    }
+
     public function test_collection_reuses_one_alternate_client_for_profile_and_two_samples(): void
     {
         $baseline = $this->assertHealthyCollectionLifecycle(3);
