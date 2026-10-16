@@ -23,6 +23,7 @@ use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\ReleaseImageService;
 use App\Support\ReleaseArchiveNamingEvidence;
+use Database\Seeders\ConfigurationSeeder;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
@@ -124,6 +125,7 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
             ]);
             DB::table('usenet_groups')->insertOrIgnore(['id' => 1, 'name' => 'alt.binaries.filename.test']);
             DB::table('predb')->insertOrIgnore(['id' => 7, 'title' => 'Unrelated.Title-GRP']);
+            (new ConfigurationSeeder)->run();
             Search::shouldReceive('searchPredbFilenameCandidates')->never();
             Event::fake([ReleaseNameFixed::class]);
         } catch (\Throwable $exception) {
@@ -272,7 +274,7 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
     ): void {
         $this->isolation($isolation);
         $this->insertRelease();
-        DB::table('release_files')->insert(['releases_id' => 1, 'name' => '01.bin']);
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => 'hash|01.bin']);
         $this->filenameDiscoveryMutation = function () use ($column, $value): array {
             DB::table('releases')->where('id', 1)->update([$column => $value]);
 
@@ -330,7 +332,7 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
     {
         $this->isolation($isolation);
         $this->insertRelease();
-        $name = '01.bin';
+        $name = 'hash|01.bin';
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => $name]);
         $fixer = $this->makeFixer();
 
@@ -363,7 +365,7 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
         $this->insertRelease();
         DB::table('release_files')->insert([
             ['releases_id' => 1, 'name' => 'SDPORN|01.bin'],
-            ['releases_id' => 1, 'name' => '01.bin'],
+            ['releases_id' => 1, 'name' => 'hash|01.bin'],
         ]);
         $manager = $this->makeManager();
         $context = $this->sourceContext(Release::query()->findOrFail(1));
@@ -410,7 +412,7 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
     ): void {
         $this->isolation($isolation);
         $this->insertRelease(['predb_id' => $observedPredb]);
-        $name = '01.bin';
+        $name = 'hash|01.bin';
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => $name]);
         $input = Release::query()->findOrFail(1);
         $input->releases_id = 1;
@@ -449,9 +451,9 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
     ): void {
         $this->isolation($isolation);
         $this->insertRelease();
-        $name = '01.bin';
+        $name = 'hash|01.bin';
         for ($index = 0; $index < $fileCount; $index++) {
-            DB::table('release_files')->insert(['releases_id' => 1, 'name' => $index === 0 ? $name : '02.bin']);
+            DB::table('release_files')->insert(['releases_id' => 1, 'name' => $index === 0 ? $name : 'hash|02.bin']);
         }
         $fixer = $this->makeFixer();
         $input = Release::query()->findOrFail(1);
