@@ -1958,13 +1958,26 @@ class NNTPService extends NntpClient
                 }
                 $body .= str_starts_with($first, '..') ? substr($first, 1) : $first;
             }
-            $rest = stream_get_line($socket, PHP_INT_MAX, "\n.\r\n");
-            if ($rest === false || feof($socket)) {
-                return $this->throwError(feof($socket)
-                    ? 'End of stream! Connection lost?'
-                    : 'Failed to read line from socket.', null);
+            $lineAndRest = $first;
+            while (true) {
+                $rest = stream_get_line($socket, PHP_INT_MAX, "\n.\r");
+                if ($rest === false) {
+                    return $this->throwError(feof($socket)
+                        ? 'End of stream! Connection lost?'
+                        : 'Failed to read line from socket.', null);
+                }
+                $lf = fgetc($socket);
+                if ($lf === false) {
+                    return $this->throwError(feof($socket)
+                        ? 'End of stream! Connection lost?'
+                        : 'Failed to read line from socket.', null);
+                }
+                if ($lf === "\n") {
+                    $lineAndRest .= $rest;
+                    break;
+                }
+                $lineAndRest .= $rest."\n.\r".$lf;
             }
-            $lineAndRest = $first.$rest;
             if (str_starts_with($lineAndRest, '..')) {
                 $lineAndRest = substr($lineAndRest, 1);
             }
