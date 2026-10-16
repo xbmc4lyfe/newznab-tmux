@@ -273,6 +273,54 @@ pub struct Rar4FirstFileHeader {
 }
 
 #[derive(Debug, Serialize)]
+pub struct Rar4VisibleBlockWalk {
+    pub status: &'static str,
+    pub coordinate_basis: &'static str,
+    pub start_offset: Option<usize>,
+    pub inspected_block_count: usize,
+    pub file_block_count: usize,
+    pub subblock_count: usize,
+    pub comment_block_seen: bool,
+    pub recovery_block_seen: bool,
+    pub authenticity_block_seen: bool,
+    pub end_of_archive_seen: bool,
+    pub end_of_archive_next_volume: Option<bool>,
+    pub end_of_archive_data_crc32: Option<u32>,
+    pub end_of_archive_rev_space_present: Option<bool>,
+    pub end_of_archive_volume_number: Option<u16>,
+    pub stopped_offset: Option<usize>,
+    pub trailing_sample_bytes: usize,
+    pub blocks: Vec<Rar4VisibleBlock>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Rar4VisibleBlock {
+    pub index: usize,
+    pub header_start_offset: usize,
+    pub header_end_offset: Option<usize>,
+    pub header_crc16_expected: Option<u16>,
+    pub header_crc16_calculated: Option<u16>,
+    pub header_crc16_valid: Option<bool>,
+    pub header_type: Option<u8>,
+    pub header_type_name: Option<&'static str>,
+    pub header_flags: Option<u16>,
+    pub header_size: Option<u16>,
+    pub add_size_present: Option<bool>,
+    pub data_size: Option<u64>,
+    pub data_start_offset: Option<usize>,
+    pub declared_data_end_offset: Option<usize>,
+    pub data_range_available: Option<bool>,
+    pub subblock_name: Option<String>,
+    pub end_archive_next_volume: Option<bool>,
+    pub end_archive_data_crc32: Option<u32>,
+    pub end_archive_rev_space_present: Option<bool>,
+    pub end_archive_volume_number: Option<u16>,
+    pub file_header: Option<Rar4FirstFileHeader>,
+}
+
+const MAX_RAR4_VISIBLE_BLOCKS: usize = 32;
+
+#[derive(Debug, Serialize)]
 #[serde(tag = "format", rename_all = "snake_case")]
 pub enum FormatHeader {
     Zstandard {
@@ -303,6 +351,7 @@ pub enum FormatHeader {
         first_file_header_status: &'static str,
         next_block_type: Option<u8>,
         first_file: Option<Rar4FirstFileHeader>,
+        visible_block_walk: Rar4VisibleBlockWalk,
     },
     Rar5 {
         offset: usize,
@@ -1164,13 +1213,36 @@ fn parse_rar4(data: &[u8], offset: usize) -> FormatHeader {
     let pos_av = full_header
         .filter(|block| block.len() >= 13 && header_type == Some(0x73))
         .map(|bytes| u32::from_le_bytes(bytes[9..13].try_into().expect("four-byte RAR4 PosAV")));
-    let (first_file_header_status, next_block_type, first_file) = parse_rar4_first_file_header(
+    let encrypted_headers_flag = flags.map(|value| value & 0x0080 != 0);
+    let (mut first_file_header_status, next_block_type, mut first_file) =
+        parse_rar4_first_file_header(
+            data,
+            header_end,
+            main_header_available,
+            checksum_valid,
+            encrypted_headers_flag,
+        );
+    let visible_block_walk = walk_rar4_visible_blocks(
         data,
         header_end,
         main_header_available,
         checksum_valid,
-        flags.map(|value| value & 0x0080 != 0),
+        encrypted_headers_flag,
     );
+    if first_file.is_none()
+        && first_file_header_status == "non_file_block"
+        && let Some(discovered) = visible_block_walk
+            .blocks
+            .iter()
+            .find_map(|block| block.file_header.as_ref())
+    {
+        first_file_header_status = if discovered.checksum_valid == Some(true) {
+            "parsed_after_prefix_blocks"
+        } else {
+            "checksum_invalid_after_prefix_blocks"
+        };
+        first_file = Some(discovered.clone());
+    }
     FormatHeader::Rar4 {
         offset,
         main_header_available,
@@ -1186,7 +1258,7 @@ fn parse_rar4(data: &[u8], offset: usize) -> FormatHeader {
         recovery_record_present: flags.map(|value| value & 0x0040 != 0),
         first_volume: flags.map(|value| value & 0x0100 != 0),
         new_numbering: flags.map(|value| value & 0x0010 != 0),
-        encrypted_headers: flags.map(|value| value & 0x0080 != 0),
+        encrypted_headers: encrypted_headers_flag,
         high_pos_av,
         pos_av,
         authenticity_position_present: high_pos_av
@@ -1197,7 +1269,343 @@ fn parse_rar4(data: &[u8], offset: usize) -> FormatHeader {
         first_file_header_status,
         next_block_type,
         first_file,
+        visible_block_walk,
     }
+}
+
+fn rar4_block_type_name(header_type: u8) -> Option<&'static str> {
+    match header_type {
+        0x72 => Some("marker"),
+        0x73 => Some("main_header"),
+        0x74 => Some("file_header"),
+        0x75 => Some("comment_header"),
+        0x76 => Some("authenticity_info"),
+        0x77 => Some("old_subblock"),
+        0x78 => Some("recovery_record"),
+        0x79 => Some("authenticity_signature"),
+        0x7a => Some("new_subblock"),
+        0x7b => Some("end_of_archive"),
+        _ => None,
+    }
+}
+
+fn walk_rar4_visible_blocks(
+    data: &[u8],
+    header_end: Option<usize>,
+    main_header_available: bool,
+    main_checksum_valid: Option<bool>,
+    encrypted_headers: Option<bool>,
+) -> Rar4VisibleBlockWalk {
+    let mut walk = Rar4VisibleBlockWalk {
+        status: "pending",
+        coordinate_basis: "decoded-sample-relative",
+        start_offset: header_end,
+        inspected_block_count: 0,
+        file_block_count: 0,
+        subblock_count: 0,
+        comment_block_seen: false,
+        recovery_block_seen: false,
+        authenticity_block_seen: false,
+        end_of_archive_seen: false,
+        end_of_archive_next_volume: None,
+        end_of_archive_data_crc32: None,
+        end_of_archive_rev_space_present: None,
+        end_of_archive_volume_number: None,
+        stopped_offset: header_end,
+        trailing_sample_bytes: 0,
+        blocks: Vec::new(),
+    };
+
+    if !main_header_available {
+        walk.status = "main_header_incomplete";
+        return walk;
+    }
+    if main_checksum_valid != Some(true) {
+        walk.status = "main_header_checksum_invalid";
+        return walk;
+    }
+    if encrypted_headers == Some(true) {
+        walk.status = "encrypted_headers";
+        return walk;
+    }
+    let Some(mut cursor) = header_end else {
+        walk.status = "main_header_incomplete";
+        return walk;
+    };
+
+    for block_index in 0..MAX_RAR4_VISIBLE_BLOCKS {
+        if cursor >= data.len() {
+            walk.status = "sample_end";
+            walk.stopped_offset = Some(cursor);
+            break;
+        }
+        let mut block_obs = Rar4VisibleBlock {
+            index: block_index,
+            header_start_offset: cursor,
+            header_end_offset: None,
+            header_crc16_expected: None,
+            header_crc16_calculated: None,
+            header_crc16_valid: None,
+            header_type: None,
+            header_type_name: None,
+            header_flags: None,
+            header_size: None,
+            add_size_present: None,
+            data_size: None,
+            data_start_offset: None,
+            declared_data_end_offset: None,
+            data_range_available: None,
+            subblock_name: None,
+            end_archive_next_volume: None,
+            end_archive_data_crc32: None,
+            end_archive_rev_space_present: None,
+            end_archive_volume_number: None,
+            file_header: None,
+        };
+
+        let Some(base_end) = cursor.checked_add(7) else {
+            walk.inspected_block_count += 1;
+            walk.blocks.push(block_obs);
+            walk.status = "truncated_base_header";
+            walk.stopped_offset = Some(cursor);
+            break;
+        };
+        let Some(base) = data.get(cursor..base_end) else {
+            walk.inspected_block_count += 1;
+            walk.blocks.push(block_obs);
+            walk.status = "truncated_base_header";
+            walk.stopped_offset = Some(cursor);
+            break;
+        };
+        let expected_crc = u16::from_le_bytes([base[0], base[1]]);
+        let header_type = base[2];
+        let flags = u16::from_le_bytes([base[3], base[4]]);
+        let header_size = u16::from_le_bytes([base[5], base[6]]);
+        let add_size_present =
+            (flags & 0x8000 != 0) || matches!(header_type, 0x74 | 0x77 | 0x78 | 0x7a);
+
+        block_obs.header_crc16_expected = Some(expected_crc);
+        block_obs.header_type = Some(header_type);
+        block_obs.header_type_name = rar4_block_type_name(header_type);
+        block_obs.header_flags = Some(flags);
+        block_obs.header_size = Some(header_size);
+        block_obs.add_size_present = Some(add_size_present);
+
+        let min_header_size = if matches!(header_type, 0x74 | 0x7a) {
+            if flags & 0x0100 != 0 {
+                40usize
+            } else {
+                32usize
+            }
+        } else if add_size_present {
+            11usize
+        } else {
+            7usize
+        };
+        if usize::from(header_size) < min_header_size {
+            walk.inspected_block_count += 1;
+            walk.blocks.push(block_obs);
+            walk.status = "invalid_header_size";
+            walk.stopped_offset = Some(cursor);
+            break;
+        }
+        let Some(block_header_end) = cursor.checked_add(usize::from(header_size)) else {
+            walk.inspected_block_count += 1;
+            walk.blocks.push(block_obs);
+            walk.status = "header_end_overflow";
+            walk.stopped_offset = Some(cursor);
+            break;
+        };
+        block_obs.header_end_offset = Some(block_header_end);
+        let Some(header_bytes) = data.get(cursor..block_header_end) else {
+            walk.inspected_block_count += 1;
+            walk.blocks.push(block_obs);
+            walk.status = "header_truncated";
+            walk.stopped_offset = Some(cursor);
+            break;
+        };
+        let calculated_crc = (crc32fast::hash(&header_bytes[2..]) & 0xffff) as u16;
+        let crc_valid = calculated_crc == expected_crc;
+        block_obs.header_crc16_calculated = Some(calculated_crc);
+        block_obs.header_crc16_valid = Some(crc_valid);
+
+        let data_size: u64 = if matches!(header_type, 0x74 | 0x7a) {
+            let low = u32::from_le_bytes([
+                header_bytes[7],
+                header_bytes[8],
+                header_bytes[9],
+                header_bytes[10],
+            ]);
+            if flags & 0x0100 != 0 {
+                let high = u32::from_le_bytes([
+                    header_bytes[32],
+                    header_bytes[33],
+                    header_bytes[34],
+                    header_bytes[35],
+                ]);
+                (u64::from(high) << 32) | u64::from(low)
+            } else {
+                u64::from(low)
+            }
+        } else if add_size_present {
+            u64::from(u32::from_le_bytes([
+                header_bytes[7],
+                header_bytes[8],
+                header_bytes[9],
+                header_bytes[10],
+            ]))
+        } else {
+            0
+        };
+        block_obs.data_size = Some(data_size);
+        block_obs.data_start_offset = Some(block_header_end);
+
+        match header_type {
+            0x74 => {
+                let (file_status, _, parsed_file) =
+                    parse_rar4_first_file_header(data, Some(cursor), true, Some(true), Some(false));
+                if parsed_file.is_none() {
+                    walk.inspected_block_count += 1;
+                    walk.blocks.push(block_obs);
+                    walk.status = file_status;
+                    walk.stopped_offset = Some(cursor);
+                    break;
+                }
+                walk.file_block_count += 1;
+                block_obs.file_header = parsed_file;
+            }
+            0x75 => {
+                walk.comment_block_seen = true;
+            }
+            0x76 | 0x79 => {
+                walk.authenticity_block_seen = true;
+            }
+            0x78 => {
+                walk.recovery_block_seen = true;
+            }
+            0x7a => {
+                walk.subblock_count += 1;
+                let name_offset = if flags & 0x0100 != 0 {
+                    40usize
+                } else {
+                    32usize
+                };
+                let name_size =
+                    usize::from(u16::from_le_bytes([header_bytes[26], header_bytes[27]]));
+                let Some(name_end) = name_offset.checked_add(name_size) else {
+                    walk.inspected_block_count += 1;
+                    walk.blocks.push(block_obs);
+                    walk.status = "invalid_header_size";
+                    walk.stopped_offset = Some(cursor);
+                    break;
+                };
+                if name_end > header_bytes.len() {
+                    walk.inspected_block_count += 1;
+                    walk.blocks.push(block_obs);
+                    walk.status = "invalid_header_size";
+                    walk.stopped_offset = Some(cursor);
+                    break;
+                }
+                let name_bytes = &header_bytes[name_offset..name_end];
+                if name_bytes.is_ascii() && !name_bytes.iter().any(u8::is_ascii_control) {
+                    let sub_name = String::from_utf8_lossy(name_bytes).into_owned();
+                    match sub_name.as_str() {
+                        "CMT" => walk.comment_block_seen = true,
+                        "RR" => walk.recovery_block_seen = true,
+                        "AV" => walk.authenticity_block_seen = true,
+                        _ => {}
+                    }
+                    block_obs.subblock_name = Some(sub_name);
+                }
+            }
+            0x7b => {
+                let next_vol = flags & 0x0001 != 0;
+                let has_crc = flags & 0x0002 != 0;
+                let rev_space = flags & 0x0004 != 0;
+                let has_volnum = flags & 0x0008 != 0;
+                let mut end_cursor = 7usize;
+                let data_crc = if has_crc {
+                    if let Some(bytes) = header_bytes.get(end_cursor..end_cursor + 4) {
+                        end_cursor += 4;
+                        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let vol_num = if has_volnum {
+                    header_bytes
+                        .get(end_cursor..end_cursor + 2)
+                        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                } else {
+                    None
+                };
+                block_obs.end_archive_next_volume = Some(next_vol);
+                block_obs.end_archive_data_crc32 = data_crc;
+                block_obs.end_archive_rev_space_present = Some(rev_space);
+                block_obs.end_archive_volume_number = vol_num;
+                if crc_valid {
+                    walk.end_of_archive_seen = true;
+                    walk.end_of_archive_next_volume = Some(next_vol);
+                    walk.end_of_archive_data_crc32 = data_crc;
+                    walk.end_of_archive_rev_space_present = Some(rev_space);
+                    walk.end_of_archive_volume_number = vol_num;
+                }
+            }
+            _ => {}
+        }
+
+        let Some(data_size_usize) = usize::try_from(data_size)
+            .ok()
+            .and_then(|sz| block_header_end.checked_add(sz))
+        else {
+            walk.inspected_block_count += 1;
+            walk.blocks.push(block_obs);
+            walk.status = "data_end_overflow";
+            walk.stopped_offset = Some(cursor);
+            break;
+        };
+        let block_end = data_size_usize;
+        block_obs.declared_data_end_offset = Some(block_end);
+        block_obs.data_range_available = Some(block_end <= data.len());
+
+        walk.inspected_block_count += 1;
+        walk.blocks.push(block_obs);
+
+        if !crc_valid {
+            walk.status = "header_checksum_invalid";
+            walk.stopped_offset = Some(cursor);
+            break;
+        }
+        if header_type == 0x7b {
+            if block_end > data.len() {
+                walk.status = "data_truncated";
+                walk.stopped_offset = Some(cursor);
+                break;
+            }
+            walk.status = "end_of_archive";
+            walk.stopped_offset = Some(cursor);
+            walk.trailing_sample_bytes = data.len().saturating_sub(block_end);
+            break;
+        }
+        if block_end > data.len() {
+            walk.status = "data_truncated";
+            walk.stopped_offset = Some(cursor);
+            break;
+        }
+        cursor = block_end;
+        if block_index + 1 == MAX_RAR4_VISIBLE_BLOCKS {
+            walk.status = "block_budget_exhausted";
+            walk.stopped_offset = Some(cursor);
+        }
+    }
+
+    if walk.status == "pending" {
+        walk.status = "block_budget_exhausted";
+        walk.stopped_offset = Some(cursor);
+    }
+    walk
 }
 
 fn parse_rar4_first_file_header(
@@ -12251,6 +12659,10 @@ mod tests {
         );
         assert_eq!(cmt_json["headers"][0]["next_block_type"], 0x75);
         assert!(cmt_json["headers"][0]["first_file"].is_null());
+        assert_eq!(
+            cmt_json["headers"][0]["visible_block_walk"]["comment_block_seen"],
+            true
+        );
 
         // 5. Invalid FILE_HEAD CRC16
         let mut bad_crc_archive = standard_archive.clone();
@@ -12264,5 +12676,97 @@ mod tests {
             bad_crc_json["headers"][0]["first_file"]["checksum_valid"],
             false
         );
+        assert_eq!(
+            bad_crc_json["headers"][0]["visible_block_walk"]["status"],
+            "header_checksum_invalid"
+        );
+
+        // 6. Visible block walk across CMT subblock (0x7a), FILE_HEAD (0x74), RR subblock (0x7a), and ENDARC_HEAD (0x7b)
+        let mut walk_archive = RAR4.to_vec();
+        walk_archive.extend_from_slice(&build_rar4_block(0x73, 0x0001, &[0u8; 6]));
+
+        // Subblock 0x7a ("CMT") with 4 bytes of comment payload
+        let mut cmt_sub_body = Vec::new();
+        cmt_sub_body.extend_from_slice(&4u32.to_le_bytes()); // pack_size_low = 4
+        cmt_sub_body.extend_from_slice(&4u32.to_le_bytes()); // unp_size_low = 4
+        cmt_sub_body.push(3); // host_os
+        cmt_sub_body.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        cmt_sub_body.extend_from_slice(&0u32.to_le_bytes());
+        cmt_sub_body.push(29);
+        cmt_sub_body.push(0x30);
+        cmt_sub_body.extend_from_slice(&3u16.to_le_bytes()); // name_size = 3 ("CMT")
+        cmt_sub_body.extend_from_slice(&0u32.to_le_bytes());
+        cmt_sub_body.extend_from_slice(b"CMT");
+        walk_archive.extend_from_slice(&build_rar4_block(0x7a, 0x8000, &cmt_sub_body));
+        walk_archive.extend_from_slice(b"test"); // 4-byte subblock payload
+
+        // FILE_HEAD (0x74) with 3 bytes of packed payload so the walk can advance to the next block
+        let small_name = b"episode01.mkv";
+        let mut small_file_body = Vec::new();
+        small_file_body.extend_from_slice(&3u32.to_le_bytes()); // pack_size_low = 3
+        small_file_body.extend_from_slice(&1024u32.to_le_bytes()); // unp_size_low = 1024
+        small_file_body.push(3); // unix
+        small_file_body.extend_from_slice(&0xcafe_babeu32.to_le_bytes());
+        small_file_body.extend_from_slice(&0x5421_1234u32.to_le_bytes());
+        small_file_body.push(29);
+        small_file_body.push(0x30); // store
+        small_file_body.extend_from_slice(&(small_name.len() as u16).to_le_bytes());
+        small_file_body.extend_from_slice(&0x0020u32.to_le_bytes());
+        small_file_body.extend_from_slice(small_name);
+        walk_archive.extend_from_slice(&build_rar4_block(0x74, 0x8000, &small_file_body));
+        walk_archive.extend_from_slice(b"abc"); // 3-byte file payload
+
+        // Subblock 0x7a ("RR") with 0 bytes payload
+        let mut rr_sub_body = Vec::new();
+        rr_sub_body.extend_from_slice(&0u32.to_le_bytes());
+        rr_sub_body.extend_from_slice(&0u32.to_le_bytes());
+        rr_sub_body.push(3);
+        rr_sub_body.extend_from_slice(&0u32.to_le_bytes());
+        rr_sub_body.extend_from_slice(&0u32.to_le_bytes());
+        rr_sub_body.push(29);
+        rr_sub_body.push(0x30);
+        rr_sub_body.extend_from_slice(&2u16.to_le_bytes()); // "RR"
+        rr_sub_body.extend_from_slice(&0u32.to_le_bytes());
+        rr_sub_body.extend_from_slice(b"RR");
+        walk_archive.extend_from_slice(&build_rar4_block(0x7a, 0x8000, &rr_sub_body));
+
+        // ENDARC_HEAD (0x7b) with EARC_NEXT_VOLUME (0x0001) | EARC_DATACRC (0x0002) | EARC_VOLNUMBER (0x0008)
+        let mut endarc_body = Vec::new();
+        endarc_body.extend_from_slice(&0x89ab_cdefu32.to_le_bytes()); // archive data CRC32
+        endarc_body.extend_from_slice(&7u16.to_le_bytes()); // volume number = 7
+        walk_archive.extend_from_slice(&build_rar4_block(0x7b, 0x000b, &endarc_body));
+
+        let walk_json = serde_json::to_value(parse(&walk_archive)).unwrap();
+        let walk_rar4 = &walk_json["headers"][0];
+        assert_eq!(walk_rar4["next_block_type"], 0x7a);
+        assert_eq!(
+            walk_rar4["first_file_header_status"],
+            "parsed_after_prefix_blocks"
+        );
+        assert_eq!(walk_rar4["first_file"]["filename"], "episode01.mkv");
+        assert_eq!(walk_rar4["first_file"]["file_crc32"], 0xcafe_babeu32);
+
+        let walk = &walk_rar4["visible_block_walk"];
+        assert_eq!(walk["status"], "end_of_archive");
+        assert_eq!(walk["inspected_block_count"], 4);
+        assert_eq!(walk["file_block_count"], 1);
+        assert_eq!(walk["subblock_count"], 2);
+        assert_eq!(walk["comment_block_seen"], true);
+        assert_eq!(walk["recovery_block_seen"], true);
+        assert_eq!(walk["authenticity_block_seen"], false);
+        assert_eq!(walk["end_of_archive_seen"], true);
+        assert_eq!(walk["end_of_archive_next_volume"], true);
+        assert_eq!(walk["end_of_archive_data_crc32"], 0x89ab_cdefu32);
+        assert_eq!(walk["end_of_archive_rev_space_present"], false);
+        assert_eq!(walk["end_of_archive_volume_number"], 7);
+        assert_eq!(walk["blocks"][0]["header_type_name"], "new_subblock");
+        assert_eq!(walk["blocks"][0]["subblock_name"], "CMT");
+        assert_eq!(walk["blocks"][1]["header_type_name"], "file_header");
+        assert_eq!(
+            walk["blocks"][1]["file_header"]["filename"],
+            "episode01.mkv"
+        );
+        assert_eq!(walk["blocks"][2]["subblock_name"], "RR");
+        assert_eq!(walk["blocks"][3]["header_type_name"], "end_of_archive");
     }
 }
