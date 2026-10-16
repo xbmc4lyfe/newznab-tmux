@@ -25,9 +25,9 @@ on:
     inputs:
       comparison:
         type: choice
-        options: [remaining, existing, all]
+        options: [remaining, existing, all, date-cpp-screen]
         default: remaining
-        description: Select the six remaining modules or existing caller families
+        description: Select caller families or the fixed descriptive C++ date screen
       mode:
         type: choice
         options: [screen, qualification]
@@ -54,14 +54,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-        kind: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.comparison == 'remaining' && '["metadata-modules","archive-modules"]' || github.event_name == 'workflow_dispatch' && inputs.comparison == 'existing' && '["sample-planning","archive-parsing","vendor-archive"]' || '["sample-planning","archive-parsing","vendor-archive","metadata-modules","archive-modules"]') }}
+        runner: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.comparison == 'date-cpp-screen' && '["ubuntu-24.04-arm"]' || '["ubuntu-latest","ubuntu-24.04-arm"]') }}
+        kind: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.comparison == 'date-cpp-screen' && '["date-cpp"]' || github.event_name == 'workflow_dispatch' && inputs.comparison == 'remaining' && '["metadata-modules","archive-modules"]' || github.event_name == 'workflow_dispatch' && inputs.comparison == 'existing' && '["sample-planning","archive-parsing","vendor-archive"]' || '["sample-planning","archive-parsing","vendor-archive","metadata-modules","archive-modules"]') }}
     env:
       RUST_TOOLCHAIN: '1.98.0'
       BENCHMARK_KIND: ${{ matrix.kind }}
       BENCHMARK_MODE: ${{ inputs.mode || 'screen' }}
       BENCHMARK_SAMPLES: ${{ inputs.samples || '31' }}
     steps:
+      - name: Require the fixed hosted ARM screen protocol
+        if: matrix.kind == 'date-cpp'
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          REQUESTED_MODE: ${{ inputs.mode }}
+          REQUESTED_SAMPLES: ${{ inputs.samples }}
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = ARM64
+          test "$REQUESTED_MODE" = screen
+          test "$REQUESTED_SAMPLES" = 31
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -86,9 +98,12 @@ jobs:
         run: |
           php vendor/bin/phpunit tests/Unit/SamplePlanningBenchmarkTest.php tests/Unit/ArchiveParsingBenchmarkTest.php tests/Unit/VendorArchiveBenchmarkTest.php
           php vendor/bin/phpunit tests/Unit/RemainingMetadataBenchmarkFixturesTest.php tests/Unit/RemainingArchiveBenchmarkFixturesTest.php tests/Unit/RemainingModulesBenchmarkTest.php
+          php vendor/bin/phpunit --fail-on-skipped --filter=test_date_worker_output_is_capped_after_large_setup_files_exist tests/Unit/RemainingModulesBenchmarkTest.php
           python3 tests/Unit/test_benchmark_callers_export.py
           python3 tests/Unit/test_benchmark_remaining_modules_export.py
           python3 tests/Unit/test_benchmark_resource_limits.py
+          python3 -B tests/Unit/test_benchmark_file_limit.py
+          python3 -B tests/Unit/test_benchmark_date_build.py
       - name: Build and test optimized locked native library
         shell: bash
         run: |
@@ -98,19 +113,22 @@ jobs:
           cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee utility-evidence/build/test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib 2>&1 | tee utility-evidence/build/build.log
       - name: Verify restricted C++ dates through literal oracles and the actual PHP worker
-        if: matrix.kind == 'metadata-modules'
+        if: matrix.kind == 'metadata-modules' || matrix.kind == 'date-cpp'
         shell: bash
         run: |
           umask 077
           mkdir -p utility-evidence/date-cpp-correctness
-          c++ -std=c++20 -O3 -DNDEBUG -fPIC -shared -Wall -Wextra -Werror \
-            scripts/benchmark-date-cpp.cpp \
-            -o "$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/libdate-reference.so" \
-            2>&1 | tee utility-evidence/date-cpp-correctness/build.log
-          NNTMUX_DATE_CPP_LIBRARY="$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/libdate-reference.so" \
+          php -r 'define("NNTMUX_REMAINING_BENCHMARK_FUNCTIONS_ONLY", true); require "scripts/benchmark-remaining-modules.php"; echo json_encode(remainingBenchmarkSources(getcwd()), JSON_THROW_ON_ERROR);' \
+            > utility-evidence/date-cpp-correctness/sources.json
+          python3 -B scripts/benchmark-date-build.py \
+            --source-dir="$GITHUB_WORKSPACE" \
+            --source-manifest="$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/sources.json" \
+            --output-dir="$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/build" \
+            > utility-evidence/date-cpp-correctness/build-console.log 2>&1
+          NNTMUX_DATE_CPP_LIBRARY="$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/build/libdate-reference.so" \
             python3 -B tests/Unit/test_date_cpp_reference.py \
             2>&1 | tee utility-evidence/date-cpp-correctness/python-oracles.log
-          NNTMUX_TEST_DATE_CPP_LIBRARY="$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/libdate-reference.so" \
+          NNTMUX_TEST_DATE_CPP_LIBRARY="$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/build/libdate-reference.so" \
             php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped tests/Unit/CppDateWorkerTest.php \
             2>&1 | tee utility-evidence/date-cpp-correctness/php-worker.log
           NNTMUX_TEST_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
@@ -135,7 +153,7 @@ jobs:
               return subprocess.check_output(args, text=True).strip()
           def digest(path):
               return hashlib.sha256(path.read_bytes()).hexdigest()
-          code = "define('NNTMUX_REMAINING_BENCHMARK_FUNCTIONS_ONLY', true); require 'scripts/benchmark-remaining-modules.php'; define('NNTMUX_VENDOR_ARCHIVE_BENCHMARK_FUNCTIONS_ONLY', true); require 'scripts/benchmark-vendor-archive.php'; echo json_encode(match (getenv('BENCHMARK_KIND')) {'metadata-modules', 'archive-modules' => remainingBenchmarkSources(getcwd()), 'vendor-archive' => vendorArchiveBenchmarkSources(getcwd()), 'archive-parsing' => archiveBenchmarkSources(getcwd()), default => sampleBenchmarkSources(getcwd())}, JSON_THROW_ON_ERROR);"
+          code = "define('NNTMUX_REMAINING_BENCHMARK_FUNCTIONS_ONLY', true); require 'scripts/benchmark-remaining-modules.php'; define('NNTMUX_VENDOR_ARCHIVE_BENCHMARK_FUNCTIONS_ONLY', true); require 'scripts/benchmark-vendor-archive.php'; echo json_encode(match (getenv('BENCHMARK_KIND')) {'metadata-modules', 'archive-modules', 'date-cpp' => remainingBenchmarkSources(getcwd()), 'vendor-archive' => vendorArchiveBenchmarkSources(getcwd()), 'archive-parsing' => archiveBenchmarkSources(getcwd()), default => sampleBenchmarkSources(getcwd())}, JSON_THROW_ON_ERROR);"
           sources = json.loads(run('php', '-r', code))
           cpu = next((line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith(('model name', 'Hardware'))), platform.machine())
           receipt = {
@@ -173,7 +191,19 @@ jobs:
             entry=scripts/benchmark-remaining-modules.php
             family=("--family=$BENCHMARK_KIND")
           fi
-          php -d ffi.enable=true "$entry" "${family[@]}" \
+          command_prefix=()
+          baseline_options=()
+          if [[ "$BENCHMARK_KIND" == date-cpp ]]; then
+            entry=scripts/benchmark-remaining-modules.php
+            family=(--family=date-cpp)
+            command_prefix=(timeout --signal=TERM --kill-after=5s 180s)
+            baseline_options=(
+              "--baseline-native=$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/build/libdate-reference.so"
+              "--baseline-runtime-manifest=$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/build/baseline-manifest.json"
+              --order-seed=20261015 --timeout=3
+            )
+          fi
+          "${command_prefix[@]}" php -d ffi.enable=true "$entry" "${family[@]}" "${baseline_options[@]}" \
             --native="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
             --runtime-manifest="$GITHUB_WORKSPACE/utility-evidence/runtime.json" \
             --source-dir="$GITHUB_WORKSPACE" --mode="$BENCHMARK_MODE" --samples="$BENCHMARK_SAMPLES" \
@@ -203,10 +233,10 @@ jobs:
             --after=utility-evidence/resource-limits-after.json \
             --output=utility-evidence/resource-limits-comparison.json
       - name: Export bounded public metrics even on failure
-        if: always()
+        if: always() && matrix.kind != 'date-cpp'
         run: python3 scripts/benchmark_callers_summary.py --kind="$BENCHMARK_KIND" --runner='${{ matrix.runner }}' --output=public-summary/summary.json
       - name: Retain public summary
-        if: always()
+        if: always() && matrix.kind != 'date-cpp'
         uses: actions/upload-artifact@v4
         with:
           name: public-benchmark-${{ matrix.kind }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}

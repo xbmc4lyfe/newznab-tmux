@@ -19,6 +19,86 @@ final class RemainingModulesBenchmarkTest extends TestCase
         require_once $path;
     }
 
+    public function test_cpp_date_orders_balance_each_four_execution_block(): void
+    {
+        $this->loadHarness();
+        self::assertTrue(function_exists('remainingBenchmarkDateCppPairOrders'));
+        self::assertSame([
+            ['cpp', 'native'], ['native', 'cpp'],
+            ['cpp', 'native'], ['native', 'cpp'],
+            ['native', 'cpp'], ['cpp', 'native'],
+            ['native', 'cpp'], ['cpp', 'native'],
+        ], remainingBenchmarkDateCppPairOrders(8, 20261015));
+        foreach ([1, 2, 3, 5, 7, 31, 1000] as $samples) {
+            $orders = remainingBenchmarkDateCppPairOrders($samples, 20261015);
+            self::assertCount($samples, $orders);
+            self::assertSame($orders, remainingBenchmarkDateCppPairOrders($samples, 20261015));
+            $cppFirst = 0;
+            foreach ($orders as $index => $order) {
+                self::assertContains($order, [['cpp', 'native'], ['native', 'cpp']]);
+                $cppFirst += (int) ($order[0] === 'cpp');
+                if ($index % 2 === 1) {
+                    self::assertSame(array_reverse($orders[$index - 1]), $order);
+                }
+            }
+            self::assertLessThanOrEqual(1, abs($cppFirst - ($samples - $cppFirst)));
+        }
+    }
+
+    public function test_cpp_date_order_generator_rejects_unbounded_or_zero_inputs(): void
+    {
+        $this->loadHarness();
+        self::assertTrue(function_exists('remainingBenchmarkDateCppPairOrders'));
+        foreach ([[0, 1], [10001, 1], [1, 0], [1, 2147483647]] as $arguments) {
+            try {
+                remainingBenchmarkDateCppPairOrders(...$arguments);
+                self::fail('Invalid order parameters were accepted.');
+            } catch (\InvalidArgumentException) {
+                self::addToAssertionCount(1);
+            }
+        }
+    }
+
+    public function test_balanced_orders_are_selected_only_for_the_cpp_date_screen(): void
+    {
+        $this->loadHarness();
+        self::assertTrue(function_exists('remainingBenchmarkScreenOrders'));
+        $protocol = ['family' => 'date-cpp', 'mode' => 'screen', 'samples' => 31, 'seed' => 20261015];
+        self::assertSame(remainingBenchmarkDateCppPairOrders(31, 20261015), remainingBenchmarkScreenOrders($protocol));
+        foreach (['date-cpp', 'metadata-modules', 'archive-modules'] as $family) {
+            foreach (['screen', 'qualification'] as $mode) {
+                if ($family !== 'date-cpp' || $mode !== 'screen') {
+                    self::assertNull(remainingBenchmarkScreenOrders(array_replace($protocol, ['family' => $family, 'mode' => $mode])));
+                }
+            }
+        }
+    }
+
+    public function test_balanced_date_screen_reports_points_without_inferential_intervals(): void
+    {
+        $this->loadHarness();
+        $baseline = array_fill(0, 31, 2.0);
+        $native = array_fill(0, 31, 1.0);
+        $result = remainingBenchmarkDecision($baseline, $native, 0, 'common', 'screen', 4, 'date-cpp');
+        self::assertSame('descriptive_screen', $result['status']);
+        self::assertSame(2.0, $result['php_over_native']);
+        self::assertSame([null, null], $result['simultaneous_95_percent_speedup_interval']);
+        self::assertSame([null, null], $result['php']['interval']);
+        self::assertNull($result['marginal_alpha']);
+        self::assertArrayNotHasKey('confidence', $result['php']);
+        self::assertFalse($result['qualifies']);
+        self::assertSame('screen_only_balanced_blocks_no_inference', $result['evidence']);
+        self::assertSame(3.0, remainingBenchmarkDecision([2.0, 4.0], [1.0, 1.0], 0, 'common', 'screen', 4, 'date-cpp')['php']['estimate']);
+        $tail = remainingBenchmarkDecision(array_map(static fn (int $value): float => (float) $value, range(1, 31)), $native, 0, 'uncommon', 'screen', 4, 'date-cpp');
+        self::assertSame('p99_latency', $tail['metric']);
+        self::assertSame(31.0, $tail['php']['estimate']);
+        self::assertSame([null, null], $tail['native']['interval']);
+        self::assertSame('invalid', remainingBenchmarkDecision($baseline, $native, 1, 'common', 'screen', 4, 'date-cpp')['status']);
+        self::assertTrue(remainingBenchmarkDecision(array_fill(0, 1000, 2.0), array_fill(0, 1000, 1.0), 0, 'common', 'qualification', 4, 'date-cpp')['qualifies']);
+        self::assertNotNull(remainingBenchmarkDecision($baseline, $native, 0, 'common', 'screen', 4)['marginal_alpha']);
+        self::assertSame(remainingBenchmarkDecision($baseline, $native, 0, 'common', 'screen', 4), remainingBenchmarkDecision($baseline, $native, 0, 'common', 'screen', 4, 'metadata-modules'));
+    }
+
     public function test_cpp_date_plan_uses_only_date_strata_and_an_honest_native_identity(): void
     {
         $this->loadHarness();
@@ -31,6 +111,97 @@ final class RemainingModulesBenchmarkTest extends TestCase
         $summary = remainingBenchmarkAcceptance(true, 0, true, 'date-cpp');
         $this->assertSame('cpp_nzbget_restricted_date_complete_metadata', $summary['baseline_kind']);
         $this->assertFalse($summary['adoption_qualified']);
+    }
+
+    public function test_date_setup_preflight_checks_sizes_and_hashes_before_copying(): void
+    {
+        $this->loadHarness();
+        self::assertTrue(function_exists('remainingBenchmarkSetupPreflight'));
+        $directory = sys_get_temp_dir().'/nntmux-date-setup-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        file_put_contents($directory.'/first', 'abc');
+        file_put_contents($directory.'/second', 'defg');
+        try {
+            $result = remainingBenchmarkSetupPreflight($directory, ['first', 'second'], 4, 7, 2);
+            self::assertSame(2, $result['file_count']);
+            self::assertSame(7, $result['total_bytes']);
+            self::assertSame(4, $result['max_file_bytes']);
+            self::assertSame(['first' => hash('sha256', 'abc'), 'second' => hash('sha256', 'defg')], $result['files']);
+            foreach ([[4, 6, 2], [2, 7, 2], [4, 7, 1], [0, 7, 2]] as $bounds) {
+                try {
+                    remainingBenchmarkSetupPreflight($directory, ['first', 'second'], ...$bounds);
+                    self::fail('Setup outside its declared copy bounds was accepted.');
+                } catch (\InvalidArgumentException|\RuntimeException) {
+                    self::addToAssertionCount(1);
+                }
+            }
+            self::assertSame('abc', file_get_contents($directory.'/first'));
+            self::assertSame('defg', file_get_contents($directory.'/second'));
+        } finally {
+            unlink($directory.'/first');
+            unlink($directory.'/second');
+            rmdir($directory);
+        }
+    }
+
+    public function test_output_limit_is_inactive_for_other_benchmark_protocols(): void
+    {
+        $this->loadHarness();
+        self::assertTrue(function_exists('remainingBenchmarkApplyScreenOutputLimit'));
+        $before = function_exists('posix_getrlimit') ? posix_getrlimit() : null;
+        foreach ([['family' => 'date-cpp', 'mode' => 'qualification'], ['family' => 'metadata-modules', 'mode' => 'screen'], ['family' => 'archive-modules', 'mode' => 'screen']] as $protocol) {
+            self::assertNull(remainingBenchmarkApplyScreenOutputLimit($protocol));
+        }
+        self::assertSame($before, function_exists('posix_getrlimit') ? posix_getrlimit() : null);
+    }
+
+    public function test_date_output_limit_rejects_unqualified_hosts(): void
+    {
+        if (PHP_OS_FAMILY === 'Linux') {
+            self::markTestSkipped('Non-Linux fail-closed contract is checked on the local host.');
+        }
+        $this->loadHarness();
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('output enforcement requires Linux');
+        remainingBenchmarkApplyScreenOutputLimit(['family' => 'date-cpp', 'mode' => 'screen']);
+    }
+
+    public function test_date_worker_output_is_capped_after_large_setup_files_exist(): void
+    {
+        if (PHP_OS_FAMILY !== 'Linux') {
+            self::markTestSkipped('Physical RLIMIT_FSIZE enforcement must pass on Linux CI; Darwin readback did not enforce writes.');
+        }
+        $this->loadHarness();
+        self::assertTrue(function_exists('remainingBenchmarkApplyScreenOutputLimit'));
+        $directory = sys_get_temp_dir().'/nntmux-date-output-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        $code = <<<'PHP'
+define('NNTMUX_REMAINING_BENCHMARK_FUNCTIONS_ONLY', true);
+require $argv[1];
+posix_setrlimit(POSIX_RLIMIT_CORE, 0, 0);
+file_put_contents($argv[2], str_repeat('s', 9 * 1024 * 1024));
+$limits = remainingBenchmarkApplyScreenOutputLimit(['family' => 'date-cpp', 'mode' => 'screen']);
+echo json_encode($limits, JSON_THROW_ON_ERROR)."\n";
+file_put_contents($argv[3], str_repeat('w', 8 * 1024 * 1024));
+$overflow = file_put_contents($argv[3], 'x', FILE_APPEND);
+exit($overflow === 1 ? 0 : 7);
+PHP;
+        try {
+            $child = yencBenchmarkRunChild([PHP_BINARY, '-r', $code, dirname(__DIR__, 2).'/scripts/benchmark-remaining-modules.php', $directory.'/setup', $directory.'/worker'], $directory.'/child', 10);
+            self::assertFalse($child['timed_out']);
+            self::assertNotSame(0, $child['exit_code']);
+            $limits = json_decode(file_get_contents($child['stdout_path']), true, flags: JSON_THROW_ON_ERROR);
+            self::assertSame(8388608, $limits['effective_file_limit_bytes']);
+            self::assertSame('after_setup_before_workers', $limits['phase']);
+            self::assertFalse($limits['aggregate_limit_enforced']);
+            self::assertSame(9 * 1024 * 1024, filesize($directory.'/setup'));
+            self::assertSame(8 * 1024 * 1024, filesize($directory.'/worker'));
+        } finally {
+            foreach (glob($directory.'/*') as $path) {
+                unlink($path);
+            }
+            rmdir($directory);
+        }
     }
 
     public function test_full_date_parity_rejects_metadata_discarded_by_the_projection(): void
