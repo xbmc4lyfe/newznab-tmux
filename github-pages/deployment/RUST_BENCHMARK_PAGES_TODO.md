@@ -31,7 +31,7 @@ Use the archive workflow's locked setup and runtime manifests. The harness comma
 php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-remaining-modules.php --family=metadata-modules --native="$RUST_LIBRARY" --runtime-manifest="$MANIFEST" --output-dir="$NEW_OUTPUT" --mode=qualification --samples=1000 --order-seed=20261015 --timeout=30
 ```
 
-Repeat with `--family=archive-modules` and a new output directory. Manual workflow selection is `comparison=[remaining,existing,all]`, `mode=[screen,qualification]`, and `samples` (31 for screens, at least 1,000 for qualification). Public summaries must retain the reference-only scope and explicit pending/failed/invalid/unavailable states. The separate `zstd_frame` and `xz_first_block` comparison gaps remain outside this six-module study.
+Repeat with `--family=archive-modules` and a new output directory. Manual workflow selection is `comparison=[remaining,existing,all]`, `mode=[screen,qualification]`, and `samples` (31 for screens, at least 1,000 for qualification). Public summaries must retain the reference-only scope and explicit pending/failed/invalid/unavailable states. The separate `iso_path_tables`, `zstd_frame`, and `xz_first_block` comparison gaps remain outside this six-module study.
 
 ## Original ownership and scope
 
@@ -119,7 +119,7 @@ These are coverage states, not speed claims. Discover Rust modules from `src/lib
 | `cpu_snapshot` | Standalone CLI paired harness; correctness tests | Wire benchmark execution separately from collection; expose p99 protocol limits. |
 | `article_dates`, `article_identity`, `article_xref` | Recurring `metadata-modules` PHP reference-projection comparisons through the actual native caller | Retain the bounded shared-output scope, correctness oracles, cold/repeated phases, uncertainty and qualification evidence; full parser equivalence and production PHP speedup remain unproven. |
 | `iso_primary_copies`, `rar5_copy_checksums`, `rar5_quick_open` | Recurring `archive-modules` PHP reference-projection comparisons through the actual native caller | Retain shared-projection limits and malformed/bounded-input semantics; richer full metadata is not equivalent. No adoption proof. |
-| Other `formats` paths, including `zstd_frame`, `xz_first_block` | Existing vendor-reader shared-header comparisons and bounded native diagnostics | Keep the zstd and xz comparison gaps explicit. These paths are outside the six-module study; a fixed RAR5 profile is not all-format performance coverage. |
+| Other `formats` paths, including `iso_path_tables`, `zstd_frame`, `xz_first_block` | Existing vendor-reader shared-header comparisons and bounded native diagnostics | Keep the ISO path-table, zstd, and xz comparison gaps explicit. These paths are outside the six-module study; a fixed RAR5 profile is not all-format performance coverage. |
 | `par2`, `par2_source_ranges` | Correctness/parity only identified | Add real caller baselines, valid/corrupt/large/uncommon recovery fixtures and ownership/correctness checks. |
 | `seven_zip_ranges` | Correctness/parity only identified | Add 7z-specific common/uncommon comparisons and caller overhead. |
 | `sample_plan` | Correctness/parity only identified | Add representative common/uncommon planning workloads, output/order equivalence and real caller cost. |

@@ -46,7 +46,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
         (new CollectReleaseFingerprintMetadata(1))->handle($collector);
         self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
-        foreach ([28, 29, 30, 31, 32, 33, 34] as $schemaVersion) {
+        foreach ([28, 29, 30, 31, 32, 33, 34, 35] as $schemaVersion) {
             ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => $schemaVersion]]);
             $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
             (new CollectReleaseFingerprintMetadata(1))->handle($collector);
@@ -76,7 +76,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
             $dates[$source]['occurrence_count_basis'] = 'retained candidates; the total may be larger when budget_exceeded';
         }
         $dates['date']['candidates'][0]['raw_field_hex'] = bin2hex("dAtE: 01 Jan 2024\r\n\t00:00 -0000\r\n");
-        $metadata = ['schema_version' => 35, 'article_observations' => [[
+        $metadata = ['schema_version' => 36, 'article_observations' => [[
             'server' => 'fixture.example.invalid', 'server_port' => 563, 'server_tls' => true,
             'provider_label' => 'Fixture provider', 'queried_at_utc' => '2026-10-16T00:00:00Z',
             'message_id' => '<clock@example.invalid>', 'sample_role' => 'first',
@@ -98,6 +98,50 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertStringContainsString('&lt;clock@example.invalid&gt;', $html);
         self::assertStringContainsString('&lt;script&gt;bad()&lt;/script&gt;', $html);
         self::assertStringNotContainsString('<script>bad()</script>', $html);
+    }
+
+    #[Test]
+    public function it_exposes_comparable_zip_and_gzip_deflate_effort_and_os_metadata_through_yenc(): void
+    {
+        $zipDeflateMax = "PK\x03\x04".pack('vvv', 20, 0x0002, 8).str_repeat("\0", 20);
+        $zipAesFast = "PK\x03\x04".pack('vvv', 51, 0x0005, 99).str_repeat("\0", 16)
+            .pack('vv', 0, 11).pack('vvv', 0x9901, 7, 2)."AE\x03".pack('v', 8);
+        $gzipMax = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03";
+        $gzipFast = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x04\x0b";
+        $sample = $zipDeflateMax.$zipAesFast.$gzipMax.$gzipFast;
+        if ((new NativeMetadataParser)->parseFormats($sample) === null) {
+            self::markTestSkipped('Native Rust format metadata is required for DEFLATE effort integration.');
+        }
+
+        $body = YencArticles::article($sample);
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        $headers = $analysis['metadata']['decoded_format_metadata']['headers'];
+        self::assertCount(4, $headers);
+
+        self::assertSame(8, $headers[0]['effective_compression_method']);
+        self::assertSame('local_header', $headers[0]['effective_compression_method_source']);
+        self::assertSame(1, $headers[0]['deflate_compression_option_bits']);
+        self::assertSame('maximum', $headers[0]['deflate_compression_option']);
+        self::assertSame('maximum', $headers[0]['deflate_effort_class']);
+        self::assertSame('resolved_local_header', $headers[0]['deflate_effort_status']);
+
+        self::assertSame(8, $headers[1]['effective_compression_method']);
+        self::assertSame('aes_extra_field', $headers[1]['effective_compression_method_source']);
+        self::assertSame(2, $headers[1]['deflate_compression_option_bits']);
+        self::assertSame('fast', $headers[1]['deflate_compression_option']);
+        self::assertSame('fast', $headers[1]['deflate_effort_class']);
+        self::assertSame('resolved_via_aes_extra_field', $headers[1]['deflate_effort_status']);
+
+        self::assertSame('maximum_compression', $headers[2]['deflate_extra_flags_meaning']);
+        self::assertSame('maximum', $headers[2]['deflate_effort_class']);
+        self::assertSame('resolved_extra_flags', $headers[2]['deflate_effort_status']);
+        self::assertSame('unix', $headers[2]['operating_system_name']);
+
+        self::assertSame('fastest_algorithm', $headers[3]['deflate_extra_flags_meaning']);
+        self::assertSame('fast', $headers[3]['deflate_effort_class']);
+        self::assertSame('resolved_extra_flags', $headers[3]['deflate_effort_status']);
+        self::assertSame('ntfs_filesystem', $headers[3]['operating_system_name']);
     }
 
     #[Test]

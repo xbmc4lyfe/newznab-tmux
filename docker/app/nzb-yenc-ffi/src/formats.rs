@@ -393,6 +393,12 @@ pub enum FormatHeader {
         data_descriptor_present: Option<bool>,
         filename_utf8_flag: Option<bool>,
         compression_method: Option<u16>,
+        effective_compression_method: Option<u16>,
+        effective_compression_method_source: Option<&'static str>,
+        deflate_compression_option_bits: Option<u8>,
+        deflate_compression_option: Option<&'static str>,
+        deflate_effort_class: Option<&'static str>,
+        deflate_effort_status: &'static str,
         dos_modification_time: Option<u16>,
         dos_modification_date: Option<u16>,
         crc32: Option<u32>,
@@ -474,7 +480,11 @@ pub enum FormatHeader {
         text_hint: Option<bool>,
         modification_time: Option<u32>,
         extra_flags: Option<u8>,
+        deflate_extra_flags_meaning: Option<&'static str>,
+        deflate_effort_class: Option<&'static str>,
+        deflate_effort_status: &'static str,
         operating_system: Option<u8>,
+        operating_system_name: Option<&'static str>,
         extra_field_present: Option<bool>,
         extra_field_length: Option<u16>,
         extra_field_sha256: Option<String>,
@@ -1164,6 +1174,14 @@ fn parse_zip(data: &[u8], offset: usize) -> FormatHeader {
     let compression_method = fixed.map(|header| u16::from_le_bytes([header[8], header[9]]));
     let crc32 = fixed.map(|header| u32::from_le_bytes(header[14..18].try_into().unwrap()));
     let aes_metadata = parse_zip_aes_metadata(extra_range, compression_method, flags);
+    let ZipDeflateEffortSummary {
+        effective_compression_method,
+        effective_compression_method_source,
+        deflate_compression_option_bits,
+        deflate_compression_option,
+        deflate_effort_class,
+        deflate_effort_status,
+    } = zip_deflate_effort_metadata(flags, compression_method, &aes_metadata);
     let crc32_authority_status =
         zip_crc32_authority_status(flags, compression_method, crc32, &aes_metadata);
     let effective_crc32 = matches!(
@@ -1279,6 +1297,12 @@ fn parse_zip(data: &[u8], offset: usize) -> FormatHeader {
         data_descriptor_present: flags.map(|value| value & 0x0008 != 0),
         filename_utf8_flag: flags.map(|value| value & 0x0800 != 0),
         compression_method,
+        effective_compression_method,
+        effective_compression_method_source,
+        deflate_compression_option_bits,
+        deflate_compression_option,
+        deflate_effort_class,
+        deflate_effort_status,
         dos_modification_time: fixed.map(|header| u16::from_le_bytes([header[10], header[11]])),
         dos_modification_date: fixed.map(|header| u16::from_le_bytes([header[12], header[13]])),
         crc32,
@@ -1439,6 +1463,88 @@ fn zip_crc32_authority_status(
         return "unexpected_aes_extra_field";
     }
     "local_crc_authoritative"
+}
+
+struct ZipDeflateEffortSummary {
+    effective_compression_method: Option<u16>,
+    effective_compression_method_source: Option<&'static str>,
+    deflate_compression_option_bits: Option<u8>,
+    deflate_compression_option: Option<&'static str>,
+    deflate_effort_class: Option<&'static str>,
+    deflate_effort_status: &'static str,
+}
+
+impl ZipDeflateEffortSummary {
+    const fn unresolved(status: &'static str) -> Self {
+        Self {
+            effective_compression_method: None,
+            effective_compression_method_source: None,
+            deflate_compression_option_bits: None,
+            deflate_compression_option: None,
+            deflate_effort_class: None,
+            deflate_effort_status: status,
+        }
+    }
+}
+
+fn zip_deflate_effort_metadata(
+    flags: Option<u16>,
+    compression_method: Option<u16>,
+    aes_metadata: &ZipAesMetadata,
+) -> ZipDeflateEffortSummary {
+    let (Some(flags), Some(method)) = (flags, compression_method) else {
+        return ZipDeflateEffortSummary::unresolved("local_header_incomplete");
+    };
+    if flags & 0x2000 != 0 {
+        return ZipDeflateEffortSummary::unresolved("masked_local_metadata");
+    }
+    let (effective_method, effective_source) = if method == 99 {
+        match (aes_metadata.status, aes_metadata.actual_compression_method) {
+            ("valid", Some(actual)) => (actual, "aes_extra_field"),
+            ("missing_required_extra", _) => {
+                return ZipDeflateEffortSummary::unresolved("aes_metadata_missing");
+            }
+            _ => return ZipDeflateEffortSummary::unresolved("aes_metadata_invalid"),
+        }
+    } else if aes_metadata.extra_field_count > 0 {
+        return ZipDeflateEffortSummary::unresolved("unexpected_aes_extra_field");
+    } else {
+        (method, "local_header")
+    };
+
+    let status_when_resolved = if effective_source == "aes_extra_field" {
+        "resolved_via_aes_extra_field"
+    } else {
+        "resolved_local_header"
+    };
+
+    if !matches!(effective_method, 8 | 9) {
+        return ZipDeflateEffortSummary {
+            effective_compression_method: Some(effective_method),
+            effective_compression_method_source: Some(effective_source),
+            deflate_compression_option_bits: None,
+            deflate_compression_option: None,
+            deflate_effort_class: None,
+            deflate_effort_status: "not_deflate",
+        };
+    }
+
+    let option_bits = ((flags >> 1) & 0x03) as u8;
+    let (option_name, effort_class) = match option_bits {
+        0 => ("normal", "normal"),
+        1 => ("maximum", "maximum"),
+        2 => ("fast", "fast"),
+        3 => ("super_fast", "fast"),
+        _ => unreachable!(),
+    };
+    ZipDeflateEffortSummary {
+        effective_compression_method: Some(effective_method),
+        effective_compression_method_source: Some(effective_source),
+        deflate_compression_option_bits: Some(option_bits),
+        deflate_compression_option: Some(option_name),
+        deflate_effort_class: Some(effort_class),
+        deflate_effort_status: status_when_resolved,
+    }
 }
 
 fn parse_zip64_size_metadata(
@@ -4279,6 +4385,9 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
             && header_crc16_valid != Some(false)
             && extra_subfield_framing_valid != Some(false)
     });
+    let (deflate_extra_flags_meaning, deflate_effort_class, deflate_effort_status) =
+        gzip_deflate_effort_metadata(fixed.is_some(), compression_method, extra_flags);
+    let operating_system_name = operating_system.map(gzip_operating_system_name);
     let GzipLocalObservations {
         fixed_header_available,
         structure_valid,
@@ -4322,7 +4431,11 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
         text_hint: flags.map(|value| value & 0x01 != 0),
         modification_time,
         extra_flags,
+        deflate_extra_flags_meaning,
+        deflate_effort_class,
+        deflate_effort_status,
         operating_system,
+        operating_system_name,
         extra_field_present: flags.map(|value| value & 0x04 != 0),
         extra_field_length,
         extra_field_sha256,
@@ -4353,6 +4466,59 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
         header_crc16_calculated,
         header_crc16_valid,
         header_bytes: complete.then_some(cursor - offset),
+    }
+}
+
+fn gzip_deflate_effort_metadata(
+    fixed_header_available: bool,
+    compression_method: Option<u8>,
+    extra_flags: Option<u8>,
+) -> (Option<&'static str>, Option<&'static str>, &'static str) {
+    if !fixed_header_available {
+        return (None, None, "fixed_header_incomplete");
+    }
+    if compression_method != Some(8) {
+        return (None, None, "not_deflate");
+    }
+    match extra_flags {
+        Some(0) => (
+            Some("default_or_unspecified"),
+            Some("normal"),
+            "resolved_extra_flags",
+        ),
+        Some(2) => (
+            Some("maximum_compression"),
+            Some("maximum"),
+            "resolved_extra_flags",
+        ),
+        Some(4) => (
+            Some("fastest_algorithm"),
+            Some("fast"),
+            "resolved_extra_flags",
+        ),
+        Some(_) => (Some("unrecognized"), None, "unrecognized_extra_flags"),
+        None => (None, None, "fixed_header_incomplete"),
+    }
+}
+
+fn gzip_operating_system_name(os: u8) -> &'static str {
+    match os {
+        0 => "fat_filesystem",
+        1 => "amiga",
+        2 => "vms",
+        3 => "unix",
+        4 => "vm_cms",
+        5 => "atari_tos",
+        6 => "hpfs_filesystem",
+        7 => "macintosh",
+        8 => "z_system",
+        9 => "cp_m",
+        10 => "tops_20",
+        11 => "ntfs_filesystem",
+        12 => "qdos",
+        13 => "acorn_risCOS",
+        255 => "unknown",
+        _ => "unassigned",
     }
 }
 
@@ -11567,5 +11733,103 @@ mod tests {
             false
         );
         assert!(metadata["headers"][0]["first_block"]["compressed_data"].is_null());
+    }
+
+    #[test]
+    fn zip_and_gzip_expose_comparable_deflate_effort_and_os_metadata() {
+        let mut zip_deflate_max = ZIP.to_vec();
+        zip_deflate_max.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        zip_deflate_max.extend_from_slice(&0x0002u16.to_le_bytes()); // flags: bits 1-2 = 1 (maximum)
+        zip_deflate_max.extend_from_slice(&8u16.to_le_bytes()); // compression method = 8 (Deflate)
+        zip_deflate_max.extend_from_slice(&[0u8; 20]); // time, date, crc, sizes, lengths
+
+        let mut zip_aes_fast = ZIP.to_vec();
+        zip_aes_fast.extend_from_slice(&51u16.to_le_bytes());
+        zip_aes_fast.extend_from_slice(&0x0005u16.to_le_bytes()); // encrypted (bit 0) + bits 1-2 = 2 (fast)
+        zip_aes_fast.extend_from_slice(&99u16.to_le_bytes()); // WinZip AES
+        zip_aes_fast.extend_from_slice(&[0u8; 16]);
+        zip_aes_fast.extend_from_slice(&0u16.to_le_bytes()); // filename len = 0
+        zip_aes_fast.extend_from_slice(&11u16.to_le_bytes()); // extra len = 11
+        zip_aes_fast.extend_from_slice(&0x9901u16.to_le_bytes());
+        zip_aes_fast.extend_from_slice(&7u16.to_le_bytes());
+        zip_aes_fast.extend_from_slice(&2u16.to_le_bytes()); // AE-2
+        zip_aes_fast.extend_from_slice(b"AE");
+        zip_aes_fast.push(3); // AES-256
+        zip_aes_fast.extend_from_slice(&8u16.to_le_bytes()); // actual method = 8 (Deflate)
+
+        let mut zip_masked = zip_deflate_max.clone();
+        zip_masked[6..8].copy_from_slice(&0x2002u16.to_le_bytes());
+
+        let gzip_max = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03".to_vec();
+        let gzip_fast = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x04\x0b".to_vec();
+        let gzip_unrecognized = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x01\xff".to_vec();
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&zip_deflate_max);
+        combined.extend_from_slice(&zip_aes_fast);
+        combined.extend_from_slice(&zip_masked);
+        combined.extend_from_slice(&gzip_max);
+        combined.extend_from_slice(&gzip_fast);
+        combined.extend_from_slice(&gzip_unrecognized);
+
+        let metadata = serde_json::to_value(parse(&combined)).unwrap();
+        let headers = metadata["headers"].as_array().unwrap();
+        assert_eq!(headers.len(), 6);
+
+        assert_eq!(headers[0]["format"], "zip");
+        assert_eq!(headers[0]["effective_compression_method"], 8);
+        assert_eq!(
+            headers[0]["effective_compression_method_source"],
+            "local_header"
+        );
+        assert_eq!(headers[0]["deflate_compression_option_bits"], 1);
+        assert_eq!(headers[0]["deflate_compression_option"], "maximum");
+        assert_eq!(headers[0]["deflate_effort_class"], "maximum");
+        assert_eq!(headers[0]["deflate_effort_status"], "resolved_local_header");
+
+        assert_eq!(headers[1]["format"], "zip");
+        assert_eq!(headers[1]["effective_compression_method"], 8);
+        assert_eq!(
+            headers[1]["effective_compression_method_source"],
+            "aes_extra_field"
+        );
+        assert_eq!(headers[1]["deflate_compression_option_bits"], 2);
+        assert_eq!(headers[1]["deflate_compression_option"], "fast");
+        assert_eq!(headers[1]["deflate_effort_class"], "fast");
+        assert_eq!(
+            headers[1]["deflate_effort_status"],
+            "resolved_via_aes_extra_field"
+        );
+
+        assert_eq!(headers[2]["format"], "zip");
+        assert!(headers[2]["effective_compression_method"].is_null());
+        assert!(headers[2]["deflate_effort_class"].is_null());
+        assert_eq!(headers[2]["deflate_effort_status"], "masked_local_metadata");
+
+        assert_eq!(headers[3]["format"], "gzip");
+        assert_eq!(
+            headers[3]["deflate_extra_flags_meaning"],
+            "maximum_compression"
+        );
+        assert_eq!(headers[3]["deflate_effort_class"], "maximum");
+        assert_eq!(headers[3]["deflate_effort_status"], "resolved_extra_flags");
+        assert_eq!(headers[3]["operating_system_name"], "unix");
+
+        assert_eq!(headers[4]["format"], "gzip");
+        assert_eq!(
+            headers[4]["deflate_extra_flags_meaning"],
+            "fastest_algorithm"
+        );
+        assert_eq!(headers[4]["deflate_effort_class"], "fast");
+        assert_eq!(headers[4]["operating_system_name"], "ntfs_filesystem");
+
+        assert_eq!(headers[5]["format"], "gzip");
+        assert_eq!(headers[5]["deflate_extra_flags_meaning"], "unrecognized");
+        assert!(headers[5]["deflate_effort_class"].is_null());
+        assert_eq!(
+            headers[5]["deflate_effort_status"],
+            "unrecognized_extra_flags"
+        );
+        assert_eq!(headers[5]["operating_system_name"], "unknown");
     }
 }
