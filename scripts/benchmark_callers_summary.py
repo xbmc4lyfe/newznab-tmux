@@ -36,7 +36,8 @@ REMAINING_MODULES = {
         "rar5_quick_open": ("rar-quick-open-match", "rar-quick-open-conflict", "rar-quick-open-uncommon-retention", "rar-quick-open-uncommon-corrupt")},
 }
 REMAINING_STRATA = {kind: {name: dict(module=module, category="common" if index < 2 else "uncommon",
-    comparison_scope="bounded-reference-shared-projection-v1" if kind == "metadata-modules" else
+    comparison_scope="bounded-reference-date-clock-projection-v2" if kind == "metadata-modules" and module == "article_dates" else
+    "bounded-reference-shared-projection-v1" if kind == "metadata-modules" else
     "bounded independent PHP reference versus shared metadata projection; no full-parser equivalence or production PHP speedup")
     for module, names in modules.items() for index, name in enumerate(names)} for kind, modules in REMAINING_MODULES.items()}
 CALLER_STRATA.update({kind: {name: row['category'] for name, row in strata.items()} for kind, strata in REMAINING_STRATA.items()})

@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import json
 import math
+import subprocess
 from pathlib import Path
 import unittest
 
@@ -51,7 +52,7 @@ def marginal(n, q, value):
 def fixture(kind, samples=3, mode='screen'):
     scope = ('bounded-reference-shared-projection-v1' if kind == 'metadata-modules' else
              'bounded independent PHP reference versus shared metadata projection; no full-parser equivalence or production PHP speedup')
-    declarations = {name: dict(module=key, category='common' if i < 2 else 'uncommon', comparison_scope=scope)
+    declarations = {name: dict(module=key, category='common' if i < 2 else 'uncommon', comparison_scope=('bounded-reference-date-clock-projection-v2' if kind == 'metadata-modules' and key == 'article_dates' else scope))
                     for key, names in MODULES[kind].items() for i, name in enumerate(names)}
     hashes = dict.fromkeys(SOURCES, 'a' * 64)
     snapshot = dict(root='/private/raw', files={WRAPPER: 'a' * 64})
@@ -93,6 +94,32 @@ def fixture(kind, samples=3, mode='screen'):
 
 class RemainingEvidenceTest(unittest.TestCase):
     export = OLD.CallerSummaryExportTest.export
+
+    def test_actual_php_metadata_declarations_match_the_exporter_contract(self):
+        result = subprocess.run(
+            ['php', '-r', 'require "tests/Fixtures/RemainingMetadataBenchmarkFixtures.php"; '
+             'echo json_encode(Tests\\Fixtures\\RemainingMetadataBenchmarkFixtures::strata(), JSON_THROW_ON_ERROR);'],
+            cwd=ROOT, check=True, capture_output=True, text=True, timeout=10)
+        actual = json.loads(result.stdout)
+        self.assertEqual(actual, EXPORT.REMAINING_STRATA['metadata-modules'])
+        records = fixture('metadata-modules')
+        self.assertEqual(actual, records[0]['strata'])
+        records[0]['strata'] = actual
+        summary = self.export('metadata-modules', records)
+        self.assertEqual(summary['status'], 'measured')
+        self.assertEqual(len(summary['rows']), 24)
+
+    def test_stale_date_scope_is_rejected_without_changing_other_module_scopes(self):
+        records = fixture('metadata-modules')
+        for name, declaration in records[0]['strata'].items():
+            if declaration['module'] == 'article_dates':
+                self.assertEqual(declaration['comparison_scope'], 'bounded-reference-date-clock-projection-v2')
+                declaration['comparison_scope'] = 'bounded-reference-shared-projection-v1'
+            else:
+                self.assertEqual(declaration['comparison_scope'], 'bounded-reference-shared-projection-v1')
+        summary = self.export('metadata-modules', records)
+        self.assertEqual(summary['status'], 'invalid')
+        self.assertTrue(all(not row['qualification_gate_passed'] and not row['eligible'] for row in summary['rows']))
 
     def test_both_fixed_families_export_24_projection_rows_privately(self):
         for kind in MODULES:
