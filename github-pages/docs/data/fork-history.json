@@ -2,8 +2,8 @@
   "snapshot": {
     "repository": "xbmc4lyfe/newznab-tmux",
     "head_ref": "master",
-    "head_sha": "5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97",
-    "head_url": "https://github.com/xbmc4lyfe/newznab-tmux/commit/5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97",
+    "head_sha": "26873006789074c436572e7f93cfbfeb03d10398",
+    "head_url": "https://github.com/xbmc4lyfe/newznab-tmux/commit/26873006789074c436572e7f93cfbfeb03d10398",
     "upstream_repository": "NNTmux/newznab-tmux",
     "upstream_ref": "master",
     "upstream_sha": "2fef08b34e4e6cced23333bd186b28a09e94ea2f",
@@ -11,10 +11,10 @@
     "common_ancestor_sha": "ef0e8c363f13cca5fb62506db64ccbbb329fde84",
     "merge_base_url": "https://github.com/xbmc4lyfe/newznab-tmux/commit/ef0e8c363f13cca5fb62506db64ccbbb329fde84",
     "upstream_only_count": 13,
-    "fork_only_count": 209,
+    "fork_only_count": 210,
     "upstream_only_compare_url": "https://github.com/NNTmux/newznab-tmux/compare/ef0e8c363f13cca5fb62506db64ccbbb329fde84...2fef08b34e4e6cced23333bd186b28a09e94ea2f",
-    "fork_only_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/ef0e8c363f13cca5fb62506db64ccbbb329fde84...5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97",
-    "fork_vs_upstream_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/2fef08b34e4e6cced23333bd186b28a09e94ea2f...5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97",
+    "fork_only_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/ef0e8c363f13cca5fb62506db64ccbbb329fde84...26873006789074c436572e7f93cfbfeb03d10398",
+    "fork_vs_upstream_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/2fef08b34e4e6cced23333bd186b28a09e94ea2f...26873006789074c436572e7f93cfbfeb03d10398",
     "captured_on": "2026-10-16"
   },
   "method": "Refs and PRs queried from GitHub at capture; commit reachability computed with git rev-list. fork-only means reachable from fork/master and not from the captured upstream/master ref. PR category buckets are editorial indexes, not exhaustive explanations of every changed line.",
@@ -22,7 +22,7 @@
     {
       "path": "README.md",
       "lines": "1-20,24-108,114-120",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97/README.md",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/README.md",
       "line_ranges": [
         [
           1,
@@ -41,7 +41,7 @@
     {
       "path": "docker/Makefile",
       "lines": "45-107",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97/docker/Makefile",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/docker/Makefile",
       "line_ranges": [
         [
           45,
@@ -52,7 +52,7 @@
     {
       "path": "docker/bin/deploy-app",
       "lines": "15-109",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97/docker/bin/deploy-app",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/docker/bin/deploy-app",
       "line_ranges": [
         [
           15,
@@ -63,7 +63,7 @@
     {
       "path": "app/Console/Commands/TmuxDrain.php",
       "lines": "20-26,106-145,174-206",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97/app/Console/Commands/TmuxDrain.php",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/app/Console/Commands/TmuxDrain.php",
       "line_ranges": [
         [
           20,
@@ -82,7 +82,7 @@
     {
       "path": "app/Services/Releases/Verification/VerifiedReleasePublisher.php",
       "lines": "28-69,100-140",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97/app/Services/Releases/Verification/VerifiedReleasePublisher.php",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/app/Services/Releases/Verification/VerifiedReleasePublisher.php",
       "line_ranges": [
         [
           28,
@@ -97,7 +97,7 @@
     {
       "path": "app/Services/Releases/Verification/PayloadVerifier.php",
       "lines": "28-63,67-100",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97/app/Services/Releases/Verification/PayloadVerifier.php",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/app/Services/Releases/Verification/PayloadVerifier.php",
       "line_ranges": [
         [
           28,
@@ -111,46 +111,46 @@
     },
     {
       "path": "app/Services/NameFixing/PredbMatchSelector.php",
-      "lines": "9-11,65-80,187-220",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97/app/Services/NameFixing/PredbMatchSelector.php",
+      "lines": "9-12,67-82,208-230",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/app/Services/NameFixing/PredbMatchSelector.php",
       "line_ranges": [
         [
           9,
-          11
+          12
         ],
         [
-          65,
-          80
+          67,
+          82
         ],
         [
-          187,
-          220
+          208,
+          230
         ]
       ]
     },
     {
       "path": "app/Services/NameFixing/NameFixingService.php",
-      "lines": "502-535,545-550,633-671",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97/app/Services/NameFixing/NameFixingService.php",
+      "lines": "587-656,665-671,753-792",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/app/Services/NameFixing/NameFixingService.php",
       "line_ranges": [
         [
-          502,
-          535
+          587,
+          656
         ],
         [
-          545,
-          550
-        ],
-        [
-          633,
+          665,
           671
+        ],
+        [
+          753,
+          792
         ]
       ]
     },
     {
       "path": ".github/workflows/benchmark-pages.yml",
       "lines": "1-103",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97/.github/workflows/benchmark-pages.yml",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/.github/workflows/benchmark-pages.yml",
       "line_ranges": [
         [
           1,
@@ -161,7 +161,7 @@
     {
       "path": "scripts/benchmark-pages.py",
       "lines": "90-147,150-180",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97/scripts/benchmark-pages.py",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/scripts/benchmark-pages.py",
       "line_ranges": [
         [
           90,
@@ -962,7 +962,7 @@
         "tests/Unit/Services/NNTPServiceConnectFailureTest.php"
       ],
       "primary_group": "NNTP, IRC, and provider reliability",
-      "author_summary": "At 05:20 and 05:25 UTC on 2026-10-11 Newshosting answered a burst of worker logins with Authentication rejected (11 that day; this stack held 58 connections against a cap of 73, so the account was probably at its limit through other…"
+      "author_summary": "At 05:20 and 05:25 UTC on 2026-10-11 Newshosting answered a burst of worker logins with Authentication rejected (11 that day; this stack held 58 connections against a cap of 73, so the account was probably at its limit through other\u2026"
     },
     {
       "number": 31,
@@ -995,7 +995,7 @@
         "tests/Unit/DockerDeployGuardTest.php"
       ],
       "primary_group": "Deployment, setup, and runtime operations",
-      "author_summary": "Follow-up to the deploy guard (27), from Codex's last review: when another session edits the shared checkout between build and up, make deploy still recreated the stack from a stale image. deploy-guard verify now compares the current…"
+      "author_summary": "Follow-up to the deploy guard (27), from Codex's last review: when another session edits the shared checkout between build and up, make deploy still recreated the stack from a stale image. deploy-guard verify now compares the current\u2026"
     },
     {
       "number": 33,
@@ -1032,7 +1032,7 @@
         "tests/Feature/TmuxFixNamesScheduleTest.php"
       ],
       "primary_group": "Release naming, PreDB, and discovery",
-      "author_summary": "PreDB feeds only help name releases once their titles are matched against the releases we already have. multiprocessing:fixrelnames predbft does that: it takes unsearched PreDB titles (oldest first), looks for releases whose name or…"
+      "author_summary": "PreDB feeds only help name releases once their titles are matched against the releases we already have. multiprocessing:fixrelnames predbft does that: it takes unsearched PreDB titles (oldest first), looks for releases whose name or\u2026"
     },
     {
       "number": 35,
@@ -1246,7 +1246,7 @@
         "tests/Feature/Console/TmuxHealthCheckCommandTest.php"
       ],
       "primary_group": "Scheduling, database correctness, and other application work",
-      "author_summary": "Found in the health window after the 43 deploy: with the database saturated, tmux:health-check logged monitorheartbeatstale three times in a row at 08:44–08:46 UTC and twelve times between 10:25 and 10:45, close to the five consecutive…"
+      "author_summary": "Found in the health window after the 43 deploy: with the database saturated, tmux:health-check logged monitorheartbeatstale three times in a row at 08:44\u201308:46 UTC and twelve times between 10:25 and 10:45, close to the five consecutive\u2026"
     },
     {
       "number": 48,
@@ -2538,7 +2538,7 @@
         "tests/Unit/ReleaseSearchFiltersTest.php"
       ],
       "primary_group": "Release naming, PreDB, and discovery",
-      "author_summary": "Follow up on 86: carry the exact poster value in the link so browsing remains stable if the source release disappears, compare it directly in SQL without requiring Manticore or the optional MySQL fallback, and escape poster punctuation…"
+      "author_summary": "Follow up on 86: carry the exact poster value in the link so browsing remains stable if the source release disappears, compare it directly in SQL without requiring Manticore or the optional MySQL fallback, and escape poster punctuation\u2026"
     },
     {
       "number": 89,
@@ -2824,7 +2824,7 @@
         "docs/deployment.md"
       ],
       "primary_group": "Deployment, setup, and runtime operations",
-      "author_summary": "The README inherited a long upstream installation guide and did not explain this fork’s recent work or its local Compose stack."
+      "author_summary": "The README inherited a long upstream installation guide and did not explain this fork\u2019s recent work or its local Compose stack."
     },
     {
       "number": 101,
@@ -3536,7 +3536,7 @@
         "tests/Unit/YencServiceTest.php"
       ],
       "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
-      "author_summary": "Additional processing can download an ambiguous archive’s first article while mapping PAR2 evidence, then fetch that same article again when reading the archive."
+      "author_summary": "Additional processing can download an ambiguous archive\u2019s first article while mapping PAR2 evidence, then fetch that same article again when reading the archive."
     },
     {
       "number": 136,
@@ -4036,7 +4036,7 @@
         "tests/Integration/VerificationReadyQueueMariaDbTest.php"
       ],
       "primary_group": "Scheduling, database correctness, and other application work",
-      "author_summary": "Candidate preparation spent 6.7–12.9 seconds updating 5,000 metadata classifications while producing few ready candidates."
+      "author_summary": "Candidate preparation spent 6.7\u201312.9 seconds updating 5,000 metadata classifications while producing few ready candidates."
     },
     {
       "number": 155,
@@ -4203,7 +4203,7 @@
         "tests/Unit/test_benchmark_cpu.py"
       ],
       "primary_group": "Rust components, benchmarking, and engineering evidence",
-      "author_summary": "CPU benchmark captures now use the existing Rust crate’s nntmux-cpu-snapshot executable."
+      "author_summary": "CPU benchmark captures now use the existing Rust crate\u2019s nntmux-cpu-snapshot executable."
     },
     {
       "number": 160,
@@ -4728,6 +4728,115 @@
       "author_summary": "The existing CPP/PHP Rust summary helpers can print the wrong last digit at a dyadic rounding tie and treat denied input parents as missing."
     },
     {
+      "number": 180,
+      "title": "Preserve literal filename evidence and require complete fresh PreDB matches",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/180",
+      "merged_at": "2026-10-16T07:47:25Z",
+      "merge_sha": "26873006789074c436572e7f93cfbfeb03d10398",
+      "categories": [
+        "database, migrations, and storage performance",
+        "release identification, naming, PreDB, and search"
+      ],
+      "paths": [
+        "app/Console/Commands/PredbIdentityRebuildCommand.php",
+        "app/Facades/Search.php",
+        "app/Services/AdditionalProcessing/ReleaseFileManager.php",
+        "app/Services/IRCScraper.php",
+        "app/Services/NameFixing/Data/FilenamePass.php",
+        "app/Services/NameFixing/DonorMatchSelector.php",
+        "app/Services/NameFixing/FileNameCleaner.php",
+        "app/Services/NameFixing/FilePrioritizer.php",
+        "app/Services/NameFixing/NameFixingQueryService.php",
+        "app/Services/NameFixing/NameFixingService.php",
+        "app/Services/NameFixing/NzbSplitUnwrapper.php",
+        "app/Services/NameFixing/OriginalFilenameEvidence.php",
+        "app/Services/NameFixing/PredbMatchSelector.php",
+        "app/Services/NameFixing/ReleaseUpdateService.php",
+        "app/Services/Predb/Feeds/PredbFeedImporter.php",
+        "app/Services/Predb/PredbIdentityKeys.php",
+        "app/Services/Predb/PredbIdentityLookup.php",
+        "app/Services/Predb/PredbIdentityPolicy.php",
+        "app/Services/Predb/PredbIdentityProjector.php",
+        "app/Services/Predb/PredbIdentityRebuild.php",
+        "app/Services/Predb/PredbIdentitySchema.php",
+        "app/Services/Predb/PredbIdentitySchemaAttestation.php",
+        "app/Services/Predb/PredbIdentityWriter.php",
+        "app/Services/Search/Contracts/PredbFilenameCandidateLookup.php",
+        "app/Services/Search/Drivers/ElasticSearchDriver.php",
+        "app/Services/Search/Drivers/ManticoreSearchDriver.php",
+        "app/Services/Search/SearchService.php",
+        "app/Support/PredbSearchDocument.php",
+        "app/Traits/DetectsHashedNames.php",
+        "app/Traits/OwnsPredbIdentityTransactions.php",
+        "database/migrations/2026_10_15_150000_create_predb_identity_projection.php",
+        "tests/Feature/AdditionalProcessingMediaIdentityTest.php",
+        "tests/Feature/AdditionalProcessingReleaseFileManagerTest.php",
+        "tests/Feature/CompleteTitleSuffixTest.php",
+        "tests/Feature/OriginalFilenameAcceptanceTest.php",
+        "tests/Feature/PredbAuthoritativeIdentityTest.php",
+        "tests/Feature/PredbFilenameBackendCompletenessTest.php",
+        "tests/Feature/PredbFilenameCompletionCallbackFailureTest.php",
+        "tests/Feature/PredbFilenameCompletionCommitFailureTest.php",
+        "tests/Feature/PredbFilenameCompletionRetryTest.php",
+        "tests/Feature/PredbFilenameCompletionRollbackNewTransactionTest.php",
+        "tests/Feature/PredbFilenameCompletionRollbackReplayTest.php",
+        "tests/Feature/PredbFilenamePipePolicyDriftTest.php",
+        "tests/Feature/PredbFilenamePipeRejectionRegressionTest.php",
+        "tests/Feature/PredbFilenameRawProjectionTest.php",
+        "tests/Feature/PredbFilenameRetryCompletionTest.php",
+        "tests/Feature/PredbFilenameRowsTest.php",
+        "tests/Feature/PredbFilenameSourceDiagnosticTest.php",
+        "tests/Feature/PredbFilenameSqlAuthorityTest.php",
+        "tests/Feature/PredbFulltextCompletionPagingBoundaryTest.php",
+        "tests/Feature/PredbFulltextCompletionTest.php",
+        "tests/Feature/PredbIdentityLookupBatchTest.php",
+        "tests/Feature/PredbIdentityLookupTest.php",
+        "tests/Feature/PredbIdentityOwnerProjectionTest.php",
+        "tests/Feature/PredbIdentityProjectionSchemaTest.php",
+        "tests/Feature/PredbIdentityRebuildTest.php",
+        "tests/Feature/PredbIdentitySchemaAttestationTest.php",
+        "tests/Feature/PredbMatchingTest.php",
+        "tests/Feature/PredbUnicodeIdentityTest.php",
+        "tests/Feature/ReleaseUpdateCommitFailureTest.php",
+        "tests/Feature/ReleaseUpdateFilenameGuardTest.php",
+        "tests/Feature/ReleaseUpdateFilenameOrderingTest.php",
+        "tests/Feature/ReleaseUpdateParentSnapshotTest.php",
+        "tests/Feature/VerifiedReleasePasswordMetadataTest.php",
+        "tests/Unit/LegacyIrcIdentityTest.php",
+        "tests/Unit/NzbSplitUnwrapperTest.php",
+        "tests/Unit/Predb/ApibayCatalogueDateTest.php",
+        "tests/Unit/Predb/OpentrackersRelayImportTest.php",
+        "tests/Unit/Predb/PredbFeedImporterCollationIdentityTest.php",
+        "tests/Unit/Predb/PredbFeedImporterIdentityTest.php",
+        "tests/Unit/Predb/PredbIdentityEngineGuardTest.php",
+        "tests/Unit/Predb/PredbIdentityKeysTest.php",
+        "tests/Unit/Predb/PredbIdentityProjectorSqlTest.php",
+        "tests/Unit/Predb/PredbIdentityRebuildCommandTest.php",
+        "tests/Unit/Predb/PredbIdentitySqlDefaultTest.php",
+        "tests/Unit/Predb/PredbIdentityTriggerSpecificationTest.php",
+        "tests/Unit/Predb/PredbOvhForeignPreImportTest.php",
+        "tests/Unit/PredbFilenameManticoreWireApiTest.php",
+        "tests/Unit/PredbSearchDriverTest.php",
+        "tests/Unit/Services/NameFixing/CertifiedPredbSqlFixture.php",
+        "tests/Unit/Services/NameFixing/CertifiedPredbSqlFixtureTest.php",
+        "tests/Unit/Services/NameFixing/CompleteTitleSuffixAuthorityTest.php",
+        "tests/Unit/Services/NameFixing/FilenamePassTest.php",
+        "tests/Unit/Services/NameFixing/GenericPredbAttachmentTest.php",
+        "tests/Unit/Services/NameFixing/NameFixingPredbSearchTextTest.php",
+        "tests/Unit/Services/NameFixing/OriginalFilenameNominationTest.php",
+        "tests/Unit/Services/NameFixing/OriginalFilenamePipeClassificationTest.php",
+        "tests/Unit/Services/NameFixing/OriginalFilenameSuffixCompatibilityTest.php",
+        "tests/Unit/Services/NameFixing/PredbFeedPublicationFailureTest.php",
+        "tests/Unit/Services/NameFixing/PredbIdentityMixedCaseShadowTest.php",
+        "tests/Unit/Services/NameFixing/PredbIdentityPolicyTest.php",
+        "tests/Unit/Services/NameFixing/PredbIdentityRebuildCustodyTest.php",
+        "tests/Unit/Services/NameFixing/PredbIdentityWriterIdentifierCaseTest.php",
+        "tests/Unit/Services/NameFixing/PredbIdentityWriterRuntimeControlsTest.php"
+      ],
+      "primary_group": "Release naming, PreDB, and discovery",
+      "author_summary": "Require complete certified SQL identity evidence and whole-pass lookup completion before linking releases to PreDB filenames."
+    },
+    {
       "number": 181,
       "title": "Honor article Pulse opt-in and preserve fixture cleanup failures",
       "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/181",
@@ -4940,7 +5049,7 @@
         "tests/Unit/test_benchmark_summary_export.py"
       ],
       "primary_group": "Rust components, benchmarking, and engineering evidence",
-      "author_summary": "The CPU benchmark’s old LCG sampled indices modulo 1,000 with a forced modulo-eight population in every bootstrap replicate."
+      "author_summary": "The CPU benchmark\u2019s old LCG sampled indices modulo 1,000 with a forced modulo-eight population in every bootstrap replicate."
     },
     {
       "number": 191,
@@ -5104,7 +5213,7 @@
         "AGENTS.md"
       ],
       "primary_group": "Deployment, setup, and runtime operations",
-      "author_summary": "The rollout guide described a 15–16 minute cadence that did not account for polling, build or drain latency, and did not define how to substantiate deployment speed."
+      "author_summary": "The rollout guide described a 15\u201316 minute cadence that did not account for polling, build or drain latency, and did not define how to substantiate deployment speed."
     },
     {
       "number": 198,
@@ -5170,7 +5279,7 @@
         "tests/Unit/test_clippy_toolchain.py"
       ],
       "primary_group": "Rust components, benchmarking, and engineering evidence",
-      "author_summary": "Clippy setup unconditionally installed Rust into the runner’s shared Rustup store, failing when that store was read-only."
+      "author_summary": "Clippy setup unconditionally installed Rust into the runner\u2019s shared Rustup store, failing when that store was read-only."
     },
     {
       "number": 201,
