@@ -21,16 +21,21 @@ class DeployMigrationOrderTest extends TestCase
             copy(__DIR__.'/../../docker/bin/'.$script, $this->directory.'/docker/bin/'.$script);
             chmod($this->directory.'/docker/bin/'.$script, 0755);
         }
-        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n");
+        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n/recreated\n");
         file_put_contents($this->directory.'/app.txt', "one\n");
         file_put_contents($this->directory.'/bin/docker', <<<'SH'
 #!/bin/sh
 printf 'COMPOSE_FILE=%s %s\n' "$COMPOSE_FILE" "$*" >> "$NNTMUX_DEPLOY_EVENTS"
 case "$*" in
     *' config --format json'*) echo "${NNTMUX_CONFIG_ID:-fixture-config}" ;;
-    *'image inspect --format'*) echo sha256:fixture ;;
+    *'image inspect --format'*) echo "${NNTMUX_IMAGE_ID:-sha256:fixture}" ;;
     *'image inspect'*) exit 0 ;;
-    *'inspect --format {{.Image}}'*) echo sha256:fixture ;;
+    *'inspect --format {{.Image}}'*)
+        if [ -f "$NNTMUX_REPO/recreated" ]; then
+            echo "${NNTMUX_IMAGE_ID:-sha256:fixture}"
+        else
+            echo "${NNTMUX_CONTAINER_IMAGE_ID:-${NNTMUX_IMAGE_ID:-sha256:fixture}}"
+        fi ;;
     *'inspect --format {{.State.Status}}'*) echo "running ${NNTMUX_HEALTH_STATUS:-healthy}" ;;
     *' ps -a -q '*) [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] || echo fixture-container ;;
     *' ps -q '*) [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo fixture-container ;;
@@ -54,7 +59,9 @@ case "$*" in
     *' stop web scheduler indexer'*)
         if [ "${NNTMUX_STALE_STOP:-0}" = 1 ]; then echo two > "$NNTMUX_REPO/app.txt"; fi ;;
     *'artisan migrate'*) [ "${NNTMUX_MIGRATION_FAIL:-0}" != 1 ] || exit 42 ;;
-    *' up -d'*) [ "${NNTMUX_HEALTH_FAIL:-0}" != 1 ] || exit 44 ;;
+    *' up -d'*)
+        [ "${NNTMUX_HEALTH_FAIL:-0}" != 1 ] || exit 44
+        case "$*" in *' --force-recreate '*) : > "$NNTMUX_REPO/recreated" ;; esac ;;
 esac
 exit 0
 SH);
@@ -77,7 +84,7 @@ SH);
     {
         $this->deploy()->mustRun();
         $events = $this->events();
-        $steps = ['build --target selfhosted', 'scheduler.py drain --timeout=1800', 'artisan tmux:drain --timeout=90', ' stop --timeout 1920 horizon', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --wait --wait-timeout 240 web horizon scheduler indexer'];
+        $steps = ['build --target selfhosted', 'scheduler.py drain --timeout=1800', 'artisan tmux:drain --timeout=90', ' stop --timeout 1920 horizon', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer'];
         $previous = -1;
         foreach ($steps as $step) {
             $position = strpos($events, $step);
@@ -133,7 +140,18 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->deploy(['NNTMUX_SERVICE_MISSING' => '1'])->mustRun();
         $this->assertStringContainsString('artisan migrate', $this->events());
-        $this->assertStringContainsString(' up -d --no-deps --wait', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait', $this->events());
+    }
+
+    public function test_stale_container_image_id_forces_recreation_so_subsequent_unchanged_deploy_skips(): void
+    {
+        $env = ['NNTMUX_IMAGE_ID' => 'sha256:new-index', 'NNTMUX_CONTAINER_IMAGE_ID' => 'sha256:old-index'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $env)->mustRun();
+        $this->assertFileExists($this->directory.'/recreated');
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $env)->mustRun();
+        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString(' up -d', $this->events());
     }
 
     public function test_failed_drain_leaves_writers_running_and_never_migrates_or_stamps(): void
@@ -262,7 +280,7 @@ SH);
         $this->make(['up'])->mustRun();
         $this->assertStringContainsString('artisan tmux:drain --timeout=90', $this->events());
         $this->assertStringContainsString('artisan migrate --force --no-interaction', $this->events());
-        $this->assertStringContainsString(' up -d --no-deps --wait', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait', $this->events());
     }
 
     public function test_up_cannot_bypass_a_failed_migration_for_existing_stopped_containers(): void
@@ -292,7 +310,7 @@ SH);
         }
         $this->assertStringContainsString(' config --format json', $this->events());
         $this->assertStringContainsString('artisan tmux:drain --timeout=90', $this->events());
-        $this->assertStringContainsString(' up -d --no-deps --wait', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait', $this->events());
     }
 
     public function test_legacy_dc_overrides_are_used_for_every_compose_call_without_shell_evaluation(): void

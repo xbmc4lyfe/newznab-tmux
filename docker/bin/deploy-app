@@ -106,4 +106,4 @@ scheduler_drained=0
 verify
 compose run --rm --no-deps web php artisan migrate --force --no-interaction
 verify
-compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" web horizon scheduler indexer
+compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" web horizon scheduler indexer
