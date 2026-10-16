@@ -124,6 +124,8 @@ class ReleaseUpdateService
      */
     public int $checked = 0;
 
+    private bool $episodeNamingDeferredByArchiveProof = false;
+
     public function __construct(
         ?CategorizationService $category = null,
         ?FileNameCleaner $fileNameCleaner = null,
@@ -163,6 +165,7 @@ class ReleaseUpdateService
         ?string $filenameEvidence = null
     ): void {
         $this->clearIdentityAttestation();
+        $this->resetArchiveNamingDeferral();
         $this->matched = $this->done = false;
         $preId = $preId ?? 0;
         if (is_array($release)) {
@@ -553,6 +556,19 @@ class ReleaseUpdateService
                 ->whereRaw('(SELECT COUNT(*) FROM par_file_hashes pfh WHERE pfh.releases_id = releases.id) = ?', [(int) $parts[2]]);
         }
         $cast = DB::connection()->getDriverName() === 'sqlite' ? 'BLOB' : 'BINARY';
+        $attributes = $release instanceof Release ? $release->getAttributes() : (array) $release;
+        if (array_key_exists('observed_archive_source_digest', $attributes)) {
+            $digest = $attributes['observed_archive_source_digest'];
+            if (! is_string($digest) || preg_match('/^[a-f0-9]{64}$/D', $digest) !== 1) {
+                return $query->whereRaw('1 = 0');
+            }
+            $query->whereExists(static function (\Illuminate\Database\Query\Builder $evidence) use ($digest, $cast): void {
+                $evidence->selectRaw('1')->from('release_archive_naming_evidence')
+                    ->whereColumn('release_archive_naming_evidence.releases_id', 'releases.id')
+                    ->whereRaw("CAST(release_archive_naming_evidence.release_guid AS {$cast}) = CAST(releases.guid AS {$cast})")
+                    ->where('release_archive_naming_evidence.source_sha256', $digest);
+            });
+        }
         foreach (['guid', 'name', 'searchname'] as $column) {
             if (($release->{$column} ?? null) === null) {
                 $query->whereNull($column);
@@ -677,8 +693,16 @@ class ReleaseUpdateService
             $newTitle = $canonicalTitle ?? $newTitle;
             $actualRelease = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
             if ($actualRelease === null
-                || ($preId > 0 && $this->renamesSeasonPackToEpisode((string) $actualRelease->searchname, $newTitle))
-                || ! $this->allowsArchiveNamingLocked($actualRelease, $newTitle, $filenameEvidence)) {
+                || ($preId > 0 && $this->renamesSeasonPackToEpisode((string) $actualRelease->searchname, $newTitle))) {
+                return false;
+            }
+            if (! $this->allowsArchiveNamingLocked($actualRelease, $newTitle, $filenameEvidence)) {
+                // Only an otherwise current canonical filename attempt may be
+                // retried after finalization supplies its missing archive proof.
+                $this->episodeNamingDeferredByArchiveProof = $preId > 0 && $filenameEvidence !== null
+                    && SeasonPackDetector::isEpisodeName($newTitle) && $expectedSnapshot !== null
+                    && $this->predbSnapshotQuery($expectedSnapshot)->exists();
+
                 return false;
             }
             $completedSnapshot = $this->completedReleaseSnapshot($actualRelease, $newTitle);
@@ -880,7 +904,13 @@ class ReleaseUpdateService
         $accepted = $this->withPredbIdentity($predbId, $expectedTitle ?? (string) $release->searchname, $filenameEvidence, function (string $canonicalTitle) use ($release, $predbId, $filenameEvidence, $attempt, &$attached): bool {
             $identity = $this->releaseSnapshotQuery($release);
             $before = (clone $identity)->lockForUpdate()->first();
-            if ($before === null || ! $this->allowsArchiveNamingLocked($before, $canonicalTitle, $filenameEvidence)) {
+            if ($before === null) {
+                return false;
+            }
+            if (! $this->allowsArchiveNamingLocked($before, $canonicalTitle, $filenameEvidence)) {
+                $this->episodeNamingDeferredByArchiveProof = $filenameEvidence !== null
+                    && SeasonPackDetector::isEpisodeName($canonicalTitle);
+
                 return false;
             }
             $alreadyLinked = (clone $identity)->where('predb_id', $predbId)->exists();
@@ -1047,7 +1077,18 @@ class ReleaseUpdateService
     public function reset(): void
     {
         $this->clearIdentityAttestation();
+        $this->resetArchiveNamingDeferral();
         $this->done = $this->matched = false;
+    }
+
+    public function resetArchiveNamingDeferral(): void
+    {
+        $this->episodeNamingDeferredByArchiveProof = false;
+    }
+
+    public function wasEpisodeNamingDeferredByArchiveProof(): bool
+    {
+        return $this->episodeNamingDeferredByArchiveProof;
     }
 
     /**

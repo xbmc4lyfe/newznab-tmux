@@ -87,6 +87,9 @@ class ReleaseProcessingContext
     /** @var array<string, true> Exact filenames observed in this attempt, including duplicate inventory. */
     public array $archiveNamingWitnesses = [];
 
+    /** @var array<string, bool> Attempted witness filenames; true only for archive-proof deferral. */
+    public array $archiveFilenameNamingAttempts = [];
+
     /** Actual observed filenames were omitted due to invalid encoding/size or admission caps. */
     public bool $namingWitnessesOmitted = false;
 
@@ -372,6 +375,7 @@ class ReleaseProcessingContext
         $this->archiveNameEvidenceIncomplete = false;
         $this->archiveFileNames = [];
         $this->archiveNamingWitnesses = [];
+        $this->archiveFilenameNamingAttempts = [];
         $this->namingWitnessBytes = 0;
         $this->namingWitnessesOmitted = false;
         $this->nzbSourceDigest = null;
@@ -425,6 +429,14 @@ class ReleaseProcessingContext
             if (! in_array($name, $this->archiveFileNames, true)) {
                 $this->archiveFileNames[] = $name;
             }
+        }
+    }
+
+    public function rememberArchiveFilenameNamingAttempt(string $name, bool $proofDeferred): void
+    {
+        // Reuse the witness count/byte bounds; no separate unbounded name set.
+        if (isset($this->archiveNamingWitnesses[$name])) {
+            $this->archiveFilenameNamingAttempts[$name] = $proofDeferred;
         }
     }
 

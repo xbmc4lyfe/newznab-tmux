@@ -32,12 +32,20 @@ final class NzbSourceGuard
     }
 
     /** @return SourceSnapshot|null */
-    public function snapshot(string $guid): ?array
+    public function snapshot(string $guid, bool $beginNamingInspection = false): ?array
     {
-        return DB::transaction(function () use ($guid): ?array {
+        return DB::transaction(function () use ($guid, $beginNamingInspection): ?array {
             $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
 
-            return $release === null ? null : $this->withLockedSource($release, static fn (?array $source): ?array => $source);
+            return $release === null ? null : $this->withLockedSource($release, static function (?array $source) use ($release, $beginNamingInspection): ?array {
+                if ($source !== null && $beginNamingInspection) {
+                    // First inspection must leave legacy admission before any
+                    // producer can mistake one readable file for the whole NZB.
+                    app(ReleaseArchiveNamingEvidence::class)->sourceReplacedLocked($release, $source['digest']);
+                }
+
+                return $source;
+            });
         });
     }
 

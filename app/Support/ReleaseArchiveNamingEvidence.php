@@ -48,7 +48,7 @@ final class ReleaseArchiveNamingEvidence
             $previous = $this->loadLocked($release);
             [$names, $overflow] = $this->boundedNames($filenames);
             $overflow = $overflow || $evidenceOmitted;
-            if (SeasonPackDetector::isMultiEpisodeSet($names)) {
+            if (SeasonPackDetector::hasDistinctEpisodeIdentities($names)) {
                 $scope = 'multi_episode';
             } elseif ($scope !== 'multi_episode' && ($overflow || ($scope === 'complete_single' && (! $authoritativeComplete || $names === [])))) {
                 $scope = 'incomplete';
@@ -63,7 +63,7 @@ final class ReleaseArchiveNamingEvidence
                 }
                 // Evidence from disjoint attempts must not erase a witnessed pack.
                 $observed = array_values(array_unique([...$this->decodeNames($previous->episode_files), ...$names]));
-                if (SeasonPackDetector::isMultiEpisodeSet($observed)) {
+                if (SeasonPackDetector::hasDistinctEpisodeIdentities($observed)) {
                     $scope = 'multi_episode';
                 } elseif (! $overflow && $previous->scope === 'complete_single' && in_array($scope, ['unknown', 'incomplete'], true)) {
                     if ($persist !== null) {
@@ -124,9 +124,10 @@ final class ReleaseArchiveNamingEvidence
 
             // Historical singleton listings cannot be certified retroactively.
             // Preserve legacy compatibility, but reject positively known packs.
-            return count($names) <= self::MAX_WITNESSES && ! SeasonPackDetector::isMultiEpisodeSet($names);
+            return count($names) <= self::MAX_WITNESSES && ! SeasonPackDetector::hasDistinctEpisodeIdentities($names);
         }
-        if ($evidence->scope !== 'complete_single') {
+        if ($evidence->scope !== 'complete_single'
+            || SeasonPackDetector::hasDistinctEpisodeIdentities($this->decodeNames($evidence->episode_files))) {
             return false;
         }
 

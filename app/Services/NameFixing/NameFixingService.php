@@ -1814,6 +1814,7 @@ class NameFixingService
      */
     public function matchPreDbFiles(object $release, bool $echo, bool $nameStatus, bool $show): int
     {
+        $this->updateService->resetArchiveNamingDeferral();
         $matching = 0;
 
         $files = explode('||', $release->filename ?? '');
@@ -1860,6 +1861,11 @@ class NameFixingService
     public function reset(): void
     {
         $this->updateService->reset();
+    }
+
+    public function wasEpisodeNamingDeferredByArchiveProof(): bool
+    {
+        return $this->updateService->wasEpisodeNamingDeferredByArchiveProof();
     }
 
     /** @return array{before: array{id: int, guid: string, name: ?string, searchname: ?string}, after: array{id: int, guid: string, name: ?string, searchname: ?string}}|null */

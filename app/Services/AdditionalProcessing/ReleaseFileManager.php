@@ -161,9 +161,10 @@ class ReleaseFileManager
                 $context->passwordStatus = ReleaseBrowseService::PASSWD_RAR;
             } elseif ($file['name'] !== '' && ! str_starts_with($file['name'], '.') && ! $context->defersArchiveNameChecks()) {
                 // Run PreDB filename check
-                $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($file): void {
+                $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($file, $context): void {
                     $entry->setAttribute('filename', $file['name']);
                     $this->nameFixingService->matchPreDbFiles($entry, true, true, true);
+                    $context->rememberArchiveFilenameNamingAttempt((string) $file['name'], $this->nameFixingService->wasEpisodeNamingDeferredByArchiveProof());
                 });
             }
 
@@ -327,6 +328,9 @@ class ReleaseFileManager
         $pendingReleaseFiles = array_values($context->pendingReleaseFiles);
         $pendingParHashes = array_values($context->pendingParHashes);
         $pendingFullParHashes = array_values($context->pendingFullParHashes);
+        $terminalNamingSnapshot = null;
+        $terminalNamingFiles = [];
+        $sourceDigest = $context->nzbSourceDigest;
 
         try {
             $insertedReleaseFiles = DB::transaction(function () use (
@@ -337,7 +341,11 @@ class ReleaseFileManager
                 $updateRows,
                 $processPasswords,
                 $passwordStatus,
+                &$terminalNamingSnapshot,
+                &$terminalNamingFiles,
             ): ?int {
+                $terminalNamingSnapshot = null;
+                $terminalNamingFiles = [];
                 if (! $this->ownsFullPar2Evidence($context)) {
                     return null;
                 }
@@ -412,6 +420,19 @@ class ReleaseFileManager
                     $scope, $names, $context->archiveNamingInspectionComplete && ! $context->archiveNameEvidenceIncomplete, $persist, $context->namingWitnessesOmitted)) {
                     return null;
                 }
+                if ($context->archiveNamingInspectionComplete && ! $context->archiveNameEvidenceIncomplete
+                    && ! $context->namingWitnessesOmitted && ! $context->seasonPack
+                    && ! SeasonPackDetector::hasDistinctEpisodeIdentities($names)) {
+                    $candidates = array_values(array_filter($names, static fn (string $name): bool => ($context->archiveFilenameNamingAttempts[$name] ?? false)
+                        || (! array_key_exists($name, $context->archiveFilenameNamingAttempts) && SeasonPackDetector::isEpisodeName($name))));
+                    if ($candidates !== []) {
+                        $current = DB::table('releases')->where('id', $context->release->id)->lockForUpdate()->first();
+                        if ($current !== null && (int) $current->predb_id === 0 && (int) $current->isrenamed === 0) {
+                            $terminalNamingSnapshot = (array) $current;
+                            $terminalNamingFiles = $candidates;
+                        }
+                    }
+                }
 
                 return $insertedReleaseFiles;
             }, 3);
@@ -432,6 +453,70 @@ class ReleaseFileManager
         $context->releaseFilesChanged = $context->releaseFilesChanged || $insertedReleaseFiles > 0;
 
         $this->searchSyncCoordinator->request((int) $context->release->id);
+        if ($terminalNamingSnapshot !== null) {
+            $this->matchFinalizedFileNames($terminalNamingSnapshot, $terminalNamingFiles, $sourceDigest);
+        }
+    }
+
+    /**
+     * A new ordinary consumer observes the committed terminal state. It never
+     * reuses the producer claim that finalization just released. Freeze values
+     * before leaving the transaction so a later worker cannot refresh this
+     * attempt into ownership of its successor's identity or source generation.
+     *
+     * @param  array<string, mixed>  $snapshot
+     * @param  list<string>  $names
+     */
+    private function matchFinalizedFileNames(array $snapshot, array $names, string $sourceDigest): void
+    {
+        $consume = function () use ($snapshot, $names, $sourceDigest): void {
+            try {
+                $entry = new Release;
+                $entry->setRawAttributes($snapshot, true);
+                $entry->setAttribute('releases_id', $snapshot['id']);
+                $entry->setAttribute('observed_isrenamed', (int) $snapshot['isrenamed']);
+                $entry->setAttribute('observed_additional_pp_claim', [
+                    'token' => $snapshot[AdditionalCandidateQuery::CLAIM_TOKEN_COLUMN],
+                    'claimed_at' => $snapshot[AdditionalCandidateQuery::CLAIMED_AT_COLUMN],
+                ]);
+                $entry->setAttribute('observed_archive_source_digest', $sourceDigest);
+                foreach (array_slice($names, 0, self::DEFAULT_RELEASE_FILE_LIMIT) as $name) {
+                    if ($name === '' || str_starts_with($name, '.')
+                        || preg_match('/'.$this->config->supportFileRegex.'$/i', $name) === 1) {
+                        continue;
+                    }
+                    $entry->setAttribute('filename', $name);
+                    $this->nameFixingService->reset();
+                    if ($this->nameFixingService->matchPreDbFiles($entry, true, true, true) > 0) {
+                        return;
+                    }
+                }
+            } catch (\Throwable $exception) {
+                // Metadata is already committed. Neither matching nor logging
+                // failure may masquerade as a finalization rollback.
+                $this->reportFinalizedNamingFailure((int) $snapshot['id'], $exception);
+            }
+        };
+        try {
+            if (DB::transactionLevel() > 0) {
+                DB::afterCommit($consume);
+            } else {
+                $consume();
+            }
+        } catch (\Throwable $exception) {
+            $this->reportFinalizedNamingFailure((int) $snapshot['id'], $exception);
+        }
+    }
+
+    private function reportFinalizedNamingFailure(int $releaseId, \Throwable $exception): void
+    {
+        try {
+            Log::warning('Post-finalization filename matching failed.', [
+                'release_id' => $releaseId, 'exception_class' => $exception::class,
+            ]);
+        } catch (\Throwable) {
+            // Logging must not interrupt an outer transaction's callbacks.
+        }
     }
 
     /**
@@ -916,9 +1001,10 @@ class ReleaseFileManager
             }
 
             $matched = 0;
-            $accepted = $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($name, &$matched): void {
+            $accepted = $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($name, $context, &$matched): void {
                 $entry->setAttribute('filename', $name);
                 $matched = $this->nameFixingService->matchPreDbFiles($entry, true, true, true);
+                $context->rememberArchiveFilenameNamingAttempt($name, $this->nameFixingService->wasEpisodeNamingDeferredByArchiveProof());
             });
             if ($accepted || $matched > 0 || $context->fullPar2EvidenceDeferred) {
                 return;

@@ -34,7 +34,7 @@ class NzbContentParser
      */
     public function parseNzb(string $guid): array
     {
-        $source = (new NzbSourceGuard($this->nzb))->snapshot($guid);
+        $source = (new NzbSourceGuard($this->nzb))->snapshot($guid, beginNamingInspection: true);
         if ($source === null) {
             return ['contents' => [], 'error' => 'NZB is missing or broken for GUID: '.$guid, 'sourceDigest' => null, 'sourceChanged' => true];
         }
@@ -46,7 +46,7 @@ class NzbContentParser
         if (count($fileList) === 0) {
             // Attempt repair if initial parse yielded no files
             $repaired = $this->repairNzb($nzbContents, $nzbPath, $guid);
-            $retained = (new NzbSourceGuard($this->nzb))->snapshot($guid);
+            $retained = (new NzbSourceGuard($this->nzb))->snapshot($guid, beginNamingInspection: true);
             if ($retained === null || ($repaired === null ? $retained['digest'] !== $source['digest'] : $retained['contents'] !== $repaired)) {
                 return ['contents' => [], 'error' => 'NZB source changed during repair for GUID: '.$guid, 'sourceDigest' => null, 'sourceChanged' => true];
             }

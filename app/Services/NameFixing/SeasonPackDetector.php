@@ -80,6 +80,31 @@ final class SeasonPackDetector
     }
 
     /**
+     * Naming admission needs one episode identity, even when different shows
+     * cannot supply the common title required by seasonNameFromEpisodes().
+     * Different encodes or ancillary files for the same episode remain one.
+     *
+     * @param  list<string>  $names
+     */
+    public static function hasDistinctEpisodeIdentities(array $names): bool
+    {
+        $first = null;
+        foreach ($names as $name) {
+            $episode = self::parseEpisode($name);
+            if ($episode === null) {
+                continue;
+            }
+            $identity = $episode['key'].':'.$episode['season'].':'.$episode['episode'];
+            if ($first !== null && $first !== $identity) {
+                return true;
+            }
+            $first = $identity;
+        }
+
+        return false;
+    }
+
+    /**
      * Collapse the episode file names of one show into a season-level release name.
      *
      * The common release information (resolution, source, codec, group) is kept and

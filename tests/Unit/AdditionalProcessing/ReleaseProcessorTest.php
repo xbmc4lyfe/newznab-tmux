@@ -1835,7 +1835,7 @@ class ReleaseProcessorTest extends TestCase
         if ($case === 'split volume') {
             $first = $this->rarVolume($episode, 'start', 100, false, true);
         } elseif ($case === 'name overflow') {
-            for ($index = 1; $index < 500; $index++) {
+            for ($index = 1; $index < 256; $index++) {
                 $first .= substr($this->rar('extra-'.$index.'.txt', 'extra'), 20);
             }
             $first .= substr($this->rar('Show.S01E02.1080p.WEB-DL-GRP.mkv', 'video'), 20);
@@ -1874,7 +1874,7 @@ class ReleaseProcessorTest extends TestCase
 
         $this->assertSame([], $renames);
         $this->assertTrue($context->defersArchiveNameChecks());
-        $this->assertLessThanOrEqual(500, count($context->archiveFileNames));
+        $this->assertLessThanOrEqual(256, count($context->archiveFileNames));
     }
 
     /** @return array<string, array{string}> */
@@ -1890,16 +1890,16 @@ class ReleaseProcessorTest extends TestCase
     public function archive_name_evidence_is_complete_at_the_cap_but_not_after_overflow(): void
     {
         $context = $this->makeContext();
-        $files = array_map(static fn (int $index): array => ['name' => 'file-'.$index.'.txt'], range(1, 500));
+        $files = array_map(static fn (int $index): array => ['name' => 'file-'.$index.'.txt'], range(1, 256));
         $context->rememberArchiveFileNames($files);
-        $this->assertCount(500, $context->archiveFileNames);
+        $this->assertCount(256, $context->archiveFileNames);
         $this->assertFalse($context->defersArchiveNameChecks());
         $context->rememberArchiveFileNames([$files[0]]);
         $this->assertFalse($context->defersArchiveNameChecks());
 
         $context->rememberArchiveFileNames([['name' => 'Show.S01E02.mkv']]);
 
-        $this->assertCount(500, $context->archiveFileNames);
+        $this->assertCount(256, $context->archiveFileNames);
         $this->assertTrue($context->defersArchiveNameChecks());
         $context->reset();
         $this->assertSame([], $context->archiveFileNames);
