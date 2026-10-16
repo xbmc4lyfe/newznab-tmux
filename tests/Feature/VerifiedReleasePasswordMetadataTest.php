@@ -76,6 +76,7 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
                 $table->integer($column);
             }
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         Schema::create('release_regexes', function (Blueprint $table): void {
             $table->integer('releases_id');
             $table->integer('collection_regex_id');
@@ -274,6 +275,7 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
             $table->id();
             $table->string('guid');
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         config(['nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/snapshot-nzbs']);
         $guid = (string) Str::uuid();
         DB::table('releases')->insert(['id' => 33, 'guid' => $guid]);

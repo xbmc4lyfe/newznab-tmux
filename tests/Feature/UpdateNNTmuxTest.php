@@ -208,7 +208,7 @@ namespace UpdaterFixture {
                 public function ping(): string
                 {
                     $host = $this->app['config']->get('database.redis.default.host');
-                    file_put_contents($this->app->basePath('probes.jsonl'), json_encode(['host' => $host, 'pid' => getmypid()])."\n", FILE_APPEND);
+                    file_put_contents($this->app->basePath('probes.jsonl'), json_encode(['host' => $host, 'pid' => getmypid(), 'transport' => 'isolated-fixture-provider'])."\n", FILE_APPEND);
                     if (! str_starts_with($host, 'healthy-')) {
                         throw new \RuntimeException('fixture endpoint unreachable');
                     }
@@ -277,7 +277,9 @@ file_put_contents(__DIR__.'/result.json', json_encode(['old_pong' => $oldPong, '
     exit(1);
 }
 PHP);
-        $process = new SymfonyProcess([PHP_BINARY, '-n', $this->directory.'/scenario.php'], $this->directory, [
+        // Use the worker's normal extension INI: Linux DOM may be a dynamic module.
+        // The provider replaces every Redis connection before either process can ping.
+        $process = new SymfonyProcess([PHP_BINARY, $this->directory.'/scenario.php'], $this->directory, [
             'REDIS_HOST' => false,
             'REDIS_CLIENT' => false,
             'APP_CONFIG_CACHE' => false,
@@ -293,6 +295,8 @@ PHP);
         $this->assertSame('healthy-old', $observed['restored_host']);
         $this->assertSame($newHost, $observed['cached_host']);
         $this->assertSame($healthy, $observed['accepted'], $observed['output']);
+        $this->assertCount(2, $observed['probes']);
+        $this->assertSame(['isolated-fixture-provider', 'isolated-fixture-provider'], array_column($observed['probes'], 'transport'));
         $this->assertSame($newHost, $observed['probes'][array_key_last($observed['probes'])]['host']);
         $this->assertNotSame($observed['probes'][0]['pid'], $observed['probes'][array_key_last($observed['probes'])]['pid']);
         if (! $healthy) {

@@ -717,7 +717,7 @@ class NzbCreationReliabilityTest extends TestCase
 
     private function createSchema(): void
     {
-        foreach (['parts', 'binaries', 'collections', 'release_nzb_creation_failures', 'releases', 'categories', 'root_categories', 'usenet_groups'] as $table) {
+        foreach (['release_archive_naming_evidence', 'parts', 'binaries', 'collections', 'release_nzb_creation_failures', 'releases', 'categories', 'root_categories', 'usenet_groups'] as $table) {
             DB::statement("DROP TABLE IF EXISTS {$table}");
         }
         DB::statement('CREATE TABLE root_categories (id INTEGER PRIMARY KEY, title VARCHAR(255), status INTEGER DEFAULT 1, disablepreview INTEGER DEFAULT 0)');
@@ -736,6 +736,7 @@ class NzbCreationReliabilityTest extends TestCase
             nzb_creation_claim_token VARCHAR(64) NULL,
             article_fingerprint CHAR(40) NULL
         )');
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         DB::statement('CREATE TABLE release_nzb_creation_failures (
             releases_id INTEGER PRIMARY KEY,
             attempts INTEGER DEFAULT 0,

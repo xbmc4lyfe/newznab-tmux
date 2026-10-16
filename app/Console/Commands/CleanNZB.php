@@ -6,6 +6,7 @@ namespace App\Console\Commands;
 
 use App\Models\Release;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
 use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseManagementService;
 use Illuminate\Console\Command;
@@ -72,7 +73,12 @@ class CleanNZB extends Command
                 // If NZB file guid is not present in DB delete the file from disk
                 if (! $releases->whereGuid($guid)->exists()) {
                     if ($delete) {
-                        File::delete($filePath);
+                        if (! app(NzbSourceGuard::class)->deleteOrphan($guid, (string) $filePath)) {
+                            $this->warn("Retained orphan file pending publication ownership verification: $guid.nzb.gz");
+                            $checked++;
+
+                            continue;
+                        }
                     }
                     $deleted++;
                     $this->line("Deleted orphan file: $guid.nzb.gz");

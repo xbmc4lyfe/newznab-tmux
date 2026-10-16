@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace App\Services\AdditionalProcessing\Media;
 
+use App\Services\AdditionalProcessing\ArchiveExtractionService;
 use App\Services\AdditionalProcessing\Enums\DownloadKind;
+use App\Services\AdditionalProcessing\Enums\VideoContainer;
 use App\Services\AdditionalProcessing\State\MediaByteBudget;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\AdditionalProcessing\UsenetDownloadService;
@@ -69,6 +71,20 @@ class MediaArticleFetcher
             $chunk = substr($result['data'], 0, $maxBytes - $written);
             if (file_put_contents($path, $chunk, FILE_APPEND) === false) {
                 break;
+            }
+            $part = $result['part'];
+            if ($index === 0 && $expectedOffset === 0 && $part !== null && $part->offset() === 0
+                && ($part->part === null || $part->part === 1) && $part->size > 0 && strlen($result['data']) <= $part->size
+                && $context->nzbSourceDigest !== null && $part->name !== '' && strlen($part->name) <= 4096
+                && mb_check_encoding($part->name, 'UTF-8') && preg_match('/[\x00-\x1f\x7f]/', $part->name) !== 1
+                && basename($part->name) === $part->name && ! str_contains($part->name, '\\')
+                && ! in_array($part->name[0], ['.', '-'], true)
+                && ! ArchiveExtractionService::hasArchiveSignature($result['data'])
+                && ($container = VideoContainer::detect($result['data'])) !== null
+                && $container === VideoContainer::fromFileName('video.'.pathinfo($part->name, PATHINFO_EXTENSION))) {
+                $context->directVideoWitnesses[hash('sha256', (string) $segments[$index])] = [
+                    'name' => $part->name, 'size' => $part->size, 'digest' => $context->nzbSourceDigest,
+                ];
             }
             $written += strlen($chunk);
             $expectedOffset = $offset + strlen($result['data']);

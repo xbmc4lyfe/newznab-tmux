@@ -16,6 +16,7 @@ use App\Services\ReleaseCleaningService;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Support\Par2RenameProgress;
 use App\Support\PredbSearchDocument;
+use App\Support\ReleaseArchiveNamingEvidence;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
@@ -221,6 +222,9 @@ class ReleaseUpdateService
 
                 $newTitle = $literalSceneName ? $newName : substr($newName, 0, 299);
 
+                if (! $echo && ! $this->allowsArchiveNamingPreview($release, $newTitle)) {
+                    return;
+                }
                 if ($echo && ! $this->performDatabaseUpdate($release, $newTitle, $type, $nameStatus, $preId, $expectedSnapshot)) {
                     $this->relid = 0;
 
@@ -266,15 +270,25 @@ class ReleaseUpdateService
             return;
         }
         if (! $update) {
-            $currentTitle = $this->currentPredbTitle($predbId, $title, $filenameEvidence);
-            if ($currentTitle === null || $this->renamesSeasonPackToEpisode((string) $release->searchname, $currentTitle)) {
+            $allowed = $this->withPredbIdentity($predbId, $title, $filenameEvidence, function (string $canonicalTitle) use ($release, $filenameEvidence, &$title): bool {
+                $current = $this->releaseSnapshotQuery($release)->lockForUpdate()->first();
+                if ($current === null || $this->renamesSeasonPackToEpisode((string) $current->searchname, $canonicalTitle)
+                    || ! $this->allowsArchiveNamingLocked($current, $canonicalTitle, $filenameEvidence)) {
+                    return false;
+                }
+                $title = $canonicalTitle;
+
+                return true;
+            });
+            if (! $allowed) {
                 return;
             }
-            $title = $currentTitle;
         }
         if (PredbSearchDocument::exactValue($title) === PredbSearchDocument::exactValue((string) $release->searchname)) {
             if ($update) {
                 $this->attachPredbSnapshot($release, $predbId, $title, $filenameEvidence);
+            } else {
+                $this->matched = $this->done = true;
             }
 
             return;
@@ -309,9 +323,11 @@ class ReleaseUpdateService
 
         if (PredbSearchDocument::exactValue($title) === PredbSearchDocument::exactValue((string) $release->searchname)) {
             $attempt = $this->identityAttempt;
-            if (! $this->withPredbIdentity($predbId, $title, null, function () use ($release, $predbId, $attempt): bool {
+            if (! $this->withPredbIdentity($predbId, $title, null, function () use ($release, $title, $predbId, $attempt): bool {
                 $before = $this->predbSnapshotQuery($release)->lockForUpdate()->first();
-                if ($before === null || $this->predbSnapshotQuery($release)->update(['predb_id' => $predbId]) !== 1) {
+                if ($before === null
+                    || ! $this->allowsArchiveNamingLocked($before, $title)
+                    || $this->predbSnapshotQuery($release)->update(['predb_id' => $predbId]) !== 1) {
                     return false;
                 }
                 $after = $this->releaseSnapshotQuery($release)->lockForUpdate()->first();
@@ -373,7 +389,8 @@ class ReleaseUpdateService
         try {
             $written = DB::transaction(function () use ($release, $title, $categoryId, $guard, $attempt, $aborted): bool {
                 $before = $this->predbSnapshotQuery($release)->lockForUpdate()->first();
-                if ($before === null || ($guard !== null && ! $guard())) {
+                if ($before === null || ($guard !== null && ! $guard())
+                    || ! $this->allowsArchiveNamingLocked($before, $title)) {
                     return false;
                 }
                 $values = ['searchname' => $title, 'categories_id' => $categoryId, 'isrenamed' => 1, 'iscategorized' => 1, 'proc_pp' => 1];
@@ -656,11 +673,12 @@ class ReleaseUpdateService
         $releaseId = (int) $release->releases_id;
         $completedSnapshot = null;
         $attempt = $this->identityAttempt;
-        $write = function (?string $canonicalTitle = null) use ($release, $releaseId, $newTitle, $type, $nameStatus, $preId, $expectedSnapshot, $attempt, &$completedSnapshot): bool {
+        $write = function (?string $canonicalTitle = null) use ($release, $releaseId, $newTitle, $type, $nameStatus, $preId, $expectedSnapshot, $filenameEvidence, $attempt, &$completedSnapshot): bool {
             $newTitle = $canonicalTitle ?? $newTitle;
             $actualRelease = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
             if ($actualRelease === null
-                || ($preId > 0 && $this->renamesSeasonPackToEpisode((string) $actualRelease->searchname, $newTitle))) {
+                || ($preId > 0 && $this->renamesSeasonPackToEpisode((string) $actualRelease->searchname, $newTitle))
+                || ! $this->allowsArchiveNamingLocked($actualRelease, $newTitle, $filenameEvidence)) {
                 return false;
             }
             $completedSnapshot = $this->completedReleaseSnapshot($actualRelease, $newTitle);
@@ -859,10 +877,10 @@ class ReleaseUpdateService
         $release = clone $release;
         $attached = false;
         $attempt = $this->identityAttempt;
-        $accepted = $this->withPredbIdentity($predbId, $expectedTitle ?? (string) $release->searchname, $filenameEvidence, function () use ($release, $predbId, $attempt, &$attached): bool {
+        $accepted = $this->withPredbIdentity($predbId, $expectedTitle ?? (string) $release->searchname, $filenameEvidence, function (string $canonicalTitle) use ($release, $predbId, $filenameEvidence, $attempt, &$attached): bool {
             $identity = $this->releaseSnapshotQuery($release);
             $before = (clone $identity)->lockForUpdate()->first();
-            if ($before === null) {
+            if ($before === null || ! $this->allowsArchiveNamingLocked($before, $canonicalTitle, $filenameEvidence)) {
                 return false;
             }
             $alreadyLinked = (clone $identity)->where('predb_id', $predbId)->exists();
@@ -1002,6 +1020,25 @@ class ReleaseUpdateService
         return SeasonPackDetector::isSeasonPack($currentName)
             && SeasonPackDetector::isEpisodeName($newName)
             && ! SeasonPackDetector::isSeasonPack($newName);
+    }
+
+    private function allowsArchiveNamingLocked(object $release, string $title, ?string $filenameEvidence = null): bool
+    {
+        return ! SeasonPackDetector::isEpisodeName($title)
+            || app(ReleaseArchiveNamingEvidence::class)->allowsEpisodeLocked($release, $title, $filenameEvidence);
+    }
+
+    private function allowsArchiveNamingPreview(object $release, string $title): bool
+    {
+        if (! SeasonPackDetector::isEpisodeName($title)) {
+            return true;
+        }
+
+        return DB::transaction(function () use ($release, $title): bool {
+            $current = $this->releaseSnapshotQuery($release)->lockForUpdate()->first();
+
+            return $current !== null && $this->allowsArchiveNamingLocked($current, $title);
+        });
     }
 
     /**

@@ -1832,15 +1832,9 @@ class NameFixingService
                 if (! $echo && $this->updateService->currentPredbTitle((int) $bestMatch['id'], (string) $bestMatch['title'], $cleanedFileName) === null) {
                     continue;
                 }
-                if (PredbSearchDocument::exactValue((string) $bestMatch['title']) !== PredbSearchDocument::exactValue((string) $release->searchname)) {
-                    $this->updateService->updateRelease($release, $bestMatch['title'], 'file matched source: '.($bestMatch['source'] ?? ''), $echo, 'PreDB file match, ', $nameStatus, $show, (int) $bestMatch['id'], $cleanedFileName);
-                    if ($echo && ! $this->updateService->matched) {
-                        continue;
-                    }
-                } elseif ($echo) {
-                    $matching = $this->updateService->attachPredbSnapshot($release, (int) $bestMatch['id'], (string) $bestMatch['title'], $cleanedFileName) ? 1 : 0;
-
-                    return $matching;
+                $this->updateService->updateRelease($release, $bestMatch['title'], 'file matched source: '.($bestMatch['source'] ?? ''), $echo, 'PreDB file match, ', $nameStatus, $show, (int) $bestMatch['id'], $cleanedFileName);
+                if (! $this->updateService->matched) {
+                    continue;
                 }
                 $matching++;
 

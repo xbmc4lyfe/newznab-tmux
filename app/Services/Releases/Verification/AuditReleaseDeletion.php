@@ -7,6 +7,7 @@ namespace App\Services\Releases\Verification;
 use App\Facades\Search;
 use App\Models\Release;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
 use App\Services\ReleaseImageService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -27,14 +28,12 @@ final class AuditReleaseDeletion
         if ($current === null) {
             throw new RuntimeException('Audited release changed before deletion.');
         }
-        $nzbPath = $this->nzb->nzbPath($release->guid);
-        if (! is_string($nzbPath) || $nzbPath === '') {
-            throw new RuntimeException('Audited NZB is unavailable before deletion.');
-        }
+        $receipt = (new NzbSourceGuard($this->nzb))->captureDeletionAnchor($current);
+        $paths = [$receipt['path'], ...$this->images->releaseFiles($release->guid)];
         $updated = DB::table('release_verification_scratch')->where('id', $scratchId)->where('audit_release_id', $release->id)
             ->where('terminal', false)->where('audit_verdict', 'unrepairable')->update([
                 'delete_guid' => $release->guid,
-                'delete_paths' => json_encode([$nzbPath, ...$this->images->releaseFiles($release->guid)], JSON_THROW_ON_ERROR),
+                'delete_paths' => json_encode(['version' => 1, 'nzb_receipt' => $receipt, 'paths' => $paths], JSON_THROW_ON_ERROR),
             ]);
         if ($updated !== 1) {
             throw new RuntimeException('Proven audit deletion state is unavailable.');
@@ -53,11 +52,31 @@ final class AuditReleaseDeletion
             || Release::query()->where('guid', $entry->delete_guid)->exists()) {
             throw new RuntimeException('Audit cleanup cannot remove a current release.');
         }
-        $paths = json_decode((string) $entry->delete_paths, true, flags: JSON_THROW_ON_ERROR);
-        if (! is_array($paths) || ! array_is_list($paths) || count($paths) !== 9) {
+        $inventory = json_decode((string) $entry->delete_paths, true, flags: JSON_THROW_ON_ERROR);
+        if (is_array($inventory) && array_is_list($inventory)) {
+            throw new RuntimeException('Legacy audit artifact ownership is unqualified; retaining it for review.');
+        }
+        if (! is_array($inventory) || ($inventory['version'] ?? null) !== 1 || ! is_array($inventory['nzb_receipt'] ?? null)
+            || ! is_array($inventory['paths'] ?? null) || ! array_is_list($inventory['paths']) || count($inventory['paths']) !== 9) {
             throw new RuntimeException('Audit artifact inventory is unavailable.');
         }
-        foreach (array_unique($paths) as $path) {
+        $paths = $inventory['paths'];
+        $receipt = $inventory['nzb_receipt'];
+        if (($receipt['guid'] ?? null) !== (string) $entry->delete_guid || ($receipt['path'] ?? null) !== $paths[0]) {
+            throw new RuntimeException('Audit NZB receipt does not match its retained inventory.');
+        }
+        $nzbPath = $paths[0];
+        if (! is_string($nzbPath) || $nzbPath === '') {
+            throw new RuntimeException('Audit NZB artifact path is invalid.');
+        }
+        $nzbParent = dirname($nzbPath);
+        if (file_exists($nzbParent) && (! is_dir($nzbParent) || ! is_readable($nzbParent) || ! is_executable($nzbParent))) {
+            throw new RuntimeException('Audit artifact directory is inaccessible.');
+        }
+        if (! (new NzbSourceGuard($this->nzb))->deleteAnchoredSource($receipt)) {
+            throw new RuntimeException('Audit NZB artifact deletion will retry.');
+        }
+        foreach (array_unique(array_slice($paths, 1)) as $path) {
             if (! is_string($path) || $path === '') {
                 throw new RuntimeException('Audit artifact path is invalid.');
             }

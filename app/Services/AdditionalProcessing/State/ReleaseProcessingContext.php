@@ -25,7 +25,9 @@ class ReleaseProcessingContext
 
     private const int MAX_RETAINED_ARCHIVE_BYTES = 16_777_216;
 
-    private const int MAX_ARCHIVE_FILE_NAMES = 500;
+    private const int MAX_ARCHIVE_FILE_NAMES = 256;
+
+    private const int MAX_NAMING_WITNESS_BYTES = 32768;
 
     // The release being processed
     public Release $release;
@@ -63,6 +65,32 @@ class ReleaseProcessingContext
 
     // NZB state
     public bool $nzbHasCompressedFile = false;
+
+    /** Full decoded source generation captured before processing. */
+    public ?string $nzbSourceDigest = null;
+
+    /** @var list<array{name: string, firstMessageId: string}>|null Full raw XML inventory, never proof alone. */
+    public ?array $nzbSourceFiles = null;
+
+    /** @var array<string, string> Complete typed archive listings keyed by source first-message digest. */
+    public array $archiveSourceWitnesses = [];
+
+    /** @var list<array{name: string, firstMessageId: string}>|null Full raw XML nominations, never proof alone. */
+    public ?array $directVideoFiles = null;
+
+    /** @var array<string, array{name: string, size: int, digest: string}> Actual typed first-article observations. */
+    public array $directVideoWitnesses = [];
+
+    /** Every archive set in this source was inspected without omissions. */
+    public bool $archiveNamingInspectionComplete = false;
+
+    /** @var array<string, true> Exact filenames observed in this attempt, including duplicate inventory. */
+    public array $archiveNamingWitnesses = [];
+
+    /** Actual observed filenames were omitted due to invalid encoding/size or admission caps. */
+    public bool $namingWitnessesOmitted = false;
+
+    private int $namingWitnessBytes = 0;
 
     /**
      * Archive inspection ran for this release (not skipped for a book flood or disabled downloads).
@@ -343,6 +371,15 @@ class ReleaseProcessingContext
         $this->seasonPackProbable = false;
         $this->archiveNameEvidenceIncomplete = false;
         $this->archiveFileNames = [];
+        $this->archiveNamingWitnesses = [];
+        $this->namingWitnessBytes = 0;
+        $this->namingWitnessesOmitted = false;
+        $this->nzbSourceDigest = null;
+        $this->nzbSourceFiles = null;
+        $this->archiveSourceWitnesses = [];
+        $this->directVideoFiles = null;
+        $this->directVideoWitnesses = [];
+        $this->archiveNamingInspectionComplete = false;
         $this->firstArchiveFiles = null;
         $this->reverseArchiveSummary = null;
         $this->mediaPlan = null;
@@ -382,16 +419,36 @@ class ReleaseProcessingContext
     {
         foreach ($files as $file) {
             $name = (string) ($file['name'] ?? '');
-            if ($name === '' || in_array($name, $this->archiveFileNames, true)) {
-                continue;
+            if (! $this->rememberNamingWitness($name)) {
+                return;
             }
-            if (count($this->archiveFileNames) >= self::MAX_ARCHIVE_FILE_NAMES) {
-                $this->archiveNameEvidenceIncomplete = true;
-
-                continue;
+            if (! in_array($name, $this->archiveFileNames, true)) {
+                $this->archiveFileNames[] = $name;
             }
-            $this->archiveFileNames[] = $name;
         }
+    }
+
+    /** Admit names once, before callers retain them for naming or inventory. */
+    public function rememberNamingWitness(string $name): bool
+    {
+        if ($this->namingWitnessesOmitted) {
+            return false;
+        }
+        if (isset($this->archiveNamingWitnesses[$name])) {
+            return true;
+        }
+        if ($name === '' || strlen($name) > 4096 || ! mb_check_encoding($name, 'UTF-8')
+            || count($this->archiveNamingWitnesses) >= self::MAX_ARCHIVE_FILE_NAMES
+            || $this->namingWitnessBytes + strlen($name) > self::MAX_NAMING_WITNESS_BYTES) {
+            $this->namingWitnessesOmitted = true;
+            $this->archiveNameEvidenceIncomplete = true;
+
+            return false;
+        }
+        $this->archiveNamingWitnesses[$name] = true;
+        $this->namingWitnessBytes += strlen($name);
+
+        return true;
     }
 
     /**

@@ -73,6 +73,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         Schema::create('releases', function (Blueprint $table): void {
             $table->id();
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         $result = app(ReleaseCreationService::class)->createReleases(1, 10, false);
         $this->assertSame(0, $result['added']);
         $this->assertSame(0, DB::table('releases')->count());
@@ -135,6 +136,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 $table->integer($column);
             }
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         Schema::create('release_regexes', function (Blueprint $table): void {
             $table->integer('releases_id');
             $table->integer('collection_regex_id');
@@ -431,7 +433,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 $this->assertCount($failure === 'retry' ? 2 : 1, $report['attempts']);
                 $attempt = $report['attempts'][array_key_last($report['attempts'])];
                 $this->assertSame(['state_lock_acquisition', 'candidate_policy', 'metadata_size', 'archive_legacy',
-                    'incoming_xml_fingerprint', 'duplicate_search_revalidation', ...($duplicateKind === 'exact' ? [] : ['final_xml_gzip', 'durable_install']),
+                    'incoming_xml_fingerprint', 'duplicate_search_revalidation', ...($duplicateKind === 'exact' ? [] : ['release_identity_sql', 'final_xml_gzip', 'durable_install']),
                     'sql_accounting'], array_keys($attempt['phases_ns']));
                 $this->assertSame('returned', $attempt['callback_status']);
                 $this->assertGreaterThanOrEqual(0, $attempt['transaction_finalization_ns']);
@@ -444,7 +446,8 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 }
                 if ($failure === 'retry') {
                     $this->assertSame('threw', $report['attempts'][0]['callback_status']);
-                    $this->assertArrayHasKey('sql_accounting', $report['attempts'][0]['phases_ns']);
+                    $this->assertArrayHasKey('release_identity_sql', $report['attempts'][0]['phases_ns']);
+                    $this->assertArrayNotHasKey('durable_install', $report['attempts'][0]['phases_ns']);
                 }
                 $this->assertStringNotContainsString('Movie', json_encode($report, JSON_THROW_ON_ERROR));
                 $this->assertStringNotContainsString('verified@article', json_encode($report, JSON_THROW_ON_ERROR));
@@ -478,6 +481,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $table->integer('predb_id')->default(0);
             $table->integer('nzbstatus')->default(NzbService::NZB_ADDED);
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         for ($id = 1; $id <= 100; $id++) {
             DB::table('releases')->insert(['id' => $id, 'name' => 'Movie', 'searchname' => 'Movie', 'guid' => 'guid-'.$id, 'size' => 5]);
         }
