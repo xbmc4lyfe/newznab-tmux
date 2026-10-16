@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class YencBenchmarkTest extends TestCase
@@ -31,6 +32,93 @@ final class YencBenchmarkTest extends TestCase
         $this->assertSame(30, $result['eligible_pairs']);
         $this->assertSame(1, $result['invalid_pairs']);
         $this->assertArrayNotHasKey('median_rust_over_cpp', $result);
+    }
+
+    /**
+     * Execute the production finalizer with real decision summaries in a subprocess,
+     * keeping native timing workers outside this deterministic exit-contract test.
+     *
+     * @param  list<float>  $ratios
+     * @param  list<int>  $invalidPairs
+     */
+    #[DataProvider('runDecisionCases')]
+    public function test_run_exit_requires_every_stratum_to_improve_and_retains_the_report(array $ratios, array $invalidPairs, int $expectedExit, string $expectedStatus, bool $expectedAdvantage): void
+    {
+        $directory = sys_get_temp_dir().'/nntmux-benchmark-gate-test-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700);
+        $script = <<<'PHP'
+define('NNTMUX_YENC_BENCHMARK_FUNCTIONS_ONLY', true);
+require $argv[1];
+$source = file_get_contents($argv[1]);
+$start = strpos($source, '        $invalid = array_any($summaries,');
+$end = $start === false ? false : strpos($source, '    } catch (Throwable $exception) {', $start);
+if ($start === false || $end === false) {
+    throw new RuntimeException('Benchmark run finalization block not found');
+}
+$cases = json_decode($argv[3], true, flags: JSON_THROW_ON_ERROR);
+$summaries = [];
+$log = fopen($argv[2].'/observations.jsonl', 'x');
+$emit = static function (array $record) use ($log): void {
+    $line = json_encode($record, JSON_THROW_ON_ERROR)."\n";
+    fwrite($log, $line);
+    fflush($log);
+    echo $line;
+};
+foreach ($cases['ratios'] as $index => $ratio) {
+    $summary = ['type' => 'stratum_summary', 'stratum' => $index]
+        + yencBenchmarkDecision(array_fill(0, 31, $ratio), $cases['invalid_pairs'][$index], 5, 5, 123, count($cases['ratios']));
+    $summaries[] = $summary;
+    $emit($summary);
+}
+$protocol = ['claim_limit' => 'Deterministic decision-contract fixture; no measured performance claim'];
+$finalize = static function () use ($summaries, $emit, $protocol, $source, $start, $end): int {
+    return eval(substr($source, $start, $end - $start));
+};
+$code = $finalize();
+fclose($log);
+exit($code);
+PHP;
+        try {
+            $process = yencBenchmarkRunChild([PHP_BINARY, '-r', $script, dirname(__DIR__, 2).'/scripts/benchmark-yenc.php', $directory,
+                json_encode(['ratios' => $ratios, 'invalid_pairs' => $invalidPairs], JSON_THROW_ON_ERROR)], $directory.'/process', 10);
+            $this->assertFalse($process['timed_out']);
+            $this->assertSame('', file_get_contents($process['stderr_path']));
+            $this->assertSame(file_get_contents($directory.'/observations.jsonl'), file_get_contents($process['stdout_path']));
+            $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
+                file($directory.'/observations.jsonl', FILE_IGNORE_NEW_LINES));
+            $this->assertCount(count($ratios) + 1, $rows);
+            foreach (array_slice($rows, 0, -1) as $index => $row) {
+                $this->assertSame('stratum_summary', $row['type']);
+                $this->assertSame(31, $row['eligible_pairs']);
+                $this->assertSame($invalidPairs[$index], $row['invalid_pairs']);
+            }
+            $summary = $rows[array_key_last($rows)];
+            $this->assertSame('run_summary', $summary['type']);
+            $this->assertSame($expectedStatus, $summary['status']);
+            $this->assertSame($expectedAdvantage, $summary['rust_speed_advantage_demonstrated_for_every_stratum']);
+            $this->assertSame(count($ratios), $summary['strata']);
+            $this->assertSame('Deterministic decision-contract fixture; no measured performance claim', $summary['claim_limit']);
+            $this->assertSame($expectedExit, $process['exit_code']);
+        } finally {
+            foreach (glob($directory.'/*') as $path) {
+                unlink($path);
+            }
+            rmdir($directory);
+        }
+    }
+
+    /** @return array<string, array{list<float>, list<int>, int, string, bool}> */
+    public static function runDecisionCases(): array
+    {
+        return [
+            'every stratum improves' => [[0.8, 0.8], [0, 0], 0, 'useful_improvement', true],
+            'valid inconclusive pairs fail the gate' => [[1.03], [0], 1, 'inconclusive', false],
+            'one improvement cannot hide an inconclusive stratum' => [[0.8, 1.03], [0, 0], 1, 'inconclusive', false],
+            'exact five percent improvement remains inconclusive' => [[0.95], [0], 1, 'inconclusive', false],
+            'regression fails the gate' => [[1.2], [0], 1, 'regression', false],
+            'invalid pairs retain invalid exit status' => [[0.8], [1], 2, 'invalid', false],
+            'invalidity takes precedence over regression' => [[1.2, 0.8], [0, 1], 2, 'invalid', false],
+        ];
     }
 
     public function test_php_baseline_selects_the_real_php_worker_without_a_cpp_library(): void
