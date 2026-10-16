@@ -191,7 +191,7 @@ final class PredbFulltextRetryQueueTest extends TestCase
     private function database(): SQLiteConnection
     {
         $pdo = new PDO('sqlite::memory:');
-        $pdo->exec('CREATE TABLE releases (additional_pack_evidence TEXT DEFAULT NULL, id INTEGER PRIMARY KEY, name TEXT, searchname TEXT, fromname TEXT, groups_id INTEGER, categories_id INTEGER, predb_id INTEGER, guid TEXT)');
+        $pdo->exec('CREATE TABLE releases (id INTEGER PRIMARY KEY, name TEXT, searchname TEXT, fromname TEXT, groups_id INTEGER, categories_id INTEGER, predb_id INTEGER, guid TEXT)');
         $pdo->exec('CREATE TABLE predb (id INTEGER PRIMARY KEY, title TEXT, source TEXT, searched INTEGER, predate TEXT, imported_at TEXT)');
         $pdo->exec('CREATE TABLE cache (key TEXT PRIMARY KEY, value TEXT, expiration INTEGER)');
         $pdo->exec('CREATE TABLE cache_locks (key TEXT PRIMARY KEY, owner TEXT, expiration INTEGER)');

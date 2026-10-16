@@ -60,7 +60,7 @@ final class GenericPredbAttachmentTest extends TestCase
         Facade::setFacadeApplication($container);
         DB::statement('CREATE TABLE par2_rename_progress (releases_id INTEGER PRIMARY KEY)');
         DB::statement("CREATE TABLE predb (id INTEGER PRIMARY KEY NOT NULL, title VARCHAR NOT NULL, filename VARCHAR NOT NULL DEFAULT '')");
-        DB::statement('CREATE TABLE releases (additional_pack_evidence TEXT DEFAULT NULL, nzbstatus INTEGER DEFAULT 1, id INTEGER PRIMARY KEY, guid TEXT, name TEXT COLLATE NOCASE, searchname TEXT COLLATE NOCASE, predb_id INTEGER DEFAULT 0, fromname TEXT, groups_id INTEGER DEFAULT 1, categories_id INTEGER DEFAULT 10, size INTEGER DEFAULT 5000, nfostatus INTEGER DEFAULT 1, isrenamed INTEGER DEFAULT 0, proc_nfo INTEGER DEFAULT 0, proc_files INTEGER DEFAULT 0, proc_par2 INTEGER DEFAULT 0, proc_uid INTEGER DEFAULT 0, proc_srr INTEGER DEFAULT 0, proc_hash16k INTEGER DEFAULT 0, proc_crc32 INTEGER DEFAULT 0)');
+        DB::statement('CREATE TABLE releases (id INTEGER PRIMARY KEY, guid TEXT, name TEXT COLLATE NOCASE, searchname TEXT COLLATE NOCASE, predb_id INTEGER DEFAULT 0, fromname TEXT, groups_id INTEGER DEFAULT 1, categories_id INTEGER DEFAULT 10, size INTEGER DEFAULT 5000, nfostatus INTEGER DEFAULT 1, isrenamed INTEGER DEFAULT 0, proc_nfo INTEGER DEFAULT 0, proc_files INTEGER DEFAULT 0, proc_par2 INTEGER DEFAULT 0, proc_uid INTEGER DEFAULT 0, proc_srr INTEGER DEFAULT 0, proc_hash16k INTEGER DEFAULT 0, proc_crc32 INTEGER DEFAULT 0)');
         DB::statement('CREATE TABLE release_files (releases_id INTEGER, name TEXT, crc32 TEXT)');
         (require database_path('migrations/2026_10_15_150000_create_predb_identity_projection.php'))->up();
     }

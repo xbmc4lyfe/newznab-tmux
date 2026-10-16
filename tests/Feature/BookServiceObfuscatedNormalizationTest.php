@@ -8,15 +8,11 @@ use App\Facades\Search;
 use App\Models\Category;
 use App\Models\Release;
 use App\Services\BookService;
-use App\Services\Categorization\CategorizationService;
-use App\Services\NameFixing\ReleaseUpdateService;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use PDO;
-use PHPUnit\Framework\Attributes\DataProvider;
-use ReflectionMethod;
 use Tests\TestCase;
 
 class BookServiceObfuscatedNormalizationTest extends TestCase
@@ -49,7 +45,6 @@ class BookServiceObfuscatedNormalizationTest extends TestCase
         $this->setEnvironmentValue('DB_DATABASE', $this->databasePath);
 
         $app = require __DIR__.'/../../bootstrap/app.php';
-        $app->useEnvironmentPath(sys_get_temp_dir())->loadEnvironmentFrom('.nntmux-validation-no-env');
         $app->make(Kernel::class)->bootstrap();
 
         return $app;
@@ -80,60 +75,6 @@ class BookServiceObfuscatedNormalizationTest extends TestCase
 
         foreach ($this->originalEnvironment as $key => $value) {
             $this->setEnvironmentValue($key, $value === false ? null : $value);
-        }
-    }
-
-    #[DataProvider('automaticEpisodeBoundaries')]
-    public function test_automatic_title_boundaries_do_not_collapse_a_bound_pack(string $boundary, ?string $state): void
-    {
-        (require database_path('migrations/2026_10_11_215821_create_par2_rename_progress_table.php'))->up();
-        $source = 'N_NZB_[1_6]_-_Show.S01E01.1080p.WEB-DL-GRP.rar';
-        if ($boundary === 'nzbsplit') {
-            $source = 'Uploader__NZBSPLIT__'.str_repeat('a', 32).'__NZBSPLIT__Show.S01E01.1080p.WEB-DL-GRP.rar';
-        }
-        $guid = str_repeat('c', 40);
-        $envelope = $state === null ? null : json_encode(['v' => 1,
-            'identity_sha256' => hash('sha256', json_encode(['1', $guid], JSON_THROW_ON_ERROR)),
-            'epoch' => str_repeat('a', 64), 'state' => $state], JSON_THROW_ON_ERROR);
-        DB::table('releases')->insert(['id' => 1, 'name' => $source, 'searchname' => $source,
-            'guid' => $guid, 'leftguid' => 'c', 'groups_id' => 1, 'postdate' => now(), 'adddate' => now(),
-            'categories_id' => Category::BOOKS_UNKNOWN, 'bookinfo_id' => -2, 'nzbstatus' => 1,
-            'additional_pack_evidence' => $envelope]);
-        Search::spy();
-        $before = Release::query()->findOrFail(1);
-        if ($boundary === 'normalize') {
-            (new ReflectionMethod(BookService::class, 'normalizeBookSearchNames'))->invoke(app(BookService::class));
-        } elseif ($boundary === 'parse') {
-            app(BookService::class)->parseTitle($source, 1, 'ebook', $before);
-        } elseif ($boundary === 'requeue') {
-            $this->artisan('books:requeue-failed', ['--normalize-obfuscated-all' => true])->assertSuccessful();
-        } elseif ($boundary === 'nzbsplit') {
-            $this->app->instance(CategorizationService::class, $this->createStub(CategorizationService::class));
-            $this->artisan('releases:fix-nzbsplit')->assertSuccessful();
-        } else {
-            $before->releases_id = 1;
-            (new ReleaseUpdateService($this->createStub(CategorizationService::class)))
-                ->updateMediaSnapshot($before, 'Show.S01E01.1080p.WEB-DL-GRP', Category::BOOKS_UNKNOWN);
-        }
-        $after = Release::query()->findOrFail(1);
-
-        if ($state === null) {
-            self::assertNotSame($source, $after->searchname);
-            self::assertStringContainsString('S01E01', $after->searchname);
-        } else {
-            self::assertSame($source, $after->searchname);
-            self::assertSame(0, (int) $after->isrenamed);
-            Search::shouldNotHaveReceived('updateRelease');
-        }
-        self::assertSame($envelope, $after->additional_pack_evidence);
-    }
-
-    public static function automaticEpisodeBoundaries(): iterable
-    {
-        foreach (['normalize', 'parse', 'requeue', 'nzbsplit', 'media'] as $boundary) {
-            foreach (['confirmed', 'probable', null] as $state) {
-                yield $boundary.' '.($state ?? 'single control') => [$boundary, $state];
-            }
         }
     }
 
@@ -257,11 +198,6 @@ class BookServiceObfuscatedNormalizationTest extends TestCase
                 $table->increments('id');
                 $table->string('name')->default('');
                 $table->string('searchname')->default('');
-                $table->json('additional_pack_evidence')->nullable();
-                $table->string('additional_pp_claim_token')->nullable();
-                $table->timestamp('additional_pp_claimed_at')->nullable();
-                $table->integer('proc_pp')->default(0);
-                $table->integer('gamesinfo_id')->default(0);
                 $table->unsignedInteger('groups_id')->default(0);
                 $table->unsignedBigInteger('size')->default(0);
                 $table->dateTime('postdate')->nullable();
@@ -272,8 +208,6 @@ class BookServiceObfuscatedNormalizationTest extends TestCase
                 $table->integer('categories_id')->default(Category::OTHER_MISC);
                 $table->unsignedInteger('videos_id')->default(0);
                 $table->integer('tv_episodes_id')->default(0);
-                $table->unsignedInteger('tv_lookup_attempts')->default(0);
-                $table->dateTime('tv_lookup_retry_at')->nullable();
                 $table->string('imdbid')->nullable();
                 $table->integer('musicinfo_id')->nullable();
                 $table->integer('consoleinfo_id')->nullable();

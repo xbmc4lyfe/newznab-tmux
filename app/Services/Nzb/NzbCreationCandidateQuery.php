@@ -8,7 +8,6 @@ use App\Models\Release;
 use App\Services\Configuration\ConfigurationProvider;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
@@ -164,18 +163,13 @@ final class NzbCreationCandidateQuery
             return;
         }
 
-        $staleBefore = self::claimStaleBefore();
+        $staleBefore = now()->subSeconds(self::claimTtlSeconds());
 
         $query->where(function (Builder $claimQuery) use ($staleBefore): void {
             $claimQuery
                 ->whereNull('r.'.self::CLAIMED_AT_COLUMN)
                 ->orWhere('r.'.self::CLAIMED_AT_COLUMN, '<', $staleBefore);
         });
-    }
-
-    public static function claimStaleBefore(): Carbon
-    {
-        return now()->subSeconds(self::claimTtlSeconds())->startOfSecond();
     }
 
     private static function claimTtlSeconds(): int

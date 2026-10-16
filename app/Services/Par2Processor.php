@@ -11,10 +11,8 @@ use App\Models\ReleaseFile;
 use App\Models\UsenetGroup;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NNTP\NNTPService;
-use App\Services\Nzb\NzbService;
 use App\Support\Par2DescriptorEvidence;
 use App\Support\Par2FileHashEvidence;
-use App\Support\ReleasePackEvidence;
 use dariusiii\rarinfo\Par2Info;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -73,15 +71,11 @@ class Par2Processor
 
         $query = Release::query()
             ->where(['isrenamed' => 0, 'id' => $relID])
-            ->select(['id', 'guid', 'groups_id', 'categories_id', 'name', 'searchname', 'postdate', 'nzbstatus', 'additional_pp_claim_token', 'additional_pp_claimed_at', ReleasePackEvidence::COLUMN, 'id as releases_id'])
+            ->select(['id', 'guid', 'groups_id', 'categories_id', 'name', 'searchname', 'postdate', 'id as releases_id'])
             ->first();
 
         if ($query === null) {
             return Par2RenameOutcome::NoMatch;
-        }
-        $canPersist = $this->generationGuard($query, $canPersist);
-        if (! $this->canPersistGeneration($canPersist)) {
-            return Par2RenameOutcome::Deferred;
         }
 
         // Get the PAR2 file.
@@ -90,13 +84,13 @@ class Par2Processor
             return Par2RenameOutcome::Retryable;
         }
 
-        if (! $this->canPersistGeneration($canPersist)) {
+        if ($canPersist !== null && ! $canPersist()) {
             return Par2RenameOutcome::Deferred;
         }
 
         // Put the PAR2 into Par2Info, check if there's an error.
         $this->par2Info->setData($par2);
-        if (! $this->canPersistGeneration($canPersist)) {
+        if ($canPersist !== null && ! $canPersist()) {
             return Par2RenameOutcome::Deferred;
         }
         if ($this->par2Info->error) {
@@ -106,7 +100,7 @@ class Par2Processor
 
         // Get the file list from Par2Info.
         $files = (new Par2FileList)->getFiles($this->par2Info);
-        if (! $this->canPersistGeneration($canPersist)) {
+        if ($canPersist !== null && ! $canPersist()) {
             return Par2RenameOutcome::Deferred;
         }
 
@@ -141,13 +135,9 @@ class Par2Processor
                 }
             }
         }
-        $query = $builder->select(['id', 'guid', 'groups_id', 'categories_id', 'name', 'searchname', 'postdate', 'nzbstatus', 'additional_pp_claim_token', 'additional_pp_claimed_at', ReleasePackEvidence::COLUMN, 'id as releases_id'])->first();
+        $query = $builder->select(['id', 'guid', 'groups_id', 'categories_id', 'name', 'searchname', 'postdate', 'id as releases_id'])->first();
         if ($query === null) {
             return $expectedSnapshot === null ? Par2RenameOutcome::NoMatch : Par2RenameOutcome::Deferred;
-        }
-        $canPersist = $this->generationGuard($query, $canPersist);
-        if (! $this->canPersistGeneration($canPersist)) {
-            return Par2RenameOutcome::Deferred;
         }
         $complete = $allowTerminalMetadata && ($inventory->isComplete() || $inventory->hasCompleteMainInventory());
         $files = [];
@@ -225,7 +215,7 @@ class Par2Processor
                         $this->assertInventorySnapshot($query, $canPersist, $aborted);
                         $query['textstring'] = $file['name'];
                         if ($this->nameFixingService->checkName($query, true, 'PAR2, ', true, (bool) $show, markProcessed: false)) {
-                            if (! $this->canPersistGeneration($canPersist)) {
+                            if ($canPersist !== null && ! $canPersist()) {
                                 throw $aborted;
                             }
 
@@ -246,40 +236,6 @@ class Par2Processor
 
             throw $error;
         }
-    }
-
-    /**
-     * The callback reads current database admission after intervening I/O or writes.
-     *
-     * @param  callable(): bool  $guard
-     *
-     * @phpstan-impure
-     */
-    private function canPersistGeneration(callable $guard): bool
-    {
-        return $guard();
-    }
-
-    /**
-     * Preserve the pre-I/O generation while existing writers admit title snapshots separately.
-     *
-     * @param  null|callable(): bool  $previous
-     * @return callable(): bool
-     */
-    private function generationGuard(Release $release, ?callable $previous): callable
-    {
-        $observed = ReleasePackEvidence::observe($release);
-
-        return static function () use ($observed, $previous): bool {
-            if ($previous !== null && ! $previous()) {
-                return false;
-            }
-            $current = DB::table('releases')->where('id', $observed['id'])->lockForUpdate()->first();
-
-            return $current !== null && (int) $current->nzbstatus === NzbService::NZB_ADDED
-                && ReleasePackEvidence::matches($current, $observed, false)
-                && ReleasePackEvidence::decode($current)['kind'] !== 'invalid';
-        };
     }
 
     /**
@@ -366,20 +322,11 @@ class Par2Processor
 
             // If we found some files.
             if (! $this->addPar2 && $countUncollected && $filesAdded > 0) {
-                $admitted = DB::transaction(static function () use ($canPersist, $relID, $filesAdded): bool {
-                    if ($canPersist !== null && ! $canPersist()) {
-                        return false;
-                    }
-                    Release::whereId($relID)->increment('rarinnerfilecount', $filesAdded);
-                    if ($canPersist !== null && ! $canPersist()) {
-                        throw new RuntimeException('PAR2 generation changed during file count persistence.');
-                    }
-
-                    return true;
-                });
-                if (! $admitted) {
+                if ($canPersist !== null && ! $canPersist()) {
                     return Par2RenameOutcome::Deferred;
                 }
+                // Update the file count with the new file count + old file count.
+                Release::whereId($relID)->increment('rarinnerfilecount', $filesAdded);
             }
             if ($foundName === true) {
                 if (! $attemptRename) {

@@ -30,7 +30,6 @@ class MetadataRepublicationLineageTest extends ReleaseVerificationCandidatesTest
         app('files')->ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
         Schema::create('releases', function (Blueprint $t) {
             $t->id();
-            $t->json('additional_pack_evidence')->nullable();
             $t->string('article_fingerprint')->nullable();
             foreach (['name', 'searchname', 'guid', 'leftguid', 'fromname', 'postdate', 'adddate'] as $c) {
                 $t->string($c);

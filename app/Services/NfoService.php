@@ -13,10 +13,8 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
 use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
-use App\Support\ReleasePackEvidence;
 use dariusiii\rarinfo\Par2Info;
 use dariusiii\rarinfo\SfvInfo;
-use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -515,90 +513,42 @@ class NfoService
         return $nfoIndicators >= 2;
     }
 
-    /** Capture the complete authoritative cohort before reading NZB or NFO bytes.
-     * @return array{present: bool, id: int, guid: string, name: mixed, searchname: mixed, value: mixed}|null
-     */
-    public function observeRelease(int $releaseId, ?string $guid = null): ?array
-    {
-        $release = DB::table('releases')->where('id', $releaseId)->first();
-        if ($release === null || ($guid !== null && $release->guid !== $guid)
-            || (int) $release->nzbstatus !== NzbService::NZB_ADDED
-            || ReleasePackEvidence::decode($release)['kind'] === 'invalid') {
-            return null;
-        }
-
-        return ReleasePackEvidence::observe($release);
-    }
-
-    /**
-     * @param  array{present: bool, id: int, guid: string, name: mixed, searchname: mixed, value: mixed}  $observed
-     * @param  callable(object): void  $write
-     *
-     * @phpstan-impure
-     *
-     * @param  array{token: ?string, claimed_at: ?string}|null  $owner
-     */
-    public function withReleaseObservation(array $observed, callable $write, bool $titles = true, ?array $owner = null): bool
-    {
-        $aborted = new \RuntimeException('NFO release observation changed during persistence.');
-        try {
-            return DB::transaction(static function () use ($observed, $write, $titles, $owner, $aborted): bool {
-                $current = DB::table('releases')->where('id', $observed['id'])->lockForUpdate()->first();
-                if ($current === null || (int) $current->nzbstatus !== NzbService::NZB_ADDED
-                    || ! ReleasePackEvidence::matches($current, $observed, $titles)
-                    || ReleasePackEvidence::decode($current)['kind'] === 'invalid'
-                    || ! ReleasePackEvidence::ownsClaim($current, $owner)) {
-                    return false;
-                }
-                $write($current);
-                $after = DB::table('releases')->where('id', $observed['id'])->first();
-                if ($after === null || (int) $after->nzbstatus !== NzbService::NZB_ADDED
-                    || ! ReleasePackEvidence::matches($after, $observed, $titles)
-                    || ! ReleasePackEvidence::ownsClaim($after, $owner)) {
-                    throw $aborted;
-                }
-
-                return true;
-            });
-        } catch (Throwable $exception) {
-            if ($exception === $aborted) {
-                return false;
-            }
-            throw $exception;
-        }
-    }
-
     /**
      * Add an NFO from alternate sources. ex.: PreDB, rar, zip, etc...
      *
-     * @param  array{present: bool, id: int, guid: string, name: mixed, searchname: mixed, value: mixed}|null  $observation
-     * @param  array{token: ?string, claimed_at: ?string}|null  $owner
      * @param  bool|string  $nfo  The nfo.
      * @param  NNTPService  $nntp  Instance of class NNTPService.
      * @return bool True on success, False on failure.
      *
      * @throws \Exception
      */
-    public function addAlternateNfo(bool|string &$nfo, mixed $release, NNTPService $nntp, ?array $observation = null, ?array $owner = null): bool
+    public function addAlternateNfo(bool|string &$nfo, mixed $release, NNTPService $nntp): bool
     {
-        $observation ??= ReleasePackEvidence::observe($release);
-        if ($release->id <= 0 || ! $observation['present']
-            || ! $this->withReleaseObservation($observation, static function (): void {}, owner: $owner)
-            || ! $this->isNFO($nfo, $release->guid)) {
-            return false;
-        }
-        if (! $this->storeNfoContent((int) $release->id, $nfo, true, $observation, false, $owner)) {
-            return false;
-        }
-        if ((int) ($release->completion ?? 0) === 0) {
-            $contents = app(NzbContentsService::class);
-            $contents->setNntp($nntp);
-            $contents->setNfo($this);
-            $contents->setEchoOutput($this->echo);
-            $contents->parseNzb($release->guid, $release->id, $release->groups_id ?? 0, false, $observation, $owner);
+        if ($release->id > 0 && $this->isNFO($nfo, $release->guid)) {
+            $check = ReleaseNfo::whereReleasesId($release->id)->first(['releases_id']);
+
+            if ($check === null) {
+                ReleaseNfo::query()->insert(['releases_id' => $release->id, 'nfo' => "\x1f\x8b\x08\x00".gzcompress($nfo)]);
+            }
+
+            Release::whereId($release->id)->update(['nfostatus' => self::NFO_FOUND]);
+
+            if (! isset($release->completion)) {
+                $release->completion = 0;
+            }
+
+            if ($release->completion === 0) {
+                $nzbContentsService = app(NzbContentsService::class);
+                $nzbContentsService->setNntp($nntp);
+                $nzbContentsService->setNfo($this);
+                $nzbContentsService->setEchoOutput($this->echo);
+                $nzbContentsService->parseNzb($release->guid, $release->id, $release->groups_id ?? 0);
+            }
+
+            return true;
         }
 
-        return true;
+        return false;
     }
 
     /**
@@ -611,16 +561,10 @@ class NfoService
      * When NFO entries exist in release_files but extraction yields no valid
      * content (e.g. 0-byte file), sets nfostatus to NFO_NONFO to stop retries.
      *
-     * @param  array{present: bool, id: int, guid: string, name: mixed, searchname: mixed, value: mixed}|null  $observation
      * @return string|false The NFO content, or false on failure
      */
-    public function attemptNfoFromArchive(string $guid, int $releaseId, NNTPService $nntp, ?array $observation = null): string|false
+    public function attemptNfoFromArchive(string $guid, int $releaseId, NNTPService $nntp): string|false
     {
-        $observation ??= $this->observeRelease($releaseId, $guid);
-        if ($observation === null || $observation['id'] !== $releaseId || $observation['guid'] !== $guid
-            || ! $this->withReleaseObservation($observation, static function (): void {})) {
-            return false;
-        }
         if ($this->unrarPath === false) {
             return false;
         }
@@ -640,9 +584,7 @@ class NfoService
             ->exists();
 
         if (! $hasContentfulNfo) {
-            $this->withReleaseObservation($observation, static function () use ($releaseId): void {
-                Release::whereId($releaseId)->update(['nfostatus' => self::NFO_NONFO]);
-            });
+            Release::whereId($releaseId)->update(['nfostatus' => self::NFO_NONFO]);
 
             return false;
         }
@@ -694,9 +636,7 @@ class NfoService
         }
 
         if ($triedArchive) {
-            $this->withReleaseObservation($observation, static function () use ($releaseId): void {
-                Release::whereId($releaseId)->update(['nfostatus' => self::NFO_NONFO]);
-            });
+            Release::whereId($releaseId)->update(['nfostatus' => self::NFO_NONFO]);
         }
 
         return false;
@@ -808,7 +748,7 @@ class NfoService
             ->orderBy('nfostatus')
             ->orderByDesc('postdate')
             ->limit($this->getNzbs())
-            ->get(['id', 'guid', 'groups_id', 'name', 'searchname', 'nzbstatus', ReleasePackEvidence::COLUMN]);
+            ->get(['id', 'guid', 'groups_id', 'name']);
 
         $nfoCount = $releases->count();
 
@@ -827,25 +767,38 @@ class NfoService
             $nzbContentsService->setNfo($this);
 
             foreach ($releases as $release) {
-                $observation = ReleasePackEvidence::observe($release);
-                if ((int) $release->nzbstatus !== NzbService::NZB_ADDED
-                    || ! $this->withReleaseObservation($observation, static function (): void {})) {
-                    continue;
-                }
                 try {
                     $groupName = UsenetGroup::getNameByID($release['groups_id']);
-                    $fetchedBinary = $nzbContentsService->getNfoFromNzb($release['guid'], $release['id'], $release['groups_id'], $groupName, $observation);
+                    $fetchedBinary = $nzbContentsService->getNfoFromNzb($release['guid'], $release['id'], $release['groups_id'], $groupName);
 
                     // Fallback: try extracting NFO from a RAR/ZIP in the NZB
                     if ($fetchedBinary === false) {
-                        $fetchedBinary = $this->attemptNfoFromArchive($release['guid'], $release['id'], $nntp, $observation);
+                        $fetchedBinary = $this->attemptNfoFromArchive($release['guid'], $release['id'], $nntp);
                         if ($fetchedBinary !== false && $this->echo) {
                             echo 'A';
                         }
                     }
 
-                    if ($fetchedBinary !== false && $this->storeNfoContent((int) $release['id'], $fetchedBinary, true, $observation, false)) {
-                        $processedCount++;
+                    if ($fetchedBinary !== false) {
+                        DB::beginTransaction();
+                        try {
+                            $exists = ReleaseNfo::whereReleasesId($release['id'])->exists();
+                            if (! $exists) {
+                                ReleaseNfo::query()->insert([
+                                    'releases_id' => $release['id'],
+                                    'nfo' => "\x1f\x8b\x08\x00".gzcompress($fetchedBinary),
+                                ]);
+                            }
+
+                            Release::whereId($release['id'])->update(['nfostatus' => self::NFO_FOUND]);
+                            DB::commit();
+                            $processedCount++;
+                        } catch (\Exception $e) {
+                            DB::rollBack();
+                            if ($this->echo) {
+                                cli()->error("Error saving NFO for release {$release['id']}: {$e->getMessage()}");
+                            }
+                        }
                     }
                 } catch (\Exception $e) {
                     if ($this->echo) {
@@ -876,13 +829,12 @@ class NfoService
     /**
      * Build base query for NFO processing with all common filters
      *
-     * @return Builder<Release>
+     * @return Builder<mixed>
      */
-    private function buildNfoProcessingQuery(string $groupID, string $guidChar): Builder
+    private function buildNfoProcessingQuery(string $groupID, string $guidChar): \Illuminate\Database\Eloquent\Builder // @phpstan-ignore class.notFound, missingType.generics, return.phpDocType
     {
         $query = Release::query()
-            ->whereBetween('nfostatus', [$this->getMaxRetries(), self::NFO_UNPROC])
-            ->where('nzbstatus', NzbService::NZB_ADDED);
+            ->whereBetween('nfostatus', [$this->getMaxRetries(), self::NFO_UNPROC]);
 
         if ($guidChar !== '') {
             $query->where('leftguid', $guidChar);
@@ -921,7 +873,7 @@ class NfoService
     /**
      * Display statistics about NFO status counts
      */
-    private function displayNfoStatusStats(Builder $baseQuery): void // @phpstan-ignore missingType.generics
+    private function displayNfoStatusStats(\Illuminate\Database\Eloquent\Builder $baseQuery): void // @phpstan-ignore missingType.generics
     {
         $nfoStats = $baseQuery->clone()
             ->select(['nfostatus as status', DB::raw('COUNT(id) as count')])
@@ -947,7 +899,6 @@ class NfoService
     {
         $query = Release::query()
             ->where('nfostatus', self::NFO_FAILED)
-            ->where('nzbstatus', NzbService::NZB_ADDED)
             ->whereExists(function ($sub) {
                 $sub->select(DB::raw(1))
                     ->from('release_files')
@@ -971,7 +922,7 @@ class NfoService
         }
 
         $releases = $query->limit($this->getNzbs())
-            ->get(['id', 'guid', 'groups_id', 'name', 'searchname', 'nzbstatus', ReleasePackEvidence::COLUMN]);
+            ->get(['id', 'guid', 'groups_id', 'name']);
 
         if ($releases->isEmpty()) {
             return 0;
@@ -984,33 +935,41 @@ class NfoService
         $processed = 0;
 
         foreach ($releases as $release) {
-            $observation = ReleasePackEvidence::observe($release);
-            if ((int) $release->nzbstatus !== NzbService::NZB_ADDED
-                    || ! $this->withReleaseObservation($observation, static function (): void {})) {
-                continue;
-            }
             try {
-                $fetchedBinary = $this->attemptNfoFromArchive($release['guid'], $release['id'], $nntp, $observation);
+                $fetchedBinary = $this->attemptNfoFromArchive($release['guid'], $release['id'], $nntp);
 
                 if ($fetchedBinary !== false) {
-                    if ($this->storeNfoContent((int) $release['id'], $fetchedBinary, true, $observation, false)) {
+                    DB::beginTransaction();
+                    try {
+                        if (! ReleaseNfo::whereReleasesId($release['id'])->exists()) {
+                            ReleaseNfo::query()->insert([
+                                'releases_id' => $release['id'],
+                                'nfo' => "\x1f\x8b\x08\x00".gzcompress($fetchedBinary),
+                            ]);
+                        }
+                        Release::whereId($release['id'])->update(['nfostatus' => self::NFO_FOUND]);
+                        DB::commit();
                         $processed++;
+
                         if ($this->echo) {
                             echo 'A';
                         }
+                    } catch (\Exception $e) {
+                        DB::rollBack();
+                        if ($this->echo) {
+                            cli()->error("Error saving archive NFO for release {$release['id']}: {$e->getMessage()}");
+                        }
                     }
                 } else {
-                    $this->withReleaseObservation($observation, static function () use ($release): void {
-                        Release::whereId($release['id'])->update(['nfostatus' => self::NFO_FAILED_ARCHIVE]);
-                    });
+                    Release::whereId($release['id'])->update(['nfostatus' => self::NFO_FAILED_ARCHIVE]);
+
                     if ($this->echo) {
                         echo '-';
                     }
                 }
             } catch (\Exception $e) {
-                $this->withReleaseObservation($observation, static function () use ($release): void {
-                    Release::whereId($release['id'])->update(['nfostatus' => self::NFO_FAILED_ARCHIVE]);
-                });
+                Release::whereId($release['id'])->update(['nfostatus' => self::NFO_FAILED_ARCHIVE]);
+
                 if ($this->echo) {
                     cli()->error("Error in archive NFO extraction for release {$release['id']}: {$e->getMessage()}");
                 }
@@ -1755,6 +1714,14 @@ class NfoService
         return $nfoRecord->nfo;
     }
 
+    /**
+     * Store NFO content for a release.
+     *
+     * @param  int  $releaseId  The release ID.
+     * @param  string  $nfoContent  The NFO content to store.
+     * @param  bool  $compress  Whether to compress the content.
+     * @return bool True on success, false on failure.
+     */
     /** Private proposal: this final writer supplies the cleanup callback only after its actual SQL writes. */
     final public function storeNfoContentWithCommit(int $releaseId, string $nfoContent, \Closure $commit): void
     {
@@ -1767,33 +1734,19 @@ class NfoService
         $commit();
     }
 
-    /**
-     * Store NFO content for a release.
-     *
-     * @param  int  $releaseId  The release ID.
-     * @param  string  $nfoContent  The NFO content to store.
-     * @param  bool  $compress  Whether to compress the content.
-     * @param  array{token: ?string, claimed_at: ?string}|null  $owner
-     * @param  array{present: bool, id: int, guid: string, name: mixed, searchname: mixed, value: mixed}|null  $observation
-     * @return bool True on success, false on failure.
-     */
-    public function storeNfoContent(int $releaseId, string $nfoContent, bool $compress = true, ?array $observation = null, bool $replace = true, ?array $owner = null): bool
+    public function storeNfoContent(int $releaseId, string $nfoContent, bool $compress = true): bool
     {
-        $observation ??= $this->observeRelease($releaseId);
-        if ($observation === null || $observation['id'] !== $releaseId) {
-            return false;
-        }
         try {
             $data = $compress ? "\x1f\x8b\x08\x00".gzcompress($nfoContent) : $nfoContent;
 
-            return $this->withReleaseObservation($observation, static function () use ($releaseId, $data, $replace): void {
-                if ($replace) {
-                    ReleaseNfo::updateOrCreate(['releases_id' => $releaseId], ['nfo' => $data]);
-                } else {
-                    ReleaseNfo::firstOrCreate(['releases_id' => $releaseId], ['nfo' => $data]);
-                }
-                Release::whereId($releaseId)->update(['nfostatus' => self::NFO_FOUND]);
-            }, owner: $owner);
+            ReleaseNfo::updateOrCreate(
+                ['releases_id' => $releaseId],
+                ['nfo' => $data]
+            );
+
+            Release::whereId($releaseId)->update(['nfostatus' => self::NFO_FOUND]);
+
+            return true;
         } catch (Throwable $e) {
             Log::error("Failed to store NFO for release {$releaseId}: ".$e->getMessage());
 

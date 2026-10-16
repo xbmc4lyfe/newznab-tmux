@@ -6,7 +6,6 @@ namespace Tests\Feature;
 
 use App\Enums\Par2RenameOutcome;
 use App\Services\NameFixing\NameFixingService;
-use App\Services\NfoService;
 use App\Services\NNTP\BoundedArticleResult;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
@@ -108,7 +107,6 @@ final class Par2IncompleteDescriptorProcessingTest extends TestCase
             public function __construct(NNTPService $nntp, PostProcessService $post)
             {
                 $this->nntp = $nntp;
-                $this->nfo = new NfoService;
                 $this->postProcessService = $post;
                 $this->parserService = new NzbParserService;
             }

@@ -8,7 +8,6 @@ use App\Enums\Par2RenameOutcome;
 use App\Facades\Search;
 use App\Models\Release;
 use App\Services\NameFixing\NameFixingService;
-use App\Services\NfoService;
 use App\Services\NNTP\BoundedArticleResult;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
@@ -16,11 +15,8 @@ use App\Services\Nzb\NzbParserService;
 use App\Services\Par2PacketAccumulator;
 use App\Services\Par2Processor;
 use App\Services\PostProcessService;
-use App\Support\Par2DescriptorEvidence;
 use App\Support\Par2RenameProgress;
-use App\Support\ReleasePackEvidence;
 use dariusiii\rarinfo\Par2Info;
-use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
@@ -37,15 +33,6 @@ final class Par2PersistenceGuardTest extends TestCase
     use Par2RenameTestDatabase;
 
     private const TITLE = 'Valid.Scene.Release.2026-GROUP';
-
-    public function createApplication()
-    {
-        $app = require __DIR__.'/../../bootstrap/app.php';
-        $app->useEnvironmentPath(sys_get_temp_dir())->loadEnvironmentFrom('.nntmux-validation-no-env');
-        $app->make(Kernel::class)->bootstrap();
-
-        return $app;
-    }
 
     protected function setUp(): void
     {
@@ -330,50 +317,6 @@ final class Par2PersistenceGuardTest extends TestCase
         $this->assertSame(0, DB::transactionLevel());
     }
 
-    public function test_republication_retires_descriptors_and_only_the_new_generation_can_persist_them(): void
-    {
-        Schema::table('releases', static function (Blueprint $table): void {
-            $table->integer('haspreview')->default(-1);
-            $table->integer('pp_timeout_count')->default(0);
-            $table->timestamp('archive_retry_at')->nullable();
-        });
-        $release = $this->pendingPar2Release();
-        DB::table('releases')->where('id', $release->id)->update([
-            ReleasePackEvidence::COLUMN => ReleasePackEvidence::tombstone($release),
-        ]);
-        $release->refresh();
-        $snapshot = ['id' => (int) $release->id, 'guid' => (string) $release->guid,
-            'name' => $release->name, 'searchname' => $release->searchname, 'predb_id' => 0, 'isrenamed' => 0];
-        $processor = new Par2Processor(new NameFixingService, new Par2Info, false, false);
-        $generationGuard = new \ReflectionMethod(Par2Processor::class, 'generationGuard');
-        $oldGuard = $generationGuard->invoke($processor, $release, null);
-        $inventory = new Par2PacketAccumulator;
-        $inventory->append($this->descriptorBody());
-        $this->assertTrue(Par2DescriptorEvidence::remember($inventory, $snapshot, $oldGuard));
-        $this->assertDatabaseCount('par2_descriptor_evidence', 1);
-
-        DB::transaction(static function () use ($release): void {
-            $current = DB::table('releases')->where('id', $release->id)->lockForUpdate()->first();
-            $reset = ReleasePackEvidence::retireDerivedEvidence((int) $current->id);
-            DB::table('releases')->where('id', $current->id)->update($reset + [
-                'nzbstatus' => 1,
-                ReleasePackEvidence::COLUMN => ReleasePackEvidence::tombstone($current),
-            ]);
-        });
-
-        $this->assertDatabaseCount('par2_descriptor_evidence', 0);
-        $this->assertFalse(Par2DescriptorEvidence::remember($inventory, $snapshot, $oldGuard));
-        $this->assertDatabaseCount('par2_descriptor_evidence', 0);
-        $freshGuard = $generationGuard->invoke($processor, $release->fresh(), null);
-        $this->assertTrue(Par2DescriptorEvidence::remember($inventory, $snapshot, $freshGuard));
-        $this->assertDatabaseCount('par2_descriptor_evidence', 1);
-        $this->assertDatabaseHas('par2_descriptor_evidence', [
-            'releases_id' => $release->id, 'release_guid' => $release->guid,
-            'descriptor_proof_version' => 1, 'classification' => 'unknown',
-            'classification_version' => 0, 'classification_provenance' => 'unclassified',
-        ]);
-    }
-
     private function pendingRelease(): Release
     {
         $release = $this->pendingPar2Release(['name' => self::TITLE, 'searchname' => self::TITLE, 'postdate' => '2026-10-11 00:00:00']);
@@ -440,7 +383,6 @@ final class Par2PersistenceGuardTest extends TestCase
             public function __construct(private SimpleXMLElement $xml, NNTPService $nntp, PostProcessService $post)
             {
                 $this->nntp = $nntp;
-                $this->nfo = new NfoService;
                 $this->postProcessService = $post;
                 $this->parserService = new NzbParserService;
             }

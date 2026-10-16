@@ -53,7 +53,7 @@ class ReleasesCleanSubjectNames extends Command
                 ->where(fn ($quoted) => $quoted->where('r.searchname', 'like', '%"%')->orWhere('r.searchname', 'like', '%#34;%'))
                 ->orderBy('r.id')
                 ->limit($limit === 0 ? $chunk : min($chunk, $limit - $checked))
-                ->get(['r.id', 'r.guid', 'r.additional_pack_evidence', 'r.name', 'r.searchname', 'r.fromname', 'r.groups_id', 'r.categories_id', 'g.name as group_name']);
+                ->get(['r.id', 'r.name', 'r.searchname', 'r.fromname', 'r.groups_id', 'r.categories_id', 'g.name as group_name']);
 
             if ($rows->isEmpty()) {
                 break;

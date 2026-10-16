@@ -419,7 +419,7 @@ final class PredbFulltextIdentityTest extends TestCase
     private function database(array $rows): SQLiteConnection
     {
         $pdo = new PDO('sqlite::memory:');
-        $pdo->exec('CREATE TABLE releases (additional_pack_evidence TEXT DEFAULT NULL, id INTEGER PRIMARY KEY, name TEXT, searchname TEXT, fromname TEXT, groups_id INTEGER, categories_id INTEGER, predb_id INTEGER, guid TEXT)');
+        $pdo->exec('CREATE TABLE releases (id INTEGER PRIMARY KEY, name TEXT, searchname TEXT, fromname TEXT, groups_id INTEGER, categories_id INTEGER, predb_id INTEGER, guid TEXT)');
         // This synthetic LIKE models the accent/case equivalence independently observed on MariaDB.
         $pdo->sqliteCreateFunction('like', static function (string $pattern, string $subject, string $escape): int {
             $fold = static fn (string $value): string => mb_strtolower(str_replace(['é', 'É'], ['e', 'E'], $value), 'UTF-8');

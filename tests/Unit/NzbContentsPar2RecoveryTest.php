@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Tests\Unit;
 
 use App\Enums\Par2RenameOutcome;
-use App\Services\NfoService;
 use App\Services\NNTP\BoundedArticleResult;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
@@ -224,7 +223,6 @@ final class NzbContentsPar2RecoveryTest extends TestCase
         (new ReflectionProperty(PostProcessService::class, 'par2Processor'))->setValue($postProcess, $processor);
         (new ReflectionProperty(NzbContentsService::class, 'postProcessService'))->setValue($service, $postProcess);
         (new ReflectionProperty(NzbContentsService::class, 'parserService'))->setValue($service, new NzbParserService);
-        (new ReflectionProperty(NzbContentsService::class, 'nfo'))->setValue($service, new NfoService);
         $nntp = $this->createStub(NNTPService::class);
         $nntp->method('getMessageBounded')->willReturnCallback(fn (string $group, string $id): BoundedArticleResult => BoundedArticleResult::success($this->descriptor($id)));
         (new ReflectionProperty(NzbContentsService::class, 'nntp'))->setValue($service, $nntp);

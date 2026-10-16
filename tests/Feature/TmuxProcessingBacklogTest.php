@@ -9,7 +9,6 @@ use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\Tmux\Tmux;
 use App\Services\Tmux\TmuxMonitorService;
 use Carbon\CarbonImmutable;
-use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -23,15 +22,6 @@ use Tests\TestCase;
 
 class TmuxProcessingBacklogTest extends TestCase
 {
-    public function createApplication()
-    {
-        $app = require __DIR__.'/../../bootstrap/app.php';
-        $app->useEnvironmentPath(sys_get_temp_dir())->loadEnvironmentFrom('.nntmux-validation-no-env');
-        $app->make(Kernel::class)->bootstrap();
-
-        return $app;
-    }
-
     protected function setUp(): void
     {
         parent::setUp();
@@ -44,7 +34,6 @@ class TmuxProcessingBacklogTest extends TestCase
 
         Schema::create('releases', static function (Blueprint $table): void {
             $table->increments('id');
-            $table->json('additional_pack_evidence')->nullable();
             $table->integer('categories_id')->default(10);
             $table->string('name')->default('obfuscated');
             $table->string('searchname')->default('obfuscated');

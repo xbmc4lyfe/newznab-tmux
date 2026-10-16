@@ -190,8 +190,6 @@ class AdditionalProcessingOrchestrator
                 'completion',
                 'categories_id',
                 'searchname',
-                'nzbstatus',
-                'additional_pack_evidence',
                 'predb_id',
                 'pp_timeout_count',
                 AdditionalCandidateQuery::CLAIM_TOKEN_COLUMN,

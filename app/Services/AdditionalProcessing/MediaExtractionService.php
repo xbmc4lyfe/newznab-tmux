@@ -19,12 +19,9 @@ use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\ReleaseUpdateService;
-use App\Services\NameFixing\SeasonPackDetector;
-use App\Services\Nzb\NzbService;
 use App\Services\ReleaseExtraService;
 use App\Services\ReleaseImageService;
 use App\Support\Par2FileHashEvidence;
-use App\Support\ReleasePackEvidence;
 use FFMpeg\Coordinate\Dimension;
 use FFMpeg\Coordinate\TimeCode;
 use FFMpeg\FFMpeg;
@@ -331,8 +328,7 @@ class MediaExtractionService
                             }
                             $title .= ' '.$ext;
                             if (mb_check_encoding($title, 'UTF-8') && mb_strlen($title, 'UTF-8') <= 255
-                                && preg_match('/\p{C}/u', $title) === 0
-                                && ! ($context->defersArchiveNameChecks() && SeasonPackDetector::isEpisodeName($title))) {
+                                && preg_match('/\p{C}/u', $title) === 0) {
                                 $category = match ($ext) {
                                     'MP3' => Category::MUSIC_MP3,
                                     'FLAC' => Category::MUSIC_LOSSLESS,
@@ -340,9 +336,7 @@ class MediaExtractionService
                                 };
                                 $categoryId = is_array($category) ? (int) $category['categories_id'] : $category;
                                 if (! $this->releaseUpdater->updateMediaSnapshot(
-                                    (object) [...$snapshot, 'releases_id' => $snapshot['id'],
-                                        'observed_pack_evidence' => $context->packEvidenceObservation,
-                                        ...($context->producerNamingClaim === null ? [] : ['observed_additional_pp_claim' => $context->producerNamingClaim])], $title, $categoryId,
+                                    (object) [...$snapshot, 'releases_id' => $snapshot['id']], $title, $categoryId,
                                     fn (): bool => $this->ownsAudioClaim($context, $snapshot),
                                 )) {
                                     throw $aborted;
@@ -437,16 +431,23 @@ class MediaExtractionService
         }
         $current = DB::table('releases')->where('id', $snapshot['id'])->first();
         if ($current === null || $current->guid !== $snapshot['guid']
-            || (int) $current->nzbstatus !== NzbService::NZB_ADDED
-            || ! ReleasePackEvidence::matches($current, $context->packEvidenceObservation, false)
             || ($current->additional_pp_claim_token ?? null) !== $snapshot['additional_pp_claim_token']) {
             return false;
         }
+        $claimedAt = $current->additional_pp_claimed_at ?? null;
+        if (array_key_exists('additional_pp_claimed_at', $snapshot) && $claimedAt !== $snapshot['additional_pp_claimed_at']) {
+            return false;
+        }
+        if ($snapshot['additional_pp_claim_token'] === null) {
+            return $claimedAt === null;
+        }
+        if (! is_string($claimedAt)) {
+            return false;
+        }
+        $parsed = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $claimedAt);
 
-        return ReleasePackEvidence::ownsClaim($current, $context->producerNamingClaim ?? [
-            'token' => $snapshot['additional_pp_claim_token'],
-            'claimed_at' => $snapshot['additional_pp_claimed_at'] ?? null,
-        ]);
+        return $parsed !== false && $parsed->format('Y-m-d H:i:s') === $claimedAt
+            && $claimedAt >= AdditionalCandidateQuery::claimStaleBefore()->format('Y-m-d H:i:s');
     }
 
     /**

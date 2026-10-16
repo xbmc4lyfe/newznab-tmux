@@ -7,7 +7,6 @@ namespace Tests\Feature;
 use App\Enums\Par2RenameOutcome;
 use App\Models\Release;
 use App\Services\NameFixing\NameFixingService;
-use App\Services\NfoService;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
 use App\Services\Nzb\NzbParserService;
@@ -521,7 +520,6 @@ class Par2RenameBatchTest extends TestCase
             public function __construct(private \Closure $load)
             {
                 $this->parserService = new NzbParserService;
-                $this->nfo = new NfoService;
                 $this->postProcessService = app(PostProcessService::class);
             }
 

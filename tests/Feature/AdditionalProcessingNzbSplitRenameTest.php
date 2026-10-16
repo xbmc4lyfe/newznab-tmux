@@ -178,14 +178,14 @@ class AdditionalProcessingNzbSplitRenameTest extends TestCase
 
     private function makeReleaseFileManager(?ReleaseUpdateService $updateService = null): ReleaseFileManager
     {
-        $updateService ??= $this->createStub(ReleaseUpdateService::class);
+        $updateService ??= $this->createMock(ReleaseUpdateService::class);
 
         return new ReleaseFileManager(
             $this->makeConfiguration(),
-            $this->createStub(ReleaseImageService::class),
-            $this->createStub(NfoService::class),
-            $this->createStub(NzbService::class),
-            $this->createStub(NameFixingService::class),
+            $this->createMock(ReleaseImageService::class),
+            $this->createMock(NfoService::class),
+            $this->createMock(NzbService::class),
+            $this->createMock(NameFixingService::class),
             $updateService,
             new FileNameCleaner
         );

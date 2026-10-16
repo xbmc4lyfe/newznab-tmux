@@ -7,7 +7,6 @@ namespace Tests\Feature;
 use App\Facades\Search;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\ReleaseCleaningService;
-use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Support\Facades\DB;
 use Mockery;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -20,15 +19,6 @@ use Tests\TestCase;
  */
 class CounterSubjectNamingTest extends TestCase
 {
-    public function createApplication()
-    {
-        $app = require __DIR__.'/../../bootstrap/app.php';
-        $app->useEnvironmentPath(sys_get_temp_dir())->loadEnvironmentFrom('.nntmux-validation-no-env');
-        $app->make(Kernel::class)->bootstrap();
-
-        return $app;
-    }
-
     protected function setUp(): void
     {
         parent::setUp();
@@ -44,7 +34,7 @@ class CounterSubjectNamingTest extends TestCase
         DB::statement('CREATE TABLE release_naming_regexes (id INTEGER PRIMARY KEY, group_regex VARCHAR(255), regex VARCHAR(255), status INTEGER DEFAULT 1, ordinal INTEGER DEFAULT 0)');
         DB::statement('CREATE TABLE predb (id INTEGER PRIMARY KEY, title VARCHAR(255), filename VARCHAR(255))');
         DB::statement('CREATE TABLE usenet_groups (id INTEGER PRIMARY KEY, name VARCHAR(255))');
-        DB::statement('CREATE TABLE releases (id INTEGER PRIMARY KEY, guid VARCHAR(255), additional_pack_evidence TEXT NULL, name VARCHAR(255), searchname VARCHAR(255), fromname VARCHAR(255), groups_id INTEGER, categories_id INTEGER, isrenamed INTEGER DEFAULT 0)');
+        DB::statement('CREATE TABLE releases (id INTEGER PRIMARY KEY, name VARCHAR(255), searchname VARCHAR(255), fromname VARCHAR(255), groups_id INTEGER, categories_id INTEGER, isrenamed INTEGER DEFAULT 0)');
         DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.binaries.multimedia.rail']);
         Search::shouldReceive('matchPredbExact')->andReturn(null)->byDefault();
     }

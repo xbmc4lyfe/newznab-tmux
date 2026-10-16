@@ -12,19 +12,11 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
-use App\Services\NfoService;
-use App\Services\NNTP\NNTPService;
-use App\Services\Nzb\NzbContentsService;
-use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\ConnectionInterface;
-use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
-use Illuminate\Support\Facades\Schema;
-use Mockery;
 use PHPUnit\Framework\Attributes\DataProvider;
-use ReflectionProperty;
 use Tests\Support\Par2RenameTestDatabase;
 use Tests\TestCase;
 
@@ -37,15 +29,6 @@ final class NfoAuthoritativeIdentityTest extends TestCase
 
     private const SOURCE = 'Different.Show.S01E01.1080p.WEB-DL-SOURCE';
 
-    public function createApplication()
-    {
-        $app = require __DIR__.'/../../bootstrap/app.php';
-        $app->useEnvironmentPath(sys_get_temp_dir())->loadEnvironmentFrom('.nntmux-validation-no-env');
-        $app->make(Kernel::class)->bootstrap();
-
-        return $app;
-    }
-
     protected function setUp(): void
     {
         parent::setUp();
@@ -57,60 +40,6 @@ final class NfoAuthoritativeIdentityTest extends TestCase
         config(['nntmux.echocli' => false, 'tmux.fix_names.cache_store' => 'array']);
         Cache::store('array')->flush();
         Event::fake([ReleaseNameFixed::class]);
-    }
-
-    #[DataProvider('asyncNfoObservationChanges')]
-    public function test_async_nfo_save_rejects_obsolete_content_and_never_changes_the_new_cohort_status(string $change): void
-    {
-        if (! Schema::hasColumn('releases', 'additional_pack_evidence')) {
-            Schema::table('releases', static function (Blueprint $table): void {
-                $table->json('additional_pack_evidence')->nullable();
-            });
-        }
-        Schema::table('release_files', static function (Blueprint $table): void {
-            $table->unsignedBigInteger('size')->default(0);
-        });
-        $guid = 'nfo-cohort-guid';
-        DB::table('releases')->insert(['id' => 1, 'guid' => $guid, 'name' => 'Source', 'searchname' => 'Source',
-            'groups_id' => 1, 'size' => 100, 'nfostatus' => -1, 'nzbstatus' => $change === 'initial-none' ? 0 : 1]);
-        $contents = Mockery::mock(NzbContentsService::class);
-        $contents->shouldReceive('setNntp', 'setNfo')->andReturnNull();
-        $fetches = 0;
-        $contents->shouldReceive('getNfoFromNzb')->andReturnUsing(static function () use ($change, $guid, &$fetches): string {
-            $fetches++;
-            $values = match ($change) {
-                'epoch' => ['additional_pack_evidence' => json_encode(['v' => 1,
-                    'identity_sha256' => hash('sha256', json_encode(['1', $guid], JSON_THROW_ON_ERROR)),
-                    'epoch' => str_repeat('b', 64), 'state' => null], JSON_THROW_ON_ERROR)],
-                'guid' => ['guid' => 'new-nfo-guid'],
-                'identity' => ['searchname' => 'New.Identity'],
-                'unpublished' => ['nzbstatus' => 0],
-                default => [],
-            };
-            if ($values !== []) {
-                DB::table('releases')->where('id', 1)->update($values);
-            }
-
-            return 'Release : Show.S01E01.1080p.WEB-DL-GRP';
-        });
-        $this->app->instance(NzbContentsService::class, $contents);
-        $service = new NfoService;
-        foreach (['nzbs' => 1, 'maxRetries' => -8, 'maxSize' => 0, 'minSize' => 0, 'echo' => false] as $property => $value) {
-            (new ReflectionProperty(NfoService::class, $property))->setValue($service, $value);
-        }
-
-        $processed = $service->processNfoFiles($this->createStub(NNTPService::class));
-
-        self::assertSame($change === 'initial-none' ? 0 : 1, $fetches);
-        self::assertSame($change === 'unchanged' ? 1 : 0, $processed);
-        self::assertSame($change === 'unchanged' ? 1 : 0, DB::table('release_nfos')->count());
-        self::assertSame($change === 'unchanged' ? 1 : -1, (int) DB::table('releases')->value('nfostatus'));
-    }
-
-    public static function asyncNfoObservationChanges(): array
-    {
-        return ['epoch during fetch' => ['epoch'], 'GUID during fetch' => ['guid'], 'identity during fetch' => ['identity'],
-            'unpublished during fetch' => ['unpublished'], 'unpublished before fetch' => ['initial-none'], 'valid save' => ['unchanged']];
     }
 
     /** @return iterable<string, array{string, string}> */

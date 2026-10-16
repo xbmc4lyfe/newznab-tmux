@@ -27,9 +27,7 @@ use App\Support\Data\NzbCreationResult;
 use App\Support\Data\ProcessReleasesSettings;
 use App\Support\Data\ReleaseCreationResult;
 use App\Support\Data\ReleaseDeleteStats;
-use App\Support\ReleasePackEvidence;
 use App\Support\ReleaseSearchIndexSync;
-use Closure;
 use DateTimeInterface;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Carbon;
@@ -1197,14 +1195,11 @@ final class ReleaseProcessingService
             'id',
             'guid',
             'name',
-            'searchname',
-            'additional_pack_evidence',
             'categories_id',
             'groups_id',
             'postdate',
             'nzbstatus',
             NzbCreationCandidateQuery::CLAIM_TOKEN_COLUMN,
-            NzbCreationCandidateQuery::CLAIMED_AT_COLUMN,
         ];
         $releases = $maxReleases === null ? null : NzbCreationCandidateQuery::claimBatch($groupID, $limit, $claimToken, $columns, $preferredIds);
         $total = $releases === null ? min(NzbCreationCandidateQuery::baseBuilder($groupID)->count(), $limit) : $releases->count();
@@ -1213,7 +1208,6 @@ final class ReleaseProcessingService
             $processed = 0;
             $releases ??= NzbCreationCandidateQuery::claimBatch($groupID, $limit, $claimToken, $columns);
             foreach ($releases as $release) {
-                $admission = clone $release;
                 try {
                     $result = $this->nzb->createNzbForRelease($release);
                     if ($result->success) {
@@ -1226,32 +1220,26 @@ final class ReleaseProcessingService
                         continue;
                     }
 
-                    if ($this->shouldDeleteFailedNzbCreation($admission, $result)) {
-                        if ($this->deleteFailedNzbCreationRelease($admission, $result)) {
-                            $deletedCount++;
-                        }
+                    if ($this->shouldDeleteFailedNzbCreation($release, $result)) {
+                        $this->deleteFailedNzbCreationRelease($release, $result, $claimToken);
+                        $deletedCount++;
 
                         continue;
                     }
 
-                    if ($this->recordNzbCreationRetry($admission, $result)) {
-                        $retryCount++;
-                    }
+                    $this->recordNzbCreationRetry($release, $result);
+                    $retryCount++;
                 } catch (Throwable $e) {
                     $result = NzbCreationResult::transient('Unexpected NZB creation failure: '.$e->getMessage());
-                    if ($this->shouldDeleteFailedNzbCreation($admission, $result)) {
-                        if ($this->deleteFailedNzbCreationRelease($admission, $result)) {
-                            $deletedCount++;
-                        }
+                    if ($this->shouldDeleteFailedNzbCreation($release, $result)) {
+                        $this->deleteFailedNzbCreationRelease($release, $result, $claimToken);
+                        $deletedCount++;
                     } else {
-                        if ($this->recordNzbCreationRetry($admission, $result)) {
-                            $retryCount++;
-                        }
+                        $this->recordNzbCreationRetry($release, $result);
+                        $retryCount++;
                     }
                 } finally {
-                    $this->withNzbCreationAdmission($admission, static function (Release $current) use ($claimToken): void {
-                        NzbCreationCandidateQuery::clearClaim((int) $current->id, $claimToken);
-                    });
+                    NzbCreationCandidateQuery::clearClaim((int) $release->id, $claimToken);
                     $processed++;
                     $this->outputProgress($processed, $total, 'Creating NZBs');
                 }
@@ -1292,46 +1280,44 @@ final class ReleaseProcessingService
         return ($failureState instanceof ReleaseNzbCreationFailure ? $failureState->attempts : 0) + 1;
     }
 
-    private function recordNzbCreationRetry(Release $release, NzbCreationResult $result): bool
+    private function recordNzbCreationRetry(Release $release, NzbCreationResult $result): void
     {
-        return $this->withNzbCreationAdmission($release, function (Release $current) use ($result): void {
-            $nextAttempt = $this->nextNzbCreationAttempt($current);
-            $failure = ReleaseNzbCreationFailure::query()->updateOrCreate(
-                ['releases_id' => (int) $current->id],
-                [
-                    'attempts' => $nextAttempt,
-                    'last_error' => mb_substr($result->reason, 0, 1000),
-                ],
-            );
-            $current->setRelation('nzbCreationFailure', $failure);
+        $nextAttempt = $this->nextNzbCreationAttempt($release);
+        $failure = ReleaseNzbCreationFailure::query()->updateOrCreate(
+            ['releases_id' => (int) $release->id],
+            [
+                'attempts' => $nextAttempt,
+                'last_error' => mb_substr($result->reason, 0, 1000),
+            ],
+        );
+        $release->setRelation('nzbCreationFailure', $failure);
 
-            Log::channel('nzb_creation')->warning('NZB creation failed; release will be retried', [
-                'release_id' => $current->id,
-                'guid' => $current->guid,
-                'failure_type' => $result->failureType,
-                'reason' => $result->reason,
-                'next_attempt' => $nextAttempt,
-                'max_attempts' => self::NZB_CREATION_MAX_ATTEMPTS,
-            ]);
-        });
+        Log::channel('nzb_creation')->warning('NZB creation failed; release will be retried', [
+            'release_id' => $release->id,
+            'guid' => $release->guid,
+            'failure_type' => $result->failureType,
+            'reason' => $result->reason,
+            'next_attempt' => $nextAttempt,
+            'max_attempts' => self::NZB_CREATION_MAX_ATTEMPTS,
+        ]);
     }
 
-    private function deleteFailedNzbCreationRelease(Release $release, NzbCreationResult $result): bool
+    private function deleteFailedNzbCreationRelease(Release $release, NzbCreationResult $result, string $claimToken): void
     {
-        return $this->withNzbCreationAdmission($release, function (Release $current) use ($result): void {
-            Log::channel('nzb_creation')->warning('Deleting release after NZB creation failure', [
-                'release_id' => $current->id,
-                'guid' => $current->guid,
-                'failure_type' => $result->failureType,
-                'reason' => $result->reason,
-                'attempt' => $this->nextNzbCreationAttempt($current),
-                'max_attempts' => self::NZB_CREATION_MAX_ATTEMPTS,
-            ]);
+        Log::channel('nzb_creation')->warning('Deleting release after NZB creation failure', [
+            'release_id' => $release->id,
+            'guid' => $release->guid,
+            'failure_type' => $result->failureType,
+            'reason' => $result->reason,
+            'attempt' => $this->nextNzbCreationAttempt($release),
+            'max_attempts' => self::NZB_CREATION_MAX_ATTEMPTS,
+        ]);
 
+        try {
             $collectionIds = $result->collectionIds !== []
                 ? $result->collectionIds
                 : Collection::query()
-                    ->where('releases_id', $current->id)
+                    ->where('releases_id', $release->id)
                     ->pluck('id')
                     ->map(static fn (mixed $id): int => (int) $id)
                     ->all();
@@ -1345,49 +1331,13 @@ final class ReleaseProcessingService
             }
 
             $this->releaseManagement->deleteSingleWithService(
-                ['g' => $current->guid, 'i' => $current->id],
+                ['g' => $release->guid, 'i' => $release->id],
                 $this->nzb,
                 $this->releaseImage
             );
-        });
-    }
-
-    /** @param Closure(Release): void $write */
-    private function withNzbCreationAdmission(Release $observed, Closure $write): bool
-    {
-        return DB::transaction(function () use ($observed, $write): bool {
-            $attributes = $observed->getAttributes();
-            $current = Release::query()->whereKey($observed->id)->lockForUpdate()->first();
-            if ($current === null || (int) $current->nzbstatus !== NzbService::NZB_NONE) {
-                return false;
-            }
-            $currentAttributes = $current->getAttributes();
-            foreach (['id', 'guid', 'name', 'searchname', 'nzbstatus', ReleasePackEvidence::COLUMN,
-                NzbCreationCandidateQuery::CLAIM_TOKEN_COLUMN, NzbCreationCandidateQuery::CLAIMED_AT_COLUMN] as $column) {
-                if (! array_key_exists($column, $attributes) || ! array_key_exists($column, $currentAttributes)) {
-                    return false;
-                }
-            }
-            if ((int) $attributes['nzbstatus'] !== NzbService::NZB_NONE
-                || ! ReleasePackEvidence::matches($current, ReleasePackEvidence::observe($observed))) {
-                return false;
-            }
-            foreach ([NzbCreationCandidateQuery::CLAIM_TOKEN_COLUMN, NzbCreationCandidateQuery::CLAIMED_AT_COLUMN] as $column) {
-                if ($currentAttributes[$column] !== $attributes[$column]) {
-                    return false;
-                }
-            }
-            $token = $currentAttributes[NzbCreationCandidateQuery::CLAIM_TOKEN_COLUMN];
-            $claimedAt = $currentAttributes[NzbCreationCandidateQuery::CLAIMED_AT_COLUMN];
-            if (! (($token === null && $claimedAt === null)
-                || (is_string($token) && $token !== '' && is_string($claimedAt)
-                    && Carbon::parse($claimedAt)->greaterThanOrEqualTo(NzbCreationCandidateQuery::claimStaleBefore())))) {
-                return false;
-            }
-            $write($current);
-
-            return true;
-        });
+        } finally {
+            NzbCreationCandidateQuery::clearClaim((int) $release->id, $claimToken);
+        }
     }
 
     /**
