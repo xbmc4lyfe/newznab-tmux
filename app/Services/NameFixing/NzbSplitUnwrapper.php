@@ -6,6 +6,8 @@ namespace App\Services\NameFixing;
 
 final class NzbSplitUnwrapper
 {
+    public const PREDB_IDENTITY_POLICY = '8d164fea7ac837a63195af3da05ba4ed09d34087937123240474e20cb555e52e';
+
     private const string WRAPPER_PATTERN = '/__NZBSPLIT__([a-f0-9]{8,})__NZBSPLIT__(.+)$/i';
 
     /**
@@ -31,6 +33,43 @@ final class NzbSplitUnwrapper
         '/"\s*yEnc.*$/i',
         '/\s+yEnc.*$/i',
     ];
+
+    /** Decode a single wrapper's literal payload; the caller owns suffix handling. */
+    public function literalPayload(string $value): ?string
+    {
+        $first = stripos($value, '__NZBSPLIT__');
+        if ($first === false) {
+            return null;
+        }
+        $second = stripos($value, '__NZBSPLIT__', $first + 1);
+        if ($second === false || stripos($value, '__NZBSPLIT__', $second + 1) !== false
+            || preg_match('/\A__NZBSPLIT__(?:[a-f0-9]{8,})__NZBSPLIT__(.+)\z/isD', substr($value, $first), $matches) !== 1) {
+            return null;
+        }
+
+        // Separator encoding is defined by the wrapper. Preserve every other payload byte.
+        return str_replace(['_', '+'], ['.', ' '], $matches[1]);
+    }
+
+    /** Remove a bounded transport trailer only from a valid archive-wrapped NZBSPLIT filename. */
+    public function stripLiteralSubjectTrailer(string $value): string
+    {
+        if ($this->literalPayload($value) === null) {
+            return $value;
+        }
+
+        if (preg_match('/"? +yEnc(?: +\([1-9]\d*(?:\/[1-9]\d*)?\))?\z/iD', $value, $trailer, PREG_OFFSET_CAPTURE) !== 1) {
+            return $value;
+        }
+        $filename = substr($value, 0, $trailer[0][1]);
+        foreach (FileNameCleaner::archiveSuffixPatterns() as $pattern) {
+            if (preg_match($pattern, $filename) === 1) {
+                return $filename;
+            }
+        }
+
+        return $value;
+    }
 
     public function unwrap(string $value): ?string
     {

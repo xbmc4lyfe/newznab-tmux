@@ -11,10 +11,14 @@ use App\Services\AdditionalProcessing\ReleaseSearchSyncCoordinator;
 use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\NameFixingService;
+use App\Services\NameFixing\OriginalFilenameEvidence;
+use App\Services\NameFixing\PredbMatchSelector;
 use App\Services\NameFixing\ReleaseUpdateService;
+use App\Services\Predb\PredbIdentityRebuild;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 use ReflectionMethod;
 use Tests\Support\Par2RenameTestDatabase;
@@ -31,6 +35,7 @@ final class PredbUnicodeIdentityTest extends TestCase
     {
         parent::setUp();
         $this->createPar2RenameSchema();
+        DB::statement("ALTER TABLE predb ADD COLUMN filename varchar NOT NULL DEFAULT ''");
         config(['nntmux.echocli' => false]);
         Event::fake([ReleaseNameFixed::class]);
     }
@@ -121,9 +126,29 @@ final class PredbUnicodeIdentityTest extends TestCase
             'invalid' => [['id' => 0, 'title' => self::TITLE]],
             default => [['id' => 7, 'title' => self::TITLE]],
         };
-        DB::table('predb')->insert(['id' => 7, 'title' => in_array($evidence, ['exact', 'duplicate'], true) ? self::TITLE : 'Different.Movie.2026-GROUP']);
-        Search::shouldReceive('searchPredb')->andReturn($hits);
-        [$service] = $this->services();
+        if (in_array($evidence, ['exact', 'duplicate', 'stale', 'invalid'], true)) {
+            DB::table('predb')->insert(['id' => 7, 'title' => self::TITLE]);
+            if ($evidence === 'duplicate') {
+                DB::table('predb')->insert(['id' => 8, 'title' => self::TITLE]);
+            }
+        } elseif ($evidence === 'ambiguous') {
+            DB::table('predb')->insert($hits);
+        } elseif ($evidence === 'alias') {
+            DB::table('predb')->insert(['id' => 7, 'title' => str_replace('Rosalía', 'Rosalia', self::TITLE)]);
+        }
+        $this->certifyFilenameSqlFixture();
+        if ($evidence === 'stale') {
+            DB::table('predb')->where('id', 7)->update(['title' => 'Different.Movie.2026-GROUP']);
+        }
+        if ($evidence === 'invalid') {
+            DB::table('predb_identity_revisions')->where('predb_id', 7)->update(['projected_revision' => null]);
+        }
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
+        [$service, $updates] = $this->services();
+        if ($evidence === 'alias') {
+            self::assertFalse((new OriginalFilenameEvidence($filename))->accepts(str_replace('Rosalía', 'Rosalia', self::TITLE)));
+            self::assertNull($updates->currentPredbTitle(7, self::TITLE, $filename));
+        }
 
         if ($handler === 'files') {
             $service->fixNamesWithFiles(0, true, 3, true, false);
@@ -138,26 +163,34 @@ final class PredbUnicodeIdentityTest extends TestCase
         self::assertSame($evidence === 'exact' ? 7 : 0, $release->fresh()->predb_id);
         $expected = match ($evidence) {
             'exact' => self::TITLE,
-            'miss' => self::TITLE,
+            // Distinct catalogue spelling is SQL ABSENT, not an accepted alias.
+            'miss', 'alias' => self::TITLE,
             default => 'Hashed.Title',
         };
         self::assertSame($expected, $release->fresh()->searchname);
-        if (! in_array($evidence, ['exact', 'miss'], true)) {
+        if ($evidence === 'alias') {
+            self::assertSame(str_replace('Rosalía', 'Rosalia', self::TITLE), DB::table('predb')->where('id', 7)->value('title'));
+            Event::assertDispatched(ReleaseNameFixed::class, static fn (ReleaseNameFixed $event): bool => $event->newName === self::TITLE);
+        }
+        if (! in_array($evidence, ['exact', 'miss', 'alias'], true)) {
             Event::assertNotDispatched(ReleaseNameFixed::class);
         }
     }
 
-    public function test_cached_rejected_filename_evidence_never_becomes_a_legacy_fallback(): void
+    public function test_repeated_scorer_rejected_sql_filename_evidence_never_becomes_a_legacy_fallback(): void
     {
         $first = $this->pendingPar2Release(['searchname' => 'Hashed.First']);
         $second = $this->pendingPar2Release(['searchname' => 'Hashed.Second']);
         foreach ([$first, $second] as $release) {
             DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => self::TITLE.'.mkv']);
         }
-        Search::shouldReceive('searchPredb')->once()->andReturn([
-            ['id' => 7, 'title' => str_replace('Rosalía', 'Rosalia', self::TITLE)],
-        ]);
-        [$service] = $this->services();
+        DB::table('predb')->insert(['id' => 7, 'title' => self::TITLE]);
+        $this->certifyFilenameSqlFixture();
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
+        $selector = $this->createMock(PredbMatchSelector::class);
+        $selector->expects(self::atLeastOnce())->method('selectBestMatch')->willReturn(null);
+        [, $updates] = $this->services();
+        $service = new NameFixingService($updates, predbMatchSelector: $selector);
 
         $service->fixNamesWithFiles(0, true, 3, true, false);
 
@@ -290,9 +323,11 @@ final class PredbUnicodeIdentityTest extends TestCase
         $release = $this->pendingPar2Release(['searchname' => 'Hashed.Title']);
         $input = $this->input($release);
         $input->filename = self::TITLE.'.mkv';
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => $different, 'filename' => $different.'.mkv']]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
         [$service] = $this->services();
 
+        DB::table('predb')->insert(['id' => 7, 'title' => $different, 'filename' => $different.'.mkv']);
+        $this->certifyFilenameSqlFixture();
         $matched = $service->matchPreDbFiles($input, true, true, false);
 
         self::assertSame(0, $matched);
@@ -324,15 +359,17 @@ final class PredbUnicodeIdentityTest extends TestCase
         DB::table('predb')->insert(['id' => 7, 'title' => self::TITLE]);
         [$service, $updates] = $this->services();
         if (in_array($path, ['filename', 'prefile'], true)) {
-            Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => self::TITLE]]);
+            Search::shouldReceive('searchPredbFilenameCandidates')->never();
         }
 
         if ($path === 'donor') {
             $donor = (object) ['releases_id' => 99, 'relsize' => 5000, 'searchname' => self::TITLE, 'predb_id' => 7];
             $matched = (new ReflectionMethod(NameFixingService::class, 'applyDonorMatch'))->invoke($service, $input, [$donor], 5, 'hashCheck: PAR2', 'PAR2 hash, ', true, true, false);
         } elseif ($path === 'filename') {
+            $this->certifyFilenameSqlFixture();
             $matched = (new ReflectionMethod(NameFixingService::class, 'preDbFileCheck'))->invoke($service, $input, true, 'Filenames, ', true, false);
         } elseif ($path === 'prefile') {
+            $this->certifyFilenameSqlFixture();
             $matched = $service->matchPreDbFiles($input, true, true, false) === 1;
         } else {
             $input->textstring = self::TITLE;
@@ -387,9 +424,10 @@ final class PredbUnicodeIdentityTest extends TestCase
         $release = $this->pendingPar2Release(['searchname' => 'Hashed.Title']);
         $input = $this->input($release);
         $input->filename = $filename;
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => $title]]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
         [$service] = $this->services();
 
+        $this->certifyFilenameSqlFixture();
         self::assertSame(1, $service->matchPreDbFiles($input, true, true, false));
         self::assertSame(7, $release->fresh()->predb_id);
         self::assertSame($title, $release->fresh()->searchname);
@@ -470,12 +508,13 @@ final class PredbUnicodeIdentityTest extends TestCase
         $release = $this->pendingPar2Release(['searchname' => 'Original.Title']);
         $input = $this->input($release);
         $input->filename = 'Archive.File-GROUP.mkv';
-        Search::shouldReceive('searchPredb')->once()->andReturn([
+        DB::table('predb')->insert([
             ['id' => 7, 'title' => self::TITLE, 'filename' => $input->filename],
             ['id' => 8, 'title' => str_replace('2026', '2025', self::TITLE), 'filename' => $input->filename],
         ]);
         [$service] = $this->services();
 
+        $this->certifyFilenameSqlFixture();
         self::assertSame(0, $service->matchPreDbFiles($input, true, true, false));
         self::assertSame(0, $release->fresh()->predb_id);
     }
@@ -487,12 +526,11 @@ final class PredbUnicodeIdentityTest extends TestCase
         $release = $this->pendingPar2Release(['searchname' => 'Original.Title']);
         $input = $this->input($release);
         $input->filename = self::TITLE.'.mkv';
-        Search::shouldReceive('searchPredb')->once()->andReturn([
-            ['id' => 8, 'title' => str_replace('2026', '2025', self::TITLE), 'filename' => $input->filename],
-            ['id' => 7, 'title' => self::TITLE, 'filename' => $input->filename],
-        ]);
+        DB::table('predb')->insert(['id' => 8, 'title' => str_replace('2026', '2025', self::TITLE), 'filename' => $input->filename]);
+        DB::table('predb')->where('id', 7)->update(['filename' => $input->filename]);
         [$service] = $this->services();
 
+        $this->certifyFilenameSqlFixture();
         self::assertSame(1, $service->matchPreDbFiles($input, true, true, false));
         self::assertSame(7, $release->fresh()->predb_id);
         self::assertSame(self::TITLE, $release->fresh()->searchname);
@@ -503,9 +541,11 @@ final class PredbUnicodeIdentityTest extends TestCase
         $release = $this->pendingPar2Release(['searchname' => 'Original.Title', 'predb_id' => 999]);
         $input = $this->input($release);
         $input->filename = self::TITLE.'.mkv';
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => self::TITLE]]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
         [$service] = $this->services();
 
+        DB::table('predb')->insert(['id' => 7, 'title' => self::TITLE]);
+        $this->certifyFilenameSqlFixture();
         self::assertSame(0, $service->matchPreDbFiles($input, true, true, false));
         self::assertSame(999, $release->fresh()->predb_id);
         self::assertSame('Original.Title', $release->fresh()->searchname);
@@ -543,5 +583,33 @@ final class PredbUnicodeIdentityTest extends TestCase
     private function input(Release $release): object
     {
         return (object) array_merge($release->getAttributes(), ['releases_id' => $release->id, 'relsize' => 5000]);
+    }
+
+    /** Explicit migration from legacy nullable/TEXT fixture, only for SQL filename routes. */
+    private function certifyFilenameSqlFixture(): void
+    {
+        if (! Schema::hasTable('predb_identity_state')) {
+            $columns = array_column(DB::select('PRAGMA table_info(predb)'), 'name');
+            $filename = in_array('filename', $columns, true) ? "COALESCE(filename,'')" : "''";
+            DB::statement('ALTER TABLE predb RENAME TO legacy_predb_fixture');
+            DB::statement("CREATE TABLE predb (id INTEGER PRIMARY KEY NOT NULL, title varchar NOT NULL, filename varchar NOT NULL DEFAULT '', source varchar, size varchar, category varchar, nuked INTEGER DEFAULT 0)");
+            DB::statement("INSERT INTO predb(id,title,filename) SELECT id,title,$filename FROM legacy_predb_fixture");
+            foreach (['source', 'size', 'category', 'nuked'] as $column) {
+                if (in_array($column, $columns, true)) {
+                    DB::statement('UPDATE predb SET '.$column.'=(SELECT '.$column.' FROM legacy_predb_fixture old WHERE old.id=predb.id)');
+                }
+            }
+            DB::statement('DROP TABLE legacy_predb_fixture');
+            (require database_path('migrations/2026_10_15_150000_create_predb_identity_projection.php'))->up();
+        }
+        if (! Schema::hasTable('release_files')) {
+            DB::statement('CREATE TABLE release_files (releases_id INTEGER NOT NULL,name varchar NOT NULL,crc32 varchar)');
+        }
+        $rebuild = new PredbIdentityRebuild;
+        $start = $rebuild->start(DB::connection());
+        do {
+            $page = $rebuild->chunk(DB::connection(), $start['generation']);
+        } while (! $page['exhausted']);
+        $rebuild->certify(DB::connection(), $start['generation']);
     }
 }

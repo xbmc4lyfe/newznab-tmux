@@ -82,4 +82,34 @@ class NzbSplitUnwrapperTest extends TestCase
 
         $this->assertNull($unwrapper->unwrap($wrapped));
     }
+
+    public function test_literal_payload_preserves_spelling_without_archive_or_whitespace_cleanup(): void
+    {
+        $unwrapper = new NzbSplitUnwrapper;
+        foreach (['Exact_Release_2026.rar', ' Exact__Release_2026-GRP ', 'Exact_Release_2026_DTS', 'Exact++Release', "Exact_Release\n"] as $payload) {
+            self::assertSame(str_replace(['_', '+'], ['.', ' '], $payload), $unwrapper->literalPayload('Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__'.$payload));
+        }
+        foreach (['Outer__NZBSPLIT__invalid__NZBSPLIT__Title', 'Outer__NZBSPLIT__abcdef0__NZBSPLIT__Title', 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__', 'Outer__NZBSPLIT__invalid__NZBSPLIT__Junk__NZBSPLIT__abcdef0123456789__NZBSPLIT__Title', '__NZBSPLIT__NZBSPLIT__abcdef01__NZBSPLIT__Title', 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__NZBSPLIT__Title'] as $invalid) {
+            self::assertNull($unwrapper->literalPayload($invalid));
+        }
+    }
+
+    public function test_literal_subject_trailer_requires_a_valid_wrapper_and_bounded_archive_boundary(): void
+    {
+        $unwrapper = new NzbSplitUnwrapper;
+        $wrapped = 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP.7z.073';
+        foreach ([' yEnc', ' yEnc (1)', '" yEnc (1/42)', '  yenc (123/456)'] as $trailer) {
+            self::assertSame($wrapped, $unwrapper->stripLiteralSubjectTrailer($wrapped.$trailer));
+        }
+        $prefix = 'Outer__NZBSPLIT__abcdef0123456789__NZBSPLIT__Exact_Release_2026-GRP';
+        foreach (['.part12345.rar', '.r00', '.r1234', '.7z', '.7z.01', '.7z.0001', '.rar', '.par', '.par2', '.vol123+456.par2', '.001'] as $suffix) {
+            self::assertSame($prefix.$suffix, $unwrapper->stripLiteralSubjectTrailer($prefix.$suffix.' yEnc (1/42)'));
+        }
+        foreach ([' yEnc unknown', ' yEnc (1) yEnc (2)', ' yEnc (0)', ' yEnc (-1)', ' yEnc (1/0)', ' yEnc (1/2/3)', ' yEnc (1 / 2)', ' yEnc (1', "\tyEnc (1)", " yEnc (1)\n", ' yEnc (1).mkv'] as $trailer) {
+            self::assertSame($wrapped.$trailer, $unwrapper->stripLiteralSubjectTrailer($wrapped.$trailer));
+        }
+        foreach (['Exact.Release.2026-GRP.7z.073 yEnc (1)', str_replace('abcdef0123456789', 'invalid', $wrapped).' yEnc (1)', $wrapped.'__NZBSPLIT__ yEnc (1)', str_replace('.7z.073', '.unknown', $wrapped).' yEnc (1)'] as $invalid) {
+            self::assertSame($invalid, $unwrapper->stripLiteralSubjectTrailer($invalid));
+        }
+    }
 }
