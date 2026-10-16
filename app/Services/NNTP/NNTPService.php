@@ -1940,9 +1940,53 @@ class NNTPService extends NntpClient
     /** Read one dot-terminated BODY response, removing NNTP dot stuffing exactly once. */
     protected function readRawBody(?callable $onRead = null): mixed
     {
+        $socket = $this->_socket;
+        if ($onRead === null) {
+            $body = '';
+            while (true) {
+                $first = fgets($socket, 4);
+                if ($first === false) {
+                    return $this->throwError(feof($socket)
+                        ? 'End of stream! Connection lost?'
+                        : 'Failed to read line from socket.', null);
+                }
+                if ($first === ".\r\n") {
+                    return $body;
+                }
+                if (! str_ends_with($first, "\n")) {
+                    break;
+                }
+                $body .= str_starts_with($first, '..') ? substr($first, 1) : $first;
+            }
+            $lineAndRest = $first;
+            while (true) {
+                $rest = stream_get_line($socket, PHP_INT_MAX, "\n.\r");
+                if ($rest === false) {
+                    return $this->throwError(feof($socket)
+                        ? 'End of stream! Connection lost?'
+                        : 'Failed to read line from socket.', null);
+                }
+                $lf = fgetc($socket);
+                if ($lf === false) {
+                    return $this->throwError(feof($socket)
+                        ? 'End of stream! Connection lost?'
+                        : 'Failed to read line from socket.', null);
+                }
+                if ($lf === "\n") {
+                    $lineAndRest .= $rest;
+                    break;
+                }
+                $lineAndRest .= $rest."\n.\r".$lf;
+            }
+            if (str_starts_with($lineAndRest, '..')) {
+                $lineAndRest = substr($lineAndRest, 1);
+            }
+
+            return $body.str_replace("\n..", "\n.", $lineAndRest)."\n";
+        }
+
         $body = '';
         $line = '';
-        $socket = $this->_socket;
         while (true) {
             $fragment = fgets($socket, 8192);
             if ($fragment === false) {
@@ -1950,7 +1994,7 @@ class NNTPService extends NntpClient
                     ? 'End of stream! Connection lost?'
                     : 'Failed to read line from socket.', null);
             }
-            if ($onRead !== null && ! $onRead()) {
+            if (! $onRead()) {
                 $this->doQuit();
 
                 return $this->throwError('NNTP article read stopped after processing lock ownership was lost.', null);

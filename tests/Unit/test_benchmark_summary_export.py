@@ -48,6 +48,17 @@ def presentation():
 
 
 class BenchmarkSummaryExportTest(unittest.TestCase):
+    def test_rust_source_allowlist_matches_committed_crate_inventory(self):
+        spec = importlib.util.spec_from_file_location("benchmark_summary_export", SCRIPT)
+        exporter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(exporter)
+        committed = set(subprocess.check_output(
+            ["git", "ls-files", "-z", "--", "docker/app/nzb-yenc-ffi/src"],
+            cwd=SCRIPT.parents[1],
+        ).decode().rstrip("\0").split("\0"))
+        committed = {path for path in committed if path.endswith(".rs")}
+        self.assertEqual(exporter.RUST_SOURCE_PATHS, committed)
+
     def test_payload_modes_follow_the_recorded_manifest_and_unsafe_or_ambiguous_modes_are_unknown(self):
         for kind in ("cpp", "php", "profile"):
             for supplied, expected in (("experimental", "experimental"), ("incumbent", "incumbent"),
@@ -222,7 +233,12 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
         bad_sources["docker/app/nzb-yenc-ffi/src/payload_decoder.rs"] = "f" * 64
         missing_sources = dict(RUST_SOURCES)
         del missing_sources["docker/app/nzb-yenc-ffi/src/zstd_frame.rs"]
+        missing_new_path = dict(RUST_SOURCES)
+        del missing_new_path["docker/app/nzb-yenc-ffi/src/abi_crc.rs"]
+        extra_source = dict(RUST_SOURCES)
+        extra_source["docker/app/nzb-yenc-ffi/src/not-committed.rs"] = "f" * 64
         for change in ({"rust_source_sha256": bad_sources}, {"rust_source_sha256": missing_sources},
+                       {"rust_source_sha256": missing_new_path}, {"rust_source_sha256": extra_source},
                        {"rust_library_sha256": "f" * 64}, {"github_run_id": "124"},
                        {"rust_payload_kernel_id": True}, {"rust_payload_kernel_id": 2.0}):
             with self.subTest(change=change):

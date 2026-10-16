@@ -67,6 +67,7 @@ docker/Makefile		-binary text eol=lf
 /docker/app/nzb-yenc-ffi/Cargo.lock	-binary text eol=lf
 /docker/app/nzb-yenc-ffi/src/*.rs	-binary text eol=lf
 /docker/app/nzb-yenc-ffi/src/**/*.rs -binary text eol=lf
+/docker/app/nzb-yenc-ffi/tests/*.rs -binary text eol=lf
 
 /tests/Fixtures/NativeSpotCheckPlannerInvalidLibrary.c -binary text eol=lf
 

@@ -57,6 +57,7 @@ pub unsafe fn decode_into(source: *const u8, destination: *mut u8, length: usize
 
 /// Runtime dispatch identity: 0 scalar, 1 SSSE3, 2 AVX2, 3 VBMI2, 4 NEON.
 /// Every optional feature required by a kernel is checked independently.
+#[inline]
 pub(crate) fn selected_kernel() -> u32 {
     #[cfg(target_arch = "aarch64")]
     {
@@ -64,20 +65,28 @@ pub(crate) fn selected_kernel() -> u32 {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("avx2")
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SELECTED: AtomicU32 = AtomicU32::new(u32::MAX);
+        let cached = SELECTED.load(Ordering::Relaxed);
+        if cached != u32::MAX {
+            return cached;
+        }
+        let detected = if is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("avx512vbmi2")
             && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512vl")
             && is_x86_feature_detected!("popcnt")
         {
-            return 3;
-        }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
-            return 2;
-        }
-        if is_x86_feature_detected!("ssse3") {
-            return 1;
-        }
+            3
+        } else if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
+            2
+        } else if is_x86_feature_detected!("ssse3") {
+            1
+        } else {
+            0
+        };
+        SELECTED.store(detected, Ordering::Relaxed);
+        return detected;
     }
     #[allow(unreachable_code)]
     0
