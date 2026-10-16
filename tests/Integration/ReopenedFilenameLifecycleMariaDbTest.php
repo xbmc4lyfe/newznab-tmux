@@ -8,6 +8,7 @@ use App\Events\ReleaseNameFixed;
 use App\Facades\Search;
 use App\Models\Category;
 use App\Models\Release;
+use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\AdditionalProcessing\ReleaseFileManager;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\Categorization\CategorizationService;
@@ -31,6 +32,7 @@ use Illuminate\Support\Facades\File;
 use Mockery;
 use PDO;
 use PHPUnit\Framework\Attributes\DataProvider;
+use ReflectionProperty;
 use RuntimeException;
 use Tests\TestCase;
 use Tests\Unit\AdditionalProcessing\CreatesProcessingConfiguration;
@@ -47,6 +49,8 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
 
     private bool $connectionConfigured = false;
 
+    private ?bool $originalSupportsClaims = null;
+
     private string $sourceDirectory = '';
 
     private ?\Closure $filenameDiscoveryMutation = null;
@@ -60,6 +64,9 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
         foreach (['database.default', 'database.connections.filename_lifecycle_qualification', 'cache.default', 'nntmux.echocli', 'nntmux_settings.path_to_nzbs'] as $key) {
             $this->originalConfig[$key] = config($key);
         }
+        $property = new ReflectionProperty(AdditionalCandidateQuery::class, 'supportsClaims');
+        $this->originalSupportsClaims = $property->getValue();
+        $property->setValue(null, null);
         $host = (string) (getenv('FILENAME_LIFECYCLE_TEST_HOST') ?: getenv('PAR2_DONOR_TEST_HOST'));
         if ($host === '') {
             $this->markTestSkipped('Set FILENAME_LIFECYCLE_TEST_HOST or PAR2_DONOR_TEST_HOST to an isolated MariaDB test server.');
@@ -157,6 +164,7 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
             }
         } finally {
             config($this->originalConfig);
+            (new ReflectionProperty(AdditionalCandidateQuery::class, 'supportsClaims'))->setValue(null, $this->originalSupportsClaims);
         }
     }
 
@@ -308,13 +316,15 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
             $manager->finalizeRelease($context, false);
             self::fail('Expected finalization ownership loss after release_files insert to abort.');
         } catch (RuntimeException $exception) {
-            self::assertSame('Additional-processing finalization lost release ownership.', $exception->getMessage());
+            self::assertSame('Additional-processing evidence ownership changed before final status update.', $exception->getMessage());
         }
 
         self::assertTrue($mutated);
         self::assertSame(0, DB::table('release_files')->where('releases_id', 1)->count());
+        self::assertSame(0, DB::table('release_archive_naming_evidence')->where('releases_id', 1)->count());
         self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
-        self::assertSame('stolen-inside-tx', DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
+        self::assertSame('token', DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
+        self::assertSame(-1, (int) DB::table('releases')->where('id', 1)->value('haspreview'));
     }
 
     #[DataProvider('isolationLevels')]
