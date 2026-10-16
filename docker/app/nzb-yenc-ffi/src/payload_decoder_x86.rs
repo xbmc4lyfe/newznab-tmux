@@ -404,6 +404,42 @@ pub(crate) unsafe fn decode_avx2(source: *const u8, destination: *mut u8, length
     }
 }
 
+static TAIL_SHUFFLE: [[u8; 16]; 8] = {
+    let mut table = [[0u8; 16]; 8];
+    let mut rem = 0;
+    while rem < 8 {
+        let mut lane = 0;
+        while lane < 8 {
+            table[rem][lane] = (rem + lane) as u8;
+            lane += 1;
+        }
+        rem += 1;
+    }
+    table
+};
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn block_masks_u32(equals: u32, newlines: u32, escaped: &mut bool) -> (u32, u32) {
+    let mut remove = newlines;
+    let mut adjust = 0u32;
+    let mut pending = *escaped;
+    let mut remaining = !newlines;
+    while remaining != 0 {
+        let bit = 1u32 << remaining.trailing_zeros();
+        remaining &= remaining - 1;
+        if pending {
+            adjust |= bit;
+            pending = false;
+        } else if equals & bit != 0 {
+            remove |= bit;
+            pending = true;
+        }
+    }
+    *escaped = pending;
+    (remove, adjust)
+}
+
 // Register compression avoids a memory-form compress-store, and exact unmasked
 // stores write only the contiguous decoded prefix without byte-masked store stalls.
 #[target_feature(enable = "avx2,avx512vbmi2,avx512bw,avx512vl,popcnt")]
@@ -417,37 +453,33 @@ unsafe fn store_compressed_vbmi2(packed: x86::__m256i, count: usize, destination
             _mm_storeu_si128(destination.cast(), _mm256_castsi256_si128(packed));
             let high = _mm256_extracti128_si256::<1>(packed);
             _mm_storel_epi64(destination.add(16).cast(), high);
-            let low_word = _mm_cvtsi128_si64(high) as u64;
-            let high_word = _mm_extract_epi64::<1>(high) as u64;
-            let combined = u128::from(low_word) | (u128::from(high_word) << 64);
-            let tail = (combined >> ((count - 24) * 8)) as u64;
-            destination
-                .add(count - 8)
-                .cast::<u64>()
-                .write_unaligned(tail.to_le());
+            if count > 24 {
+                let shuf = _mm_loadu_si128(TAIL_SHUFFLE[count - 24].as_ptr().cast());
+                _mm_storel_epi64(
+                    destination.add(count - 8).cast(),
+                    _mm_shuffle_epi8(high, shuf),
+                );
+            }
         } else if count >= 16 {
-            let low = _mm256_castsi256_si128(packed);
-            _mm_storeu_si128(destination.cast(), low);
-            let high = _mm256_extracti128_si256::<1>(packed);
-            let low_word = _mm_extract_epi64::<1>(low) as u64;
-            let high_word = _mm_cvtsi128_si64(high) as u64;
-            let combined = u128::from(low_word) | (u128::from(high_word) << 64);
-            let tail = (combined >> ((count - 16) * 8)) as u64;
-            destination
-                .add(count - 8)
-                .cast::<u64>()
-                .write_unaligned(tail.to_le());
+            _mm_storeu_si128(destination.cast(), _mm256_castsi256_si128(packed));
+            if count > 16 {
+                let high = _mm256_extracti128_si256::<1>(packed);
+                store_word(
+                    (_mm_cvtsi128_si64(high) as u64).to_le(),
+                    destination.add(16),
+                    count - 16,
+                );
+            }
         } else if count >= 8 {
             let low = _mm256_castsi256_si128(packed);
-            let low_word = _mm_cvtsi128_si64(low) as u64;
-            let high_word = _mm_extract_epi64::<1>(low) as u64;
-            destination.cast::<u64>().write_unaligned(low_word.to_le());
-            let combined = u128::from(low_word) | (u128::from(high_word) << 64);
-            let tail = (combined >> ((count - 8) * 8)) as u64;
-            destination
-                .add(count - 8)
-                .cast::<u64>()
-                .write_unaligned(tail.to_le());
+            _mm_storel_epi64(destination.cast(), low);
+            if count > 8 {
+                let shuf = _mm_loadu_si128(TAIL_SHUFFLE[count - 8].as_ptr().cast());
+                _mm_storel_epi64(
+                    destination.add(count - 8).cast(),
+                    _mm_shuffle_epi8(low, shuf),
+                );
+            }
         } else if count != 0 {
             let low = _mm256_castsi256_si128(packed);
             store_word((_mm_cvtsi128_si64(low) as u64).to_le(), destination, count);
@@ -482,13 +514,7 @@ unsafe fn compact_vbmi2(
             *escaped = equals & 0x8000_0000 != 0;
             (equals | newlines, following | u32::from(incoming))
         } else {
-            let (lo_remove, lo_adjust) = block_masks(equals as u16, newlines as u16, escaped);
-            let (hi_remove, hi_adjust) =
-                block_masks((equals >> 16) as u16, (newlines >> 16) as u16, escaped);
-            (
-                u32::from(lo_remove) | (u32::from(hi_remove) << 16),
-                u32::from(lo_adjust) | (u32::from(hi_adjust) << 16),
-            )
+            block_masks_u32(equals, newlines, escaped)
         };
         let keep = !remove;
         let count = keep.count_ones() as usize;
@@ -534,11 +560,14 @@ unsafe fn decode_vbmi2_dense(source: *const u8, destination: *mut u8, length: us
         let lf = _mm256_set1_epi8(b'\n' as i8);
         let offset = _mm256_set1_epi8(106);
         while length - read >= 32 {
-            while read < length && matches!(source.add(read).read(), b'\r' | b'\n') {
-                read += 1;
-            }
-            if length - read < 32 {
-                break;
+            let first_byte = source.add(read).read();
+            if first_byte == b'\r' || first_byte == b'\n' {
+                read += if first_byte == b'\r' && source.add(read + 1).read() == b'\n' {
+                    2
+                } else {
+                    1
+                };
+                continue;
             }
             let expected_markers = if escaped {
                 0xaaaa_aaaau32
@@ -571,6 +600,12 @@ unsafe fn decode_vbmi2_dense(source: *const u8, destination: *mut u8, length: us
                     );
                     written += 32;
                     read += 64;
+                    if read + 1 < length
+                        && source.add(read).read() == b'\r'
+                        && source.add(read + 1).read() == b'\n'
+                    {
+                        read += 2;
+                    }
                     continue;
                 }
             }
@@ -608,11 +643,13 @@ pub(crate) unsafe fn decode_vbmi2(source: *const u8, destination: *mut u8, lengt
             }
         }
         while length - read >= 64 {
-            if matches!(source.add(read).read(), b'\r' | b'\n') {
-                read += 1;
-                while read < length && matches!(source.add(read).read(), b'\r' | b'\n') {
-                    read += 1;
-                }
+            let first_byte = source.add(read).read();
+            if first_byte == b'\r' || first_byte == b'\n' {
+                read += if first_byte == b'\r' && source.add(read + 1).read() == b'\n' {
+                    2
+                } else {
+                    1
+                };
                 continue;
             }
             // Load both vectors before any store, including overlapping output.
@@ -636,13 +673,21 @@ pub(crate) unsafe fn decode_vbmi2(source: *const u8, destination: *mut u8, lengt
                     compact_vbmi2(high, high_specials, destination.add(written), &mut escaped);
             }
             read += 64;
+            if read + 1 < length
+                && source.add(read).read() == b'\r'
+                && source.add(read + 1).read() == b'\n'
+            {
+                read += 2;
+            }
         }
         while length - read >= 32 {
-            if matches!(source.add(read).read(), b'\r' | b'\n') {
-                read += 1;
-                while read < length && matches!(source.add(read).read(), b'\r' | b'\n') {
-                    read += 1;
-                }
+            let first_byte = source.add(read).read();
+            if first_byte == b'\r' || first_byte == b'\n' {
+                read += if first_byte == b'\r' && source.add(read + 1).read() == b'\n' {
+                    2
+                } else {
+                    1
+                };
                 continue;
             }
             let bytes = _mm256_loadu_si256(source.add(read).cast());
