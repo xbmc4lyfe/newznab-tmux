@@ -31,11 +31,13 @@ use App\Services\NameFixing\Extractors\FileNameExtractor;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NameFixing\NameFixingService;
+use App\Services\NameFixing\OriginalFilenameEvidence;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\NfoService;
 use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
+use App\Services\Predb\PredbIdentityRebuild;
 use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\TempWorkspaceService;
@@ -74,6 +76,8 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
 
     private string $sourceDirectory;
 
+    private ?\Closure $filenameDiscoveryMutation = null;
+
     /** @var list<string> */
     private array $par2HashFixtureFiles = [];
 
@@ -84,7 +88,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
 
     public function createApplication()
     {
-        $this->databasePath = sys_get_temp_dir().'/nntmux-release-file-manager-test.sqlite';
+        $this->databasePath = sys_get_temp_dir().'/nntmux-release-file-manager-test-'.bin2hex(random_bytes(8)).'.sqlite';
 
         $this->originalEnvironment = [
             'APP_ENV' => getenv('APP_ENV'),
@@ -436,7 +440,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
         $this->prepareFullPar2NamingEvidence($title);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title, 'source' => 'fixture']]);
+        $this->installFilenameSqlIdentity();
         $context = $this->sourceContext(Release::query()->findOrFail(1));
         DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => 'replacement-owner']);
         $published = [];
@@ -466,7 +470,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
         $this->prepareFullPar2NamingEvidence($title);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title, 'source' => 'fixture']]);
+        $this->installFilenameSqlIdentity();
         $context = $this->sourceContext(Release::query()->findOrFail(1));
         $published = [];
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
@@ -876,20 +880,26 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     private function makeFullPar2NamingManager(ReleaseSearchSyncCoordinator $sync, ?\Closure $observeFilenameCheck = null): ReleaseFileManager
     {
         $updater = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
-        $nameFixing = $observeFilenameCheck === null ? new NameFixingService($updater) : new class($updater, $observeFilenameCheck) extends NameFixingService
-        {
-            public function __construct(ReleaseUpdateService $updates, private readonly \Closure $observe)
+        $cleaner = $this->filenameDiscoveryCleaner();
+        $nameFixing = $observeFilenameCheck === null
+            ? new NameFixingService($updater, fileNameCleaner: $cleaner)
+            : new class($updater, $cleaner, $observeFilenameCheck) extends NameFixingService
             {
-                parent::__construct($updates);
-            }
+                public function __construct(ReleaseUpdateService $updates, FileNameCleaner $fileNameCleaner, private readonly \Closure $observe)
+                {
+                    parent::__construct($updates, fileNameCleaner: $fileNameCleaner);
+                }
 
-            public function matchPreDbFiles(object $release, bool $echo, bool $nameStatus, bool $show): int
-            {
-                ($this->observe)($release);
+                public function matchPreDbFileNames(object $release, array $files, bool $echo, bool $nameStatus, bool $show, ?array $persistedNames = null): int
+                {
+                    if (! isset($release->filename) || $release->filename === '') {
+                        $release->filename = $files[0] ?? '';
+                    }
+                    ($this->observe)($release);
 
-                return parent::matchPreDbFiles($release, $echo, $nameStatus, $show);
-            }
-        };
+                    return parent::matchPreDbFileNames($release, $files, $echo, $nameStatus, $show, $persistedNames);
+                }
+            };
 
         return new ReleaseFileManager(
             $this->makeConfig(['renamePar2' => true, 'echoCLI' => true, 'addPAR2Files' => true]),
@@ -941,6 +951,52 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         return $path;
     }
 
+    #[DataProvider('literalDelimiterFilenameCases')]
+    public function test_add_file_info_keeps_one_literal_filename_as_one_observation(bool $literalDelimiter, string $tail, int $expected, string $queryTail = ''): void
+    {
+        $title = 'Exact.Release.2026-GRP';
+        $this->prepareFullPar2NamingEvidence($title);
+        $this->installFilenameSqlIdentity();
+        DB::table('releases')->where('id', 1)->update(['searchname' => $title]);
+        Search::shouldReceive('supportsReleaseCandidatePaging')->andReturnFalse();
+        $discoveredQueries = [];
+        $this->filenameDiscoveryMutation = static function (string $query) use (&$discoveredQueries, $title): array {
+            $discoveredQueries[] = $query;
+
+            return [['id' => 7, 'title' => $title]];
+        };
+        Search::shouldReceive('updateRelease')->andReturnNull();
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $manager = $this->makeFullPar2NamingManager($sync);
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $originalAttributes = $context->release->getAttributes();
+        $originalClaim = $context->producerNamingClaim;
+        $filename = ($literalDelimiter ? 'Auxiliary.Asset||' : '').$title.$tail;
+
+        self::assertTrue($manager->addFileInfo(['name' => $filename, 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
+
+        self::assertSame($expected, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+        self::assertSame($title, $context->release->searchname);
+        self::assertArrayNotHasKey('filename', $context->release->getAttributes());
+        self::assertArrayNotHasKey('observed_additional_pp_claim', $context->release->getAttributes());
+        self::assertCount(1, $context->pendingReleaseFiles);
+        self::assertSame([($literalDelimiter ? 'Auxiliary.Asset||' : '').$title.$queryTail], $discoveredQueries);
+        self::assertSame($originalAttributes, $context->release->getAttributes());
+        self::assertSame($originalClaim, $context->producerNamingClaim);
+        self::assertSame($originalAttributes['additional_pp_claim_token'], DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
+        self::assertSame($originalAttributes['additional_pp_claimed_at'], DB::table('releases')->where('id', 1)->value('additional_pp_claimed_at'));
+    }
+
+    public static function literalDelimiterFilenameCases(): array
+    {
+        return [
+            'literal delimiter' => [true, '.mkv', 0],
+            'normal singleton control' => [false, '.mkv', 7],
+            'erased group substring' => [false, 'disc1.mkv', 0, 'disc1'],
+            'double payload suffix' => [false, '.flac.mkv', 0, '.flac'],
+        ];
+    }
+
     public function test_release_file_rows_are_deduped_and_flushed_once_at_finalize(): void
     {
         DB::table('releases')->insert($this->releaseRow());
@@ -982,9 +1038,8 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFilenameNaming();
         $title = 'Example.Movie.2026.1080p.WEB-DL.x264-GRP';
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
-        Search::shouldReceive('searchPredb')->andReturn([]);
         Search::shouldReceive('updateRelease')->twice()->with(1);
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)), fileNameCleaner: $this->filenameDiscoveryCleaner());
         $queries = new NameFixingQueryService;
         $fixer->fixNamesWithFiles(0, true, 1, true, false);
         self::assertSame([], $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
@@ -1047,10 +1102,9 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFilenameNaming();
         $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
-        Search::shouldReceive('searchPredb')->andReturn([]);
         Search::shouldReceive('updateRelease')->twice()->with(1);
         $updater = new ReleaseUpdateService($this->createStub(CategorizationService::class));
-        $fixer = new NameFixingService($updater);
+        $fixer = new NameFixingService($updater, fileNameCleaner: $this->filenameDiscoveryCleaner());
         $queries = new NameFixingQueryService;
         $fixer->fixNamesWithFiles(0, true, 1, true, false);
         self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
@@ -1081,7 +1135,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         self::assertTrue($manager->addFileInfo(['name' => $title.'.mkv', 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
         $inserted = false;
         Search::shouldReceive('updateRelease')->twice()->with(1);
-        Search::shouldReceive('searchPredb')->andReturnUsing(function () use (&$inserted, $manager, $context): array {
+        $this->filenameDiscoveryMutation = function () use (&$inserted, $manager, $context): array {
             self::assertSame(0, DB::transactionLevel(), 'Filename discovery must not hold the completion lock.');
             if (! $inserted) {
                 $inserted = true;
@@ -1089,8 +1143,8 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             }
 
             return [];
-        });
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        };
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)), fileNameCleaner: $this->filenameDiscoveryCleaner());
 
         if ($handler === 'files') {
             $fixer->fixNamesWithFiles(0, true, 1, true, false);
@@ -1122,8 +1176,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         for ($index = 0; $index < $fileCount; $index++) {
             DB::table('release_files')->insert(['releases_id' => 1, 'name' => $index === 0 ? $name : str_repeat('b', 32).'.bin']);
         }
-        Search::shouldReceive('searchPredb')->once()->andReturn([]);
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)), fileNameCleaner: $this->filenameDiscoveryCleaner());
         $input = Release::query()->findOrFail(1);
         $input->releases_id = 1;
         $input->textstring = $name;
@@ -1147,8 +1200,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
         $queries = new NameFixingQueryService;
         self::assertCount(1, $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
-        Search::shouldReceive('searchPredb')->once()->andReturn([]);
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)), fileNameCleaner: $this->filenameDiscoveryCleaner());
 
         $fixer->fixNamesWithFiles(0, true, 1, true, false);
 
@@ -1165,12 +1217,12 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFilenameNaming();
         DB::table('releases')->where('id', 1)->update(['isrenamed' => 1, 'categories_id' => $category]);
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
-        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function (): array {
+        $this->filenameDiscoveryMutation = function (): array {
             DB::table('releases')->where('id', 1)->update(['categories_id' => Category::MOVIE_HD]);
 
             return [];
-        });
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        };
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)), fileNameCleaner: $this->filenameDiscoveryCleaner());
 
         $fixer->fixNamesWithFiles(0, true, 1, true, false);
 
@@ -1195,8 +1247,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         self::assertSame([], $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 0));
         $candidates = $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 3);
         self::assertCount(1, $candidates);
-        Search::shouldReceive('searchPredb')->once()->andReturn([]);
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)), fileNameCleaner: $this->filenameDiscoveryCleaner());
 
         if ($handler === 'categories3') {
             $fixer->fixNamesWithFiles(0, true, 3, true, false);
@@ -1227,12 +1278,12 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $input = Release::query()->findOrFail(1);
         $input->releases_id = 1;
         $input->textstring = $name;
-        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function () use ($currentPredb): array {
+        $this->filenameDiscoveryMutation = function () use ($currentPredb): array {
             DB::table('releases')->where('id', 1)->update(['predb_id' => $currentPredb]);
 
             return [];
-        });
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        };
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)), fileNameCleaner: $this->filenameDiscoveryCleaner());
 
         $fixer->checkName($input, true, 'Filenames, ', true, false);
 
@@ -1269,12 +1320,12 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $this->prepareFilenameNaming();
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
-        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function () use ($column, $value): array {
+        $this->filenameDiscoveryMutation = function () use ($column, $value): array {
             DB::table('releases')->where('id', 1)->update([$column => $value]);
 
             return [];
-        });
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        };
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)), fileNameCleaner: $this->filenameDiscoveryCleaner());
 
         $fixer->fixNamesWithFiles(0, true, 1, true, false);
 
@@ -1378,7 +1429,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
                 $manager->finalizeRelease($context, false);
             }
         });
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)), fileNameCleaner: $this->filenameDiscoveryCleaner());
 
         $fixer->fixXXXNamesWithFiles(0, true, 1, true, false);
 
@@ -1398,16 +1449,56 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFilenameNaming();
         $name = str_repeat('a', 32).'.bin';
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => $name]);
-        Search::shouldReceive('searchPredb')->once()->andReturnUsing(function () use ($name): array {
+        $this->filenameDiscoveryMutation = function () use ($name): array {
             DB::table('release_files')->where('releases_id', 1)->update(['name' => strtoupper($name)]);
 
             return [];
-        });
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
+        };
+        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)), fileNameCleaner: $this->filenameDiscoveryCleaner());
 
         $fixer->fixNamesWithFiles(0, true, 1, true, false);
 
         self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
+    }
+
+    private function installFilenameSqlIdentity(): void
+    {
+        if (! Schema::hasColumn('predb', 'filename')) {
+            DB::statement("ALTER TABLE predb ADD COLUMN filename varchar NOT NULL DEFAULT ''");
+        }
+        if (! Schema::hasTable('predb_identity_projection_state')) {
+            (require database_path('migrations/2026_10_15_150000_create_predb_identity_projection.php'))->up();
+        }
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
+        $this->rebuildFilenameSqlIdentity();
+    }
+
+    private function rebuildFilenameSqlIdentity(): void
+    {
+        $rebuild = new PredbIdentityRebuild;
+        $start = $rebuild->start(DB::connection());
+        do {
+            $chunk = $rebuild->chunk(DB::connection(), $start['generation']);
+        } while (! $chunk['exhausted']);
+        $rebuild->certify(DB::connection(), $start['generation']);
+    }
+
+    private function filenameDiscoveryCleaner(): FileNameCleaner
+    {
+        $actual = new FileNameCleaner;
+        $cleaner = self::getStubBuilder(FileNameCleaner::class)->enableOriginalConstructor()->onlyMethods(['cleanForFilenameDiscovery'])->getStub();
+        $cleaner->method('cleanForFilenameDiscovery')->willReturnCallback(function (OriginalFilenameEvidence $evidence) use ($actual): string|false {
+            $query = $actual->cleanForFilenameDiscovery($evidence);
+            if ($this->filenameDiscoveryMutation !== null) {
+                $mutation = $this->filenameDiscoveryMutation;
+                $this->filenameDiscoveryMutation = null;
+                $mutation($query);
+            }
+
+            return $query;
+        });
+
+        return $cleaner;
     }
 
     private function prepareFilenameNaming(): void
@@ -1419,6 +1510,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
                 $table->integer($column)->default(1);
             }
         });
+        $this->installFilenameSqlIdentity();
     }
 
     public function test_season_pack_files_are_not_matched_to_predb_one_by_one(): void
@@ -2141,7 +2233,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $title = $episode ? 'Show.S01E01.1080p.WEB-DL-GRP' : 'Movie.2026.1080p.WEB-DL-GRP';
         $this->prepareFullPar2NamingEvidence($title);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title, 'source' => 'fixture']]);
+        $this->installFilenameSqlIdentity();
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $manager = $this->makeFullPar2NamingManager($sync);
         $dir = sys_get_temp_dir().'/'.uniqid('7z-naming-', true);
@@ -2284,20 +2376,15 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Schema::table('releases', static function (Blueprint $table): void {
             $table->string('fromname')->default('fixture');
         });
+        $this->installFilenameSqlIdentity();
         if ($kind === 'opaque episode rar') {
-            Schema::table('predb', static function (Blueprint $table): void {
-                $table->string('filename')->nullable();
-            });
             DB::table('predb')->where('id', 7)->update(['filename' => 'abcdef12.mkv']);
         }
         if (! $firstScan || $lookupMiss) {
             DB::table('predb')->where('id', 7)->delete();
         }
+        $this->rebuildFilenameSqlIdentity();
         DB::table('releases')->where('id', 1)->update(['name' => $opaque, 'searchname' => $opaque, 'nfostatus' => 1]);
-        $consumerReady = $firstScan && ! $lookupMiss;
-        Search::shouldReceive('searchPredb')->andReturnUsing(static function () use (&$consumerReady, $title, $kind): array {
-            return $consumerReady ? [['id' => 7, 'title' => $title, 'source' => 'fixture', ...($kind === 'opaque episode rar' ? ['filename' => 'abcdef12.mkv'] : [])]] : [];
-        });
         $published = [];
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
             $published[] = $id;
@@ -2503,7 +2590,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $this->assertCount($kind === 'mixed show pack 7z' ? 3 : ((in_array($kind, ['pack 7z', 'episode variants 7z'], true) || $mixedShows) ? 2 : 1), $inventory);
             Event::assertNotDispatched(ReleaseNameFixed::class);
             DB::table('predb')->insert(['id' => 7, 'title' => $title]);
-            $consumerReady = true;
+            $this->rebuildFilenameSqlIdentity();
             $consumerUpdates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
             // A new service has no processing context: this is the real persisted-file consumer.
             (new NameFixingService($consumerUpdates))->getPreFileNames(['prefiles', 1]);
@@ -2626,27 +2713,17 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Schema::table('releases', static function (Blueprint $table): void {
             $table->string('fromname')->default('fixture');
         });
-        Schema::table('predb', static function (Blueprint $table): void {
-            $table->string('filename')->nullable();
-        });
+        $this->installFilenameSqlIdentity();
         DB::table('predb')->delete();
-        $id = 7;
-        foreach ($mappings as $filename => $title) {
-            DB::table('predb')->insert(['id' => $id++, 'title' => $title, 'filename' => $filename]);
+        if ($firstScan) {
+            $id = 7;
+            foreach ($mappings as $filename => $title) {
+                DB::table('predb')->insert(['id' => $id++, 'title' => $title, 'filename' => $filename]);
+            }
         }
+        $this->rebuildFilenameSqlIdentity();
         $opaqueRelease = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
         DB::table('releases')->where('id', 1)->update(['name' => $opaqueRelease, 'searchname' => $opaqueRelease, 'nfostatus' => 1]);
-        $discoveryAvailable = $firstScan;
-        $cleaner = new FileNameCleaner;
-        Search::shouldReceive('searchPredb')->andReturnUsing(static function (string $query) use (&$discoveryAvailable, $cleaner): array {
-            if (! $discoveryAvailable) {
-                return [];
-            }
-
-            // The search backend only discovers the exact filename mappings in
-            // this fixture; canonical acceptance still reads the real DB row.
-            return DB::table('predb')->orderBy('id')->get()->filter(static fn (object $row): bool => $cleaner->cleanForMatching($row->filename, preserveLeadingNumber: true) === $query)->map(static fn (object $row): array => (array) $row)->all();
-        });
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $manager = $this->makeFullPar2NamingManager($sync);
         $directory = sys_get_temp_dir().'/resolved-main-episode-'.bin2hex(random_bytes(8));
@@ -2713,7 +2790,11 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             if (! $firstScan) {
                 $this->assertSame($opaqueRelease, DB::table('releases')->where('id', 1)->value('searchname'));
                 Event::assertNotDispatched(ReleaseNameFixed::class);
-                $discoveryAvailable = true;
+                $id = 7;
+                foreach ($mappings as $filename => $title) {
+                    DB::table('predb')->insert(['id' => $id++, 'title' => $title, 'filename' => $filename]);
+                }
+                $this->rebuildFilenameSqlIdentity();
                 $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
                 (new NameFixingService($updates))->getPreFileNames(['prefiles', 1]);
                 $this->assertSame($accepted, $updates->matched);
@@ -2751,6 +2832,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Schema::table('releases', static function (Blueprint $table): void {
             $table->string('fromname')->default('fixture');
         });
+        $this->installFilenameSqlIdentity();
         $opaque = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
         DB::table('releases')->where('id', 1)->update([
             'name' => $opaque, 'searchname' => $opaque,
@@ -2762,7 +2844,6 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $sources = new NzbSourceGuard(new TestNzbService);
         $this->app->instance(NzbSourceGuard::class, $sources);
         $this->app->instance(ReleaseArchiveNamingEvidence::class, new ReleaseArchiveNamingEvidence($sources));
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title, 'source' => 'fixture']]);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
 
@@ -2784,10 +2865,9 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $title = 'Show.S01E01.1080p.WEB-DL-GRP';
         $this->prepareFullPar2NamingEvidence($title);
-        Schema::table('predb', static function (Blueprint $table): void {
-            $table->string('filename')->nullable();
-        });
+        $this->installFilenameSqlIdentity();
         DB::table('predb')->where('id', 7)->update(['filename' => 'abcdef12.mkv']);
+        $this->rebuildFilenameSqlIdentity();
         $release = Release::query()->findOrFail(1);
         $context = $this->sourceContext($release);
         $sourceDigest = $context->nzbSourceDigest;
@@ -2796,8 +2876,6 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $current = DB::table('releases')->where('id', 1)->lockForUpdate()->first();
             app(ReleaseArchiveNamingEvidence::class)->sourceReplacedLocked($current, $sourceDigest);
         });
-        Search::shouldReceive('searchPredb')->andReturnUsing(static fn (string $query): array => $query === 'abcdef12'
-            ? [['id' => 7, 'title' => $title, 'filename' => 'abcdef12.mkv', 'source' => 'fixture']] : []);
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class));
         $names = new NameFixingService($updates);
         $observed = DB::table('releases')->where('id', 1)->first();
@@ -2849,14 +2927,11 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Schema::table('releases', static function (Blueprint $table): void {
             $table->string('fromname')->default('fixture');
         });
+        $this->installFilenameSqlIdentity();
         $opaque = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
         DB::table('releases')->where('id', 1)->update(['name' => $opaque, 'searchname' => $opaque, 'nfostatus' => 1]);
         DB::table('predb')->delete();
-        $consumerReady = false;
-        // Capture by reference so only the later ordinary consumer sees canonical evidence.
-        Search::shouldReceive('searchPredb')->andReturnUsing(static function () use (&$consumerReady, $title): array {
-            return $consumerReady ? [['id' => 7, 'title' => $title, 'source' => 'fixture']] : [];
-        });
+        $this->rebuildFilenameSqlIdentity();
         $dir = sys_get_temp_dir().'/'.uniqid('direct-body-scope-', true);
         mkdir($dir);
         try {
@@ -2914,7 +2989,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $stored = DB::table('release_files')->where('releases_id', 1)->orderBy('name')->pluck('name')->all();
             $this->assertCount(in_array($kind, ['episode', 'movie'], true) ? min(2, $count) : 0, $stored);
             DB::table('predb')->insert(['id' => 7, 'title' => $title]);
-            $consumerReady = true;
+            $this->rebuildFilenameSqlIdentity();
             $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
             (new NameFixingService($updates))->getPreFileNames(['prefiles', 1]);
             $this->assertSame($accepted ? $title : $opaque, DB::table('releases')->where('id', 1)->value('searchname'));
@@ -2948,8 +3023,8 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $sameName = in_array($path, ['attach', 'same-name candidate', 'same-name preview'], true);
         $preview = in_array($path, ['preview', 'generic preview', 'same-name preview'], true);
         $this->prepareFullPar2NamingEvidence($title);
+        $this->installFilenameSqlIdentity();
         DB::table('releases')->where('id', 1)->update(['searchname' => $sameName ? $title : 'a1b2c3d4e5f60718293a4b5c6d7e8f90']);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title, 'source' => 'fixture']]);
         $dir = sys_get_temp_dir().'/'.uniqid('shared-archive-admission-', true);
         mkdir($dir);
         try {
@@ -3418,7 +3493,7 @@ class CountingNameFixingService extends NameFixingService
 {
     public int $matchPreDbFilesCalls = 0;
 
-    public function matchPreDbFiles(object $release, bool $echo, bool $nameStatus, bool $show): int
+    public function matchPreDbFileNames(object $release, array $files, bool $echo, bool $nameStatus, bool $show, ?array $persistedNames = null): int
     {
         $this->matchPreDbFilesCalls++;
 

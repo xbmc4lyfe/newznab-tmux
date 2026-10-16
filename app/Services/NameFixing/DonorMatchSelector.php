@@ -8,6 +8,8 @@ use App\Support\PredbSearchDocument;
 
 final class DonorMatchSelector
 {
+    public const PREDB_IDENTITY_POLICY = '911cad40abd7de92b23adad58fd2a3daa045ea988f13bed35078805edf49f6cd';
+
     /** @param list<object> $donors */
     public function selectCanonical(array $donors): ?object
     {

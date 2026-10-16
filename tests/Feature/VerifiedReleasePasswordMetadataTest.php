@@ -35,6 +35,8 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
     public static function cases(): array
     {
         return [
+            'complex later compatible preserves repetitions' => ['sibling-fingerprint', 'different', false, false, false, false, false, true],
+            'complex all incompatible retains metadata' => ['sibling-fingerprint', 'different', true, false, true, false, false, true],
             'exact missing assertions retains archive' => ['exact', 'missing', true],
             'later compatible fingerprint missing' => ['sibling-fingerprint', 'missing', false],
             'later compatible fingerprint different' => ['sibling-fingerprint', 'different', false],
@@ -62,7 +64,7 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
     }
 
     #[DataProvider('cases')]
-    public function test_publisher_preserves_document_assertions(string $relation, string $assertions, bool $hold, bool $workerException = false, bool $allIncompatible = false, bool $exhausted = false, bool $byteExhausted = false): void
+    public function test_publisher_preserves_document_assertions(string $relation, string $assertions, bool $hold, bool $workerException = false, bool $allIncompatible = false, bool $exhausted = false, bool $byteExhausted = false, bool $complexMetadata = false): void
     {
         config(['nntmux.release_dedupe_enabled' => true, 'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
         app('files')->ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
@@ -107,7 +109,7 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
 
         $manifest = ['subject' => 'Movie', 'fromname' => 'poster', 'date' => '2026-10-11 12:00:00', 'groups_id' => 1,
             'groups' => ['alt.test'], 'expected_files' => 1, 'regex_id' => 0, 'verified_bytes' => 5,
-            'verified_file_names' => ['movie.mkv'], 'verified_file_count' => 1, 'passwords' => ['fixture assertion'],
+            'verified_file_names' => ['movie.mkv'], 'verified_file_count' => 1, 'passwords' => $complexMetadata ? ['', 'synthetic value', 'synthetic value'] : ['fixture assertion'],
             'files' => [['key' => 'file', 'subject' => 'movie.mkv', 'totalparts' => 1,
                 'segments' => [['number' => 1, 'messageid' => 'verified@article', 'bytes' => 5]]]]];
         $guid = (string) Str::uuid();
@@ -121,7 +123,7 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
             unset($retained['passwords']);
         }
         if ($assertions === 'different') {
-            $retained['passwords'] = ['fixture other assertion'];
+            $retained['passwords'] = $complexMetadata ? ['', 'synthetic value'] : ['fixture other assertion'];
         }
         if ($relation === 'subset') {
             $retained['files'][0]['segments'][] = ['number' => 2, 'messageid' => 'extra@article', 'bytes' => 9];
@@ -265,6 +267,7 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
                 'groups_id' => 1, 'searchname' => 'Movie', 'fromname' => 'poster', 'postdate' => $manifest['date']]);
             $this->assertSame($manifest['passwords'], $published['passwords']);
             $this->assertSame('', $candidate->manifest_path);
+            $this->assertFalse(is_file($store->path($path)));
             $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
         }
     }

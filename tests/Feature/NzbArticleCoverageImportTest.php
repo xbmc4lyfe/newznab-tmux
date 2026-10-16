@@ -126,6 +126,7 @@ final class NzbArticleCoverageImportTest extends TestCase
             $table->string('title');
             $table->string('filename')->default('');
         });
+        (require database_path('migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         DB::table('predb')->insert(['id' => 42, 'title' => 'Same.Release-GRP']);
         $this->insertCategory(7010, 'Other', 1);
         $xml = static function (array $messageIds, int $size): string {
@@ -195,7 +196,8 @@ final class NzbArticleCoverageImportTest extends TestCase
             $incomingXml = str_replace('</nzb>', '<file poster="poster" date="1" subject="empty"><groups><group>alt.test</group></groups><segments /></file></nzb>', $incomingXml);
         }
         file_put_contents($incoming, $incomingXml);
-        $nzb = $this->getStubBuilder(NzbService::class)->disableOriginalConstructor()->onlyMethods(['getNzbPath', 'nzbPath'])->getStub();
+        $nzb = $this->getStubBuilder(NzbService::class)->disableOriginalConstructor()->onlyMethods(['buildNzbPath', 'getNzbPath', 'nzbPath'])->getStub();
+        $nzb->method('buildNzbPath')->willReturn($directory.DIRECTORY_SEPARATOR);
         $nzb->method('getNzbPath')->willReturnCallback(static fn (string $guid): string => $directory.'/'.$guid.'.nzb.gz');
         $nzb->method('nzbPath')->willReturnCallback(static function (string $guid) use ($directory, $mode): string|false {
             if ($mode === 'guid_replacement' && $guid === 'original') {
@@ -235,7 +237,7 @@ final class NzbArticleCoverageImportTest extends TestCase
             self::assertSame($existingRows + ($expected === NzbImportStatus::Inserted ? 1 : 0), DB::table('releases')->count());
             self::assertSame($existingRows + ($expected === NzbImportStatus::Inserted ? 1 : 0), DB::table('releases')->where('predb_id', 42)->count());
         } finally {
-            foreach (glob($directory.'/*') as $file) {
+            foreach (glob($directory.'/{,.}[!.,!..]*', GLOB_MARK | GLOB_BRACE) ?: [] as $file) {
                 unlink($file);
             }
             rmdir($directory);

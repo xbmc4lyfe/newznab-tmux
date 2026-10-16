@@ -163,7 +163,7 @@ class ReleaseFileManager
                 // Run PreDB filename check
                 $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($file, $context): void {
                     $entry->setAttribute('filename', $file['name']);
-                    $this->nameFixingService->matchPreDbFiles($entry, true, true, true);
+                    $this->nameFixingService->matchPreDbFileNames($entry, [$file['name']], true, true, true);
                     $context->rememberArchiveFilenameNamingAttempt((string) $file['name'], $this->nameFixingService->wasEpisodeNamingDeferredByArchiveProof());
                 });
             }
