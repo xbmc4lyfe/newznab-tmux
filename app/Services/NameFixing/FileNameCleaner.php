@@ -15,6 +15,8 @@ use App\Traits\DetectsHashedNames;
  */
 class FileNameCleaner
 {
+    public const PREDB_IDENTITY_POLICY = '66ed485e533be5dfd9644473bbed4741cabb0ace13f885722c31a30da1dc7010';
+
     use DetectsHashedNames;
 
     protected NzbSplitUnwrapper $nzbSplitUnwrapper;
@@ -79,6 +81,17 @@ class FileNameCleaner
         '/\.\d{3}$/i',
     ];
 
+    /** @return list<string> */
+    public static function archiveSuffixPatterns(): array
+    {
+        return [
+            '/\.7z\.\d{2,4}$/i',
+            '/\.part\d+\.rar$/i',
+            ...self::ARCHIVE_PATTERNS,
+            '/\.(zst|tgz|lz4|enc|rev)$/i',
+        ];
+    }
+
     /**
      * Video file extension pattern.
      */
@@ -131,10 +144,9 @@ class FileNameCleaner
     private function stripKnownFileSuffixes(string $fileName, bool $preserveCodecAfterWrapper): string
     {
         $wrappers = [
-            ...self::ARCHIVE_PATTERNS,
-            '/\.(zst|tgz|lz4|enc|rev)$/i',
+            ...self::archiveSuffixPatterns(),
             '/\.vol\d+[+-]\d+$/i',
-            '/\.part\d{0,4}$/i',
+            '/\.part\d*$/i',
             '/\.(nfo|sfv|nzb|srr|srs)$/i',
         ];
 
@@ -146,7 +158,9 @@ class FileNameCleaner
 
         // After a wrapper (`.rar`, `.par2`) came off, a trailing codec word is part of the title, not a file
         // extension: `Movie.2020.1080p.DTS.rar` is the title `Movie.2020.1080p.DTS`.
-        if ($preserveCodecAfterWrapper && $fileName !== $original && preg_match('/\.(dts|ac3|eac3|truehd|ts|opus|flac|aac|mp3|ogg|wav|m4a|mka|wma)$/i', $fileName) === 1) {
+        if ($preserveCodecAfterWrapper && $fileName !== $original
+            && (preg_match(self::AUDIO_EXTENSIONS, $fileName) === 1
+                || preg_match('/\.(ts|divx|wmv|mpg|mpeg|rm|rmvb|m1v|m2v|mpv|mpgv|mp2|m4b|aiff?|amr|ra|w64)$/i', $fileName) === 1)) {
             return $fileName;
         }
 
@@ -161,6 +175,14 @@ class FileNameCleaner
         }
 
         return $fileName;
+    }
+
+    /** Preserve literal spelling for nomination; generic cleaning only validates usability. */
+    public function cleanForFilenameDiscovery(OriginalFilenameEvidence $evidence): string|false
+    {
+        return $this->cleanForMatching($evidence->stem, preserveLeadingNumber: true) === false
+            ? false
+            : $evidence->stem;
     }
 
     /**
@@ -202,6 +224,8 @@ class FileNameCleaner
         if ($fileName === '' || str_starts_with($fileName, '.')) {
             return false;
         }
+
+        $fileName = $this->nzbSplitUnwrapper->stripLiteralSubjectTrailer($fileName);
 
         // Extract filename from path
         $fileName = $this->extractFilenameFromPath($fileName);

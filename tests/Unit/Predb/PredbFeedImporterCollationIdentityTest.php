@@ -16,6 +16,7 @@ use Illuminate\Database\Capsule\Manager as Capsule;
 use Illuminate\Database\ConnectionResolverInterface;
 use Illuminate\Database\Connectors\ConnectionFactory;
 use Illuminate\Database\DatabaseManager;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\MySqlConnection;
@@ -59,6 +60,7 @@ final class PredbFeedImporterCollationIdentityTest extends TestCase
         $this->database = new Capsule($app);
         $this->database->addConnection(['driver' => 'sqlite', 'database' => ':memory:']);
         $this->database->bootEloquent();
+        $this->database->getConnection()->setTransactionManager(new DatabaseTransactionsManager);
         $app->instance('db', $this->database->getDatabaseManager());
         $pdo = PDO::connect('sqlite::memory:');
         $this->assertInstanceOf(Sqlite::class, $pdo);

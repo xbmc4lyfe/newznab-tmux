@@ -6,8 +6,10 @@ namespace Tests\Unit;
 
 use App\Console\Commands\NntmuxOffsetWorker;
 use App\Services\NameFixing\PredbMatchSelector;
+use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\Drivers\ElasticSearchDriver;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
+use App\Services\Search\SearchService;
 use App\Support\PredbSearchDocument;
 use Elastic\Elasticsearch\Client as ElasticClient;
 use Elastic\Elasticsearch\ClientBuilder;
@@ -231,7 +233,7 @@ final class PredbSearchDriverTest extends TestCase
     private function driver(string $backend, array $responses, array &$queries): ManticoreSearchDriver|ElasticSearchDriver
     {
         if ($backend === 'manticore') {
-            $client = $this->createMock(Client::class);
+            $client = $this->createStub(Client::class);
             $client->method('search')->willReturnCallback(function (array $request) use (&$responses, &$queries): Response {
                 $queries[] = $request['body'];
                 $hits = array_shift($responses);
@@ -239,7 +241,7 @@ final class PredbSearchDriverTest extends TestCase
                     throw $hits;
                 }
                 self::assertIsArray($hits);
-                $response = $this->createMock(Response::class);
+                $response = $this->createStub(Response::class);
                 $response->method('getResponse')->willReturn(['hits' => ['hits' => $hits, 'total' => count($hits)]]);
 
                 return $response;
@@ -368,6 +370,240 @@ final class PredbSearchDriverTest extends TestCase
         self::assertSame(['keep' => true], $cache->get('unrelated-fixture-key'));
     }
 
+    #[DataProvider('backends')]
+    public function test_filename_nominations_bypass_backend_cache_and_observe_late_competitor(string $backend): void
+    {
+        $first = [['_id' => 7, '_source' => ['title' => 'Canonical.Release-GRP', 'filename' => 'Alias.Release-GRP']]];
+        $second = [...$first, ['_id' => 8, '_source' => ['title' => 'Competing.Release-GRP', 'filename' => 'Alias.Release-GRP']]];
+        $queries = [];
+        $third = [['_id' => 9, '_source' => ['title' => 'New.Mapping-GRP', 'filename' => 'Alias.Release-GRP']]];
+        $driver = $this->filenameDriver($backend, [$this->completeFilenameResponse($backend, $first), $this->completeFilenameResponse($backend, $second), $this->completeFilenameResponse($backend, $third)], $queries, true);
+        // Populate the real generic backend cache, then mutate the synthetic SDK response.
+        self::assertSame(7, $driver->searchPredb('Alias.Release-GRP')[0]['id']);
+        self::assertCount(2, $driver->searchPredbFilenameCandidates('Alias.Release-GRP'));
+        self::assertSame(9, $driver->searchPredbFilenameCandidates('Alias.Release-GRP')[0]['id']);
+        self::assertCount(3, $queries, 'Every filename observation requires a fresh backend response');
+        foreach ($queries as $query) {
+            self::assertSame(1000, $query['limit'] ?? $query['size']);
+            if ($backend === 'elasticsearch') {
+                self::assertTrue($query['track_total_hits']);
+            }
+        }
+    }
+
+    public static function incompleteFilenameResponses(): array
+    {
+        $cases = [];
+        foreach (['manticore', 'elasticsearch'] as $backend) {
+            foreach (['missing metadata', 'lower bound', 'truncated', 'full window', 'timeout', 'warning', 'error', 'invalid identity', 'transport error'] as $failure) {
+                $cases[$backend.' '.$failure] = [$backend, $failure];
+            }
+        }
+        $cases['elasticsearch failed shard'] = ['elasticsearch', 'failed shard'];
+        $cases['elasticsearch zero shards'] = ['elasticsearch', 'zero shards'];
+        $cases['elasticsearch cross cluster'] = ['elasticsearch', 'cross cluster'];
+        $cases['elasticsearch early termination'] = ['elasticsearch', 'early termination'];
+
+        return $cases;
+    }
+
+    #[DataProvider('incompleteFilenameResponses')]
+    public function test_filename_nominations_fail_closed_without_positive_completeness(string $backend, string $failure): void
+    {
+        $rows = [['_id' => 7, '_source' => ['title' => 'Canonical.Release-GRP']]];
+        if ($failure === 'full window') {
+            $rows = array_fill(0, 1000, $rows[0]);
+        }
+        $response = $this->completeFilenameResponse($backend, $rows);
+        switch ($failure) {
+            case 'missing metadata':
+                unset($response['hits']['total_relation']);
+                if ($backend === 'elasticsearch') {
+                    unset($response['hits']['total']['relation']);
+                }
+                break;
+            case 'lower bound':
+                if ($backend === 'manticore') {
+                    $response['hits']['total_relation'] = 'gte';
+                } else {
+                    $response['hits']['total']['relation'] = 'gte';
+                }
+                break;
+            case 'truncated':
+                if ($backend === 'manticore') {
+                    $response['hits']['total'] = 1001;
+                } else {
+                    $response['hits']['total']['value'] = 1001;
+                }
+                break;
+            case 'timeout': $response['timed_out'] = true;
+                break;
+            case 'warning': $response['warning'] = 'partial response';
+                break;
+            case 'error': $response['error'] = 'partial response';
+                break;
+            case 'invalid identity': $response['hits']['hits'][0]['_id'] = 0;
+                break;
+            case 'transport error': $response = new RuntimeException('synthetic unavailable');
+                break;
+            case 'zero shards':
+                $response['_shards'] = ['total' => 0, 'successful' => 0, 'failed' => 0];
+                break;
+            case 'cross cluster':
+                $response['_clusters'] = ['total' => 2, 'successful' => 1, 'skipped' => 1];
+                break;
+            case 'failed shard': $response['_shards']['failed'] = 1;
+                break;
+            case 'early termination': $response['terminated_early'] = true;
+                break;
+        }
+        $queries = [];
+        $driver = $this->filenameDriver($backend, [$response], $queries);
+        self::assertNull($driver->searchPredbFilenameCandidates('Canonical.Release-GRP'));
+        self::assertCount(1, $queries);
+    }
+
+    #[DataProvider('backends')]
+    public function test_filename_nominations_distinguish_proven_empty_from_unknown(string $backend): void
+    {
+        $queries = [];
+        $driver = $this->filenameDriver($backend, [$this->completeFilenameResponse($backend, [])], $queries);
+        self::assertSame([], $driver->searchPredbFilenameCandidates('Missing.Release-GRP'));
+    }
+
+    public function test_filename_lookup_is_unknown_for_an_unsupported_custom_driver(): void
+    {
+        $container = Container::getInstance();
+        $container->make('config')->set('search.default', 'fixture');
+        $search = new SearchService($container);
+        $driver = $this->createStub(SearchDriverInterface::class);
+        $search->extend('fixture', static fn () => $driver);
+        self::assertNull($search->searchPredbFilenameCandidates('Canonical.Release-GRP'));
+    }
+
+    private function completeFilenameResponse(string $backend, array $rows): array
+    {
+        return ['timed_out' => false, '_shards' => ['total' => 1, 'successful' => 1, 'failed' => 0], 'hits' => [
+            'hits' => $rows,
+            'total' => $backend === 'manticore' ? count($rows) : ['value' => count($rows), 'relation' => 'eq'],
+            'total_relation' => 'eq',
+        ]];
+    }
+
+    private function filenameDriver(string $backend, array $responses, array &$queries, bool $genericFirst = false): ManticoreSearchDriver|ElasticSearchDriver
+    {
+        if ($backend === 'manticore') {
+            $client = $this->createStub(Client::class);
+            $client->method('search')->willReturnCallback(function (array $request) use (&$responses, &$queries): Response {
+                $queries[] = $request['body'];
+                $response = array_shift($responses);
+                if ($response instanceof RuntimeException) {
+                    throw $response;
+                }
+
+                return new Response($response);
+            });
+            $driver = new ManticoreSearchDriver(['indexes' => ['predb' => 'custom_pre']]);
+            $driver->manticoreSearch = $client;
+
+            return $driver;
+        }
+        $this->setElasticClient($this->elasticClient(function (RequestInterface $request) use (&$responses, &$queries, $genericFirst): HttpResponse {
+            parse_str($request->getUri()->getQuery(), $parameters);
+            if (! $genericFirst || $queries !== []) {
+                self::assertSame('false', $parameters['allow_partial_search_results']);
+                self::assertSame('false', $parameters['allow_no_indices']);
+                self::assertSame('false', $parameters['ignore_unavailable']);
+            }
+            $queries[] = json_decode((string) $request->getBody(), true, 512, JSON_THROW_ON_ERROR);
+            $response = array_shift($responses);
+            if ($response instanceof RuntimeException) {
+                throw $response;
+            }
+
+            return $this->elasticResponse($response);
+        }));
+
+        return new ElasticSearchDriver(['indexes' => ['predb' => 'custom_pre']]);
+    }
+
+    public static function rawRows(): array
+    {
+        $cases = [];
+        $good = ['_id' => '7', '_source' => ['title' => 'Canonical.Release-GRP']];
+        foreach (['manticore', 'elasticsearch'] as $backend) {
+            foreach ([false, 7.9, '7tail', '9223372036854775808', true, [], (object) ['x' => 1]] as $id) {
+                $row = $good;
+                $row['_id'] = $id;
+                $cases[$backend.' id '.get_debug_type($id).' '.json_encode($id)] = [$backend, [$row], false];
+            }
+            foreach (['title', 'filename', 'source'] as $field) {
+                foreach ([[], ['Alias.Release-GRP'], (object) ['x' => 1], true, false, 17, 17.2] as $value) {
+                    $row = $good;
+                    $row['_source'][$field] = $value;
+                    $cases[$backend.' '.$field.' '.json_encode($value)] = [$backend, [$row], false];
+                }
+            }
+            foreach (['title' => 255, 'filename' => 255, 'source' => 50] as $field => $maximum) {
+                foreach (['ascii' => 'a', 'four-byte' => "\u{1F3B5}"] as $encoding => $character) {
+                    foreach ([0, 1] as $overflow) {
+                        $row = $good;
+                        $row['_source'][$field] = str_repeat($character, $maximum + $overflow);
+                        $cases[$backend.' bounded '.$field.' '.$encoding.' '.$overflow] = [$backend, [$good, $row], $overflow === 0];
+                    }
+                }
+            }
+            foreach (['title', 'filename'] as $field) {
+                foreach (["bad\0identity", "bad\nidentity", "bad\x7fidentity", "bad\u{200B}identity", "bad\u{0085}identity", "bad\u{E000}identity"] as $index => $value) {
+                    $row = $good;
+                    $row['_source'][$field] = $value;
+                    $cases[$backend.' malformed identity '.$field.' '.$index] = [$backend, [$good, $row], false];
+                }
+            }
+            foreach (['bad/title', 'bad\\title', 'bad|title'] as $index => $value) {
+                $row = $good;
+                $row['_source']['title'] = $value;
+                $cases[$backend.' forbidden title separator '.$index] = [$backend, [$good, $row], false];
+            }
+            foreach (['/directory/Alias.Release-GRP.rar', 'C:\\directory\\Alias.Release-GRP.rar', '<<< NZBSPLIT >>> Alias.Release-GRP.rar yEnc (1/2)'] as $index => $value) {
+                $row = $good;
+                $row['_source']['filename'] = $value;
+                $cases[$backend.' valid filename path or trailer '.$index] = [$backend, [$row], true];
+            }
+            $row = $good;
+            $row['_source']['filename'] = "/bad\u{200B}directory/Alias.Release-GRP.rar";
+            $cases[$backend.' malformed discarded directory'] = [$backend, [$good, $row], false];
+            $cases[$backend.' missing optional fields'] = [$backend, [$good], true];
+            $cases[$backend.' null optional fields'] = [$backend, [['_id' => '7', '_source' => ['title' => 'Canonical.Release-GRP', 'filename' => null, 'source' => null]]], true];
+            $cases[$backend.' leading zero decimal wire id'] = [$backend, [['_id' => '07', '_source' => ['title' => 'Canonical.Release-GRP']]], true];
+            $cases[$backend.' decimal wire id'] = [$backend, [$good], true];
+            $cases[$backend.' associative hit collection'] = [$backend, ['first' => $good], false];
+            $cases[$backend.' duplicate identity'] = [$backend, [$good, $good], true];
+        }
+
+        return $cases;
+    }
+
+    #[DataProvider('rawRows')]
+    public function test_raw_filename_projection_is_complete_only_for_valid_wire_rows(string $backend, array $rows, bool $valid): void
+    {
+        $queries = [];
+        $driver = $this->filenameDriver($backend, [$this->completeFilenameResponse($backend, $rows)], $queries);
+        $result = $driver->searchPredbFilenameCandidates('Alias.Release-GRP');
+        if ($valid) {
+            // Expected wire normalization is explicit; do not use the production projector as its own oracle.
+            $expected = array_map(static fn (array $row): array => [
+                'id' => (int) $row['_id'],
+                'title' => $row['_source']['title'],
+                'filename' => $row['_source']['filename'] ?? '',
+                'source' => $row['_source']['source'] ?? '',
+            ], $rows);
+            self::assertSame($expected, $result);
+        } else {
+            self::assertNull($result, json_encode($result));
+        }
+    }
+
     private function setElasticClient(ElasticClient $client): void
     {
         (new ReflectionProperty(ElasticSearchDriver::class, 'client'))->setValue(null, $client);
@@ -383,7 +619,7 @@ final class PredbSearchDriverTest extends TestCase
 
     private function elasticClient(callable $handler): ElasticClient
     {
-        $http = $this->createMock(ClientInterface::class);
+        $http = $this->createStub(ClientInterface::class);
         $http->method('sendRequest')->willReturnCallback($handler);
 
         return ClientBuilder::create()->setHosts(['http://localhost:9200'])->setHttpClient($http)->build();
