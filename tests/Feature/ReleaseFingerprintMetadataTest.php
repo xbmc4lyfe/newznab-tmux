@@ -47,7 +47,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
         (new CollectReleaseFingerprintMetadata(1))->handle($collector);
         self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
-        foreach ([28, 29, 30, 31, 32, 33, 34, 35, 36, 37] as $schemaVersion) {
+        foreach ([28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38] as $schemaVersion) {
             ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => $schemaVersion]]);
             $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
             (new CollectReleaseFingerprintMetadata(1))->handle($collector);
@@ -195,6 +195,13 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertTrue($firstFile['solid']);
         self::assertSame('scene-release.mkv', $firstFile['filename']);
         self::assertSame('ascii', $firstFile['name_encoding']);
+
+        $walk = $rar4['visible_block_walk'];
+        self::assertSame('data_truncated', $walk['status']);
+        self::assertSame(1, $walk['inspected_block_count']);
+        self::assertSame(1, $walk['file_block_count']);
+        self::assertSame('file_header', $walk['blocks'][0]['header_type_name']);
+        self::assertSame('scene-release.mkv', $walk['blocks'][0]['file_header']['filename']);
     }
 
     #[Test]
