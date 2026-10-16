@@ -112,7 +112,7 @@ These are coverage states, not speed claims. Discover Rust modules from `src/lib
 
 | Module family | Existing coverage | Required work before calling performance coverage complete |
 | --- | --- | --- |
-| `payload_decoder` and x86/ARM SIMD, `yenc_framing` | Decoder C++/PHP comparisons; real caller and profile paths | Maintain architecture/kernel qualification and independently verify each advertised path. Add representative uncommon cases and reliable p99. |
+| `payload_decoder` and x86/ARM SIMD, `yenc_framing`, `abi_decoder*`, `abi_crc` | Decoder C++/PHP comparisons; real caller and profile paths; opt-in experimental RapidYenc ABI sources remain an explicit comparison gap | Maintain architecture/kernel qualification and independently verify each advertised path. Add representative uncommon cases and reliable p99. |
 | `nntp_body`, `nntp_headers`, framing, full analyzer integration | Caller profiles / optional frozen-source comparisons | Publish phase and whole-caller costs; define stable per-module common/uncommon comparison fixtures. |
 | `release_names` | Separate native/PHP rendering CI | Integrate its workflow summaries and runtime evidence. |
 | `article_fingerprint` | Standalone paired harness | Wire both backends and extend uncommon-tail coverage. |
@@ -123,7 +123,7 @@ These are coverage states, not speed claims. Discover Rust modules from `src/lib
 | `par2`, `par2_source_ranges` | Correctness/parity only identified | Add real caller baselines, valid/corrupt/large/uncommon recovery fixtures and ownership/correctness checks. |
 | `seven_zip_ranges` | Correctness/parity only identified | Add 7z-specific common/uncommon comparisons and caller overhead. |
 | `sample_plan` | Correctness/parity only identified | Add representative common/uncommon planning workloads, output/order equivalence and real caller cost. |
-| Evidence utility and CLI binaries | Correctness checks / used by workflows | Explicitly classify auxiliary tooling and report whether it has its own comparison; binary existence is not benchmark coverage. |
+| Evidence utility, offline yEnc qualification/installation tooling (`abi_receipts`, `benchmark`, `evidence`, `installation`, `tooling`), and CLI binaries | Correctness checks / used by workflows | Explicitly classify auxiliary tooling and report whether it has its own comparison; binary existence is not benchmark coverage. |
 | Database/ingestion storage and other application modules | Separate historical studies, not general module CI | Review `docs/ingestion-benchmark-procedure.md`, `docs/ingestion-candidate-benchmark-protocol.md`, `docs/hot-workload-validation.md` and `docs/performance/evidence/`. Historical scratch harnesses are not supported repo commands. Design isolated current fixtures before recurring execution. |
 
 ## Acceptance gates
