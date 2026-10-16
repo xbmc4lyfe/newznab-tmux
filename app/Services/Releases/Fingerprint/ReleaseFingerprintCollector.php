@@ -41,8 +41,11 @@ final class ReleaseFingerprintCollector
     public function __construct(private readonly NzbService $nzb, private readonly NzbFingerprintAnalyzer $analyzer,
         private readonly Par2MetadataParser $par2, private readonly YencService $yenc) {}
 
-    /** @return array{status: string, data: array<string, mixed>} */
-    public function collect(Release $release, ?NNTPService $nntp = null): array
+    /**
+     * @param  (\Closure(): void)|null  $afterTransport
+     * @return array{status: string, data: array<string, mixed>}
+     */
+    public function collect(Release $release, ?NNTPService $nntp = null, ?\Closure $afterTransport = null): array
     {
         $xml = $this->nzb->readNzbContents((string) $release->guid);
         if (! is_string($xml) || $xml === '') {
@@ -380,6 +383,8 @@ final class ReleaseFingerprintCollector
                 }
             }
         }
+
+        $afterTransport?->__invoke();
 
         $sevenZipRelationships = $this->resolveSevenZipRelationships($sevenZipCandidates);
 

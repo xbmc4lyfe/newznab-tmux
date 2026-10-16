@@ -175,6 +175,13 @@ final class FingerprintCollectionReuseNntpHarness extends FingerprintConnectionR
         return $this->_socket;
     }
 
+    public function peerReachedEof(): bool
+    {
+        $this->observedBytes();
+
+        return is_resource($this->peer) && feof($this->peer);
+    }
+
     public function useSameHostForBothRoles(): void
     {
         $this->_configAlternateServer = $this->_configServer;

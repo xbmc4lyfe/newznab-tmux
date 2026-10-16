@@ -505,6 +505,151 @@ final class ReleaseFingerprintConnectionLifecycleTest extends TestCase
         }
     }
 
+    public function test_transport_boundary_releases_only_the_alternate_once_before_local_analysis(): void
+    {
+        $owner = new FingerprintCollectionReuseNntpHarness(
+            $this->profileWire().$this->articleWire('first', 'primary').$this->articleWire('second', 'primary'),
+        );
+        $child = new FingerprintCollectionReuseNntpHarness(
+            $this->profileWire().$this->articleWire('first', 'alternate').$this->articleWire('second', 'alternate'), true,
+        );
+        $owner->queueAlternates([$child]);
+        $calls = 0;
+        try {
+            $result = $owner->withFingerprintConnectionReuse(function () use ($owner, $child, &$calls): array {
+                return $this->collector($this->manifest())->collect($this->release(), $owner,
+                    function () use ($owner, $child, &$calls): void {
+                        $calls++;
+                        $primarySocket = $owner->fixtureSocket();
+                        $alternateSocket = $child->fixtureSocket();
+                        $this->assertTrue(is_resource($primarySocket));
+                        $this->assertTrue(is_resource($alternateSocket));
+                        $this->releaseAlternateAtBoundary($owner);
+                        $this->assertNull($child->fixtureSocket(), 'The alternate must close before collector-local analysis.');
+                        $this->assertSame($primarySocket, $owner->fixtureSocket(), 'The transport boundary must retain the primary.');
+                        $this->assertTrue($child->peerReachedEof(), 'The alternate peer must observe transport closure at the boundary.');
+                        $this->assertFalse($owner->peerReachedEof(), 'The primary peer must remain open at the boundary.');
+                        $resets = $child->resetCalls;
+                        $this->releaseAlternateAtBoundary($owner);
+                        $this->assertSame($resets, $child->resetCalls, 'Repeated boundary release must be idempotent.');
+                        $this->assertSame(1, $owner->alternateFactoryCalls);
+                    });
+            });
+            $this->assertSame(1, $calls, 'The collector must invoke its transport boundary exactly once.');
+            $this->assertSame([], $result['data']['errors']);
+            $this->assertSame(2, $result['data']['collection_policy']['article_samples_selected']);
+            $this->assertCount(4, $result['data']['article_observations']);
+            $commands = ['CAPABILITIES', 'LIST OVERVIEW.FMT', ...$this->articleCommands('first'), ...$this->articleCommands('second')];
+            $this->assertSame($commands, $owner->observedCommands());
+            $this->assertSame($commands, $child->observedCommands());
+            $this->assertFalse($owner->isConnected());
+            $this->assertFalse($child->isConnected());
+        } finally {
+            $this->closeOwned([$owner, $child]);
+        }
+    }
+
+    public function test_transport_boundary_runs_for_empty_samples_and_an_unsuccessful_profile(): void
+    {
+        foreach ([false, true] as $profileFails) {
+            $owner = new FingerprintCollectionReuseNntpHarness($this->profileWire());
+            $child = new FingerprintCollectionReuseNntpHarness($profileFails ? "500 unsupported\r\n" : $this->profileWire(), true);
+            $owner->queueAlternates([$child]);
+            $calls = 0;
+            try {
+                $result = $owner->withFingerprintConnectionReuse(function () use ($owner, $child, &$calls): array {
+                    return $this->collector($this->manifestWithoutSamples())->collect($this->release(), $owner,
+                        function () use ($owner, $child, &$calls): void {
+                            $calls++;
+                            $this->releaseAlternateAtBoundary($owner);
+                            $this->releaseAlternateAtBoundary($owner);
+                            $this->assertFalse($child->isConnected());
+                            $this->assertTrue($owner->isConnected());
+                        });
+                });
+                $this->assertSame(1, $calls);
+                $this->assertSame(0, $result['data']['collection_policy']['article_samples_selected']);
+                $this->assertSame([], $result['data']['article_observations']);
+                $this->assertSame([], $result['data']['errors']);
+                $this->assertSame($profileFails ? ['CAPABILITIES'] : ['CAPABILITIES', 'LIST OVERVIEW.FMT'], $child->observedCommands());
+                $this->assertSame(1, $owner->alternateFactoryCalls);
+            } finally {
+                $this->closeOwned([$owner, $child]);
+            }
+        }
+    }
+
+    public function test_transport_boundary_callback_failure_preserves_the_exception_and_scope_cleanup(): void
+    {
+        $owner = new FingerprintCollectionReuseNntpHarness($this->profileWire());
+        $child = new FingerprintCollectionReuseNntpHarness($this->profileWire(), true);
+        $owner->queueAlternates([$child]);
+        $calls = 0;
+        $failure = new \RuntimeException('Transport boundary callback failure.');
+        $caught = null;
+        try {
+            try {
+                $owner->withFingerprintConnectionReuse(function () use ($owner, &$calls, $failure): array {
+                    return $this->collector($this->manifestWithoutSamples())->collect($this->release(), $owner,
+                        function () use ($owner, &$calls, $failure): void {
+                            $calls++;
+                            $this->releaseAlternateAtBoundary($owner);
+                            throw $failure;
+                        });
+                });
+            } catch (\Throwable $exception) {
+                $caught = $exception;
+            }
+            $this->assertSame(1, $calls);
+            $this->assertSame($failure, $caught);
+            $this->assertFalse($owner->isConnected());
+            $this->assertFalse($child->isConnected());
+            $this->assertSame(['CAPABILITIES', 'LIST OVERVIEW.FMT'], $owner->observedCommands());
+            $this->assertSame(['CAPABILITIES', 'LIST OVERVIEW.FMT'], $child->observedCommands());
+        } finally {
+            $this->closeOwned([$owner, $child]);
+        }
+    }
+
+    public function test_transport_boundary_is_not_called_before_an_unavailable_or_invalid_nzb(): void
+    {
+        foreach (['', '<invalid'] as $xml) {
+            $owner = new FingerprintCollectionReuseNntpHarness('');
+            $calls = 0;
+            try {
+                $result = $this->capture(function () use ($owner, $xml, &$calls): array {
+                    return $owner->withFingerprintConnectionReuse(function () use ($owner, $xml, &$calls): array {
+                        return $this->collector($xml)->collect($this->release(), $owner,
+                            static function () use (&$calls): void {
+                                $calls++;
+                            });
+                    });
+                });
+                if ($xml === '') {
+                    $this->assertSame('unavailable', $result['result']['status']);
+                } else {
+                    $this->assertSame(\RuntimeException::class, $result['exception']);
+                }
+                $this->assertSame(0, $calls);
+                $this->assertSame([], $owner->connections);
+                $this->assertSame([], $owner->observedCommands());
+                $this->assertSame(0, $owner->alternateFactoryCalls);
+            } finally {
+                $this->closeOwned([$owner]);
+            }
+        }
+    }
+
+    private function manifestWithoutSamples(): string
+    {
+        return '<nzb><file subject="empty.bin" poster="fixture" date="1760000000"><groups><group>alt.test</group></groups><segments/></file></nzb>';
+    }
+
+    private function releaseAlternateAtBoundary(FingerprintCollectionReuseNntpHarness $owner): void
+    {
+        $owner->releaseFingerprintAlternateTransport();
+    }
+
     /** @return array<string, mixed> */
     private function capture(callable $read): array
     {

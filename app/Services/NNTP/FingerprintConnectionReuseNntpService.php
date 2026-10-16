@@ -41,6 +41,17 @@ class FingerprintConnectionReuseNntpService extends NNTPService
         }
     }
 
+    public function releaseFingerprintAlternateTransport(): void
+    {
+        if (! $this->collectionActive) {
+            return;
+        }
+
+        $alternate = $this->alternateConnection;
+        $this->alternateConnection = null;
+        $alternate?->closeOwnedSocket();
+    }
+
     public function getFingerprintServerProfile(bool $alternate = false): array
     {
         if (! $this->collectionActive || ! $alternate) {

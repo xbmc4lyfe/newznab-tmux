@@ -281,7 +281,9 @@ try {
             if ($input['arm'] === 'candidate') {
                 $owner = new FingerprintConnectionReuseNntpService;
                 try {
-                    $report = $owner->withFingerprintConnectionReuse(fn (): array => $collector->collect($release, $owner));
+                    $report = $owner->withFingerprintConnectionReuse(fn (): array => $collector->collect(
+                        $release, $owner, $owner->releaseFingerprintAlternateTransport(...),
+                    ));
                 } finally {
                     unset($owner);
                 }
