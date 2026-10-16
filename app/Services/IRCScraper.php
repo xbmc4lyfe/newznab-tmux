@@ -10,10 +10,15 @@ use App\Models\UsenetGroup;
 use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Services\Predb\Irc\IrcNetworks;
 use App\Services\Predb\Irc\PreAnnounceParser;
+use App\Services\Predb\PredbIdentityWriter;
 use App\Support\PredbSearchDocument;
 use Carbon\CarbonImmutable;
+use Illuminate\Database\Connection;
+use Illuminate\Database\QueryException;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use RuntimeException;
 
 /**
  * Class IRCScraper.
@@ -363,88 +368,41 @@ class IRCScraper extends IRCClient
             return;
         }
 
-        // Double-check database to ensure we don't have stale search index data
-        $existingPre = Predb::query()->where('title', $this->_curPre['title'])->first();
-        if ($existingPre !== null) {
+        $connection = DB::connection();
+        $ambient = $connection->transactionLevel() > 0;
+        $current = $this->_curPre;
+        $written = (new PredbIdentityWriter($connection))->insertLegacy($current);
+        if ($written['status'] === 'source_rejected') {
+            $failure = $written['source_failure'];
+            if (! $failure instanceof QueryException) {
+                throw new RuntimeException('PreDB writer source rejection lacks its original failure.');
+            }
+            if (! $failure instanceof UniqueConstraintViolationException && ! str_starts_with((string) $failure->getCode(), '22')) {
+                throw $failure;
+            }
             if ($this->_debug && ! $this->_silent) {
-                echo '[DEBUG] PRE already exists in database (ID: '.$existingPre->id.'), skipping insert'.PHP_EOL;
+                echo '[DEBUG] ERROR inserting PRE: '.$failure->getMessage().PHP_EOL;
             }
 
             return;
         }
-
-        if ($this->_debug && ! $this->_silent) {
-            echo '[DEBUG] PRE not in database, proceeding with insert...'.PHP_EOL;
+        if (in_array($written['status'], ['noop', 'exists'], true)) {
+            return;
         }
-
-        $query = 'INSERT INTO predb (';
-
-        $query .= (! empty($this->_curPre['size']) ? 'size, ' : '');
-        $query .= (! empty($this->_curPre['category']) ? 'category, ' : '');
-        $query .= (! empty($this->_curPre['source']) ? 'source, ' : '');
-        $query .= (! empty($this->_curPre['reason']) ? 'nukereason, ' : '');
-        $query .= (! empty($this->_curPre['files']) ? 'files, ' : '');
-        $query .= (! empty($this->_curPre['reqid']) ? 'requestid, ' : '');
-        $query .= (! empty($this->_curPre['group_id']) ? 'groups_id, ' : '');
-        $query .= (! empty($this->_curPre['nuked']) ? 'nuked, ' : '');
-        $query .= (! empty($this->_curPre['filename']) ? 'filename, ' : '');
-
-        $query .= 'predate, title) VALUES (';
-
-        $query .= (! empty($this->_curPre['size']) ? escapeString($this->_curPre['size']).', ' : '');
-        $query .= (! empty($this->_curPre['category']) ? escapeString($this->_curPre['category']).', ' : '');
-        $query .= (! empty($this->_curPre['source']) ? escapeString($this->_curPre['source']).', ' : '');
-        $query .= (! empty($this->_curPre['reason']) ? escapeString($this->_curPre['reason']).', ' : '');
-        $query .= (! empty($this->_curPre['files']) ? escapeString($this->_curPre['files']).', ' : '');
-        $query .= (! empty($this->_curPre['reqid']) ? $this->_curPre['reqid'].', ' : '');
-        $query .= (! empty($this->_curPre['group_id']) ? $this->_curPre['group_id'].', ' : '');
-        $query .= (! empty($this->_curPre['nuked']) ? $this->_curPre['nuked'].', ' : '');
-        $query .= (! empty($this->_curPre['filename']) ? escapeString($this->_curPre['filename']).', ' : '');
-        $query .= (! empty($this->_curPre['predate']) ? $this->_curPre['predate'].', ' : 'NOW(), ');
-
-        $query .= '%s)';
-
-        if ($this->_debug && ! $this->_silent) {
-            echo '[DEBUG] Executing SQL: '.substr($query, 0, 100).'...'.PHP_EOL;
+        if ($written['status'] !== 'inserted' || $written['id'] === null) {
+            throw new RuntimeException('PreDB writer did not return the inserted legacy owner.');
         }
-
-        try {
-            DB::insert(
-                sprintf(
-                    $query,
-                    escapeString($this->_curPre['title'])
-                )
-            );
-
-            $lastId = DB::connection()->getPdo()->lastInsertId();
-
-            if ($this->_debug && ! $this->_silent) {
-                echo '[DEBUG] Successfully inserted PRE with ID: '.$lastId.PHP_EOL;
-            }
-
-            $parameters = [
-                'id' => $lastId,
-                'title' => $this->_curPre['title'],
-                'filename' => $this->_curPre['filename'] ?? null,
-                'source' => $this->_curPre['source'] ?? null,
-            ];
-
-            Search::insertPredb($parameters);
-
-            $this->_doEcho(true);
-        } catch (\Exception $e) {
-            if ($this->_debug && ! $this->_silent) {
-                echo '[DEBUG] ERROR inserting PRE: '.$e->getMessage().PHP_EOL;
-            }
-        }
+        $parameters = [
+            'id' => (string) $written['id'],
+            'title' => $current['title'],
+            'filename' => $current['filename'] ?? null,
+            'source' => $current['source'] ?? null,
+        ];
+        $this->publishPredbDocument($connection, $ambient, 'insert', $parameters);
+        $this->_doEcho(true);
     }
 
-    /**
-     * Updates PRE data in the DB.
-     *
-     *
-     * @throws \Exception
-     */
+    /** Updates PRE data while the observed literal title remains current. */
     protected function _updatePre(): void
     {
         if (empty($this->_curPre['title']) || $this->_oldPre === null
@@ -452,52 +410,58 @@ class IRCScraper extends IRCClient
         ) {
             return;
         }
-
-        $query = 'UPDATE predb SET ';
-
-        $query .= (! empty($this->_curPre['size']) ? 'size = '.escapeString($this->_curPre['size']).', ' : '');
-        // Keep the source of the ingester that stored the PRE first; an update only names a missing source.
-        $query .= (! empty($this->_curPre['source']) && empty($this->_oldPre['source']) ? 'source = '.escapeString($this->_curPre['source']).', ' : '');
-        $query .= (! empty($this->_curPre['files']) ? 'files = '.escapeString($this->_curPre['files']).', ' : '');
-        $query .= (! empty($this->_curPre['reason']) ? 'nukereason = '.escapeString($this->_curPre['reason']).', ' : '');
-        $query .= (! empty($this->_curPre['reqid']) ? 'requestid = '.$this->_curPre['reqid'].', ' : '');
-        $query .= (! empty($this->_curPre['group_id']) ? 'groups_id = '.$this->_curPre['group_id'].', ' : '');
-        $query .= (! empty($this->_curPre['predate']) ? 'predate = '.$this->_curPre['predate'].', ' : '');
-        $query .= (! empty($this->_curPre['nuked']) ? 'nuked = '.$this->_curPre['nuked'].', ' : '');
-        $query .= (! empty($this->_curPre['filename']) ? 'filename = '.escapeString($this->_curPre['filename']).', ' : '');
-        $query .= (
-            (empty($this->_oldPre['category']) && ! empty($this->_curPre['category']))
-                ? 'category = '.escapeString($this->_curPre['category']).', '
-                : ''
+        $connection = DB::connection();
+        $ambient = $connection->transactionLevel() > 0;
+        $written = (new PredbIdentityWriter($connection))->updateLegacy(
+            (int) $this->_oldPre['id'],
+            (string) $this->_oldPre['title'],
+            $this->_curPre,
         );
-
-        if ($query === 'UPDATE predb SET ') {
+        if ($written['status'] === 'source_rejected') {
+            $failure = $written['source_failure'];
+            if (! $failure instanceof QueryException) {
+                throw new RuntimeException('PreDB writer source rejection lacks its original failure.');
+            }
+            // Legacy update previously propagated source errors; keep the exact object.
+            throw $failure;
+        }
+        if ($written['status'] === 'noop') {
             return;
         }
+        if ($written['status'] === 'stale') {
+            $this->_doEcho(false);
 
-        $query .= 'title = '.escapeString($this->_curPre['title']);
-        $query .= ' WHERE id = '.(int) $this->_oldPre['id'];
-        $query .= ' AND HEX(title) = '.escapeString(strtoupper(bin2hex((string) $this->_oldPre['title'])));
-
-        $updated = DB::update($query);
-
-        $pre = Predb::query()->find((int) $this->_oldPre['id'], ['id', 'title', 'filename', 'source']);
-
-        if ($pre !== null
-            && PredbSearchDocument::exactValue((string) $pre->title) === PredbSearchDocument::exactValue((string) $this->_curPre['title'])
-            && ($updated > 0 || (string) $pre->title === (string) $this->_oldPre['title'])
-        ) {
-            $parameters = [
-                'id' => (int) $pre->id,
-                'title' => $pre->title,
-                'filename' => $pre->filename,
-                'source' => $pre->source,
-            ];
-
-            Search::updatePreDb($parameters);
+            return;
         }
-
+        if (! in_array($written['status'], ['updated', 'unchanged'], true) || $written['row'] === null) {
+            throw new RuntimeException('PreDB writer did not return an accepted legacy update row.');
+        }
+        $row = $written['row'];
+        $parameters = [
+            'id' => (int) $row['id'],
+            'title' => $row['title'],
+            'filename' => $row['filename'],
+            'source' => $row['source'],
+        ];
+        $this->publishPredbDocument($connection, $ambient, 'update', $parameters);
         $this->_doEcho(false);
+    }
+
+    /** @param array<string, mixed> $parameters */
+    private function publishPredbDocument(Connection $connection, bool $ambient, string $method, array $parameters): void
+    {
+        $publish = static function () use ($method, $parameters): void {
+            if ($method === 'insert') {
+                Search::insertPredb($parameters);
+            } else {
+                Search::updatePreDb($parameters);
+            }
+        };
+        if ($ambient) {
+            $connection->afterCommit($publish);
+        } else {
+            $publish();
+        }
     }
 
     /**

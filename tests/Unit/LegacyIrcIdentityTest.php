@@ -11,6 +11,7 @@ use Illuminate\Container\Container;
 use Illuminate\Contracts\Events\Dispatcher as DispatcherContract;
 use Illuminate\Database\Capsule\Manager as Capsule;
 use Illuminate\Database\ConnectionResolverInterface;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Events\Dispatcher;
@@ -53,6 +54,7 @@ final class LegacyIrcIdentityTest extends TestCase
         $this->database = new Capsule($app);
         $this->database->addConnection(['driver' => 'sqlite', 'database' => ':memory:']);
         $this->database->bootEloquent();
+        $this->database->getConnection()->setTransactionManager(new DatabaseTransactionsManager);
         $app->instance('db', $this->database->getDatabaseManager());
         $pdo = PDO::connect('sqlite::memory:');
         $this->assertInstanceOf(Sqlite::class, $pdo);

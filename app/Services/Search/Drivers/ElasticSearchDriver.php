@@ -12,6 +12,7 @@ use App\Models\MovieInfo;
 use App\Models\MusicInfo;
 use App\Models\SteamApp;
 use App\Models\Video;
+use App\Services\Search\Contracts\PredbFilenameCandidateLookup;
 use App\Services\Search\Contracts\ReleaseCandidatePager;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
@@ -36,7 +37,7 @@ use RuntimeException;
  * Provides search functionality for the releases and predb indices with
  * caching, connection pooling, and automatic reconnection.
  */
-class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterface
+class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandidatePager, SearchDriverInterface
 {
     private const CACHE_TTL_MINUTES = 5;
 
@@ -925,6 +926,64 @@ class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterfac
         return $hits;
     }
 
+    /** @return list<array{id: int, title: string, filename: string, source: string}>|null */
+    public function searchPredbFilenameCandidates(string $searchTerm): ?array
+    {
+        $keywords = $this->sanitizeSearchTerms($searchTerm);
+        if ($keywords === '') {
+            return null;
+        }
+
+        try {
+            // Deliberately bypass predbIndexSearch()/executeSearch(): cached or
+            // flattened hits cannot prove a complete current nomination set.
+            $search = $this->buildSearchQuery(
+                index: $this->getPredbIndex(),
+                keywords: $keywords,
+                fields: ['title^2', 'filename'],
+                limit: 1000,
+                options: ['fuzziness' => 'AUTO'],
+                includeDateSort: false
+            );
+            $search['body']['_source'] = ['title', 'filename', 'source'];
+            $search['body']['track_total_hits'] = true;
+            $search['allow_partial_search_results'] = false;
+            $search['allow_no_indices'] = false;
+            $search['ignore_unavailable'] = false;
+            $response = $this->getClient()->search($search);
+            $rows = $response['hits']['hits'] ?? null;
+            $total = $response['hits']['total']['value'] ?? null;
+            if (($response['timed_out'] ?? null) !== false
+                || ! empty($response['error']) || ! empty($response['warning'])
+                || ($response['terminated_early'] ?? false) !== false
+                || ($response['_shards']['failed'] ?? null) !== 0
+                || ! is_int($response['_shards']['total'] ?? null)
+                || $response['_shards']['total'] <= 0
+                || isset($response['_clusters'])
+                || ($response['_shards']['successful'] ?? null) !== $response['_shards']['total']
+                || ($response['hits']['total']['relation'] ?? null) !== 'eq'
+                || ! is_array($rows) || ! array_is_list($rows) || ! is_int($total)
+                || $total !== count($rows) || count($rows) >= 1000) {
+                return null;
+            }
+
+            $hits = [];
+            foreach ($rows as $row) {
+                $hit = PredbSearchDocument::filenameCandidate($row);
+                if ($hit === null) {
+                    return null;
+                }
+                $hits[] = $hit;
+            }
+
+            return $hits;
+        } catch (\Throwable $exception) {
+            Log::warning('Elasticsearch PreDB filename lookup failed', ['exception_class' => $exception::class]);
+
+            return null;
+        }
+    }
+
     /** @return array{id: int, title: string, filename: string, source: string}|null */
     public function matchPredbExact(string $name): ?array
     {
@@ -1008,7 +1067,7 @@ class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterfac
             $search = $this->buildSearchQuery(
                 index: $this->getReleasesIndex(),
                 keywords: $keywords,
-                fields: self::RELEASE_TEXT_FIELDS, // @phpstan-ignore argument.type
+                fields: self::RELEASE_TEXT_FIELDS,
                 limit: $limit
             );
 
@@ -1056,7 +1115,7 @@ class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterfac
             $search = $this->buildSearchQuery(
                 index: $this->getReleasesIndex(),
                 keywords: $keywords,
-                fields: self::RELEASE_TEXT_FIELDS, // @phpstan-ignore argument.type
+                fields: self::RELEASE_TEXT_FIELDS,
                 limit: $limit
             );
 
@@ -1104,7 +1163,7 @@ class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterfac
             $search = $this->buildSearchQuery(
                 index: $this->getReleasesIndex(),
                 keywords: $keywords,
-                fields: self::RELEASE_TEXT_FIELDS, // @phpstan-ignore argument.type
+                fields: self::RELEASE_TEXT_FIELDS,
                 limit: $limit,
                 options: [
                     'boost' => 1.2,
@@ -1154,7 +1213,7 @@ class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterfac
             $search = $this->buildSearchQuery(
                 index: $this->getPredbIndex(),
                 keywords: $keywords,
-                fields: ['title^2', 'filename'], // @phpstan-ignore argument.type
+                fields: ['title^2', 'filename'],
                 limit: 1000,
                 options: [
                     'fuzziness' => 'AUTO',
@@ -1762,7 +1821,7 @@ class ElasticSearchDriver implements ReleaseCandidatePager, SearchDriverInterfac
      *
      * @param  string  $index  Index name
      * @param  string  $keywords  Sanitized keywords
-     * @param  array<string, mixed>  $fields  Fields to search with boosts
+     * @param  list<string>  $fields  Fields to search with boosts
      * @param  int  $limit  Maximum results
      * @param  array<string, mixed>  $options  Additional query_string options
      * @param  bool  $includeDateSort  Include date sorting

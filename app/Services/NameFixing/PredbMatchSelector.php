@@ -12,6 +12,8 @@ use App\Support\PredbSearchDocument;
  */
 class PredbMatchSelector
 {
+    public const PREDB_IDENTITY_POLICY = 'a82a013885530d8e35920bb6bdfd1b75b5b4237e7d4e3938f2ed0c69d2668eba';
+
     private const MAX_RESULTS_TO_SCORE = 50;
 
     private const MIN_ACCEPTABLE_SCORE = 60.0;
@@ -50,10 +52,10 @@ class PredbMatchSelector
      * @param  array<int, array<string, mixed>|object>  $hits
      * @return array<string, mixed>|null
      */
-    public function selectBestMatch(string $query, array $hits): ?array
+    public function selectBestMatch(string $query, array $hits, ?OriginalFilenameEvidence $originalFilename = null): ?array
     {
         return $this->fileNameCleaner->withMatchingReuse(
-            fn (): ?array => $this->selectWithinLookup($query, $hits),
+            fn (): ?array => $this->selectWithinLookup($query, $hits, $originalFilename),
             joinActiveLookup: true
         );
     }
@@ -62,7 +64,7 @@ class PredbMatchSelector
      * @param  array<int, array<string, mixed>|object>  $hits
      * @return array<string, mixed>|null
      */
-    private function selectWithinLookup(string $query, array $hits): ?array
+    private function selectWithinLookup(string $query, array $hits, ?OriginalFilenameEvidence $originalFilename): ?array
     {
         if (! mb_check_encoding($query, 'UTF-8')) {
             return null;
@@ -89,7 +91,9 @@ class PredbMatchSelector
             $titleIdentity = PredbSearchDocument::exactValue($title);
             if ($titleIdentity === $queryIdentity) {
                 $literalTitles[] = $hitData;
-            } elseif ($this->hasLiteralFilename($queryIdentity, $hitData)) {
+            } elseif ($originalFilename !== null
+                ? $originalFilename->accepts($title, (string) ($hitData['filename'] ?? ''))
+                : $this->hasLiteralFilename($queryIdentity, $hitData)) {
                 $literalFilenames[] = $hitData;
                 $filenameTitles[$titleIdentity] = true;
             }
