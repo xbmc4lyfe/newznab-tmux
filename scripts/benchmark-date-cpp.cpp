@@ -213,7 +213,7 @@ time_t WebUtil::ParseRfc822DateTime(const char* dateTimeStr)
 namespace date_reference {
 constexpr size_t max_input = 65'536;
 constexpr size_t max_occurrences = 256;
-constexpr const char* names[] = {"date", "injection_date", "legacy_nntp_posting_date"};
+constexpr const char* names[] = {"date", "injection_date", "legacy_nntp_posting_date", "expires"};
 constexpr const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 constexpr const char* weekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 constexpr const char* epoch_basis = "Gregorian calendar and POSIX seconds; second 60 maps to the following POSIX second without asserting a historical leap-second event";
@@ -327,6 +327,8 @@ Candidate parse_value(std::string_view value, std::string raw, std::vector<size_
         sign = p.peek();
         ++p.position;
         if (!p.number(4, 4, zone) || zone / 100 > 23 || zone % 100 > 59) return result;
+        result.zone_token.assign(value.substr(zone_start, p.position - zone_start));
+        result.has_zone_token = true;
         result.unknown_local_zone = sign == '-' && zone == 0;
     } else {
         const auto token = p.word();
@@ -339,8 +341,6 @@ Candidate parse_value(std::string_view value, std::string raw, std::vector<size_
         }
         result.unknown_local_zone = 0;
     }
-    result.zone_token.assign(value.substr(zone_start, p.position - zone_start));
-    result.has_zone_token = true;
     result.zone_offset = (zone / 100 * 60 + zone % 100) * (sign == '-' ? -1 : 1);
     result.seconds_present = has_seconds;
     result.leap_second = second == 60;
@@ -377,9 +377,9 @@ struct Source {
     bool available() const { return std::strcmp(status(), "valid") == 0; }
 };
 
-std::array<Source, 3> extract(std::string_view input)
+std::array<Source, 4> extract(std::string_view input)
 {
-    std::array<Source, 3> sources;
+    std::array<Source, 4> sources;
     int active = -1;
     std::string value;
     std::string raw;
@@ -414,6 +414,7 @@ std::array<Source, 3> extract(std::string_view input)
         if (equal_ascii(name, "Date")) active = 0;
         else if (equal_ascii(name, "Injection-Date")) active = 1;
         else if (equal_ascii(name, "NNTP-Posting-Date")) active = 2;
+        else if (equal_ascii(name, "Expires")) active = 3;
         if (active >= 0 && sources[active].candidates.size() < max_occurrences) {
             value.assign(line.substr(colon + 1));
             raw.assign(physical);
@@ -449,7 +450,7 @@ void epoch(std::string& out, const Candidate& candidate) {
     else out.append("null");
 }
 
-std::string serialize(const std::array<Source, 3>& sources)
+std::string serialize(const std::array<Source, 4>& sources)
 {
     std::string out;
     out.reserve(2048);
@@ -490,8 +491,8 @@ std::string serialize(const std::array<Source, 3>& sources)
         out.push_back('}');
     }
     out.append(",\"reported_clock_relations\":{");
-    constexpr int pairs[][2] = {{0, 1}, {0, 2}, {1, 2}};
-    for (size_t i = 0; i < 3; ++i) {
+    constexpr int pairs[][2] = {{0, 1}, {0, 2}, {1, 2}, {0, 3}, {1, 3}, {2, 3}};
+    for (size_t i = 0; i < 6; ++i) {
         const auto& lhs = sources[pairs[i][0]];
         const auto& rhs = sources[pairs[i][1]];
         if (i) out.push_back(',');

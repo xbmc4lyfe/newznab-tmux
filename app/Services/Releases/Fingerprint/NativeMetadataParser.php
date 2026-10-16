@@ -133,7 +133,7 @@ final class NativeMetadataParser
             || ! is_array($metadata['reported_clock_relations'] ?? null)) {
             return false;
         }
-        $sources = ['date', 'injection_date', 'legacy_nntp_posting_date'];
+        $sources = ['date', 'injection_date', 'legacy_nntp_posting_date', 'expires'];
         foreach ($sources as $source) {
             $value = $metadata[$source] ?? null;
             if (! is_array($value) || ! in_array($value['parse_status'] ?? null, [
@@ -188,8 +188,14 @@ final class NativeMetadataParser
                 return false;
             }
         }
-        foreach ([['date', 'injection_date'], ['date', 'legacy_nntp_posting_date'],
-            ['injection_date', 'legacy_nntp_posting_date']] as [$lhs, $rhs]) {
+        foreach ([
+            ['date', 'injection_date'],
+            ['date', 'legacy_nntp_posting_date'],
+            ['injection_date', 'legacy_nntp_posting_date'],
+            ['date', 'expires'],
+            ['injection_date', 'expires'],
+            ['legacy_nntp_posting_date', 'expires'],
+        ] as [$lhs, $rhs]) {
             $relation = $metadata['reported_clock_relations'][$lhs.'_to_'.$rhs] ?? null;
             if (! is_array($relation)
                 || ($relation['lhs_parse_status'] ?? null) !== $metadata[$lhs]['parse_status']

@@ -39,8 +39,14 @@ final class RemainingMetadataBenchmarkFixturesTest extends TestCase
         $fixture = RemainingMetadataBenchmarkFixtures::make('dates-ordinary');
         $projection = RemainingMetadataBenchmarkFixtures::baseline($fixture);
         self::assertArrayHasKey('reported_clock_relations', $projection);
-        $pairs = ['date_to_injection_date' => [3600, 'before'], 'date_to_legacy_nntp_posting_date' => [0, 'equal'],
-            'injection_date_to_legacy_nntp_posting_date' => [-3600, 'after']];
+        $pairs = [
+            'date_to_injection_date' => [3600, 'before'],
+            'date_to_legacy_nntp_posting_date' => [0, 'equal'],
+            'injection_date_to_legacy_nntp_posting_date' => [-3600, 'after'],
+            'date_to_expires' => [86400, 'before'],
+            'injection_date_to_expires' => [82800, 'before'],
+            'legacy_nntp_posting_date_to_expires' => [86400, 'before'],
+        ];
         foreach ($pairs as $pair => [$delta, $order]) {
             self::assertSame(['comparison_status' => 'compared', 'lhs_parse_status' => 'valid', 'rhs_parse_status' => 'valid',
                 'rhs_minus_lhs_seconds' => $delta, 'lhs_order_relative_to_rhs' => $order], $projection['reported_clock_relations'][$pair]);
@@ -95,8 +101,8 @@ final class RemainingMetadataBenchmarkFixturesTest extends TestCase
         self::assertNotSame($expected, RemainingMetadataBenchmarkFixtures::normalizeFullDates($nestedIdentification));
 
         $reordered = ['interpretation' => $expected['interpretation'], 'reported_clock_relations' => $expected['reported_clock_relations'],
-            'legacy_nntp_posting_date' => $expected['legacy_nntp_posting_date'], 'injection_date' => $expected['injection_date'],
-            'date' => $expected['date'], 'schema_version' => $expected['schema_version']];
+            'expires' => $expected['expires'], 'legacy_nntp_posting_date' => $expected['legacy_nntp_posting_date'],
+            'injection_date' => $expected['injection_date'], 'date' => $expected['date'], 'schema_version' => $expected['schema_version']];
         self::assertSame($expected, RemainingMetadataBenchmarkFixtures::normalizeFullDates($reordered));
 
         $reordered['date']['candidates'][0]['source_line_indices'] = [2, 1];
