@@ -22,32 +22,42 @@ export BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAG
 targets=$(DEPLOY_STAMP="${DEPLOY_STAMP:-$DIR/.build.stamp}" "$DIR/bin/deploy-plan" --build-targets)
 [ -n "$targets" ] || exit 0
 
-shared_tag=0
-if [ "$WEB_IMAGE" = "$HORIZON_IMAGE" ] || [ "$WEB_IMAGE" = "$SCHEDULER_IMAGE" ] || [ "$WEB_IMAGE" = "$INDEXER_IMAGE" ] \
-    || [ "$HORIZON_IMAGE" = "$SCHEDULER_IMAGE" ] || [ "$HORIZON_IMAGE" = "$INDEXER_IMAGE" ] || [ "$SCHEDULER_IMAGE" = "$INDEXER_IMAGE" ]; then
-    shared_tag=1
-fi
+tag_for_role() {
+    case "$1" in
+        web) printf '%s\n' "$WEB_IMAGE" ;;
+        horizon) printf '%s\n' "$HORIZON_IMAGE" ;;
+        scheduler) printf '%s\n' "$SCHEDULER_IMAGE" ;;
+        indexer) printf '%s\n' "$INDEXER_IMAGE" ;;
+    esac
+}
 
-built_shared=0
+tag_role_count() {
+    count=0
+    for candidate in "$WEB_IMAGE" "$HORIZON_IMAGE" "$SCHEDULER_IMAGE" "$INDEXER_IMAGE"; do
+        if [ "$candidate" = "$1" ]; then
+            count=$((count + 1))
+        fi
+    done
+    printf '%s\n' "$count"
+}
+
+built_tags=" "
 for target in $targets; do
     case "$target" in
         base)
             docker build --target base -t "$BASE_IMAGE" -f "$REPO/Dockerfile" "$REPO"
             ;;
         web|horizon|scheduler|indexer)
-            if [ "$shared_tag" = 1 ]; then
-                if [ "$built_shared" = 0 ]; then
-                    docker build --target selfhosted -t "$WEB_IMAGE" -f "$REPO/Dockerfile" "$REPO"
-                    built_shared=1
-                fi
+            role_tag=$(tag_for_role "$target")
+            case "$built_tags" in
+                *" $role_tag "*) continue ;;
+            esac
+            if [ "$(tag_role_count "$role_tag")" -gt 1 ]; then
+                docker build --target selfhosted -t "$role_tag" -f "$REPO/Dockerfile" "$REPO"
             else
-                case "$target" in
-                    web) docker build --target selfhosted-web -t "$WEB_IMAGE" -f "$REPO/Dockerfile" "$REPO" ;;
-                    horizon) docker build --target selfhosted-horizon -t "$HORIZON_IMAGE" -f "$REPO/Dockerfile" "$REPO" ;;
-                    scheduler) docker build --target selfhosted-scheduler -t "$SCHEDULER_IMAGE" -f "$REPO/Dockerfile" "$REPO" ;;
-                    indexer) docker build --target selfhosted-indexer -t "$INDEXER_IMAGE" -f "$REPO/Dockerfile" "$REPO" ;;
-                esac
+                docker build --target "selfhosted-$target" -t "$role_tag" -f "$REPO/Dockerfile" "$REPO"
             fi
+            built_tags="$built_tags$role_tag "
             ;;
     esac
 done

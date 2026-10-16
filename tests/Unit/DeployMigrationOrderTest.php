@@ -584,7 +584,64 @@ SH);
         $this->assertStringNotContainsString('tmux:drain', $events);
         $this->assertStringNotContainsString(' stop ', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate proxy', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
+    }
+
+    public function test_web_routes_changes_rebuild_and_recreate_both_web_and_horizon(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        mkdir($this->directory.'/routes', 0777, true);
+        file_put_contents($this->directory.'/routes/web.php', "<?php\n");
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-web', $events);
+        $this->assertStringContainsString('build --target selfhosted-horizon', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-scheduler', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-indexer', $events);
+        $this->assertStringContainsString(' stop --timeout 1920 horizon', $events);
+        $this->assertStringNotContainsString('scheduler.py drain', $events);
+        $this->assertStringNotContainsString('tmux:drain', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon', $events);
+    }
+
+    public function test_dockerignore_and_file_permission_changes_invalidate_build_fingerprints(): void
+    {
+        mkdir($this->directory.'/docker/app', 0777, true);
+        file_put_contents($this->directory.'/docker/app/Caddyfile', ":8080\n");
+        chmod($this->directory.'/docker/app/Caddyfile', 0644);
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+
+        file_put_contents($this->directory.'/events', '');
+        chmod($this->directory.'/docker/app/Caddyfile', 0640);
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringContainsString('build --target selfhosted-web', $this->events());
+
+        file_put_contents($this->directory.'/events', '');
+        file_put_contents($this->directory.'/.dockerignore', "vendor\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-web', $events);
+        $this->assertStringContainsString('build --target selfhosted-horizon', $events);
+        $this->assertStringContainsString('build --target selfhosted-scheduler', $events);
+        $this->assertStringContainsString('build --target selfhosted-indexer', $events);
+    }
+
+    public function test_partial_shared_role_image_tags_build_selfhosted_for_shared_tag_and_specific_targets_for_unique_tags(): void
+    {
+        $this->make(['build'], [
+            'WEB_IMAGE' => 'custom/web:local',
+            'HORIZON_IMAGE' => 'custom/worker:local',
+            'SCHEDULER_IMAGE' => 'custom/worker:local',
+            'INDEXER_IMAGE' => 'custom/indexer:local',
+        ])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-web -t custom/web:local', $events);
+        $this->assertStringContainsString('build --target selfhosted -t custom/worker:local', $events);
+        $this->assertStringContainsString('build --target selfhosted-indexer -t custom/indexer:local', $events);
+        $this->assertSame(1, substr_count($events, '-t custom/worker:local'));
     }
 
     public function test_stateful_data_service_config_changes_drain_writers_before_recreating_the_data_service(): void

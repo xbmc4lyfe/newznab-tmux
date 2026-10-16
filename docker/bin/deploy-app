@@ -171,5 +171,5 @@ fi
 
 if [ -n "$DIRTY_INFRA" ]; then
     # shellcheck disable=SC2086
-    compose up -d --no-deps --force-recreate $DIRTY_INFRA
+    compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_INFRA
 fi

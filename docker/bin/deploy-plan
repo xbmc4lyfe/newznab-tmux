@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shlex
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -33,7 +34,6 @@ SERVICE_TARGET = {
 }
 
 IGNORED_EXACT = {
-    ".dockerignore",
     ".editorconfig",
     ".gitattributes",
     ".gitignore",
@@ -98,7 +98,6 @@ WEB_ONLY_EXACT = {
     "routes/api.php",
     "routes/channels.php",
     "routes/rss.php",
-    "routes/web.php",
     "config/captcha.php",
     "config/cors.php",
     "config/google2fa.php",
@@ -228,6 +227,10 @@ def classify_path(rel_path: str) -> tuple[str, ...]:
     if rel_path.startswith("database/migrations/"):
         return ("migrations", "shared-app")
 
+    # Web routes are also used by queued notifications/mailers running in Horizon
+    if rel_path == "routes/web.php":
+        return ("web", "horizon")
+
     # Web-only paths
     if rel_path in WEB_ONLY_EXACT or any(rel_path.startswith(p) for p in WEB_ONLY_PREFIXES):
         return ("web",)
@@ -261,7 +264,7 @@ def file_record(repo: Path, rel_path: str) -> str:
         st = os.lstat(full)
     except OSError:
         return f"deleted {rel_path}"
-    mode = "755" if (st.st_mode & 0o111) else "644"
+    mode = f"{stat.S_IMODE(st.st_mode):04o}"
     if os.path.islink(full):
         target = os.readlink(full)
         try:
@@ -325,6 +328,37 @@ def compose_command(docker_dir: Path) -> list[str]:
     return [str(docker_dir / "bin/compose")]
 
 
+def service_top_level_compose_deps(parsed: dict[str, object], svc_cfg: object) -> dict[str, object]:
+    """Extract top-level networks, volumes, configs, secrets, and global keys referenced by a service."""
+    if not isinstance(svc_cfg, dict):
+        return {}
+    deps: dict[str, object] = {}
+    for section in ("networks", "volumes", "configs", "secrets"):
+        top_sec = parsed.get(section)
+        if not isinstance(top_sec, dict):
+            continue
+        svc_sec = svc_cfg.get(section)
+        referenced: set[str] = set()
+        if isinstance(svc_sec, dict):
+            referenced.update(svc_sec.keys())
+        elif isinstance(svc_sec, list):
+            for item in svc_sec:
+                if isinstance(item, str):
+                    referenced.add(item.split(":", 1)[0])
+                elif isinstance(item, dict):
+                    src = item.get("source")
+                    if isinstance(src, str):
+                        referenced.add(src)
+        elif section == "networks" and "default" in top_sec:
+            referenced.add("default")
+        if referenced:
+            deps[section] = {k: top_sec[k] for k in sorted(referenced) if k in top_sec}
+    for key, val in parsed.items():
+        if key not in ("services", "networks", "volumes", "configs", "secrets"):
+            deps[f"top:{key}"] = val
+    return deps
+
+
 def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
     """Return (global_config_hash, per_service_config_hashes)."""
     env = dict(os.environ)
@@ -349,7 +383,11 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
             services_map = parsed["services"]
             for svc in ALL_SERVICES:
                 if svc in services_map:
-                    svc_json = json.dumps(services_map[svc], sort_keys=True)
+                    svc_payload = {
+                        "service": services_map[svc],
+                        "top_level": service_top_level_compose_deps(parsed, services_map[svc]),
+                    }
+                    svc_json = json.dumps(svc_payload, sort_keys=True)
                     per_service[svc] = sha256_text(f"{svc_json}\n{context_meta}")
                 else:
                     per_service[svc] = "absent"
@@ -640,6 +678,10 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
             infra_reasons[svc] = "unchanged"
 
     compose_global_changed = not first_deploy and stamped.get("effective") != state["effective"]
+    if compose_global_changed and not dirty_app and not dirty_data and not dirty_infra:
+        for svc in APP_SERVICES:
+            dirty_app.append(svc)
+            app_reasons[svc] = "compose config changed"
     # If all 4 app services changed due to a global compose config change, run migrations too
     all_app_compose_changed = compose_global_changed and len(dirty_app) == len(APP_SERVICES)
 
