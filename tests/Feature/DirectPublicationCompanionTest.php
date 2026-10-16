@@ -442,10 +442,6 @@ class DirectPublicationCompanionTest extends ReleaseVerificationCandidatesTest
             $table->id();
             $table->string('guid');
             $table->integer('nfostatus')->default(-1);
-            $table->integer('nzbstatus')->default(1);
-            $table->json('additional_pack_evidence')->nullable();
-            $table->string('name')->default('Fixture');
-            $table->string('searchname')->default('Fixture');
         });
         Schema::create('release_nfos', static function (Blueprint $table): void {
             $table->integer('releases_id')->primary();

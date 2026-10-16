@@ -757,16 +757,6 @@ final class NzbUploadManifestService
                 }
             };
             try {
-                $existingReceipt = DB::table('nfo_cleanup_commits')
-                    ->where('binding', $this->nfoCommitBinding($m))->exists();
-                $observation = null;
-                if (! $existingReceipt) {
-                    $observation = $store->observeRelease((int) $m['release_id'], $m['release_guid']);
-                    if ($observation === null || $observation['id'] !== (int) $m['release_id']
-                        || $observation['guid'] !== $m['release_guid']) {
-                        throw new RuntimeException('Release observation is unavailable for companion store');
-                    }
-                }
                 $validate();
                 $body = $this->filesystem->get($path);
                 if (! hash_equals($receipt['digest'], hash('sha256', $body))) {
@@ -778,12 +768,14 @@ final class NzbUploadManifestService
                 }
                 // A sequential restart may resume only the exact already committed operation.
                 // Neither matching payload bytes nor a filesystem marker supplies authority.
+                $existingReceipt = DB::table('nfo_cleanup_commits')
+                    ->where('binding', $this->nfoCommitBinding($m))->exists();
                 if ($existingReceipt) {
                     if (! $this->nfoCleanupCommitted($m)) {
                         throw new RuntimeException('Existing NFO receipt does not match committed operation');
                     }
                 } else {
-                    DB::transaction(function () use ($store, $m, $body, $validate, $observation): void {
+                    DB::transaction(function () use ($store, $m, $body, $validate): void {
                         if (! $this->nfoCandidateCurrent($m)) {
                             throw new RuntimeException('NFO candidate publication changed');
                         }
@@ -794,27 +786,23 @@ final class NzbUploadManifestService
                             || (new Release)->getConnection()->getPdo() !== DB::getPdo()) {
                             throw new RuntimeException('NFO storage must share the receipt transaction connection');
                         }
-                        if (! $store->withReleaseObservation($observation, function () use ($store, $m, $body, $validate): void {
-                            $store->storeNfoContentWithCommit((int) $m['release_id'], $body, function () use ($m, $body, $validate): void {
-                                $validate();
-                                // SQL authority is created with the actual NFO write.
-                                $stored = DB::table('release_nfos')->where('releases_id', $m['release_id'])->value('nfo');
-                                $expected = "\x1f\x8b\x08\x00".gzcompress($body);
-                                if (! is_string($stored) || ! hash_equals($expected, $stored)) {
-                                    throw new RuntimeException('NFO writer did not persist the admitted bytes');
-                                }
-                                DB::table('nfo_cleanup_commits')->insert([
-                                    'binding' => $this->nfoCommitBinding($m),
-                                    'release_id' => $m['release_id'],
-                                    'release_guid' => $m['release_guid'],
-                                    'candidate_identity' => $m['candidate_identity'],
-                                    'stored_digest' => hash('sha256', $stored),
-                                ]);
-                                $validate();
-                            });
-                        })) {
-                            throw new RuntimeException('Release observation changed during companion store');
-                        }
+                        $store->storeNfoContentWithCommit((int) $m['release_id'], $body, function () use ($m, $body, $validate): void {
+                            $validate();
+                            // SQL authority is created with the actual NFO write.
+                            $stored = DB::table('release_nfos')->where('releases_id', $m['release_id'])->value('nfo');
+                            $expected = "\x1f\x8b\x08\x00".gzcompress($body);
+                            if (! is_string($stored) || ! hash_equals($expected, $stored)) {
+                                throw new RuntimeException('NFO writer did not persist the admitted bytes');
+                            }
+                            DB::table('nfo_cleanup_commits')->insert([
+                                'binding' => $this->nfoCommitBinding($m),
+                                'release_id' => $m['release_id'],
+                                'release_guid' => $m['release_guid'],
+                                'candidate_identity' => $m['candidate_identity'],
+                                'stored_digest' => hash('sha256', $stored),
+                            ]);
+                            $validate();
+                        });
                     });
                 }
                 $validate();

@@ -11,8 +11,10 @@ use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\ReleaseUpdateService;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\Support\Par2RenameTestDatabase;
 use Tests\TestCase;
@@ -50,6 +52,10 @@ final class ReleaseUpdateParentSnapshotTest extends TestCase
         $release = $this->pendingPar2Release(['guid' => 'SyntheticGuidABC', 'name' => $mutation === 'null name becomes empty' ? null : 'Synthetic.Original', 'searchname' => $route === 'rename' ? 'Synthetic.Input' : $title]);
         $input = (object) [...$release->getAttributes(), 'releases_id' => $release->id];
         if ($mutation === 'lost additional claim') {
+            Schema::table('releases', static function (Blueprint $table): void {
+                $table->string('additional_pp_claim_token')->nullable();
+                $table->dateTime('additional_pp_claimed_at')->nullable();
+            });
             $stamp = now()->format('Y-m-d H:i:s');
             DB::table('releases')->where('id', $release->id)->update(['additional_pp_claim_token' => 'original-claim', 'additional_pp_claimed_at' => $stamp]);
             $input->observed_additional_pp_claim = ['token' => 'original-claim', 'claimed_at' => $stamp];

@@ -37,6 +37,7 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
             unlink($source);
             $source .= '.gz';
         }
+        Schema::table('releases', static fn (Blueprint $table) => $table->integer('nzbstatus')->default(1));
         $filesystem = new class($source) extends Filesystem
         {
             public int $probes = 0;
@@ -93,6 +94,7 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
     {
         [$source, $mp] = $this->upload(false);
         unlink($mp);
+        Schema::table('releases', static fn (Blueprint $table) => $table->integer('nzbstatus')->default(1));
         $root = config('release_verification.storage_path');
         config(['release_verification.storage_path' => $root.'/verification-state']);
         try {
@@ -707,10 +709,6 @@ class CleanupIntentResumeTest extends ReleaseVerificationCandidatesTest
             $t->id();
             $t->string('guid');
             $t->integer('nfostatus')->default(-1);
-            $t->integer('nzbstatus')->default(1);
-            $t->json('additional_pack_evidence')->nullable();
-            $t->string('name')->default('Fixture');
-            $t->string('searchname')->default('Fixture');
         });
         $dir = config('release_verification.storage_path').'/origin';
         app('files')->ensureDirectoryExists($dir);

@@ -315,6 +315,8 @@ final class OriginalFilenameAcceptanceTest extends TestCase
         $this->installSqlIdentityFixture();
         config(['nntmux.echocli' => false]);
         Event::fake([ReleaseNameFixed::class]);
+        DB::statement('ALTER TABLE releases ADD COLUMN additional_pp_claim_token TEXT');
+        DB::statement('ALTER TABLE releases ADD COLUMN additional_pp_claimed_at TEXT');
         $title = 'Exact.Release.2026-GRP';
         $release = $this->pendingPar2Release(['searchname' => $title, 'predb_id' => 0]);
         $stamp = now()->format('Y-m-d H:i:s');
