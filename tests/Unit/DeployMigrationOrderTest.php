@@ -535,8 +535,8 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        mkdir($this->directory.'/app/Jobs', 0777, true);
-        file_put_contents($this->directory.'/app/Jobs/SendWelcomeEmail.php', "<?php\n");
+        mkdir($this->directory.'/config', 0777, true);
+        file_put_contents($this->directory.'/config/horizon.php', "<?php return [];\n");
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $events = $this->events();

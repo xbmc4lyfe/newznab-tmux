@@ -12,10 +12,6 @@ export DC := env("DC", "docker compose --project-directory " + quote(CURDIR))
 export HELPER_IMAGE := env("HELPER_IMAGE", "alpine:3.22.2")
 export BASE_IMAGE := env("BASE_IMAGE", "nntmux/base:local")
 export APP_IMAGE := env("APP_IMAGE", "nntmux/app:local")
-export WEB_IMAGE := env("WEB_IMAGE", env("APP_IMAGE", "nntmux/web:local"))
-export HORIZON_IMAGE := env("HORIZON_IMAGE", env("APP_IMAGE", "nntmux/horizon:local"))
-export SCHEDULER_IMAGE := env("SCHEDULER_IMAGE", env("APP_IMAGE", "nntmux/scheduler:local"))
-export INDEXER_IMAGE := env("INDEXER_IMAGE", env("APP_IMAGE", "nntmux/indexer:local"))
 export DEPLOY_MIN_INTERVAL := env("DEPLOY_MIN_INTERVAL", "900")
 export DEPLOY_DRAIN_TIMEOUT := env("DEPLOY_DRAIN_TIMEOUT", "90")
 export DEPLOY_SCHEDULER_DRAIN_TIMEOUT := env("DEPLOY_SCHEDULER_DRAIN_TIMEOUT", "1800")
@@ -28,7 +24,7 @@ export cmd := env("cmd", "")
 DATA_DIRS := "data/storage data/install data/mariadb data/redis data/manticore data/caddy/data data/caddy/config data/prometheus data/grafana logs/mariadb logs/manticore logs/caddy backups"
 
 # Show available stack recipes
-help:
+help *args:
     @just --list --justfile "{{justfile()}}"
 
 # Generate docker/.env and config/app.env (secrets, NNTP creds); safe to re-run
@@ -37,17 +33,21 @@ env *args:
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     "{{CURDIR}}/bin/generate-env"
-    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" perms
+    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" perms "$@"
 
 # Create bind-mount directories
 dirs *args:
-    @cd "{{CURDIR}}" && mkdir -p {{DATA_DIRS}}
-
-# Linux hosts: let the app containers' user (33:33) use their bind mounts
-perms *args: dirs
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
+    cd "{{CURDIR}}" && mkdir -p {{DATA_DIRS}}
+
+# Linux hosts: let the app containers' user (33:33) use their bind mounts
+perms *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
+    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" dirs "$@"
     if [ "$(uname -s)" = Linux ]; then
         docker run --rm -v "{{CURDIR}}:/stack" "$HELPER_IMAGE" sh -c \
             "chown -R 33:33 /stack/data/storage /stack/data/install && chown $(id -u):33 /stack/config/app.env && chmod 0640 /stack/config/app.env"
@@ -65,6 +65,17 @@ build *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
+    if [ "${APP_IMAGE:-nntmux/app:local}" != "nntmux/app:local" ]; then
+        export WEB_IMAGE="${WEB_IMAGE:-$APP_IMAGE}"
+        export HORIZON_IMAGE="${HORIZON_IMAGE:-$APP_IMAGE}"
+        export SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-$APP_IMAGE}"
+        export INDEXER_IMAGE="${INDEXER_IMAGE:-$APP_IMAGE}"
+    else
+        export WEB_IMAGE="${WEB_IMAGE:-nntmux/web:local}"
+        export HORIZON_IMAGE="${HORIZON_IMAGE:-nntmux/horizon:local}"
+        export SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-nntmux/scheduler:local}"
+        export INDEXER_IMAGE="${INDEXER_IMAGE:-nntmux/indexer:local}"
+    fi
     SKIP_IF_UNCHANGED=1 STAMP_ON_SUCCESS=1 \
         REQUIRE_IMAGE="$WEB_IMAGE $HORIZON_IMAGE $SCHEDULER_IMAGE $INDEXER_IMAGE" \
         DEPLOY_STAMP="{{CURDIR}}/.build.stamp" FORCE="$FORCE" \
@@ -102,6 +113,17 @@ deploy *args:
         DEPLOY_CONFIG_COMMAND="{{CURDIR}}/bin/deploy-current" "{{CURDIR}}/bin/deploy-plan" --explain
         exit 0
     fi
+    if [ "${APP_IMAGE:-nntmux/app:local}" != "nntmux/app:local" ]; then
+        export WEB_IMAGE="${WEB_IMAGE:-$APP_IMAGE}"
+        export HORIZON_IMAGE="${HORIZON_IMAGE:-$APP_IMAGE}"
+        export SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-$APP_IMAGE}"
+        export INDEXER_IMAGE="${INDEXER_IMAGE:-$APP_IMAGE}"
+    else
+        export WEB_IMAGE="${WEB_IMAGE:-nntmux/web:local}"
+        export HORIZON_IMAGE="${HORIZON_IMAGE:-nntmux/horizon:local}"
+        export SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-nntmux/scheduler:local}"
+        export INDEXER_IMAGE="${INDEXER_IMAGE:-nntmux/indexer:local}"
+    fi
     SKIP_IF_UNCHANGED=1 STAMP_ON_SUCCESS=1 RECORD_DEPLOY_TIME=1 \
         REQUIRE_IMAGE="$WEB_IMAGE $HORIZON_IMAGE $SCHEDULER_IMAGE $INDEXER_IMAGE" \
         DEPLOY_CONFIG_COMMAND="{{CURDIR}}/bin/deploy-current" \
@@ -117,10 +139,13 @@ deploy *args:
         "{{CURDIR}}/bin/deploy-app"
 
 # First-time install: build, migrate+seed, indexes, groups, tuning, predb seed, start
-init *args: env dirs build
+init *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
+    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" env "$@"
+    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" dirs "$@"
+    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" build "$@"
     "{{CURDIR}}/bin/compose" up -d --wait mariadb redis manticore mailpit
     if [ -f "{{CURDIR}}/data/install/install.lock" ]; then
         echo "install.lock present; skipping nntmux:deploy-init"
@@ -128,7 +153,7 @@ init *args: env dirs build
         "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan nntmux:deploy-init --no-interaction
     fi
     "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan monitoring:install --sail --no-interaction
-    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" seed-db
+    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" seed-db "$@"
     "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan predb:import-feed --pages=20 || true
     "{{CURDIR}}/bin/compose" up -d
     echo "NNTmux: http://localhost:${APP_PORT:-8080}  (admin password: grep ADMIN_PASS docker/config/app.env)"
@@ -143,7 +168,11 @@ seed-db *args:
     "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan cache:clear
 
 # Re-seed groups/tuning and restart the indexer to pick it up
-seed *args: seed-db
+seed *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
+    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" seed-db "$@"
     "{{CURDIR}}/bin/compose" restart indexer
 
 # First bringup, or safe guarded deploy when app containers already exist
@@ -155,6 +184,9 @@ up *args:
 
 # Stop the stack (tmux session stops cleanly)
 down *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     "{{CURDIR}}/bin/compose" down
 
 # Restart app services (s=service for one)
@@ -170,6 +202,9 @@ restart *args:
 
 # Service status / health
 ps *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     "{{CURDIR}}/bin/compose" ps
 
 # Follow logs (s=service)
@@ -181,10 +216,16 @@ logs *args:
 
 # Attach to the indexer tmux session (detach: Ctrl-a d)
 tmux *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     "{{CURDIR}}/bin/compose" exec indexer tmux attach -t nntmux
 
 # Shell in the web container
 shell *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     "{{CURDIR}}/bin/compose" exec web bash
 
 # Run artisan: just -f docker/Justfile artisan cmd="predb:import-feed --dry-run"
@@ -196,12 +237,16 @@ artisan *args:
 
 # MariaDB client as root
 mysql *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     "{{CURDIR}}/bin/compose" exec mariadb mariadb -uroot -p"${DB_ROOTPASSWORD}" "${DB_DATABASE}"
 
 # Dump MariaDB to backups/ (keeps 7)
 backup *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     umask 077
     mkdir -p "{{CURDIR}}/backups"
     chmod 0700 "{{CURDIR}}/backups"
@@ -218,6 +263,7 @@ backup *args:
 status *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     echo "SELECT COUNT(*) active_groups, SUM(last_record>0) scanned FROM usenet_groups WHERE active=1; \
     SELECT (SELECT COUNT(*) FROM collections) collections, (SELECT COUNT(*) FROM binaries) binaries, (SELECT COUNT(*) FROM releases) releases; \
     SELECT source, COUNT(*) pres FROM predb GROUP BY source ORDER BY 2 DESC LIMIT 10;" \

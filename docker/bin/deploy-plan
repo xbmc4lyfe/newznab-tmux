@@ -120,18 +120,12 @@ HORIZON_ONLY_EXACT = {
     "config/horizon.php",
 }
 
-HORIZON_ONLY_PREFIXES = (
-    "app/Mail/",
-    "app/Notifications/",
-    "resources/views/emails/",
-    "resources/views/mail/",
-)
+HORIZON_ONLY_PREFIXES: tuple[str, ...] = ()
 
 SCHEDULER_ONLY_EXACT = {
     "docker/app/bin/scheduler.py",
     "routes/console.php",
     "config/predb_feeds.php",
-    "config/release_verification.php",
     "app/Console/Commands/PredbImportFeed.php",
     "app/Console/Commands/WarmAdminDashboard.php",
     "app/Console/Commands/CollectStats.php",
@@ -158,9 +152,7 @@ SCHEDULER_ONLY_PREFIXES = (
 INDEXER_ONLY_EXACT = {
     "docker/app/bin/indexer.sh",
     "docker/app/php/yenc-ffi.ini",
-    "config/irc_settings.php",
     "config/tmux.conf",
-    "config/tmux.php",
     "app/Services/IRCClient.php",
     "app/Services/IRCScraper.php",
     "app/Console/Commands/NntmuxIrcScraper.php",
@@ -183,7 +175,6 @@ INDEXER_ONLY_EXACT = {
 }
 
 INDEXER_ONLY_PREFIXES = (
-    "app/Services/AdditionalProcessing/",
     "app/Services/Backfill/",
     "app/Services/Binaries/",
     "app/Services/Runners/",
@@ -244,15 +235,11 @@ def classify_path(rel_path: str) -> tuple[str, ...]:
         return ("web",)
     if rel_path.startswith("resources/views/"):
         if rel_path.startswith("resources/views/emails/") or rel_path.startswith("resources/views/mail/"):
-            return ("horizon",)
+            return ("shared-app",)
         return ("web",)
 
     # Horizon-only paths
     if rel_path in HORIZON_ONLY_EXACT or any(rel_path.startswith(p) for p in HORIZON_ONLY_PREFIXES):
-        return ("horizon",)
-    if rel_path.startswith("app/Jobs/"):
-        if rel_path in ("app/Jobs/PurgeDeletedAccounts.php", "app/Jobs/RemoveInactiveAccounts.php"):
-            return ("horizon", "scheduler")
         return ("horizon",)
 
     # Scheduler-only paths
@@ -263,7 +250,7 @@ def classify_path(rel_path: str) -> tuple[str, ...]:
     if rel_path in INDEXER_ONLY_EXACT or any(rel_path.startswith(p) for p in INDEXER_ONLY_PREFIXES):
         return ("indexer",)
 
-    # Everything else (shared PHP core, composer, Dockerfile, etc.) affects all 4 app services
+    # Everything else (shared PHP core, Jobs/Mail/Notifications, composer, Dockerfile, etc.) affects all 4 app services
     return ("shared-app",)
 
 
@@ -274,7 +261,7 @@ def file_record(repo: Path, rel_path: str) -> str:
         st = os.lstat(full)
     except OSError:
         return f"deleted {rel_path}"
-    mode = oct(st.st_mode & 0o7777)[2:]
+    mode = "755" if (st.st_mode & 0o111) else "644"
     if os.path.islink(full):
         target = os.readlink(full)
         try:
@@ -282,67 +269,45 @@ def file_record(repo: Path, rel_path: str) -> str:
             content_hash = sha256_bytes(target_bytes)
         except OSError:
             content_hash = "dangling"
-        return f"link {mode} {content_hash} {rel_path} -> {target}"
+        return f"link {content_hash} {rel_path} -> {target}"
     if os.path.isfile(full):
         return f"file {mode} {sha256_bytes(full.read_bytes())} {rel_path}"
     return f"other {mode} {rel_path}"
 
 
 def collect_repo_records(repo: Path) -> list[tuple[str, str]]:
-    """Return sorted (rel_path, record_line) for all tracked and untracked files in repo."""
-    records: dict[str, str] = {}
-
+    """Return sorted (rel_path, record_line) for all runtime files on disk in repo."""
+    candidates: set[str] = set()
     ls_files = subprocess.run(
-        ["git", "-C", str(repo), "ls-files", "-s", "-z"],
+        ["git", "-C", str(repo), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
         capture_output=True,
         check=False,
     )
-    dirty_files: set[str] = set()
-    diff_proc = subprocess.run(
-        ["git", "-C", str(repo), "diff", "--name-only", "-z", "HEAD"],
-        capture_output=True,
-        check=False,
-    )
-    if diff_proc.returncode == 0 and diff_proc.stdout:
-        for entry in diff_proc.stdout.split(b"\x00"):
-            if entry:
-                dirty_files.add(entry.decode("utf-8", errors="surrogateescape"))
-
-    if ls_files.returncode == 0 and ls_files.stdout:
+    if ls_files.returncode == 0:
         for raw in ls_files.stdout.split(b"\x00"):
-            if not raw:
-                continue
-            text = raw.decode("utf-8", errors="surrogateescape")
-            meta, _, rel_path = text.partition("\t")
-            parts = meta.split()
-            if len(parts) >= 2 and rel_path not in dirty_files and (repo / rel_path).exists():
-                mode, blob_sha = parts[0], parts[1]
-                records[rel_path] = f"git {mode} {blob_sha} {rel_path}"
-            else:
-                records[rel_path] = file_record(repo, rel_path)
+            if raw:
+                candidates.add(raw.decode("utf-8", errors="surrogateescape"))
+        diff_head = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--name-only", "-z", "HEAD"],
+            capture_output=True,
+            check=False,
+        )
+        if diff_head.returncode == 0 and diff_head.stdout:
+            for raw in diff_head.stdout.split(b"\x00"):
+                if raw:
+                    candidates.add(raw.decode("utf-8", errors="surrogateescape"))
     else:
         for path in sorted(repo.rglob("*")):
             if ".git" in path.parts:
                 continue
-            rel = path.relative_to(repo).as_posix()
-            records[rel] = file_record(repo, rel)
+            candidates.add(path.relative_to(repo).as_posix())
 
-    for rel_path in dirty_files:
-        records[rel_path] = file_record(repo, rel_path)
-
-    untracked = subprocess.run(
-        ["git", "-C", str(repo), "ls-files", "-o", "--exclude-standard", "-z"],
-        capture_output=True,
-        check=False,
-    )
-    if untracked.returncode == 0 and untracked.stdout:
-        for raw in untracked.stdout.split(b"\x00"):
-            if not raw:
-                continue
-            rel_path = raw.decode("utf-8", errors="surrogateescape")
-            records[rel_path] = file_record(repo, rel_path)
-
-    return sorted(records.items(), key=lambda item: item[0])
+    records: list[tuple[str, str]] = []
+    for rel_path in sorted(candidates):
+        if not classify_path(rel_path):
+            continue
+        records.append((rel_path, file_record(repo, rel_path)))
+    return records
 
 
 def dockerfile_base_hash(repo: Path) -> str:
@@ -471,14 +436,21 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
 def parse_stamp(stamp_path: Path) -> dict[str, str]:
     if not stamp_path.is_file():
         return {}
-    lines = stamp_path.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+    lines = [line.strip() for line in stamp_path.read_text(encoding="utf-8", errors="surrogateescape").splitlines() if line.strip()]
     if not lines:
         return {}
-    parsed: dict[str, str] = {"fingerprint": lines[0].strip()}
+    parsed: dict[str, str] = {"fingerprint": lines[0]}
+    has_kv = False
     for line in lines[1:]:
         if "=" in line:
+            has_kv = True
             k, _, v = line.partition("=")
             parsed[k.strip()] = v.strip()
+    if not has_kv:
+        parsed["__legacy__"] = "1"
+        tokens = lines[0].split()
+        if len(tokens) >= 3:
+            parsed["effective"] = tokens[2]
     return parsed
 
 
@@ -493,8 +465,9 @@ def service_image_name(svc: str) -> str:
     env_key = f"{svc.upper()}_IMAGE"
     if os.environ.get(env_key):
         return os.environ[env_key]
-    if os.environ.get("APP_IMAGE"):
-        return os.environ["APP_IMAGE"]
+    app_img = os.environ.get("APP_IMAGE", "")
+    if app_img and app_img != "nntmux/app:local":
+        return app_img
     return f"nntmux/{svc}:local"
 
 
@@ -557,6 +530,24 @@ def check_app_container(docker_dir: Path, svc: str, verify_image: bool = True) -
     return True, "healthy"
 
 
+def recent_dirty_buckets(repo: Path) -> set[str]:
+    """Return ownership buckets modified in working tree or in HEAD commit (used during legacy stamp upgrades)."""
+    buckets: set[str] = set()
+    cmds = [
+        ["git", "-C", str(repo), "diff", "--name-only", "-z", "HEAD"],
+        ["git", "-C", str(repo), "ls-files", "-o", "--exclude-standard", "-z"],
+        ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD"],
+    ]
+    for cmd in cmds:
+        proc = subprocess.run(cmd, capture_output=True, check=False)
+        if proc.returncode == 0 and proc.stdout:
+            for raw in proc.stdout.split(b"\x00"):
+                if raw:
+                    rel_path = raw.decode("utf-8", errors="surrogateescape")
+                    buckets.update(classify_path(rel_path))
+    return buckets
+
+
 def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path) -> list[str]:
     state = compute_state(repo, docker_dir, include_compose=False)
     stamped = parse_stamp(stamp_path)
@@ -584,7 +575,9 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     state = compute_state(repo, docker_dir, include_compose=True)
     stamped = parse_stamp(stamp_path)
     force = os.environ.get("FORCE", "0") == "1"
-    first_deploy = not bool(stamped) or "migration" not in stamped
+    first_deploy = not bool(stamped)
+    legacy_stamp = "__legacy__" in stamped
+    legacy_buckets = recent_dirty_buckets(repo) if legacy_stamp else set()
 
     dirty_app: list[str] = []
     app_reasons: dict[str, str] = {}
@@ -592,7 +585,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
 
     for svc in APP_SERVICES:
         ok, reason = check_app_container(docker_dir, svc, verify_image=True)
-        if not ok and reason in ("missing", "missing-image") or reason.startswith("unhealthy"):
+        if not ok and (reason == "missing" or reason.startswith("unhealthy")):
             any_missing_or_unhealthy = True
         if force:
             dirty_app.append(svc)
@@ -600,6 +593,9 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
         elif first_deploy:
             dirty_app.append(svc)
             app_reasons[svc] = "initial deployment"
+        elif legacy_stamp:
+            dirty_app.append(svc)
+            app_reasons[svc] = "legacy stamp upgrade"
         elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
             dirty_app.append(svc)
             app_reasons[svc] = "code/config changed"
@@ -612,7 +608,15 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     dirty_data: list[str] = []
     data_reasons: dict[str, str] = {}
     for svc in DATA_SERVICES:
-        if not first_deploy and stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
+        if first_deploy:
+            data_reasons[svc] = "unchanged"
+        elif legacy_stamp:
+            if svc in legacy_buckets:
+                dirty_data.append(svc)
+                data_reasons[svc] = "config/compose changed"
+            else:
+                data_reasons[svc] = "unchanged"
+        elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
             dirty_data.append(svc)
             data_reasons[svc] = "config/compose changed"
         else:
@@ -621,7 +625,15 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     dirty_infra: list[str] = []
     infra_reasons: dict[str, str] = {}
     for svc in INFRA_SERVICES:
-        if not first_deploy and stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
+        if first_deploy:
+            infra_reasons[svc] = "unchanged"
+        elif legacy_stamp:
+            if svc in legacy_buckets:
+                dirty_infra.append(svc)
+                infra_reasons[svc] = "config/compose changed"
+            else:
+                infra_reasons[svc] = "unchanged"
+        elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
             dirty_infra.append(svc)
             infra_reasons[svc] = "config/compose changed"
         else:
@@ -634,6 +646,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     migrate = (
         force
         or first_deploy
+        or legacy_stamp
         or any_missing_or_unhealthy
         or stamped.get("migration") != state["migration"]
         or all_app_compose_changed
@@ -643,8 +656,11 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
         mode = "noop"
     elif migrate or dirty_data:
         mode = "full"
-        if not dirty_app:
-            dirty_app = list(APP_SERVICES)
+        for svc in APP_SERVICES:
+            if svc not in dirty_app:
+                dirty_app.append(svc)
+                if app_reasons.get(svc) == "unchanged":
+                    app_reasons[svc] = "migration quiesce" if migrate else "data service restart"
     else:
         mode = "selective"
 
@@ -707,10 +723,14 @@ def main() -> None:
         print(f"{'Service':<18} {'Category':<10} {'Action':<18} {'Reason'}")
         print("-" * 72)
         for svc in APP_SERVICES:
-            action = "drain+recreate" if svc in plan["dirty_app"] and svc != "web" else ("recreate" if svc in plan["dirty_app"] else "skip")
-            if plan["migrate"] and svc not in plan["dirty_app"]:
+            reason = plan["app_reasons"][svc]
+            if reason in ("migration quiesce", "data service restart"):
                 action = "quiesce+restart"
-            print(f"{svc:<18} {'app':<10} {action:<18} {plan['app_reasons'][svc]}")
+            elif svc in plan["dirty_app"]:
+                action = "recreate" if svc == "web" else "drain+recreate"
+            else:
+                action = "skip"
+            print(f"{svc:<18} {'app':<10} {action:<18} {reason}")
         for svc in DATA_SERVICES:
             action = "drain+recreate" if svc in plan["dirty_data"] else "skip"
             print(f"{svc:<18} {'data':<10} {action:<18} {plan['data_reasons'][svc]}")

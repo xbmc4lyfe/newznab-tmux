@@ -104,6 +104,8 @@ class ViteDockerConfigurationTest extends TestCase
         $this->assertLessThan($firstCopyPos, $basePos, 'OS base stage must precede repository COPY layers');
 
         $this->assertStringContainsString('--mount=type=cache,target=/src/docker/app/nzb-yenc-ffi/target', $dockerfile);
+        $this->assertStringContainsString('COPY app/Support/AdminReleaseNames.php /app/app/Support/AdminReleaseNames.php', $dockerfile);
+        $this->assertStringContainsString('COPY resources/forum /app/resources/forum', $dockerfile);
         $this->assertMatchesRegularExpression('/^FROM base-os AS vendor$/m', $dockerfile);
         $this->assertMatchesRegularExpression('/^FROM node AS frontend$/m', $dockerfile);
         $this->assertMatchesRegularExpression('/^FROM selfhost-runtime AS app-core$/m', $dockerfile);
@@ -111,10 +113,10 @@ class ViteDockerConfigurationTest extends TestCase
             $this->assertMatchesRegularExpression('/^FROM [^\r\n]+ AS '.preg_quote($target, '/').'$/m', $dockerfile);
         }
 
-        $this->assertSame('${WEB_IMAGE:-${APP_IMAGE:-nntmux/web:local}}', $compose['web']['image']);
-        $this->assertSame('${HORIZON_IMAGE:-${APP_IMAGE:-nntmux/horizon:local}}', $compose['horizon']['image']);
-        $this->assertSame('${SCHEDULER_IMAGE:-${APP_IMAGE:-nntmux/scheduler:local}}', $compose['scheduler']['image']);
-        $this->assertSame('${INDEXER_IMAGE:-${APP_IMAGE:-nntmux/indexer:local}}', $compose['indexer']['image']);
+        $this->assertSame('${WEB_IMAGE:-nntmux/web:local}', $compose['web']['image']);
+        $this->assertSame('${HORIZON_IMAGE:-nntmux/horizon:local}', $compose['horizon']['image']);
+        $this->assertSame('${SCHEDULER_IMAGE:-nntmux/scheduler:local}', $compose['scheduler']['image']);
+        $this->assertSame('${INDEXER_IMAGE:-nntmux/indexer:local}', $compose['indexer']['image']);
     }
 
     /**

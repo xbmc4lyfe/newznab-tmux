@@ -17,11 +17,15 @@ fi
 
 APP_IMAGE="${APP_IMAGE:-nntmux/app:local}"
 service_image() {
+    default_role_img="nntmux/$1:local"
+    if [ "$APP_IMAGE" != "nntmux/app:local" ]; then
+        default_role_img="$APP_IMAGE"
+    fi
     case "$1" in
-        web) printf '%s\n' "${WEB_IMAGE:-$APP_IMAGE}" ;;
-        horizon) printf '%s\n' "${HORIZON_IMAGE:-$APP_IMAGE}" ;;
-        scheduler) printf '%s\n' "${SCHEDULER_IMAGE:-$APP_IMAGE}" ;;
-        indexer) printf '%s\n' "${INDEXER_IMAGE:-$APP_IMAGE}" ;;
+        web) printf '%s\n' "${WEB_IMAGE:-$default_role_img}" ;;
+        horizon) printf '%s\n' "${HORIZON_IMAGE:-$default_role_img}" ;;
+        scheduler) printf '%s\n' "${SCHEDULER_IMAGE:-$default_role_img}" ;;
+        indexer) printf '%s\n' "${INDEXER_IMAGE:-$default_role_img}" ;;
     esac
 }
 
