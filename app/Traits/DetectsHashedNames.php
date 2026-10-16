@@ -15,6 +15,8 @@ namespace App\Traits;
  */
 trait DetectsHashedNames
 {
+    public const PREDB_HASHED_NAMES_POLICY = '3f5efc9f1145180668038a35d726463db1aa80fc2dd5d259d58ac9c2f89b22df';
+
     /**
      * Combined check: returns true if the name appears hashed or gibberish.
      */
