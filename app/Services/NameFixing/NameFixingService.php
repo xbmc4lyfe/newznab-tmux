@@ -33,7 +33,7 @@ use Throwable;
  */
 class NameFixingService
 {
-    public const PREDB_IDENTITY_POLICY = 'b082953d3709f28e3c527688fa683a4eed60f2aaa1642ecea49df44dc37c3581';
+    public const PREDB_IDENTITY_POLICY = '1919aa942e15c30f6c3fc7c3b0a28534d22f7bd58d09efcd4497834910455f82';
 
     private const PREDB_CANDIDATE_PAGE_SIZE = 21;
 
@@ -554,6 +554,13 @@ class NameFixingService
         if (! $echo && $this->updateService->currentPredbTitle((int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $originalFilename) === null) {
             return false;
         }
+        if (PredbSearchDocument::exactValue((string) ($bestMatch['title'] ?? '')) === PredbSearchDocument::exactValue((string) $release->searchname)) {
+            if ($echo) {
+                $this->updateService->attachPredbSnapshot($release, (int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $originalFilename, $filenameGuard);
+            }
+
+            return $this->updateService->matched;
+        }
 
         $this->updateService->updateRelease(
             $release,
@@ -859,6 +866,14 @@ class NameFixingService
         $donor = $this->donorMatchSelector->select($donors, (int) $release->relsize, $tolerancePercent);
         if ($donor === null) {
             return false;
+        }
+
+        if (PredbSearchDocument::exactValue((string) $donor->searchname) === PredbSearchDocument::exactValue((string) $release->searchname)) {
+            if ($echo) {
+                $this->updateService->attachPredbSnapshot($release, (int) $donor->predb_id);
+            }
+
+            return $this->updateService->matched;
         }
 
         $this->updateService->updateRelease(
@@ -1893,7 +1908,13 @@ class NameFixingService
         // Check PreDB first
         $preDbMatch = $this->updateService->checkPreDbMatch($release, $identityText);
         if ($preDbMatch !== null) {
-            $this->updateService->updateRelease($release, $preDbMatch['title'], 'preDB: Match', $echo, $type, $nameStatus, $show, $preDbMatch['id']);
+            if (PredbSearchDocument::exactValue((string) $preDbMatch['title']) === PredbSearchDocument::exactValue((string) $release->searchname)) {
+                if ($echo) {
+                    $this->updateService->attachPredbSnapshot($release, (int) $preDbMatch['id']);
+                }
+            } else {
+                $this->updateService->updateRelease($release, $preDbMatch['title'], 'preDB: Match', $echo, $type, $nameStatus, $show, $preDbMatch['id']);
+            }
 
             return $this->updateService->matched;
         }
@@ -1982,7 +2003,7 @@ class NameFixingService
         foreach ($pass->uniqueMatches() as $selected) {
             $bestMatch = $selected['match'];
             $fileName = $selected['filename'];
-            $sameTitle = (string) ($release->searchname ?? '') === $bestMatch['title'];
+            $sameTitle = PredbSearchDocument::exactValue((string) $bestMatch['title']) === PredbSearchDocument::exactValue((string) ($release->searchname ?? ''));
             $hasSnapshot = isset($release->guid, $release->name);
             if ($sameTitle && $echo) {
                 if (! $this->updateService->attachPredbSnapshot($release, (int) $bestMatch['id'], (string) $bestMatch['title'], $fileName, $filenameGuard)) {

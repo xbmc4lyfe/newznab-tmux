@@ -54,8 +54,9 @@ final class PredbAuthoritativeIdentityTest extends TestCase
         $release = $this->pendingPar2Release(['searchname' => $searchname]);
         self::assertTrue(Par2RenameProgress::save($release->id, 'manifest', 1, []));
         DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => $title, 'filename' => $filename]]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
         $updates = $this->updater();
+        $this->certifyFilenameSqlFixture();
 
         (new NameFixingService($updates))->getPreFileNames(['prefiles', 1]);
 

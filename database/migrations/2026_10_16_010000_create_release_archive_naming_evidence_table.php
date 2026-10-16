@@ -8,6 +8,10 @@ return new class extends Migration
 {
     public function up(): void
     {
+        if (Schema::hasTable('release_archive_naming_evidence')) {
+            return;
+        }
+
         Schema::create('release_archive_naming_evidence', static function (Blueprint $table): void {
             $table->unsignedInteger('releases_id')->primary();
             $table->string('release_guid', 40);
