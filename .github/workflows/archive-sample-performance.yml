@@ -23,7 +23,7 @@ on:
     inputs:
       comparison:
         type: choice
-        options: [remaining, existing, all]
+        options: [remaining, existing, all, fingerprint-tls-screen]
         default: remaining
         description: Select the six remaining modules or existing caller families
       mode:
@@ -33,7 +33,7 @@ on:
         description: Qualification requires 1000 independent pairs
       samples:
         default: '31'
-        description: Pairs per comparative stratum; use at least 1000 for qualification
+        description: Module pairs; qualification needs 1000. Fingerprint TLS screen uses five pairs.
         required: true
 
 permissions:
@@ -46,6 +46,7 @@ concurrency:
 
 jobs:
   compare:
+    if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'fingerprint-tls-screen'
     name: ${{ matrix.kind }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
@@ -196,5 +197,121 @@ jobs:
         with:
           name: native-utility-${{ matrix.kind }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: utility-evidence/
+          retention-days: 14
+          if-no-files-found: warn
+
+  fingerprint_tls_screen:
+    if: github.event_name == 'workflow_dispatch' && inputs.comparison == 'fingerprint-tls-screen'
+    name: Fingerprint TLS diagnostic (existing x86_64 artifact)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require the declared disposable runtime before checkout
+        env:
+          EXECUTOR_ENVIRONMENT: ${{ runner.environment }}
+          EXECUTOR_OS: ${{ runner.os }}
+          EXECUTOR_ARCH: ${{ runner.arch }}
+          REQUESTED_MODE: ${{ inputs.mode }}
+        run: |
+          test "$EXECUTOR_ENVIRONMENT" = github-hosted
+          test "$EXECUTOR_OS" = Linux
+          test "$EXECUTOR_ARCH" = X64
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          test "$REQUESTED_MODE" = screen
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5.11'
+          extensions: bcmath, dom, curl, exif, ffi, gd, intl, mbstring, pdo, pdo_sqlite, simplexml, sockets, xmlwriter, zip
+          coverage: none
+      - name: Reuse the pinned native artifact and locked vendor without compiling Rust
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir fingerprint-tls-evidence
+          curl --fail --silent --show-error --max-time 60 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/xbmc4lyfe/newznab-tmux/actions/artifacts/12009103317 \
+            -o fingerprint-tls-evidence/artifact-api.json
+          python3 - <<'PY'
+          import json, pathlib
+          value = json.loads(pathlib.Path('fingerprint-tls-evidence/artifact-api.json').read_text())
+          assert value['id'] == 12009103317 and not value['expired']
+          assert value['workflow_run']['id'] == 38812539972
+          assert value['workflow_run']['head_sha'] == '0e62874c6a1090072de9fac50e50a6ec7f4c5bea'
+          assert value['digest'] == 'sha256:8011646596debf96645b1d18ede0afb0e66e098471ea3ec34fd77215a7005e8a'
+          assert value['size_in_bytes'] <= 209715200
+          PY
+          curl --fail --silent --show-error --location --max-time 120 --max-filesize 209715200 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/xbmc4lyfe/newznab-tmux/actions/artifacts/12009103317/zip \
+            -o "$RUNNER_TEMP/fingerprint-original-build.zip"
+          python3 - "$RUNNER_TEMP/fingerprint-original-build.zip" <<'PY'
+          import hashlib, json, pathlib, stat, sys, zipfile
+          archive = pathlib.Path(sys.argv[1])
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == '8011646596debf96645b1d18ede0afb0e66e098471ea3ec34fd77215a7005e8a'
+          prefix = 'sample-planning/source/vendor/'
+          assert not pathlib.Path('vendor').exists()
+          with zipfile.ZipFile(archive) as source:
+              assert source.read('sample-planning/source/composer.lock') == pathlib.Path('composer.lock').read_bytes()
+              library = source.read('sample-planning/native.so')
+              assert hashlib.sha256(library).hexdigest() == '02eeb2be7d182cbc046cd5358792795825acf9daac549a020afc0fb2ea847213'
+              pathlib.Path('fingerprint-tls-evidence/native.so').write_bytes(library)
+              receipt = json.loads(source.read('runtime.json'))
+              assert receipt['executed_sha'] == '0e62874c6a1090072de9fac50e50a6ec7f4c5bea'
+              receipt['reuse_only_no_new_compilation'] = True
+              receipt['historical_build_isa_known'] = False
+              receipt['historical_build_abi_known'] = False
+              receipt['adoption_qualified'] = False
+              pathlib.Path('fingerprint-tls-evidence/original-build-runtime.json').write_text(json.dumps(receipt, indent=2) + '\n')
+              entries = [entry for entry in source.infolist() if entry.filename.startswith(prefix)]
+              assert entries and sum(entry.file_size for entry in entries) <= 524288000
+              for entry in entries:
+                  relative = pathlib.PurePosixPath(entry.filename.removeprefix(prefix))
+                  assert not relative.is_absolute() and '..' not in relative.parts
+                  assert not stat.S_ISLNK(entry.external_attr >> 16)
+                  destination = pathlib.Path('vendor').joinpath(*relative.parts)
+                  if entry.is_dir():
+                      destination.mkdir(parents=True, exist_ok=True)
+                  else:
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      destination.write_bytes(source.read(entry))
+          PY
+          composer dump-autoload --no-scripts --no-plugins --optimize --no-interaction
+          git diff --exit-code -- composer.json composer.lock
+      - name: Check the reviewed caller and screen sources
+        env:
+          APP_ENV: testing
+          DB_CONNECTION: testing
+          DB_DATABASE: ':memory:'
+          CACHE_STORE: array
+        run: |
+          php -l scripts/benchmark-fingerprint-tls-worker.php
+          php vendor/bin/pint --test scripts/benchmark-fingerprint-tls-worker.php app/Services/NNTP/FingerprintConnectionReuseNntpService.php tests/Unit/ReleaseFingerprintConnectionLifecycleTest.php
+          php vendor/bin/phpunit tests/Unit/ReleaseFingerprintConnectionLifecycleTest.php
+          python3 - <<'PY'
+          import ast, pathlib
+          ast.parse(pathlib.Path('scripts/benchmark-fingerprint-tls.py').read_text())
+          PY
+      - name: Record source identity and run the fixed five-pair diagnostic
+        run: |
+          git rev-parse HEAD > fingerprint-tls-evidence/executed-sha.txt
+          git status --porcelain > fingerprint-tls-evidence/worktree-status.txt
+          python3 scripts/benchmark-fingerprint-tls.py \
+            --library "$GITHUB_WORKSPACE/fingerprint-tls-evidence/native.so" \
+            --output-dir "$GITHUB_WORKSPACE/fingerprint-tls-evidence/screen" \
+            --pairs 5
+      - name: Retain diagnostic observations even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fingerprint-tls-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fingerprint-tls-evidence/
           retention-days: 14
           if-no-files-found: warn
