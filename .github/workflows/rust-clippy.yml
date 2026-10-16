@@ -51,6 +51,12 @@ jobs:
       - name: Test experimental XZ Index library
         run: cargo +"$RUST_TOOLCHAIN" test --locked --jobs 2 --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib --features experimental-xz-index
 
+      - name: Test experimental RapidYenc ABI library
+        run: cargo +"$RUST_TOOLCHAIN" test --locked --jobs 2 --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib --features experimental-rapidyenc-abi
+
+      - name: Test combined experimental Rust library
+        run: cargo +"$RUST_TOOLCHAIN" test --locked --jobs 2 --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib --all-features
+
       - name: Install SARIF converter
         run: cargo +"$RUST_TOOLCHAIN" install --locked clippy-sarif --version 0.8.0
 

@@ -29,7 +29,7 @@ static PAIR_REMOVAL_INDEXES: [[u8; 16]; 15] = removal_indexes::<15>(2);
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn decode_neon_block(
+pub(crate) unsafe fn decode_neon_block(
     bytes: std::arch::aarch64::uint8x16_t,
     equals: std::arch::aarch64::uint8x16_t,
     special: std::arch::aarch64::uint8x16_t,

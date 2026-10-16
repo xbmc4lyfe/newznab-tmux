@@ -319,6 +319,76 @@ final class NNTPBodyDecodingTest extends TestCase
             }
         }
     }
+
+    /** @return iterable<string, array{string, string}> */
+    public static function rawBodiesWithoutHeartbeat(): iterable
+    {
+        yield 'empty body' => [".\r\n", ''];
+        yield 'single 1-byte line' => ["a\r\n.\r\n", "a\r\n"];
+        yield 'single 2-byte line' => ["ab\r\n.\r\n", "ab\r\n"];
+        yield 'single dot-stuffed short line' => ["..\r\n.\r\n", ".\r\n"];
+        yield 'dot-stuffed first line and subsequent lines' => [
+            "..first\r\n...second\r\n..third\r\n.\r\n",
+            ".first\r\n..second\r\n.third\r\n",
+        ];
+        yield 'short prefix lines followed by multi-line payload' => [
+            "a\r\n..\r\n=ybegin line=128 size=3 name=a.bin\r\nklm\r\n=yend size=3 crc32=352441c2\r\n.\r\n",
+            "a\r\n.\r\n=ybegin line=128 size=3 name=a.bin\r\nklm\r\n=yend size=3 crc32=352441c2\r\n",
+        ];
+    }
+
+    #[DataProvider('rawBodiesWithoutHeartbeat')]
+    public function test_raw_body_without_heartbeat_matches_expected_on_temp_and_half_closed_socket(string $wire, string $expected): void
+    {
+        $temp = fopen('php://temp', 'w+');
+        fwrite($temp, $wire);
+        rewind($temp);
+        try {
+            $result = (new ReflectionMethod(NNTPService::class, 'readRawBody'))->invoke(new YencNntpHarness($temp));
+            self::assertSame($expected, $result);
+        } finally {
+            fclose($temp);
+        }
+
+        $withNext = fopen('php://temp', 'w+');
+        fwrite($withNext, $wire."NEXT\r\n");
+        rewind($withNext);
+        try {
+            $result = (new ReflectionMethod(NNTPService::class, 'readRawBody'))->invoke(new YencNntpHarness($withNext));
+            self::assertSame($expected, $result);
+            self::assertSame("NEXT\r\n", fgets($withNext));
+        } finally {
+            fclose($withNext);
+        }
+
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        self::assertIsArray($pair);
+        try {
+            fwrite($pair[1], $wire);
+            stream_socket_shutdown($pair[1], STREAM_SHUT_WR);
+            $result = (new ReflectionMethod(NNTPService::class, 'readRawBody'))->invoke(new YencNntpHarness($pair[0]));
+            self::assertSame($expected, $result);
+        } finally {
+            fclose($pair[0]);
+            fclose($pair[1]);
+        }
+    }
+
+    public function test_raw_body_without_heartbeat_rejects_unterminated_stream_at_eof(): void
+    {
+        foreach (["unterminated line\r\n", "unterminated line\r\n.\r", "a\r\n"] as $wire) {
+            $stream = fopen('php://temp', 'w+');
+            fwrite($stream, $wire);
+            rewind($stream);
+            try {
+                $result = (new ReflectionMethod(NNTPService::class, 'readRawBody'))->invoke(new YencNntpHarness($stream));
+                self::assertInstanceOf(NntpError::class, $result);
+                self::assertSame('End of stream! Connection lost?', $result->getMessage());
+            } finally {
+                fclose($stream);
+            }
+        }
+    }
 }
 
 final class NNTPBodyReadFailureStream

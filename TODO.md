@@ -1,5 +1,19 @@
 # To do
 
+## Replace the RapidYenc C++ build path with qualified Rust
+
+Rust replacement is the user's standing priority. Compile on the local Mac;
+`192.168.1.93` is offline. The written design, including compatibility corrections
+and two PHP diagnostic text updates, was approved on 2026-10-14 after two
+GPT-6 Astra Max review passes.
+
+- [ ] Complete the full decoder/CRC ABI of the pinned decode-only C++ build in Rust, including raw/incremental state, in-place decoding and CRC field helpers. Preserve existing Rust metadata exports and application behavior. The incumbent backend includes Rust SIMD payload decoding; its five RapidYenc exports do not establish full sixteen-function ABI parity.
+- [ ] Freeze reference vectors and a paired benchmark protocol, then prove byte/state/CRC parity and at least 1.5x speedup for each common actual-caller path and representative uncommon p99; aim for 2–3x. Retain failures and raw observations. The local Linux caller fixture must use no production credentials, mounts or jobs.
+- [ ] Repair qualification-harness custody before further execution: retain an exact owned unreaped leader through group settlement, disarm signaling before reaping, never reconstruct signal authority from a historical PID file, and prove bounded cancellation/owner-death cleanup with independently owned containment.
+- [ ] Reject experimental library profiles before canonical decoder calls or cache publication, using the reviewed combined nullable profile/capability admission contract. Preserve anchored FFI identity, exact missing-symbol error handling and legacy-compatible combinations.
+- [ ] Remove the replaced C++ download/build/cache path after the gates pass, select the Rust artifact in native CI and qualify the actual Rust backend without unexpected decoder fallback. All new implementation and benchmark logic is Rust; the two existing PHP diagnostic text edits are approved.
+- [ ] Obtain local Codex validation with `--yolo`, current-head GitHub Codex clearance and green CI; include current upstream commits, squash merge with verified `xbmc4lyfe` identity, then hand the exact verified squash SHA to `DEPLOY M5STEPHEN` for deployment and verify the rollout and fresh native decoding before checking this replacement complete and moving on.
+
 ## Qualify upstream archive synchronization (2026-10-15)
 
 - [ ] Run the full integrated PHPUnit/native retest on final synchronized master, including RAR4/RAR5 terminal and more-volume evidence, exact-boundary and partial-header prefixes, incomplete 7-Zip episode naming, real Linux 7-Zip compressed/encrypted-header fixtures, the native stored-sample preview with FFmpeg/FFprobe, fresh Redis cached-config preflight, archive naming, claim/provenance and publication guards, and tmux/updater behavior. Include real processor→finalization→filename consumers, merged/uninspected NZB inventory, source replacement and repair races, current filename witnesses, same-name/preview admission, direct-video body corroboration, and audit-anchor cleanup across rollback and successor installation. The native `it_lists_real_7z_archives_with_compressed_headers` and `it_takes_a_preview_from_a_sample_stored_in_an_archive_without_extracting_it` checks remain unverified. Bounded private SQLite and fake-client checks do not complete this gate.

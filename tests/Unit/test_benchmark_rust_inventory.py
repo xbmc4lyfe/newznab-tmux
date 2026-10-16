@@ -24,8 +24,8 @@ class RustInventoryTest(unittest.TestCase):
     def test_every_current_export_has_a_source_location_and_explicit_scope(self):
         self.assertTrue(SCRIPT.exists(), 'source-derived inventory helper is missing')
         rows = module().inventory(ROOT)
-        self.assertEqual(len(rows), 29)
-        self.assertEqual(len({row['name'] for row in rows}), 29)
+        self.assertEqual(len(rows), 41)
+        self.assertEqual(len({row['name'] for row in rows}), 41)
         self.assertEqual(module().check(ROOT), [])
         for row in rows:
             path = ROOT / row['target']
@@ -35,6 +35,56 @@ class RustInventoryTest(unittest.TestCase):
             for caller in row['callers']:
                 self.assertTrue((ROOT / caller).is_file())
                 self.assertIn(row['name'], (ROOT / caller).read_text())
+
+    def test_experimental_rapidyenc_exports_and_profile_are_explicit_unmeasured_gaps(self):
+        experimental = {
+            'rapidyenc_decode_kernel', 'rapidyenc_encode_max_length', 'rapidyenc_decode',
+            'rapidyenc_decode_incremental', 'rapidyenc_crc_kernel', 'rapidyenc_crc_combine',
+            'rapidyenc_crc_zeros', 'rapidyenc_crc_unzero', 'rapidyenc_crc_multiply',
+            'rapidyenc_crc_2pow', 'rapidyenc_crc_256pow',
+        }
+        rows = {row['name']: row for row in module().inventory(ROOT)}
+        source = (ROOT / SOURCE).read_text()
+        for name in experimental:
+            with self.subTest(name=name):
+                row = rows[name]
+                self.assertEqual(row['coverage'], 'experimental-compatibility-gap')
+                self.assertEqual(row['evidence_kinds'], [])
+                self.assertEqual(row['callers'], [])
+                self.assert_experimental_feature_gate(source, name)
+        profile = rows['nntmux_yenc_implementation_profile_v1']
+        self.assertEqual(profile['coverage'], 'profile-unmeasured-gap')
+        self.assertEqual(profile['evidence_kinds'], [])
+        self.assertEqual(profile['callers'], [])
+
+        name = 'rapidyenc_decode_kernel'
+        gated_prefix = ('#[cfg(feature = "experimental-rapidyenc-abi")]\n'
+                        '#[unsafe(no_mangle)]\n'
+                        'pub extern "C" fn ' + name + '(')
+        ungated_source = source.replace(gated_prefix,
+                                        '#[unsafe(no_mangle)]\n'
+                                        'pub extern "C" fn ' + name + '(', 1)
+        self.assertNotEqual(ungated_source, source)
+        with self.assertRaises(AssertionError):
+            self.assert_experimental_feature_gate(ungated_source, name)
+
+    def assert_experimental_feature_gate(self, source, name):
+        position = source.index('fn ' + name + '(')
+        lines = source.splitlines()
+        function_line = source.count('\n', 0, position)
+        self.assertGreaterEqual(function_line, 2)
+        self.assertEqual(lines[function_line - 1].strip(), '#[unsafe(no_mangle)]')
+        self.assertEqual(lines[function_line - 2].strip(),
+                         '#[cfg(feature = "experimental-rapidyenc-abi")]')
+
+    def test_duplicate_linker_exports_remain_rejected(self):
+        root = self.fixture('''
+#[unsafe(no_mangle)]
+extern "C" fn duplicate_export() {}
+#[unsafe(no_mangle)]
+extern "C" fn duplicate_export() {}
+''')
+        self.assertIn('duplicate export: duplicate_export', module().check(root))
 
     def test_scope_does_not_turn_support_or_legacy_apis_into_speedup_claims(self):
         self.assertTrue(SCRIPT.exists(), 'source-derived inventory helper is missing')

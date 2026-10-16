@@ -12,6 +12,8 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
+# Explicit canonical RapidYenc experiment; not adoption authorization.
+experimental-rapidyenc-abi = []
 # Experimental only until full-caller correctness and performance gates pass.
 experimental-xz-index = []
 
