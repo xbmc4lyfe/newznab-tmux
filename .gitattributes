@@ -120,3 +120,4 @@ docker/Makefile		-binary text eol=lf
 /tests/Unit/test_benchmark_concurrency.py -binary text eol=lf
 /tests/Unit/test_composer_install_retry.py -binary text eol=lf
 /scripts/benchmark-fingerprint-tls.py -binary text eol=lf
+/scripts/test-fingerprint-tls-idle-close.py -binary text eol=lf

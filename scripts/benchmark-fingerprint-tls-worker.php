@@ -53,6 +53,9 @@ $observations = [];
 $preflight = [];
 $input = [];
 $exitCode = 1;
+$correctness = false;
+$preflightCompleted = false;
+$correctnessTrace = null;
 ob_start();
 try {
     if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || ! extension_loaded('FFI')) {
@@ -71,7 +74,12 @@ try {
         throw new InvalidArgumentException('Use a dedicated disposable input directory.');
     }
     $input = json_decode(file_get_contents($inputPath), true, 32, JSON_THROW_ON_ERROR);
-    if (! is_array($input) || ! in_array($input['arm'] ?? null, ['baseline', 'candidate'], true)) {
+    $correctness = is_array($input) && ($input['purpose'] ?? null) === 'idle_tls_correctness';
+    $allowedArms = $correctness ? ['baseline', 'candidate-held', 'candidate'] : ['baseline', 'candidate'];
+    if (! is_array($input) || ! in_array($input['arm'] ?? null, $allowedArms, true)) {
+        if ($correctness) {
+            throw new InvalidArgumentException('Correctness arm must be baseline, candidate-held or candidate.');
+        }
         throw new InvalidArgumentException('arm must be baseline or candidate.');
     }
     foreach (['primary_port', 'alternate_port'] as $key) {
@@ -140,6 +148,9 @@ try {
             throw new RuntimeException('Missing mandatory repository source pin: '.$requiredSource);
         }
     }
+    if ($correctness && ! isset($sourceHashes['scripts/fingerprint-tls-correctness-trace.php'])) {
+        throw new RuntimeException('Missing mandatory correctness trace source pin.');
+    }
     foreach ($sourceHashes as $relative => $expected) {
         if (! is_string($relative) || str_starts_with($relative, '/') || str_contains($relative, '..')
             || ! is_string($expected) || preg_match('/\A[0-9a-f]{64}\z/D', $expected) !== 1
@@ -177,6 +188,10 @@ try {
     }
     // Application path access must never inherit the repository or ambient storage tree.
     require $repo.'/vendor/autoload.php';
+    if ($correctness) {
+        require $repo.'/scripts/fingerprint-tls-correctness-trace.php';
+        $correctnessTrace = new FingerprintTlsCorrectnessTrace;
+    }
     $app = new Application($repo);
     $app->useStoragePath($runtimeRoot.'/storage');
     $app->useBootstrapPath($runtimeRoot.'/bootstrap');
@@ -271,14 +286,50 @@ try {
     $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
     $release = new Release;
     $release->guid = $input['guid'];
-    foreach (['first_after_preflight', 'repeat'] as $phase) {
+    if ($correctness) {
+        // An injected incumbent is comparable only when the collector would construct its own owner.
+        $fixtureXml = $nzb->readNzbContents($input['guid']);
+        if (! is_string($fixtureXml) || $fixtureXml === '') {
+            throw new RuntimeException('Correctness capture requires an available valid NZB.');
+        }
+        $fixtureAnalyzer = new NzbFingerprintAnalyzer($yenc);
+        $fixtureManifest = $fixtureAnalyzer->analyzeManifest($fixtureXml);
+        $fixtureOmitted = 0;
+        $fixtureSamples = $fixtureAnalyzer->selectArticleSamples($fixtureManifest['files'], NzbFingerprintAnalyzer::MAX_ARTICLE_SAMPLES, $fixtureOmitted);
+        if ($fixtureOmitted !== 0 || count($fixtureSamples) !== $input['expected_samples']
+            || array_column($fixtureSamples, 'messageid') !== array_keys($expectedPayloads)) {
+            throw new RuntimeException('Correctness NZB sample identities do not match the declared fixture.');
+        }
+        unset($fixtureXml, $fixtureAnalyzer, $fixtureManifest, $fixtureSamples);
+    }
+    $preflightCompleted = true;
+    $phases = $correctness ? ['first_after_preflight'] : ['first_after_preflight', 'repeat'];
+    foreach ($phases as $phase) {
         $memoryBefore = memory_get_usage(true);
         $usageBefore = getrusage();
         $report = null;
         $phaseFailure = null;
         $start = hrtime(true);
         try {
-            if ($input['arm'] === 'candidate') {
+            if ($correctness) {
+                $owner = $input['arm'] === 'baseline'
+                    ? new FingerprintTlsCorrectnessBaselineNntp($correctnessTrace)
+                    : new FingerprintTlsCorrectnessReuseNntp($correctnessTrace);
+                try {
+                    // A/B markers are correctness-only no-ops; C releases exactly at this boundary.
+                    $capture = fn (): array => $collector->collect($release, $owner, function () use ($owner, $input): void {
+                        $owner->fingerprintTraceMarker('transport_boundary_enter');
+                        if ($input['arm'] === 'candidate') {
+                            $owner->releaseFingerprintAlternateTransport();
+                        }
+                        $owner->fingerprintTraceMarker('transport_boundary_return');
+                    });
+                    $report = $input['arm'] === 'baseline' ? $capture() : $owner->withFingerprintConnectionReuse($capture);
+                } finally {
+                    // Release the callback capture before the locally owned incumbent's destructor.
+                    unset($capture, $owner);
+                }
+            } elseif ($input['arm'] === 'candidate') {
                 $owner = new FingerprintConnectionReuseNntpService;
                 try {
                     $report = $owner->withFingerprintConnectionReuse(fn (): array => $collector->collect(
@@ -292,7 +343,9 @@ try {
             }
         } catch (Throwable $collectionException) {
             $phaseFailure = ['type' => $collectionException::class, 'message' => $collectionException->getMessage()];
-            throw $collectionException;
+            if (! $correctness) {
+                throw $collectionException;
+            }
         } finally {
             $elapsed = hrtime(true) - $start;
             $observations[] = [
@@ -301,6 +354,10 @@ try {
                 'process_peak_bytes' => memory_get_peak_usage(true), 'rusage_before' => $usageBefore, 'rusage_after' => getrusage(),
                 'report' => $report, 'failure' => $phaseFailure,
             ];
+        }
+        if ($correctness) {
+            // Adverse caller output is evidence; the independent peer/driver owns its parity oracle.
+            continue;
         }
         $data = $report['data'];
         if ($report['status'] !== 'complete' || $data['schema_version'] !== ReleaseFingerprintCollector::SCHEMA_VERSION
@@ -348,16 +405,51 @@ try {
         }
     }
 }
+$capturedStdout = ob_get_clean();
+if ($correctness && strlen($capturedStdout) > 65_536) {
+    // Bound the serialized capture without changing the caller's existing output buffer.
+    $capturedStdout = substr($capturedStdout, 0, 65_536);
+    $correctnessTrace?->fail('Captured stdout exceeded its 65536 byte correctness limit.');
+    $payload['valid'] = false;
+    $exitCode = 1;
+}
 $payload += [
     'boundary' => 'standalone real collector with owned gzip NZB, in-memory configuration database, actual loopback TLS/authentication and native FFI; excludes job persistence and production',
     'phase_definition' => 'first_after_preflight is the first collection after native decoder, header, date and framing preflight outside the collection timer; it is partially warmed and may initialize identity, xref, body and format parser families inside its timer. repeat is the second collection in the same PHP process. Each collection constructs a fresh NNTP owner inside its timer and includes cleanup.',
     'arm' => $input['arm'] ?? null, 'workload_id' => $input['workload_id'] ?? null,
     'preflight' => $preflight, 'observations' => $observations,
     'runtime' => ['php' => PHP_VERSION, 'os' => PHP_OS_FAMILY, 'pid' => getmypid()],
-    'captured_stdout' => ob_get_clean(),
+    'captured_stdout' => $capturedStdout,
 ];
+if ($correctness) {
+    $trace = $correctnessTrace?->snapshot();
+    $infrastructureValid = $payload['valid'] && $preflightCompleted && $trace !== null && $trace['infrastructure_failure'] === null;
+    if (! $infrastructureValid) {
+        $payload['valid'] = false;
+        $exitCode = 1;
+    }
+    $payload += [
+        'purpose' => 'idle_tls_correctness', 'validation_scope' => 'caller_capture_not_parity',
+        'preflight_completed' => $preflightCompleted, 'infrastructure_valid' => $infrastructureValid,
+        'collections' => 1, 'trace' => $trace,
+        'limits' => ['max_output_file_bytes' => 1_048_576, 'max_captured_stdout_bytes' => 65_536],
+        'instrumentation' => 'correctness-only injected call-through owner and boundary markers; baseline is not a performance baseline; logical quit events do not imply wire QUIT; qualified parent calls bypass virtual observers',
+    ];
+    $payload['phase_definition'] = 'One first_after_preflight collection after native and valid-NZB preflight; partially warmed, instrumented caller capture only. Caller report/errors/failure are retained without a parity claim. A/B boundary callbacks only mark the boundary; C also releases its owned alternate transport. Owner cleanup is inside caller_ns.';
+}
 try {
-    $json = json_encode($payload, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE)."\n";
+    $json = json_encode($payload, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE | ($correctness ? 0 : JSON_PRETTY_PRINT))."\n";
+    if ($correctness && strlen($json) > 1_048_576) {
+        // Check before opening/writing the result, rather than inspecting an oversized file afterwards.
+        $json = json_encode([
+            'valid' => false, 'purpose' => 'idle_tls_correctness',
+            'validation_scope' => 'caller_capture_not_parity', 'preflight_completed' => $preflightCompleted,
+            'infrastructure_valid' => false, 'arm' => $input['arm'] ?? null,
+            'failure' => ['type' => 'CorrectnessOutputLimitExceeded', 'message' => 'Serialized correctness output exceeded its 1048576 byte pre-write limit; observations omitted.'],
+            'limits' => ['max_output_file_bytes' => 1_048_576, 'max_captured_stdout_bytes' => 65_536],
+        ], JSON_THROW_ON_ERROR)."\n";
+        $exitCode = 1;
+    }
     if ($outputPath !== null) {
         $output = fopen($outputPath, 'x');
         if ($output === false) {
