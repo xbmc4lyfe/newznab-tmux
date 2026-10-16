@@ -26,7 +26,7 @@ ENV LANG=C.UTF-8
 WORKDIR /app
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl unzip tmux par2 unrar-free lame ffmpeg mediainfo jpegoptim webp \
+    ca-certificates curl unzip tmux par2 unrar-free p7zip-full lame ffmpeg mediainfo jpegoptim webp \
     optipng pngquant libavif-bin python3 time procps mariadb-client libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 RUN install-php-extensions bcmath exif gd intl mbstring pdo_mysql pdo_sqlite sockets pcntl redis imagick zip ffi

@@ -122,14 +122,6 @@ final class VerifiedReleasePublisher
                         return $duplicateId;
                     }
                     $guid = $legacy === null ? (string) Str::uuid() : (string) $legacy->guid;
-                    $timing?->nextPhase('final_xml_gzip');
-                    $path = $this->writer->write($manifest, $guid, $timing);
-                    $timing?->nextPhase('sql_accounting');
-                    DB::afterRollBack(static function () use ($path): void {
-                        if (is_file($path)) {
-                            unlink($path);
-                        }
-                    });
                     $parameters = $metadata + [
                         'totalpart' => ($manifest['verification_mode'] ?? null) === 'spot_check'
                             ? max(0, (int) ($manifest['publication_file_count'] ?? $manifest['expected_files'] ?? count($manifest['files'])))
@@ -137,6 +129,7 @@ final class VerifiedReleasePublisher
                                 ? count(array_unique($manifest['verified_file_names'])) : max((int) $manifest['expected_files'], count($manifest['files']))),
                         'groups_id' => (int) $manifest['groups_id'], 'guid' => $guid, 'postdate' => $manifest['date'],
                         'size' => $size, 'nzbstatus' => NzbService::NZB_ADDED];
+                    $timing?->nextPhase('release_identity_sql');
                     if ($legacy === null) {
                         $id = Release::insertRelease($parameters);
                     } else {
@@ -148,6 +141,15 @@ final class VerifiedReleasePublisher
                     if ($id === null) {
                         throw new RuntimeException('Verified release insertion failed.');
                     }
+                    $release = DB::table('releases')->where('id', $id)->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
+                    if ($release === null) {
+                        throw new RuntimeException('Verified release identity disappeared before NZB installation.');
+                    }
+                    $timing?->nextPhase('final_xml_gzip');
+                    $receipt = $this->writer->writeWithReceipt($manifest, $guid, $release, $timing);
+                    DB::afterRollBack(static fn () => $receipt->rollback());
+                    DB::afterCommit(static fn () => $receipt->close());
+                    $timing?->nextPhase('sql_accounting');
                     ReleaseRegex::insertOrIgnore(['releases_id' => $id, 'collection_regex_id' => $manifest['regex_id'],
                         'naming_regex_id' => $metadata['naming_regex_id']]);
                     DB::afterCommit(static function () use ($id): void {

@@ -10,6 +10,7 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseImageService;
 use App\Services\Releases\Verification\AuditReleaseDeletion;
+use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\YencService;
 use Illuminate\Database\QueryException;
@@ -56,6 +57,7 @@ class ReleaseVerificationAuditDeletionTest extends TestCase
             $table->id();
             $table->foreignId('release_id')->constrained('releases')->cascadeOnDelete();
         });
+        (require database_path('migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         DB::table('releases')->insert(['id' => 1, 'guid' => 'audit-delete', 'searchname' => 'Movie',
             'fromname' => 'poster', 'groups_id' => 1, 'postdate' => '2026-10-11 12:00:00']);
         DB::table('release_children')->insert(['release_id' => 1]);
@@ -169,6 +171,34 @@ class ReleaseVerificationAuditDeletionTest extends TestCase
         yield 'thumbnail removal after NZB is removed' => [true];
     }
 
+    public function test_committed_audit_anchor_cleanup_releases_its_retained_scratch_capacity(): void
+    {
+        $this->audit();
+        $entry = DB::table('release_verification_scratch')->sole();
+        $inventory = json_decode($entry->delete_paths, true, flags: JSON_THROW_ON_ERROR);
+        $anchor = $inventory['nzb_receipt']['anchor'];
+        $scratch = $this->scratch((int) $entry->id);
+        $this->assertSame(1, $inventory['version']);
+        $this->assertSame('inode', $inventory['nzb_receipt']['kind']);
+        $this->assertFileExists($this->nzbPath);
+        $this->assertFileExists($anchor);
+        $this->assertDirectoryExists($scratch);
+        $this->assertTrue(app(ScratchBudget::class)->initialize());
+        $reserved = (int) DB::table('release_verification_scratch_budget')->value('reserved_bytes');
+        $this->assertGreaterThan(0, $reserved);
+        $this->assertSame($reserved, (int) DB::table('release_verification_scratch')->value('reserved_bytes'));
+        config(['release_verification.scratch_bytes' => $reserved]);
+
+        $this->worker();
+
+        $this->assertFileDoesNotExist($this->nzbPath);
+        $this->assertFileDoesNotExist($anchor);
+        $this->assertFileDoesNotExist($this->imagePath);
+        $this->assertDirectoryDoesNotExist($scratch);
+        $this->assertSame(0, DB::table('release_verification_scratch')->count());
+        $this->assertSame(0, (int) DB::table('release_verification_scratch_budget')->value('reserved_bytes'));
+    }
+
     #[DataProvider('artifactFailurePoints')]
     public function test_failed_artifact_removal_retains_durable_work_even_when_scratch_is_absent(bool $failImage): void
     {
@@ -176,13 +206,26 @@ class ReleaseVerificationAuditDeletionTest extends TestCase
         $entry = DB::table('release_verification_scratch')->sole();
         (new Filesystem)->deleteDirectory($this->scratch((int) $entry->id));
         $failedPath = $failImage ? $this->imagePath : $this->nzbPath;
-        $filesystem = \Mockery::mock(Filesystem::class)->makePartial();
-        $filesystem->shouldReceive('delete')->with($failedPath)->once()->andReturnFalse();
-        File::swap($filesystem);
-        $this->worker();
-        $this->assertFileExists($failedPath);
-        $this->assertSame(1, DB::table('release_verification_scratch')->count());
-        File::swap(new Filesystem);
+        $parent = dirname($failedPath);
+        if ($failImage) {
+            $filesystem = \Mockery::mock(Filesystem::class)->makePartial();
+            $filesystem->shouldReceive('delete')->with($failedPath)->once()->andReturnFalse();
+            File::swap($filesystem);
+        } else {
+            $this->assertTrue(chmod($parent, 0500));
+            clearstatcache(true, $parent);
+            $this->assertFalse(is_writable($parent));
+        }
+        try {
+            $this->worker();
+            $this->assertFileExists($failedPath);
+            $this->assertSame(1, DB::table('release_verification_scratch')->count());
+        } finally {
+            if (! $failImage) {
+                chmod($parent, 0700);
+            }
+            File::swap(new Filesystem);
+        }
         $this->worker();
         $this->assertFileDoesNotExist($this->nzbPath);
         $this->assertFileDoesNotExist($this->imagePath);

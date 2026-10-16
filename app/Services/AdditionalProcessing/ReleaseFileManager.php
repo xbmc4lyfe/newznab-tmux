@@ -17,6 +17,7 @@ use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
+use App\Services\NameFixing\SeasonPackDetector;
 use App\Services\NfoService;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
@@ -25,6 +26,7 @@ use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Support\Par2FileHashEvidence;
 use App\Support\PredbSearchDocument;
+use App\Support\ReleaseArchiveNamingEvidence;
 use dariusiii\rarinfo\Par2Info;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Database\Eloquent\Builder;
@@ -39,6 +41,8 @@ use Illuminate\Support\Facades\Log;
  */
 class ReleaseFileManager
 {
+    private const int DEFAULT_RELEASE_FILE_LIMIT = 11;
+
     private readonly ReleaseUpdateService $releaseUpdateService;
 
     private readonly FileNameCleaner $fileNameCleaner;
@@ -128,8 +132,11 @@ class ReleaseFileManager
         // Increment total file info count
         $context->totalFileInfo++;
 
+        $context->rememberNamingWitness((string) $file['name']);
         // Don't add too many files
-        if ($context->addedFileInfo >= 11) {
+        if ($context->addedFileInfo >= $this->releaseFileLimit($context)) {
+            $context->archiveNameEvidenceIncomplete = true;
+
             return false;
         }
 
@@ -152,11 +159,12 @@ class ReleaseFileManager
                 }
                 $context->releaseHasPassword = true;
                 $context->passwordStatus = ReleaseBrowseService::PASSWD_RAR;
-            } elseif ($file['name'] !== '' && ! str_starts_with($file['name'], '.')) {
+            } elseif ($file['name'] !== '' && ! str_starts_with($file['name'], '.') && ! $context->defersArchiveNameChecks()) {
                 // Run PreDB filename check
-                $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($file): void {
+                $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($file, $context): void {
                     $entry->setAttribute('filename', $file['name']);
                     $this->nameFixingService->matchPreDbFileNames($entry, [$file['name']], true, true, true);
+                    $context->rememberArchiveFilenameNamingAttempt((string) $file['name'], $this->nameFixingService->wasEpisodeNamingDeferredByArchiveProof());
                 });
             }
 
@@ -287,7 +295,8 @@ class ReleaseFileManager
      */
     public function finalizeRelease(ReleaseProcessingContext $context, bool $processPasswords): void
     {
-        if ($context->fullPar2EvidenceDeferred) {
+        if ($context->fullPar2EvidenceDeferred || $context->nzbSourceDigest === null) {
+            $context->fullPar2EvidenceDeferred = true;
             $this->searchSyncCoordinator->discard($context->par2EvidenceSnapshot['id']);
 
             return;
@@ -319,7 +328,9 @@ class ReleaseFileManager
         $pendingReleaseFiles = array_values($context->pendingReleaseFiles);
         $pendingParHashes = array_values($context->pendingParHashes);
         $pendingFullParHashes = array_values($context->pendingFullParHashes);
-        $requiresSnapshotGuard = $pendingReleaseFiles !== [] || $pendingFullParHashes !== [] || $context->audioMetadataCommitted || $context->producerNamingAttempted;
+        $terminalNamingSnapshot = null;
+        $terminalNamingFiles = [];
+        $sourceDigest = $context->nzbSourceDigest;
 
         try {
             $insertedReleaseFiles = DB::transaction(function () use (
@@ -327,15 +338,20 @@ class ReleaseFileManager
                 $pendingReleaseFiles,
                 $pendingParHashes,
                 $pendingFullParHashes,
-                $requiresSnapshotGuard,
                 $updateRows,
                 $processPasswords,
                 $passwordStatus,
+                &$terminalNamingSnapshot,
+                &$terminalNamingFiles,
             ): ?int {
-                if ($requiresSnapshotGuard) {
-                    if (! $this->ownsFullPar2Evidence($context)) {
-                        return null;
-                    }
+                $terminalNamingSnapshot = null;
+                $terminalNamingFiles = [];
+                if (! $this->ownsFullPar2Evidence($context)) {
+                    return null;
+                }
+                $insertedReleaseFiles = null;
+                $persist = function () use ($context, $pendingReleaseFiles, $pendingParHashes, $pendingFullParHashes,
+                    $updateRows, $processPasswords, $passwordStatus, &$insertedReleaseFiles): void {
                     foreach ($pendingFullParHashes as $evidence) {
                         if (! Par2FileHashEvidence::remember(
                             $context->fullPar2EvidenceSnapshot()['id'], $evidence['full_md5'], $evidence['hash16k'], $evidence['size'],
@@ -347,53 +363,81 @@ class ReleaseFileManager
                     if (! $this->ownsFullPar2Evidence($context)) {
                         throw new \RuntimeException('Additional-processing evidence ownership changed inside finalization.');
                     }
-                }
-                $inserted = $pendingReleaseFiles === []
-                    ? 0
-                    : ReleaseFile::query()->insertOrIgnore($pendingReleaseFiles);
+                    $inserted = $pendingReleaseFiles === []
+                        ? 0
+                        : ReleaseFile::query()->insertOrIgnore($pendingReleaseFiles);
 
-                if ($inserted > 0) {
-                    $current = DB::table('releases')->where('id', $context->release->id)->lockForUpdate()->first();
-                    if ($current !== null && (int) $current->isrenamed === 0 && (int) $current->predb_id === 0) {
-                        $updateRows['proc_files'] = NameFixingService::PROC_FILES_NONE;
+                    if ($inserted > 0) {
+                        $current = DB::table('releases')->where('id', $context->release->id)->lockForUpdate()->first();
+                        if ($current !== null && (int) $current->isrenamed === 0 && (int) $current->predb_id === 0) {
+                            $updateRows['proc_files'] = NameFixingService::PROC_FILES_NONE;
+                        }
+                    }
+
+                    if ($pendingParHashes !== []) {
+                        ParHash::query()->insertOrIgnore($pendingParHashes);
+                    }
+
+                    $releaseFilesCount = ReleaseFile::whereReleasesId($context->release->id)->count('releases_id') ?? 0;
+
+                    if (! $context->releaseHasPassword && $context->nzbHasCompressedFile && ! $context->compressedFilesAreMedia()
+                        && $releaseFilesCount === 0
+                    ) {
+                        // No file list could be read, often because volumes were still missing.
+                        // Queue the release once more after a delay; a second failure stays unknown.
+                        // Only retry when inspection ran and a later attempt could still read the list.
+                        $retried = $updateRows['haspreview'] === 0
+                            && $context->archiveInspectionAttempted
+                            && (! $context->archiveListingUndecodable || $context->archiveRetryable)
+                            && $this->commitFullPar2FinalizationUpdate(
+                                $context,
+                                Release::query()->where('id', $context->release->id)->whereNull(AdditionalCandidateQuery::ARCHIVE_RETRY_COLUMN),
+                                [...$updateRows, 'haspreview' => -1, AdditionalCandidateQuery::ARCHIVE_RETRY_COLUMN => now()->addSeconds(AdditionalCandidateQuery::archiveRetryDelaySeconds())],
+                                true,
+                                true,
+                            ) > 0;
+                        if (! $retried) {
+                            $this->commitFullPar2FinalizationUpdate($context, Release::query()->where('id', $context->release->id), $updateRows, true);
+                        }
+                    } else {
+                        // A cut-off listing cannot rule out an encrypted entry beyond the cut.
+                        if (! $processPasswords) {
+                            $updateRows['passwordstatus'] = ReleaseBrowseService::PASSWD_NONE;
+                        } elseif ($context->releaseHasPassword || ! $context->archiveListingIncomplete) {
+                            $updateRows['passwordstatus'] = $passwordStatus;
+                        }
+                        $updateRows['rarinnerfilecount'] = $releaseFilesCount;
+                        $this->commitFullPar2FinalizationUpdate($context, Release::query()->where('id', $context->release->id), $updateRows, true);
+                    }
+
+                    $insertedReleaseFiles = $inserted;
+                };
+                $names = array_keys($context->archiveNamingWitnesses);
+                $scope = ($context->seasonPack || SeasonPackDetector::isMultiEpisodeSet($names))
+                    ? 'multi_episode'
+                    : ($context->archiveNamingInspectionComplete && ! $context->archiveNameEvidenceIncomplete ? 'complete_single' : 'incomplete');
+                if (! app(ReleaseArchiveNamingEvidence::class)->recordLocked($context->release, $context->nzbSourceDigest,
+                    $scope, $names, $context->archiveNamingInspectionComplete && ! $context->archiveNameEvidenceIncomplete, $persist, $context->namingWitnessesOmitted)) {
+                    return null;
+                }
+                if ($context->archiveNamingInspectionComplete && ! $context->archiveNameEvidenceIncomplete
+                    && ! $context->namingWitnessesOmitted && ! $context->seasonPack
+                    && ! SeasonPackDetector::hasDistinctEpisodeIdentities($names)) {
+                    $candidates = array_values(array_filter($names, static fn (string $name): bool => ($context->archiveFilenameNamingAttempts[$name] ?? false)
+                        || (! array_key_exists($name, $context->archiveFilenameNamingAttempts) && SeasonPackDetector::isEpisodeName($name))));
+                    if ($candidates !== []) {
+                        $current = DB::table('releases')->where('id', $context->release->id)->lockForUpdate()->first();
+                        if ($current !== null && (int) $current->predb_id === 0 && (int) $current->isrenamed === 0) {
+                            $terminalNamingSnapshot = (array) $current;
+                            $terminalNamingFiles = $candidates;
+                        }
                     }
                 }
 
-                if ($pendingParHashes !== []) {
-                    ParHash::query()->insertOrIgnore($pendingParHashes);
-                }
-
-                $releaseFilesCount = ReleaseFile::whereReleasesId($context->release->id)->count('releases_id') ?? 0;
-
-                if (! $context->releaseHasPassword && $context->nzbHasCompressedFile && $releaseFilesCount === 0) {
-                    // No file list could be read, often because volumes were still missing.
-                    // Queue the release once more after a delay; a second failure stays unknown.
-                    // Only retry when inspection ran and a later attempt could still read the list.
-                    $retried = $updateRows['haspreview'] === 0
-                        && $context->archiveInspectionAttempted
-                        && (! $context->archiveListingUndecodable || $context->archiveRetryable)
-                        && $this->commitFullPar2FinalizationUpdate(
-                            $context,
-                            Release::query()->where('id', $context->release->id)->whereNull(AdditionalCandidateQuery::ARCHIVE_RETRY_COLUMN),
-                            [...$updateRows, 'haspreview' => -1, AdditionalCandidateQuery::ARCHIVE_RETRY_COLUMN => now()->addSeconds(AdditionalCandidateQuery::archiveRetryDelaySeconds())],
-                            $requiresSnapshotGuard,
-                            true,
-                        ) > 0;
-                    if (! $retried) {
-                        $this->commitFullPar2FinalizationUpdate($context, Release::query()->where('id', $context->release->id), $updateRows, $requiresSnapshotGuard);
-                    }
-                } else {
-                    $updateRows['passwordstatus'] = $processPasswords ? $passwordStatus : ReleaseBrowseService::PASSWD_NONE;
-                    $updateRows['rarinnerfilecount'] = $releaseFilesCount;
-                    $this->commitFullPar2FinalizationUpdate($context, Release::query()->where('id', $context->release->id), $updateRows, $requiresSnapshotGuard);
-                }
-
-                return $inserted;
+                return $insertedReleaseFiles;
             }, 3);
         } catch (\Throwable $exception) {
-            if ($requiresSnapshotGuard) {
-                $this->searchSyncCoordinator->discard($context->par2EvidenceSnapshot['id']);
-            }
+            $this->searchSyncCoordinator->discard($context->par2EvidenceSnapshot['id']);
             throw $exception;
         }
 
@@ -409,6 +453,70 @@ class ReleaseFileManager
         $context->releaseFilesChanged = $context->releaseFilesChanged || $insertedReleaseFiles > 0;
 
         $this->searchSyncCoordinator->request((int) $context->release->id);
+        if ($terminalNamingSnapshot !== null) {
+            $this->matchFinalizedFileNames($terminalNamingSnapshot, $terminalNamingFiles, $sourceDigest);
+        }
+    }
+
+    /**
+     * A new ordinary consumer observes the committed terminal state. It never
+     * reuses the producer claim that finalization just released. Freeze values
+     * before leaving the transaction so a later worker cannot refresh this
+     * attempt into ownership of its successor's identity or source generation.
+     *
+     * @param  array<string, mixed>  $snapshot
+     * @param  list<string>  $names
+     */
+    private function matchFinalizedFileNames(array $snapshot, array $names, string $sourceDigest): void
+    {
+        $consume = function () use ($snapshot, $names, $sourceDigest): void {
+            try {
+                $entry = new Release;
+                $entry->setRawAttributes($snapshot, true);
+                $entry->setAttribute('releases_id', $snapshot['id']);
+                $entry->setAttribute('observed_isrenamed', (int) $snapshot['isrenamed']);
+                $entry->setAttribute('observed_additional_pp_claim', [
+                    'token' => $snapshot[AdditionalCandidateQuery::CLAIM_TOKEN_COLUMN],
+                    'claimed_at' => $snapshot[AdditionalCandidateQuery::CLAIMED_AT_COLUMN],
+                ]);
+                $entry->setAttribute('observed_archive_source_digest', $sourceDigest);
+                foreach (array_slice($names, 0, self::DEFAULT_RELEASE_FILE_LIMIT) as $name) {
+                    if ($name === '' || str_starts_with($name, '.')
+                        || preg_match('/'.$this->config->supportFileRegex.'$/i', $name) === 1) {
+                        continue;
+                    }
+                    $entry->setAttribute('filename', $name);
+                    $this->nameFixingService->reset();
+                    if ($this->nameFixingService->matchPreDbFiles($entry, true, true, true) > 0) {
+                        return;
+                    }
+                }
+            } catch (\Throwable $exception) {
+                // Metadata is already committed. Neither matching nor logging
+                // failure may masquerade as a finalization rollback.
+                $this->reportFinalizedNamingFailure((int) $snapshot['id'], $exception);
+            }
+        };
+        try {
+            if (DB::transactionLevel() > 0) {
+                DB::afterCommit($consume);
+            } else {
+                $consume();
+            }
+        } catch (\Throwable $exception) {
+            $this->reportFinalizedNamingFailure((int) $snapshot['id'], $exception);
+        }
+    }
+
+    private function reportFinalizedNamingFailure(int $releaseId, \Throwable $exception): void
+    {
+        try {
+            Log::warning('Post-finalization filename matching failed.', [
+                'release_id' => $releaseId, 'exception_class' => $exception::class,
+            ]);
+        } catch (\Throwable) {
+            // Logging must not interrupt an outer transaction's callbacks.
+        }
     }
 
     /**
@@ -463,10 +571,7 @@ class ReleaseFileManager
 
             // Delete NZB file
             try {
-                $nzbPath = $this->nzb->nzbPath($guid);
-                if ($nzbPath && File::exists($nzbPath)) {
-                    File::delete($nzbPath);
-                }
+                $this->nzb->deleteNzb($guid);
             } catch (\Throwable) {
                 // Ignore
             }
@@ -551,19 +656,20 @@ class ReleaseFileManager
 
         $this->queueFullPar2Evidence($fileLocation, $context, $par2Info);
         $filesAdded = 0;
+        $fileLimit = $this->releaseFileLimit($context);
 
         foreach ((new Par2FileList)->getFiles($par2Info) as $file) {
             if (! isset($file['name'])) {
                 continue;
             }
 
-            if ($foundName && $filesAdded > 10) {
+            if ($foundName && $filesAdded >= $fileLimit) {
                 break;
             }
 
             // Add to release files
             if ($this->config->addPAR2Files) {
-                if ($filesAdded < 11) {
+                if ($filesAdded < $fileLimit) {
                     if ($this->queueReleaseFile(
                         $context,
                         $context->release->id,
@@ -875,6 +981,38 @@ class ReleaseFileManager
     }
 
     /**
+     * Match listed file names to PreDB, as addFileInfo() does per file, for names that
+     * were held back while the release might still turn out to be a season pack.
+     *
+     * @param  array<int, array<string, mixed>>  $files
+     */
+    public function matchFileNamesToPreDb(array $files, ReleaseProcessingContext $context): void
+    {
+        if ($context->defersArchiveNameChecks()) {
+            return;
+        }
+
+        foreach (array_slice($files, 0, self::DEFAULT_RELEASE_FILE_LIMIT) as $file) {
+            $name = (string) ($file['name'] ?? '');
+            if ($name === '' || str_starts_with($name, '.')
+                || preg_match('/'.$this->config->supportFileRegex.'$/i', $name) === 1
+            ) {
+                continue;
+            }
+
+            $matched = 0;
+            $accepted = $this->applyProducerName($context, $this->nameFixingService, function (Release $entry) use ($name, $context, &$matched): void {
+                $entry->setAttribute('filename', $name);
+                $matched = $this->nameFixingService->matchPreDbFiles($entry, true, true, true);
+                $context->rememberArchiveFilenameNamingAttempt($name, $this->nameFixingService->wasEpisodeNamingDeferredByArchiveProof());
+            });
+            if ($accepted || $matched > 0 || $context->fullPar2EvidenceDeferred) {
+                return;
+            }
+        }
+    }
+
+    /**
      * Handle release name extraction from RAR file content.
      *
      * @param  array<string, mixed>  $dataSummary
@@ -883,6 +1021,11 @@ class ReleaseFileManager
         array $dataSummary,
         ReleaseProcessingContext $context
     ): void {
+        // One inner file names one episode, not the whole season pack
+        if ($context->defersArchiveNameChecks()) {
+            return;
+        }
+
         $fileData = $dataSummary['file_list'] ?? [];
         if (empty($fileData)) {
             return;
@@ -1002,6 +1145,7 @@ class ReleaseFileManager
             return false;
         }
 
+        $context->rememberNamingWitness($name);
         $this->loadExistingReleaseFileNames($context);
         if ($this->config->addPAR2Files && strlen($hash) === 32 && ctype_xdigit($hash)) {
             $normalizedHash = strtolower($hash);
@@ -1103,6 +1247,14 @@ class ReleaseFileManager
     /**
      * Check if a title is plausible for release naming.
      */
+    /**
+     * Inner files stored per release; a season pack lists more so every episode shows.
+     */
+    private function releaseFileLimit(ReleaseProcessingContext $context): int
+    {
+        return $context->seasonPack ? $this->config->seasonPackMaxReleaseFiles : self::DEFAULT_RELEASE_FILE_LIMIT;
+    }
+
     private function isPlausibleReleaseTitle(string $title): bool
     {
         return $this->fileNameCleaner->isPlausibleReleaseTitle($title);

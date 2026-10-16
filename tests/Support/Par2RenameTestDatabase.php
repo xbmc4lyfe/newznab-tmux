@@ -30,6 +30,7 @@ trait Par2RenameTestDatabase
                 $table->string($column)->nullable();
             }
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         Schema::create('usenet_groups', function (Blueprint $table): void {
             $table->id();
             $table->string('name');

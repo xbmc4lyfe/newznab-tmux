@@ -7,10 +7,12 @@ namespace App\Console\Commands;
 use App\Services\NntmuxUpdateLock;
 use App\Services\Tmux\Tmux;
 use Illuminate\Console\Command;
+use Illuminate\Contracts\Process\ProcessResult;
 use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Str;
 use Symfony\Component\Console\Helper\ProgressBar;
 
@@ -24,6 +26,7 @@ class UpdateNNTmux extends Command
                             {--skip-composer : Skip composer update}
                             {--skip-npm : Skip npm operations}
                             {--skip-db : Skip database migrations}
+                            {--redis-preflight : Check Redis without performing an update}
                             {--git-lock-timeout=10 : Seconds to wait for an existing Git index lock}
                             {--force : Force update even if up-to-date}';
 
@@ -57,6 +60,18 @@ class UpdateNNTmux extends Command
      */
     public function handle(NntmuxUpdateLock $lock): int
     {
+        if ($this->option('redis-preflight')) {
+            try {
+                $this->checkRedisRuntimeIsHealthy();
+
+                return Command::SUCCESS;
+            } catch (\Throwable $e) {
+                $this->error($e->getMessage());
+
+                return Command::FAILURE;
+            }
+        }
+
         try {
             return $lock->run(fn (): int => $this->updateInstallation(), checkGit: ! $this->option('skip-git'), gitLockTimeout: (int) $this->option('git-lock-timeout'));
         } catch (\Exception $e) {
@@ -98,7 +113,7 @@ class UpdateNNTmux extends Command
             $this->progressBar->clear();
             $this->newLine(2);
             $this->error('❌ Update failed: '.$e->getMessage());
-            $this->restoreEnvironment(restartTmux: false);
+            $this->restoreEnvironment(startTmux: false);
 
             return Command::FAILURE;
         }
@@ -149,8 +164,8 @@ class UpdateNNTmux extends Command
         // Check if tmux is running
         $tmux = new Tmux;
         $this->tmuxWasRunning = $tmux->isRunning();
-        if ($this->tmuxWasRunning) {
-            $this->call('tmux:stop', ['--force' => true]);
+        if ($this->call('tmux:stop', ['--force' => true, '--wait' => true]) !== Command::SUCCESS) {
+            throw new \RuntimeException('Failed to stop tmux before updating');
         }
 
         $this->progressBar->advance();
@@ -238,15 +253,15 @@ class UpdateNNTmux extends Command
     }
 
     /**
-     * Run an Artisan command in a new PHP process so updated dependencies are loaded consistently.
+     * Run an Artisan command in a new PHP process so updated code and dependencies are loaded consistently.
      *
      * @param  list<string>  $arguments
      */
-    private function runFreshArtisanCommand(array $arguments): int
+    private function runFreshArtisanCommand(array $arguments, int $timeout = 3600): int
     {
-        $this->line('  ℹ Restarting Artisan for updated dependencies...');
+        $this->line('  ℹ Restarting Artisan to load updated code...');
 
-        $result = Process::timeout(3600)
+        $result = Process::timeout($timeout)
             ->path(base_path())
             ->run(array_merge([PHP_BINARY, 'artisan'], $arguments), function (string $type, string $output): void {
                 $this->output->write($output);
@@ -272,12 +287,14 @@ class UpdateNNTmux extends Command
 
         if (! $process->successful()) {
             // Fallback to npm install if ci fails
+            $this->warn('  ⚠ npm ci failed, falling back to npm install');
+            $this->line($this->formatProcessFailure($process, 'npm ci'));
             $process = Process::timeout(600)
                 ->path(base_path())
                 ->run('npm install --silent');
 
             if (! $process->successful()) {
-                throw new \Exception('NPM install failed: '.$process->errorOutput());
+                throw new \Exception($this->formatProcessFailure($process, 'npm install'));
             }
         }
 
@@ -286,12 +303,20 @@ class UpdateNNTmux extends Command
         // Build assets
         $this->info('🔨 Building assets...');
 
-        $buildProcess = Process::timeout(600)
+        $typeTransformProcess = Process::timeout(600)
             ->path(base_path())
-            ->run('npm run build');
+            ->run('php artisan typescript:transform --force');
 
-        if (! $buildProcess->successful()) {
-            throw new \Exception('Asset build failed: '.$buildProcess->errorOutput());
+        if (! $typeTransformProcess->successful()) {
+            throw new \Exception($this->formatProcessFailure($typeTransformProcess, 'TypeScript transform'));
+        }
+
+        $viteBuildProcess = Process::timeout(600)
+            ->path(base_path())
+            ->run('npm exec vite build');
+
+        if (! $viteBuildProcess->successful()) {
+            throw new \Exception($this->formatProcessFailure($viteBuildProcess, 'Vite build'));
         }
 
         $this->progressBar->advance();
@@ -302,6 +327,16 @@ class UpdateNNTmux extends Command
      */
     private function performMaintenanceTasks(): void
     {
+        // Merge environment variables before caching their configuration values.
+        $this->info('⚙️ Merging environment configuration...');
+        $this->mergeEnvironmentConfig();
+
+        // Refresh config cache so runtime client/host settings cannot drift.
+        $this->info('🧹 Clearing config cache...');
+        $this->call('config:clear');
+        $this->info('Caching config...');
+        $this->call('config:cache');
+
         // Clear view cache
         $this->info('🧹 Clearing view cache...');
         $this->call('view:clear');
@@ -312,9 +347,6 @@ class UpdateNNTmux extends Command
         $this->call('route:cache');
         $this->info('Routes cached successfully');
 
-        // Merge environment variables
-        $this->info('⚙️ Merging environment configuration...');
-        $this->mergeEnvironmentConfig();
         $this->progressBar->advance();
     }
 
@@ -417,8 +449,11 @@ class UpdateNNTmux extends Command
         // Clear application caches
         Cache::flush();
 
+        // Fail fast if production runtime drifts away from phpredis.
+        $this->ensureRedisRuntimeIsHealthy();
+
         // Restore application state
-        $this->restoreEnvironment();
+        $this->restoreEnvironment(startTmux: true);
 
         $this->progressBar->advance();
     }
@@ -426,7 +461,7 @@ class UpdateNNTmux extends Command
     /**
      * Restore the original environment state
      */
-    private function restoreEnvironment(bool $restartTmux = true): void
+    private function restoreEnvironment(bool $startTmux): void
     {
         // Restore maintenance mode state
         if (! $this->wasInMaintenance && App::isDownForMaintenance()) {
@@ -434,10 +469,82 @@ class UpdateNNTmux extends Command
         }
 
         // Restore tmux state
-        if ($this->tmuxWasRunning && $restartTmux) {
-            $this->call('tmux:start');
+        if ($this->tmuxWasRunning && $startTmux) {
+            $this->info('🔁 Restoring tmux processing session...');
+            // tmux:stop ran before the update and loaded the old Tmux classes into this process.
+            $tmuxStartResult = $this->runFreshArtisanCommand(['tmux:start']);
+
+            if ($tmuxStartResult !== Command::SUCCESS) {
+                throw new \Exception('tmux:start failed while restoring environment');
+            }
         } elseif ($this->tmuxWasRunning) {
             $this->warn('  ⚠ Skipping tmux restart because update did not complete successfully');
         }
+    }
+
+    /**
+     * Enforce production Redis client expectations and basic connectivity.
+     */
+    private function ensureRedisRuntimeIsHealthy(): void
+    {
+        if ($this->runFreshArtisanCommand(['nntmux:all', '--redis-preflight'], 30) !== Command::SUCCESS) {
+            throw new \RuntimeException('Redis preflight failed in a fresh Artisan process; workers remain stopped.');
+        }
+    }
+
+    private function checkRedisRuntimeIsHealthy(): void
+    {
+        $redisClient = strtolower((string) config('database.redis.client', ''));
+        if ($redisClient !== 'phpredis') {
+            throw new \Exception(
+                "Redis client mismatch detected: runtime uses '{$redisClient}', expected 'phpredis'. ".
+                'Check REDIS_CLIENT in environment, clear config cache, and verify deployment configuration.'
+            );
+        }
+
+        if (! extension_loaded('redis')) {
+            throw new \Exception(
+                "Redis PHP extension is not loaded while runtime expects 'phpredis'. ".
+                'Install/enable ext-redis before restarting workers.'
+            );
+        }
+
+        try {
+            $pong = Redis::connection()->ping();
+            $isHealthy = $pong === true || $pong === '+PONG' || strtoupper((string) $pong) === 'PONG';
+            if (! $isHealthy) {
+                throw new \Exception('Redis ping returned unexpected response: '.(string) $pong);
+            }
+        } catch (\Throwable $e) {
+            throw new \Exception('Redis preflight failed: '.$e->getMessage(), 0, $e);
+        }
+    }
+
+    /**
+     * Build actionable process diagnostics for failed shell commands.
+     */
+    private function formatProcessFailure(ProcessResult $process, string $context): string
+    {
+        $stdout = trim($process->output());
+        $stderr = trim($process->errorOutput());
+
+        $details = [
+            "{$context} failed",
+            'exit_code='.($process->exitCode() ?? 'n/a'),
+        ];
+
+        if ($stderr !== '') {
+            $details[] = 'stderr='.$stderr;
+        }
+
+        if ($stdout !== '') {
+            $details[] = 'stdout='.$stdout;
+        }
+
+        if ($stderr === '' && $stdout === '') {
+            $details[] = 'no stdout/stderr captured (process may have been terminated or timed out)';
+        }
+
+        return implode(' | ', $details);
     }
 }

@@ -30,6 +30,69 @@ final class PredbAuthoritativeIdentityTest extends TestCase
 
     use Par2RenameTestDatabase;
 
+    /** @return array<string, array{string, string, bool}> */
+    public static function seasonFilenameMatches(): array
+    {
+        return [
+            'season cannot become one episode' => ['Example.Show.S01.1080p-GRP', 'Example.Show.S01E01.1080p-GRP', false],
+            'year season cannot become one episode' => ['Example.Show.S2024.1080p-GRP', 'Example.Show.S2024E01.1080p-GRP', false],
+            'episode filename can identify a canonical season' => ['Example.Show.S01.1080p-GRP', 'Example.Show.Season.1.COMPLETE.1080p-GRP', true],
+            'episode can retain episode identity' => ['Example.Show.S01E01.720p-GRP', 'Example.Show.S01E01.1080p-GRP', true],
+            'movie can acquire canonical identity' => ['Example.Movie.2026.720p-GRP', 'Example.Movie.2026.1080p-GRP', true],
+        ];
+    }
+
+    #[DataProvider('seasonFilenameMatches')]
+    public function test_prefile_handler_preserves_season_scope_of_canonical_identity(string $searchname, string $title, bool $accepted): void
+    {
+        $this->createPar2RenameSchema();
+        config(['nntmux.echocli' => false]);
+        Event::fake([ReleaseNameFixed::class]);
+        DB::statement('ALTER TABLE predb ADD COLUMN filename TEXT');
+        $filename = 'Example.Show.S01E01.1080p-GRP.mkv';
+        DB::table('predb')->insert(['id' => 7, 'title' => $title, 'filename' => $filename]);
+        $release = $this->pendingPar2Release(['searchname' => $searchname]);
+        self::assertTrue(Par2RenameProgress::save($release->id, 'manifest', 1, []));
+        DB::table('release_files')->insert(['releases_id' => $release->id, 'name' => $filename]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
+        $updates = $this->updater();
+        $this->certifyFilenameSqlFixture();
+
+        (new NameFixingService($updates))->getPreFileNames(['prefiles', 1]);
+
+        self::assertSame($accepted ? $title : $searchname, $release->fresh()->searchname);
+        self::assertSame($accepted ? 7 : 0, $release->fresh()->predb_id);
+        self::assertSame($accepted, $updates->matched);
+        self::assertSame($accepted ? 1 : 0, $updates->fixed);
+        if ($accepted) {
+            self::assertNull(Par2RenameProgress::get($release->id));
+            self::assertSame($title, $updates->lastCommittedIdentity()['after']['searchname'] ?? null);
+            Event::assertDispatched(ReleaseNameFixed::class);
+        } else {
+            self::assertNotNull(Par2RenameProgress::get($release->id));
+            self::assertNull($updates->lastCommittedIdentity());
+            Event::assertNotDispatched(ReleaseNameFixed::class);
+        }
+    }
+
+    public function test_confirmed_predb_preview_does_not_offer_season_to_episode_rename(): void
+    {
+        $this->createPar2RenameSchema();
+        config(['nntmux.echocli' => false]);
+        $title = 'Example.Show.S01E01.1080p-GRP';
+        DB::table('predb')->insert(['id' => 7, 'title' => $title]);
+        $release = $this->pendingPar2Release(['searchname' => 'Example.Show.S01.1080p-GRP']);
+        $updates = $this->updater();
+
+        $updates->updateRelease($release, $title, 'PreDB', false, 'PreDB file match, ', true, false, 7);
+
+        self::assertFalse($updates->matched);
+        self::assertSame(0, $updates->fixed);
+        self::assertNull($updates->lastCommittedIdentity());
+        self::assertSame('Example.Show.S01.1080p-GRP', $release->fresh()->searchname);
+        self::assertSame(0, $release->fresh()->predb_id);
+    }
+
     /** @return array<string, array{string}> */
     public static function paths(): array
     {

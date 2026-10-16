@@ -16,12 +16,14 @@ use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\NfoService;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
 use App\Services\ReleaseExtraService;
 use App\Services\ReleaseImageService;
 use App\Support\Par2FileHashEvidence;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 use Mhor\MediaInfo\Builder\MediaInfoContainerBuilder;
 use Mhor\MediaInfo\MediaInfo;
@@ -39,6 +41,8 @@ final class AdditionalProcessingMediaIdentityTest extends TestCase
     use Par2RenameTestDatabase;
 
     private string $audioFile;
+
+    private string $sourceDirectory;
 
     protected function setUp(): void
     {
@@ -67,12 +71,15 @@ final class AdditionalProcessingMediaIdentityTest extends TestCase
         });
         $this->audioFile = tempnam(sys_get_temp_dir(), 'media-identity-');
         file_put_contents($this->audioFile, 'external tool is mocked');
-        config(['nntmux.echocli' => false]);
+        $this->sourceDirectory = sys_get_temp_dir().'/media-identity-nzb-'.bin2hex(random_bytes(8));
+        File::ensureDirectoryExists($this->sourceDirectory);
+        config(['nntmux.echocli' => false, 'nntmux_settings.path_to_nzbs' => $this->sourceDirectory.'/']);
     }
 
     protected function tearDown(): void
     {
         @unlink($this->audioFile);
+        File::deleteDirectory($this->sourceDirectory);
         parent::tearDown();
     }
 
@@ -377,6 +384,7 @@ final class AdditionalProcessingMediaIdentityTest extends TestCase
         /** @var NameFixingService&MockInterface $names */
         $names = Mockery::mock(NameFixingService::class);
         $names->shouldReceive('matchPreDbFileNames')->once()->andReturn(0);
+        $names->shouldReceive('wasEpisodeNamingDeferredByArchiveProof')->andReturnFalse();
         $names->shouldReceive('reset')->andReturnNull();
         $names->shouldReceive('lastCommittedIdentity')->andReturnNull();
         /** @var CategorizationService&MockInterface $category */
@@ -392,11 +400,26 @@ final class AdditionalProcessingMediaIdentityTest extends TestCase
 
     private function context(): ReleaseProcessingContext
     {
-        return new ReleaseProcessingContext($this->pendingPar2Release([
+        $release = $this->pendingPar2Release([
             'guid' => 'guid-1', 'name' => 'Original.Canonical-GRP', 'searchname' => 'Original.Canonical-GRP',
             'categories_id' => Category::OTHER_MISC, 'additional_pp_claim_token' => 'claim',
             'additional_pp_claimed_at' => now()->format('Y-m-d H:i:s'),
-        ]));
+        ]);
+        $nzb = app(NzbService::class);
+        $path = $nzb->getNzbPath($release->guid, createIfNotExist: true);
+        if (! File::isFile($path)) {
+            $xml = '<nzb><file subject="fixture.mp3 yEnc (1/1)"><groups><group>alt.binaries.test</group></groups>'
+                .'<segments><segment bytes="1" number="1">fixture-source@article</segment></segments></file></nzb>';
+            File::put($path, gzencode($xml));
+        }
+        $sources = new NzbSourceGuard($nzb);
+        $this->app->instance(NzbSourceGuard::class, $sources);
+        $snapshot = $sources->snapshot($release->guid);
+        self::assertNotNull($snapshot);
+        $context = new ReleaseProcessingContext($release);
+        $context->nzbSourceDigest = $snapshot['digest'];
+
+        return $context;
     }
 
     /** @param array<string, mixed>|null $tags */

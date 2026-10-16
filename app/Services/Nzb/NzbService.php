@@ -262,16 +262,16 @@ class NzbService
 
             $fingerprint = $fingerprintAccumulator->value();
 
-            if (! $this->moveTemporaryNzbIntoPlace($tempPath, $path)) {
-                return NzbCreationResult::transient("Failed to move temporary NZB into place: {$tempPath} -> {$path}", $collectionIds, $path);
-            }
-            $tempPath = null;
-
-            if (! File::isFile($path) || ! is_readable($path)) {
-                return NzbCreationResult::transient("Final NZB file is missing or unreadable: {$path}", $collectionIds, $path);
-            }
-
-            DB::transaction(function () use ($release, $fingerprint): void {
+            DB::transaction(function () use ($release, $fingerprint, &$tempPath, $path): void {
+                $current = Release::query()->whereKey($release->id)->where('guid', $release->guid)->lockForUpdate()->first();
+                if ($current === null) {
+                    throw new \RuntimeException('Release changed before NZB installation.');
+                }
+                $receipt = (new NzbSourceGuard($this))->install($current, $tempPath, $path,
+                    move: fn (string $temporary, string $destination): bool => $this->moveTemporaryNzbIntoPlace($temporary, $destination));
+                DB::afterRollBack(static fn () => $receipt->rollback());
+                DB::afterCommit(static fn () => $receipt->close());
+                $tempPath = null;
                 $release->update($this->successfulReleaseUpdateValues($fingerprint));
 
                 if (NzbCreationCandidateQuery::supportsFailureState()) {
@@ -548,12 +548,7 @@ class NzbService
      */
     public function deleteNzb(string $releaseGuid): bool
     {
-        $nzbPath = $this->nzbPath($releaseGuid);
-        if ($nzbPath === false) {
-            return false;
-        }
-
-        return File::delete($nzbPath);
+        return (new NzbSourceGuard($this))->delete($releaseGuid);
     }
 
     /**

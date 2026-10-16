@@ -302,6 +302,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
         Schema::create('releases', static function (Blueprint $table): void {
             $table->id();
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         // The actual publisher must reject at its custody gate before metadata or final NZB writing.
         $nzb = $this->createMock(NzbService::class);
         $nzb->expects(self::never())->method('getNzbPath');
@@ -572,6 +573,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
             $t->id();
             $t->string('guid');
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         config(['release_verification.pending_bytes' => 1048576]);
         self::assertNull(app(CandidateRepository::class)->claim());
         self::assertTrue($manifests->shouldImportNzb($path), 'Once capacity returns, retained source must be eligible for the exact metadata replay required by the held candidate.');
@@ -593,6 +595,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
             $t->id();
             $t->string('guid');
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         $directory = config('release_verification.storage_path').'/projection';
         app('files')->ensureDirectoryExists($directory);
         $path = $directory.'/incoming.nzb';
