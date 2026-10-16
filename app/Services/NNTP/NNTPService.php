@@ -1059,6 +1059,13 @@ class NNTPService extends NntpClient
             return $connected;
         }
 
+        $ownershipLost = false;
+        $heartbeat = $onRead === null ? null : static function () use ($onRead, &$ownershipLost): bool {
+            $ownershipLost = $ownershipLost || ! $onRead();
+
+            return ! $ownershipLost;
+        };
+
         // String to hold all the bodies.
         $body = '';
 
@@ -1083,7 +1090,14 @@ class NNTPService extends NntpClient
                 }
 
                 // Download the body.
-                $message = $this->_getMessage($groupName, $wanted, $onRead);
+                [$message, $ownershipLost] = $this->readMessageWithOwnership($this, $groupName, $wanted, $heartbeat, $ownershipLost);
+                if ($ownershipLost) {
+                    if ($aConnected === true) {
+                        $nntp->doQuit();
+                    }
+
+                    return $message;
+                }
 
                 // Append the body to $body.
                 if (! self::isError($message)) {
@@ -1103,12 +1117,12 @@ class NNTPService extends NntpClient
                     }
                     // If we connected successfully to usenet try to download the article body.
                     if ($aConnected === true) {
-                        $newBody = $nntp->_getMessage($groupName, $wanted, $onRead);
+                        [$newBody, $ownershipLost] = $this->readMessageWithOwnership($nntp, $groupName, $wanted, $heartbeat, $ownershipLost);
                         // Check if we got an error.
                         if ($nntp->isError($newBody)) {
                             $nntp->doQuit();
                             // If we got some data, return it.
-                            if ($body !== '') {
+                            if (! $ownershipLost && $body !== '') {
                                 return $body;
                             }
 
@@ -1130,10 +1144,10 @@ class NNTPService extends NntpClient
 
             // If it's a string check if it's a valid message-ID.
         } elseif (\is_string($identifiers) || is_numeric($identifiers)) {
-            $body = $this->_getMessage($groupName, $identifiers, $onRead);
-            if ($alternate && self::isError($body)) {
+            [$body, $ownershipLost] = $this->readMessageWithOwnership($this, $groupName, $identifiers, $heartbeat, $ownershipLost);
+            if ($alternate && ! $ownershipLost && self::isError($body)) {
                 $nntp->doConnect($this->_configCompressedHeaders, true);
-                $body = $nntp->_getMessage($groupName, $identifiers, $onRead);
+                [$body, $ownershipLost] = $this->readMessageWithOwnership($nntp, $groupName, $identifiers, $heartbeat, $ownershipLost);
                 $aConnected = true;
             }
 
@@ -1149,6 +1163,18 @@ class NNTPService extends NntpClient
         }
 
         return $body;
+    }
+
+    /**
+     * Capture cancellation together with the body after the synchronous read.
+     *
+     * @return array{mixed, bool}
+     */
+    private function readMessageWithOwnership(self $client, string $groupName, mixed $identifier, ?callable $onRead, bool &$ownershipLost): array
+    {
+        $body = $client->_getMessage($groupName, $identifier, $onRead);
+
+        return [$body, $ownershipLost];
     }
 
     /**
