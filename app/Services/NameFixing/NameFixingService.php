@@ -33,7 +33,7 @@ use Throwable;
  */
 class NameFixingService
 {
-    public const PREDB_IDENTITY_POLICY = 'd0c911098ad0980330c5bec5f0e86ea7a7c00778e8efc2ff12b3d8052c3d6544';
+    public const PREDB_IDENTITY_POLICY = '1919aa942e15c30f6c3fc7c3b0a28534d22f7bd58d09efcd4497834910455f82';
 
     private const PREDB_CANDIDATE_PAGE_SIZE = 21;
 
@@ -1996,26 +1996,37 @@ class NameFixingService
      */
     public function matchPreDbFileNames(object $release, array $files, bool $echo, bool $nameStatus, bool $show, ?array $persistedNames = null): int
     {
+        $this->updateService->resetArchiveNamingDeferral();
         $inventory = $persistedNames ?? $this->persistedFilenameInventory($release);
         $pass = $this->collectPredbFilenamePass($this->filePrioritizer->prioritizeForPreDb($files), 8);
         $filenameGuard = $this->filenamePassGuard($release, $pass, 8, $inventory);
         foreach ($pass->uniqueMatches() as $selected) {
             $bestMatch = $selected['match'];
             $fileName = $selected['filename'];
-            if (! $echo && $this->updateService->currentPredbTitle((int) $bestMatch['id'], (string) $bestMatch['title'], $fileName) === null) {
-                continue;
-            }
-            if (PredbSearchDocument::exactValue((string) $bestMatch['title']) !== PredbSearchDocument::exactValue((string) $release->searchname)) {
-                $this->updateService->updateRelease($release, $bestMatch['title'], 'file matched source: '.$this->predbFilenameSourceDiagnostic((int) $bestMatch['id']), $echo, 'PreDB file match, ', $nameStatus, $show, (int) $bestMatch['id'], $fileName, $filenameGuard);
-                if ($echo && ! $this->updateService->matched) {
+            $sameTitle = PredbSearchDocument::exactValue((string) $bestMatch['title']) === PredbSearchDocument::exactValue((string) ($release->searchname ?? ''));
+            $hasSnapshot = isset($release->guid, $release->name);
+            if ($sameTitle && $echo) {
+                if (! $this->updateService->attachPredbSnapshot($release, (int) $bestMatch['id'], (string) $bestMatch['title'], $fileName, $filenameGuard)) {
                     continue;
                 }
+            } elseif (! $echo && ! $hasSnapshot) {
+                if ($this->updateService->currentPredbTitle((int) $bestMatch['id'], (string) $bestMatch['title'], $fileName) === null) {
+                    continue;
+                }
+                if (! $sameTitle) {
+                    $this->updateService->updateRelease($release, $bestMatch['title'], 'file matched source: '.$this->predbFilenameSourceDiagnostic((int) $bestMatch['id']), false, 'PreDB file match, ', $nameStatus, $show, (int) $bestMatch['id'], $fileName, $filenameGuard);
+                    if (! $this->updateService->matched) {
+                        continue;
+                    }
+                }
+            } else {
+                $this->updateService->updateRelease($release, $bestMatch['title'], 'file matched source: '.$this->predbFilenameSourceDiagnostic((int) $bestMatch['id']), $echo, 'PreDB file match, ', $nameStatus, $show, (int) $bestMatch['id'], $fileName, $filenameGuard);
+                if (! $this->updateService->matched) {
+                    continue;
+                }
+            }
 
-                return 1;
-            }
-            if (! $echo || $this->updateService->attachPredbSnapshot($release, (int) $bestMatch['id'], (string) $bestMatch['title'], $fileName, $filenameGuard)) {
-                return 1;
-            }
+            return 1;
         }
 
         return 0;
@@ -2040,14 +2051,12 @@ class NameFixingService
     }
 
     /**
-     * Check if a release name looks like a season pack.
-     * Season packs have S01/S02 etc. without an episode (E01) suffix.
-     * Uses atomic group so "S02E07" matches "S02" then fails the (?!E\d+) lookahead
-     * instead of backtracking to "S0" and incorrectly matching.
+     * Check if a release name looks like a season pack (a standalone S01, Season.1 or
+     * Complete.Series token and no episode marker).
      */
     public function isSeasonPack(string $name): bool
     {
-        return (bool) preg_match('/S(?>\d{1,2})(?!E\d+)/i', $name);
+        return SeasonPackDetector::isSeasonPack($name);
     }
 
     /**
@@ -2056,6 +2065,11 @@ class NameFixingService
     public function reset(): void
     {
         $this->updateService->reset();
+    }
+
+    public function wasEpisodeNamingDeferredByArchiveProof(): bool
+    {
+        return $this->updateService->wasEpisodeNamingDeferredByArchiveProof();
     }
 
     /** @return array{before: array{id: int, guid: string, name: ?string, searchname: ?string}, after: array{id: int, guid: string, name: ?string, searchname: ?string}}|null */

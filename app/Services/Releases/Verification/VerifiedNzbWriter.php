@@ -5,7 +5,10 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
+use App\Services\Nzb\NzbSourceInstallation;
 use App\Support\NzbPasswordMetadata;
+use Illuminate\Support\Facades\DB;
 use RuntimeException;
 use XMLWriter;
 
@@ -15,6 +18,22 @@ final class VerifiedNzbWriter
 
     /** @param array<string, mixed> $manifest */
     public function write(array $manifest, string $guid, ?PublicationTiming $timing = null): string
+    {
+        return DB::transaction(function () use ($manifest, $guid, $timing): string {
+            $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
+            if ($release === null) {
+                throw new RuntimeException('Verified NZB installation requires its release row.');
+            }
+            $receipt = $this->writeWithReceipt($manifest, $guid, $release, $timing);
+            DB::afterRollBack(static fn () => $receipt->rollback());
+            DB::afterCommit(static fn () => $receipt->close());
+
+            return $receipt->path;
+        });
+    }
+
+    /** @param array<string, mixed> $manifest */
+    public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null): NzbSourceInstallation
     {
         $path = $this->nzb->getNzbPath($guid, createIfNotExist: true);
         $body = gzencode($this->document($manifest));
@@ -35,16 +54,15 @@ final class VerifiedNzbWriter
             } finally {
                 fclose($handle);
             }
-            if (! rename($temporary, $path)) {
-                throw new RuntimeException('Cannot finalize verified NZB.');
-            }
+            $sources = new NzbSourceGuard($this->nzb);
+            $receipt = $sources->install($release, $temporary, $path);
         } finally {
             if (is_file($temporary)) {
                 unlink($temporary);
             }
         }
 
-        return $path;
+        return $receipt;
     }
 
     /** @param array<string, mixed> $manifest */

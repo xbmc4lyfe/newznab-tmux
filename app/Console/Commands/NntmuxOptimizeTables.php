@@ -34,7 +34,7 @@ class NntmuxOptimizeTables extends Command
         if (empty($table) || $table[0] === 'all') {
             $this->optimizeAllTables();
         } else {
-            $this->optimizeTable($table); // @phpstan-ignore argument.type
+            $this->optimizeTable($table);
         }
     }
 

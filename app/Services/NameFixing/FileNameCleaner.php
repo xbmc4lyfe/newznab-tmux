@@ -15,7 +15,7 @@ use App\Traits\DetectsHashedNames;
  */
 class FileNameCleaner
 {
-    public const PREDB_IDENTITY_POLICY = '66ed485e533be5dfd9644473bbed4741cabb0ace13f885722c31a30da1dc7010';
+    public const PREDB_IDENTITY_POLICY = '3cc5cfe848ed5a685bda1c95998bb113f4e25e6caacfc17c87dd990b6c8286b4';
 
     use DetectsHashedNames;
 
@@ -402,7 +402,7 @@ class FileNameCleaner
         $hasGroupSuffix = (bool) preg_match('/[-.][A-Za-z0-9]{2,}$/', $t);
         $hasYear = (bool) preg_match('/\b(19|20)\d{2}\b/', $t);
         $hasQuality = (bool) preg_match('/\b(480p|720p|1080p|2160p|4k|webrip|web[ .-]?dl|bluray|bdrip|dvdrip|hdtv|hdrip|xvid|x264|x265|hevc|h\.?264|ts|cam|r5|proper|repack)\b/i', $t);
-        $hasTV = (bool) preg_match('/\bS\d{1,2}[Eex]\d{1,3}\b/i', $t);
+        $hasTV = (bool) preg_match('/\bS\d{1,2}[Eex]\d{1,3}\b/i', $t) || SeasonPackDetector::isSeasonPack($t);
         $hasXXX = (bool) preg_match('/\bXXX\b/i', $t);
 
         return $hasGroupSuffix || ($hasTV && $hasQuality) || ($hasYear && ($hasQuality || $hasTV)) || $hasXXX || $hasQuality || $hasTV;

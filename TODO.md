@@ -1,5 +1,11 @@
 # To do
 
+## Qualify upstream archive synchronization (2026-10-15)
+
+- [ ] Run the full integrated PHPUnit/native retest on final synchronized master, including RAR4/RAR5 terminal and more-volume evidence, exact-boundary and partial-header prefixes, incomplete 7-Zip episode naming, real Linux 7-Zip compressed/encrypted-header fixtures, the native stored-sample preview with FFmpeg/FFprobe, fresh Redis cached-config preflight, archive naming, claim/provenance and publication guards, and tmux/updater behavior. Include real processor→finalization→filename consumers, merged/uninspected NZB inventory, source replacement and repair races, current filename witnesses, same-name/preview admission, direct-video body corroboration, and audit-anchor cleanup across rollback and successor installation. The native `it_lists_real_7z_archives_with_compressed_headers` and `it_takes_a_preview_from_a_sample_stored_in_an_archive_without_extracting_it` checks remain unverified. Bounded private SQLite and fake-client checks do not complete this gate.
+- [ ] Qualify complete ZIP episode evidence and ownership of legacy audit/orphan NZBs before relaxing their conservative deferral. Subject filenames alone do not certify body type or complete archive scope; uninspected files remain incomplete.
+- [ ] Measure full-caller and lock-held overhead of source evidence, including duplicate staged NZB decompression/hashing during publication. Compare representative 1,000-, 10,000- and 91,000-article inventories before claiming unchanged shared-capacity latency or adopting a preparation optimization.
+
 ## Retest scalar NNTP ownership callbacks (2026-10-16)
 
 - [x] Reproduce missing callbacks through the public handler, then pass focused NNTP validation with literal `codex --yolo`: 86 tests and 381 assertions, no errors or skips. Pint, changed-file syntax and focused NNTP PHPStan passed.

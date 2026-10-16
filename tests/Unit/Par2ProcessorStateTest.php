@@ -49,6 +49,7 @@ final class Par2ProcessorStateTest extends TestCase
         $this->database->bootEloquent();
         $this->database->getConnection()->setTransactionManager(new DatabaseTransactionsManager);
         $container->instance('db', $this->database->getDatabaseManager());
+        $container->instance('db.schema', $this->database->getConnection()->getSchemaBuilder());
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication($container);
         $schema = $this->database->getConnection()->getSchemaBuilder();
@@ -75,6 +76,21 @@ final class Par2ProcessorStateTest extends TestCase
         $schema->create('usenet_groups', function (Blueprint $table): void {
             $table->integer('id')->primary();
             $table->string('name');
+        });
+        $schema->create('release_files', function (Blueprint $table): void {
+            $table->integer('releases_id');
+            $table->string('name');
+            $table->integer('size');
+            $table->primary(['releases_id', 'name']);
+        });
+        $schema->create('release_archive_naming_evidence', function (Blueprint $table): void {
+            $table->integer('releases_id')->primary();
+            $table->string('release_guid', 64);
+            $table->string('source_sha256', 64);
+            $table->integer('proof_version');
+            $table->string('scope', 32);
+            $table->text('episode_files');
+            $table->dateTime('updated_at');
         });
         $this->database->getConnection()->table('usenet_groups')->insert([
             'id' => 1, 'name' => 'alt.binaries.test',
@@ -140,12 +156,6 @@ final class Par2ProcessorStateTest extends TestCase
     {
         $schema = $this->database->getConnection()->getSchemaBuilder();
 
-        $schema->create('release_files', function (Blueprint $table): void {
-            $table->integer('releases_id');
-            $table->string('name');
-            $table->integer('size');
-            $table->primary(['releases_id', 'name']);
-        });
         $schema->create('par_hashes', function (Blueprint $table): void {
             $table->integer('releases_id');
             $table->string('hash', 32);

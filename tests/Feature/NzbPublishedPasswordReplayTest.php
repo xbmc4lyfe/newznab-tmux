@@ -48,6 +48,7 @@ class NzbPublishedPasswordReplayTest extends ReleaseVerificationCandidatesTest
             $table->string('guid');
             $table->integer('nzbstatus');
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         $passwords = match ($mode) {
             'empty', 'passwordless-missing-artifact', 'passwordless-changed-hash', 'passwordless-metadata-review', 'passwordless-metadata-deferred' => [], 'empty-string' => [''],
             'repeated', 'dropped-repeat' => ['first assertion', 'first assertion', 'second assertion'],

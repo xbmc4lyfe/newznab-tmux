@@ -474,15 +474,23 @@ class NzbImportService
             if (File::isFile($temporaryPath)) {
                 File::delete($temporaryPath);
             }
-            if (! $stored) {
-                File::delete($path);
-            }
         }
     }
 
     protected function moveCompressedNzbIntoPlace(string $temporaryPath, string $finalPath): bool
     {
-        return @rename($temporaryPath, $finalPath);
+        return DB::transaction(function () use ($temporaryPath, $finalPath): bool {
+            $release = DB::table('releases')->where('id', $this->relId)->where('guid', $this->relGuid)
+                ->lockForUpdate()->first(['id', 'guid']);
+            if ($release === null) {
+                throw new \RuntimeException('Imported release changed before NZB installation.');
+            }
+            $receipt = (new NzbSourceGuard($this->nzb))->install($release, $temporaryPath, $finalPath);
+            DB::afterRollBack(static fn () => $receipt->rollback());
+            DB::afterCommit(static fn () => $receipt->close());
+
+            return true;
+        });
     }
 
     /**
@@ -631,7 +639,19 @@ class NzbImportService
         $path = null;
         try {
             $path = $this->nzb->getNzbPath($this->relGuid, 0, true);
-            $stored = $this->writeCompressedNzb($path, $nzbString);
+            $stored = DB::transaction(function () use ($path, $nzbString): bool {
+                $release = Release::query()->where('id', $this->relId)->where('guid', $this->relGuid)->lockForUpdate()->first();
+                if ($release === null) {
+                    throw new \RuntimeException('Imported release disappeared before storage.');
+                }
+                $stored = $this->writeCompressedNzb($path, $nzbString);
+                if (! $stored && (new NzbSourceGuard($this->nzb))->snapshot($this->relGuid) === null) {
+                    // Preserve any generation another writer already retained for this row.
+                    $release->delete();
+                }
+
+                return $stored;
+            });
         } catch (\Throwable $exception) {
             Log::error('NZB import failed while storing the compressed file.', [
                 'guid' => $this->relGuid,
@@ -639,11 +659,6 @@ class NzbImportService
                 'exception' => $exception,
             ]);
             $stored = false;
-        }
-
-        if (! $stored) {
-            // Delete through the model so ReleaseObserver also removes the search document.
-            Release::query()->where('guid', $this->relGuid)->first()?->delete();
         }
 
         return [$stored, $path];

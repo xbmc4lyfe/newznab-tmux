@@ -192,6 +192,7 @@ class QueuedNzbCategoryTest extends ReleaseVerificationCandidatesTest
                 $table->integer($column);
             }
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         Schema::create('release_regexes', function (Blueprint $table): void {
             $table->integer('releases_id');
             $table->integer('collection_regex_id');

@@ -37,6 +37,7 @@ class MetadataRepublicationLineageTest extends ReleaseVerificationCandidatesTest
                 $t->integer($c);
             }
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         Schema::create('release_regexes', function (Blueprint $t) {
             foreach (['releases_id', 'collection_regex_id', 'naming_regex_id'] as $c) {
                 $t->integer($c);

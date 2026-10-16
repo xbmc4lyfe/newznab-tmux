@@ -5,8 +5,11 @@ declare(strict_types=1);
 namespace App\Services\AdditionalProcessing;
 
 use App\Services\AdditionalProcessing\Config\ProcessingConfiguration;
+use App\Services\AdditionalProcessing\Enums\VideoContainer;
 use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 
@@ -27,68 +30,112 @@ class NzbContentParser
      * Parse an NZB file and return its contents as an array of files.
      *
      * @param  string  $guid  The release GUID to find the NZB for
-     * @return array{contents: array<string, mixed>, error: string|null}
+     * @return array{contents: array<string, mixed>, error: string|null, sourceDigest?: ?string, sourceChanged?: bool, directVideoFiles?: list<array{name: string, firstMessageId: string}>|null, sourceFiles?: list<array{name: string, firstMessageId: string}>|null}
      */
     public function parseNzb(string $guid): array
     {
-        $nzbPath = $this->nzb->nzbPath($guid);
-        if ($nzbPath === false) {
-            return ['contents' => [], 'error' => 'NZB not found for GUID: '.$guid];
+        $source = (new NzbSourceGuard($this->nzb))->snapshot($guid, beginNamingInspection: true);
+        if ($source === null) {
+            return ['contents' => [], 'error' => 'NZB is missing or broken for GUID: '.$guid, 'sourceDigest' => null, 'sourceChanged' => true];
         }
-
-        $nzbContents = unzipGzipFile($nzbPath);
-        if (! $nzbContents) {
-            // Try repair on raw file contents
-            $nzbContents = $this->attemptRawRepair($nzbPath);
-            if (! $nzbContents) {
-                return ['contents' => [], 'error' => 'NZB is empty or broken for GUID: '.$guid];
-            }
-        }
+        $nzbPath = $source['path'];
+        $nzbContents = $source['contents'];
 
         // Get a list of files in the NZB
         $fileList = $this->nzbParser->parseNzbFileList($nzbContents, ['no-file-key' => false, 'strip-count' => true]);
         if (count($fileList) === 0) {
             // Attempt repair if initial parse yielded no files
             $repaired = $this->repairNzb($nzbContents, $nzbPath, $guid);
+            $retained = (new NzbSourceGuard($this->nzb))->snapshot($guid, beginNamingInspection: true);
+            if ($retained === null || ($repaired === null ? $retained['digest'] !== $source['digest'] : $retained['contents'] !== $repaired)) {
+                return ['contents' => [], 'error' => 'NZB source changed during repair for GUID: '.$guid, 'sourceDigest' => null, 'sourceChanged' => true];
+            }
+            $source = $retained;
             if ($repaired !== null) {
                 $fileList = $this->nzbParser->parseNzbFileList($repaired, ['no-file-key' => false, 'strip-count' => true]);
             }
             if (count($fileList) === 0) {
-                return ['contents' => [], 'error' => 'NZB is potentially broken for GUID: '.$guid];
+                return ['contents' => [], 'error' => 'NZB is potentially broken for GUID: '.$guid, 'sourceDigest' => $source['digest'], 'sourceChanged' => true];
             }
         }
 
         // Sort keys naturally
         ksort($fileList, SORT_NATURAL);
 
-        return ['contents' => $fileList, 'error' => null];
+        $sourceFiles = $this->sourceFileInventory($source['contents'], $fileList);
+        $directFiles = $sourceFiles;
+        foreach ($sourceFiles ?? [] as $file) {
+            if (VideoContainer::fromFileName('video.'.pathinfo($file['name'], PATHINFO_EXTENSION)) === null) {
+                $directFiles = null;
+                break;
+            }
+        }
+
+        return ['contents' => $fileList, 'error' => null, 'sourceDigest' => $source['digest'],
+            'sourceFiles' => $sourceFiles, 'directVideoFiles' => $directFiles];
     }
 
     /**
-     * Attempt to repair raw file contents before XML parsing.
+     * Nominate the full unmerged source inventory. Subjects alone never attest
+     * whether a file is an archive, direct media, or harmless metadata.
+     *
+     * @param  array<string, mixed>  $parsedFiles
+     * @return list<array{name: string, firstMessageId: string}>|null
      */
-    private function attemptRawRepair(string $nzbPath): ?string
+    private function sourceFileInventory(string $decoded, array $parsedFiles): ?array
     {
-        try {
-            $rawFile = @File::get($nzbPath);
-            if (! $rawFile) {
+        if (stripos($decoded, '<!ENTITY') !== false) {
+            return null;
+        }
+        $xml = simplexml_load_string($decoded, 'SimpleXMLElement', LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING);
+        if ($xml === false || count($xml->file) === 0 || count($xml->file) > 256 || count($xml->file) !== count($parsedFiles)) {
+            return null;
+        }
+        foreach ($parsedFiles as $file) {
+            if (! is_array($file) || (int) ($file['filecount'] ?? 0) !== 1) {
                 return null;
             }
-
-            // If gzipped, attempt decompress
-            if (str_ends_with(strtolower($nzbPath), '.gz')) {
-                $decompressed = @gzdecode($rawFile);
-                if ($decompressed !== false) {
-                    return $this->repairNzb($decompressed, $nzbPath, '');
-                }
-            } else {
-                return $this->repairNzb($rawFile, $nzbPath, '');
+        }
+        foreach ($xml->head->meta ?? [] as $meta) {
+            if (in_array((string) $meta['type'], ['nntmux:declared-file-count', 'nntmux:verified-file-count'], true)
+                && (! ctype_digit((string) $meta) || (int) (string) $meta > count($xml->file))) {
+                return null;
             }
-        } catch (\Throwable) {
-            // Ignore
+        }
+        $inventory = [];
+        $messageIds = [];
+        $nameBytes = 0;
+        foreach ($xml->file as $file) {
+            $subject = (string) $file['subject'];
+            if (preg_match('/^[^"\r\n]*"([^"\r\n]+)"(?:\s+yEnc)?(?:\s+\(\d+\/(\d+)\))?\s*$/iD', $subject, $match) !== 1
+                && preg_match('/^([^"\r\n]+?)(?:\s+yEnc)?(?:\s+\(\d+\/(\d+)\))?\s*$/iD', $subject, $match) !== 1) {
+                return null;
+            }
+            $name = trim($match[1]);
+            $nameBytes += strlen($name);
+            if ($name === '' || strlen($name) > 4096 || $nameBytes > 32768 || ! mb_check_encoding($name, 'UTF-8')
+                || preg_match('/[\x00-\x1f\x7f]/', $name) === 1 || in_array($name[0], ['.', '-'], true)
+                || basename($name) !== $name || str_contains($name, '\\')) {
+                return null;
+            }
+            $segments = [];
+            foreach ($file->segments->segment ?? [] as $segment) {
+                $number = (string) $segment['number'];
+                if (! ctype_digit($number) || (int) $number < 1 || isset($segments[(int) $number]) || trim((string) $segment) === '') {
+                    return null;
+                }
+                $segments[(int) $number] = (string) $segment;
+            }
+            ksort($segments);
+            if ($segments === [] || array_keys($segments) !== range(1, count($segments))
+                || (isset($match[2]) && (int) $match[2] !== count($segments)) || isset($messageIds[$segments[1]])) {
+                return null;
+            }
+            $messageIds[$segments[1]] = true;
+            $inventory[] = ['name' => $name, 'firstMessageId' => $segments[1]];
         }
 
-        return null;
+        return $inventory;
     }
 
     /**
@@ -126,18 +173,37 @@ class NzbContentParser
             return null;
         }
 
-        // Persist a repaired version if content changed
+        if ($fixed === $raw) {
+            return $raw;
+        }
+        $temporary = NzbService::temporaryNzbPathFor($originalPath);
         try {
-            if ($fixed !== $raw) {
-                if (str_ends_with(strtolower($originalPath), '.gz')) {
-                    @File::put($originalPath, gzencode($fixed));
-                } else {
-                    @File::put($originalPath, $fixed);
-                }
+            if ($guid === '') {
+                return null;
             }
+            $body = str_ends_with(strtolower($originalPath), '.gz') ? gzencode($fixed) : $fixed;
+            if ($body === false || File::put($temporary, $body) !== strlen($body)) {
+                return null;
+            }
+            DB::transaction(function () use ($guid, $temporary, $originalPath, $raw): void {
+                $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
+                if ($release === null) {
+                    throw new \RuntimeException('NZB release disappeared during repair.');
+                }
+                $receipt = (new NzbSourceGuard($this->nzb))->install($release, $temporary, $originalPath, NzbSourceGuard::digest($raw));
+                DB::afterRollBack(static fn () => $receipt->rollback());
+                DB::afterCommit(static fn () => $receipt->close());
+            });
         } catch (\Throwable $e) {
             if ($this->debugMode) {
                 Log::debug('Failed to persist repaired NZB: '.$e->getMessage());
+            }
+
+            // Proposed bytes are never evidence when the replacement failed.
+            return null;
+        } finally {
+            if (File::isFile($temporary)) {
+                File::delete($temporary);
             }
         }
 
