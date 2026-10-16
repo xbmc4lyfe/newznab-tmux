@@ -142,4 +142,49 @@ class SeasonPackDetectorTest extends TestCase
         $this->assertNull(SeasonPackDetector::seasonFolder(['Show.S01E01.mkv']));
         $this->assertNull(SeasonPackDetector::seasonFolder(['Movie.2020/VIDEO_TS/VTS_01_1.VOB']));
     }
+
+    #[Test]
+    public function it_preserves_single_episode_identity_across_release_info_tokens_and_rejects_continuations(): void
+    {
+        $tokens = [
+            '720p', '1080p', '2160p', '1080i', '4k', 'uhd', 'hdr', 'hdr10', 'hdr10plus', 'dv', 'sdr',
+            'web', 'webrip', 'webdl', 'bluray', 'blu', 'bd', 'bdrip', 'bdremux', 'brrip', 'remux',
+            'dvd', 'dvdrip', 'dvdr', 'dvd5', 'dvd9', 'hdtv', 'pdtv', 'sdtv', 'hdrip', 'dsr',
+            'amzn', 'nf', 'dsnp', 'hmax', 'atvp', 'hulu', 'pcok', 'pmtp', 'stan', 'crav',
+            'x264', 'x265', 'X264', 'X265', 'h264', 'h265', 'hevc', 'avc', 'xvid', 'divx',
+            '10bit', '8bit', 'aac', 'aac2', 'ac3', 'eac3', 'dd', 'dd5', 'ddp', 'ddp5', 'dts', 'truehd', 'atmos', 'flac',
+            'proper', 'repack', 'repack2', 'rerip', 'internal', 'multi', 'dual', 'subbed', 'dubbed', 'extended', 'uncut',
+            'german', 'french', 'spanish', 'italian', 'dutch', 'nordic', 'swedish', 'danish', 'finnish', 'norwegian',
+            'polish', 'russian', 'hindi', 'japanese', 'korean',
+        ];
+
+        foreach ($tokens as $token) {
+            $name = 'Show.S01E01.1080p.WEB.'.$token.'-GRP.mkv';
+            $this->assertSame('show:1:1', SeasonPackDetector::episodeIdentity($name), $token);
+            $this->assertFalse(SeasonPackDetector::hasNonSingleEpisodeEvidence([$name]), $token);
+        }
+
+        foreach (['S01E01' => 'show:1:1', 'S01.E01' => 'show:1:1', 'S2024E01' => 'show:2024:1', '1x01' => 'show:1:1'] as $marker => $identity) {
+            foreach (['x264', 'x265', 'X264', 'X265'] as $codec) {
+                foreach (['.', '-', '_', ' '] as $sep) {
+                    $name = 'Show'.$sep.$marker.$sep.'1080p'.$sep.'WEB'.$sep.$codec.'-GRP.mkv';
+                    $this->assertSame($identity, SeasonPackDetector::episodeIdentity($name), $name);
+                    $this->assertFalse(SeasonPackDetector::hasNonSingleEpisodeEvidence([$name]), $name);
+                }
+            }
+        }
+
+        foreach ([
+            'Show.S01E01.1080p.WEB.x02-GRP.mkv',
+            'Show.1x01x02.1080p.WEB.x264-GRP.mkv',
+            'Show.S01E01.1080p.WEB.x264E02-GRP.mkv',
+            'Show.S01E01.1080p.WEB.x265x02-GRP.mkv',
+            'Show.S01E01.1080p.WEB.x264.E02-GRP.mkv',
+            'Show.S01E01.1080p.WEB.x265.S02-GRP.mkv',
+            'Show.S01E01.1080p.WEB.x264.Complete.Season-GRP.mkv',
+        ] as $ambiguous) {
+            $this->assertNull(SeasonPackDetector::episodeIdentity($ambiguous), $ambiguous);
+            $this->assertTrue(SeasonPackDetector::hasNonSingleEpisodeEvidence([$ambiguous]), $ambiguous);
+        }
+    }
 }

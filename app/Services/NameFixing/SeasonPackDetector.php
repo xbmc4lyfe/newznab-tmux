@@ -120,7 +120,8 @@ final class SeasonPackDetector
         $rest = $match['rest'];
         if (self::isEpisodeName($match['prefix']) || self::isEpisodeName($rest)
             || preg_match('/^[a-z0-9]/i', $rest) === 1
-            || preg_match('/(?:^|[^a-z0-9])(?:S\d+[._ ]?E\d+|E(?:pisode|P)?[._ ]?\d+|x\d+)/i', $rest) === 1
+            || preg_match('/(?:^|[^a-z0-9])(?:S\d+[._ ]?E\d+|E(?:pisode|P)?[._ ]?\d+)/i', $rest) === 1
+            || self::hasXEpisodeContinuation($rest)
             || preg_match('/^[._ ]*(?:[-+&,]|–|—|(?:to|through)[._ ]+)[._ ]*\d+(?=$|[^a-z0-9])/i', $rest) === 1) {
             return null;
         }
@@ -132,6 +133,20 @@ final class SeasonPackDetector
         $episode = $match['episode'] !== '' ? $match['episode'] : $match['xepisode'];
 
         return $prefix.':'.(int) $season.':'.(int) $episode;
+    }
+
+    private static function hasXEpisodeContinuation(string $rest): bool
+    {
+        // Keep the whole token: x264/x265 are codecs, but x02 and x264E02
+        // cannot become codecs by accepting only an initial numeric prefix.
+        preg_match_all('/(?:^|[^a-z0-9])(x\d+[^._ \-\[\](){}]*)/i', $rest, $matches);
+        foreach ($matches[1] as $token) {
+            if (preg_match(self::RELEASE_INFO_TOKEN_REGEX, $token) !== 1) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /** Explicit pack/compound evidence cannot become an opaque canonical singleton.

@@ -2582,6 +2582,31 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
                 [$e01.'.mkv' => $e01], true, $firstScan,
             ];
         }
+        foreach (['same-cycle' => true, 'later consumer' => false] as $phase => $firstScan) {
+            foreach (['S01E01', 'S01.E01', 'S2024E01', '1x01'] as $notation) {
+                foreach (['x264', 'x265'] as $codec) {
+                    $title = 'Show.'.$notation.'.1080p.WEB.'.$codec.'-GRP';
+                    yield 'codec regression named '.$notation.' '.$codec.' '.$phase => [[$title.'.mkv'], [$title.'.mkv' => $title], true, $firstScan];
+                    yield 'codec regression opaque '.$notation.' '.$codec.' '.$phase => [[$opaque], [$opaque => $title], true, $firstScan];
+                }
+            }
+            foreach ([
+                'h264 audio and bitdepth' => 'Show.S01E01.1080p.WEB.H264.DDP5.1.8bit-GRP',
+                'h265 audio and bitdepth' => 'Show.S01E01.2160p.WEB.H265.EAC3.10bit-GRP',
+                'hevc quality' => 'Show.S01E01.2160p.UHD.HEVC.HDR10-GRP',
+                'avc quality' => 'Show.S01E01.720p.BluRay.AVC.DTS5.1-GRP',
+                'uppercase dot codec' => 'Show.S01E01.1080p.WEB.X264.DDP5.1-GRP',
+                'hyphen codec boundary' => 'Show.S01E01-1080p-WEB-x265-GRP',
+            ] as $label => $title) {
+                yield 'codec regression release info '.$label.' '.$phase => [[$title.'.mkv'], [$title.'.mkv' => $title], true, $firstScan];
+            }
+            foreach (['x02', 'x264E02', 'x265x02', 'x264.E02', 'x265.E02', 'x264.S02', 'x265.Complete.Season'] as $continuation) {
+                $ambiguous = 'Show.S01E01.1080p.WEB.'.$continuation.'-GRP';
+                yield 'codec regression unsafe witness '.$continuation.' '.$phase => [[$ambiguous.'.mkv'], [$ambiguous.'.mkv' => $e01], false, $firstScan];
+                yield 'codec regression unsafe canonical '.$continuation.' '.$phase => [[$opaque], [$opaque => $ambiguous], false, $firstScan];
+            }
+            yield 'codec regression immediate x continuation '.$phase => [[$opaque], [$opaque => 'Show.1x01x02.1080p.WEB.x264-GRP'], false, $firstScan];
+        }
         yield 'same episode encode variants' => [[$e01.'.mkv', 'Show.S01E01.720p.WEB-DL-GRP.mkv'], [$e01.'.mkv' => $e01], true, true];
         yield 'ordinary movie with an unresolved video sibling' => [
             ['Movie.2026.1080p.WEB-DL-GRP.mkv', $opaque],
@@ -2674,6 +2699,13 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             }
             $this->assertSame(NzbSourceGuard::digest($source), $context->nzbSourceDigest);
             $this->assertSame($context->nzbSourceDigest, DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('source_sha256'));
+            if ($accepted && $canonicalTitle !== 'Movie.2026.1080p.WEB-DL-GRP') {
+                $this->assertSame('complete_single', DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('scope'));
+                $this->assertTrue(DB::transaction(fn (): bool => app(ReleaseArchiveNamingEvidence::class)->recordLocked(
+                    Release::query()->findOrFail(1), $context->nzbSourceDigest, 'complete_single', $names, true
+                )));
+                $this->assertSame('complete_single', DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('scope'), 'Repeated inspection of the same source must preserve complete_single.');
+            }
             $inventory = DB::table('release_files')->where('releases_id', 1)->orderBy('name')->get()->map(static fn (object $file): array => (array) $file)->all();
             $expectedNames = $names;
             sort($expectedNames, SORT_STRING);
@@ -2706,6 +2738,9 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             'seasonless Episode token is not a complete identity' => ['Show.Episode.5.1080p.WEB-DL-GRP', false],
             'seasonless EP token is not a complete identity' => ['Show.EP05.1080p.WEB-DL-GRP', false],
             'historical simple episode keeps legacy compatibility' => ['Show.S01E01.1080p.WEB-DL-GRP', true],
+            'historical x264 episode keeps legacy compatibility' => ['Show.S01E01.1080p.WEB.x264-GRP', true],
+            'historical x265 episode keeps legacy compatibility' => ['Show.S01E01.1080p.WEB.x265-GRP', true],
+            'historical x02 continuation is not a singleton' => ['Show.S01E01.1080p.WEB.x02-GRP', false],
         ];
     }
 
@@ -2907,8 +2942,8 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     #[DataProvider('sharedArchiveAdmissionCases')]
     public function test_shared_rename_admission_requires_current_archive_scope_and_filename(string $path, string $proof, bool $accepted): void
     {
-        $oldTitle = 'Show.S01E01.1080p.WEB-DL-GRP';
-        $currentTitle = 'Show.S01E03.1080p.WEB-DL-GRP';
+        $oldTitle = 'Show.S01E01.1080p.WEB.x264-GRP';
+        $currentTitle = 'Show.S01E03.1080p.WEB.x265-GRP';
         $title = $proof === 'replacement current' ? $currentTitle : $oldTitle;
         $sameName = in_array($path, ['attach', 'same-name candidate', 'same-name preview'], true);
         $preview = in_array($path, ['preview', 'generic preview', 'same-name preview'], true);
