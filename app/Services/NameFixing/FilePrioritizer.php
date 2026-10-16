@@ -11,6 +11,8 @@ namespace App\Services\NameFixing;
  */
 class FilePrioritizer
 {
+    public const PREDB_IDENTITY_POLICY = 'f70a4604767f9914da3550b84b37bc432d2b165e28fd6b94c6c215f34ba8566a';
+
     /**
      * Video file extensions.
      */

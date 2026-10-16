@@ -15,6 +15,7 @@ use App\Models\Release;
 use App\Models\SteamApp;
 use App\Models\Video;
 use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
+use App\Services\Search\Contracts\PredbFilenameCandidateLookup;
 use App\Services\Search\Contracts\ReleaseCandidatePager;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
@@ -38,7 +39,7 @@ use Manticoresearch\Search;
 /**
  * ManticoreSearch driver for full-text search functionality.
  */
-class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidatePager, SearchDriverInterface
+class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCandidateLookup, ReleaseCandidatePager, SearchDriverInterface
 {
     private const AVAILABILITY_CHECK_CACHE_TTL = 30;
 
@@ -1738,6 +1739,55 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, ReleaseCandidate
         }
 
         return $hits;
+    }
+
+    /** @return list<array{id: int, title: string, filename: string, source: string}>|null */
+    public function searchPredbFilenameCandidates(string $searchTerm): ?array
+    {
+        $prepared = self::prepareUserSearchQuery($searchTerm);
+        if (empty($prepared)) {
+            return null;
+        }
+
+        try {
+            // Deliberately bypass searchIndexes(): its cross-call cache and bare hit list
+            // cannot attest freshness or completeness for an identity attachment.
+            $expression = '@@relaxed '.self::scopeReleaseSearchQuery($searchTerm, $prepared, '@(title,filename)');
+            $results = (new Search($this->manticoreSearch))
+                ->setTable($this->getPredbIndex())
+                ->maxMatches(1000)
+                ->limit(1000)
+                ->stripBadUtf8(false)
+                ->search($expression)
+                ->get();
+            $response = $results->getResponse()->getResponse();
+            $rows = $response['hits']['hits'] ?? null;
+            $total = $response['hits']['total'] ?? null;
+            // A full window is deliberately denied, even when total claims equality.
+            // Manticore max_matches is a nomination bound, not proof of exhaustion.
+            if (($response['timed_out'] ?? null) !== false
+                || ! empty($response['error']) || ! empty($response['warning'])
+                || ($response['hits']['total_relation'] ?? null) !== 'eq'
+                || ! is_array($rows) || ! array_is_list($rows) || ! is_int($total)
+                || $total !== count($rows) || count($rows) >= 1000) {
+                return null;
+            }
+
+            $hits = [];
+            foreach ($rows as $row) {
+                $hit = PredbSearchDocument::filenameCandidate($row);
+                if ($hit === null) {
+                    return null;
+                }
+                $hits[] = $hit;
+            }
+
+            return $hits;
+        } catch (\Throwable $exception) {
+            Log::warning('Manticore PreDB filename lookup failed', ['exception_class' => $exception::class]);
+
+            return null;
+        }
     }
 
     /** @return array{id: int, title: string, filename: string, source: string}|null */

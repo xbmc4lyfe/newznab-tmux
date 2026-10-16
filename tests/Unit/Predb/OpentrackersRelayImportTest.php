@@ -15,6 +15,7 @@ use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Foundation\Application as ApplicationContract;
 use Illuminate\Database\Capsule\Manager as Capsule;
 use Illuminate\Database\ConnectionResolverInterface;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\DB;
@@ -49,6 +50,7 @@ final class OpentrackersRelayImportTest extends TestCase
         $this->database = new Capsule($app);
         $this->database->addConnection(['driver' => 'sqlite', 'database' => ':memory:']);
         $this->database->bootEloquent();
+        $this->database->getConnection()->setTransactionManager(new DatabaseTransactionsManager);
         $app->instance('db', $this->database->getDatabaseManager());
         $pdo = $this->database->getConnection()->getPdo();
         assert($pdo instanceof Sqlite);
