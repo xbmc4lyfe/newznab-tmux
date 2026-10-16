@@ -415,6 +415,18 @@
       "raw_artifact_id": 11966969190,
       "raw_artifact_zip_digest": "sha256:ca992091b7c2ad543a42c2a9e0c46f9f14d55f5c6c317c3093565af9fb269b3e",
       "raw_artifact_expires_at": "2026-10-29T10:57:41Z"
+    },
+    {
+      "file": "diagnostic-fingerprint-provider-reuse.json",
+      "sha256": "89ee67ab493a45e4e54c4f097abe0101e30933f4e1377c01474db408adc9d6ae",
+      "run_id": 38831253316,
+      "run_attempt": 1,
+      "kind": "synthetic-provider-reuse-diagnostic",
+      "runner": "ubuntu-latest",
+      "executed_sha": "badb7683cd0f99bb45df5bbf3be48e77647a8048",
+      "artifact_id": 12016309812,
+      "artifact_zip_sha256": "66976acded9a3a2c19b11de2311327eb2852254686296b1003a26f0af50f7a83",
+      "adoption_qualified": false
     }
   ],
   "cpu_protocol3_study": {
