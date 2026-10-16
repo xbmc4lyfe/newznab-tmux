@@ -1,7 +1,7 @@
 {
-  "snapshot_head": "7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
+  "snapshot_head": "a4d52f4e0da633bf3bc8163e61ef6f2291f87abc",
   "upstream_baseline": "2fef08b34e4e6cced23333bd186b28a09e94ea2f",
-  "fork_only_commit_count": 211,
+  "fork_only_commit_count": 213,
   "association_source": "GitHub associated-PR API and commit subjects; unknown commits explicitly marked unassociated",
   "commits": [
     {
@@ -6304,6 +6304,57 @@
       ],
       "pull_request_urls": [
         "https://github.com/xbmc4lyfe/newznab-tmux/pull/220"
+      ]
+    },
+    {
+      "sha": "3bae3f387e39da9c3edfb2107c8d883c11e843b0",
+      "subject": "Refresh GitHub Pages fork ledger and source links through PR #220 (#222)",
+      "parents": [
+        "7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839"
+      ],
+      "authored_at": "2026-10-16T10:27:23+02:00",
+      "committed_at": "2026-10-16T10:27:23+02:00",
+      "pull_requests": [
+        222
+      ],
+      "association": "merged_pull_request",
+      "first_parent_changed_paths": [
+        "github-pages/deployment/RUST_BENCHMARK_PAGES_TODO.md",
+        "github-pages/docs/content/deployment.html",
+        "github-pages/docs/content/differences.html",
+        "github-pages/docs/content/evidence.html",
+        "github-pages/docs/content/performance.html",
+        "github-pages/docs/content/processing.html",
+        "github-pages/docs/content/pull-requests.html",
+        "github-pages/docs/content/releases.html",
+        "github-pages/docs/content/rust.html",
+        "github-pages/docs/data/fork-commits.json",
+        "github-pages/docs/data/fork-history.json"
+      ],
+      "pull_request_urls": [
+        "https://github.com/xbmc4lyfe/newznab-tmux/pull/222"
+      ]
+    },
+    {
+      "sha": "a4d52f4e0da633bf3bc8163e61ef6f2291f87abc",
+      "subject": "Extract comparable ZIP and gzip DEFLATE compression-effort metadata (#221)",
+      "parents": [
+        "3bae3f387e39da9c3edfb2107c8d883c11e843b0"
+      ],
+      "authored_at": "2026-10-16T10:30:43+02:00",
+      "committed_at": "2026-10-16T10:30:43+02:00",
+      "pull_requests": [
+        221
+      ],
+      "association": "merged_pull_request",
+      "first_parent_changed_paths": [
+        ".github/workflows/yenc-performance.yml",
+        "app/Services/Releases/Fingerprint/ReleaseFingerprintCollector.php",
+        "docker/app/nzb-yenc-ffi/src/formats.rs",
+        "tests/Feature/ReleaseFingerprintMetadataTest.php"
+      ],
+      "pull_request_urls": [
+        "https://github.com/xbmc4lyfe/newznab-tmux/pull/221"
       ]
     }
   ]
