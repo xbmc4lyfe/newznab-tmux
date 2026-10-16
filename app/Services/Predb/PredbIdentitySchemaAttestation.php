@@ -12,7 +12,7 @@ use RuntimeException;
 /** Read-only installed-schema compatibility. Coverage and concurrent DDL require separate fences. */
 final class PredbIdentitySchemaAttestation
 {
-    public const PREDB_IDENTITY_POLICY = '9bb6c01cada1a3d912ce801ffb40ce56cf56bf35706099d759e624420408b47e';
+    public const PREDB_IDENTITY_POLICY = 'd88b1ed8e2242683f98de576b7edbff364f4855a6d850737660190d191447337';
 
     /** @var array<string, array<string, array{string, int, string, int}>> */
     private const SQLITE_COLUMNS = [
@@ -121,7 +121,7 @@ final class PredbIdentitySchemaAttestation
             .'@@session.character_set_client AS client_charset, @@lower_case_table_names AS lower_case_table_names, '
             .'OCTET_LENGTH(@@session.sql_mode) AS mode_bytes, SUBSTRING(CAST(@@session.sql_mode AS BINARY),1,4097) AS mode_raw', [], false);
         if ($session === null || $session->schema_name !== $schema || ! is_string($session->version) || strlen($session->version) > 256
-            || $session->version !== '11.4.8-MariaDB-ubu2404'
+            || ! in_array($session->version, ['11.4.8-MariaDB-ubu2404', '11.4.8-MariaDB-ubu2404-log'], true)
             || $session->isolation_level !== 'READ-COMMITTED' || $session->connection_collation !== 'utf8mb4_unicode_ci'
             || $session->client_charset !== 'utf8mb4' || $session->lower_case_table_names !== 0
             || ! $this->mariaModeMatches($session->mode_raw, $session->mode_bytes)) {

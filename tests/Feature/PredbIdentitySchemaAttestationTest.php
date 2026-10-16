@@ -6,6 +6,7 @@ namespace Tests\Feature;
 
 use App\Services\Predb\PredbIdentitySchema;
 use App\Services\Predb\PredbIdentitySchemaAttestation;
+use Illuminate\Database\Connection;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -47,6 +48,7 @@ final class PredbIdentitySchemaAttestationTest extends TestCase
         self::assertSame(0, DB::table('predb_identity_revisions')->count());
     }
 
+    /** @return list<array{string}> */
     public static function incompatibleContracts(): array
     {
         return [
@@ -166,6 +168,7 @@ final class PredbIdentitySchemaAttestationTest extends TestCase
         }
     }
 
+    /** @return list<list<object>> */
     private function schemaSnapshot(): array
     {
         return [
@@ -214,5 +217,92 @@ final class PredbIdentitySchemaAttestationTest extends TestCase
         }
         $rows = DB::connection()->select($query[0], $query[1]);
         self::assertLessThanOrEqual(7, strlen($rows[0]->coll));
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function mariaSessionVersions(): array
+    {
+        return [
+            'base 11.4.8 version' => ['11.4.8-MariaDB-ubu2404', true],
+            'binary log 11.4.8 version' => ['11.4.8-MariaDB-ubu2404-log', true],
+            'unqualified debug suffix' => ['11.4.8-MariaDB-ubu2404-debug', false],
+            'unqualified major version' => ['10.11.6-MariaDB-ubu2404', false],
+        ];
+    }
+
+    #[DataProvider('mariaSessionVersions')]
+    public function test_mariadb_session_version_accepts_log_suffix_and_rejects_unqualified_versions(string $version, bool $accepted): void
+    {
+        $pdo = DB::connection()->getPdo();
+        $pdo->beginTransaction();
+        try {
+            $connection = new class($pdo, 'nntmux', '', ['driver' => 'mariadb']) extends Connection
+            {
+                /** @param array<string, mixed> $config */
+                public function __construct(\PDO $pdo, string $database, string $tablePrefix, array $config)
+                {
+                    parent::__construct($pdo, $database, $tablePrefix, $config);
+                    $this->transactions = 1;
+                }
+
+                public string $testVersion = '11.4.8-MariaDB-ubu2404';
+
+                public function getDriverName(): string
+                {
+                    return 'mariadb';
+                }
+
+                /**
+                 * @param  array<array-key, mixed>  $bindings
+                 * @param  array<array-key, mixed>  $fetchUsing
+                 * @return list<object>
+                 */
+                public function select($query, $bindings = [], $useReadPdo = true, array $fetchUsing = []): array
+                {
+                    if (str_contains($query, 'predb_identity_state') && str_contains($query, 'for update')) {
+                        return [(object) ['id' => '1']];
+                    }
+                    if (str_contains($query, 'limit 1')) {
+                        return [];
+                    }
+                    if (str_contains($query, 'FROM information_schema.TABLES')) {
+                        throw new RuntimeException('Reached table attestation past session check.');
+                    }
+
+                    return [];
+                }
+
+                /** @param array<array-key, mixed> $bindings */
+                public function selectOne($query, $bindings = [], $useReadPdo = true): mixed
+                {
+                    return (object) [
+                        'version' => $this->testVersion,
+                        'schema_name' => 'nntmux',
+                        'isolation_level' => 'READ-COMMITTED',
+                        'connection_collation' => 'utf8mb4_unicode_ci',
+                        'client_charset' => 'utf8mb4',
+                        'lower_case_table_names' => 0,
+                        'mode_bytes' => 22,
+                        'mode_raw' => 'NO_ENGINE_SUBSTITUTION',
+                    ];
+                }
+            };
+            $connection->testVersion = $version;
+
+            try {
+                (new PredbIdentitySchemaAttestation)->assertCurrent($connection);
+                self::fail('Expected exception.');
+            } catch (RuntimeException $e) {
+                if ($accepted) {
+                    self::assertSame('Reached table attestation past session check.', $e->getMessage());
+                } else {
+                    self::assertSame('MariaDB PreDB session contract is unqualified.', $e->getMessage());
+                }
+            }
+        } finally {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+        }
     }
 }
