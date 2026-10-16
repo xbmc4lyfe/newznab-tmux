@@ -15,7 +15,6 @@ use App\Services\AdditionalProcessing\ConsoleOutputService;
 use App\Services\AdditionalProcessing\DTO\DownloadMetrics;
 use App\Services\AdditionalProcessing\Enums\DownloadKind;
 use App\Services\AdditionalProcessing\Enums\ProcessingOutcome;
-use App\Services\AdditionalProcessing\Media\MediaSourceResolver;
 use App\Services\AdditionalProcessing\MediaExtractionService;
 use App\Services\AdditionalProcessing\NzbContentParser;
 use App\Services\AdditionalProcessing\ReleaseFileManager;
@@ -33,6 +32,7 @@ use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\NfoService;
+use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseBrowseService;
@@ -888,10 +888,54 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->assertNull(DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
     }
 
+    /** @var array<string, mixed>|null */
+    private static ?array $mappedArchiveFlowBaseline = null;
+
     #[DataProvider('mappedArticleIntegrityCases')]
     public function test_mapped_archive_download_persists_the_scene_filename_and_wakes_the_real_filename_fixer(bool $withChecksum): void
     {
+        $observed = $this->runMappedArchiveParserToFilenameConsumerFlow($withChecksum);
+
+        self::assertSame(
+            $withChecksum ? ['BODY <index>', 'BODY <a>', 'BODY <b>', 'BODY <c>'] : ['BODY <index>', 'BODY <a>', 'BODY <a>', 'BODY <b>', 'BODY <c>'],
+            $observed['commands'],
+        );
+        self::assertSame($withChecksum ? 17000 : 0, $observed['bytesReused']);
+
+        $outcomeSummary = [
+            'archiveBytes' => $observed['archiveBytes'],
+            'persistedFiles' => $observed['persistedFiles'],
+            'finalIdentity' => $observed['finalIdentity'],
+            'outcome' => $observed['outcome'],
+        ];
+        if (self::$mappedArchiveFlowBaseline === null) {
+            self::$mappedArchiveFlowBaseline = $outcomeSummary;
+        } else {
+            self::assertSame(self::$mappedArchiveFlowBaseline, $outcomeSummary);
+            self::$mappedArchiveFlowBaseline = null;
+        }
+    }
+
+    /**
+     * @return array{
+     *     archiveBytes: list<string>,
+     *     persistedFiles: list<array<string, mixed>>,
+     *     finalIdentity: array<string, mixed>,
+     *     outcome: ProcessingOutcome,
+     *     commands: list<string>,
+     *     bytesReused: int
+     * }
+     */
+    private function runMappedArchiveParserToFilenameConsumerFlow(bool $withChecksum): array
+    {
         $this->prepareFilenameNaming();
+        Schema::dropIfExists('usenet_groups');
+        Schema::create('usenet_groups', function (Blueprint $table): void {
+            $table->unsignedInteger('id')->primary();
+            $table->string('name');
+        });
+        DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'group']);
+        DB::table('releases')->where('id', 1)->update(['nfostatus' => 1]);
         $title = 'Example.Movie.2026.1080p.WEB-DL.x264-GRP';
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
         Search::shouldReceive('searchPredb')->andReturn([]);
@@ -900,13 +944,36 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $queries = new NameFixingQueryService;
         $fixer->fixNamesWithFiles(0, true, 1, true, false);
         self::assertSame([], $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
-        $manager = $this->makeManager($fixer);
-        $config = $this->makeConfig(['par2MediaMapping' => true, 'par2VerifyFiles' => 1]);
+        $config = $this->makeConfig(['par2MediaMapping' => true, 'par2VerifyFiles' => 1, 'processPasswords' => true]);
         $archive = $this->rar($title.'.mkv', str_repeat('CONTENT', 3000));
         $index = $this->par2Index([
             ['release.part01.rar', strlen($archive), $archive],
             ['release.part02.rar', strlen($archive), str_repeat('OTHER', 5000)],
         ]);
+        $partBytes = (int) ceil(strlen($archive) * 1.03 / 3);
+        $nzbPath = tempnam(sys_get_temp_dir(), 'nntmux-mapped-nzb-').'.nzb.gz';
+        $this->par2HashFixtureFiles[] = $nzbPath;
+        $nzbXml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">'
+            .'<file poster="p" date="1" subject="&quot;release.par2&quot; yEnc (1/1)"><groups><group>group</group></groups><segments><segment bytes="'.strlen($index).'" number="1">index</segment></segments></file>'
+            .'<file poster="p" date="1" subject="&quot;opaque1&quot; yEnc (1/3)"><groups><group>group</group></groups><segments>'
+            .'<segment bytes="'.$partBytes.'" number="1">a</segment><segment bytes="'.$partBytes.'" number="2">b</segment><segment bytes="'.$partBytes.'" number="3">c</segment>'
+            .'</segments></file>'
+            .'<file poster="p" date="1" subject="&quot;opaque2&quot; yEnc (1/3)"><groups><group>group</group></groups><segments>'
+            .'<segment bytes="'.$partBytes.'" number="1">d</segment><segment bytes="'.$partBytes.'" number="2">e</segment><segment bytes="'.$partBytes.'" number="3">f</segment>'
+            .'</segments></file></nzb>';
+        file_put_contents($nzbPath, gzencode($nzbXml));
+        $nzbService = new class($nzbPath) extends TestNzbService
+        {
+            public function __construct(private readonly string $fixturePath)
+            {
+                parent::__construct();
+            }
+
+            public function nzbPath(string $releaseGuid = ''): string|false
+            {
+                return $releaseGuid === 'guid-1' ? $this->fixturePath : false;
+            }
+        };
         $a = YencArticles::part(substr($archive, 0, 17000), 'opaque', strlen($archive), 1, 1, 3);
         $mapping = $withChecksum ? $a : preg_replace('/ pcrc32=[0-9a-f]+/', '', $a);
         $wire = MappingArticleNntpHarness::body($index, 'release.par2').MappingArticleNntpHarness::rawBody($mapping);
@@ -917,26 +984,46 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             .MappingArticleNntpHarness::rawBody(YencArticles::part(substr($archive, 19000), 'opaque', strlen($archive), 3, 19001, 3));
         $nntp = new MappingArticleNntpHarness($wire);
         $download = new UsenetDownloadService($config, $nntp);
+        $manager = new ReleaseFileManager($config, new ReleaseImageService, new NfoService, $nzbService, $fixer);
+        $archiveService = new class($config) extends ArchiveExtractionService
+        {
+            /**
+             * @var list<string>
+             */
+            public array $capturedBytes = [];
+
+            public function processCompressedData(string $compressedData, ReleaseProcessingContext $context, string $tmpPath): array
+            {
+                $this->capturedBytes[] = $compressedData;
+
+                return parent::processCompressedData($compressedData, $context, $tmpPath);
+            }
+        };
+        /** @var ConsoleOutputService&MockInterface $output */
+        $output = Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing();
+        $processor = new ReleaseProcessor(
+            $config,
+            new NzbContentParser($nzbService, new NzbParserService),
+            new AdditionalWorkPlanner($config),
+            $archiveService,
+            $this->createStub(MediaExtractionService::class),
+            $download,
+            $manager,
+            $this->createStub(ReleaseFilesArchiveFallback::class),
+            new TempWorkspaceService,
+            $output,
+        );
         $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $context->nzbContents = [
-            ['title' => '"release.par2" yEnc (1/1)', 'segments' => ['index'], 'size' => strlen($index), 'filecount' => 1],
-            ['title' => '"opaque1" yEnc (1/3)', 'segments' => ['a', 'b', 'c'], 'size' => (int) ceil(strlen($archive) * 1.03), 'filecount' => 1],
-            ['title' => '"opaque2" yEnc (1/3)', 'segments' => ['d', 'e', 'f'], 'size' => (int) ceil(strlen($archive) * 1.03), 'filecount' => 1],
-        ];
-        $context->workPlan = (new AdditionalWorkPlanner($config))->plan($context->nzbContents, 'group');
-        $context->releaseGroupName = 'group';
-        $download->beginReleaseScope();
-        $context->mediaPlan = (new MediaSourceResolver($config, $download))->resolve($context);
-        self::assertSame('release.part01.rar', $context->mediaPlan?->mappedFiles[1]->file->name);
-        $downloaded = $download->download(DownloadKind::Compressed, ['a', 'b', 'c'], 'group', 1);
-        self::assertSame($archive, $downloaded['data']);
-        $listing = (new ArchiveExtractionService($config))->processCompressedData($downloaded['data'], $context, '/tmp/');
-        self::assertTrue($listing['success']);
-        self::assertSame($title.'.mkv', $listing['files'][0]['name']);
-        foreach ($listing['files'] as $file) {
-            self::assertTrue($manager->addFileInfo($file, $context, '\.(?:par2|sfv|nzb)'));
+        $mainTmp = sys_get_temp_dir().'/nntmux-mapped-flow-'.uniqid('', true).'/';
+        File::ensureDirectoryExists($mainTmp);
+        try {
+            $result = $processor->process($context, $mainTmp);
+        } finally {
+            File::deleteDirectory($mainTmp);
         }
-        $manager->finalizeRelease($context, false);
+
+        self::assertSame([$archive], $archiveService->capturedBytes);
+        self::assertSame('release.part01.rar', $context->mediaPlan?->mappedFiles[0]->file->name);
         self::assertSame($title.'.mkv', DB::table('release_files')->where('name', $title.'.mkv')->value('name'));
         self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
         self::assertCount(1, $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
@@ -945,10 +1032,37 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         self::assertSame($title, $release->searchname);
         self::assertSame(1, (int) $release->isrenamed);
         self::assertSame(1, (int) $release->proc_files);
-        self::assertSame($withChecksum ? ['BODY <index>', 'BODY <a>', 'BODY <b>', 'BODY <c>'] : ['BODY <index>', 'BODY <a>', 'BODY <a>', 'BODY <b>', 'BODY <c>'], $nntp->sentCommands());
-        self::assertSame($withChecksum ? 17000 : 0, $download->finishReleaseScope()->bytesReused);
+
+        return [
+            'archiveBytes' => $archiveService->capturedBytes,
+            'persistedFiles' => array_map(
+                static fn (object $row): array => [
+                    'name' => $row->name,
+                    'size' => (int) $row->size,
+                    'crc32' => (string) $row->crc32,
+                    'passworded' => (int) $row->passworded,
+                ],
+                DB::table('release_files')->where('releases_id', 1)->orderBy('name')->get()->all(),
+            ),
+            'finalIdentity' => [
+                'guid' => $release->guid,
+                'name' => $release->name,
+                'searchname' => $release->searchname,
+                'isrenamed' => (int) $release->isrenamed,
+                'predb_id' => (int) $release->predb_id,
+                'proc_files' => (int) $release->proc_files,
+                'rarinnerfilecount' => (int) $release->rarinnerfilecount,
+                'passwordstatus' => (int) $release->passwordstatus,
+            ],
+            'outcome' => $result->outcome,
+            'commands' => $nntp->sentCommands(),
+            'bytesReused' => (int) ($result->downloadMetrics->bytesReused ?? 0),
+        ];
     }
 
+    /**
+     * @return array<string, array{bool}>
+     */
     public static function mappedArticleIntegrityCases(): array
     {
         return ['retained CRC-valid primary article' => [true], 'checksumless mapping control' => [false]];
