@@ -43,22 +43,79 @@ final readonly class Par2FileMapper
             static fn (Par2FileEntry $file): bool => ! in_array($file, $verified, true),
         ));
 
-        $fitsByFile = [];
-        $fitsByEntry = [];
-        foreach ($remainingFiles as $fileIndex => $file) {
-            foreach ($this->candidateIndexes($nzbContents, $file, $articlePartSize) as $sourceIndex) {
+        if ($remainingFiles !== []) {
+            $postedSizes = [];
+            $segmentCounts = [];
+            foreach (array_values($nzbContents) as $sourceIndex => $entry) {
+                if (! $this->isSingleFile($entry)) {
+                    continue;
+                }
                 if (isset($mapped[$sourceIndex])) {
                     continue;
                 }
-                $fitsByFile[$fileIndex][] = $sourceIndex;
-                $fitsByEntry[$sourceIndex][] = $fileIndex;
+                $postedSizes[$sourceIndex] = (int) $entry['size'];
+                $segmentCounts[$sourceIndex] = count($entry['segments']);
             }
-        }
 
-        foreach ($fitsByFile as $fileIndex => $sourceIndexes) {
-            $sourceIndex = $sourceIndexes[0];
-            if (count($sourceIndexes) === 1 && count($fitsByEntry[$sourceIndex]) === 1) {
-                $mapped[$sourceIndex] = new MappedNzbFile($sourceIndex, $remainingFiles[$fileIndex], MappingConfidence::UniqueSize);
+            if ($postedSizes !== []) {
+                asort($postedSizes, SORT_NUMERIC);
+                $sortedSources = array_keys($postedSizes);
+                $sortedSizes = array_values($postedSizes);
+                $entryCount = count($sortedSizes);
+
+                $checkSegments = $articlePartSize !== null && $articlePartSize > 0;
+                $fileFitCounts = [];
+                $fileFirstSource = [];
+                $entryFitCounts = [];
+
+                foreach ($remainingFiles as $fileIndex => $file) {
+                    $fileSize = $file->size;
+                    if ($fileSize <= 0) {
+                        continue;
+                    }
+                    $expectedSegments = $checkSegments ? (int) ceil($fileSize / $articlePartSize) : null;
+                    $minPosted = $fileSize - ($fileSize >> 9);
+                    $low = 0;
+                    $high = $entryCount;
+                    while ($low < $high) {
+                        $mid = ($low + $high) >> 1;
+                        if ($sortedSizes[$mid] < $minPosted) {
+                            $low = $mid + 1;
+                        } else {
+                            $high = $mid;
+                        }
+                    }
+
+                    for ($index = $low; $index < $entryCount; $index++) {
+                        $postedSize = $sortedSizes[$index];
+                        $ratio = $fileSize / $postedSize;
+                        if ($ratio < self::MIN_SIZE_RATIO) {
+                            break;
+                        }
+                        if ($ratio > self::MAX_SIZE_RATIO) {
+                            continue;
+                        }
+                        $sourceIndex = $sortedSources[$index];
+                        if ($expectedSegments !== null && $expectedSegments !== $segmentCounts[$sourceIndex]) {
+                            continue;
+                        }
+                        $fitCount = ($fileFitCounts[$fileIndex] ?? 0) + 1;
+                        $fileFitCounts[$fileIndex] = $fitCount;
+                        if ($fitCount === 1) {
+                            $fileFirstSource[$fileIndex] = $sourceIndex;
+                        }
+                        $entryFitCounts[$sourceIndex] = ($entryFitCounts[$sourceIndex] ?? 0) + 1;
+                    }
+                }
+
+                foreach ($fileFitCounts as $fileIndex => $fitCount) {
+                    if ($fitCount === 1) {
+                        $sourceIndex = $fileFirstSource[$fileIndex];
+                        if ($entryFitCounts[$sourceIndex] === 1) {
+                            $mapped[$sourceIndex] = new MappedNzbFile($sourceIndex, $remainingFiles[$fileIndex], MappingConfidence::UniqueSize);
+                        }
+                    }
+                }
             }
         }
 
