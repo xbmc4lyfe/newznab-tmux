@@ -72,7 +72,7 @@ class CppDateReferenceTest(unittest.TestCase):
                     for candidate in metadata[name]["candidates"]
                 ],
             }
-            for name in ("date", "injection_date", "legacy_nntp_posting_date")
+            for name in ("date", "injection_date", "legacy_nntp_posting_date", "expires")
         }
 
     @staticmethod
@@ -92,6 +92,9 @@ class CppDateReferenceTest(unittest.TestCase):
                 "date_to_injection_date",
                 "date_to_legacy_nntp_posting_date",
                 "injection_date_to_legacy_nntp_posting_date",
+                "date_to_expires",
+                "injection_date_to_expires",
+                "legacy_nntp_posting_date_to_expires",
             )
         }
 
@@ -163,6 +166,7 @@ class CppDateReferenceTest(unittest.TestCase):
             b"Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n"
             b"Injection-Date: 01 Jan 2024 01:00:00 +0000\r\n"
             b"NNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\n"
+            b"Expires: 02 Jan 2024 00:00:00 +0000\r\n"
         )
         self.assert_full(ordinary, {
             "date": self.full_source(valid, 1704067200, [self.full_candidate(
@@ -174,10 +178,16 @@ class CppDateReferenceTest(unittest.TestCase):
             "legacy_nntp_posting_date": self.full_source(valid, 1704067200, [self.full_candidate(
                 b"NNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\n", b" 31 Dec 2023 19:00:00 -0500", [3],
                 valid, 1704067200, "-0500", -300, False, True, False)]),
+            "expires": self.full_source(valid, 1704153600, [self.full_candidate(
+                b"Expires: 02 Jan 2024 00:00:00 +0000\r\n", b" 02 Jan 2024 00:00:00 +0000", [4],
+                valid, 1704153600, "+0000", 0, False, True, False)]),
         }, {
             "date_to_injection_date": self.relation("compared", valid, valid, 3600, "before"),
             "date_to_legacy_nntp_posting_date": self.relation("compared", valid, valid, 0, "equal"),
             "injection_date_to_legacy_nntp_posting_date": self.relation("compared", valid, valid, -3600, "after"),
+            "date_to_expires": self.relation("compared", valid, valid, 86400, "before"),
+            "injection_date_to_expires": self.relation("compared", valid, valid, 82800, "before"),
+            "legacy_nntp_posting_date_to_expires": self.relation("compared", valid, valid, 86400, "before"),
         })
         folded = (b"Subject: folded offline date\r\ndAtE: 01 Jan 2024\r\n\t00:00 -0000\r\n"
                   b"Injection-Date: 01 Jan 2024 00:00:00 GMT\r\n")
@@ -189,10 +199,14 @@ class CppDateReferenceTest(unittest.TestCase):
                 b"Injection-Date: 01 Jan 2024 00:00:00 GMT\r\n", b" 01 Jan 2024 00:00:00 GMT", [4],
                 valid, 1704067200, "GMT", 0, False, True, False)]),
             "legacy_nntp_posting_date": empty,
+            "expires": empty,
         }, {
             "date_to_injection_date": self.relation("compared", valid, valid, 0, "equal"),
             "date_to_legacy_nntp_posting_date": self.relation("source_unavailable", valid, missing, None, None),
             "injection_date_to_legacy_nntp_posting_date": self.relation("source_unavailable", valid, missing, None, None),
+            "date_to_expires": self.relation("source_unavailable", valid, missing, None, None),
+            "injection_date_to_expires": self.relation("source_unavailable", valid, missing, None, None),
+            "legacy_nntp_posting_date_to_expires": self.relation("source_unavailable", missing, missing, None, None),
         })
         raw = b"Date: 01 Jan 2024 00:00:00 +0000\r\n"
         duplicates = raw * 257
@@ -204,10 +218,14 @@ class CppDateReferenceTest(unittest.TestCase):
                 "+0000", 0, False, True, False) for line in range(1, 257)]),
             "injection_date": empty,
             "legacy_nntp_posting_date": empty,
+            "expires": empty,
         }, {
             "date_to_injection_date": self.relation("source_unavailable", "budget_exceeded", missing, None, None),
             "date_to_legacy_nntp_posting_date": self.relation("source_unavailable", "budget_exceeded", missing, None, None),
             "injection_date_to_legacy_nntp_posting_date": self.relation("source_unavailable", missing, missing, None, None),
+            "date_to_expires": self.relation("source_unavailable", "budget_exceeded", missing, None, None),
+            "injection_date_to_expires": self.relation("source_unavailable", missing, missing, None, None),
+            "legacy_nntp_posting_date_to_expires": self.relation("source_unavailable", missing, missing, None, None),
         })
         calendar, zone, octet = "invalid_calendar_or_time", "unsupported_absolute_timezone", "invalid_octet_or_folding"
         self.assert_full(
@@ -222,10 +240,14 @@ class CppDateReferenceTest(unittest.TestCase):
                 "legacy_nntp_posting_date": self.full_source(octet, None, [self.full_candidate(
                     b"NNTP-Posting-Date: 01 Jan 2024 00:00:00 +0000\0\r\n", b" 01 Jan 2024 00:00:00 +0000\0", [3],
                     octet, None)]),
+                "expires": empty,
             }, {
                 "date_to_injection_date": self.relation("source_unavailable", calendar, zone, None, None),
                 "date_to_legacy_nntp_posting_date": self.relation("source_unavailable", calendar, octet, None, None),
                 "injection_date_to_legacy_nntp_posting_date": self.relation("source_unavailable", zone, octet, None, None),
+                "date_to_expires": self.relation("source_unavailable", calendar, missing, None, None),
+                "injection_date_to_expires": self.relation("source_unavailable", zone, missing, None, None),
+                "legacy_nntp_posting_date_to_expires": self.relation("source_unavailable", octet, missing, None, None),
             })
 
     def test_full_positive_boundary_evidence(self) -> None:
@@ -272,6 +294,8 @@ class CppDateReferenceTest(unittest.TestCase):
                 self.assertEqual(metadata["date"]["candidates"][0]["source_line_indices"], [1])
                 self.assertEqual(metadata["reported_clock_relations"]["date_to_injection_date"],
                                  self.relation("source_unavailable", status, "missing", None, None))
+                self.assertEqual(metadata["reported_clock_relations"]["date_to_expires"],
+                                 self.relation("source_unavailable", status, "missing", None, None))
 
     def test_exact_occurrence_limit_and_duplicates_are_distinct(self) -> None:
         for count, status in [(255, "duplicate"), (256, "budget_exceeded")]:
@@ -285,28 +309,40 @@ class CppDateReferenceTest(unittest.TestCase):
     def test_one_duplicate_source_does_not_disable_the_other_pair(self) -> None:
         metadata = self.parse(b"Date: 01 Jan 1970 00:00:00 +0000\r\n" * 2
                               + b"Injection-Date: 01 Jan 1970 00:00:01 +0000\r\n"
-                              + b"NNTP-Posting-Date: 01 Jan 1970 00:00:02 +0000\r\n")
+                              + b"NNTP-Posting-Date: 01 Jan 1970 00:00:02 +0000\r\n"
+                              + b"Expires: 01 Jan 1970 00:00:05 +0000\r\n")
         self.assertEqual(metadata["date"]["parse_status"], "duplicate")
         self.assertEqual(metadata["reported_clock_relations"]["date_to_injection_date"],
                          self.relation("source_unavailable", "duplicate", "valid", None, None))
+        self.assertEqual(metadata["reported_clock_relations"]["date_to_expires"],
+                         self.relation("source_unavailable", "duplicate", "valid", None, None))
         self.assertEqual(metadata["reported_clock_relations"]["injection_date_to_legacy_nntp_posting_date"],
                          self.relation("compared", "valid", "valid", 1, "before"))
+        self.assertEqual(metadata["reported_clock_relations"]["injection_date_to_expires"],
+                         self.relation("compared", "valid", "valid", 4, "before"))
+        self.assertEqual(metadata["reported_clock_relations"]["legacy_nntp_posting_date_to_expires"],
+                         self.relation("compared", "valid", "valid", 3, "before"))
 
     def test_ordinary_offsets_produce_all_three_literal_relations(self) -> None:
         valid = "valid"
         self.assert_projection(
             b"Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n"
             b"Injection-Date: Thu, 01 Jan 1970 01:00:00 +0000\r\n"
-            b"NNTP-Posting-Date: Wed, 31 Dec 1969 19:00:00 -0500\r\n",
+            b"NNTP-Posting-Date: Wed, 31 Dec 1969 19:00:00 -0500\r\n"
+            b"Expires: Thu, 01 Jan 1970 02:00:00 +0000\r\n",
             {
                 "date": {"parse_status": valid, "utc_epoch_seconds": 0, "candidates": [self.candidate(valid, 0, [1])]},
                 "injection_date": {"parse_status": valid, "utc_epoch_seconds": 3600, "candidates": [self.candidate(valid, 3600, [2])]},
                 "legacy_nntp_posting_date": {"parse_status": valid, "utc_epoch_seconds": 0, "candidates": [self.candidate(valid, 0, [3])]},
+                "expires": {"parse_status": valid, "utc_epoch_seconds": 7200, "candidates": [self.candidate(valid, 7200, [4])]},
             },
             {
                 "date_to_injection_date": self.relation("compared", valid, valid, 3600, "before"),
                 "date_to_legacy_nntp_posting_date": self.relation("compared", valid, valid, 0, "equal"),
                 "injection_date_to_legacy_nntp_posting_date": self.relation("compared", valid, valid, -3600, "after"),
+                "date_to_expires": self.relation("compared", valid, valid, 7200, "before"),
+                "injection_date_to_expires": self.relation("compared", valid, valid, 3600, "before"),
+                "legacy_nntp_posting_date_to_expires": self.relation("compared", valid, valid, 7200, "before"),
             },
         )
 
@@ -315,16 +351,21 @@ class CppDateReferenceTest(unittest.TestCase):
         metadata = self.assert_projection(
             b"Date: Thu, 01 Jan 1970\r\n 00:00:00 -0000\r\n"
             b"Injection-Date: Thu, 01 Jan 1970 01:00:00 +0100\r\n"
-            b"NNTP-Posting-Date: Thu, 01 Jan 1970 00:00:00 GMT\r\n",
+            b"NNTP-Posting-Date: Thu, 01 Jan 1970 00:00:00 GMT\r\n"
+            b"Expires: Thu, 01 Jan 1970 00:00:00 UT\r\n",
             {
                 "date": {"parse_status": valid, "utc_epoch_seconds": 0, "candidates": [self.candidate(valid, 0, [1, 2])]},
                 "injection_date": {"parse_status": valid, "utc_epoch_seconds": 0, "candidates": [self.candidate(valid, 0, [3])]},
                 "legacy_nntp_posting_date": {"parse_status": valid, "utc_epoch_seconds": 0, "candidates": [self.candidate(valid, 0, [4])]},
+                "expires": {"parse_status": valid, "utc_epoch_seconds": 0, "candidates": [self.candidate(valid, 0, [5])]},
             },
             {
                 "date_to_injection_date": self.relation("compared", valid, valid, 0, "equal"),
                 "date_to_legacy_nntp_posting_date": self.relation("compared", valid, valid, 0, "equal"),
                 "injection_date_to_legacy_nntp_posting_date": self.relation("compared", valid, valid, 0, "equal"),
+                "date_to_expires": self.relation("compared", valid, valid, 0, "equal"),
+                "injection_date_to_expires": self.relation("compared", valid, valid, 0, "equal"),
+                "legacy_nntp_posting_date_to_expires": self.relation("compared", valid, valid, 0, "equal"),
             },
         )
         self.assertIs(metadata["date"]["candidates"][0]["timezone_local_offset_unknown"], True)
@@ -340,11 +381,15 @@ class CppDateReferenceTest(unittest.TestCase):
                 "date": {"parse_status": budget, "utc_epoch_seconds": None, "candidates": candidates},
                 "injection_date": {"parse_status": missing, "utc_epoch_seconds": None, "candidates": []},
                 "legacy_nntp_posting_date": {"parse_status": missing, "utc_epoch_seconds": None, "candidates": []},
+                "expires": {"parse_status": missing, "utc_epoch_seconds": None, "candidates": []},
             },
             {
                 "date_to_injection_date": self.relation("source_unavailable", budget, missing, None, None),
                 "date_to_legacy_nntp_posting_date": self.relation("source_unavailable", budget, missing, None, None),
                 "injection_date_to_legacy_nntp_posting_date": self.relation("source_unavailable", missing, missing, None, None),
+                "date_to_expires": self.relation("source_unavailable", budget, missing, None, None),
+                "injection_date_to_expires": self.relation("source_unavailable", missing, missing, None, None),
+                "legacy_nntp_posting_date_to_expires": self.relation("source_unavailable", missing, missing, None, None),
             },
         )
 
@@ -352,6 +397,7 @@ class CppDateReferenceTest(unittest.TestCase):
         calendar = "invalid_calendar_or_time"
         zone = "unsupported_absolute_timezone"
         octet = "invalid_octet_or_folding"
+        missing = "missing"
         self.assert_projection(
             b"Date: Sat, 31 Feb 2024 00:00:00 +0000\r\n"
             b"Injection-Date: 01 Jan 2024 00:00:00 PST\r\n"
@@ -360,11 +406,15 @@ class CppDateReferenceTest(unittest.TestCase):
                 "date": {"parse_status": calendar, "utc_epoch_seconds": None, "candidates": [self.candidate(calendar, None, [1])]},
                 "injection_date": {"parse_status": zone, "utc_epoch_seconds": None, "candidates": [self.candidate(zone, None, [2])]},
                 "legacy_nntp_posting_date": {"parse_status": octet, "utc_epoch_seconds": None, "candidates": [self.candidate(octet, None, [3])]},
+                "expires": {"parse_status": missing, "utc_epoch_seconds": None, "candidates": []},
             },
             {
                 "date_to_injection_date": self.relation("source_unavailable", calendar, zone, None, None),
                 "date_to_legacy_nntp_posting_date": self.relation("source_unavailable", calendar, octet, None, None),
                 "injection_date_to_legacy_nntp_posting_date": self.relation("source_unavailable", zone, octet, None, None),
+                "date_to_expires": self.relation("source_unavailable", calendar, missing, None, None),
+                "injection_date_to_expires": self.relation("source_unavailable", zone, missing, None, None),
+                "legacy_nntp_posting_date_to_expires": self.relation("source_unavailable", octet, missing, None, None),
             },
         )
 
@@ -372,7 +422,7 @@ class CppDateReferenceTest(unittest.TestCase):
         missing = "missing"
         expected_sources = {
             name: {"parse_status": missing, "utc_epoch_seconds": None, "candidates": []}
-            for name in ("date", "injection_date", "legacy_nntp_posting_date")
+            for name in ("date", "injection_date", "legacy_nntp_posting_date", "expires")
         }
         expected_relations = {
             name: self.relation("source_unavailable", missing, missing, None, None)
@@ -380,6 +430,9 @@ class CppDateReferenceTest(unittest.TestCase):
                 "date_to_injection_date",
                 "date_to_legacy_nntp_posting_date",
                 "injection_date_to_legacy_nntp_posting_date",
+                "date_to_expires",
+                "injection_date_to_expires",
+                "legacy_nntp_posting_date_to_expires",
             )
         }
         self.assert_projection(
@@ -404,11 +457,15 @@ class CppDateReferenceTest(unittest.TestCase):
                 "date": {"parse_status": valid, "utc_epoch_seconds": 0, "candidates": [self.candidate(valid, 0, [2])]},
                 "injection_date": {"parse_status": missing, "utc_epoch_seconds": None, "candidates": []},
                 "legacy_nntp_posting_date": {"parse_status": missing, "utc_epoch_seconds": None, "candidates": []},
+                "expires": {"parse_status": missing, "utc_epoch_seconds": None, "candidates": []},
             },
             {
                 "date_to_injection_date": self.relation("source_unavailable", valid, missing, None, None),
                 "date_to_legacy_nntp_posting_date": self.relation("source_unavailable", valid, missing, None, None),
                 "injection_date_to_legacy_nntp_posting_date": self.relation("source_unavailable", missing, missing, None, None),
+                "date_to_expires": self.relation("source_unavailable", valid, missing, None, None),
+                "injection_date_to_expires": self.relation("source_unavailable", missing, missing, None, None),
+                "legacy_nntp_posting_date_to_expires": self.relation("source_unavailable", missing, missing, None, None),
             },
         )
         self.assertFalse(self.parse_dates(None, 1))
