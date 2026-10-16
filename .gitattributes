@@ -120,3 +120,11 @@ docker/Makefile		-binary text eol=lf
 
 /tests/Unit/test_benchmark_concurrency.py -binary text eol=lf
 /tests/Unit/test_composer_install_retry.py -binary text eol=lf
+
+# The C++ date reference and its literal oracle are reviewable source.
+/scripts/benchmark-date-cpp.cpp -binary text eol=lf
+/tests/Unit/test_date_cpp_reference.py -binary text eol=lf
+/scripts/benchmark-file-limit.py -binary text eol=lf
+/tests/Unit/test_benchmark_file_limit.py -binary text eol=lf
+/scripts/benchmark-date-build.py -binary text eol=lf
+/tests/Unit/test_benchmark_date_build.py -binary text eol=lf

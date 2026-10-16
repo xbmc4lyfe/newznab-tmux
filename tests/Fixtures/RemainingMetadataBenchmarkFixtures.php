@@ -27,7 +27,7 @@ final class RemainingMetadataBenchmarkFixtures
             foreach ($names as $name) {
                 $result[$module.'-'.$name] = ['module' => 'article_'.$module,
                     'category' => str_starts_with($name, 'uncommon-') ? 'uncommon' : 'common',
-                    'comparison_scope' => 'bounded-reference-shared-projection-v1'];
+                    'comparison_scope' => $module === 'dates' ? 'bounded-reference-date-clock-projection-v2' : 'bounded-reference-shared-projection-v1'];
             }
         }
 
@@ -69,6 +69,18 @@ final class RemainingMetadataBenchmarkFixtures
                     'injection_date' => self::dateSource('unsupported_absolute_timezone', [self::dateCandidate('unsupported_absolute_timezone', null, [2])]),
                     'legacy_nntp_posting_date' => self::dateSource('invalid_octet_or_folding', [self::dateCandidate('invalid_octet_or_folding', null, [3])])];
             }
+            $tuples = match ($name) {
+                'dates-ordinary' => [['compared', 'valid', 'valid', 3600, 'before'], ['compared', 'valid', 'valid', 0, 'equal'], ['compared', 'valid', 'valid', -3600, 'after']],
+                'dates-folded' => [['compared', 'valid', 'valid', 0, 'equal'], ['source_unavailable', 'valid', 'missing', null, null], ['source_unavailable', 'valid', 'missing', null, null]],
+                'dates-uncommon-duplicates' => [['source_unavailable', 'budget_exceeded', 'missing', null, null], ['source_unavailable', 'budget_exceeded', 'missing', null, null], ['source_unavailable', 'missing', 'missing', null, null]],
+                default => [['source_unavailable', 'invalid_calendar_or_time', 'unsupported_absolute_timezone', null, null], ['source_unavailable', 'invalid_calendar_or_time', 'invalid_octet_or_folding', null, null], ['source_unavailable', 'unsupported_absolute_timezone', 'invalid_octet_or_folding', null, null]],
+            };
+            $expected['reported_clock_relations'] = array_combine(
+                ['date_to_injection_date', 'date_to_legacy_nntp_posting_date', 'injection_date_to_legacy_nntp_posting_date'],
+                array_map(static fn (array $tuple): array => array_combine(
+                    ['comparison_status', 'lhs_parse_status', 'rhs_parse_status', 'rhs_minus_lhs_seconds', 'lhs_order_relative_to_rhs'], $tuple,
+                ), $tuples),
+            );
         } elseif ($definition['module'] === 'article_identity') {
             $id = $fixture['requested_message_id'];
             $fixture['raw_headers'] = ["Message-ID: $id\r\n"];
@@ -195,7 +207,7 @@ final class RemainingMetadataBenchmarkFixtures
                 return ['parse_status' => $full[$key]['parse_status'], 'occurrence_count' => $full[$key]['occurrence_count'],
                     'utc_epoch_seconds' => $full[$key]['utc_epoch_seconds'], 'candidates' => array_map(static fn (array $row): array => self::dateCandidate(
                         $row['parse_status'], $row['utc_epoch_seconds'], $row['source_line_indices']), $full[$key]['candidates'])];
-            }, ['date', 'injection_date', 'legacy_nntp_posting_date'])),
+            }, ['date', 'injection_date', 'legacy_nntp_posting_date'])) + ['reported_clock_relations' => $full['reported_clock_relations']],
             'article_identity' => ['request_status' => $full['request']['syntax_status'],
                 'head' => self::identityProjection($full['head_message_id']), 'overview' => self::identityProjection($full['overview_message_id']),
                 'overview_article_number' => $full['overview_article_number'],
@@ -219,11 +231,136 @@ final class RemainingMetadataBenchmarkFixtures
         return $fixture['expected'] === $projection;
     }
 
+    /**
+     * Independent complete-output oracle for the four fixed restricted-date fixtures.
+     * Parser and syntax identifiers are intentionally excluded; every other field is literal.
+     *
+     * @param  array<string,mixed>  $fixture
+     * @return array<string,mixed>
+     */
+    public static function expectedFullDates(array $fixture): array
+    {
+        $name = $fixture['name'] ?? null;
+        if (! is_string($name) || ! in_array($name, ['dates-ordinary', 'dates-folded', 'dates-uncommon-duplicates', 'dates-uncommon-malformed'], true)
+            || ($fixture['module'] ?? null) !== 'article_dates') {
+            throw new InvalidArgumentException('Complete date oracle only covers its four fixed article-date fixtures.');
+        }
+
+        $expectedHeaders = match ($name) {
+            'dates-ordinary' => ["Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n", "Injection-Date: 01 Jan 2024 01:00:00 +0000\r\n", "NNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\n"],
+            'dates-folded' => ["Subject: folded offline date\r\n", "dAtE: 01 Jan 2024\r\n", "\t00:00 -0000\r\n", "Injection-Date: 01 Jan 2024 00:00:00 GMT\r\n"],
+            'dates-uncommon-duplicates' => self::padHeaders(array_fill(0, 257, "Date: 01 Jan 2024 00:00:00 +0000\r\n")),
+            default => ["Date: 31 Feb 2024 00:00:00 +0000\r\n", "Injection-Date: 01 Jan 2024 00:00:00 PST\r\n", "NNTP-Posting-Date: 01 Jan 2024 00:00:00 +0000\0\r\n"],
+        };
+        if (($fixture['raw_headers'] ?? null) !== $expectedHeaders) {
+            throw new InvalidArgumentException('Complete date oracle input differs from its fixed literal fixture.');
+        }
+
+        $epochBasis = 'Gregorian calendar and POSIX seconds; second 60 maps to the following POSIX second without asserting a historical leap-second event';
+        $candidate = static function (string $raw, string $value, array $lines, string $status, ?int $epoch,
+            ?string $timezone, ?int $offset, ?bool $unknown, ?bool $seconds, ?bool $leap, ?bool $weekday) use ($epochBasis): array {
+            return ['source_line_indices' => $lines, 'raw_field_hex' => bin2hex($raw), 'unfolded_value_hex' => bin2hex($value),
+                'parse_status' => $status, 'utc_epoch_seconds' => $epoch, 'timezone_token' => $timezone,
+                'timezone_offset_minutes' => $offset, 'timezone_local_offset_unknown' => $unknown,
+                'seconds_present' => $seconds, 'leap_second' => $leap,
+                'weekday_matches_calendar' => $weekday, 'epoch_basis' => $epochBasis];
+        };
+        $source = static fn (string $status, array $candidates, ?int $epoch): array => [
+            'parse_status' => $status,
+            'occurrence_count' => count($candidates),
+            'occurrence_count_basis' => 'retained candidates; the total may be larger when budget_exceeded',
+            'candidates' => $candidates,
+            'utc_epoch_seconds' => $epoch,
+        ];
+        $missing = $source('missing', [], null);
+        $unavailable = static fn (string $lhs, string $rhs): array => [
+            'comparison_status' => 'source_unavailable', 'lhs_parse_status' => $lhs, 'rhs_parse_status' => $rhs,
+            'rhs_minus_lhs_seconds' => null, 'lhs_order_relative_to_rhs' => null,
+        ];
+        $compared = static fn (int $delta): array => [
+            'comparison_status' => 'compared', 'lhs_parse_status' => 'valid', 'rhs_parse_status' => 'valid',
+            'rhs_minus_lhs_seconds' => $delta, 'lhs_order_relative_to_rhs' => $delta > 0 ? 'before' : ($delta < 0 ? 'after' : 'equal'),
+        ];
+
+        if ($name === 'dates-ordinary') {
+            $date = $source('valid', [$candidate("Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n", ' Mon, 01 Jan 2024 00:00:00 +0000', [1], 'valid', 1704067200, '+0000', 0, false, true, false, true)], 1704067200);
+            $injection = $source('valid', [$candidate("Injection-Date: 01 Jan 2024 01:00:00 +0000\r\n", ' 01 Jan 2024 01:00:00 +0000', [2], 'valid', 1704070800, '+0000', 0, false, true, false, null)], 1704070800);
+            $legacy = $source('valid', [$candidate("NNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\n", ' 31 Dec 2023 19:00:00 -0500', [3], 'valid', 1704067200, '-0500', -300, false, true, false, null)], 1704067200);
+            $relations = [$compared(3600), $compared(0), $compared(-3600)];
+        } elseif ($name === 'dates-folded') {
+            $date = $source('valid', [$candidate("dAtE: 01 Jan 2024\r\n\t00:00 -0000\r\n", " 01 Jan 2024\t00:00 -0000", [2, 3], 'valid', 1704067200, '-0000', 0, true, false, false, null)], 1704067200);
+            $injection = $source('valid', [$candidate("Injection-Date: 01 Jan 2024 00:00:00 GMT\r\n", ' 01 Jan 2024 00:00:00 GMT', [4], 'valid', 1704067200, 'GMT', 0, false, true, false, null)], 1704067200);
+            $legacy = $missing;
+            $relations = [$compared(0), $unavailable('valid', 'missing'), $unavailable('valid', 'missing')];
+        } elseif ($name === 'dates-uncommon-duplicates') {
+            $raw = "Date: 01 Jan 2024 00:00:00 +0000\r\n";
+            $dateCandidate = $candidate($raw, ' 01 Jan 2024 00:00:00 +0000', [], 'valid', 1704067200, '+0000', 0, false, true, false, null);
+            $candidates = [];
+            for ($line = 1; $line <= 256; $line++) {
+                $candidates[] = [...$dateCandidate, 'source_line_indices' => [$line]];
+            }
+            $date = $source('budget_exceeded', $candidates, null);
+            $injection = $legacy = $missing;
+            $relations = [$unavailable('budget_exceeded', 'missing'), $unavailable('budget_exceeded', 'missing'), $unavailable('missing', 'missing')];
+        } else {
+            $dateStatus = 'invalid_calendar_or_time';
+            $injectionStatus = 'unsupported_absolute_timezone';
+            $legacyStatus = 'invalid_octet_or_folding';
+            $date = $source($dateStatus, [$candidate("Date: 31 Feb 2024 00:00:00 +0000\r\n", ' 31 Feb 2024 00:00:00 +0000', [1], $dateStatus, null, '+0000', 0, false, true, false, null)], null);
+            $injection = $source($injectionStatus, [$candidate("Injection-Date: 01 Jan 2024 00:00:00 PST\r\n", ' 01 Jan 2024 00:00:00 PST', [2], $injectionStatus, null, 'PST', null, null, null, null, null)], null);
+            $legacy = $source($legacyStatus, [$candidate("NNTP-Posting-Date: 01 Jan 2024 00:00:00 +0000\0\r\n", " 01 Jan 2024 00:00:00 +0000\0", [3], $legacyStatus, null, null, null, null, null, null, null)], null);
+            $relations = [$unavailable($dateStatus, $injectionStatus), $unavailable($dateStatus, $legacyStatus), $unavailable($injectionStatus, $legacyStatus)];
+        }
+
+        return self::normalizeFullDates([
+            'schema_version' => 2,
+            'date' => $date,
+            'injection_date' => $injection,
+            'legacy_nntp_posting_date' => $legacy,
+            'reported_clock_relations' => array_combine(
+                ['date_to_injection_date', 'date_to_legacy_nntp_posting_date', 'injection_date_to_legacy_nntp_posting_date'], $relations,
+            ),
+            'interpretation' => 'Absolute header timestamps describe reported composition or injection clocks; they do not measure uploader bandwidth or establish uploader location. A -0000 zone gives UTC time without information about the originating local timezone.',
+        ]);
+    }
+
+    /**
+     * Remove only top-level parser-identification strings and canonicalize object key order.
+     * Lists remain ordered because their order is semantic provenance.
+     *
+     * @param  array<string,mixed>  $full
+     * @return array<string,mixed>
+     */
+    public static function normalizeFullDates(array $full): array
+    {
+        unset($full['parser_engine'], $full['syntax_profile']);
+
+        $normalize = static function (mixed $value) use (&$normalize): mixed {
+            if (! is_array($value)) {
+                return $value;
+            }
+            foreach ($value as $key => $child) {
+                $value[$key] = $normalize($child);
+            }
+            if (! array_is_list($value)) {
+                ksort($value, SORT_STRING);
+            }
+
+            return $value;
+        };
+
+        /** @var array<string,mixed> $normalized */
+        $normalized = $normalize($full);
+
+        return $normalized;
+    }
+
     /** @return list<string> */
     public static function sourcePaths(): array
     {
         return ['app/Services/Releases/Fingerprint/NativeMetadataParser.php',
-            'tests/Fixtures/RemainingMetadataBenchmarkFixtures.php', 'tests/Unit/RemainingMetadataBenchmarkFixturesTest.php'];
+            'tests/Fixtures/RemainingMetadataBenchmarkFixtures.php', 'tests/Unit/RemainingMetadataBenchmarkFixturesTest.php',
+            'scripts/benchmark-date-cpp.cpp', 'tests/Unit/test_date_cpp_reference.py', 'tests/Unit/CppDateWorkerTest.php'];
     }
 
     /** @return list<string> */
@@ -290,6 +427,17 @@ final class RemainingMetadataBenchmarkFixtures
             $status = strlen($headers) > 65536 || count($candidates) >= 256 ? 'budget_exceeded'
                 : (count($candidates) > 1 ? 'duplicate' : ($candidates[0]['parse_status'] ?? 'missing'));
             $result[$key] = self::dateSource($status, $candidates);
+        }
+
+        foreach ([['date', 'injection_date'], ['date', 'legacy_nntp_posting_date'], ['injection_date', 'legacy_nntp_posting_date']] as [$lhs, $rhs]) {
+            $available = $result[$lhs]['parse_status'] === 'valid' && $result[$rhs]['parse_status'] === 'valid';
+            $delta = $available ? $result[$rhs]['utc_epoch_seconds'] - $result[$lhs]['utc_epoch_seconds'] : null;
+            $result['reported_clock_relations'][$lhs.'_to_'.$rhs] = [
+                'comparison_status' => $available ? 'compared' : 'source_unavailable',
+                'lhs_parse_status' => $result[$lhs]['parse_status'], 'rhs_parse_status' => $result[$rhs]['parse_status'],
+                'rhs_minus_lhs_seconds' => $delta,
+                'lhs_order_relative_to_rhs' => $available ? ($delta > 0 ? 'before' : ($delta < 0 ? 'after' : 'equal')) : null,
+            ];
         }
 
         return $result;

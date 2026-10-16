@@ -1029,6 +1029,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn article_dates_export_preserves_clock_relations_and_owned_json() {
+        for (input, expected) in [
+            (
+                b"Date: 01 Jan 2024 00:00:00 +0000\r\nInjection-Date: 01 Jan 2024 01:00:00 +0000\r\nNNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\n".as_slice(),
+                [
+                    ("compared", "valid", "valid", Some(3600), Some("before")),
+                    ("compared", "valid", "valid", Some(0), Some("equal")),
+                    ("compared", "valid", "valid", Some(-3600), Some("after")),
+                ],
+            ),
+            (
+                b"Date: bad\r\nInjection-Date: 01 Jan 2024 01:00:00 +0000\r\n".as_slice(),
+                [
+                    ("source_unavailable", "malformed_or_unsupported_absolute_date", "valid", None, None),
+                    ("source_unavailable", "malformed_or_unsupported_absolute_date", "missing", None, None),
+                    ("source_unavailable", "valid", "missing", None, None),
+                ],
+            ),
+        ] {
+            let output = unsafe { nntmux_article_dates_v1_json(input.as_ptr(), input.len()) };
+            assert!(!output.is_null());
+            let bytes = unsafe { CStr::from_ptr(output) }.to_bytes().to_owned();
+            unsafe { nntmux_metadata_string_free(output) };
+            let metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(metadata["schema_version"], 2);
+            assert_eq!(metadata["parser_engine"], "nntmux-rust-article-dates");
+            let relations = &metadata["reported_clock_relations"];
+            assert_eq!(relations.as_object().unwrap().len(), 3);
+            for (pair, (status, lhs, rhs, delta, order)) in [
+                "date_to_injection_date",
+                "date_to_legacy_nntp_posting_date",
+                "injection_date_to_legacy_nntp_posting_date",
+            ].into_iter().zip(expected) {
+                assert_eq!(relations[pair], serde_json::json!({
+                    "comparison_status": status,
+                    "lhs_parse_status": lhs,
+                    "rhs_parse_status": rhs,
+                    "rhs_minus_lhs_seconds": delta,
+                    "lhs_order_relative_to_rhs": order,
+                }));
+            }
+        }
+        assert!(unsafe { nntmux_article_dates_v1_json(ptr::null(), 1) }.is_null());
+        let oversized = vec![b'X'; 65_537];
+        assert!(
+            unsafe { nntmux_article_dates_v1_json(oversized.as_ptr(), oversized.len()) }.is_null()
+        );
+        for input in [None, Some(&oversized[..65_536])] {
+            let (pointer, length) =
+                input.map_or((ptr::null(), 0), |bytes| (bytes.as_ptr(), bytes.len()));
+            let output = unsafe { nntmux_article_dates_v1_json(pointer, length) };
+            assert!(!output.is_null());
+            let bytes = unsafe { CStr::from_ptr(output) }.to_bytes().to_owned();
+            unsafe { nntmux_metadata_string_free(output) };
+            let metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(metadata["schema_version"], 2);
+            assert_eq!(metadata["date"]["parse_status"], "missing");
+        }
+    }
+
+    #[test]
     fn payload_kernel_export_reports_the_runtime_selector_without_decoding() {
         let selected = nntmux_yenc_payload_kernel_v1();
         assert!(selected <= 4);
@@ -1109,7 +1170,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "experimental-xz-index")]
     pub(crate) fn observed_allocations<T>(operation: impl FnOnce() -> T) -> (T, usize) {
         struct StopCounting;
         impl Drop for StopCounting {
@@ -1124,6 +1184,19 @@ mod tests {
         let result = operation();
         drop(stop);
         (result, ALLOCATION_COUNT.with(Cell::get))
+    }
+
+    #[test]
+    fn article_dates_do_not_allocate_for_unrelated_headers() {
+        let input = b"Subject: unrelated\r\n\tfolded subject\r\nX-Trace: unrelated\r\n\r\nDate: 01 Jan 2024 00:00 +0000\r\n";
+        let (metadata, allocations) = observed_allocations(|| article_dates::parse(input));
+        assert_eq!(metadata.date.parse_status, "missing");
+        assert_eq!(metadata.injection_date.parse_status, "missing");
+        assert_eq!(metadata.legacy_nntp_posting_date.parse_status, "missing");
+        assert_eq!(
+            allocations, 0,
+            "unrelated fields have no retained date evidence"
+        );
     }
 
     #[test]
