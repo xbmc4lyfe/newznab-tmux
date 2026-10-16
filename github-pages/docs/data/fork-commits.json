@@ -1,7 +1,7 @@
 {
-  "snapshot_head": "a4d52f4e0da633bf3bc8163e61ef6f2291f87abc",
+  "snapshot_head": "5e3b45c2a12650504accea96cd0d34f468d8c906",
   "upstream_baseline": "2fef08b34e4e6cced23333bd186b28a09e94ea2f",
-  "fork_only_commit_count": 213,
+  "fork_only_commit_count": 219,
   "association_source": "GitHub associated-PR API and commit subjects; unknown commits explicitly marked unassociated",
   "commits": [
     {
@@ -6355,6 +6355,255 @@
       ],
       "pull_request_urls": [
         "https://github.com/xbmc4lyfe/newznab-tmux/pull/221"
+      ]
+    },
+    {
+      "sha": "a6a054768795262165eda48135de3fdc23eb9463",
+      "subject": "Add reported article clock relations and complete Rust/C++ date evidence (#217)",
+      "parents": [
+        "a4d52f4e0da633bf3bc8163e61ef6f2291f87abc"
+      ],
+      "authored_at": "2026-10-16T10:54:50+02:00",
+      "committed_at": "2026-10-16T10:54:50+02:00",
+      "pull_requests": [
+        217
+      ],
+      "association": "merged_pull_request",
+      "first_parent_changed_paths": [
+        ".gitattributes",
+        ".github/workflows/archive-sample-performance.yml",
+        "app/Services/Releases/Fingerprint/NativeMetadataParser.php",
+        "app/Services/Releases/Fingerprint/ReleaseFingerprintCollector.php",
+        "docker/app/nzb-yenc-ffi/src/article_dates.rs",
+        "docker/app/nzb-yenc-ffi/src/lib.rs",
+        "scripts/benchmark-date-build.py",
+        "scripts/benchmark-date-cpp.cpp",
+        "scripts/benchmark-file-limit.py",
+        "scripts/benchmark-remaining-modules.php",
+        "scripts/benchmark_callers_summary.py",
+        "tests/Feature/ReleaseFingerprintMetadataTest.php",
+        "tests/Fixtures/RemainingMetadataBenchmarkFixtures.php",
+        "tests/Unit/ArticleDateSchemaTest.php",
+        "tests/Unit/CppDateWorkerTest.php",
+        "tests/Unit/RemainingMetadataBenchmarkFixturesTest.php",
+        "tests/Unit/RemainingModulesBenchmarkTest.php",
+        "tests/Unit/test_benchmark_date_build.py",
+        "tests/Unit/test_benchmark_file_limit.py",
+        "tests/Unit/test_benchmark_remaining_modules_export.py",
+        "tests/Unit/test_date_cpp_reference.py"
+      ],
+      "pull_request_urls": [
+        "https://github.com/xbmc4lyfe/newznab-tmux/pull/217"
+      ]
+    },
+    {
+      "sha": "fe8b285fddbf8dbe42f053b30faefdd6e65df441",
+      "subject": "Fix PR #222 review findings and refresh ledger through PR #221 (#223)",
+      "parents": [
+        "a6a054768795262165eda48135de3fdc23eb9463"
+      ],
+      "authored_at": "2026-10-16T10:54:56+02:00",
+      "committed_at": "2026-10-16T10:54:56+02:00",
+      "pull_requests": [
+        223
+      ],
+      "association": "merged_pull_request",
+      "first_parent_changed_paths": [
+        "github-pages/docs/content/deployment.html",
+        "github-pages/docs/content/differences.html",
+        "github-pages/docs/content/evidence.html",
+        "github-pages/docs/content/performance.html",
+        "github-pages/docs/content/processing.html",
+        "github-pages/docs/content/pull-requests.html",
+        "github-pages/docs/content/releases.html",
+        "github-pages/docs/content/rust.html",
+        "github-pages/docs/data/fork-commits.json",
+        "github-pages/docs/data/fork-history.json"
+      ],
+      "pull_request_urls": [
+        "https://github.com/xbmc4lyfe/newznab-tmux/pull/223"
+      ]
+    },
+    {
+      "sha": "81dd72e46d7bfa082c6e305102d54811fd9af06f",
+      "subject": "Extract RAR4 first FILE_HEAD (0x74) metadata in Rust format parser (#224)",
+      "parents": [
+        "fe8b285fddbf8dbe42f053b30faefdd6e65df441"
+      ],
+      "authored_at": "2026-10-16T11:28:53+02:00",
+      "committed_at": "2026-10-16T11:28:53+02:00",
+      "pull_requests": [
+        224
+      ],
+      "association": "merged_pull_request",
+      "first_parent_changed_paths": [
+        ".github/workflows/yenc-performance.yml",
+        "app/Services/Releases/Fingerprint/ReleaseFingerprintCollector.php",
+        "docker/app/nzb-yenc-ffi/src/formats.rs",
+        "tests/Feature/ReleaseFingerprintMetadataTest.php",
+        "tests/Unit/ArticleDateSchemaTest.php"
+      ],
+      "pull_request_urls": [
+        "https://github.com/xbmc4lyfe/newznab-tmux/pull/224"
+      ]
+    },
+    {
+      "sha": "ef6c0d083575713b9791f32f2fe9be15b55b9bde",
+      "subject": "Synchronize upstream archive handling while preserving fork release guards (#215)",
+      "parents": [
+        "81dd72e46d7bfa082c6e305102d54811fd9af06f"
+      ],
+      "authored_at": "2026-10-16T11:38:45+02:00",
+      "committed_at": "2026-10-16T11:38:45+02:00",
+      "pull_requests": [
+        215
+      ],
+      "association": "merged_pull_request",
+      "first_parent_changed_paths": [
+        ".env.example",
+        "Dockerfile",
+        "TODO.md",
+        "app/Console/Commands/CleanNZB.php",
+        "app/Console/Commands/NntmuxOptimizeTables.php",
+        "app/Console/Commands/NntmuxResetPostProcessing.php",
+        "app/Console/Commands/TmuxStop.php",
+        "app/Console/Commands/UpdateNNTmux.php",
+        "app/Services/AdditionalProcessing/AdditionalWorkPlanner.php",
+        "app/Services/AdditionalProcessing/ArchiveExtractionService.php",
+        "app/Services/AdditionalProcessing/Config/ProcessingConfiguration.php",
+        "app/Services/AdditionalProcessing/DTO/AdditionalWorkPlan.php",
+        "app/Services/AdditionalProcessing/DTO/ArchiveCandidate.php",
+        "app/Services/AdditionalProcessing/Media/MediaArticleFetcher.php",
+        "app/Services/AdditionalProcessing/NzbContentParser.php",
+        "app/Services/AdditionalProcessing/ReleaseFileManager.php",
+        "app/Services/AdditionalProcessing/ReleaseProcessor.php",
+        "app/Services/AdditionalProcessing/SevenZipListingParser.php",
+        "app/Services/AdditionalProcessing/State/ReleaseProcessingContext.php",
+        "app/Services/NameFixing/FileNameCleaner.php",
+        "app/Services/NameFixing/NameFixingService.php",
+        "app/Services/NameFixing/ReleaseUpdateService.php",
+        "app/Services/NameFixing/SeasonPackDetector.php",
+        "app/Services/Nzb/NzbImportService.php",
+        "app/Services/Nzb/NzbService.php",
+        "app/Services/Nzb/NzbSourceGuard.php",
+        "app/Services/Nzb/NzbSourceInstallation.php",
+        "app/Services/Releases/ReleaseManagementService.php",
+        "app/Services/Releases/Verification/AuditReleaseDeletion.php",
+        "app/Services/Releases/Verification/VerifiedNzbWriter.php",
+        "app/Services/Releases/Verification/VerifiedReleasePublisher.php",
+        "app/Support/ReleaseArchiveNamingEvidence.php",
+        "composer.lock",
+        "config/nntmux.php",
+        "config/nntmux_settings.php",
+        "database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php",
+        "docker/8.5/Dockerfile",
+        "tests/Feature/AdditionalProcessingMediaIdentityTest.php",
+        "tests/Feature/AdditionalProcessingReleaseFileManagerTest.php",
+        "tests/Feature/CbpCleanupServiceTest.php",
+        "tests/Feature/ExistingImportPasswordEnrichmentTest.php",
+        "tests/Feature/MetadataRepublicationLineageTest.php",
+        "tests/Feature/NzbArticleCoverageImportTest.php",
+        "tests/Feature/NzbCreationReliabilityTest.php",
+        "tests/Feature/NzbPublishedPasswordRaceTest.php",
+        "tests/Feature/NzbPublishedPasswordReplayTest.php",
+        "tests/Feature/NzbPublisherPasswordReplayTest.php",
+        "tests/Feature/PredbAuthoritativeIdentityTest.php",
+        "tests/Feature/PredbMatchingTest.php",
+        "tests/Feature/QueuedNzbCategoryTest.php",
+        "tests/Feature/ReleaseArchiveNamingEvidenceTest.php",
+        "tests/Feature/ReleaseNameFixedRecategorizationTest.php",
+        "tests/Feature/ReleaseVerificationArtifactCleanupTest.php",
+        "tests/Feature/ReleaseVerificationAuditDeletionTest.php",
+        "tests/Feature/ReleaseVerificationCandidateLifecycleTest.php",
+        "tests/Feature/ReleaseVerificationCandidatesTest.php",
+        "tests/Feature/TmuxRuntimeTest.php",
+        "tests/Feature/UpdateNNTmuxTest.php",
+        "tests/Feature/VerifiedCollectionPolicyTest.php",
+        "tests/Feature/VerifiedReleasePasswordMetadataTest.php",
+        "tests/Feature/VerifiedReleasePublicationTest.php",
+        "tests/Fixtures/7z-list-slt.txt",
+        "tests/Support/Par2RenameTestDatabase.php",
+        "tests/Unit/AdditionalProcessing/AdditionalWorkPlannerTest.php",
+        "tests/Unit/AdditionalProcessing/ArchiveExtractionServiceTest.php",
+        "tests/Unit/AdditionalProcessing/BuildsArchiveFixtures.php",
+        "tests/Unit/AdditionalProcessing/CreatesProcessingConfiguration.php",
+        "tests/Unit/AdditionalProcessing/ReleaseProcessorTest.php",
+        "tests/Unit/NameFixing/SeasonPackDetectorTest.php",
+        "tests/Unit/NzbImportServiceTest.php",
+        "tests/Unit/Par2ProcessorStateTest.php"
+      ],
+      "pull_request_urls": [
+        "https://github.com/xbmc4lyfe/newznab-tmux/pull/215"
+      ]
+    },
+    {
+      "sha": "3df5f4bf6bf16402f4763a2e42a381a32459ebbf",
+      "subject": "feat(yenc): replace RapidYenc with native Rust ABI decoder (#174)",
+      "parents": [
+        "ef6c0d083575713b9791f32f2fe9be15b55b9bde"
+      ],
+      "authored_at": "2026-10-16T12:57:57+02:00",
+      "committed_at": "2026-10-16T12:57:57+02:00",
+      "pull_requests": [
+        174
+      ],
+      "association": "merged_pull_request",
+      "first_parent_changed_paths": [
+        ".gitattributes",
+        ".github/workflows/rust-clippy.yml",
+        "TODO.md",
+        "app/Services/NNTP/NNTPService.php",
+        "docker/app/nzb-yenc-ffi/Cargo.toml",
+        "docker/app/nzb-yenc-ffi/fixtures/rapidyenc-abi-v1.json",
+        "docker/app/nzb-yenc-ffi/src/abi_crc.rs",
+        "docker/app/nzb-yenc-ffi/src/abi_decoder.rs",
+        "docker/app/nzb-yenc-ffi/src/abi_decoder_arm.rs",
+        "docker/app/nzb-yenc-ffi/src/abi_decoder_x86.rs",
+        "docker/app/nzb-yenc-ffi/src/abi_receipts.rs",
+        "docker/app/nzb-yenc-ffi/src/benchmark.rs",
+        "docker/app/nzb-yenc-ffi/src/bin/install-yenc.rs",
+        "docker/app/nzb-yenc-ffi/src/bin/qualify-yenc.rs",
+        "docker/app/nzb-yenc-ffi/src/bin/verify-yenc-evidence.rs",
+        "docker/app/nzb-yenc-ffi/src/evidence.rs",
+        "docker/app/nzb-yenc-ffi/src/installation.rs",
+        "docker/app/nzb-yenc-ffi/src/lib.rs",
+        "docker/app/nzb-yenc-ffi/src/payload_decoder.rs",
+        "docker/app/nzb-yenc-ffi/src/payload_decoder_arm.rs",
+        "docker/app/nzb-yenc-ffi/src/payload_decoder_x86.rs",
+        "docker/app/nzb-yenc-ffi/src/tooling.rs",
+        "docker/app/nzb-yenc-ffi/tests/historical_report_cli.rs",
+        "docker/app/nzb-yenc-ffi/tests/installation_cli.rs",
+        "github-pages/docs/content/rust.html",
+        "scripts/benchmark_rust_inventory.py",
+        "scripts/export-benchmark-summary.py",
+        "tests/Feature/ReleaseFingerprintMetadataTest.php",
+        "tests/Unit/NNTPBodyDecodingTest.php",
+        "tests/Unit/test_benchmark_pages_completeness.py",
+        "tests/Unit/test_benchmark_rust_inventory.py",
+        "tests/Unit/test_benchmark_summary_export.py"
+      ],
+      "pull_request_urls": [
+        "https://github.com/xbmc4lyfe/newznab-tmux/pull/174"
+      ]
+    },
+    {
+      "sha": "5e3b45c2a12650504accea96cd0d34f468d8c906",
+      "subject": "Force recreate app containers during guarded deploy rollout (#226)",
+      "parents": [
+        "3df5f4bf6bf16402f4763a2e42a381a32459ebbf"
+      ],
+      "authored_at": "2026-10-16T13:00:55+02:00",
+      "committed_at": "2026-10-16T13:00:55+02:00",
+      "pull_requests": [
+        226
+      ],
+      "association": "merged_pull_request",
+      "first_parent_changed_paths": [
+        "docker/bin/deploy-app",
+        "tests/Unit/DeployMigrationOrderTest.php"
+      ],
+      "pull_request_urls": [
+        "https://github.com/xbmc4lyfe/newznab-tmux/pull/226"
       ]
     }
   ]
