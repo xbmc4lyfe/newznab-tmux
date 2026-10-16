@@ -572,6 +572,12 @@ pub enum FormatHeader {
         zip_unicode_path_records: Option<Vec<ZipUnicodePathExtra>>,
         zip_unicode_path_record_count: Option<usize>,
         zip_unicode_path_records_truncated: Option<bool>,
+        filename: Option<String>,
+        filename_display_truncated: Option<bool>,
+        resolved_filename: Option<String>,
+        resolved_filename_display_truncated: Option<bool>,
+        resolved_filename_source: Option<&'static str>,
+        resolved_filename_status: &'static str,
     },
     Gzip {
         offset: usize,
@@ -606,6 +612,11 @@ pub enum FormatHeader {
         filename_sha256_basis: Option<&'static str>,
         filename_bytes_hex: Option<String>,
         filename_bytes_hex_truncated: bool,
+        filename_utf8_valid: Option<bool>,
+        filename_latin1_printable: Option<bool>,
+        filename_encoding: Option<&'static str>,
+        filename: Option<String>,
+        filename_display_truncated: Option<bool>,
         comment_present: Option<bool>,
         comment_terminated: Option<bool>,
         comment_byte_length: Option<usize>,
@@ -614,6 +625,11 @@ pub enum FormatHeader {
         comment_sha256_basis: Option<&'static str>,
         comment_bytes_hex: Option<String>,
         comment_bytes_hex_truncated: bool,
+        comment_utf8_valid: Option<bool>,
+        comment_latin1_printable: Option<bool>,
+        comment_encoding: Option<&'static str>,
+        comment: Option<String>,
+        comment_display_truncated: Option<bool>,
         header_crc16_expected: Option<u16>,
         header_crc16_calculated: Option<u16>,
         header_crc16_valid: Option<bool>,
@@ -1055,8 +1071,10 @@ const MAX_RECORDED_GZIP_FIELD_HEX_BYTES: usize = 256;
 // Support this many non-NUL text bytes, with one bounded terminator/lookahead
 // byte. Retained previews are capped independently above.
 const MAX_GZIP_OPTIONAL_FIELD_BYTES: usize = 65_536;
+const MAX_RETAINED_GZIP_TEXT_DISPLAY_BYTES: usize = 4_096;
 const MAX_RECORDED_GZIP_EXTRA_SUBFIELD_IDS: usize = 4_096;
 const MAX_RECORDED_ZIP_FIELD_HEX_BYTES: usize = 256;
+const MAX_RETAINED_ZIP_FILENAME_DISPLAY_BYTES: usize = 4_096;
 const MAX_RECORDED_ZIP_EXTRA_FIELD_IDS: usize = 4_096;
 #[cfg(test)]
 const ISO_PVD_OFFSET: usize = 32_768;
@@ -1070,6 +1088,11 @@ struct GzipTextFieldObservation {
     sha256_basis: &'static str,
     bytes_hex: String,
     bytes_hex_truncated: bool,
+    utf8_valid: bool,
+    latin1_printable: bool,
+    encoding: &'static str,
+    decoded_text: Option<String>,
+    display_truncated: bool,
     next_offset: usize,
     complete: bool,
 }
@@ -1947,6 +1970,29 @@ fn parse_zip(data: &[u8], offset: usize) -> FormatHeader {
         zip_unicode_path_records_truncated,
         ..
     } = read_zip_local_observations(data, offset, &zip64_size_metadata);
+    let (local_filename_str, local_filename_display_truncated) = match filename_range {
+        Some(bytes) => {
+            let (s, trunc) =
+                bounded_utf8_prefix_string(bytes, MAX_RETAINED_ZIP_FILENAME_DISPLAY_BYTES);
+            (s, Some(trunc))
+        }
+        None => (None, None),
+    };
+    let (
+        resolved_filename,
+        resolved_filename_display_truncated,
+        resolved_filename_source,
+        resolved_filename_status,
+    ) = resolve_zip_filename_authority(
+        fixed_header_available,
+        filename_length,
+        filename_range,
+        flags.map(|value| value & 0x0800 != 0),
+        local_filename_str.as_ref(),
+        local_filename_display_truncated,
+        zip_unicode_path_records.as_deref(),
+        zip_unicode_path_record_count,
+    );
     FormatHeader::Zip {
         local_header_available,
         structure_valid,
@@ -1991,6 +2037,12 @@ fn parse_zip(data: &[u8], offset: usize) -> FormatHeader {
         zip_unicode_path_records,
         zip_unicode_path_record_count,
         zip_unicode_path_records_truncated,
+        filename: local_filename_str,
+        filename_display_truncated: local_filename_display_truncated,
+        resolved_filename,
+        resolved_filename_display_truncated,
+        resolved_filename_source,
+        resolved_filename_status,
         offset,
         local_file_header_signature: true,
         fixed_header_available,
@@ -2036,6 +2088,117 @@ fn parse_zip(data: &[u8], offset: usize) -> FormatHeader {
         extra_field_ids_truncated: extra_field_count > MAX_RECORDED_ZIP_EXTRA_FIELD_IDS,
         zip64_size_metadata,
     }
+}
+
+fn bounded_utf8_prefix_string(bytes: &[u8], max_bytes: usize) -> (Option<String>, bool) {
+    let Ok(full_str) = std::str::from_utf8(bytes) else {
+        return (None, bytes.len() > max_bytes);
+    };
+    if full_str.len() <= max_bytes {
+        return (Some(full_str.to_owned()), false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !full_str.is_char_boundary(end) {
+        end -= 1;
+    }
+    (Some(full_str[..end].to_owned()), true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_zip_filename_authority(
+    fixed_header_available: bool,
+    filename_length: Option<usize>,
+    filename_range: Option<&[u8]>,
+    efs_utf8_flag: Option<bool>,
+    local_filename_str: Option<&String>,
+    local_filename_display_truncated: Option<bool>,
+    unicode_path_records: Option<&[ZipUnicodePathExtra]>,
+    unicode_path_record_count: Option<usize>,
+) -> (
+    Option<String>,
+    Option<bool>,
+    Option<&'static str>,
+    &'static str,
+) {
+    if !fixed_header_available {
+        return (None, None, None, "fixed_header_incomplete");
+    }
+    if filename_length.is_some() && filename_range.is_none() {
+        return (None, None, None, "local_filename_truncated");
+    }
+    let Some(filename_bytes) = filename_range else {
+        return (None, None, None, "fixed_header_incomplete");
+    };
+    if filename_bytes.is_empty() {
+        return (Some(String::new()), Some(false), None, "empty_filename");
+    }
+
+    let records = unicode_path_records.unwrap_or_default();
+    let usable_records: Vec<&ZipUnicodePathExtra> = records
+        .iter()
+        .filter(|record| record.usable_as_filename_override)
+        .collect();
+    if let Some((first, rest)) = usable_records.split_first() {
+        let all_match = rest.iter().all(|other| {
+            other.unicode_filename_bytes_sha256 == first.unicode_filename_bytes_sha256
+        });
+        let truncated_records = unicode_path_record_count.unwrap_or(0) > records.len();
+        if !all_match || (truncated_records && !usable_records.is_empty()) {
+            return (None, None, None, "unicode_path_extra_ambiguous");
+        }
+        if efs_utf8_flag == Some(true) && first.unicode_filename_matches_efs_filename == Some(true)
+        {
+            return (
+                local_filename_str.cloned(),
+                local_filename_display_truncated,
+                Some("local_header_utf8_confirmed_by_unicode_path_extra"),
+                "resolved",
+            );
+        }
+        return (
+            first.unicode_filename.clone(),
+            first.unicode_filename_display_truncated,
+            Some("unicode_path_extra"),
+            "resolved",
+        );
+    }
+
+    if efs_utf8_flag == Some(true) {
+        if let Some(name) = local_filename_str {
+            return (
+                Some(name.clone()),
+                local_filename_display_truncated,
+                Some("local_header_utf8_flag"),
+                "resolved",
+            );
+        }
+        return (None, None, None, "utf8_flag_set_but_invalid_utf8");
+    }
+
+    if filename_bytes.is_ascii() {
+        return (
+            local_filename_str.cloned(),
+            local_filename_display_truncated,
+            Some("local_header_ascii"),
+            "resolved",
+        );
+    }
+
+    if local_filename_str.is_some() {
+        return (
+            local_filename_str.cloned(),
+            local_filename_display_truncated,
+            Some("local_header_utf8_unflagged"),
+            "resolved_unflagged_utf8",
+        );
+    }
+
+    (
+        None,
+        Some(filename_bytes.len() > MAX_RETAINED_ZIP_FILENAME_DISPLAY_BYTES),
+        None,
+        "legacy_non_utf8_without_unicode_path_extra",
+    )
 }
 
 fn parse_zip_aes_metadata(
@@ -5002,6 +5165,11 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
     let mut filename_sha256_basis = None;
     let mut filename_bytes_hex = None;
     let mut filename_bytes_hex_truncated = false;
+    let mut filename_utf8_valid = None;
+    let mut filename_latin1_printable = None;
+    let mut filename_encoding = None;
+    let mut filename = None;
+    let mut filename_display_truncated = None;
     let mut comment_terminated = None;
     let mut comment_byte_length = None;
     let mut comment_full_byte_length = None;
@@ -5009,6 +5177,11 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
     let mut comment_sha256_basis = None;
     let mut comment_bytes_hex = None;
     let mut comment_bytes_hex_truncated = false;
+    let mut comment_utf8_valid = None;
+    let mut comment_latin1_printable = None;
+    let mut comment_encoding = None;
+    let mut comment = None;
+    let mut comment_display_truncated = None;
     let mut header_crc16_expected = None;
     let mut header_crc16_calculated = None;
     let mut header_crc16_valid = None;
@@ -5052,6 +5225,11 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
             filename_sha256_basis = Some(field.sha256_basis);
             filename_bytes_hex = Some(field.bytes_hex);
             filename_bytes_hex_truncated = field.bytes_hex_truncated;
+            filename_utf8_valid = Some(field.utf8_valid);
+            filename_latin1_printable = Some(field.latin1_printable);
+            filename_encoding = Some(field.encoding);
+            filename = field.decoded_text;
+            filename_display_truncated = Some(field.display_truncated);
             cursor = field.next_offset;
             complete &= field.complete;
         }
@@ -5064,6 +5242,11 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
             comment_sha256_basis = Some(field.sha256_basis);
             comment_bytes_hex = Some(field.bytes_hex);
             comment_bytes_hex_truncated = field.bytes_hex_truncated;
+            comment_utf8_valid = Some(field.utf8_valid);
+            comment_latin1_printable = Some(field.latin1_printable);
+            comment_encoding = Some(field.encoding);
+            comment = field.decoded_text;
+            comment_display_truncated = Some(field.display_truncated);
             cursor = field.next_offset;
             complete &= field.complete;
         }
@@ -5157,6 +5340,11 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
         filename_sha256_basis,
         filename_bytes_hex,
         filename_bytes_hex_truncated,
+        filename_utf8_valid,
+        filename_latin1_printable,
+        filename_encoding,
+        filename,
+        filename_display_truncated,
         comment_present: flags.map(|value| value & 0x10 != 0),
         comment_terminated,
         comment_byte_length,
@@ -5165,6 +5353,11 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
         comment_sha256_basis,
         comment_bytes_hex,
         comment_bytes_hex_truncated,
+        comment_utf8_valid,
+        comment_latin1_printable,
+        comment_encoding,
+        comment,
+        comment_display_truncated,
         header_crc16_expected,
         header_crc16_calculated,
         header_crc16_valid,
@@ -5276,6 +5469,53 @@ fn parse_gzip_extra_subfields(extra: &[u8]) -> GzipExtraSubfieldSummary {
     summary
 }
 
+fn decode_gzip_text_bytes(
+    observed: &[u8],
+    terminated: bool,
+) -> (bool, bool, &'static str, Option<String>, bool) {
+    let utf8_valid = std::str::from_utf8(observed).is_ok();
+    let latin1_printable = observed
+        .iter()
+        .all(|&b| matches!(b, 0x09 | 0x0a | 0x0d | 0x20..=0x7e | 0xa0..=0xff));
+    let display_truncated = observed.len() > MAX_RETAINED_GZIP_TEXT_DISPLAY_BYTES;
+    if !terminated {
+        return (
+            utf8_valid,
+            latin1_printable,
+            "unterminated",
+            None,
+            display_truncated,
+        );
+    }
+    if !latin1_printable {
+        return (
+            utf8_valid,
+            false,
+            "binary_or_control_bytes",
+            None,
+            display_truncated,
+        );
+    }
+    if observed.is_ascii() {
+        let prefix = &observed[..observed.len().min(MAX_RETAINED_GZIP_TEXT_DISPLAY_BYTES)];
+        return (
+            true,
+            true,
+            "ascii",
+            std::str::from_utf8(prefix).ok().map(str::to_owned),
+            display_truncated,
+        );
+    }
+    if utf8_valid {
+        let (decoded, trunc) =
+            bounded_utf8_prefix_string(observed, MAX_RETAINED_GZIP_TEXT_DISPLAY_BYTES);
+        return (true, true, "utf8", decoded, trunc);
+    }
+    let prefix = &observed[..observed.len().min(MAX_RETAINED_GZIP_TEXT_DISPLAY_BYTES)];
+    let decoded: String = prefix.iter().map(|&b| char::from(b)).collect();
+    (false, true, "iso_8859_1", Some(decoded), display_truncated)
+}
+
 fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation {
     let Some(search_end) = cursor
         .checked_add(MAX_GZIP_OPTIONAL_FIELD_BYTES + 1)
@@ -5289,6 +5529,11 @@ fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation
             sha256_basis: "observed-prefix-sample-ended",
             bytes_hex: String::new(),
             bytes_hex_truncated: false,
+            utf8_valid: true,
+            latin1_printable: true,
+            encoding: "unterminated",
+            decoded_text: None,
+            display_truncated: false,
             next_offset: cursor,
             complete: false,
         };
@@ -5302,6 +5547,11 @@ fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation
             sha256_basis: "observed-prefix-sample-ended",
             bytes_hex: String::new(),
             bytes_hex_truncated: false,
+            utf8_valid: true,
+            latin1_printable: true,
+            encoding: "unterminated",
+            decoded_text: None,
+            display_truncated: false,
             next_offset: cursor,
             complete: false,
         };
@@ -5311,6 +5561,8 @@ fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation
     let observed = &field[..observed_length];
     let retained = &observed[..observed.len().min(MAX_RECORDED_GZIP_FIELD_HEX_BYTES)];
     let terminated = terminator.is_some();
+    let (utf8_valid, latin1_printable, encoding, decoded_text, display_truncated) =
+        decode_gzip_text_bytes(observed, terminated);
     let next = if terminated {
         cursor + observed_length + 1
     } else {
@@ -5330,6 +5582,11 @@ fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation
         },
         bytes_hex: hex(retained),
         bytes_hex_truncated: retained.len() < observed.len(),
+        utf8_valid,
+        latin1_printable,
+        encoding,
+        decoded_text,
+        display_truncated,
         next_offset: next,
         complete: terminated,
     }
@@ -6194,6 +6451,8 @@ pub struct ZipUnicodePathExtra {
     pub unicode_filename_prefix_hex: Option<String>,
     pub unicode_filename_prefix_truncated: Option<bool>,
     pub unicode_filename_utf8_valid: Option<bool>,
+    pub unicode_filename: Option<String>,
+    pub unicode_filename_display_truncated: Option<bool>,
     pub unicode_filename_bom_present: Option<bool>,
     pub unicode_filename_matches_efs_filename: Option<bool>,
     pub usable_as_filename_override: bool,
@@ -7491,6 +7750,14 @@ fn parse_zip_unicode_path_record(
     let unicode_filename = payload.get(5..);
     let unicode_filename_utf8_valid =
         unicode_filename.map(|bytes| std::str::from_utf8(bytes).is_ok());
+    let (unicode_filename_str, unicode_filename_display_truncated) = match unicode_filename {
+        Some(bytes) => {
+            let (s, trunc) =
+                bounded_utf8_prefix_string(bytes, MAX_RETAINED_ZIP_FILENAME_DISPLAY_BYTES);
+            (s, Some(trunc))
+        }
+        None => (None, None),
+    };
     let unicode_filename_bom_present =
         unicode_filename.map(|bytes| bytes.starts_with(&[0xef, 0xbb, 0xbf]));
     let efs_flag_set = flags.map(|value| value & 0x0800 != 0);
@@ -7516,6 +7783,8 @@ fn parse_zip_unicode_path_record(
             .map(|bytes| hex(&bytes[..bytes.len().min(128)])),
         unicode_filename_prefix_truncated: unicode_filename.map(|bytes| bytes.len() > 128),
         unicode_filename_utf8_valid,
+        unicode_filename: unicode_filename_str,
+        unicode_filename_display_truncated,
         unicode_filename_bom_present,
         unicode_filename_matches_efs_filename,
         usable_as_filename_override,
@@ -12768,5 +13037,130 @@ mod tests {
         );
         assert_eq!(walk["blocks"][2]["subblock_name"], "RR");
         assert_eq!(walk["blocks"][3]["header_type_name"], "end_of_archive");
+    }
+
+    #[test]
+    fn zip_and_gzip_resolve_filenames_and_unicode_path_authority() {
+        let build_zip = |flags: u16, name: &[u8], extra: &[u8]| -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(ZIP);
+            buf.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            buf.extend_from_slice(&flags.to_le_bytes());
+            buf.extend_from_slice(&8u16.to_le_bytes()); // deflate
+            buf.extend_from_slice(&0u16.to_le_bytes()); // time
+            buf.extend_from_slice(&0u16.to_le_bytes()); // date
+            buf.extend_from_slice(&0x1234_5678u32.to_le_bytes()); // crc32
+            buf.extend_from_slice(&100u32.to_le_bytes()); // compressed
+            buf.extend_from_slice(&200u32.to_le_bytes()); // uncompressed
+            buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name);
+            buf.extend_from_slice(extra);
+            buf
+        };
+
+        let build_upath_extra = |version: u8, crc32: u32, utf8_name: &[u8]| -> Vec<u8> {
+            let payload_len = 5 + utf8_name.len();
+            let mut extra = Vec::new();
+            extra.extend_from_slice(&0x7075u16.to_le_bytes());
+            extra.extend_from_slice(&(payload_len as u16).to_le_bytes());
+            extra.push(version);
+            extra.extend_from_slice(&crc32.to_le_bytes());
+            extra.extend_from_slice(utf8_name);
+            extra
+        };
+
+        // 1. Legacy CP437 local filename overridden by valid 0x7075 Info-ZIP Unicode Path extra field
+        let legacy_name = b"caf\x82.mkv";
+        let legacy_crc = crc32fast::hash(legacy_name);
+        let override_utf8 = "café.mkv".as_bytes();
+        let upath_extra = build_upath_extra(1, legacy_crc, override_utf8);
+        let zip_override = build_zip(0x0000, legacy_name, &upath_extra);
+        let json_override = serde_json::to_value(parse(&zip_override)).unwrap();
+        let h_override = &json_override["headers"][0];
+        assert!(h_override["filename"].is_null());
+        assert_eq!(h_override["filename_display_truncated"], false);
+        assert_eq!(h_override["resolved_filename"], "café.mkv");
+        assert_eq!(h_override["resolved_filename_display_truncated"], false);
+        assert_eq!(h_override["resolved_filename_source"], "unicode_path_extra");
+        assert_eq!(h_override["resolved_filename_status"], "resolved");
+        assert_eq!(
+            h_override["zip_unicode_path_records"][0]["unicode_filename"],
+            "café.mkv"
+        );
+        assert_eq!(
+            h_override["zip_unicode_path_records"][0]["unicode_filename_display_truncated"],
+            false
+        );
+
+        // 2. EFS UTF-8 flag set + matching 0x7075 extra field
+        let utf8_name = "série-01.mkv".as_bytes();
+        let utf8_crc = crc32fast::hash(utf8_name);
+        let upath_confirm = build_upath_extra(1, utf8_crc, utf8_name);
+        let zip_confirmed = build_zip(0x0800, utf8_name, &upath_confirm);
+        let json_confirmed = serde_json::to_value(parse(&zip_confirmed)).unwrap();
+        let h_confirmed = &json_confirmed["headers"][0];
+        assert_eq!(h_confirmed["filename"], "série-01.mkv");
+        assert_eq!(h_confirmed["resolved_filename"], "série-01.mkv");
+        assert_eq!(
+            h_confirmed["resolved_filename_source"],
+            "local_header_utf8_confirmed_by_unicode_path_extra"
+        );
+        assert_eq!(h_confirmed["resolved_filename_status"], "resolved");
+
+        // 3. Conflicting duplicate 0x7075 extra fields -> unicode_path_extra_ambiguous
+        let mut conflicting_extra = build_upath_extra(1, legacy_crc, "café-a.mkv".as_bytes());
+        conflicting_extra.extend_from_slice(&build_upath_extra(
+            1,
+            legacy_crc,
+            "café-b.mkv".as_bytes(),
+        ));
+        let zip_conflict = build_zip(0x0000, legacy_name, &conflicting_extra);
+        let json_conflict = serde_json::to_value(parse(&zip_conflict)).unwrap();
+        let h_conflict = &json_conflict["headers"][0];
+        assert!(h_conflict["resolved_filename"].is_null());
+        assert!(h_conflict["resolved_filename_source"].is_null());
+        assert_eq!(
+            h_conflict["resolved_filename_status"],
+            "unicode_path_extra_ambiguous"
+        );
+
+        // 4. ASCII local filename without EFS flag
+        let zip_ascii = build_zip(0x0000, b"release.r00", &[]);
+        let json_ascii = serde_json::to_value(parse(&zip_ascii)).unwrap();
+        let h_ascii = &json_ascii["headers"][0];
+        assert_eq!(h_ascii["filename"], "release.r00");
+        assert_eq!(h_ascii["resolved_filename"], "release.r00");
+        assert_eq!(h_ascii["resolved_filename_source"], "local_header_ascii");
+        assert_eq!(h_ascii["resolved_filename_status"], "resolved");
+
+        // 5. Legacy non-UTF-8 without 0x7075 extra field
+        let zip_legacy = build_zip(0x0000, legacy_name, &[]);
+        let json_legacy = serde_json::to_value(parse(&zip_legacy)).unwrap();
+        let h_legacy = &json_legacy["headers"][0];
+        assert!(h_legacy["filename"].is_null());
+        assert!(h_legacy["resolved_filename"].is_null());
+        assert!(h_legacy["resolved_filename_source"].is_null());
+        assert_eq!(
+            h_legacy["resolved_filename_status"],
+            "legacy_non_utf8_without_unicode_path_extra"
+        );
+
+        // 6. Gzip with ISO-8859-1 FNAME and UTF-8 FCOMMENT
+        let mut gzip_buf = vec![0x1f, 0x8b, 0x08, 0x18, 0, 0, 0, 0, 0x02, 0x03];
+        gzip_buf.extend_from_slice(b"caf\xe9.tar\0"); // ISO-8859-1 'é' (0xe9)
+        gzip_buf.extend_from_slice("packed by café\0".as_bytes()); // UTF-8
+        let json_gzip = serde_json::to_value(parse(&gzip_buf)).unwrap();
+        let h_gzip = &json_gzip["headers"][0];
+        assert_eq!(h_gzip["filename_utf8_valid"], false);
+        assert_eq!(h_gzip["filename_latin1_printable"], true);
+        assert_eq!(h_gzip["filename_encoding"], "iso_8859_1");
+        assert_eq!(h_gzip["filename"], "café.tar");
+        assert_eq!(h_gzip["filename_display_truncated"], false);
+        assert_eq!(h_gzip["comment_utf8_valid"], true);
+        assert_eq!(h_gzip["comment_latin1_printable"], true);
+        assert_eq!(h_gzip["comment_encoding"], "utf8");
+        assert_eq!(h_gzip["comment"], "packed by café");
+        assert_eq!(h_gzip["comment_display_truncated"], false);
     }
 }
