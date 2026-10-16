@@ -16,10 +16,13 @@ use App\Services\ReleaseCleaningService;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Support\Par2RenameProgress;
 use App\Support\PredbSearchDocument;
+use App\Traits\OwnsPredbIdentityTransactions;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
+use RuntimeException;
+use Throwable;
 
 /**
  * Service for updating releases with new names.
@@ -29,6 +32,10 @@ use InvalidArgumentException;
  */
 class ReleaseUpdateService
 {
+    use OwnsPredbIdentityTransactions;
+
+    public const PREDB_IDENTITY_POLICY = '33a258cabb831df86752549c1dadc6d58a5cb372e5dc5bcd9e36ccdd36ce4efc';
+
     /**
      * @var list<string>
      */
@@ -146,7 +153,7 @@ class ReleaseUpdateService
      * @param  bool  $nameStatus  Whether to update status columns
      * @param  bool  $show  Whether to show output
      * @param  int|null  $preId  PreDB ID if matched
-     * @param  string|null  $filenameEvidence  Cleaned literal filename used to select a PreDB mapping
+     * @param  string|null  $filenameEvidence  Original filename used to accept a PreDB mapping
      *
      * @throws \Exception
      */
@@ -159,7 +166,8 @@ class ReleaseUpdateService
         bool $nameStatus,
         bool $show,
         ?int $preId = 0,
-        ?string $filenameEvidence = null
+        ?string $filenameEvidence = null,
+        ?callable $filenameGuard = null
     ): void {
         $this->clearIdentityAttestation();
         $this->matched = $this->done = false;
@@ -179,7 +187,7 @@ class ReleaseUpdateService
         }
 
         if ($preId > 0) {
-            $this->updateConfirmedPredbRelease($release, $name, $method, $echo, $type, $nameStatus, $show, $preId, $filenameEvidence);
+            $this->updateConfirmedPredbRelease($release, $name, $method, $echo, $type, $nameStatus, $show, $preId, $filenameEvidence, $filenameGuard);
 
             return;
         }
@@ -215,7 +223,7 @@ class ReleaseUpdateService
 
                 $newTitle = $literalSceneName ? $newName : substr($newName, 0, 299);
 
-                if ($echo && ! $this->performDatabaseUpdate($release, $newTitle, $type, $nameStatus, $preId, $expectedSnapshot)) {
+                if ($echo && ! $this->performDatabaseUpdate($release, $newTitle, $type, $nameStatus, $preId, $expectedSnapshot, null, $filenameGuard)) {
                     $this->relid = 0;
 
                     return;
@@ -250,7 +258,8 @@ class ReleaseUpdateService
         bool $nameStatus,
         bool $show,
         int $predbId,
-        ?string $filenameEvidence = null
+        ?string $filenameEvidence = null,
+        ?callable $filenameGuard = null
     ): void {
         $this->reset();
         $release = clone $release;
@@ -268,12 +277,12 @@ class ReleaseUpdateService
         }
         if (PredbSearchDocument::exactValue($title) === PredbSearchDocument::exactValue((string) $release->searchname)) {
             if ($update) {
-                $this->attachPredbSnapshot($release, $predbId, $title, $filenameEvidence);
+                $this->attachPredbSnapshot($release, $predbId, $title, $filenameEvidence, $filenameGuard);
             }
 
             return;
         }
-        if ($update && ! $this->performDatabaseUpdate($release, $title, $type, $nameStatus, $predbId, $release, $filenameEvidence)) {
+        if ($update && ! $this->performDatabaseUpdate($release, $title, $type, $nameStatus, $predbId, $release, $filenameEvidence, $filenameGuard)) {
             return;
         }
 
@@ -303,7 +312,7 @@ class ReleaseUpdateService
 
         if (PredbSearchDocument::exactValue($title) === PredbSearchDocument::exactValue((string) $release->searchname)) {
             $attempt = $this->identityAttempt;
-            if (! $this->withPredbIdentity($predbId, $title, null, function () use ($release, $predbId, $attempt): bool {
+            if (! $this->withPredbIdentity($release, $predbId, $title, null, function () use ($release, $predbId, $attempt): bool {
                 $before = $this->predbSnapshotQuery($release)->lockForUpdate()->first();
                 if ($before === null || $this->predbSnapshotQuery($release)->update(['predb_id' => $predbId]) !== 1) {
                     return false;
@@ -363,7 +372,7 @@ class ReleaseUpdateService
         }
         $release->releases_id = $snapshot['id'];
         $attempt = $this->identityAttempt;
-        $aborted = new \RuntimeException('Media release identity or admission changed.');
+        $aborted = new RuntimeException('Media release identity or admission changed.');
         try {
             $written = DB::transaction(function () use ($release, $title, $categoryId, $guard, $attempt, $aborted): bool {
                 $before = $this->predbSnapshotQuery($release)->lockForUpdate()->first();
@@ -399,7 +408,7 @@ class ReleaseUpdateService
 
                 return true;
             });
-        } catch (\RuntimeException $exception) {
+        } catch (RuntimeException $exception) {
             if ($exception !== $aborted) {
                 throw $exception;
             }
@@ -558,7 +567,7 @@ class ReleaseUpdateService
 
         try {
             $work();
-        } catch (\Throwable $exception) {
+        } catch (Throwable $exception) {
             $this->searchSyncCoordinator->discard($releaseId);
             $this->searchSyncCoordinator->finishReleaseScope();
 
@@ -643,7 +652,8 @@ class ReleaseUpdateService
         bool $nameStatus,
         int $preId,
         ?object $expectedSnapshot = null,
-        ?string $filenameEvidence = null
+        ?string $filenameEvidence = null,
+        ?callable $filenameGuard = null
     ): bool {
         $release = clone $release;
         $expectedSnapshot = $expectedSnapshot === null ? null : clone $expectedSnapshot;
@@ -727,8 +737,10 @@ class ReleaseUpdateService
             return true;
         };
         $updated = $preId > 0
-            ? $this->withPredbIdentity($preId, $newTitle, $filenameEvidence, $write)
-            : DB::transaction(static fn (): bool => $write());
+            ? $this->withPredbIdentity($expectedSnapshot ?? $release, $preId, $newTitle, $filenameEvidence, $write, $filenameGuard)
+            : ($filenameGuard === null
+                ? DB::transaction(static fn (): bool => $write())
+                : $this->withFilenameGuard($expectedSnapshot ?? $release, $filenameGuard, $write));
 
         if ($updated) {
             if ($preId > 0 || ($nameStatus && ($this->getStatusColumnsForType($type)['isrenamed'] ?? 0) === 1)) {
@@ -791,14 +803,16 @@ class ReleaseUpdateService
     }
 
     /** Complete filename inspection only while the captured identity and PreDB link remain unchanged. */
-    public function completeFilenameSnapshot(object $release): bool
+    public function completeFilenameSnapshot(object $release, ?callable $filenameGuard = null): bool
     {
         $predbId = filter_var($release->predb_id ?? 0, FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
         if ($predbId === false) {
             return false;
         }
 
-        return $this->updateSnapshotStatus($release, 'proc_files', self::PROC_FILES_DONE, $predbId);
+        return $filenameGuard === null
+            ? $this->updateSnapshotStatus($release, 'proc_files', self::PROC_FILES_DONE, $predbId)
+            : $this->withFilenameGuard($release, $filenameGuard, fn (): bool => $this->updateSnapshotStatus($release, 'proc_files', self::PROC_FILES_DONE, $predbId), 3);
     }
 
     private function updateSnapshotStatus(object $release, string $column, int $status, int $expectedPredbId): bool
@@ -838,7 +852,7 @@ class ReleaseUpdateService
      * Attach same-name evidence only while its release identity is unchanged.
      * An established identical link is a match without another write.
      */
-    public function attachPredbSnapshot(object $release, int $predbId, ?string $expectedTitle = null, ?string $filenameEvidence = null): bool
+    public function attachPredbSnapshot(object $release, int $predbId, ?string $expectedTitle = null, ?string $filenameEvidence = null, ?callable $filenameGuard = null): bool
     {
         $this->reset();
         $releaseId = (int) ($release->releases_id ?? 0);
@@ -852,7 +866,7 @@ class ReleaseUpdateService
         $release = clone $release;
         $attached = false;
         $attempt = $this->identityAttempt;
-        $accepted = $this->withPredbIdentity($predbId, $expectedTitle ?? (string) $release->searchname, $filenameEvidence, function () use ($release, $predbId, $attempt, &$attached): bool {
+        $accepted = $this->withPredbIdentity($release, $predbId, $expectedTitle ?? (string) $release->searchname, $filenameEvidence, function () use ($release, $predbId, $attempt, &$attached): bool {
             $identity = $this->releaseSnapshotQuery($release);
             $before = (clone $identity)->lockForUpdate()->first();
             if ($before === null) {
@@ -867,7 +881,7 @@ class ReleaseUpdateService
             }
 
             return $accepted;
-        });
+        }, $filenameGuard);
         if (! $accepted) {
             return false;
         }
@@ -887,29 +901,89 @@ class ReleaseUpdateService
      *
      * @param  callable(string): bool  $write
      */
-    private function withPredbIdentity(int $predbId, string $title, ?string $filenameEvidence, callable $write): bool
+    private function withPredbIdentity(object $release, int $predbId, string $title, ?string $filenameEvidence, callable $write, ?callable $filenameGuard = null): bool
     {
-        $lostIdentity = new \RuntimeException('PreDB identity changed during release matching.');
+        $lostIdentity = new RuntimeException('PreDB identity changed during release matching.');
         try {
-            return DB::transaction(function () use ($predbId, $title, $filenameEvidence, $write, $lostIdentity): bool {
+            return $this->predbIdentityTransaction(function () use ($release, $predbId, $title, $filenameEvidence, $write, $lostIdentity, $filenameGuard): bool {
+                if ($this->releaseSnapshotQuery($release)->lockForUpdate()->first() === null) {
+                    return false;
+                }
+                if ($filenameGuard !== null && ! $this->filenameGuardAccepted($filenameGuard)) {
+                    return false;
+                }
                 $canonicalTitle = $this->predbCanonicalTitle($predbId, $title, $filenameEvidence);
                 if ($canonicalTitle === null) {
                     return false;
                 }
                 $accepted = $write($canonicalTitle);
-                if ($accepted && $this->predbCanonicalTitle($predbId, $title, $filenameEvidence) !== $canonicalTitle) {
+                if ($accepted && ($this->predbCanonicalTitle($predbId, $title, $filenameEvidence) !== $canonicalTitle
+                    || ($filenameGuard !== null && ! $this->filenameGuardAccepted($filenameGuard)))) {
                     throw $lostIdentity;
                 }
 
                 return $accepted;
             });
-        } catch (\RuntimeException $exception) {
+        } catch (RuntimeException $exception) {
             if ($exception !== $lostIdentity) {
                 throw $exception;
             }
 
+            $this->clearIdentityAttestation();
+
             return false;
         }
+    }
+
+    /** @param callable(): bool $guard
+     * @param  callable(): bool  $write
+     */
+    private function withFilenameGuard(object $release, callable $guard, callable $write, int $attempts = 1): bool
+    {
+        $lostAuthority = new RuntimeException('Filename authority changed during release matching.');
+        try {
+            return $this->predbIdentityTransaction(function () use ($release, $guard, $write, $lostAuthority): bool {
+                if ($this->releaseSnapshotQuery($release)->lockForUpdate()->first() === null || ! $this->filenameGuardAccepted($guard)) {
+                    return false;
+                }
+                $accepted = $write();
+                if ($accepted && ! $this->filenameGuardAccepted($guard)) {
+                    throw $lostAuthority;
+                }
+
+                return $accepted;
+            }, $attempts);
+        } catch (RuntimeException $exception) {
+            if ($exception !== $lostAuthority) {
+                throw $exception;
+            }
+
+            $this->clearIdentityAttestation();
+
+            return false;
+        }
+    }
+
+    /**
+     * Rechecking database-backed authority can return a different value after a write.
+     *
+     * @param  callable(): bool  $guard
+     *
+     * @phpstan-impure
+     */
+    private function filenameGuardAccepted(callable $guard): bool
+    {
+        return $guard();
+    }
+
+    /**
+     * Root-owned cleanup only; existing caller-owned transactions retain their owner.
+     *
+     * @param  callable(): bool  $write
+     */
+    private function predbIdentityTransaction(callable $write, int $attempts = 1): bool
+    {
+        return $this->runOwnedPredbTransaction(DB::connection(), $write, $attempts);
     }
 
     /** Read-only preview evidence; the guarded write must independently validate it again. */
@@ -934,11 +1008,11 @@ class ReleaseUpdateService
             || PredbSearchDocument::exactValue((string) $row->title) !== PredbSearchDocument::exactValue($title)) {
             return null;
         }
-        if ($filenameEvidence === null || PredbSearchDocument::exactValue($title) === PredbSearchDocument::exactValue($filenameEvidence)) {
+        if ($filenameEvidence === null) {
             return (string) $row->title;
         }
 
-        return $this->fileNameCleaner->matchesPredbFilenameEvidence((string) ($row->filename ?? ''), $filenameEvidence)
+        return (new OriginalFilenameEvidence($filenameEvidence))->accepts((string) $row->title, (string) ($row->filename ?? ''))
             ? (string) $row->title : null;
     }
 

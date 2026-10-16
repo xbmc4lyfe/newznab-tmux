@@ -12,6 +12,8 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
+use Illuminate\Database\Connection;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\SQLiteConnection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -40,10 +42,14 @@ final class PredbFulltextCompletionTest extends TestCase
         $winner = $this->updater($synchronized);
         $snapshot = (object) array_merge((array) $database->table('releases')->find(1), ['releases_id' => 1]);
         $changed = false;
-        $database->beforeExecuting(function (string $query) use ($winner, $snapshot, &$changed): void {
-            if (! $changed && str_starts_with($query, 'update "releases"')) {
+        DB::listen(function (QueryExecuted $event) use ($database, $winner, $snapshot, &$changed): void {
+            if (! $changed && $event->connection === $database && str_starts_with($event->sql, 'SELECT r.id AS releases_id')) {
                 $changed = true;
+                $this->assertSame(0, $database->transactionLevel());
+                $this->assertFalse($database->getPdo()->inTransaction());
                 $this->assertTrue($winner->updatePredbCandidate($snapshot, self::TITLE, 7, 'synthetic'));
+                $this->assertSame(0, $database->transactionLevel());
+                $this->assertFalse($database->getPdo()->inTransaction());
             }
         });
         $this->bindServices($database, $loser, [1]);
@@ -62,6 +68,53 @@ final class PredbFulltextCompletionTest extends TestCase
         } else {
             Event::assertNotDispatched(ReleaseNameFixed::class);
         }
+    }
+
+    #[DataProvider('winningPaths')]
+    public function test_same_pdo_nested_winner_is_rejected_without_committed_effects(string $searchname, bool $rename): void
+    {
+        $database = $this->database();
+        $this->release(1, $searchname);
+        Event::fake([ReleaseNameFixed::class]);
+        $synchronized = [];
+        $loser = $this->updater($synchronized);
+        $winner = $this->updater($synchronized);
+        $snapshot = (object) array_merge((array) $database->table('releases')->find(1), ['releases_id' => 1]);
+        $before = (array) $database->table('releases')->find(1);
+        $beforePredb = (array) $database->table('predb')->find(7);
+        $changed = false;
+        $database->beforeExecuting(function (string $query) use ($database, $winner, $snapshot, &$changed): void {
+            if (! $changed && str_starts_with($query, 'update "releases"')) {
+                $changed = true;
+                $this->assertSame(1, $database->transactionLevel());
+                $this->assertTrue($database->getPdo()->inTransaction());
+                $this->assertTrue($winner->updatePredbCandidate($snapshot, self::TITLE, 7, 'synthetic'));
+            }
+        });
+        $this->bindServices($database, $loser, [1]);
+
+        $this->artisan('releases:fix-names-group', ['type' => 'predbft', '--limit' => 1])
+            ->expectsOutputToContain('PreDB identity cannot own the callback boundary.')
+            ->assertFailed();
+
+        $this->assertTrue($changed);
+        $this->assertSame($beforePredb, (array) $database->table('predb')->find(7));
+        $this->assertSame($before, (array) $database->table('releases')->find(1));
+        $this->assertSame(0, $database->transactionLevel());
+        $this->assertFalse($database->getPdo()->inTransaction());
+        $manager = (new \ReflectionProperty(Connection::class, 'transactionsManager'))->getValue($database);
+        $owned = static fn ($record): bool => $record->connection === $database->getName();
+        $this->assertFalse($manager->getPendingTransactions()->contains($owned));
+        $this->assertFalse($manager->getCommittedTransactions()->contains($owned));
+        $this->assertSame(0, $loser->fixed);
+        $this->assertFalse($loser->matched);
+        $this->assertSame(0, $winner->fixed);
+        $this->assertSame([], $synchronized);
+        Event::assertNotDispatched(ReleaseNameFixed::class);
+        $database->transaction(static fn (): bool => true);
+        $this->assertSame([], $synchronized);
+        $this->assertSame(0, $winner->fixed);
+        Event::assertNotDispatched(ReleaseNameFixed::class);
     }
 
     /** @return array<string, array{string, bool}> */
@@ -393,7 +446,7 @@ final class PredbFulltextCompletionTest extends TestCase
         $pdo->exec('CREATE TABLE cache_locks (key TEXT PRIMARY KEY, owner TEXT, expiration INTEGER)');
         $pdo->sqliteCreateFunction('regexp', static fn (string $pattern, string $subject): int => (int) preg_match('~'.$pattern.'~', $subject), 2);
         $pdo->sqliteCreateFunction('MOD', static fn (int $value, int $divisor): int => $value % $divisor, 2);
-        $database = new class($pdo, ':memory:', '', ['driver' => 'sqlite']) extends SQLiteConnection
+        $database = new class($pdo, ':memory:', '', ['driver' => 'sqlite', 'name' => 'completion']) extends SQLiteConnection
         {
             /**
              * @param  string  $query

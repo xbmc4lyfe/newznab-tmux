@@ -11,9 +11,11 @@ use App\Services\AdditionalProcessing\State\PersistenceMetricsCollector;
 use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
+use App\Services\Predb\PredbIdentityRebuild;
 use App\Support\Par2RenameProgress;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\Support\Par2RenameTestDatabase;
 use Tests\TestCase;
@@ -45,10 +47,11 @@ final class PredbAuthoritativeIdentityTest extends TestCase
         self::assertTrue(Par2RenameProgress::save($release->id, 'manifest', 1, []));
         DB::table('predb')->insert(['id' => 7, 'title' => 'Different.Release.2025-OTHER']);
         $input = (object) array_merge($release->getAttributes(), ['releases_id' => $release->id, 'relsize' => 5000, 'filename' => $title.'.mkv']);
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => $title]]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
         $service = new NameFixingService($updates);
+        $this->certifyFilenameSqlFixture();
         $result = $service->matchPreDbFiles($input, true, true, false);
         self::assertSame('Different.Release.2025-OTHER', DB::table('predb')->where('id', 7)->value('title'));
         self::assertSame(0, $release->fresh()->predb_id, 'Committed link points at a different canonical title');
@@ -69,12 +72,14 @@ final class PredbAuthoritativeIdentityTest extends TestCase
         DB::table('predb')->insert(['id' => 7, 'title' => $title, 'filename' => 'different-file-name.mkv']);
         $release = $this->pendingPar2Release(['searchname' => 'Hashed.Title']);
         $input = (object) array_merge($release->getAttributes(), ['releases_id' => $release->id, 'filename' => $filename.'.mkv']);
-        Search::shouldReceive('searchPredb')->twice()->andReturn([['id' => 7, 'title' => $title, 'filename' => $filename.'.mkv']]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
         $updates = $this->updater();
+        $this->certifyFilenameSqlFixture();
         self::assertSame(0, (new NameFixingService($updates))->matchPreDbFiles($input, true, true, false));
         self::assertSame(0, $release->fresh()->predb_id);
         Event::assertNotDispatched(ReleaseNameFixed::class);
         DB::table('predb')->where('id', 7)->update(['filename' => 'Folder/PUBLISHER-FILE-NAME.MKV']);
+        $this->certifyFilenameSqlFixture();
         self::assertSame(1, (new NameFixingService($updates))->matchPreDbFiles($input, true, true, false));
         self::assertSame(7, $release->fresh()->predb_id);
         self::assertSame($title, $release->fresh()->searchname);
@@ -237,7 +242,8 @@ final class PredbAuthoritativeIdentityTest extends TestCase
         }
         $release = $this->pendingPar2Release(['searchname' => 'Hashed.Title']);
         $input = (object) array_merge($release->getAttributes(), ['releases_id' => $release->id, 'filename' => 'publisher-file.mkv']);
-        Search::shouldReceive('searchPredb')->once()->andReturn([['id' => 7, 'title' => 'Exact.Release.2026-GRP', 'filename' => 'publisher-file.mkv']]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
+        $this->certifyFilenameSqlFixture();
         $writes = 0;
         DB::connection()->beforeExecuting(static function (string $query) use (&$writes): void {
             if (preg_match('/^(?:update|insert|delete)/i', $query) === 1) {
@@ -245,7 +251,11 @@ final class PredbAuthoritativeIdentityTest extends TestCase
             }
         });
         $updates = $this->updater();
-        self::assertSame($valid ? 1 : 0, (new NameFixingService($updates))->matchPreDbFiles($input, false, true, false));
+        if ($currentTitle !== null && $currentTitle !== 'Exact.Release.2026-GRP') {
+            self::assertNull($updates->currentPredbTitle(7, 'Exact.Release.2026-GRP', 'publisher-file.mkv'), 'A stale claimed canonical title remains rejected independently of current alias nomination.');
+        }
+        $currentAliasOwner = $currentTitle !== null && $currentFilename === 'publisher-file.mkv';
+        self::assertSame($valid || $currentAliasOwner ? 1 : 0, (new NameFixingService($updates))->matchPreDbFiles($input, false, true, false));
         self::assertSame(0, $writes);
         self::assertSame(0, $release->fresh()->predb_id);
         self::assertSame('Hashed.Title', $release->fresh()->searchname);
@@ -280,5 +290,33 @@ final class PredbAuthoritativeIdentityTest extends TestCase
     private function updater(): ReleaseUpdateService
     {
         return new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {}));
+    }
+
+    /** Explicit migration from legacy nullable/TEXT fixture, only for SQL filename routes. */
+    private function certifyFilenameSqlFixture(): void
+    {
+        if (! Schema::hasTable('predb_identity_state')) {
+            $columns = array_column(DB::select('PRAGMA table_info(predb)'), 'name');
+            $filename = in_array('filename', $columns, true) ? "COALESCE(filename,'')" : "''";
+            DB::statement('ALTER TABLE predb RENAME TO legacy_predb_fixture');
+            DB::statement("CREATE TABLE predb (id INTEGER PRIMARY KEY NOT NULL, title varchar NOT NULL, filename varchar NOT NULL DEFAULT '', source varchar, size varchar, category varchar, nuked INTEGER DEFAULT 0)");
+            DB::statement("INSERT INTO predb(id,title,filename) SELECT id,title,$filename FROM legacy_predb_fixture");
+            foreach (['source', 'size', 'category', 'nuked'] as $column) {
+                if (in_array($column, $columns, true)) {
+                    DB::statement('UPDATE predb SET '.$column.'=(SELECT '.$column.' FROM legacy_predb_fixture old WHERE old.id=predb.id)');
+                }
+            }
+            DB::statement('DROP TABLE legacy_predb_fixture');
+            (require database_path('migrations/2026_10_15_150000_create_predb_identity_projection.php'))->up();
+        }
+        if (! Schema::hasTable('release_files')) {
+            DB::statement('CREATE TABLE release_files (releases_id INTEGER NOT NULL,name varchar NOT NULL,crc32 varchar)');
+        }
+        $rebuild = new PredbIdentityRebuild;
+        $start = $rebuild->start(DB::connection());
+        do {
+            $page = $rebuild->chunk(DB::connection(), $start['generation']);
+        } while (! $page['exhausted']);
+        $rebuild->certify(DB::connection(), $start['generation']);
     }
 }
