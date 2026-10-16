@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 37;
+    public const SCHEMA_VERSION = 38;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 
@@ -1318,7 +1318,7 @@ final class ReleaseFingerprintCollector
                 if (! NativeMetadataParser::hasCurrentArticleDatesSchema($dates)) {
                     return false;
                 }
-                foreach (['date', 'injection_date', 'legacy_nntp_posting_date'] as $source) {
+                foreach (['date', 'injection_date', 'legacy_nntp_posting_date', 'expires'] as $source) {
                     if ($dates[$source]['parse_status'] === 'budget_exceeded') {
                         return false;
                     }
